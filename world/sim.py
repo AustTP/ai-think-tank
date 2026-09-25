@@ -31,6 +31,7 @@ import os
 import random
 import threading
 import time
+import urllib.parse
 from collections import deque
 
 # 2026-09-23: 1.0s (was 2.0s). The server only PUBLISHES new positions ~once
@@ -573,7 +574,7 @@ def _reconcile_stranded_agents(state, grid):
     """2026-09-22: heal agents stranded in a reachability gap (the map has
     occlusions that leave some outdoor cells unreachable from SPAWN, which used
     to strand agents who couldn't path to a trailhead door -- ben at the map
-    edge, faye at the origin corner). A VISIBLE agent with no task,
+    edge, theo at the origin corner). A VISIBLE agent with no task,
     path, pair, or handoff that sits on a collision cell or in an unreachable
     region is re-picked to a free reachable spot (pick_free_spot's reachability
     guarantee). Bound: >40px/year sliding -- if a visible, idle agent is stuck
@@ -1465,6 +1466,10 @@ def queue_work(state, items):
             # Phase E2d: an INCIDENT (bug) is pinned to the owning team's on-call
             # and pin-woken even though it carries no reviewOf.
             'incident': bool(item.get('incident')),
+            # Theo routing (2026-09-25): a spike the classifier could attribute
+            # to a specific team is pinned to that team's on-call worker, same
+            # pin-and-wake treatment as an incident -- see _assign_due_item.
+            'directRoute': bool(item.get('directRoute')),
             'sprintId': item.get('sprintId') or None,
             # Phase E: a pressoffice task may target a product (its build
             # releases the artifact) and carry optional pre-injected wiki pages.
@@ -2169,7 +2174,7 @@ def appear_from_outskirts(state, agent_id, doors=None, grid=None):
     a['visible'] = True
     a['inRoom'] = None
     # An agent being woken is, by definition, newly ready for work: clear any
-    # stale busy/task so a ghost (busy+offDuty, e.g. faye) can't wake up still
+    # stale busy/task so a ghost (busy+offDuty, e.g. theo) can't wake up still
     # flagged busy -- which would make her visible but ineligible for assignment.
     a['busy'] = False
     a['task'] = None
@@ -2394,6 +2399,53 @@ def send_agent_off_duty(state, agent_id, doors, grid):
     a['replanCount'] = 0
     a['offDuty'] = True
     a['visible'] = False
+
+
+MIN_RESEARCH_CADENCE_MS = 5 * 60 * 1000  # floor: a misparsed "every second" can't spam the queue
+
+
+def next_topic_id(state):
+    """Server-side monotonic counter for researchTopics ids (topic-1, topic-2,
+    ...), mirroring next_issue_key's cold-starts-at-1/never-collides shape.
+    Topics aren't team-scoped, so this is one global counter, not per-prefix."""
+    n = (state.get('researchTopicCounter') or 0) + 1
+    state['researchTopicCounter'] = n
+    return f'topic-{n}'
+
+
+def add_research_topic(state, topic, start_url, cadence_ms, now_ms=None,
+                       link_keyword=None, page_keyword=None):
+    """The creator side of the standing research-topic cadence: _check_schedules
+    (below) has always been able to FIRE a due topic, but nothing ever appended
+    one to state['researchTopics'] -- it was seeded empty at boot and never
+    written to again. This is that missing write path.
+
+    Fails closed rather than guessing: rejects an empty topic, a start_url that
+    doesn't parse as a real absolute URL (scheme + host), and clamps cadence_ms
+    to MIN_RESEARCH_CADENCE_MS so a bad interval can't turn into a queue-flood.
+    Returns the new record, or None if rejected. `lastRunAt` starts at 0 so the
+    first crawl fires on the very next _check_schedules pass, matching the
+    intuitive "start checking X" request rather than waiting a full cadence."""
+    topic = (topic or '').strip()
+    start_url = (start_url or '').strip()
+    if not topic or not start_url:
+        return None
+    parsed = urllib.parse.urlparse(start_url)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        return None
+    cadence_ms = max(int(cadence_ms or 0), MIN_RESEARCH_CADENCE_MS)
+    record = {
+        'id': next_topic_id(state),
+        'topic': topic,
+        'startUrl': start_url,
+        'cadenceMs': cadence_ms,
+        'lastRunAt': 0,
+        'seenUrls': [],
+        'linkKeyword': link_keyword or None,
+        'pageKeyword': page_keyword or None,
+    }
+    state.setdefault('researchTopics', []).append(record)
+    return record
 
 
 def _check_schedules(state, now, now_ms):
@@ -3352,7 +3404,7 @@ def _next_hire_name(state):
     """A deterministic-ish unique first name for a hire. The JS uses an LLM to
     generate + validate a real unused name; here (no network in sim.py) we take
     a small pool of ordinary names not already in the roster, else None."""
-    pool = ['maya', 'leo', 'zara', 'owen', 'lyra', 'theo', 'ida', 'vela']
+    pool = ['maya', 'leo', 'zara', 'owen', 'lyra', 'ida', 'vela']
     used = {d.get('name', '').lower() for d in (state.get('agentRoster') or [])}
     for n in pool:
         if n not in used:
@@ -6309,7 +6361,10 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     # woken and the gate deadlocks at one approval.
     # Phase E2d: an INCIDENT (bug) is likewise pinned to the owning team's
     # on-call -- same wake semantics as a reviewer pin, even with no reviewOf.
-    pinned = pick.get('assignedTo') if (pick.get('reviewOf') or pick.get('incident') or pick.get('_mailResume')) else None
+    # Theo routing (2026-09-25): directRoute is the same pin/wake treatment for
+    # a spike the classifier attributed to a specific team's worker.
+    pinned = pick.get('assignedTo') if (pick.get('reviewOf') or pick.get('incident')
+                                         or pick.get('_mailResume') or pick.get('directRoute')) else None
     if pinned and agents.get(pinned):
         pinned_agent = agents.get(pinned)
         if not pinned_agent.get('busy') and not pinned_agent.get('task') and not pinned_agent.get('pairWith'):

@@ -16,7 +16,7 @@ let AGENT_ROSTER = [];
 
 // An authority figure who can carry out an action that used to be admin-only
 // -- hiring, big-task delegation. Under the single-admin model the admin
-// (isAdmin, Faye) handles these and passes day-to-day approval/denial work
+// (isAdmin, Theo) handles these and passes day-to-day approval/denial work
 // down to the directors; the senior-most director (isDirector, not admin, no
 // own `director` -- Nora) stands in for the admin on approval work. So "who
 // does this admin-type action" is: the admin if available, else the
@@ -529,7 +529,7 @@ function drawAgentAt(ctx, toScreen, zoom, playerSprites, a, x, y) {
 // offDuty is server-authoritative (synced every poll, sim_bridge.js) while
 // `visible` is client-owned and only as fresh as the last client flow that
 // touched it -- so an agent the server sent off-duty can otherwise linger
-// on the map as a ghost (faye was found busy+offDuty at the map origin).
+// on the map as a ghost (theo was found busy+offDuty at the map origin).
 // "When they go offline, they disappear."
 function agentIsDrawn(a) {
   return a.visible && !a.offDuty;

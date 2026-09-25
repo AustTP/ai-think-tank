@@ -1,0 +1,10 @@
+{
+  "id": "ada",
+  "name": "Ada",
+  "color": "#e06666",
+  "role": "Research",
+  "model": "small",
+  "isAdmin": false,
+  "elevatedAccess": false,
+  "accessGrant": null
+}
