@@ -3074,7 +3074,7 @@ async function main() {
     // that this number should visibly drop when someone clocks off and
     // rise again when the village calls them back in. Only count VISIBLE
     // busy agents: an off-duty agent is invisible, so a stale `busy` flag
-    // on a resting agent (a known ghost, e.g. faye parked at the origin)
+    // on a resting agent (a known ghost, e.g. theo parked at the origin)
     // must not count as someone actually working.
     document.getElementById('hudVillagers').textContent = activeAgentCount();
     document.getElementById('hudWorking').textContent = Object.values(AGENTS).filter(a => a.busy && a.visible).length;

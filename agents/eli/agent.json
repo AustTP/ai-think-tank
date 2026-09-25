@@ -1,0 +1,10 @@
+{
+  "id": "eli",
+  "name": "Eli",
+  "color": "#c27ba0",
+  "role": "Weather Station",
+  "model": "small",
+  "isAdmin": false,
+  "elevatedAccess": false,
+  "accessGrant": null
+}

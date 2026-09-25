@@ -8,7 +8,7 @@
 // instead of always firing whoever's worst off.
 //
 // Architecture (2026-09-21): the new approval model has a SINGLE admin
-// (Faye) who passes personnel/approval matters down to the directors,
+// (Theo) who passes personnel/approval matters down to the directors,
 // and the senior-most director (Nora) approves/denies on the admin's
 // behalf. Admin/director identity lives in the DATABASE and reaches this
 // JS only because the server hydrates AGENT_ROSTER from it on load --
@@ -31,7 +31,7 @@ let lastFiringReviewAt = 0;
 // The two independent approvers who jointly review a firing: the admin
 // (isAdmin) and the senior-most director (isDirector && !isAdmin && no
 // `director` of their own -- the top of the director chain that stands in
-// for the admin on approvals). Faye + Nora in the current roster.
+// for the admin on approvals). Theo + Nora in the current roster.
 // Returns [] if both can't be identified (shouldn't happen with the
 // current roster, but a future edit that removes one shouldn't crash this
 // instead of just silently not firing anyone).

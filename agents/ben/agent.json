@@ -1,0 +1,10 @@
+{
+  "id": "ben",
+  "name": "Ben",
+  "color": "#6fa8dc",
+  "role": "Banking",
+  "model": "small",
+  "isAdmin": false,
+  "elevatedAccess": false,
+  "accessGrant": null
+}
