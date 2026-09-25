@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>World 2 — door trigger editor</title>
+<style>
+  html, body {
+    margin: 0;
+    background: #1b1e22;
+    font-family: monospace;
+    color: #e8e8e8;
+  }
+  #wrap { display: flex; flex-direction: column; align-items: center; padding: 12px; }
+  #main { display: flex; gap: 14px; align-items: flex-start; }
+  #viewport {
+    position: relative;
+    border: 2px solid #444;
+    background: #000;
+    overflow: hidden;
+  }
+  canvas { image-rendering: pixelated; display: block; }
+  #toolbar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin: 10px 0;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  button {
+    font-family: monospace;
+    font-size: 13px;
+    background: #2a2e34;
+    color: #e8e8e8;
+    border: 1px solid #555;
+    border-radius: 6px;
+    padding: 8px 14px;
+    cursor: pointer;
+  }
+  button.active { background: #465066; border-color: #7a8ab0; }
+  button:hover { background: #363c44; }
+  #status { font-size: 12px; opacity: 0.75; min-height: 18px; }
+  p.help { max-width: 700px; font-size: 12px; opacity: 0.7; text-align: center; margin: 6px 0; }
+  #sidebar { width: 220px; display: flex; flex-direction: column; gap: 10px; }
+  #buildingList { display: flex; flex-direction: column; gap: 4px; }
+  #buildingList button { text-align: left; }
+  #buildingList button.selected { background: #5a3f66; border-color: #b07ac0; }
+  #fields { display: flex; flex-direction: column; gap: 6px; background: #22262c; border: 1px solid #444; border-radius: 6px; padding: 10px; }
+  #fields label { font-size: 12px; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  #fields input { width: 70px; font-family: monospace; background: #14161a; color: #e8e8e8; border: 1px solid #555; border-radius: 4px; padding: 3px 6px; }
+  #fields h4 { margin: 0 0 4px 0; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h3 style="margin:4px 0;">World 2 — door trigger editor</h3>
+  <p class="help">Pick a building on the left (or click its box on the map), then drag the box
+     to move it or drag a corner to resize it -- or type exact numbers on the right. Native
+     (688x384) outdoor-map pixel coordinates, same space as the collision grid. Save writes
+     straight to door_triggers.json -- reload world/index.html afterward to play with the
+     update.</p>
+  <div id="toolbar">
+    <button id="panModeBtn">&#9995; Pan</button>
+    <button id="moveModeBtn" class="active">&#9995; Move/Resize</button>
+    <button id="zoomInBtn">+</button>
+    <button id="zoomOutBtn">&minus;</button>
+    <button id="zoomAllBtn">Show all</button>
+    <button id="saveBtn">Save to door_triggers.json</button>
+    <button id="downloadBtn">Download instead</button>
+    <button id="undoBtn">Undo</button>
+  </div>
+  <div id="main">
+    <div id="sidebar">
+      <div id="buildingList"></div>
+      <div id="fields">
+        <h4 id="fieldsTitle">No building selected</h4>
+        <label>x <input type="number" id="fx" step="1"></label>
+        <label>y <input type="number" id="fy" step="1"></label>
+        <label>w <input type="number" id="fw" step="1"></label>
+        <label>h <input type="number" id="fh" step="1"></label>
+      </div>
+    </div>
+    <div id="viewport">
+      <canvas id="canvas"></canvas>
+    </div>
+  </div>
+  <p id="status"></p>
+</div>
+<script src="world.js"></script>
+<script>
+const VIEW_W = 960, VIEW_H = 640;
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+canvas.width = VIEW_W;
+canvas.height = VIEW_H;
+ctx.imageSmoothingEnabled = false;
+
+let doors = {}; // { building: {x,y,w,h} } in native coords
+let bgImg;
+let selected = null;
+
+let camX = 0, camY = 0, zoom = 1;
+const ZOOM_MIN = 0.5, ZOOM_MAX = 10, ZOOM_STEP_FACTOR = 1.25;
+let zoomShowAll = 1;
+
+let mode = 'move'; // 'move' | 'pan'
+let panning = false, panLastX = 0, panLastY = 0;
+let dragging = null; // { kind: 'move'|'resize', corner, startNative:[x,y], startRect:{...} }
+const HANDLE_PX = 9; // screen-space hit radius for a resize handle
+
+let undoStack = [];
+const statusEl = document.getElementById('status');
+function setStatus(msg) { statusEl.textContent = msg; }
+
+function pushUndo() {
+  undoStack.push(JSON.stringify(doors));
+  if (undoStack.length > 50) undoStack.shift();
+}
+
+function clampCamera() {
+  const visW = VIEW_W / zoom, visH = VIEW_H / zoom;
+  camX = visW >= NATIVE_W ? -(visW - NATIVE_W) / 2 : Math.max(0, Math.min(NATIVE_W - visW, camX));
+  camY = visH >= NATIVE_H ? -(visH - NATIVE_H) / 2 : Math.max(0, Math.min(NATIVE_H - visH, camY));
+}
+function toScreen(x, y) { return [(x - camX) * zoom, (y - camY) * zoom]; }
+function toNative(sx, sy) { return [sx / zoom + camX, sy / zoom + camY]; }
+
+function corners(r) {
+  return {
+    nw: [r.x, r.y], ne: [r.x + r.w, r.y],
+    sw: [r.x, r.y + r.h], se: [r.x + r.w, r.y + r.h],
+  };
+}
+
+function render() {
+  ctx.clearRect(0, 0, VIEW_W, VIEW_H);
+  const [bx, by] = toScreen(0, 0);
+  ctx.drawImage(bgImg, bx, by, NATIVE_W * zoom, NATIVE_H * zoom);
+
+  for (const building in doors) {
+    const r = doors[building];
+    const isSel = building === selected;
+    const [dx, dy] = toScreen(r.x, r.y);
+    ctx.strokeStyle = isSel ? 'rgba(120,180,255,0.95)' : 'rgba(255,210,60,0.85)';
+    ctx.lineWidth = isSel ? 2 : 1.5;
+    ctx.strokeRect(dx, dy, r.w * zoom, r.h * zoom);
+    ctx.fillStyle = isSel ? 'rgba(120,180,255,0.25)' : 'rgba(255,210,60,0.15)';
+    ctx.fillRect(dx, dy, r.w * zoom, r.h * zoom);
+
+    ctx.font = '12px monospace';
+    ctx.fillStyle = isSel ? '#a8d0ff' : '#ffd23c';
+    ctx.fillText(building, dx, dy - 4);
+
+    if (isSel) {
+      ctx.fillStyle = 'rgba(120,180,255,0.95)';
+      for (const [cx, cy] of Object.values(corners(r))) {
+        const [sx, sy] = toScreen(cx, cy);
+        ctx.fillRect(sx - 4, sy - 4, 8, 8);
+      }
+    }
+  }
+}
+
+function setZoom(newZoom, pivotSx, pivotSy) {
+  const [nx, ny] = toNative(pivotSx, pivotSy);
+  zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZoom));
+  camX = nx - pivotSx / zoom;
+  camY = ny - pivotSy / zoom;
+  clampCamera();
+  render();
+}
+
+function setMode(newMode) {
+  mode = newMode;
+  document.getElementById('panModeBtn').classList.toggle('active', mode === 'pan');
+  document.getElementById('moveModeBtn').classList.toggle('active', mode === 'move');
+  canvas.style.cursor = mode === 'pan' ? 'grab' : 'default';
+}
+
+function renderBuildingList() {
+  const list = document.getElementById('buildingList');
+  list.innerHTML = '';
+  for (const building in doors) {
+    const btn = document.createElement('button');
+    btn.textContent = building;
+    btn.className = building === selected ? 'selected' : '';
+    btn.addEventListener('click', () => selectBuilding(building, true));
+    list.appendChild(btn);
+  }
+}
+
+function selectBuilding(building, recenter) {
+  selected = building;
+  renderBuildingList();
+  updateFields();
+  if (recenter && doors[building]) {
+    const r = doors[building];
+    camX = r.x + r.w / 2 - (VIEW_W / zoom) / 2;
+    camY = r.y + r.h / 2 - (VIEW_H / zoom) / 2;
+    clampCamera();
+  }
+  render();
+}
+
+function updateFields() {
+  const title = document.getElementById('fieldsTitle');
+  const r = selected ? doors[selected] : null;
+  title.textContent = selected ? selected : 'No building selected';
+  for (const [id, key] of [['fx','x'],['fy','y'],['fw','w'],['fh','h']]) {
+    document.getElementById(id).value = r ? r[key] : '';
+    document.getElementById(id).disabled = !r;
+  }
+}
+
+function wireFields() {
+  for (const [id, key] of [['fx','x'],['fy','y'],['fw','w'],['fh','h']]) {
+    document.getElementById(id).addEventListener('change', e => {
+      if (!selected) return;
+      pushUndo();
+      const v = parseInt(e.target.value, 10);
+      if (!Number.isNaN(v)) doors[selected][key] = v;
+      render();
+    });
+  }
+}
+
+function localXY(e) {
+  const rect = canvas.getBoundingClientRect();
+  return [e.clientX - rect.left, e.clientY - rect.top];
+}
+
+function hitTest(sx, sy) {
+  // Corner handles of the selected rect take priority over body drags.
+  if (selected) {
+    const r = doors[selected];
+    for (const [name, [cx, cy]] of Object.entries(corners(r))) {
+      const [hsx, hsy] = toScreen(cx, cy);
+      if (Math.hypot(hsx - sx, hsy - sy) <= HANDLE_PX) return { kind: 'resize', corner: name };
+    }
+  }
+  const [nx, ny] = toNative(sx, sy);
+  // Prefer the currently selected rect if the click is inside it, so
+  // overlapping boxes don't steal the drag.
+  if (selected) {
+    const r = doors[selected];
+    if (nx >= r.x && nx <= r.x + r.w && ny >= r.y && ny <= r.y + r.h) return { kind: 'move' };
+  }
+  for (const building in doors) {
+    const r = doors[building];
+    if (nx >= r.x && nx <= r.x + r.w && ny >= r.y && ny <= r.y + r.h) return { kind: 'select', building };
+  }
+  return null;
+}
+
+function wireCanvas() {
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const [sx, sy] = localXY(e);
+    const factor = e.deltaY < 0 ? ZOOM_STEP_FACTOR : 1 / ZOOM_STEP_FACTOR;
+    setZoom(zoom * factor, sx, sy);
+  }, { passive: false });
+
+  canvas.addEventListener('mousedown', e => {
+    const [sx, sy] = localXY(e);
+    if (mode === 'pan' || e.button === 1) {
+      panning = true;
+      panLastX = sx; panLastY = sy;
+      canvas.style.cursor = 'grabbing';
+      return;
+    }
+    const hit = hitTest(sx, sy);
+    const [nx, ny] = toNative(sx, sy);
+    if (!hit) { return; }
+    if (hit.kind === 'select') {
+      selectBuilding(hit.building, false);
+      pushUndo();
+      dragging = { kind: 'move', startNative: [nx, ny], startRect: { ...doors[hit.building] } };
+    } else if (hit.kind === 'move') {
+      pushUndo();
+      dragging = { kind: 'move', startNative: [nx, ny], startRect: { ...doors[selected] } };
+    } else if (hit.kind === 'resize') {
+      pushUndo();
+      dragging = { kind: 'resize', corner: hit.corner, startRect: { ...doors[selected] } };
+    }
+  });
+
+  canvas.addEventListener('mousemove', e => {
+    const [sx, sy] = localXY(e);
+    if (panning) {
+      camX -= (sx - panLastX) / zoom;
+      camY -= (sy - panLastY) / zoom;
+      panLastX = sx; panLastY = sy;
+      clampCamera();
+      render();
+      return;
+    }
+    if (!dragging) return;
+    const [nx, ny] = toNative(sx, sy);
+    const r = doors[selected];
+    if (dragging.kind === 'move') {
+      const [snx, sny] = dragging.startNative;
+      r.x = Math.round(dragging.startRect.x + (nx - snx));
+      r.y = Math.round(dragging.startRect.y + (ny - sny));
+    } else if (dragging.kind === 'resize') {
+      const s = dragging.startRect;
+      let { x, y, w, h } = s;
+      if (dragging.corner === 'nw') { w = s.x + s.w - nx; h = s.y + s.h - ny; x = nx; y = ny; }
+      else if (dragging.corner === 'ne') { w = nx - s.x; h = s.y + s.h - ny; y = ny; }
+      else if (dragging.corner === 'sw') { w = s.x + s.w - nx; h = ny - s.y; x = nx; }
+      else if (dragging.corner === 'se') { w = nx - s.x; h = ny - s.y; }
+      r.x = Math.round(x); r.y = Math.round(y);
+      r.w = Math.max(4, Math.round(w)); r.h = Math.max(4, Math.round(h));
+    }
+    updateFields();
+    render();
+  });
+
+  window.addEventListener('mouseup', () => {
+    dragging = null;
+    if (panning) { panning = false; canvas.style.cursor = mode === 'pan' ? 'grab' : 'default'; }
+  });
+}
+
+async function main() {
+  bgImg = new Image();
+  await new Promise((res, rej) => {
+    bgImg.onload = res; bgImg.onerror = rej;
+    bgImg.src = BG_SPRITE + '?v=' + Date.now();
+  });
+
+  const res = await fetch('door_triggers.json?v=' + Date.now());
+  doors = await res.json();
+
+  zoomShowAll = Math.min(VIEW_W / NATIVE_W, VIEW_H / NATIVE_H);
+  zoom = zoomShowAll;
+  camX = 0; camY = 0;
+  clampCamera();
+
+  wireCanvas();
+  wireFields();
+  setMode('move');
+  renderBuildingList();
+  updateFields();
+  render();
+
+  document.getElementById('panModeBtn').addEventListener('click', () => setMode('pan'));
+  document.getElementById('moveModeBtn').addEventListener('click', () => setMode('move'));
+
+  document.getElementById('zoomInBtn').addEventListener('click', () => setZoom(zoom * ZOOM_STEP_FACTOR, VIEW_W / 2, VIEW_H / 2));
+  document.getElementById('zoomOutBtn').addEventListener('click', () => setZoom(zoom / ZOOM_STEP_FACTOR, VIEW_W / 2, VIEW_H / 2));
+  document.getElementById('zoomAllBtn').addEventListener('click', () => {
+    zoom = zoomShowAll; camX = 0; camY = 0; clampCamera(); render();
+  });
+
+  document.getElementById('undoBtn').addEventListener('click', () => {
+    if (!undoStack.length) return;
+    doors = JSON.parse(undoStack.pop());
+    if (!doors[selected]) selected = null;
+    renderBuildingList();
+    updateFields();
+    render();
+  });
+
+  document.getElementById('downloadBtn').addEventListener('click', () => {
+    const blob = new Blob([JSON.stringify(doors, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'door_triggers.json';
+    a.click();
+    URL.revokeObjectURL(url);
+    setStatus('Downloaded -- move it into world/ to replace door_triggers.json.');
+  });
+
+  document.getElementById('saveBtn').addEventListener('click', async () => {
+    setStatus('Saving...');
+    try {
+      const r = await fetch('/save-doors', {
+        method: 'POST',
+        body: JSON.stringify(doors),
+      });
+      setStatus(r.ok ? 'Saved to door_triggers.json.' : 'Save failed: ' + await r.text());
+    } catch (e) {
+      setStatus('Save failed (is serve.py running, not a plain http.server?): ' + e.message);
+    }
+  });
+}
+
+main();
+</script>
+</body>
+</html>
