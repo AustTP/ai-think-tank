@@ -4250,7 +4250,14 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/execute', '/api/pipeline', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/keys')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/execute', '/api/pipeline', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/keys', '/api/player-email')
+# Real gap found 2026-09-25: /api/player-email/credential's OWN handler
+# rejects an agent that explicitly self-identifies via ?requesterId=, but
+# with the prefix missing here that check was the ONLY gate -- a request
+# with NO session cookie and NO agent key at all reached the handler and
+# silently overwrote the player's real Gmail app-password. Same two-layer
+# shape /api/keys already uses: this middleware requires SOME valid auth
+# (session or agent key) before the handler's own player-only check ever runs.
 
 
 def _valid_agent_key_presented(presented_key):

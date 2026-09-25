@@ -10,8 +10,11 @@ raise). A real send is only testable once the player provisions the live
 app-password, so the endpoint's self-test is the live-verification path.
 """
 import os
+import shutil
 import sys
+import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -19,6 +22,35 @@ import sim  # noqa: E402
 import serve  # noqa: E402
 
 _NOW_MS = 1_725_000_000_000
+_TMP_DIR = None
+_PATCHER = None
+
+
+def setUpModule():
+    # Real gap found 2026-09-25 (same class as test_composite_trust.py's own
+    # fix): this file was never DB-isolated -- FailClosed.
+    # test_send_without_credential_fails_closed calls serve._delete_credential
+    # directly, which would delete a REAL player's provisioned Gmail
+    # credential if this ever ran against a live village.db. Also not in
+    # tests/run_all.sh, so it had never actually been exercised as part of
+    # "the test suite" at all until now.
+    global _TMP_DIR, _PATCHER
+    _TMP_DIR = tempfile.mkdtemp(prefix='village-email-test-')
+    _PATCHER = unittest.mock.patch.multiple(
+        serve,
+        DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
+        VILLAGE_DIR=_TMP_DIR,
+        AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
+        LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
+        PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
+    )
+    _PATCHER.start()
+    serve.init_db()
+
+
+def tearDownModule():
+    _PATCHER.stop()
+    shutil.rmtree(_TMP_DIR, ignore_errors=True)
 
 
 def _state(**over):
@@ -107,6 +139,48 @@ class TriggerSites(unittest.TestCase):
         self.assertIsNotNone(gate)
         kinds = [e['kind'] for e in st['emailOutbox']]
         self.assertIn('story_needs_review', kinds)
+
+
+class EndpointAuth(unittest.TestCase):
+    """Real gap found live 2026-09-25: /api/player-email/credential's handler
+    checks _resolve_requester to reject an agent that explicitly self-
+    identifies (?requesterId=<id>), but the path was missing from
+    AUTH_PROTECTED_PREFIXES entirely -- that check was the ONLY gate, so a
+    request with NO session cookie and NO agent key at all reached the
+    handler and silently overwrote the player's real credential. Confirmed
+    live against a real village before this fix existed. Two-layer shape,
+    matching /api/keys: the middleware must see SOME valid auth first."""
+
+    def _client(self):
+        from starlette.testclient import TestClient
+        return TestClient(serve.app)
+
+    def test_unauthenticated_request_is_rejected(self):
+        c = self._client()  # no session cookie, no X-Agent-Key at all
+        r = c.post('/api/player-email/credential', json={'appPassword': 'abcdefghijklmnop'})
+        self.assertEqual(r.status_code, 401)
+
+    def test_authenticated_agent_still_gets_player_only_rejection(self):
+        # The middleware's OWN auth check (any real agent key) is not the
+        # same thing as being the player -- the handler's _resolve_requester
+        # check must still fire on top of it when the caller explicitly
+        # self-identifies as an agent.
+        agent_id = 'test-endpointauth-agent'
+        key = serve.get_or_create_agent_key(agent_id)
+        c = self._client()
+        r = c.post(f'/api/player-email/credential?requesterId={agent_id}',
+                   json={'appPassword': 'abcdefghijklmnop'},
+                   headers={'X-Agent-Key': key})
+        self.assertEqual(r.status_code, 403)
+
+    def test_real_session_is_accepted(self):
+        c = self._client()
+        c.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
+        r = c.post('/api/player-email/credential', json={'appPassword': 'not-16-chars'})
+        # Reaches the handler (past auth) and fails on format, not auth --
+        # proves a real session is NOT blocked by this fix.
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('app-password', r.json().get('error', ''))
 
 
 class FailClosed(unittest.TestCase):
