@@ -649,7 +649,7 @@ def _openrouter_account_credits():
 # only job after this is to hydrate from /api/state -- names, roles, colors,
 # director pointers are all taken from the DB, never from a JS literal.
 # Idempotent: only seeds when kv_state is completely empty, and stamps the
-# director tier (Faye admin, Nora senior director, walk-the-chain pointers)
+# director tier (Theo admin, Nora senior director, walk-the-chain pointers)
 # immediately so the DB is authoritative before any client reads it.
 # ---------------------------------------------------------------------------
 def _default_roster_definitions():
@@ -664,7 +664,7 @@ def _default_roster_definitions():
         {'id': 'cora', 'name': 'Cora', 'color': '#93c47d', 'role': 'Post Office', 'model': 'small'},
         {'id': 'dev', 'name': 'Dev', 'color': '#ffd966', 'role': 'Studio', 'model': 'small'},
         {'id': 'eli', 'name': 'Eli', 'color': '#c27ba0', 'role': 'Weather Station', 'model': 'small'},
-        {'id': 'faye', 'name': 'Faye', 'color': '#b48ce0', 'role': 'Control Room', 'model': 'mid'},
+        {'id': 'theo', 'name': 'Theo', 'color': '#b48ce0', 'role': 'Control Room', 'model': 'mid'},
         {'id': 'nora', 'name': 'Nora', 'color': '#e69138', 'role': 'Personnel', 'model': 'mid'},
     ]
 
@@ -1704,8 +1704,7 @@ async def _telegram_process_update(update):
     state = get_state_from_db()
     if not state:
         return chat_id, 'The village is not up right now.'
-    admin_id = _admin_agent_id(state)
-    result = await _ask_core(state, text, admin_id)
+    result = await _route_player_request(state, text)
     reply = result.get('reply') or result.get('error') or "Didn't get a usable reply."
     return chat_id, reply
 
@@ -1882,7 +1881,7 @@ def _senior_most_director_id(state):
     # approve/deny on the admin's behalf. It is therefore the top of the
     # director chain EXCLUDING the admin(s): a director, not themselves
     # supervised by any other director (no `director` field), and not an admin.
-    # In the current roster that is Nora (Faye is the admin and also a director,
+    # In the current roster that is Nora (Theo is the admin and also a director,
     # but she doesn't delegate to herself). Returns the agent id, or None if
     # there is no eligible non-admin director to stand in (in which case
     # escalations just keep waiting for the human, as before).
@@ -2178,27 +2177,29 @@ async def _lifespan(app):
         sim_task.cancel()
 
 
-# Workers report to one of the two directors (Faye — the admin, and Nora —
+# Workers report to one of the two directors (Theo — the admin, and Nora —
 # the senior-most director). Kept in sync with the DB backfill so a fresh
 # start and a repaired DB agree. Assignments are deterministic: technical/
-# creative/research roles -> faye, operations/personnel/banking -> nora.
-# Everyone ultimately resolves to a director (faye or nora) by the time the
+# creative/research roles -> theo, operations/personnel/banking -> nora.
+# Everyone ultimately resolves to a director (theo or nora) by the time the
 # chain is walked. Mid-level team LEADS get their own direct reports below
 # them, which is what makes them directors too under the walk-the-chain model
 # (anyone with a direct report is a director). dev (Studio lead) and sam
 # (a team lead) get direct reports, giving REAL
 # admin -> director -> director -> employee nesting:
-#   faye -> dev -> nadia/priya/omar/yuki/greta/sam2/mira
-#   faye -> sam -> maya
+#   theo -> dev -> nadia/priya/omar/yuki/greta/sam2/mira
+#   theo -> sam -> maya
 # and the rest of the roster reports straight up to a director.
 def _director_backfill_map():
     return {
-        # seed: dev reports to faye; the support team reports to dev (a mid-director)
-        'ada': 'faye', 'dev': 'faye', 'eli': 'faye', 'ben': 'nora', 'cora': 'nora',
-        # research leads report to faye; maya under sam (a mid-director)
-        'sam': 'faye', 'marcus': 'faye', 'theo': 'faye', 'leo': 'faye',
-        'ines': 'faye', 'maya': 'sam',
-        # support assistants report to dev (not directly to faye)
+        # seed: dev reports to theo; the support team reports to dev (a mid-director)
+        'ada': 'theo', 'dev': 'theo', 'eli': 'theo', 'ben': 'nora', 'cora': 'nora',
+        # research leads report to theo; maya under sam (a mid-director)
+        # 'theo' itself is deliberately absent here -- it's the admin's own id
+        # now (renamed from faye, its original id), so it can never be a future hire's name too.
+        'sam': 'theo', 'marcus': 'theo', 'leo': 'theo',
+        'ines': 'theo', 'maya': 'sam',
+        # support assistants report to dev (not directly to theo)
         'nadia': 'dev', 'priya': 'dev', 'omar': 'dev', 'yuki': 'dev',
         'greta': 'dev', 'sam2': 'dev', 'mira': 'dev',
         # personnel/ops-adjacent -> nora
@@ -2216,15 +2217,16 @@ def _director_backfill_map():
 # its header comment).
 #
 # Per your 2026-09-21 call: ONE admin agent ("let's just make that one admin
-# -- change either faye or nora to a director"). The admin approves/denies
+# -- change either theo or nora to a director"). The admin approves/denies
 # requests and passes everything else down to the directors; the senior-most
 # director approves/denies on the admin's behalf. So:
-#   - Faye stays the single admin (isAdmin: true). She is also a director, and
-#     being at the top of the chain she supervises no other director.
+#   - Theo (renamed from Faye, its original id/name) stays the single admin (isAdmin: true). He is
+#     also a director, and being at the top of the chain supervises no other
+#     director.
 #   - Nora is demoted from admin to the SENIOR-MOST DIRECTOR (isDirector: true,
-#     no isAdmin, no own `director`), standing in for Faye on approvals.
+#     no isAdmin, no own `director`), standing in for Theo on approvals.
 #   - Everything below reports up to a director.
-ADMIN_IDS = {'faye'}
+ADMIN_IDS = {'theo'}
 # Senior-most director: a director with no `director` of their own (top of the
 # director chain) that is NOT the admin -- that one approves/denies on the
 # admin's behalf. Nora in the current roster.
@@ -2243,7 +2245,7 @@ def _backfill_directors_in_db():
         if bool(d.get('isAdmin')) != is_admin:
             d['isAdmin'] = is_admin
             changed = True
-        # Faye (admin) and Nora (senior director) are both directors.
+        # Theo (admin) and Nora (senior director) are both directors.
         if (is_admin or is_senior_dir) and not d.get('isDirector'):
             d['isDirector'] = True
             changed = True
@@ -2361,7 +2363,7 @@ def _derive_team_members(state, director_id):
     """Who belongs to director_id's team, DERIVED from the `director` graph:
     a WORKER (not a director) belongs to the team of the NEAREST director they
     report into. Directors themselves are never counted as members of their
-    parent's team -- a mid-director (dev under faye) or a promoted employee
+    parent's team -- a mid-director (dev under theo) or a promoted employee
     (maya) leads their OWN team, so they drop out of the parent team the moment
     they gain the director stamp. Thus every worker has exactly one team."""
     directors = _director_ids(state)
@@ -2444,7 +2446,7 @@ def _backfill_teams_in_db():
 
 
 _TEAM_FUNNY_NAMES = {
-    'faye': 'The Control Room Cabal',
+    'theo': 'The Control Room Cabal',
     'nora': 'The Personnel Posse',
     'dev': 'The Wrench Gang',
     'sam': 'The Research Racket',
@@ -2470,10 +2472,10 @@ def _stable_fallback_color(agent_id):
 
 
 # Idempotent boot migration, same shape as _backfill_directors_in_db/
-# _backfill_teams_in_db above. Caught live (2026-09-24): Faye's nameplate on
+# _backfill_teams_in_db above. Caught live (2026-09-24): Theo's nameplate on
 # the map rendered as the literal text "undefined" and the HUD's morale meter
 # read NaN. Both traced to the same root cause -- the original three seeded
-# agents (faye, ada, ben) predate `name`/`color`/`role`/`approvedCount`/
+# agents (theo, ada, ben) predate `name`/`color`/`role`/`approvedCount`/
 # `droppedCount`/`profile` existing on the per-agent record at all, and
 # nothing ever backfilled them onto a live DB the way director/team state
 # already gets backfilled. `ctx.fillText(a.name, ...)` draws `undefined`
@@ -2500,7 +2502,7 @@ def _heal_agent_identity(state):
     changed = False
 
     # The roster entries themselves can predate `color`/`model` too (ada/
-    # ben/faye's roster defs have neither) -- fix those first since the
+    # ben/theo's roster defs have neither) -- fix those first since the
     # agents loop below sources its own backfill from the roster.
     for d in roster:
         aid = d.get('id')
@@ -3442,7 +3444,10 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
         message = choice.get('message') or {}
         tool_calls = message.get('tool_calls') or []
         if not tool_calls:
-            return (message.get('content') or '').strip()
+            content = (message.get('content') or '').strip()
+            if not content:
+                print(f'[ask-debug] empty content for model={model} raw={json.dumps(data)[:2000]}', flush=True)
+            return content
         # Executed results -> role:tool, back into the conversation.
         current_messages.append(message)
         for call in tool_calls:
@@ -4513,7 +4518,7 @@ def _room_definitions(state):
 
 
 def _free_authority(state):
-    """tasks.js assignBigTask's authority pick: the admin (Faye) if free, else
+    """tasks.js assignBigTask's authority pick: the admin (Theo) if free, else
     the senior-most director (Nora). Works from server-authoritative roster +
     agent busy/offDuty state."""
     roster = state.get('agentRoster') or []
@@ -5461,11 +5466,21 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     # never assign a task, we only borrow an agent's voice for a reply).
     agents = state.get('agents') or {}
     candidates = [aid for aid in _sim._eligible_candidates(state, include_off_duty=True) if agents.get(aid)]
-    if not candidates:
-        return {'error': 'No agent is free to answer right now. Try again shortly.', 'status': 409}
     requested_agent = (agent_id_hint or '').strip()
-    if requested_agent and requested_agent in candidates:
+    # A deliberate pin (e.g. the Telegram bridge asking for the admin by id)
+    # must be able to name an admin -- _eligible_candidates excludes admins
+    # because IT'S shared with task assignment (you don't want the admin doing
+    # routine work), but that's not a reason to block her from answering a
+    # question she was explicitly asked. Checked directly against `agents`,
+    # not `candidates`, so a pin only needs the agent to exist and be free
+    # (not busy/task/pairWith) -- not also pass the non-admin filter.
+    requested_record = agents.get(requested_agent) if requested_agent else None
+    requested_is_free = bool(requested_record) and not requested_record.get('busy') \
+        and not requested_record.get('task') and not requested_record.get('pairWith')
+    if requested_agent and requested_is_free:
         pick = requested_agent
+    elif not candidates:
+        return {'error': 'No agent is free to answer right now. Try again shortly.', 'status': 409}
     else:
         pick = candidates[0]
     # The live agents dict (not _agent_record_for, which checks the roster
@@ -5606,6 +5621,350 @@ async def intent_ask(request: Request):
     if 'error' in result:
         return JSONResponse({'error': result['error']}, status_code=result.get('status', 500))
     return JSONResponse(result)
+
+
+# ---------------------------------------------------------------------------
+# Theo request routing (2026-09-25): classify a free-text player request
+# (today only reached from the Telegram bridge) into one of six lanes, using
+# the same Jev N-way choice pattern the rest of the codebase already uses for
+# judgment calls (sim._governance_decider_default; the model-tier picker
+# above). Every lane wires into machinery that already existed but had no
+# real caller (sim.queue_spike, sim.queue_bug) or no creation path at all
+# (researchTopics) -- see /Users/poole86/.claude/plans/tidy-doodling-storm.md.
+# ---------------------------------------------------------------------------
+
+_ROUTING_LANES = [
+    {'id': 'ask', 'description': "A direct question expecting an immediate, conversational answer right now (trivia, opinion, a quick lookup, small talk) -- not a request to change, build, or investigate anything in the village or its products."},
+    {'id': 'schedule', 'description': "Asks for something to happen automatically on a recurring or periodic basis going forward (e.g. 'check X every hour/day', 'keep watching Y and update it') -- a standing job, not a one-time favor."},
+    {'id': 'spike', 'description': "Asks the village to look into or figure something out ONE TIME, with no need for an immediate reply and no clearly defined deliverable yet -- exploratory, time-boxed digging, not a committed piece of work."},
+    {'id': 'story', 'description': "Asks for something substantial to be BUILT, CHANGED, or DELIVERED -- a real feature, fix, or piece of work with a concrete outcome, sized for a team's real backlog and sprint process."},
+    {'id': 'incident', 'description': "Reports something already broken, down, or failing RIGHT NOW in a live product, wanting it fixed urgently."},
+    {'id': 'unclear', 'description': "None of the above genuinely fits, or it's ambiguous/contradictory/high-stakes enough that only a human director should decide how to handle it -- do not force a fit."},
+]
+
+
+def _classify_request_lane_default(state, text):
+    """Jev choice over _ROUTING_LANES -- same dynamic-candidates-to-criteria
+    shape as sim._governance_decider_default and the model-tier picker above,
+    kept in serve.py (not sim.py) because this feature is driven top-down FROM
+    serve.py's Telegram bridge, and a separate injectable here can't collide
+    with a test that monkeypatches one of sim.py's own ceremony deciders.
+    Returns a lane id, or None on a Jev outage or an unrecognized choice --
+    the caller treats None as 'unclear', this function never guesses."""
+    try:
+        data = _call_openrouter_decision_sync(
+            'typesafe/jev-1.13', {'messages': [], 'signals': {}},
+            {'choice': {'type': 'choice',
+                        'instructions': f'Theo, the village admin, is triaging one free-text message the player just sent. Player\'s message: "{text}"',
+                        'criteria': {c['id']: c['description'] for c in _ROUTING_LANES}}})
+        choice = _jev_choice(data)[0]
+    except Exception:
+        return None
+    return choice if any(c['id'] == choice for c in _ROUTING_LANES) else None
+
+
+_lane_decider = _classify_request_lane_default  # injectable test seam
+
+
+def _classify_team_default(state, text):
+    """Jev choice over state['teams'] -- because a team IS a director
+    (team['id'] == team['directorId'], teams are derived one-per-director,
+    serve.py _backfill_teams_in_db), picking a team is picking a director; no
+    separate director-resolution step is needed. Returns a team/director id,
+    or None on outage or no teams exist yet."""
+    teams = [t for t in (state.get('teams') or []) if t.get('id')]
+    if not teams:
+        return None
+    candidates = [{'id': t['id'], 'description': t.get('purpose') or f"Team directed by {t.get('name', t['id'])}."}
+                  for t in teams]
+    try:
+        data = _call_openrouter_decision_sync(
+            'typesafe/jev-1.13', {'messages': [], 'signals': {}},
+            {'choice': {'type': 'choice',
+                        'instructions': f'Which team should handle this player request: "{text}"',
+                        'criteria': {c['id']: c['description'] for c in candidates}}})
+        choice = _jev_choice(data)[0]
+    except Exception:
+        return None
+    return choice if any(c['id'] == choice for c in candidates) else None
+
+
+_team_decider = _classify_team_default  # injectable test seam
+
+
+def _classify_room_default(state, text):
+    """Jev choice over _DELEGATABLE_ROOMS, reusing the same purpose text
+    assign-big-task's own prompt already uses. Falls back to 'observatory'
+    (the general investigate/research room) on outage rather than returning
+    None -- every spike needs SOME room to be queued into."""
+    room_defs = _room_definitions(state)
+    candidates = [{'id': r, 'description': room_defs[r]['purpose']} for r in _DELEGATABLE_ROOMS]
+    try:
+        data = _call_openrouter_decision_sync(
+            'typesafe/jev-1.13', {'messages': [], 'signals': {}},
+            {'choice': {'type': 'choice',
+                        'instructions': f'Which room\'s real capability best fits investigating this: "{text}"',
+                        'criteria': {c['id']: c['description'] for c in candidates}}})
+        choice = _jev_choice(data)[0]
+    except Exception:
+        choice = None
+    return choice if any(c['id'] == choice for c in candidates) else 'observatory'
+
+
+def _classify_product_default(state, text):
+    """Jev choice over state['products']. Returns a product id, or None on
+    outage/no products/no confident match -- the incident lane must never
+    guess which product is broken (a mis-pinned incident is worse than an
+    unattributed investigation, see _route_lane_incident's fallback)."""
+    products = state.get('products') or {}
+    if not products:
+        return None
+    candidates = [{'id': pid, 'description': (p.get('name') or pid) + (f" -- {p.get('summary')}" if p.get('summary') else '')}
+                  for pid, p in products.items()]
+    try:
+        data = _call_openrouter_decision_sync(
+            'typesafe/jev-1.13', {'messages': [], 'signals': {}},
+            {'choice': {'type': 'choice',
+                        'instructions': f'Which product does this incident report describe: "{text}"',
+                        'criteria': {c['id']: c['description'] for c in candidates}}})
+        choice = _jev_choice(data)[0]
+    except Exception:
+        return None
+    return choice if any(c['id'] == choice for c in candidates) else None
+
+
+def _extract_schedule_fields_sync(admin_id, key, text):
+    """A small /api/chat JSON-extraction call (mirrors assign-big-task's own
+    extraction pattern above) -- Jev is a choice-over-a-fixed-set primitive,
+    the wrong tool for pulling a URL and a cadence out of free text. Returns
+    {'topic','startUrl','cadenceMs'} or None on anything that doesn't parse
+    cleanly -- fails closed, never invents a URL. Blocking (urllib); callers
+    run it via asyncio.to_thread, same convention as _call_openrouter_sync."""
+    system_prompt = (
+        'Extract a recurring web-monitoring request from the player\'s message. '
+        'Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: '
+        '{"topic": "short label for what to watch", "startUrl": "a real absolute URL to start from, or empty string if none was given", "cadenceMs": integer milliseconds between checks}. '
+        'If the message gives a cadence in words (daily, hourly, every 6 hours, weekly), convert it to milliseconds. '
+        'If no real URL is identifiable, set startUrl to an empty string -- do not invent one.'
+    )
+    try:
+        r = _http_json('POST', SELF_BASE_URL, '/api/chat',
+                       {'model': _mid_tier_slug(),
+                        'messages': [{'role': 'system', 'content': system_prompt},
+                                     {'role': 'user', 'content': text}],
+                        'max_tokens': 200, 'agentId': admin_id}, key)
+    except Exception:
+        return None
+    if not isinstance(r, dict) or r.get('error') or not r.get('reply'):
+        return None
+    cleaned = re.sub(r'^```json\s*|^```\s*|```\s*$', '', r['reply'].strip())
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        return None
+    topic = (parsed.get('topic') or '').strip()
+    start_url = (parsed.get('startUrl') or '').strip()
+    cadence_ms = parsed.get('cadenceMs')
+    if not topic or not start_url or not isinstance(cadence_ms, (int, float)):
+        return None
+    return {'topic': topic, 'startUrl': start_url, 'cadenceMs': int(cadence_ms)}
+
+
+def _pick_team_worker(state, director_id):
+    """A real worker to pin a directly-routed spike to -- reuses
+    sim.on_call_agent's existing deterministic-rotation-preferring-active
+    picker rather than a bespoke one; an incident already needs exactly this
+    'a real team member, prefer someone awake' property, and a spike wants
+    the same thing. Off-duty pinned agents are woken automatically at
+    assignment time by _assign_due_item's existing pin-wake logic once
+    directRoute is set -- no separate wake call is needed here."""
+    import sim as _sim
+    return _sim.on_call_agent(state, director_id)
+
+
+async def _route_lane_ask(state, text, admin_id):
+    return await _ask_core(state, text, admin_id)
+
+
+async def _route_lane_unclear(state, text, admin_id):
+    # Pinning to _free_authority (admin first, else senior-most director)
+    # instead of a random free agent IS the "needs a director's judgment
+    # call" behavior -- the senior-most available director personally
+    # answers in character rather than whoever's next in round robin.
+    authority = _free_authority(state)
+    return await _ask_core(state, text, (authority or {}).get('id') or admin_id)
+
+
+async def _route_lane_schedule(state, text, admin_id):
+    key = get_or_create_agent_key(admin_id)
+    fields = await asyncio.to_thread(_extract_schedule_fields_sync, admin_id, key, text)
+    if not fields:
+        return {'reply': "I couldn't pin down a starting link and how often to check it -- "
+                          "can you give me a URL and a cadence, e.g. \"check https://example.com "
+                          "daily\" or \"every 6 hours\"?"}
+    import sim as _sim
+    record = _sim.add_research_topic(state, fields['topic'], fields['startUrl'], fields['cadenceMs'])
+    if not record:
+        return {'reply': "That didn't look like a real link I could start from -- can you double-check the URL?"}
+    save_state_to_db(state)
+    log_action('player', 'schedule_created', {'topicId': record['id'], 'topic': record['topic'],
+                                              'startUrl': record['startUrl'], 'cadenceMs': record['cadenceMs']},
+              authorized=True)
+    _append_passport_decision('schedule_created', admin_id, {'topicId': record['id'], 'topic': record['topic']})
+    hours = record['cadenceMs'] / 3600000
+    cadence_desc = f"every {hours:.1f}h" if hours < 48 else f"every {hours / 24:.1f}d"
+    return {'reply': f"Got it -- I'll keep checking \"{record['topic']}\" ({cadence_desc}), starting shortly."}
+
+
+async def _route_lane_spike(state, text, admin_id):
+    import sim as _sim
+    team_id = await asyncio.to_thread(_team_decider, state, text)
+    room = await asyncio.to_thread(_classify_room_default, state, text)
+    title = text[:120]
+    queued = _sim.queue_spike(state, title, room, budget_ms=None, goal=text)
+    if not queued:
+        return {'reply': "I couldn't queue that as an investigation -- try rephrasing it."}
+    worker_id = None
+    if team_id:
+        worker_id = _pick_team_worker(state, team_id)
+        if worker_id:
+            state['workQueue'][-1]['assignedTo'] = worker_id
+            state['workQueue'][-1]['directRoute'] = True
+    save_state_to_db(state)
+    log_action('player', 'spike_filed', {'title': title, 'room': room, 'teamId': team_id, 'assignedTo': worker_id},
+              authorized=True)
+    _append_passport_decision('spike_filed', team_id or admin_id, {'title': title, 'room': room})
+    who = f" with {team_id}'s team" if team_id else ""
+    return {'reply': f"On it -- I've queued a quick investigation on that{who}. I'll let you know what turns up."}
+
+
+async def _route_lane_story(state, text, admin_id):
+    # Filing against an unidentifiable team is worse than a director
+    # answering directly -- fall back rather than guess.
+    team_id = await asyncio.to_thread(_team_decider, state, text)
+    if not team_id:
+        return await _route_lane_unclear(state, text, admin_id)
+    import sim as _sim
+    team = next((t for t in (state.get('teams') or []) if t.get('id') == team_id), None)
+    feature = (team or {}).get('name') or team_id
+    issue = _sim.file_issue(state, team_id=team_id, issue_type='story',
+                            summary=text[:500], feature=feature, reporter_id='player')
+    if not issue:
+        return await _route_lane_unclear(state, text, admin_id)
+    save_state_to_db(state)
+    # Reuses the existing 'issue_created' label/payload shape /api/intent/issues
+    # already logs, with an added provenance field -- same convention, not a
+    # parallel label.
+    log_action('player', 'issue_created', {'key': issue['key'], 'type': 'story', 'teamId': team_id,
+                                           'summary': issue['summary'][:200], 'origin': 'telegram_route'},
+              authorized=True)
+    _append_passport_decision('issue_created', 'player', {'key': issue['key'], 'teamId': team_id})
+    team_name = (team or {}).get('name') or team_id
+    return {'reply': f"Filed as {issue['key']} with {team_name} -- it'll go through their backlog grooming from here."}
+
+
+async def _route_lane_incident(state, text, admin_id):
+    # Never guess which product is broken -- an unattributed investigation
+    # (spike) is safe, a mis-pinned incident is not.
+    product_id = await asyncio.to_thread(_classify_product_default, state, text)
+    if not product_id:
+        return await _route_lane_spike(state, text, admin_id)
+    import sim as _sim
+    product = (state.get('products') or {}).get(product_id) or {}
+    title = text[:120]
+    queued = _sim.queue_bug(state, product_id, title, reported_by='player')
+    if not queued:
+        # Unroutable (no owning team, no on-call, or one already open) --
+        # same safe fallback as an unidentifiable product.
+        return await _route_lane_spike(state, text, admin_id)
+    director_id = product.get('teamId')
+    on_call = _sim.on_call_agent(state, director_id) if director_id else None
+    on_call_name = ((state.get('agents') or {}).get(on_call) or {}).get('name') or on_call or 'someone'
+    save_state_to_db(state)
+    log_action('player', 'incident_filed', {'productId': product_id, 'title': title, 'assignedTo': on_call},
+              authorized=True)
+    _append_passport_decision('incident_filed', product_id, {'title': title})
+    product_name = product.get('name') or product_id
+    return {'reply': f"Flagged as an incident on {product_name} -- {on_call_name} is on it now."}
+
+
+_ROUTING_HANDLERS = {
+    'ask': _route_lane_ask,
+    'schedule': _route_lane_schedule,
+    'spike': _route_lane_spike,
+    'story': _route_lane_story,
+    'incident': _route_lane_incident,
+    'unclear': _route_lane_unclear,
+}
+
+
+async def _route_player_request(state, text):
+    """Classify a free-text player request into a lane (_ROUTING_LANES) and
+    dispatch to the matching handler. Entry point for the Telegram bridge
+    (_telegram_process_update) -- replaces its old unconditional _ask_core
+    pin. Returns the same {'reply', ...} / {'error', 'status'} shape
+    _ask_core already produces, since every lane either wraps _ask_core
+    directly or builds its own reply text before returning.
+
+    Every lane except ask/unclear mutates `state` and is responsible for its
+    OWN save_state_to_db call -- _ask_core never touches state, so this
+    function itself must not assume one happened."""
+    text = (text or '').strip()
+    if not text:
+        return {'error': 'a message is required', 'status': 400}
+    admin_id = _admin_agent_id(state)
+    lane = await asyncio.to_thread(_lane_decider, state, text) or 'unclear'
+    log_action('player', 'route_classified', {'lane': lane, 'text': text[:200]}, authorized=True)
+    handler = _ROUTING_HANDLERS.get(lane, _route_lane_unclear)
+    return await handler(state, text, admin_id)
+
+
+@app.post('/api/intent/schedule')
+async def intent_schedule(request: Request):
+    """Structured parity endpoint for the schedule lane: POST
+    {topic, startUrl, cadenceMs}. The free-text extraction step
+    (_extract_schedule_fields_sync) is exclusive to the Telegram routing
+    layer; this takes already-structured fields -- the same relationship
+    /api/intent/ask already has to _ask_core."""
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    import sim as _sim
+    record = _sim.add_research_topic(state, body.get('topic'), body.get('startUrl'), body.get('cadenceMs'))
+    if not record:
+        return JSONResponse({'error': 'topic, a real absolute startUrl, and cadenceMs are required'}, status_code=400)
+    save_state_to_db(state)
+    log_action('player', 'schedule_created', {'topicId': record['id'], 'topic': record['topic']}, authorized=True)
+    _append_passport_decision('schedule_created', 'player', {'topicId': record['id']})
+    return JSONResponse({'ok': True, 'topic': record})
+
+
+@app.post('/api/intent/incidents')
+async def intent_incidents(request: Request):
+    """Structured parity endpoint for the incident lane: POST {productId, title}."""
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    product_id = (body.get('productId') or '').strip()
+    title = (body.get('title') or '').strip()
+    if not product_id or not title:
+        return JSONResponse({'error': 'productId and title are required'}, status_code=400)
+    import sim as _sim
+    queued = _sim.queue_bug(state, product_id, title, reported_by='player')
+    if not queued:
+        return JSONResponse({'error': 'could not route this incident (unknown product, no on-call, or one already open)'}, status_code=400)
+    save_state_to_db(state)
+    log_action('player', 'incident_filed', {'productId': product_id, 'title': title}, authorized=True)
+    _append_passport_decision('incident_filed', 'player', {'productId': product_id, 'title': title})
+    return JSONResponse({'ok': True, 'productId': product_id, 'title': title})
 
 
 # ---------------------------------------------------------------------------

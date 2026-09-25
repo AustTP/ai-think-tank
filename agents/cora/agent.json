@@ -1,0 +1,10 @@
+{
+  "id": "cora",
+  "name": "Cora",
+  "color": "#93c47d",
+  "role": "Post Office",
+  "model": "small",
+  "isAdmin": false,
+  "elevatedAccess": false,
+  "accessGrant": null
+}

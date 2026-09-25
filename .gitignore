@@ -28,6 +28,13 @@ sandboxes/workroom-shared/
 # Per-agent project repos are independently versioned (gitlinks, not tracked content)
 agents/*/prototypes/
 
+# Per-agent activity logs regenerate from village.db and accumulate fast
+# (report-<ts>-<agent>.md per completion, one player.md per conversation) --
+# the durable identity files (agent.json/AGENTS.md/MEMORY.md/state.json)
+# are what's worth tracking, not the runtime trail.
+agents/*/reports/
+agents/*/conversations/
+
 # Team-shared space is agents' working directory -- in-progress artifacts stay
 # out of the repo; finished work gets pushed/tracked deliberately in a later phase.
 agents/teams/*/shared/

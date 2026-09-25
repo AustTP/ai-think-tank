@@ -1,0 +1,10 @@
+{
+  "id": "dev",
+  "name": "Dev",
+  "color": "#ffd966",
+  "role": "Studio",
+  "model": "small",
+  "isAdmin": false,
+  "elevatedAccess": false,
+  "accessGrant": null
+}

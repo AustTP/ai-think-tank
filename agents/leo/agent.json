@@ -1,0 +1,10 @@
+{
+  "id": "leo",
+  "name": "leo",
+  "color": "#d5a6bd",
+  "role": "Assistant to Ada",
+  "model": "small",
+  "isAdmin": false,
+  "elevatedAccess": true,
+  "accessGrant": "Read/write access to Ada's Research files and tooling."
+}

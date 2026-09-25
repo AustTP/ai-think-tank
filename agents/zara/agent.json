@@ -1,0 +1,10 @@
+{
+  "id": "zara",
+  "name": "zara",
+  "color": "#ffe599",
+  "role": "Assistant to Ada",
+  "model": "small",
+  "isAdmin": false,
+  "elevatedAccess": true,
+  "accessGrant": "Read/write access to Ada's Research files and tooling."
+}

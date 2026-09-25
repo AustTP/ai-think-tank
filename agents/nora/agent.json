@@ -1,0 +1,10 @@
+{
+  "id": "nora",
+  "name": "Nora",
+  "color": "#e69138",
+  "role": "Personnel",
+  "model": "mid",
+  "isAdmin": false,
+  "elevatedAccess": false,
+  "accessGrant": null
+}

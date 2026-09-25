@@ -4,7 +4,7 @@
 // director) periodically hires someone to help whoever's struggling most,
 // with no player action required. Under the single-admin model the admin
 // passes day-to-day personnel work down to the directors, so the senior
-// director is a legitimate hirer too, not just Faye. House (a separate,
+// director is a legitimate hirer too, not just Theo. House (a separate,
 // physical building) is "just the board" for you; Control Room (reachable
 // only via the HUD's Command Center button, see rooms.js) is where this
 // actually happens.
