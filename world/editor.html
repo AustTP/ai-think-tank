@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>World 2 — collision grid editor</title>
+<style>
+  html, body {
+    margin: 0;
+    background: #1b1e22;
+    font-family: monospace;
+    color: #e8e8e8;
+  }
+  #wrap { display: flex; flex-direction: column; align-items: center; padding: 12px; }
+  #viewport {
+    position: relative;
+    border: 2px solid #444;
+    background: #000;
+    overflow: hidden;
+  }
+  canvas { image-rendering: pixelated; display: block; }
+  #toolbar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin: 10px 0;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  button {
+    font-family: monospace;
+    font-size: 13px;
+    background: #2a2e34;
+    color: #e8e8e8;
+    border: 1px solid #555;
+    border-radius: 6px;
+    padding: 8px 14px;
+    cursor: pointer;
+  }
+  button.active { background: #465066; border-color: #7a8ab0; }
+  button:hover { background: #363c44; }
+  #status { font-size: 12px; opacity: 0.75; min-height: 18px; }
+  p.help { max-width: 700px; font-size: 12px; opacity: 0.7; text-align: center; margin: 6px 0; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h3 style="margin:4px 0;">World 2 — collision grid editor</h3>
+  <p class="help">Pick a mode, then click/drag on the map. Block and Erase paint cells;
+     Pan drags the view around while zoomed in (scroll wheel zooms too, centered on the cursor
+     -- this pan/zoom is an editing convenience only, the actual game canvas doesn't have it).
+     Loads the current auto-generated collision_grid.json (from CLIPSeg) so you're correcting
+     it, not starting from scratch. Save writes straight to collision_grid.json on disk --
+     reload world/index.html afterward to play with the update.</p>
+  <div id="toolbar">
+    <button id="blockModeBtn" class="active">&#9632; Block (red)</button>
+    <button id="eraseModeBtn">&#9633; Erase (walkable)</button>
+    <button id="panModeBtn">&#9995; Pan</button>
+    <label style="font-size:12px;">Brush size
+      <select id="brushSize">
+        <option value="1">1 cell</option>
+        <option value="2" selected>2x2</option>
+        <option value="3">3x3</option>
+      </select>
+    </label>
+  </div>
+  <div id="toolbar">
+    <button id="zoomInBtn">+</button>
+    <button id="zoomOutBtn">&minus;</button>
+    <button id="zoomAllBtn">Show all</button>
+    <button id="saveBtn">Save to collision_grid.json</button>
+    <button id="downloadBtn">Download grid.json instead</button>
+    <button id="clearAllBtn">Clear entire grid</button>
+    <button id="undoBtn">Undo</button>
+  </div>
+  <div id="viewport">
+    <canvas id="canvas"></canvas>
+  </div>
+  <p id="status"></p>
+</div>
+<script src="world.js"></script>
+<script>
+// Fixed-size viewport, same idea as the game's own canvas (VIEW_W x VIEW_H)
+// -- the map is panned/zoomed inside it rather than the canvas itself
+// growing to the size of the whole map (which is what made it impossible
+// to see the whole thing at once before).
+const VIEW_W = 960, VIEW_H = 640;
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+canvas.width = VIEW_W;
+canvas.height = VIEW_H;
+ctx.imageSmoothingEnabled = false;
+
+let grid, cols, rows, cell;
+let bgImg;
+// NATIVE_W/NATIVE_H come from world.js already (688x384)
+
+let camX = 0, camY = 0, zoom = 1;
+const ZOOM_MIN = 0.5, ZOOM_MAX = 10, ZOOM_STEP_FACTOR = 1.25;
+let zoomShowAll = 1;
+
+let mode = 'block'; // 'block' | 'erase' | 'pan'
+let brush = 2;
+let painting = false;
+let panning = false, panLastX = 0, panLastY = 0;
+let undoStack = [];
+
+const statusEl = document.getElementById('status');
+function setStatus(msg) { statusEl.textContent = msg; }
+
+function pushUndo() {
+  undoStack.push(JSON.stringify(grid));
+  if (undoStack.length > 50) undoStack.shift();
+}
+
+function clampCamera() {
+  const visW = VIEW_W / zoom, visH = VIEW_H / zoom;
+  camX = visW >= NATIVE_W ? -(visW - NATIVE_W) / 2 : Math.max(0, Math.min(NATIVE_W - visW, camX));
+  camY = visH >= NATIVE_H ? -(visH - NATIVE_H) / 2 : Math.max(0, Math.min(NATIVE_H - visH, camY));
+}
+function toScreen(x, y) { return [(x - camX) * zoom, (y - camY) * zoom]; }
+function toNative(sx, sy) { return [sx / zoom + camX, sy / zoom + camY]; }
+
+function render() {
+  ctx.clearRect(0, 0, VIEW_W, VIEW_H);
+  const [bx, by] = toScreen(0, 0);
+  ctx.drawImage(bgImg, bx, by, NATIVE_W * zoom, NATIVE_H * zoom);
+
+  ctx.fillStyle = 'rgba(255,40,40,0.45)';
+  for (let gy = 0; gy < rows; gy++) {
+    for (let gx = 0; gx < cols; gx++) {
+      if (!grid[gy][gx]) continue;
+      const [dx, dy] = toScreen(gx * cell, gy * cell);
+      ctx.fillRect(dx, dy, cell * zoom, cell * zoom);
+    }
+  }
+  // faint grid lines, only worth drawing once cells are big enough to see
+  if (cell * zoom > 5) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+    ctx.lineWidth = 1;
+    const [ox, oy] = toScreen(0, 0);
+    for (let gx = 0; gx <= cols; gx++) {
+      const x = ox + gx * cell * zoom;
+      if (x < 0 || x > VIEW_W) continue;
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, VIEW_H); ctx.stroke();
+    }
+    for (let gy = 0; gy <= rows; gy++) {
+      const y = oy + gy * cell * zoom;
+      if (y < 0 || y > VIEW_H) continue;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(VIEW_W, y); ctx.stroke();
+    }
+  }
+}
+
+function setZoom(newZoom, pivotSx, pivotSy) {
+  // keep the point under the cursor (pivot, in screen px) fixed while
+  // zooming, instead of always zooming toward the top-left corner
+  const [nx, ny] = toNative(pivotSx, pivotSy);
+  zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, newZoom));
+  camX = nx - pivotSx / zoom;
+  camY = ny - pivotSy / zoom;
+  clampCamera();
+  render();
+}
+
+function setMode(newMode) {
+  mode = newMode;
+  document.getElementById('blockModeBtn').classList.toggle('active', mode === 'block');
+  document.getElementById('eraseModeBtn').classList.toggle('active', mode === 'erase');
+  document.getElementById('panModeBtn').classList.toggle('active', mode === 'pan');
+  canvas.style.cursor = mode === 'pan' ? 'grab' : 'crosshair';
+}
+
+function paintAt(gx, gy, value) {
+  const half = Math.floor(brush / 2);
+  for (let dy = -half; dy < brush - half; dy++) {
+    for (let dx = -half; dx < brush - half; dx++) {
+      const x = gx + dx, y = gy + dy;
+      if (x >= 0 && x < cols && y >= 0 && y < rows) grid[y][x] = value;
+    }
+  }
+}
+
+function localXY(e) {
+  const rect = canvas.getBoundingClientRect();
+  return [e.clientX - rect.left, e.clientY - rect.top];
+}
+
+function wireCanvas() {
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const [sx, sy] = localXY(e);
+    const factor = e.deltaY < 0 ? ZOOM_STEP_FACTOR : 1 / ZOOM_STEP_FACTOR;
+    setZoom(zoom * factor, sx, sy);
+  }, { passive: false });
+
+  canvas.addEventListener('mousedown', e => {
+    const [sx, sy] = localXY(e);
+    if (mode === 'pan' || e.button === 1) {
+      panning = true;
+      panLastX = sx; panLastY = sy;
+      canvas.style.cursor = 'grabbing';
+      return;
+    }
+    painting = true;
+    const value = e.button === 2 ? 0 : (mode === 'block' ? 1 : 0);
+    pushUndo();
+    const [nx, ny] = toNative(sx, sy);
+    paintAt(Math.floor(nx / cell), Math.floor(ny / cell), value);
+    render();
+  });
+
+  canvas.addEventListener('mousemove', e => {
+    const [sx, sy] = localXY(e);
+    if (panning) {
+      camX -= (sx - panLastX) / zoom;
+      camY -= (sy - panLastY) / zoom;
+      panLastX = sx; panLastY = sy;
+      clampCamera();
+      render();
+      return;
+    }
+    if (!painting) return;
+    const value = mode === 'block' ? 1 : 0;
+    const [nx, ny] = toNative(sx, sy);
+    paintAt(Math.floor(nx / cell), Math.floor(ny / cell), value);
+    render();
+  });
+
+  window.addEventListener('mouseup', () => {
+    painting = false;
+    if (panning) { panning = false; canvas.style.cursor = mode === 'pan' ? 'grab' : 'crosshair'; }
+  });
+}
+
+async function main() {
+  bgImg = new Image();
+  await new Promise((res, rej) => {
+    bgImg.onload = res; bgImg.onerror = rej;
+    bgImg.src = BG_SPRITE + '?v=' + Date.now();
+  });
+
+  const res = await fetch(GRID_SPRITE + '?v=' + Date.now());
+  const data = await res.json();
+  ({ cols, rows, cell, grid } = data);
+
+  zoomShowAll = Math.min(VIEW_W / NATIVE_W, VIEW_H / NATIVE_H);
+  zoom = zoomShowAll;
+  camX = 0; camY = 0;
+  clampCamera();
+
+  wireCanvas();
+  setMode('block');
+  render();
+
+  document.getElementById('blockModeBtn').addEventListener('click', () => setMode('block'));
+  document.getElementById('eraseModeBtn').addEventListener('click', () => setMode('erase'));
+  document.getElementById('panModeBtn').addEventListener('click', () => setMode('pan'));
+
+  document.getElementById('zoomInBtn').addEventListener('click', () => setZoom(zoom * ZOOM_STEP_FACTOR, VIEW_W / 2, VIEW_H / 2));
+  document.getElementById('zoomOutBtn').addEventListener('click', () => setZoom(zoom / ZOOM_STEP_FACTOR, VIEW_W / 2, VIEW_H / 2));
+  document.getElementById('zoomAllBtn').addEventListener('click', () => {
+    zoom = zoomShowAll; camX = 0; camY = 0; clampCamera(); render();
+  });
+
+  document.getElementById('brushSize').addEventListener('change', e => {
+    brush = parseInt(e.target.value, 10);
+  });
+
+  document.getElementById('clearAllBtn').addEventListener('click', () => {
+    pushUndo();
+    for (let gy = 0; gy < rows; gy++) for (let gx = 0; gx < cols; gx++) grid[gy][gx] = 0;
+    render();
+  });
+
+  document.getElementById('undoBtn').addEventListener('click', () => {
+    if (!undoStack.length) return;
+    grid = JSON.parse(undoStack.pop());
+    render();
+  });
+
+  document.getElementById('downloadBtn').addEventListener('click', () => {
+    const blob = new Blob([JSON.stringify({ cols, rows, cell, grid })], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'collision_grid.json';
+    a.click();
+    URL.revokeObjectURL(url);
+    setStatus('Downloaded -- move it into world/ to replace collision_grid.json.');
+  });
+
+  document.getElementById('saveBtn').addEventListener('click', async () => {
+    setStatus('Saving...');
+    try {
+      const r = await fetch('/save', {
+        method: 'POST',
+        body: JSON.stringify({ cols, rows, cell, grid }),
+      });
+      setStatus(r.ok ? 'Saved to collision_grid.json.' : 'Save failed: ' + await r.text());
+    } catch (e) {
+      setStatus('Save failed (is serve.py running, not a plain http.server?): ' + e.message);
+    }
+  });
+}
+
+main();
+</script>
+</body>
+</html>

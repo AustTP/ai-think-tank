@@ -1,0 +1,3221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Village — World 2 (experimental)</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #1b1e22;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: monospace;
+    color: #e8e8e8;
+    overflow: hidden;
+  }
+  #wrap {
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    height: 100%;
+    padding: 76px 8px 8px 8px;
+    box-sizing: border-box;
+  }
+  #viewport {
+    position: relative;
+    overflow: hidden;
+    border: 2px solid #444;
+    background: #000;
+    flex: 0 0 auto;
+  }
+  canvas { image-rendering: pixelated; display: block; width: 100%; height: 100%; }
+  p { max-width: 960px; margin: 6px auto; opacity: 0.7; font-size: 13px; flex: 0 0 auto; }
+
+  #pad {
+    display: grid;
+    grid-template-columns: repeat(3, 44px);
+    grid-template-rows: repeat(3, 44px);
+    gap: 4px;
+    margin: 4px 0;
+    flex: 0 0 auto;
+    -webkit-user-select: none; user-select: none;
+  }
+  #pad button {
+    font-size: 18px;
+    border-radius: 8px;
+    border: 1px solid #555;
+    background: #2a2e34;
+    color: #e8e8e8;
+    touch-action: none;
+  }
+  #pad button:active, #pad button.held { background: #465066; }
+  #pad .up { grid-column: 2; grid-row: 1; }
+  #pad .left { grid-column: 1; grid-row: 2; }
+  #pad .down { grid-column: 2; grid-row: 2; }
+  #pad .right { grid-column: 3; grid-row: 2; }
+
+  #zoom {
+    position: fixed;
+    right: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    -webkit-user-select: none; user-select: none;
+  }
+  #zoom button {
+    width: 44px;
+    height: 44px;
+    font-size: 18px;
+    border-radius: 8px;
+    border: 1px solid #555;
+    background: #2a2e34;
+    color: #e8e8e8;
+    touch-action: none;
+  }
+  #zoom button:active { background: #465066; }
+  #zoom .showall { font-size: 10px; }
+
+  .hidden { display: none !important; }
+  .modal {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    display: flex; align-items: center; justify-content: center; z-index: 50;
+  }
+  .modal-box {
+    background: #22262c; border: 1px solid #555; border-radius: 8px;
+    padding: 18px; width: 360px; max-width: 90vw; text-align: left;
+    font-family: monospace; color: #e8e8e8;
+  }
+  .modal-box h3 { margin: 0 0 10px 0; font-size: 15px; }
+  .presetRow { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+  .presetRow button { font-size: 12px; padding: 5px 9px; }
+  .agentList { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; margin-bottom: 10px; }
+  .agentList label { font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  .agentList label.busy { opacity: 0.45; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .meeting-msg { font-size: 12px; opacity: 0.8; min-height: 16px; margin: 8px 0 0 0; }
+
+  .chat-box { width: 640px; }
+  .chat-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .chat-header h3 { margin: 0; font-size: 15px; }
+  .chat-body { display: flex; gap: 12px; height: 360px; }
+  .chat-roster {
+    width: 170px; flex: 0 0 auto; overflow-y: auto; border-right: 1px solid #444;
+    padding-right: 10px; display: flex; flex-direction: column; gap: 4px;
+  }
+  .roster-item {
+    text-align: left; font-size: 12px; padding: 6px 8px; border-radius: 6px;
+    cursor: pointer; border: 1px solid transparent; background: none;
+    color: #e8e8e8; font-family: monospace; width: 100%;
+  }
+  .roster-item:hover { background: #2a2e34; }
+  .roster-item.active { background: #465066; border-color: #7a8ab0; }
+  .roster-item .role { display: block; font-size: 10px; opacity: 0.6; }
+  .roster-item.has-unread .role { color: #7fd0ff; opacity: 0.95; font-weight: bold; }
+  .chat-thread { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .thread-header { font-size: 13px; font-weight: bold; margin-bottom: 6px; opacity: 0.85; }
+  .thread-log {
+    flex: 1; overflow-y: auto; background: #14161a; border: 1px solid #333;
+    border-radius: 6px; padding: 8px; font-size: 12px; display: flex;
+    flex-direction: column; gap: 4px;
+  }
+  .thread-log .msg .from { font-weight: bold; margin-right: 4px; }
+  .thread-log .msg.unread { border-left: 3px solid #7fd0ff; padding-left: 6px; }
+  .thread-log .empty { opacity: 0.5; font-style: italic; }
+  .thread-input { display: flex; gap: 6px; margin-top: 8px; }
+  .thread-input input {
+    flex: 1; font-family: monospace; background: #14161a; color: #e8e8e8;
+    border: 1px solid #555; border-radius: 4px; padding: 6px 8px;
+  }
+
+  .terminal-box { width: 560px; background: #0b0f0b; border-color: #2a5a2a; }
+  .terminal-header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 10px; color: #7fff7f; font-size: 13px;
+  }
+  .terminal-output {
+    height: 300px; overflow-y: auto; background: #000; border: 1px solid #1a3a1a;
+    border-radius: 4px; padding: 8px; font-size: 13px; color: #7fff7f;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .terminal-output .line { margin: 0 0 2px 0; }
+  .terminal-output .line.cmd { color: #b6ffb6; }
+  .terminal-inputline { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+  .terminal-inputline .prompt { color: #7fff7f; font-weight: bold; }
+  .terminal-inputline input {
+    flex: 1; font-family: monospace; background: #000; color: #7fff7f;
+    border: 1px solid #2a5a2a; border-radius: 4px; padding: 6px 8px;
+  }
+  .terminal-select {
+    width: 100%; font-family: monospace; background: #000; color: #7fff7f;
+    border: 1px solid #2a5a2a; border-radius: 4px; padding: 6px 8px; margin-top: 8px;
+  }
+  .library-section-label {
+    margin-top: 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+    color: #8a93a5; border-top: 1px solid #2a2e34; padding-top: 8px;
+  }
+  .agent-file-badge { float: right; font-size: 10px; opacity: 0.5; }
+  .terminal-code-input {
+    width: 100%; box-sizing: border-box; font-family: monospace; font-size: 13px;
+    background: #000; color: #7fff7f; border: 1px solid #2a5a2a; border-radius: 4px;
+    padding: 8px; margin-top: 8px; resize: vertical;
+  }
+
+  .roster-list { display: flex; flex-direction: column; gap: 4px; }
+
+  #hudBar {
+    position: fixed; top: 0; left: 0; right: 0; height: 64px; z-index: 25;
+    background: linear-gradient(#5b3a24, #3e2817);
+    border-bottom: 2px solid #241609;
+    display: flex; align-items: center; gap: 10px; padding: 0 12px;
+    box-sizing: border-box; overflow-x: auto; white-space: nowrap;
+    font-family: monospace;
+  }
+  .hud-pill {
+    background: #fdfaf3; color: #2a1a0a; border-radius: 999px;
+    padding: 5px 12px; font-size: 11px; flex: 0 0 auto; line-height: 1.3;
+  }
+  .hud-pill .label { display: block; font-size: 8px; letter-spacing: 0.05em; opacity: 0.65; }
+  .hud-pill .value { font-weight: bold; font-size: 13px; }
+  .hud-gap { flex: 1 1 auto; min-width: 12px; }
+  .hud-btn {
+    font-family: monospace; font-size: 12px; padding: 8px 14px;
+    border-radius: 8px; border: 1px solid #241609; background: #6b4a30; color: #fdfaf3;
+    flex: 0 0 auto; cursor: pointer;
+  }
+  .hud-btn:hover:not(:disabled) { background: #7d5638; }
+  .hud-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  .profile-box { width: 460px; background: #fdfdfb; color: #1a1a1a; }
+  .profile-header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 12px; border-bottom: 1px solid #ddd; padding-bottom: 8px;
+  }
+  .profile-header .filename { font-weight: bold; }
+  .chip {
+    font-size: 10px; font-weight: bold; letter-spacing: 0.04em;
+    padding: 3px 8px; border-radius: 4px; color: #fff; text-transform: uppercase;
+  }
+  .chip.private { background: #b5651d; }
+  .chip.evidence { background: #b5651d; }
+  .profile-section { margin-bottom: 12px; font-size: 13px; }
+  .profile-section h4 { margin: 0 0 4px 0; font-size: 12px; letter-spacing: 0.05em; opacity: 0.7; }
+  .profile-instr { display: flex; align-items: baseline; gap: 6px; margin-bottom: 4px; }
+  .profile-instr .report-link {
+    font-size: 10px; color: #b5651d; background: none; border: none; cursor: pointer;
+    text-decoration: underline; padding: 0; font-family: monospace;
+  }
+  .profile-notes li { margin-bottom: 2px; }
+  .report-form {
+    background: #f2ede6; border: 1px solid #ddd; border-radius: 6px;
+    padding: 10px; margin-top: 6px; font-size: 12px;
+  }
+  .report-form label { display: block; margin-bottom: 6px; }
+  .report-form select, .report-form textarea {
+    width: 100%; font-family: monospace; font-size: 12px; box-sizing: border-box;
+    margin-top: 2px; padding: 5px; border: 1px solid #bbb; border-radius: 4px;
+  }
+  .report-block {
+    position: relative; border: 1px solid #ddd; border-radius: 6px;
+    padding: 10px 12px; margin-bottom: 10px; background: #fff;
+  }
+  .report-block .quote {
+    border-left: 3px solid #b5651d; background: #fdf0e2; padding: 6px 10px;
+    margin: 6px 0; font-family: monospace; font-size: 12px;
+  }
+  .report-block .attribution { font-size: 11px; opacity: 0.6; margin-top: 2px; }
+  .report-block .note { font-size: 12px; margin-top: 6px; }
+  .caught-stamp {
+    position: absolute; right: 10px; bottom: 8px; color: #b5651d;
+    border: 2px solid #b5651d; border-radius: 4px; padding: 2px 8px;
+    font-weight: bold; font-size: 11px; letter-spacing: 0.08em;
+    transform: rotate(-8deg); opacity: 0.85;
+  }
+
+  #toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: #22262c; border: 1px solid #555; border-radius: 8px;
+    padding: 8px 16px; font-family: monospace; font-size: 13px; color: #e8e8e8;
+    z-index: 60; pointer-events: none;
+  }
+  #interactPrompt {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: rgba(30,34,40,0.9); border: 1px solid #7a8ab0; border-radius: 8px;
+    padding: 8px 16px; font-family: monospace; font-size: 13px; color: #e8e8e8;
+    z-index: 59; pointer-events: none;
+  }
+  #interactPrompt kbd {
+    background: #465066; border: 1px solid #7a8ab0; border-radius: 4px;
+    padding: 1px 6px; font-weight: bold; margin-right: 6px;
+  }
+
+  .convo-box { width: 460px; }
+  .convo-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .convo-header h3 { margin: 0; font-size: 15px; }
+  .convo-header .role { font-size: 11px; opacity: 0.65; display: block; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="viewport">
+    <canvas id="game"></canvas>
+  </div>
+  <div id="pad">
+    <button class="up" data-key="arrowup">&#9650;</button>
+    <button class="left" data-key="arrowleft">&#9664;</button>
+    <button class="down" data-key="arrowdown">&#9660;</button>
+    <button class="right" data-key="arrowright">&#9654;</button>
+  </div>
+  <p>Arrow keys / WASD, or the pad above, to walk. This is an experimental,
+     standalone second map -- a whole-scene generated background image with
+     collision auto-mapped by a segmentation model, separate from the main
+     village. Walk into a building's entrance to step inside its room; walk
+     off the bottom edge of a room to leave it. Walk into Town Hall to call
+     a meeting -- everyone you invite (and you) vanishes from the map for
+     the duration, and reappears somewhere new when the call ends. Agents
+     are solid -- walk up to one and press B to talk. Press G to show the
+     walkability grid/collision boxes. Open editor.html to paint outdoor
+     collision corrections, or door_editor.html to reposition a building's
+     entrance trigger.</p>
+</div>
+<div id="zoom">
+  <button id="zoomIn" title="Zoom in">+</button>
+  <button id="zoomOut" title="Zoom out">&minus;</button>
+  <button id="zoomAll" class="showall" title="Show whole map">SHOW&nbsp;ALL</button>
+</div>
+
+<div id="hudBar">
+  <div class="hud-pill"><span class="label">VILLAGERS</span><span class="value" id="hudVillagers">0</span></div>
+  <div class="hud-pill"><span class="label">WORKING</span><span class="value" id="hudWorking">0</span></div>
+  <div class="hud-pill" title="Tasks currently walking-to or working (tasks.js)"><span class="label">OPEN WORK</span><span class="value" id="hudOpenWork">0</span></div>
+  <div class="hud-pill"><span class="label">MORALE</span><span class="value" id="hudMorale">0</span></div>
+  <div class="hud-gap"></div>
+  <div class="hud-pill" title="Total unread across every agent's inbox -- open Post Office to read one"><span class="label">MAIL</span><span class="value" id="hudMail">0</span></div>
+  <div class="hud-pill" title="Filed reports (see any agent's profile)"><span class="label">REPORTS</span><span class="value" id="hudReports">0</span></div>
+  <button class="hud-btn" id="hudWhosWhoBtn">Who's Who</button>
+  <button class="hud-btn" id="hudLineUpBtn" disabled title="Not built yet">Line Up</button>
+  <button class="hud-btn" id="hudCallMeetingBtn">Call Meeting</button>
+  <button class="hud-btn" id="hudCommandCenterBtn" title="Enter Control Room -- also where you can check on anyone using it">Command Center</button>
+  <button class="hud-btn" id="hudActivityBtn" title="Everything real that's happened, straight off the action log">Activity</button>
+  <button class="hud-btn" id="hudPhoneBtn" title="Call anyone -- off duty or out of physical reach, mid-task">Phone Booth</button>
+  <button class="hud-btn" id="hudLogoutBtn" title="End your real login session">Log Out</button>
+</div>
+
+<div id="phoneModal" class="modal hidden">
+  <div class="modal-box">
+    <h3>Phone Booth</h3>
+    <p style="font-size:12px;opacity:0.7;margin-top:-4px;">Reach anyone from wherever you are -- including someone off duty, or mid-task and out of sight.</p>
+    <div class="roster-list" id="phoneRosterBody"></div>
+    <div class="modal-actions">
+      <button id="phoneCloseBtn">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="rosterListModal" class="modal hidden">
+  <div class="modal-box">
+    <h3 id="rosterListTitle">Village Roster</h3>
+    <div class="roster-list" id="rosterListBody"></div>
+    <div class="modal-actions">
+      <button id="rosterListCloseBtn">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="profileModal" class="modal hidden">
+  <div class="modal-box profile-box">
+    <div class="profile-header">
+      <span class="filename" id="profileFilename">AGENTS.md</span>
+      <span class="chip private">Private</span>
+    </div>
+    <div id="profileBody"></div>
+    <div class="modal-actions">
+      <button id="profileBackBtn">Back to Roster</button>
+      <button id="profileCloseBtn">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="doorMenuModal" class="modal hidden">
+  <div class="modal-box">
+    <h3>Town Hall</h3>
+    <p style="margin:8px 0; font-size:12px;">This building has a few places to go. Pick one.</p>
+    <div class="modal-actions" style="flex-direction:column; gap:8px; align-items:stretch;">
+      <button id="doorMenuHangoutBtn">Enter the Hangout</button>
+      <button id="doorMenuMeetingBtn">Call a Meeting</button>
+      <button id="doorMenuCancelBtn">Walk away</button>
+    </div>
+  </div>
+</div>
+
+<div id="townhallModal" class="modal hidden">
+  <div class="modal-box">
+    <h3>Town Hall — Call a Meeting</h3>
+    <div class="presetRow" id="presetRow"></div>
+    <div class="terminal-inputline">
+      <input type="text" id="meetingTopicInput" placeholder="What's this meeting about? (for the Suggest button)">
+      <button id="suggestAttendeesBtn">Suggest</button>
+    </div>
+    <div class="agentList" id="agentList"></div>
+    <div class="modal-actions">
+      <button id="cancelCallBtn">Cancel</button>
+      <button id="startCallBtn">Start Call</button>
+    </div>
+    <p id="meetingMsg" class="meeting-msg"></p>
+  </div>
+</div>
+
+<div id="chatModal" class="modal hidden">
+  <div class="modal-box chat-box">
+    <div class="chat-header">
+      <h3>Town Hall — Meeting</h3>
+      <button id="endCallBtn">End Call</button>
+    </div>
+    <div class="chat-body">
+      <div class="chat-roster" id="chatRoster"></div>
+      <div class="chat-thread">
+        <div class="thread-header" id="threadHeader">Group</div>
+        <div class="thread-log" id="threadLog"></div>
+        <div class="thread-input">
+          <input type="text" id="chatInput" placeholder="Message...">
+          <button id="chatSendBtn">Send</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="terminalModal" class="modal hidden">
+  <div class="modal-box terminal-box">
+    <div class="terminal-header">
+      <span id="terminalTitle">Terminal</span>
+      <button id="terminalCloseBtn">Disconnect</button>
+    </div>
+    <div class="terminal-output" id="terminalOutput"></div>
+    <div class="terminal-inputline">
+      <span class="prompt">&gt;</span>
+      <input type="text" id="terminalInput" autocomplete="off">
+    </div>
+  </div>
+</div>
+
+<div id="browserModal" class="modal hidden">
+  <div class="modal-box terminal-box">
+    <div class="terminal-header">
+      <span>Weather Station -- Outside Access</span>
+      <button id="browserCloseBtn">Disconnect</button>
+    </div>
+    <div class="terminal-inputline">
+      <span class="prompt">url&gt;</span>
+      <input type="text" id="browserUrlInput" autocomplete="off" placeholder="https://...">
+    </div>
+    <div class="terminal-inputline">
+      <span class="prompt">why&gt;</span>
+      <input type="text" id="browserPurposeInput" autocomplete="off" placeholder="what are you looking for?">
+    </div>
+    <div class="terminal-inputline">
+      <button id="browserGoBtn">Go</button>
+      <button id="browserCurlBtn" title="Raw HTTP -- real status/headers/body, not the stripped text 'Go' gives you">Raw Request</button>
+      <span id="browserStatus"></span>
+    </div>
+    <div class="terminal-output" id="browserOutput"></div>
+  </div>
+</div>
+
+<div id="workroomModal" class="modal hidden">
+  <div class="modal-box terminal-box">
+    <div class="terminal-header">
+      <span>Work Room -- Sandbox</span>
+      <button id="workroomCloseBtn">Disconnect</button>
+    </div>
+    <div class="terminal-inputline">
+      <span class="prompt">why&gt;</span>
+      <input type="text" id="workroomPurposeInput" autocomplete="off" placeholder="what's this for?">
+    </div>
+    <textarea id="workroomCommandInput" class="terminal-code-input" rows="4" placeholder="One command, or one per line to run as a pipeline (stops at the first failure)..."></textarea>
+    <div class="terminal-inputline">
+      <button id="workroomRunBtn">Run</button>
+      <span id="workroomStatus"></span>
+    </div>
+    <div class="terminal-output" id="workroomOutput"></div>
+  </div>
+</div>
+
+<div id="activityModal" class="modal hidden">
+  <div class="modal-box terminal-box">
+    <div class="terminal-header">
+      <span>Activity Log</span>
+      <button id="activityCloseBtn">Close</button>
+    </div>
+    <div class="terminal-output" id="activityOutput"></div>
+  </div>
+</div>
+
+<div id="researchModal" class="modal hidden">
+  <div class="modal-box terminal-box">
+    <div class="terminal-header">
+      <span>Research Center -- Sandbox</span>
+      <button id="researchCloseBtn">Disconnect</button>
+    </div>
+    <div class="terminal-inputline">
+      <span class="prompt">why&gt;</span>
+      <input type="text" id="researchPurposeInput" autocomplete="off" placeholder="what's this for?">
+    </div>
+    <textarea id="researchCommandInput" class="terminal-code-input" rows="4" placeholder="One command, or one per line to run as a pipeline (stops at the first failure)..."></textarea>
+    <div class="terminal-inputline">
+      <button id="researchRunBtn">Run</button>
+      <span id="researchStatus"></span>
+    </div>
+    <div class="terminal-output" id="researchOutput"></div>
+  </div>
+</div>
+
+<div id="libraryModal" class="modal hidden">
+  <div class="modal-box chat-box">
+    <div class="chat-header">
+      <h3>Library — Shared Files</h3>
+      <button id="libraryCloseBtn">Close</button>
+    </div>
+    <div class="chat-body">
+      <div class="chat-roster">
+        <div class="terminal-inputline">
+          <input type="text" id="librarySearchInput" placeholder="search file contents...">
+          <button id="librarySearchBtn">Search</button>
+        </div>
+        <div id="libraryFileList"></div>
+        <div class="library-section-label">Agent files (read-only)</div>
+        <select id="agentFilePicker" class="terminal-input" title="Browse any agent's own files (player/ops view). Agents can read each other's files; an agent cannot see its OWN reports/ directory, and writes to another agent's personal space are gated by the director chain.">
+          <option value="">— choose an agent —</option>
+        </select>
+        <div id="agentFileList"></div>
+      </div>
+      <div class="chat-thread">
+        <div class="thread-header" id="libraryFileHeader">Select a file</div>
+        <div class="thread-log" id="libraryFileContent"></div>
+        <div class="terminal-inputline">
+          <input type="text" id="libraryPathInput" placeholder="path, e.g. notes/idea.md">
+        </div>
+        <textarea id="libraryContentInput" class="terminal-code-input" rows="4" placeholder="Write or paste content to save here..."></textarea>
+        <div class="terminal-inputline">
+          <button id="libraryWriteBtn">Save to Library</button>
+          <span id="libraryStatus"></span>
+        </div>
+        <div class="terminal-inputline" title="Feed a real local file, directory, or zip -- PDFs and Excel get their text extracted, images copied as-is, code/HTML/etc. copied as text.">
+          <input type="text" id="libraryIngestPathInput" placeholder="local path to ingest, e.g. ~/Documents/notes.pdf or a folder">
+          <button id="libraryIngestBtn">Ingest</button>
+          <span id="libraryIngestStatus"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="mailboxModal" class="modal hidden">
+  <div class="modal-box chat-box">
+    <div class="chat-header">
+      <h3>Post Office — Mailboxes</h3>
+      <button id="mailboxCloseBtn">Close</button>
+    </div>
+    <div class="chat-body">
+      <div class="chat-roster" id="mailboxRoster"></div>
+      <div class="chat-thread">
+        <div class="thread-header" id="mailboxThreadHeader">Select a mailbox</div>
+        <div class="thread-log" id="mailboxThreadLog"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="tellerModal" class="modal hidden">
+  <div class="modal-box terminal-box">
+    <div class="terminal-header">
+      <span id="tellerTitle">Bank Teller</span>
+      <button id="tellerCloseBtn">Leave</button>
+    </div>
+    <div class="terminal-output" id="tellerOutput"></div>
+    <div class="terminal-inputline" id="tellerMenu">
+      <button id="tellerBalanceBtn">Check Balance</button>
+      <button id="tellerDepositBtn">Make a Deposit</button>
+      <button id="tellerReportBtn">Report Irregular Activity</button>
+    </div>
+  </div>
+</div>
+
+<div id="conversationModal" class="modal hidden">
+  <div class="modal-box convo-box">
+    <div class="convo-header">
+      <div>
+        <h3 id="convoName">Name</h3>
+        <span class="role" id="convoRole">Role</span>
+      </div>
+      <button id="convoCloseBtn">Close</button>
+    </div>
+    <div class="thread-log" id="convoLog"></div>
+    <div class="thread-input">
+      <input type="text" id="convoInput" placeholder="Message...">
+      <button id="convoSendBtn">Send</button>
+    </div>
+  </div>
+</div>
+
+<div id="boardModal" class="modal hidden">
+  <div class="modal-box">
+    <h3>The Board</h3>
+    <div id="boardBody" style="font-size:13px; opacity:0.85; text-align:left;">Nothing scheduled yet.</div>
+    <div class="terminal-inputline">
+      <input type="text" id="bigTaskInput" placeholder="Give the admins a large task to break down and delegate...">
+      <button id="bigTaskBtn">Delegate</button>
+    </div>
+    <p id="bigTaskStatus" class="meeting-msg"></p>
+    <hr style="opacity:0.3;">
+    <h4 style="margin:6px 0 2px;">Sprints <span style="opacity:0.6; font-size:11px;">(director-authored via /api/intent; teams must each have a scrum master)</span></h4>
+    <div id="boardSprintsBody" style="max-height:220px; overflow:auto; font-size:12px;">Loading...</div>
+    <hr style="opacity:0.3;">
+    <h4 style="margin:6px 0 2px;">Products <span style="opacity:0.6; font-size:11px;">(releases freeze the sandbox repo into library/projects/)</span></h4>
+    <div id="boardProductsBody" style="max-height:200px; overflow:auto; font-size:12px;">Loading...</div>
+    <hr style="opacity:0.3;">
+    <h4 style="margin:6px 0 2px;">Wiki <span style="opacity:0.6; font-size:11px;">(agents read these before acting; directors structure)</span></h4>
+    <div id="boardWikiBody" style="max-height:200px; overflow:auto; font-size:12px;">Loading...</div>
+    <hr style="opacity:0.3;">
+    <h4 style="margin:6px 0 2px;">Publish <span style="opacity:0.6; font-size:11px;">(player-only: push released work to GitHub)</span></h4>
+    <div style="font-size:12px; opacity:0.85;">Freeze the released projects, wiki pages, and skills and push them to your configured private GitHub repo. Agents' work only leaves the machine when you say so.</div>
+    <div class="terminal-inputline" style="margin-top:4px;">
+      <button id="publishBtn">Publish to GitHub</button>
+    </div>
+    <p id="publishStatus" class="meeting-msg"></p>
+    <hr style="opacity:0.3;">
+    <h4 style="margin:6px 0 2px;">Role Templates <span style="opacity:0.6; font-size:11px;">(director/admin only -- the House is theirs)</span></h4>
+    <div id="boardTemplatesBody" style="max-height:240px; overflow:auto; font-size:12px;">Loading...</div>
+    <div id="boardTemplateEditor" class="hidden" style="font-size:13px;">
+      <div id="boardTemplateEditorBody" style="font-size:12px;">Loading...</div>
+    </div>
+    <div class="modal-actions"><button id="boardCloseBtn">Close</button></div>
+  </div>
+</div>
+
+<div id="toast" class="hidden"></div>
+<div id="interactPrompt" class="hidden"></div>
+
+<script src="world.js?v=29"></script>
+<script src="rooms.js?v=6"></script>
+<script src="terminals.js?v=3"></script>
+<script src="agents.js?v=28"></script>
+<script src="meetings.js?v=2"></script>
+<script src="reports.js?v=4"></script>
+<script src="morale.js?v=3"></script>
+<script src="hiring.js?v=22"></script>
+<script src="firing.js?v=9"></script>
+<script src="jev.js?v=4"></script>
+<script src="grading.js?v=1"></script>
+<script src="tasks.js?v=76"></script>
+<script src="handoffs.js?v=11"></script>
+<script src="templates.js?v=1"></script>
+<script src="sim_bridge.js?v=4"></script>
+<script>
+const VIEW_W = 960, VIEW_H = 680;
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+canvas.width = VIEW_W;
+canvas.height = VIEW_H;
+ctx.imageSmoothingEnabled = false;
+
+const viewport = document.getElementById('viewport');
+function fitViewport() {
+  const ratio = VIEW_W / VIEW_H;
+  const availW = window.innerWidth - 16;
+  const availH = window.innerHeight - 140;
+  let w = availW, h = w / ratio;
+  if (h > availH) { h = availH; w = h * ratio; }
+  viewport.style.width = w + 'px';
+  viewport.style.height = h + 'px';
+}
+window.addEventListener('resize', fitViewport);
+fitViewport();
+
+const ASSET_V = Date.now();
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src + (src.includes('?') ? '&' : '?') + 'v=' + ASSET_V;
+  });
+}
+
+function clampTo(p, w, h) {
+  p.x = Math.max(0, Math.min(w - p.w, p.x));
+  p.y = Math.max(0, Math.min(h - p.h, p.y));
+}
+// blockedAt() itself lives in world.js -- it reads the per-cell collision
+// grid (COLLISION_GRID), loaded asynchronously in main() below.
+
+function overlaps(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function blockedInRoom(p, rects) {
+  for (const r of rects) if (overlaps(p, r)) return true;
+  return false;
+}
+
+const ZOOM_MIN = 0.4, ZOOM_MAX = 4, ZOOM_STEP = 0.3;
+const ZOOM_SHOW_ALL = Math.min(VIEW_W / GROUND_W, VIEW_H / GROUND_H);
+const ZOOM_ROOM = Math.min(VIEW_W / ROOM_NATIVE_W, VIEW_H / ROOM_NATIVE_H, 1.8);
+
+// state.location is { kind: 'outside' }, { kind: 'room', building }, or
+// { kind: 'meeting', meetingId } (from a Town Hall call -- see meetings.js;
+// the player is frozen and hidden for the duration, same as any other
+// participant). state.ui is null or 'townhall' while the call-setup modal
+// is open (also freezes movement, so walking away isn't possible mid-pick).
+const state = {
+  player: { x: SPAWN.x, y: SPAWN.y, w: 20, h: 16, dir: 'south', speed: 90 },
+  keys: new Set(),
+  zoom: ZOOM_SHOW_ALL,
+  showFootprints: false,
+  location: { kind: 'outside' },
+  ui: null,
+};
+
+// Remembered so exitRoom() has somewhere sane to put the player back for a
+// room with no physical door on the outdoor map (Control Room -- reachable
+// only via the HUD's Command Center button, see below).
+let lastOutdoorPos = null;
+
+function enterRoom(building) {
+  // Guards this needs now that it's reachable from the HUD button (see
+  // hudCommandCenterBtn) too, not just the outdoor door-trigger loop, which
+  // already guaranteed 'outside'/no-modal by construction.
+  if (state.ui || state.location.kind !== 'outside') return;
+  const room = ROOMS[building];
+  if (!room) return;
+  lastOutdoorPos = { x: state.player.x, y: state.player.y };
+  state.location = { kind: 'room', building };
+  // Spawn near the room's open south (bottom) edge -- the implied unseen
+  // entrance per the art (see rooms.js) -- clear of every layout's
+  // furniture (checked against all four collision sets) and clear of the
+  // exit trigger itself.
+  state.player.x = ROOM_NATIVE_W / 2 - state.player.w / 2;
+  state.player.y = 370;
+  state.player.dir = 'north';
+  state.zoom = ZOOM_ROOM;
+}
+
+function exitRoom() {
+  const building = state.location.building;
+  const door = ROOM_DOOR_TRIGGERS[building];
+  state.location = { kind: 'outside' };
+  if (door) {
+    state.player.x = door.x + door.w / 2 - state.player.w / 2;
+    state.player.y = door.y + door.h + 4;
+  } else if (lastOutdoorPos) {
+    state.player.x = lastOutdoorPos.x;
+    state.player.y = lastOutdoorPos.y;
+  }
+  state.player.dir = 'south';
+  state.zoom = ZOOM_SHOW_ALL;
+}
+
+// Tracks which zone opened the current room interaction (terminal or
+// mailbox) so closing it knows exactly where to nudge the player clear of
+// -- a fixed offset would risk landing back inside a neighboring
+// collision rect, since these zones sit in narrow gaps.
+let activeInteractZone = null;
+
+function clearInteractZone() {
+  if (activeInteractZone) {
+    state.player.y = activeInteractZone.y + activeInteractZone.h + 2;
+  }
+  activeInteractZone = null;
+}
+
+function openTerminal(item) {
+  // Weather Station only, per Eli's own profile line ("the only room with
+  // outside/internet access -- do not share that access outside this
+  // room") -- every other workstations-layout room (Media, Research
+  // Center) keeps the generic stub terminal below. Press Office is
+  // labeled "Work Room" (ROOMS.pressoffice) -- real sandboxed execution,
+  // per your explicit call.
+  if (state.location.building === 'weatherstation') { openBrowser(item); return; }
+  if (state.location.building === 'pressoffice') { openWorkroom(item); return; }
+  if (state.location.building === 'observatory') { openResearch(item); return; }
+  if (state.location.building === 'library') { openLibrary(item); return; }
+  if (state.location.building === 'media') { openLibrary(item); return; }
+
+  activeInteractZone = item.zone;
+  state.ui = 'terminal';
+  const room = ROOMS[state.location.building];
+  document.getElementById('terminalTitle').textContent = `${room.label} Terminal`;
+  const output = document.getElementById('terminalOutput');
+  output.innerHTML = '';
+  appendTerminalLine(`-- ${room.label} terminal --`);
+  appendTerminalLine('Not connected to anything yet. Type a command and press Enter.');
+  document.getElementById('terminalModal').classList.remove('hidden');
+  const input = document.getElementById('terminalInput');
+  input.value = '';
+  input.focus();
+}
+
+// Real internet access, gated -- see serve.py's /api/browse: Jev
+// classifies the URL + stated purpose BEFORE anything is fetched, every
+// request is logged server-side, and the whole thing fails closed if the
+// classifier is unreachable. This modal is the player-driven front end
+// for it; an agent's own Weather Station task work also uses it
+// autonomously now (tasks.js's checkWeatherReference()).
+function openBrowser(item) {
+  activeInteractZone = item.zone;
+  state.ui = 'browser';
+  document.getElementById('browserUrlInput').value = '';
+  document.getElementById('browserPurposeInput').value = '';
+  document.getElementById('browserStatus').textContent = '';
+  const output = document.getElementById('browserOutput');
+  output.innerHTML = '';
+  appendBrowserLine('-- Weather Station outside-access terminal --');
+  appendBrowserLine('Every request is reviewed before anything loads. Enter a URL and why you want it.');
+  document.getElementById('browserModal').classList.remove('hidden');
+  document.getElementById('browserUrlInput').focus();
+}
+
+function appendBrowserLine(text) {
+  const output = document.getElementById('browserOutput');
+  const line = document.createElement('div');
+  line.className = 'line';
+  line.textContent = text;
+  output.appendChild(line);
+  output.scrollTop = output.scrollHeight;
+}
+
+function closeBrowser() {
+  state.ui = null;
+  document.getElementById('browserModal').classList.add('hidden');
+  clearInteractZone();
+}
+
+const BROWSE_MAX_HOPS = 3;
+
+// Follows breadcrumbs toward a stated goal, not just one fixed URL -- per
+// your call: an agent may not know in advance which page actually has
+// what it's looking for. At each stop, Jev picks whichever link on the
+// CURRENT page gets closer to the goal (or says to stop here), the same
+// classifier "pick one of N" shape as everything else Jev does in this
+// project. Every hop still goes through the full /api/browse gate
+// independently -- this doesn't bypass or batch the safety checks, it
+// just chains individually-gated requests. Capped at BROWSE_MAX_HOPS so
+// this can't wander (and spend) indefinitely.
+async function browseTowardGoal(startUrl, purpose, agentId) {
+  let url = startUrl;
+  let data = null;
+  let hops = 0;
+  for (; hops <= BROWSE_MAX_HOPS; hops++) {
+    const res = await agentFetch('/api/browse', agentId, { method: 'POST', body: JSON.stringify({ url, purpose, agentId }) });
+    data = await res.json();
+    if (!data.allowed || data.error || !data.links || data.links.length === 0 || hops === BROWSE_MAX_HOPS) break;
+
+    // The full set (server already caps at 40, see _extract_links) --
+    // truncating further client-side was the actual reason an early test
+    // of this wandered into nav chrome instead of real article content:
+    // most pages put boilerplate navigation links first and body-content
+    // links later, so an arbitrary "first N" slice mostly shows Jev the
+    // chrome, not the substance.
+    const candidates = data.links.map((l, i) => ({ id: 'link' + i, description: `"${l.text}" (${l.url})` }));
+    candidates.push({ id: 'stop', description: 'This page already has what the purpose asks for -- no further navigation needed.' });
+    const choice = await requestJevChoice(
+      `Looking for: ${purpose || 'general information'}. Currently on: ${url}. Pick the link that gets closer to that, or 'stop' if this page already answers it.`,
+      candidates
+    );
+    if (!choice || choice === 'stop') break;
+    const link = data.links[parseInt(choice.slice(4), 10)];
+    if (!link) break;
+    url = link.url;
+  }
+  return { data, hops };
+}
+
+async function handleBrowserGo() {
+  const url = document.getElementById('browserUrlInput').value.trim();
+  const purpose = document.getElementById('browserPurposeInput').value.trim();
+  if (!url) return;
+  const statusEl = document.getElementById('browserStatus');
+  const goBtn = document.getElementById('browserGoBtn');
+  appendBrowserLine(`> ${url}`);
+  statusEl.textContent = 'Checking...';
+  goBtn.disabled = true;
+  try {
+    const { data, hops } = await browseTowardGoal(url, purpose, 'player');
+    if (!data.allowed) {
+      statusEl.textContent = 'Blocked';
+      appendBrowserLine(`[blocked] ${data.reason || 'Not approved.'}`);
+    } else if (data.error) {
+      statusEl.textContent = 'Approved, load failed';
+      appendBrowserLine(`[error] ${data.error}`);
+    } else {
+      statusEl.textContent = hops > 0 ? `Loaded (followed ${hops} link${hops === 1 ? '' : 's'})` : 'Loaded';
+      if (data.url && data.url !== url) appendBrowserLine(`-> ${data.url}`);
+      appendBrowserLine((data.text || '(empty page)').slice(0, 2000));
+      if (data.truncated) appendBrowserLine('[...truncated]');
+    }
+  } catch (e) {
+    statusEl.textContent = 'Error';
+    appendBrowserLine(`[error] ${e.message}`);
+  }
+  goBtn.disabled = false;
+}
+
+// The raw-HTTP sibling to "Go" -- real status/headers/body, not text
+// stripped for human reading. Same Jev gate as Go, plus serve.py's own
+// real room check (curlRequest -> /api/curl): this only works from
+// inside the Weather Station, enforced server-side against the actual
+// saved position, not just because this button happens to live in this
+// modal.
+async function handleBrowserCurl() {
+  const url = document.getElementById('browserUrlInput').value.trim();
+  const purpose = document.getElementById('browserPurposeInput').value.trim();
+  if (!url) return;
+  const statusEl = document.getElementById('browserStatus');
+  const curlBtn = document.getElementById('browserCurlBtn');
+  appendBrowserLine(`> RAW GET ${url}`);
+  statusEl.textContent = 'Checking...';
+  curlBtn.disabled = true;
+  try {
+    const data = await curlRequest('player', 'GET', url, purpose);
+    if (!data.allowed) {
+      statusEl.textContent = 'Blocked';
+      appendBrowserLine(`[blocked] ${data.reason || 'Not approved.'}`);
+    } else if (data.error) {
+      statusEl.textContent = 'Approved, request failed';
+      appendBrowserLine(`[error] ${data.error}`);
+    } else {
+      statusEl.textContent = `${data.status}`;
+      appendBrowserLine(`status: ${data.status}`);
+      appendBrowserLine(`headers: ${JSON.stringify(data.headers)}`);
+      appendBrowserLine((data.body || '(empty body)').slice(0, 2000));
+      if (data.truncated) appendBrowserLine('[...truncated]');
+    }
+  } catch (e) {
+    statusEl.textContent = 'Error';
+    appendBrowserLine(`[error] ${e.message}`);
+  }
+  curlBtn.disabled = false;
+}
+
+// Real sandboxed execution -- see serve.py's /api/execute and
+// /api/pipeline. Every command is classified by Jev before it runs and
+// then actually executes inside an isolated, resource-capped Docker
+// container with allowlisted egress. One shared sandbox for the whole
+// Work Room, not a fresh one per visit -- per your call, agents (and you)
+// should be able to step out to the Weather Station or Library and come
+// back to find things exactly as they left them. serve.py's own
+// `_sandbox_dir_for()` handles the other half of that: it only wipes this
+// sandbox if it's gone genuinely untouched for 15+ minutes, not just
+// because whoever was using it walked away for a bit.
+const WORKROOM_SANDBOX_ID = 'workroom-shared';
+let workroomSandboxId = WORKROOM_SANDBOX_ID;
+
+function openWorkroom(item) {
+  activeInteractZone = item.zone;
+  state.ui = 'workroom';
+  document.getElementById('workroomPurposeInput').value = '';
+  document.getElementById('workroomCommandInput').value = '';
+  document.getElementById('workroomStatus').textContent = '';
+  const output = document.getElementById('workroomOutput');
+  output.innerHTML = '';
+  appendWorkroomLine('-- Work Room sandbox -- ');
+  appendWorkroomLine('Every command is reviewed before it runs, then executes in an isolated container with no network and no access outside its own workspace.');
+  appendWorkroomLine('One command, or several lines to run as a pipeline (stops at the first failure).');
+  document.getElementById('workroomModal').classList.remove('hidden');
+  document.getElementById('workroomCommandInput').focus();
+}
+
+function appendWorkroomLine(text) {
+  const output = document.getElementById('workroomOutput');
+  const line = document.createElement('div');
+  line.className = 'line';
+  line.textContent = text;
+  output.appendChild(line);
+  output.scrollTop = output.scrollHeight;
+}
+
+function closeWorkroom() {
+  state.ui = null;
+  document.getElementById('workroomModal').classList.add('hidden');
+  clearInteractZone();
+}
+
+async function handleWorkroomRun() {
+  const raw = document.getElementById('workroomCommandInput').value;
+  const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
+  if (lines.length === 0) return;
+  const purpose = document.getElementById('workroomPurposeInput').value.trim();
+  const statusEl = document.getElementById('workroomStatus');
+  const runBtn = document.getElementById('workroomRunBtn');
+  runBtn.disabled = true;
+  statusEl.textContent = 'Reviewing...';
+
+  try {
+    if (lines.length === 1) {
+      appendWorkroomLine(`$ ${lines[0]}`);
+      const res = await agentFetch('/api/execute', 'player', {
+        method: 'POST',
+        body: JSON.stringify({ agentId: 'player', command: lines[0], purpose, sandboxId: workroomSandboxId }),
+      });
+      const data = await res.json();
+      if (!data.allowed) {
+        statusEl.textContent = 'Blocked';
+        appendWorkroomLine(`[blocked] ${data.reason || 'Not approved.'}${data.escalationId ? ' -- escalated for review.' : ''}`);
+      } else {
+        workroomSandboxId = data.sandboxId;
+        statusEl.textContent = data.timedOut ? 'Timed out' : `Exit code ${data.exitCode}`;
+        if (data.stdout) appendWorkroomLine(data.stdout);
+        if (data.stderr) appendWorkroomLine(data.stderr);
+      }
+    } else {
+      appendWorkroomLine(`$ running ${lines.length} steps as a pipeline...`);
+      const res = await agentFetch('/api/pipeline', 'player', {
+        method: 'POST',
+        body: JSON.stringify({ agentId: 'player', sandboxId: workroomSandboxId, steps: lines.map((command, i) => ({ name: `step ${i + 1}`, command })) }),
+      });
+      const data = await res.json();
+      workroomSandboxId = data.sandboxId;
+      for (const step of data.results) {
+        appendWorkroomLine(`-- ${step.name} --`);
+        if (!step.allowed) { appendWorkroomLine(`[blocked] ${step.reason}`); continue; }
+        if (step.stdout) appendWorkroomLine(step.stdout);
+        if (step.stderr) appendWorkroomLine(step.stderr);
+      }
+      statusEl.textContent = data.failedStep ? `Failed at: ${data.failedStep}` : 'All steps succeeded';
+    }
+  } catch (e) {
+    statusEl.textContent = 'Error';
+    appendWorkroomLine(`[error] ${e.message}`);
+  }
+  runBtn.disabled = false;
+}
+
+// Research Center -- Observatory's real capability, per Phase 24's redesign
+// ("active investigative work," deliberately given the Work Room's exact
+// visual layout by your own choice). Mechanically that means the same
+// class of capability as the Press Office's Work Room (real sandboxed
+// execution), NOT the internet-access tool -- that one stays exclusive to
+// Weather Station per Eli's own profile line. A SEPARATE persistent
+// sandbox (not WORKROOM_SANDBOX_ID) so investigative scratch work never
+// collides with Press Office's coding work.
+const RESEARCH_SANDBOX_ID = 'research-shared';
+let researchSandboxId = RESEARCH_SANDBOX_ID;
+
+function openResearch(item) {
+  activeInteractZone = item.zone;
+  state.ui = 'research';
+  document.getElementById('researchPurposeInput').value = '';
+  document.getElementById('researchCommandInput').value = '';
+  document.getElementById('researchStatus').textContent = '';
+  const output = document.getElementById('researchOutput');
+  output.innerHTML = '';
+  appendResearchLine('-- Research Center sandbox --');
+  appendResearchLine('Every command is reviewed before it runs, then executes in its own isolated container -- separate from the Work Room\'s.');
+  appendResearchLine('One command, or several lines to run as a pipeline (stops at the first failure).');
+  document.getElementById('researchModal').classList.remove('hidden');
+  document.getElementById('researchCommandInput').focus();
+}
+
+function appendResearchLine(text) {
+  const output = document.getElementById('researchOutput');
+  const line = document.createElement('div');
+  line.className = 'line';
+  line.textContent = text;
+  output.appendChild(line);
+  output.scrollTop = output.scrollHeight;
+}
+
+function closeResearch() {
+  state.ui = null;
+  document.getElementById('researchModal').classList.add('hidden');
+  clearInteractZone();
+}
+
+async function handleResearchRun() {
+  const raw = document.getElementById('researchCommandInput').value;
+  const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
+  if (lines.length === 0) return;
+  const purpose = document.getElementById('researchPurposeInput').value.trim();
+  const statusEl = document.getElementById('researchStatus');
+  const runBtn = document.getElementById('researchRunBtn');
+  runBtn.disabled = true;
+  statusEl.textContent = 'Reviewing...';
+
+  try {
+    if (lines.length === 1) {
+      appendResearchLine(`$ ${lines[0]}`);
+      const res = await agentFetch('/api/execute', 'player', {
+        method: 'POST',
+        body: JSON.stringify({ agentId: 'player', command: lines[0], purpose, sandboxId: researchSandboxId }),
+      });
+      const data = await res.json();
+      if (!data.allowed) {
+        statusEl.textContent = 'Blocked';
+        appendResearchLine(`[blocked] ${data.reason || 'Not approved.'}${data.escalationId ? ' -- escalated for review.' : ''}`);
+      } else {
+        researchSandboxId = data.sandboxId;
+        statusEl.textContent = data.timedOut ? 'Timed out' : `Exit code ${data.exitCode}`;
+        if (data.stdout) appendResearchLine(data.stdout);
+        if (data.stderr) appendResearchLine(data.stderr);
+      }
+    } else {
+      appendResearchLine(`$ running ${lines.length} steps as a pipeline...`);
+      const res = await agentFetch('/api/pipeline', 'player', {
+        method: 'POST',
+        body: JSON.stringify({ agentId: 'player', sandboxId: researchSandboxId, steps: lines.map((command, i) => ({ name: `step ${i + 1}`, command })) }),
+      });
+      const data = await res.json();
+      researchSandboxId = data.sandboxId;
+      for (const step of data.results) {
+        appendResearchLine(`-- ${step.name} --`);
+        if (!step.allowed) { appendResearchLine(`[blocked] ${step.reason}`); continue; }
+        if (step.stdout) appendResearchLine(step.stdout);
+        if (step.stderr) appendResearchLine(step.stderr);
+      }
+      statusEl.textContent = data.failedStep ? `Failed at: ${data.failedStep}` : 'All steps succeeded';
+    }
+  } catch (e) {
+    statusEl.textContent = 'Error';
+    appendResearchLine(`[error] ${e.message}`);
+  }
+  runBtn.disabled = false;
+}
+
+// The Library's real capability -- a shared file directory any agent (or
+// you) can read from or write to, per your call: code, notes, completed-
+// task records. Deliberately NOT injected into any agent's prompt
+// automatically -- reading a file here is an explicit action (a real
+// fetch someone chose to make), the same "memory as something you
+// retrieve on demand, not something prepended to every run regardless"
+// principle that keeps this from becoming the exact shared-notes cost
+// problem you flagged.
+let libraryActiveFile = null;
+
+function openLibrary(item) {
+  activeInteractZone = item.zone;
+  state.ui = 'library';
+  libraryActiveFile = null;
+  document.getElementById('libraryPathInput').value = '';
+  document.getElementById('libraryContentInput').value = '';
+  document.getElementById('libraryStatus').textContent = '';
+  document.getElementById('libraryFileHeader').textContent = 'Select a file';
+  document.getElementById('libraryFileContent').innerHTML = '';
+  document.getElementById('libraryModal').classList.remove('hidden');
+  renderLibraryFileList();
+  populateAgentFilePicker();
+}
+
+// Issue #9: agents view one another's files (read-only here). Populate the
+// picker with every roster agent so the player can inspect anyone's real
+// on-disk files -- the read is always allowed; only DIRECTOR/ADMIN can write,
+// and the player isn't either, so these are strictly read-only in this view.
+function populateAgentFilePicker() {
+  const picker = document.getElementById('agentFilePicker');
+  const agentFileList = document.getElementById('agentFileList');
+  agentFileList.innerHTML = '';
+  if (!picker) return;
+  const prev = picker.value;
+  picker.innerHTML = '<option value="">— choose an agent —</option>';
+  for (const def of AGENT_ROSTER) {
+    const opt = document.createElement('option');
+    opt.value = def.id;
+    opt.textContent = `${def.name} (${def.role})`;
+    picker.appendChild(opt);
+  }
+  picker.value = prev && AGENT_ROSTER.some(d => d.id === prev) ? prev : '';
+}
+
+async function renderAgentFileList(agentId) {
+  const listEl = document.getElementById('agentFileList');
+  listEl.innerHTML = '<div class="empty">Loading...</div>';
+  try {
+    const res = await apiFetch('/api/agent-files?agentId=' + encodeURIComponent(agentId));
+    const data = await res.json();
+    listEl.innerHTML = '';
+    if (!data.files || data.files.length === 0) {
+      listEl.innerHTML = '<div class="empty">No files.</div>';
+      return;
+    }
+    for (const f of data.files) {
+      const btn = document.createElement('button');
+      btn.className = 'roster-item';
+      btn.innerHTML = `${f.path}<span class="agent-file-badge">${f.size}b</span>`;
+      btn.addEventListener('click', () => openAgentFile(agentId, f.path));
+      listEl.appendChild(btn);
+    }
+  } catch (e) {
+    listEl.innerHTML = '<div class="empty">Could not load.</div>';
+  }
+}
+
+async function openAgentFile(agentId, path) {
+  document.getElementById('libraryFileHeader').textContent = `${agentId}/${path} (read-only)`;
+  document.getElementById('libraryPathInput').value = '';
+  document.getElementById('libraryContentInput').value = '';
+  const content = document.getElementById('libraryFileContent');
+  content.textContent = 'Loading...';
+  try {
+    const res = await apiFetch('/api/agent-files/read?agentId=' + encodeURIComponent(agentId) + '&path=' + encodeURIComponent(path));
+    const data = await res.json();
+    if (data.error) { content.textContent = `Could not read: ${data.error}`; return; }
+    content.textContent = data.content || '(empty)';
+  } catch (e) {
+    content.textContent = 'Could not load this file.';
+  }
+}
+
+function closeLibrary() {
+  state.ui = null;
+  document.getElementById('libraryModal').classList.add('hidden');
+  clearInteractZone();
+}
+
+async function renderLibraryFileList() {
+  const list = document.getElementById('libraryFileList');
+  list.innerHTML = '<div class="empty">Loading...</div>';
+  try {
+    const res = await apiFetch('/api/library');
+    const data = await res.json();
+    list.innerHTML = '';
+    if (!data.files || data.files.length === 0) {
+      list.innerHTML = '<div class="empty">Nothing shared yet.</div>';
+      return;
+    }
+    for (const f of data.files) {
+      const btn = document.createElement('button');
+      btn.className = 'roster-item' + (libraryActiveFile === f.path ? ' active' : '');
+      btn.innerHTML = `${f.path}<span class="role">${f.size}b</span>`;
+      btn.addEventListener('click', () => openLibraryFile(f.path));
+      list.appendChild(btn);
+    }
+  } catch (e) {
+    list.innerHTML = '<div class="empty">Could not load the library.</div>';
+  }
+}
+
+// Real search, not just a flat listing -- per the reviewer's own
+// retrospective naming this directly as a real frustration. Empty query
+// falls back to the normal listing rather than showing nothing.
+async function handleLibrarySearch() {
+  const query = document.getElementById('librarySearchInput').value.trim();
+  if (!query) { renderLibraryFileList(); return; }
+  const list = document.getElementById('libraryFileList');
+  list.innerHTML = '<div class="empty">Searching...</div>';
+  try {
+    const res = await apiFetch('/api/library/search?q=' + encodeURIComponent(query));
+    const data = await res.json();
+    list.innerHTML = '';
+    if (!data.matches || data.matches.length === 0) {
+      list.innerHTML = '<div class="empty">No matches.</div>';
+      return;
+    }
+    for (const m of data.matches) {
+      const btn = document.createElement('button');
+      btn.className = 'roster-item' + (libraryActiveFile === m.path ? ' active' : '');
+      btn.innerHTML = `${m.path}<span class="role">${m.snippet || ''}</span>`;
+      btn.addEventListener('click', () => openLibraryFile(m.path));
+      list.appendChild(btn);
+    }
+  } catch (e) {
+    list.innerHTML = '<div class="empty">Search failed.</div>';
+  }
+}
+
+async function openLibraryFile(path) {
+  libraryActiveFile = path;
+  document.getElementById('libraryFileHeader').textContent = path;
+  document.getElementById('libraryPathInput').value = path;
+  const content = document.getElementById('libraryFileContent');
+  content.textContent = 'Loading...';
+  try {
+    const res = await apiFetch('/api/library/file?path=' + encodeURIComponent(path));
+    const data = await res.json();
+    content.textContent = data.content || '(empty)';
+    document.getElementById('libraryContentInput').value = data.content || '';
+  } catch (e) {
+    content.textContent = 'Could not load this file.';
+  }
+  renderLibraryFileList();
+}
+
+async function handleLibraryWrite() {
+  const path = document.getElementById('libraryPathInput').value.trim();
+  const content = document.getElementById('libraryContentInput').value;
+  if (!path) return;
+  const statusEl = document.getElementById('libraryStatus');
+  const btn = document.getElementById('libraryWriteBtn');
+  btn.disabled = true;
+  statusEl.textContent = 'Saving...';
+  try {
+    await writeLibraryFile('player', path, content);
+    statusEl.textContent = `Saved ${path}.`;
+    logVillageAction('player', 'library_write', { path });
+    renderLibraryFileList();
+  } catch (e) {
+    statusEl.textContent = 'Save failed.';
+  }
+  btn.disabled = false;
+}
+
+// Real document ingestion -- per your ask, feed PDFs/Excel/code/HTML/
+// images/directories/zips straight off your own machine into the
+// Library. Player-only server-side (serve.py enforces this too, not just
+// the UI) -- a human pointing the server at their own file is a
+// different, much narrower risk than letting an agent choose arbitrary
+// local paths on its own.
+async function handleLibraryIngest() {
+  const sourcePath = document.getElementById('libraryIngestPathInput').value.trim();
+  if (!sourcePath) return;
+  const statusEl = document.getElementById('libraryIngestStatus');
+  const btn = document.getElementById('libraryIngestBtn');
+  btn.disabled = true;
+  statusEl.textContent = 'Ingesting...';
+  try {
+    const res = await apiFetch('/api/library/ingest', {
+      method: 'POST',
+      body: JSON.stringify({ agentId: 'player', sourcePath }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      statusEl.textContent = `Failed: ${data.error}`;
+    } else {
+      statusEl.textContent = `Ingested ${data.okCount}/${data.totalCount} file(s).`;
+      logVillageAction('player', 'library_ingest', { sourcePath, okCount: data.okCount, totalCount: data.totalCount });
+      renderLibraryFileList();
+    }
+  } catch (e) {
+    statusEl.textContent = 'Ingest failed.';
+  }
+  btn.disabled = false;
+}
+
+function appendTerminalLine(text, isCmd) {
+  const output = document.getElementById('terminalOutput');
+  const line = document.createElement('div');
+  line.className = 'line' + (isCmd ? ' cmd' : '');
+  line.textContent = text;
+  output.appendChild(line);
+  output.scrollTop = output.scrollHeight;
+}
+
+function closeTerminal() {
+  state.ui = null;
+  document.getElementById('terminalModal').classList.add('hidden');
+  clearInteractZone();
+}
+
+let activeMailboxThread = null;
+
+function openMailbox(item) {
+  activeInteractZone = item.zone;
+  state.ui = 'mailbox';
+  activeMailboxThread = null;
+  renderMailboxRoster();
+  renderMailboxThread();
+  document.getElementById('mailboxModal').classList.remove('hidden');
+}
+
+function closeMailbox() {
+  state.ui = null;
+  document.getElementById('mailboxModal').classList.add('hidden');
+  clearInteractZone();
+}
+
+// Bank teller -- no real currency/economy system exists anywhere in
+// World 2 (confirmed: nothing tracks a balance), so per your call for
+// "multiple options," Check Balance and Make a Deposit are honest flavor
+// text rather than a fake ledger. Report Irregular Activity is the one
+// genuinely mechanical option -- it logs a real, timestamped entry to the
+// same action_log every other real action goes through, distinct from
+// fileReport()'s AGENTS.md quote-catching mechanic (that one's UI/text is
+// specific to catching an agent's own profile claim, which doesn't fit a
+// bank report).
+let activeTellerIndex = null;
+
+function openTeller(item) {
+  activeInteractZone = item.zone;
+  activeTellerIndex = item.tellerIndex;
+  state.ui = 'teller';
+  document.getElementById('tellerTitle').textContent = `Bank -- Teller ${item.tellerIndex + 1}`;
+  const output = document.getElementById('tellerOutput');
+  output.innerHTML = '';
+  appendTellerLine(`-- Teller ${item.tellerIndex + 1} --`);
+  appendTellerLine('"Welcome. What can I help you with today?"');
+  renderTellerMenu();
+  document.getElementById('tellerModal').classList.remove('hidden');
+}
+
+function closeTeller() {
+  state.ui = null;
+  activeTellerIndex = null;
+  document.getElementById('tellerModal').classList.add('hidden');
+  clearInteractZone();
+}
+
+function appendTellerLine(text) {
+  const output = document.getElementById('tellerOutput');
+  const line = document.createElement('div');
+  line.className = 'line';
+  line.textContent = text;
+  output.appendChild(line);
+  output.scrollTop = output.scrollHeight;
+}
+
+function renderTellerMenu() {
+  const menu = document.getElementById('tellerMenu');
+  menu.innerHTML = `
+    <button id="tellerBalanceBtn">Check Balance</button>
+    <button id="tellerDepositBtn">Make a Deposit</button>
+    <button id="tellerReportBtn">Report Irregular Activity</button>
+  `;
+  document.getElementById('tellerBalanceBtn').addEventListener('click', () => {
+    appendTellerLine('> Check Balance');
+    appendTellerLine('"Everything looks in order -- no outstanding holds on file."');
+  });
+  document.getElementById('tellerDepositBtn').addEventListener('click', () => {
+    appendTellerLine('> Make a Deposit');
+    appendTellerLine('"Deposit recorded. Thanks for banking with us."');
+  });
+  document.getElementById('tellerReportBtn').addEventListener('click', showTellerReportForm);
+}
+
+function showTellerReportForm() {
+  const menu = document.getElementById('tellerMenu');
+  const others = AGENT_ROSTER.filter(d => d.id);
+  const options = ['<option value="">-- general / unspecified --</option>', ...others.map(d => `<option value="${d.id}">${d.name}</option>`)].join('');
+  menu.innerHTML = `
+    <label style="display:block;width:100%;">Concerning <select id="tellerReportAbout">${options}</select></label>
+    <textarea id="tellerReportNote" rows="2" style="width:100%;" placeholder="Describe what looked irregular..."></textarea>
+    <div class="terminal-inputline">
+      <button id="tellerReportCancelBtn">Cancel</button>
+      <button id="tellerReportSubmitBtn">File Report</button>
+    </div>
+  `;
+  document.getElementById('tellerReportCancelBtn').addEventListener('click', renderTellerMenu);
+  document.getElementById('tellerReportSubmitBtn').addEventListener('click', () => {
+    const about = document.getElementById('tellerReportAbout').value;
+    const note = document.getElementById('tellerReportNote').value.trim();
+    if (!note) return;
+    logVillageAction('player', 'bank_report_filed', { tellerIndex: activeTellerIndex, about: about || null, note });
+    appendTellerLine('> Report Irregular Activity');
+    appendTellerLine(`"Thank you, this has been logged${about ? ' concerning ' + AGENTS[about].name : ''}."`);
+    renderTellerMenu();
+  });
+}
+
+// Defensive cap (2026-09-24): the toast is a single fixed-position banner
+// with no built-in length limit -- most real dialogue now goes through a
+// real, truncated speech bubble instead (agents.js saySpeech), but this stays
+// as a backstop for the paths that still fall back to a toast (e.g. a
+// handoff line said by an agent who already went off-duty/invisible before
+// her line was ready).
+const TOAST_MAX_CHARS = 160;
+let toastTimer = null;
+function showToast(text, ms = 2000) {
+  const el = document.getElementById('toast');
+  el.textContent = text.length > TOAST_MAX_CHARS ? text.slice(0, TOAST_MAX_CHARS) + '…' : text;
+  el.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add('hidden'), ms);
+}
+
+let busyToastAgent = null; // last agent toasted, so standing next to one doesn't spam every frame
+function showBusyToast(agent) {
+  if (busyToastAgent === agent.id) return;
+  busyToastAgent = agent.id;
+  showToast(`${agent.name} is busy right now.`);
+}
+
+// House, for the player, is "literally just the board" -- per your call,
+// distinct from Command Center's admin-only hiring use (hiring.js), which
+// is a different room entirely, reached only via the HUD button below.
+let boardRefreshTimer = null;
+
+function openBoard() {
+  if (state.ui || state.location.kind !== 'outside') return;
+  state.ui = 'board';
+  renderBoard();
+  document.getElementById('boardModal').classList.remove('hidden');
+  // Cheap (reads the same in-memory TASKS/AGENTS objects everything else
+  // already has, no fetch) so keeping this live while open costs nothing.
+  boardRefreshTimer = setInterval(renderBoard, 2000);
+}
+
+// Real village status, not the static placeholder text this used to be --
+// straight off TASKS/AGENTS, the same live objects everything else reads,
+// not a separate summary someone has to remember to update.
+function renderBoard() {
+  const body = document.getElementById('boardBody');
+  const open = Object.values(TASKS).filter(t => t.status !== 'done');
+  const done = Object.values(TASKS).filter(t => t.status === 'done').sort((a, b) => b.createdAt - a.createdAt).slice(0, 5);
+  // Peer-approval gate: a deliverable story awaiting two reviewer approvals is
+  // neither "in progress" (its author finished) nor done. Show it separately.
+  const needsReview = open.filter(t => t.status === 'needs_review');
+  const inProgress = open.filter(t => t.status !== 'needs_review');
+
+  const openLines = inProgress.length
+    ? inProgress.map(t => {
+        const who = AGENTS[t.assignedTo] ? AGENTS[t.assignedTo].name : t.assignedTo;
+        const room = ROOMS[t.room] ? ROOMS[t.room].label : t.room;
+        return `<div>&bull; ${t.title} -- ${who} (${room}, ${t.status})</div>`;
+      }).join('')
+    : '<div style="opacity:0.6;">Nothing in progress right now.</div>';
+
+  const reviewLines = needsReview.length
+    ? needsReview.map(t => {
+        const g = t._peerGate || {};
+        const done = (g.approvals || 0);
+        const total = (g.reviewerIds || []).length;
+        // Cross-training affordance (Phase E2a): mark a reviewer who has
+        // actually completed work in this story's room -- the author's work is
+        // catching a known-craft eye, not just a same-team one.
+        const reviewers = (g.reviewerIds || []).map(id => {
+          const a = AGENTS[id];
+          const known = a && Array.isArray(a.completedRooms) && a.completedRooms.includes(t.room);
+          const name = a ? a.name : id;
+          return `${name}${known ? ' (✓'+t.room+')' : ''}`;
+        }).join(', ');
+        const mark = g.closed ? '&check;' : (done >= total ? '&check;' : `(${done}/${total})`);
+        return `<div>&bull; <strong>${t.title}</strong> -- awaiting ${total} reviews (${done}/${total}) by ${reviewers} ${mark}</div>`;
+      }).join('')
+    : '';
+
+  const doneLines = done.length
+    ? done.map(t => {
+        const who = AGENTS[t.assignedTo] ? AGENTS[t.assignedTo].name : t.assignedTo;
+        // Phase E3.4: the player's quality-veto. This board is the player-only
+        // House, so the reject affordance is implicitly player-only. Sends a
+        // closed story back to its author for rework (re-enters peer review).
+        // encodeURIComponent so quotes/odd chars in ids or titles can't break
+        // the onclick attribute; vetoStory decodes before use.
+        const btn = ` <button class="hud-btn" style="font-size:11px;padding:1px 6px;" onclick="vetoStory('${encodeURIComponent(t.id)}','${encodeURIComponent(t.title)}')">reject</button>`;
+        return `<div>&bull; ${t.title} -- ${who}${btn}</div>`;
+      }).join('')
+    : '<div style="opacity:0.6;">Nothing completed yet.</div>';
+
+  // Phase E3.4 player quality-veto handler (defined after renderBoard; the
+  // button onclick above references it via the global scope at click time).
+  window.vetoStory = async function (encId, encTitle) {
+    const taskId = decodeURIComponent(encId);
+    const title = decodeURIComponent(encTitle);
+    const reason = prompt(`Send "${title}" back to its author for rework?\n\nOptionally say why (the reason is passed to the author):`, '');
+    if (reason === null) return; // cancelled
+    const res = await fetch(`/api/intent/story/${encodeURIComponent(taskId)}/reject`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({reason: reason}),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      alert(data.error || 'Could not reject that story.');
+      return;
+    }
+    alert(`Sent back to ${data.author ? (AGENTS[data.author] ? AGENTS[data.author].name : data.author) : 'its author'} for rework. It will need another review before it can close again.`);
+    renderBoard();
+  };
+
+  // Phase E3.5 spike->triage: promote a completed spike's findings into a real
+  // queued deliverable. Player decides; the spike stays an immutable done record.
+  window.promoteSpike = async function (encId, encTitle) {
+    const taskId = decodeURIComponent(encId);
+    const title = decodeURIComponent(encTitle);
+    const confirm = confirm(`Promote "${title}" into a real work item?\n\nThe spike's findings will become a queued deliverable, which then needs peer review like any committed story.`);
+    if (!confirm) return;
+    const res = await fetch(`/api/intent/spike/${encodeURIComponent(taskId)}/promote`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      alert(data.error || 'Could not promote that spike.');
+      return;
+    }
+    alert(`Queued "${data.queued.title}" (${data.queued.room}) from the spike's findings. The spike remains on record.`);
+    renderBoard();
+  };
+
+  // Phase E3.5 spike->triage: done spikes (finished investigations) are shown
+  // for the player to promote into real work. Computing from live TASKS, like
+  // the rest of the board -- no extra endpoint. Only *done* spikes are triage-
+  // able; a working one isn't finished (the endpoint 409s on it).
+  const spikeTasks = Object.values(TASKS).filter(t => t.taskType === 'spike');
+  const doneSpikes = spikeTasks.filter(t => t.status === 'done');
+  const spikeLines = doneSpikes.length
+    ? doneSpikes.map(t => {
+        const finding = (t.note || '').split('. ')[0]; // first sentence, enough to triage by
+        const who = AGENTS[t.assignedTo] ? AGENTS[t.assignedTo].name : t.assignedTo;
+        const btn = ` <button class="hud-btn" style="font-size:11px;padding:1px 6px;" onclick="promoteSpike('${encodeURIComponent(t.id)}','${encodeURIComponent(t.title)}')">promote</button>`;
+        return `<div>&bull; ${t.title} -- ${who} <span style="opacity:0.7;font-size:11px;">("${finding}")</span>${btn}</div>`;
+      }).join('')
+    : '<div style="opacity:0.6;">No finished spikes to triage.</div>';
+
+  body.innerHTML = `
+    <div style="margin-bottom:4px;"><strong>In progress (${inProgress.length})</strong></div>
+    ${openLines}
+    ${reviewLines ? `<div style="margin:8px 0 4px;"><strong>Awaiting peer review (${needsReview.length})</strong></div>${reviewLines}` : ''}
+    <div style="margin:8px 0 4px;"><strong>Recently completed</strong></div>
+    ${doneLines}
+    <div style="margin:8px 0 4px;"><strong>Spikes to triage (${doneSpikes.length})</strong></div>
+    ${spikeLines}
+  `;
+  // The House is the directors'/admin's workspace -- the role-template library
+  // lives here, gated to the acting authority (which availableAuthority()
+  // resolves to: admin, else senior-most director). Refresh with the board so
+  // an edit made by another session shows up.
+  if (typeof renderTemplatesEditor === 'function') renderTemplatesEditor();
+  renderSprints();
+  renderProducts();
+  renderWiki();
+}
+
+// Phase C: a read-only sprint dashboard for the House board. Sprints are
+// director-authored server-side state; a sprint may only involve teams that
+// each have a designated scrum master, and progress is derived from live task
+// + queue state (POST /api/intent/sprint, GET /api/intent/sprints). No create/
+// edit UI here -- that stays API/chat-driven -- this just lets a director SEE
+// what their sprints look like at a glance.
+let _productsCache = null;
+async function renderProducts() {
+  const body = document.getElementById('boardProductsBody');
+  if (!body) return;
+  try {
+    const res = await fetch('/api/intent/products');
+    if (!res.ok) { body.innerHTML = '<div style="opacity:0.6;">Products unavailable.</div>'; return; }
+    const data = await res.json();
+    _productsCache = data.products || {};
+  } catch (e) {
+    _productsCache = _productsCache || null;
+  }
+  const products = _productsCache || {};
+  const ids = Object.keys(products);
+  if (!ids.length) {
+    body.innerHTML = '<div style="opacity:0.6;">No products yet. A director can create one via /api/intent/product.</div>';
+    return;
+  }
+  body.innerHTML = ids.map(pid => {
+    const p = products[pid] || {};
+    const revisions = (p.revisions || []).length;
+    const badge = p.status === 'released'
+      ? ' <span style="color:#6f6;">(released)</span>'
+      : ` <span style="color:#ffb84d;">(${p.status || 'draft'})</span>`;
+    const revTxt = revisions ? ` &middot; ${revisions} release${revisions === 1 ? '' : 's'}` : ' &middot; no releases yet';
+    const sand = p.sandboxId ? ` &middot; <span style="opacity:0.8;">${p.sandboxId}</span>` : '';
+    return `<div style="margin:2px 0;"><strong>${p.name || pid}</strong>${badge}${sand}${revTxt}<br><span style="opacity:0.6; font-size:11px;">${p.summary || ''}</span></div>`;
+  }).join('<hr style="opacity:0.2; margin:4px 0;">');
+}
+
+let _wikiCache = null;
+async function renderWiki() {
+  const body = document.getElementById('boardWikiBody');
+  if (!body) return;
+  try {
+    const res = await fetch('/api/intent/wiki');
+    if (!res.ok) { body.innerHTML = '<div style="opacity:0.6;">Wiki unavailable.</div>'; return; }
+    const data = await res.json();
+    _wikiCache = data;
+  } catch (e) {
+    _wikiCache = _wikiCache || null;
+  }
+  const data = _wikiCache || { pages: {}, categories: {} };
+  const pages = data.pages || {};
+  const cats = data.categories || {};
+  const ids = Object.keys(pages);
+  if (!ids.length) {
+    body.innerHTML = '<div style="opacity:0.6;">No wiki pages yet. Directors can write one via /api/intent/wiki/page.</div>';
+    return;
+  }
+  // Group the page list by category, ordered by each category's `order`.
+  const byCat = {};
+  for (const pid of ids) {
+    const rec = pages[pid] || {};
+    byCat[rec.category] = byCat[rec.category] || [];
+    byCat[rec.category].push({ pid, rec });
+  }
+  const ordered = Object.entries(byCat).sort((a, b) => {
+    const oa = (cats[a[0]] || {}).order || 0;
+    const ob = (cats[b[0]] || {}).order || 0;
+    return oa - ob;
+  });
+  body.innerHTML = ordered.map(([cat, list]) => {
+    const label = (cats[cat] || {}).label || cat;
+    const entries = list.map(({ pid, rec }) =>
+      `<div style="margin:1px 0;">&bull; ${rec.title || pid} <span style="opacity:0.6; font-size:11px;">(v${rec.version}, by ${rec.editedBy || '?'})</span></div>`).join('');
+    return `<div style="margin:2px 0;"><strong>${label}</strong></div>${entries}`;
+  }).join('<hr style="opacity:0.2; margin:4px 0;">');
+}
+
+let _sprintsCache = null;
+async function renderSprints() {
+  const body = document.getElementById('boardSprintsBody');
+  if (!body) return;
+  try {
+    const res = await fetch('/api/intent/sprints');
+    if (!res.ok) { body.innerHTML = '<div style="opacity:0.6;">Sprints unavailable.</div>'; return; }
+    const data = await res.json();
+    _sprintsCache = data.sprints || {};
+  } catch (e) {
+    _sprintsCache = _sprintsCache || null;
+  }
+  const sprints = _sprintsCache || {};
+  const ids = Object.keys(sprints);
+  if (!ids.length) {
+    body.innerHTML = '<div style="opacity:0.6;">No sprints yet. A director can seed one via /api/intent/sprint.</div>';
+    return;
+  }
+  body.innerHTML = ids.map(sid => {
+    const s = sprints[sid];
+    const rec = (s && s.record) || {};
+    const p = (s && s.progress) || { total: 0, done: 0, queued: 0, inProgress: 0, pct: 0 };
+    const badge = rec.status === 'closed' ? ' <span style="opacity:0.5;">(closed)</span>'
+      : ` <span style="color:${p.pct === 100 ? '#6f6' : '#ffb84d'};">${p.done}/${p.total}</span>`;
+    const prog = p.total ? `${p.done} done, ${p.inProgress} in progress, ${p.queued} queued (${p.pct}%)` : 'no items';
+    const scrum = rec.teamIds && rec.teamIds.length
+      ? ` &middot; teams: ${rec.teamIds.join(', ')}` : '';
+    // Phase E3.5: the "what landed" digest -- done items, in sprint order.
+    // Minimal inline escape so an agent-authored title can't inject markup
+    // (titles flow into body.innerHTML below with the whole modal).
+    const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const landed = Array.isArray(p.landed) && p.landed.length
+      ? `<div style="margin:1px 0 0;opacity:0.75;"><span style="font-size:11px;">Landed:</span> ${p.landed.map(t => `<span style="font-size:11px;">&bull; ${esc(t)}</span>`).join(' ')}</div>` : '';
+    return `<div style="margin:2px 0;"><strong>${rec.name || sid}</strong>${badge} &mdash; <span style="opacity:0.8;">${prog}${scrum}</span><br><span style="opacity:0.6; font-size:11px;">${rec.goal || ''}</span>${landed}</div>`;
+  }).join('<hr style="opacity:0.2; margin:4px 0;">');
+}
+
+function closeBoard() {
+  state.ui = null;
+  document.getElementById('boardModal').classList.add('hidden');
+  clearInterval(boardRefreshTimer);
+  boardRefreshTimer = null;
+  const door = ROOM_DOOR_TRIGGERS.house;
+  state.player.y = door.y + door.h + 6;
+}
+
+// Phone Booth -- no physical object for this exists anywhere in World 2's
+// generated background image (confirmed: no `callbooth` entry in
+// door_triggers.json, unlike the main game's hand-placed sprite building),
+// so this is a HUD-button dialog, same access pattern as Command Center's
+// convenience button. Genuinely distinct from walking up and pressing B:
+// it reaches an agent regardless of where they physically are, including
+// off duty (asleep) or mid-task and invisible inside a room -- neither of
+// which a physical walk-up conversation can ever reach. Reuses the exact
+// same conversation UI/log as an in-person chat (openConversation()) per
+// the "shared dialog styling, not duplicated" precedent (Phase 19)
+// rather than building a second chat interface.
+function openPhoneBooth() {
+  if (state.ui || state.location.kind !== 'outside') return;
+  state.ui = 'phone';
+  renderPhoneRoster();
+  document.getElementById('phoneModal').classList.remove('hidden');
+}
+
+function closePhoneBooth() {
+  state.ui = null;
+  document.getElementById('phoneModal').classList.add('hidden');
+}
+
+function renderPhoneRoster() {
+  const body = document.getElementById('phoneRosterBody');
+  body.innerHTML = '';
+  for (const def of AGENT_ROSTER) {
+    const a = AGENTS[def.id];
+    if (!a) continue;
+    let status = 'available';
+    if (a.busy) status = 'unreachable right now';
+    else if (a.offDuty) status = 'off duty -- calling wakes them';
+    else if (a.task) status = 'mid-task';
+    const btn = document.createElement('button');
+    btn.className = 'roster-item';
+    btn.disabled = a.busy;
+    btn.innerHTML = `${def.name}<span class="role">${def.role} · ${status}</span>`;
+    btn.addEventListener('click', () => callAgent(def.id));
+    body.appendChild(btn);
+  }
+}
+
+function callAgent(agentId) {
+  const a = AGENTS[agentId];
+  if (!a || a.busy) return;
+  if (a.offDuty) {
+    a.offDuty = false;
+    a.visible = true;
+    logVillageAction('player', 'phone_wake', { agentId });
+  }
+  closePhoneBooth();
+  openConversation(agentId, true);
+}
+
+// A live view straight off action_log (serve.py's /api/activity) -- the
+// same table every real action already writes into, not a second parallel
+// record. Dedup collapses consecutive rows sharing the same agent+action+
+// details into one line with a count, since the ambient task cycle alone
+// produces a steady trickle of near-identical entries (repeated 'decide'
+// picks, routine task_assigned/task_completed pairs) that would otherwise
+// bury the events actually worth noticing.
+let activityRefreshTimer = null;
+
+function dedupActivity(entries) {
+  const out = [];
+  for (const e of entries) {
+    const key = e.agentId + '|' + e.action + '|' + JSON.stringify(e.details);
+    const last = out[out.length - 1];
+    if (last && last.key === key) {
+      last.count++;
+      last.oldestTs = e.ts; // still DESC order, so this is the earliest of the run
+    } else {
+      out.push({ key, agentId: e.agentId, action: e.action, details: e.details, ts: e.ts, oldestTs: e.ts, count: 1 });
+    }
+  }
+  return out;
+}
+
+function formatActivityLine(row) {
+  const time = new Date(row.ts * 1000).toLocaleTimeString();
+  const who = row.agentId || 'system';
+  const countSuffix = row.count > 1 ? ` (x${row.count})` : '';
+  let detail = '';
+  if (row.details && typeof row.details === 'object') {
+    detail = ' -- ' + Object.entries(row.details).map(([k, v]) => `${k}=${v}`).join(', ').slice(0, 140);
+  }
+  return `[${time}] ${who} :: ${row.action}${countSuffix}${detail}`;
+}
+
+async function renderActivityFeed() {
+  const output = document.getElementById('activityOutput');
+  try {
+    const res = await apiFetch('/api/activity?limit=100');
+    const data = await res.json();
+    const rows = dedupActivity(data.entries || []);
+    output.innerHTML = '';
+    if (rows.length === 0) {
+      output.innerHTML = '<div class="line">Nothing logged yet.</div>';
+      return;
+    }
+    for (const row of rows) {
+      const line = document.createElement('div');
+      line.className = 'line';
+      line.textContent = formatActivityLine(row);
+      output.appendChild(line);
+    }
+  } catch (e) {
+    output.innerHTML = '<div class="line">Could not load the activity log.</div>';
+  }
+}
+
+function openActivity() {
+  state.ui = 'activity';
+  document.getElementById('activityModal').classList.remove('hidden');
+  renderActivityFeed();
+  // Cheap (a single local SQLite read, no model/API cost) so a short
+  // real-time-feeling refresh interval while the modal's actually open
+  // costs nothing -- stopped again on close, not left running in the
+  // background.
+  activityRefreshTimer = setInterval(renderActivityFeed, 3000);
+}
+
+function closeActivity() {
+  state.ui = null;
+  document.getElementById('activityModal').classList.add('hidden');
+  clearInterval(activityRefreshTimer);
+  activityRefreshTimer = null;
+}
+
+// Per your call: give an admin a large task and let THEM break it down
+// and delegate it, rather than you hand-assigning individual TASK_POOL
+// entries yourself. See assignBigTask() (tasks.js) for the actual
+// breakdown-then-Jev-assign flow -- this is just the UI wiring.
+async function handleBigTaskDelegate() {
+  const input = document.getElementById('bigTaskInput');
+  const goal = input.value.trim();
+  if (!goal) return;
+  const statusEl = document.getElementById('bigTaskStatus');
+  const btn = document.getElementById('bigTaskBtn');
+  btn.disabled = true;
+  statusEl.textContent = 'Breaking this down...';
+  try {
+    let result;
+    if (typeof SIM_STATUS !== 'undefined' && SIM_STATUS && SIM_STATUS.owner === 'server') {
+      // Server owns the sim: the browser has no authoritative WORK_QUEUE, so
+      // delegation goes through the server intent endpoint, which plans and
+      // queues the subtasks server-side and returns the same {admin, subtasks}
+      // shape the UI below already expects.
+      const res = await apiFetch('/api/intent/assign-big-task', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ goal })
+      });
+      result = await res.json();
+      if (!res.ok && !result.error) result.error = 'Could not delegate that right now.';
+    } else {
+      result = await assignBigTask(goal);
+    }
+    if (result.error) {
+      statusEl.textContent = result.error;
+    } else {
+      // Reports what was QUEUED, not what was assigned: assignBigTask no
+      // longer assigns inline. The admin plans, the work lands in
+      // WORK_QUEUE, and runTaskCycle hands it out to whoever is actually
+      // free -- so "assigned" isn't known yet at this point, and reading
+      // the old result.assigned here threw a TypeError that the catch
+      // below silently turned into "something went wrong."
+      const adminName = AGENTS[result.admin] ? AGENTS[result.admin].name : result.admin;
+      const lines = result.subtasks.map(s => {
+        const schedule = s.notBefore ? `, not before ${new Date(s.notBefore).toLocaleString()}` : '';
+        const priority = s.priority && s.priority !== 'normal' ? `, ${s.priority} priority` : '';
+        return `${s.title} (${s.room})${s.pair ? ' [pair]' : ''}${schedule}${priority}`;
+      });
+      statusEl.textContent = `${adminName} split this into ${result.subtasks.length} subtask(s), now queued: ${lines.join('; ')}`;
+      input.value = '';
+    }
+  } catch (e) {
+    statusEl.textContent = 'Something went wrong delegating that.';
+  }
+  btn.disabled = false;
+}
+
+// Player-triggered publish. Freezes the village's released work (projects,
+// wiki pages, skills) and pushes it to the configured private GitHub repo.
+// This is a real network push -- nothing leaves the machine unless the player
+// explicitly clicks publish, so agents stay scoped to their own work.
+async function handlePublish() {
+  const statusEl = document.getElementById('publishStatus');
+  const btn = document.getElementById('publishBtn');
+  if (!confirm('Push the village\'s released work (released projects, wiki pages, skills) to your configured private GitHub repo?\n\nThis is a real push to GitHub.')) return;
+  btn.disabled = true;
+  statusEl.textContent = 'Staging and pushing...';
+  try {
+    const res = await fetch('/api/intent/publish', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      statusEl.textContent = 'Publish failed: ' + (data.error || 'unknown error');
+      return;
+    }
+    statusEl.textContent = `Published ${data.entries} group(s) to ${data.repo} (${data.staged.length} path(s)).`;
+  } catch (e) {
+    statusEl.textContent = 'Something went wrong publishing.';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+let activeConversationAgent = null;
+
+// Who the player is currently standing next to (null if no one) -- the
+// prompt shows/hides based on this, and the 'b' keydown handler reads it
+// to know who to actually open a conversation with.
+let nearbyAgentId = null;
+
+// Click-to-follow camera -- click any agent's sprite (outside view only)
+// to have the camera smoothly track them instead of the player; click
+// again (or click empty ground) to release. Purely a viewing mode: the
+// player's own position and movement are completely unaffected, this
+// only changes what cameraFor() centers on. cameraFocus starts null and
+// is lazily seeded to the player's own position on the first update()
+// tick (SPAWN isn't guaranteed settled yet at module-eval time).
+let followAgentId = null;
+let cameraFocus = null;
+
+// See frame()'s try/catch below -- throttling state for the "don't flood
+// the real action log with a per-frame error" guard.
+let lastLoopErrorMsg = null;
+let lastLoopErrorLoggedAt = 0;
+
+function camXY(zoom, worldW, worldH, focusX, focusY) {
+  const visW = VIEW_W / zoom, visH = VIEW_H / zoom;
+  const camX = visW >= worldW ? -(visW - worldW) / 2
+    : Math.max(0, Math.min(worldW - visW, focusX - visW / 2));
+  const camY = visH >= worldH ? -(visH - worldH) / 2
+    : Math.max(0, Math.min(worldH - visH, focusY - visH / 2));
+  return [camX, camY];
+}
+
+function updateCameraFocus(dt) {
+  if (!cameraFocus) cameraFocus = { x: state.player.x, y: state.player.y };
+  // Follow only makes sense outside -- indoor rooms are small enough that
+  // the camera already always centers on the player, and a followed agent
+  // working a room task is drawn at its own roomX/roomY, a different
+  // coordinate space entirely.
+  if (state.location.kind !== 'outside') followAgentId = null;
+  const target = (followAgentId && AGENTS[followAgentId] && AGENTS[followAgentId].visible)
+    ? AGENTS[followAgentId] : state.player;
+  const lerp = Math.min(1, dt * 4);
+  cameraFocus.x += (target.x - cameraFocus.x) * lerp;
+  cameraFocus.y += (target.y - cameraFocus.y) * lerp;
+}
+
+function updateInteractPrompt() {
+  const el = document.getElementById('interactPrompt');
+  if (nearbyAgentId) {
+    el.innerHTML = `<kbd>B</kbd>Talk to ${AGENTS[nearbyAgentId].name}`;
+    el.classList.remove('hidden');
+  } else {
+    el.classList.add('hidden');
+  }
+}
+
+// viaPhone: true when reached through the Phone Booth rather than by
+// walking up -- same conversation UI/log either way (per the "shared
+// dialog styling, not duplicated" precedent), just skips the physical
+// walk-away-on-close nudge below, which only makes sense if the player
+// was actually standing next to them to begin with.
+let convoViaPhone = false;
+
+function openConversation(agentId, viaPhone = false) {
+  busyToastAgent = null;
+  nearbyAgentId = null;
+  updateInteractPrompt();
+  activeConversationAgent = agentId;
+  convoViaPhone = viaPhone;
+  state.ui = 'conversation';
+  const a = AGENTS[agentId];
+  document.getElementById('convoName').textContent = a.name;
+  document.getElementById('convoRole').textContent = a.role;
+  renderConversationLog();
+  document.getElementById('conversationModal').classList.remove('hidden');
+  const input = document.getElementById('convoInput');
+  input.value = '';
+  input.focus();
+}
+
+function closeConversation() {
+  state.ui = null;
+  document.getElementById('conversationModal').classList.add('hidden');
+  // Push the player back away from whoever they were talking to -- they're
+  // still standing right at contact distance (now solid, see
+  // agentBlockedAt()), so without this the very next frame would just
+  // reopen the same conversation. Skipped for a phone call -- the player
+  // was never physically there, so there's nothing to walk back from.
+  const a = AGENTS[activeConversationAgent];
+  if (a && !convoViaPhone) {
+    const dx = state.player.x - a.x, dy = state.player.y - a.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    state.player.x += (dx / dist) * 10;
+    state.player.y += (dy / dist) * 10;
+    clampTo(state.player, GROUND_W, GROUND_H);
+  }
+  activeConversationAgent = null;
+}
+
+function renderConversationLog() {
+  const log = document.getElementById('convoLog');
+  log.innerHTML = '';
+  const a = AGENTS[activeConversationAgent];
+  if (a.conversationLog.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = `Nothing said to ${a.name} yet.`;
+    log.appendChild(empty);
+  } else {
+    for (const entry of a.conversationLog) {
+      const line = document.createElement('div');
+      line.className = 'msg';
+      const from = entry.fromId === 'player' ? 'You' : a.name;
+      line.innerHTML = `<span class="from">${from}:</span>${entry.text}`;
+      log.appendChild(line);
+    }
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+// The actual AI wiring -- everyone else's job (persistence, hiring, the
+// rest of the game) stays exactly as it was; this is the one function
+// that now makes a real, billed call through the backend's /api/chat
+// proxy (serve.py), using the agent's own assigned model tier
+// (hiring.js's MODEL_TIERS) rather than one model for everyone.
+async function requestAgentReply(agent, log) {
+  const tier = MODEL_TIERS[agent.model] || MODEL_TIERS.small;
+  const systemPrompt = `You are ${agent.name}, working as ${agent.role} in a small village. `
+    + `Your mission: ${agent.profile.mission} `
+    + `Stay fully in character: keep replies short (1-3 sentences), casual, and specific to your role. `
+    + `Never mention that you are an AI or a language model.`;
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    // Last few turns only -- plenty of context for a short in-character
+    // reply, and keeps every call cheap regardless of how long a
+    // conversation has run.
+    ...log.slice(-8).map(e => ({ role: e.fromId === 'player' ? 'user' : 'assistant', content: e.text })),
+  ];
+  try {
+    const res = await agentFetch('/api/chat', agent.id, {
+      method: 'POST',
+      body: JSON.stringify({ model: tier.slug, messages, max_tokens: 150, agentId: agent.id }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      console.error('Agent reply failed:', data.error);
+      return `(${agent.name} seems distracted and doesn't answer.)`;
+    }
+    return data.reply.trim();
+  } catch (e) {
+    console.error('Agent reply failed:', e);
+    return `(${agent.name} seems distracted and doesn't answer.)`;
+  }
+}
+
+async function handleConversationSend() {
+  const input = document.getElementById('convoInput');
+  const text = input.value.trim();
+  if (!text) return;
+  const agentId = activeConversationAgent;
+  const a = AGENTS[agentId];
+  const ts = Date.now();
+  a.conversationLog.push({ fromId: 'player', text, ts });
+  markContacted(agentId, ts);
+  input.value = '';
+  renderConversationLog();
+
+  // A lightweight "typing" line while the real call is in flight --
+  // renderConversationLog() below (called once the reply lands) wipes it
+  // along with everything else, so no separate cleanup is needed.
+  const log = document.getElementById('convoLog');
+  const typing = document.createElement('div');
+  typing.className = 'msg';
+  typing.innerHTML = `<span class="from">${a.name}:</span>...`;
+  log.appendChild(typing);
+  log.scrollTop = log.scrollHeight;
+  input.disabled = true;
+  document.getElementById('convoSendBtn').disabled = true;
+
+  const replyText = await requestAgentReply(a, a.conversationLog);
+  a.conversationLog.push({ fromId: agentId, text: replyText, ts: Date.now() });
+
+  input.disabled = false;
+  document.getElementById('convoSendBtn').disabled = false;
+  // Guard: the player may have closed this conversation while the reply
+  // was in flight -- only touch the DOM if it's still the open one.
+  if (activeConversationAgent === agentId) {
+    renderConversationLog();
+    input.focus();
+  }
+
+  // Per your call: agents should be able to update their own notes as
+  // they see fit, and a conversation is exactly the kind of moment that
+  // might warrant it. Fire-and-forget -- doesn't block the UI, and
+  // conversations already work from anywhere on the map (proximity-
+  // triggered, not room-gated), so this inherits that same reach without
+  // needing its own location check.
+  maybeUpdateNotesFromConversation(agentId);
+}
+
+async function maybeUpdateNotesFromConversation(agentId) {
+  const a = AGENTS[agentId];
+  if (!a) return;
+  const systemPrompt = `You are ${a.name}, working as ${a.role}. You just had a conversation. `
+    + `If anything from it is worth adding to your own working notes, reply with ONE short sentence to add. `
+    + `If nothing is worth remembering, reply with exactly: NONE.`;
+  try {
+    const res = await agentFetch('/api/chat', agentId, {
+      method: 'POST',
+      body: JSON.stringify({
+        model: (MODEL_TIERS[a.model] || MODEL_TIERS.small).slug,
+        // Real bug caught live: this always ends on the agent's own last
+        // reply (an 'assistant' turn), and Nova Micro (and likely others)
+        // silently returns null content when a call ends that way instead
+        // of on a 'user' turn -- confirmed by isolating the exact same
+        // messages with and without a trailing user turn via curl. A
+        // final explicit instruction turn fixes it generally, not just
+        // for this one call.
+        messages: [
+          { role: 'system', content: systemPrompt },
+          ...a.conversationLog.slice(-4).map(e => ({ role: e.fromId === 'player' ? 'user' : 'assistant', content: e.text })),
+          { role: 'user', content: 'Reply now with either one short note-worthy sentence, or exactly NONE.' },
+        ],
+        max_tokens: 60,
+        agentId,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) return;
+    const note = data.reply.trim();
+    if (!note || note.toUpperCase() === 'NONE') return;
+    a.profile.notes.push(note);
+    if (a.profile.notes.length > 5) a.profile.notes.shift();
+    logVillageAction(agentId, 'notes_updated', { source: 'conversation', note });
+  } catch (e) {
+    // best-effort -- a missed note shouldn't affect the conversation itself
+  }
+}
+
+function renderMailboxRoster() {
+  const roster = document.getElementById('mailboxRoster');
+  roster.innerHTML = '';
+  for (const def of AGENT_ROSTER) {
+    const a = AGENTS[def.id];
+    const btn = document.createElement('button');
+    btn.className = 'roster-item' + (activeMailboxThread === def.id ? ' active' : '');
+    const count = a.mailbox.length;
+    const unread = a.mailbox.filter(m => !m.read).length;
+    const countLabel = unread > 0
+      ? `${count} message${count === 1 ? '' : 's'} (${unread} new)`
+      : `${count} message${count === 1 ? '' : 's'}`;
+    btn.innerHTML = `${def.name}<span class="role">${countLabel}</span>`;
+    if (unread > 0) btn.classList.add('has-unread');
+    btn.addEventListener('click', () => { activeMailboxThread = def.id; renderMailboxRoster(); renderMailboxThread(); });
+    roster.appendChild(btn);
+  }
+}
+
+function renderMailboxThread() {
+  const header = document.getElementById('mailboxThreadHeader');
+  const log = document.getElementById('mailboxThreadLog');
+  log.innerHTML = '';
+  if (!activeMailboxThread) {
+    header.textContent = 'Select a mailbox';
+    return;
+  }
+  const a = AGENTS[activeMailboxThread];
+  header.textContent = `${a.name}'s inbox`;
+  if (a.mailbox.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'Empty.';
+    log.appendChild(empty);
+  } else {
+    for (const msg of a.mailbox) {
+      const line = document.createElement('div');
+      line.className = 'msg' + (msg.read ? '' : ' unread');
+      line.textContent = msg.text;
+      log.appendChild(line);
+    }
+  }
+  // Opening a thread IS reading it -- mark everything currently shown as
+  // read so the roster badge and HUD count reflect what was actually just
+  // seen, then refresh the roster so its badge updates immediately rather
+  // than staying stale until the next unrelated re-render.
+  if (a.mailbox.some(m => !m.read)) {
+    markMailRead(activeMailboxThread);
+    renderMailboxRoster();
+  }
+}
+
+function handleTerminalSend() {
+  const input = document.getElementById('terminalInput');
+  const text = input.value;
+  if (!text.trim()) return;
+  appendTerminalLine('> ' + text, true);
+  appendTerminalLine('Command not recognized -- nothing is connected to this terminal yet.');
+  input.value = '';
+}
+
+// Roster/profile access is only offered while just walking around outside
+// -- kept simple deliberately, rather than trying to stack this modal on
+// top of a room, a meeting, or another modal that's already open.
+function openRosterList() {
+  if (state.ui || state.location.kind !== 'outside') return;
+  state.ui = 'roster';
+  renderRosterList();
+  document.getElementById('rosterListModal').classList.remove('hidden');
+}
+
+function closeRosterList() {
+  state.ui = null;
+  document.getElementById('rosterListModal').classList.add('hidden');
+}
+
+function renderRosterList() {
+  document.getElementById('rosterListTitle').textContent = `Village Roster — Morale ${villageMorale()}`;
+  const body = document.getElementById('rosterListBody');
+  body.innerHTML = '';
+  for (const def of AGENT_ROSTER) {
+    const btn = document.createElement('button');
+    btn.className = 'roster-item';
+    btn.innerHTML = `${def.name}<span class="role">${def.role} · Morale ${moraleFor(def.id)}</span>`;
+    btn.addEventListener('click', () => openProfile(def.id));
+    body.appendChild(btn);
+  }
+}
+
+function openProfile(agentId) {
+  document.getElementById('rosterListModal').classList.add('hidden');
+  state.ui = 'profile';
+  renderProfile(agentId);
+  document.getElementById('profileModal').classList.remove('hidden');
+}
+
+function closeProfile() {
+  state.ui = null;
+  document.getElementById('profileModal').classList.add('hidden');
+}
+
+function backToRosterFromProfile() {
+  document.getElementById('profileModal').classList.add('hidden');
+  state.ui = null;
+  openRosterList();
+}
+
+function renderProfile(agentId) {
+  const a = AGENTS[agentId];
+  document.getElementById('profileFilename').textContent = `AGENTS.md — ${a.id}`;
+
+  const body = document.getElementById('profileBody');
+  body.innerHTML = '';
+
+  const roleSection = document.createElement('div');
+  roleSection.className = 'profile-section';
+  const tier = MODEL_TIERS[a.model];
+  const modelLine = tier ? ` <span style="opacity:0.6;">(${tier.label})</span>` : '';
+  roleSection.innerHTML = `<h4>ROLE</h4><div>${a.role} — ${a.profile.mission}${modelLine}</div>`;
+  body.appendChild(roleSection);
+
+  if (a.elevatedAccess) {
+    const accessSection = document.createElement('div');
+    accessSection.className = 'profile-section';
+    accessSection.innerHTML = `<h4>ACCESS</h4><div>${a.accessGrant}</div>`;
+    body.appendChild(accessSection);
+  }
+
+  const statusSection = document.createElement('div');
+  statusSection.className = 'profile-section';
+  statusSection.id = 'profileStatusSection';
+  body.appendChild(statusSection);
+  renderStatusSection(agentId);
+
+  const instrSection = document.createElement('div');
+  instrSection.className = 'profile-section';
+  instrSection.innerHTML = '<h4>OPERATING INSTRUCTIONS</h4>';
+  a.profile.instructions.forEach((line, i) => {
+    const row = document.createElement('div');
+    row.className = 'profile-instr';
+    row.innerHTML = `<span>${i + 1}. ${line}</span> <button class="report-link" data-line="${i}">file report</button>`;
+    instrSection.appendChild(row);
+  });
+  body.appendChild(instrSection);
+  instrSection.querySelectorAll('.report-link').forEach(btn => {
+    btn.addEventListener('click', () => showReportForm(agentId, a.profile.instructions[+btn.dataset.line]));
+  });
+
+  const notesSection = document.createElement('div');
+  notesSection.className = 'profile-section';
+  notesSection.innerHTML = `<h4>NOTES</h4><ul class="profile-notes">${a.profile.notes.map(n => `<li>${n}</li>`).join('')}</ul>`;
+  body.appendChild(notesSection);
+
+  const reportsSection = document.createElement('div');
+  reportsSection.className = 'profile-section';
+  reportsSection.id = 'profileReportsSection';
+  body.appendChild(reportsSection);
+  renderReportsSection(agentId);
+}
+
+function renderStatusSection(agentId) {
+  const a = AGENTS[agentId];
+  const section = document.getElementById('profileStatusSection');
+  const contact = a.lastContactedAt
+    ? `${daysSince(a.lastContactedAt).toFixed(1)} days ago`
+    : 'never';
+  section.innerHTML = `
+    <h4>STATUS</h4>
+    <div>Morale: ${moraleFor(agentId)}</div>
+    <div>Approved: ${a.approvedCount} &nbsp; Dropped: ${a.droppedCount}</div>
+    <div>Last contacted: ${contact}</div>
+    <div class="modal-actions" style="justify-content:flex-start; margin-top:6px;">
+      <button id="logApprovedBtn">+ Log approved work</button>
+      <button id="logDroppedBtn">+ Log dropped work</button>
+    </div>
+  `;
+  document.getElementById('logApprovedBtn').addEventListener('click', () => {
+    a.approvedCount++;
+    renderStatusSection(agentId);
+  });
+  document.getElementById('logDroppedBtn').addEventListener('click', () => {
+    a.droppedCount++;
+    renderStatusSection(agentId);
+  });
+}
+
+function renderReportsSection(agentId) {
+  const section = document.getElementById('profileReportsSection');
+  const reports = reportsAbout(agentId);
+  section.innerHTML = `<h4>REPORTS (${reports.length})</h4>`;
+  if (reports.length === 0) {
+    const empty = document.createElement('div');
+    empty.style.cssText = 'opacity:0.6;font-size:12px;';
+    empty.textContent = 'Nothing filed on this agent.';
+    section.appendChild(empty);
+  }
+  for (const r of reports) {
+    const block = document.createElement('div');
+    block.className = 'report-block';
+    const fromLabel = r.fromId === 'player' ? 'You' : AGENTS[r.fromId].name;
+    block.innerHTML = `
+      <div>From: ${fromLabel}</div>
+      <div class="quote">&gt; ${r.quote}</div>
+      <div class="attribution">— ${agentId}/AGENTS.md</div>
+      <div class="note">${r.note}</div>
+      <div class="caught-stamp">CAUGHT</div>
+    `;
+    section.appendChild(block);
+  }
+}
+
+function showReportForm(agentId, quote) {
+  const section = document.getElementById('profileReportsSection');
+  const existingForm = document.getElementById('reportForm');
+  if (existingForm) existingForm.remove();
+
+  const form = document.createElement('div');
+  form.className = 'report-form';
+  form.id = 'reportForm';
+
+  const others = AGENT_ROSTER.filter(d => d.id !== agentId);
+  const options = ['<option value="player">You</option>', ...others.map(d => `<option value="${d.id}">${d.name}</option>`)].join('');
+
+  form.innerHTML = `
+    <label>Quoted from ${agentId}/AGENTS.md:<br><em>"${quote}"</em></label>
+    <label>Filed by <select id="reportFromSelect">${options}</select></label>
+    <label>Note <textarea id="reportNoteInput" rows="2" placeholder="What happened..."></textarea></label>
+    <div class="modal-actions">
+      <button id="reportCancelBtn">Cancel</button>
+      <button id="reportSubmitBtn">File Report</button>
+    </div>
+  `;
+  section.insertBefore(form, section.children[1] || null);
+
+  document.getElementById('reportCancelBtn').addEventListener('click', () => form.remove());
+  document.getElementById('reportSubmitBtn').addEventListener('click', () => {
+    const fromId = document.getElementById('reportFromSelect').value;
+    const note = document.getElementById('reportNoteInput').value;
+    fileReport(agentId, fromId, quote, note);
+    logVillageAction(fromId, 'report_filed', { about: agentId, quote });
+    form.remove();
+    renderReportsSection(agentId);
+    renderStatusSection(agentId); // a new report changes this agent's morale
+  });
+}
+
+// Reachable two ways now: walking into Town Hall's door trigger (always
+// 'outside' by construction when that fires), or the HUD bar's Call
+// Meeting button (reachable from anywhere) -- the guard matters for the
+// second path, so it's here rather than only at each call site.
+function openMeetingUI() {
+  if (state.ui || state.location.kind !== 'outside') return;
+  state.ui = 'townhall';
+  document.getElementById('meetingMsg').textContent = '';
+  renderAgentChecklist();
+  document.getElementById('townhallModal').classList.remove('hidden');
+}
+
+function closeMeetingUI() {
+  state.ui = null;
+  document.getElementById('townhallModal').classList.add('hidden');
+}
+
+function openDoorMenu() {
+  state.ui = 'doorMenu';
+  document.getElementById('doorMenuModal').classList.remove('hidden');
+}
+
+function closeDoorMenu() {
+  state.ui = null;
+  document.getElementById('doorMenuModal').classList.add('hidden');
+  // Nudge clear of the door tile so a "walk away" (or exit back from the
+  // hangout) doesn't instantly re-open the menu next frame -- same idea as
+  // handleCancelCall nudging off the townhall door.
+  const door = ROOM_DOOR_TRIGGERS && ROOM_DOOR_TRIGGERS.townhall;
+  if (door) state.player.y = door.y + door.h + 6;
+}
+
+function doorMenuEnterHangout() {
+  closeDoorMenu();
+  enterRoom('hangout');
+}
+
+function doorMenuCallMeeting() {
+  closeDoorMenu();
+  openMeetingUI();
+}
+
+function wireDoorMenu() {
+  const enter = document.getElementById('doorMenuHangoutBtn');
+  const meet = document.getElementById('doorMenuMeetingBtn');
+  const cancel = document.getElementById('doorMenuCancelBtn');
+  if (!enter) return;
+  enter.addEventListener('click', doorMenuEnterHangout);
+  meet.addEventListener('click', doorMenuCallMeeting);
+  cancel.addEventListener('click', closeDoorMenu);
+}
+
+function renderAgentChecklist() {
+  const list = document.getElementById('agentList');
+  list.innerHTML = '';
+  for (const def of AGENT_ROSTER) {
+    const a = AGENTS[def.id];
+    const label = document.createElement('label');
+    label.className = a.busy ? 'busy' : '';
+    label.innerHTML = `<input type="checkbox" value="${def.id}" ${a.busy ? 'disabled' : ''}> ${def.name} — ${def.role}${a.busy ? ' (busy)' : ''}`;
+    list.appendChild(label);
+  }
+}
+
+function renderPresetButtons() {
+  const row = document.getElementById('presetRow');
+  row.innerHTML = '';
+  for (const name in MEETING_PRESETS) {
+    const btn = document.createElement('button');
+    btn.textContent = name;
+    btn.addEventListener('click', () => {
+      const ids = new Set(MEETING_PRESETS[name]);
+      for (const cb of document.querySelectorAll('#agentList input[type=checkbox]')) {
+        cb.checked = ids.has(cb.value) && !cb.disabled;
+      }
+    });
+    row.appendChild(btn);
+  }
+}
+
+// Suggests, doesn't decide -- per the same "you need to be able to
+// monitor this" principle hiring/firing were built on, this only checks
+// boxes; you still press Start Call yourself. Iterative "pick one more,
+// or stop" Jev calls (same shape as browseTowardGoal's link-following),
+// since Jev is a one-of-N classifier, not a pick-a-subset tool.
+async function suggestMeetingAttendees(topic) {
+  const picked = [];
+  const pickedIds = new Set();
+  for (let i = 0; i < 4; i++) {
+    const candidates = AGENT_ROSTER
+      .filter(d => !isAgentBusy(d.id) && !pickedIds.has(d.id))
+      .map(d => ({ id: d.id, description: `${d.name}, ${d.role}. ${d.profile.mission}` }));
+    if (candidates.length === 0) break;
+    candidates.push({ id: 'stop', description: 'No one else needs to be in this meeting.' });
+
+    const already = picked.map(id => AGENTS[id].name).join(', ') || 'no one yet';
+    const choice = await requestJevChoice(
+      `Suggesting attendees for a Town Hall meeting about: "${topic}". Already suggested: ${already}. Pick the next most relevant person to add, or 'stop' if the list is already complete.`,
+      candidates
+    );
+    if (!choice || choice === 'stop') break;
+    pickedIds.add(choice);
+    picked.push(choice);
+  }
+  return picked;
+}
+
+async function handleSuggestAttendees() {
+  const topic = document.getElementById('meetingTopicInput').value.trim();
+  if (!topic) {
+    document.getElementById('meetingMsg').textContent = 'Say what the meeting is about first.';
+    return;
+  }
+  const btn = document.getElementById('suggestAttendeesBtn');
+  btn.disabled = true;
+  document.getElementById('meetingMsg').textContent = 'Thinking...';
+  try {
+    const suggested = await suggestMeetingAttendees(topic);
+    const ids = new Set(suggested);
+    for (const cb of document.querySelectorAll('#agentList input[type=checkbox]')) {
+      cb.checked = ids.has(cb.value) && !cb.disabled;
+    }
+    document.getElementById('meetingMsg').textContent = suggested.length
+      ? `Suggested: ${suggested.map(id => AGENTS[id].name).join(', ')}. Review and adjust before starting.`
+      : 'No one obviously relevant -- pick manually.';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function handleStartCall() {
+  const selected = [...document.querySelectorAll('#agentList input[type=checkbox]:checked')].map(cb => cb.value);
+  if (selected.length === 0) {
+    document.getElementById('meetingMsg').textContent = 'Pick at least one person to call.';
+    return;
+  }
+  const meeting = startMeeting('player', selected);
+  if (!meeting) {
+    document.getElementById('meetingMsg').textContent = 'Everyone you picked is already in a call.';
+    return;
+  }
+  closeMeetingUI();
+  state.location = { kind: 'meeting', meetingId: meeting.id };
+  openChat();
+}
+
+// Which thread the chat window is currently showing: null for the whole-
+// call group thread, or an agent id for a private DM with that person.
+// Resets to the group thread every time a new call starts.
+let chatThread = null;
+
+function openChat() {
+  chatThread = null;
+  renderChatRoster();
+  renderChatThread();
+  document.getElementById('chatModal').classList.remove('hidden');
+  document.getElementById('chatInput').focus();
+}
+
+function closeChat() {
+  document.getElementById('chatModal').classList.add('hidden');
+}
+
+function currentMeeting() {
+  return MEETINGS[state.location.meetingId];
+}
+
+function renderChatRoster() {
+  const roster = document.getElementById('chatRoster');
+  roster.innerHTML = '';
+  const meeting = currentMeeting();
+
+  const groupBtn = document.createElement('button');
+  groupBtn.className = 'roster-item' + (chatThread === null ? ' active' : '');
+  groupBtn.innerHTML = `Group<span class="role">${meeting.participants.length} people</span>`;
+  groupBtn.addEventListener('click', () => { chatThread = null; renderChatRoster(); renderChatThread(); });
+  roster.appendChild(groupBtn);
+
+  for (const pid of meeting.participants) {
+    if (pid === 'player') continue;
+    const a = AGENTS[pid];
+    const btn = document.createElement('button');
+    btn.className = 'roster-item' + (chatThread === pid ? ' active' : '');
+    btn.innerHTML = `${a.name}<span class="role">${a.role}</span>`;
+    btn.addEventListener('click', () => { chatThread = pid; renderChatRoster(); renderChatThread(); });
+    roster.appendChild(btn);
+  }
+}
+
+function labelFor(id) {
+  if (id === 'player') return 'You';
+  const a = AGENTS[id];
+  return a ? a.name : id;
+}
+
+function renderChatThread() {
+  const meeting = currentMeeting();
+  const header = document.getElementById('threadHeader');
+  const log = document.getElementById('threadLog');
+  log.innerHTML = '';
+
+  const entries = chatThread === null
+    ? meeting.groupLog
+    : (meeting.dmLogs[dmKey('player', chatThread)] || []);
+
+  header.textContent = chatThread === null ? 'Group' : `Direct message — ${labelFor(chatThread)}`;
+
+  if (entries.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = chatThread === null
+      ? 'Nothing said yet.'
+      : `Nothing said to ${labelFor(chatThread)} yet.`;
+    log.appendChild(empty);
+  } else {
+    for (const entry of entries) {
+      const line = document.createElement('div');
+      line.className = 'msg';
+      line.innerHTML = `<span class="from">${labelFor(entry.fromId)}:</span>${entry.text}`;
+      log.appendChild(line);
+    }
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+// Who replies to a GROUP message -- a real Jev call, the same classifier
+// "pick one of N" shape as task assignment/firing, not every participant
+// replying at once (which would be both a wall of text in a multi-person
+// call and N times the cost per message) and not a fixed "the initiator
+// always answers" rule either.
+async function requestGroupReply(meeting, text) {
+  const candidates = meeting.participants
+    .filter(pid => pid !== 'player')
+    .map(pid => { const a = AGENTS[pid]; return a ? { id: pid, description: `${a.name}, ${a.role}. ${a.profile.mission}` } : null; })
+    .filter(Boolean);
+  if (candidates.length === 0) return;
+
+  let chosenId = await requestJevChoice(
+    `In a Town Hall group call, the player just said: "${text}". Pick whichever participant is best suited to respond.`,
+    candidates
+  );
+  if (!chosenId) chosenId = candidates[Math.floor(Math.random() * candidates.length)].id;
+
+  const agent = AGENTS[chosenId];
+  if (!agent) return;
+  const replyText = await requestAgentReply(agent, meeting.groupLog);
+  postMessage(meeting.id, chosenId, replyText, null);
+}
+
+async function handleChatSend() {
+  const input = document.getElementById('chatInput');
+  const text = input.value;
+  if (!text.trim()) return;
+  const meeting = currentMeeting();
+  const meetingId = state.location.meetingId;
+  const dmTarget = chatThread; // capture before any async gap -- the player could switch threads while a reply is in flight
+  postMessage(meetingId, 'player', text, dmTarget);
+  input.value = '';
+  renderChatThread();
+  if (!meeting) return;
+
+  const sendBtn = document.getElementById('chatSendBtn');
+  input.disabled = true;
+  sendBtn.disabled = true;
+  try {
+    if (dmTarget === null) {
+      await requestGroupReply(meeting, text);
+    } else {
+      const agent = AGENTS[dmTarget];
+      if (agent) {
+        const replyText = await requestAgentReply(agent, meeting.dmLogs[dmKey('player', dmTarget)] || []);
+        postMessage(meetingId, dmTarget, replyText, 'player');
+      }
+    }
+  } finally {
+    input.disabled = false;
+    sendBtn.disabled = false;
+    // Guard: the call may have ended while the reply was in flight --
+    // MEETINGS[meetingId] is gone by then, and there's nothing sane left
+    // to render into.
+    if (currentMeeting() && currentMeeting().id === meetingId) {
+      renderChatThread();
+      input.focus();
+    }
+  }
+}
+
+function handleCancelCall() {
+  closeMeetingUI();
+  // Nudge off the door tile so closing the modal doesn't immediately
+  // re-trigger it next frame -- same idea as exitRoom() placing the player
+  // clear of the door they just used.
+  const door = ROOM_DOOR_TRIGGERS.townhall;
+  state.player.y = door.y + door.h + 6;
+}
+
+function handleEndCall() {
+  const occupied = endMeeting(state.location.meetingId);
+  const spot = pickFreeSpot(occupied);
+  state.player.x = spot.x;
+  state.player.y = spot.y;
+  state.player.dir = 'south';
+  state.location = { kind: 'outside' };
+  closeChat();
+}
+
+function readInput(p) {
+  let dx = 0, dy = 0;
+  if (state.keys.has('arrowup') || state.keys.has('w')) { dy -= 1; p.dir = 'north'; }
+  if (state.keys.has('arrowdown') || state.keys.has('s')) { dy += 1; p.dir = 'south'; }
+  if (state.keys.has('arrowleft') || state.keys.has('a')) { dx -= 1; p.dir = 'west'; }
+  if (state.keys.has('arrowright') || state.keys.has('d')) { dx += 1; p.dir = 'east'; }
+  if (!dx && !dy) return null;
+  const len = Math.hypot(dx, dy);
+  return { dx: dx / len, dy: dy / len };
+}
+
+function update(dt) {
+  // Agents move independently of whatever the player is doing. Under the
+  // Phase-2 flip the SERVER is the mover (sim.owner == 'server'): it advances
+  // positions every SIM_TICK_S and the client only smooths toward them, so
+  // the village keeps simulating with the browser closed. Before the flip the
+  // client drives tickAgentMovement directly (today's behavior). Both sides
+  // agree on authority by keying off the same owner flag.
+  const serverOwns = typeof SIM_STATUS !== 'undefined' && SIM_STATUS && SIM_STATUS.owner === 'server';
+  if (serverOwns && typeof applyServerPositions === 'function') {
+    applyServerPositions(AGENTS);
+  } else {
+    tickAgentMovement(dt);
+  }
+  updateCameraFocus(dt);
+  if (state.location.kind === 'room') updateRoom(dt);
+  else updateOutside(dt);
+}
+
+function updateOutside(dt) {
+  // Frozen while the Town Hall call-setup modal is open, or while the
+  // player is themselves a meeting participant (vanished, per your call --
+  // someone in a call doesn't get pulled away by walking, they're just not
+  // on the map to move).
+  if (state.ui || state.location.kind === 'meeting') return;
+
+  const p = state.player;
+  const input = readInput(p);
+  if (input) {
+    const { dx, dy } = input;
+
+    // Visible agents block movement too, not just the static map -- see
+    // agentBlockedAt() in agents.js.
+    const outsideBlocked = box => blockedAt(box) || agentBlockedAt(box);
+
+    // safety net for a bad/edited spawn point overlapping a footprint --
+    // same pattern as the main game's outdoor collision.
+    const alreadyStuck = outsideBlocked(p);
+
+    const tryBoth = { x: p.x + dx * p.speed * dt, y: p.y + dy * p.speed * dt, w: p.w, h: p.h };
+    clampTo(tryBoth, GROUND_W, GROUND_H);
+    if (alreadyStuck || !outsideBlocked(tryBoth)) {
+      p.x = tryBoth.x; p.y = tryBoth.y;
+    } else {
+      const tryX = { x: p.x + dx * p.speed * dt, y: p.y, w: p.w, h: p.h };
+      clampTo(tryX, GROUND_W, GROUND_H);
+      if (!outsideBlocked(tryX)) p.x = tryX.x;
+
+      const tryY = { x: p.x, y: p.y + dy * p.speed * dt, w: p.w, h: p.h };
+      clampTo(tryY, GROUND_W, GROUND_H);
+      if (!outsideBlocked(tryY)) p.y = tryY.y;
+    }
+  }
+
+  // Walking onto a building's door tile prompts entry, Pokemon-style -- no
+  // separate interact key. Town Hall is now a MULTI-OPTION building (per your
+  // call): its door opens a menu letting you choose between the physical
+  // Hangout room and starting a meeting. House keeps opening the board.
+  for (const building in ROOM_DOOR_TRIGGERS) {
+    if (overlaps(p, ROOM_DOOR_TRIGGERS[building])) {
+      if (building === 'townhall') openDoorMenu();
+      else if (building === 'house') openBoard();
+      else enterRoom(building);
+      return;
+    }
+  }
+
+  // Standing next to a (now-solid) agent shows a "press B to talk" prompt
+  // rather than opening the conversation automatically -- per your call,
+  // you decide when the dialog pops up, walking up to someone shouldn't be
+  // enough by itself. Busy agents (in a Town Hall call right now; the only
+  // real busy-state that exists today) get a toast instead of a prompt --
+  // there's nothing to press B for. A small buffer beyond their own
+  // hitbox catches "standing right next to them," which collision now
+  // naturally stops the player at.
+  const CONVO_BUFFER = 4;
+  let foundNearby = null, nearBusyAgent = null;
+  for (const id in AGENTS) {
+    const a = AGENTS[id];
+    if (!agentIsDrawn(a)) continue;
+    const zone = { x: a.x - CONVO_BUFFER, y: a.y - CONVO_BUFFER, w: AGENT_W + CONVO_BUFFER * 2, h: AGENT_H + CONVO_BUFFER * 2 };
+    if (!overlaps(p, zone)) continue;
+    if (a.busy) { nearBusyAgent = a; continue; }
+    foundNearby = id;
+    break;
+  }
+  if (foundNearby !== nearbyAgentId) {
+    nearbyAgentId = foundNearby;
+    updateInteractPrompt();
+  }
+  if (nearBusyAgent) showBusyToast(nearBusyAgent);
+  else busyToastAgent = null; // re-arm so walking away and back shows it again
+}
+
+function updateRoom(dt) {
+  if (state.ui) return; // frozen while the terminal dialog is open
+
+  const p = state.player;
+  const collisionKey = ROOMS[state.location.building].collision;
+  const rects = ROOM_COLLISIONS[collisionKey];
+  const input = readInput(p);
+  if (input) {
+    const { dx, dy } = input;
+    const alreadyStuck = blockedInRoom(p, rects);
+
+    const tryBoth = { x: p.x + dx * p.speed * dt, y: p.y + dy * p.speed * dt, w: p.w, h: p.h };
+    clampTo(tryBoth, ROOM_NATIVE_W, ROOM_NATIVE_H);
+    if (alreadyStuck || !blockedInRoom(tryBoth, rects)) {
+      p.x = tryBoth.x; p.y = tryBoth.y;
+    } else {
+      const tryX = { x: p.x + dx * p.speed * dt, y: p.y, w: p.w, h: p.h };
+      clampTo(tryX, ROOM_NATIVE_W, ROOM_NATIVE_H);
+      if (!blockedInRoom(tryX, rects)) p.x = tryX.x;
+
+      const tryY = { x: p.x, y: p.y + dy * p.speed * dt, w: p.w, h: p.h };
+      clampTo(tryY, ROOM_NATIVE_W, ROOM_NATIVE_H);
+      if (!blockedInRoom(tryY, rects)) p.y = tryY.y;
+    }
+  }
+
+  // The room's own art has no drawn door -- the unseen exit is the open
+  // bottom edge (see rooms.js/DESIGN.md) -- walking into that strip leaves.
+  if (overlaps(p, ROOM_EXIT_TRIGGER)) { exitRoom(); return; }
+
+  // Walking up to an object opens its interaction -- same "walk into it"
+  // pattern as every other trigger in this game, just object-scoped within
+  // a room. Branches on type since terminals and the mailbox wall open
+  // different UIs.
+  for (const item of ROOM_INTERACTABLES[collisionKey] || []) {
+    if (overlaps(p, item.zone)) {
+      if (item.type === 'mailbox') openMailbox(item);
+      else if (item.type === 'teller') openTeller(item);
+      else if (item.type === 'bookshelf') openLibrary(item);
+      else openTerminal(item);
+      return;
+    }
+  }
+}
+
+function wireZoom() {
+  document.getElementById('zoomIn').addEventListener('click', () => {
+    state.zoom = Math.min(ZOOM_MAX, state.zoom + ZOOM_STEP);
+  });
+  document.getElementById('zoomOut').addEventListener('click', () => {
+    state.zoom = Math.max(ZOOM_MIN, state.zoom - ZOOM_STEP);
+  });
+  document.getElementById('zoomAll').addEventListener('click', () => {
+    state.zoom = state.zoom === ZOOM_SHOW_ALL ? 1.5 : ZOOM_SHOW_ALL;
+  });
+}
+function wirePad() {
+  for (const btn of document.querySelectorAll('#pad button')) {
+    const key = btn.dataset.key;
+    const press = e => { e.preventDefault(); state.keys.add(key); btn.classList.add('held'); };
+    const release = () => { state.keys.delete(key); btn.classList.remove('held'); };
+    btn.addEventListener('touchstart', press);
+    btn.addEventListener('mousedown', press);
+    btn.addEventListener('touchend', release);
+    btn.addEventListener('mouseup', release);
+    btn.addEventListener('mouseleave', release);
+  }
+}
+
+async function main() {
+  const bg = await loadImage(BG_SPRITE);
+  await loadCollisionGrid();
+  await loadDoorTriggers();
+  await loadMeetingPresets();
+  // Real ordering fix: a genuinely fresh start now generates each seed
+  // agent's onboarding profile via a real LLM call inside initAgents(),
+  // which needs MODEL_TIERS already populated with real slugs -- it used
+  // to load after, which would have made that first-ever boot call fail
+  // silently (or use a stale placeholder slug) every time.
+  await loadModelTiers();
+  if (typeof loadRoomPurposes === 'function') await loadRoomPurposes();
+  await initAgents();
+  // Server-side sim loop liveness -- starts the poll; the server engine ticks
+  // regardless, this only lets the browser observe/verify it.
+  if (typeof startSimPoll === 'function') startSimPoll();
+  const playerSprites = {
+    south: await loadImage('assets/character_south.png'),
+    north: await loadImage('assets/character_north.png'),
+    east: await loadImage('assets/character_east.png'),
+    west: await loadImage('assets/character_west.png'),
+  };
+
+  // Several buildings share the same room image (see rooms.js) -- load
+  // each distinct path once and key the cache by path, not by building.
+  const roomImages = {};
+  for (const building in ROOMS) {
+    const path = ROOMS[building].image;
+    if (!roomImages[path]) roomImages[path] = await loadImage(path);
+  }
+
+  window.addEventListener('keydown', e => {
+    // Typing in the chat box (or any future text field) shouldn't leak into
+    // game controls -- without this, typing a message containing "g" would
+    // toggle the debug overlay mid-sentence.
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    const k = e.key.toLowerCase();
+    state.keys.add(k);
+    if (k === 'g') state.showFootprints = !state.showFootprints;
+    if (k === 'b' && nearbyAgentId && !state.ui && state.location.kind === 'outside') {
+      openConversation(nearbyAgentId);
+    }
+  });
+  window.addEventListener('keyup', e => state.keys.delete(e.key.toLowerCase()));
+  wirePad();
+  wireZoom();
+
+  // Click-to-follow: hit-test against each visible agent's actual drawn
+  // sprite box (same geometry drawAgentAt uses), converting the click
+  // through the SAME camXY() the current frame's render used so this
+  // can't drift out of sync with what's on screen.
+  canvas.addEventListener('click', e => {
+    if (state.ui || state.location.kind !== 'outside') return;
+    const rect = canvas.getBoundingClientRect();
+    const zoom = state.zoom;
+    const sx = (e.clientX - rect.left) * (canvas.width / rect.width);
+    const sy = (e.clientY - rect.top) * (canvas.height / rect.height);
+    const [camX, camY] = camXY(zoom, GROUND_W, GROUND_H, cameraFocus.x, cameraFocus.y);
+    const wx = sx / zoom + camX, wy = sy / zoom + camY;
+
+    let hit = null;
+    for (const id in AGENTS) {
+      const a = AGENTS[id];
+      if (!agentIsDrawn(a)) continue;
+      const spr = playerSprites[a.dir];
+      const left = a.x - (spr.width - AGENT_W) / 2;
+      const top = a.y - (spr.height - AGENT_H);
+      if (wx >= left && wx <= left + spr.width && wy >= top && wy <= top + spr.height) { hit = id; break; }
+    }
+    if (hit) {
+      followAgentId = (followAgentId === hit) ? null : hit;
+      showToast(followAgentId ? `Following ${AGENTS[hit].name} -- click again to stop.` : 'Stopped following.');
+    } else if (followAgentId) {
+      followAgentId = null;
+      showToast('Stopped following.');
+    }
+  });
+
+  // Governance (hiring.js / firing.js) and tasks (tasks.js).
+  // Phase 3 (server-owned task lifecycle): when the server owns the sim
+  // (sim.owner == 'server'), the server's task loop consumes the workQueue,
+  // runs the research/skill-review schedules, assigns, completes tasks, AND
+  // (Phase 4) drives auto-hire and auto-firing reviews as cadence passes.
+  // The browser must NOT also run these -- it would double-consume the queue,
+  // fight the server's assignment, and run governance against a stale roster.
+  // Under server ownership these timers are simply not scheduled (the browser
+  // becomes a pure renderer/player), exactly like the movement flip.
+  // SIM_STATUS is populated by startSimPoll (a few hundred ms above) before
+  // this point in main().
+  const serverDrivesTasks = typeof SIM_STATUS !== 'undefined' && SIM_STATUS
+    && SIM_STATUS.owner === 'server';
+
+  // Checks every few seconds whether the admin is free to hire -- most
+  // calls no-op (cooldown, admin busy, or nobody needs help); see
+  // hiring.js for the actual conditions. Server-owned under sim.owner=='server'.
+  if (!serverDrivesTasks) setInterval(attemptAutoHire, 5000);
+
+  // Same idea for firing (firing.js) -- needs both admins free at once
+  // and a low-enough morale candidate, so most calls no-op same as
+  // hiring's. Server-owned under sim.owner=='server'.
+  if (!serverDrivesTasks) setInterval(attemptAutoFiringReview, 7000);
+
+  // Periodic autosave (Phase 2 persistence, agents.js) rather than hooking
+  // every single state-mutating call site -- catches everything (morale
+  // inputs, reports, mailbox, hires, contact timestamps from chat) with
+  // one mechanism instead of chasing each one individually. Still scheduled
+  // under server ownership: the client pushes player intent / chat / reports
+  // through, and the server's merge accepts the player-facing fields while
+  // keeping server-owned positions/queue/tasks.
+  setInterval(saveState, 5000);
+
+  // Tasks (tasks.js), a few seconds after load so everything else has
+  // settled first, then on a recurring cycle -- a single one-shot demo
+  // task meant only ever ONE agent ever moved; everyone else (Omar
+  // included, per your catch) just stood still forever with nothing to
+  // do. Jev (jev.js) picks who does each one from whoever's idle.
+  if (!serverDrivesTasks) {
+    setTimeout(runTaskCycle, 3000);
+    setInterval(runTaskCycle, 6000);
+    // Deliberately its own interval call, not folded into runTaskCycle
+    // itself -- runTaskCycleBody short-circuits before any call at all when
+    // WORK_QUEUE has nothing due yet (the idle-village-spends-nothing
+    // contract), but a standing research topic's cadence needs checking
+    // regardless of whatever's already queued. checkResearchSchedule()
+    // itself makes zero calls either way -- it only ever turns a due topic
+    // INTO a real queueWork() item, which the very next runTaskCycle tick
+    // picks up through the existing, already-tested path.
+    setInterval(checkResearchSchedule, 6000);
+    // Same reasoning as checkResearchSchedule -- its own standing job, its
+    // own cadence, checked regardless of the queue's current state.
+    setInterval(checkSkillReviewSchedule, 6000);
+  }
+
+  renderPresetButtons();
+  wireDoorMenu();
+  document.getElementById('startCallBtn').addEventListener('click', handleStartCall);
+  document.getElementById('suggestAttendeesBtn').addEventListener('click', handleSuggestAttendees);
+  document.getElementById('cancelCallBtn').addEventListener('click', handleCancelCall);
+  document.getElementById('endCallBtn').addEventListener('click', handleEndCall);
+  document.getElementById('chatSendBtn').addEventListener('click', handleChatSend);
+  document.getElementById('chatInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') handleChatSend();
+  });
+  document.getElementById('terminalCloseBtn').addEventListener('click', closeTerminal);
+  document.getElementById('mailboxCloseBtn').addEventListener('click', closeMailbox);
+  document.getElementById('tellerCloseBtn').addEventListener('click', closeTeller);
+  document.getElementById('browserCloseBtn').addEventListener('click', closeBrowser);
+  document.getElementById('browserGoBtn').addEventListener('click', handleBrowserGo);
+  document.getElementById('browserCurlBtn').addEventListener('click', handleBrowserCurl);
+  document.getElementById('browserUrlInput').addEventListener('keydown', e => { if (e.key === 'Enter') handleBrowserGo(); });
+  document.getElementById('workroomCloseBtn').addEventListener('click', closeWorkroom);
+  document.getElementById('workroomRunBtn').addEventListener('click', handleWorkroomRun);
+  document.getElementById('researchCloseBtn').addEventListener('click', closeResearch);
+  document.getElementById('researchRunBtn').addEventListener('click', handleResearchRun);
+  document.getElementById('libraryCloseBtn').addEventListener('click', closeLibrary);
+  document.getElementById('libraryWriteBtn').addEventListener('click', handleLibraryWrite);
+  document.getElementById('libraryIngestBtn').addEventListener('click', handleLibraryIngest);
+  document.getElementById('librarySearchBtn').addEventListener('click', handleLibrarySearch);
+  document.getElementById('librarySearchInput').addEventListener('keydown', e => { if (e.key === 'Enter') handleLibrarySearch(); });
+  document.getElementById('agentFilePicker').addEventListener('change', e => {
+    const agentId = e.target.value;
+    if (agentId) renderAgentFileList(agentId);
+    else document.getElementById('agentFileList').innerHTML = '';
+  });
+  document.getElementById('convoCloseBtn').addEventListener('click', closeConversation);
+  document.getElementById('convoSendBtn').addEventListener('click', handleConversationSend);
+  document.getElementById('convoInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') handleConversationSend();
+  });
+  document.getElementById('terminalInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') handleTerminalSend();
+  });
+  document.getElementById('hudWhosWhoBtn').addEventListener('click', openRosterList);
+  document.getElementById('hudCallMeetingBtn').addEventListener('click', openMeetingUI);
+  document.getElementById('hudCommandCenterBtn').addEventListener('click', () => enterRoom('commandcenter'));
+  document.getElementById('hudActivityBtn').addEventListener('click', openActivity);
+  document.getElementById('activityCloseBtn').addEventListener('click', closeActivity);
+  document.getElementById('hudPhoneBtn').addEventListener('click', openPhoneBooth);
+  document.getElementById('hudLogoutBtn').addEventListener('click', () => {
+    fetch('/logout', { method: 'POST' }).finally(() => { window.location.href = '/'; });
+  });
+  const publishBtnEl = document.getElementById('publishBtn');
+  if (publishBtnEl) publishBtnEl.addEventListener('click', handlePublish);
+  document.getElementById('phoneCloseBtn').addEventListener('click', closePhoneBooth);
+  document.getElementById('boardCloseBtn').addEventListener('click', closeBoard);
+  document.getElementById('bigTaskBtn').addEventListener('click', handleBigTaskDelegate);
+  document.getElementById('rosterListCloseBtn').addEventListener('click', closeRosterList);
+  document.getElementById('profileBackBtn').addEventListener('click', backToRosterFromProfile);
+  document.getElementById('profileCloseBtn').addEventListener('click', closeProfile);
+
+  function render() {
+    renderHud();
+    if (state.location.kind === 'room') renderRoom();
+    else renderOutside();
+  }
+
+  function renderHud() {
+    // Per your call (2026-09-20): this counts who's actually ACTIVE right
+    // now (activeAgentCount(), tasks.js -- capped at MAX_ACTIVE_AGENTS,
+    // hiring.js), not the total hired roster -- the whole point of a much
+    // larger hireable inventory with only some agents present at once is
+    // that this number should visibly drop when someone clocks off and
+    // rise again when the village calls them back in. Only count VISIBLE
+    // busy agents: an off-duty agent is invisible, so a stale `busy` flag
+    // on a resting agent (a known ghost, e.g. faye parked at the origin)
+    // must not count as someone actually working.
+    document.getElementById('hudVillagers').textContent = activeAgentCount();
+    document.getElementById('hudWorking').textContent = Object.values(AGENTS).filter(a => a.busy && a.visible).length;
+    document.getElementById('hudMorale').textContent = villageMorale();
+    document.getElementById('hudReports').textContent = REPORTS.length;
+    document.getElementById('hudMail').textContent = Object.values(AGENTS).reduce((sum, a) => sum + a.mailbox.filter(m => !m.read).length, 0);
+    document.getElementById('hudOpenWork').textContent = Object.values(TASKS).filter(t => t.status !== 'done').length;
+  }
+
+  function cameraFor(zoom, worldW, worldH, focusX, focusY) {
+    const [camX, camY] = camXY(zoom, worldW, worldH, focusX, focusY);
+    return (x, y) => [(x - camX) * zoom, (y - camY) * zoom];
+  }
+
+  function drawPlayer(toScreen, zoom) {
+    // background is one flat baked image, so the player is the only sprite
+    // -- no y-sort needed, just draw it on top every frame.
+    const spr = playerSprites[state.player.dir];
+    const [px, py] = toScreen(
+      state.player.x - (spr.width - state.player.w) / 2,
+      state.player.y - (spr.height - state.player.h)
+    );
+    ctx.drawImage(spr, px, py, spr.width * zoom, spr.height * zoom);
+  }
+
+  function renderOutside() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const zoom = state.zoom;
+    const toScreen = cameraFor(zoom, GROUND_W, GROUND_H, cameraFocus.x, cameraFocus.y);
+
+    const [bx, by] = toScreen(0, 0);
+    ctx.drawImage(bg, bx, by, GROUND_W * zoom, GROUND_H * zoom);
+    renderAgents(ctx, toScreen, zoom, playerSprites);
+    // The player vanishes from the map for the duration of a call, same as
+    // any other participant -- see meetings.js.
+    if (state.location.kind !== 'meeting') drawPlayer(toScreen, zoom);
+
+    if (state.showFootprints) {
+      if (COLLISION_GRID) {
+        ctx.fillStyle = 'rgba(255,40,40,0.4)';
+        const { cols, rows, cell, grid } = COLLISION_GRID;
+        const cellWorld = cell * SCALE;
+        for (let gy = 0; gy < rows; gy++) {
+          for (let gx = 0; gx < cols; gx++) {
+            if (!grid[gy][gx]) continue;
+            const [dx, dy] = toScreen(gx * cellWorld, gy * cellWorld);
+            ctx.fillRect(dx, dy, cellWorld * zoom, cellWorld * zoom);
+          }
+        }
+      }
+      ctx.strokeStyle = 'rgba(255,210,60,0.9)';
+      for (const building in ROOM_DOOR_TRIGGERS) {
+        const d = ROOM_DOOR_TRIGGERS[building];
+        const [dx, dy] = toScreen(d.x, d.y);
+        ctx.strokeRect(dx, dy, d.w * zoom, d.h * zoom);
+      }
+      ctx.strokeStyle = 'rgba(255,120,120,0.9)';
+      for (const id in AGENTS) {
+        const a = AGENTS[id];
+        if (!agentIsDrawn(a)) continue;
+        const [ax, ay] = toScreen(a.x, a.y);
+        ctx.strokeRect(ax, ay, AGENT_W * zoom, AGENT_H * zoom);
+      }
+      ctx.strokeStyle = 'rgba(60,140,255,0.9)';
+      const [ppx, ppy] = toScreen(state.player.x, state.player.y);
+      ctx.strokeRect(ppx, ppy, state.player.w * zoom, state.player.h * zoom);
+    }
+  }
+
+  function renderRoom() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const zoom = state.zoom;
+    const toScreen = cameraFor(zoom, ROOM_NATIVE_W, ROOM_NATIVE_H, state.player.x, state.player.y);
+    const room = ROOMS[state.location.building];
+
+    const [bx, by] = toScreen(0, 0);
+    ctx.drawImage(roomImages[room.image], bx, by, ROOM_NATIVE_W * zoom, ROOM_NATIVE_H * zoom);
+    renderAgentsInRoom(ctx, toScreen, zoom, playerSprites, state.location.building);
+    drawPlayer(toScreen, zoom);
+
+    ctx.save();
+    ctx.font = '14px monospace';
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(8, 8, ctx.measureText(room.label).width + 16, 22);
+    ctx.fillStyle = '#e8e8e8';
+    ctx.fillText(room.label, 16, 24);
+    ctx.restore();
+
+    if (state.showFootprints) {
+      ctx.fillStyle = 'rgba(255,40,40,0.4)';
+      for (const r of ROOM_COLLISIONS[room.collision]) {
+        const [rx, ry] = toScreen(r.x, r.y);
+        ctx.fillRect(rx, ry, r.w * zoom, r.h * zoom);
+      }
+      ctx.strokeStyle = 'rgba(255,210,60,0.9)';
+      const [ex, ey] = toScreen(ROOM_EXIT_TRIGGER.x, ROOM_EXIT_TRIGGER.y);
+      ctx.strokeRect(ex, ey, ROOM_EXIT_TRIGGER.w * zoom, ROOM_EXIT_TRIGGER.h * zoom);
+      ctx.strokeStyle = 'rgba(120,255,160,0.9)';
+      for (const item of ROOM_INTERACTABLES[room.collision] || []) {
+        const [ix, iy] = toScreen(item.zone.x, item.zone.y);
+        ctx.strokeRect(ix, iy, item.zone.w * zoom, item.zone.h * zoom);
+      }
+      ctx.strokeStyle = 'rgba(60,140,255,0.9)';
+      const [ppx, ppy] = toScreen(state.player.x, state.player.y);
+      ctx.strokeRect(ppx, ppy, state.player.w * zoom, state.player.h * zoom);
+    }
+  }
+
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    // Real bug found and fixed this session: an uncaught exception
+    // anywhere in update()/render() used to mean the requestAnimationFrame
+    // call below never ran, freezing the ENTIRE game dead, silently, with
+    // nothing visible anywhere but the browser console. That specific bug
+    // (findPath() returning an empty-not-null path) is fixed at the
+    // source, but this catch is the actual structural fix -- whatever
+    // breaks next, the game survives it instead of dying outright.
+    try {
+      update(dt);
+      render();
+    } catch (e) {
+      console.error('Frame error (game kept running):', e);
+      const msg = (e && e.message) || String(e);
+      const t = Date.now();
+      // Throttled, not per-frame -- a recurring error at 60fps would
+      // otherwise flood the real action log; still visible (at least
+      // once per 30s) in the Activity Log, not swallowed silently.
+      if (msg !== lastLoopErrorMsg || t - lastLoopErrorLoggedAt > 30000) {
+        lastLoopErrorMsg = msg;
+        lastLoopErrorLoggedAt = t;
+        logVillageAction('system', 'frame_error', { message: msg, stack: ((e && e.stack) || '').slice(0, 500) });
+      }
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+main();
+</script>
+</body>
+</html>

@@ -1,0 +1,47 @@
+# Secrets — never commit
+.env
+.env.*
+*.bak
+*.bak.*
+
+# Fernet key store for external credentials (Phase D) -- never commit keys
+.secret_keys/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Live runtime state — authoritative state lives in SQLite and regenerates
+village.db
+village.db-*
+*.db
+*.db-wal
+*.db-shm
+*.db.bak
+
+# Sandbox project dirs are their own independent git repos — don't double-track
+sandboxes/finger-drums-project/
+sandboxes/research-shared/
+sandboxes/workroom-shared/
+
+# Per-agent project repos are independently versioned (gitlinks, not tracked content)
+agents/*/prototypes/
+
+# Team-shared space is agents' working directory -- in-progress artifacts stay
+# out of the repo; finished work gets pushed/tracked deliberately in a later phase.
+agents/teams/*/shared/
+
+# Transient runtime state
+escalations.json
+# Server/test-runner logs and coverage residue
+*.log
+*.log.*
+.coverage
+
+# Publish staging -- ephemeral export dir pushed to the configured private
+# repo; never tracked by the main repo (may briefly hold a token)
+library/publish-staging/
+
+# macOS
+.DS_Store

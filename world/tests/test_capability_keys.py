@@ -1,0 +1,297 @@
+"""Tests for Phase D: external-credential vault + capability handles.
+
+Covers the confused-deputy core: an agent presents an opaque handle, the server
+verifies scope (right agent, unexpired, host+method in scope), decrypts the
+real credential in-process, and injects it into the outbound request -- never
+returning or logging the raw secret. Runs against a hermetic temp DB + a temp
+Fernet key dir so nothing touches the live vault or makes network calls.
+"""
+import os
+import shutil
+import tempfile
+import unittest
+import unittest.mock
+
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import serve
+from fastapi.testclient import TestClient
+
+
+class CapabilityKeys(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='village-keys-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            VILLAGE_DIR=self.tmp,
+            AGENTS_DIR=os.path.join(self.tmp, 'agents'),
+            LIBRARY_DIR=os.path.join(self.tmp, 'library'),
+            PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
+            # Fernet EDEK master key must live in the temp dir, not the repo.
+            _FERNET_EDEK_DIR=os.path.join(self.tmp, '.secret_keys'),
+            _FERNET_EDEK_PATH=os.path.join(self.tmp, '.secret_keys', 'edek.key'),
+        )
+        self._cm.start()
+        serve.init_db()
+
+    def tearDown(self):
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_credential_roundtrip_and_never_listed(self):
+        serve._store_credential('github-token', 'github', 'sk-very-secret')
+        listed = serve._list_credentials()
+        self.assertEqual(listed, [{'name': 'github-token', 'service': 'github'}])
+        # The raw value must never be readable back out of the vault.
+        row = None
+        with serve._db() as conn:
+            row = conn.execute(
+                'SELECT encrypted_value FROM external_credentials WHERE name = ?',
+                ('github-token',)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertNotIn('sk-very-secret', row[0])
+
+    def test_handle_mint_requires_existing_credential(self):
+        no_handle, reason = serve.mint_capability_handle(
+            'agent-a', 'does-not-exist', 'deploy', '*', ['GET'], 'player', 3600)
+        self.assertIsNone(no_handle)
+        self.assertEqual(reason, 'unknown credential')
+
+        serve._store_credential('gh', 'github', 'secret-1')
+        h, reason = serve.mint_capability_handle(
+            'agent-a', 'gh', 'deploy', '*', ['GET'], 'player', 3600)
+        self.assertTrue(h)
+        self.assertIsNone(reason)
+        self.assertNotIn('secret-1', h)
+        self.assertEqual(len(h), 64)
+
+    def test_resolve_checks_scope(self):
+        serve._store_credential('gh', 'github', 'secret-1')
+        h, _ = serve.mint_capability_handle(
+            'agent-a', 'gh', 'deploy', ['api.github.com'], ['GET'], 'player', 3600)
+
+        # Right agent + right host + right method -> resolves, secret decrypted.
+        grant = serve.resolve_capability_handle('agent-a', h, 'GET', 'https://api.github.com/repos/x')
+        self.assertIsNotNone(grant)
+        self.assertEqual(grant['secret'], 'secret-1')
+        self.assertEqual(grant['service'], 'github')
+
+        # Wrong agent.
+        self.assertIsNone(serve.resolve_capability_handle('agent-b', h, 'GET', 'https://api.github.com/x'))
+        # Wrong host (not in the allowed scape).
+        self.assertIsNone(serve.resolve_capability_handle('agent-a', h, 'GET', 'https://evil.example.com'))
+        # Wrong method.
+        self.assertIsNone(serve.resolve_capability_handle('agent-a', h, 'POST', 'https://api.github.com/x'))
+        # Wildcard host still lets any host through.
+        h2, _ = serve.mint_capability_handle('agent-a', 'gh', 'anywhere', '*', ['GET'], 'player', 3600)
+        self.assertIsNotNone(serve.resolve_capability_handle('agent-a', h2, 'GET', 'https://anything.example.com/x'))
+
+    def test_resolve_rejects_expired_handle(self):
+        serve._store_credential('gh', 'github', 'secret-1')
+        # ttl 1s: mint with a short TTL, then time-travel past expiry.
+        h, _ = serve.mint_capability_handle('agent-a', 'gh', 'deploy', '*', ['GET'], 'player', 0)
+        with serve._db() as conn:
+            conn.execute('UPDATE capability_handles SET expires_at = ? WHERE handle = ?',
+                         (serve.time.time() - 10, h))
+        self.assertIsNone(serve.resolve_capability_handle('agent-a', h, 'GET', 'https://api.github.com/x'))
+        # And the stale row was swept out.
+        with serve._db() as conn:
+            self.assertIsNone(conn.execute('SELECT 1 FROM capability_handles WHERE handle = ?', (h,)).fetchone())
+
+    def test_expire_sweep_removes_stale_handles(self):
+        serve._store_credential('gh', 'github', 'secret-1')
+        live, _ = serve.mint_capability_handle('agent-a', 'gh', 'a', '*', ['GET'], 'player', 3600)
+        stale, _ = serve.mint_capability_handle('agent-a', 'gh', 'b', '*', ['GET'], 'player', 3600)
+        with serve._db() as conn:
+            conn.execute('UPDATE capability_handles SET expires_at = ? WHERE handle = ?',
+                         (serve.time.time() - 5, stale))
+        serve._expire_handles()
+        with serve._db() as conn:
+            remains = [r[0] for r in conn.execute('SELECT handle FROM capability_handles')]
+        self.assertIn(live, remains)
+        self.assertNotIn(stale, remains)
+
+    def test_revoke_all_clears_agents_handles(self):
+        serve._store_credential('gh', 'github', 'secret-1')
+        serve.mint_capability_handle('agent-a', 'gh', 'x', '*', ['GET'], 'player', 3600)
+        serve.mint_capability_handle('agent-a', 'gh', 'y', '*', ['GET'], 'player', 3600)
+        survive, _ = serve.mint_capability_handle('agent-b', 'gh', 'z', '*', ['GET'], 'player', 3600)
+        serve.revoke_all_handles('agent-a')
+        with serve._db() as conn:
+            remains = [r[0] for r in conn.execute('SELECT handle FROM capability_handles')]
+        self.assertEqual(remains, [survive])
+
+    def test_delete_credential_voids_its_handles(self):
+        serve._store_credential('gh', 'github', 'secret-1')
+        h, _ = serve.mint_capability_handle('agent-a', 'gh', 'x', '*', ['GET'], 'player', 3600)
+        self.assertIsNotNone(serve.resolve_capability_handle('agent-a', h, 'GET', 'https://x.y/z'))
+        serve._delete_credential('gh')
+        # Credential gone, and the handle that pointed at it can no longer resolve.
+        self.assertIsNone(serve.resolve_capability_handle('agent-a', h, 'GET', 'https://x.y/z'))
+        with serve._db() as conn:
+            self.assertIsNone(conn.execute('SELECT 1 FROM capability_handles WHERE handle = ?', (h,)).fetchone())
+
+    def test_capability_auth_headers_are_per_service(self):
+        # /api/curl injects whatever this returns into the outbound request.
+        # DigitalOcean and PixelLab both take a standard Bearer token; Treg's
+        # real API does not (X-Treg-Token instead) -- found live 2026-09-24
+        # while wiring up the first real handle-authenticated action.
+        self.assertEqual(serve._capability_auth_headers('digitalocean', 's3cret'),
+                          {'Authorization': 'Bearer s3cret'})
+        self.assertEqual(serve._capability_auth_headers('pixellab', 's3cret'),
+                          {'Authorization': 'Bearer s3cret'})
+        self.assertEqual(serve._capability_auth_headers('treg', 's3cret'),
+                          {'X-Treg-Token': 's3cret'})
+        # Unknown credential names default to Bearer, the common case.
+        self.assertEqual(serve._capability_auth_headers('some-new-service', 's3cret'),
+                          {'Authorization': 'Bearer s3cret'})
+
+    def test_mint_refused_when_hard_cap_exceeded(self):
+        # The hard circuit breaker (2026-09-24): a credential in
+        # _HARD_CAPPED_CREDENTIALS with a configured budgetCapUsd on its
+        # product must refuse EVEN the mint step once real usage is at/over
+        # cap -- the agent never even gets a handle to try.
+        serve._store_credential('digitalocean', 'digitalocean', 'do-secret')
+        state = {'products': {'digitalocean': {'budgetCapUsd': 25}}}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.dict(serve._HARD_CAPPED_CREDENTIALS,
+                                       {'digitalocean': lambda: 30.0}):
+            handle, reason = serve.mint_capability_handle(
+                'agent-a', 'digitalocean', 'check balance', '*', ['GET'], 'player', 3600)
+        self.assertIsNone(handle)
+        self.assertIn('25.00', reason)
+        # And under cap, minting succeeds normally.
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.dict(serve._HARD_CAPPED_CREDENTIALS,
+                                       {'digitalocean': lambda: 5.0}):
+            handle, reason = serve.mint_capability_handle(
+                'agent-a', 'digitalocean', 'check balance', '*', ['GET'], 'player', 3600)
+        self.assertIsNotNone(handle)
+        self.assertIsNone(reason)
+
+    def test_revoke_agent_credentials_clears_keys_grants_and_handles(self):
+        # The fire path: one call must wipe every standing credential for the
+        # agent -- attribution secret, temp grants, and capability handles --
+        # while leaving other agents' grants intact.
+        serve._store_credential('gh', 'github', 'secret-1')
+        key = serve.get_or_create_agent_key('agent-a')
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO temp_access_grants (agent_id, capability, granted_by, reason, granted_at, expires_at) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                ('agent-a', 'library_write', 'faye', 'review', 0, serve.time.time() + 3600))
+        h, _ = serve.mint_capability_handle('agent-a', 'gh', 'x', '*', ['GET'], 'player', 3600)
+        other_key = serve.get_or_create_agent_key('agent-b')
+        other_handle, _ = serve.mint_capability_handle('agent-b', 'gh', 'y', '*', ['GET'], 'player', 3600)
+
+        serve.revoke_agent_credentials('agent-a')
+
+        # agent-a loses its key, grants, and handles.
+        with serve._db() as conn:
+            key_row = conn.execute('SELECT 1 FROM agent_keys WHERE agent_id = ?', ('agent-a',)).fetchone()
+            grant_row = conn.execute('SELECT 1 FROM temp_access_grants WHERE agent_id = ?', ('agent-a',)).fetchone()
+            handle_row = conn.execute('SELECT 1 FROM capability_handles WHERE agent_id = ?', ('agent-a',)).fetchone()
+        self.assertIsNone(key_row)
+        self.assertIsNone(grant_row)
+        self.assertIsNone(handle_row)
+        # agent-b is untouched.
+        with serve._db() as conn:
+            self.assertEqual(conn.execute('SELECT secret_key FROM agent_keys WHERE agent_id = ?', ('agent-b',)).fetchone()[0], other_key)
+            self.assertIsNotNone(conn.execute('SELECT 1 FROM capability_handles WHERE handle = ?', (other_handle,)).fetchone())
+        # And the old key no longer verifies for a freshly re-minted one (re-hire mints fresh).
+        fresh = serve.get_or_create_agent_key('agent-a')
+        self.assertNotEqual(fresh, key)
+        self.assertIs(serve.verify_agent_key('agent-a', key), False)
+
+
+class HandlesEndpointAuth(unittest.TestCase):
+    """HTTP-level test of POST/DELETE /api/keys/handles' 'player-only' gate.
+
+    Found 2026-09-24, while wiring up the first real handle-authenticated
+    action, that the gate used _resolve_requester(request) -- which reads
+    "player" from the ABSENCE of a self-declared `requesterId` query param,
+    not from a verified player session. An agent's own HTTP client already
+    needs a valid X-Agent-Key just to clear the global auth middleware for
+    this path (it's in AUTH_PROTECTED_PREFIXES); it could then reach this
+    handler and mint itself a handle -- to DigitalOcean, with DELETE
+    allowed, if it chose to ask for that -- simply by not sending
+    `requesterId`. Fixed by requiring an actual verified player session
+    cookie instead. No test caught this because no HTTP-level test of this
+    endpoint existed before now -- only the pure mint_capability_handle /
+    resolve_capability_handle functions were covered above."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='village-handles-auth-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            VILLAGE_DIR=self.tmp,
+            AGENTS_DIR=os.path.join(self.tmp, 'agents'),
+            LIBRARY_DIR=os.path.join(self.tmp, 'library'),
+            PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
+            _FERNET_EDEK_DIR=os.path.join(self.tmp, '.secret_keys'),
+            _FERNET_EDEK_PATH=os.path.join(self.tmp, '.secret_keys', 'edek.key'),
+        )
+        self._cm.start()
+        serve.init_db()
+        serve._store_credential('gh', 'github', 'secret-1')
+        self.agent_key = serve.get_or_create_agent_key('agent-a')
+
+    def tearDown(self):
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _mint_body(self):
+        return {'agentId': 'agent-a', 'credentialName': 'gh', 'purpose': 'x',
+                'allowedHosts': '*', 'allowedMethods': ['GET']}
+
+    def test_agent_key_alone_cannot_self_mint_even_without_requesterId(self):
+        # The exact bypass: a valid agent key, no player session cookie, and
+        # no `requesterId` query param -- this must now be refused, not
+        # silently treated as the player.
+        c = TestClient(serve.app)
+        r = c.post('/api/keys/handles', json=self._mint_body(),
+                   headers={'X-Agent-Key': self.agent_key})
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertIn('player-only', r.json().get('error', ''))
+        with serve._db() as conn:
+            self.assertIsNone(conn.execute('SELECT 1 FROM capability_handles').fetchone())
+
+    def test_agent_key_with_requesterId_is_also_refused(self):
+        c = TestClient(serve.app)
+        r = c.post('/api/keys/handles?requesterId=agent-a', json=self._mint_body(),
+                   headers={'X-Agent-Key': self.agent_key})
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_no_auth_at_all_is_401_from_the_middleware(self):
+        c = TestClient(serve.app)
+        r = c.post('/api/keys/handles', json=self._mint_body())
+        self.assertEqual(r.status_code, 401, r.text)
+
+    def test_real_player_session_can_mint(self):
+        session_id = serve.create_session()
+        c = TestClient(serve.app, cookies={serve.SESSION_COOKIE_NAME: session_id})
+        r = c.post('/api/keys/handles', json=self._mint_body())
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json().get('handle'))
+
+    def test_real_player_session_can_delete(self):
+        session_id = serve.create_session()
+        h, _ = serve.mint_capability_handle('agent-a', 'gh', 'x', '*', ['GET'], 'player', 3600)
+        c = TestClient(serve.app, cookies={serve.SESSION_COOKIE_NAME: session_id})
+        r = c.delete(f'/api/keys/handles/{h}')
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_agent_key_alone_cannot_delete(self):
+        h, _ = serve.mint_capability_handle('agent-a', 'gh', 'x', '*', ['GET'], 'player', 3600)
+        c = TestClient(serve.app)
+        r = c.delete(f'/api/keys/handles/{h}', headers={'X-Agent-Key': self.agent_key})
+        self.assertEqual(r.status_code, 403, r.text)
+        with serve._db() as conn:
+            self.assertIsNotNone(conn.execute('SELECT 1 FROM capability_handles WHERE handle = ?', (h,)).fetchone())
+
+
+if __name__ == '__main__':
+    unittest.main()
