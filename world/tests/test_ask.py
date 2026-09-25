@@ -425,19 +425,26 @@ class TelegramBridge(unittest.TestCase):
         self.assertIn('not up right now', outcome[1])
 
     def test_allowlisted_chat_reaches_the_admin_via_ask_core(self):
+        # Theo routing (2026-09-25): _telegram_process_update now goes through
+        # _route_player_request's classifier before reaching _ask_core -- mock
+        # the classifier to the 'ask' lane so this stays a hermetic unit test
+        # of the dispatch wiring, not a real Jev call.
         s = _state()
         s['agentRoster'][0]['isAdmin'] = True  # maya
         seen = {}
-        async def fake_ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300):
+        async def fake_ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False):
             seen['question'] = question
             seen['agent_id_hint'] = agent_id_hint
+            seen['allow_admin_pin'] = allow_admin_pin
             return {'reply': 'All quiet.', 'agent': 'maya', 'tools': []}
         with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=s), \
+             unittest.mock.patch.object(serve, '_lane_decider', return_value='ask'), \
              unittest.mock.patch.object(serve, '_ask_core', side_effect=fake_ask_core):
             outcome = asyncio.run(serve._telegram_process_update(self._update(text='status?')))
         self.assertEqual(outcome, ('111', 'All quiet.'))
         self.assertEqual(seen['question'], 'status?')
         self.assertEqual(seen['agent_id_hint'], 'maya')  # pinned to the ADMIN, not round-robin
+        self.assertTrue(seen['allow_admin_pin'])  # the internal ask lane trusts this pin
 
 
 if __name__ == '__main__':
