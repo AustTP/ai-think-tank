@@ -315,7 +315,10 @@ class AskEndpoint(unittest.TestCase):
             r = c.post('/api/intent/ask', json={'question': 'hi', 'agentId': 'ben'})
         self.assertEqual(r.status_code, 200, r.text)
         tool_names = {t['function']['name'] for t in seen['tools']}
-        self.assertEqual(tool_names, {'weather_now'})
+        # browse_page (2026-09-25) is a general AGENT_ASK_TOOLS capability,
+        # not security-role-gated -- only attempt_curl/request_capability_handle
+        # (SECURITY_TEST_TOOLS) are restricted to the Red Team Auditor role.
+        self.assertEqual(tool_names, {'weather_now', 'browse_page'})
 
     def test_red_team_auditor_gets_security_tools_and_they_hit_real_endpoints(self):
         s = _state()
