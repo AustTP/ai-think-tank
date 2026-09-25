@@ -5449,7 +5449,7 @@ async def intent_clarify(request: Request):
     })
 
 
-async def _ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300):
+async def _ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False):
     """The real logic behind /api/intent/ask, pulled out so a non-HTTP caller
     (the Telegram bridge) can invoke it directly -- no fake Request object,
     no self-loopback HTTP hop, no auth dance for an already-trusted in-process
@@ -5472,12 +5472,19 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     # because IT'S shared with task assignment (you don't want the admin doing
     # routine work), but that's not a reason to block her from answering a
     # question she was explicitly asked. Checked directly against `agents`,
-    # not `candidates`, so a pin only needs the agent to exist and be free
-    # (not busy/task/pairWith) -- not also pass the non-admin filter.
+    # not `candidates`, so a non-admin pin only needs the agent to exist and
+    # be free (not busy/task/pairWith) -- not also pass the non-admin filter.
+    # allow_admin_pin gates whether an ADMIN specifically may be the pin
+    # target: True only for trusted internal callers that deliberately chose
+    # the admin (the Theo routing layer's ask/unclear lanes) -- False (the
+    # default) for the public /api/intent/ask endpoint, where `agentId` is
+    # raw player input and must still respect "admin never does routine
+    # ask-answering" (test_ask.py::test_agentId_ignored_when_not_a_real_eligible_candidate).
     requested_record = agents.get(requested_agent) if requested_agent else None
     requested_is_free = bool(requested_record) and not requested_record.get('busy') \
         and not requested_record.get('task') and not requested_record.get('pairWith')
-    if requested_agent and requested_is_free:
+    requested_is_valid_pin = requested_is_free and (allow_admin_pin or requested_agent in candidates)
+    if requested_agent and requested_is_valid_pin:
         pick = requested_agent
     elif not candidates:
         return {'error': 'No agent is free to answer right now. Try again shortly.', 'status': 409}
@@ -5783,7 +5790,11 @@ def _pick_team_worker(state, director_id):
 
 
 async def _route_lane_ask(state, text, admin_id):
-    return await _ask_core(state, text, admin_id)
+    # Trusted internal pin: the player is texting Theo specifically, so Theo
+    # (the admin) is who answers -- allow_admin_pin=True is safe here in a
+    # way it is not for the public /api/intent/ask endpoint's raw player-
+    # submitted agentId (see _ask_core's own comment on the parameter).
+    return await _ask_core(state, text, admin_id, allow_admin_pin=True)
 
 
 async def _route_lane_unclear(state, text, admin_id):
@@ -5792,7 +5803,7 @@ async def _route_lane_unclear(state, text, admin_id):
     # call" behavior -- the senior-most available director personally
     # answers in character rather than whoever's next in round robin.
     authority = _free_authority(state)
-    return await _ask_core(state, text, (authority or {}).get('id') or admin_id)
+    return await _ask_core(state, text, (authority or {}).get('id') or admin_id, allow_admin_pin=True)
 
 
 async def _route_lane_schedule(state, text, admin_id):

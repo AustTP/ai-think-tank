@@ -1016,7 +1016,7 @@ class ServerOwnedSeed(unittest.TestCase):
         roster = serve._default_roster_definitions()
         self.assertEqual(len(roster), 7)
         names = {d['name'] for d in roster}
-        self.assertEqual(names, {'Ada', 'Ben', 'Cora', 'Dev', 'Eli', 'Faye', 'Nora'})
+        self.assertEqual(names, {'Ada', 'Ben', 'Cora', 'Dev', 'Eli', 'Theo', 'Nora'})
         for d in roster:
             self.assertTrue(d['id'])
             self.assertTrue(d['name'])
@@ -1033,11 +1033,11 @@ class ServerOwnedSeed(unittest.TestCase):
         self.assertEqual(len(state['agentRoster']), 7)
         self.assertEqual(len(state['agents']), 7)
         # Director tier stamped server-side, not carried in the seed literal.
-        faye = next(d for d in state['agentRoster'] if d['id'] == 'faye')
+        theo = next(d for d in state['agentRoster'] if d['id'] == 'theo')
         nora = next(d for d in state['agentRoster'] if d['id'] == 'nora')
-        self.assertTrue(faye.get('isAdmin'))
-        self.assertTrue(faye.get('isDirector'))
-        self.assertFalse(faye.get('director'))
+        self.assertTrue(theo.get('isAdmin'))
+        self.assertTrue(theo.get('isDirector'))
+        self.assertFalse(theo.get('director'))
         self.assertTrue(nora.get('isDirector'))
         self.assertFalse(nora.get('isAdmin'))
         self.assertFalse(nora.get('director'), 'senior-most director has no own director')
@@ -1055,12 +1055,12 @@ class ServerOwnedSeed(unittest.TestCase):
         serve._seed_default_roster()
         state = serve.get_state_from_db()
         by_id = {d['id']: d for d in state['agentRoster']}
-        self.assertEqual(by_id['dev']['director'], 'faye')
-        self.assertEqual(by_id['eli']['director'], 'faye')
+        self.assertEqual(by_id['dev']['director'], 'theo')
+        self.assertEqual(by_id['eli']['director'], 'theo')
         self.assertEqual(by_id['ben']['director'], 'nora')
         self.assertFalse(by_id['nora'].get('director'))       # senior-most director
-        self.assertFalse(by_id['faye'].get('director'))       # admin at top
-        self.assertTrue(by_id['faye']['isAdmin'])
+        self.assertFalse(by_id['theo'].get('director'))       # admin at top
+        self.assertTrue(by_id['theo']['isAdmin'])
         self.assertTrue(by_id['nora']['isDirector'])          # stamped, not literal
 
 
