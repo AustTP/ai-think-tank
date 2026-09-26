@@ -427,46 +427,64 @@ def _run_distill_content(snapshot, agent_id, task, base_ctx=None):
                                        'distilled': len(archives), 'wikiPage': record.get('id')})
 
 
+def _run_observatory_content(snapshot, agent_id, task, base_ctx=None):
+    """Observatory's own executor choice branches on which flag the task
+    carries, not a fixed 1:1 key like every other room -- pulled out of the
+    dispatcher (2026-09-25, registry conversion) so it reads and tests the
+    same way every other _run_*_content executor does."""
+    if task.get('distill'):
+        _run_distill_content(snapshot, agent_id, task, base_ctx)
+    elif task.get('skillReview'):
+        _run_skill_review_content(snapshot, agent_id, task, base_ctx)
+    elif task.get('research'):
+        _run_research_content(snapshot, agent_id, task, base_ctx)
+    elif task.get('projectLabel'):
+        _run_research_project_content(snapshot, agent_id, task, base_ctx)
+    else:
+        _run_research_bare_content(snapshot, agent_id, task, base_ctx)
+
+
 def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
     """The router registered as sim._content_executor. Decides by task.room +
     task flags which real content executor runs, mirroring arriveAtTask's
     dispatch + runResearchTask's branch split. Rooms with no ported executor
     (bank / library / postoffice / unset) are NOT dispatched -- those fall back
-    to the slice-1 workUntil placeholder."""
-    room = task.get('room')
-    if task.get('taskType') == 'spike':
-        # A spike is room-agnostic: it's an investigation, not the room's craft,
-        # so route it to the spike findings executor before any room logic.
-        _run_spike_content(snapshot, agent_id, task, base_ctx)
-    elif task.get('taskType') == 'review' or task.get('taskType') == 'qa':
+    to the slice-1 workUntil placeholder.
+
+    Registry conversion (2026-09-25): was a single if/elif chain: taskType
+    checked before room (a review/spike overrides whatever room it's queued
+    into -- see each branch's own reasoning below), room itself a flat match
+    except observatory's flag-based sub-dispatch (now _run_observatory_content,
+    same shape as every other room executor). Built HERE, not as module-level
+    dict literals, so this function can stay where it naturally reads first in
+    the file without caring that most _run_*_content executors are defined
+    further down -- by the time this runs (per-task, at simulation runtime)
+    the whole module has already finished loading, so the forward references
+    are always valid."""
+    task_type_executors = {
+        # A spike is room-agnostic: an investigation, not the room's craft.
+        'spike': _run_spike_content,
         # A peer-gate review/QA pass inherits its PARENT story's room (the
         # deliverable is where it was built -- e.g. an observatory research
-        # bulletin). Dispatch by taskType BEFORE room, so a review in any room
-        # emits the peerVerdict the parent gate needs. The room-specific
-        # executors below only produce research/craft notes, never a verdict;
-        # letting a review fall through to them silently drops the vote and
-        # wedges the story open in 'needs_review' forever (the infinite fork).
-        _run_review_content(snapshot, agent_id, task, base_ctx)
-    elif room == 'observatory':
-        if task.get('distill'):
-            _run_distill_content(snapshot, agent_id, task, base_ctx)
-        elif task.get('skillReview'):
-            _run_skill_review_content(snapshot, agent_id, task, base_ctx)
-        elif task.get('research'):
-            _run_research_content(snapshot, agent_id, task, base_ctx)
-        elif task.get('projectLabel'):
-            _run_research_project_content(snapshot, agent_id, task, base_ctx)
-        else:
-            _run_research_bare_content(snapshot, agent_id, task, base_ctx)
-    elif room == 'weatherstation':
-        _run_weather_content(snapshot, agent_id, task, base_ctx)
-    elif room == 'media':
-        _run_media_content(snapshot, agent_id, task, base_ctx)
-    elif room == 'pressoffice':
-        _run_workroom_content(snapshot, agent_id, task, base_ctx)
-    elif room == 'bank':
-        _run_bank_content(snapshot, agent_id, task, base_ctx)
-    # else: library / postoffice / unset -> placeholder.
+        # bulletin). Checked before room so a review in ANY room emits the
+        # peerVerdict the parent gate needs -- the room-specific executors
+        # only produce research/craft notes, never a verdict; letting a
+        # review fall through to them silently drops the vote and wedges the
+        # story open in 'needs_review' forever (the infinite fork).
+        'review': _run_review_content,
+        'qa': _run_review_content,
+    }
+    room_executors = {
+        'observatory': _run_observatory_content,
+        'weatherstation': _run_weather_content,
+        'media': _run_media_content,
+        'pressoffice': _run_workroom_content,
+        'bank': _run_bank_content,
+        # library / postoffice / unset -> no entry -> placeholder (unchanged).
+    }
+    executor = task_type_executors.get(task.get('taskType')) or room_executors.get(task.get('room'))
+    if executor:
+        executor(snapshot, agent_id, task, base_ctx)
 
 
 def _agent_name(snapshot, agent_id):
