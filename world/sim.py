@@ -1470,6 +1470,17 @@ def queue_work(state, items):
             # to a specific team is pinned to that team's on-call worker, same
             # pin-and-wake treatment as an incident -- see _assign_due_item.
             'directRoute': bool(item.get('directRoute')),
+            # Real gap found 2026-09-25: filing a story against a specific
+            # team never meant it would be WORKED by that team -- assignment
+            # (_assign_due_item) is village-wide round robin with zero team
+            # awareness, only reviewer selection (_pick_reviewer_ids) ever
+            # preferred same-team. teamId is the director id owning this item
+            # (the queue-item-level analog of a backlogRequest's teamId), used
+            # by _assign_due_item to PREFER that team the same soft way
+            # _pick_reviewer_ids already does -- never a hard lock like an
+            # incident's on-call pin, since a small village can't afford to
+            # starve one team's queue while another sits idle.
+            'teamId': item.get('teamId') or None,
             'sprintId': item.get('sprintId') or None,
             # Phase E: a pressoffice task may target a product (its build
             # releases the artifact) and carry optional pre-injected wiki pages.
@@ -5152,10 +5163,15 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
             req['status'] = 'accepted'
             # queue_work whitelists fields, so the provenance (filer/groomer/
             # room/title) lives on the durable `backlogRequests` record + the
-            # digest -- not on the queue item.
+            # digest -- not on the queue item. teamId is the one exception
+            # (2026-09-25): _assign_due_item needs it to PREFER this team at
+            # assignment time (see queue_work's own comment on the field) --
+            # req['teamId'] is already known here (the grooming ceremony
+            # itself is per-team), it just never survived onto the real task.
             queue_work(state, [{
                 'title': req['title'], 'room': req['room'], 'goal': req.get('title'),
                 'instructions': (f"Filed by {filed_by} during backlog refinement. {req.get('reason')}"),
+                'teamId': req.get('teamId'),
             }])
             accepted.append(req)
         else:
@@ -6388,6 +6404,20 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         pointer = rr.get('task', 0)
         # First eligible index at/after the pointer.
         ordered = [cid for cid in candidates if cid in agents]
+        # Real gap found 2026-09-25: a story filed against a specific team
+        # (pick['teamId']) had zero team preference at assignment -- only
+        # reviewer selection (_pick_reviewer_ids) ever preferred same-team.
+        # SOFT preference only, same shape as that precedent: narrow to the
+        # team's own free members when any exist, else fall back to the full
+        # village pool unchanged. Never a hard lock (unlike an incident's
+        # on-call pin) -- a small village can't afford to starve one team's
+        # queue while another sits idle just because its own members are busy.
+        team_id = pick.get('teamId')
+        if team_id:
+            team_members = set(_sim_direct_reports(state, team_id))
+            team_ordered = [cid for cid in ordered if cid in team_members]
+            if team_ordered:
+                ordered = team_ordered
         if not ordered:
             return None
         idx = pointer % len(ordered)
