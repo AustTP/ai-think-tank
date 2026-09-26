@@ -1489,10 +1489,20 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
               f'{" Method/constraints: " + instructions if instructions else ""}. '
               'Write 2-4 concrete sentences of real findings -- what was tried, '
               'what was learned, and a recommendation. No filler, no release notes.')
+    # Real request (2026-09-26): the player asked whether they'd ever hear
+    # about a spike finishing, on either channel -- they wouldn't have; the
+    # village was reactive-only. notifyPlayer is the (safe, indirect --
+    # _apply_content_result actually queues it) way any executor asks to be
+    # notified on completion, success or failure alike, so silence never
+    # reads as "still working" when it already gave up.
     tier_slug = _serve._mid_tier_slug()
     if not tier_slug:
-        _sim_module._store_content_result(task.get('id'),
-                                          {'note': f'Spiked "{backlog}", but no model tier is configured yet.', 'ok': False})
+        _sim_module._store_content_result(task.get('id'), {
+            'note': f'Spiked "{backlog}", but no model tier is configured yet.', 'ok': False,
+            'notifyPlayer': {'kind': 'spike_done',
+                             'subject': f'[AI Village] Spike stalled: {backlog[:80]}',
+                             'body': f'{name} tried to spike "{backlog}" but no model tier is configured yet -- nothing was actually attempted.'},
+        })
         return
     r = _serve._http_json('POST', base, '/api/chat',
                    {'model': tier_slug,
@@ -1501,8 +1511,12 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                     'agentId': agent_id}, key)
     finding = (r.get('reply') or r.get('content') or '').strip() if isinstance(r, dict) else ''
     if not finding:
-        _sim_module._store_content_result(task.get('id'),
-                                          {'note': f'Spiked "{backlog}", but the model call returned nothing usable.', 'ok': False})
+        _sim_module._store_content_result(task.get('id'), {
+            'note': f'Spiked "{backlog}", but the model call returned nothing usable.', 'ok': False,
+            'notifyPlayer': {'kind': 'spike_done',
+                             'subject': f'[AI Village] Spike came up empty: {backlog[:80]}',
+                             'body': f'{name} looked into "{backlog}" but the model call returned nothing usable. You may want to ask again or rephrase it.'},
+        })
         return
     _serve._http_json('POST', base, '/api/library/file',
                {'agentId': agent_id,
@@ -1517,9 +1531,16 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # library file above, task.note in the hot kv_state blob serialized on
     # every save, and the agent's profile). Every other executor already uses
     # a short summary here; the full finding's one real home is the library
-    # file just written.
-    _sim_module._store_content_result(task.get('id'),
-                                      {'note': f'{name} spiked "{backlog}" -- see the Library entry just filed.', 'ok': True})
+    # file just written. The notification email/Telegram push below is a
+    # THIRD, deliberate exception to that same rule -- the player asking to
+    # be told what was found is a genuinely different need than the durable
+    # task record staying lean, not a regression of the same bug.
+    _sim_module._store_content_result(task.get('id'), {
+        'note': f'{name} spiked "{backlog}" -- see the Library entry just filed.', 'ok': True,
+        'notifyPlayer': {'kind': 'spike_done',
+                         'subject': f'[AI Village] Spike done: {backlog[:80]}',
+                         'body': f'{name} looked into "{backlog}":\n\n{finding[:1500]}'},
+    })
 
 
 def _run_workroom_content(snapshot, agent_id, task, base_ctx=None):

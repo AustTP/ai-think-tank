@@ -1291,6 +1291,15 @@ def _apply_content_result(state, task, result):
         # A gate review that must go BACK to the same author + the same gate
         # carries the parent id; a free-form pressoffice fix does not.
         queue_work(state, [qf])
+    # Real request (2026-09-26): a content executor (currently just spikes)
+    # can ask to notify the player when it lands, same safe indirection as
+    # queueFix above -- executors run off-thread with only a read-oriented
+    # snapshot, so they report the WISH here rather than calling
+    # _queue_player_email directly; this runs inside the tick's real
+    # read-modify-write, where state is actually the live, mutable object.
+    notify = result.get('notifyPlayer')
+    if notify and notify.get('kind') and notify.get('subject') and notify.get('body'):
+        _queue_player_email(state, notify['kind'], notify['subject'], notify['body'])
     # Peer-approval gate (Phase E addendum): when the completing task is a
     # review subtask carrying a `reviewOf` pointer, fold its Jev verdict into
     # the PARENT task's gate -- clean = +1 approval (distinct reviewers only),
@@ -3189,6 +3198,15 @@ def _close_gated_story(state, parent):
                     'approvers': review_counts.get('approvers', [])}, authorized=True)
     except Exception:
         pass
+    # Real request (2026-09-26): entering review deliberately stays quiet
+    # (peer review is agent-to-agent, per the 2026-09-24 call) but a story
+    # actually SHIPPING is exactly the "you'll want to know this" moment the
+    # player was asking about -- called directly (not via the notifyPlayer
+    # indirection content executors need) since this already runs inside the
+    # tick's real read-modify-write with live, mutable `state` in hand.
+    title = parent.get('title') or parent.get('projectLabel') or 'a story'
+    _queue_player_email(state, 'story_done', f'[AI Village] Shipped: {title[:80]}',
+                        f'"{title}" just landed after {review_counts.get("approvals", 0)} peer approval(s).')
     return True
 
 
@@ -4352,28 +4370,35 @@ def _queue_player_email(state, kind, subject, body_text, now_ms=None):
 
 
 def _drain_email_outbox_sync(state):
-    """Best-effort synchronous send of every queued player email on this state's
-    outbox; clears the outbox regardless so a permanent SMTP failure doesn't
-    wedge the queue. Calls into serve lazily (side-effect), returns a list of
-    (kind, ok) results. Pure callers never hit the network."""
+    """Best-effort synchronous send of every queued player notification on
+    this state's outbox, on BOTH channels (2026-09-26: was email-only --
+    the village had no proactive push at all before this, only a reactive
+    reply when the player texted in first). Clears the outbox regardless so
+    a permanent SMTP/Telegram failure doesn't wedge the queue. Calls into
+    serve lazily (side-effect), returns a list of (kind, emailOk, telegramOk)
+    results. Pure callers never hit the network."""
     outbox = state.get('emailOutbox') or []
     if not outbox:
         return []
     results = []
     try:
-        from serve import send_player_email_sync
+        from serve import send_player_email_sync, send_player_telegram_sync
     except Exception as e:  # pragma: no cover - import failure only
         print(f'[email] drain unavailable: {e}')
         state['emailOutbox'] = []
-        return [('import', False)]
+        return [('import', False, False)]
     for entry in list(outbox):
         try:
-            ok = send_player_email_sync(entry.get('subject'),
-                                        entry.get('body'))
+            email_ok = send_player_email_sync(entry.get('subject'), entry.get('body'))
         except Exception as e:  # pragma: no cover
-            ok = False
+            email_ok = False
             print(f'[email] send raised: {e}')
-        results.append((entry.get('kind'), bool(ok)))
+        try:
+            telegram_ok = send_player_telegram_sync(entry.get('subject'), entry.get('body'))
+        except Exception as e:  # pragma: no cover
+            telegram_ok = False
+            print(f'[telegram] player push raised: {e}')
+        results.append((entry.get('kind'), bool(email_ok), bool(telegram_ok)))
     state['emailOutbox'] = []
     return results
 

@@ -2983,6 +2983,32 @@ def send_player_email_sync(subject, body_text):
     return _send_player_email_sync(subject, body_text)
 
 
+def send_player_telegram_sync(subject, body_text):
+    """Real request (2026-09-26): the village was reactive-only on Telegram --
+    it could reply to an incoming message but never push anything on its own,
+    so a spike/story finishing generated no notice on either channel unless
+    it happened to be one of the two existing email triggers (agent_ask,
+    card_blocked). This is the proactive half: same outbox entry, same
+    dedup/drain mechanism as send_player_email_sync (sim.py's
+    _drain_email_outbox_sync calls both for every entry), just a second
+    best-effort delivery channel. No-op (returns False, never raises) if the
+    bridge isn't configured -- mirrors every other optional-integration gate
+    in this file (AGENT_BROWSING_ENABLED, TAVILY_API_KEY). Telegram has no
+    separate subject line, so it's folded into the message text."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS):
+        return False
+    text = f"{subject}\n\n{body_text}" if subject else body_text
+    ok = False
+    for chat_id in TELEGRAM_ALLOWED_CHAT_IDS:
+        try:
+            result = _telegram_api_sync('sendMessage', {'chat_id': chat_id, 'text': text})
+        except Exception as e:
+            print(f'[telegram] player push failed for {chat_id}: {e}', flush=True)
+            result = None
+        ok = ok or (result is not None)
+    return ok
+
+
 def provision_player_email(app_password):
     """Admin endpoint body: validate + store the Gmail app-password in the vault,
     then fire a self-test so provisioning is verified, not assumed. Returns a
