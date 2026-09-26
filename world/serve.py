@@ -2758,6 +2758,29 @@ def _get_or_create_admin_credentials():
 ADMIN_USERNAME, ADMIN_PASSWORD_SALT, ADMIN_PASSWORD_HASH, _GENERATED_PASSWORD = _get_or_create_admin_credentials()
 
 
+def _get_or_create_device_key():
+    # Real request (2026-09-26): a device (an iOS Shortcut, to start) that
+    # isn't a player browser session (no cookie support) and isn't an AI
+    # agent (agent_keys are per-agent, not per-device) needs its own bearer
+    # credential. One player, one phone today -- a single token, not a
+    # per-device table; that's real complexity for a need that doesn't exist
+    # yet. Same "auto-generate, persist, surface once" shape as the admin
+    # password above, but compared directly (secrets.compare_digest) like
+    # agent_keys/TELEGRAM_BOT_TOKEN, not hashed -- this is a bearer token
+    # presented on every request, not a human-typed password.
+    env = _load_env()
+    key = env.get('DEVICE_API_KEY')
+    if key:
+        return key, None
+    key = secrets.token_urlsafe(24)
+    with open(os.path.join(VILLAGE_DIR, '.env'), 'a') as f:
+        f.write(f'\nDEVICE_API_KEY={key}\n')
+    return key, key  # second value set only when freshly generated -- print it once
+
+
+DEVICE_API_KEY, _GENERATED_DEVICE_KEY = _get_or_create_device_key()
+
+
 def create_session():
     session_id = secrets.token_urlsafe(32)
     now = time.time()
@@ -5425,6 +5448,46 @@ async def test_player_email(request: Request):
         'This is a self-test from your AI Village. Notifications are delivered to this address.')
     log_action('player', 'player_email_test', {'sent': bool(ok)}, authorized=True)
     return JSONResponse({'ok': True, 'sent': bool(ok)})
+
+
+@app.post('/api/device/checkin')
+async def device_checkin(request: Request):
+    """A phone (an iOS Shortcut, to start) reports its own current location/
+    battery/Focus/Wi-Fi. Self-guarded like /api/chat -- NOT in
+    AUTH_PROTECTED_PREFIXES (that middleware only recognizes a player session
+    or an agent key, neither of which a Shortcut can hold), checks its own
+    bearer credential instead. Body is deliberately open-ended -- every field
+    optional, no fixed schema -- so a future field or device never needs this
+    endpoint redesigned, just a new key in the same dict. No LLM/Jev call
+    involved (pure data storage), so unlike task-driving endpoints this is
+    NOT gated by _dormant() -- a check-in should land even while the village
+    is asleep."""
+    presented = request.headers.get('X-Device-Key')
+    if not presented or not secrets.compare_digest(presented, DEVICE_API_KEY):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    if not body:
+        return JSONResponse({'error': 'empty body'}, status_code=400)
+    loc = body.get('location')
+    if loc is not None and not (isinstance(loc, dict) and isinstance(loc.get('lat'), (int, float))
+                                 and isinstance(loc.get('lon'), (int, float))):
+        return JSONResponse({'error': 'location, if present, must be {lat, lon}'}, status_code=400)
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    import sim as _sim
+    entry = _sim.record_device_checkin(state, {
+        'location': loc, 'battery': body.get('battery'),
+        'focus': body.get('focus'), 'wifi': body.get('wifi'),
+        'trigger': body.get('trigger'),
+    })
+    save_state_to_db(state)
+    log_action('player', 'device_checkin', {'trigger': body.get('trigger'),
+              'hasLocation': loc is not None}, authorized=True)
+    return JSONResponse({'ok': True, 'storedAt': entry['receivedAt']})
 
 
 @app.post('/api/teams/{team_id}/prefix')
@@ -9648,6 +9711,11 @@ if __name__ == '__main__':
         print('=' * 60, flush=True)
     else:
         print(f'[auth] admin account: {ADMIN_USERNAME} (password already set -- not shown)', flush=True)
+    if _GENERATED_DEVICE_KEY:
+        print('=' * 60, flush=True)
+        print('[device] First run -- device check-in key created.', flush=True)
+        print(f'[device] X-Device-Key: {_GENERATED_DEVICE_KEY}  (shown once -- save it)', flush=True)
+        print('=' * 60, flush=True)
     if EXECUTION_ENABLED:
         try:
             ensure_sandbox_networking()

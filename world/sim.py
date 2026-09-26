@@ -2468,6 +2468,31 @@ def add_research_topic(state, topic, start_url, cadence_ms, now_ms=None,
     return record
 
 
+_DEVICE_CHECKIN_HISTORY_MAX = 50  # bounded ring buffer -- no consumer yet, but never unbounded growth
+
+
+def record_device_checkin(state, fields, now_ms=None):
+    """Record one check-in from the player's phone (POST /api/device/checkin,
+    serve.py). Pure state mutation, no consumer wired up yet (2026-09-26) --
+    the whole point was landing a clean, generic ingestion pipe first and
+    deciding what to build on top once data is actually flowing. `fields`
+    is whatever the caller received (location/battery/focus/wifi/trigger
+    today, deliberately open to more later); None values are dropped rather
+    than stored as noise. Keeps only the last _DEVICE_CHECKIN_HISTORY_MAX
+    entries -- state['deviceCheckins'] lives in the same hot kv_state blob
+    every other piece of state does, so this must never grow unbounded."""
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    entry = {k: v for k, v in (fields or {}).items() if v is not None}
+    entry['receivedAt'] = now_ms
+    bucket = state.setdefault('deviceCheckins', {'last': None, 'history': []})
+    bucket['last'] = entry
+    history = bucket.setdefault('history', [])
+    history.append(entry)
+    if len(history) > _DEVICE_CHECKIN_HISTORY_MAX:
+        del history[:-_DEVICE_CHECKIN_HISTORY_MAX]
+    return entry
+
+
 def _check_schedules(state, now, now_ms):
     """Port of tasks.js checkResearchSchedule + checkSkillReviewSchedule: queue
     due standing work, stamping lastRunAt/lastSkillReviewAt BEFORE assignment so
