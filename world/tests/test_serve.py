@@ -511,6 +511,57 @@ class JevTierGate(unittest.TestCase):
         self._decision, self._confidence = 'maybe', 0.9
         self.assertEqual(self._resolve('anything'), 'low-model')
 
+    def test_high_rejected_when_monthly_high_tier_budget_spent(self):
+        # Even with JEV confidently saying high, if the month's high-tier
+        # allowance is consumed the gate fails CLOSED to mid -- the expensive
+        # tier never overruns its budget.
+        self._decision, self._confidence = 'high', 0.9
+        with unittest.mock.patch.object(serve, '_high_tier_budget_exceeded', return_value=True):
+            self.assertEqual(self._resolve('decompose huge request', allow_high=True), 'mid-model')
+
+    def test_high_allowed_when_budget_fresh(self):
+        self._decision, self._confidence = 'high', 0.9
+        with unittest.mock.patch.object(serve, '_high_tier_budget_exceeded', return_value=False):
+            self.assertEqual(self._resolve('decompose huge request', allow_high=True), 'high-model')
+
+
+class HighTierPriceCeiling(unittest.TestCase):
+    # The daily refresh must never OFFER the high tier a model priced above
+    # HIGH_TIER_MAX_PRICE_USD -- price is a hard bound for the expensive tier,
+    # not a tiebreak settled after the fact.
+
+    def _model(self, id_, price):
+        return {'id': id_, 'name': id_, 'price': price}
+
+    def test_high_tier_price_ceiling_filters_over_priced_models(self):
+        # The ceiling applies only to the high band and only when set; an
+        # over-ceiling model (even a top scorer) is dropped from the pool.
+        models = [
+            self._model('vendor/cheap-good', 2.00),
+            self._model('vendor/mid-good', 4.50),
+            self._model('vendor/expensive-best', 30.00),
+        ]
+        with unittest.mock.patch.object(serve, 'HIGH_TIER_MAX_PRICE_USD', 5.0):
+            filtered = serve._apply_band_price_ceiling('high', models)
+        ids = [m['id'] for m in filtered]
+        self.assertIn('vendor/cheap-good', ids)
+        self.assertIn('vendor/mid-good', ids)
+        self.assertNotIn('vendor/expensive-best', ids, 'over-ceiling model must never be offered for high')
+        self.assertTrue(all(m['price'] <= 5.0 for m in filtered))
+
+    def test_high_tier_price_ceiling_noop_when_disabled(self):
+        models = [self._model('vendor/whatever', 999.0)]
+        with unittest.mock.patch.object(serve, 'HIGH_TIER_MAX_PRICE_USD', 0.0):
+            filtered = serve._apply_band_price_ceiling('high', models)
+        self.assertEqual([m['id'] for m in filtered], ['vendor/whatever'])
+
+    def test_high_tier_price_ceiling_does_not_affect_other_bands(self):
+        models = [self._model('vendor/mid', 10.0)]
+        with unittest.mock.patch.object(serve, 'HIGH_TIER_MAX_PRICE_USD', 5.0):
+            filtered = serve._apply_band_price_ceiling('mid', models)
+        self.assertEqual([m['id'] for m in filtered], ['vendor/mid'],
+                         'the ceiling is high-tier-only')
+
 
 class AuthSessions(unittest.TestCase):
     @classmethod
