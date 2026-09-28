@@ -274,15 +274,20 @@ class BankContent(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return seen
 
-    def test_worker_is_deflected_to_director(self):
+    def test_worker_gets_readonly_cumulative_view(self):
+        # A worker (non-director) gets a READ-ONLY cumulative summary -- hive-mind
+        # awareness of village spend (2026-09-24). Only reallocation AUTHORITY is
+        # director-only; visibility into "are we healthy" is not.
         snap = _snapshot()
         seen = self._store()
         task = {'id': 't1', 'room': 'bank', 'title': 'check the budget'}
         with unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={'a': {'used': 1.0, 'calls': 1, 'lastAt': 'x', 'byDay': {d: 1.0 for d in _last_n_days(7)}}}):
             serve._run_bank_content(snap, 'ben', task)
         note = seen['t1']['note']
-        self.assertIn('budget authority belongs to the directors', note)
-        self.assertNotIn('$1.00', note)  # worker never sees the ledger
+        # Worker sees the cumulative spend (read-only), not per-service reallocation.
+        self.assertIn('$1.00', note)
+        self.assertIn('cumulative budget', note)
+        self.assertNotIn('reallocate', note)  # no director authority in a worker's view
 
     def test_director_gets_cumulative_view(self):
         snap = _snapshot()
