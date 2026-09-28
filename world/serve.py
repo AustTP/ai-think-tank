@@ -262,8 +262,17 @@ def init_db():
             action TEXT NOT NULL,
             details TEXT,
             authorized INTEGER,
-            ts REAL NOT NULL
+            ts REAL NOT NULL,
+            trace_id TEXT
         )''')
+        # Audit trace linkage (2026-09-28): trace_id ties a JEV decision
+        # (decision_tape) to the resulting tool outcomes (action_log) in a
+        # single queryable chain, so "what decision led to this action" is
+        # explicit rather than relying on a loose (ts, agent_id) heuristic.
+        try:
+            conn.execute('ALTER TABLE action_log ADD COLUMN trace_id TEXT')
+        except Exception:
+            pass  # column already exists (idempotent)
         # index drug (2026-09-27): per-agent lookups (peer review, firing
         # review, passport audit) scan the whole table otherwise -- with no
         # index action_log grew to 295MB/216k rows and every agent query was a
@@ -288,12 +297,17 @@ def init_db():
             confidence REAL,
             cost REAL,
             raw TEXT NOT NULL,
-            ok INTEGER NOT NULL
+            ok INTEGER NOT NULL,
+            trace_id TEXT
         )''')
         # Same unindexed-scan class as action_log above: decision_tape grew to
         # 641MB/223k rows with no index, so any time-windowed read full-scans
         # it. Index on ts (primary ordering key).
         conn.execute('CREATE INDEX IF NOT EXISTS idx_decision_tape_ts ON decision_tape(ts)')
+        try:
+            conn.execute('ALTER TABLE decision_tape ADD COLUMN trace_id TEXT')
+        except Exception:
+            pass
         conn.execute('''CREATE TABLE IF NOT EXISTS model_tiers (
             band TEXT PRIMARY KEY,
             slug TEXT NOT NULL,
@@ -1209,7 +1223,7 @@ def sync_prototypes(agent_id, sandbox_dir):
         print(f'[agent-dirs] prototypes sync failed for {agent_id}: {e}')
 
 
-def log_action(agent_id, action, details=None, authorized=None):
+def log_action(agent_id, action, details=None, authorized=None, trace_id=None):
     # The single, comprehensive activity log -- per your call to log all
     # actions, not just the ones a specific feature happened to write to
     # its own file. `authorized` is None for actions that have no
@@ -1218,8 +1232,8 @@ def log_action(agent_id, action, details=None, authorized=None):
     # verify_agent_key() below).
     with _db() as conn:
         conn.execute(
-            'INSERT INTO action_log (agent_id, action, details, authorized, ts) VALUES (?, ?, ?, ?, ?)',
-            (agent_id, action, json.dumps(details) if details is not None else None, authorized, time.time()),
+            'INSERT INTO action_log (agent_id, action, details, authorized, ts, trace_id) VALUES (?, ?, ?, ?, ?, ?)',
+            (agent_id, action, json.dumps(details) if details is not None else None, authorized, time.time(), trace_id),
         )
 
 
@@ -1257,14 +1271,20 @@ def _decision_kind(instructions):
     return 'other'
 
 
-def _append_decision_tape(kind, model, prompt, criteria, choice, confidence, cost, raw, ok):
+def _append_decision_tape(kind, model, prompt, criteria, choice, confidence, cost, raw, ok, trace_id=None):
     # Best-effort, bounded record of a Jev decision call. A tape-write failure
     # must never fail the caller (the decision already happened), so swallow it.
+    # `trace_id` (2026-09-28): correlates this decision with the resulting
+    # action_log entry(s) for the same execution chain. Auto-generated here if
+    # the caller didn't supply one; the caller should pass it through to
+    # log_action so actions are traceable back to this decision.
     try:
         with _db() as conn:
+            if trace_id is None:
+                trace_id = secrets.token_hex(8)
             conn.execute(
-                'INSERT INTO decision_tape (ts, kind, model, prompt, criteria, choice, confidence, cost, raw, ok) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                'INSERT INTO decision_tape (ts, kind, model, prompt, criteria, choice, confidence, cost, raw, ok, trace_id) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 (
                     time.time(),
                     kind,
@@ -1276,6 +1296,7 @@ def _append_decision_tape(kind, model, prompt, criteria, choice, confidence, cos
                     cost,
                     raw if isinstance(raw, str) else json.dumps(raw),
                     int(bool(ok)),
+                    trace_id,
                 ),
             )
     except Exception:
@@ -4694,6 +4715,11 @@ def _call_openrouter_decision_sync(model, state, questions):
     # recorded before the caller throws the details away. `_jev_choice` is pure
     # (parses the same data the caller parses), so calling it for the tape adds
     # no behavior beyond the row itself.
+    #
+    # A single trace_id is generated per call and stamped on both the tape entry
+    # and (if the caller extracts it from the returned data) the resulting tool
+    # action(s) in action_log, so the decision chain is queryably self-consistent.
+    trace_id = secrets.token_hex(8)
     if _village_spend_cap_exceeded():
         raise RuntimeError(f'Village spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     prompt = (questions or {}).get('choice', {}).get('instructions') if isinstance(questions, dict) else None
@@ -4718,6 +4744,7 @@ def _call_openrouter_decision_sync(model, state, questions):
         _append_decision_tape(
             _decision_kind(prompt), model, prompt, criteria,
             None, None, None, {'error': 'decision call raised'}, False,
+            trace_id=trace_id,
         )
         raise
     choice, confidence, cost = _jev_choice(data)
@@ -4732,7 +4759,9 @@ def _call_openrouter_decision_sync(model, state, questions):
     _append_decision_tape(
         _decision_kind(prompt), model, prompt, criteria,
         choice, confidence, cost, data, True,
+        trace_id=trace_id,
     )
+    data['trace_id'] = trace_id
     return data
 
 
@@ -9071,6 +9100,25 @@ async def chat(request: Request):
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
     if not model or not messages:
         return JSONResponse({'error': 'model and messages are required'}, status_code=400)
+    # Input pattern guard (2026-09-28): fast, deterministic injection-vector
+    # check BEFORE the call reaches the model. Scans the concatenated message
+    # text for known prompt-injection patterns (ignore previous instructions,
+    # tone override, system-prompt extraction, role-play inversion). A match
+    # is rejected as 400 with an audit log entry so the player can see whether
+    # an agent or an external source triggered it -- not silently dropped.
+    _INPUT_GUARD_PATTERNS = (
+        r'(?i)(ignore|forget|override|disregard|skip)\s+(all\s+)?(previous|prior|the\s+above)',
+        r'(?i)(you\s+are\s+now|from\s+now\s+on|your\s+new\s+role|act\s+as)',
+        r'(?i)system\s+(prompt|instruction|message|override)\s*(:|is|:)',
+        r'(?i)(reveal|show|print|output|leak|display)\s+(your|the)\s+(prompt|system|instructions)',
+    )
+    for msg in (messages or []):
+        text = (msg.get('content') or '') if isinstance(msg, dict) else ''
+        if any(re.search(p, text) for p in _INPUT_GUARD_PATTERNS):
+            log_action(agent_id, 'chat_input_guard_blocked',
+                       {'model': model, 'patterns_matched': [str(p) for p in _INPUT_GUARD_PATTERNS if re.search(p, text)]},
+                       authorized=authorized)
+            return JSONResponse({'error': 'Blocked by input guard (potential prompt injection)'}, status_code=400)
     # 300 was sized for a short in-character 1:1 reply -- real gap caught
     # live: assignBigTask()'s structured multi-subtask JSON breakdown got
     # silently truncated mid-response by this same cap, producing invalid

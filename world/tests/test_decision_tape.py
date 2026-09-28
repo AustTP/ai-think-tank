@@ -58,6 +58,10 @@ class DecisionTapeTests(unittest.TestCase):
         with unittest.mock.patch('serve._urlopen_with_resilience',
                                  return_value=json.dumps(_jev_response()).encode()):
             data = serve._call_openrouter_decision_sync('typesafe/jev-1.13', {}, questions)
+        self.assertIsNotNone(data.get('trace_id'))
+        # trace_id is a per-call nonce -- strip for the structural comparison
+        trace_id = data.pop('trace_id', None)
+        self.assertIsNotNone(trace_id)
         self.assertEqual(data, _jev_response())
         with serve._db() as conn:
             rows = self._rows(conn)
@@ -113,6 +117,10 @@ class DecisionTapeTests(unittest.TestCase):
                 'typesafe/jev-1.13', {},
                 {'choice': {'type': 'choice', 'instructions': 'accept or reject',
                             'criteria': {'accept': 'yes'}}})
+        self.assertIsNotNone(data.get('trace_id'))
+        # trace_id is a per-call nonce -- strip for the structural comparison
+        trace_id = data.pop('trace_id', None)
+        self.assertIsNotNone(trace_id)
         self.assertEqual(data, _jev_response())
 
 
