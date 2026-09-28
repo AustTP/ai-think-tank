@@ -248,6 +248,17 @@ def init_db():
             blob TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
+        # Runtime-switchable settings (2026-09-28): a small key/value table
+        # for values that must change without a server restart -- currently
+        # just the Jev decisions-model slug (see _jev_model). Deliberately
+        # NOT auto-refreshed like model_tiers: a new decision model appearing
+        # on OpenRouter is a deliberate operator decision, not something the
+        # village should re-pick for itself daily.
+        conn.execute('''CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
         conn.execute('''CREATE TABLE IF NOT EXISTS agent_keys (
             agent_id TEXT PRIMARY KEY,
             secret_key TEXT NOT NULL,
@@ -4917,6 +4928,46 @@ def _jev_choice(data):
     return choice, confidence, float(cost) if isinstance(cost, (int, float)) else 0.0
 
 
+# The single decisions-type model this project uses (see
+# _call_openrouter_decision_sync for why there's exactly one). The env var /
+# default here is the FALLBACK; the runtime value resolves through _jev_model(),
+# which checks the `settings` DB table first (switchable live via the
+# /api/jev/model admin endpoint, no restart, no daily auto-refresh) and only
+# then falls back to this constant. Centralized so swapping the slug is one
+# change instead of touching ~15 call sites across serve.py, sim.py, content.py
+# and the browser client. serve.py is the authority: /api/decide ignores
+# whatever model a client sends and always uses the resolved value, so a
+# switch takes effect everywhere, including jev.js.
+JEV_MODEL = _load_env().get('JEV_MODEL', 'typesafe/jev-1.13')
+
+
+def _get_setting(key, default=None):
+    try:
+        with _db() as conn:
+            row = conn.execute('SELECT value FROM settings WHERE key = ?', (key,)).fetchone()
+            return row[0] if row else default
+    except Exception:
+        return default
+
+
+def _set_setting(key, value, conn=None):
+    if conn is None:
+        with _db() as conn:
+            return _set_setting(key, value, conn)
+    conn.execute(
+        'INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) '
+        'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
+        (key, value, time.time()),
+    )
+
+
+def _jev_model():
+    """The decisions model this village actually runs on, resolved fresh at
+    call time: DB `settings` row > env/default constant. The DB row is the
+    operator switch (set via /api/jev/model, survives restarts, takes effect
+    immediately -- no process restart needed), and it is never auto-updated."""
+    return _get_setting('jev_model') or JEV_MODEL
+
 # Any safety gate that gets a Jev "allow/approve" below this confidence is
 # treated as "unsure" and escalated to a human instead of acted on -- the
 # intended Jev contract. Only safety gates use this; routine decisions just
@@ -4949,7 +5000,7 @@ async def _jev_quorum_decision(instructions, criteria):
     unreachable classifier is not consent to skip the gate."""
     async def sample():
         data = await asyncio.to_thread(
-            _call_openrouter_decision_sync, 'typesafe/jev-1.13',
+            _call_openrouter_decision_sync, _jev_model(),
             {'messages': [], 'signals': {}},
             {'choice': {'type': 'choice', 'instructions': instructions, 'criteria': criteria}},
         )
@@ -5015,7 +5066,7 @@ def _jev_quorum_choice_sync(instructions, criteria):
     unchanged."""
     def sample():
         data = _call_openrouter_decision_sync(
-            'typesafe/jev-1.13', {'messages': [], 'signals': {}},
+            _jev_model(), {'messages': [], 'signals': {}},
             {'choice': {'type': 'choice', 'instructions': instructions, 'criteria': criteria}})
         return _jev_choice(data)
 
@@ -5432,7 +5483,7 @@ async def refresh_model_tiers():
             candidates = [{'id': m['id'], 'description': f"{m['name']} -- ${m['price']:.3f}/M tokens"} for m in shortlist]
             try:
                 data = await asyncio.to_thread(
-                    _call_openrouter_decision_sync, 'typesafe/jev-1.13',
+                    _call_openrouter_decision_sync, _jev_model(),
                     {'messages': [], 'signals': {}},
                     {'choice': {'type': 'choice', 'instructions': f'Picking the {band}-cost model tier for a small village simulation. {purpose}', 'criteria': {c['id']: c['description'] for c in candidates}}},
                 )
@@ -5530,7 +5581,7 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/execute', '/api/pipeline', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/keys', '/api/player-email', '/api/player-inbox')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/execute', '/api/pipeline', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev')
 # Real gap found 2026-09-25: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
@@ -10710,6 +10761,14 @@ HEALTH_ALERT_DEDUP_WINDOW_S = 3600
 # flags it so it's caught while it's happening, not after the budget's gone.
 ANOMALY_WINDOW_S = 15 * 60
 ANOMALY_AGENT_TOOL_THRESHOLD = 60  # >60 tool calls / 15 min per agent
+# Jev availability (2026-09-28): how far back to measure Jev decision
+# failures, and what failure RATE (not raw count) trips the degraded alert.
+# Jev is a single-model/single-provider SPOF with deliberately no circuit
+# breaker, so the health check is what surfaces an outage instead of the
+# colony silently running deterministic fallbacks.
+JEV_HEALTH_WINDOW_S = 60 * 60
+JEV_HEALTH_FAILURE_RATE = 0.5      # >=50% of Jev calls failing = degraded
+JEV_HEALTH_MIN_ATTEMPTS = 10       # don't trip on a handful of attempts
 
 
 def _health_alerts_for_signals(signals):
@@ -10757,6 +10816,20 @@ def _health_alerts_for_signals(signals):
         alert('model_tiers', 'warning',
               f'no chosen model for band(s): {", ".join(signals["missing_model_tier_bands"])} -- '
               f'refresh_model_tiers may not have found a working candidate')
+
+    # Jev availability (2026-09-28): a degraded/absent decisions model is a
+    # SPOF (single slug, single provider, deliberately no circuit breaker) --
+    # when it fails, every Jev feature silently runs its deterministic
+    # fallback. The failure RATE over the window, not a raw count, is the
+    # signal (a busy village blips a call or two and shouldn't alert; a real
+    # outage fails most or all of them).
+    jev_attempts = signals['jev_decision_attempts_last_hour']
+    jev_failures = signals['jev_decision_failures_last_hour']
+    if (jev_attempts >= JEV_HEALTH_MIN_ATTEMPTS
+            and jev_failures >= jev_attempts * JEV_HEALTH_FAILURE_RATE):
+        alert('jev', 'warning',
+              f'{jev_failures}/{jev_attempts} Jev decision call(s) failed in the last hour -- '
+              f'the decisions model may be down, colony running deterministic fallbacks')
 
     # Coordination-pathology check: a lot of review/escalation/re-queue
     # activity with little or nothing actually shipped in the same window is
@@ -10859,6 +10932,17 @@ def compute_health_snapshot():
             "GROUP BY agent_id HAVING COUNT(*) >= ?",
             (now - ANOMALY_WINDOW_S, ANOMALY_AGENT_TOOL_THRESHOLD),
         ).fetchall()
+        # Jev availability (2026-09-28): decision_tape records every Jev call
+        # with its ok flag, so a degrading/absent decisions model (the SPOF --
+        # single slug, single provider, deliberately no circuit breaker) is
+        # visible as a failure rate instead of silently falling back to
+        # deterministic rules for hours. Count attempts AND failures so the
+        # alert can judge the RATIO, not a raw count that a busy village
+        # would trip on with a couple of blips.
+        jev_attempt_rows = conn.execute(
+            'SELECT COUNT(*), SUM(ok = 0) FROM decision_tape WHERE ts > ?',
+            (now - JEV_HEALTH_WINDOW_S,),
+        ).fetchone()
 
     chosen_bands = {row[0] for row in tier_rows}
     signals = {
@@ -10875,6 +10959,12 @@ def compute_health_snapshot():
         'login_failures_last_hour': login_failures,
         'blocked_or_failed_actions_last_hour': {row[0]: row[1] for row in blocked_or_failed_rows},
         'tool_volume_by_agent_last_15m': {row[0]: row[1] for row in tool_volume_rows},
+        # Jev availability: (attempts, failures) over the window. A degraded/
+        # absent decisions model is a SPOF -- single slug, single provider,
+        # no circuit breaker -- so this surfaces an outage as a failure rate
+        # instead of letting the colony run deterministic fallbacks for hours.
+        'jev_decision_attempts_last_hour': jev_attempt_rows[0],
+        'jev_decision_failures_last_hour': jev_attempt_rows[1],
         'model_tier_bands': {row[0]: {'chosen_at': row[1], 'age_hours': (now - row[1]) / 3600} for row in tier_rows},
         'missing_model_tier_bands': [b for b in EXPECTED_MODEL_BANDS if b not in chosen_bands],
         'ceremony_actions_last_24h': ceremony_count,
@@ -11094,7 +11184,11 @@ async def decide(request: Request):
     if not OPENROUTER_API_KEY:
         return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-village/.env'}, status_code=500)
     body = await request.json()
-    model = body.get('model', 'typesafe/jev-1.13')
+    # The resolved JEV model is authoritative -- a client-provided model is
+    # ignored so an operator switch (env or the /api/jev/model DB setting)
+    # takes effect for browser-driven calls too (jev.js sends no model; the
+    # server, not the client, owns which decisions model this village runs on).
+    model = _jev_model()
     state = body.get('state')
     questions = body.get('questions')
     agent_id = body.get('agentId')
@@ -11118,6 +11212,36 @@ async def decide(request: Request):
         return JSONResponse({'error': e.read().decode()}, status_code=e.code)
     except Exception as e:
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.get('/api/jev/model')
+async def jev_model_get():
+    # Read-only for anyone logged in: what decisions model is this village
+    # actually running on right now? Answers via the same _jev_model() the
+    # call sites use, so this always reflects the live value, plus the env/
+    # default fallback for context.
+    return JSONResponse({'model': _jev_model(), 'fallback': JEV_MODEL})
+
+
+@app.post('/api/jev/model')
+async def jev_model_set(request: Request):
+    # Player-only, same session proof as the credential vault/handle minting
+    # (_resolve_requester falls closed to "player" for a misclaimed agent,
+    # which is exactly backwards here): switching the village's decisions
+    # model is an operator action. Writes the `settings` DB row so the switch
+    # survives restarts and takes effect immediately -- no process restart,
+    # and (unlike model_tiers) it is never auto-updated; a new decision model
+    # on OpenRouter is something the player chooses to adopt, deliberately.
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'Jev model switching is player-only'}, status_code=403)
+    body = await request.json()
+    model = (body.get('model') or '').strip()
+    if not model:
+        return JSONResponse({'error': 'model is required'}, status_code=400)
+    _set_setting('jev_model', model)
+    log_action('player', 'jev_model_set', {'model': model}, authorized=True)
+    _append_passport_decision('jev_model_set', 'player', {'model': model})
+    return JSONResponse({'ok': True, 'model': model})
 
 
 @app.post('/api/review/escalate')

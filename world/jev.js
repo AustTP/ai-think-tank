@@ -11,8 +11,10 @@
 // Deliberately generic -- picks one of N labeled candidates given some
 // context, nothing task- or hiring-specific baked in. tasks.js and
 // hiring.js both use this for exactly the kind of classifier "pick one of
-// N" decision Jev is for; neither generates a reply from it.
-const JEV_MODEL = 'typesafe/jev-1.13';
+// N" decision Jev is for; neither generates a reply from it. The decisions
+// model slug lives server-side (serve.py's _jev_model, switchable live via
+// the /api/jev/model admin endpoint or the JEV_MODEL .env fallback) -- the server is authoritative, so /api/decide ignores any model
+// a client sends. This file therefore doesn't hardcode one.
 
 // Confidence at or above this is treated as "act on it"; below it a
 // decision is routed to a human instead of acted on (the Jev contract:
@@ -36,7 +38,6 @@ async function requestJevChoice(instructions, candidates, agentId) {
     const res = await apiFetch('/api/decide', {
       method: 'POST',
       body: JSON.stringify({
-        model: JEV_MODEL,
         agentId: agentId,
         state: { messages: [], signals: {} },
         questions: { choice: { type: 'choice', instructions, criteria } },
