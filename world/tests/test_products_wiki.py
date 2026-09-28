@@ -323,5 +323,71 @@ class WikiEndpoints(unittest.TestCase):
         self.assertIn('ops', r.json()['categories'])
 
 
+class WriteWikiServerAutoSeed(unittest.TestCase):
+    """_write_wiki_server's 'village' auto-seed (2026-09-26): real gap caught
+    live -- distillation's server-owned write path required a 'village' wiki
+    category to already exist, but nothing ever seeds one; it's only ever
+    created via a director manually calling POST /api/intent/wiki/category.
+    A village where nobody happened to do that had every distillation
+    attempt silently fail its write, forever. Real function under test here
+    (unlike test_distill.py's DistillExecutor, which mocks _write_wiki_server
+    entirely) -- isolated the same way WikiEndpoints above is."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='village-wiki-autoseed-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            VILLAGE_DIR=self.tmp,
+            AGENTS_DIR=os.path.join(self.tmp, 'agents'),
+            LIBRARY_DIR=os.path.join(self.tmp, 'library'),
+            SANDBOXES_DIR=os.path.join(self.tmp, 'sandboxes'),
+            PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
+            _FERNET_EDEK_DIR=os.path.join(self.tmp, '.secret_keys'),
+            _FERNET_EDEK_PATH=os.path.join(self.tmp, '.secret_keys', 'edek.key'),
+        )
+        self._cm.start()
+        serve.init_db()
+
+    def tearDown(self):
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_writes_successfully_when_village_category_is_missing_and_auto_seeds_it(self):
+        state = _make_product_state()  # only has 'workroom'/'research' categories
+        serve.save_state_to_db(state)
+        record = serve._write_wiki_server('state-of-knowledge', 'Village state of knowledge',
+                                          'village', 'Merged village knowledge.')
+        self.assertIsNotNone(record, 'the write must succeed, not silently fail')
+        persisted = serve.get_state_from_db()
+        self.assertIn('village', persisted['wiki']['categories'])
+        body_path = os.path.join(self.tmp, 'library', 'wiki', 'village', 'state-of-knowledge.md')
+        self.assertTrue(os.path.isfile(body_path))
+
+    def test_does_not_auto_seed_an_arbitrary_missing_category(self):
+        # Only 'village' is special-cased (a hardcoded system constant the
+        # server-owned path itself depends on) -- any other missing category
+        # still fails closed exactly as before, no silent auto-creation.
+        state = _make_product_state()
+        serve.save_state_to_db(state)
+        record = serve._write_wiki_server('p', 'P', 'nonexistent-category', 'body')
+        self.assertIsNone(record)
+        persisted = serve.get_state_from_db()
+        self.assertNotIn('nonexistent-category', persisted['wiki']['categories'])
+
+    def test_does_not_overwrite_an_already_existing_village_category(self):
+        # A director may already have set a custom label/order for 'village'
+        # -- the auto-seed must only fire when truly missing, never clobber
+        # an existing one back to the generic default.
+        state = _make_product_state()
+        state['wiki']['categories']['village'] = {'label': 'Custom Village Label', 'order': 7}
+        serve.save_state_to_db(state)
+        record = serve._write_wiki_server('state-of-knowledge', 'T', 'village', 'body')
+        self.assertIsNotNone(record)
+        persisted = serve.get_state_from_db()
+        self.assertEqual(persisted['wiki']['categories']['village'],
+                         {'label': 'Custom Village Label', 'order': 7})
+
+
 if __name__ == '__main__':
     unittest.main()

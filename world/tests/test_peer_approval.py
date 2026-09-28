@@ -451,5 +451,86 @@ class Integration(unittest.TestCase):
         self.assertTrue(closed, 'a closed story must persist as done + gate.closed')
 
 
+class BoundedReviewEscalation(unittest.TestCase):
+    """Bounded review-cycle escalation (2026-09-26): real gap caught live --
+    a promoted follow-up story cycled through review->fix->review 45+ times
+    in under 20 minutes with no bound at all. sim._maybe_escalate_stuck_gate
+    is the shared counter checked from both re-entry mechanisms
+    (_apply_content_result's 'actionable' fold here, and
+    _sweep_stuck_gates's own rescue path -- see test_stuck_gate.py)."""
+
+    def _gated_state(self):
+        state = _state()
+        task = _task()
+        state['tasks'][task['id']] = task
+        sim._enter_peer_review(state, task, now_ms=1000)
+        return state, task
+
+    def _reject(self, state, parent_id, reviewer='ada'):
+        review_task = {'id': f'rev-{reviewer}-{sim.MAX_REVIEW_CYCLES}', 'reviewOf': parent_id,
+                       'assignedTo': reviewer, 'taskType': 'review', 'status': 'working'}
+        sim._apply_content_result(state, review_task, {'note': 'bad', 'peerVerdict': 'actionable'})
+        return state['tasks'][parent_id]
+
+    def test_pure_counter_escalates_exactly_at_the_threshold(self):
+        parent = {'id': 't1', 'title': 'A story'}
+        gate = {}
+        with unittest.mock.patch.object(serve, 'create_escalation') as esc:
+            for i in range(sim.MAX_REVIEW_CYCLES - 1):
+                frozen = sim._maybe_escalate_stuck_gate(parent, gate, 'test reason')
+                self.assertFalse(frozen, f'must not freeze before the threshold (cycle {i+1})')
+            esc.assert_not_called()
+            frozen = sim._maybe_escalate_stuck_gate(parent, gate, 'test reason')
+        self.assertTrue(frozen)
+        self.assertTrue(gate['escalated'])
+        esc.assert_called_once()
+        self.assertIn('A story', esc.call_args.args[1])
+
+    def test_pure_counter_is_idempotent_once_escalated(self):
+        parent = {'id': 't1', 'title': 'A story'}
+        gate = {'escalated': True, 'cycleCount': 99}
+        with unittest.mock.patch.object(serve, 'create_escalation') as esc:
+            frozen = sim._maybe_escalate_stuck_gate(parent, gate, 'test reason')
+        self.assertTrue(frozen)
+        esc.assert_not_called()  # already escalated once -- never re-fires
+        self.assertEqual(gate['cycleCount'], 99)  # doesn't keep counting once frozen
+
+    def test_repeated_rejections_freeze_the_gate_instead_of_looping_forever(self):
+        state, task = self._gated_state()
+        with unittest.mock.patch.object(serve, 'create_escalation') as esc:
+            for _ in range(sim.MAX_REVIEW_CYCLES):
+                parent = self._reject(state, task['id'])
+        self.assertTrue(parent['_peerGate']['escalated'])
+        esc.assert_called_once()
+
+    def test_frozen_gate_stops_resetting_approvals_on_further_rejections(self):
+        state, task = self._gated_state()
+        with unittest.mock.patch.object(serve, 'create_escalation'):
+            for _ in range(sim.MAX_REVIEW_CYCLES):
+                parent = self._reject(state, task['id'])
+        # Manually give it a stray approval, then reject again -- once frozen,
+        # a further rejection must NOT reset it back to 0 (that reset/notify
+        # path is exactly what's supposed to stop once escalated).
+        parent['_peerGate']['approvals'] = 1
+        parent['_peerGate']['approvers'] = ['ada']
+        with unittest.mock.patch.object(serve, 'create_escalation') as esc:
+            self._reject(state, task['id'])
+        self.assertEqual(parent['_peerGate']['approvals'], 1)
+        esc.assert_not_called()  # no re-escalation once already frozen
+
+    def test_below_threshold_still_resets_and_notifies_normally(self):
+        # Regression guard: a normal, small number of real rejections must
+        # keep working exactly as before -- the bound only kicks in once
+        # genuinely exceeded.
+        state, task = self._gated_state()
+        with unittest.mock.patch.object(serve, 'create_escalation') as esc:
+            parent = self._reject(state, task['id'])
+        self.assertFalse(parent['_peerGate'].get('escalated', False))
+        self.assertEqual(parent['_peerGate']['approvals'], 0)
+        kinds = [m.get('kind') for m in state['agents']['ben'].setdefault('mailbox', [])]
+        self.assertIn('peer_review_rejected', kinds)
+        esc.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

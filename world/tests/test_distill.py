@@ -220,5 +220,138 @@ class DistillExecutor(unittest.TestCase):
                       'current wiki is fed to the synthesis model for an incremental merge')
 
 
+class CsvLikeBlockExtraction(unittest.TestCase):
+    """content._extract_csv_like_blocks: the pure detector behind the
+    distill CSV-preservation safety net (2026-09-26). Lazily imports content
+    (matching this file's own established convention, see DistillExecutor
+    and DistillCsvPreservation's local imports below) -- a top-level `import
+    content` here, ahead of any `import serve`, hits a pre-existing circular
+    import (content imports serve; serve's own bottom re-exports from
+    content) that's otherwise never triggered because every OTHER test file
+    that imports content at module level does `import serve` first."""
+
+    @classmethod
+    def setUpClass(cls):
+        import serve  # noqa: F401 -- must load BEFORE content (see class docstring)
+        import content as content_mod
+        cls.content = content_mod
+
+    def test_fenced_csv_block_is_detected(self):
+        text = ('some prose\n\n```csv\nname,url\nAda,https://a.com\n'
+               'Ben,https://b.com\n```\n\nmore prose')
+        blocks = self.content._extract_csv_like_blocks(text)
+        self.assertEqual(len(blocks), 1)
+        self.assertIn('name,url', blocks[0])
+
+    def test_unfenced_csv_like_lines_are_detected(self):
+        text = 'Findings:\nname,url\nAda,https://a.com\nBen,https://b.com\n\nDone.'
+        blocks = self.content._extract_csv_like_blocks(text)
+        self.assertEqual(len(blocks), 1)
+        self.assertIn('Ada,https://a.com', blocks[0])
+
+    def test_short_comma_bearing_prose_is_not_flagged(self):
+        # Two consecutive comma-bearing sentences (ordinary prose, not
+        # tabular data) -- below _DISTILL_CSV_MIN_LINES, must not false-
+        # positive as a CSV.
+        text = 'Ada, Ben, and Cora attended.\nIt went well, overall.'
+        self.assertEqual(self.content._extract_csv_like_blocks(text), [])
+
+    def test_three_comma_bearing_sentences_with_varying_comma_counts_not_flagged(self):
+        # Real gap fixed (2026-09-26): the ORIGINAL loose scan only checked
+        # "any comma present" -- three ordinary prose sentences in a row,
+        # each with at least one comma, would have false-positived as a
+        # CSV. Real CSV rows share their header's column count; these three
+        # sentences have 1, 2, and 1 commas respectively -- inconsistent,
+        # so the tightened (matching comma count) scan correctly rejects it.
+        text = ('The meeting ran long, but it was productive.\n'
+               'Ada, Ben, and Cora all contributed real ideas.\n'
+               'We should follow up, probably next week.')
+        self.assertEqual(self.content._extract_csv_like_blocks(text), [])
+
+    def test_no_csv_returns_empty_list(self):
+        self.assertEqual(self.content._extract_csv_like_blocks('Just plain prose, no data here.'), [])
+
+    def test_fenced_and_loose_scan_do_not_duplicate_the_same_block(self):
+        text = '```csv\nname,url\nAda,https://a.com\nBen,https://b.com\n```'
+        self.assertEqual(len(self.content._extract_csv_like_blocks(text)), 1)
+
+    def test_empty_text_returns_empty_list(self):
+        self.assertEqual(self.content._extract_csv_like_blocks(''), [])
+        self.assertEqual(self.content._extract_csv_like_blocks(None), [])
+
+
+class DistillCsvPreservation(unittest.TestCase):
+    """Deterministic safety net (2026-09-26): the synthesis prompt tells the
+    model to summarize, not re-print, the archives it merges -- the same
+    instruction that already flattened a spike's real CSV into prose during
+    its OWN synthesis. This is the same failure one step downstream: a
+    spike's real CSV, archived verbatim, getting lost when distilled into
+    the wiki. Uses its own harness (not DistillExecutor._run) because that
+    one's mock always echoes the model's OWN input back as the reply, which
+    can never exercise "the model's reply dropped real source data.\""""
+
+    def _run(self, archive_body, wiki_reply, since=0):
+        tmp = tempfile.mkdtemp()
+        archive_dir = os.path.join(tmp, 'archive')
+        os.makedirs(archive_dir, exist_ok=True)
+        mtime = int(_NOW_MS / 1000) - 100
+        p = os.path.join(archive_dir, 'spike.md')
+        with open(p, 'w') as f:
+            f.write(archive_body)
+        os.utime(p, (mtime, mtime))
+
+        import serve as serve_mod
+
+        with mock.patch.object(serve_mod, 'LIBRARY_DIR', tmp), \
+             mock.patch.object(serve_mod, 'LIBRARY_ARCHIVE_DIR', archive_dir), \
+             mock.patch.object(serve_mod, '_mid_tier_slug', return_value='mid-tier'), \
+             mock.patch.object(serve_mod, '_http_json', return_value={'reply': wiki_reply}), \
+             mock.patch.object(serve_mod, 'get_or_create_agent_key', return_value='k'), \
+             mock.patch.object(serve_mod, '_write_wiki_server',
+                               return_value={'id': 'state-of-knowledge', 'title': 't',
+                                             'category': 'village', 'version': 1}) as wk, \
+             mock.patch.object(sim, '_store_content_result'):
+            from content import _run_distill_content
+            _run_distill_content({'agents': {}}, 'ada', _distill_task(distillSince=since))
+        return wk
+
+    def test_csv_dropped_by_the_model_is_appended_back_verbatim(self):
+        archive_body = ('# Spike findings\n\n```csv\nsource,url,method\n'
+                        'OpenAI,https://openai.com,api\nGoogle,https://google.com,scrape\n```\n')
+        wk = self._run(archive_body, wiki_reply='## Merged\n\nSources were investigated.')
+        (_pid, _title, _cat, body), _k = wk.call_args
+        self.assertIn('OpenAI,https://openai.com,api', body)
+        self.assertIn('added automatically', body)
+        self.assertIn('spike.md', body)
+
+    def test_csv_already_preserved_by_the_model_is_not_duplicated(self):
+        archive_body = ('```csv\nsource,url,method\n'
+                        'OpenAI,https://openai.com,api\nGoogle,https://google.com,scrape\n```\n')
+        wiki_reply = ('## Merged\n\n```csv\nsource,url,method\n'
+                     'OpenAI,https://openai.com,api\nGoogle,https://google.com,scrape\n```\n')
+        wk = self._run(archive_body, wiki_reply=wiki_reply)
+        (_pid, _title, _cat, body), _k = wk.call_args
+        self.assertEqual(body.count('OpenAI,https://openai.com,api'), 1)
+        self.assertNotIn('added automatically', body)
+
+    def test_csv_beyond_the_truncated_excerpt_is_still_recovered(self):
+        # The CSV sits past _DISTILL_ARCHIVE_EXCERPT_CHARS -- the synthesis
+        # model never even saw it (a separate failure from paraphrasing it
+        # away), but the safety net reads the archive's FULL body, not the
+        # truncated excerpt, so it's still recovered.
+        import content as content_mod
+        padding = 'x' * (content_mod._DISTILL_ARCHIVE_EXCERPT_CHARS + 500)
+        archive_body = (padding + '\n\n```csv\nsource,url\n'
+                        'OpenAI,https://openai.com\nGoogle,https://google.com\n```\n')
+        wk = self._run(archive_body, wiki_reply='## Merged\n\nNothing further to add.')
+        (_pid, _title, _cat, body), _k = wk.call_args
+        self.assertIn('OpenAI,https://openai.com', body)
+
+    def test_no_csv_in_archive_leaves_the_reply_untouched(self):
+        wk = self._run('Just a prose finding, nothing tabular.', wiki_reply='## Merged\n\nProse.')
+        (_pid, _title, _cat, body), _k = wk.call_args
+        self.assertEqual(body, '## Merged\n\nProse.')
+
+
 if __name__ == '__main__':
     unittest.main()

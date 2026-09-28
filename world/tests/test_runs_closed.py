@@ -124,17 +124,26 @@ class RunsClosed(unittest.TestCase):
         # village resolves with two peer approvals). This test asserts the gated
         # lifecycle persists: primary work done -> needs_review + review subtasks
         # queued + author released off duty.
+        #
+        # A genuine authored deliverable (taskType='code', no `research` marker)
+        # -- NOT a scheduled research task. That used to be this fixture's shape
+        # until a real, confirmed production bug (2026-09-26): task['research']
+        # is exempt from the peer gate now (see _peer_gated_lane), because a
+        # scheduled crawl has no real "fix" a reviewer can send back -- its
+        # "review" always found it actionable (no passing flake8/mypy/pytest-cov
+        # suite to fail cleanly), spiraling one real "weather data" schedule
+        # into 7,408 calls in a single evening before the fix. See
+        # test_scheduled_research_completes_without_gating below for that path.
         calls = {}
 
         def fake_executor(snapshot, agent_id, task, base_ctx):
             calls['room'] = task.get('room')
             calls['id'] = task.get('id')
-            self._real_store(task['id'], {'note': 'collected 1 page, wrote updated skill',
-                                          'seenUrls': ['https://w.example']})
+            self._real_store(task['id'], {'note': 'collected 1 page, wrote updated skill'})
 
         sim._content_executor = fake_executor
         grid, doors = sim._load_outdoor_geometry()
-        self._seed([self._item()])
+        self._seed([self._item(title='Build the widget dashboard', research=None, taskType='code')])
         engine = sim.SimEngine()
         engine._grid, engine._doors = grid, doors
         now = 1000.0
@@ -171,7 +180,7 @@ class RunsClosed(unittest.TestCase):
         self.assertGreaterEqual(len(review_links), 1,
                                 'a review subtask must be queued (or live) for the story')
         self.assertEqual(calls.get('room'), 'observatory',
-                         'a research task must dispatch real content work')
+                         'a deliverable task must dispatch real content work')
         # The author was released (approvedCount bumped) and is off duty, while
         # the story waits for review.
         author = story.get('assignedTo')
@@ -182,12 +191,43 @@ class RunsClosed(unittest.TestCase):
                       'the author must not be stranded on a freshly-assigned task')
         self.assertFalse(author_state.get('busy'),
                          'a gated worker must be released from busy while the story awaits review')
-        # The content result's seenUrl flowed back into the topic (the research
-        # write path), persisted.
+
+    def test_scheduled_research_completes_without_gating(self):
+        # Companion to the gated-lifecycle test above: a scheduled research
+        # task (task['research'] set, as _check_schedules queues it) must
+        # complete straight to 'done' -- never needs_review -- while the
+        # content result's seenUrl still flows back into the topic, exactly
+        # as it always has. See _peer_gated_lane's docstring for the real
+        # production incident this fixes.
+        def fake_executor(snapshot, agent_id, task, base_ctx):
+            self._real_store(task['id'], {'note': 'collected 1 page, wrote updated skill',
+                                          'seenUrls': ['https://w.example']})
+
+        sim._content_executor = fake_executor
+        grid, doors = sim._load_outdoor_geometry()
+        self._seed([self._item()])
+        engine = sim.SimEngine()
+        engine._grid, engine._doors = grid, doors
+        now = 1000.0
+        done = False
+        for _ in range(400):
+            now += sim.SIM_TICK_S
+            state = serve.get_state_from_db()
+            state = engine.tick(state, now=now)
+            serve.save_state_to_db(state)
+            tasks = state.get('tasks') or {}
+            if tasks and any(t.get('status') == 'needs_review' for t in tasks.values()):
+                self.fail('a scheduled research task must never reach needs_review')
+            if tasks and any(t.get('status') == 'done' and t.get('research') for t in tasks.values()):
+                done = True
+                break
+
+        self.assertTrue(done, 'scheduled research task did not reach done after 400 ticks')
+        final = serve.get_state_from_db()
         topics = final.get('researchTopics') or []
         self.assertIn('https://w.example',
                       next((t.get('seenUrls') for t in topics if t.get('id') == 't1'), []),
-                      'content result seenUrl must merge back into the topic')
+                      'content result seenUrl must still merge back into the topic')
 
 
 if __name__ == '__main__':

@@ -3,19 +3,34 @@ own long-lived Docker container, dual-homed on both the sandbox's fully
 isolated network (no route to the internet at all) and a real egress
 network. Sandbox containers reach the internet ONLY through this proxy,
 which only permits CONNECT/HTTP to a fixed set of known package-registry
-hosts. Confirmed live before this was written: a container on the
-isolated network alone has zero direct route out (an `apk add` inside one
-failed outright), and this proxy container's second network attachment
-gives it real internet access to bridge the two.
+hosts, plus (2026-09-26) the player-vetted BROWSE_ALLOWLIST_DOMAINS a script
+may need for real, systematic data work -- e.g. a spike's finding that
+one-URL-at-a-time browse_page tool calls can't do real multi-page crawling
+as efficiently as a script would. Confirmed live before this was written: a
+container on the isolated network alone has zero direct route out (an
+`apk add` inside one failed outright), and this proxy container's second
+network attachment gives it real internet access to bridge the two.
 
 CONNECT tunnels are relayed byte-for-byte, not TLS-terminated -- this
 proxy never decrypts HTTPS traffic, it only decides (by hostname alone,
 before the tunnel opens) whether a destination is on the allowlist. No
 custom CA, no certificate handling, no visibility into request bodies.
+
+Extending this to real data sites is deliberately narrow: only hosts the
+PLAYER already vetted via BROWSE_ALLOWLIST_DOMAINS (the same list
+/api/browse's Jev-classify-skip uses) are added here, via the
+SANDBOX_EGRESS_EXTRA_HOSTS env var serve.py passes at container start --
+never a general "let scripts hit any URL" relaxation. Ad-hoc browsing of an
+arbitrary, not-yet-vetted site still has to go through browse_page's
+per-URL Jev classify+escalate flow one at a time; a script here only ever
+reaches domains that flow has already been bypassed for by explicit player
+choice.
 """
+import os
 import re
 import socket
 import threading
+import time
 
 PROXY_PORT = 8899
 
@@ -30,10 +45,57 @@ ALLOWED_HOSTS = {
     'archive.ubuntu.com', 'security.ubuntu.com',
     'github.com', 'raw.githubusercontent.com', 'codeload.github.com', 'objects.githubusercontent.com', 'api.github.com',
 }
+# Player-vetted data-site hosts, passed in at container start (comma-
+# separated) so this standalone script never has to import serve.py's env-
+# loading machinery -- it runs in a different container/image entirely.
+ALLOWED_HOSTS |= {h.strip().lower() for h in os.environ.get('SANDBOX_EGRESS_EXTRA_HOSTS', '').split(',') if h.strip()}
 
 
 def is_allowed(host):
-    return host in ALLOWED_HOSTS
+    return (host or '').lower() in ALLOWED_HOSTS
+
+
+# Real constraint, found while auditing this for a possible GET-only
+# restriction on data-site hosts (2026-09-26): this proxy deliberately never
+# terminates TLS (see the module docstring) -- CONNECT tunnels are relayed
+# byte-for-byte, so it cannot see or restrict the HTTP method inside HTTPS,
+# which is how virtually all real traffic works. A method restriction here
+# would only cover the plain-HTTP path below, giving false confidence for
+# the case that actually matters. Real HTTPS method-filtering would need
+# MITM TLS termination (a custom CA, cert trust in the sandbox image) --
+# deliberately NOT done; it's a much bigger, more invasive change than this
+# allowlist model, and trades away the "never decrypts traffic" property on
+# purpose. Practical takeaway: only add a domain to BROWSE_ALLOWLIST_DOMAINS
+# if you're comfortable with a script having full read+write reachability
+# to it, not just reads -- this proxy cannot make that distinction for you.
+
+
+# Real gap flagged live (2026-09-26), same evening a scheduled-task bug (see
+# _peer_gated_lane) burned ~$9 in an unrelated runaway loop: a script with
+# real egress but no request cap could hammer an allowlisted site far harder
+# than the deliberate, budget-capped browse_page tool loop ever would.
+# Fixed-window per-host limit, independent of what's inside a request (this
+# proxy never sees request bodies) -- generous enough for a normal pip/npm
+# install or a real crawl, tight enough to stop a runaway loop from doing
+# real damage to an external site or spinning forever unnoticed.
+RATE_LIMIT_MAX_REQUESTS = 60
+RATE_LIMIT_WINDOW_S = 60
+_rate_lock = threading.Lock()
+_request_log = {}  # host -> [timestamps within the current window]
+
+
+def rate_limited(host):
+    host = (host or '').lower()
+    now = time.time()
+    cutoff = now - RATE_LIMIT_WINDOW_S
+    with _rate_lock:
+        times = _request_log.setdefault(host, [])
+        while times and times[0] < cutoff:
+            times.pop(0)
+        if len(times) >= RATE_LIMIT_MAX_REQUESTS:
+            return True
+        times.append(now)
+        return False
 
 
 def relay(a, b):
@@ -88,6 +150,9 @@ def handle_client(conn):
             if not is_allowed(host):
                 conn.sendall(b'HTTP/1.1 403 Forbidden\r\n\r\n')
                 return
+            if rate_limited(host):
+                conn.sendall(b'HTTP/1.1 429 Too Many Requests\r\n\r\n')
+                return
             try:
                 remote = socket.create_connection((host, port), timeout=10)
             except OSError:
@@ -103,6 +168,9 @@ def handle_client(conn):
             host = m.group(1).decode(errors='replace').split(':')[0] if m else None
             if not host or not is_allowed(host):
                 conn.sendall(b'HTTP/1.1 403 Forbidden\r\n\r\n')
+                return
+            if rate_limited(host):
+                conn.sendall(b'HTTP/1.1 429 Too Many Requests\r\n\r\n')
                 return
             try:
                 remote = socket.create_connection((host, 80), timeout=10)

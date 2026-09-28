@@ -118,12 +118,26 @@ class DirectorAutoApprovalTests(unittest.TestCase):
         the Jev decision call and the director/state plumbing. `decision` lets a
         test supply a custom /api/alpha/decisions payload; `side_effect` overrides
         it with a raised exception (fail-closed path). The esc dict is mutated in
-        place by the resolver."""
+        place by the resolver.
+
+        Real gap caught (2026-09-26): this used to assign serve.get_state_from_db /
+        _load_escalations / _save_escalations directly (`serve.x = Mock(...)`),
+        with NO restoration afterward -- once any test in this class ran, those
+        three stayed permanently mocked for the rest of the process, breaking any
+        LATER test (in this file or another) that needed the real functions.
+        Found live via PeerReviewWorkerPickerTests failing only when run as part
+        of the whole file, never in isolation. Now properly scoped + auto-restored
+        via addCleanup, same as every other mock in this codebase."""
         pending_id = 'esc-test'
-        serve._load_escalations = unittest.mock.Mock(return_value={pending_id: esc})
-        serve._save_escalations = unittest.mock.Mock()
-        serve.get_state_from_db = unittest.mock.Mock(return_value={
-            'agentRoster': [{'id': 'a', 'name': 'Ada', 'isDirector': True, 'isAdmin': False}]})
+        for name, mock_value in (
+            ('_load_escalations', unittest.mock.Mock(return_value={pending_id: esc})),
+            ('_save_escalations', unittest.mock.Mock()),
+            ('get_state_from_db', unittest.mock.Mock(return_value={
+                'agentRoster': [{'id': 'a', 'name': 'Ada', 'isDirector': True, 'isAdmin': False}]})),
+        ):
+            patcher = unittest.mock.patch.object(serve, name, mock_value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         if side_effect is not None:
             patch = unittest.mock.patch('serve._call_openrouter_decision_sync', side_effect=side_effect)
         else:
@@ -134,13 +148,16 @@ class DirectorAutoApprovalTests(unittest.TestCase):
         return esc
 
     def test_blocked_command_never_auto_approved(self):
-        # A human's own "blocked command" verdict is 1.0 floor: even a very
-        # confident Jev approve must stay pending for the human.
+        # A human's own "blocked command" verdict is 1.0 floor: the director is
+        # not permitted to resolve it AT ALL (2026-09-27). It's skipped before
+        # any Jev call -- stays pending for the human, and no auto-approval
+        # (or even an unsure-decision log) happens for it.
         esc = {'status': 'pending', 'kind': 'blocked command', 'question': 'run rm -rf'}
-        with unittest.mock.patch('serve.log_action') as log:
+        with unittest.mock.patch('serve.log_action') as log, \
+             unittest.mock.patch('serve._call_openrouter_decision_sync') as jev:
             self._run_resolver(esc, decision=decision_payload('approve', 0.99))
         self.assertEqual(esc['status'], 'pending', 'blocked command must not be auto-approved')
-        self._assert_escalation_unsure(log)
+        jev.assert_not_called()  # skipped entirely -- no Jev round trip wasted
 
     def test_routine_kind_auto_approved_at_high_confidence(self):
         esc = {'status': 'pending', 'kind': 'unresolved review requirement', 'question': 'docs?', 'resolvedBy': '', 'resolvedAt': 0}
@@ -262,6 +279,91 @@ class FreshnessProvenanceTests(unittest.TestCase):
                              'lastReviewed must be an ISO-8601 UTC timestamp')
         finally:
             sim._grading_decider = old
+
+
+# ---------------------------------------------------------------------------
+# Peer-report worker picker -- real Jev bug found live (2026-09-26)
+# ---------------------------------------------------------------------------
+
+class PeerReviewWorkerPickerTests(unittest.TestCase):
+    """serve._peer_review_loop_pass's Jev choice used to pass a single fixed
+    criterion key {'idx': 'The index of the worker to report on'} -- the SAME
+    bug class already found and fixed once for grading
+    (_grading_decider_default's own docstring): Jev's real API is a typed
+    multiple-choice system with no "give me a free index" mode, so it could
+    only ever echo the single key back verbatim ('idx', never 'idx_3').
+    str(chosen).startswith('idx_') was ALWAYS False, meaning this Jev call
+    was 100% dead code -- every real invocation silently fell back to the
+    deterministic "lowest real-work worker" rule, never actually asking Jev
+    anything a real answer could satisfy."""
+
+    def _seed_roster_and_activity(self, now):
+        state = {
+            'agentRoster': [
+                {'id': 'maya', 'name': 'Maya', 'isDirector': True, 'isAdmin': False},
+                {'id': 'ada', 'name': 'Ada', 'director': 'maya'},
+                {'id': 'ben', 'name': 'Ben', 'director': 'maya'},
+            ],
+            'agents': {'maya': {'id': 'maya'}, 'ada': {'id': 'ada'}, 'ben': {'id': 'ben'}},
+            'reports': [],
+        }
+        serve.save_state_to_db(state)
+        # Real action_log rows: ada does plenty of real work, ben does none --
+        # a clear, real signal a genuine Jev call could act on.
+        for _ in range(5):
+            serve.log_action('ada', 'task_completed', {}, authorized=True)
+        return state
+
+    def test_criteria_dict_has_one_real_key_per_candidate_not_a_single_fixed_key(self):
+        self._seed_roster_and_activity(time.time())
+        captured = {}
+
+        def fake_decision(model, state_arg, questions):
+            captured['criteria'] = questions['choice']['criteria']
+            return {'answers': {'choice': {'choice': 'idx_0', 'confidence': 0.9, 'probabilities': {}}},
+                   'usage': {'cost': 0.0}}
+
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync', side_effect=fake_decision):
+            serve._peer_review_loop_pass()
+        # The real bug: this used to be exactly {'idx': '...'} -- one fixed
+        # key no real answer could ever match. Now: one real key per
+        # candidate worker actually in the pool.
+        self.assertGreater(len(captured['criteria']), 1)
+        self.assertTrue(all(k.startswith('idx_') for k in captured['criteria']))
+
+    def test_a_real_valid_jev_choice_is_actually_used_not_overridden_by_the_fallback(self):
+        state = self._seed_roster_and_activity(time.time())
+        # ben has 0 real work -- the deterministic fallback would ALSO pick
+        # ben (lowest real-work), so pin Jev's real choice to ADA instead
+        # specifically to prove the real answer is what's used, not a
+        # coincidental match with the fallback.
+        candidates_order = ['ada', 'ben']  # roster order after maya/director exclusion
+        idx_of_ada = candidates_order.index('ada')
+
+        def fake_decision(model, state_arg, questions):
+            return {'answers': {'choice': {'choice': f'idx_{idx_of_ada}', 'confidence': 0.9, 'probabilities': {}}},
+                   'usage': {'cost': 0.0}}
+
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync', side_effect=fake_decision):
+            serve._peer_review_loop_pass()
+        saved = serve.get_state_from_db()
+        reports = saved.get('reports') or []
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]['aboutId'], 'ada')
+
+    def test_an_invalid_jev_choice_still_falls_back_safely(self):
+        self._seed_roster_and_activity(time.time())
+
+        def fake_decision(model, state_arg, questions):
+            return {'answers': {'choice': {'choice': 'idx_99', 'confidence': 0.9, 'probabilities': {}}},
+                   'usage': {'cost': 0.0}}
+
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync', side_effect=fake_decision):
+            serve._peer_review_loop_pass()  # must not raise (out-of-range index)
+        saved = serve.get_state_from_db()
+        reports = saved.get('reports') or []
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]['aboutId'], 'ben')  # fallback: lowest real-work
 
 
 if __name__ == '__main__':
