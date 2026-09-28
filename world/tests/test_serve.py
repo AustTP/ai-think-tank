@@ -888,6 +888,8 @@ class HealthChecks(unittest.TestCase):
             'blocked_or_failed_actions_last_hour': {},
             'tool_volume_by_agent_last_15m': {},
             'missing_model_tier_bands': [],
+            'jev_decision_attempts_last_hour': 0,
+            'jev_decision_failures_last_hour': 0,
             'ceremony_actions_last_24h': 0,
             'progress_actions_last_24h': 0,
             'ceremony_to_progress_ratio': None,
@@ -970,6 +972,33 @@ class HealthChecks(unittest.TestCase):
         self.assertEqual(alerts[0]['category'], 'model_tiers')
         self.assertIn('coding', alerts[0]['message'])
         self.assertIn('vision', alerts[0]['message'])
+
+    def test_jev_health_below_min_attempts_raises_nothing(self):
+        # Fewer than the minimum attempts can't establish a failure rate --
+        # a quiet village with 2 blips out of 3 calls isn't a Jev outage.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            jev_decision_attempts_last_hour=3, jev_decision_failures_last_hour=3,
+        ))
+        self.assertEqual(alerts, [])
+
+    def test_jev_health_below_failure_rate_raises_nothing(self):
+        # A busy village blips a call or two without being down -- the RATE,
+        # not the raw count, is the signal.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            jev_decision_attempts_last_hour=100, jev_decision_failures_last_hour=30,
+        ))
+        self.assertEqual(alerts, [])
+
+    def test_jev_health_majority_failures_raise_a_warning(self):
+        # >=50% of Jev calls failing over the window = the decisions model is
+        # likely down, and the colony is running deterministic fallbacks.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            jev_decision_attempts_last_hour=40, jev_decision_failures_last_hour=30,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['category'], 'jev')
+        self.assertEqual(alerts[0]['severity'], 'warning')
+        self.assertIn('30/40', alerts[0]['message'])
 
     def test_multiple_real_conditions_at_once_all_surface(self):
         alerts = serve._health_alerts_for_signals(self._signals(

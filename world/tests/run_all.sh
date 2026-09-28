@@ -127,6 +127,9 @@ echo
 echo "== Python: decision tape -- raw model-facing record of every Jev decision at the chokepoint =="
 python3 tests/test_decision_tape.py
 echo
+echo "== Python: DB-backed Jev decisions-model setting -- live switch via /api/jev/model =="
+python3 tests/test_jev_model.py
+echo
 echo "== Python: clarify router -- player ask -> on-call -> KB-first -> completing agent =="
 python3 tests/test_clarify_router.py
 echo
