@@ -1189,5 +1189,145 @@ class GoogleToolsExecutor(unittest.TestCase):
         self.assertIn('create_calendar_event', tool_names)
 
 
+class GitHubToolsExecutor(unittest.TestCase):
+    """github_get_repo / github_list_issues / github_get_issue /
+    github_search_code -- real read-only GitHub API calls (2026-09-28) so
+    engineering work grounds itself in real public code instead of
+    hallucinating plausible-looking repos/issues."""
+
+    def test_get_repo_builds_the_real_url_and_returns_metadata(self):
+        executor = content._make_github_tools_executor()
+        with unittest.mock.patch.object(serve, '_github_call',
+                                        return_value=({'full_name': 'python/cpython', 'stargazers_count': 70000}, None)) as call:
+            out = executor('github_get_repo', {'owner': 'python', 'repo': 'cpython'})
+        call.assert_called_once_with(
+            'GET', 'https://api.github.com/repos/python/cpython')
+        self.assertIn('python/cpython', out)
+        self.assertIn('stars', out)
+
+    def test_get_repo_url_escapes_owner_and_repo(self):
+        executor = content._make_github_tools_executor()
+        with unittest.mock.patch.object(serve, '_github_call', return_value=({}, None)) as call:
+            executor('github_get_repo', {'owner': 'my org', 'repo': 'my/repo'})
+        self.assertIn('my%20org', call.call_args.args[1])
+        self.assertIn('my%2Frepo', call.call_args.args[1])
+
+    def test_get_repo_requires_owner_and_repo(self):
+        executor = content._make_github_tools_executor()
+        with unittest.mock.patch.object(serve, '_github_call') as call:
+            out = executor('github_get_repo', {'owner': '', 'repo': ''})
+        call.assert_not_called()
+        self.assertIn('required', out)
+
+    def test_list_issues_filters_out_pull_requests(self):
+        executor = content._make_github_tools_executor()
+        fake = [
+            {'number': 1, 'title': 'an issue', 'state': 'open', 'labels': [], 'comments': 2, 'html_url': 'u1'},
+            {'number': 2, 'title': 'a PR', 'state': 'open', 'labels': [], 'comments': 0, 'html_url': 'u2', 'pull_request': {}},
+        ]
+        with unittest.mock.patch.object(serve, '_github_call', return_value=(fake, None)) as call:
+            out = executor('github_list_issues', {'owner': 'python', 'repo': 'cpython'})
+        self.assertIn('an issue', out)
+        self.assertIn('state=open', call.call_args.args[1])
+        self.assertIn('per_page=10', call.call_args.args[1])
+        self.assertNotIn('a PR', out)
+
+    def test_list_issues_respects_state_and_limit(self):
+        executor = content._make_github_tools_executor()
+        with unittest.mock.patch.object(serve, '_github_call', return_value=([], None)) as call:
+            executor('github_list_issues', {'owner': 'o', 'repo': 'r', 'state': 'closed', 'limit': 30})
+        self.assertIn('state=closed', call.call_args.args[1])
+        self.assertIn('per_page=30', call.call_args.args[1])
+
+    def test_get_issue_guards_against_pull_requests(self):
+        executor = content._make_github_tools_executor()
+        with unittest.mock.patch.object(serve, '_github_call',
+                                        return_value=({'number': 7, 'pull_request': {'url': 'x'}}, None)) as call:
+            out = executor('github_get_issue', {'owner': 'o', 'repo': 'r', 'issue_number': 7})
+        self.assertIn('is a pull request', out)
+        # The comments fetch must not have happened for a PR.
+        call.assert_called_once()
+
+    def test_get_issue_fetches_top_comments(self):
+        executor = content._make_github_tools_executor()
+        issue = {'number': 1, 'title': 't', 'state': 'open', 'labels': [], 'body': 'body', 'html_url': 'u'}
+        comments = [{'user': {'login': 'alice'}, 'body': 'agree'}]
+        with unittest.mock.patch.object(serve, '_github_call',
+                                        side_effect=[(issue, None), (comments, None)]) as call:
+            out = executor('github_get_issue', {'owner': 'o', 'repo': 'r', 'issue_number': 1})
+        self.assertIn('top_comments', out)
+        self.assertIn('alice', out)
+        self.assertEqual(call.call_count, 2)
+        self.assertIn('comments?per_page=20', call.call_args_list[1].args[1])
+
+    def test_get_issue_requires_number(self):
+        executor = content._make_github_tools_executor()
+        with unittest.mock.patch.object(serve, '_github_call') as call:
+            out = executor('github_get_issue', {'owner': 'o', 'repo': 'r'})
+        call.assert_not_called()
+        self.assertIn('required', out)
+
+    def test_search_code_builds_the_real_query_url(self):
+        executor = content._make_github_tools_executor()
+        fake = {'total_count': 1, 'items': [{'repository': {'full_name': 'o/r'}, 'path': 'p.py', 'html_url': 'u'}]}
+        with unittest.mock.patch.object(serve, '_github_call', return_value=(fake, None)) as call:
+            out = executor('github_search_code', {'query': 'openrouter language:python'})
+        self.assertIn('total_count', out)
+        self.assertIn('openrouter%20language%3Apython', call.call_args.args[1])
+        self.assertIn('per_page=5', call.call_args.args[1])
+
+    def test_search_code_requires_a_query(self):
+        executor = content._make_github_tools_executor()
+        with unittest.mock.patch.object(serve, '_github_call') as call:
+            out = executor('github_search_code', {'query': ''})
+        call.assert_not_called()
+        self.assertIn('required', out)
+
+    def test_error_from_github_call_is_surfaced_not_raised(self):
+        executor = content._make_github_tools_executor()
+        with unittest.mock.patch.object(serve, '_github_call', return_value=(None, 'GitHub call failed (404): not found')):
+            out = executor('github_get_repo', {'owner': 'o', 'repo': 'nope'})
+        self.assertIn('Could not read the repo', out)
+
+    def test_unknown_tool_name_raises(self):
+        executor = content._make_github_tools_executor()
+        with self.assertRaises(ValueError):
+            executor('some_other_tool', {})
+
+    def test_wired_into_spike_tool_list_only_when_token_set(self):
+        self._common_mocks = SpikeContent._common_mocks.__get__(self)
+        self._store = SpikeContent._store.__get__(self)
+        self._common_mocks()
+        self._store()
+        task = {'id': 'spike-github-1', 'title': 'Check open issues for the cpython repo', 'budgetMs': 60000}
+        # Token set -> all four GitHub tools offered, and github_get_repo forced first.
+        with unittest.mock.patch.object(serve, 'GITHUB_TOKEN', 'fake-token'), \
+             unittest.mock.patch.object(serve, '_call_agent_tool_loop') as loop, \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                         side_effect=[_completion('plan'), _completion('report')]):
+            loop.return_value = ('done', [{'role': 'system', 'content': 's'}])
+            content._run_spike_content(_snapshot(), 'cora', task)
+        tool_names = {t['function']['name'] for t in loop.call_args.args[2]}
+        for name in ('github_get_repo', 'github_list_issues', 'github_get_issue', 'github_search_code'):
+            self.assertIn(name, tool_names)
+        self.assertEqual(loop.call_args.kwargs.get('force_first_tool'), 'github_get_repo')
+
+    def test_github_tools_absent_when_token_unset(self):
+        self._common_mocks = SpikeContent._common_mocks.__get__(self)
+        self._store = SpikeContent._store.__get__(self)
+        self._common_mocks()
+        self._store()
+        task = {'id': 'spike-github-2', 'title': 'Check open issues for a repo', 'budgetMs': 60000}
+        with unittest.mock.patch.object(serve, 'GITHUB_TOKEN', ''), \
+             unittest.mock.patch.object(serve, '_call_agent_tool_loop') as loop, \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                         side_effect=[_completion('plan'), _completion('report')]):
+            loop.return_value = ('done', [{'role': 'system', 'content': 's'}])
+            content._run_spike_content(_snapshot(), 'cora', task)
+        tool_names = {t['function']['name'] for t in loop.call_args.args[2]}
+        for name in ('github_get_repo', 'github_list_issues', 'github_get_issue', 'github_search_code'):
+            self.assertNotIn(name, tool_names)
+
+
 if __name__ == '__main__':
     unittest.main()
