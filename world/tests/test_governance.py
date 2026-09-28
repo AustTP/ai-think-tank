@@ -452,5 +452,97 @@ class FiringReview(unittest.TestCase):
                          'drop-off (handed work, dropped it) is a firing signal')
 
 
+class WhoNeedsReview(unittest.TestCase):
+    """who_needs_review picks the STRONGEST firing signal among candidates,
+    not the first in roster order (2026-09-28 audit: the severity weighting
+    was documented in a comment but never actually computed)."""
+
+    def _idle(self, state):
+        for a in state['agents'].values():
+            a['busy'] = False
+            a['task'] = None
+            a['pairWith'] = None
+            a['handoff'] = None
+        return state
+
+    def test_severity_weighted_report_beats_dropoff_only(self):
+        state = _seed()
+        self._idle(state)
+        # ada: a severe report filed against her (weight 3) but no overload.
+        state['reports'] = [{'aboutId': 'ada', 'fromId': 'ben',
+                             'quote': 'botched a critical task',
+                             'severity': 'severe', 'note': 'left it broken'}]
+        # ben: no reports, but a real drop-off (dropped 10, approved 0) --
+        # strength (0, 10) under the tuple sort.
+        state['agents']['ben'].update({'droppedCount': 10, 'approvedCount': 0})
+        pick = sim.who_needs_review(state, now_ms=10 ** 12)
+        self.assertEqual(pick.get('id'), 'ada',
+                         'a severe report must outrank an unreported overload')
+
+    def test_more_reports_outrank_fewer(self):
+        state = _seed()
+        self._idle(state)
+        # ada: two serious reports (2+2=4). ben: one severe (3). 4 > 3.
+        state['reports'] = [
+            {'aboutId': 'ada', 'fromId': 'ben', 'quote': 'a', 'severity': 'serious', 'note': 'x'},
+            {'aboutId': 'ada', 'fromId': 'nora', 'quote': 'b', 'severity': 'serious', 'note': 'x'},
+            {'aboutId': 'ben', 'fromId': 'ada', 'quote': 'c', 'severity': 'severe', 'note': 'x'},
+        ]
+        pick = sim.who_needs_review(state, now_ms=10 ** 12)
+        self.assertEqual(pick.get('id'), 'ada')
+
+    def test_overload_tiebreaks_equal_report_weight(self):
+        state = _seed()
+        self._idle(state)
+        # Both have one severe report (weight 3); ada is far more overloaded.
+        state['reports'] = [
+            {'aboutId': 'ada', 'fromId': 'ben', 'quote': 'a', 'severity': 'severe', 'note': 'x'},
+            {'aboutId': 'ben', 'fromId': 'ada', 'quote': 'b', 'severity': 'severe', 'note': 'x'},
+        ]
+        state['agents']['ada'].update({'droppedCount': 100, 'approvedCount': 10})
+        state['agents']['ben'].update({'droppedCount': 10, 'approvedCount': 10})
+        pick = sim.who_needs_review(state, now_ms=10 ** 12)
+        self.assertEqual(pick.get('id'), 'ada',
+                         'most-overloaded wins among equally-reported candidates')
+
+
+class FiringFallback(unittest.TestCase):
+    """Jev-outage fallback in _fire_decision requires BOTH a negative report
+    AND a genuine drop-off to fire -- either alone stays 'keep' (2026-09-28
+    audit: the OR inside _has_firing_signal collapsed the AND to fire on
+    drop-off alone, contradicting the documented rule)."""
+
+    def _state(self, reports, dropped, approved):
+        state = _seed()
+        state['reports'] = reports
+        state['agents']['ben'].update({'droppedCount': dropped,
+                                       'approvedCount': approved})
+        reviewers = [next(d for d in state['agentRoster'] if d['id'] == rid)
+                     for rid in ('faye', 'nora')]
+        return state, reviewers
+
+    def _outage_decision(self, state, reviewers):
+        return sim._fire_decision(state, reviewers, {'id': 'ben'}, 10 ** 12,
+                                  decider=lambda *a, **k: None)[0]
+
+    def test_dropoff_alone_stays_keep(self):
+        state, reviewers = self._state(reports=[], dropped=10, approved=0)
+        self.assertEqual(self._outage_decision(state, reviewers), 'keep')
+
+    def test_report_alone_stays_keep(self):
+        state, reviewers = self._state(
+            reports=[{'aboutId': 'ben', 'fromId': 'ada', 'quote': 'x',
+                      'severity': 'severe', 'note': 'n'}],
+            dropped=0, approved=10)
+        self.assertEqual(self._outage_decision(state, reviewers), 'keep')
+
+    def test_report_and_dropoff_fires(self):
+        state, reviewers = self._state(
+            reports=[{'aboutId': 'ben', 'fromId': 'ada', 'quote': 'x',
+                      'severity': 'severe', 'note': 'n'}],
+            dropped=10, approved=0)
+        self.assertEqual(self._outage_decision(state, reviewers), 'fire')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
