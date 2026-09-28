@@ -732,21 +732,40 @@ def _bank_budget_view(snapshot):
             'over': False, 'calls': 0, 'lastAt': None,
             'burnPerDay': 0.0, 'daysLeft': None,
         }
+    # Apify FREE-plan monthly budget (2026-09-28): same "visible from day
+    # one" rule -- the $5/month cap is real (enforced by the plan, not just a
+    # village convention), so it belongs in the Bank even before the first
+    # actor run accrues anything. Only when the account is actually configured
+    # (APIFY_API_KEY) AND the budget is enabled (APIFY_MONTHLY_BUDGET_USD > 0)
+    # -- a clone without an Apify account sees no phantom row, mirroring how
+    # the OpenRouter reconcile line is omitted without a key.
+    if APIFY_API_KEY and APIFY_MONTHLY_BUDGET_USD > 0 \
+            and APIFY_LEDGER_KEY not in services:
+        services[APIFY_LEDGER_KEY] = {
+            'service': APIFY_LEDGER_KEY,
+            'used': 0.0, 'cap': float(APIFY_MONTHLY_BUDGET_USD),
+            'left': float(APIFY_MONTHLY_BUDGET_USD), 'over': False,
+            'calls': 0, 'lastAt': None, 'burnPerDay': 0.0, 'daysLeft': None,
+        }
     return services
 
 
 def _forecast(bucket, cap):
     """Return (daily_burn, days_until_cap_at_that_rate). daily burn is the last
-    7 UTC days' spend / 7; daysLeft is None when there's no signal (no series,
-    zero burn, or already over -- you're not forecasting your way out of an
-    overrun, you're re-budgeting). Cheap integer-date bucketing, no timezone
-    wrangling: days older than 7 fall out of a rolling window naturally."""
+    7 UTC days' spend / the number of days actually present in that window (not
+    a hard 7 -- a fresh ledger with two days of spend is burning fast, and
+    dividing by 7 would hide it); daysLeft is None when there's no signal (no
+    series, zero burn, or already over -- you're not forecasting your way out
+    of an overrun, you're re-budgeting). Cheap integer-date bucketing, no
+    timezone wrangling: days older than 7 fall out of a rolling window
+    naturally."""
     used = float(bucket.get('used', 0) or 0)
     by_day = bucket.get('byDay') or {}
     if not by_day or used <= 0:
         return 0.0, None
     today = datetime.date.today()
     window = 0.0
+    days_present = 0
     for day_str, amt in by_day.items():
         try:
             day = datetime.date.fromisoformat(day_str)
@@ -754,7 +773,10 @@ def _forecast(bucket, cap):
             continue
         if (today - day).days <= 7:
             window += float(amt or 0)
-    burn = window / 7.0
+            days_present += 1
+    if not days_present:
+        return 0.0, None
+    burn = window / days_present
     if burn <= 0 or used >= cap:
         return round(burn, 6), None
     left = cap - used
@@ -3239,6 +3261,12 @@ TAVILY_API_KEY = _load_env().get('TAVILY_API_KEY')
 # (blank) means the GitHub tools are simply NOT offered to agents -- same
 # pattern as search_web, so the surface never advertises an unusable tool.
 GITHUB_TOKEN = _load_env().get('GITHUB_TOKEN')
+# Apify API key (2026-09-28): real account access for web scraping/automation
+# (running actors, fetching datasets). The account is on the FREE plan with a
+# ~$5/mo usage cap by the player's choice -- see the Apify budget block below
+# for the monthly cap surfaced in the Bank. Absent (blank) means the reconcile
+# line is omitted (fail closed), never fabricated.
+APIFY_API_KEY = _load_env().get('APIFY_API_KEY')
 
 
 def _get_or_create_server_secret():
@@ -3546,6 +3574,122 @@ def _accrue_high_tier_spend(cost):
         _spend_ledger_write(ledger)
     except Exception:
         pass  # accounting never blocks a real call
+
+
+# Apify FREE-plan monthly budget (2026-09-28): the player's Apify account is on
+# the FREE plan with a ~$5/mo usage cap by choice -- no subscription, no
+# pay-as-you-go. This is a MONTHLY budget, mirroring the high-tier cap above:
+# the Bank shows used/cap/left against it, and _accrue_apify_spend records
+# real actor-run spend so the village never quietly exceeds what the plan
+# allows. Set APIFY_MONTHLY_BUDGET_USD in .env (default 5.00 = the FREE plan's
+# real cap); 0/unset disables the budget row entirely.
+APIFY_MONTHLY_BUDGET_USD = float(
+    _load_env().get('APIFY_MONTHLY_BUDGET_USD', '5') or 0)
+# Reserved spend-ledger bucket name for Apify accrual -- kept apart from
+# per-service buckets like the high-tier one, and seeded into the Bank view as
+# its own row so the $5/month cap is visible from day one, not only after the
+# first actor run lands in the ledger.
+APIFY_LEDGER_KEY = '__apify__'
+# Brief cache for the live account-usage reconcile (mirrors the OpenRouter
+# credits cache: a bank readout shouldn't always cost a network round-trip).
+_APIFY_USAGE_CACHE = {'at': 0.0, 'data': None}
+_APIFY_USAGE_CACHE_TTL_S = 60
+
+
+def _apify_budget_month():
+    """The current UTC calendar month (2026-09) -- the rollover key: a fresh
+    month resets the Apify allowance."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
+
+
+def _apify_spend_this_month():
+    """Total Apify spend accrued this calendar month (USD)."""
+    try:
+        ledger = _spend_ledger_read()
+        bucket = ledger.get(APIFY_LEDGER_KEY) or {}
+        series = bucket.get('byMonth') or {}
+        return float(series.get(_apify_budget_month(), 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def _apify_budget_exceeded():
+    """True when the Apify account's monthly allowance is spent. Never true
+    when the budget is disabled (0/unset)."""
+    if not APIFY_MONTHLY_BUDGET_USD:
+        return False
+    return _apify_spend_this_month() >= APIFY_MONTHLY_BUDGET_USD
+
+
+def _accrue_apify_spend(cost):
+    """Accrue an Apify actor run's real cost against the monthly budget.
+    Best-effort like _accrue_spend: an accounting failure must never break the
+    actual run. Uses the same kv_spend ledger so the Bank sees it, under the
+    reserved __apify__ bucket with a monthly series keyed by month."""
+    if not isinstance(cost, (int, float)) or not cost:
+        return
+    try:
+        ledger = _spend_ledger_read()
+        bucket = ledger.setdefault(
+            APIFY_LEDGER_KEY, {'used': 0.0, 'calls': 0, 'byMonth': {}})
+        cost = float(cost)
+        bucket['used'] = float(bucket.get('used', 0) or 0) + cost
+        bucket['calls'] = int(bucket.get('calls', 0) or 0) + 1
+        month = _apify_budget_month()
+        bucket['byMonth'][month] = \
+            float((bucket['byMonth'] or {}).get(month, 0) or 0) + cost
+        _spend_ledger_write(ledger)
+    except Exception:
+        pass  # accounting never blocks a real run
+
+
+def _apify_account_usage():
+    """Live reconcile against the REAL Apify account -- GET /v2/users/me for
+    the plan's monthly cap, then /v2/users/me/usage/monthly for what this
+    cycle has actually spent. Account-wide (not the village's own ledger), so
+    a bank readout can show the real number the plan is enforcing. Returns a
+    dict {capUsd, usedUsd, remainingUsd, cycleStart, cycleEnd} or None on any
+    failure (no key, network, bad response) so the Bank teller fails closed
+    and omits the line rather than ever showing stale or fabricated numbers.
+    Cached briefly like the OpenRouter credits reconcile."""
+    if not APIFY_API_KEY:
+        return None
+    now = time.time()
+    cached = _APIFY_USAGE_CACHE
+    if cached['data'] is not None \
+            and (now - cached['at']) < _APIFY_USAGE_CACHE_TTL_S:
+        return cached['data']
+    try:
+        def _get(path):
+            req = urllib.request.Request(
+                f'https://api.apify.com/v2{path}',
+                headers={'Authorization': f'Bearer {APIFY_API_KEY}'})
+            with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310
+                raw = resp.read().decode('utf-8', errors='replace')
+                return json.loads(raw)
+        me = _get('/users/me')
+        plan = (me.get('data') or {}).get('plan') or {}
+        cap = float(plan.get('maxMonthlyUsageUsd') or 0) \
+            or APIFY_MONTHLY_BUDGET_USD
+        usage = _get('/users/me/usage/monthly')
+        u = (usage or {}).get('data') or {}
+        used = 0.0
+        for svc, v in (u.get('monthlyServiceUsage') or {}).items():
+            used += float((v or {}).get('amountAfterVolumeDiscountUsd') or 0)
+        cycle = u.get('usageCycle') or {}
+        result = {
+            'capUsd': cap,
+            'usedUsd': round(used, 6),
+            'remainingUsd': round(max(0.0, cap - used), 6),
+            'cycleStart': cycle.get('startAt'),
+            'cycleEnd': cycle.get('endAt'),
+        }
+        cached['at'] = now
+        cached['data'] = result
+        return result
+    except Exception:
+        return None
+
 
 BROWSE_MAX_BYTES = 200_000
 BROWSE_TIMEOUT_S = 10
