@@ -992,6 +992,7 @@ class HealthChecks(unittest.TestCase):
             'work_items_abandoned_last_24h': 0,
             'login_failures_last_hour': 0,
             'blocked_or_failed_actions_last_hour': {},
+            'tool_volume_by_agent_last_15m': {},
             'missing_model_tier_bands': [],
             'ceremony_actions_last_24h': 0,
             'progress_actions_last_24h': 0,
@@ -1002,6 +1003,21 @@ class HealthChecks(unittest.TestCase):
 
     def test_nominal_state_raises_no_alerts(self):
         self.assertEqual(serve._health_alerts_for_signals(self._signals()), [])
+
+    def test_agent_tool_volume_anomaly_raises_behavior_alert(self):
+        # An agent firing >threshold spend-inducing tool calls in the window
+        # is flagged as a likely runaway loop / tool churn.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            tool_volume_by_agent_last_15m={'ada': serve.ANOMALY_AGENT_TOOL_THRESHOLD + 5},
+        ))
+        self.assertTrue(any(a['category'] == 'behavior' for a in alerts))
+        self.assertIn('ada', alerts[0]['message'])
+
+    def test_agent_tool_volume_below_threshold_no_alert(self):
+        alerts = serve._health_alerts_for_signals(self._signals(
+            tool_volume_by_agent_last_15m={'ada': serve.ANOMALY_AGENT_TOOL_THRESHOLD - 1},
+        ))
+        self.assertFalse(any(a['category'] == 'behavior' for a in alerts))
 
     def test_a_stale_queue_with_due_items_raises_an_info_alert(self):
         alerts = serve._health_alerts_for_signals(self._signals(

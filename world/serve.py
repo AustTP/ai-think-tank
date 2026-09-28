@@ -10572,6 +10572,13 @@ HEALTH_STATE_STALE_AFTER_S = 30
 # Don't re-log the same standing condition every 5-minute check -- an
 # alert this old is either already seen or already acted on.
 HEALTH_ALERT_DEDUP_WINDOW_S = 3600
+# Behavioral anomaly detection (2026-09-28): an agent firing more than this
+# many spend-inducing tool calls (browse/execute/curl/chat) within this
+# window is treated as a likely runaway loop / injection-driven churn -- the
+# same shape as the escalation storm this project survived. The health check
+# flags it so it's caught while it's happening, not after the budget's gone.
+ANOMALY_WINDOW_S = 15 * 60
+ANOMALY_AGENT_TOOL_THRESHOLD = 60  # >60 tool calls / 15 min per agent
 
 
 def _health_alerts_for_signals(signals):
@@ -10603,6 +10610,17 @@ def _health_alerts_for_signals(signals):
     for action_name, count in signals['blocked_or_failed_actions_last_hour'].items():
         if count >= 10:
             alert('capability', 'warning', f'{count} blocked/failed "{action_name}" call(s) in the last hour')
+
+    # Behavioral anomaly (2026-09-28): an agent firing an abnormal volume of
+    # tool calls in the window is a likely runaway loop / injection-driven
+    # churn -- surface it while it's happening, not after the budget's gone.
+    # The threshold is re-checked here (not just in the query) so the pure
+    # decision function is self-contained and independently testable.
+    for agent_id, count in signals.get('tool_volume_by_agent_last_15m', {}).items():
+        if count >= ANOMALY_AGENT_TOOL_THRESHOLD:
+            alert('behavior', 'warning',
+                  f'agent "{agent_id}" made {count} browse/execute/curl/chat calls in the last '
+                  f'{ANOMALY_WINDOW_S // 60} min -- possible runaway loop or tool churn')
 
     if signals['missing_model_tier_bands']:
         alert('model_tiers', 'warning',
@@ -10697,6 +10715,19 @@ def compute_health_snapshot():
             f"({','.join('?' for _ in _PROGRESS_ACTIONS)}) AND ts > ?",
             (*_PROGRESS_ACTIONS, now - 86400),
         ).fetchone()[0]
+        # Behavioral anomaly signal (2026-09-28): per-agent tool-call volume in
+        # a short window. A runaway loop or injection-driven tool churn shows
+        # up as one agent firing an abnormal number of spend-inducing actions
+        # (browse/execute/curl/chat) in a few minutes -- the same shape as the
+        # escalation storm this project actually survived. Detected here, not
+        # reactively after the budget is gone.
+        tool_volume_rows = conn.execute(
+            "SELECT agent_id, COUNT(*) FROM action_log "
+            "WHERE action IN ('browse', 'execute', 'curl', 'chat') AND ts > ? "
+            "AND agent_id IS NOT NULL AND agent_id != 'player' "
+            "GROUP BY agent_id HAVING COUNT(*) >= ?",
+            (now - ANOMALY_WINDOW_S, ANOMALY_AGENT_TOOL_THRESHOLD),
+        ).fetchall()
 
     chosen_bands = {row[0] for row in tier_rows}
     signals = {
@@ -10712,6 +10743,7 @@ def compute_health_snapshot():
         'work_items_abandoned_last_24h': abandoned,
         'login_failures_last_hour': login_failures,
         'blocked_or_failed_actions_last_hour': {row[0]: row[1] for row in blocked_or_failed_rows},
+        'tool_volume_by_agent_last_15m': {row[0]: row[1] for row in tool_volume_rows},
         'model_tier_bands': {row[0]: {'chosen_at': row[1], 'age_hours': (now - row[1]) / 3600} for row in tier_rows},
         'missing_model_tier_bands': [b for b in EXPECTED_MODEL_BANDS if b not in chosen_bands],
         'ceremony_actions_last_24h': ceremony_count,
