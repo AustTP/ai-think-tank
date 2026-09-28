@@ -3915,6 +3915,53 @@ class ChatEndpointAuth(unittest.TestCase):
             r2 = c.get('/api/sim/status')
         self.assertEqual(r2.status_code, 401, 'no session and no key fails closed')
 
+    def test_decisions_and_player_inbox_require_credentials(self):
+        # Regression (2026-09-28): /api/decisions (JEV decision tape) and
+        # /api/player-inbox (read + the responding WRITE) were absent from
+        # AUTH_PROTECTED_PREFIXES, so anonymous callers could read the tape and
+        # -- worse -- the respond endpoint could mutate state with no auth at
+        # all. The prefix list must now bounce all three without credentials.
+        c = TestClient(serve.app)
+        for path in ('/api/decisions', '/api/player-inbox', '/api/player-inbox/ask-1/respond'):
+            with unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
+                 unittest.mock.patch.object(serve, '_valid_agent_key_presented', return_value=False):
+                r = c.get(path) if 'respond' not in path else c.post(path, json={'answer': 'x'})
+            self.assertEqual(r.status_code, 401, f'{path} must require a credential')
+
+    def test_player_inbox_respond_rejects_valid_agent_key(self):
+        # The respond endpoint is PLAYER-ONLY: a valid agent key must NOT be able
+        # to answer an awaiting question, because doing so would let an agent
+        # unblock its own stalled work around the human-in-the-loop gate.
+        c = TestClient(serve.app)
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_valid_agent_key_presented', return_value=True):
+            r = c.post('/api/player-inbox/ask-1/respond', json={'answer': 'x'})
+        self.assertEqual(r.status_code, 401, 'an agent key is not a player credential here')
+
+    def test_high_tier_chat_call_accrues_monthly_budget_exactly_once(self):
+        # Regression (2026-09-28): the /api/chat choke point accrued a high-tier
+        # call to the monthly budget TWICE via two duplicate blocks, so a $2/mo
+        # allowance was exhausted in half the intended calls. A single high-tier
+        # call must land exactly once in the kv_spend high-tier monthly series.
+        calls = []
+        def fake_accrue(cost):
+            calls.append(cost)
+        with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, '_high_tier_slug', return_value='expensive-model'), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                        return_value={'choices': [{'message': {'content': 'ok'}}],
+                                                      'usage': {'cost': 0.25}}), \
+             unittest.mock.patch.object(serve, '_accrue_spend'), \
+             unittest.mock.patch.object(serve, '_accrue_high_tier_spend', side_effect=fake_accrue), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            c = TestClient(serve.app)
+            r = c.post('/api/chat', json={'model': 'expensive-model',
+                                          'messages': [{'role': 'user', 'content': 'x'}]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(calls), 1, 'a high-tier call accrues to the monthly budget exactly once')
+        self.assertEqual(calls, [0.25])
+
 
 class OperationalGuardrails(unittest.TestCase):
     def test_backup_creates_rotated_snapshots(self):

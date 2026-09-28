@@ -273,6 +273,12 @@ class AskEndpoint(unittest.TestCase):
     weather all mocked (no live village / no live network), mirroring the
     clarify endpoint suite's hermetic pattern."""
 
+    def setUp(self):
+        # The ask lane is rate-limited (2026-09-28) -- clear the shared bucket
+        # so these tests (which fire many asks through one process) never hit
+        # the 20/60s limit and get 429s that have nothing to do with behavior.
+        serve._rate_limit_calls.pop(serve.ASK_LANE_RATE_LIMIT_KEY, None)
+
     def _client(self, state):
         from starlette.testclient import TestClient
         c = TestClient(serve.app)
@@ -551,6 +557,20 @@ class AskEndpoint(unittest.TestCase):
                                                 'location': 'Charlotte, NC'})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertNotIn('SECRETS', r.json()['reply'])
+
+    def test_ask_lane_is_rate_limited_shared_bucket(self):
+        # Regression (2026-09-28): /api/intent/ask and /api/intent/clarify were
+        # real-spend model lanes with NO rate limit -- the only spend paths
+        # without one. Both must trip the same 20/60s bucket, so a runaway
+        # caller can't hammer either lane past the tool endpoints' own cap.
+        serve._rate_limit_calls.pop(serve.ASK_LANE_RATE_LIMIT_KEY, None)
+        c = self._client(_state())
+        for _ in range(serve.RATE_LIMIT_MAX_CALLS):
+            self.assertTrue(serve.check_rate_limit(serve.ASK_LANE_RATE_LIMIT_KEY))
+        with unittest.mock.patch.object(serve, 'get_state_from_db') as gsd:
+            r = c.post('/api/intent/ask', json={'question': 'hi'})
+        self.assertEqual(r.status_code, 429, r.text)
+        gsd.assert_not_called()  # rate-limited BEFORE any state read or spend
 
 
 class AdminAgentId(unittest.TestCase):

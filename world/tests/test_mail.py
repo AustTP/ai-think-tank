@@ -95,6 +95,23 @@ class DeliverMail(unittest.TestCase):
         self.assertEqual(mailbox[0]['text'], 'mail 25')
         self.assertEqual(mailbox[-1]['text'], f'mail {sim.MAILBOX_KEEP_COUNT + 24}')
 
+    def test_peer_review_request_mailbox_is_trimmed_too(self):
+        # Regression (2026-09-28 audit): MAILBOX_KEEP_COUNT was only enforced in
+        # _deliver_mail -- the _enter_peer_review / _sim_notify_author / gate
+        # re-pick append paths grew the mailbox unboundedly. Every append path
+        # must trim to the same cap, so a busy reviewer's mailbox can't balloon.
+        st = _state()
+        author = st['agents']['nadia']
+        for i in range(sim.MAILBOX_KEEP_COUNT + 25):
+            sim._sim_notify_author(st, {'id': f'story-{i}',
+                                        'assignedTo': 'nadia',
+                                        'title': f'Story {i}'}, 'reviewer-x')
+        mailbox = author['mailbox']
+        self.assertEqual(len(mailbox), sim.MAILBOX_KEEP_COUNT)
+        self.assertEqual(mailbox[0]['kind'], 'peer_review_rejected')
+        self.assertEqual(mailbox[0]['about'], 'story-25')
+        self.assertEqual(mailbox[-1]['about'], f'story-{sim.MAILBOX_KEEP_COUNT + 24}')
+
 
 class ParkGuard(unittest.TestCase):
     def test_unacted_mail_agent_is_not_parked(self):

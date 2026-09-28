@@ -267,10 +267,6 @@ def _parse_feed_urls_after(text):
     return [l for l in (text or '').split('\n') if l.strip() and not l.strip().startswith('#')]
 
 
-def _file_digest_url(url):
-    return url.replace('https://', '').replace('http://', '').replace(' ', '-').strip('-')
-
-
 def _run_media_content(snapshot, agent_id, task, base_ctx=None):
     """Port of tasks.js runMediaDigestTask: read media/feeds.md, fetch ONE
     subscribed feed (via /api/browse with the thin-page render fallback),
@@ -1649,15 +1645,6 @@ def _spike_wants_linkedin_search(backlog, instructions):
     return 'linkedin' in text
 
 
-def _spike_wants_linkedin_jobs(backlog, instructions):
-    """More specific than _spike_wants_linkedin_search -- must be checked
-    BEFORE it in any first-tool chain (a job search also mentions
-    'linkedin', so the generic post-search check would otherwise win first
-    and force the wrong tool)."""
-    text = f'{backlog or ""} {instructions or ""}'.lower()
-    return 'linkedin' in text and ('job' in text or 'hiring' in text)
-
-
 def _extract_execute_script_outputs(transcript):
     """Pull the stdout of every execute_script tool call out of a real
     _call_agent_tool_loop transcript (matching each tool_call_id to its
@@ -2005,83 +1992,9 @@ _TREG_LINKEDIN_SEARCH_TOOL = {
     },
 }
 
-# Real LinkedIn job search + post-engagement endpoints (2026-09-27), per your
-# explicit request to expand beyond post-search. Treg's catalog page
-# publishes only human-readable family names (e.g. "Search job postings by
-# keyword"), never the actual callable endpoint id or its param schema --
-# these THREE ids and shapes were discovered live via Treg's own
-# self-documenting error text (404 "did you mean X", 400 "valid fields:
-# [...]"), the same method already used for the two tools above, not
-# guessed from docs. Two families the same request asked about --
-# `linkedin.post.reposts` and the comment-level `linkedin.comment.reactions`
-# / `linkedin.comment.replies` -- came back a confirmed "no endpoint in the
-# catalog" for every provider tried (apify/anyapi/adyntel); they are not
-# available today, not just unwired.
-_TREG_LINKEDIN_JOB_SEARCH_TOOL = {
-    'type': 'function',
-    'function': {
-        'name': 'search_linkedin_jobs',
-        'description': (
-            "Search real, current LinkedIn job postings by title/keyword, via Treg's real "
-            "Apify-backed LinkedIn jobs API (a real ~$0.011 call against the village's Treg "
-            "balance -- more expensive than the other Treg tools, only call this once per "
-            "distinct search). Returns real postings (title, company, location, full "
-            "description, apply link) -- never invent a plausible-sounding job listing."
-        ),
-        'parameters': {
-            'type': 'object',
-            'properties': {
-                'job_title': {'type': 'string', 'description': 'The job title or keyword to search for, e.g. "backend engineer".'},
-            },
-            'required': ['job_title'],
-        },
-    },
-}
-
-_TREG_LINKEDIN_POST_COMMENTS_TOOL = {
-    'type': 'function',
-    'function': {
-        'name': 'get_linkedin_post_comments',
-        'description': (
-            "Get real comments on a specific LinkedIn post, via Treg's real LinkedIn API proxy "
-            "(a real ~$0.005 call against the village's Treg balance). Requires a real, specific "
-            "LinkedIn post URL -- e.g. one already found via search_linkedin_posts. Never invent "
-            "a plausible-sounding comment."
-        ),
-        'parameters': {
-            'type': 'object',
-            'properties': {
-                'post_url': {'type': 'string', 'description': 'A real, specific LinkedIn post URL, e.g. one returned by search_linkedin_posts.'},
-            },
-            'required': ['post_url'],
-        },
-    },
-}
-
-_TREG_LINKEDIN_POST_REACTIONS_TOOL = {
-    'type': 'function',
-    'function': {
-        'name': 'get_linkedin_post_reactions',
-        'description': (
-            "Get real reactions (likes, celebrates, etc.) on a specific LinkedIn post, via Treg's "
-            "real LinkedIn API proxy (a real ~$0.005 call against the village's Treg balance). "
-            "Requires a real, specific LinkedIn post URL -- e.g. one already found via "
-            "search_linkedin_posts. Never invent a plausible-sounding reaction count."
-        ),
-        'parameters': {
-            'type': 'object',
-            'properties': {
-                'post_url': {'type': 'string', 'description': 'A real, specific LinkedIn post URL, e.g. one returned by search_linkedin_posts.'},
-            },
-            'required': ['post_url'],
-        },
-    },
-}
-
 
 def _make_treg_tools_executor():
-    """x_trending_topics / search_linkedin_posts / search_linkedin_jobs /
-    get_linkedin_post_comments / get_linkedin_post_reactions -- thin
+    """x_trending_topics / search_linkedin_posts -- thin
     wrappers over _serve._treg_call. No one-strike/struck_tools tracking
     here (unlike the web/sandbox executors): those track POLICY denials
     from a real gate (Jev, the sandbox classifier), and there is no such
@@ -2106,32 +2019,6 @@ def _make_treg_tools_executor():
             if error:
                 return f'Could not search LinkedIn posts: {error}'
             _serve._accrue_spend('treg', _serve.TREG_ENDPOINT_COSTS['scrapecreators.x.v1-linkedin-search-posts'])
-            return json.dumps(data)[:4000]
-        if name == 'search_linkedin_jobs':
-            job_title = (args.get('job_title') or '').strip()
-            if not job_title:
-                return 'job_title is required'
-            # maxTotalChargeUsd/timeout are real Apify-platform-level query
-            # params Treg requires on top of the JSON body (confirmed live,
-            # see _treg_call's `query` docstring) -- not agent-controllable
-            # knobs, a fixed operational cap on this specific call.
-            data, error = _serve._treg_call(
-                'apify.linkedin.search.jobs', {'jobTitles': [job_title]}, method='POST',
-                query={'maxTotalChargeUsd': 0.5, 'timeout': 60})
-            if error:
-                return f'Could not search LinkedIn jobs: {error}'
-            _serve._accrue_spend('treg', _serve.TREG_ENDPOINT_COSTS['apify.linkedin.search.jobs'])
-            return json.dumps(data)[:4000]
-        if name in ('get_linkedin_post_comments', 'get_linkedin_post_reactions'):
-            post_url = (args.get('post_url') or '').strip()
-            if not post_url:
-                return 'post_url is required'
-            endpoint_id = ('anyapi.linkedin.post_comments' if name == 'get_linkedin_post_comments'
-                            else 'anyapi.linkedin.post_reactions')
-            data, error = _serve._treg_call(endpoint_id, {'url': post_url, 'limit': 20}, method='POST')
-            if error:
-                return f'Could not get LinkedIn post {"comments" if name == "get_linkedin_post_comments" else "reactions"}: {error}'
-            _serve._accrue_spend('treg', _serve.TREG_ENDPOINT_COSTS[endpoint_id])
             return json.dumps(data)[:4000]
         raise ValueError(f'unknown tool: {name}')
     return execute_tool
