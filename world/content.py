@@ -349,7 +349,7 @@ def _run_skill_review_content(snapshot, agent_id, task, base_ctx=None):
         verdict = 'keep'
         try:
             decision = _serve._call_openrouter_decision_sync(
-                'typesafe/jev-1.13', {'messages': [], 'signals': {}},
+                _serve._jev_model(), {'messages': [], 'signals': {}},
                 {'choice': {'type': 'choice',
                             'instructions': f'A candidate skill-reference file is waiting for review. Its content: "{body[:1500]}" Is this accurate and genuinely useful as real reference material for future work, or should it be discarded?',
                             'criteria': {'keep': 'Yes -- accurate and specific enough to be worth keeping as real reference material.',
@@ -1376,7 +1376,7 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     verdict = 'clean'
     try:
         decision = _serve._call_openrouter_decision_sync(
-            'typesafe/jev-1.13', {'messages': [], 'signals': {}},
+            _serve._jev_model(), {'messages': [], 'signals': {}},
             {'choice': {'type': 'choice',
                         'instructions': f'A {kind} just wrote this about "{project_label}": "{full_review[:1500]}" '
                                         f'\n\nQuality pipeline (run live): {qp["note"]}'

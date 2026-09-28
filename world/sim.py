@@ -2694,7 +2694,7 @@ def _governance_decider_default(state, instructions, candidates):
     import serve
     try:
         data = serve._call_openrouter_decision_sync(
-            'typesafe/jev-1.13', {'messages': [], 'signals': {}},
+            serve._jev_model(), {'messages': [], 'signals': {}},
             {'choice': {'type': 'choice', 'instructions': instructions,
                         'criteria': {c['id']: c['description'] for c in candidates}}})
         choice, _, _ = serve._jev_choice(data)
@@ -3964,7 +3964,7 @@ def _social_decider_default(instructions, criteria):
     import serve
     try:
         data = serve._call_openrouter_decision_sync(
-            'typesafe/jev-1.13', {'messages': [], 'signals': {}},
+            serve._jev_model(), {'messages': [], 'signals': {}},
             {'choice': {'type': 'choice', 'instructions': instructions,
                         'criteria': {c['id']: c['description'] for c in criteria}}})
         choice, confidence, _ = serve._jev_choice(data)
@@ -4615,7 +4615,7 @@ def _player_ask_decider_default(state, issue_key, director_id, question, context
     import serve  # noqa
     try:
         data = serve._call_openrouter_decision_sync(
-            'typesafe/jev-1.13', {'messages': [], 'signals': {}},
+            serve._jev_model(), {'messages': [], 'signals': {}},
             {'choice': {'type': 'choice', 'instructions': (
                 f"{director_id} is reviewing whether agent work on {issue_key} "
                 f"really needs the player. The agent asked: '{question}'. "
@@ -5224,7 +5224,7 @@ def _supervisor_vote_decider_default(state, issue_key, director_id, agent_id,
     import serve  # noqa
     try:
         data = serve._call_openrouter_decision_sync(
-            'typesafe/jev-1.13', {'messages': [], 'signals': {}},
+            serve._jev_model(), {'messages': [], 'signals': {}},
             {'choice': {'type': 'choice', 'instructions': (
                 f"{director_id} is reviewing whether agent {agent_id}'s claim on "
                 f"{issue_key} that the player's requirements are met is credible. "
@@ -5325,7 +5325,7 @@ def _refinement_decider_default(instructions, criteria):
     import serve
     try:
         data = serve._call_openrouter_decision_sync(
-            'typesafe/jev-1.13', {'messages': [], 'signals': {}},
+            serve._jev_model(), {'messages': [], 'signals': {}},
             {'choice': {'type': 'choice', 'instructions': instructions,
                         'criteria': {c['id']: c['description'] for c in criteria}}})
         choice, _, _ = serve._jev_choice(data)
@@ -5667,7 +5667,7 @@ def _grading_decider_default(state, instructions, task_title, room):
         return None
     try:
         data = serve._call_openrouter_decision_sync(
-            'typesafe/jev-1.13', {'messages': [], 'signals': {}},
+            serve._jev_model(), {'messages': [], 'signals': {}},
             {'choice': {'type': 'choice', 'instructions': instructions,
                         'criteria': dict(_GRADE_BUCKETS)}})
         choice, _, _ = serve._jev_choice(data)
@@ -5974,7 +5974,7 @@ def _escalation_decider_default(state, instructions, product_id, title):
         return None
     try:
         data = serve._call_openrouter_decision_sync(
-            'typesafe/jev-1.13', {'messages': [], 'signals': {}},
+            serve._jev_model(), {'messages': [], 'signals': {}},
             {'choice': {'type': 'choice', 'instructions': instructions,
                         'criteria': {
                             'story': "The failing behavior is understood and scoped -- a team can card a concrete story to restore it.",
