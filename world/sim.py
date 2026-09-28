@@ -1256,11 +1256,6 @@ REFINEMENT_MEET_MS = 10_000                     # brief decision horizon (never 
 # instructions at ASSIGNMENT, never at grooming.
 DELIVERABLE_GRADE_FLOOR = 5.0      # graded below this -> coaching-worthy
 ROADMAP_CADENCE_MS = 7 * 24 * 3600 * 1000   # weekly silent priority recompute
-COACHING_NOTE_TEMPLATES = {
-    'drop_off': "Coaching: you've dropped more work than a third of what you approved. Pick up only what you can actually finish this cycle.",
-    'low_grade': "Coaching: your recent deliverable missed the bar. Read the room's prior artifacts before starting so you match the established spec.",
-    'severe_report': "Coaching: a peer filed a severe report against you. Address the specific concern directly and verify it before you hand off.",
-}
 # A runbook's most recent entry, once written for a product/room, gets pulled
 # into every FUTURE incident task on that product as a "prior incident said:"
 # note, so handlers learn instead of re-discovering.
@@ -1290,7 +1285,6 @@ REFINEMENT_MAX_REQUESTS = 20
 # server pass (shared-Command-Center convention), gated so a team's SM commits its
 # own team's cards and is briefly stamped as the committer.
 BLOCK_CHANGE_CADENCE_MS = 5_000          # min gap between SM commits (not a wait)
-BLOCK_CHANGE_MAX_PER_PASS = 1            # one flip per pass, mirroring ceremonies
 # Blocked-claims awaiting a supervisor verdict (requirements-met path) are judged
 # by the owning director only after this window so the gate isn't hair-trigger.
 BLOCK_CLAIM_GATE_MS = 5_000
@@ -1894,7 +1888,6 @@ def _completing_agent_for_product(state, product_id, prod=None):
 # status + queue presence. Pure state mutation (no serve import at call site),
 # unit-testable, run through the serve.py wrapper like everything else.
 # ---------------------------------------------------------------------------
-SPRINT_STATUSES = ('active', 'closed')
 def queue_sprint(state, sprint_id, name, goal, owner_id, items, valid_rooms,
                  target_date_ms=None, now_ms=None, team_ids=None):
     """Create a sprint record and append its valid items to the workQueue, each
@@ -2122,10 +2115,6 @@ WIKI_CATEGORY_ROOMS = {  # default category -> room affinity for read-before-act
     'village': None,
     'product': None,
 }
-def next_wiki_version(state, page_id):
-    """Pure: the next version for a page (starts at 1)."""
-    pages = ensure_wiki(state)
-    return (int((pages.get(page_id) or {}).get('version') or 0)) + 1
 
 
 def wiki_write_page(state, page_id, title, category, body, edited_by,
@@ -2698,15 +2687,6 @@ def morale_for(state, agent_id, now_ms=None):
     return int(max(0, min(100, round(raw))))
 
 
-def village_morale(state, now_ms=None):
-    """morale.js villageMorale: mean morale across all present agents."""
-    scores = [morale_for(state, aid, now_ms) for aid in (state.get('agents') or {})]
-    scores = [s for s in scores if s is not None]
-    if not scores:
-        return None
-    return int(round(sum(scores) / len(scores)))
-
-
 def _governance_decider_default(state, instructions, candidates):
     """Default Jev resolver for governance, late-importing serve.py so sim.py
     stays importable/unit-testable offline. `candidates` is a list of
@@ -3056,11 +3036,11 @@ def _enter_peer_review(state, task, now_ms, preferred=None):
     # below). This used to also email the player here; removed on request.
     review_items = []
     for rid in reviewers:
-        mailbox = (state.get('agents') or {}).get(rid, {}).setdefault('mailbox', [])
-        mailbox.append({'kind': 'peer_review_request',
-                        'about': task.get('id'),
-                        'title': task.get('title'),
-                        'text': f'Work on "{task.get("title")}" is ready for your review. Please review it and approve or send it back.'})
+        _append_mailbox((state.get('agents') or {}).get(rid, {}), {
+            'kind': 'peer_review_request',
+            'about': task.get('id'),
+            'title': task.get('title'),
+            'text': f'Work on "{task.get("title")}" is ready for your review. Please review it and approve or send it back.'})
         review_items.append({
             'title': f'Review: {task.get("title")}',
             'room': task.get('room'),
@@ -3102,11 +3082,11 @@ def _sim_notify_author(state, parent, reviewer_id):
     author = parent.get('assignedTo')
     if not author:
         return
-    mailbox = (state.get('agents') or {}).get(author, {}).setdefault('mailbox', [])
-    mailbox.append({'kind': 'peer_review_rejected',
-                    'about': parent.get('id'),
-                    'title': parent.get('title'),
-                    'text': f'A reviewer{(" (" + reviewer_id + ")") if reviewer_id else ""} sent your work on "{parent.get("title")}" back -- it needs a fix before it can close. Fix it and it will be reviewed again.'})
+    _append_mailbox((state.get('agents') or {}).get(author, {}), {
+        'kind': 'peer_review_rejected',
+        'about': parent.get('id'),
+        'title': parent.get('title'),
+        'text': f'A reviewer{(" (" + reviewer_id + ")") if reviewer_id else ""} sent your work on "{parent.get("title")}" back -- it needs a fix before it can close. Fix it and it will be reviewed again.'})
 
 
 def _peer_gate_should_close(gate, now_ms, entered_ms):
@@ -3297,11 +3277,11 @@ def _reenter_gate_review(state, parent, reviewer_ids):
         return []
     items = []
     for rid in reviewers:
-        mailbox = (state.get('agents') or {}).get(rid, {}).setdefault('mailbox', [])
-        mailbox.append({'kind': 'peer_review_request',
-                        'about': parent.get('id'),
-                        'title': parent.get('title'),
-                        'text': f'A previous review of "{parent.get("title")}" was lost without a decision. Work on it is ready for your review again -- please review and approve or send it back.'})
+        _append_mailbox((state.get('agents') or {}).get(rid, {}), {
+            'kind': 'peer_review_request',
+            'about': parent.get('id'),
+            'title': parent.get('title'),
+            'text': f'A previous review of "{parent.get("title")}" was lost without a decision. Work on it is ready for your review again -- please review and approve or send it back.'})
         items.append({
             'title': f'Review: {parent.get("title")}',
             'room': parent.get('room'),
@@ -4835,6 +4815,18 @@ def _file_block_change(state, issue_key, wanted, requester_id, kind, reason,
     return rid
 
 
+def _append_mailbox(agent, entry):
+    """Append one entry to an agent's mailbox and trim to MAILBOX_KEEP_COUNT.
+    Every mailbox write goes through here so retention is enforced on ALL
+    append paths (peer-review requests, rejected-author notes, gate re-picks,
+    wake-on-mail) -- not just _deliver_mail, which is what MAILBOX_KEEP_COUNT
+    originally forgot (2026-09-28 audit)."""
+    mailbox = agent.setdefault('mailbox', [])
+    mailbox.append(entry)
+    if len(mailbox) > MAILBOX_KEEP_COUNT:
+        agent['mailbox'] = mailbox[-MAILBOX_KEEP_COUNT:]
+
+
 def _deliver_mail(state, agent_id, kind, payload=None):
     """File one action-needed mail item into an agent's mailbox. If the
     recipient is OFF-DUTY, wake her (appear_from_outskirts -- lazily loads
@@ -4855,9 +4847,7 @@ def _deliver_mail(state, agent_id, kind, payload=None):
         for k in ('issueKey', 'taskId', 'about'):
             if k in payload:
                 entry[k] = payload[k]
-    a.setdefault('mailbox', []).append(entry)
-    if len(a['mailbox']) > MAILBOX_KEEP_COUNT:
-        a['mailbox'] = a['mailbox'][-MAILBOX_KEEP_COUNT:]
+    _append_mailbox(a, entry)
     if a.get('offDuty'):
         # Wake the affected agent to act on the mail. Waking from an
         # off-duty rest is the whole point of wake-on-mail.

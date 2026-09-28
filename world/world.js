@@ -168,47 +168,6 @@ async function reviewScreenshot(agentId, sandboxId, path, question) {
   }
 }
 
-// Real UI/image-based research on the open web -- the gap you named
-// directly: text-only browsing throws away the actual design of a page,
-// exactly what a UI/UX researcher needs to see. Goes through the exact
-// same Jev-gated /api/browse endpoint as text research (no second,
-// unvetted path to a URL) -- `visual: true` just also asks serve.py to
-// render a real screenshot of the same already-approved page. Uses
-// MODEL_TIERS.vision (see reviewScreenshot's comment for why this isn't
-// premium).
-async function researchVisually(agentId, url, purpose, question) {
-  const res = await agentFetch('/api/browse', agentId, {
-    method: 'POST',
-    body: JSON.stringify({ url, agentId, purpose, visual: true }),
-  });
-  const data = await res.json();
-  if (!data.allowed) return { ok: false, note: `not approved: ${data.reason || 'no reason given'}` };
-  if (!data.imageBase64) return { ok: false, note: 'approved, but no screenshot was captured (page may have failed to render, or no headless browser is available)' };
-
-  try {
-    const chatRes = await agentFetch('/api/chat', agentId, {
-      method: 'POST',
-      body: JSON.stringify({
-        model: MODEL_TIERS.vision.slug,
-        messages: [{
-          role: 'user',
-          content: [
-            { type: 'text', text: question },
-            { type: 'image_url', image_url: { url: `data:image/png;base64,${data.imageBase64}` } },
-          ],
-        }],
-        max_tokens: 700,
-        agentId,
-      }),
-    });
-    const chatData = await chatRes.json();
-    if (!chatRes.ok || chatData.error || !chatData.reply) return { ok: false, note: 'vision call failed or returned nothing' };
-    return { ok: true, url: data.url, findings: chatData.reply.trim() };
-  } catch (e) {
-    return { ok: false, note: 'vision call failed: ' + e.message };
-  }
-}
-
 // The Library's real capability -- a shared file directory any agent (or
 // the player) can write to, per your call. Fire-and-forget, same as
 // logVillageAction -- a missed archive write shouldn't block gameplay.
@@ -251,42 +210,6 @@ async function listLibraryFiles() {
     return [];
   }
 }
-
-// Real ask: agents should be able to download actual files (a dataset, a
-// PDF, real reference material), not just extract page text the way
-// fetchPageSmart/browse does. Same Jev-gate-before-fetching discipline
-// as everything else that leaves this machine; always lands in
-// pending_review/ server-side regardless of what's asked for, since a
-// downloaded file is exactly as untrusted as browsed page content.
-//
-// `scope`: 'personal' (default) keeps it in this agent's own directory
-// once promoted (downloads/<agentId>/) -- fine for something only they
-// need. 'shared' promotes instead to shared/, a real common location
-// every agent's search/list already covers -- use this whenever OTHER
-// agents will need the same file, so it doesn't end up sitting somewhere
-// only its downloader would ever think to look (see LIBRARY_SCOPE_GUIDE).
-async function downloadFile(agentId, url, filename, purpose, scope = 'personal') {
-  try {
-    const res = await agentFetch('/api/library/download', agentId, {
-      method: 'POST',
-      body: JSON.stringify({ agentId, url, filename, purpose, scope }),
-    });
-    return await res.json();
-  } catch (e) {
-    return { allowed: false, ok: false, reason: e.message };
-  }
-}
-
-// Handed to agents alongside downloadFile so the personal/shared choice
-// is a real, explained decision rather than a guess -- your explicit
-// concern was that agents defaulting to keeping things in their own
-// corner (even with no technical access barrier -- the Library has none)
-// is functionally the same risk as real collusion: other agents never
-// think to look there, so nobody ever benefits from it but the
-// downloader.
-const LIBRARY_SCOPE_GUIDE = `Use scope 'personal' only when you're confident no one else in the village would ever need this file. `
-  + `Use scope 'shared' whenever the file is reference material, a dataset, or anything another agent's work could plausibly draw on -- `
-  + `it lands in the Library's shared/ directory, which every agent's search already covers.`;
 
 // The other half of write_library_file's pending_review/ quarantine
 // (serve.py): a real, deliberate promotion, never automatic. Only ever
@@ -480,27 +403,6 @@ async function curlRequest(agentId, method, url, purpose, headers, body) {
   }
 }
 
-// Real ask (2026-09-20): a research agent should be able to pull a real
-// file (a dataset, a paper, a tool) straight into their sandbox, judged
-// by Jev the same way every other outbound request already is -- but
-// WITHOUT giving the sandbox container itself network access (it's
-// deliberately isolated, see SANDBOX_NETWORK, serve.py). The fetch
-// happens server-side; this just asks for it and gets back where it
-// landed. `path` in the result is relative to /workspace inside the
-// sandbox -- exactly where the next runSandboxCommand/pipeline call for
-// this sandboxId will see it.
-async function downloadIntoSandbox(agentId, sandboxId, url, filename, purpose) {
-  try {
-    const res = await agentFetch('/api/sandbox-download', agentId, {
-      method: 'POST',
-      body: JSON.stringify({ agentId, sandboxId, url, filename, purpose, inRoom: _liveRoomFor(agentId) }),
-    });
-    return await res.json();
-  } catch (e) {
-    return { allowed: false, ok: false, reason: 'request failed: ' + e.message };
-  }
-}
-
 async function savePageIntoSandbox(agentId, sandboxId, url, purpose, filename, content) {
   try {
     const res = await agentFetch('/api/sandbox-save-page', agentId, {
@@ -663,33 +565,6 @@ function formatPageProbeResult(data) {
   return lines.join('\n');
 }
 
-// Real "ask your supervisor" flow, per your explicit call: an agent
-// without standing access to something (e.g. curl -- normally Weather
-// Station only) can ask a specific supervisor and get REAL, TEMPORARY
-// access if the reason is legitimate. The actual judgment is a real Jev
-// classification (serve.py's /api/access/request), not a rubber stamp --
-// but a real mail exchange happens either way, so there's a visible,
-// auditable record of who was asked and what was decided, not just a
-// silent server-side flag nobody else can see.
-async function requestTemporaryAccess(agentId, supervisorId, capability, reason) {
-  sendMail(agentId, supervisorId, `Requesting temporary access to ${capability}: ${reason}`);
-  let data;
-  try {
-    const res = await agentFetch('/api/access/request', agentId, {
-      method: 'POST',
-      body: JSON.stringify({ agentId, supervisorId, capability, reason }),
-    });
-    data = await res.json();
-  } catch (e) {
-    return { approved: false, note: 'request failed: ' + e.message };
-  }
-  if (data.error) return { approved: false, note: data.error };
-  sendMail(supervisorId, agentId, data.approved
-    ? `Approved -- temporary access to ${capability} granted for ${Math.round((data.durationS || 0) / 60)} minutes.`
-    : `Denied -- ${data.reason || 'not approved'}.`);
-  return data;
-}
-
 const BG_SPRITE = 'assets/village_background.png';
 const NATIVE_W = 688;
 const NATIVE_H = 384;
@@ -727,59 +602,5 @@ function blockedAt(p) {
   return false;
 }
 
-// Real, village-wide retrospective -- per your direct ask: the WHOLE
-// roster's own honest words on the village's tools/mechanisms as they
-// stand right now. Explicitly asks the "does anything here not need to
-// exist" question you raised, since that's a genuinely different question
-// from "what's missing" -- easy to never ask otherwise.
-async function collectVillageRetrospectives() {
-  const results = [];
-  for (const def of AGENT_ROSTER) {
-    const a = AGENTS[def.id];
-    if (!a) continue;
-    // Real fix for a real bug found the same night: asked to reflect on
-    // the village with nothing but a role and a vague prompt, agents
-    // confabulated confidently -- "quarterly review process," "Gemini
-    // writes, DeepSeek codes," one agent complaining about curl despite
-    // never having had room access to touch it. This pulls their own
-    // REAL, verifiable action history (the same action_log every real
-    // action already writes into) and hands it to them BEFORE asking,
-    // so a retrospective is anchored to what they actually did, not a
-    // free-form guess at what a village like this "should" contain.
-    let activityLine = '(no real activity history found for you yet)';
-    try {
-      const actRes = await fetch(`/api/activity/summary?agentId=${encodeURIComponent(def.id)}`);
-      const actData = await actRes.json();
-      const counts = actData.counts || {};
-      const entries = Object.entries(counts);
-      if (entries.length > 0) {
-        activityLine = entries.map(([action, count]) => `${action}: ${count}`).join(', ');
-      }
-    } catch (e) { /* fall through with the default line */ }
-
-    const systemPrompt = `You are ${a.name}, working as ${a.role} in a small village of AI agents built by a human developer. `
-      + `Your REAL, actually-recorded action counts this session: ${activityLine}. Ground your answer in this real history -- if something isn't in this list, you haven't actually done it, so don't describe it as something that happens to you regularly. `
-      + `Give an honest, critical retrospective on the VILLAGE ITSELF as it exists right now -- its real tools and mechanisms (hiring, firing/performance review, task assignment, mail, the shared Library, model-tier selection, sandboxed coding, code review, browsing, curl) and how work actually gets done here, not any one specific project. `
-      + `Be specific and critical, not diplomatic: what genuinely works well for you? What gets in your way? Is there anything you've noticed that exists here but doesn't seem to need to -- something over-built, redundant, or run more often than the actual problem it's for would justify? A few sentences.`;
-    let note;
-    try {
-      const res = await agentFetch('/api/chat', def.id, {
-        method: 'POST',
-        body: JSON.stringify({
-          model: (MODEL_TIERS[a.model] || MODEL_TIERS.mid).slug,
-          messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: 'Give your honest retrospective.' }],
-          max_tokens: 400,
-          agentId: def.id,
-        }),
-      });
-      const data = await res.json();
-      note = (!res.ok || data.error) ? null : data.reply.trim();
-    } catch (e) { note = null; }
-    results.push({ id: def.id, name: a.name, role: a.role, note: note || '(no response -- model call failed)' });
-  }
-  await writeLibraryFile('player', 'village/RETROSPECTIVE.md',
-    `# Village-wide retrospective\n\nCollected ${new Date().toISOString()}\n\n`
-    + results.map(r => `## ${r.name} (${r.role})\n\n${r.note}\n`).join('\n'), 'firsthand');
-  logVillageAction('player', 'village_retrospective_collected', { count: results.length });
-  return results;
-}
+// (Village-wide retrospective removed 2026-09-28 -- it had no caller; the
+// player-facing activity feed covers the same ground without a model call.)
