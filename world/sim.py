@@ -1323,6 +1323,13 @@ TASK_CONTENT_TIMEOUT_S = 120.0
 # (index.html, 6s). Distinct from the movement tick (SIM_TICK_S=2).
 TASK_CYCLE_S = 6.0
 
+# Mailbox retention (2026-09-28): mail items live in kv_state, so an unbounded
+# mailbox makes every save rewrite a bigger blob forever. Keep the most recent
+# entries per agent; anything older is dropped. Generous enough that a long
+# player 1:1 thread and pending review requests survive, tight enough that the
+# state blob can't grow without bound.
+MAILBOX_KEEP_COUNT = 200
+
 # Server in-memory task-id counter (mirrors tasks.js nextTaskId). Not persisted
 # -- on restart it resets; a fresh 'task-N' id is unique for a given server run,
 # and the durable state['tasks'] mirror keyed by it is authoritative.
@@ -4849,6 +4856,8 @@ def _deliver_mail(state, agent_id, kind, payload=None):
             if k in payload:
                 entry[k] = payload[k]
     a.setdefault('mailbox', []).append(entry)
+    if len(a['mailbox']) > MAILBOX_KEEP_COUNT:
+        a['mailbox'] = a['mailbox'][-MAILBOX_KEEP_COUNT:]
     if a.get('offDuty'):
         # Wake the affected agent to act on the mail. Waking from an
         # off-duty rest is the whole point of wake-on-mail.
