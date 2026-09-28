@@ -55,11 +55,17 @@ class SpikeContent(unittest.TestCase):
     def _common_mocks(self, tavily=True):
         # Real network boundaries every test must stub: agent-key lookup, the
         # model tiers, and the library-file write (a real _http_json call).
+        # The JEV tier gate (2026-09-27) is stubbed deterministically to 'mid'
+        # so a spike (an investigation) exercises the mid path -- and the
+        # underlying tier slugs are pinned so no real model resolution happens.
         patchers = [
             unittest.mock.patch.object(serve, 'get_or_create_agent_key', return_value='key-123'),
             unittest.mock.patch.object(serve, '_coding_tier_slug', return_value=None),
+            unittest.mock.patch.object(serve, '_low_tier_slug', return_value='low-tier-slug'),
             unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-tier-slug'),
             unittest.mock.patch.object(serve, '_reasoning_tier_slug', return_value='reasoning-tier-slug'),
+            unittest.mock.patch.object(serve, '_tier_gate_decider',
+                                       lambda instructions, criteria: ('mid', 0.9)),
             unittest.mock.patch.object(serve, 'TAVILY_API_KEY', 'fake-tavily-key' if tavily else ''),
             unittest.mock.patch.object(serve, '_http_json', return_value={'ok': True}),
         ]
@@ -424,6 +430,7 @@ class SpikeContent(unittest.TestCase):
         seen = self._store()
         task = {'id': 'spike-6', 'title': 'Anything', 'budgetMs': 60000}
         with unittest.mock.patch.object(serve, '_coding_tier_slug', return_value=None), \
+             unittest.mock.patch.object(serve, '_low_tier_slug', return_value=None), \
              unittest.mock.patch.object(serve, '_mid_tier_slug', return_value=None), \
              unittest.mock.patch.object(serve, '_call_openrouter_sync') as oc, \
              unittest.mock.patch.object(serve, '_call_agent_tool_loop') as loop:
