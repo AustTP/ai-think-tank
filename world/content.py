@@ -109,7 +109,7 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
         existing = _serve._http_json('GET', base, '/api/library/file?path=' +
                               urllib.parse.quote(f"skills/{_skill_slug(topic.get('topic'))}.md"))
         existing_content = existing.get('content') if isinstance(existing, dict) and 'content' in existing else None
-        tier_slug = _serve._mid_tier_slug()
+        tier_slug = _serve._resolve_model_tier(f'Synthesize an updated skill-reference file for research topic: {topic.get("topic")}')
         if not tier_slug:
             note = f'Collected {len(kept)} new page(s) for "{topic.get("topic")}", but synthesis failed (no model tier).'
         else:
@@ -304,7 +304,7 @@ def _run_media_content(snapshot, agent_id, task, base_ctx=None):
         return
     # Summarize.
     py_notes = _agent_name(snapshot, agent_id)
-    model_slug = _serve._mid_tier_slug()
+    model_slug = _serve._resolve_model_tier('Summarize a fetched web page in a few honest sentences')
     summary = None
     if model_slug:
         r = _serve._http_json('POST', base, '/api/chat',
@@ -429,7 +429,7 @@ def _run_distill_content(snapshot, agent_id, task, base_ctx=None):
                                           {'note': 'Distillation ran -- no new archive findings since the last pass, so the village knowledge is unchanged.', 'noop': True})
         return
 
-    tier_slug = _serve._mid_tier_slug()
+    tier_slug = _serve._resolve_model_tier('Distill recent archived village findings into the wiki, merging and de-duplicating what the village now knows')
     if not tier_slug:
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f'Found {len(archives)} new finding(s) to distill, but the synthesis call failed (no model tier).',
@@ -634,7 +634,7 @@ def _run_research_project_content(snapshot, agent_id, task, base_ctx=None):
     key = _serve.get_or_create_agent_key(agent_id)
     project = task.get('projectLabel') or ''
     backlog = f"{task.get('title')} -- {task.get('instructions')}" if task.get('instructions') else (task.get('title') or '')
-    tier_slug = _serve._mid_tier_slug()
+    tier_slug = _serve._resolve_model_tier(f'Write research findings for a project: {project or backlog[:120]}')
     finding = None
     if tier_slug:
         r = _serve._http_json('POST', base, '/api/chat',
@@ -1289,7 +1289,7 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     qp = _run_quality_pipeline(base, key, agent_id, WORKROOM_SANDBOX_ID,
                                f'Quality gate for {("QA" if is_qa else "review")} of: {backlog_item}')
 
-    tier_slug = _serve._mid_tier_slug()
+    tier_slug = _serve._coding_tier_slug() or _serve._mid_tier_slug() or _serve._low_tier_slug()
     if not tier_slug:
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f'Tried to {("QA-test" if is_qa else "review")} "{backlog}", but no model tier is configured yet.',
@@ -2388,7 +2388,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # _apply_content_result actually queues it) way any executor asks to be
     # notified on completion, success or failure alike, so silence never
     # reads as "still working" when it already gave up.
-    tier_slug = _serve._coding_tier_slug() or _serve._mid_tier_slug()
+    tier_slug = _serve._resolve_model_tier(f'Run a time-boxed web investigation (spike): {backlog[:200]}')
     reasoning_slug = _serve._reasoning_tier_slug() or tier_slug
     if not tier_slug:
         _sim_module._store_content_result(task.get('id'), {

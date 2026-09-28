@@ -2131,6 +2131,19 @@ def _mid_tier_slug():
     return _model_tier_slug('mid')
 
 
+def _low_tier_slug():
+    # The default tier for routine work (2026-09-27): cheap above all else.
+    # Kept as its own accessor (like _mid_tier_slug) so tests can mock it and
+    # the JEV tier gate can fail closed to it.
+    return _model_tier_slug('low')
+
+
+def _high_tier_slug():
+    # The high tier for genuinely hard, high-stakes planning work (2026-09-27).
+    # Used by the JEV tier gate; kept as an accessor so tests can mock it.
+    return _model_tier_slug('high')
+
+
 def _coding_tier_slug():
     # The SWE-bench-chosen band for real code generation/editing. Ported
     # from runCodingTask's pickModelTierForAction, which deliberately routes
@@ -2160,6 +2173,76 @@ def _reasoning_tier_slug():
     return _model_tier_slug('reasoning') or _coding_tier_slug()
 
 
+# JEV-gated tier escalation (2026-09-27). Policy, per the player: by default
+# EVERYTHING uses the cheap LOW tier; only a real need escalates. Coding is
+# DETERMINISTIC (a code/review/qa task always uses the coding tier -- it's
+# easy to tell when code is being written, and correctness there doesn't scale
+# down with apparent size). For everything else, JEV decides:
+#   - MID is LIGHTLY gated -- the criteria ask whether the task needs real
+#     reasoning (synthesis, judgment, classification) and a plain "yes" earns
+#     mid. It is NOT the default; low is. But it doesn't demand a strong case.
+#   - HIGH is HEAVILY gated -- JEV must explicitly judge the work as
+#     high-stakes planning/decomposition where getting it wrong wastes
+#     everything downstream (the assign-big-task case). High is a RARE upgrade.
+# Fails CLOSED to low: on any JEV outage/error the call stays on the cheap
+# tier rather than spending up on a guess. Returns a resolved model slug.
+_TIER_GATE_CRITERIA = [
+    {'id': 'high', 'description': 'High-stakes, one-shot planning or decomposition where getting it wrong wastes every downstream step (e.g. breaking one large vague request into the subtasks everything else depends on).'},
+    {'id': 'mid', 'description': 'Needs real multi-step reasoning or judgment: synthesis, classification, summarization of gathered material, a considered in-character reply. Routine but non-trivial thinking.'},
+    {'id': 'low', 'description': 'Routine, cheap work: a short reply, simple extraction, or a one-line note where the cheap tier is plenty.'},
+]
+# A genuinely low JEV confidence should not trigger a spend-up -- require the
+# chosen escalation to carry at least this confidence (mirrors JEV_SAFETY_CONFIDENCE's
+# own "don't act on weak signal" bar).
+TIER_GATE_MIN_CONFIDENCE = 0.55
+
+
+def _tier_gate_decider_default(instructions, criteria):
+    # Injectable seam (mirrors the other ceremony deciders); the live loop uses
+    # the real Jev quorum choice so a noisy classifier doesn't spend up on a
+    # fluke. Fails closed to (None, 0.0) on any outage -- the gate then stays
+    # on the cheap tier.
+    try:
+        decision, confidence, _cost = _jev_quorum_choice_sync(instructions, criteria)
+        return decision, confidence
+    except Exception:
+        return None, 0.0
+
+
+_tier_gate_decider = _tier_gate_decider_default
+
+
+def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None):
+    """Pick which model tier a call deserves, under the JEV-gated escalation
+    policy (2026-09-27). Returns a resolved model slug (never None).
+
+    `task_type` 'code'/'review'/'qa' -> deterministic CODING tier (no JEV).
+    `allow_high` -> JEV may pick HIGH; otherwise the decision is low-or-mid.
+    `purpose` -> a one-line description of what the call is for, so JEV's
+    judgment is grounded in the actual work rather than a generic "should I
+    spend more?" prompt.
+
+    Fails CLOSED to low: a JEV outage, a non-binary answer, or a low-confidence
+    escalation all keep the cheap tier."""
+    if task_type in ('code', 'review', 'qa'):
+        return _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()
+    decider = decider or _tier_gate_decider
+    try:
+        decision, confidence = decider(
+            f'Pick the model tier this village call deserves. The work: {purpose or "routine task"}.',
+            _TIER_GATE_CRITERIA,
+        )
+    except Exception:
+        decision, confidence = None, 0.0
+    if decision == 'high' and allow_high and confidence >= TIER_GATE_MIN_CONFIDENCE:
+        return _high_tier_slug() or _mid_tier_slug() or _low_tier_slug()
+    if decision == 'mid' and confidence >= TIER_GATE_MIN_CONFIDENCE:
+        return _mid_tier_slug() or _low_tier_slug()
+    # Everything else -- low decision, low confidence, outage, or a high pick
+    # on a non-allow_high call -- stays on the cheap tier.
+    return _low_tier_slug() or _mid_tier_slug()
+
+
 def _run_mail_audit_sync():
     data = get_state_from_db()
     if not data:
@@ -2183,9 +2266,9 @@ def _run_mail_audit_sync():
     if not mailbox_dump:
         return  # nothing to review -- don't spend a call on an empty village
 
-    model_slug = _mid_tier_slug()
+    model_slug = _resolve_model_tier('Admin mailbox audit -- review agent mailboxes for anything unusual or concerning')
     if not model_slug:
-        return  # no mid-tier model chosen yet -- nothing to audit with
+        return  # no model tier chosen yet -- nothing to audit with
 
     system_prompt = (
         "You are an admin in a small village of AI worker agents, doing a routine, "
@@ -4086,13 +4169,14 @@ def _call_openrouter_sync(model, messages, max_tokens):
         raise RuntimeError(f'Village spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if is_model_circuit_broken(model):
         raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
-    # Keep reasoning for the two tiers that actually benefit from it (coding
-    # and high), but CAP it to half the request budget so the visible answer
+    # Keep reasoning for the tiers that benefit from it (coding, high, and mid --
+    # the JEV gate now escalates mid for judgment calls, so it earns the same
+    # reasoning), but CAP it to half the request budget so the visible answer
     # still has room. The system's max_tokens is deliberately tight, and
     # hidden reasoning can otherwise consume the whole budget and come back
     # empty (the bug traced in refresh_model_tiers). Every other tier never
     # reads reasoning output, so turning it off there is free.
-    if model in (_coding_tier_slug(), _model_tier_slug('high'), _reasoning_tier_slug()):
+    if model in (_coding_tier_slug(), _high_tier_slug(), _mid_tier_slug(), _reasoning_tier_slug()):
         reasoning = {'max_tokens': max_tokens // 2}
     else:
         reasoning = {'enabled': False}
@@ -5679,8 +5763,15 @@ async def intent_assign_big_task(request: Request):
     # model"). Off-thread so the worker stays free to answer itself, and with a
     # long timeout: a 4000-token decomposition on a cold model can legally take
     # well over the default 30s.
+    # High-stakes planning tier, JEV-gated (2026-09-27): a large-request
+    # decomposition is exactly the "damn good reason to use high" case -- the
+    # whole downstream depends on this one call. JEV decides whether it's truly
+    # high-worthy; a routine request stays on a cheaper tier.
+    plan_tier = _resolve_model_tier(
+        f'Decomposing a large request into concrete subtasks: {goal[:200]}',
+        allow_high=True)
     r = await asyncio.to_thread(_http_json, 'POST', SELF_BASE_URL, '/api/chat',
-                                {'model': _model_tier_slug('high'),
+                                {'model': plan_tier,
                                  'messages': [{'role': 'system', 'content': system_prompt},
                                               {'role': 'user', 'content': goal}],
                                  'max_tokens': _big_task_max_tokens,
@@ -6556,7 +6647,9 @@ async def intent_clarify(request: Request):
     kb_matches = _library_search_matches(kb_query)
     messages = _clarify_in_character_messages(agent, kb_matches, product_name, question)
 
-    model = _coding_tier_slug() or _mid_tier_slug()
+    # Clarify is an in-character answer about completed work -- judgment-heavy
+    # but not code, so it goes through the JEV gate (default low, light mid).
+    model = _resolve_model_tier(f'Answer an on-call agent clarifying a question about completed work: {question[:200]}')
     try:
         data = await asyncio.to_thread(_call_openrouter_sync, model, messages,
                                        int(body.get('max_tokens', 300)))
@@ -6763,7 +6856,9 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     user = f"## Player's fresh question\n{question}"
     messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}]
 
-    model = _coding_tier_slug() or _mid_tier_slug()
+    # Ask lane: a fresh player question. Not code, so JEV-gated (default low,
+    # light mid for a question that needs real reasoning).
+    model = _resolve_model_tier(f'Answer the player\'s question: {question[:200]}')
     tools_used = []
     agent_key = get_or_create_agent_key(pick)
 
@@ -7013,7 +7108,7 @@ def _extract_schedule_fields_sync(admin_id, key, text):
     )
     try:
         r = _http_json('POST', SELF_BASE_URL, '/api/chat',
-                       {'model': _mid_tier_slug(),
+                       {'model': _resolve_model_tier('Extract a recurring web-monitoring request (topic, start URL, cadence) from a free-text message'),
                         'messages': [{'role': 'system', 'content': system_prompt},
                                      {'role': 'user', 'content': text}],
                         'max_tokens': 200, 'agentId': admin_id}, key)
