@@ -18,7 +18,7 @@ import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import sim
+import sim  # noqa: E402
 
 
 def spawn_a_batch(grid, n, rng):
