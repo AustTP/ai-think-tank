@@ -85,6 +85,16 @@ class DeliverMail(unittest.TestCase):
     def test_unknown_agent_returns_false(self):
         self.assertFalse(sim._deliver_mail(_state(), 'ghost', 'player_answer'))
 
+    def test_mailbox_is_capped_to_keep_recent_entries(self):
+        st = _state()
+        for i in range(sim.MAILBOX_KEEP_COUNT + 25):
+            sim._deliver_mail(st, 'nadia', 'player_answer',
+                              {'issueKey': f'DEV-{i}', 'text': f'mail {i}'})
+        mailbox = st['agents']['nadia']['mailbox']
+        self.assertEqual(len(mailbox), sim.MAILBOX_KEEP_COUNT)
+        self.assertEqual(mailbox[0]['text'], 'mail 25')
+        self.assertEqual(mailbox[-1]['text'], f'mail {sim.MAILBOX_KEEP_COUNT + 24}')
+
 
 class ParkGuard(unittest.TestCase):
     def test_unacted_mail_agent_is_not_parked(self):
