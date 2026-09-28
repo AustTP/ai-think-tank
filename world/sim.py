@@ -34,6 +34,23 @@ import time
 import urllib.parse
 from collections import deque
 
+# Pure, self-contained helpers extracted to their own module (2026-09-27) to
+# shrink the sim.py monolith. See sim_helpers.py.
+from sim_helpers import (  # noqa: E402
+    WORK_PRIORITY,
+    _WORK_PRIORITY_VALUES,
+    _deliverable_room,
+    _is_fully_idle,
+    _sprint_item_id,
+    _team_row,
+    days_since,
+    ensure_wiki,
+    is_work_item_due,
+    next_product_id,
+    next_sprint_id,
+    normalize_priority,
+)
+
 # 2026-09-23: 1.0s (was 2.0s). The server only PUBLISHES new positions ~once
 # per tick, and the client renders whatever the server last published -- so the
 # visible map animation is gated by SIM_TICK_S regardless of the client's 60fps
@@ -806,6 +823,24 @@ def _reclaim_orphaned_walking_tasks(state):
         # Orphaned: no agent is walking/working this. Re-queue it fresh (the
         # whitelist drops nothing assignment needs -- reviewOf/assignedTo pins a
         # re-opened fix to its author, incident to team on-call).
+        # Bound the reclaim re-queue (2026-09-27): a task that keeps getting
+        # orphaned by its assignee must not be re-issued forever. Carry the
+        # task's own attempt history forward and shed the item once it hits the
+        # same WORK_ITEM_MAX_ATTEMPTS cap the assignment loop enforces, so a
+        # genuinely un-workable task ages out instead of churning the queue.
+        attempts = int(task.get('attempts') or 0) + 1
+        if attempts >= WORK_ITEM_MAX_ATTEMPTS:
+            from serve import log_action
+            try:
+                log_action(None, 'work_item_abandoned',
+                           {'title': task.get('title'), 'room': task.get('room'),
+                            'attempts': attempts, 'reason': 'repeatedly orphaned'}, authorized=True)
+            except Exception:
+                pass
+            _on_work_item_abandoned(state, task, now_ms=int(time.time() * 1000))
+            del tasks[task_id]
+            reclaimed += 1
+            continue
         work_queue.append({
             'title': task.get('title'),
             'room': task.get('room'),
@@ -837,6 +872,7 @@ def _reclaim_orphaned_walking_tasks(state):
             'reviewOf': task.get('reviewOf') or None,
             'reviewAuthorId': task.get('reviewAuthorId') or None,
             'checklist': task.get('checklist') or None,
+            'attempts': attempts,
         })
         # Fault-aware routing memory: this agent's work attempt just failed
         # to complete -- steer the next round-robin pick away from it for a
@@ -1096,8 +1132,8 @@ def _drain_emails_from_db():
 # ---------------------------------------------------------------------------
 
 # Mirrors tasks.js -- copied constants, not drift-prone redefinitions.
-WORK_PRIORITY = {'low': 0, 'normal': 1, 'high': 2, 'urgent': 3}
-_WORK_PRIORITY_VALUES = frozenset(WORK_PRIORITY.values())
+# WORK_PRIORITY / _WORK_PRIORITY_VALUES now live in sim_helpers.py (imported
+# at the top of this module) -- see normalize_priority.
 WORK_ITEM_MAX_ATTEMPTS = 3
 MAX_ACTIVE_AGENTS = 25  # hiring.js:41
 MAX_TOTAL_AGENTS = 500  # hiring.js:40 -- total inventory cap, vs MAX_ACTIVE_AGENTS
@@ -1538,20 +1574,6 @@ def resolve_room_with_overflow(state, room):
     if room_occupancy(state, overflow_to) < room_desk_capacity(_ROOM_COLLISION.get(overflow_to, 'workstations')):
         return overflow_to
     return room
-
-
-def normalize_priority(p):
-    """Port of tasks.js _normalizePriority: a string name or number in WORK_PRIORITY
-    -> its int; anything else -> normal."""
-    if isinstance(p, (int, float)) and p in _WORK_PRIORITY_VALUES:
-        return int(p)
-    if isinstance(p, str):
-        key = p.lower()
-        if key in WORK_PRIORITY:
-            return WORK_PRIORITY[key]
-    return WORK_PRIORITY['normal']
-
-
 def queue_work(state, items):
     """Port of tasks.js queueWork: whitelist each item's fields into a WORK_QUEUE
     entry. Mutates state['workQueue'] (creates it if absent). Returns new length."""
@@ -1639,13 +1661,6 @@ def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructi
         'taskType': 'spike',
         'budgetMs': budget_ms or 60_000,
     }])
-
-
-def is_work_item_due(item, now_ms):
-    """Port of tasks.js _isWorkItemDue."""
-    return not item.get('notBefore') or now_ms >= item['notBefore']
-
-
 def village_has_work(state, now_ms):
     """Port of tasks.js villageHasWork: a due queue item, or any agent currently
     task/handoff/pair/busy."""
@@ -1873,17 +1888,6 @@ def _completing_agent_for_product(state, product_id, prod=None):
 # unit-testable, run through the serve.py wrapper like everything else.
 # ---------------------------------------------------------------------------
 SPRINT_STATUSES = ('active', 'closed')
-
-
-def _sprint_item_id(item):
-    # Stable-enough identity for progress derivation. Both workQueue items and
-    # task dicts are mutable/unhashable, so a bare dict can't key a map; a
-    # title+room pair is unambiguous within a freshly-seeded sprint and lets us
-    # match across the queue AND the created task (assign_task copies title/room
-    # onto the task verbatim).
-    return (item.get('title') or '', item.get('room') or '')
-
-
 def queue_sprint(state, sprint_id, name, goal, owner_id, items, valid_rooms,
                  target_date_ms=None, now_ms=None, team_ids=None):
     """Create a sprint record and append its valid items to the workQueue, each
@@ -2006,21 +2010,6 @@ def _auto_close_completed_sprints(state, now_ms=None):
             record['autoClosed'] = True
             closed.append(sid)
     return closed
-
-
-def next_sprint_id(state):
-    """Server-side monotonic sprint id (spr-1, spr-2, ...) keyed off existing
-    records so a cold state starts at 1 and a hot one never collides."""
-    n = 0
-    for sid in (state.get('sprints') or {}):
-        if isinstance(sid, str) and sid.startswith('spr-'):
-            try:
-                n = max(n, int(sid[4:]))
-            except ValueError:
-                pass
-    return f'spr-{n + 1}'
-
-
 # ---------------------------------------------------------------------------
 # Phase E: products + wiki. A PRODUCT is a named, director-authored artifact
 # with a spec/owner/contributors/revision log whose "release" freezes its
@@ -2034,21 +2023,6 @@ def next_sprint_id(state):
 # ---------------------------------------------------------------------------
 
 PRODUCT_STATUSES = ('draft', 'in_progress', 'review', 'released')
-
-
-def next_product_id(state):
-    """Server-side monotonic product id (prd-1, prd-2, ...), mirroring
-    next_sprint_id. Collision-free against a cold or hot state."""
-    n = 0
-    for pid in (state.get('products') or {}):
-        if isinstance(pid, str) and pid.startswith('prd-'):
-            try:
-                n = max(n, int(pid[4:]))
-            except ValueError:
-                pass
-    return f'prd-{n + 1}'
-
-
 def create_product(state, product_id, name, summary, spec, owner_id, sandbox_id,
                    team_id=None, contributor_ids=None, handles=None):
     """Create a product catalog entry. Pure: returns the record dict, or None
@@ -2141,12 +2115,6 @@ WIKI_CATEGORY_ROOMS = {  # default category -> room affinity for read-before-act
     'village': None,
     'product': None,
 }
-
-
-def ensure_wiki(state):
-    return state.setdefault('wiki', {}).setdefault('pages', {})
-
-
 def next_wiki_version(state, page_id):
     """Pure: the next version for a page (starts at 1)."""
     pages = ensure_wiki(state)
@@ -2697,13 +2665,6 @@ def _check_schedules(state, now, now_ms):
 # Pure state mutation only; the Jev decision is resolved through an injectable
 # `_governance_decider` so sim.py stays unit-testable with zero network.
 # ---------------------------------------------------------------------------
-def days_since(ts_ms, now_ms):
-    """morale.js daysSince (ms -> fractional days)."""
-    if not ts_ms:
-        return 0
-    return max(0.0, (now_ms - ts_ms) / (24 * 3600 * 1000))
-
-
 def reports_about(state, about_id):
     """Port of reports.js reportsAbout: all reports filed against an agent."""
     return [r for r in (state.get('reports') or []) if r.get('aboutId') == about_id]
@@ -2954,14 +2915,6 @@ PEER_REVIEW_TIMEOUT_MS = 15 * 60 * 1000  # sim-ms: waiting window after which on
 STUCK_GATE_CADENCE_MS               = 20_000
 STUCK_GATE_GRACE_MS                 = 5 * 60 * 1000   # no widening before this age
 STUCK_GATE_RESCUE_REVIEW_TIMEOUT_MS = 30 * 60 * 1000  # min gap between re-picks
-
-
-def _deliverable_room(room):
-    """Rooms whose real content work is gated behind peer approval. Observatory and
-    Press Office do genuine research/coding; the others are placeholder chores."""
-    return room in ('pressoffice', 'observatory')
-
-
 # Non-gated work lanes (Phase E2b/E2d): a SPIKE is a time-boxed investigation
 # with no committed deliverable; a BUG is incident response on a live product
 # (see the on-call phase). Neither ships a peer-reviewed story -- both land a
@@ -4347,16 +4300,6 @@ def normalize_gwt_block(text):
              text[idx_w:idx_t].strip(),
              text[idx_t:].strip()]
     return ', '.join(p.strip().rstrip(',') for p in parts)
-
-
-def _team_row(state, team_id):
-    """The team record for team_id (by `id`), or None."""
-    for t in (state.get('teams') or []):
-        if t.get('id') == team_id:
-            return t
-    return None
-
-
 def _default_team_prefix(team_id):
     """A deterministic default prefix from a team id slug (dev -> DEV). Only
     auto-derived; an explicit `prefix` on the team record always wins."""
@@ -6713,16 +6656,6 @@ def _any_agent_active(agents):
         if a and (a.get('task') or a.get('handoff') or a.get('pairWith') or a.get('busy')):
             return True
     return False
-
-
-def _is_fully_idle(a, in_room):
-    """True when an agent is doing nothing: no task, movement, pair, handoff,
-    or room occupancy. Non-spatial flags only -- the mirror of what the
-    assignment/active paths treat as 'working'."""
-    return not (a.get('busy') or a.get('task') or a.get('path') or a.get('pathActive')
-                or a.get('pairWith') or a.get('handoff') or a.get('inRoom') or in_room)
-
-
 def _park_idle_wanderers(state):
     """2026-09-23: an agent is only woken by task assignment or the waking
     intents -- but a woken agent who is never *assigned* (e.g. the queue
