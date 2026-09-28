@@ -43,6 +43,20 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+# Pure web/text/path/security helpers extracted to their own module (2026-09-27)
+# to shrink the serve.py monolith. See web_helpers.py.
+from web_helpers import (  # noqa: E402
+    _block_link_value,
+    _download_dest_rel_path,
+    _extract_links,
+    _is_safe_public_host,
+    _looks_like_gmail_app_password,
+    _parse_http_date_ms,
+    _sanitize_download_filename,
+    _sha256_file,
+    _strip_html_to_text,
+)
+
 # Optional, real dependencies for document ingestion (/api/library/ingest,
 # below) -- openpyxl (Excel) was already installed for something else in
 # this environment; pypdf (PDF text extraction) was added specifically for
@@ -2912,7 +2926,13 @@ def _heal_agent_identity(state):
     do for other drift) makes it self-healing regardless of the source."""
     roster = state.get('agentRoster', [])
     roster_by_id = {d.get('id'): d for d in roster}
+    # Per-tick invariant: tolerate a malformed `agents` value (e.g. a stale
+    # autosave shipping a non-dict) instead of crashing the whole tick -- the
+    # point of running this heal every tick is self-healing, so a broken shape
+    # must be normalized, not fatal.
     agents = state.get('agents', {})
+    if not isinstance(agents, dict):
+        state['agents'] = agents = {}
     defaults_by_id = {d['id']: d for d in _default_roster_definitions()}
     changed = False
 
@@ -3773,15 +3793,6 @@ def provision_player_email(app_password):
     return {'ok': True, 'test_ok': bool(test_ok)}
 
 
-def _looks_like_gmail_app_password(pw):
-    """A Gmail app-password is exactly 16 chars: XXXX XXXX XXXX XXXX (spaces
-    optional). Reject anything else loudly rather than storing a bad secret."""
-    pw = (pw or '').strip().replace(' ', '')
-    if len(pw) != 16 or not pw.isalnum():
-        return False
-    return True
-
-
 def create_escalation(kind, question, on_approve_note=''):
     # A random unguessable token per escalation, not just the record id --
     # the resolve link needs to not be trivially enumerable (id alone
@@ -3911,89 +3922,6 @@ def _run_in_sandbox_sync(sandbox_dir, command):
         return {'exitCode': None, 'stdout': (e.stdout or '')[:SANDBOX_MAX_OUTPUT], 'stderr': (e.stderr or '')[:SANDBOX_MAX_OUTPUT], 'timedOut': True}
 
 
-def _is_safe_public_host(hostname):
-    # SSRF protection -- this is security hygiene, not a content policy:
-    # regardless of what category gate is chosen, this backend must never
-    # let a request reach this machine's own network. Resolves the
-    # hostname and rejects anything private/loopback/link-local/reserved,
-    # in addition to the obvious localhost names.
-    if not hostname or hostname.lower() in ('localhost', '0.0.0.0'):  # nosec B104 -- this REJECTS localhost/0.0.0.0; it is the SSRF guard, not a bind
-        return False
-    try:
-        infos = socket.getaddrinfo(hostname, None)
-    except socket.gaierror:
-        return False
-    for info in infos:
-        addr = info[4][0]
-        try:
-            ip = ipaddress.ip_address(addr)
-        except ValueError:
-            return False
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-            return False
-    return True
-
-
-_TAG_RE = re.compile(r'<(script|style)[^>]*>.*?</\1>', re.IGNORECASE | re.DOTALL)
-_ANY_TAG_RE = re.compile(r'<[^>]+>')
-_LINK_RE = re.compile(r'<a\s+([^>]*)>(.*?)</a>', re.IGNORECASE | re.DOTALL)
-_HREF_RE = re.compile(r'href=["\']([^"\']*)["\']', re.IGNORECASE)
-
-
-def _strip_html_to_text(raw_html):
-    # A plain-text reading view, not a rendering engine -- this feeds an
-    # agent's own context (and the in-game fake-browser display), neither
-    # of which need or should execute page JS/CSS.
-    text = _TAG_RE.sub(' ', raw_html)
-    text = _ANY_TAG_RE.sub(' ', text)
-    text = html.unescape(text)
-    return re.sub(r'\s+', ' ', text).strip()
-
-
-def _extract_links(raw_html, base_url):
-    # Stripping tags for the reading view (above) throws away every
-    # <a href> along with them -- real gap you caught: an agent has no way
-    # to "follow a breadcrumb" to a page it doesn't already know the URL
-    # for. Each extracted link still goes through the full /api/browse
-    # gate independently when followed (classify, SSRF-check, log) -- this
-    # only surfaces what's on the page, it doesn't fetch anything itself.
-    seen = set()
-    links = []
-    for m in _LINK_RE.finditer(raw_html):
-        attrs, link_text = m.group(1), m.group(2)
-        # Real gap caught live: a language-alternate link (standard
-        # hreflang attribute, not a Wikipedia-specific pattern) filled an
-        # entire lower link-extraction budget on a real test page before
-        # any actual article-body link was ever reached. hreflang is
-        # specifically the HTML spec's own signal for "this is a
-        # language alternate, not primary content" -- skipping it is a
-        # general fix, not a one-site hack.
-        if 'hreflang=' in attrs.lower():
-            continue
-        href_m = _HREF_RE.search(attrs)
-        if not href_m:
-            continue
-        href = href_m.group(1)
-        if not href or href[0] == '#' or href.lower().startswith(('javascript:', 'mailto:', 'tel:')):
-            continue
-        abs_url = urllib.parse.urljoin(base_url, href)
-        parsed = urllib.parse.urlparse(abs_url)
-        if parsed.scheme not in ('http', 'https') or abs_url in seen:
-            continue
-        seen.add(abs_url)
-        clean_text = _ANY_TAG_RE.sub(' ', link_text)
-        clean_text = re.sub(r'\s+', ' ', html.unescape(clean_text)).strip()
-        links.append({'text': clean_text[:100] or abs_url, 'url': abs_url})
-        # Real gap caught live: a lower cap (40) was entirely consumed by
-        # a link-dense page's own chrome (Wikipedia's nav sidebar plus its
-        # ~300-language switcher) before reaching any actual article
-        # content, so the multi-hop "follow toward a goal" helper below
-        # never even saw the relevant link as a candidate.
-        if len(links) >= 200:
-            break
-    return links
-
-
 # How long real JS/AJAX content gets to finish loading before the text is
 # read back out -- a FIXED settle window, not "wait for network idle"
 # (page.goto's own wait_until option): a feed site's background polling or
@@ -4038,26 +3966,6 @@ def _fetch_rendered_page_sync(url):
             return final_url, text, links
         finally:
             browser.close()
-
-
-def _parse_http_date_ms(value):
-    # Real ask (2026-09-21): "date-aware" incremental research needs SOME
-    # real signal that a page's content actually changed, not just that
-    # its URL was already seen -- Last-Modified is the one plain HTTP
-    # already carries, imperfect as it is (plenty of sites never set it,
-    # or set it to render time rather than true content-modification
-    # time). Failing closed to None on anything unparseable -- a caller
-    # treating "we don't know" as "assume changed" is the safe default,
-    # not this function guessing.
-    if not value:
-        return None
-    try:
-        dt = email.utils.parsedate_to_datetime(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=datetime.timezone.utc)
-        return int(dt.timestamp() * 1000)
-    except (TypeError, ValueError):
-        return None
 
 
 def _fetch_page_sync(url):
@@ -8433,23 +8341,6 @@ async def write_library_file(request: Request):
 DOWNLOAD_MAX_BYTES = 20_000_000  # 20MB -- generous for a real reference document, still bounded
 
 
-def _download_dest_rel_path(scope, agent_id, safe_name):
-    # Extracted as its own pure function so the personal-vs-shared routing
-    # decision is directly testable without mocking the network fetch and
-    # Jev classification call that sit around it in the real endpoint.
-    if scope == 'shared':
-        return f'pending_review/shared/{safe_name}'
-    return f'pending_review/downloads/{agent_id}/{safe_name}'
-
-
-def _sanitize_download_filename(filename):
-    # A safe, flat filename only -- os.path.basename strips any directory
-    # component (../../.env style traversal via the filename itself),
-    # then anything left that isn't alphanumeric/underscore/dot/hyphen is
-    # replaced, and the whole thing is length-capped.
-    return re.sub(r'[^A-Za-z0-9_.\-]', '_', os.path.basename(filename))[:200]
-
-
 def _download_file_sync(url, max_bytes):
     req = urllib.request.Request(url, headers={'User-Agent': 'AIVillageAgent/1.0'}, method='GET')
     with urllib.request.urlopen(req, timeout=BROWSE_TIMEOUT_S) as resp:  # nosec B310 -- user URLs pre-cleared by _jev_safety_gate's SSRF hostname guard (:2157); this helper only fetches already-approved hosts
@@ -8559,14 +8450,6 @@ def _load_passport():
     return data
 
 
-def _sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, 'rb') as f:
-        for chunk in iter(lambda: f.read(64 * 1024), b''):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def _append_passport(rel_path, owner, promoted_by):
     # Adds a block to the chain for a just-promoted (trusted) file. Each block
     # carries the file's content hash, the path, who promoted it, and the hash
@@ -8630,16 +8513,6 @@ def _append_passport_decision(kind, actor, payload):
         return block
     except Exception:
         return None
-
-
-def _block_link_value(block):
-    # The value a block contributes to the chain link -- what the NEXT block's
-    # `prev` must reference. For a promoted-FILE block it is the file's content
-    # hash; for a DECISION block it is the re-serialized content hash. Both
-    # block kinds share one ledger and link through the same `head`.
-    if block.get('kind'):
-        return hashlib.sha256(json.dumps(block, sort_keys=True, default=str).encode()).hexdigest()
-    return block.get('sha256')
 
 
 def verify_passport():

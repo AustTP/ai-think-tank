@@ -130,6 +130,11 @@ class TriggerSites(unittest.TestCase):
         self.assertIn('card_blocked', kinds)
 
     def test_peer_review_queues_email(self):
+        # Peer review is agent-to-agent (2026-09-24): entering review notifies
+        # the picked reviewers via their MAILBOX, not the player -- the player
+        # only hears about a story when it actually SHIPS (story_done). This
+        # asserts both halves: the reviewers got their mailbox notice, and no
+        # player email fired merely for entering review.
         st = _state()
         st['agents'].setdefault('priya', {})['offDuty'] = False
         task = {'id': 'task-r1', 'title': 'Author a research brief',
@@ -137,8 +142,13 @@ class TriggerSites(unittest.TestCase):
                 'assignedTo': 'nadia', 'status': 'working', 'workUntil': 0}
         gate = sim._enter_peer_review(st, task, _NOW_MS)
         self.assertIsNotNone(gate)
-        kinds = [e['kind'] for e in st['emailOutbox']]
-        self.assertIn('story_needs_review', kinds)
+        # Reviewers were notified in-band (mailbox), not via a player email.
+        reviewer_mailboxes = [st['agents'][r].get('mailbox', []) for r in gate.get('reviewerIds', [])]
+        self.assertTrue(any('peer_review_request' in (m.get('kind') if isinstance(m, dict) else m)
+                            for mb in reviewer_mailboxes for m in mb),
+                        'reviewers get a mailbox peer_review_request on entry')
+        # No player email was queued just for entering review.
+        self.assertEqual(st.get('emailOutbox', []), [])
 
 
 class EndpointAuth(unittest.TestCase):
