@@ -436,6 +436,82 @@ class ModelBenchmarkScores(unittest.TestCase):
         self.assertIsNone(old_table_gone, 'the old table should be dropped once its data is migrated')
 
 
+class JevTierGate(unittest.TestCase):
+    # JEV-gated tier escalation (2026-09-27): everything defaults to LOW; coding
+    # is deterministic; mid is lightly gated; high is heavily gated. Fails
+    # CLOSED to low on any outage or low-confidence escalation.
+
+    def _slugs(self):
+        return [
+            unittest.mock.patch.object(serve, '_coding_tier_slug', return_value='coding-model'),
+            unittest.mock.patch.object(serve, '_low_tier_slug', return_value='low-model'),
+            unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-model'),
+            unittest.mock.patch.object(serve, '_high_tier_slug', return_value='high-model'),
+        ]
+
+    def _resolve(self, purpose, **kw):
+        patchers = self._slugs() + [unittest.mock.patch.object(serve, '_tier_gate_decider', self._decider)]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+        return serve._resolve_model_tier(purpose, **kw)
+
+    def _decider(self, instructions, criteria):
+        return self._decision, self._confidence
+
+    def test_coding_task_is_deterministic_no_jev(self):
+        # A code/review/qa task always uses the coding tier, no JEV consulted.
+        calls = []
+        def decider(i, c):
+            calls.append(1)
+            return 'low', 0.9
+        patchers = self._slugs() + [unittest.mock.patch.object(serve, '_tier_gate_decider', decider)]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+        for tt in ('code', 'review', 'qa'):
+            self.assertEqual(serve._resolve_model_tier('do the thing', task_type=tt), 'coding-model')
+        self.assertEqual(calls, [], 'coding must not consult JEV')
+
+    def test_defaults_to_low(self):
+        self._decision, self._confidence = 'low', 0.9
+        self.assertEqual(self._resolve('routine task'), 'low-model')
+
+    def test_mid_lightly_gated(self):
+        self._decision, self._confidence = 'mid', 0.8
+        self.assertEqual(self._resolve('synthesize findings'), 'mid-model')
+
+    def test_low_confidence_mid_stays_low(self):
+        self._decision, self._confidence = 'mid', 0.3
+        self.assertEqual(self._resolve('judgment call'), 'low-model')
+
+    def test_high_requires_allow_high(self):
+        # JEV says high, but the call didn't opt into high -> stays low.
+        self._decision, self._confidence = 'high', 0.9
+        self.assertEqual(self._resolve('big task', allow_high=False), 'low-model')
+
+    def test_high_gated_on_allow_high(self):
+        self._decision, self._confidence = 'high', 0.9
+        self.assertEqual(self._resolve('decompose huge request', allow_high=True), 'high-model')
+
+    def test_low_confidence_high_fails_closed(self):
+        self._decision, self._confidence = 'high', 0.4
+        self.assertEqual(self._resolve('decompose huge request', allow_high=True), 'low-model')
+
+    def test_outage_fails_closed_to_low(self):
+        def boom(i, c):
+            raise RuntimeError('jev down')
+        patchers = self._slugs() + [unittest.mock.patch.object(serve, '_tier_gate_decider', boom)]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+        self.assertEqual(serve._resolve_model_tier('anything'), 'low-model')
+
+    def test_unknown_decision_fails_closed_to_low(self):
+        self._decision, self._confidence = 'maybe', 0.9
+        self.assertEqual(self._resolve('anything'), 'low-model')
+
+
 class AuthSessions(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

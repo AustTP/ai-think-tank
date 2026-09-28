@@ -5680,7 +5680,7 @@ def _runbook_decider_default(state, instructions, product_id, room, title, agent
     try:
         base = serve.SELF_BASE_URL
         key = serve.get_or_create_agent_key(agent_id) if agent_id else None
-        tier_slug = serve._mid_tier_slug()
+        tier_slug = serve._resolve_model_tier('Write one runbook line: what broke in this incident and how it was fixed')
         if not tier_slug:
             return None
         r = serve._http_json('POST', base, '/api/chat',
