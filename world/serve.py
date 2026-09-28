@@ -147,6 +147,13 @@ LOG_RETENTION_DAYS_DEFAULT = 7
 LOG_PRUNE_INTERVAL_S = 6 * 3600          # twice a day is plenty for a rolling prune
 LOG_PRUNE_MAX_ROWS = 50_000              # cap per run so a big backlog can't block the loop
 _LAST_LOG_PRUNE = None
+# Daily model-tier re-pick (2026-09-27): the OpenRouter catalog + prices move
+# fast, and the player explicitly wants the village to re-derive the best
+# value pick per band from that day's scores AND prices rather than freezing
+# a stale choice. refresh_model_tiers() already does exactly that (best score
+# within the band's quality floor, then cheapest); this loop just runs it once
+# a day so the tiers track the market instead of a manual button.
+MODEL_TIER_REFRESH_INTERVAL_S = 24 * 3600  # daily
 _MAX_IDLE_MINUTES = 0.0  # 0 = disabled; set via --max-idle-minutes (float: allows <1m)
 _LAST_REQUEST_TIME = None  # touched by the no_store middleware below
 # Sleep-not-die (2026-09-24). When --max-idle-minutes elapses, the server does
@@ -481,6 +488,35 @@ async def _log_prune_loop():
         await asyncio.sleep(LOG_PRUNE_INTERVAL_S)
         await asyncio.to_thread(_prune_logs)
         _LAST_LOG_PRUNE = time.time()
+
+
+async def _model_tier_refresh_loop():
+    """Daily model-tier re-pick, run AS a governance action by the admin (or
+    the senior-most director standing in), not a silent background chore
+    (2026-09-27). The OpenRouter catalog + prices move fast; the player wants
+    the village to re-derive each band's best value from THAT day's scores and
+    prices. refresh_model_tiers() already picks best-score-within-floor, then
+    cheapest -- this loop just runs it daily and logs the decision through the
+    normal governance/audit path (log_action), attributed to whoever holds the
+    admin authority, so the player can see "Theo re-picked the tiers" in the
+    activity feed exactly like a bank review or a firing review."""
+    while True:
+        await asyncio.sleep(MODEL_TIER_REFRESH_INTERVAL_S)
+        try:
+            fresh = await refresh_model_tiers()
+            state = get_state_from_db()
+            actor = _admin_agent_id(state) or _senior_most_director_id(state)
+            if actor:
+                log_action(actor, 'model_tiers_refreshed',
+                           {'tiers': {band: m['id'] for band, m in fresh.items()},
+                            'note': 'daily re-pick: best scored value within each band\'s quality floor, then cheapest'},
+                           authorized=False)
+            else:
+                print(f'[model-tiers] daily refresh ran, no admin/director to attribute to: {list(fresh)}', flush=True)
+        except Exception as e:
+            # A refresh failure is not fatal -- keep the previous tiers and
+            # retry tomorrow (fails open to the last good choice).
+            print(f'[model-tiers] daily refresh failed (keeping current tiers): {e}', flush=True)
 
 
 async def _idle_shutdown_loop(poll_s=30):
@@ -2235,6 +2271,11 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None)
     except Exception:
         decision, confidence = None, 0.0
     if decision == 'high' and allow_high and confidence >= TIER_GATE_MIN_CONFIDENCE:
+        # High tier is expensive and designed for RARE use -- a dollar budget,
+        # not just a confidence gate. If the month's high-tier allowance is
+        # spent, fail CLOSED to mid rather than overrunning the expensive tier.
+        if _high_tier_budget_exceeded():
+            return _mid_tier_slug() or _low_tier_slug()
         return _high_tier_slug() or _mid_tier_slug() or _low_tier_slug()
     if decision == 'mid' and confidence >= TIER_GATE_MIN_CONFIDENCE:
         return _mid_tier_slug() or _low_tier_slug()
@@ -2649,6 +2690,7 @@ async def _lifespan(app):
     peer_task = asyncio.create_task(_peer_review_loop())
     backup_task = asyncio.create_task(_backup_loop())
     prune_task = asyncio.create_task(_log_prune_loop())
+    tier_refresh_task = asyncio.create_task(_model_tier_refresh_loop())
     telegram_task = None
     if TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS:
         telegram_task = asyncio.create_task(_telegram_poll_loop())
@@ -3457,8 +3499,78 @@ def _accrue_page_request():
             ledger[PAGE_REQUEST_BUDGET_START_KEY] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         _page_budget_ledger_write(ledger)
     except Exception:
-        pass  # accounting never blocks a real fetch
+        pass  # accounting never breaks a real fetch
     return True
+
+# HIGH-tier spend cap (2026-09-27): the high tier is the expensive one (a
+# stronger model for high-stakes planning), and the player wants its USE kept
+# very limited -- a dollar budget, not a confidence one. This is a MONTHLY cap
+# on total high-tier model spend: once the month's allowance is consumed, the
+# JEV tier gate fails CLOSED on high (routing to mid instead), so the expensive
+# tier can never overrun. Set HIGH_TIER_MONTHLY_BUDGET_USD in .env to change it
+# (e.g. 1.00 = at most $1 of high-tier spend per calendar month); 0/unset
+# disables the cap. Accrual happens at the /api/chat choke point (see
+# _accrue_high_tier_spend), the single place every model call's real cost is
+# known.
+HIGH_TIER_MONTHLY_BUDGET_USD = float(_load_env().get('HIGH_TIER_MONTHLY_BUDGET_USD', '0') or 0)
+# Highest per-million-token price the HIGH tier will even CONSIDER (2026-09-27):
+# the daily refresh only offers Jev/score-pick candidates priced at or below
+# this, so a $210/M model can never win the high tier no matter its score.
+# This is a per-call price ceiling (models under it), distinct from the monthly
+# spend cap above (how much aggregate high-tier spend is allowed). Set
+# HIGH_TIER_MAX_PRICE_USD in .env (e.g. 6.00 = never pick a model over $6/M);
+# 0/unset disables the ceiling.
+HIGH_TIER_MAX_PRICE_USD = float(_load_env().get('HIGH_TIER_MAX_PRICE_USD', '0') or 0)
+# Reserved spend-ledger bucket name for high-tier accrual (kept apart from
+# per-service buckets so the bank can show "how much went to the expensive
+# tier" at a glance, and so the cap reads it cleanly).
+HIGH_TIER_LEDGER_KEY = '__high_tier__'
+
+
+def _high_tier_budget_month():
+    """The current UTC calendar month (2026-09) -- the rollover key: a fresh
+    month resets the high-tier allowance."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
+
+
+def _high_tier_spend_this_month():
+    """Total high-tier model spend this calendar month (USD)."""
+    try:
+        ledger = _spend_ledger_read()
+        bucket = ledger.get(HIGH_TIER_LEDGER_KEY) or {}
+        series = bucket.get('byMonth') or {}
+        return float(series.get(_high_tier_budget_month(), 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def _high_tier_budget_exceeded():
+    """True when the high tier has consumed its monthly budget (no more
+    high-tier calls allowed unless the cap is raised / the month rolls over).
+    Never true when the cap is disabled (0/unset)."""
+    if not HIGH_TIER_MONTHLY_BUDGET_USD:
+        return False
+    return _high_tier_spend_this_month() >= HIGH_TIER_MONTHLY_BUDGET_USD
+
+
+def _accrue_high_tier_spend(cost):
+    """Accrue a high-tier model call's cost against the monthly high-tier
+    budget. Best-effort like _accrue_spend: an accounting failure must never
+    break the actual call. Uses the SAME kv_spend ledger as _accrue_spend (so
+    the bank sees it) but a reserved bucket + monthly series keyed by month."""
+    if not isinstance(cost, (int, float)) or not cost:
+        return
+    try:
+        ledger = _spend_ledger_read()
+        bucket = ledger.setdefault(HIGH_TIER_LEDGER_KEY, {'used': 0.0, 'calls': 0, 'byMonth': {}})
+        cost = float(cost)
+        bucket['used'] = float(bucket.get('used', 0) or 0) + cost
+        bucket['calls'] = int(bucket.get('calls', 0) or 0) + 1
+        month = _high_tier_budget_month()
+        bucket['byMonth'][month] = float((bucket['byMonth'] or {}).get(month, 0) or 0) + cost
+        _spend_ledger_write(ledger)
+    except Exception:
+        pass  # accounting never blocks a real call
 
 BROWSE_MAX_BYTES = 200_000
 BROWSE_TIMEOUT_S = 10
@@ -4956,9 +5068,10 @@ BAND_BENCHMARK = {
 # BENCHMARK, still counts as "good enough" to let price break the tie --
 # picked to match your explicit choice on 2026-09-19 for the coding band:
 # Qwen3-Coder-480B (72.5%, $1.30/M) over Claude Sonnet 4.5 (77.2%, $18/M),
-# a 4.7-point gap. Set with a little headroom above that exact gap.
+# a 4.7-point gap. Set with a little headroom above that exact gap. Score keeps
+# its place (2026-09-27): a meaningfully worse model does NOT win on price.
 BENCHMARK_QUALITY_FLOOR_GAP = 6
-# ...except the planning band, where you said you're willing to spend a
+# ...except the planning band, where the player is willing to spend a
 # lot. Operationalized as a TIGHTER quality floor rather than "ignore
 # price": the pick still has to justify itself on score, but far less
 # compromise is accepted before cost breaks the tie, because every
@@ -4987,12 +5100,14 @@ def set_model_benchmark_score(model_id, benchmark, score, source_url):
 
 
 async def _best_value_pick(candidates, scores, floor_gap=None):
-    # Shared by every band: among candidates with a real stored score,
-    # keep only those within the band's quality floor of the best score
-    # present, then take the cheapest of those that actually still work
-    # (live-verified, same as every other pick here). Returns None if
-    # nothing in `candidates` has a stored score yet, or nothing verified
-    # works -- callers fall back to Jev's classifier in that case.
+    # Shared by every band (2026-09-27, restored): score keeps its place. Among
+    # candidates with a real stored score, keep only those within the band's
+    # quality floor of the best score present, then take the cheapest of those
+    # that actually still work (live-verified, same as every other pick here).
+    # Score guards against picking a meaningfully worse model purely on price;
+    # price then breaks ties among models that pass the quality bar. Returns
+    # None if nothing in `candidates` has a stored score yet, or nothing
+    # verified works -- callers fall back to Jev's classifier in that case.
     if floor_gap is None:
         floor_gap = BENCHMARK_QUALITY_FLOOR_GAP
     scored = [m for m in candidates if m['id'] in scores]
@@ -5109,6 +5224,17 @@ def _verify_model_works_sync(model_id):
     return False
 
 
+def _apply_band_price_ceiling(band, candidate_pool):
+    """The high tier carries a per-model PRICE CEILING (2026-09-27): the
+    expensive tier is bounded, so the daily refresh only presents candidates
+    at or below HIGH_TIER_MAX_PRICE_USD. A model over the ceiling is never
+    offered, even if it tops the score table -- price is a hard bound for
+    high, not a tiebreak. Every other band passes through unchanged."""
+    if band == 'high' and HIGH_TIER_MAX_PRICE_USD:
+        return [m for m in candidate_pool if m['price'] <= HIGH_TIER_MAX_PRICE_USD]
+    return candidate_pool
+
+
 async def refresh_model_tiers():
     models = await asyncio.to_thread(_fetch_openrouter_catalog_sync)
     buckets = _bucket_models_by_price(models)
@@ -5132,6 +5258,7 @@ async def refresh_model_tiers():
         # them distinct, cheaper tiers.
         capability_band = band in ('coding', 'high')
         candidate_pool = [m for band_pool in buckets.values() for m in band_pool] if capability_band else pool
+        candidate_pool = _apply_band_price_ceiling(band, candidate_pool)
         picked = await _best_value_pick(candidate_pool, scores, BAND_QUALITY_FLOOR_GAP.get(band))
 
         if picked is None and not pool:
@@ -8976,6 +9103,17 @@ async def chat(request: Request):
         usage_cost = (data.get('usage') or {}).get('cost', 0.0)
         if isinstance(usage_cost, (int, float)) and usage_cost:
             _accrue_spend(service, usage_cost)
+            # High tier is its own accountable service line (2026-09-27) so the
+            # bank shows how much the expensive tier cost AND the JEV gate can
+            # fail closed when the month's high-tier allowance is spent.
+            if model == _high_tier_slug():
+                _accrue_high_tier_spend(usage_cost)
+            # High-tier calls accrue against the dedicated high-tier monthly
+            # budget too (2026-09-27) so the JEV gate can cap expensive-tier
+            # usage. Checks whether THIS call used the high-tier model.
+            high_slug = _high_tier_slug()
+            if high_slug and model == high_slug:
+                _accrue_high_tier_spend(usage_cost)
         log_action(agent_id, 'chat', {'model': model, 'service': service, 'cost': float(usage_cost) if isinstance(usage_cost, (int, float)) else 0.0}, authorized=authorized)
         return JSONResponse({'reply': reply})
     except urllib.error.HTTPError as e:
@@ -10695,10 +10833,11 @@ async def model_tiers():
 
 @app.post('/api/model-tiers/refresh')
 async def model_tiers_refresh():
-    # An explicit, deliberate action (a button, not a timer) -- per the
-    # same cost-consciousness as everything else here, refreshing the
-    # catalog and re-running Jev three times isn't something that should
-    # happen on its own on a schedule.
+    # An explicit, deliberate action (a button) -- but also run AUTOMATICALLY
+    # once a day by _model_tier_refresh_loop, attributed to the admin/director
+    # (2026-09-27: the model landscape moves fast, so the village re-picks its
+    # best-value tier from that day's scores + prices on a schedule). This
+    # endpoint just lets the player force an immediate re-pick too.
     try:
         fresh = await refresh_model_tiers()
         return JSONResponse({band: {'slug': m['id'], 'name': m['name'], 'price': m['price']} for band, m in fresh.items()})
