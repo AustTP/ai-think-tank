@@ -2389,7 +2389,13 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # notified on completion, success or failure alike, so silence never
     # reads as "still working" when it already gave up.
     tier_slug = _serve._resolve_model_tier(f'Run a time-boxed web investigation (spike): {backlog[:200]}')
-    reasoning_slug = _serve._reasoning_tier_slug() or tier_slug
+    # The plan/synthesize bookends do the genuine reasoning of a spike. No
+    # separate reasoning band needed (2026-09-27): the JEV tier gate already
+    # routes consequential work to mid/high, whose models are reasoning-
+    # capable. Gate with allow_high so a hard investigation can spend up.
+    reasoning_slug = _serve._resolve_model_tier(
+        f'Plan and synthesize a time-boxed investigation, judging own completeness: {backlog[:200]}',
+        allow_high=True)
     if not tier_slug:
         _sim_module._store_content_result(task.get('id'), {
             'note': f'Spiked "{backlog}", but no model tier is configured yet.', 'ok': False,

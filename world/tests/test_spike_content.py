@@ -392,7 +392,10 @@ class SpikeContent(unittest.TestCase):
         synth_call_messages = oc.call_args_list[1].args[1]
         joined = ' '.join(m.get('content', '') for m in synth_call_messages)
         self.assertIn('REAL PAGE CONTENT ABOUT DREYX TOOLS', joined)
-        self.assertEqual(oc.call_args_list[1].args[0], 'reasoning-tier-slug')
+        # The spike's plan/synthesize go through the JEV tier gate now (no
+        # separate reasoning band); the test's decider stub returns mid, so
+        # both bookends use the mid tier model.
+        self.assertEqual(oc.call_args_list[1].args[0], 'mid-tier-slug')
 
     def test_synthesis_failure_falls_back_to_execute_text(self):
         self._common_mocks()
