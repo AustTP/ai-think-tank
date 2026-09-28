@@ -1553,7 +1553,13 @@ def _digitalocean_account_balance():
     (dollars) or None on any failure (no credential, network, bad response),
     so the circuit breaker below fails CLOSED (refuse) rather than silently
     treating an unreachable check as "must be fine." Cached briefly so a
-    handle-mint request doesn't always cost a live network round-trip."""
+    handle-mint request doesn't always cost a live network round-trip.
+    While SANDBOX_EXECUTION=local the DO credential is unreachable by design
+    (_digitalocean_enabled is False), so this returns None without touching
+    the network -- the master switch cuts off even the read-only balance
+    check, not just agent handles."""
+    if not _digitalocean_enabled():
+        return None
     token = _open_secret(_credential_token('digitalocean') or '')
     if not token:
         return None
@@ -1875,6 +1881,34 @@ def _google_call(method, url, body=None, timeout=30):
             return None, f'Google call failed: {e}'
 
 
+def _github_call(method, url, body=None, timeout=30):
+    """Real authenticated call to the GitHub REST API (api.github.com), given
+    a full URL. Read-only capability (2026-09-28): lets the village's
+    engineering work ground itself in REAL public repos/issues/PRs instead of
+    hallucinating plausible-looking ones. The PAT comes from GITHUB_TOKEN in
+    .env (classic/fine-grained with read:repo+public read scope). Free --
+    GitHub's public API has no per-call spend, only a per-hour rate limit, so
+    there's no kv_spend accrual (same as Google Sheets/Calendar). Returns
+    (data, error), the same 2-tuple shape as _google_call / _treg_call."""
+    token = GITHUB_TOKEN
+    if not token:
+        return None, 'GitHub is not configured (no GITHUB_TOKEN in .env)'
+    try:
+        data_bytes = json.dumps(body).encode('utf-8') if body is not None else None
+        req = urllib.request.Request(
+            url, data=data_bytes, method=method,
+            headers={'Authorization': f'Bearer {token}',
+                     'Accept': 'application/vnd.github+json',
+                     'X-GitHub-Api-Version': '2022-11-28'})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- fixed GitHub API host
+            return json.loads(resp.read().decode('utf-8', errors='replace')), None
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode('utf-8', errors='replace')[:500]
+        return None, f'GitHub call failed ({e.code}): {detail}'
+    except Exception as e:
+        return None, f'GitHub call failed: {e}'
+
+
 # Per your call (2026-09-24): DigitalOcean is the one external credential
 # where a mistake is real, hard-to-reverse money (a created Droplet keeps
 # billing even powered off -- see library/skills/digitalocean.md), so it gets
@@ -1951,6 +1985,18 @@ def mint_capability_handle(agent_id, credential_name, purpose, allowed_hosts,
                            (credential_name,)).fetchone()
         if not row:
             return None, 'unknown credential'
+        # Master gate for the DigitalOcean credential (2026-09-28): the DO
+        # token is only reachable when SANDBOX_EXECUTION=digitalocean. While
+        # the switch reads `local` (the default), NO handle for it can even be
+        # minted -- an agent can never get a DO handle to try, matching the
+        # player's rule that DO is unreachable until the variable is flipped.
+        if credential_name == 'digitalocean' and not _digitalocean_enabled():
+            reason = ('DigitalOcean is disabled: SANDBOX_EXECUTION=local in .env. '
+                      'Set SANDBOX_EXECUTION=digitalocean to enable it.')
+            log_action(granted_by, 'handle_mint_refused',
+                      {'agentId': agent_id, 'credential': credential_name, 'reason': reason},
+                      authorized=True)
+            return None, reason
         over_cap, reason = _credential_over_cap(credential_name, get_state_from_db() or {})
         if over_cap:
             log_action(granted_by, 'handle_mint_refused',
@@ -2016,6 +2062,13 @@ def resolve_capability_handle(agent_id, handle, method, url):
         if not row:
             return None
         credential_name, purpose, allowed_hosts, allowed_methods, expires_at = row
+        # Defense-in-depth on top of the mint gate (2026-09-28): a handle
+        # minted while SANDBOX_EXECUTION=digitalocean must NOT keep working if
+        # the switch is later flipped back to `local`. The mint gate stops new
+        # DO handles; this stops a leftover one from resolving, so DO stays
+        # unreachable the instant the variable stops saying digitalocean.
+        if credential_name == 'digitalocean' and not _digitalocean_enabled():
+            return None
         # Handles store their scope as JSON ('["api.github.com"]', '["*"]'); the
         # '*' wildcard is stored as a singleton list. Decode back to real lists
         # so the scope checks below compare actual values, not the raw JSON text.
@@ -3180,6 +3233,12 @@ OPENROUTER_API_KEY = _load_env().get('OPENROUTER_API_KEY')
 # returns clean {title, url, content} results, no scraping/CAPTCHA involved.
 # search_web is simply absent from AGENT_ASK_TOOLS when this is unset.
 TAVILY_API_KEY = _load_env().get('TAVILY_API_KEY')
+# GitHub PAT (2026-09-28): read-only access to real public repos/issues/PRs
+# so engineering work grounds itself in real code. Loaded as a module constant
+# like TAVILY/OPENROUTER keys; _github_call reads it for every request. Absent
+# (blank) means the GitHub tools are simply NOT offered to agents -- same
+# pattern as search_web, so the surface never advertises an unusable tool.
+GITHUB_TOKEN = _load_env().get('GITHUB_TOKEN')
 
 
 def _get_or_create_server_secret():
@@ -3708,6 +3767,21 @@ EXECUTION_ENABLED = _load_env().get('AGENT_EXECUTION_ENABLED', 'true').strip().l
 SANDBOX_IMAGE = 'ai-village-work-sandbox'  # world/sandbox/Dockerfile -- has flake8/mypy/bandit/pytest-cov baked in (Cut 4)
 SANDBOX_TIMEOUT_S = 30
 SANDBOX_MAX_OUTPUT = 20_000
+# Where agent commands actually run (2026-09-28): `local` = the local Docker
+# sandbox (the default and only tested backend); `digitalocean` = a provisioned
+# DigitalOcean Droplet. This ALSO serves as the master gate for the DO
+# credential -- see _digitalocean_enabled / the mint+resolve refusals below:
+# while local, agents can never obtain or use a DO capability handle, so the
+# vault-held DO token is unreachable until this is flipped to 'digitalocean'.
+SANDBOX_EXECUTION = _load_env().get('SANDBOX_EXECUTION', 'local').strip().lower()
+
+
+def _digitalocean_enabled():
+    """True only when SANDBOX_EXECUTION=digitalocean -- the single switch that
+    makes the DigitalOcean credential usable by the village. Every agent-facing
+    entry point (handle mint, handle resolve) hard-refuses while this is False,
+    so flipping the variable is the SOLE way DO becomes reachable."""
+    return SANDBOX_EXECUTION == 'digitalocean'
 
 # Categories a proposed command is checked against BEFORE it ever runs --
 # same "classify the request, not the result" shape as browsing, and for
@@ -3999,6 +4073,24 @@ def ensure_sandbox_networking():
 
 
 def _run_in_sandbox_sync(sandbox_dir, command):
+    # Backend dispatch (2026-09-28): SANDBOX_EXECUTION chooses WHERE agent
+    # commands run. `local` (default) -> the local Docker sandbox below;
+    # `digitalocean` -> a provisioned Droplet. The digitalocean branch FAILS
+    # CLOSED with an explicit error until a remote executor is actually
+    # provisioned -- it must never silently fall through to the local
+    # backend, because that would run a command the agent believed was
+    # executing on DigitalOcean somewhere entirely different (a security lie,
+    # not just a correctness bug). Only reachable when the player has flipped
+    # the switch, per _digitalocean_enabled.
+    if SANDBOX_EXECUTION == 'digitalocean':
+        return {
+            'exitCode': None,
+            'stdout': '',
+            'stderr': ('SANDBOX_EXECUTION=digitalocean is set but a DigitalOcean execution '
+                       'backend has not been provisioned yet. No command was run anywhere -- '
+                       'flip SANDBOX_EXECUTION back to local, or provision the DO executor.'),
+            'timedOut': False,
+        }
     # Only reachable network is SANDBOX_NETWORK (internal -- see
     # ensure_sandbox_networking() above); the proxy env vars are what let
     # a well-behaved package manager actually install anything, not a

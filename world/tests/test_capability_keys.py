@@ -152,10 +152,13 @@ class CapabilityKeys(unittest.TestCase):
         # The hard circuit breaker (2026-09-24): a credential in
         # _HARD_CAPPED_CREDENTIALS with a configured budgetCapUsd on its
         # product must refuse EVEN the mint step once real usage is at/over
-        # cap -- the agent never even gets a handle to try.
+        # cap -- the agent never even gets a handle to try. Runs with the
+        # DigitalOcean master switch ON (SANDBOX_EXECUTION=digitalocean) so
+        # the balance cap is what's being tested, not the switch gate.
         serve._store_credential('digitalocean', 'digitalocean', 'do-secret')
         state = {'products': {'digitalocean': {'budgetCapUsd': 25}}}
         with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, '_digitalocean_enabled', return_value=True), \
              unittest.mock.patch.dict(serve._HARD_CAPPED_CREDENTIALS,
                                        {'digitalocean': lambda: 30.0}):
             handle, reason = serve.mint_capability_handle(
@@ -164,12 +167,88 @@ class CapabilityKeys(unittest.TestCase):
         self.assertIn('25.00', reason)
         # And under cap, minting succeeds normally.
         with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, '_digitalocean_enabled', return_value=True), \
              unittest.mock.patch.dict(serve._HARD_CAPPED_CREDENTIALS,
                                        {'digitalocean': lambda: 5.0}):
             handle, reason = serve.mint_capability_handle(
                 'agent-a', 'digitalocean', 'check balance', '*', ['GET'], 'player', 3600)
         self.assertIsNotNone(handle)
         self.assertIsNone(reason)
+
+    def test_digitalocean_master_switch_blocks_mint_while_local(self):
+        # The player's rule (2026-09-28): DigitalOcean must be UNREACHABLE
+        # unless SANDBOX_EXECUTION=digitalocean. While the switch reads
+        # `local` (the default), even a provisioned DO credential and a
+        # healthy balance must NOT yield a handle -- the switch is the sole
+        # gate, checked BEFORE the balance circuit breaker.
+        serve._store_credential('digitalocean', 'digitalocean', 'do-secret')
+        state = {'products': {'digitalocean': {'budgetCapUsd': 25}}}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, '_digitalocean_enabled', return_value=False), \
+             unittest.mock.patch.dict(serve._HARD_CAPPED_CREDENTIALS,
+                                       {'digitalocean': lambda: 0.0}):
+            handle, reason = serve.mint_capability_handle(
+                'agent-a', 'digitalocean', 'check balance', '*', ['GET'], 'player', 3600)
+        self.assertIsNone(handle)
+        self.assertIn('SANDBOX_EXECUTION', reason)
+        # Non-DO credentials are unaffected by the switch.
+        serve._store_credential('gh', 'github', 'secret-1')
+        with unittest.mock.patch.object(serve, '_digitalocean_enabled', return_value=False):
+            h, reason = serve.mint_capability_handle(
+                'agent-a', 'gh', 'deploy', '*', ['GET'], 'player', 3600)
+        self.assertTrue(h)
+        self.assertIsNone(reason)
+
+    def test_digitalocean_master_switch_blocks_stale_handle_resolution(self):
+        # Defense in depth: a handle minted while the switch was ON must not
+        # keep resolving after it's flipped back to `local`.
+        serve._store_credential('digitalocean', 'digitalocean', 'do-secret')
+        with unittest.mock.patch.object(serve, '_digitalocean_enabled', return_value=True):
+            h, _ = serve.mint_capability_handle(
+                'agent-a', 'digitalocean', 'check balance', '*', ['GET'], 'player', 3600)
+        with unittest.mock.patch.object(serve, '_digitalocean_enabled', return_value=False):
+            self.assertIsNone(serve.resolve_capability_handle(
+                'agent-a', h, 'GET', 'https://api.digitalocean.com/v2/customers/my/balance'))
+        # And with the switch back ON it resolves normally again.
+        with unittest.mock.patch.object(serve, '_digitalocean_enabled', return_value=True):
+            grant = serve.resolve_capability_handle(
+                'agent-a', h, 'GET', 'https://api.digitalocean.com/v2/customers/my/balance')
+        self.assertIsNotNone(grant)
+        self.assertEqual(grant['secret'], 'do-secret')
+
+    def test_digitalocean_balance_check_fails_closed_while_local(self):
+        # While the switch is `local` the balance check returns None WITHOUT
+        # touching the network -- _credential_over_cap then treats an
+        # unverifiable balance as over cap (fails closed), so DO cannot be
+        # granted even through the account-usage path.
+        serve._store_credential('digitalocean', 'digitalocean', 'do-secret')
+        with unittest.mock.patch.object(serve, '_digitalocean_enabled', return_value=False), \
+             unittest.mock.patch.object(serve, 'urllib') as fake_urllib:
+            self.assertIsNone(serve._digitalocean_account_balance())
+        fake_urllib.request.Request.assert_not_called()
+
+    def test_sandbox_execution_fails_closed_when_switch_set_to_digitalocean(self):
+        # Flipping SANDBOX_EXECUTION=digitalocean without a provisioned remote
+        # executor must NEVER silently run the command locally -- it fails
+        # closed with an explicit error instead.
+        with unittest.mock.patch.object(serve, 'SANDBOX_EXECUTION', 'digitalocean'):
+            result = serve._run_in_sandbox_sync('/tmp/whatever', 'echo hi')
+        self.assertIsNone(result['exitCode'])
+        self.assertIn('has not been provisioned', result['stderr'])
+        self.assertEqual(result['stdout'], '')
+        # And the default `local` backend still runs locally (the switch does
+        # not change behavior unless it explicitly says digitalocean).
+        with unittest.mock.patch.object(serve, 'SANDBOX_EXECUTION', 'local'), \
+             unittest.mock.patch.object(serve, 'subprocess') as fake_subprocess, \
+             unittest.mock.patch.object(serve, 'SANDBOX_NETWORK', 'net'), \
+             unittest.mock.patch.object(serve, 'PROXY_CONTAINER', 'proxy'), \
+             unittest.mock.patch.object(serve, 'PROXY_PORT', 8080), \
+             unittest.mock.patch.object(serve, 'SANDBOX_IMAGE', 'img'):
+            fake_subprocess.run.return_value = unittest.mock.Mock(
+                returncode=0, stdout='ok', stderr='')
+            result = serve._run_in_sandbox_sync('/tmp/whatever', 'echo hi')
+        self.assertEqual(result['exitCode'], 0)
+        self.assertEqual(result['stdout'], 'ok')
 
     def test_revoke_agent_credentials_clears_keys_grants_and_handles(self):
         # The fire path: one call must wipe every standing credential for the
