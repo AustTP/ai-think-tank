@@ -183,26 +183,58 @@ class ScrumMasterCondition(unittest.TestCase):
 
     def test_teams_missing_scrum_master(self):
         state = serve.get_state_from_db()
+        # Scrum masters scale with team size (2026-09-27): both teams here are
+        # below SCRUM_MASTER_MIN_TEAM_SIZE (faye has 1 worker, dev has 2), so
+        # neither REQUIRES a designated scrum master -- the director stands in.
         missing = serve._teams_missing_scrum_master(state, ['faye', 'dev'])
         ids = {m['id'] for m in missing}
-        self.assertEqual(ids, {'faye', 'dev'})
-        # Designate dev's, then only faye should be missing.
+        self.assertEqual(ids, set(), 'small teams below the threshold need no scrum master')
+        # Grow dev's team to the threshold and confirm IT is now flagged.
+        import sim as _sim
+        roster = state['agentRoster']
+        for i, nme in enumerate(['w1', 'w2']):
+            roster.append({'id': nme, 'name': nme, 'role': 'engineer', 'director': 'dev'})
+            state['agents'][nme] = {'id': nme, 'name': nme, 'busy': False, 'offDuty': False}
+        self.assertGreaterEqual(_sim._team_member_count(state, 'dev'),
+                                _sim.SCRUM_MASTER_MIN_TEAM_SIZE)
+        missing2 = serve._teams_missing_scrum_master(state, ['faye', 'dev'])
+        self.assertEqual({m['id'] for m in missing2}, {'dev'})
+        # Designate dev's, then nothing is missing.
         t = next(x for x in state['teams'] if x['id'] == 'dev')
         t['scrumMasterId'] = 'ben'
-        missing2 = serve._teams_missing_scrum_master(state, ['faye', 'dev'])
-        self.assertEqual([m['id'] for m in missing2], ['faye'])
+        missing3 = serve._teams_missing_scrum_master(state, ['faye', 'dev'])
+        self.assertEqual([m['id'] for m in missing3], [])
 
-    def test_sprint_create_gate_blocks_team_without_scrum_master(self):
+    def test_sprint_create_allows_small_team_without_scrum_master(self):
         c = self._client()
-        # No scrum master on either team -> gate blocks with 409 + the culprit.
+        # Both teams are below SCRUM_MASTER_MIN_TEAM_SIZE, so the director
+        # stands in as facilitator -- a sprint on them is NOT blocked.
         resp = c.post('/api/intent/sprint', json={
             'name': 'April', 'goal': 'Ship it', 'teamIds': ['faye', 'dev'],
             'items': [{'title': 'build', 'room': 'pressoffice',
                        'instructions': 'build it'}],
         })
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()['ok'])
+
+    def test_sprint_create_gate_blocks_big_team_without_scrum_master(self):
+        c = self._client()
+        # Grow dev's team to the threshold, clear its scrum master, then the
+        # gate blocks with 409 + the culprit.
+        state = serve.get_state_from_db()
+        import sim as _sim
+        for i, nme in enumerate(['w1', 'w2']):
+            state['agentRoster'].append({'id': nme, 'name': nme, 'role': 'engineer', 'director': 'dev'})
+            state['agents'][nme] = {'id': nme, 'name': nme, 'busy': False, 'offDuty': False}
+        serve.save_state_to_db(state)
+        resp = c.post('/api/intent/sprint', json={
+            'name': 'April', 'goal': 'Ship it', 'teamIds': ['dev'],
+            'items': [{'title': 'build', 'room': 'pressoffice',
+                       'instructions': 'build it'}],
+        })
         self.assertEqual(resp.status_code, 409)
         self.assertIn('scrum master', resp.json()['error'].lower())
-        self.assertEqual(len(resp.json()['missingTeams']), 2)
+        self.assertEqual(len(resp.json()['missingTeams']), 1)
 
     def test_sprint_create_succeeds_when_teams_have_scrum_masters(self):
         # Designate scrum masters for both teams, then sprint creation passes.

@@ -207,5 +207,25 @@ class FailClosed(unittest.TestCase):
         self.assertFalse(serve._looks_like_gmail_app_password('ab cd ef gh ij kl mn opX'))
 
 
+class PlayerEmailDisabled(unittest.TestCase):
+    """Player's call (2026-09-26): Telegram only, no more email. Same
+    kill-switch shape as AGENT_BROWSING_ENABLED -- flips the send off without
+    touching the credential/outbox machinery."""
+
+    def test_disabled_short_circuits_even_with_a_real_credential(self):
+        serve._store_credential(serve._GMAIL_CRED_NAME, 'Gmail SMTP (player notifications)', 'abcd efgh ijkl mnop')
+        self.addCleanup(serve._delete_credential, serve._GMAIL_CRED_NAME)
+        with unittest.mock.patch.object(serve, 'PLAYER_EMAIL_ENABLED', False):
+            self.assertIs(serve.send_player_email_sync('subj', 'body'), False)
+
+    def test_enabled_still_reaches_the_credential_check(self):
+        # Not disabled -> falls through to the real logic, which fails
+        # closed for a different reason (no credential) -- proves the
+        # toggle isn't accidentally short-circuiting everything.
+        serve._delete_credential(serve._GMAIL_CRED_NAME)
+        with unittest.mock.patch.object(serve, 'PLAYER_EMAIL_ENABLED', True):
+            self.assertIs(serve.send_player_email_sync('subj', 'body'), False)
+
+
 if __name__ == '__main__':
     unittest.main()

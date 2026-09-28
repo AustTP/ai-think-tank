@@ -707,6 +707,53 @@ def _repair_stalled_interactions(state):
     return released
 
 
+# Fault-aware routing memory (2026-09-26), ported from a real 2026 paper
+# (StigmergyRouter, UC Berkeley/ACM CAIS): a lightweight pheromone-memory
+# layer that steers multi-agent routing away from an agent whose work just
+# failed, using only cheap local counters -- no re-classification, no LLM
+# call, same "trust a real signal over another model call" spirit as Cut
+# 4's automated pipeline gate. Deliberately SHORT-lived (a cooldown, not a
+# lasting judgment -- that's the grading system's job, see
+# _grade_completed_task/_room_trailing_grade): an agent whose task was
+# reclaimed 5 minutes ago is worth routing around for a bit; one whose task
+# was reclaimed last week is not still being penalized for it.
+FAILURE_COOLDOWN_HALF_LIFE_S = 1800  # 30 minutes
+# 0.5, not 1.0: a single fresh failure scores ~1.0 but starts decaying
+# immediately, so a 1.0 threshold would stop treating it as "hot" within
+# milliseconds (a float-epsilon false negative). 0.5 gives a fresh single
+# failure a real ~one-half-life (30 min) cooldown window, matching the
+# constant's own name.
+FAILURE_COOLDOWN_THRESHOLD = 0.5
+
+
+def record_agent_failure(state, agent_id, now_ms=None):
+    """Bump agent_id's fault-memory the moment its work attempt genuinely
+    failed to complete (currently: its task was orphaned/reclaimed -- see
+    _reclaim_orphaned_walking_tasks). Pure on state; safe to call with a
+    falsy agent_id (e.g. an orphan with no assignedTo) -- no-ops."""
+    if not agent_id:
+        return
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    mem = state.setdefault('agentFailureMemory', {})
+    entry = mem.get(agent_id) or {'count': 0, 'lastFailedAt': 0}
+    entry['count'] = entry.get('count', 0) + 1
+    entry['lastFailedAt'] = now_ms
+    mem[agent_id] = entry
+
+
+def _agent_failure_score(state, agent_id, now_ms):
+    """Exponentially-decayed fault score (half-life FAILURE_COOLDOWN_HALF_LIFE_S)
+    -- a trail that isn't reinforced by a fresh failure fades on its own,
+    same reinforcement/decay shape real ant pheromone trails follow. 0.0 for
+    an agent with no recorded failure."""
+    mem = (state.get('agentFailureMemory') or {}).get(agent_id)
+    if not mem or 'lastFailedAt' not in mem:
+        return 0.0
+    age_s = max(0.0, (now_ms - mem['lastFailedAt']) / 1000.0)
+    decay = 0.5 ** (age_s / FAILURE_COOLDOWN_HALF_LIFE_S)
+    return mem.get('count', 0) * decay
+
+
 def _reclaim_orphaned_walking_tasks(state):
     """2026-09-23: a task left in 'walking'/'working' status whose assignee no
     longer holds it (agent.task != task_id, or the assignee vanished) will never
@@ -791,6 +838,10 @@ def _reclaim_orphaned_walking_tasks(state):
             'reviewAuthorId': task.get('reviewAuthorId') or None,
             'checklist': task.get('checklist') or None,
         })
+        # Fault-aware routing memory: this agent's work attempt just failed
+        # to complete -- steer the next round-robin pick away from it for a
+        # bit (see _agent_failure_score / _assign_due_item).
+        record_agent_failure(state, task.get('assignedTo'))
         del tasks[task_id]
         reclaimed += 1
     return reclaimed
@@ -1054,6 +1105,11 @@ MAX_TOTAL_AGENTS = 500  # hiring.js:40 -- total inventory cap, vs MAX_ACTIVE_AGE
 # members, NOT counting the scrum master. Team membership is DERIVED from the
 # `director` graph (see _derive_team_members), so this checks that derived set.
 MAX_TEAM_MEMBERS = 6
+# Scrum-master scaling (user call, 2026-09-27): a scrum master is a standing
+# facilitator a small team doesn't need yet -- only once a team reaches this
+# many workers does a dedicated scrum master become REQUIRED. Below it, the
+# team's director stands in as the groomer/facilitator for ceremonies.
+SCRUM_MASTER_MIN_TEAM_SIZE = 4
 
 
 def _team_member_count(state, director_id):
@@ -1254,6 +1310,45 @@ def _store_content_result(task_id, result):
         _content_results[task_id] = dict(result)
 
 
+# Bounded review-cycle escalation (2026-09-26): real gap caught live -- a
+# promoted follow-up story cycled through review->fix->review 45+ times in
+# under 20 minutes before settling on its own, with no bound at all. Two
+# SEPARATE mechanisms were each re-entering the gate with no shared cap: a
+# genuine 'actionable' rejection (_apply_content_result below) and
+# _sweep_stuck_gates's own "review vanished with no verdict" rescue -- both
+# re-queue another review/fix round indefinitely. One shared counter on the
+# gate, checked from both places, bounds the total regardless of WHICH
+# mechanism keeps re-triggering it.
+MAX_REVIEW_CYCLES = 8
+
+
+def _maybe_escalate_stuck_gate(parent, gate, reason):
+    """Bump the gate's cycle counter; once it crosses MAX_REVIEW_CYCLES,
+    freeze the gate (mark it escalated) and notify the player instead of
+    continuing to loop. Returns True if the gate is (now, or already)
+    frozen -- the caller must skip its normal re-queue action in that case.
+    Idempotent: only escalates once per gate (a frozen gate stays frozen;
+    it does not re-escalate every subsequent cycle)."""
+    if gate.get('escalated'):
+        return True
+    gate['cycleCount'] = gate.get('cycleCount', 0) + 1
+    if gate['cycleCount'] < MAX_REVIEW_CYCLES:
+        return False
+    gate['escalated'] = True
+    title = parent.get('title') or 'a story'
+    try:
+        from serve import create_escalation
+        create_escalation(
+            'stuck review loop',
+            f'"{title}" has gone through {gate["cycleCount"]} review cycles without closing ({reason}). '
+            'Automatic review/fix cycling has been paused for this story -- it needs manual attention '
+            '(reject it outright, edit its scope, or otherwise intervene) rather than continuing to loop.',
+        )
+    except Exception:
+        pass
+    return True
+
+
 def _apply_content_result(state, task, result):
     """Merge a completed content-executor result into the durable state, inside
     the task_cycle's single read-modify-write. Writes the research topic's
@@ -1263,6 +1358,20 @@ def _apply_content_result(state, task, result):
     note = result.get('note')
     if note:
         task['note'] = note
+    # Real gap caught live (2026-09-26): a spike's FULL findings only ever
+    # lived in the Library file -- task.note is deliberately kept lean (a
+    # short pointer, "see the Library entry just filed"), by design (see the
+    # data-minimization comment in content.py's spike executor). But
+    # /api/intent/spike/{id}/promote (turning a spike into a real followup
+    # story) only ever had task.note to work with, so promoting a spike
+    # handed the new story's author a vague pointer, never the actual
+    # research (source lists, CSVs, feasibility data). Recording the exact
+    # path here (not a task-id glob -- task ids get REUSED across unrelated
+    # investigations, confirmed live, so a glob could match the wrong
+    # finding) lets promotion pull the real content forward.
+    library_path = result.get('libraryPath')
+    if library_path:
+        task['libraryPath'] = library_path
     # Merge grown seenUrls back into the topic (dedup is stored per-topic).
     seen = result.get('seenUrls')
     if seen:
@@ -1312,9 +1421,10 @@ def _apply_content_result(state, task, result):
             reviewer = task.get('assignedTo')
             gate = parent['_peerGate']
             if verdict == 'actionable':
-                gate['approvals'] = 0
-                gate['approvers'] = []
-                _sim_notify_author(state, parent, reviewer)
+                if not _maybe_escalate_stuck_gate(parent, gate, 'repeated rejections'):
+                    gate['approvals'] = 0
+                    gate['approvers'] = []
+                    _sim_notify_author(state, parent, reviewer)
             elif verdict == 'clean':
                 # Cut 4 hard gate: a review that finds the work clean can only
                 # count as an APPROVAL if its quality pipeline objectively
@@ -1326,9 +1436,10 @@ def _apply_content_result(state, task, result):
                 if not result.get('pipelineOk'):
                     verdict = 'actionable'
                 if verdict == 'actionable':
-                    gate['approvals'] = 0
-                    gate['approvers'] = []
-                    _sim_notify_author(state, parent, reviewer)
+                    if not _maybe_escalate_stuck_gate(parent, gate, 'repeated red-pipeline rejections'):
+                        gate['approvals'] = 0
+                        gate['approvers'] = []
+                        _sim_notify_author(state, parent, reviewer)
                 elif reviewer and reviewer not in gate['approvers']:
                     gate['approvers'].append(reviewer)
                     gate['approvals'] += 1
@@ -1872,6 +1983,29 @@ def close_sprint(state, sprint_id):
         return None
     record['status'] = 'closed'
     return record
+
+
+def _auto_close_completed_sprints(state, now_ms=None):
+    """Close any ACTIVE sprint whose entire body of work is done AND approved.
+    'Done and approved' is exactly what sprint_progress counts as `done`: for a
+    peer-gated story that means 2 clean peer approvals (or 1 + timeout) have
+    closed its gate (_close_gated_story flips status to 'done' only on that),
+    and for a non-gated task it means finish_task completed it. So done == total
+    is the "fully completed and approved for the entire sprint" signal, and an
+    active sprint at that point is automatically closed instead of waiting for
+    the player to tap close. Returns the list of sprint ids closed."""
+    sprints = state.get('sprints') or {}
+    closed = []
+    for sid, record in list(sprints.items()):
+        if record.get('status') != 'active':
+            continue
+        progress = sprint_progress(state, sid)
+        if progress and progress.get('total') and progress['done'] >= progress['total']:
+            close_sprint(state, sid)
+            record['closedAt'] = (time.time() * 1000) if now_ms is None else now_ms
+            record['autoClosed'] = True
+            closed.append(sid)
+    return closed
 
 
 def next_sprint_id(state):
@@ -2841,20 +2975,30 @@ def _peer_gated_lane(task):
     spike/bug in a deliverable room completes directly (its author is released
     but no gate is opened; nothing to vote on).
 
-    skillReview/distill are standing housekeeping sweeps (_check_schedules),
-    not authored stories -- there is no real "fix" for a reviewer to send back
-    against "review whatever is in pending_review/skills/", so a reject just
-    spawns a fix subtask whose completion unconditionally re-arms the SAME
-    gate (_task_cycle's reviewOf/fix branch has no _peer_gated_lane check,
-    unlike the initial-entry branch). Live-caught (2026-09-24): one skill-
-    review sweep, routed through this same gate as real coding/research work,
-    looped reviewer-reject/re-fix for over 20 minutes straight, flooding the
-    workQueue with 50+ duplicate 'Review: Review pending skill files' entries
-    and sending the same handful of agents back to the observatory door over
-    and over. Exempting both here (same shape as NON_GATED_LANES) stops them
-    from ever entering the gate at all, so there is no vote to reject and
-    nothing to re-arm."""
-    if task.get('skillReview') or task.get('distill'):
+    skillReview/distill/research are standing housekeeping sweeps
+    (_check_schedules), not authored stories -- there is no real "fix" for a
+    reviewer to send back against "review whatever is in
+    pending_review/skills/" or "crawl this site and update its skill file",
+    so a reject just spawns a fix subtask whose completion unconditionally
+    re-arms the SAME gate (_task_cycle's reviewOf/fix branch has no
+    _peer_gated_lane check, unlike the initial-entry branch). Live-caught
+    (2026-09-24): one skill-review sweep, routed through this same gate as
+    real coding/research work, looped reviewer-reject/re-fix for over 20
+    minutes straight, flooding the workQueue with 50+ duplicate 'Review:
+    Review pending skill files' entries and sending the same handful of
+    agents back to the observatory door over and over -- exempted then, but
+    a scheduled research crawl (task['research'], also queued by
+    _check_schedules, also landing in the observatory -- a deliverable room)
+    was missed. Confirmed live AGAIN (2026-09-26): a single "AI regulation
+    news" schedule spiraled into 3,917 task assignments and 26,687
+    escalations over one evening -- review found the crawl "actionable" (a
+    scheduled crawl obviously has no passing flake8/mypy/pytest-cov suite to
+    fail cleanly), queued a code fix for something that was never a coding
+    deliverable, that fix's own review found it just as unfixable, forever.
+    Exempting all three here (same shape as NON_GATED_LANES) stops them from
+    ever entering the gate at all, so there is no vote to reject and nothing
+    to re-arm."""
+    if task.get('skillReview') or task.get('distill') or task.get('research'):
         return False
     return _deliverable_room(task.get('room')) and task.get('taskType') not in NON_GATED_LANES
 
@@ -3095,6 +3239,8 @@ def _sweep_stuck_gates(state, now_ms):
         gate = task.get('_peerGate')
         if not gate or task.get('status') != 'needs_review':
             continue
+        if gate.get('escalated'):
+            continue  # frozen -- _maybe_escalate_stuck_gate already notified the player
         entered = gate.get('enteredMs') or 0
         if now_ms - entered < STUCK_GATE_GRACE_MS:
             continue  # young gate -- reviewer 1 may still be about to vote
@@ -3117,7 +3263,12 @@ def _sweep_stuck_gates(state, now_ms):
                 # Reviewers are free but the review work silently vanished
                 # (consumed with no verdict, or never enqueued): re-queue a fresh
                 # review to the SAME (reachable) pair so the gate gains a vote
-                # path back. Bounded by the rescue cooldown above + grace.
+                # path back. Bounded by the rescue cooldown above + grace, AND
+                # by the shared cycle cap -- this rescue path used to be able
+                # to re-enter indefinitely (once per cooldown window, forever)
+                # with no overall bound at all.
+                if _maybe_escalate_stuck_gate(task, gate, 'repeated failed review attempts'):
+                    continue
                 repl = _reenter_gate_review(state, task, locked)
                 if repl:
                     gate['stuckRescueTs'] = now_ms
@@ -3464,6 +3615,165 @@ def _next_hire_name(state):
         if n not in used:
             return n
     return None
+
+
+# Larger pool for spawning a BRAND-NEW team's director + members (2026-09-27).
+# Distinct from _next_hire_name's small assistant pool so a village whose hire
+# pool is exhausted can still spin up a new team for an incoming large request.
+_NEW_TEAM_NAME_POOL = [
+    'aria', 'briar', 'cairo', 'dune', 'elio', 'fawn', 'gull', 'hale',
+    'indie', 'jove', 'kestrel', 'lian', 'marlow', 'niso', 'orion', 'penn',
+    'quill', 'rune', 'sable', 'taro', 'umi', 'vireo', 'wren', 'ximena',
+    'yarrow', 'zephyr', 'astra', 'baxter', 'cedar', 'dax', 'ember', 'fox',
+]
+
+
+def _next_new_team_name(state):
+    """A unique name for a new-team director or member, drawn from
+    _NEW_TEAM_NAME_POOL. Never collides with the existing roster (including
+    names already taken from the hire pool). Returns None when exhausted."""
+    used = {d.get('name', '').lower() for d in (state.get('agentRoster') or [])}
+    for n in _NEW_TEAM_NAME_POOL:
+        if n not in used:
+            return n
+    return None
+
+
+def _spawn_team_agent(state, name, role, director_id, now_ms, grid, is_director=False,
+                      elevated=False):
+    """Create one brand-new agent record (roster entry + live agent) for a team
+    spawned on a large-request (2026-09-27). Mirrors _complete_auto_hire's
+    structure: joins on foot at a free outdoor spot if the ACTIVE ceiling has
+    room, else joins the dormant inventory. Returns the new agent id, or None
+    if the name pool is exhausted."""
+    new_id = name.lower()
+    color_pool = HIRE_COLOR_POOL
+    color = color_pool[random.randrange(len(color_pool))]
+    profile = {
+        'mission': f"Part of the {director_id} team, taking on the village's newest large request.",
+        'instructions': [
+            f"Report to {director_id}; your work lands in the {director_id} team's shared space.",
+            "You were brought in when every existing team was busy in a sprint -- your team owns the incoming large request.",
+        ],
+        'notes': [f"Created 2026-09-27 as part of a new team for an incoming large request."],
+    }
+    roster_entry = {
+        'id': new_id, 'name': name, 'color': color, 'role': role, 'model': 'small',
+        'director': None if is_director else director_id,
+        'approvedCount': 0, 'droppedCount': 0, 'weekApprovals': 0,
+        'mailbox': [f"Welcome aboard -- you're on the new {director_id} team."],
+        'elevatedAccess': elevated, 'accessGrant': None, 'profile': profile,
+    }
+    if is_director:
+        roster_entry['isDirector'] = True
+        roster_entry['directorSince'] = time.time()
+    state.setdefault('agentRoster', []).append(roster_entry)
+    can_activate = can_activate_another(state)
+    spot = _free_outdoor_spot(state, grid)
+    agents = state.setdefault('agents', {})
+    agents[new_id] = {
+        'id': new_id, 'name': name, 'color': color, 'role': role, 'profile': profile,
+        'model': 'small', 'approvedCount': 0, 'droppedCount': 0, 'weekApprovals': 0,
+        'mailbox': [{'text': f"Welcome aboard -- you're on the new {director_id} team.", 'read': False, 'ts': now_ms}],
+        'conversationLog': [], 'lastContactedAt': None, 'hiredAt': now_ms,
+        'elevatedAccess': elevated, 'accessGrant': None,
+        'inRoom': None, 'roomX': None, 'roomY': None,
+        'x': spot['x'], 'y': spot['y'], 'dir': 'south',
+        'visible': can_activate, 'busy': False, 'meetingId': None,
+        'offDuty': not can_activate,
+    }
+    return new_id
+
+
+def _estimate_employees_for_request(goal):
+    """How many employees a new team should start with for a large request
+    (2026-09-27). Heuristic, not a science: breadth-of-ask signals (word count,
+    explicit scoping verbs like 'build/create/platform/website') scale the
+    starting headcount so a genuinely large ask isn't bottlenecked by a single
+    hire. Bounded to a sane small-team range (1..3) -- a big team grows via the
+    normal auto-hire loop rather than spawning a dozen agents at once."""
+    text = (goal or '').strip()
+    if not text:
+        return 1
+    words = len(text.split())
+    scope_verbs = ('build ', 'create ', 'develop ', 'platform', 'website', 'app ',
+                   'system', 'suite', 'full ', 'complete ', 'end-to-end')
+    hits = sum(1 for v in scope_verbs if v in text.lower())
+    n = 1
+    if words >= 40 or hits >= 2:
+        n = 2
+    if words >= 120 or hits >= 4:
+        n = 3
+    return n
+
+
+def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employees=None):
+    """Create a brand-new team to take an incoming large request when every
+    existing team is already busy in a sprint (2026-09-27). Spawns a new
+    DIRECTOR (reporting to the admin), a fresh team record, one EMPLOYEE (or
+    `employees` if more help is needed), and leaves the scrum-master role to
+    the size rule: a brand-new team is small, so the DIRECTOR stands in as the
+    effective scrum master (_refinement_scrum_master_for_team falls back to the
+    director below SCRUM_MASTER_MIN_TEAM_SIZE) -- the employee and director
+    handle ceremonies until the team grows. Then files the goal as a pending
+    backlog request for the new team and kicks its refinement to be due on the
+    very next pass, so the new team starts refining the large ask immediately
+    rather than waiting for the weekly cadence. Returns the new team record, or
+    None if the name pool / agent caps are exhausted."""
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    roster = state.get('agentRoster') or []
+    if len(roster) >= MAX_TOTAL_AGENTS:
+        return None
+    admin_id = admin_id or next((d.get('id') for d in roster if d.get('isAdmin')), None)
+    if not admin_id:
+        return None
+    director_name = _next_new_team_name(state)
+    if not director_name:
+        return None
+    director_id = director_name.lower()
+    grid, _doors = _load_outdoor_geometry()
+    _spawn_team_agent(state, director_name, 'Director', director_id, now_ms, grid,
+                      is_director=True, elevated=True)
+    # New director reports to the admin so authority still resolves upward.
+    dir_roster = next((d for d in state['agentRoster'] if d.get('id') == director_id), None)
+    if dir_roster:
+        dir_roster['director'] = admin_id
+    # Team record -- the director is the id (matches _promote_to_director).
+    teams = state.setdefault('teams', [])
+    team = {
+        'id': director_id,
+        'name': f"{director_name.title()}'s Crew",
+        'directorId': director_id,
+        'purpose': f"New team created on 2026-09-27 to take a large request while existing teams were busy in sprints.",
+        'members': [],
+        'createdAt': time.time(),
+        'createdForRequest': (goal or '')[:200],
+    }
+    teams.append(team)
+    member_ids = []
+    emp_count = _estimate_employees_for_request(goal) if employees is None else max(1, int(employees or 1))
+    for i in range(emp_count):
+        emp_name = _next_new_team_name(state)
+        if not emp_name:
+            break
+        emp_id = _spawn_team_agent(state, emp_name, 'Engineer', director_id, now_ms, grid)
+        member_ids.append(emp_id)
+    team['members'] = member_ids
+    # File the goal as this new team's first backlog request.
+    req = {
+        'id': f"wrq-{len(state.get('backlogRequests') or []) + 1}",
+        'filedBy': director_id, 'title': (goal or 'Large request')[:120],
+        'room': 'pressoffice',
+        'reason': f"Incoming large request -- new team {director_id} was spun up to take it.",
+        'filedAt': now_ms, 'status': 'pending',
+        'origin': 'large_request', 'teamId': director_id,
+    }
+    state.setdefault('backlogRequests', []).append(req)
+    # Kick this team's refinement to be immediately due (next pass), not weekly.
+    kick_refinement_now(state, director_id, now_ms)
+    _log_governance(state, director_id, 'new_team_for_request',
+                    {'team': director_id, 'members': member_ids, 'request': req['id']})
+    return team
 
 
 # Phase B: the onboard ceremony mirrors the firing ceremony's convene-then-
@@ -3916,7 +4226,7 @@ def _social_step(state, now, now_ms, decider=None):
 # Backlog refinement (Cut 1, 2026-09-23). The scrum master -- a standing,
 # director-designated per-team role -- is RESPONSIBLE for turning agent-filed
 # work into real stories. Agents communicate what needs doing by FILING a
-# work-request; a weekly ceremony (`_pendingRefinement`) convenes the scrum
+# work-request; a ceremony (`pendingRefinements[team_id]`) convenes the scrum
 # master with the filing agents at the Command Center, and at resolve the Jev
 # refinement decider grooms each request into a `queue_work` story (accept) or
 # back to the requester (reject). Runs ungated like the Social -- the ceremony
@@ -5082,13 +5392,21 @@ def _refinement_team(state, req):
 
 
 def _refinement_scrum_master_for_team(state, team_id):
-    """The scrum master of `team_id`, or None if none has been designated yet.
-    Per-team ceremonies: only a team's OWN scrum master grooms that team's
-    requests, never a cross-team stand-in (matches a real org where each team
-    refines its own backlog)."""
+    """The effective scrum master of `team_id`: the designated scrum master, or
+    -- for a team below SCRUM_MASTER_MIN_TEAM_SIZE workers -- the team director
+    standing in (a small team doesn't need a dedicated facilitator yet, per the
+    user's 2026-09-27 call). Returns None only for a big team that genuinely
+    lacks a designated scrum master. Per-team ceremonies: only a team's OWN
+    scrum master grooms that team's requests, never a cross-team stand-in
+    (matches a real org where each team refines its own backlog)."""
     for t in (state.get('teams') or []):
         if t.get('id') == team_id or t.get('directorId') == team_id:
-            return t.get('scrumMasterId') or None
+            if t.get('scrumMasterId'):
+                return t['scrumMasterId']
+            director_id = t.get('directorId')
+            if director_id and _team_member_count(state, director_id) < SCRUM_MASTER_MIN_TEAM_SIZE:
+                return director_id
+            return None
     return None
 
 
@@ -5112,16 +5430,21 @@ def _refinement_attendees(state, req_ids, scrum_master_id):
     return ids
 
 
-def _start_refinement(state, req_ids, scrum_master_id, now_ms):
+def _start_refinement(state, team_id, req_ids, scrum_master_id, now_ms, pos_offset=0):
     """Convene the backlog-refinement ceremony at the Command Center: snapshot
     each attendee's prior state into `pending['people']`, mark them busy at a
     spread, and schedule the resolve REFINEMENT_MEET_MS later. Returns True if
-    convened (attendees healthy), False to defer and retry next pass."""
+    convened (attendees healthy), False to defer and retry next pass.
+
+    `pos_offset` spreads simultaneous per-team ceremonies apart at the Command
+    Center (each team is its own ceremony slot; the shared room must not fully
+    overlap its attendees' positions -- see _refinement_step)."""
     ids = _refinement_attendees(state, req_ids, scrum_master_id)
     if not ids:
         return False
     agents = state.get('agents') or {}
     snap = {}
+    base_x = 315 + (pos_offset * 460)
     for i, aid in enumerate(ids):
         a = agents.get(aid)
         snap[aid] = {k: a.get(k) for k in ('offDuty', 'visible', 'x', 'y', 'dir',
@@ -5132,11 +5455,12 @@ def _start_refinement(state, req_ids, scrum_master_id, now_ms):
         a['task'] = None
         a['inRoom'] = 'commandcenter'
         a['dir'] = 'south'
-        a['roomX'] = 315 + (i * 85)
+        a['roomX'] = base_x + (i * 85)
         a['roomY'] = 155
-    state['_pendingRefinement'] = {
+    state.setdefault('pendingRefinements', {})[team_id] = {
         'at': now_ms + REFINEMENT_MEET_MS, 'embarked': True,
         'scrumMasterId': scrum_master_id, 'reqIds': req_ids, 'people': snap,
+        'teamId': team_id,
     }
     _log_governance(state, scrum_master_id, 'refinement',
                     {'action': 'meeting_start', 'requests': req_ids})
@@ -5244,7 +5568,7 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
         log_refinement_digest(state, agents, {'scrumMasterId': scrum_master_id, 'accepted': accepted})
     except Exception:
         pass
-    state.pop('_pendingRefinement', None)
+    state.setdefault('pendingRefinements', {}).pop(team_id, None) if team_id else state.pop('_pendingRefinement', None)
 
 
 def _refinement_cadence_due_for(state, team_id, now_ms, legacy=None):
@@ -5260,33 +5584,58 @@ def _refinement_cadence_due_for(state, team_id, now_ms, legacy=None):
     return now_ms - last >= REFINEMENT_CADENCE_MS
 
 
+def kick_refinement_now(state, team_id, now_ms=None):
+    """Make a team's backlog refinement due on the VERY next pass instead of
+    waiting for the weekly cadence (2026-09-27 -- large requests kick refinement
+    the moment they arrive). Safe against the kick + weekly-cadence double-groom
+    trap: it is a no-op if the team already has an in-flight ceremony (that
+    ceremony will groom the new request) or its cadence is already due (the next
+    pass will pick it up anyway). Returns True if the kick armed, False if it
+    was already covered."""
+    if not team_id:
+        return False
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    # In-flight ceremony already covers this team -- don't stack a second one.
+    if team_id in (state.get('pendingRefinements') or {}):
+        return False
+    if _refinement_cadence_due_for(state, team_id, now_ms):
+        return False  # already due -- next pass picks it up
+    state.setdefault('teamRefinementAt', {})[team_id] = 0
+    return True
+
+
 def _refinement_step(state, now, now_ms, decider=None):
     """One backlog-refinement pass, called from _task_cycle ungated (each team's
-    ceremony is the point even on a quiet village). Per-team ceremonies: at most
-    ONE team occupies the shared Command Center at a time, so a pass either
-    (a) advances an in-flight ceremony (embark on one pass, RELEASE on the next --
-    no required fixed hold), or (b) picks the next team -- in roster order -- whose
-    weekly cadence is due AND has pending requests AND a free+on-duty scrum master
-    and filers, and convenes its ceremony. Never convenes an empty meeting; defers
-    a team if its scrum master or filers are busy/off-duty."""
-    # (a) Advance the single in-flight ceremony (one team at a time). Embark on
-    # one pass, then RELEASE on the immediately-following pass -- the scrum
-    # master groomed everything synchronously in the resolve, so there's no
-    # clock to wait out. A team that finishes refining early leaves early.
-    pending = state.get('_pendingRefinement')
-    if pending is not None:
+    ceremony is the point even on a quiet village). Per-team ceremonies now run
+    CONCURRENTLY (2026-09-27): each team has its OWN ceremony slot
+    (`pendingRefinements[team_id]`), so one team no longer blocks another at the
+    shared Command Center. A pass (a) advances every in-flight ceremony (embark
+    on one pass, RELEASE on the next -- no required fixed hold), and (b) convenes
+    a new ceremony for every team whose cadence is due AND has pending requests
+    AND a free+on-duty scrum master and filers. Never convenes an empty meeting;
+    defers a team if its scrum master or filers are busy/off-duty."""
+    pending_map = state.setdefault('pendingRefinements', {})
+    # (a) Advance every in-flight ceremony. Embark on one pass, then RELEASE on
+    # the immediately-following pass -- the scrum master groomed everything
+    # synchronously in the resolve, so there's no clock to wait out.
+    for team_id in list(pending_map.keys()):
+        pending = pending_map[team_id]
         if not pending.get('embarked'):
-            _start_refinement(state, pending.get('reqIds', []),
+            _start_refinement(state, team_id, pending.get('reqIds', []),
                               pending.get('scrumMasterId'), now_ms)
         else:
             _resolve_refinement(state, pending, now_ms, decider=decider)
-        return
-    # (b) Pick the next team whose ceremony is due and has groomable requests.
+    # (b) Convene a ceremony for every team that is due and has groomable
+    # requests and whose scrum master is free. Each team gets its own slot, so
+    # multiple teams can refine in the same pass (spread apart in the room).
+    slot = 0
     for team in (state.get('teams') or []):
         team_id = team.get('id') or team.get('directorId')
-        scrum_master_id = team.get('scrumMasterId') or None
+        if team_id in pending_map:
+            continue  # this team already has an in-flight ceremony
+        scrum_master_id = _refinement_scrum_master_for_team(state, team_id)
         if not scrum_master_id:
-            continue  # this team has no scrum master designated yet
+            continue  # this team has no (effective) scrum master designated yet
         if not _refinement_cadence_due_for(state, team_id, now_ms,
                                            legacy=state.get('lastBacklogRefinementAt')):
             continue
@@ -5302,12 +5651,12 @@ def _refinement_step(state, now, now_ms, decider=None):
             continue  # nothing to groom -- don't convene an empty meeting
         req_ids = req_ids[:REFINEMENT_MAX_REQUESTS]
         state.setdefault('teamRefinementAt', {})[team_id] = now_ms
-        state['_pendingRefinement'] = {
+        pending_map[team_id] = {
             'at': now_ms + REFINEMENT_MEET_MS, 'embarked': False,
             'scrumMasterId': scrum_master_id, 'reqIds': req_ids,
             'teamId': team_id, 'people': {},
         }
-        return  # only one team's ceremony convenes per pass
+        slot += 1  # only to spread simultaneous ceremonies apart in the room
 
 
 # ---------------------------------------------------------------------------
@@ -6316,6 +6665,10 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         # (Off-duty walks that already ARRIVED were finalized by the movement
         # tick's ('arrive','offduty') dispatch; nothing left to do here.)
 
+    # A sprint whose every item is done AND approved closes itself (2026-09-27) --
+    # no need for the player to tap close once the whole sprint has landed.
+    _auto_close_completed_sprints(state, now_ms)
+
     # Assignment loop (bounded by roster size, like the JS runTaskCycleBody).
     roster = state.get('agentRoster') or []
     roster_size = sum(1 for d in roster if not d.get('isAdmin'))
@@ -6470,6 +6823,15 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
                 ordered = team_ordered
         if not ordered:
             return None
+        # Fault-aware routing (2026-09-26): soft-prefer a candidate with no
+        # recent unfaded failure signal over the plain round-robin order --
+        # same "soft preference, never a hard lock" shape as the team
+        # preference just above. If EVERY eligible candidate is currently
+        # cooling down, fall back to the full ordered list rather than ever
+        # blocking a real assignment over a transient signal.
+        cool = [cid for cid in ordered if _agent_failure_score(state, cid, now_ms) < FAILURE_COOLDOWN_THRESHOLD]
+        if cool:
+            ordered = cool
         idx = pointer % len(ordered)
         chosen_id = ordered[idx]
         rr['task'] = (pointer + 1) % max(1, len(ordered))

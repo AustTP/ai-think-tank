@@ -100,6 +100,9 @@ echo
 echo "== Python: spike lane (Phase E2b) =="
 python3 tests/test_spikes.py
 echo
+echo "== Python: spike content executor -- real search_web/browse_page tool loop =="
+python3 tests/test_spike_content.py
+echo
 echo "== Python: hangout room (non-delegable, behind Town Hall) =="
 python3 tests/test_hangout.py
 echo
@@ -133,6 +136,15 @@ echo
 echo "== Python: phone check-in -- POST /api/device/checkin (location/battery/Focus/Wi-Fi) =="
 python3 tests/test_device_checkin.py
 echo
+echo "== Python: player-vetted browse allowlist -- skips Jev for named domains only =="
+python3 tests/test_browse_allowlist.py
+echo
+echo "== Python: sandbox egress proxy -- allowlist + per-host rate limit (pure logic) =="
+python3 tests/test_sandbox_proxy.py
+echo
+echo "== Python: sandbox networking setup -- proxy create/recreate-on-drift =="
+python3 tests/test_sandbox_networking.py
+echo
 echo "== Python: the Bank -- model-spend ledger + director teller (used/left/forecast) =="
 python3 tests/test_bank.py
 echo
@@ -150,6 +162,9 @@ python3 tests/test_dormancy.py
 echo
 echo "== Python: round-robin on-call (Phase E2d) =="
 python3 tests/test_oncall.py
+echo
+echo "== Python: fault-aware routing memory (insect-colony pheromone routing, 2026-09-26) =="
+python3 tests/test_fault_aware_routing.py
 echo
 echo "== Python: stuck-at-review watchdog (Phase E3.1) =="
 python3 tests/test_stuck_gate.py

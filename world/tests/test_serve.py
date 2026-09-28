@@ -8,6 +8,7 @@ existing key from .env if one's already there (idempotent).
 
 Run: python3 tests/test_serve.py
 """
+import io
 import json
 import os
 import shutil
@@ -17,6 +18,8 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+import urllib.error
+import urllib.parse
 
 import asyncio
 import openpyxl
@@ -89,6 +92,115 @@ class SafeLibraryPath(unittest.TestCase):
         target = serve._safe_library_path('notes/idea.md')
         self.assertIsNotNone(target)
         self.assertTrue(target.startswith(os.path.abspath(serve.LIBRARY_DIR)))
+
+
+class LibraryTrailReinforcement(unittest.TestCase):
+    """Stigmergic trail reinforcement/decay (2026-09-26), ported from real ant
+    pheromone-trail biology: search_library used to rank purely by file
+    mtime, so a file read/cited 40 times but written 2 weeks ago always lost
+    to one written 2 minutes ago and never read at all. Usage lives in its
+    own sidecar file (LIBRARY_USAGE_PATH), fully isolated per test here."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='village-library-trail-')
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.lib_dir = os.path.join(self.tmp, 'library')
+        os.makedirs(self.lib_dir, exist_ok=True)
+        self.usage_path = os.path.join(self.tmp, 'library_usage.json')
+        patcher = unittest.mock.patch.multiple(
+            serve, LIBRARY_DIR=self.lib_dir, LIBRARY_USAGE_PATH=self.usage_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write(self, rel_path, content, mtime=None):
+        full = os.path.join(self.lib_dir, rel_path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, 'w') as f:
+            f.write(content)
+        if mtime is not None:
+            os.utime(full, (mtime, mtime))
+
+    def test_usage_read_returns_empty_dict_when_no_file_exists_yet(self):
+        self.assertEqual(serve._library_usage_read(), {})
+
+    def test_record_library_read_persists_count_and_last_read(self):
+        serve.record_library_read('notes/idea.md')
+        usage = serve._library_usage_read()
+        self.assertEqual(usage['notes/idea.md']['count'], 1)
+        self.assertGreater(usage['notes/idea.md']['lastRead'], 0)
+
+    def test_record_library_read_accumulates_across_calls(self):
+        serve.record_library_read('notes/idea.md')
+        serve.record_library_read('notes/idea.md')
+        self.assertEqual(serve._library_usage_read()['notes/idea.md']['count'], 2)
+
+    def test_record_library_read_is_a_noop_for_a_falsy_path(self):
+        serve.record_library_read('')
+        serve.record_library_read(None)
+        self.assertEqual(serve._library_usage_read(), {})
+
+    def test_corrupt_usage_file_reads_back_as_empty_not_a_crash(self):
+        with open(self.usage_path, 'w') as f:
+            f.write('not valid json{{{')
+        self.assertEqual(serve._library_usage_read(), {})
+
+    def test_trail_score_zero_for_a_never_read_path(self):
+        self.assertEqual(serve._library_trail_score('never/touched.md', {}), 0.0)
+
+    def test_trail_score_full_count_with_zero_elapsed_age(self):
+        usage = {'x.md': {'count': 3, 'lastRead': 1000.0}}
+        self.assertAlmostEqual(serve._library_trail_score('x.md', usage, now=1000.0), 3.0)
+
+    def test_trail_score_decays_by_half_after_one_half_life(self):
+        usage = {'x.md': {'count': 4, 'lastRead': 0.0}}
+        score = serve._library_trail_score('x.md', usage, now=serve.LIBRARY_TRAIL_HALF_LIFE_S)
+        self.assertAlmostEqual(score, 2.0, places=6)
+
+    def test_search_ranks_a_heavily_reinforced_older_file_above_an_untouched_newer_one(self):
+        now = time.time()
+        self._write('old-but-validated.md', 'ant colony trail reinforcement', mtime=now - 200_000)
+        self._write('new-but-never-read.md', 'ant colony trail reinforcement', mtime=now)
+        for _ in range(10):
+            serve.record_library_read('old-but-validated.md')
+        matches = serve._library_search_matches('trail reinforcement')
+        paths = [m['path'] for m in matches]
+        self.assertEqual(paths[0], 'old-but-validated.md')
+
+    def test_search_falls_back_to_recency_when_neither_path_was_ever_read(self):
+        # Preserves the OLD pure-recency behavior exactly when trail scores
+        # tie at zero (the common case for anything never read via a
+        # tracked path) -- this change must not bury a fresh, unread file.
+        now = time.time()
+        self._write('older.md', 'stigmergy', mtime=now - 100)
+        self._write('newer.md', 'stigmergy', mtime=now)
+        matches = serve._library_search_matches('stigmergy')
+        self.assertEqual([m['path'] for m in matches], ['newer.md', 'older.md'])
+
+    def test_search_matches_carry_a_real_file_size(self):
+        # Real gap caught live (2026-09-26): the top-ranked match isn't
+        # always the most substantial one -- a cheap, real, mechanical
+        # signal (file size) lets a caller judge substance directly, rather
+        # than trusting rank alone or hoping a model "tries harder."
+        content_text = 'stigmergy: ' + ('x' * 200)
+        self._write('big.md', content_text)
+        matches = serve._library_search_matches('stigmergy')
+        self.assertEqual(matches[0]['size'], len(content_text))
+
+    def test_search_and_list_skip_dotfiles(self):
+        # Real gap caught while building this: neither walk skipped
+        # dotfiles, so .passport.json (LIBRARY_DIR's own reserved ledger)
+        # was listed and content-searchable right alongside real knowledge.
+        self._write('.passport.json', '{"decision": "handle_minted"}')
+        self._write('real-note.md', 'a real note mentioning decision-making')
+        matches = serve._library_search_matches('decision')
+        self.assertEqual([m['path'] for m in matches], ['real-note.md'])
+
+    def test_read_library_file_endpoint_records_a_trail_read(self):
+        self._write('found.md', 'a real finding')
+        with unittest.mock.patch.object(serve, 'record_library_read') as record:
+            result = asyncio.run(serve.read_library_file('found.md'))
+        self.assertEqual(json.loads(result.body)['content'], 'a real finding')
+        record.assert_called_once_with('found.md')
 
 
 class SanitizeDownloadFilename(unittest.TestCase):
@@ -1006,10 +1118,28 @@ class ServerOwnedSeed(unittest.TestCase):
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
         )
         self._cm.start()
+        # Seed identities are config-driven (SEED_ROSTER / SEED_DIRECTOR_MAP /
+        # SEED_ADMIN_IDS / SEED_SENIOR_DIRECTOR in .env, 2026-09-27), so this
+        # hermetic test injects them rather than relying on a real .env.
+        self._env_patch = unittest.mock.patch.object(
+            serve, '_load_env', return_value={
+                'SEED_ROSTER': ('ada|Ada|#e06666|Research|small,'
+                                'ben|Ben|#6fa8dc|Banking|small,'
+                                'cora|Cora|#93c47d|Post Office|small,'
+                                'dev|Dev|#ffd966|Studio|small,'
+                                'eli|Eli|#c27ba0|Weather Station|small,'
+                                'theo|Theo|#b48ce0|Control Room|mid,'
+                                'nora|Nora|#e69138|Personnel|mid'),
+                'SEED_DIRECTOR_MAP': 'ada:theo,dev:theo,eli:theo,ben:nora,cora:nora',
+                'SEED_ADMIN_IDS': 'theo',
+                'SEED_SENIOR_DIRECTOR': 'nora',
+            })
+        self._env_patch.start()
         serve.init_db()
 
     def tearDown(self):
         self._cm.stop()
+        self._env_patch.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_default_roster_is_typed_and_free_of_authority_fields(self):
@@ -1780,6 +1910,447 @@ class DecideRateLimiter(unittest.TestCase):
         self.assertTrue(allowed, f'window should drain and re-allow, got: {reason}')
 
 
+class GoogleOAuth(unittest.TestCase):
+    """_google_access_token / _google_call: real OAuth mechanics confirmed
+    live (2026-09-26) against a real refresh token minted through a real
+    installed-app consent flow (accounts.google.com -> oauth2.googleapis.com
+    token exchange), before anything was built on top of it."""
+
+    def _resp(self, body):
+        class R:
+            def read(self):
+                return body
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+        return R()
+
+    def setUp(self):
+        serve._GOOGLE_ACCESS_TOKEN_CACHE['at'] = 0.0
+        serve._GOOGLE_ACCESS_TOKEN_CACHE['token'] = None
+        self.addCleanup(lambda: serve._GOOGLE_ACCESS_TOKEN_CACHE.update({'at': 0.0, 'token': None}))
+
+    def test_no_credential_fails_closed(self):
+        with unittest.mock.patch.object(serve, '_open_secret', return_value=None):
+            token, error = serve._google_access_token()
+        self.assertIsNone(token)
+        self.assertIn('not configured', error)
+
+    def test_missing_refresh_token_fails_closed_with_a_clear_reason(self):
+        creds = json.dumps({'client_id': 'cid', 'client_secret': 'sec', 'refresh_token': None})
+        with unittest.mock.patch.object(serve, '_open_secret', return_value=creds):
+            token, error = serve._google_access_token()
+        self.assertIsNone(token)
+        self.assertIn('OAuth consent step was never completed', error)
+
+    def test_real_refresh_request_shape(self):
+        creds = json.dumps({'client_id': 'cid', 'client_secret': 'sec', 'refresh_token': 'rt-1'})
+        captured = {}
+
+        def fake_urlopen(req, timeout=20):
+            captured['url'] = req.full_url
+            captured['body'] = urllib.parse.parse_qs(req.data.decode())
+            return self._resp(b'{"access_token": "at-1", "expires_in": 3599}')
+
+        with unittest.mock.patch.object(serve, '_open_secret', return_value=creds), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=fake_urlopen):
+            token, error = serve._google_access_token()
+        self.assertIsNone(error)
+        self.assertEqual(token, 'at-1')
+        self.assertEqual(captured['url'], 'https://oauth2.googleapis.com/token')
+        self.assertEqual(captured['body']['refresh_token'], ['rt-1'])
+        self.assertEqual(captured['body']['grant_type'], ['refresh_token'])
+
+    def test_cached_token_avoids_a_second_network_call(self):
+        creds = json.dumps({'client_id': 'cid', 'client_secret': 'sec', 'refresh_token': 'rt-1'})
+        with unittest.mock.patch.object(serve, '_open_secret', return_value=creds), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen',
+                                        return_value=self._resp(b'{"access_token": "at-1"}')) as net:
+            serve._google_access_token()
+            serve._google_access_token()
+        net.assert_called_once()
+
+    def test_google_call_retries_once_on_401_with_a_forced_refresh(self):
+        creds = json.dumps({'client_id': 'cid', 'client_secret': 'sec', 'refresh_token': 'rt-1'})
+        calls = {'n': 0}
+
+        def fake_urlopen(req, timeout=30):
+            if 'oauth2.googleapis.com' in req.full_url:
+                return self._resp(b'{"access_token": "at-fresh"}')
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise urllib.error.HTTPError(req.full_url, 401, 'Unauthorized', {}, io.BytesIO(b'expired'))
+            return self._resp(b'{"items": []}')
+
+        with unittest.mock.patch.object(serve, '_open_secret', return_value=creds), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=fake_urlopen):
+            data, error = serve._google_call('GET', 'https://www.googleapis.com/calendar/v3/calendars/primary/events')
+        self.assertIsNone(error)
+        self.assertEqual(data, {'items': []})
+        self.assertEqual(calls['n'], 2)  # the real endpoint was hit twice: 401, then success
+
+    def test_google_call_surfaces_a_non_401_error_without_retrying(self):
+        creds = json.dumps({'client_id': 'cid', 'client_secret': 'sec', 'refresh_token': 'rt-1'})
+
+        def fake_urlopen(req, timeout=30):
+            if 'oauth2.googleapis.com' in req.full_url:
+                return self._resp(b'{"access_token": "at-1"}')
+            raise urllib.error.HTTPError(req.full_url, 403, 'Forbidden', {}, io.BytesIO(b'quota exceeded'))
+
+        with unittest.mock.patch.object(serve, '_open_secret', return_value=creds), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=fake_urlopen):
+            data, error = serve._google_call('GET', 'https://www.googleapis.com/calendar/v3/calendars/primary/events')
+        self.assertIsNone(data)
+        self.assertIn('403', error)
+        self.assertIn('quota exceeded', error)
+
+
+class PixellabCall(unittest.TestCase):
+    """_pixellab_call / _pixellab_poll_job: real API mechanics, matching the
+    village's own already-tested spike script (scripts/pixellab_spike.py)
+    -- not guessed from the public OpenAPI spec, per the same "verify,
+    don't assume" discipline as every other real integration tonight."""
+
+    def _resp(self, body):
+        class R:
+            def read(self):
+                return body
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+        return R()
+
+    def test_no_credential_fails_closed_without_a_network_call(self):
+        with unittest.mock.patch.object(serve, '_open_secret', return_value=None), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen') as net:
+            data, error = serve._pixellab_call('POST', '/create-character-with-4-directions', {})
+        net.assert_not_called()
+        self.assertIsNone(data)
+        self.assertIn('not configured', error)
+
+    def test_real_call_shape_matches_the_tested_spike_script(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=30):
+            captured['url'] = req.full_url
+            captured['method'] = req.get_method()
+            captured['headers'] = {k.lower(): v for k, v in req.headers.items()}
+            captured['body'] = json.loads(req.data)
+            return self._resp(b'{"character_id": "c1", "background_job_id": "j1"}')
+
+        with unittest.mock.patch.object(serve, '_open_secret', return_value='fake-pixellab-key'), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=fake_urlopen):
+            data, error = serve._pixellab_call('POST', '/create-character-with-4-directions', {
+                'description': 'a knight', 'image_size': {'width': 48, 'height': 48},
+                'view': 'high top-down', 'template_id': 'mannequin'})
+        self.assertIsNone(error)
+        self.assertEqual(data, {'character_id': 'c1', 'background_job_id': 'j1'})
+        self.assertEqual(captured['url'], 'https://api.pixellab.ai/v2/create-character-with-4-directions')
+        self.assertEqual(captured['method'], 'POST')
+        self.assertEqual(captured['headers'].get('authorization'), 'Bearer fake-pixellab-key')
+        self.assertEqual(captured['body']['description'], 'a knight')
+
+    def test_http_error_is_surfaced(self):
+        def raise_http_error(req, timeout=30):
+            raise urllib.error.HTTPError(req.full_url, 401, 'Unauthorized', {}, io.BytesIO(b'bad key'))
+        with unittest.mock.patch.object(serve, '_open_secret', return_value='fake-key'), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=raise_http_error):
+            data, error = serve._pixellab_call('GET', '/balance')
+        self.assertIsNone(data)
+        self.assertIn('401', error)
+        self.assertIn('bad key', error)
+
+    def test_poll_job_returns_on_completed(self):
+        with unittest.mock.patch.object(serve, '_pixellab_call', return_value=({'status': 'completed'}, None)):
+            data, error = serve._pixellab_poll_job('job-1', timeout=10, interval=0)
+        self.assertIsNone(error)
+        self.assertEqual(data['status'], 'completed')
+
+    def test_poll_job_surfaces_a_failed_status(self):
+        with unittest.mock.patch.object(serve, '_pixellab_call', return_value=({'status': 'failed'}, None)):
+            data, error = serve._pixellab_poll_job('job-1', timeout=10, interval=0)
+        self.assertIsNone(data)
+        self.assertIn('job failed', error)
+
+    def test_poll_job_times_out_on_a_never_completing_job(self):
+        with unittest.mock.patch.object(serve, '_pixellab_call', return_value=({'status': 'processing'}, None)):
+            data, error = serve._pixellab_poll_job('job-1', timeout=0.05, interval=0.01)
+        self.assertIsNone(data)
+        self.assertIn('timed out', error)
+
+    def test_poll_job_surfaces_a_transient_call_error_immediately(self):
+        with unittest.mock.patch.object(serve, '_pixellab_call', return_value=(None, 'PixelLab call failed: network blip')):
+            data, error = serve._pixellab_poll_job('job-1', timeout=10, interval=0)
+        self.assertIsNone(data)
+        self.assertIn('network blip', error)
+
+
+class TregCall(unittest.TestCase):
+    """_treg_call: real API mechanics confirmed live against Treg's own docs
+    (POST https://treg.to/call/{endpoint_id}, header X-Treg-Token) -- built
+    per your explicit request for real X-trending/LinkedIn-search tools,
+    2026-09-26."""
+
+    def _resp(self, body):
+        class R:
+            def read(self):
+                return body
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+        return R()
+
+    def test_no_credential_fails_closed_without_a_network_call(self):
+        with unittest.mock.patch.object(serve, '_open_secret', return_value=None), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen') as net:
+            data, error = serve._treg_call('x.x.get-trends-by-woeid', {'woeid': 1})
+        net.assert_not_called()
+        self.assertIsNone(data)
+        self.assertIn('not configured', error)
+
+    def test_default_post_call_shape_matches_treg_docs(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=30):
+            captured['url'] = req.full_url
+            captured['method'] = req.get_method()
+            captured['headers'] = {k.lower(): v for k, v in req.headers.items()}
+            captured['body'] = req.data
+            return self._resp(b'{"posts": []}')
+
+        with unittest.mock.patch.object(serve, '_open_secret', return_value='fake-treg-token'), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=fake_urlopen):
+            data, error = serve._treg_call('moz.web.url.metrics', {'targets': ['moz.com']})
+        self.assertIsNone(error)
+        self.assertEqual(data, {'posts': []})
+        self.assertEqual(captured['url'], 'https://treg.to/call/moz.web.url.metrics')
+        self.assertEqual(captured['method'], 'POST')
+        self.assertEqual(captured['headers'].get('x-treg-token'), 'fake-treg-token')
+        self.assertEqual(json.loads(captured['body']), {'targets': ['moz.com']})
+
+    def test_get_call_sends_params_as_a_query_string_not_a_body(self):
+        # Confirmed LIVE (2026-09-26): a GET endpoint's params belong in the
+        # URL query string, never a request body -- Treg's own real error
+        # for the opposite mistake was explicit ("is GET -- add --method
+        # GET", then "needs --query woeid=<value>").
+        captured = {}
+
+        def fake_urlopen(req, timeout=30):
+            captured['url'] = req.full_url
+            captured['method'] = req.get_method()
+            captured['body'] = req.data
+            return self._resp(b'{"data": [{"trend_name": "AI safety"}]}')
+
+        with unittest.mock.patch.object(serve, '_open_secret', return_value='fake-treg-token'), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=fake_urlopen):
+            data, error = serve._treg_call('x.x.get-trends-by-woeid', {'woeid': 1}, method='GET')
+        self.assertIsNone(error)
+        self.assertEqual(captured['method'], 'GET')
+        self.assertIsNone(captured['body'])
+        self.assertEqual(captured['url'], 'https://treg.to/call/x.x.get-trends-by-woeid?woeid=1')
+
+    def test_non_json_response_falls_back_to_raw_text(self):
+        with unittest.mock.patch.object(serve, '_open_secret', return_value='fake-token'), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen',
+                                        return_value=self._resp(b'not json at all')):
+            data, error = serve._treg_call('some.endpoint', {})
+        self.assertIsNone(error)
+        self.assertEqual(data, {'_raw': 'not json at all'})
+
+    def test_http_error_is_surfaced_with_status_and_detail(self):
+        def raise_http_error(req, timeout=30):
+            raise urllib.error.HTTPError(req.full_url, 402, 'Payment Required',
+                                         {}, io.BytesIO(b'insufficient balance'))
+        with unittest.mock.patch.object(serve, '_open_secret', return_value='fake-token'), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=raise_http_error):
+            data, error = serve._treg_call('x.x.get-trends-by-woeid', {'woeid': 1})
+        self.assertIsNone(data)
+        self.assertIn('402', error)
+        self.assertIn('insufficient balance', error)
+
+    def test_network_exception_is_surfaced_not_raised(self):
+        with unittest.mock.patch.object(serve, '_open_secret', return_value='fake-token'), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=OSError('timed out')):
+            data, error = serve._treg_call('x.x.get-trends-by-woeid', {'woeid': 1})
+        self.assertIsNone(data)
+        self.assertIn('timed out', error)
+
+    def test_known_endpoint_prices_match_what_was_verified_live(self):
+        # x.x.get-trends-by-woeid: one real live call, billed exactly $0.01.
+        # scrapecreators.x.v1-linkedin-search-posts: independently RE-DERIVED
+        # from 2 real billed calls ($0.00376 total / 2 = $0.00188), matching
+        # the catalog's own stated price exactly -- not just trusted from
+        # the catalog page alone (see the Treg skill's own "Lessons learned"
+        # about a spike that invented wrong prices once).
+        self.assertEqual(serve.TREG_ENDPOINT_COSTS['x.x.get-trends-by-woeid'], 0.01)
+        self.assertEqual(serve.TREG_ENDPOINT_COSTS['scrapecreators.x.v1-linkedin-search-posts'], 0.00188)
+
+
+class JevQuorumDecision(unittest.TestCase):
+    """Quorum sensing (2026-09-26), ported from real Temnothorax ant nest-site
+    selection: pool multiple independent Jev samples specifically to overcome
+    errors inherent in any ONE sample -- live-confirmed problem here (the
+    same URL got a confident 0.87 allow one run, a low-confidence 0.56
+    escalate-and-deny the next). Only re-samples on an ambiguous FIRST call
+    (a low-confidence allow); a confident allow or a firm block costs one
+    sample, same as before -- real money per extra sample, unlike a real ant."""
+
+    def _mock_sample_sequence(self, choices):
+        # choices: list of {'answers': {...}} dicts, one per _call_openrouter_
+        # decision_sync invocation, consumed in order.
+        return unittest.mock.patch.object(serve, '_call_openrouter_decision_sync', side_effect=choices)
+
+    def _answer(self, decision, confidence, cost=0.01):
+        return {'answers': {'choice': {'choice': decision, 'confidence': confidence, 'probabilities': {}}},
+                'usage': {'cost': cost}}
+
+    def test_confident_allow_takes_exactly_one_sample(self):
+        with self._mock_sample_sequence([self._answer('allow', 0.9)]) as mock_call:
+            decision, confidence, cost = asyncio.run(serve._jev_quorum_decision('i', {}))
+        self.assertEqual(mock_call.call_count, 1)
+        self.assertEqual((decision, confidence), ('allow', 0.9))
+
+    def test_firm_block_takes_exactly_one_sample_even_at_low_confidence(self):
+        # A block is a block -- quorum sensing exists to resolve an unsure
+        # ALLOW, not to second-guess a confident classifier that already
+        # said no.
+        with self._mock_sample_sequence([self._answer('block', 0.3)]) as mock_call:
+            decision, confidence, cost = asyncio.run(serve._jev_quorum_decision('i', {}))
+        self.assertEqual(mock_call.call_count, 1)
+        self.assertEqual(decision, 'block')
+
+    def test_ambiguous_allow_resamples_up_to_quorum_sample_size(self):
+        with self._mock_sample_sequence([self._answer('allow', 0.4)] * serve.QUORUM_SAMPLE_SIZE) as mock_call:
+            asyncio.run(serve._jev_quorum_decision('i', {}))
+        self.assertEqual(mock_call.call_count, serve.QUORUM_SAMPLE_SIZE)
+
+    def test_two_of_three_agreeing_allow_forms_a_quorum_and_reports_the_strongest_agreeing_confidence(self):
+        with self._mock_sample_sequence([
+            self._answer('allow', 0.4),   # ambiguous first sample -> triggers resampling
+            self._answer('allow', 0.85),  # agrees, confidently
+            self._answer('block', 0.9),   # disagrees -- excluded from the agreeing set
+        ]):
+            decision, confidence, cost = asyncio.run(serve._jev_quorum_decision('i', {}))
+        self.assertEqual(decision, 'allow')
+        self.assertAlmostEqual(confidence, 0.85)  # the strongest AGREEING vote, not an average
+
+    def test_no_quorum_reports_the_original_low_confidence_result(self):
+        with self._mock_sample_sequence([
+            self._answer('allow', 0.4),
+            self._answer('block', 0.9),
+            self._answer('block', 0.8),
+        ]):
+            decision, confidence, cost = asyncio.run(serve._jev_quorum_decision('i', {}))
+        # Only 1 agreeing vote (< QUORUM_MIN_AGREEING) -- stays the original
+        # unsure result, not silently upgraded or downgraded.
+        self.assertEqual((decision, confidence), ('allow', 0.4))
+
+    def test_total_cost_sums_every_sample_actually_taken(self):
+        with self._mock_sample_sequence([
+            self._answer('allow', 0.4, cost=0.01),
+            self._answer('allow', 0.5, cost=0.02),
+            self._answer('block', 0.9, cost=0.03),
+        ]):
+            _decision, _confidence, cost = asyncio.run(serve._jev_quorum_decision('i', {}))
+        self.assertAlmostEqual(cost, 0.06)
+
+    def test_a_failed_resample_is_skipped_not_fatal(self):
+        with self._mock_sample_sequence([
+            self._answer('allow', 0.4),
+            RuntimeError('network blip'),
+            self._answer('allow', 0.85),
+        ]):
+            decision, confidence, cost = asyncio.run(serve._jev_quorum_decision('i', {}))
+        # Still reaches a quorum from the 2 real votes despite the blip.
+        self.assertEqual(decision, 'allow')
+        self.assertAlmostEqual(confidence, 0.85)
+
+    def test_unreachable_classifier_on_the_first_call_fails_closed(self):
+        with self._mock_sample_sequence([RuntimeError('down')]) as mock_call:
+            decision, confidence, cost = asyncio.run(serve._jev_quorum_decision('i', {}))
+        self.assertEqual(mock_call.call_count, 1)
+        self.assertIsNone(decision)
+        self.assertEqual(confidence, 1.0)
+
+
+class JevQuorumChoiceSync(unittest.TestCase):
+    """_jev_quorum_choice_sync: real gap caught (2026-09-26) -- quorum
+    sampling was only ever applied to safety gates, never to this module's
+    own routine-but-consequential multi-way routing deciders (request lane,
+    team, room, product, the peer-report worker picker, the escalation
+    delegated-approval decision). Unlike the safety-specific async version,
+    there's no 'a firm block is always trusted' asymmetry -- every option
+    is equally worth getting right, so this resamples on ANY low-confidence
+    result and resolves by plurality vote, not an allow/block rule."""
+
+    def _mock_sample_sequence(self, choices):
+        return unittest.mock.patch.object(serve, '_call_openrouter_decision_sync', side_effect=choices)
+
+    def _answer(self, decision, confidence, cost=0.01):
+        return {'answers': {'choice': {'choice': decision, 'confidence': confidence, 'probabilities': {}}},
+                'usage': {'cost': cost}}
+
+    def test_confident_choice_takes_exactly_one_sample(self):
+        with self._mock_sample_sequence([self._answer('room_a', 0.9)]) as mock_call:
+            decision, confidence, cost = serve._jev_quorum_choice_sync('i', {})
+        self.assertEqual(mock_call.call_count, 1)
+        self.assertEqual((decision, confidence), ('room_a', 0.9))
+
+    def test_low_confidence_resamples_up_to_quorum_sample_size(self):
+        with self._mock_sample_sequence([self._answer('room_a', 0.4)] * serve.QUORUM_SAMPLE_SIZE) as mock_call:
+            serve._jev_quorum_choice_sync('i', {})
+        self.assertEqual(mock_call.call_count, serve.QUORUM_SAMPLE_SIZE)
+
+    def test_plurality_vote_picks_the_option_most_samples_agreed_on(self):
+        with self._mock_sample_sequence([
+            self._answer('room_a', 0.4),  # ambiguous first sample -> triggers resampling
+            self._answer('room_b', 0.85),
+            self._answer('room_b', 0.5),
+        ]):
+            decision, confidence, cost = serve._jev_quorum_choice_sync('i', {})
+        self.assertEqual(decision, 'room_b')  # 2 votes beats 1
+        self.assertAlmostEqual(confidence, 0.85)  # the winning option's OWN strongest vote
+
+    def test_three_way_tie_breaks_on_highest_confidence(self):
+        with self._mock_sample_sequence([
+            self._answer('room_a', 0.4),
+            self._answer('room_b', 0.55),
+            self._answer('room_c', 0.3),
+        ]):
+            decision, confidence, cost = serve._jev_quorum_choice_sync('i', {})
+        self.assertEqual(decision, 'room_b')  # all 1 vote each -- highest confidence wins
+        self.assertAlmostEqual(confidence, 0.55)
+
+    def test_total_cost_sums_every_sample_actually_taken(self):
+        with self._mock_sample_sequence([
+            self._answer('room_a', 0.4, cost=0.01),
+            self._answer('room_b', 0.5, cost=0.02),
+            self._answer('room_a', 0.45, cost=0.03),
+        ]):
+            _decision, _confidence, cost = serve._jev_quorum_choice_sync('i', {})
+        self.assertAlmostEqual(cost, 0.06)
+
+    def test_a_failed_resample_is_skipped_not_fatal(self):
+        with self._mock_sample_sequence([
+            self._answer('room_a', 0.4),
+            RuntimeError('network blip'),
+            self._answer('room_a', 0.7),
+        ]):
+            decision, confidence, cost = serve._jev_quorum_choice_sync('i', {})
+        self.assertEqual(decision, 'room_a')
+        self.assertAlmostEqual(confidence, 0.7)
+
+    def test_unreachable_classifier_on_the_first_call_fails_closed(self):
+        with self._mock_sample_sequence([RuntimeError('down')]) as mock_call:
+            decision, confidence, cost = serve._jev_quorum_choice_sync('i', {})
+        self.assertEqual(mock_call.call_count, 1)
+        self.assertIsNone(decision)
+        self.assertEqual(confidence, 1.0)
+
+
 class _ClassifyCommandJev(unittest.TestCase):
     # The shared command gate behind /api/execute and /api/pipeline. Same
     # confidence contract as the URL gates: low-confidence allow escalates.
@@ -2140,23 +2711,44 @@ class RemainingExecutors(unittest.TestCase):
     def test_spike_lands_findings_and_marks_ok(self):
         # A spike (Phase E2b) is room-agnostic and files a findings artifact --
         # never a product release. Route it straight through the dispatcher to
-        # prove the room-agnostic dispatch happens.
+        # prove the room-agnostic dispatch happens. Hermetic against the
+        # tool-loop spike executor (2026-09-27): the executor calls the model
+        # DIRECTLY (_call_openrouter_sync for plan/synthesize, _post_openrouter_raw
+        # for the tool loop), not through _http_json -- so both are mocked here.
         self._patch_store()
-        try:
-            with unittest.mock.patch.object(serve, '_http_json',
-                                            self._fake_http(chat='WebAssembly works headless via a patched GLIBC stub.'),
-                                            create=False):
-                serve._server_content_dispatcher(
-                    {'agents': {'ada': {'name': 'Ada'}}}, 'ada',
-                    {'id': 'sp1', 'room': 'pressoffice', 'taskType': 'spike',
-                     'title': 'Does WASM work headless?', 'instructions': 'spike it',
-                     'budgetMs': 30_000}, {})
-        finally:
-            self._restore()
+        fake_model = {'choices': [{'message': {'content': 'WebAssembly works headless via a patched GLIBC stub.'}}],
+                      'usage': {'cost': 0.0}}
+
+        def fake_raw(model, messages, tools=None, max_tokens=None, tool_choice=None):
+            # Round 1: forced tool call -- have the model browse a page so a
+            # real (mocked) tool runs and the spike counts as "investigated".
+            # The browse_page tool is served by _http_json (mocked) below.
+            if tool_choice is not None:
+                return {'choices': [{'message': {'tool_calls': [
+                    {'id': 'call_1', 'function': {'name': 'browse_page',
+                     'arguments': '{"url": "https://example.com", "purpose": "verify WASM"}'}},
+                ]}}], 'usage': {'cost': 0.0}}
+            # Round 2: model settles with its investigation summary.
+            return {'choices': [{'message': {'content': 'Investigated the WASM question.'}}],
+                    'usage': {'cost': 0.0}}
+
+        with unittest.mock.patch.object(serve, '_http_json',
+                                        self._fake_http(chat='WebAssembly works headless via a patched GLIBC stub.'),
+                                        create=False), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync', return_value=fake_model), \
+             unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_raw):
+            serve._server_content_dispatcher(
+                {'agents': {'ada': {'name': 'Ada'}}}, 'ada',
+                {'id': 'sp1', 'room': 'pressoffice', 'taskType': 'spike',
+                 'title': 'Does WASM work headless?', 'instructions': 'spike it',
+                 'budgetMs': 30_000}, {})
+        self._restore()
         posts = [p for p in self.http_log if p[1] == '/api/library/file' and p[0] == 'POST']
         self.assertEqual(1, len(posts), 'a spike must file a findings artifact')
         self.assertTrue(self.stored['sp1'].get('ok'), 'a successful spike commits a real finding')
-        self.assertIn('WebAssembly', self.stored['sp1']['note'])
+        # The full finding lives in the library file (data-minimization, 2026-09-24),
+        # not the short note -- the note points at the artifact instead.
+        self.assertIsNotNone(self.stored['sp1'].get('libraryPath'))
 
     def test_spike_model_failure_reports_not_ok(self):
         self._patch_store()
@@ -2863,10 +3455,12 @@ class PlayerIntentEndpoints(unittest.TestCase):
              unittest.mock.patch.object(serve, 'log_action') as log, \
              unittest.mock.patch.object(serve, '_append_passport_decision') as passport:
             c = TestClient(serve.app)
-            r = c.post('/api/intent/spike/spike-done/promote', json={})
+            r = c.post('/api/intent/spike/spike-done/promote', json={'taskType': 'code'})
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
-        # A real deliverable was queued, defaulting to pressoffice/code.
+        # A real deliverable was queued into pressoffice/code (both explicit
+        # now -- taskType is required, not defaulted, see BoundedReviewEscalation's
+        # sibling gap: PromoteSpikeTaskType below).
         item = body['queued']
         self.assertEqual(item['room'], 'pressoffice')
         self.assertEqual(item['taskType'], 'code')
@@ -2913,6 +3507,53 @@ class PlayerIntentEndpoints(unittest.TestCase):
             r = c.post('/api/intent/spike/nope/promote', json={})
         self.assertEqual(r.status_code, 404)
         save.assert_not_called()
+
+    def test_promote_with_library_path_embeds_the_real_findings_not_the_short_note(self):
+        """Real gap caught live (2026-09-26): task.note is a deliberately
+        short pointer ("see the Library entry just filed"); the FULL
+        findings (source lists, CSVs, feasibility data) only ever lived in
+        the Library file. Promoting a spike must pull the real content
+        forward when its exact path was recorded, not just the pointer."""
+        tmp = tempfile.mkdtemp(prefix='village-promote-lib-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        os.makedirs(os.path.join(tmp, 'archive'), exist_ok=True)
+        real_findings = ('# Spike: Can we use WebRTC?\n\nBy: ada\n\n'
+                         'Source,URL,Basis\nlibwebrtc,https://webrtc.org,verified\n'
+                         'Full real findings far more detailed than the short note.')
+        with open(os.path.join(tmp, 'archive', '123-spike-spike-done.md'), 'w') as f:
+            f.write(real_findings)
+        state = self._spike_state()
+        state['tasks']['spike-done']['libraryPath'] = 'archive/123-spike-spike-done.md'
+        saved = {}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db', side_effect=lambda s: saved.update(s)), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'LIBRARY_DIR', tmp), \
+             unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch.object(serve, '_append_passport_decision'):
+            c = TestClient(serve.app)
+            r = c.post('/api/intent/spike/spike-done/promote', json={'taskType': 'code'})
+        self.assertEqual(r.status_code, 200, r.text)
+        queued = saved['workQueue'][0]
+        self.assertIn('libwebrtc,https://webrtc.org,verified', queued['instructions'])
+        self.assertIn('Full real findings far more detailed', queued['instructions'])
+
+    def test_promote_falls_back_to_the_short_note_when_the_library_file_is_missing(self):
+        # libraryPath recorded, but the file itself isn't there (deleted,
+        # moved, or a stale path) -- must degrade to the note, not error out.
+        state = self._spike_state()
+        state['tasks']['spike-done']['libraryPath'] = 'archive/does-not-exist.md'
+        saved = {}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db', side_effect=lambda s: saved.update(s)), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch.object(serve, '_append_passport_decision'):
+            c = TestClient(serve.app)
+            r = c.post('/api/intent/spike/spike-done/promote', json={'taskType': 'code'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn('relay server', saved['workQueue'][0]['instructions'])
+
 
 # --- Publish: player-triggered push of released work ------------------------
 
@@ -3119,6 +3760,78 @@ class PlayerIntentEndpoints(unittest.TestCase):
             self.assertEqual(ver['badBlocks'][0]['reason'], 'broken_link')
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class PromoteSpikeTaskType(unittest.TestCase):
+    """Real gap caught live (2026-09-26): promote-spike used to silently
+    default a missing taskType to 'code' -- a real test promotion of a
+    purely informational finding got promoted into taskType='code' anyway
+    and burned 45+ review/fix cycles because no reviewer could approve
+    'code' that didn't correspond to any real recommendation. taskType is
+    now REQUIRED, and 'spike' is a real, valid choice for a non-actionable
+    finding (stays out of the peer gate entirely)."""
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        c = TestClient(serve.app)
+        c.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
+        return c
+
+    def _state(self):
+        return {
+            'agentRoster': [], 'agents': {}, 'workQueue': [],
+            'tasks': {'spike-done': {'id': 'spike-done', 'title': 'DreyX research',
+                                     'room': 'observatory', 'taskType': 'spike',
+                                     'status': 'done', 'assignedTo': 'ada',
+                                     'goal': 'Investigate DreyX', 'createdAt': 1000,
+                                     'note': 'Purely informational -- no concrete recommendation.'}},
+            'reports': [], 'researchTopics': [],
+        }
+
+    def test_missing_task_type_is_rejected_not_defaulted(self):
+        state = self._state()
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db') as save:
+            r = self._client().post('/api/intent/spike/spike-done/promote', json={})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('taskType is required', r.json()['error'])
+        save.assert_not_called()
+
+    def test_invalid_task_type_is_rejected(self):
+        state = self._state()
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db') as save:
+            r = self._client().post('/api/intent/spike/spike-done/promote', json={'taskType': 'nonsense'})
+        self.assertEqual(r.status_code, 400)
+        save.assert_not_called()
+
+    def test_spike_task_type_builds_a_real_spike_not_a_deliverable(self):
+        state = self._state()
+        saved = {}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db', side_effect=lambda s: saved.update(s)), \
+             unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch.object(serve, '_append_passport_decision'):
+            r = self._client().post('/api/intent/spike/spike-done/promote', json={'taskType': 'spike'})
+        self.assertEqual(r.status_code, 200, r.text)
+        queued = saved['workQueue'][0]
+        self.assertEqual(queued['taskType'], 'spike')
+        self.assertIn('budgetMs', queued)
+        self.assertIn('Investigate further', queued['instructions'])
+        # Never "pursue the recommendation into real work" -- that phrasing
+        # presumes actionability a purely informational finding doesn't have.
+        self.assertNotIn('Pursue the recommendation', queued['instructions'])
+
+    def test_code_task_type_still_works_explicitly(self):
+        state = self._state()
+        saved = {}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db', side_effect=lambda s: saved.update(s)), \
+             unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch.object(serve, '_append_passport_decision'):
+            r = self._client().post('/api/intent/spike/spike-done/promote', json={'taskType': 'code'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(saved['workQueue'][0]['taskType'], 'code')
 
 
 class ChatEndpointAuth(unittest.TestCase):

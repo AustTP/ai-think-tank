@@ -208,6 +208,35 @@ class StuckGateSweep(unittest.TestCase):
         gate = state['tasks']['task-1']['_peerGate']
         self.assertEqual(gate['enteredMs'], 40 * 60 * 1000)
 
+    def test_repeated_no_verdict_rescues_freeze_after_the_bound(self):
+        # Bounded review-cycle escalation (2026-09-26): real gap caught live --
+        # this exact rescue path (a review consumed with no verdict, reachable
+        # pair, re-enqueue a fresh one) used to be able to fire once per
+        # cooldown window FOREVER, with no overall cap. Sweep past the 30-min
+        # cooldown MAX_REVIEW_CYCLES+1 times; it must stop re-enqueuing and
+        # escalate once, not keep going indefinitely.
+        state = _state()
+        _gated_task(state, entered_ms=0, reviewed_task_ids=['r1', 'r2'])
+        total_enqueued = 0
+        with unittest.mock.patch.object(serve, 'create_escalation') as esc:
+            for i in range(sim.MAX_REVIEW_CYCLES + 2):
+                now_ms = (i + 1) * (sim.STUCK_GATE_RESCUE_REVIEW_TIMEOUT_MS + 1000)
+                sim._sweep_stuck_gates(state, now_ms=now_ms)
+                pending = [q for q in state['workQueue'] if q.get('reviewOf') == 'task-1']
+                total_enqueued += len(pending)
+                # Simulate each rescued review being picked up and consumed
+                # with no verdict again (the real failure this bug protects
+                # against) -- once assigned, a real work item leaves
+                # workQueue, so the next sweep sees "no pending review" again.
+                state['workQueue'] = [q for q in state['workQueue'] if q.get('reviewOf') != 'task-1']
+        gate = state['tasks']['task-1']['_peerGate']
+        self.assertTrue(gate['escalated'])
+        esc.assert_called_once()
+        # MAX_REVIEW_CYCLES-1 real re-enqueues (2 reviewers each) happened
+        # before the Nth check itself froze the gate instead of rescuing --
+        # not one per sweep call (there were MAX_REVIEW_CYCLES+2 sweeps total).
+        self.assertEqual(total_enqueued, (sim.MAX_REVIEW_CYCLES - 1) * 2)
+
 
 if __name__ == '__main__':
     unittest.main()

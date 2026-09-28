@@ -65,7 +65,7 @@ def _stub_grade(score=8.0):
 
 
 def _stub_runbook(summary='The API returned nulls; added a retry guard.'):
-    def decider(state, instructions, product_id, room, title):
+    def decider(state, instructions, product_id, room, title, agent_id=None):
         return summary
     return decider
 
@@ -251,7 +251,7 @@ class Runbook(unittest.TestCase):
         state = _seed()
         # Ensure _runbook_decider_default raises (Jev gone) then falls back.
         old_default = sim._runbook_decider_default
-        sim._runbook_decider_default = lambda *a: None
+        sim._runbook_decider_default = lambda *a, **kw: None
         sim._runbook_decider = sim._runbook_decider_default
         try:
             sim._note_completed_room(state, 'ben', {'id': 't', 'room': 'pressoffice',

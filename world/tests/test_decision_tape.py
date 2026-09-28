@@ -166,7 +166,8 @@ class DecisionTapeFeedTests(unittest.TestCase):
 def _call_feed(route, **params):
     # FastAPI's TestClient would be the natural home; this slim helper drives the
     # endpoint function directly (awaiting async ones), mirroring how other hermetic
-    # tests avoid a server.
+    # tests avoid a server. Uses asyncio.run (robust to a prior test having closed
+    # the main-thread event loop) rather than the deprecated get_event_loop().
     import asyncio
     import inspect
     sig = inspect.signature(route.endpoint)
@@ -174,7 +175,7 @@ def _call_feed(route, **params):
     from fastapi.responses import JSONResponse
     res = route.endpoint(**kwargs)
     if inspect.iscoroutine(res):
-        res = asyncio.get_event_loop().run_until_complete(res)
+        res = asyncio.run(res)
     if isinstance(res, JSONResponse):
         return json.loads(res.body)
     return res
