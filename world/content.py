@@ -1645,6 +1645,24 @@ def _spike_wants_linkedin_search(backlog, instructions):
     return 'linkedin' in text
 
 
+def _spike_wants_github(backlog, instructions):
+    """Same forced-tool-choice reasoning as the other _spike_wants_*
+    detectors, applied preemptively (day one) for the GitHub read tools: a
+    spike about a real project -- "how does cpython handle X", "check the
+    open issues for a repo", "what does the standard library actually
+    contain" -- should reach for github_get_repo / github_list_issues first,
+    not browse_page (which would hit bot walls or a docs page) and not
+    search_web (which is ungrounded for repo internals). Only fires when
+    GITHUB_TOKEN is set, mirroring how search_web only fires when Tavily is."""
+    text = f'{backlog or ""} {instructions or ""}'.lower()
+    if not _serve.GITHUB_TOKEN:
+        return False
+    markers = ('github', 'open issues', 'issue list', 'pull request', 'the repo', 'the repository',
+               'this project on github', 'how does', 'how do they', 'in the real', 'standard library',
+               'a real project', 'that repo', 'the cpython', 'in python', 'how is it implemented')
+    return any(marker in text for marker in markers)
+
+
 def _extract_execute_script_outputs(transcript):
     """Pull the stdout of every execute_script tool call out of a real
     _call_agent_tool_loop transcript (matching each tool_call_id to its
@@ -2239,6 +2257,193 @@ def _make_google_tools_executor():
     return execute_tool
 
 
+# GitHub read tools (2026-09-28), per the player's call: the village is an
+# engineering org that already PUBLISHES to GitHub, but had no READ access --
+# it could push real code yet could never ground its engineering work in real
+# repos/issues/PRs (it would hallucinate plausible-looking ones instead). These
+# are FIXED, narrow, READ-ONLY calls (a repo's metadata, a repo's open issues,
+# a single issue's thread, a code search) -- no writes, no comments, no PR
+# creation. Free: GitHub's public API has no per-call spend, only a per-hour
+# rate limit (core API 5,000/hr, search 10/min), so unlike Treg/PixelLab there
+# is nothing to accrue -- the real constraint is rate, and the skill stays
+# low-frequency / single-call like the Google tools above.
+_GITHUB_REPO_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'github_get_repo',
+        'description': (
+            "Fetch REAL metadata about a GitHub repository (owner/repo): description, stars, "
+            "language, topics, default branch, open-issue count. Use this when engineering or "
+            "research work references a real project -- read the real repo, never invent a "
+            "plausible-sounding one from training knowledge."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'owner': {'type': 'string', 'description': 'The repo owner (user or org), e.g. "python".'},
+                'repo': {'type': 'string', 'description': 'The repository name, e.g. "cpython".'},
+            },
+            'required': ['owner', 'repo'],
+        },
+    },
+}
+
+_GITHUB_ISSUES_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'github_list_issues',
+        'description': (
+            "List REAL open issues for a GitHub repository (owner/repo) -- number, title, state, "
+            "labels. Use this when engineering work should track what a real project is actually "
+            "dealing with (open bugs, feature requests), never invent a plausible-looking issue."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'owner': {'type': 'string', 'description': 'The repo owner (user or org).'},
+                'repo': {'type': 'string', 'description': 'The repository name.'},
+                'state': {'type': 'string', 'description': 'Issue state: "open" (default), "closed", or "all".', 'enum': ['open', 'closed', 'all']},
+                'limit': {'type': 'integer', 'description': 'Max issues to return (default 10, max 30).'},
+            },
+            'required': ['owner', 'repo'],
+        },
+    },
+}
+
+_GITHUB_ISSUE_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'github_get_issue',
+        'description': (
+            "Fetch ONE REAL GitHub issue by number (owner/repo#number) -- title, body, state, "
+            "labels, and the top comments. Use this to read the actual discussion of a real "
+            "issue before reasoning about it, never reconstruct it from memory."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'owner': {'type': 'string', 'description': 'The repo owner (user or org).'},
+                'repo': {'type': 'string', 'description': 'The repository name.'},
+                'issue_number': {'type': 'integer', 'description': 'The issue number, e.g. 1234.'},
+            },
+            'required': ['owner', 'repo', 'issue_number'],
+        },
+    },
+}
+
+_GITHUB_SEARCH_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'github_search_code',
+        'description': (
+            "Search REAL public GitHub code by query (e.g. a library name, a config pattern, a "
+            "function). Returns matching repos/files with URLs. Use this to find how real "
+            "projects actually do something before copying or referencing a pattern. Search API "
+            "is rate-limited harder than the core API (10/min), so keep code searches few."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'query': {'type': 'string', 'description': 'A GitHub code-search query, e.g. "openrouter in:file language:python".'},
+                'limit': {'type': 'integer', 'description': 'Max results to return (default 5, max 10).'},
+            },
+            'required': ['query'],
+        },
+    },
+}
+
+_GITHUB_TOOL_NAMES = ('github_get_repo', 'github_list_issues', 'github_get_issue', 'github_search_code')
+
+
+def _make_github_tools_executor():
+    """github_get_repo / github_list_issues / github_get_issue / github_search_code
+    -- thin wrappers over _serve._github_call. No struck_tools / no spend
+    accrual: read-only, rate-limited (not gated), and free like Google."""
+
+    def _owner_repo(args):
+        owner = (args.get('owner') or '').strip()
+        repo = (args.get('repo') or '').strip()
+        return owner, repo
+
+    def execute_tool(name, args):
+        args = args or {}
+        if name == 'github_get_repo':
+            owner, repo = _owner_repo(args)
+            if not owner or not repo:
+                return 'owner and repo are required'
+            data, error = _serve._github_call(
+                'GET', f'https://api.github.com/repos/{_serve.urllib.parse.quote(owner, safe="")}/{_serve.urllib.parse.quote(repo, safe="")}')
+            if error:
+                return f'Could not read the repo: {error}'
+            return json.dumps({
+                'full_name': data.get('full_name'),
+                'description': data.get('description'),
+                'stars': data.get('stargazers_count'),
+                'forks': data.get('forks_count'),
+                'language': data.get('language'),
+                'topics': data.get('topics'),
+                'default_branch': data.get('default_branch'),
+                'open_issues': data.get('open_issues_count'),
+                'pushed_at': data.get('pushed_at'),
+                'html_url': data.get('html_url'),
+            }, indent=1)[:4000]
+        if name == 'github_list_issues':
+            owner, repo = _owner_repo(args)
+            if not owner or not repo:
+                return 'owner and repo are required'
+            state = (args.get('state') or 'open').strip()
+            limit = min(int(args.get('limit') or 10), 30)
+            data, error = _serve._github_call(
+                'GET', f'https://api.github.com/repos/{_serve.urllib.parse.quote(owner, safe="")}/{_serve.urllib.parse.quote(repo, safe="")}/issues'
+                       f'?state={state}&per_page={limit}')
+            if error:
+                return f'Could not list issues: {error}'
+            items = data if isinstance(data, list) else []
+            rows = [{'number': it.get('number'), 'title': it.get('title'),
+                     'state': it.get('state'), 'labels': [l.get('name') for l in (it.get('labels') or [])],
+                     'comments': it.get('comments'), 'html_url': it.get('html_url')}
+                    for it in items if 'pull_request' not in it]
+            return json.dumps(rows, indent=1)[:4000]
+        if name == 'github_get_issue':
+            owner, repo = _owner_repo(args)
+            number = args.get('issue_number')
+            if not owner or not repo or number is None:
+                return 'owner, repo, and issue_number are required'
+            base = f'https://api.github.com/repos/{_serve.urllib.parse.quote(owner, safe="")}/{_serve.urllib.parse.quote(repo, safe="")}'
+            data, error = _serve._github_call('GET', f'{base}/issues/{int(number)}')
+            if error:
+                return f'Could not read the issue: {error}'
+            if data.get('pull_request'):
+                return f'#{number} is a pull request, not an issue -- use the issues list.'
+            comments_data, comments_error = _serve._github_call('GET', f'{base}/issues/{int(number)}/comments?per_page=20')
+            comments = []
+            if not comments_error and isinstance(comments_data, list):
+                comments = [{'user': (c.get('user') or {}).get('login'), 'body': c.get('body')[:1000]}
+                            for c in comments_data]
+            return json.dumps({
+                'number': data.get('number'), 'title': data.get('title'),
+                'state': data.get('state'), 'labels': [l.get('name') for l in (data.get('labels') or [])],
+                'body': (data.get('body') or '')[:2000], 'html_url': data.get('html_url'),
+                'top_comments': comments,
+            }, indent=1)[:5000]
+        if name == 'github_search_code':
+            query = (args.get('query') or '').strip()
+            if not query:
+                return 'query is required'
+            limit = min(int(args.get('limit') or 5), 10)
+            data, error = _serve._github_call(
+                'GET', 'https://api.github.com/search/code'
+                       f'?q={_serve.urllib.parse.quote(query, safe="")}&per_page={limit}')
+            if error:
+                return f'Could not search code: {error}'
+            items = (data or {}).get('items') or []
+            rows = [{'repo': ((it.get('repository') or {}).get('full_name')),
+                     'path': it.get('path'), 'html_url': it.get('html_url')} for it in items]
+            return json.dumps({'total_count': data.get('total_count'), 'matches': rows}, indent=1)[:4000]
+        raise ValueError(f'unknown tool: {name}')
+    return execute_tool
+
+
 def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     """Phase E2b: a SPIKE is a time-boxed investigation with no committed
     deliverable. Writes a concise findings artifact to the Library and stores
@@ -2409,11 +2614,17 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     treg_tool = _make_treg_tools_executor()
     pixellab_tool = _make_pixellab_tools_executor()
     google_tool = _make_google_tools_executor()
+    github_tool = _make_github_tools_executor()
     spike_tools = _serve.AGENT_ASK_TOOLS + [_SPIKE_SANDBOX_TOOL, _LIBRARY_SEARCH_TOOL, _LIBRARY_READ_TOOL,
                                             _TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL,
                                             _PIXELLAB_CHARACTER_TOOL,
                                             _GOOGLE_SHEETS_READ_TOOL, _GOOGLE_SHEETS_APPEND_TOOL,
                                             _GOOGLE_CALENDAR_LIST_TOOL, _GOOGLE_CALENDAR_CREATE_TOOL]
+    # GitHub read tools (2026-09-28): offered only when GITHUB_TOKEN is set --
+    # same conditional-availability rule as search_web (unset = tool simply
+    # absent, so the surface never advertises something that would fail).
+    if _serve.GITHUB_TOKEN:
+        spike_tools += [_GITHUB_REPO_TOOL, _GITHUB_ISSUES_TOOL, _GITHUB_ISSUE_TOOL, _GITHUB_SEARCH_TOOL]
     _GOOGLE_TOOL_NAMES = ('read_google_sheet', 'append_google_sheet_row',
                           'list_calendar_events', 'create_calendar_event')
 
@@ -2431,6 +2642,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             return pixellab_tool(tool_name, args)
         if tool_name in _GOOGLE_TOOL_NAMES:
             return google_tool(tool_name, args)
+        if tool_name in _GITHUB_TOOL_NAMES:
+            return github_tool(tool_name, args)
         return web_tool(tool_name, args)
 
     # 18/900 (was 10/600): a "list every X across the whole site" question
@@ -2465,6 +2678,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         first_tool = 'x_trending_topics'
     elif _spike_wants_linkedin_search(backlog, instructions):
         first_tool = 'search_linkedin_posts'
+    elif _spike_wants_github(backlog, instructions):
+        first_tool = 'github_get_repo'
     else:
         first_tool = 'search_web' if _serve.TAVILY_API_KEY else True
     # Chunked into rounds of 4 with a reflection self-check between them

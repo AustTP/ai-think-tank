@@ -28,6 +28,14 @@ charging real money after you think you've stopped.
   revocable handle, secret never leaves the server process).
 
 ## Policy for this village
+0. **The master switch.** The village can only reach DigitalOcean at all when
+   `SANDBOX_EXECUTION=digitalocean` in `.env` (default is `local`). While it
+   reads `local`, every agent-facing entry point hard-refuses -- no capability
+   handle can be minted or resolved, the live balance check never runs, and the
+   sandbox stays on local Docker. Do NOT flip the switch until a real remote
+   execution backend is provisioned (the current `digitalocean` sandbox branch
+   fails closed with an explicit error rather than silently running anywhere).
+   This is a deliberate, paid decision; local Docker is the safe default.
 1. Never create a real Droplet (or any other billed resource) without an explicit,
    logged, player-authorized capability grant for that specific action.
 2. The moment the work that needed the Droplet is done -- code pushed, tests run,
