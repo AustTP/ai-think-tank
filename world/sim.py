@@ -2764,14 +2764,36 @@ def _has_firing_signal(state, agent_id):
     return dropped > approved * 0.3
 
 
+def _firing_signal_strength(state, agent_id):
+    """Comparable strength of an agent's firing signal for who_needs_review:
+    (severity-weighted negative report count, overload). Severe>serious>major
+    (3/2/1); overload = dropped / (approved + 1), the same ratio _has_firing_signal
+    thresholds at 0.3. Primary sort = the report evidence, secondary = how far
+    behind they've fallen -- so a reported+overloaded agent beats a report-only
+    one, and an unreported overload alone ranks below any real report."""
+    info = _firing_consultation(state, agent_id)
+    weights = {'severe': 3, 'serious': 2, 'major': 1}
+    score = 0
+    for r in info['reporters']:
+        for sev in (r.get('severity') or '').split(','):
+            score += weights.get(sev.strip().lower(), 0)
+    a = (state.get('agents') or {}).get(agent_id) or {}
+    dropped = a.get('droppedCount') or 0
+    approved = a.get('approvedCount') or 0
+    return score, dropped / (approved + 1)
+
+
 def who_needs_review(state, now_ms):
     """firing.js whoNeedsReview: the worker (non-admin, non-director) with the
     strongest firing signal -- a negative report or a real drop-off -- who is
     not already settled. 2026-09-23: re-keyed OFF the raw morale score (a
     neglected-but-otherwise-fine agent is a hiring/help target, not a firing
-    one); see _has_firing_signal. Same idle guard -- never pick someone
-    mid-task/pair/handoff, so a fire can't strand a live collaboration ref."""
+    one); see _has_firing_signal. Among multiple signal-holders the review
+    targets the strongest evidence first (_firing_signal_strength), not roster
+    order. Same idle guard -- never pick someone mid-task/pair/handoff, so a
+    fire can't strand a live collaboration ref."""
     best = None
+    best_strength = None
     for d in (state.get('agentRoster') or []):
         if d.get('isAdmin') or d.get('isDirector'):
             continue
@@ -2782,10 +2804,10 @@ def who_needs_review(state, now_ms):
             continue
         if not _has_firing_signal(state, d.get('id')):
             continue
-        # Among candidates with a real signal, prioritize the strongest:
-        # severity-weighted via report count, then most-overloaded.
-        if best is None:
+        strength = _firing_signal_strength(state, d.get('id'))
+        if best is None or strength > best_strength:
             best = d
+            best_strength = strength
     return best
 
 
@@ -2878,8 +2900,11 @@ def _fire_decision(state, reviewers, candidate_def, now_ms, decider=None):
         # than a third of what they approved). Either alone stays 'keep' --
         # a report-only or drop-off-only agent is a help/hiring target, not a
         # firing one (see _has_firing_signal).
-        neg = _has_firing_signal(state, candidate_def.get('id'))
-        decision = ('fire' if neg and (candidate.get('droppedCount') or 0) > (candidate.get('approvedCount') or 0) * 0.3
+        info = _firing_consultation(state, candidate_def.get('id'))
+        has_report = any(_is_negative_severity(r['severity']) for r in info['reporters'])
+        dropped = candidate.get('droppedCount') or 0
+        approved = candidate.get('approvedCount') or 0
+        decision = ('fire' if has_report and dropped > approved * 0.3
                     else 'keep')
     return decision, morale
 

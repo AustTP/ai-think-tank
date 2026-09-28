@@ -618,6 +618,14 @@ def _run_bank_content(snapshot, agent_id, task, base_ctx=None):
     if credits:
         note += (f" OpenRouter account (real): ${credits['totalCredits']:.2f} total credits, "
                  f"${credits['totalUsage']:.2f} used lifetime, ${credits['remaining']:.2f} remaining.")
+    # Apify FREE-plan reconcile (2026-09-28): same live-account pattern -- show
+    # the REAL cycle spend/cap the plan is enforcing, not just the village's
+    # own ledger, so the teller sees the $5/month wall it's actually against.
+    apify_usage = _serve._apify_account_usage()
+    if apify_usage:
+        note += (f" Apify account (real): ${apify_usage['usedUsd']:.4f} of "
+                 f"${apify_usage['capUsd']:.2f} monthly cap spent "
+                 f"(${apify_usage['remainingUsd']:.4f} remaining).")
     _sim_module._store_content_result(task.get('id'), {'note': note})
 
 

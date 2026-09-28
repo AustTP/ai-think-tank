@@ -114,6 +114,25 @@ class Ledger(unittest.TestCase):
         self.assertIn('byDay', ledger['alpha'])
         self.assertGreater(sum(ledger['alpha']['byDay'].values()), 0)
 
+    def test_forecast_divides_by_days_present_not_a_hard_seven(self):
+        # A fresh ledger with spend on only 2 of the last 7 days is burning at
+        # $5/day, not $10/7 -- dividing by 7 would hide a fast new burn.
+        bucket = {'used': 10.0, 'calls': 2,
+                  'byDay': {d: 5.0 for d in _last_n_days(2)}}
+        burn, days_left = serve._forecast(bucket, cap=40.0)
+        self.assertAlmostEqual(burn, 5.0)
+        self.assertAlmostEqual(days_left, 6.0)  # 30 left / 5 per day
+
+    def test_forecast_empty_window_yields_no_signal(self):
+        # All spend older than 7 days (or an empty series) -> no forecast.
+        import datetime
+        today = datetime.date.today()
+        old = {(today - datetime.timedelta(days=i)).isoformat(): 10.0
+               for i in (8, 9, 10)}
+        bucket = {'used': 10.0, 'calls': 1, 'byDay': old}
+        self.assertEqual(serve._forecast(bucket, cap=40.0), (0.0, None))
+        self.assertEqual(serve._forecast({'used': 10.0, 'byDay': {}}, cap=40.0), (0.0, None))
+
 
 class SpendCap(unittest.TestCase):
     """Hard absolute spend cap (2026-09-26): independent, general protection
@@ -252,13 +271,150 @@ class BudgetView(unittest.TestCase):
     def test_cumulative_across_services(self):
         ledger = {'a': {'used': 10.0, 'calls': 1, 'lastAt': 'x', 'byDay': {d: 1.0 for d in _last_n_days(7)}},
                   'b': {'used': 20.0, 'calls': 1, 'lastAt': 'x', 'byDay': {d: 1.0 for d in _last_n_days(7)}}}
-        with unittest.mock.patch.object(serve, '_spend_ledger_read', return_value=ledger):
+        # Apify budget row disabled so this is purely about the two services.
+        with unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 0), \
+             unittest.mock.patch.object(serve, '_spend_ledger_read', return_value=ledger):
             view = serve._bank_budget_view(_snapshot())
         self.assertEqual(set(view), {'a', 'b'})
 
     def test_no_data_yields_empty_view(self):
-        with unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}):
+        with unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 0), \
+             unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}):
             self.assertEqual(serve._bank_budget_view(_snapshot()), {})
+
+
+class ApifyBudget(unittest.TestCase):
+    """The Apify FREE-plan ~$5/mo budget (2026-09-28): a real monthly cap the
+    plan enforces, surfaced in the Bank as its own __apify__ row from day one
+    (before any accrual) and reconciled live against the real account."""
+
+    def test_bank_view_seeds_apify_row_even_with_zero_spend(self):
+        # The cap is real (enforced by the plan), so it belongs in the Bank
+        # before the first actor run accrues anything -- same "visible from
+        # day one" rule as product caps.
+        with unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 5.0), \
+             unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}):
+            view = serve._bank_budget_view(_snapshot())
+        self.assertIn('__apify__', view)
+        row = view['__apify__']
+        self.assertAlmostEqual(row['cap'], 5.0)
+        self.assertAlmostEqual(row['used'], 0.0)
+        self.assertAlmostEqual(row['left'], 5.0)
+        self.assertFalse(row['over'])
+
+    def test_bank_view_omits_apify_row_when_budget_disabled(self):
+        # 0/unset budget = no row at all.
+        with unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 0), \
+             unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}):
+            view = serve._bank_budget_view(_snapshot())
+        self.assertNotIn('__apify__', view)
+
+    def test_accrue_apify_spend_records_monthly_and_total(self):
+        # Accrual lands in the same kv_spend ledger under the reserved bucket,
+        # keyed by month so the cap reads cleanly and the Bank sees it.
+        store = {}
+        def fake_read():
+            return dict(store)  # fresh copy each read, like a real DB round-trip
+        def fake_write(lg):
+            store.clear()
+            store.update(lg)
+        with unittest.mock.patch.object(serve, '_spend_ledger_read', side_effect=fake_read), \
+             unittest.mock.patch.object(serve, '_spend_ledger_write', side_effect=fake_write):
+            serve._accrue_apify_spend(1.25)
+            serve._accrue_apify_spend(2.75)
+            self.assertAlmostEqual(serve._apify_spend_this_month(), 4.0)
+        bucket = store['__apify__']
+        self.assertAlmostEqual(bucket['used'], 4.0)
+        self.assertEqual(bucket['calls'], 2)
+        month = serve._apify_budget_month()
+        self.assertAlmostEqual(bucket['byMonth'][month], 4.0)
+
+    def test_apify_budget_exceeded_only_when_over_cap(self):
+        with unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 5.0), \
+             unittest.mock.patch.object(serve, '_apify_spend_this_month', return_value=4.0):
+            self.assertFalse(serve._apify_budget_exceeded())
+        with unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 5.0), \
+             unittest.mock.patch.object(serve, '_apify_spend_this_month', return_value=5.0):
+            self.assertTrue(serve._apify_budget_exceeded())
+        # Disabled budget is never "exceeded".
+        with unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 0), \
+             unittest.mock.patch.object(serve, '_apify_spend_this_month', return_value=99.0):
+            self.assertFalse(serve._apify_budget_exceeded())
+
+    def test_account_usage_reconciles_live_and_caches(self):
+        # GET /users/me (plan cap) then /users/me/usage/monthly (cycle spend).
+        me = {'data': {'plan': {'maxMonthlyUsageUsd': 5.0}}}
+        usage = {'data': {'usageCycle': {'startAt': '2026-09-01', 'endAt': '2026-10-01'},
+                          'monthlyServiceUsage': {'facebook': {'amountAfterVolumeDiscountUsd': 1.25},
+                                                  'instagram': {'amountAfterVolumeDiscountUsd': 2.50}}}}
+        import json as _json
+        responses = iter([me, usage])
+        def fake_urlopen(req, timeout=10):
+            resp = unittest.mock.MagicMock()
+            resp.read.return_value = _json.dumps(next(responses)).encode('utf-8')
+            resp.__enter__.return_value = resp  # context manager returns itself
+            return resp
+        with unittest.mock.patch.object(serve, 'APIFY_API_KEY', 'key'), \
+             unittest.mock.patch.object(serve, '_APIFY_USAGE_CACHE', {'at': 0.0, 'data': None}), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=fake_urlopen) as urlopen:
+            result = serve._apify_account_usage()
+            # Second call within the TTL must NOT hit the network again.
+            result2 = serve._apify_account_usage()
+        self.assertAlmostEqual(result['capUsd'], 5.0)
+        self.assertAlmostEqual(result['usedUsd'], 3.75)
+        self.assertAlmostEqual(result['remainingUsd'], 1.25)
+        self.assertEqual(result['cycleStart'], '2026-09-01')
+        self.assertEqual(result2, result)
+        self.assertEqual(urlopen.call_count, 2)  # 2 endpoints, once each
+
+    def test_account_usage_fails_closed_without_key_or_network(self):
+        # No key -> None without touching the network.
+        with unittest.mock.patch.object(serve, 'APIFY_API_KEY', ''), \
+             unittest.mock.patch.object(serve, 'urllib') as fake_urllib:
+            self.assertIsNone(serve._apify_account_usage())
+        fake_urllib.request.urlopen.assert_not_called()
+        # Network failure -> None (the teller omits the line, never fabricates).
+        with unittest.mock.patch.object(serve, 'APIFY_API_KEY', 'key'), \
+             unittest.mock.patch.object(serve, 'urllib') as fake_urllib:
+            fake_urllib.request.urlopen.side_effect = Exception('boom')
+            self.assertIsNone(serve._apify_account_usage())
+
+    def test_bank_content_director_appends_apify_reconcile(self):
+        # A director's readout includes the live Apify account line (fail-open
+        # when the reconcile returns None: the rest of the note still shows).
+        snap = _snapshot()
+        seen = {}
+        patcher = unittest.mock.patch('sim._store_content_result',
+                                      lambda task_id, result: seen.__setitem__(task_id, result))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        task = {'id': 't-apify', 'room': 'bank', 'title': 'check the budget'}
+        usage = {'usedUsd': 1.2500, 'capUsd': 5.0, 'remainingUsd': 3.75}
+        with unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}), \
+             unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 5.0), \
+             unittest.mock.patch.object(serve, '_openrouter_account_credits', return_value=None), \
+             unittest.mock.patch.object(serve, '_apify_account_usage', return_value=usage):
+            serve._run_bank_content(snap, 'nora', task)
+        self.assertIn('Apify account (real): $1.2500 of $5.00 monthly cap', seen['t-apify']['note'])
+        self.assertIn('$3.7500 remaining', seen['t-apify']['note'])
+
+    def test_bank_content_omits_apify_reconcile_when_unavailable(self):
+        # Reconcile None -> no Apify line, but the rest of the note is intact.
+        snap = _snapshot()
+        seen = {}
+        patcher = unittest.mock.patch('sim._store_content_result',
+                                      lambda task_id, result: seen.__setitem__(task_id, result))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        task = {'id': 't-apify-2', 'room': 'bank', 'title': 'check the budget'}
+        with unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}), \
+             unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 5.0), \
+             unittest.mock.patch.object(serve, '_openrouter_account_credits', return_value=None), \
+             unittest.mock.patch.object(serve, '_apify_account_usage', return_value=None):
+            serve._run_bank_content(snap, 'nora', task)
+        note = seen['t-apify-2']['note']
+        self.assertNotIn('Apify account', note)
+        self.assertIn('director) reviewed the bank', note)
 
 
 class BankContent(unittest.TestCase):
@@ -306,7 +462,8 @@ class BankContent(unittest.TestCase):
         snap = _snapshot()
         seen = self._store()
         task = {'id': 't3', 'room': 'bank'}
-        with unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}):
+        with unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 0), \
+             unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}):
             serve._run_bank_content(snap, 'faye', task)
         note = seen['t3']['note']
         self.assertIn('nothing has been spent yet', note)
@@ -328,7 +485,8 @@ class Dispatcher(unittest.TestCase):
         self.addCleanup(patcher.stop)
         task = {'id': room + agent_id, 'room': room, 'title': 'x', 'taskType': 'code'}
         task.update(task_over)
-        with unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}):
+        with unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 0), \
+             unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}):
             serve._server_content_dispatcher(_snapshot(), agent_id, task)
         return seen
 
