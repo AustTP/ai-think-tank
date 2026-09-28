@@ -66,6 +66,21 @@ class SpikeLane(unittest.TestCase):
             t = _task(taskType=task_type, room='library')
             self.assertFalse(sim._peer_gated_lane(t))
 
+    def test_scheduled_research_never_gates_even_in_a_deliverable_room(self):
+        # Real bug, confirmed live 2026-09-26: task['research'] (the marker
+        # _check_schedules sets on a scheduled crawl) is NOT a taskType, and
+        # observatory IS a deliverable room -- so a scheduled research task
+        # slipped past the taskType-only NON_GATED_LANES check and entered
+        # peer review like a real authored story. Its "review" always found
+        # it "actionable" (a scheduled crawl has no passing flake8/mypy/
+        # pytest-cov suite to fail cleanly), which queued a code fix for
+        # something that was never a coding deliverable -- whose own review
+        # found it just as unfixable, forever. One real "AI regulation news"
+        # schedule spiraled into 3,917 task assignments and 26,687
+        # escalations in a single evening before this fix.
+        scheduled = _task(room='observatory', research={'topicId': 'topic-1', 'since': 0})
+        self.assertFalse(sim._peer_gated_lane(scheduled))
+
 
 def _task(**over):
     task = {'id': 'task-1', 'title': 't', 'room': 'pressoffice',

@@ -123,7 +123,7 @@ class RefinementEntry(unittest.TestCase):
         state = _seed()
         # No pending requests, even though cadence is due -> no ceremony.
         _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=_stub_decider())
-        self.assertIsNone(state.get('_pendingRefinement'))
+        self.assertEqual(state.get('pendingRefinements') or {}, {})
         self.assertEqual(state['backlogRequests'], [])
         self.assertEqual(state['workQueue'], [])
 
@@ -131,20 +131,20 @@ class RefinementEntry(unittest.TestCase):
         state, _req = _seed_with_request()
         del state['teams']
         _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=_stub_decider())
-        self.assertIsNone(state.get('_pendingRefinement'))
+        self.assertEqual(state.get('pendingRefinements') or {}, {})
         self.assertEqual(state['workQueue'], [])
 
     def test_convene_due_at_future(self):
         state, _req = _seed_with_request()
         # Pass 1: cadence due + pending requests -> schedules the record (embarked=False).
         _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=_stub_decider())
-        pending = state.get('_pendingRefinement')
+        pending = (state.get('pendingRefinements') or {}).get('dev')
         self.assertIsNotNone(pending)
         self.assertEqual(pending['scrumMasterId'], 'ada')
         self.assertIn('wrq-1', pending['reqIds'])
         # Pass 2: a convened-but-not-embarked record is embarked (attendees busy).
         _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=_stub_decider())
-        pending = state['_pendingRefinement']
+        pending = state['pendingRefinements']['dev']
         self.assertTrue(pending['embarked'])
         self.assertTrue(state['agents']['ben']['busy'])
         self.assertEqual(state['agents']['ben']['inRoom'], 'commandcenter')
@@ -157,7 +157,7 @@ class RefinementEntry(unittest.TestCase):
         state, req = _seed_with_request()
         req['filedBy'] = 'faye'  # faye is busy -> cannot convene
         _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=_stub_decider())
-        self.assertIsNone(state.get('_pendingRefinement'))
+        self.assertEqual(state.get('pendingRefinements') or {}, {})
         # Not stamped so a later pass can retry once faye is free.
         self.assertEqual(state['lastBacklogRefinementAt'], 0)
 
@@ -166,10 +166,10 @@ class RefinementResolve(unittest.TestCase):
     def _convened(self):
         state, req = _seed_with_request()
         state['lastBacklogRefinementAt'] = 1_000_000
-        state['_pendingRefinement'] = {
+        state['pendingRefinements'] = {'dev': {
             'at': sim.REFINEMENT_MEET_MS + 1_000_000,
             'embarked': True, 'scrumMasterId': 'ada',
-            'reqIds': ['wrq-1'],
+            'reqIds': ['wrq-1'], 'teamId': 'dev',
             'people': {
                 'ben': {'offDuty': False, 'visible': True, 'x': 40, 'y': 10,
                         'dir': 'south', 'task': None, 'busy': False,
@@ -180,7 +180,7 @@ class RefinementResolve(unittest.TestCase):
                         'inRoom': None, 'pairWith': None, 'handoff': None,
                         'workUntil': None},
             },
-        }
+        }}
         return state, req
 
     def test_accept_creates_story(self):
@@ -192,7 +192,7 @@ class RefinementResolve(unittest.TestCase):
         self.assertEqual(state['workQueue'][0]['title'], 'Add a ledger export')
         self.assertEqual(state['workQueue'][0]['room'], 'pressoffice')
         # Ceremony resolved: attendees restored idle, pending cleared.
-        self.assertIsNone(state.get('_pendingRefinement'))
+        self.assertEqual(state.get('pendingRefinements') or {}, {})
         self.assertFalse(state['agents']['ben']['busy'])
         self.assertEqual(state['agents']['ben']['inRoom'], None)
 
@@ -220,16 +220,16 @@ class RefinementWorkerRestore(unittest.TestCase):
                                      'status': 'working', 'room': 'pressoffice',
                                      'title': 'Build ledger tool', 'workUntil': 5_000_0}}
         # Resolve directly with a snapshot where ada was mid-task.
-        state['_pendingRefinement'] = {
+        state['pendingRefinements'] = {'dev': {
             'at': sim.REFINEMENT_MEET_MS + 1_000_000, 'embarked': True,
-            'scrumMasterId': 'ada', 'reqIds': ['wrq-1'],
+            'scrumMasterId': 'ada', 'reqIds': ['wrq-1'], 'teamId': 'dev',
             'people': {
                 'ada': {'offDuty': False, 'visible': True, 'x': 10, 'y': 10,
                         'dir': 'south', 'task': 'task-1', 'busy': True,
                         'inRoom': 'pressoffice', 'pairWith': None, 'handoff': None,
                         'workUntil': 5_000_0},
             },
-        }
+        }}
         _step(state, None, sim.REFINEMENT_MEET_MS + 2_000_000, decider=_stub_decider('accept'))
         a = state['agents']['ada']
         self.assertEqual(a['task'], 'task-1')
@@ -242,9 +242,9 @@ class RefinementWorkerRestore(unittest.TestCase):
         state, req = _seed_with_request()
         # Simulate an off-duty filer convened then restored.
         state['lastBacklogRefinementAt'] = 1_000_000
-        state['_pendingRefinement'] = {
+        state['pendingRefinements'] = {'dev': {
             'at': sim.REFINEMENT_MEET_MS + 1_000_000, 'embarked': True,
-            'scrumMasterId': 'ada', 'reqIds': ['wrq-1'],
+            'scrumMasterId': 'ada', 'reqIds': ['wrq-1'], 'teamId': 'dev',
             'people': {
                 'ben': {'offDuty': True, 'visible': False, 'x': 40, 'y': 10,
                         'dir': 'south', 'task': None, 'busy': False,
@@ -255,7 +255,7 @@ class RefinementWorkerRestore(unittest.TestCase):
                         'inRoom': None, 'pairWith': None, 'handoff': None,
                         'workUntil': None},
             },
-        }
+        }}
         _step(state, None, sim.REFINEMENT_MEET_MS + 2_000_000, decider=_stub_decider('accept'))
         # Ben returns off-duty (vanished), not stranded visible.
         self.assertTrue(state['agents']['ben']['offDuty'])
@@ -272,10 +272,10 @@ class RefinementEarlyRelease(unittest.TestCase):
         _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=_stub_decider('accept'))
         # Pass 2: embark. (Everyone is in the Command Center.)
         _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=_stub_decider('accept'))
-        self.assertTrue(state['_pendingRefinement']['embarked'])
+        self.assertTrue(state['pendingRefinements']['dev']['embarked'])
         # Pass 3: released the next pass regardless of the `at` clock.
         _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=_stub_decider('accept'))
-        self.assertIsNone(state.get('_pendingRefinement'))
+        self.assertEqual(state.get('pendingRefinements') or {}, {})
         self.assertFalse(state['agents']['ben']['busy'])
         self.assertFalse(state['agents']['ada']['busy'])
         # And the request was groomed into a story.
@@ -310,35 +310,31 @@ class RefinementPerTeam(unittest.TestCase):
     def test_each_team_grooms_only_its_own_requests(self):
         state = self._two_teams()
         decider = _stub_decider('accept')
-        # Pass 1+2+3: dev's ceremony -- ada runs it over ONLY ben's request.
+        # Pass 1+2+3: BOTH teams' ceremonies run concurrently now (per-team
+        # slots) -- dev's scrum master grooms dev's request, maya's grooms
+        # maya's. Each team only ever grooms its OWN requests.
         _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=decider)
         _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=decider)
         _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=decider)
-        # Dev's ceremony groomed only its own team's request; maya's is untouched.
         queued_titles = [x['title'] for x in state['workQueue']]
         self.assertIn('Dev ledger export', queued_titles)
-        self.assertNotIn('Maya observatory sweep', queued_titles)
+        self.assertIn('Maya observatory sweep', queued_titles)
         self.assertEqual(state['backlogRequests'][0]['status'], 'accepted')
-        self.assertEqual(state['backlogRequests'][1]['status'], 'pending')
-        # Only one ceremony at a time: no pending record left after dev's released.
-        self.assertIsNone(state.get('_pendingRefinement'))
+        self.assertEqual(state['backlogRequests'][1]['status'], 'accepted')
+        # Both ceremonies resolved: no pending records left.
+        self.assertEqual(state.get('pendingRefinements') or {}, {})
 
     def test_second_team_ceremony_runs_on_next_window(self):
         state = self._two_teams()
         st = _stub_decider('accept')
         now = sim.REFINEMENT_CADENCE_MS + 1_000_000
-        # Dev's ceremony completes first (its team appeared first in the roster).
+        # Both teams' ceremonies complete concurrently (per-team slots).
         for _ in range(3):
             _step(state, None, now, decider=st)
-        # Advance past dev's cadence so only maya's (due from the same start) can
-        # be picked; dev's stamp is now set, so wrap to a new window where dev
-        # isn't due but maya is -- assert maya's ceremony picks maya's request.
-        state['teamRefinementAt']['dev'] = now  # dev just ran; not due again
-        next_window = now + sim.REFINEMENT_CADENCE_MS + 1
-        for _ in range(3):
-            _step(state, None, next_window, decider=st)
-        # Maya's scrum master (zoe) groomed maya's request.
+        # Both groomed their own request in the same window.
+        self.assertEqual(state['backlogRequests'][0]['status'], 'accepted')
         self.assertEqual(state['backlogRequests'][1]['status'], 'accepted')
+        self.assertIn('Dev ledger export', [x['title'] for x in state['workQueue']])
         self.assertIn('Maya observatory sweep', [x['title'] for x in state['workQueue']])
 
 
@@ -384,13 +380,13 @@ class RefinementCadence(unittest.TestCase):
         state['lastBacklogRefinementAt'] = 1_000_000
         # 1 second before the weekly window elapses -> no ceremony.
         _step(state, None, 1_000_000 + sim.REFINEMENT_CADENCE_MS - 1, decider=_stub_decider())
-        self.assertIsNone(state.get('_pendingRefinement'))
+        self.assertEqual(state.get('pendingRefinements') or {}, {})
 
     def test_due_after_cadence(self):
         state, _req = _seed_with_request()
         state['lastBacklogRefinementAt'] = 1_000_000
         _step(state, None, 1_000_000 + sim.REFINEMENT_CADENCE_MS + 1, decider=_stub_decider())
-        self.assertIsNotNone(state.get('_pendingRefinement'))
+        self.assertIn('dev', state.get('pendingRefinements') or {})
 
 
 if __name__ == '__main__':

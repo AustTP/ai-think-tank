@@ -185,6 +185,60 @@ _DISTILL_MAX_ARCHIVES = 25
 _DISTILL_ARCHIVE_EXCERPT_CHARS = 4000
 _DISTILL_WIKI_EXCERPT_CHARS = 6000
 _DISTILL_VILLAGE_PAGE_ID = 'state-of-knowledge'
+_DISTILL_CSV_MIN_LINES = 3
+
+
+def _extract_csv_like_blocks(text):
+    """Best-effort detection of real CSV/tabular data inside an archive
+    file's FULL body (not the truncated excerpt the synthesis prompt sees --
+    this must catch data the model never even saw, not just data it saw and
+    paraphrased away). Pure heuristic -- a fenced code block, or a run of
+    3+ consecutive comma-bearing lines -- same 'don't reach for a heavier
+    tool than the problem needs' reasoning as the Library's own plain
+    substring search.
+
+    Deterministic safety net (2026-09-26): the distill synthesis prompt
+    explicitly tells the model to 'extract what the village NOW knows...
+    do not just re-print the raw archive files' -- exactly the summarize-
+    don't-preserve instruction that already, twice tonight, caused a
+    spike's real CSV to get flattened into prose instead of kept verbatim
+    during ITS OWN synthesis step. This is the same failure one step
+    downstream, when a spike's archived findings get folded into the wiki."""
+    blocks = []
+    for block in re.findall(r'```(?:csv)?\n(.*?)```', text or '', re.DOTALL):
+        lines = [l for l in block.strip().split('\n') if l.strip()]
+        if len(lines) >= _DISTILL_CSV_MIN_LINES and all(',' in l for l in lines[:_DISTILL_CSV_MIN_LINES]):
+            blocks.append(block.strip())
+    # Loose scan for CSV-like data that was never fenced -- a run of 3+
+    # consecutive non-empty lines with a CONSISTENT comma count (matching
+    # their header's column count), not just "any comma present."
+    #
+    # Real gap flagged (2026-09-26): the original check (>=1 comma, no
+    # consistency requirement) could false-positive on ordinary prose -- 3
+    # consecutive comma-bearing sentences is rare but not impossible. A
+    # blanket higher minimum (e.g. >=2 commas) was considered and rejected:
+    # it would have broken real, legitimate 2-column CSVs (a simple
+    # name,url list has exactly 1 comma per row) -- caught by this file's
+    # OWN existing test for exactly that shape. Consistency is the sharper
+    # signal either way: real CSV rows share their header's column count;
+    # ordinary prose sentences essentially never land on the same comma
+    # count 3+ times running, regardless of how many commas each has.
+    lines = (text or '').split('\n')
+    i = 0
+    while i < len(lines):
+        commas = lines[i].count(',') if lines[i].strip() else 0
+        if commas >= 1:
+            j = i + 1
+            while j < len(lines) and lines[j].strip() and lines[j].count(',') == commas:
+                j += 1
+            if j - i >= _DISTILL_CSV_MIN_LINES:
+                candidate = '\n'.join(lines[i:j])
+                if not any(candidate in b or b in candidate for b in blocks):
+                    blocks.append(candidate)
+            i = j
+        else:
+            i += 1
+    return blocks
 
 
 def _run_weather_content(snapshot, agent_id, task, base_ctx=None):
@@ -415,7 +469,23 @@ def _run_distill_content(snapshot, agent_id, task, base_ctx=None):
                                           {'note': f'Distilled {len(archives)} finding(s), but the synthesis call returned nothing usable.', 'noop': True})
         return
 
-    # 4. Persist as server authority (chains the passport; survives autosave).
+    # 4. Deterministic safety net (2026-09-26): the synthesis prompt above
+    # explicitly tells the model to summarize, not re-print, the archives --
+    # the same instruction that already flattened a spike's real CSV into
+    # prose during ITS OWN synthesis, one step upstream of here. Any real
+    # CSV-like block in a folded-in archive's FULL body (not just the
+    # truncated excerpt the model saw) that isn't substantially still
+    # present in the merged page gets appended back verbatim, cited to its
+    # source file, so real structured data is never silently lost to a
+    # lossy wiki merge.
+    for _t, fn, body in archives:
+        for block in _extract_csv_like_blocks(body):
+            if len(block) > 40 and block[:80] not in reply:
+                reply += (f'\n\n---\n\nRaw source data preserved from {fn} (added automatically -- '
+                         f'the merge above may have summarized rather than kept this verbatim):\n\n'
+                         f'```\n{block[:4000]}\n```')
+
+    # 5. Persist as server authority (chains the passport; survives autosave).
     record = _serve._write_wiki_server(
         _DISTILL_VILLAGE_PAGE_ID, 'Village state of knowledge', 'village', reply)
     if record is None:
@@ -1471,12 +1541,840 @@ def _release_product_from_build(product_id, releasing_agent, base, key):
         return
 
 
+def _plain_completion(model, messages, max_tokens, service='spike'):
+    """One non-tool completion call, with the same spend accrual _http_json
+    self-loopback calls get from serve.py's own endpoints -- used for the
+    plan/synthesize bookends of a spike, which need real (possibly extended-
+    reasoning) deliberation but no tool access of their own. Returns stripped
+    text, or '' on any failure (never raises -- a spike must always still
+    complete via SOME path, per the notifyPlayer-on-every-outcome rule)."""
+    try:
+        data = _serve._call_openrouter_sync(model, messages, max_tokens)
+    except Exception as e:
+        print(f'[spike] plain completion failed: {e}', flush=True)
+        return ''
+    cost = (data.get('usage') or {}).get('cost', 0.0)
+    if isinstance(cost, (int, float)) and cost:
+        _serve._accrue_spend(service, cost)
+    try:
+        return (data['choices'][0]['message']['content'] or '').strip()
+    except (KeyError, IndexError, TypeError):
+        return ''
+
+
+def _parse_reflection(text):
+    """Parse a reflection self-check's JSON reply, ported (structure, not
+    code) from the user's own MAGI framework's ReflectionEngine.parse_
+    reflection -- same shape: tolerate a bare JSON object or one embedded in
+    surrounding prose, fall back to a safe default on anything else.
+    Confidence defaults to 1.0 (not 0.0 or 0.5) on parse failure -- a
+    reflection call that itself failed is not evidence the investigation is
+    going badly, and shouldn't inject a confusing nudge on top of a shaky
+    signal."""
+    text = (text or '').strip()
+    data = None
+    try:
+        if text.startswith('{'):
+            data = json.loads(text)
+        else:
+            m = re.search(r'\{.*\}', text, re.DOTALL)
+            if m:
+                data = json.loads(m.group())
+    except (json.JSONDecodeError, TypeError):
+        data = None
+    if not isinstance(data, dict):
+        return 1.0, ''
+    confidence = data.get('confidence')
+    confidence = float(confidence) if isinstance(confidence, (int, float)) and 0.0 <= confidence <= 1.0 else 1.0
+    note = data.get('note') if isinstance(data.get('note'), str) else ''
+    return confidence, note
+
+
+def _plan_requires_verification_basis(plan_text):
+    """Best-effort detection of whether the PLAN decided a basis (verified/
+    estimated) column was needed for a judgment CSV -- used as the trigger
+    for the post-hoc disclaimer below, since the plan saying the right thing
+    is not the same as the final report actually containing it (real gap
+    caught live, 2026-09-26)."""
+    t = (plan_text or '').lower()
+    return 'basis' in t and ('verified' in t or 'estimated' in t)
+
+
+def _finding_shows_basis_column(finding_text):
+    t = (finding_text or '').lower()
+    return 'basis' in t or ('verified' in t and 'estimated' in t)
+
+
+_INTERNAL_REVIEW_MARKERS = (
+    'our own', 'internal', 'prior research', 'prior investigation', 'prior work',
+    'prior spike', 'already found', 'already know', 'already investigated',
+    'existing research', 'existing findings', 'existing work', 'previous spike',
+    'previous investigation', 'previously found', 'another team', 'other team',
+    'a different team', 'before investigating anything new', "what we've",
+    "what have we", 'what do we already know', 'built by', 'done by',
+)
+
+
+def _spike_wants_internal_review(backlog, instructions):
+    """Best-effort keyword detection of an internal-prior-art-flavored spike
+    (e.g. "review Team A's approach before we build something similar") --
+    same 'don't reach for a heavier tool than the problem needs' style as
+    the other plan-phase detectors above. Used to FORCE search_library as
+    the first tool call, not just ask the PLAN prompt to suggest it: real
+    gap caught LIVE (2026-09-26) -- a real spike asked to "review the
+    village's own prior research on DreyX.com" went straight to browse_page
+    and reported "no existing records" despite 7+ real matching entries
+    already in the Library, because the PLAN prompt's own "search_library
+    first" instruction was never reliably followed. This is the exact same
+    failure class already fixed once tonight for search_web (force_first_
+    tool=True alone always still reached for browse_page) -- the SAME
+    proven fix: force the specific tool by name, don't just ask nicely."""
+    text = f'{backlog or ""} {instructions or ""}'.lower()
+    return any(marker in text for marker in _INTERNAL_REVIEW_MARKERS)
+
+
+def _spike_wants_x_trending(backlog, instructions):
+    """Same forced-tool-choice reasoning as _spike_wants_internal_review,
+    applied on day one instead of after a live miss: 'trending' alone is too
+    generic (could mean any platform), so also require a real X/Twitter
+    mention -- a bare 'x' is checked as a whole word to avoid matching it
+    inside ordinary words (e.g. 'flexible')."""
+    text = f'{backlog or ""} {instructions or ""}'.lower()
+    mentions_x = bool(re.search(r'\bx\b', text)) or 'twitter' in text or 'x.com' in text
+    return 'trending' in text and mentions_x
+
+
+def _spike_wants_linkedin_search(backlog, instructions):
+    text = f'{backlog or ""} {instructions or ""}'.lower()
+    return 'linkedin' in text
+
+
+def _spike_wants_linkedin_jobs(backlog, instructions):
+    """More specific than _spike_wants_linkedin_search -- must be checked
+    BEFORE it in any first-tool chain (a job search also mentions
+    'linkedin', so the generic post-search check would otherwise win first
+    and force the wrong tool)."""
+    text = f'{backlog or ""} {instructions or ""}'.lower()
+    return 'linkedin' in text and ('job' in text or 'hiring' in text)
+
+
+def _extract_execute_script_outputs(transcript):
+    """Pull the stdout of every execute_script tool call out of a real
+    _call_agent_tool_loop transcript (matching each tool_call_id to its
+    result). Used as a deterministic safety net (2026-09-26): confirmed
+    live that a spike can cat a real produced file into its own transcript
+    and then still summarize it in prose during synthesis instead of
+    including it verbatim -- the real data existed, it just never made it
+    into the final report. Same philosophy as the basis-column check above:
+    catch the miss after the fact rather than trust another round of
+    prompting to prevent it."""
+    script_call_ids = set()
+    for m in (transcript or []):
+        if m.get('role') == 'assistant':
+            for call in (m.get('tool_calls') or []):
+                if (call.get('function') or {}).get('name') == 'execute_script':
+                    script_call_ids.add(call.get('id'))
+    outputs = []
+    for m in (transcript or []):
+        if m.get('role') == 'tool' and m.get('tool_call_id') in script_call_ids:
+            match = re.search(r'stdout:\n(.*?)(?:\n\nstderr:|\Z)', m.get('content') or '', re.DOTALL)
+            if match:
+                stdout = match.group(1).strip()
+                if stdout:
+                    outputs.append(stdout)
+    return outputs
+
+
+# Reflection/replan (2026-09-26), ported (design, not code) from the user's
+# own MAGI framework's react_engine.py ReflectionEngine -- a real gap: the
+# EXECUTE tool loop ran as ONE flat call for its whole iteration budget,
+# with no mid-run check on whether it was actually still on track. This
+# chunks the SAME total iteration budget into rounds, with a cheap
+# confidence/replan self-check between rounds -- never more total tool
+# calls than before, just a chance to course-correct WITHIN that budget
+# instead of only finding out it went sideways after it's already over.
+_REFLECTION_CHUNK_SIZE = 4
+_REFLECTION_CONFIDENCE_FLOOR = 0.5
+
+
+def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, tools, execute_tool,
+                                         total_iterations, max_tokens, force_first_tool):
+    remaining = total_iterations
+    current_messages = list(messages)
+    first_round = True
+    execute_text = None
+    while remaining > 0:
+        this_round = min(_REFLECTION_CHUNK_SIZE, remaining)
+        before_len = len(current_messages)
+        execute_text, current_messages = _serve._call_agent_tool_loop(
+            tier_slug, current_messages, tools, execute_tool,
+            max_iterations=this_round, max_tokens=max_tokens, service='spike',
+            force_first_tool=(force_first_tool if first_round else False), return_transcript=True)
+        remaining -= this_round
+        if len(current_messages) == before_len:
+            # No progress at all this round (no tool call, no settling text
+            # -- shouldn't normally happen once force_first_tool covers
+            # round one, but a genuinely stalled round is not worth
+            # reflecting on or burning more rounds over).
+            break
+        first_round = False
+        if execute_text is not None or remaining <= 0:
+            # Settled on its own, or the budget is spent either way -- no
+            # value in reflecting on a round that won't be followed by
+            # another one.
+            break
+        reflection = _plain_completion(reasoning_slug, current_messages + [
+            {'role': 'user', 'content': (
+                'Self-check, before you continue (this question and your answer to it are NOT part '
+                'of your final report): given everything above, respond with ONLY a JSON object: '
+                '{"confidence": <0.0-1.0, how likely you are to produce a real, complete answer with '
+                'what has actually been gathered so far>, "note": "<one short sentence: what to do '
+                'differently, or \'on track\' if the current approach is working>"}.')},
+        ], max_tokens=150)
+        confidence, note = _parse_reflection(reflection)
+        if confidence < _REFLECTION_CONFIDENCE_FLOOR and note and note.strip().lower() != 'on track':
+            current_messages.append({'role': 'user', 'content': f'Self-check before continuing: {note}'})
+    return execute_text, current_messages
+
+
+# Real request (2026-09-26): "no committed deliverable" (a spike's actual
+# defining property -- it never opens a peer gate, see _peer_gated_lane)
+# got conflated with "no code execution." Sometimes the honest answer to an
+# investigation needs to DO something with what was found -- write a CSV of
+# the sources, parse/transform collected data, compute a real number instead
+# of estimating one -- not just describe it in prose. This gives the
+# EXECUTE phase the same real sandboxed execution pressoffice coding tasks
+# already use (/api/execute -- classified before it runs, isolated,
+# resource-capped), scoped to a PER-SPIKE sandbox (not the shared
+# workroom-shared/research-shared ones) so nothing written here is ever
+# reachable by a later, unrelated task -- the same class of risk a real
+# security audit flagged this same evening for the shared sandboxes.
+_SPIKE_SANDBOX_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'execute_script',
+        'description': (
+            'Run a real shell command in an isolated, resource-capped sandbox scoped to THIS '
+            'investigation only -- e.g. write a small Python/shell script with a heredoc, then run '
+            'it. Use this when the investigation needs to actually DO something with what you '
+            'found, not just describe it -- write a CSV of the sources you found, parse/transform '
+            'collected data, compute a real number instead of estimating one. If your plan calls for '
+            'building a CSV or other structured file, this is how you actually build it -- writing '
+            'a description of what the file would contain, in your own answer text, does NOT count '
+            'as completing that step; only an actual execute_script call that writes the file does. '
+            'The sandbox can install packages (pip/npm) and reach any domain already on the '
+            'player-vetted browse allowlist, but has no other internet access. Files you write '
+            'persist across calls within this investigation (not across different investigations) -- '
+            'cat any file worth keeping out in a later call so its real contents can be included in '
+            'your final report.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'command': {'type': 'string',
+                           'description': 'A real shell command, e.g. writing a file with a heredoc and then running it.'},
+                'purpose': {'type': 'string', 'description': 'One short sentence: why this command is needed.'},
+            },
+            'required': ['command', 'purpose'],
+        },
+    },
+}
+
+
+def _make_spike_sandbox_executor(agent_id, agent_key, sandbox_id, struck_tools=None):
+    """`struck_tools`, if given a set, gets 'execute_script' added the moment
+    a command is BLOCKED (a real policy denial) -- same one-strike shape
+    _make_web_tools_executor uses, ported from the user's own MAGI
+    framework. A timed-out or failed-but-approved command is transient, not
+    a strike -- it may be worth one retry with a different approach.
+    Self-checks `struck_tools` too (not just records into it) -- defense in
+    depth so a caller that passes the set but forgets to check it itself
+    doesn't silently get a no-op."""
+    def execute_tool(name, args):
+        if struck_tools is not None and name in struck_tools:
+            return ('execute_script was already blocked once this investigation (one-strike) -- '
+                    'do not call it again, use a different tool or approach instead.')
+        if name != 'execute_script':
+            raise ValueError(f'unknown tool: {name}')
+        command = (args or {}).get('command') or ''
+        purpose = (args or {}).get('purpose') or 'spike investigation'
+        result = _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/execute', {
+            'agentId': agent_id, 'command': command, 'purpose': purpose, 'sandboxId': sandbox_id,
+        }, agent_key, timeout=60)
+        if not isinstance(result, dict):
+            return 'Could not run that command (unexpected response).'
+        if result.get('allowed') is False:
+            if struck_tools is not None:
+                struck_tools.add('execute_script')
+            return (f"Command blocked: {result.get('reason', 'not approved')} "
+                    "[ONE-STRIKE: this was a policy denial -- do not retry execute_script with a "
+                    "similar command, try a genuinely different approach]")
+        if result.get('error'):
+            return f"Command failed: {result['error']} [this may be transient -- may retry once]"
+        stdout = (result.get('stdout') or '').strip()
+        stderr = (result.get('stderr') or '').strip()
+        exit_code = result.get('exitCode')
+        parts = [f'exit code: {exit_code}']
+        if stdout:
+            parts.append(f'stdout:\n{stdout}')
+        if stderr:
+            parts.append(f'stderr:\n{stderr}')
+        if result.get('timedOut'):
+            parts.append('(command timed out -- this may be transient, may retry once with a shorter/simpler command)')
+        return '\n\n'.join(parts)
+    return execute_tool
+
+
+# Real request (2026-09-26): the inverse of promote-spike's fix (a spike's
+# real findings now flow FORWARD into a new story) is a spike whose job is
+# to review work another team already did (a finished story, an earlier
+# spike, a distilled wiki page) BEFORE this team builds something similar
+# of its own. Until now a spike had zero way to actually read that prior
+# work -- only search_web/browse_page (the outside internet) -- so a
+# "review Team A's approach" spike could only guess at what Team A did, the
+# same fabrication risk web tool access was built to fix, just aimed
+# inward instead of outward. These wrap the same real, already-proven
+# search (_library_search_matches -- also what the clarify router's
+# knowledge-base-first lookup uses, so agents search the identical index a
+# real player-facing feature already relies on) and read (_safe_library_path
+# -- the same containment intent_promote_spike itself uses) the Library
+# already holds, in-process, no self-loopback hop needed.
+_LIBRARY_SEARCH_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'search_library',
+        'description': (
+            "Search the village's own Library -- real completed work from ANY team (finished "
+            "stories, past spikes, research, peer reviews, wiki merges). Use this BEFORE "
+            "search_web when the investigation is about reviewing, comparing against, or building "
+            "on something already done inside this village (e.g. \"review Team A's approach before "
+            "we build something similar\") -- guessing at another team's work instead of actually "
+            "reading it produces a fabricated review. Returns matching file paths with a short real "
+            "snippet around each hit; call read_library_file on a promising path for the full text."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'query': {'type': 'string',
+                          'description': 'Keywords likely to appear in the prior work, e.g. "login rate limiting" or a team/project name.'},
+            },
+            'required': ['query'],
+        },
+    },
+}
+
+_LIBRARY_READ_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'read_library_file',
+        'description': (
+            'Read the full real content of one Library file by its exact path (from '
+            "search_library's results). Use this to actually read another team's finished work -- "
+            'its findings, code notes, or CSV -- instead of relying on a search snippet alone.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'path': {'type': 'string', 'description': 'Exact Library-relative path, e.g. "archive/1234-spike-task-9.md".'},
+            },
+            'required': ['path'],
+        },
+    },
+}
+
+
+def _make_library_tools_executor(agent_id, struck_tools=None):
+    """search_library / read_library_file for a spike reviewing another
+    team's real prior work. Read-only, no ACL beyond what the Library
+    already applies to everyone (the village is transparent about who did
+    what). Self-checks `struck_tools` (defense in depth, same shape as the
+    other two executors) even though a read-only lookup failing is unlikely
+    to ever be a POLICY denial rather than "no matches" -- kept consistent
+    so a future caller that adds a gate here for free gets one-strike too.
+
+    Logs via log_action (2026-09-26, added after a live burn-in): these two
+    tools are in-process (no /api/browse-style HTTP hop), so unlike every
+    other tool they had ZERO observability -- when a real live run's report
+    claimed "no existing records" despite matching entries already in the
+    Library, there was no way to directly confirm whether search_library
+    was ever actually called at all versus just never finding a match. This
+    closes that gap for good, not just for tonight's one-off check."""
+    def execute_tool(name, args):
+        if struck_tools is not None and name in struck_tools:
+            return (f'{name} was already blocked once this investigation (one-strike) -- '
+                    'do not call it again, use a different tool or approach instead.')
+        args = args or {}
+        if name == 'search_library':
+            query = (args.get('query') or '').strip()
+            if not query:
+                return 'query is required'
+            matches = _serve._library_search_matches(query)[:20]
+            _serve.log_action(agent_id, 'search_library',
+                              {'query': query, 'matches': len(matches)}, authorized=True)
+            if not matches:
+                return f'No Library matches for "{query}" -- no internal record of this was found.'
+            # Real gap caught live (2026-09-26): the top-ranked match isn't
+            # always the most substantial one -- a live run read the first
+            # (most recent) result, which happened to be a prior attempt's
+            # OWN thin, inconclusive finding, while richer earlier
+            # investigations of the same question ranked lower. Real size
+            # (not a prompt asking the model to "try harder") is a cheap,
+            # mechanical signal of which match is actually worth reading.
+            lines = [f'{m["path"]} ({m.get("size", "?")} bytes): {m["snippet"]}' for m in matches]
+            hint = ''
+            if len(matches) > 1:
+                hint = ('\n\n(Multiple matches found -- if these look like repeated attempts at the '
+                       'same question, the largest is not automatically the best, but a much smaller '
+                       'one is a real signal it may be thin or inconclusive. Consider reading more '
+                       'than one before concluding.)')
+            return '\n'.join(lines) + hint
+        if name == 'read_library_file':
+            path = (args.get('path') or '').strip()
+            target = _serve._safe_library_path(path)
+            if not target or not os.path.isfile(target):
+                _serve.log_action(agent_id, 'read_library_file',
+                                  {'path': path, 'found': False}, authorized=True)
+                return f'Not found: {path}'
+            try:
+                with open(target, 'r', errors='replace') as f:
+                    content_text = f.read(20_000)
+            except OSError:
+                return f'Could not read {path}'
+            # Trail reinforcement (2026-09-26): a real, actual read of this
+            # finding by another team's investigation is exactly the signal
+            # that should make it rank higher in future search_library calls.
+            _serve.record_library_read(path)
+            _serve.log_action(agent_id, 'read_library_file',
+                              {'path': path, 'found': True}, authorized=True)
+            return content_text
+        raise ValueError(f'unknown tool: {name}')
+    return execute_tool
+
+
+# Real, on-demand social/trend monitoring (2026-09-26), per your explicit
+# request. Deliberately on-demand only, not a recurring cadence -- real
+# per-call cost against Treg's own $10+ balance (separate from the
+# OpenRouter spend cap), and the discipline established this same evening
+# was "no more building beyond what's needed, watch spend closely." These
+# are FIXED-purpose, narrow calls (a location's trends, a keyword search),
+# not an open redirect to an arbitrary agent-chosen URL -- same reasoning
+# weather_now is not Jev-gated: there is no domain/URL for Jev to judge,
+# the target is fixed by the tool itself.
+_TREG_X_TRENDING_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'x_trending_topics',
+        'description': (
+            "Get real, currently trending topics on X (Twitter) for a location, via Treg's real "
+            "X API proxy (a real ~$0.01 call against the village's Treg balance). Use this when "
+            "the investigation needs to know what is ACTUALLY trending right now -- never invent "
+            "a plausible-sounding trend from training knowledge."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'woeid': {'type': 'integer',
+                          'description': 'Where On Earth ID for the location; 1 = worldwide (default if omitted).'},
+            },
+            'required': [],
+        },
+    },
+}
+
+_TREG_LINKEDIN_SEARCH_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'search_linkedin_posts',
+        'description': (
+            "Search real, recent public LinkedIn posts by keyword, via Treg's real LinkedIn API "
+            "proxy (a real ~$0.002 call against the village's Treg balance). Use this for a real, "
+            "current view of what is actually being posted about a topic -- never invent a "
+            "plausible-sounding LinkedIn post."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'query': {'type': 'string', 'description': 'The search query, e.g. "AI security".'},
+                'date_posted': {'type': 'string',
+                                'description': ('Recency filter: one of "last-hour", "last-day", '
+                                                '"last-week", "last-month", "last-year". Defaults to "last-week".'),
+                                'enum': ['last-hour', 'last-day', 'last-week', 'last-month', 'last-year']},
+            },
+            'required': ['query'],
+        },
+    },
+}
+
+# Real LinkedIn job search + post-engagement endpoints (2026-09-27), per your
+# explicit request to expand beyond post-search. Treg's catalog page
+# publishes only human-readable family names (e.g. "Search job postings by
+# keyword"), never the actual callable endpoint id or its param schema --
+# these THREE ids and shapes were discovered live via Treg's own
+# self-documenting error text (404 "did you mean X", 400 "valid fields:
+# [...]"), the same method already used for the two tools above, not
+# guessed from docs. Two families the same request asked about --
+# `linkedin.post.reposts` and the comment-level `linkedin.comment.reactions`
+# / `linkedin.comment.replies` -- came back a confirmed "no endpoint in the
+# catalog" for every provider tried (apify/anyapi/adyntel); they are not
+# available today, not just unwired.
+_TREG_LINKEDIN_JOB_SEARCH_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'search_linkedin_jobs',
+        'description': (
+            "Search real, current LinkedIn job postings by title/keyword, via Treg's real "
+            "Apify-backed LinkedIn jobs API (a real ~$0.011 call against the village's Treg "
+            "balance -- more expensive than the other Treg tools, only call this once per "
+            "distinct search). Returns real postings (title, company, location, full "
+            "description, apply link) -- never invent a plausible-sounding job listing."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'job_title': {'type': 'string', 'description': 'The job title or keyword to search for, e.g. "backend engineer".'},
+            },
+            'required': ['job_title'],
+        },
+    },
+}
+
+_TREG_LINKEDIN_POST_COMMENTS_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'get_linkedin_post_comments',
+        'description': (
+            "Get real comments on a specific LinkedIn post, via Treg's real LinkedIn API proxy "
+            "(a real ~$0.005 call against the village's Treg balance). Requires a real, specific "
+            "LinkedIn post URL -- e.g. one already found via search_linkedin_posts. Never invent "
+            "a plausible-sounding comment."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'post_url': {'type': 'string', 'description': 'A real, specific LinkedIn post URL, e.g. one returned by search_linkedin_posts.'},
+            },
+            'required': ['post_url'],
+        },
+    },
+}
+
+_TREG_LINKEDIN_POST_REACTIONS_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'get_linkedin_post_reactions',
+        'description': (
+            "Get real reactions (likes, celebrates, etc.) on a specific LinkedIn post, via Treg's "
+            "real LinkedIn API proxy (a real ~$0.005 call against the village's Treg balance). "
+            "Requires a real, specific LinkedIn post URL -- e.g. one already found via "
+            "search_linkedin_posts. Never invent a plausible-sounding reaction count."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'post_url': {'type': 'string', 'description': 'A real, specific LinkedIn post URL, e.g. one returned by search_linkedin_posts.'},
+            },
+            'required': ['post_url'],
+        },
+    },
+}
+
+
+def _make_treg_tools_executor():
+    """x_trending_topics / search_linkedin_posts / search_linkedin_jobs /
+    get_linkedin_post_comments / get_linkedin_post_reactions -- thin
+    wrappers over _serve._treg_call. No one-strike/struck_tools tracking
+    here (unlike the web/sandbox executors): those track POLICY denials
+    from a real gate (Jev, the sandbox classifier), and there is no such
+    gate here to deny anything -- an error from Treg is a real API/network
+    failure, not a policy decision, so it's always worth a caller retrying
+    once rather than being refused locally on a second attempt."""
+    def execute_tool(name, args):
+        args = args or {}
+        if name == 'x_trending_topics':
+            woeid = args.get('woeid') or 1
+            data, error = _serve._treg_call('x.x.get-trends-by-woeid', {'woeid': woeid}, method='GET')
+            if error:
+                return f'Could not get trending topics: {error}'
+            _serve._accrue_spend('treg', _serve.TREG_ENDPOINT_COSTS['x.x.get-trends-by-woeid'])
+            return json.dumps(data)[:4000]
+        if name == 'search_linkedin_posts':
+            query = (args.get('query') or '').strip()
+            if not query:
+                return 'query is required'
+            params = {'query': query, 'date_posted': args.get('date_posted') or 'last-week'}
+            data, error = _serve._treg_call('scrapecreators.x.v1-linkedin-search-posts', params, method='GET')
+            if error:
+                return f'Could not search LinkedIn posts: {error}'
+            _serve._accrue_spend('treg', _serve.TREG_ENDPOINT_COSTS['scrapecreators.x.v1-linkedin-search-posts'])
+            return json.dumps(data)[:4000]
+        if name == 'search_linkedin_jobs':
+            job_title = (args.get('job_title') or '').strip()
+            if not job_title:
+                return 'job_title is required'
+            # maxTotalChargeUsd/timeout are real Apify-platform-level query
+            # params Treg requires on top of the JSON body (confirmed live,
+            # see _treg_call's `query` docstring) -- not agent-controllable
+            # knobs, a fixed operational cap on this specific call.
+            data, error = _serve._treg_call(
+                'apify.linkedin.search.jobs', {'jobTitles': [job_title]}, method='POST',
+                query={'maxTotalChargeUsd': 0.5, 'timeout': 60})
+            if error:
+                return f'Could not search LinkedIn jobs: {error}'
+            _serve._accrue_spend('treg', _serve.TREG_ENDPOINT_COSTS['apify.linkedin.search.jobs'])
+            return json.dumps(data)[:4000]
+        if name in ('get_linkedin_post_comments', 'get_linkedin_post_reactions'):
+            post_url = (args.get('post_url') or '').strip()
+            if not post_url:
+                return 'post_url is required'
+            endpoint_id = ('anyapi.linkedin.post_comments' if name == 'get_linkedin_post_comments'
+                            else 'anyapi.linkedin.post_reactions')
+            data, error = _serve._treg_call(endpoint_id, {'url': post_url, 'limit': 20}, method='POST')
+            if error:
+                return f'Could not get LinkedIn post {"comments" if name == "get_linkedin_post_comments" else "reactions"}: {error}'
+            _serve._accrue_spend('treg', _serve.TREG_ENDPOINT_COSTS[endpoint_id])
+            return json.dumps(data)[:4000]
+        raise ValueError(f'unknown tool: {name}')
+    return execute_tool
+
+
+# Real character-sprite generation (2026-09-26), per your explicit request
+# to wire up the remaining documented-but-unused APIs. Follows the SAME
+# call shape as the village's own already-tested spike script
+# (scripts/pixellab_spike.py), not a fresh guess at the public API. Real
+# cost tracked via a before/after balance delta (PixelLab has no per-call
+# price list the way Treg's catalog does -- see _pixellab_account_balance's
+# own docstring for why a forced, uncached read is required on both sides
+# of the call), matching the "don't fabricate a number, use a verified one"
+# rule already applied to every other real integration tonight.
+_PIXELLAB_CHARACTER_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'generate_pixel_character',
+        'description': (
+            "Generate a real 4-direction pixel-art game character sprite from a text description, "
+            "via the village's real PixelLab account. This is a real, metered generation (billed "
+            "against the village's PixelLab balance or subscription allotment) and can take up to "
+            "~90 real seconds -- only call this when the investigation genuinely needs a real "
+            "generated sprite, not a description of what one might look like."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'description': {'type': 'string',
+                                'description': ('What the character should look like, e.g. "young office '
+                                                'worker in casual attire, SNES-style top-down RPG sprite".')},
+                'view': {'type': 'string', 'description': 'Camera angle, e.g. "high top-down" (the default).'},
+            },
+            'required': ['description'],
+        },
+    },
+}
+
+
+def _make_pixellab_tools_executor():
+    def execute_tool(name, args):
+        args = args or {}
+        if name != 'generate_pixel_character':
+            raise ValueError(f'unknown tool: {name}')
+        description = (args.get('description') or '').strip()
+        if not description:
+            return 'description is required'
+        balance_before = _serve._pixellab_account_balance(force=True)
+        resp, error = _serve._pixellab_call('POST', '/create-character-with-4-directions', {
+            'description': description,
+            'image_size': {'width': 48, 'height': 48},
+            'view': args.get('view') or 'high top-down',
+            'template_id': 'mannequin',
+        })
+        if error:
+            return f'Could not generate character: {error}'
+        char_id = (resp or {}).get('character_id')
+        job_id = (resp or {}).get('background_job_id')
+        if not char_id or not job_id:
+            return f'Unexpected response from PixelLab: {json.dumps(resp)[:500]}'
+        _job, error = _serve._pixellab_poll_job(job_id)
+        if error:
+            return f'Could not generate character: {error}'
+        char, error = _serve._pixellab_call('GET', f'/characters/{char_id}')
+        if error:
+            return f'Could not fetch the generated character: {error}'
+        rotation_urls = (char or {}).get('rotation_urls') or {}
+        balance_after = _serve._pixellab_account_balance(force=True)
+        if isinstance(balance_before, (int, float)) and isinstance(balance_after, (int, float)):
+            # Spending REDUCES the balance -- cost is before minus after, not
+            # the other way around (real bug caught by this file's own test:
+            # a balance drop from 7.41 to 7.35 must accrue $0.06, not $0.00).
+            real_cost = max(0.0, balance_before - balance_after)
+            if real_cost > 0:
+                _serve._accrue_spend('pixellab', real_cost)
+        return json.dumps({'character_id': char_id, 'rotation_urls': rotation_urls})
+    return execute_tool
+
+
+# Google Sheets/Calendar (2026-09-26), per your explicit request. Both APIs
+# are free today (quota, not cost -- see library/skills/google-sheets-
+# calendar.md), so unlike Treg/PixelLab there's no spend to accrue; the
+# real constraint here is quota, and the skill doc's own stated policy is
+# "prefer read-only / low-frequency use... over any write-heavy or high-
+# frequency automation" -- these tools stay simple, single-call operations,
+# never a batch/high-frequency loop.
+_GOOGLE_SHEETS_READ_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'read_google_sheet',
+        'description': (
+            "Read a real range of cells from a real Google Sheet, via the village's own Google "
+            "account. Use this to check real, current spreadsheet data -- never invent plausible-"
+            "looking cell values."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'spreadsheet_id': {'type': 'string', 'description': 'The spreadsheet ID from its URL (the long id between /d/ and /edit).'},
+                'range': {'type': 'string', 'description': 'A1-notation range, e.g. "Sheet1!A1:D20".'},
+            },
+            'required': ['spreadsheet_id', 'range'],
+        },
+    },
+}
+
+_GOOGLE_SHEETS_APPEND_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'append_google_sheet_row',
+        'description': (
+            "Append one real row to a real Google Sheet, via the village's own Google account. "
+            "Use this sparingly (occasional syncs, not a high-frequency loop) -- e.g. adding a "
+            "finding to a shared roadmap sheet."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'spreadsheet_id': {'type': 'string', 'description': 'The spreadsheet ID from its URL.'},
+                'range': {'type': 'string', 'description': 'A1-notation range identifying the sheet/table to append to, e.g. "Sheet1!A1".'},
+                'values': {'type': 'array', 'items': {'type': 'string'}, 'description': "The row's real values, in column order."},
+            },
+            'required': ['spreadsheet_id', 'range', 'values'],
+        },
+    },
+}
+
+_GOOGLE_CALENDAR_LIST_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'list_calendar_events',
+        'description': (
+            "List real, real upcoming events on the village's own Google Calendar. Use this to "
+            "check what's actually scheduled -- never invent a plausible-sounding event."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'max_results': {'type': 'integer', 'description': 'Maximum events to return (default 10).'},
+            },
+            'required': [],
+        },
+    },
+}
+
+_GOOGLE_CALENDAR_CREATE_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'create_calendar_event',
+        'description': (
+            "Create one real event on the village's own Google Calendar -- e.g. for a real "
+            "ceremony. Use this sparingly (a handful of real events, not a high-frequency loop)."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'summary': {'type': 'string', 'description': 'The event title.'},
+                'start_datetime': {'type': 'string', 'description': 'ISO 8601 start, e.g. "2026-10-01T14:00:00-04:00".'},
+                'end_datetime': {'type': 'string', 'description': 'ISO 8601 end, e.g. "2026-10-01T15:00:00-04:00".'},
+                'description': {'type': 'string', 'description': 'Optional event description.'},
+            },
+            'required': ['summary', 'start_datetime', 'end_datetime'],
+        },
+    },
+}
+
+
+def _make_google_tools_executor():
+    def execute_tool(name, args):
+        args = args or {}
+        if name == 'read_google_sheet':
+            spreadsheet_id = (args.get('spreadsheet_id') or '').strip()
+            rng = (args.get('range') or '').strip()
+            if not spreadsheet_id or not rng:
+                return 'spreadsheet_id and range are required'
+            url = (f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/'
+                  f'{_serve.urllib.parse.quote(rng, safe="")}')
+            data, error = _serve._google_call('GET', url)
+            if error:
+                return f'Could not read the sheet: {error}'
+            return json.dumps(data)[:4000]
+        if name == 'append_google_sheet_row':
+            spreadsheet_id = (args.get('spreadsheet_id') or '').strip()
+            rng = (args.get('range') or '').strip()
+            values = args.get('values')
+            if not spreadsheet_id or not rng or not values:
+                return 'spreadsheet_id, range, and values are required'
+            url = (f'https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}/values/'
+                  f'{_serve.urllib.parse.quote(rng, safe="")}:append?valueInputOption=USER_ENTERED')
+            data, error = _serve._google_call('POST', url, {'values': [values]})
+            if error:
+                return f'Could not append the row: {error}'
+            return json.dumps(data)[:2000]
+        if name == 'list_calendar_events':
+            max_results = args.get('max_results') or 10
+            now_iso = _serve.datetime.datetime.utcnow().isoformat() + 'Z'
+            url = ('https://www.googleapis.com/calendar/v3/calendars/primary/events?'
+                  f'maxResults={int(max_results)}&orderBy=startTime&singleEvents=true&timeMin={now_iso}')
+            data, error = _serve._google_call('GET', url)
+            if error:
+                return f'Could not list calendar events: {error}'
+            return json.dumps(data.get('items', []))[:4000]
+        if name == 'create_calendar_event':
+            summary = (args.get('summary') or '').strip()
+            start = (args.get('start_datetime') or '').strip()
+            end = (args.get('end_datetime') or '').strip()
+            if not summary or not start or not end:
+                return 'summary, start_datetime, and end_datetime are required'
+            body = {'summary': summary, 'start': {'dateTime': start}, 'end': {'dateTime': end}}
+            if args.get('description'):
+                body['description'] = args['description']
+            data, error = _serve._google_call(
+                'POST', 'https://www.googleapis.com/calendar/v3/calendars/primary/events', body)
+            if error:
+                return f'Could not create the event: {error}'
+            return json.dumps({'id': data.get('id'), 'htmlLink': data.get('htmlLink')})
+        raise ValueError(f'unknown tool: {name}')
+    return execute_tool
+
+
 def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     """Phase E2b: a SPIKE is a time-boxed investigation with no committed
-    deliverable. The executor keeps it to a SINGLE short model call (honoring
-    the spike's budgetMs), writes a concise findings artifact to the Library,
-    and stores a content result. A spike never opens a peer gate and never
-    releases a product -- it answers a question, that's all."""
+    deliverable. Writes a concise findings artifact to the Library and stores
+    a content result. A spike never opens a peer gate and never releases a
+    product -- it answers a question, that's all.
+
+    2026-09-26: this used to be a single free-text /api/chat completion with
+    NO tool access at all -- the model just guessed from training knowledge
+    and called it "findings" (see the SECURITY_TEST_TOOLS comment in serve.py
+    for the fabricated-report incident that exact pattern already caused
+    once, for the security-test role). Then got real search_web/browse_page
+    tool access via the shared _make_web_tools_executor -- fixed the
+    fabrication, but a real, harder DreyX request ("list every source ever
+    used, assess replicating each daily") showed the NEXT gap: a single
+    non-reasoning model in one flat tool loop settles too early on genuinely
+    open-ended, multi-step work, because it can't reliably judge "have I
+    covered this exhaustively." Real, explicit fix, per your call: PLAN
+    (reasoning tier, one call, a concrete checklist) -> EXECUTE (mid tier,
+    the existing many-iteration tool loop, now following that checklist) ->
+    SYNTHESIZE (reasoning tier, one call, given the FULL gathered transcript,
+    write the complete report against the checklist). The reasoning tier's
+    much higher per-token cost is paid twice per investigation this way, not
+    once per tool call."""
     import sim as _sim_module
     base = _serve.SELF_BASE_URL
     key = _serve.get_or_create_agent_key(agent_id)
@@ -1484,18 +2382,14 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     backlog = task.get('title') or ''
     instructions = task.get('instructions')
     budget = task.get('budgetMs')
-    prompt = (f'You are {name}, running a time-boxed SPIKE (~{(budget or 60_000) / 1000:.0f}s). '
-              f'Question: {backlog}.'
-              f'{" Method/constraints: " + instructions if instructions else ""}. '
-              'Write 2-4 concrete sentences of real findings -- what was tried, '
-              'what was learned, and a recommendation. No filler, no release notes.')
     # Real request (2026-09-26): the player asked whether they'd ever hear
     # about a spike finishing, on either channel -- they wouldn't have; the
     # village was reactive-only. notifyPlayer is the (safe, indirect --
     # _apply_content_result actually queues it) way any executor asks to be
     # notified on completion, success or failure alike, so silence never
     # reads as "still working" when it already gave up.
-    tier_slug = _serve._mid_tier_slug()
+    tier_slug = _serve._coding_tier_slug() or _serve._mid_tier_slug()
+    reasoning_slug = _serve._reasoning_tier_slug() or tier_slug
     if not tier_slug:
         _sim_module._store_content_result(task.get('id'), {
             'note': f'Spiked "{backlog}", but no model tier is configured yet.', 'ok': False,
@@ -1504,12 +2398,244 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                              'body': f'{name} tried to spike "{backlog}" but no model tier is configured yet -- nothing was actually attempted.'},
         })
         return
-    r = _serve._http_json('POST', base, '/api/chat',
-                   {'model': tier_slug,
-                    'messages': [{'role': 'system', 'content': prompt},
-                                 {'role': 'user', 'content': 'Go ahead.'}],
-                    'agentId': agent_id}, key)
-    finding = (r.get('reply') or r.get('content') or '').strip() if isinstance(r, dict) else ''
+    # Real multi-tool investigation (a browse_page render=true call launches
+    # a real headless browser per fetch) can genuinely take longer than the
+    # generic 120s content ceiling _dispatch_content_work installs -- widen
+    # it here so a slow-but-real result isn't dropped by that timeout's
+    # fallback-completion path before this thread finishes.
+    task['workUntil'] = time.time() + 300
+
+    # PLAN -- a short, concrete checklist of sub-goals, from the stronger
+    # reasoning tier. Best-effort: an empty plan just means the execute step
+    # falls back to its own generic instructions below, not a failure.
+    plan_text = _plain_completion(reasoning_slug, [
+        {'role': 'system', 'content': (
+            'You are planning a real, tool-driven web investigation. Given the question below, '
+            'write a short numbered checklist (3-7 items) of concrete sub-goals needed to answer it '
+            'thoroughly and honestly -- e.g. which pages/categories to visit, what to extract from '
+            'each, and what a real answer must cover. The FIRST item must always be a search_web '
+            'query for what OTHER sites say about the subject -- a subject\'s own pages never '
+            'disclose everything about it (methodology, reputation, who else covers it), and a '
+            'JS-heavy site may not even be readable by a plain fetch. If the subject has a large '
+            'list of items (a directory, a catalog), include a step to sample a few individual item '
+            'pages, not just the top-level listing.\n\n'
+            'INTERNAL PRIOR ART -- if this question is about reviewing, comparing against, or '
+            'building on work already done inside this village (another team\'s finished story, an '
+            'earlier spike, prior research), the FIRST item must instead be a search_library query '
+            '(not search_web) -- read what was actually done internally before looking externally, '
+            'and follow a promising hit with read_library_file for the full content. If '
+            'search_library finds nothing relevant, say so explicitly in the plan rather than '
+            'assuming what the other team probably did.\n\n'
+            'DELIVERABLE DECISION -- make this call explicitly: does answering this question well '
+            'mean listing/comparing multiple items with attributes (sources, tools, options, prices, '
+            'anything enumerable), or computing/transforming something from what gets found? If yes, '
+            'the plan MUST include a MANDATORY step, worded exactly like this shape: "Use '
+            'execute_script to write <filename>.csv with columns: <col1>, <col2>, ... -- one row per '
+            '<item>." -- with REAL column names and a REAL filename you choose for this question, not '
+            'a placeholder, and REAL columns for what the answer needs to be a real answer rather than '
+            'a page description (e.g. a source/feasibility question needs columns like '
+            'source_name, url, retrieval_method, api_or_rss_available -- not just source_name). Make '
+            'this the LAST step, run only after the earlier research steps found real data to put in '
+            'it. Say explicitly that describing the CSV in prose instead of actually building it does '
+            'NOT satisfy this step. If the question is a simple yes/no or single-fact lookup with '
+            'nothing to enumerate, skip this and say so -- do not force a CSV that doesn\'t fit.\n\n'
+            'VERIFICATION HONESTY -- real gap caught live (2026-09-26): a CSV with a per-item judgment '
+            'column (feasibility, difficulty, recommendation, anything requiring assessment, not just a '
+            'fact copied from a page) looks equally authoritative whether each row was actually checked '
+            'or just guessed from general knowledge -- there was no way to tell which from the output. '
+            'If the CSV has a judgment column like this, the plan MUST require: (1) a status column '
+            '(e.g. "basis") on EVERY row stating either "verified" (actually checked via a tool this '
+            'run) or "estimated" (general knowledge, not directly checked this run) -- never leave this '
+            'ambiguous; (2) an explicit step to ACTUALLY VERIFY a small sample (3-5 representative '
+            'rows, or all of them if there are fewer than 6) via search_web/browse_page/execute_script '
+            'before finalizing, so the CSV isn\'t 100% estimated -- pick rows that matter most to the '
+            'question, not arbitrary ones. This does not apply to columns that are plain facts already '
+            'confirmed during research (a name, a URL actually seen) -- only to judgment/assessment '
+            'columns.\n\n'
+            'This is a plan for another agent who will actually browse_page/search_web/execute_script '
+            '-- do not answer the question yourself, do not invent facts, just plan the investigation.')},
+        {'role': 'user', 'content': f'Question: {backlog}'
+                                     f'{(" Method/constraints: " + instructions) if instructions else ""}'},
+    ], max_tokens=500)
+
+    # EXECUTE -- the existing many-iteration real tool loop (mid tier: cheap
+    # enough to spend on up to 18 round trips), now following the plan above
+    # when one was produced.
+    system = (
+        f'You are {name}, running a time-boxed SPIKE (~{(budget or 60_000) / 1000:.0f}s). '
+        f'Question: {backlog}.'
+        f'{" Method/constraints: " + instructions if instructions else ""} '
+        + (f'Follow this plan:\n{plan_text}\n\n' if plan_text else '')
+        + 'This is REAL investigative work, not a guess from memory -- if the question depends on the '
+        'actual current content of a specific website or any other live/current fact you do not '
+        'already know for certain, you MUST use the search_web/browse_page tools to actually look it '
+        'up before answering. If the question is about reviewing or building on work another team '
+        'inside this village already did, use search_library/read_library_file to actually read '
+        'their real findings first -- never describe another team\'s work from a guess; if '
+        'search_library turns up nothing, say plainly that no internal record was found. Never '
+        'invent specifics (numbers, names, sources, quotes) you did not '
+        'actually get back from a tool -- if you can\'t find something real, say so instead of '
+        'guessing. Many sites load their real content via JavaScript/AJAX -- if a plain browse_page '
+        'fetch comes back as an empty shell or just navigation/boilerplate with no real content, '
+        'retry the SAME url with render=true to get the real rendered page. If the question needs '
+        'looking at multiple items (several posts/articles on a site, not just the front page), '
+        'follow real links you found on the page and browse_page the individual pages too -- do not '
+        'stop at the homepage. If a page lists a large catalog/directory of items, browse_page at '
+        'least 2-3 of the individual item pages too, not just the top-level listing -- a category '
+        'name is not the same as what that specific item actually is. Only ever follow a URL you '
+        'actually saw returned by search_web or in a page\'s real links list -- never invent or guess '
+        'a URL path. A spike never opens a peer-review gate, but it CAN still produce a real '
+        'artifact -- if your plan has an execute_script/CSV step, that step is MANDATORY, not '
+        'optional: you must actually call execute_script and write the real file. Describing what '
+        'the CSV would contain, in prose, is NOT the same as building it and does NOT satisfy that '
+        'plan item -- if you catch yourself writing "the CSV would include..." instead of actually '
+        'writing csv rows to a real file, stop and go build it for real. Only build it from data you '
+        'actually collected above -- if research fell short of what a row needs, use "unknown" for '
+        'that cell rather than inventing a plausible-looking value. If your plan requires a "basis" '
+        'column and a verification sample, that is ALSO mandatory: mark each row "verified" only if '
+        'you actually checked it this run (a real search_web/browse_page/execute_script result), '
+        '"estimated" otherwise -- do not mark a row "verified" just because you\'re confident about it '
+        'from general knowledge. Work through every item in your '
+        'plan before concluding -- if you genuinely cannot complete one, say so explicitly rather than '
+        'skipping it silently. When you are done investigating, summarize what you actually found -- '
+        'a later step will turn this into the final report, so completeness here matters more than '
+        'polish. If you produced a file, cat its full contents out before you finish so the final '
+        'report can include it verbatim.'
+    )
+    messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': 'Go ahead.'}]
+    # One-strike-per-tool (ported from the user's own MAGI framework's
+    # ReflectionEngine): a shared set across BOTH sub-executors, so a policy
+    # denial on either browse_page or execute_script is remembered and the
+    # SAME tool is refused (no network call at all) if the model tries it
+    # again this investigation -- it can still try a genuinely different tool.
+    struck_tools = set()
+    web_tool = _serve._make_web_tools_executor(agent_id, key, default_query=backlog, struck_tools=struck_tools)
+    sandbox_id = f"spike-{task.get('id') or 'adhoc'}"
+    sandbox_tool = _make_spike_sandbox_executor(agent_id, key, sandbox_id, struck_tools=struck_tools)
+    library_tool = _make_library_tools_executor(agent_id, struck_tools=struck_tools)
+    treg_tool = _make_treg_tools_executor()
+    pixellab_tool = _make_pixellab_tools_executor()
+    google_tool = _make_google_tools_executor()
+    spike_tools = _serve.AGENT_ASK_TOOLS + [_SPIKE_SANDBOX_TOOL, _LIBRARY_SEARCH_TOOL, _LIBRARY_READ_TOOL,
+                                            _TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL,
+                                            _PIXELLAB_CHARACTER_TOOL,
+                                            _GOOGLE_SHEETS_READ_TOOL, _GOOGLE_SHEETS_APPEND_TOOL,
+                                            _GOOGLE_CALENDAR_LIST_TOOL, _GOOGLE_CALENDAR_CREATE_TOOL]
+    _GOOGLE_TOOL_NAMES = ('read_google_sheet', 'append_google_sheet_row',
+                          'list_calendar_events', 'create_calendar_event')
+
+    def execute_tool(tool_name, args):
+        if tool_name in struck_tools:
+            return (f'{tool_name} was already blocked once this investigation (one-strike) -- do '
+                     'not call it again, use a different tool or approach instead.')
+        if tool_name == 'execute_script':
+            return sandbox_tool(tool_name, args)
+        if tool_name in ('search_library', 'read_library_file'):
+            return library_tool(tool_name, args)
+        if tool_name in ('x_trending_topics', 'search_linkedin_posts'):
+            return treg_tool(tool_name, args)
+        if tool_name == 'generate_pixel_character':
+            return pixellab_tool(tool_name, args)
+        if tool_name in _GOOGLE_TOOL_NAMES:
+            return google_tool(tool_name, args)
+        return web_tool(tool_name, args)
+
+    # 18/900 (was 10/600): a "list every X across the whole site" question
+    # (real request, 2026-09-26 -- "a full list of sources ever used on
+    # DreyX") needs many more browse_page round trips than a single-fact
+    # lookup. This turn's own text no longer has to BE the final report
+    # (synthesize does that from the full transcript below), so its token
+    # budget stays modest -- it only needs room for a working summary plus
+    # each tool call's own arguments.
+    # Forcing search_web specifically (not just force_first_tool=True's
+    # "any tool") -- real gap caught live: force_first_tool=True alone still
+    # ALWAYS reached for browse_page on the target's own pages and never
+    # called search_web at all, missing facts that only live in OTHER sites'
+    # coverage of the target (a manual search surfaced DreyX's named upstream
+    # sources that 3 rounds of browsing dreyx.com itself never found).
+    #
+    # Same fix, second application (2026-09-26): an internal-prior-art
+    # question needs search_library forced first for the identical reason --
+    # a PLAN-prompt instruction to "search the library first" was NOT
+    # reliably followed in a real live run (see _spike_wants_internal_review's
+    # own docstring for the exact incident). Checked before the search_web
+    # default so an internal-review spike doesn't reach for the outside web
+    # before it has even looked at what the village already knows.
+    #
+    # Same fix, third application (2026-09-26): a real X-trending or
+    # LinkedIn-search question needs its own specific tool forced first for
+    # the identical reason -- built preemptively this time, on day one,
+    # rather than after a live miss, now that the pattern is proven twice.
+    if _spike_wants_internal_review(backlog, instructions):
+        first_tool = 'search_library'
+    elif _spike_wants_x_trending(backlog, instructions):
+        first_tool = 'x_trending_topics'
+    elif _spike_wants_linkedin_search(backlog, instructions):
+        first_tool = 'search_linkedin_posts'
+    else:
+        first_tool = 'search_web' if _serve.TAVILY_API_KEY else True
+    # Chunked into rounds of 4 with a reflection self-check between them
+    # (see _run_spike_tool_loop_with_reflection) -- same 50-call total
+    # budget (raised 18->30->50, 2026-09-27), just spent with a chance to
+    # course-correct partway through instead of only finding out it went
+    # sideways at the end.
+    try:
+        execute_text, transcript = _run_spike_tool_loop_with_reflection(
+            tier_slug, reasoning_slug, messages, spike_tools, execute_tool,
+            total_iterations=50, max_tokens=900, force_first_tool=first_tool)
+    except Exception as e:
+        # A model-call failure (circuit-breaker RuntimeError, a 4xx, a network
+        # blip) must never crash the spike executor or leave a half-baked
+        # result -- record an honest not-ok like the empty-investigation path
+        # below does, and bail. (2026-09-27: without this, a tripped circuit
+        # breaker propagated out of the tool loop and blew up the whole task.)
+        _sim_module._store_content_result(task.get('id'), {
+            'note': f'Spiked "{backlog}", but the investigation could not run (model call failed): {e}', 'ok': False,
+            'notifyPlayer': {'kind': 'spike_done',
+                             'subject': f'[AI Village] Spike came up empty: {backlog[:80]}',
+                             'body': f'{name} tried to spike "{backlog}" but the model call failed: {e}'},
+        })
+        return
+    # Ground truth from the transcript itself (not a side-channel counter) --
+    # true whenever execute_tool actually ran at least once.
+    investigated = any(m.get('role') == 'tool' for m in (transcript or []))
+    if not investigated:
+        # force_first_tool=True should make this unreachable in practice --
+        # kept as an explicit, honest failure rather than synthesizing a
+        # report from a transcript that never actually investigated anything.
+        _sim_module._store_content_result(task.get('id'), {
+            'note': f'Spiked "{backlog}", but the model call returned nothing usable.', 'ok': False,
+            'notifyPlayer': {'kind': 'spike_done',
+                             'subject': f'[AI Village] Spike came up empty: {backlog[:80]}',
+                             'body': f'{name} looked into "{backlog}" but the model call returned nothing usable. You may want to ask again or rephrase it.'},
+        })
+        return
+
+    # SYNTHESIZE -- the stronger reasoning tier, given the FULL transcript
+    # (every real page fetched and every real search result), writes the
+    # actual final report against the plan. Falls back to the execute step's
+    # own closing text if synthesis itself comes back empty.
+    synth_prompt = (
+        'Based on everything above -- the plan, and everything actually found via the tools -- write '
+        'the complete final findings report. If the question asked for a full/exhaustive/complete list '
+        'of something, state every distinct item actually found, not a sample. Only report facts that '
+        'were actually returned by a tool above; if something could not be determined, say so plainly '
+        'rather than guessing. If different tool results above disagree on a fact (e.g. two different '
+        'counts or conflicting claims), state the discrepancy explicitly instead of silently picking '
+        'one. If any item from the plan was never actually completed, list it under a short "Not '
+        'covered" section rather than omitting it. If an execute_script call above produced a real '
+        'artifact (a CSV, a data file, a script) and its contents were cat\'d out, include the FULL '
+        'contents verbatim in a fenced code block in your report, EXACTLY as produced (including any '
+        '"basis"/verified-vs-estimated column) -- this is the actual deliverable, not something to '
+        'summarize or clean up. If the CSV has a basis column, briefly note in your own summary how '
+        'many rows were actually verified vs estimated, so that distinction isn\'t buried in a table '
+        'nobody reads closely. Organize the answer clearly (a short list or numbered sections is '
+        'fine). No filler, no release notes.'
+    )
+    finding = _plain_completion(
+        reasoning_slug, transcript + [{'role': 'user', 'content': synth_prompt}], max_tokens=1800)
+    if not finding:
+        finding = (execute_text or '').strip()
     if not finding:
         _sim_module._store_content_result(task.get('id'), {
             'note': f'Spiked "{backlog}", but the model call returned nothing usable.', 'ok': False,
@@ -1518,9 +2644,38 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                              'body': f'{name} looked into "{backlog}" but the model call returned nothing usable. You may want to ask again or rephrase it.'},
         })
         return
+    # Deterministic safety net (2026-09-26), not a prompt: confirmed live
+    # that the model doesn't reliably follow through on the VERIFICATION
+    # HONESTY plan requirement above even when the plan itself calls for
+    # it -- a per-item judgment CSV can still come back with no basis
+    # column, silently looking equally confident whether checked or
+    # guessed. Rather than trying to block execute_script from writing a
+    # non-compliant CSV (fragile -- too many ways to write a CSV to
+    # reliably detect in a shell command), catch it AFTER the fact and
+    # disclose it, so the player is never silently left without knowing.
+    if _plan_requires_verification_basis(plan_text) and not _finding_shows_basis_column(finding):
+        finding = (
+            'NOTE (added automatically): this investigation\'s plan called for a "basis" column '
+            '(verified vs estimated) on judgment/assessment data, but the report below does not '
+            'appear to include one. Treat any feasibility/quality/recommendation-style assessments '
+            'below as UNVERIFIED -- general knowledge, not independently checked this run -- unless '
+            'stated otherwise.\n\n' + finding
+        )
+    # Second deterministic safety net (2026-09-26): confirmed live in the
+    # SAME investigation -- a real file got cat'd into the transcript (a
+    # genuine execute_script result, real data), but synthesis summarized it
+    # in prose instead of including it verbatim, so the actual produced
+    # artifact never reached the report at all. Append the raw output
+    # whenever it exists and isn't already substantially present, so a real
+    # produced file is never silently lost to a lossy summary.
+    for output in _extract_execute_script_outputs(transcript):
+        if len(output) > 40 and output[:80] not in finding:
+            finding += (f'\n\n---\n\nRaw output from execute_script (added automatically -- not '
+                       f'already included in the report above):\n\n```\n{output[:4000]}\n```')
+    library_path = f"archive/{int(time.time() * 1000)}-spike-{task.get('id') or 'adhoc'}.md"
     _serve._http_json('POST', base, '/api/library/file',
                {'agentId': agent_id,
-                'path': f"archive/{int(time.time() * 1000)}-spike-{task.get('id') or 'adhoc'}.md",
+                'path': library_path,
                 'content': f'# Spike: {backlog}\n\nBy: {name}\n\n{finding}\n',
                 'source': 'firsthand'}, key)
     # Data-minimization audit finding (2026-09-24, Hermes Town comparison):
@@ -1537,9 +2692,19 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # task record staying lean, not a regression of the same bug.
     _sim_module._store_content_result(task.get('id'), {
         'note': f'{name} spiked "{backlog}" -- see the Library entry just filed.', 'ok': True,
+        # Real gap caught live (2026-09-26): /api/intent/spike/{id}/promote
+        # (turning a spike into a real followup story) only ever had the
+        # short note above to work with -- recording the exact path lets it
+        # pull the REAL findings (source lists, CSVs, feasibility data)
+        # forward instead of a vague pointer.
+        'libraryPath': library_path,
         'notifyPlayer': {'kind': 'spike_done',
                          'subject': f'[AI Village] Spike done: {backlog[:80]}',
-                         'body': f'{name} looked into "{backlog}":\n\n{finding[:1500]}'},
+                         # 3600 (was 1500): a real list-style answer (e.g. "every
+                         # source used") needs more room than a 2-4 sentence
+                         # summary; kept under Telegram's 4096-char hard message
+                         # cap once the subject/prefix overhead is added.
+                         'body': f'{name} looked into "{backlog}":\n\n{finding[:3600]}'},
     })
 
 

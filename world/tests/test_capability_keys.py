@@ -206,6 +206,95 @@ class CapabilityKeys(unittest.TestCase):
         self.assertIs(serve.verify_agent_key('agent-a', key), False)
 
 
+class CurlCredentialEcho(unittest.TestCase):
+    """Real, narrow gap found in a security audit (2026-09-26): a capability-
+    handle-authenticated /api/curl response used to go back to the agent
+    completely raw. If the target API ever echoed the injected credential
+    back (some APIs do, in error/debug responses), that secret would land in
+    the agent's visible tool output -- and from there could get written into
+    the shared, PERSISTENT sandbox (workroom-shared/research-shared),
+    readable by any later, unrelated task. Same shape as the real Pocket
+    OS/Railway incident (a leftover credential found in an unrelated file).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='village-curl-echo-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            VILLAGE_DIR=self.tmp,
+            AGENTS_DIR=os.path.join(self.tmp, 'agents'),
+            LIBRARY_DIR=os.path.join(self.tmp, 'library'),
+            PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
+            _FERNET_EDEK_DIR=os.path.join(self.tmp, '.secret_keys'),
+            _FERNET_EDEK_PATH=os.path.join(self.tmp, '.secret_keys', 'edek.key'),
+        )
+        self._cm.start()
+        serve.init_db()
+        serve._store_credential('some-api', 'Some API', 'sk-live-real-secret-value')
+        self.agent_key = serve.get_or_create_agent_key('eli')
+        self.handle, refusal = serve.mint_capability_handle(
+            'eli', 'some-api', 'test', '*', ['GET'], 'player', 3600)
+        self.assertIsNone(refusal)
+
+    def tearDown(self):
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_echoed_credential_is_redacted_from_body_and_headers(self):
+        c = TestClient(serve.app)
+        c.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
+        fake_response = {
+            'status': 200, 'finalUrl': 'https://api.example.com/whoami',
+            'headers': {'X-Echoed-Auth': 'Bearer sk-live-real-secret-value'},
+            'body': 'You sent: Authorization: Bearer sk-live-real-secret-value',
+            'truncated': False,
+        }
+        with unittest.mock.patch.object(serve, 'BROWSING_ENABLED', True), \
+             unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'fake'), \
+             unittest.mock.patch.object(serve, 'check_rate_limit', return_value=True), \
+             unittest.mock.patch.object(serve, '_agent_is_in_weatherstation', return_value=True), \
+             unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True), \
+             unittest.mock.patch.object(serve, '_call_openrouter_decision_sync'), \
+             unittest.mock.patch.object(serve, '_jev_choice', return_value=('allow', 0.95, 0.0)), \
+             unittest.mock.patch.object(serve, '_curl_request_sync', return_value=fake_response):
+            r = c.post('/api/curl', json={
+                'agentId': 'eli', 'url': 'https://api.example.com/whoami', 'method': 'GET',
+                'purpose': 'test', 'capabilityHandle': self.handle,
+            }, headers={'X-Agent-Key': self.agent_key})
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        raw = str(body)
+        self.assertNotIn('sk-live-real-secret-value', raw)
+        self.assertIn('[REDACTED]', body['body'])
+        self.assertIn('[REDACTED]', body['headers']['X-Echoed-Auth'])
+
+    def test_no_handle_used_leaves_unrelated_content_untouched(self):
+        # No capability handle presented -> no secret to redact by exact
+        # value; ordinary response content must pass through unchanged.
+        c = TestClient(serve.app)
+        c.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
+        fake_response = {
+            'status': 200, 'finalUrl': 'https://api.example.com/public',
+            'headers': {'Content-Type': 'application/json'},
+            'body': '{"ok": true}', 'truncated': False,
+        }
+        with unittest.mock.patch.object(serve, 'BROWSING_ENABLED', True), \
+             unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'fake'), \
+             unittest.mock.patch.object(serve, 'check_rate_limit', return_value=True), \
+             unittest.mock.patch.object(serve, '_agent_is_in_weatherstation', return_value=True), \
+             unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True), \
+             unittest.mock.patch.object(serve, '_call_openrouter_decision_sync'), \
+             unittest.mock.patch.object(serve, '_jev_choice', return_value=('allow', 0.95, 0.0)), \
+             unittest.mock.patch.object(serve, '_curl_request_sync', return_value=fake_response):
+            r = c.post('/api/curl', json={
+                'agentId': 'eli', 'url': 'https://api.example.com/public', 'method': 'GET',
+                'purpose': 'test',
+            }, headers={'X-Agent-Key': self.agent_key})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['body'], '{"ok": true}')
+
+
 class HandlesEndpointAuth(unittest.TestCase):
     """HTTP-level test of POST/DELETE /api/keys/handles' 'player-only' gate.
 
