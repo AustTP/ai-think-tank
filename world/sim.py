@@ -36,7 +36,7 @@ from collections import deque
 
 # Pure, self-contained helpers extracted to their own module (2026-09-27) to
 # shrink the sim.py monolith. See sim_helpers.py.
-from sim_helpers import (  # noqa: E402
+from sim_helpers import (  # noqa: E402, F401
     WORK_PRIORITY,
     _deliverable_room,
     _is_fully_idle,
@@ -46,8 +46,8 @@ from sim_helpers import (  # noqa: E402
     ensure_wiki,
     is_work_item_due,
     # Re-exported for serve.py / tests (e.g. `from sim import next_sprint_id`).
-    next_product_id,  # noqa: F401
-    next_sprint_id,  # noqa: F401
+    next_product_id,
+    next_sprint_id,
     normalize_priority,
 )
 
