@@ -26,7 +26,6 @@ import html
 import ipaddress
 import json
 import os
-import random
 import re
 import secrets
 import shutil
@@ -2156,18 +2155,6 @@ async def _telegram_poll_loop():
             await asyncio.sleep(5)
 
 
-# Real ask: an admin should periodically review every agent's mailbox
-# for anything odd, on a schedule nobody INSIDE the village can predict
-# or game -- a fixed cadence (exactly every 12h, say) would let an agent
-# learn "the coast is clear until then." A uniformly random interval
-# between these two bounds means the next check could be soon or could
-# be hours out, with no pattern to learn. Runs server-side, like the
-# health-check loop above, specifically so it happens reliably over real
-# elapsed time even if nobody has the game open in a browser tab.
-MAIL_AUDIT_MIN_INTERVAL_S = 3 * 3600
-MAIL_AUDIT_MAX_INTERVAL_S = 12 * 3600
-
-
 def _model_tier_slug(band):
     # Generalised band lookup used by the per-band pickers below. Exposed
     # separately so the band-specific wrappers stay individually mockable in
@@ -2303,86 +2290,6 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None)
     # Everything else -- low decision, low confidence, outage, or a high pick
     # on a non-allow_high call -- stays on the cheap tier.
     return _low_tier_slug() or _mid_tier_slug()
-
-
-def _run_mail_audit_sync():
-    data = get_state_from_db()
-    if not data:
-        return
-    agents = data.get('agents', {})
-    admin_ids = {d.get('id') for d in data.get('agentRoster', []) if d.get('isAdmin')}
-
-    # Real mailbox content, every non-admin agent, not a sample -- the
-    # whole point is an admin who'd actually notice something odd
-    # anywhere, not a spot-check.
-    mailbox_dump = []
-    for agent_id, agent in agents.items():
-        if agent_id in admin_ids:
-            continue  # admins auditing each other's mail isn't the ask
-        mailbox = agent.get('mailbox') or []
-        if not mailbox:
-            continue
-        texts = [(m.get('text') if isinstance(m, dict) else m) for m in mailbox]
-        name = agent.get('name', agent_id)
-        mailbox_dump.append(f"{name} ({agent_id}):\n" + "\n".join(f"- {t}" for t in texts if t))
-    if not mailbox_dump:
-        return  # nothing to review -- don't spend a call on an empty village
-
-    model_slug = _resolve_model_tier('Admin mailbox audit -- review agent mailboxes for anything unusual or concerning')
-    if not model_slug:
-        return  # no model tier chosen yet -- nothing to audit with
-
-    system_prompt = (
-        "You are an admin in a small village of AI worker agents, doing a routine, "
-        "unannounced review of everyone's mailbox to make sure nothing odd is going on -- "
-        "harassment, a stuck workflow, a suspicious or out-of-place request, anything a real "
-        "admin would want to know about. Most of the time there is nothing to report; don't "
-        "invent a concern just to have something to say. "
-        "Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this "
-        "shape: {\"finding\": \"one sentence describing what you found, or null if nothing "
-        "notable\"}"
-    )
-    try:
-        result = _call_openrouter_sync(
-            model_slug,
-            [
-                {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': "\n\n".join(mailbox_dump)[:8000]},
-            ],
-            max_tokens=300,
-        )
-        reply = result['choices'][0]['message']['content']
-    except Exception as e:
-        print(f'[mail-audit] call failed: {e}', flush=True)
-        return
-    if not reply:
-        return
-
-    try:
-        cleaned = reply.strip()
-        if cleaned.startswith('```'):
-            cleaned = cleaned.strip('`').removeprefix('json').strip()
-        parsed = json.loads(cleaned)
-    except (json.JSONDecodeError, AttributeError):
-        return
-    finding = parsed.get('finding')
-
-    log_action(None, 'mail_audit', {'mailboxesReviewed': len(mailbox_dump), 'finding': finding})
-    if finding and str(finding).strip().lower() not in ('null', 'none', ''):
-        with _db() as conn:
-            conn.execute(
-                'INSERT INTO health_alerts (category, severity, message, ts) VALUES (?, ?, ?, ?)',
-                ('mail_audit', 'info', str(finding), time.time()),
-            )
-
-
-async def _mail_audit_loop():
-    while True:
-        await asyncio.sleep(random.uniform(MAIL_AUDIT_MIN_INTERVAL_S, MAIL_AUDIT_MAX_INTERVAL_S))
-        try:
-            await asyncio.to_thread(_run_mail_audit_sync)
-        except Exception as e:
-            print(f'[mail-audit] loop error: {e}', flush=True)
 
 
 # Real ask (2026-09-21): "multiple directors under the admin with the senior
@@ -2706,7 +2613,6 @@ async def _lifespan(app):
     except Exception as e:
         print(f'[identity] backfill failed: {e}', flush=True)
     health_task = asyncio.create_task(_health_check_loop())
-    mail_audit_task = asyncio.create_task(_mail_audit_loop())
     director_task = asyncio.create_task(_director_approval_loop())
     peer_task = asyncio.create_task(_peer_review_loop())
     backup_task = asyncio.create_task(_backup_loop())
@@ -2734,7 +2640,6 @@ async def _lifespan(app):
         print(f'[sim] failed to start loop: {e}', flush=True)
     yield
     health_task.cancel()
-    mail_audit_task.cancel()
     director_task.cancel()
     peer_task.cancel()
     backup_task.cancel()
