@@ -38,7 +38,6 @@ from collections import deque
 # shrink the sim.py monolith. See sim_helpers.py.
 from sim_helpers import (  # noqa: E402
     WORK_PRIORITY,
-    _WORK_PRIORITY_VALUES,
     _deliverable_room,
     _is_fully_idle,
     _sprint_item_id,
@@ -46,8 +45,9 @@ from sim_helpers import (  # noqa: E402
     days_since,
     ensure_wiki,
     is_work_item_due,
-    next_product_id,
-    next_sprint_id,
+    # Re-exported for serve.py / tests (e.g. `from sim import next_sprint_id`).
+    next_product_id,  # noqa: F401
+    next_sprint_id,  # noqa: F401
     normalize_priority,
 )
 
@@ -3620,7 +3620,7 @@ def _spawn_team_agent(state, name, role, director_id, now_ms, grid, is_director=
             f"Report to {director_id}; your work lands in the {director_id} team's shared space.",
             "You were brought in when every existing team was busy in a sprint -- your team owns the incoming large request.",
         ],
-        'notes': [f"Created 2026-09-27 as part of a new team for an incoming large request."],
+        'notes': ["Created 2026-09-27 as part of a new team for an incoming large request."],
     }
     roster_entry = {
         'id': new_id, 'name': name, 'color': color, 'role': role, 'model': 'small',
@@ -3709,7 +3709,7 @@ def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employee
         'id': director_id,
         'name': f"{director_name.title()}'s Crew",
         'directorId': director_id,
-        'purpose': f"New team created on 2026-09-27 to take a large request while existing teams were busy in sprints.",
+        'purpose': "New team created on 2026-09-27 to take a large request while existing teams were busy in sprints.",
         'members': [],
         'createdAt': time.time(),
         'createdForRequest': (goal or '')[:200],
