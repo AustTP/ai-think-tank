@@ -244,40 +244,6 @@ const VILLAGE_REAL_MECHANISMS = `Real facts about how work actually happens in t
   + `research and reviews get filed as real files in a shared Library, not a wiki or ticket; `
   + `agents send each other real in-village mail, not chat messages on an external tool.`;
 
-// Real ask: an original seed agent's onboarding file used to be
-// hardcoded prose baked directly into agents.js's AGENT_ROSTER --
-// static, stale the moment reality diverges from it, and inconsistent
-// with the "the database is the one source of truth" principle every
-// hire since has followed. Generated for real on a genuinely fresh
-// start instead, through this same grounded mechanism, so day-one
-// onboarding is accurate from the very first boot rather than a fiction
-// someone has to remember to keep updated. No admin/hirer framing here
-// (there's no admin yet on a truly fresh boot) -- just a direct,
-// grounded request for this specific role.
-async function generateSeedProfile(name, role) {
-  const systemPrompt = `Write a real onboarding file for ${name}, whose role in a small village of AI worker agents is "${role}". `
-    + `${VILLAGE_REAL_MECHANISMS} `
-    + `Keep every field concise but genuinely useful for someone doing this job here. `
-    + `Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: `
-    + `{"mission":"one sentence mission statement","instructions":["short operating instructions, as many as genuinely needed"],"notes":[]}`;
-  try {
-    const res = await agentFetch('/api/chat', null, {
-      method: 'POST',
-      body: JSON.stringify({
-        model: MODEL_TIERS.mid.slug,
-        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: `Write ${name}'s onboarding file.` }],
-        max_tokens: 500,
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok || data.error || !data.reply) return null;
-    const cleaned = data.reply.trim().replace(/^```json\s*|^```\s*|```\s*$/g, '');
-    const parsed = JSON.parse(cleaned);
-    if (parsed.mission && Array.isArray(parsed.instructions)) return parsed;
-  } catch (e) { /* fall through to the caller's own template fallback */ }
-  return null;
-}
-
 // Per your call: the admin who hires someone should be the one who
 // writes their AGENTS.md-equivalent file, not a fixed template -- and if
 // there's a specific reason for the hire (helping a specific agent with

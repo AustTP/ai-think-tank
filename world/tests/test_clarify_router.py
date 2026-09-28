@@ -139,6 +139,11 @@ class ClarifyEndpointTests(unittest.TestCase):
     """Endpoint via TestClient with a real player session, all live side effects
     (DB state, model, KB search) mocked so a real village is never touched."""
 
+    def setUp(self):
+        # Clarify shares the rate-limited ask lane (2026-09-28) -- clear the
+        # bucket per test so this suite is hermetic regardless of order.
+        serve._rate_limit_calls.pop(serve.ASK_LANE_RATE_LIMIT_KEY, None)
+
     def _client(self, state):
         from fastapi.testclient import TestClient
         c = TestClient(serve.app)

@@ -190,6 +190,11 @@
   }
   .hud-btn:hover:not(:disabled) { background: #7d5638; }
   .hud-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .inbox-count {
+    display: inline-block; min-width: 14px; height: 14px; line-height: 14px;
+    border-radius: 999px; background: #c34f1f; color: #fff; font-size: 10px;
+    text-align: center; margin-left: 4px; font-weight: bold;
+  }
 
   .profile-box { width: 460px; background: #fdfdfb; color: #1a1a1a; }
   .profile-header {
@@ -302,6 +307,7 @@
   <button class="hud-btn" id="hudCallMeetingBtn">Call Meeting</button>
   <button class="hud-btn" id="hudCommandCenterBtn" title="Enter Control Room -- also where you can check on anyone using it">Command Center</button>
   <button class="hud-btn" id="hudActivityBtn" title="Everything real that's happened, straight off the action log">Activity</button>
+  <button class="hud-btn" id="hudInboxBtn" title="Questions agents are blocked waiting on your answer for">Inbox<span id="hudInboxCount" class="inbox-count"></span></button>
   <button class="hud-btn" id="hudPhoneBtn" title="Call anyone -- off duty or out of physical reach, mid-task">Phone Booth</button>
   <button class="hud-btn" id="hudLogoutBtn" title="End your real login session">Log Out</button>
 </div>
@@ -453,6 +459,18 @@
       <button id="activityCloseBtn">Close</button>
     </div>
     <div class="terminal-output" id="activityOutput"></div>
+  </div>
+</div>
+
+<div id="playerInboxModal" class="modal hidden">
+  <div class="modal-box chat-box">
+    <div class="chat-header">
+      <h3>Player Inbox</h3>
+      <button id="playerInboxCloseBtn">Close</button>
+    </div>
+    <div class="chat-body">
+      <div class="thread-log" id="playerInboxLog"></div>
+    </div>
   </div>
 </div>
 
@@ -1825,6 +1843,132 @@ function closeActivity() {
   activityRefreshTimer = null;
 }
 
+// Player Inbox (2026-09-28): the one place agents can genuinely block the
+// village waiting on YOU -- a director-gated question the agent couldn't
+// resolve internally (sim.py _deliver_player_ask). Until this panel existed
+// the questions were filed server-side and the player was emailed, but the
+// UI to actually answer them was missing, so an awaiting question left the
+// agent frozen forever. Open → fetch, poll while open, answer posts back.
+let playerInboxRefreshTimer = null;
+
+function openPlayerInbox() {
+  state.ui = 'player-inbox';
+  document.getElementById('playerInboxModal').classList.remove('hidden');
+  renderPlayerInbox();
+  playerInboxRefreshTimer = setInterval(renderPlayerInbox, 3000);
+}
+
+function closePlayerInbox() {
+  state.ui = null;
+  document.getElementById('playerInboxModal').classList.add('hidden');
+  clearInterval(playerInboxRefreshTimer);
+  playerInboxRefreshTimer = null;
+}
+
+let playerInboxCache = [];
+
+async function refreshPlayerInbox() {
+  try {
+    const res = await apiFetch('/api/player-inbox');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (data.ok) playerInboxCache = data.messages || [];
+  } catch (e) { /* poll errors are transient -- keep the last good cache */ }
+}
+
+async function renderPlayerInbox() {
+  await refreshPlayerInbox();
+  const log = document.getElementById('playerInboxLog');
+  log.innerHTML = '';
+  const awaiting = playerInboxCache.filter(m => m.status === 'awaiting_input');
+  const answered = playerInboxCache.filter(m => m.status !== 'awaiting_input');
+  if (playerInboxCache.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'Nothing waiting. Agents only block on you when a director-approved question can\u2019t be answered internally.';
+    log.appendChild(empty);
+    return;
+  }
+  const header = document.createElement('div');
+  header.className = 'thread-header';
+  header.textContent = awaiting.length > 0
+    ? `${awaiting.length} agent${awaiting.length === 1 ? '' : 's'} waiting on your answer`
+    : 'No questions waiting';
+  log.appendChild(header);
+  for (const m of awaiting) appendInboxMessage(log, m, true);
+  for (const m of answered) appendInboxMessage(log, m, false);
+}
+
+function appendInboxMessage(log, m, waiting) {
+  const box = document.createElement('div');
+  box.className = 'msg' + (waiting ? ' unread' : '');
+  box.style.borderLeft = waiting ? '3px solid #c34f1f' : '3px solid #7fd0ff';
+  box.style.paddingLeft = '6px';
+  const agentName = (AGENT_ROSTER.find(d => d.id === m.agentId) || {}).name || m.agentId;
+  const who = document.createElement('div');
+  who.className = 'from';
+  who.textContent = `${agentName} — ${m.issueKey || 'ask'}`;
+  box.appendChild(who);
+  const q = document.createElement('div');
+  q.textContent = m.question || '';
+  box.appendChild(q);
+  if (m.context) {
+    const ctx = document.createElement('div');
+    ctx.style.opacity = '0.6';
+    ctx.style.fontSize = '11px';
+    ctx.textContent = m.context;
+    box.appendChild(ctx);
+  }
+  if (waiting) {
+    const row = document.createElement('div');
+    row.className = 'thread-input';
+    row.style.display = 'flex';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'Your answer unblocks them...';
+    input.style.flex = '1';
+    const btn = document.createElement('button');
+    btn.textContent = 'Answer';
+    const send = async () => {
+      const answer = input.value.trim();
+      if (!answer) return;
+      btn.disabled = true;
+      try {
+        const res = await apiFetch(`/api/player-inbox/${encodeURIComponent(m.id)}/respond`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ answer }),
+        });
+        if (res.ok) await renderPlayerInbox();
+        else {
+          btn.disabled = false;
+          input.value = '';
+          input.placeholder = 'Failed -- try again';
+        }
+      } catch (e) { btn.disabled = false; }
+    };
+    btn.addEventListener('click', send);
+    input.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+    row.appendChild(input);
+    row.appendChild(btn);
+    box.appendChild(row);
+  } else {
+    const a = document.createElement('div');
+    a.style.opacity = '0.85';
+    a.textContent = `\u2192 ${m.answer || '(no answer recorded)'}`;
+    box.appendChild(a);
+  }
+  log.appendChild(box);
+}
+
+async function refreshInboxCount() {
+  await refreshPlayerInbox();
+  const el = document.getElementById('hudInboxCount');
+  const n = playerInboxCache.filter(m => m.status === 'awaiting_input').length;
+  el.textContent = n > 0 ? String(n) : '';
+  el.style.background = n > 0 ? '#c34f1f' : 'transparent';
+}
+
 // Per your call: give an admin a large task and let THEM break it down
 // and delegate it, rather than you hand-assigning individual TASK_POOL
 // entries yourself. See assignBigTask() (tasks.js) for the actual
@@ -2981,6 +3125,13 @@ async function main() {
   // keeping server-owned positions/queue/tasks.
   setInterval(saveState, 5000);
 
+  // Player Inbox: a slow badge poll keeps the HUD count fresh (an awaiting
+  // question is a genuinely urgent thing -- an agent is frozen on it), and
+  // costs a single local SQLite read every 10s. Never runs while the panel
+  // is open (that path polls every 3s and the modal's own timer takes over).
+  refreshInboxCount();
+  setInterval(refreshInboxCount, 10000);
+
   // Tasks (tasks.js), a few seconds after load so everything else has
   // settled first, then on a recurring cycle -- a single one-shot demo
   // task meant only ever ONE agent ever moved; everyone else (Omar
@@ -3047,6 +3198,8 @@ async function main() {
   document.getElementById('hudCommandCenterBtn').addEventListener('click', () => enterRoom('commandcenter'));
   document.getElementById('hudActivityBtn').addEventListener('click', openActivity);
   document.getElementById('activityCloseBtn').addEventListener('click', closeActivity);
+  document.getElementById('hudInboxBtn').addEventListener('click', openPlayerInbox);
+  document.getElementById('playerInboxCloseBtn').addEventListener('click', closePlayerInbox);
   document.getElementById('hudPhoneBtn').addEventListener('click', openPhoneBooth);
   document.getElementById('hudLogoutBtn').addEventListener('click', () => {
     fetch('/logout', { method: 'POST' }).finally(() => { window.location.href = '/'; });

@@ -1631,16 +1631,6 @@ def _treg_account_balance():
 TREG_ENDPOINT_COSTS = {
     'x.x.get-trends-by-woeid': 0.01,
     'scrapecreators.x.v1-linkedin-search-posts': 0.00188,
-    # Real endpoint IDs below were NOT documented anywhere -- discovered live
-    # (2026-09-27) via Treg's own self-documenting 404/400 error text (e.g.
-    # "no endpoint X in the catalog -- did you mean Y", "additional
-    # properties 'z' not allowed; valid fields: [...]"), same method already
-    # used for the two above. Prices are real, derived from a before/after
-    # balance delta across one real successful call each, not the catalog
-    # page's generic "from $0.0005" marketing figure.
-    'apify.linkedin.search.jobs': 0.011,
-    'anyapi.linkedin.post_comments': 0.005,
-    'anyapi.linkedin.post_reactions': 0.005,
 }
 
 
@@ -5304,7 +5294,7 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/execute', '/api/pipeline', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/keys', '/api/player-email')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/execute', '/api/pipeline', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/keys', '/api/player-email', '/api/player-inbox')
 # Real gap found 2026-09-25: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
@@ -6508,7 +6498,12 @@ async def get_player_inbox(request: Request):
 @app.post('/api/player-inbox/{message_id}/respond')
 async def respond_player_inbox(message_id: str, request: Request):
     """The player answers an awaiting inbox question. The reply is stamped onto
-    the agent's task as context and the SM clears the blocked field. Body: {'answer'}."""
+    the agent's task as context and the SM clears the blocked field. Body: {'answer'}.
+    PLAYER-only -- a valid agent key is NOT a credential here, because answering
+    one of your own questions would unblock yourself around the human-in-the-loop
+    gate this inbox exists to enforce."""
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -6682,6 +6677,8 @@ async def intent_clarify(request: Request):
     agent, answers KNOWLEDGE-BASE-FIRST (real Library search), and only
     escalates to the completing agent if the on-call can't answer. Returns
     {reply, onCall, completing, escalatedTo}."""
+    if not check_rate_limit(ASK_LANE_RATE_LIMIT_KEY):
+        return JSONResponse({'error': 'Rate limit hit -- too many questions at once. Wait a minute and try again.'}, status_code=429)
     state = get_state_from_db()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -7048,6 +7045,8 @@ async def intent_ask(request: Request):
     Thin wrapper: all real behavior lives in _ask_core (also called directly
     by the Telegram bridge, added 2026-09-27, with no HTTP hop in between).
     """
+    if not check_rate_limit(ASK_LANE_RATE_LIMIT_KEY):
+        return JSONResponse({'error': 'Rate limit hit -- too many questions at once. Wait a minute and try again.'}, status_code=429)
     state = get_state_from_db()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -8409,6 +8408,11 @@ def verify_boundary_intact(content, nonce, tag):
 RATE_LIMIT_WINDOW_S = 60
 RATE_LIMIT_MAX_CALLS = 20
 _rate_limit_calls: dict[str, list[float]] = {}  # agent_id -> [timestamps within the current window]
+# The ask/clarify lanes (real model spend) share one bucket so a burst of
+# player questions can't blow through the month's budget -- same 20/60s rule
+# every tool endpoint already enforces. Player questions are human-paced, so
+# a human player will never feel this; it only stops a runaway/looping caller.
+ASK_LANE_RATE_LIMIT_KEY = '__player_ask_lane__'
 
 
 def check_rate_limit(agent_id):
@@ -9056,16 +9060,12 @@ async def chat(request: Request):
         usage_cost = (data.get('usage') or {}).get('cost', 0.0)
         if isinstance(usage_cost, (int, float)) and usage_cost:
             _accrue_spend(service, usage_cost)
-            # High tier is its own accountable service line (2026-09-27) so the
-            # bank shows how much the expensive tier cost AND the JEV gate can
-            # fail closed when the month's high-tier allowance is spent.
-            if model == _high_tier_slug():
-                _accrue_high_tier_spend(usage_cost)
             # High-tier calls accrue against the dedicated high-tier monthly
-            # budget too (2026-09-27) so the JEV gate can cap expensive-tier
-            # usage. Checks whether THIS call used the high-tier model.
-            high_slug = _high_tier_slug()
-            if high_slug and model == high_slug:
+            # budget too (2026-09-27) so the JEV gate can fail closed when the
+            # month's high-tier allowance is spent. Single accrual point -- this
+            # is the one place the expensive tier's cost is counted (was doubled
+            # by a duplicate block 2026-09-28, halving the effective budget).
+            if model == _high_tier_slug():
                 _accrue_high_tier_spend(usage_cost)
         log_action(agent_id, 'chat', {'model': model, 'service': service, 'cost': float(usage_cost) if isinstance(usage_cost, (int, float)) else 0.0}, authorized=authorized)
         return JSONResponse({'reply': reply})
@@ -9767,18 +9767,8 @@ async def _classify_command(command, purpose, agent_id='unknown'):
     return True, 'allow'
 
 
-# sandboxId -> last time anything actually ran against it. Kept for
-# observability/logging, NOT for wiping anymore -- your call: the shared
-# sandbox is where real code and pipelines live now, not disposable
-# scratch space, so it should never reset on its own regardless of how
-# long it sits idle. Deleting it (if ever wanted) is a deliberate action
-# from now on, not a timer's decision.
-_sandbox_last_activity = {}
-
-
 def _sandbox_dir_for(sandbox_id):
     path = os.path.join(SANDBOXES_DIR, sandbox_id)
-    _sandbox_last_activity[sandbox_id] = time.time()
     os.makedirs(path, exist_ok=True)
     return path
 

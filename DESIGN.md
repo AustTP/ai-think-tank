@@ -34,11 +34,10 @@ background loops:
 | Loop | Cadence | What it does |
 |------|---------|-------------|
 | `_sim_loop` | 6s task cycle | Drive the simulation: movement, task lifecycle, ceremonies |
-| `_health_check_loop` | 300s | Check model tiers, circuit breaker recovery |
+| `_health_check_loop` | 300s | Compute health signals, persist new alerts (model tiers, coordination, runaway-tool churn) |
 | `_peer_review_loop` | 90s | Senior director files peer reports on low-activity workers |
 | `_director_approval_loop` | 30s | Resolve pending escalations via delegated JEV approvals |
 | `_telegram_poll_loop` | 25s | Poll Telegram for player messages, route into village |
-| `_mail_audit_loop` | 3-12h | Admin reviews agent mailboxes for unusual activity |
 | `_backup_loop` | 5min | Snapshot village.db (keeps newest 24) |
 | `_log_prune_loop` | 6h | Delete decision_tape/action_log rows older than retention (7d) |
 | `_model_tier_refresh_loop` | daily | Re-pick each band's best-value model from live catalog + prices |
