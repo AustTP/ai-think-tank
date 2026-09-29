@@ -221,7 +221,7 @@
   .roster-list { display: flex; flex-direction: column; gap: 4px; }
 
   #hudBar {
-    position: relative; z-index: 25; height: 52px;
+    position: relative; z-index: 25; height: 60px;
     background:
       linear-gradient(180deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0) 50%),
       linear-gradient(180deg, #283157 0%, #1b2242 55%, #141a33 100%);
@@ -403,9 +403,6 @@
       <div class="hud-gap"></div>
       <button class="hud-btn" id="hudCallMeetingBtn">Call Meeting</button>
       <button class="hud-btn" id="hudCommandCenterBtn" title="Enter Control Room -- also where you can check on anyone using it">Command Center</button>
-      <button class="hud-btn" id="hudActivityBtn" title="Everything real that's happened, straight off the action log">Activity</button>
-      <button class="hud-btn" id="hudInboxBtn" title="Questions agents are blocked waiting on your answer for">Inbox<span id="hudInboxCount" class="inbox-count"></span></button>
-      <button class="hud-btn" id="hudPhoneBtn" title="Call anyone -- off duty or out of physical reach, mid-task">Phone Booth</button>
       <button class="hud-btn" id="hudLogoutBtn" title="End your real login session">Log Out</button>
     </div>
     <div id="viewport">
@@ -752,7 +749,7 @@ ctx.imageSmoothingEnabled = false;
 
 const viewport = document.getElementById('viewport');
 const stage = document.getElementById('stage');
-const HUD_H = 52, ACTION_H = 34;
+const HUD_H = 60, ACTION_H = 34;
 function fitViewport() {
   const ratio = VIEW_W / VIEW_H;
   const availW = window.innerWidth - 16;
@@ -2075,6 +2072,7 @@ function appendInboxMessage(log, m, waiting) {
 async function refreshInboxCount() {
   await refreshPlayerInbox();
   const el = document.getElementById('hudInboxCount');
+  if (!el) return;
   const n = playerInboxCache.filter(m => m.status === 'awaiting_input').length;
   el.textContent = n > 0 ? String(n) : '';
   el.style.background = n > 0 ? '#c34f1f' : 'transparent';
@@ -3293,11 +3291,6 @@ async function main() {
   });
   document.getElementById('hudCallMeetingBtn').addEventListener('click', openMeetingUI);
   document.getElementById('hudCommandCenterBtn').addEventListener('click', () => enterRoom('commandcenter'));
-  document.getElementById('hudActivityBtn').addEventListener('click', openActivity);
-  document.getElementById('activityCloseBtn').addEventListener('click', closeActivity);
-  document.getElementById('hudInboxBtn').addEventListener('click', openPlayerInbox);
-  document.getElementById('playerInboxCloseBtn').addEventListener('click', closePlayerInbox);
-  document.getElementById('hudPhoneBtn').addEventListener('click', openPhoneBooth);
   document.getElementById('hudLogoutBtn').addEventListener('click', () => {
     fetch('/logout', { method: 'POST' }).finally(() => { window.location.href = '/'; });
   });
