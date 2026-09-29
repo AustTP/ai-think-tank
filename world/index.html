@@ -5,15 +5,30 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI Think Tank — World (experimental)</title>
 <style>
+  :root {
+    --bg: #0e1218;
+    --surface-0: #161e28;
+    --surface-1: #0f1620;
+    --surface-2: #1b2533;
+    --border: #263241;
+    --border-soft: #1c2633;
+    --text: #dde6f0;
+    --text-dim: #8b99ab;
+    --accent: #4fc1ff;
+    --accent-soft: rgba(79, 195, 255, 0.14);
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
   html, body {
     margin: 0;
     height: 100%;
-    background: #1b1e22;
+    background: var(--bg);
+    background-image: radial-gradient(1200px 800px at 50% -10%, #1a2430 0%, var(--bg) 60%);
     display: flex;
     align-items: center;
     justify-content: center;
-    font-family: monospace;
-    color: #e8e8e8;
+    font-family: var(--font-sans);
+    color: var(--text);
     overflow: hidden;
   }
   #wrap {
@@ -28,119 +43,124 @@
   #viewport {
     position: relative;
     overflow: hidden;
-    border: 2px solid #444;
+    border: 1px solid var(--border);
+    border-radius: 10px;
     background: #000;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
     flex: 0 0 auto;
   }
   canvas { image-rendering: pixelated; display: block; width: 100%; height: 100%; }
-  p { max-width: 960px; margin: 6px auto; opacity: 0.7; font-size: 13px; flex: 0 0 auto; }
-
-  #pad {
-    display: grid;
-    grid-template-columns: repeat(3, 44px);
-    grid-template-rows: repeat(3, 44px);
-    gap: 4px;
-    margin: 4px 0;
-    flex: 0 0 auto;
-    -webkit-user-select: none; user-select: none;
-  }
-  #pad button {
-    font-size: 18px;
-    border-radius: 8px;
-    border: 1px solid #555;
-    background: #2a2e34;
-    color: #e8e8e8;
-    touch-action: none;
-  }
-  #pad button:active, #pad button.held { background: #465066; }
-  #pad .up { grid-column: 2; grid-row: 1; }
-  #pad .left { grid-column: 1; grid-row: 2; }
-  #pad .down { grid-column: 2; grid-row: 2; }
-  #pad .right { grid-column: 3; grid-row: 2; }
+  p { max-width: 960px; margin: 6px auto; color: var(--text-dim); font-size: 12.5px; line-height: 1.5; flex: 0 0 auto; }
 
   #zoom {
-    position: fixed;
-    right: 12px;
-    top: 50%;
-    transform: translateY(-50%);
+    position: absolute;
+    right: 10px;
+    bottom: 10px;
     display: flex;
     flex-direction: column;
     gap: 6px;
+    z-index: 10;
     -webkit-user-select: none; user-select: none;
   }
   #zoom button {
     width: 44px;
     height: 44px;
     font-size: 18px;
-    border-radius: 8px;
-    border: 1px solid #555;
-    background: #2a2e34;
-    color: #e8e8e8;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--surface-1);
+    color: var(--text);
     touch-action: none;
+    cursor: pointer;
+    transition: background 0.12s ease, border-color 0.12s ease;
   }
-  #zoom button:active { background: #465066; }
-  #zoom .showall { font-size: 10px; }
+  #zoom button:hover { background: var(--surface-2); }
+  #zoom button:active { background: var(--accent-soft); border-color: var(--accent); }
+  #zoom .showall { font-size: 10px; letter-spacing: 0.05em; }
 
   .hidden { display: none !important; }
   .modal {
-    position: fixed; inset: 0; background: rgba(0,0,0,0.6);
+    position: fixed; inset: 0; background: rgba(5, 9, 14, 0.72);
     display: flex; align-items: center; justify-content: center; z-index: 50;
   }
   .modal-box {
-    background: #22262c; border: 1px solid #555; border-radius: 8px;
-    padding: 18px; width: 360px; max-width: 90vw; text-align: left;
-    font-family: monospace; color: #e8e8e8;
+    background: var(--surface-0); border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px; width: 360px; max-width: 90vw; max-height: 88vh; overflow-y: auto;
+    box-sizing: border-box; text-align: left;
+    font-family: var(--font-sans); color: var(--text);
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
   }
-  .modal-box h3 { margin: 0 0 10px 0; font-size: 15px; }
+  .modal-box h3 { margin: 0 0 10px 0; font-size: 15px; letter-spacing: 0.01em; }
+  :where(.modal-box) button {
+    font-family: inherit; font-size: 13px; padding: 7px 14px;
+    border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2);
+    color: var(--text); cursor: pointer;
+    transition: background 0.12s ease, border-color 0.12s ease;
+  }
+  :where(.modal-box) button:hover { background: #243246; border-color: #3b5370; }
+  :where(.modal-box) button:disabled { opacity: 0.45; cursor: not-allowed; }
+  :where(.modal-box) input[type="text"], :where(.modal-box) input[type="password"], :where(.modal-box) select {
+    font-family: inherit; font-size: 13px; color: var(--text);
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+    padding: 7px 10px; box-sizing: border-box; outline: none;
+    transition: border-color 0.12s ease, box-shadow 0.12s ease;
+  }
+  :where(.modal-box) input[type="text"]:focus, :where(.modal-box) select:focus {
+    border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft);
+  }
+  :where(.modal-box) textarea {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+    padding: 7px 10px; box-sizing: border-box; outline: none;
+  }
   .presetRow { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
   .presetRow button { font-size: 12px; padding: 5px 9px; }
   .agentList { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; margin-bottom: 10px; }
   .agentList label { font-size: 13px; display: flex; align-items: center; gap: 6px; }
   .agentList label.busy { opacity: 0.45; }
   .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
-  .meeting-msg { font-size: 12px; opacity: 0.8; min-height: 16px; margin: 8px 0 0 0; }
+  .meeting-msg { font-size: 12px; color: var(--text-dim); min-height: 16px; margin: 8px 0 0 0; }
 
   .chat-box { width: 640px; }
   .chat-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
   .chat-header h3 { margin: 0; font-size: 15px; }
   .chat-body { display: flex; gap: 12px; height: 360px; }
   .chat-roster {
-    width: 170px; flex: 0 0 auto; overflow-y: auto; border-right: 1px solid #444;
+    width: 170px; flex: 0 0 auto; overflow-y: auto; border-right: 1px solid var(--border);
     padding-right: 10px; display: flex; flex-direction: column; gap: 4px;
   }
   .roster-item {
-    text-align: left; font-size: 12px; padding: 6px 8px; border-radius: 6px;
+    text-align: left; font-size: 12px; padding: 6px 8px; border-radius: 8px;
     cursor: pointer; border: 1px solid transparent; background: none;
-    color: #e8e8e8; font-family: monospace; width: 100%;
+    color: var(--text); font-family: var(--font-mono); width: 100%;
   }
-  .roster-item:hover { background: #2a2e34; }
-  .roster-item.active { background: #465066; border-color: #7a8ab0; }
+  .roster-item:hover { background: var(--surface-2); }
+  .roster-item.active { background: var(--accent-soft); border-color: var(--accent); }
   .roster-item .role { display: block; font-size: 10px; opacity: 0.6; }
-  .roster-item.has-unread .role { color: #7fd0ff; opacity: 0.95; font-weight: bold; }
+  .roster-item.has-unread .role { color: var(--accent); opacity: 0.95; font-weight: bold; }
   .chat-thread { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  .thread-header { font-size: 13px; font-weight: bold; margin-bottom: 6px; opacity: 0.85; }
+  .thread-header { font-size: 13px; font-weight: bold; margin-bottom: 6px; color: var(--text-dim); }
   .thread-log {
-    flex: 1; overflow-y: auto; background: #14161a; border: 1px solid #333;
-    border-radius: 6px; padding: 8px; font-size: 12px; display: flex;
+    flex: 1; overflow-y: auto; background: var(--surface-1); border: 1px solid var(--border-soft);
+    border-radius: 8px; padding: 8px; font-size: 12px; display: flex;
     flex-direction: column; gap: 4px;
   }
-  .thread-log .msg .from { font-weight: bold; margin-right: 4px; }
-  .thread-log .msg.unread { border-left: 3px solid #7fd0ff; padding-left: 6px; }
-  .thread-log .empty { opacity: 0.5; font-style: italic; }
+  .thread-log .msg .from { font-weight: bold; margin-right: 4px; color: var(--accent); }
+  .thread-log .msg.unread { border-left: 3px solid var(--accent); padding-left: 6px; }
+  .thread-log .empty { color: var(--text-dim); font-style: italic; }
   .thread-input { display: flex; gap: 6px; margin-top: 8px; }
   .thread-input input {
-    flex: 1; font-family: monospace; background: #14161a; color: #e8e8e8;
-    border: 1px solid #555; border-radius: 4px; padding: 6px 8px;
+    flex: 1; font-family: var(--font-mono); background: var(--surface-1); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px;
   }
 
-  .terminal-box { width: 560px; background: #0b0f0b; border-color: #2a5a2a; }
+  .terminal-box { width: 560px; background: #0c110c; border-color: #264d2a; }
   .terminal-header {
     display: flex; justify-content: space-between; align-items: center;
     margin-bottom: 10px; color: #7fff7f; font-size: 13px;
   }
   .terminal-output {
-    height: 300px; overflow-y: auto; background: #000; border: 1px solid #1a3a1a;
-    border-radius: 4px; padding: 8px; font-size: 13px; color: #7fff7f;
+    height: 300px; overflow-y: auto; background: #050805; border: 1px solid #1a3a1a;
+    border-radius: 8px; padding: 8px; font-size: 13px; color: #7fff7f;
     white-space: pre-wrap; word-break: break-word;
   }
   .terminal-output .line { margin: 0 0 2px 0; }
@@ -148,21 +168,22 @@
   .terminal-inputline { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
   .terminal-inputline .prompt { color: #7fff7f; font-weight: bold; }
   .terminal-inputline input {
-    flex: 1; font-family: monospace; background: #000; color: #7fff7f;
-    border: 1px solid #2a5a2a; border-radius: 4px; padding: 6px 8px;
+    flex: 1; font-family: var(--font-mono); background: #0a100a; color: #7fff7f;
+    border: 1px solid #26542a; border-radius: 8px; padding: 6px 8px; outline: none;
   }
+  .terminal-inputline input:focus { border-color: #4f9a55; }
   .terminal-select {
-    width: 100%; font-family: monospace; background: #000; color: #7fff7f;
-    border: 1px solid #2a5a2a; border-radius: 4px; padding: 6px 8px; margin-top: 8px;
+    width: 100%; font-family: var(--font-mono); background: #0a100a; color: #7fff7f;
+    border: 1px solid #26542a; border-radius: 8px; padding: 6px 8px; margin-top: 8px; outline: none;
   }
   .library-section-label {
-    margin-top: 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
-    color: #8a93a5; border-top: 1px solid #2a2e34; padding-top: 8px;
+    margin-top: 12px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--text-dim); border-top: 1px solid var(--border-soft); padding-top: 8px;
   }
   .agent-file-badge { float: right; font-size: 10px; opacity: 0.5; }
   .terminal-code-input {
-    width: 100%; box-sizing: border-box; font-family: monospace; font-size: 13px;
-    background: #000; color: #7fff7f; border: 1px solid #2a5a2a; border-radius: 4px;
+    width: 100%; box-sizing: border-box; font-family: var(--font-mono); font-size: 13px;
+    background: #0a100a; color: #7fff7f; border: 1px solid #26542a; border-radius: 8px;
     padding: 8px; margin-top: 8px; resize: vertical;
   }
 
@@ -170,93 +191,102 @@
 
   #hudBar {
     position: fixed; top: 0; left: 0; right: 0; height: 64px; z-index: 25;
-    background: linear-gradient(#5b3a24, #3e2817);
-    border-bottom: 2px solid #241609;
+    background: linear-gradient(180deg, #151d28 0%, #10161f 100%);
+    border-bottom: 1px solid var(--border);
+    border-top: 2px solid var(--accent);
+    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
     display: flex; align-items: center; gap: 10px; padding: 0 12px;
     box-sizing: border-box; overflow-x: auto; white-space: nowrap;
-    font-family: monospace;
+    font-family: var(--font-sans);
   }
+  .hud-brand { flex: 0 0 auto; margin-right: 4px; text-align: left; }
+  .hud-brand .hud-brand-title { display: block; font-weight: 700; font-size: 14px; letter-spacing: 0.14em; color: var(--accent); }
+  .hud-brand .hud-brand-sub { display: block; font-size: 9px; letter-spacing: 0.28em; color: var(--text-dim); text-transform: uppercase; }
   .hud-pill {
-    background: #fdfaf3; color: #2a1a0a; border-radius: 999px;
-    padding: 5px 12px; font-size: 11px; flex: 0 0 auto; line-height: 1.3;
+    background: var(--surface-1); color: var(--text); border: 1px solid var(--border);
+    border-radius: 999px; padding: 5px 12px; font-size: 11px; flex: 0 0 auto; line-height: 1.3;
+    min-width: 52px; text-align: center;
   }
-  .hud-pill .label { display: block; font-size: 8px; letter-spacing: 0.05em; opacity: 0.65; }
-  .hud-pill .value { font-weight: bold; font-size: 13px; }
+  .hud-pill .label { display: block; font-size: 8px; letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.6; }
+  .hud-pill .value { font-weight: 700; font-size: 13px; color: #f2f7fc; }
   .hud-gap { flex: 1 1 auto; min-width: 12px; }
   .hud-btn {
-    font-family: monospace; font-size: 12px; padding: 8px 14px;
-    border-radius: 8px; border: 1px solid #241609; background: #6b4a30; color: #fdfaf3;
+    font-family: var(--font-sans); font-size: 12px; padding: 8px 14px;
+    border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
     flex: 0 0 auto; cursor: pointer;
+    transition: background 0.12s ease, border-color 0.12s ease;
   }
-  .hud-btn:hover:not(:disabled) { background: #7d5638; }
-  .hud-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .hud-btn:hover:not(:disabled) { background: #243246; border-color: #3b5370; }
+  .hud-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .inbox-count {
     display: inline-block; min-width: 14px; height: 14px; line-height: 14px;
-    border-radius: 999px; background: #c34f1f; color: #fff; font-size: 10px;
-    text-align: center; margin-left: 4px; font-weight: bold;
+    border-radius: 999px; background: #ff8f3d; color: #14181f; font-size: 10px;
+    text-align: center; margin-left: 4px; font-weight: 700;
   }
 
-  .profile-box { width: 460px; background: #fdfdfb; color: #1a1a1a; }
+  .profile-box { width: 460px; background: #f4f6f9; color: #1c2530; }
   .profile-header {
     display: flex; justify-content: space-between; align-items: center;
-    margin-bottom: 12px; border-bottom: 1px solid #ddd; padding-bottom: 8px;
+    margin-bottom: 12px; border-bottom: 1px solid #dbe2eb; padding-bottom: 8px;
   }
-  .profile-header .filename { font-weight: bold; }
+  .profile-header .filename { font-weight: 700; font-size: 14px; }
   .chip {
-    font-size: 10px; font-weight: bold; letter-spacing: 0.04em;
-    padding: 3px 8px; border-radius: 4px; color: #fff; text-transform: uppercase;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.06em;
+    padding: 3px 8px; border-radius: 5px; color: #fff; text-transform: uppercase;
   }
-  .chip.private { background: #b5651d; }
-  .chip.evidence { background: #b5651d; }
+  .chip.private { background: #b45309; }
+  .chip.evidence { background: #b45309; }
   .profile-section { margin-bottom: 12px; font-size: 13px; }
-  .profile-section h4 { margin: 0 0 4px 0; font-size: 12px; letter-spacing: 0.05em; opacity: 0.7; }
+  .profile-section h4 { margin: 0 0 4px 0; font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: #6b7a8c; }
   .profile-instr { display: flex; align-items: baseline; gap: 6px; margin-bottom: 4px; }
   .profile-instr .report-link {
-    font-size: 10px; color: #b5651d; background: none; border: none; cursor: pointer;
-    text-decoration: underline; padding: 0; font-family: monospace;
+    font-size: 10px; color: #b45309; background: none; border: none; cursor: pointer;
+    text-decoration: underline; padding: 0; font-family: inherit;
   }
   .profile-notes li { margin-bottom: 2px; }
   .report-form {
-    background: #f2ede6; border: 1px solid #ddd; border-radius: 6px;
+    background: #eef1f5; border: 1px solid #dbe2eb; border-radius: 8px;
     padding: 10px; margin-top: 6px; font-size: 12px;
   }
   .report-form label { display: block; margin-bottom: 6px; }
   .report-form select, .report-form textarea {
-    width: 100%; font-family: monospace; font-size: 12px; box-sizing: border-box;
-    margin-top: 2px; padding: 5px; border: 1px solid #bbb; border-radius: 4px;
+    width: 100%; font-family: var(--font-mono); font-size: 12px; box-sizing: border-box;
+    margin-top: 2px; padding: 5px; border: 1px solid #c8d2de; border-radius: 6px;
+    background: #fff; color: #1c2530;
   }
   .report-block {
-    position: relative; border: 1px solid #ddd; border-radius: 6px;
+    position: relative; border: 1px solid #dbe2eb; border-radius: 8px;
     padding: 10px 12px; margin-bottom: 10px; background: #fff;
   }
   .report-block .quote {
-    border-left: 3px solid #b5651d; background: #fdf0e2; padding: 6px 10px;
-    margin: 6px 0; font-family: monospace; font-size: 12px;
+    border-left: 3px solid #d97706; background: #fdf1e1; padding: 6px 10px;
+    margin: 6px 0; font-family: var(--font-mono); font-size: 12px;
   }
-  .report-block .attribution { font-size: 11px; opacity: 0.6; margin-top: 2px; }
+  .report-block .attribution { font-size: 11px; color: #6b7a8c; margin-top: 2px; }
   .report-block .note { font-size: 12px; margin-top: 6px; }
   .caught-stamp {
-    position: absolute; right: 10px; bottom: 8px; color: #b5651d;
-    border: 2px solid #b5651d; border-radius: 4px; padding: 2px 8px;
+    position: absolute; right: 10px; bottom: 8px; color: #b45309;
+    border: 2px solid #b45309; border-radius: 4px; padding: 2px 8px;
     font-weight: bold; font-size: 11px; letter-spacing: 0.08em;
     transform: rotate(-8deg); opacity: 0.85;
   }
 
   #toast {
     position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
-    background: #22262c; border: 1px solid #555; border-radius: 8px;
-    padding: 8px 16px; font-family: monospace; font-size: 13px; color: #e8e8e8;
+    background: var(--surface-0); border: 1px solid var(--accent); border-radius: 999px;
+    padding: 8px 16px; font-family: var(--font-mono); font-size: 13px; color: var(--text);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
     z-index: 60; pointer-events: none;
   }
   #interactPrompt {
     position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
-    background: rgba(30,34,40,0.9); border: 1px solid #7a8ab0; border-radius: 8px;
-    padding: 8px 16px; font-family: monospace; font-size: 13px; color: #e8e8e8;
+    background: rgba(15, 22, 32, 0.92); border: 1px solid var(--accent); border-radius: 999px;
+    padding: 8px 16px; font-family: var(--font-mono); font-size: 13px; color: var(--text);
     z-index: 59; pointer-events: none;
   }
   #interactPrompt kbd {
-    background: #465066; border: 1px solid #7a8ab0; border-radius: 4px;
-    padding: 1px 6px; font-weight: bold; margin-right: 6px;
+    background: var(--surface-2); border: 1px solid var(--accent); border-radius: 4px;
+    padding: 1px 6px; font-weight: bold; margin-right: 6px; color: var(--accent);
   }
 
   .convo-box { width: 460px; }
@@ -269,18 +299,16 @@
 <div id="wrap">
   <div id="viewport">
     <canvas id="game"></canvas>
+    <div id="zoom">
+      <button id="zoomIn" title="Zoom in">+</button>
+      <button id="zoomOut" title="Zoom out">&minus;</button>
+      <button id="zoomAll" class="showall" title="Show whole map">SHOW&nbsp;ALL</button>
+    </div>
   </div>
-  <div id="pad">
-    <button class="up" data-key="arrowup">&#9650;</button>
-    <button class="left" data-key="arrowleft">&#9664;</button>
-    <button class="down" data-key="arrowdown">&#9660;</button>
-    <button class="right" data-key="arrowright">&#9654;</button>
-  </div>
-  <p>Arrow keys / WASD, or the pad above, to walk. This is an experimental,
-     standalone second map -- a whole-scene generated background image with
-     collision auto-mapped by a segmentation model, separate from the main
-     think tank. Walk into a building's entrance to step inside its room; walk
-     off the bottom edge of a room to leave it. Walk into Town Hall to call
+  <p>Arrow keys / WASD to walk. This is the think tank -- a
+     whole-scene generated background image with collision auto-mapped by a
+     segmentation model. Walk into a building's entrance to step inside its room;
+     walk off the bottom edge of a room to leave it. Walk into Town Hall to call
      a meeting -- everyone you invite (and you) vanishes from the map for
      the duration, and reappears somewhere new when the call ends. Agents
      are solid -- walk up to one and press B to talk. Press G to show the
@@ -288,13 +316,9 @@
      collision corrections, or door_editor.html to reposition a building's
      entrance trigger.</p>
 </div>
-<div id="zoom">
-  <button id="zoomIn" title="Zoom in">+</button>
-  <button id="zoomOut" title="Zoom out">&minus;</button>
-  <button id="zoomAll" class="showall" title="Show whole map">SHOW&nbsp;ALL</button>
-</div>
 
 <div id="hudBar">
+  <div class="hud-brand"><span class="hud-brand-title">AI THINK TANK</span><span class="hud-brand-sub">world</span></div>
   <div class="hud-pill"><span class="label">RESEARCHERS</span><span class="value" id="hudResearchers">0</span></div>
   <div class="hud-pill"><span class="label">WORKING</span><span class="value" id="hudWorking">0</span></div>
   <div class="hud-pill" title="Tasks currently walking-to or working (tasks.js)"><span class="label">OPEN WORK</span><span class="value" id="hudOpenWork">0</span></div>
@@ -3001,18 +3025,6 @@ function wireZoom() {
     state.zoom = state.zoom === ZOOM_SHOW_ALL ? 1.5 : ZOOM_SHOW_ALL;
   });
 }
-function wirePad() {
-  for (const btn of document.querySelectorAll('#pad button')) {
-    const key = btn.dataset.key;
-    const press = e => { e.preventDefault(); state.keys.add(key); btn.classList.add('held'); };
-    const release = () => { state.keys.delete(key); btn.classList.remove('held'); };
-    btn.addEventListener('touchstart', press);
-    btn.addEventListener('mousedown', press);
-    btn.addEventListener('touchend', release);
-    btn.addEventListener('mouseup', release);
-    btn.addEventListener('mouseleave', release);
-  }
-}
 
 async function main() {
   const bg = await loadImage(BG_SPRITE);
@@ -3058,7 +3070,6 @@ async function main() {
     }
   });
   window.addEventListener('keyup', e => state.keys.delete(e.key.toLowerCase()));
-  wirePad();
   wireZoom();
 
   // Click-to-follow: hit-test against each visible agent's actual drawn
