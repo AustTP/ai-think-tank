@@ -39,6 +39,9 @@ def setUpModule():
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
+        # Standby off in the hermetic process keeps decision chains singular
+        # so the shared-process breaker never arms or leaks.
+        COLAB_STANDBY_ENABLED=False,
     )
     _PATCHER.start()
     serve.init_db()

@@ -42,6 +42,12 @@ def setUpModule():
         # write a real browse_trail.json into the actual project directory
         # (caught live running this exact suite).
         BROWSE_TRAIL_PATH=os.path.join(_TMP_DIR, 'browse_trail.json'),
+        # The CLI-run Laya standby appends a provider to every decision chain
+        # when enabled (it IS enabled in the project .env, which serves loads).
+        # Hermetic modules must pin it off so decision chains stay single-slug
+        # and the multi-slug circuit breaker never arms in the test process
+        # (arm + leak would poison later modules with open breakers).
+        COLAB_STANDBY_ENABLED=False,
     )
     _PATCHER.start()
     serve.init_db()

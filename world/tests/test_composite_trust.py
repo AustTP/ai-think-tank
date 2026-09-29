@@ -28,7 +28,6 @@ default path. Found 2026-09-25: this file alone added 58 real rows (mostly
 during a routine test run.
 """
 
-import io
 import json
 import os
 import shutil
@@ -43,7 +42,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import serve  # noqa: E402  (sys.path insert above is the repo test convention)
 import sim  # noqa: E402
 import content  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
 
 _TMP_DIR = None
 _PATCHER = None
@@ -261,11 +259,13 @@ class JevFailoverTests(unittest.TestCase):
         with serve._db() as conn:
             conn.execute('DELETE FROM decision_tape')
             conn.execute("DELETE FROM settings WHERE key = 'jev_model'")
-            # A standby pairing left behind by a previous test would append a
-            # provider URL to every chain here (and its _transport reads
-            # body['model']); make the failover tests hermetic against it.
-            for key in ('colab_laya_url', 'colab_laya_key'):
-                conn.execute('DELETE FROM settings WHERE key = ?', (key,))
+        # The CLI-driven standby would append its loopback provider URL to
+        # every chain here (and this class's _transport reads body['model']);
+        # pin it off so every chain under test is exactly what the test set.
+        self._stan_patch = unittest.mock.patch.object(
+            serve, '_colab_standby_enabled', return_value=False)
+        self._stan_patch.start()
+        self.addCleanup(self._stan_patch.stop)
 
     def _set_chain(self, *slugs):
         serve._set_setting('jev_model', ','.join(slugs))
@@ -370,18 +370,18 @@ class JevFailoverTests(unittest.TestCase):
 
 
 class ColabStandbyTests(unittest.TestCase):
-    """The Colab/Laya sentinel coupling (2026-09-29): a remote Jev-compatible
-    server on a Colab runtime, paired via /api/colab/register and driven by
-    the 15-min _colab_failover_loop. Hermetic: no tunnel, no network -- urlopen
-    is only inspected, never reached. The village only ever ROUTES to the
-    runtime; the model never loads on the laptop."""
+    """The CLI-managed Colab/Laya standby (2026-09-29): a dedicated CPU Colab
+    session ('village-standby') owned via the colab CLI, laya-serve booted over
+    `colab exec`, reached through a LOCALHOST-only ssh forward at
+    127.0.0.1:8939, driven by the 15-min _colab_failover_loop. No sentinel
+    notebook, no /api/colab/register, no pairing. Hermetic: _colab_cli /
+    _colab_session_exists / subprocess.Popen are mocked; the only real call is
+    the loopback /health check under fake urlopen."""
 
     def setUp(self):
         serve._model_circuit_state.clear()
         with serve._db() as conn:
             conn.execute('DELETE FROM decision_tape')
-            for key in ('jev_model', 'colab_laya_url', 'colab_laya_key'):
-                conn.execute('DELETE FROM settings WHERE key = ?', (key,))
 
     def _seed_jev(self, failures, successes):
         for _ in range(failures):
@@ -391,30 +391,33 @@ class ColabStandbyTests(unittest.TestCase):
 
     def test_provider_chain_entry_appends_the_standby_url_last(self):
         serve._set_setting('jev_model', 'primary-x')
-        serve._set_setting('colab_laya_url', 'https://tunnel.example')
-        self.assertEqual(serve._decision_model_chain(),
-                         ['primary-x', 'https://tunnel.example/v1/systemone'],
-                         'the sentinel trails the chain as the LAST fallback')
+        self.assertTrue(serve.COLAB_STANDBY_URL.startswith('http://127.0.0.1:'),
+                        'the standby is loopback-only by construction')
+        with unittest.mock.patch.object(serve, 'COLAB_STANDBY_ENABLED', True):
+            self.assertEqual(serve._decision_model_chain(),
+                             ['primary-x', serve.COLAB_STANDBY_URL + serve.COLAB_STANDBY_DECISION_PATH],
+                             'the standby trails the chain as the LAST fallback')
+        with unittest.mock.patch.object(serve, 'COLAB_STANDBY_ENABLED', False):
+            self.assertEqual(serve._decision_model_chain(), ['primary-x'],
+                             'standby disabled -> no provider in the chain')
         self.assertEqual(serve._jev_model(), 'primary-x',
                          'the primary slug still leads; _jev_model is unchanged')
-        serve._set_setting('colab_laya_url', '')
-        self.assertEqual(serve._decision_model_chain(), ['primary-x'],
-                         'cleared pairing removes the provider from the chain')
 
     def test_chain_dedupes_a_manually_configured_provider(self):
-        serve._set_setting('jev_model', 'primary-x,https://tunnel.example/v1/systemone')
-        serve._set_setting('colab_laya_url', 'https://tunnel.example')
-        self.assertEqual(serve._decision_model_chain(),
-                         ['primary-x', 'https://tunnel.example/v1/systemone'])
+        provider = serve.COLAB_STANDBY_URL + serve.COLAB_STANDBY_DECISION_PATH
+        serve._set_setting('jev_model', 'primary-x,' + provider)
+        with unittest.mock.patch.object(serve, 'COLAB_STANDBY_ENABLED', True):
+            self.assertEqual(serve._decision_model_chain(), ['primary-x', provider],
+                             'an already-configured standby URL is not appended twice')
 
     def test_provider_request_is_direct_not_openrouter(self):
-        serve._set_setting('colab_laya_key', 'laya-secret')
-        req = serve._decision_request(
-            'https://tunnel.example/v1/systemone', {'messages': []}, {'choice': {}})
-        self.assertEqual(req.full_url, 'https://tunnel.example/v1/systemone')
-        self.assertEqual(req.get_header('Authorization'), 'Bearer laya-secret')
+        provider = serve.COLAB_STANDBY_URL + serve.COLAB_STANDBY_DECISION_PATH
+        req = serve._decision_request(provider, {'messages': []}, {'choice': {}})
+        self.assertEqual(req.full_url, provider)
+        self.assertIsNone(req.get_header('Authorization'),
+                          'the loopback standby needs no bearer key')
         body = json.loads(req.data.decode())
-        self.assertNotIn('model', body, 'layan routes internally; no slug is sent')
+        self.assertNotIn('model', body, 'laya routes internally; no slug is sent')
         self.assertIn('state', body)
         self.assertIn('questions', body)
 
@@ -431,48 +434,109 @@ class ColabStandbyTests(unittest.TestCase):
         self.assertFalse(serve._jev_is_degraded(),
                          'a handful of attempts never trips the standby')
 
-    def test_control_requests_standup_and_teardown(self):
-        captured = {}
+    def test_ensure_session_provisions_when_missing(self):
+        calls = []
+        with unittest.mock.patch.object(serve, '_colab_session_exists', return_value=False), \
+             unittest.mock.patch.object(serve, '_colab_cli',
+                                        side_effect=lambda *a, **k: calls.append(a) or (0, '')):
+            ok, msg = serve._colab_standby_ensure_session()
+        self.assertTrue(ok, msg)
+        self.assertEqual(calls, [('new', '-s', serve.COLAB_STANDBY_SESSION)],
+                         'a missing standby session is created via the CLI')
 
-        def fake_urlopen(req, timeout=None):
-            captured['url'] = req.full_url
-            return io.BytesIO(b'{"ok": true}')
+    def test_ensure_session_reuses_an_existing_one(self):
+        with unittest.mock.patch.object(serve, '_colab_session_exists', return_value=True), \
+             unittest.mock.patch.object(serve, '_colab_cli') as cli:
+            ok, _ = serve._colab_standby_ensure_session()
+        self.assertTrue(ok)
+        cli.assert_not_called(), 'an existing session is not recreated'
 
-        with unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=fake_urlopen):
-            self.assertEqual(serve._colab_standup('https://tunnel.example', 'k')['ok'], True)
-            self.assertEqual(captured['url'],
-                             'https://tunnel.example/control?action=standup')
-        with unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=fake_urlopen):
-            serve._colab_teardown('https://tunnel.example', 'k')
-            self.assertEqual(captured['url'],
-                             'https://tunnel.example/control?action=teardown')
+    def test_boot_code_installs_and_starts_laya(self):
+        calls = []
+        with unittest.mock.patch.object(serve, '_colab_cli',
+                                        side_effect=lambda *a, **k: calls.append((a, k)) or (0, '')):
+            serve._colab_standby_ensure_service()
+        args, kwargs = calls[0]
+        self.assertEqual(args, ('exec', '-s', serve.COLAB_STANDBY_SESSION, '--timeout', '600'))
+        payload = kwargs['input']
+        self.assertIn('laya[serve]', payload)
+        self.assertIn('laya-serve', payload)
+        self.assertIn('__STANDBY_UP__', payload)
 
-    def test_register_requires_the_device_key(self):
-        c = TestClient(serve.app)
-        r = c.post('/api/colab/register',
-                   json={'url': 'https://tunnel.example', 'key': 'k'})
-        self.assertEqual(r.status_code, 401)
+    def test_teardown_kills_the_laya_process_only(self):
+        calls = []
+        with unittest.mock.patch.object(serve, '_colab_cli',
+                                        side_effect=lambda *a, **k: calls.append((a, k)) or (0, '')):
+            serve._colab_standby_teardown_service()
+        payload = calls[0][1]['input']
+        self.assertIn('pkill', payload)
+        self.assertIn('laya-serve', payload)
 
-    def test_register_stores_and_clears_the_pairing(self):
-        c = TestClient(serve.app)
-        headers = {'X-Device-Key': serve.DEVICE_API_KEY}
-        r = c.post('/api/colab/register', headers=headers,
-                   json={'url': 'https://tunnel.example', 'key': 'laya-key'})
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(serve._get_setting('colab_laya_url'), 'https://tunnel.example')
-        self.assertEqual(serve._get_setting('colab_laya_key'), 'laya-key')
-        r = c.post('/api/colab/register', headers=headers, json={'url': '', 'key': ''})
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(serve._get_setting('colab_laya_url'), '', 'empty url clears the pairing')
+    def test_forward_spawned_once_and_reused_for_the_same_session(self):
+        fake = unittest.mock.Mock(pid=111)
+        with unittest.mock.patch.object(serve.subprocess, 'Popen', return_value=fake) as popen, \
+             unittest.mock.patch('os.kill', return_value=None):
+            serve._COLAB_STANDBY_FORWARD.clear()
+            first = serve._colab_standby_ensure_forward('village-standby')
+            second = serve._colab_standby_ensure_forward('village-standby')
+        self.assertIs(first, second)
+        self.assertEqual(popen.call_count, 1, 'a live forward is reused, not respawned')
+        cmd = popen.call_args[0][0]
+        self.assertIn('ssh', cmd)
+        self.assertTrue(any(c == '-L' and n == f'127.0.0.1:{serve.COLAB_STANDBY_PORT}:localhost:8000'
+                            for c, n in zip(cmd, cmd[1:])), 'forward targets the loopback port')
+        self.assertTrue(any('ProxyCommand' in c and '--proxy-mode' in c for c in cmd),
+                        'the forward rides the colab CLI proxy-mode bridge')
+        self.assertIn('-N', cmd)
+        self.assertTrue(any('User=root' in c for c in cmd))
+        serve._colab_standby_stop_forward()
 
-    def test_register_rejects_non_http_urls(self):
-        c = TestClient(serve.app)
-        r = c.post('/api/colab/register',
-                   headers={'X-Device-Key': serve.DEVICE_API_KEY},
-                   json={'url': 'file:///etc/passwd', 'key': 'k'})
-        self.assertEqual(r.status_code, 400)
-        self.assertEqual(serve._get_setting('colab_laya_url'), None,
-                         'nothing is stored on invalid input')
+    def test_forward_respawns_when_the_old_one_died(self):
+        fake = unittest.mock.Mock(pid=999)
+        with unittest.mock.patch.object(serve.subprocess, 'Popen', return_value=fake) as popen, \
+             unittest.mock.patch('os.kill', return_value=None):      # alive: reuse
+            serve._COLAB_STANDBY_FORWARD.clear()
+            serve._colab_standby_ensure_forward('village-standby')
+            serve._colab_standby_ensure_forward('village-standby')
+            self.assertEqual(popen.call_count, 1)
+        with unittest.mock.patch.object(serve.subprocess, 'Popen', return_value=fake) as popen, \
+             unittest.mock.patch('os.kill', side_effect=ProcessLookupError('gone')):  # dead: respawn
+            serve._colab_standby_ensure_forward('village-standby')
+            self.assertEqual(popen.call_count, 1, 'a dead forward is recognised and respawned')
+        serve._colab_standby_stop_forward()
+
+    def test_standby_reachable_checks_the_loopback_health(self):
+        with unittest.mock.patch.object(serve.urllib.request, 'urlopen') as u:
+            u.return_value.__enter__.return_value.status = 200
+            self.assertTrue(serve._colab_standby_reachable())
+        with unittest.mock.patch.object(serve.urllib.request, 'urlopen',
+                                        side_effect=OSError('nothing on the port')):
+            self.assertFalse(serve._colab_standby_reachable())
+        with unittest.mock.patch.object(serve.urllib.request, 'urlopen') as u:
+            u.return_value.__enter__.return_value.status = 503
+            self.assertFalse(serve._colab_standby_reachable(),
+                             'a non-200 /health is not a standing Laya')
+
+    def test_standby_enabled_gates_on_cli_switch_and_opt_in(self):
+        with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+             unittest.mock.patch.object(serve, 'COLAB_ENABLED', True), \
+             unittest.mock.patch.object(serve, 'COLAB_STANDBY_ENABLED', True):
+            self.assertTrue(serve._colab_standby_enabled())
+        with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+             unittest.mock.patch.object(serve, 'COLAB_ENABLED', False), \
+             unittest.mock.patch.object(serve, 'COLAB_STANDBY_ENABLED', True):
+            self.assertFalse(serve._colab_standby_enabled(),
+                             'COLAB_ENABLED=0 switches the whole standby off')
+        with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', False), \
+             unittest.mock.patch.object(serve, 'COLAB_ENABLED', True), \
+             unittest.mock.patch.object(serve, 'COLAB_STANDBY_ENABLED', True):
+            self.assertFalse(serve._colab_standby_enabled(),
+                             'no CLI -> no standby, no chain entry')
+        with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+             unittest.mock.patch.object(serve, 'COLAB_ENABLED', True), \
+             unittest.mock.patch.object(serve, 'COLAB_STANDBY_ENABLED', False):
+            self.assertFalse(serve._colab_standby_enabled(),
+                             'COLAB_STANDBY_ENABLED is a deliberate opt-in')
 
 
 class ColabComputeTests(unittest.TestCase):

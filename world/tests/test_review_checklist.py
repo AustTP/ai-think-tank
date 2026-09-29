@@ -52,6 +52,9 @@ def setUpModule():
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
+        # Standby off in hermetic modules: single-slug chain keeps the
+        # decision breaker unarmed in the shared test process.
+        COLAB_STANDBY_ENABLED=False,
     )
     _PATCHER.start()
     serve.init_db()

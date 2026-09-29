@@ -4914,17 +4914,16 @@ def _weather_code_human(code):
 
 
 def _decision_request(model, state, questions):
-    # A '://' chain entry is a REMOTE Jev-compatible provider (the Colab/Laya
-    # sentinel) reached directly, not an OpenRouter slug: literally the URL,
-    # its own bearer key, the same {state, questions} wire format. No 'model'
-    # field -- laya routes internally on the Colab runtime.
+    # A '://' chain entry is a Jev-compatible provider reached directly (the
+    # Colab/Laya standby), not an OpenRouter slug: literally the URL, the same
+    # {state, questions} wire format. No 'model' field -- laya routes
+    # internally on the Colab runtime. The standby is LOCALHOST-only (loopback
+    # ssh forward), so there is no bearer key to attach and nothing public.
     if '://' in model:
         src = json.dumps({'state': state, 'questions': questions}).encode()
-        headers = {'Content-Type': 'application/json'}
-        key = (_get_setting('colab_laya_key') or '').strip()
-        if key:
-            headers['Authorization'] = f'Bearer {key}'
-        return urllib.request.Request(model, data=src, headers=headers, method='POST')
+        return urllib.request.Request(
+            model, data=src, headers={'Content-Type': 'application/json'},
+            method='POST')
     payload = json.dumps({'model': model, 'state': state, 'questions': questions}).encode()
     return urllib.request.Request(
         'https://openrouter.ai/api/alpha/decisions',
@@ -5133,14 +5132,13 @@ def _decision_model_chain():
                 chain = cand
     if chain is None:
         chain = [JEV_MODEL]
-    # A registered Colab/Laya sentinel trails the chain as the LAST fallback:
-    # the primary slug still leads (and _jev_model() keeps returning it), the
-    # provider only ever answers when the remote decisions model is down. The
-    # standby loop decides when the sentinel's Laya is standing up; this just
-    # advertises it for the failover to find.
-    base, _key = _colab_standby()
-    if base:
-        provider = base.rstrip('/') + COLAB_STANDBY_DECISION_PATH
+    # The CLI-managed Colab/Laya standby trails the chain as the LAST fallback:
+    # when the colab CLI is available (and not operator-disabled), the loopback
+    # Laya provider is advertised so the failover can reach it during an outage
+    # -- nothing is registered, keyed, or paired; like every OpenRouter
+    # candidate it is just a chain entry that _decision_request routes by '://'.
+    if _colab_standby_enabled():
+        provider = COLAB_STANDBY_URL.rstrip('/') + COLAB_STANDBY_DECISION_PATH
         if provider not in chain:
             chain.append(provider)
     return chain
@@ -5157,27 +5155,199 @@ def _jev_model():
 
 # ---- Colab/Laya standby (2026-09-29) ---------------------------------
 # The decisions-model backing layer can include a REMOTE Jev-compatible
-# server (Laya) running on a Google Colab runtime, reachable through the
-# sentinel notebook's public tunnel. The user starts the sentinel once (see
-# world/colab_standby_notebook.md); the notebook POSTs its tunnel base + key
-# to /api/colab/register, which lands in the same `settings` DB as
-# everything else. From there the village owns the lifecycle: the chain
-# appends the provider URL as the last failover candidate, and
-# _colab_failover_loop tells the notebook to stand Laya up when Jev degrades
-# and to tear it down once Jev is healthy again. The laptop never hosts the
-# model -- only the routing. No Google credential is involved anywhere: the
-# runtime is the user's own Colab session, and the notebook reports in over
-# the tunnel like any remote endpoint.
+# server (Laya) running on the operator's Google Colab runtime. The original
+# sentinel design used a notebook with a public cloudflared tunnel paired via
+# /api/colab/register; the current standby is instead owned ENTIRELY by the
+# village through the colab CLI on this machine -- no notebook, no tunnel, no
+# pairing step, nothing ever exposed beyond loopback. When Jev degrades,
+# _colab_failover_loop provisions a dedicated CPU session ('village-standby')
+# on demand, boots laya-serve in it over `colab exec`, and keeps a
+# LOCALHOST-ONLY ssh forward (`127.0.0.1:8939 -> session:8000`) alive through
+# the same CLI's --proxy-mode bridge. The chain appends
+# `http://127.0.0.1:8939/v1/systemone` as the last failover candidate; the
+# laptop hosts only routing, and the only code ever run in the runtime is the
+# guardrailed laya boot (compute-only, same boundary as run_on_colab).
 COLAB_FAILOVER_INTERVAL_S = 15 * 60   # 15 min, matching the health cadence
 COLAB_STANDBY_HEALTHY_CYCLES = 2      # consecutive healthy cycles -> teardown
 COLAB_STANDBY_DECISION_PATH = '/v1/systemone'
+COLAB_STANDBY_SESSION = 'village-standby'
+COLAB_STANDBY_PORT = 8939             # loopback; the dev server uses 8936
+COLAB_STANDBY_URL = f'http://127.0.0.1:{COLAB_STANDBY_PORT}'
+COLAB_STANDBY_SSH_KEY = os.path.expanduser('~/.ssh/id_ed25519_colab')
+COLAB_STANDBY_ENABLED = str(_load_env().get('COLAB_STANDBY_ENABLED', '') or '').lower() in ('1', 'true', 'yes')
+_COLAB_STANDBY_FORWARD = {'pid': None, 'proc': None, 'session': None}
 
 
-def _colab_standby():
-    """(base_url, key) of the registered Colab sentinel, or (None, None)."""
-    base = (_get_setting('colab_laya_url') or '').strip()
-    key = (_get_setting('colab_laya_key') or '').strip()
-    return base or None, key or None
+def _colab_standby_enabled():
+    """The CLI-managed Laya standby is only ever on the board when the colab
+    CLI is present AND the operator hasn't flipped COLAB_ENABLED=0 (the same
+    switch that turns agent compute on/off) AND has explicitly opted into the
+    standby itself (COLAB_STANDBY_ENABLED=1). Deliberate triple opt-in: this
+    appends a real provider to the decision chain and spawns an ssh process,
+    so it must never turn on accidentally -- keeping hermetic test suites (and
+    machines without Colab) single-chain by default."""
+    return bool(COLAB_ENABLED and COLAB_CLI_AVAILABLE and COLAB_STANDBY_ENABLED)
+
+
+def _colab_standby_ensure_session(session=None):
+    """Make sure the dedicated CPU standby session exists, creating it via
+    `colab new` if not. CPU on purpose -- it is the LAST-RESORT fallback that
+    should still boot when GPU quota is gone or unavailable, and it doesn't
+    burn Colab compute units sitting idle. Returns (ok, msg)."""
+    session = session or COLAB_STANDBY_SESSION
+    if _colab_session_exists(session):
+        return True, 'ok'
+    rc, out = _colab_cli('new', '-s', session, timeout=300)
+    if rc != 0:
+        return False, f'provision failed: {out[-500:]}'
+    return True, 'ok'
+
+
+_COLAB_STANDBY_BOOT_CODE = (
+    "import os, shutil, subprocess, time, urllib.request\n"
+    "def _ready():\n"
+    "    try:\n"
+    "        with urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4) as r:\n"
+    "            return r.status == 200\n"
+    "    except Exception:\n"
+    "        return False\n"
+    "if not _ready() and shutil.which('laya-serve') is None:\n"
+    "    subprocess.run(['pip', 'install', '-q', 'laya[serve]'], timeout=540)\n"
+    "if not _ready() and shutil.which('laya-serve') is not None:\n"
+    "    log = open('/content/laya-standby.log', 'ab')\n"
+    "    env = dict(os.environ); env['LAYA_DEVICE'] = 'cpu'; env['LAYA_PRELOAD'] = '1'\n"
+    "    subprocess.Popen(['nohup', 'laya-serve'], env=env, stdout=log, stderr=subprocess.STDOUT)\n"
+    "    for _ in range(30):\n"
+    "        time.sleep(2)\n"
+    "        if _ready():\n"
+    "            break\n"
+    "print('__STANDBY_UP__' if _ready() else '__STANDBY_STARTING__')\n"
+)
+
+
+def _colab_standby_ensure_service(session=None):
+    """Idempotent laya boot over `colab exec`: installs laya on first use,
+    preloads the model on the CPU runtime, and leaves laya-serve running
+    detached (verified live: a backgrounded child survives the exec call that
+    spawned it). Returns the exec tail for the loop's log line."""
+    session = session or COLAB_STANDBY_SESSION
+    rc, out = _colab_cli('exec', '-s', session, '--timeout', '600',
+                         input=_COLAB_STANDBY_BOOT_CODE)
+    return out[-300:] or 'no output'
+
+
+def _colab_standby_teardown_service(session=None):
+    """Stop laya-serve on the standby session once Jev has recovered -- the
+    expensive model process is the only thing worth cycling; the session and
+    the forward stay warm for the next outage."""
+    session = session or COLAB_STANDBY_SESSION
+    _colab_cli('exec', '-s', session, '--timeout', '60',
+               input='import subprocess\n'
+                     'subprocess.run(["pkill", "-f", "laya-serve"], capture_output=True)\n'
+                     'print("__STANDBY_TORN_DOWN__")\n')
+
+
+def _colab_standby_ensure_forward(session=None):
+    """Own the persistent loopback ssh forward to the standby session:
+    spawn `ssh -N -L 127.0.0.1:8939:localhost:8000` through the colab CLI's
+    --proxy-mode bridge when we don't already hold a live one for THIS
+    session (a VM-recycled / reaped forward is detected and respawned). The
+    forward binds localhost only, which is exactly why the standby needs no
+    tunnel, no pairing, and no key material in the DB. Returns the
+    subprocess, or None on a spawn failure (the loop logs and retries)."""
+    session = session or COLAB_STANDBY_SESSION
+    state = _COLAB_STANDBY_FORWARD
+    if state.get('session') == session and state.get('pid') is not None:
+        try:
+            os.kill(state['pid'], 0)
+            return state['proc']
+        except OSError:
+            pass  # forward died; respawn it below
+    _colab_standby_stop_forward()
+    identity = os.path.expanduser(COLAB_STANDBY_SSH_KEY)
+    proxy = f'{COLAB_CLI_PATH} ssh --proxy-mode -s {session} -i {identity}'
+    log = open('/tmp/colab-standby-forward.log', 'ab')
+    try:
+        proc = subprocess.Popen(
+            ['ssh', '-N', '-o', 'User=root',
+             '-o', f'ProxyCommand={proxy}',
+             '-o', 'ExitOnForwardFailure=yes',
+             '-o', 'ServerAliveInterval=30',
+             '-o', 'ServerAliveCountMax=2',
+             '-o', 'StrictHostKeyChecking=no',
+             '-o', 'UserKnownHostsFile=/dev/null',
+             '-o', 'IdentitiesOnly=yes',
+             '-i', identity,
+             '-L', f'127.0.0.1:{COLAB_STANDBY_PORT}:localhost:8000',
+             'root@laya-standby'],
+            stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    except Exception as e:
+        print(f'[colab-standby] forward spawn failed: {e}', flush=True)
+        return None
+    state.update({'pid': proc.pid, 'proc': proc, 'session': session})
+    return proc
+
+
+def _colab_standby_stop_forward():
+    state = _COLAB_STANDBY_FORWARD
+    if state.get('proc') is not None:
+        try:
+            state['proc'].kill()
+        except Exception:
+            pass
+    state.update({'pid': None, 'proc': None, 'session': None})
+
+
+def _colab_standby_reachable(port=None):
+    """True when laya answers /health through the loopback forward -- the
+    loop trusts this (not the boot exec) before declaring the standby up."""
+    port = port or COLAB_STANDBY_PORT
+    try:
+        with urllib.request.urlopen(  # nosec B310 -- loopback-only by construction
+                f'http://127.0.0.1:{port}/health', timeout=5) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+async def _colab_failover_loop():
+    """15-min poll. Jev degraded -> stand Laya up on the dedicated CPU standby
+    session (provision via CLI if missing, boot laya-serve, keep the loopback
+    ssh forward alive); the chain then reaches it at 127.0.0.1:8939 with no
+    tunnel, no pairing, nothing public. Jev healthy -> kill the remote laya
+    process once two clean cycles confirm recovery. All CLI calls run on
+    threads so a slow boot (first-use pip install / model preload) never
+    stalls the event loop that serves the village. Nothing happens at all
+    unless COLAB_ENABLED and the colab CLI is present."""
+    healthy_cycles = 0
+    while True:
+        try:
+            session = COLAB_STANDBY_SESSION
+            if not _colab_standby_enabled():
+                await asyncio.sleep(COLAB_FAILOVER_INTERVAL_S)
+                continue
+            if _jev_is_degraded():
+                healthy_cycles = 0
+                ok, msg = await asyncio.to_thread(_colab_standby_ensure_session, session)
+                if not ok:
+                    print(f'[colab-standby] cannot provision {session}: {msg}', flush=True)
+                else:
+                    await asyncio.to_thread(_colab_standby_ensure_forward, session)
+                    if await asyncio.to_thread(_colab_standby_reachable):
+                        print('[colab-standby] Jev degraded; Laya up behind the loopback forward', flush=True)
+                    else:
+                        boot = await asyncio.to_thread(_colab_standby_ensure_service, session)
+                        if not await asyncio.to_thread(_colab_standby_reachable):
+                            print(f'[colab-standby] standing Laya up (not reachable yet): {boot}', flush=True)
+            else:
+                if await asyncio.to_thread(_colab_standby_reachable):
+                    await asyncio.to_thread(_colab_standby_teardown_service, session)
+                healthy_cycles += 1
+                if healthy_cycles >= COLAB_STANDBY_HEALTHY_CYCLES:
+                    print('[colab-standby] Jev healthy; Colab standby stood down', flush=True)
+        except Exception as e:
+            print(f'[colab-standby] loop error: {e}', flush=True)
+        await asyncio.sleep(COLAB_FAILOVER_INTERVAL_S)
 
 
 def _jev_health_window():
@@ -5199,62 +5369,6 @@ def _jev_is_degraded():
     attempts, failures = _jev_health_window()
     return (attempts >= JEV_HEALTH_MIN_ATTEMPTS
             and failures >= attempts * JEV_HEALTH_FAILURE_RATE)
-
-
-def _colab_control(base, action, key):
-    """Ask the sentinel notebook to stand Laya up or tear it down. The
-    notebook is the authority on its own process tree (it runs on the Colab
-    runtime, where the model must load); the village only sends intent. The
-    notebook keeps laya-serve behind *its* tunnel, so this is a public URL
-    the registration vouched for."""
-    req = urllib.request.Request(f'{base}/control?action={action}')
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:  # nosec B310 -- registration-vouched public tunnel URL
-            body = resp.read().decode('utf-8', errors='replace')
-            return json.loads(body) if body else {'ok': True}
-    except Exception as e:
-        print(f'[colab-standby] {action} on {base} failed: {e}', flush=True)
-        return None
-
-
-def _colab_standup(base, key):
-    result = _colab_control(base, 'standup', key)
-    if result is None:
-        print('[colab-standby] standup failed -- sentinel unreachable?', flush=True)
-    return result
-
-
-def _colab_teardown(base, key):
-    result = _colab_control(base, 'teardown', key)
-    if result is None:
-        print('[colab-standby] teardown failed -- sentinel unreachable?', flush=True)
-    return result
-
-
-async def _colab_failover_loop():
-    """15-min poll: Jev degraded -> tell the sentinel notebook to stand Laya
-    up (preloads on the Colab runtime, never here); Jev healthy -> tell it to
-    stand down once two clean cycles confirm recovery. No sentinel registered
-    -> just log; the health alert already covers an uncovered outage."""
-    healthy_cycles = 0
-    while True:
-        try:
-            base, key = _colab_standby()
-            if _jev_is_degraded():
-                healthy_cycles = 0
-                if base:
-                    print('[colab-standby] Jev degraded; standing Laya up on Colab', flush=True)
-                    _colab_standup(base, key)
-                else:
-                    print('[colab-standby] Jev degraded but no Colab sentinel registered', flush=True)
-            elif base:
-                _colab_teardown(base, key)
-                healthy_cycles += 1
-                if healthy_cycles >= COLAB_STANDBY_HEALTHY_CYCLES:
-                    print('[colab-standby] Jev healthy; Colab standby stood down', flush=True)
-        except Exception as e:
-            print(f'[colab-standby] loop error: {e}', flush=True)
-        await asyncio.sleep(COLAB_FAILOVER_INTERVAL_S)
 
 
 # ---- Colab agent compute -- run_on_colab tool (2026-09-29) ----------------
@@ -12386,41 +12500,6 @@ async def jev_model_set(request: Request):
     log_action('player', 'jev_model_set', {'model': model}, authorized=True)
     _append_passport_decision('jev_model_set', 'player', {'model': model})
     return JSONResponse({'ok': True, 'model': model})
-
-
-@app.post('/api/colab/register')
-async def colab_register(request: Request):
-    # Pairing point for the sentinel notebook (world/colab_standby_notebook.md).
-    # The notebook is a DEVICE in exactly the sense of the check-in endpoint:
-    # no player session, no agent_key -- so it authenticates with the same
-    # X-Device-Key bearer the iOS shortcut uses. It reports the public tunnel
-    # base + the key the notebook uses for both laya-serve bearer auth and the
-    # /control channel, and the village stores them in `settings` (persisted,
-    # applied instantly, replaced on every re-beacon -- each Colab session gets
-    # a fresh URL, so re-running the sentinel simply overwrites this row).
-    presented = request.headers.get('X-Device-Key')
-    if not presented or not secrets.compare_digest(presented, DEVICE_API_KEY):
-        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({'error': 'malformed body'}, status_code=400)
-    body = body or {}
-    url = (body.get('url') or '').strip()
-    key = (body.get('key') or '').strip()
-    if not url:
-        # empty url clears the pairing (e.g. operator wants the standby offline)
-        _set_setting('colab_laya_url', '')
-        _set_setting('colab_laya_key', '')
-        return JSONResponse({'ok': True, 'registered': False})
-    if len(url) > 500 or not re.match(r'^https?://', url):
-        return JSONResponse({'error': 'url must be http(s) and short'}, status_code=400)
-    if not key or len(key) > 256:
-        return JSONResponse({'error': 'key is required'}, status_code=400)
-    _set_setting('colab_laya_url', url)
-    _set_setting('colab_laya_key', key)
-    log_action(None, 'colab_standby_registered', {'url': url}, authorized=True)
-    return JSONResponse({'ok': True, 'registered': True, 'jev_degraded_now': _jev_is_degraded()})
 
 
 @app.post('/api/review/escalate')
