@@ -275,12 +275,31 @@ class RunReviewContentEnsemble(unittest.TestCase):
         self.assertTrue(result['queueFix'])  # ensemble outvoted the clean verdict
         self.assertEqual(result['note'], 'Filed a review on "Review landing" (text + visual), queued a fix')
         self.assertEqual(result['processTraceCount'], 1)  # SWiRL trace for the verified failure
+        # The fix task is steered at the actual missed requirement, not just
+        # pointed at the Library entry.
+        self.assertIn('Is the opening specific?', result['queueFix']['instructions'])
+        self.assertIn('Verified failing requirements', result['queueFix']['instructions'])
 
     def test_human_requirement_escalates_without_auto_deciding(self):
         checklist = [{'id': 'h1', 'question': 'Is the tone right?', 'section': 'tone', 'type': 'human'}]
         result = self._run(checklist, [_answer('clean', 0.95)], [_HOLISTIC_CLEAN])
         self.assertNotIn('queueFix', result)  # nothing auto-decided
         self.assertEqual(result['checklistEscalated'], ['h1'])
+
+    def test_only_top_two_failed_requirements_named_in_the_fix(self):
+        # Bounded steering: three verified fails, but the fix instruction names
+        # the first MAX_QUEUE_FIX_REQUIREMENTS and no more.
+        checklist = [{'id': f'j{i}', 'question': f'Question {i}?', 'section': 's', 'type': 'jev'}
+                     for i in range(3)]
+        result = self._run(
+            checklist,
+            [_answer('clean', 0.95)] + [_answer(content.GRADE_FAILS, 0.9)] * 3,
+            [_HOLISTIC_CLEAN] + [(content.GRADE_FAILS, 0.9, 0.01)] * 3,
+        )
+        instructions = result['queueFix']['instructions']
+        self.assertIn('Question 0?', instructions)
+        self.assertIn('Question 1?', instructions)
+        self.assertNotIn('Question 2?', instructions)  # capped
 
     def test_unsure_jev_requirement_escalates(self):
         checklist = [{'id': 'j1', 'question': 'Is the opening specific?', 'section': 'opening', 'type': 'jev'}]
