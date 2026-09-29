@@ -608,6 +608,11 @@ def _budget_cap_usd(service, products=None):
     whole village allowed to spend before directors must re-budget."""
     if not isinstance(service, str):
         return DEFAULT_BUDGET_CAP_USD
+    if service == COLAB_LEDGER_KEY:
+        # Compute-UNIT budget (not USD) -- the generic ledger row would
+        # otherwise show the $ default cap against a units number. Constants
+        # are defined later in this module; resolved at call time.
+        return float(COLAB_MONTHLY_UNITS)
     products = products or []
     for p in products:
         if p.get('id') == service or p.get('name') == service:
@@ -756,6 +761,23 @@ def _bank_budget_view(snapshot):
             'used': 0.0, 'cap': float(APIFY_MONTHLY_BUDGET_USD),
             'left': float(APIFY_MONTHLY_BUDGET_USD), 'over': False,
             'calls': 0, 'lastAt': None, 'burnPerDay': 0.0, 'daysLeft': None,
+        }
+    # Colab agent compute (2026-09-29): same "visible from day one" rule -- a
+    # GPU session burns the account's compute units fast, so the cap belongs
+    # in the Bank before the first run_on_colab run. Shown only when the
+    # colab CLI actually exists on this machine (the village's lever) and the
+    # budget is enabled (>0); a clone without the CLI sees no phantom row.
+    if COLAB_CLI_AVAILABLE and COLAB_MONTHLY_UNITS > 0 \
+            and COLAB_LEDGER_KEY not in services:
+        _used = _colab_spend_this_month()
+        _usage = _colab_account_usage()
+        services[COLAB_LEDGER_KEY] = {
+            'service': COLAB_LEDGER_KEY,
+            'used': round(_used, 3), 'cap': float(COLAB_MONTHLY_UNITS),
+            'left': round(max(0.0, COLAB_MONTHLY_UNITS - _used), 3),
+            'over': _used > COLAB_MONTHLY_UNITS,
+            'calls': 0, 'lastAt': None, 'burnPerDay': 0.0, 'daysLeft': None,
+            'balance_units': None if _usage is None else round(_usage['balance'], 3),
         }
     return services
 
@@ -2717,6 +2739,8 @@ async def _lifespan(app):
     tier_refresh_task = asyncio.create_task(_model_tier_refresh_loop())
     calibration_task = asyncio.create_task(_calibration_loop())
     colab_task = asyncio.create_task(_colab_failover_loop())
+    colab_compute_task = asyncio.create_task(_colab_compute_idle_loop()) \
+        if COLAB_CLI_AVAILABLE else None
     telegram_task = None
     if TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS:
         telegram_task = asyncio.create_task(_telegram_poll_loop())
@@ -2744,6 +2768,8 @@ async def _lifespan(app):
     backup_task.cancel()
     calibration_task.cancel()
     colab_task.cancel()
+    if colab_compute_task is not None:
+        colab_compute_task.cancel()
     prune_task.cancel()
     tier_refresh_task.cancel()
     if telegram_task is not None:
@@ -5229,6 +5255,270 @@ async def _colab_failover_loop():
         except Exception as e:
             print(f'[colab-standby] loop error: {e}', flush=True)
         await asyncio.sleep(COLAB_FAILOVER_INTERVAL_S)
+
+
+# ---- Colab agent compute -- run_on_colab tool (2026-09-29) ----------------
+# The village can borrow a real Google Colab runtime for agent work this Mac
+# cannot do (CUDA/torch GPU jobs, fine-tuning experiments, heavy numeric
+# work). Same lever as the Laya standby -- the colab CLI running on this
+# machine's account -- for a dedicated 'village-gpu' session, provisioned on
+# demand by a spike agent's run_on_colab call and stood down after a short
+# idle grace.
+#
+# Budgeting is deliberately HONEST about what Colab actually enforces: Google
+# publishes no fixed, guaranteed free quota -- limits are dynamic (sessions
+# cap at ~12h, idle auto-disconnect lands around ~90 min, GPU availability and
+# cooldowns shift with demand). The account does carry a REAL, live compute-
+# unit balance, read by `colab usage` and reconciled here (_colab_account_usage)
+# -- that is the genuine hard gate: a GPU job is refused when the account
+# balance is exhausted. COLAB_MONTHLY_UNITS is ONLY an optional operator-set
+# village convention cap on top (default 0 = off, mirroring SPEND_CAP_USD), not
+# a number Google publishes; when set it also surfaces in the Bank. The idle
+# teardown (15 min) keeps a parked GPU below Colab's ~90-min idle disconnect so
+# the session never lingers to a limit Google would hit first. The tool only
+# appears in the spike toolchain when the CLI is actually installed here -- the
+# same "absent = the surface never advertises it" rule as search_web/GitHub.
+COLAB_CLI_PATH = shutil.which('colab') or os.path.expanduser('~/.local/bin/colab')
+COLAB_CLI_AVAILABLE = bool(COLAB_CLI_PATH) and os.path.exists(COLAB_CLI_PATH)
+COLAB_GPU_SESSION = 'village-gpu'
+COLAB_GPU_ACCEL = 'T4'
+COLAB_MONTHLY_UNITS = float(_load_env().get('COLAB_MONTHLY_UNITS', '0') or 0)
+COLAB_FREE_TIER = str(_load_env().get('COLAB_FREE_TIER', '') or '').lower() in ('1', 'true', 'yes')
+COLAB_LEDGER_KEY = '__colab_compute__'
+_COLAB_USAGE_CACHE = {'at': 0.0, 'data': None}
+_COLAB_USAGE_CACHE_TTL_S = 120
+COLAB_MIN_UNITS_PER_RUN = 1.0       # every run pays a floor, even a 5s one
+COLAB_UNITS_PER_MIN_GPU = 1.0       # T4 burn estimate per elapsed minute
+COLAB_CODE_MAX_CHARS = 30000
+COLAB_TIMEOUT_MAX_S = 900
+COLAB_IDLE_GRACE_S = 15 * 60        # a parked GPU tears down after this idle
+_COLAB_COMPUTE_LAST_USED = 0.0
+_COLAB_COMPUTE_LOCK = threading.Lock()
+
+
+def _colab_budget_month():
+    """The current UTC calendar month (2026-09) -- the rollover key: a fresh
+    month resets the Colab compute-unit allowance."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
+
+
+def _colab_spend_this_month():
+    """Compute units accrued this calendar month (NOT USD -- the Bank row for
+    this service reads units against the COLAB_MONTHLY_UNITS cap)."""
+    try:
+        ledger = _spend_ledger_read()
+        bucket = ledger.get(COLAB_LEDGER_KEY) or {}
+        series = bucket.get('byMonth') or {}
+        return float(series.get(_colab_budget_month(), 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def _colab_budget_exceeded():
+    """True when Colab compute should refuse a new run:
+      * the operator's village cap is spent (COLAB_MONTHLY_UNITS > 0 -- Google
+        publishes no fixed quota, so this is a self-imposed convention, not a
+        real contract);
+      * OR, on a NON-free account only, `colab usage` reports the real prepaid
+        balance is exhausted (0 or negative).
+    On the free tier (COLAB_FREE_TIER=1) the real balance is NOT a gate: free
+    tier has no prepaid wallet, `colab usage` will typically report 0.00, and
+    Google enforces free-tier limits dynamically (session length, idle auto-
+    disconnect, GPU availability, cooldowns) -- the refusal would just block
+    every run for nothing. A None balance (CLI missing/unparseable) likewise is
+    never treated as spent on its own."""
+    if COLAB_MONTHLY_UNITS and _colab_spend_this_month() >= COLAB_MONTHLY_UNITS:
+        return True
+    if COLAB_FREE_TIER:
+        return False
+    usage = _colab_account_usage()
+    if usage is not None and float(usage.get('balance') or 0) <= 0:
+        return True
+    return False
+
+
+def _accrue_colab_units(units):
+    """Accrue a run's compute units against the monthly budget. Best-effort
+    like _accrue_spend: an accounting failure must never break the real run.
+    Uses the same kv_spend ledger so the Bank sees it, under the reserved
+    __colab_compute__ bucket with a monthly series keyed by month."""
+    if not isinstance(units, (int, float)) or not units:
+        return
+    try:
+        ledger = _spend_ledger_read()
+        bucket = ledger.setdefault(
+            COLAB_LEDGER_KEY, {'used': 0.0, 'calls': 0, 'byMonth': {}})
+        units = float(units)
+        bucket['used'] = float(bucket.get('used', 0) or 0) + units
+        bucket['calls'] = int(bucket.get('calls', 0) or 0) + 1
+        month = _colab_budget_month()
+        bucket['byMonth'][month] = \
+            float((bucket['byMonth'] or {}).get(month, 0) or 0) + units
+        _spend_ledger_write(ledger)
+    except Exception:
+        pass  # accounting never blocks a real run
+
+
+def _colab_cli(*args, timeout=120, input=None):
+    """Run a colab CLI subcommand. Returns (exit_code, output_text). Never
+    raises -- every caller surfaces the text like any other tool result.
+    Inherits this process's environment (PATH for the SSH bridge etc.)."""
+    cmd = [COLAB_CLI_PATH] + [str(a) for a in args]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, input=input)
+        return proc.returncode, ((proc.stdout or '') + '\n' + (proc.stderr or '')).strip()
+    except subprocess.TimeoutExpired:
+        return -1, f'timeout after {timeout}s'
+    except Exception as e:
+        return -1, str(e)
+
+
+def _colab_session_exists(session):
+    """True when a colab CLI session with this name is currently provisioned
+    (status exits 0)."""
+    rc, _out = _colab_cli('status', '-s', session, timeout=90)
+    return rc == 0
+
+
+def _colab_account_usage():
+    """Live reconcile against the REAL Colab account via `colab usage`:
+    current compute-unit balance, burn rate, active assignments. Colab
+    publishes no fixed quota (limits are dynamic -- session caps, idle auto-
+    disconnect, GPU availability, cooldowns), but `colab usage` reports the
+    real current balance the account is enforcing, so this is the genuine
+    gate. Returns {'balance', 'rate', 'assignments'} or None on any failure
+    (CLI missing, timeout, unparseable) so callers fail closed and fall back
+    to the operator cap alone. Cached briefly like the Apify/OpenRouter
+    reconciles: a bank readout or availability check shouldn't always shell
+    out to the CLI."""
+    if not COLAB_CLI_AVAILABLE:
+        return None
+    now = time.time()
+    cached = _COLAB_USAGE_CACHE
+    if cached['data'] is not None \
+            and (now - cached['at']) < _COLAB_USAGE_CACHE_TTL_S:
+        return cached['data']
+    rc, out = _colab_cli('usage', timeout=30)
+    if rc != 0:
+        return None
+    data = {'balance': None, 'rate': None, 'assignments': None}
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith('Current balance:'):
+            m = re.search(r'([\d.]+)', line)
+            if m:
+                data['balance'] = float(m.group(1))
+        elif line.startswith('Usage rate:'):
+            m = re.search(r'([\d.]+)', line)
+            if m:
+                data['rate'] = float(m.group(1))
+        elif line.startswith('Active assignments:'):
+            m = re.search(r'(\d+)', line)
+            if m:
+                data['assignments'] = int(m.group(1))
+    if data['balance'] is None:
+        return None  # unparseable output -- fail closed
+    cached['at'] = now
+    cached['data'] = data
+    return data
+
+
+def _colab_compute_provision():
+    """Idempotent: ensure the dedicated GPU session exists. Returns (ok, msg).
+    No GPU-capacity check -- a 'colab new --gpu T4' that fails (quota/capacity)
+    just returns an honest per-run error the agent can retry later."""
+    if not COLAB_CLI_AVAILABLE:
+        return False, 'the colab CLI is not installed on this machine'
+    if _colab_session_exists(COLAB_GPU_SESSION):
+        return True, 'ok'
+    rc, out = _colab_cli('new', '-s', COLAB_GPU_SESSION,
+                         '--gpu', COLAB_GPU_ACCEL, timeout=300)
+    if rc != 0:
+        return False, f'provision failed: {out[-500:]}'
+    return True, 'ok'
+
+
+def _colab_compute_run(code, purpose, packages, timeout_seconds):
+    """Run `code` (Python) on the dedicated Colab GPU session and capture its
+    output. Blocking -- the spike tool executor calls this on a worker thread
+    like every other agent tool (see the ask lane's nested-call deadlock note).
+    Returns a dict {stdout, units, elapsed_s, session} on success or {error,
+    ...} on any failure; the executor formats it for the model. Budget-gated:
+    an exhausted month is refused with the same tone as a metered-out search,
+    and the Bank shows used/cap/left. Every run accrues wall-clock compute
+    units (T4 estimate) against the monthly cap."""
+    global _COLAB_COMPUTE_LAST_USED
+    if not code or not code.strip():
+        return {'error': 'code is required'}
+    if len(code) > COLAB_CODE_MAX_CHARS:
+        return {'error': f'code must be under {COLAB_CODE_MAX_CHARS} characters'}
+    if _colab_budget_exceeded():
+        if COLAB_MONTHLY_UNITS and _colab_spend_this_month() >= COLAB_MONTHLY_UNITS:
+            return {'error': 'the village has used its monthly Colab compute-unit budget '
+                             '(GPU jobs are paused until next month)'}
+        return {'error': 'the Colab account has no compute units left right now -- '
+                         'GPU jobs cannot run until the account balance recovers'}
+    try:
+        timeout = max(1, min(int(timeout_seconds or 300), COLAB_TIMEOUT_MAX_S))
+    except (TypeError, ValueError):
+        timeout = 300
+    with _COLAB_COMPUTE_LOCK:
+        start = time.time()
+        ok, msg = _colab_compute_provision()
+        if not ok:
+            return {'error': f'could not provision a Colab GPU session: {msg}'}
+        if packages:
+            clean = [re.sub(r'[^A-Za-z0-9._=-]', '', str(p))
+                     for p in packages if isinstance(p, str)]
+            pkg_line = ' '.join(p for p in clean if p)
+            if pkg_line:
+                rc, out = _colab_cli(
+                    'exec', '-s', COLAB_GPU_SESSION, '--timeout', '600',
+                    '--env', f'COLAB_PKGS={pkg_line}',
+                    input=('import os, subprocess\n'
+                           'subprocess.run("pip install -q " + os.environ["COLAB_PKGS"], '
+                           'shell=True, timeout=540)\nprint("__COLAB_PKGS_INSTALLED__")\n'))
+                if rc != 0 or '__COLAB_PKGS_INSTALLED__' not in out:
+                    return {'error': f'package install failed on Colab: {out[-800:]}'}
+        rc, out = _colab_cli(
+            'exec', '-s', COLAB_GPU_SESSION, '--timeout', str(timeout + 30),
+            input=code + '\nprint("__COLAB_DONE__")\n')
+        elapsed = max(1, int(time.time() - start))
+        _COLAB_COMPUTE_LAST_USED = time.time()
+        units = max(COLAB_MIN_UNITS_PER_RUN,
+                    round(elapsed / 60.0 * COLAB_UNITS_PER_MIN_GPU, 3))
+        _accrue_colab_units(units)
+        log_action('agent', 'colab_compute_run', {
+            'purpose': (purpose or '')[:120],
+            'session': COLAB_GPU_SESSION,
+            'timeout': timeout,
+            'units': units,
+            'rc': rc,
+        }, authorized=True)
+        if rc != 0:
+            return {'error': f'Colab run failed (exit {rc}): {out[-1500:]}', 'units': units}
+        out = '\n'.join(l for l in out.splitlines() if '__COLAB_DONE__' not in l)
+        return {'stdout': out[-6000:], 'units': units, 'elapsed_s': elapsed,
+                'session': COLAB_GPU_SESSION}
+
+
+async def _colab_compute_idle_loop():
+    """Parked-GPU guard: every 5 min, stop the dedicated GPU session once it
+    has sat idle past COLAB_IDLE_GRACE_S, so a standing T4 stops burning the
+    account's compute units between agent jobs. Same lifecycle ownership as
+    the Jev standby, but for the agent-compute session and driven by an idle
+    timer rather than a health signal."""
+    while True:
+        try:
+            if _COLAB_COMPUTE_LAST_USED > 0 \
+                    and (time.time() - _COLAB_COMPUTE_LAST_USED) > COLAB_IDLE_GRACE_S \
+                    and _colab_session_exists(COLAB_GPU_SESSION):
+                print('[colab-compute] GPU session idle; tearing down', flush=True)
+                _colab_cli('stop', '-s', COLAB_GPU_SESSION, timeout=120)
+        except Exception as e:
+            print(f'[colab-compute] idle teardown error: {e}', flush=True)
+        await asyncio.sleep(5 * 60)
 
 
 # Any safety gate that gets a Jev "allow/approve" below this confidence is

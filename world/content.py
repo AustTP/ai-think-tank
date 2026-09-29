@@ -2067,6 +2067,92 @@ def _make_spike_sandbox_executor(agent_id, agent_key, sandbox_id, struck_tools=N
     return execute_tool
 
 
+# Real request (2026-09-29): agent work this Mac cannot do -- CUDA/torch GPU
+# jobs, fine-tuning experiments, heavy numeric work -- now runs on a real
+# Google Colab T4 runtime, provisioned on demand by the spike toolchain and
+# budgeted as compute units in the Bank. run_on_colab mirrors execute_script
+# (a spike agent hands real code, gets real stdout back) but for a remote GPU
+# session instead of the tiny local sandbox. Budget-gated by serve's monthly
+# COLAB_MONTHLY_UNITS cap; only offered when the colab CLI is actually
+# installed on the machine (see COLAB_CLI_AVAILABLE).
+_COLAB_RUN_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'run_on_colab',
+        'description': (
+            "Run real Python on a Google Colab GPU (T4) runtime -- for computation this "
+            "village's own machine cannot do: CUDA/torch GPU work, fine-tuning experiments, "
+            "large matrix/ML or numeric jobs. The village provisions a GPU session on demand, "
+            "executes your code, and returns exactly what it printed -- so your code MUST print "
+            "everything you need to see. Use this when a plan step genuinely requires real "
+            "computation (not for browsing/text questions, and not for anything the tiny local "
+            "sandbox can already do). It runs on the player's real Colab account, metered against "
+            "whatever COLAB_MONTHLY_UNITS village cap is set. Remember it is the FREE tier: "
+            "limitations apply -- a run must finish in its own short timeout, sessions get torn "
+            "down after idle, GPU availability is not guaranteed, and a heavy job can fail if "
+            "the account has no quota left. Keep runs small and quick."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'code': {'type': 'string',
+                         'description': 'Complete, self-contained Python source to run on the GPU runtime. It must print its results.'},
+                'purpose': {'type': 'string',
+                            'description': 'Short statement of what this computation is for (attribution, like execute_script purpose).'},
+                'packages': {'type': 'array', 'items': {'type': 'string'},
+                             'description': 'Optional pip package names to install before running (e.g. ["transformers", "sentencepiece"]). torch/cuda come preinstalled.'},
+                'timeout_seconds': {'type': 'integer',
+                                    'description': 'Optional execution timeout in seconds (default 300, hard max 900).'},
+            },
+            'required': ['code'],
+        },
+    },
+}
+
+
+def _make_colab_compute_executor(agent_id, struck_tools=None):
+    """run_on_colab for a spike. In-process call into serve's Colab gateway
+    (_colab_compute_run -- blocking, runs in this worker thread), formatted
+    like execute_script so the model sees exit/units/stdout as one result.
+    One-strike shape kept for consistency with the other executors (a budget-
+    exhausted or provisioning failure is a transient/metered note, not a
+    POLICY denial, so it does NOT strike -- retry/rephrase stays open)."""
+    def execute_tool(name, args):
+        if struck_tools is not None and name in struck_tools:
+            return (f'{name} was already blocked once this investigation (one-strike) -- '
+                    'do not call it again, use a different tool or approach instead.')
+        if name != 'run_on_colab':
+            raise ValueError(f'unknown tool: {name}')
+        args = args or {}
+        code = (args.get('code') or '').strip()
+        if not code:
+            return '__TOOL_ERROR__: run_on_colab requires the "code" argument'
+        purpose = args.get('purpose') or 'spike computation'
+        packages = [p for p in (args.get('packages') or [])
+                    if isinstance(p, str) and p.strip()][:12]
+        try:
+            timeout = int(args.get('timeout_seconds') or 300)
+        except (TypeError, ValueError):
+            timeout = 300
+        try:
+            result = _serve._colab_compute_run(code, purpose, packages, timeout)
+        except Exception as e:
+            return f'__TOOL_ERROR__: Colab run crashed: {e}'
+        if not isinstance(result, dict):
+            return '__TOOL_ERROR__: unexpected Colab run response'
+        if result.get('error'):
+            return f'__TOOL_ERROR__: {result["error"]}'
+        parts = [f'Colab GPU run OK (session: {result.get("session") or "colab"}, '
+                 f'{result.get("elapsed_s", 0)}s, {result.get("units", 0)} compute units):']
+        stdout = (result.get('stdout') or '').strip()
+        if stdout:
+            parts.append(f'output:\n{stdout}')
+        if not stdout:
+            parts.append('(no output -- your code printed nothing)')
+        return '\n\n'.join(parts)
+    return execute_tool
+
+
 # Real request (2026-09-26): the inverse of promote-spike's fix (a spike's
 # real findings now flow FORWARD into a new story) is a spike whose job is
 # to review work another team already did (a finished story, an earlier
@@ -2819,7 +2905,16 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         'least 2-3 of the individual item pages too, not just the top-level listing -- a category '
         'name is not the same as what that specific item actually is. Only ever follow a URL you '
         'actually saw returned by search_web or in a page\'s real links list -- never invent or guess '
-        'a URL path. A spike never opens a peer-review gate, but it CAN still produce a real '
+        'a URL path. '
+        + ("If a plan step or the question genuinely needs real computation this machine cannot do "
+            "-- CUDA/GPU work, a fine-tuning experiment, a heavy numeric job -- use run_on_colab to "
+            "run complete Python on a real Colab GPU and read its output, rather than skipping it or "
+            "claiming the village can't do it. It is a metered cost against the village's Colab "
+            "compute budget shown in the Bank; use it only when the local sandbox genuinely cannot "
+            "handle the work. Colab here is the FREE tier -- a run must finish within its own "
+            "timeout (keep them small), a session idles out and gets recycled, GPU slots are not "
+            "guaranteed, and a job can fail if free quota is drained. " if _serve.COLAB_CLI_AVAILABLE else "")
+        + 'A spike never opens a peer-review gate, but it CAN still produce a real '
         'artifact -- if your plan has an execute_script/CSV step, that step is MANDATORY, not '
         'optional: you must actually call execute_script and write the real file. Describing what '
         'the CSV would contain, in prose, is NOT the same as building it and does NOT satisfy that '
@@ -2852,6 +2947,11 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     pixellab_tool = _make_pixellab_tools_executor()
     google_tool = _make_google_tools_executor()
     github_tool = _make_github_tools_executor()
+    # Colab agent compute (run_on_colab) -- offered only when the colab CLI
+    # is actually on this machine; absent means the tool is simply absent.
+    colab_compute_tool = None
+    if _serve.COLAB_CLI_AVAILABLE:
+        colab_compute_tool = _make_colab_compute_executor(agent_id, struck_tools=struck_tools)
     spike_tools = _serve.AGENT_ASK_TOOLS + [_SPIKE_SANDBOX_TOOL, _LIBRARY_SEARCH_TOOL, _LIBRARY_READ_TOOL,
                                             _TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL,
                                             _PIXELLAB_CHARACTER_TOOL,
@@ -2862,6 +2962,10 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # absent, so the surface never advertises something that would fail).
     if _serve.GITHUB_TOKEN:
         spike_tools += [_GITHUB_REPO_TOOL, _GITHUB_ISSUES_TOOL, _GITHUB_ISSUE_TOOL, _GITHUB_SEARCH_TOOL]
+    # Colab agent compute (2026-09-29): offered only when the colab CLI is
+    # actually installed on this machine -- same conditional-availability rule.
+    if _serve.COLAB_CLI_AVAILABLE:
+        spike_tools += [_COLAB_RUN_TOOL]
     _GOOGLE_TOOL_NAMES = ('read_google_sheet', 'append_google_sheet_row',
                           'list_calendar_events', 'create_calendar_event')
 
@@ -2881,6 +2985,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             return google_tool(tool_name, args)
         if tool_name in _GITHUB_TOOL_NAMES:
             return github_tool(tool_name, args)
+        if tool_name == 'run_on_colab' and colab_compute_tool is not None:
+            return colab_compute_tool(tool_name, args)
         return web_tool(tool_name, args)
 
     # 18/900 (was 10/600): a "list every X across the whole site" question
