@@ -284,7 +284,7 @@ class JevFailoverTests(unittest.TestCase):
 
     def _chain_tape_rows(self):
         with serve._db() as conn:
-            return conn.execute('SELECT model, ok FROM decision_tape ORDER BY ts').fetchall()
+            return conn.execute('SELECT model, ok, raw FROM decision_tape ORDER BY ts').fetchall()
 
     def test_failover_serves_the_second_slug_when_the_primary_raises(self):
         self._set_chain('primary-x', 'fallback-y')
@@ -325,6 +325,11 @@ class JevFailoverTests(unittest.TestCase):
         rows = self._chain_tape_rows()
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0][0], rows[0][1]), ('primary-x', 0))
+        raw = json.loads(rows[0][2])
+        # The ok=0 row carries the concrete exception so the incident is
+        # diagnosable from the tape (kind/status/detail), not just a generic
+        # 'decision call raised'.
+        self.assertEqual(raw['kind'], 'ConnectionError')
 
     def test_all_open_fails_closed_without_calling_any_slug(self):
         self._set_chain('primary-x', 'fallback-y')
