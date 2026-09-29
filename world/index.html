@@ -4,30 +4,39 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI Think Tank</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #0e1218;
-    --surface-0: #161e28;
-    --surface-1: #0f1620;
-    --surface-2: #1b2533;
-    --border: #263241;
-    --border-soft: #1c2633;
-    --text: #dde6f0;
-    --text-dim: #8b99ab;
-    --accent: #4fc1ff;
-    --accent-soft: rgba(79, 195, 255, 0.14);
+    --bg: #e9edf4;
+    --surface-0: #ffffff;
+    --surface-1: #f3f6fb;
+    --surface-2: #e8edf5;
+    --border: #d4dce8;
+    --border-soft: #e3e9f1;
+    --text: #1d2634;
+    --text-dim: #5c6b7d;
+    --accent: #1a73e8;
+    --accent-soft: rgba(26, 115, 232, 0.12);
     --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --font-pixel: "Press Start 2P", "SF Pixelate", monospace;
+    --font-term: "VT323", "Courier New", monospace;
   }
+  @keyframes pixBlink { 50% { opacity: 0; } }
   html, body {
     margin: 0;
     height: 100%;
     background: var(--bg);
-    background-image: radial-gradient(1200px 800px at 50% -10%, #1a2430 0%, var(--bg) 60%);
+    background-image:
+      radial-gradient(1000px 700px at 50% -10%, #f7f9fd 0%, var(--bg) 65%),
+      repeating-linear-gradient(0deg, rgba(26, 115, 232, 0.05) 0 1px, transparent 1px 28px),
+      repeating-linear-gradient(90deg, rgba(26, 115, 232, 0.05) 0 1px, transparent 1px 28px);
     display: flex;
     flex-direction: column;
     align-items: center;
-    justify-content: flex-start;
+    justify-content: center;
     font-family: var(--font-sans);
     color: var(--text);
     overflow: hidden;
@@ -37,6 +46,7 @@
     display: flex;
     flex-direction: column;
     align-items: center;
+    justify-content: center;
     height: 100%;
     padding: 8px;
     box-sizing: border-box;
@@ -72,21 +82,26 @@
     width: 44px;
     height: 44px;
     font-size: 18px;
-    border-radius: 10px;
-    border: 1px solid var(--border);
-    background: var(--surface-1);
-    color: var(--text);
+    border-radius: 0;
+    font-family: var(--font-pixel);
+    color: #eaf1ff; text-shadow: 0 1px 0 rgba(0, 0, 0, 0.6);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.24) 0%, rgba(255, 255, 255, 0.04) 42%, rgba(255, 255, 255, 0) 100%),
+      linear-gradient(180deg, #3d4c86 0%, #232c52 52%, #141a38 100%);
+    border: 2px solid;
+    border-color: #91a2e6 #0b1026 #0b1026 #7a8dce;
+    box-shadow: 0 2px 0 rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.18);
     touch-action: none;
     cursor: pointer;
-    transition: background 0.12s ease, border-color 0.12s ease;
+    transition: color 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
   }
-  #zoom button:hover { background: var(--surface-2); }
-  #zoom button:active { background: var(--accent-soft); border-color: var(--accent); }
+  #zoom button:hover { color: #fff; border-color: #8ff6ff #0a3050 #0a3050 #5fd8f0; box-shadow: 0 0 14px rgba(111, 240, 255, 0.6); }
+  #zoom button:active { transform: translateY(1px); box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.5); }
   #zoom .showall { display: flex; align-items: center; justify-content: center; }
 
   .hidden { display: none !important; }
   .modal {
-    position: fixed; inset: 0; background: rgba(5, 9, 14, 0.72);
+    position: fixed; inset: 0; background: rgba(23, 33, 48, 0.45);
     display: flex; align-items: center; justify-content: center; z-index: 50;
   }
   .modal-box {
@@ -98,12 +113,23 @@
   }
   .modal-box h3 { margin: 0 0 10px 0; font-size: 15px; letter-spacing: 0.01em; }
   :where(.modal-box) button {
-    font-family: inherit; font-size: 13px; padding: 7px 14px;
-    border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2);
-    color: var(--text); cursor: pointer;
-    transition: background 0.12s ease, border-color 0.12s ease;
+    font-family: var(--font-pixel); font-size: 9px; padding: 9px 12px;
+    color: #eaf1ff; text-shadow: 0 1px 0 rgba(0, 0, 0, 0.6);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.24) 0%, rgba(255, 255, 255, 0.04) 42%, rgba(255, 255, 255, 0) 100%),
+      linear-gradient(180deg, #3d4c86 0%, #232c52 52%, #141a38 100%);
+    border: 2px solid; border-radius: 0;
+    border-color: #91a2e6 #0b1026 #0b1026 #7a8dce;
+    box-shadow: 0 2px 0 rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    cursor: pointer; line-height: 1.2;
+    transition: color 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
   }
-  :where(.modal-box) button:hover { background: #243246; border-color: #3b5370; }
+  :where(.modal-box) button:hover {
+    color: #fff;
+    border-color: #8ff6ff #0a3050 #0a3050 #5fd8f0;
+    box-shadow: 0 0 12px rgba(111, 240, 255, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.28);
+  }
+  :where(.modal-box) button:active { transform: translateY(1px); box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.5); }
   :where(.modal-box) button:disabled { opacity: 0.45; cursor: not-allowed; }
   :where(.modal-box) input[type="text"], :where(.modal-box) input[type="password"], :where(.modal-box) select {
     font-family: inherit; font-size: 13px; color: var(--text);
@@ -196,33 +222,57 @@
   .roster-list { display: flex; flex-direction: column; gap: 4px; }
 
   #hudBar {
-    position: relative; z-index: 25; height: 48px;
-    background: linear-gradient(180deg, #151d28 0%, #10161f 100%);
-    border-bottom: 1px solid var(--border);
-    border-top: 2px solid var(--accent);
-    box-shadow: 0 4px 18px rgba(0, 0, 0, 0.35);
+    position: relative; z-index: 25; height: 52px;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.06) 0%, rgba(255, 255, 255, 0) 50%),
+      linear-gradient(180deg, #283157 0%, #1b2242 55%, #141a33 100%);
+    border-top: 2px solid #4a5ba0;
+    border-bottom: 2px solid #0c1126;
+    box-shadow: 0 6px 22px rgba(15, 23, 42, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.08);
     display: flex; align-items: center; gap: 10px; padding: 0 12px;
     box-sizing: border-box; overflow-x: auto; white-space: nowrap;
-    font-family: var(--font-sans);
+    font-family: var(--font-pixel);
   }
   .hud-brand { flex: 0 0 auto; margin-right: 4px; text-align: left; }
-  .hud-brand .hud-brand-title { display: block; font-weight: 700; font-size: 14px; letter-spacing: 0.14em; color: var(--accent); }
-  .hud-brand .hud-brand-sub { display: block; font-size: 9px; letter-spacing: 0.28em; color: var(--text-dim); text-transform: uppercase; }
-  .hud-pill {
-    background: var(--surface-1); color: var(--text); border: 1px solid var(--border);
-    border-radius: 999px; padding: 5px 12px; font-size: 11px; flex: 0 0 auto; line-height: 1.3;
-    min-width: 52px; text-align: center;
+  .hud-brand .hud-brand-title {
+    display: block; font-family: var(--font-pixel); font-weight: 400; font-size: 13px;
+    letter-spacing: 0.05em; color: #6ff0ff; text-shadow: 0 0 8px rgba(111, 240, 255, 0.55);
   }
-  .hud-pill .label { display: block; font-size: 8px; letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.6; }
-  .hud-pill .value { font-weight: 700; font-size: 13px; color: #f2f7fc; }
+  .hud-brand .hud-brand-title::after { content: '▌'; color: #ffd54a; animation: pixBlink 1.1s steps(1) infinite; margin-left: 3px; }
+  .hud-brand .hud-brand-sub {
+    display: block; font-family: var(--font-term); font-size: 13px; letter-spacing: 0.18em;
+    color: #8fa2d9; text-transform: uppercase;
+  }
+  .hud-pill {
+    background: rgba(8, 12, 26, 0.55); color: #e6ecff; border: 1px solid #3a4878;
+    padding: 5px 12px; font-size: 10px; flex: 0 0 auto; line-height: 1.35;
+    min-width: 52px; text-align: center; box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.5);
+  }
+  .hud-pill::before {
+    content: '●'; font-size: 7px; color: #3ef08a; margin-right: 6px; vertical-align: 1px;
+    text-shadow: 0 0 7px rgba(62, 240, 138, 0.9);
+  }
+  .hud-pill .label { display: block; font-family: var(--font-term); font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: #7d8ec0; line-height: 1.1; }
+  .hud-pill .value { font-family: var(--font-pixel); font-weight: 400; font-size: 13px; color: #ffd54a; text-shadow: 0 0 9px rgba(255, 213, 74, 0.5); }
   .hud-gap { flex: 1 1 auto; min-width: 12px; }
   .hud-btn {
-    font-family: var(--font-sans); font-size: 12px; padding: 8px 14px;
-    border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text);
-    flex: 0 0 auto; cursor: pointer;
-    transition: background 0.12s ease, border-color 0.12s ease;
+    font-family: var(--font-pixel); font-size: 9px; padding: 11px 12px;
+    color: #eaf1ff; text-shadow: 0 1px 0 rgba(0, 0, 0, 0.6);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.24) 0%, rgba(255, 255, 255, 0.04) 42%, rgba(255, 255, 255, 0) 100%),
+      linear-gradient(180deg, #3d4c86 0%, #232c52 52%, #141a38 100%);
+    border: 2px solid; border-radius: 0;
+    border-color: #91a2e6 #0b1026 #0b1026 #7a8dce;
+    box-shadow: 0 2px 0 rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    flex: 0 0 auto; cursor: pointer; line-height: 1.2;
+    transition: color 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
   }
-  .hud-btn:hover:not(:disabled) { background: #243246; border-color: #3b5370; }
+  .hud-btn:hover:not(:disabled) {
+    color: #fff;
+    border-color: #8ff6ff #0a3050 #0a3050 #5fd8f0;
+    box-shadow: 0 0 14px rgba(111, 240, 255, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.28);
+  }
+  .hud-btn:active:not(:disabled) { transform: translateY(1px); box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.5); }
   .hud-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .inbox-count {
     display: inline-block; min-width: 14px; height: 14px; line-height: 14px;
@@ -277,22 +327,33 @@
     transform: rotate(-8deg); opacity: 0.85;
   }
 
-  #toast {
-    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
-    background: var(--surface-0); border: 1px solid var(--accent); border-radius: 999px;
-    padding: 8px 16px; font-family: var(--font-mono); font-size: 13px; color: var(--text);
-    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
-    z-index: 60; pointer-events: none;
+  #actionBar {
+    position: relative;
+    height: 34px;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.04) 0%, rgba(255, 255, 255, 0) 50%),
+      #05060a;
+    border-top: 2px solid #3a4878;
+    flex: 0 0 auto;
+    overflow: hidden;
+    color: #7dff9a;
   }
-  #interactPrompt {
-    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
-    background: rgba(15, 22, 32, 0.92); border: 1px solid var(--accent); border-radius: 999px;
-    padding: 8px 16px; font-family: var(--font-mono); font-size: 13px; color: var(--text);
-    z-index: 59; pointer-events: none;
+  #actionBar::before {
+    content: '▌'; position: absolute; left: 8px; top: 50%; transform: translateY(-50%);
+    color: #6ff0ff; font-size: 10px; animation: pixBlink 1.1s steps(1) infinite;
+    text-shadow: 0 0 6px rgba(111, 240, 255, 0.7);
+  }
+  #toast, #interactPrompt {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    max-width: 88%; padding: 0 4px; box-sizing: border-box;
+    font-family: var(--font-term); font-size: 15px; color: inherit;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    pointer-events: none; z-index: 60;
   }
   #interactPrompt kbd {
-    background: var(--surface-2); border: 1px solid var(--accent); border-radius: 4px;
-    padding: 1px 6px; font-weight: bold; margin-right: 6px; color: var(--accent);
+    background: #26313f; border: 1px solid #6ff0ff; border-radius: 0;
+    padding: 0 6px; font-family: var(--font-pixel); font-size: 9px;
+    font-weight: 400; margin-right: 6px; color: #7cc4ff;
   }
 
   .convo-box { width: 460px; }
@@ -325,9 +386,10 @@
 
     #hudBar { gap: 6px; padding: 0 8px; }
     .hud-brand { display: none; }
-    .hud-pill { padding: 4px 9px; min-width: 44px; font-size: 10px; }
+    .hud-pill { padding: 4px 8px; min-width: 40px; }
+    .hud-pill .label { font-size: 10px; }
     .hud-pill .value { font-size: 12px; }
-    .hud-btn { padding: 6px 9px; font-size: 11px; }
+    .hud-btn { padding: 9px 9px; font-size: 8px; }
   }
 </style>
 </head>
@@ -354,6 +416,10 @@
         <button id="zoomOut" title="Zoom out">&minus;</button>
         <button id="zoomAll" class="showall" title="Show whole map"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v3a2 2 0 0 1-2 2H3"/><path d="M16 3v3a2 2 0 0 0 2 2h3"/><path d="M8 21v-3a2 2 0 0 0-2-2H3"/><path d="M16 21v-3a2 2 0 0 1 2-2h3"/></svg></button>
       </div>
+    </div>
+    <div id="actionBar">
+      <div id="interactPrompt" class="hidden"></div>
+      <div id="toast" class="hidden"></div>
     </div>
   </div>
 </div>
@@ -662,9 +728,6 @@
   </div>
 </div>
 
-<div id="toast" class="hidden"></div>
-<div id="interactPrompt" class="hidden"></div>
-
 <script src="world.js?v=29"></script>
 <script src="rooms.js?v=6"></script>
 <script src="terminals.js?v=3"></script>
@@ -681,7 +744,7 @@
 <script src="templates.js?v=1"></script>
 <script src="sim_bridge.js?v=4"></script>
 <script>
-const VIEW_W = 688, VIEW_H = 384;
+const VIEW_W = 1024, VIEW_H = Math.round(1024 * 384 / 688);
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 canvas.width = VIEW_W;
@@ -690,12 +753,13 @@ ctx.imageSmoothingEnabled = false;
 
 const viewport = document.getElementById('viewport');
 const stage = document.getElementById('stage');
-const HUD_H = 48;
+const HUD_H = 52, ACTION_H = 34;
 function fitViewport() {
   const ratio = VIEW_W / VIEW_H;
   const availW = window.innerWidth - 16;
-  const availH = window.innerHeight - HUD_H - 16;
-  let w = availW, h = w / ratio;
+  const availH = window.innerHeight - HUD_H - ACTION_H - 16;
+  let w = Math.min(VIEW_W, availW);
+  let h = Math.min(VIEW_H, w / ratio);
   if (h > availH) { h = availH; w = h * ratio; }
   stage.style.width = w + 'px';
   viewport.style.height = h + 'px';
