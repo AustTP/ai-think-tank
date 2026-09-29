@@ -216,6 +216,112 @@ class BrowseTrailBuilding(unittest.TestCase):
         self.assertIn('example.com', esc.call_args[0][1])
 
 
+class AllowlistRequestEndpoint(unittest.TestCase):
+    """POST /api/allowlist/request -- the agent-facing path to ask the player
+    for a new allowlist grant. Grants are permanent capability changes, so the
+    request fires a floor-1.0 escalation (never director-auto-approved) whose
+    approval by the human's email link is what actually applies the grant."""
+
+    def _client(self):
+        from starlette.testclient import TestClient
+        c = TestClient(serve.app)
+        c.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
+        return c
+
+    def _common_mocks(self):
+        patchers = [
+            unittest.mock.patch.object(serve, 'check_rate_limit', return_value=True),
+            unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True),
+            unittest.mock.patch.object(serve, '_send_escalation_email_sync'),
+            unittest.mock.patch.object(serve, 'ensure_sandbox_networking'),
+            # ESCALATIONS_PATH is a module constant from the REAL VILLAGE_DIR
+            # at import time -- same pitfall as BROWSE_TRAIL_PATH, so any test
+            # creating/resolving an escalation must pin it to the temp dir or
+            # it writes the live ~/ai-village/escalations.json.
+            unittest.mock.patch.object(serve, 'ESCALATIONS_PATH',
+                                       os.path.join(_TMP_DIR, 'escalations.json')),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_unauthenticated_request_is_rejected(self):
+        from starlette.testclient import TestClient
+        r = TestClient(serve.app).post('/api/allowlist/request', json={
+            'agentId': 'ben', 'host': 'example.com', 'purpose': 'research'})
+        self.assertEqual(r.status_code, 401)
+
+    def test_private_host_is_refused_before_any_request(self):
+        self._common_mocks()
+        with unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=False):
+            r = self._client().post('/api/allowlist/request', json={
+                'agentId': 'ben', 'host': '10.0.0.5', 'purpose': 'internal api'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('never be allowlisted', r.json()['error'])
+
+    def test_already_allowlisted_host_returns_without_an_escalation(self):
+        self._common_mocks()
+        with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', {'dreyx.com'}), \
+             unittest.mock.patch.object(serve, 'create_escalation') as esc:
+            r = self._client().post('/api/allowlist/request', json={
+                'agentId': 'ben', 'host': 'dreyx.com', 'purpose': 'already fine'})
+        self.assertTrue(r.json()['allowlisted'])
+        esc.assert_not_called()
+
+    def test_url_input_is_normalized_to_hostname(self):
+        self._common_mocks()
+        with unittest.mock.patch.object(serve, 'create_escalation', return_value='esc-test') as esc:
+            r = self._client().post('/api/allowlist/request', json={
+                'agentId': 'ben', 'host': 'https://api.example.net/v1/data', 'purpose': 'quotes'})
+        body = r.json()
+        self.assertEqual(body['host'], 'api.example.net')
+        esc.assert_called_once()
+        kind, question = esc.call_args[0]
+        self.assertEqual(kind, 'allowlist request')
+        self.assertEqual(esc.call_args.kwargs['on_approve_note'], 'api.example.net')
+
+    def test_pending_duplicate_returns_same_escalation(self):
+        self._common_mocks()
+        with unittest.mock.patch.object(serve, '_load_escalations', return_value={
+            'esc-1': {'kind': 'allowlist request', 'status': 'pending', 'note': 'example.com'},
+        }):
+            r = self._client().post('/api/allowlist/request', json={
+                'agentId': 'ben', 'host': 'example.com', 'purpose': 'again'})
+        body = r.json()
+        self.assertTrue(body['requested'])
+        self.assertEqual(body['escalationId'], 'esc-1')
+
+    def test_resolve_approval_applies_the_grant(self):
+        # The approval side-effect is the whole point: an approved 'allowlist
+        # request' escalation actually grants the host to the runtime list,
+        # which then feeds every gate (browse, colab, egress proxy alike).
+        import asyncio
+        self._common_mocks()
+        _grant_escalation_id = serve.create_escalation(
+            'allowlist request', 'grant me', on_approve_note='GrantHost.example')
+        esc = serve._load_escalations()[_grant_escalation_id]
+        with unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch.object(serve, 'ensure_sandbox_networking'):
+            asyncio.run(serve.resolve_escalation(_grant_escalation_id, esc['token'], 'approve'))
+        self.assertTrue(serve._is_allowlisted_host('GrantHost.example'))
+        self.assertTrue(serve._is_allowlisted_host('www.granthost.example'))
+        # And the grant is durable: persisted in the settings table.
+        with serve._db() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key = 'allowlist_grants'").fetchone()
+        self.assertIn('granthost.example', row[0])
+
+    def test_resolve_denial_never_grants(self):
+        import asyncio
+        self._common_mocks()
+        _denied_id = serve.create_escalation(
+            'allowlist request', 'deny me', on_approve_note='deniedhost.example')
+        esc = serve._load_escalations()[_denied_id]
+        with unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch.object(serve, 'ensure_sandbox_networking'):
+            asyncio.run(serve.resolve_escalation(_denied_id, esc['token'], 'deny'))
+        self.assertFalse(serve._is_allowlisted_host('deniedhost.example'))
+
+
 class BrowseEndpointMullvadVpn(unittest.TestCase):
     """POST /api/browse with viaVpnCountry -- real subprocess calls are
     mocked throughout (_mullvad_connect_sync/_mullvad_disconnect_sync);
