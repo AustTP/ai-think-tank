@@ -31,7 +31,7 @@ let nextHandoffId = 1;
 // self-contained call instead of contorting that one to fit.
 async function requestHandoffLine(fromAgent, toAgent, taskTitle) {
   const tier = MODEL_TIERS[fromAgent.model] || MODEL_TIERS.small;
-  const systemPrompt = `You are ${fromAgent.name}, working as ${fromAgent.role} in a small village. `
+  const systemPrompt = `You are ${fromAgent.name}, working as ${fromAgent.role} in a small think tank. `
     + `You just finished "${taskTitle}", and ${toAgent.name} (${toAgent.role}) needs to know because their own work depends on it. `
     + `Say one short, casual, in-character sentence handing that off to them. Never mention you are an AI or a language model.`;
   try {
@@ -54,7 +54,7 @@ async function requestHandoffLine(fromAgent, toAgent, taskTitle) {
 // to the specific line just said, not a generic acknowledgment.
 async function requestHandoffReply(toAgent, fromAgent, line, taskTitle) {
   const tier = MODEL_TIERS[toAgent.model] || MODEL_TIERS.small;
-  const systemPrompt = `You are ${toAgent.name}, working as ${toAgent.role} in a small village. `
+  const systemPrompt = `You are ${toAgent.name}, working as ${toAgent.role} in a small think tank. `
     + `${fromAgent.name} just told you: "${line}" -- about finishing "${taskTitle}", which your own work depends on. `
     + `Reply with one short, casual, in-character sentence acknowledging it. Never mention you are an AI or a language model.`;
   try {
@@ -81,7 +81,7 @@ async function attemptHandoff(fromId, finishedRoom, finishedTitle) {
   const idleCandidates = AGENT_ROSTER
     // DEDICATED_PROJECT_ROLES (tasks.js) -- same reasoning as
     // assignTaskViaJev/assignPairTask: a hired project specialist
-    // shouldn't be pulled into unrelated ambient village handoffs either.
+    // shouldn't be pulled into unrelated ambient think tank handoffs either.
     .filter(d => !d.isAdmin && d.id !== fromId && !DEDICATED_PROJECT_ROLES.has(d.role))
     // !a.pairWith -- same race as assignTaskViaJev (tasks.js): an agent
     // mid-walk toward a pair session still shows visible/not-busy/no-task
@@ -102,7 +102,7 @@ async function attemptHandoff(fromId, finishedRoom, finishedTitle) {
   if (candidates.length === 0) return false;
 
   const chosenId = (await requestJevChoice(
-    `${AGENTS[fromId].name} just finished "${finishedTitle}", which other work in the village depends on. Pick whoever should be told about it next.`,
+    `${AGENTS[fromId].name} just finished "${finishedTitle}", which other work in the think tank depends on. Pick whoever should be told about it next.`,
     candidates
   ))?.choice;
   if (!chosenId) return false;
@@ -200,7 +200,7 @@ function arriveAtHandoff(id) {
     // them here means the Activity Log (and MEMORY.md's decay-scored
     // history) can actually show what was said, not just that something
     // was.
-    logVillageAction(a.id, 'handoff', { to: h.toId, title: h.title, line, reply });
+    logThinkTankAction(a.id, 'handoff', { to: h.toId, title: h.title, line, reply });
     if (AGENTS[a.id]) {
       AGENTS[a.id].profile.notes.push(`Told ${to.name}: "${line}"`);
       if (AGENTS[a.id].profile.notes.length > 5) AGENTS[a.id].profile.notes.shift();

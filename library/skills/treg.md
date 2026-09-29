@@ -15,17 +15,17 @@ platform Treg catalogs is worth using.
   before the call. No subscription -- pay per call only.
 - Every new team gets **$1.00 in free credit**. The developer's account carries a
   separate $10 balance on top of that.
-- Treg's own architecture already matches this village's confused-deputy vault
+- Treg's own architecture already matches this think tank's confused-deputy vault
   design almost exactly: the caller never holds the upstream provider's key --
-  Treg's proxy injects credentials server-side and relays the request. A village
-  integration would layer the village's OWN vault/capability-handle on top of
-  Treg's key (agent -> village vault -> Treg -> X/LinkedIn), not replace it.
+  Treg's proxy injects credentials server-side and relays the request. A think tank
+  integration would layer the think tank's OWN vault/capability-handle on top of
+  Treg's key (agent -> think tank vault -> Treg -> X/LinkedIn), not replace it.
 - Specific per-endpoint prices vary by provider even within one platform (e.g.
   different X endpoints from different scrapers may not all be exactly $0.001) --
   the catalog shows the exact price for a given endpoint before it's called; don't
   assume every call costs the same without checking.
 
-## Policy for this village
+## Policy for this think tank
 1. Same vault pattern as everything else external: the Treg API key lives
    encrypted server-side; an agent gets a scoped capability handle, never the raw
    key.

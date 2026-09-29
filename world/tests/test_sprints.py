@@ -153,11 +153,11 @@ class SprintHelpers(unittest.TestCase):
 
 class ScrumMasterCondition(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-sprints-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-sprints-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),

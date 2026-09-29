@@ -1,6 +1,6 @@
 """Weekly model probe: run a fixed prompt set through a candidate model and log
 a comparable scoreboard row. This is the "generalist on purpose" practice -- the
-village's home-base model stays put, and once a week you check whether any new
+think tank's home-base model stays put, and once a week you check whether any new
 model earns a real job by running it through the SAME prompts you always use.
 
 Uses serve's own lowest-level chat path (`_post_openrouter_raw`) so the probe
@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import serve as _serve  # noqa: E402
 
-# Fixed set: the same handful of village-real tasks, verbatim every week, so
+# Fixed set: the same handful of think tank-real tasks, verbatim every week, so
 # cross-model rows are comparable (changing the prompts breaks the comparison).
 _DEFAULT_PROMPTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'probe_prompts.md')
 SCORES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'library', 'probe')

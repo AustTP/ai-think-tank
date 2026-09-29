@@ -2,7 +2,7 @@
 
 Previously the idle watcher (`--max-idle-minutes`) EXITED the server, which
 left nothing port-bound to hear a remote wake request -- so resuming the
-village required being physically at a computer. Sleep-not-die changes the
+think tank required being physically at a computer. Sleep-not-die changes the
 action: the process stays up and keeps the port, but the simulation (movement,
 task cycle, content executors, and every model/OpenRouter spend) is skipped
 while DORMANT. ANY request flips it back awake instantly (zero infra, identical

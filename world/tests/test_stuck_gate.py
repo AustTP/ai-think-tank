@@ -11,9 +11,9 @@ governed by _peer_gate_should_close.
 This suite validates the watchdog hermetically. Not actually DB-free:
 _sweep_stuck_gates' rescue path has inline `from serve import log_action`
 calls (task_peer_widened / task_review_requeued), a real side effect that
-writes into whatever real village.db sits at serve.py's default path unless
+writes into whatever real think_tank.db sits at serve.py's default path unless
 DB_PATH is redirected below. Found 2026-09-25 via a live production
-village.db that picked up these exact fixture rows after a routine test run.
+think_tank.db that picked up these exact fixture rows after a routine test run.
 """
 
 import os
@@ -34,11 +34,11 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-stuck-gate-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-stuck-gate-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),

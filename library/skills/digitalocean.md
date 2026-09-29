@@ -27,8 +27,8 @@ charging real money after you think you've stopped.
   pattern (see Gmail SMTP for the reference shape: encrypted credential + scoped,
   revocable handle, secret never leaves the server process).
 
-## Policy for this village
-0. **The master switch.** The village can only reach DigitalOcean at all when
+## Policy for this think tank
+0. **The master switch.** The think tank can only reach DigitalOcean at all when
    `SANDBOX_EXECUTION=digitalocean` in `.env` (default is `local`). While it
    reads `local`, every agent-facing entry point hard-refuses -- no capability
    handle can be minted or resolved, the live balance check never runs, and the

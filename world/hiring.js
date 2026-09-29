@@ -53,8 +53,8 @@ function noteHireBlockedAtCap(adminId) {
   const now = Date.now();
   if (now - lastHireCapNoticeAt < HIRE_CAP_NOTICE_COOLDOWN_MS) return;
   lastHireCapNoticeAt = now;
-  logVillageAction(adminId || 'admin', 'hire_blocked_at_cap', { rosterSize: AGENT_ROSTER.length, max: MAX_TOTAL_AGENTS });
-  showToast(`Village is at its ${MAX_TOTAL_AGENTS}-agent total inventory limit (${AGENT_ROSTER.length} hired) -- no further hires until someone leaves for good.`, 6000);
+  logThinkTankAction(adminId || 'admin', 'hire_blocked_at_cap', { rosterSize: AGENT_ROSTER.length, max: MAX_TOTAL_AGENTS });
+  showToast(`Think Tank is at its ${MAX_TOTAL_AGENTS}-agent total inventory limit (${AGENT_ROSTER.length} hired) -- no further hires until someone leaves for good.`, 6000);
 }
 
 // Model tier metadata -- wired for real via /api/chat (serve.py) and
@@ -74,7 +74,7 @@ const MODEL_TIERS = {
   small: { label: 'loading...', slug: 'amazon/nova-micro-v1' },
   // Per your call (2026-09-25): mid and high/planning replaced with the low
   // band's model -- most agent work doesn't need more than that. Old values
-  // commented out (and preserved in village.db's model_tiers.previous_* columns,
+  // commented out (and preserved in think_tank.db's model_tiers.previous_* columns,
   // same rows) so this is a one-line revert if you change your mind:
   // mid: { label: 'loading...', slug: 'deepseek/deepseek-v4-flash-0731' },
   mid: { label: 'loading...', slug: 'deepseek/deepseek-v4-flash' },
@@ -181,11 +181,11 @@ async function whoNeedsHelp(hirerId) {
 // hire just started (useful for tests/verification), not the hire itself
 // -- the new agent doesn't exist until finishHire() runs.
 async function attemptAutoHire() {
-  // Per your call that an idle village should make no API calls at all:
-  // hiring help for a village with nothing to do is spend with no
+  // Per your call that an idle think tank should make no API calls at all:
+  // hiring help for a think tank with nothing to do is spend with no
   // possible payoff. whoNeedsHelp() below is a real Jev call, so this
   // check has to come before it, not after.
-  if (!villageHasWork()) return false;
+  if (!thinkTankHasWork()) return false;
   const now = Date.now();
   if (now - lastHireAt < HIRE_COOLDOWN_MS) return false;
 
@@ -232,17 +232,17 @@ async function attemptAutoHire() {
 // grounding in what actually exists here, the model defaults to generic,
 // plausible-sounding software-team boilerplate -- "push to the develop
 // branch," "communicate via the project's Slack channel" -- for tools
-// that don't exist anywhere in this village. Same failure shape as an
+// that don't exist anywhere in this think tank. Same failure shape as an
 // agent guessing at a nonexistent global instead of checking (the whole
 // reason page-probe exists), just at hiring time instead of coding time.
 // This is the fix: tell the admin plainly what's real, and forbid
 // inventing what isn't, so the instructions it writes are actually
 // usable by the person who has to follow them.
-const VILLAGE_REAL_MECHANISMS = `Real facts about how work actually happens in this village -- ground the onboarding file in ONLY these, and do not invent a tool or process that isn't listed here (no GitHub, no git branches, no Slack, no ticketing system -- none of that exists): `
+const THINK_TANK_REAL_MECHANISMS = `Real facts about how work actually happens in this think tank -- ground the onboarding file in ONLY these, and do not invent a tool or process that isn't listed here (no GitHub, no git branches, no Slack, no ticketing system -- none of that exists): `
   + `code is written and run via real shell commands in a shared sandbox (not committed to any repository); `
   + `a real page-probe can check what a page's DOM/console actually shows right now, which should be trusted over guessing what a variable or function is named; `
   + `research and reviews get filed as real files in a shared Library, not a wiki or ticket; `
-  + `agents send each other real in-village mail, not chat messages on an external tool.`;
+  + `agents send each other real in-think tank mail, not chat messages on an external tool.`;
 
 // Per your call: the admin who hires someone should be the one who
 // writes their AGENTS.md-equivalent file, not a fixed template -- and if
@@ -265,7 +265,7 @@ async function generateHireProfile(admin, role, helpFor) {
   const usedNames = AGENT_ROSTER.map(d => d.name).join(', ');
   const systemPrompt = `You are ${admin.name}, an admin who just hired someone as "${role}" specifically to help ${helpFor.name} (${helpFor.role}) with overflow work. `
     + `Pick a real, ordinary first name for them -- it must NOT be any of these already-used names: ${usedNames}. `
-    + `Write their onboarding file, reflecting that specific reason for the hire. Keep every field to one short sentence. ${VILLAGE_REAL_MECHANISMS} `
+    + `Write their onboarding file, reflecting that specific reason for the hire. Keep every field to one short sentence. ${THINK_TANK_REAL_MECHANISMS} `
     + `Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: `
     + `{"name":"a single real first name, not already used","mission":"one sentence mission statement","instructions":["one or two short operating instructions"],"notes":["one short onboarding note"]}`;
   try {
@@ -321,7 +321,7 @@ async function finishHire(adminDef, helpFor) {
       mission: `Support ${helpFor.name} (${helpFor.role}) with overflow work.`,
       instructions: [
         `Report to ${helpFor.name} -- pick up whatever they flag as overloaded.`,
-        'Hired via Command Center -- elevated access is scoped to what you\'re helping with, not village-wide.',
+        'Hired via Command Center -- elevated access is scoped to what you\'re helping with, not think tank-wide.',
       ],
       notes: [`Hired by ${admin.name} via Command Center.`],
     };
@@ -361,7 +361,7 @@ async function finishHire(adminDef, helpFor) {
   // only if there's actually room for her to be active. Per your call on
   // 2026-09-20: a large total inventory (MAX_TOTAL_AGENTS) is fine, but
   // only MAX_ACTIVE_AGENTS may be online/awaiting scheduled work at once.
-  // Hiring someone new for overflow help while the village is already at
+  // Hiring someone new for overflow help while the think tank is already at
   // its active ceiling means she joins the inventory dormant, not walking
   // out uselessly into an already-full active roster.
   if (canActivateAnother()) {
@@ -372,7 +372,7 @@ async function finishHire(adminDef, helpFor) {
   }
 
   showToast(`${admin.name} hired ${name} to help ${helpFor.name}.`, 4000);
-  logVillageAction(adminDef.id, 'hire', { hired: id, helping: helpFor.id });
+  logThinkTankAction(adminDef.id, 'hire', { hired: id, helping: helpFor.id });
 }
 
 // A more general hire, built for the finger-drumming project -- the
@@ -403,7 +403,7 @@ async function hireSpecialist(adminId, role, model, missionHint) {
   const usedNames = AGENT_ROSTER.map(d => d.name).join(', ');
   const systemPrompt = `You are ${admin.name}, an admin who just hired someone as "${role}" for a specific project: ${missionHint}. `
     + `Pick a real, ordinary first name for them -- it must NOT be any of these already-used names: ${usedNames}. `
-    + `Write their onboarding file. Keep every field to one short sentence. ${VILLAGE_REAL_MECHANISMS} `
+    + `Write their onboarding file. Keep every field to one short sentence. ${THINK_TANK_REAL_MECHANISMS} `
     + `Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: `
     + `{"name":"a single real first name, not already used","mission":"one sentence mission statement","instructions":["one or two short operating instructions"],"notes":["one short onboarding note"]}`;
   let profile = null;
@@ -470,6 +470,6 @@ async function hireSpecialist(adminId, role, model, missionHint) {
   }
 
   showToast(`${admin.name} hired ${name} as ${role}.`, 4000);
-  logVillageAction(adminId, 'hire', { hired: id, role, model });
+  logThinkTankAction(adminId, 'hire', { hired: id, role, model });
   return id;
 }

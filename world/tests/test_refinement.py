@@ -10,9 +10,9 @@ story (accept) or back to the requester (reject). Runs ungated like the Social
 but no-ops with no pending requests or no scrum master. Deterministic -- no
 Jev, direct _refinement_step calls. NOT actually DB-free: _refinement_step's
 carry-away/logging path has inline `from serve import log_action` calls, a
-real side effect that writes into whatever real village.db sits at serve.py's
+real side effect that writes into whatever real think_tank.db sits at serve.py's
 default path unless DB_PATH is redirected below. Found 2026-09-25 via a live
-production village.db that picked up test fixture rows after a routine
+production think_tank.db that picked up test fixture rows after a routine
 `tests/run_all.sh` run.
 """
 import os
@@ -33,11 +33,11 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-refinement-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-refinement-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
@@ -234,7 +234,7 @@ class RefinementResolve(unittest.TestCase):
     def test_reject_carryaway_logs_self_proposed_rejected_signal(self):
         # Absolute Zero rejection signal: a groomed-out self-proposal is logged
         # with an explicit marker the health check counts (a rising reject rate
-        # = the village's own proposals trending trivial).
+        # = the think tank's own proposals trending trivial).
         state, _req = self._convened()
         with serve._db() as conn:
             conn.execute("DELETE FROM action_log WHERE action = 'refinement_carryaway'")

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AI Village — World 2 (experimental)</title>
+<title>AI Think Tank — World (experimental)</title>
 <style>
   html, body {
     margin: 0;
@@ -279,7 +279,7 @@
   <p>Arrow keys / WASD, or the pad above, to walk. This is an experimental,
      standalone second map -- a whole-scene generated background image with
      collision auto-mapped by a segmentation model, separate from the main
-     village. Walk into a building's entrance to step inside its room; walk
+     think tank. Walk into a building's entrance to step inside its room; walk
      off the bottom edge of a room to leave it. Walk into Town Hall to call
      a meeting -- everyone you invite (and you) vanishes from the map for
      the duration, and reappears somewhere new when the call ends. Agents
@@ -295,7 +295,7 @@
 </div>
 
 <div id="hudBar">
-  <div class="hud-pill"><span class="label">VILLAGERS</span><span class="value" id="hudVillagers">0</span></div>
+  <div class="hud-pill"><span class="label">RESEARCHERS</span><span class="value" id="hudResearchers">0</span></div>
   <div class="hud-pill"><span class="label">WORKING</span><span class="value" id="hudWorking">0</span></div>
   <div class="hud-pill" title="Tasks currently walking-to or working (tasks.js)"><span class="label">OPEN WORK</span><span class="value" id="hudOpenWork">0</span></div>
   <div class="hud-pill"><span class="label">MORALE</span><span class="value" id="hudMorale">0</span></div>
@@ -325,7 +325,7 @@
 
 <div id="rosterListModal" class="modal hidden">
   <div class="modal-box">
-    <h3 id="rosterListTitle">Village Roster</h3>
+    <h3 id="rosterListTitle">Think Tank Roster</h3>
     <div class="roster-list" id="rosterListBody"></div>
     <div class="modal-actions">
       <button id="rosterListCloseBtn">Close</button>
@@ -1272,7 +1272,7 @@ async function handleLibraryWrite() {
   try {
     await writeLibraryFile('player', path, content);
     statusEl.textContent = `Saved ${path}.`;
-    logVillageAction('player', 'library_write', { path });
+    logThinkTankAction('player', 'library_write', { path });
     renderLibraryFileList();
   } catch (e) {
     statusEl.textContent = 'Save failed.';
@@ -1303,7 +1303,7 @@ async function handleLibraryIngest() {
       statusEl.textContent = `Failed: ${data.error}`;
     } else {
       statusEl.textContent = `Ingested ${data.okCount}/${data.totalCount} file(s).`;
-      logVillageAction('player', 'library_ingest', { sourcePath, okCount: data.okCount, totalCount: data.totalCount });
+      logThinkTankAction('player', 'library_ingest', { sourcePath, okCount: data.okCount, totalCount: data.totalCount });
       renderLibraryFileList();
     }
   } catch (e) {
@@ -1345,7 +1345,7 @@ function closeMailbox() {
 }
 
 // Bank teller -- no real currency/economy system exists anywhere in
-// World 2 (confirmed: nothing tracks a balance), so per your call for
+// World (confirmed: nothing tracks a balance), so per your call for
 // "multiple options," Check Balance and Make a Deposit are honest flavor
 // text rather than a fake ledger. Report Irregular Activity is the one
 // genuinely mechanical option -- it logs a real, timestamped entry to the
@@ -1419,7 +1419,7 @@ function showTellerReportForm() {
     const about = document.getElementById('tellerReportAbout').value;
     const note = document.getElementById('tellerReportNote').value.trim();
     if (!note) return;
-    logVillageAction('player', 'bank_report_filed', { tellerIndex: activeTellerIndex, about: about || null, note });
+    logThinkTankAction('player', 'bank_report_filed', { tellerIndex: activeTellerIndex, about: about || null, note });
     appendTellerLine('> Report Irregular Activity');
     appendTellerLine(`"Thank you, this has been logged${about ? ' concerning ' + AGENTS[about].name : ''}."`);
     renderTellerMenu();
@@ -1464,7 +1464,7 @@ function openBoard() {
   boardRefreshTimer = setInterval(renderBoard, 2000);
 }
 
-// Real village status, not the static placeholder text this used to be --
+// Real think tank status, not the static placeholder text this used to be --
 // straight off TASKS/AGENTS, the same live objects everything else reads,
 // not a separate summary someone has to remember to update.
 function renderBoard() {
@@ -1714,7 +1714,7 @@ function closeBoard() {
   state.player.y = door.y + door.h + 6;
 }
 
-// Phone Booth -- no physical object for this exists anywhere in World 2's
+// Phone Booth -- no physical object for this exists anywhere in World's
 // generated background image (confirmed: no `callbooth` entry in
 // door_triggers.json, unlike the main game's hand-placed sprite building),
 // so this is a HUD-button dialog, same access pattern as Command Center's
@@ -1762,7 +1762,7 @@ function callAgent(agentId) {
   if (a.offDuty) {
     a.offDuty = false;
     a.visible = true;
-    logVillageAction('player', 'phone_wake', { agentId });
+    logThinkTankAction('player', 'phone_wake', { agentId });
   }
   closePhoneBooth();
   openConversation(agentId, true);
@@ -1844,7 +1844,7 @@ function closeActivity() {
 }
 
 // Player Inbox (2026-09-28): the one place agents can genuinely block the
-// village waiting on YOU -- a director-gated question the agent couldn't
+// think tank waiting on YOU -- a director-gated question the agent couldn't
 // resolve internally (sim.py _deliver_player_ask). Until this panel existed
 // the questions were filed server-side and the player was emailed, but the
 // UI to actually answer them was missing, so an awaiting question left the
@@ -2022,14 +2022,14 @@ async function handleBigTaskDelegate() {
   btn.disabled = false;
 }
 
-// Player-triggered publish. Freezes the village's released work (projects,
+// Player-triggered publish. Freezes the think tank's released work (projects,
 // wiki pages, skills) and pushes it to the configured private GitHub repo.
 // This is a real network push -- nothing leaves the machine unless the player
 // explicitly clicks publish, so agents stay scoped to their own work.
 async function handlePublish() {
   const statusEl = document.getElementById('publishStatus');
   const btn = document.getElementById('publishBtn');
-  if (!confirm('Push the village\'s released work (released projects, wiki pages, skills) to your configured private GitHub repo?\n\nThis is a real push to GitHub.')) return;
+  if (!confirm('Push the think tank\'s released work (released projects, wiki pages, skills) to your configured private GitHub repo?\n\nThis is a real push to GitHub.')) return;
   btn.disabled = true;
   statusEl.textContent = 'Staging and pushing...';
   try {
@@ -2177,7 +2177,7 @@ function renderConversationLog() {
 // (hiring.js's MODEL_TIERS) rather than one model for everyone.
 async function requestAgentReply(agent, log) {
   const tier = MODEL_TIERS[agent.model] || MODEL_TIERS.small;
-  const systemPrompt = `You are ${agent.name}, working as ${agent.role} in a small village. `
+  const systemPrompt = `You are ${agent.name}, working as ${agent.role} in a small think tank. `
     + `Your mission: ${agent.profile.mission} `
     + `Stay fully in character: keep replies short (1-3 sentences), casual, and specific to your role. `
     + `Never mention that you are an AI or a language model.`;
@@ -2283,7 +2283,7 @@ async function maybeUpdateNotesFromConversation(agentId) {
     if (!note || note.toUpperCase() === 'NONE') return;
     a.profile.notes.push(note);
     if (a.profile.notes.length > 5) a.profile.notes.shift();
-    logVillageAction(agentId, 'notes_updated', { source: 'conversation', note });
+    logThinkTankAction(agentId, 'notes_updated', { source: 'conversation', note });
   } catch (e) {
     // best-effort -- a missed note shouldn't affect the conversation itself
   }
@@ -2366,7 +2366,7 @@ function closeRosterList() {
 }
 
 function renderRosterList() {
-  document.getElementById('rosterListTitle').textContent = `Village Roster — Morale ${villageMorale()}`;
+  document.getElementById('rosterListTitle').textContent = `Think Tank Roster — Morale ${thinkTankMorale()}`;
   const body = document.getElementById('rosterListBody');
   body.innerHTML = '';
   for (const def of AGENT_ROSTER) {
@@ -2528,7 +2528,7 @@ function showReportForm(agentId, quote) {
     const fromId = document.getElementById('reportFromSelect').value;
     const note = document.getElementById('reportNoteInput').value;
     fileReport(agentId, fromId, quote, note);
-    logVillageAction(fromId, 'report_filed', { about: agentId, quote });
+    logThinkTankAction(fromId, 'report_filed', { about: agentId, quote });
     form.remove();
     renderReportsSection(agentId);
     renderStatusSection(agentId); // a new report changes this agent's morale
@@ -2856,7 +2856,7 @@ function update(dt) {
   // Agents move independently of whatever the player is doing. Under the
   // Phase-2 flip the SERVER is the mover (sim.owner == 'server'): it advances
   // positions every SIM_TICK_S and the client only smooths toward them, so
-  // the village keeps simulating with the browser closed. Before the flip the
+  // the think tank keeps simulating with the browser closed. Before the flip the
   // client drives tickAgentMovement directly (today's behavior). Both sides
   // agree on authority by keying off the same owner flag.
   const serverOwns = typeof SIM_STATUS !== 'undefined' && SIM_STATUS && SIM_STATUS.owner === 'server';
@@ -3142,7 +3142,7 @@ async function main() {
     setInterval(runTaskCycle, 6000);
     // Deliberately its own interval call, not folded into runTaskCycle
     // itself -- runTaskCycleBody short-circuits before any call at all when
-    // WORK_QUEUE has nothing due yet (the idle-village-spends-nothing
+    // WORK_QUEUE has nothing due yet (the idle-think tank-spends-nothing
     // contract), but a standing research topic's cadence needs checking
     // regardless of whatever's already queued. checkResearchSchedule()
     // itself makes zero calls either way -- it only ever turns a due topic
@@ -3225,13 +3225,13 @@ async function main() {
     // hiring.js), not the total hired roster -- the whole point of a much
     // larger hireable inventory with only some agents present at once is
     // that this number should visibly drop when someone clocks off and
-    // rise again when the village calls them back in. Only count VISIBLE
+    // rise again when the think tank calls them back in. Only count VISIBLE
     // busy agents: an off-duty agent is invisible, so a stale `busy` flag
     // on a resting agent (a known ghost, e.g. theo parked at the origin)
     // must not count as someone actually working.
-    document.getElementById('hudVillagers').textContent = activeAgentCount();
+    document.getElementById('hudResearchers').textContent = activeAgentCount();
     document.getElementById('hudWorking').textContent = Object.values(AGENTS).filter(a => a.busy && a.visible).length;
-    document.getElementById('hudMorale').textContent = villageMorale();
+    document.getElementById('hudMorale').textContent = thinkTankMorale();
     document.getElementById('hudReports').textContent = REPORTS.length;
     document.getElementById('hudMail').textContent = Object.values(AGENTS).reduce((sum, a) => sum + a.mailbox.filter(m => !m.read).length, 0);
     document.getElementById('hudOpenWork').textContent = Object.values(TASKS).filter(t => t.status !== 'done').length;
@@ -3360,7 +3360,7 @@ async function main() {
       if (msg !== lastLoopErrorMsg || t - lastLoopErrorLoggedAt > 30000) {
         lastLoopErrorMsg = msg;
         lastLoopErrorLoggedAt = t;
-        logVillageAction('system', 'frame_error', { message: msg, stack: ((e && e.stack) || '').slice(0, 500) });
+        logThinkTankAction('system', 'frame_error', { message: msg, stack: ((e && e.stack) || '').slice(0, 500) });
       }
     }
     requestAnimationFrame(frame);

@@ -5,11 +5,11 @@ approved deliverable this week (weekApprovals > 0). Attendees return exactly to
 their prior state on resolve: a mid-task worker keeps her task (budget extended),
 an off-duty agent is woken for the event and returned off-duty, an idle on-duty
 one returns to idle. Runs ungated (the event is the point even on an idle
-village). Deterministic -- no Jev, direct _social_step calls. NOT actually
+think tank). Deterministic -- no Jev, direct _social_step calls. NOT actually
 DB-free: the carry-away/digest logging path has inline `from serve import
 log_action` calls, a real side effect that writes into whatever real
-village.db sits at serve.py's default path unless DB_PATH is redirected
-below. Found 2026-09-25 via a live production village.db that picked up test
+think_tank.db sits at serve.py's default path unless DB_PATH is redirected
+below. Found 2026-09-25 via a live production think_tank.db that picked up test
 fixture rows after a routine `tests/run_all.sh` run.
 """
 import os
@@ -30,11 +30,11 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-social-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-social-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),

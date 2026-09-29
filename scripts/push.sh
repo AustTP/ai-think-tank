@@ -5,7 +5,7 @@
 # (line-grep, NOT `. .env` -- SEED_ROSTER contains pipes that bash would
 # misparse as a pipeline) and pushes with the token in the URL:
 #
-#   git -c credential.helper= push "https://x-access-token:${GITHUB_TOKEN}@github.com/AustTP/ai-village.git" main
+#   git -c credential.helper= push "https://x-access-token:${GITHUB_TOKEN}@github.com/AustTP/ai-think-tank.git" main
 #
 # Usage: ./scripts/push.sh [branch]   (defaults to main)
 set -euo pipefail
@@ -16,4 +16,4 @@ if [ -z "$GITHUB_TOKEN" ]; then
     exit 1
 fi
 BRANCH="${1:-main}"
-git -c credential.helper= push "https://x-access-token:${GITHUB_TOKEN}@github.com/AustTP/ai-village.git" "$BRANCH"
+git -c credential.helper= push "https://x-access-token:${GITHUB_TOKEN}@github.com/AustTP/ai-think-tank.git" "$BRANCH"

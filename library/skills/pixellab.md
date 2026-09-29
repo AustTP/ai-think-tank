@@ -19,7 +19,7 @@ product).
   "high top-down"), `template_id`. Returns `character_id` + a
   `background_job_id`; poll `GET /background-jobs/{id}` until
   `status: "completed"`, then `GET /characters/{character_id}` for
-  `rotation_urls` keyed by direction. This is the ONLY endpoint the village's
+  `rotation_urls` keyed by direction. This is the ONLY endpoint the think tank's
   existing spike script (`scripts/pixellab_spike.py`) has actually exercised
   and confirmed working -- read that file for a real, tested call shape before
   writing a new one from scratch.
@@ -40,7 +40,7 @@ product).
   existing `poll_job()` helper in the spike script is a reasonable pattern
   (3s interval, generous timeout).
 
-## Policy for this village
+## Policy for this think tank
 1. Same vault pattern as everything else external: agents get a scoped
    capability handle (`api.pixellab.ai`, GET+POST), never the raw key.
 2. This is a real, metered paid API -- log every generation call's real cost

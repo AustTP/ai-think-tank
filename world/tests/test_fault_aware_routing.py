@@ -7,8 +7,8 @@ that's the grading system's job) and a SOFT preference, never a hard lock: if
 every eligible candidate is currently cooling down, assignment falls back to
 the plain round-robin pick rather than ever blocking real work.
 
-Isolated the same way tests/test_oncall.py is (a real village.db side effect
-lives inside _assign_due_item via serve.log_action) -- DB_PATH/VILLAGE_DIR/etc
+Isolated the same way tests/test_oncall.py is (a real think_tank.db side effect
+lives inside _assign_due_item via serve.log_action) -- DB_PATH/THINK_TANK_DIR/etc
 redirected to a temp dir for the whole module.
 """
 
@@ -30,11 +30,11 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-fault-routing-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-fault-routing-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),

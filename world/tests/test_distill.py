@@ -1,10 +1,10 @@
 """Tests for the hive-mind distillation loop (2026-09-25).
 
-The village shares storage (library/archive/) and injects wiki context before a
+The think tank shares storage (library/archive/) and injects wiki context before a
 task acts, but had no step that *merges* many past findings into living,
 synthesized knowledge. Distillation is that step: a cadence-driven task reads
 the archive files written since the last run, LLM-synthesizes them (plus the
-current village wiki) into an updated wiki page, and persists it as server
+current think tank wiki) into an updated wiki page, and persists it as server
 authority so inject_wiki_context feeds the merged knowledge back to every
 subsequent agent.
 
@@ -16,9 +16,9 @@ Covered here:
    would otherwise be silently dropped).
 3. `_run_distill_content` reads only archive files NEWER than `distillSince`
    and caps at `_DISTILL_MAX_ARCHIVES`.
-4. On synthesis it writes a village wiki page via serve._write_wiki_server,
+4. On synthesis it writes a think tank wiki page via serve._write_wiki_server,
    records the distilled count, and the writer is called with category
-   'village' (so inject_wiki_context injects it village-wide).
+   'think_tank' (so inject_wiki_context injects it think tank-wide).
 5. noop guards: no new archives -> no wiki write; model returns nothing -> no
    wiki write.
 """
@@ -44,7 +44,7 @@ def _state(**over):
         'researchTopics': [],
         'tasks': {},
         'workQueue': [],
-        'wiki': {'pages': {}, 'categories': {'village': {}, 'workroom': {},
+        'wiki': {'pages': {}, 'categories': {'think_tank': {}, 'workroom': {},
                                              'observatory': {}}},
     }
     base.update(over)
@@ -52,7 +52,7 @@ def _state(**over):
 
 
 def _distill_task(**over):
-    task = {'id': 'task-d1', 'title': 'Distill recent village knowledge',
+    task = {'id': 'task-d1', 'title': 'Distill recent think tank knowledge',
             'room': 'observatory', 'instructions': 'merge findings',
             'distill': True, 'distillSince': 0}
     task.update(over)
@@ -166,7 +166,7 @@ class DistillQueueWhitelist(unittest.TestCase):
     def test_distill_fields_survive_queue_work(self):
         state = _state()
         sim.queue_work(state, [{
-            'title': 'Distill recent village knowledge', 'room': 'observatory',
+            'title': 'Distill recent think tank knowledge', 'room': 'observatory',
             'instructions': 'merge findings', 'distill': True,
             'distillSince': 123456,
         }])
@@ -176,8 +176,8 @@ class DistillQueueWhitelist(unittest.TestCase):
 
 
 class DistillExecutor(unittest.TestCase):
-    def _run(self, archive_files, village_body='',
-             model_reply='# Village knowledge\n\nMerged.', since=0):
+    def _run(self, archive_files, think_tank_body='',
+             model_reply='# Think Tank knowledge\n\nMerged.', since=0):
         """Temp LIBRARY_DIR, mocked model call + server wiki-write, run executor.
 
         The /api/chat mock ECHOES the sources it was handed (call_args[0][2][-1])
@@ -186,7 +186,7 @@ class DistillExecutor(unittest.TestCase):
         Returns (write_wiki_mock, captured_content_result)."""
         tmp = tempfile.mkdtemp()
         archive_dir = os.path.join(tmp, 'archive')
-        wiki_dir = os.path.join(tmp, 'wiki', 'village')
+        wiki_dir = os.path.join(tmp, 'wiki', 'think_tank')
         os.makedirs(archive_dir, exist_ok=True)
         os.makedirs(wiki_dir, exist_ok=True)
         for fn, body, mtime_s in archive_files:
@@ -194,9 +194,9 @@ class DistillExecutor(unittest.TestCase):
             with open(p, 'w') as f:
                 f.write(body)
             os.utime(p, (mtime_s, mtime_s))
-        if village_body:
+        if think_tank_body:
             with open(os.path.join(wiki_dir, 'state-of-knowledge.md'), 'w') as f:
-                f.write(village_body)
+                f.write(think_tank_body)
 
         import serve as serve_mod
 
@@ -220,8 +220,8 @@ class DistillExecutor(unittest.TestCase):
                                return_value='k'), \
              mock.patch.object(serve_mod, '_write_wiki_server',
                                return_value={'id': 'state-of-knowledge',
-                                             'title': 'Village state of knowledge',
-                                             'category': 'village',
+                                             'title': 'Think Tank state of knowledge',
+                                             'category': 'think_tank',
                                              'version': 3}) as wk, \
              mock.patch.object(sim, '_store_content_result',
                                side_effect=lambda _tid, res: captured.update(res)):
@@ -230,14 +230,14 @@ class DistillExecutor(unittest.TestCase):
             _run_distill_content(snapshot, 'ada', _distill_task(distillSince=since))
         return wk, captured, system_messages.get('system', '')
 
-    def test_reads_newest_archives_and_writes_village_wiki(self):
+    def test_reads_newest_archives_and_writes_think_tank_wiki(self):
         recent = ('new.md', 'NEW: butterflies migrate', int(_NOW_MS / 1000) - 100)
         wk, captured, _sys = self._run([recent])
         self.assertEqual(wk.call_count, 1)
         (page_id, title, category, _body), _k = wk.call_args
         self.assertEqual(page_id, 'state-of-knowledge')
-        self.assertEqual(category, 'village',
-                         'village category -> injected village-wide by affinity')
+        self.assertEqual(category, 'think_tank',
+                         'think tank category -> injected think tank-wide by affinity')
         self.assertEqual(captured.get('distilled'), 1)
         self.assertNotIn('noop', captured)
 
@@ -282,12 +282,12 @@ class DistillExecutor(unittest.TestCase):
         self.assertEqual(sum(f'F{i}' in body for i in range(40)), 25,
                          'input capped at _DISTILL_MAX_ARCHIVES (25)')
 
-    def test_merges_current_village_wiki_into_the_llm_call(self):
-        # The current village page is passed to the synthesis model (via the
+    def test_merges_current_think_tank_wiki_into_the_llm_call(self):
+        # The current think tank page is passed to the synthesis model (via the
         # system prompt) so the merge is INCREMENTAL, not a from-scratch rewrite.
         recent = ('new.md', 'NEW finding', int(_NOW_MS / 1000) - 100)
         _wk, _c, system_content = self._run(
-            [recent], village_body='# Village state of knowledge\n\nKNOWN baseline.')
+            [recent], think_tank_body='# Think Tank state of knowledge\n\nKNOWN baseline.')
         self.assertIn('KNOWN baseline', system_content,
                       'current wiki is fed to the synthesis model for an incremental merge')
 
@@ -381,7 +381,7 @@ class DistillCsvPreservation(unittest.TestCase):
              mock.patch.object(serve_mod, 'get_or_create_agent_key', return_value='k'), \
              mock.patch.object(serve_mod, '_write_wiki_server',
                                return_value={'id': 'state-of-knowledge', 'title': 't',
-                                             'category': 'village', 'version': 1}) as wk, \
+                                             'category': 'think_tank', 'version': 1}) as wk, \
              mock.patch.object(sim, '_store_content_result'):
             from content import _run_distill_content
             _run_distill_content({'agents': {}}, 'ada', _distill_task(distillSince=since))

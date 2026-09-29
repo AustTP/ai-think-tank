@@ -8,11 +8,11 @@ pipeline.
 
 Hermetic: the model call (_post_openrouter_raw), the weather fetch
 (_weather_fetch), the DB, and the player session are all mocked or sandboxed
-so no live network/village is touched. The "DB...mocked" claim only covered
+so no live network/think tank is touched. The "DB...mocked" claim only covered
 the READ side (get_state_from_db is patched per-test); save_state_to_db and
 log_action were never mocked and go straight to serve.py's real DB_PATH via
 TestClient(serve.app), so a write during any of these tests landed in a real
-village.db. Found 2026-09-25 via a live production village.db that picked up
+think_tank.db. Found 2026-09-25 via a live production think_tank.db that picked up
 "player ask" log rows after a routine test run; DB_PATH is now redirected
 below so even an unmocked write lands in a throwaway temp file.
 """
@@ -35,11 +35,11 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-ask-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-ask-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
@@ -68,7 +68,7 @@ def _state(**over):
         'agentRoster': roster,
         'agents': {a['id']: {'id': a['id'], 'name': a['name'], 'role': a['role'],
                              'offDuty': False, 'busy': False, 'task': None,
-                             'pairWith': None, 'profile': {'mission': 'help the village'}}
+                             'pairWith': None, 'profile': {'mission': 'help the think tank'}}
                    for a in roster},
         'workQueue': [],
         'tasks': {},
@@ -270,7 +270,7 @@ class WebToolsExecutorBrowsePage(unittest.TestCase):
 
 class AskEndpoint(unittest.TestCase):
     """Endpoint via TestClient with a real player session, state + model +
-    weather all mocked (no live village / no live network), mirroring the
+    weather all mocked (no live think tank / no live network), mirroring the
     clarify endpoint suite's hermetic pattern."""
 
     def setUp(self):

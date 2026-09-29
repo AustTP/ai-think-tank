@@ -145,7 +145,7 @@ await test('attemptAutoFiringReview does not start while one admin is off duty, 
   // unconditionally sets visible=true on completion without ever
   // restoring offDuty, leaving her stuck offDuty=true/visible=true
   // simultaneously -- an impossible combination.
-  setGlobal('villageHasWork', () => true);
+  setGlobal('thinkTankHasWork', () => true);
   setGlobal('AGENT_ROSTER', [
     { id: 'admin1', isAdmin: true }, { id: 'admin2', isAdmin: true }, { id: 'dev', isAdmin: false },
   ]);

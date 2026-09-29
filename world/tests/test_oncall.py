@@ -15,8 +15,8 @@ NON-GATED incident. This suite validates the routing hermetically:
 Not actually hermetic against the real DB despite the plain-dict states used
 throughout: _assign_due_item's assignment path has an inline `from serve
 import log_action` call, a real side effect that writes into whatever real
-village.db sits at serve.py's default path unless DB_PATH is redirected
-below. Found 2026-09-25 via a live production village.db that picked up a
+think_tank.db sits at serve.py's default path unless DB_PATH is redirected
+below. Found 2026-09-25 via a live production think_tank.db that picked up a
 test fixture row after a routine test run.
 """
 
@@ -38,11 +38,11 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-oncall-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-oncall-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),

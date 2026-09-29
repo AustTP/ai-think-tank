@@ -60,7 +60,7 @@ await test('a topic not yet due queues nothing and leaves lastRunAt untouched', 
 });
 
 await test('a due topic queues a real WORK_QUEUE item carrying its topicId, and stamps lastRunAt immediately', () => {
-  setGlobal('RESEARCH_TOPICS', [{ id: 'topic-2', topic: 'village governance', startUrl: 'https://example.com', cadenceMs: 1000, lastRunAt: 0, seenUrls: [] }]);
+  setGlobal('RESEARCH_TOPICS', [{ id: 'topic-2', topic: 'think tank governance', startUrl: 'https://example.com', cadenceMs: 1000, lastRunAt: 0, seenUrls: [] }]);
   setGlobal('WORK_QUEUE', []);
   checkResearchSchedule();
   const queue = getGlobal('WORK_QUEUE');
@@ -111,7 +111,7 @@ await test('TASKS[id].research matches what was passed through', () => {
   setGlobal('_resolveRoomWithOverflow', (room) => room);
   setGlobal('ROOM_DOOR_TRIGGERS', { observatory: { x: 100, y: 100, w: 16, h: 16 } });
   setGlobal('findPath', () => [{ x: 90, y: 108 }]);
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
   setGlobal('AGENTS', { dev: { id: 'dev', busy: false, task: null, x: 0, y: 0 } });
   const task = assignTask('dev', 'Scheduled research: x', 'observatory', 'instructions', 'x', { research: { topicId: 'topic-9' } });
   assert.deepEqual(task.research, { topicId: 'topic-9' });
@@ -120,7 +120,7 @@ await test('TASKS[id].research matches what was passed through', () => {
 console.log('\nrunResearchTask: the scheduled crawl + skill-file synthesis branch (2026-09-21)');
 
 await test('collects pages, updates seenUrls, and writes an externally-sourced skill file', async () => {
-  const topic = { id: 'topic-4', topic: 'village governance', startUrl: 'https://example.com', linkKeyword: '', pageKeyword: '', seenUrls: ['https://example.com/old'] };
+  const topic = { id: 'topic-4', topic: 'think tank governance', startUrl: 'https://example.com', linkKeyword: '', pageKeyword: '', seenUrls: ['https://example.com/old'] };
   setGlobal('RESEARCH_TOPICS', [topic]);
   setGlobal('AGENTS', { dev: { id: 'dev', name: 'Dev', profile: { notes: [] } } });
   setGlobal('RESEARCH_SANDBOX_ID', 'research-shared');
@@ -136,7 +136,7 @@ await test('collects pages, updates seenUrls, and writes an externally-sourced s
     // would see the post-mutation state instead of what was actually
     // passed in.
     crawlArgs = { agentId, sandboxId, startUrl, opts: { ...opts, skipUrls: [...opts.skipUrls] } };
-    return { ok: true, pagesVisited: 2, pagesKept: 1, pages: [{ url: 'https://example.com/new', text: 'Real new content about village governance.' }], manifestPath: 'downloads/manifest.json' };
+    return { ok: true, pagesVisited: 2, pagesKept: 1, pages: [{ url: 'https://example.com/new', text: 'Real new content about think tank governance.' }], manifestPath: 'downloads/manifest.json' };
   });
   setGlobal('readLibraryFile', async () => 'EXISTING SKILL CONTENT');
   setGlobal('pickModelTierForAction', async () => ({ slug: 'test/research-model', label: 'test' }));
@@ -147,7 +147,7 @@ await test('collects pages, updates seenUrls, and writes an externally-sourced s
     return { ok: true, json: async () => ({}) };
   });
 
-  const task = { id: 'task-research-4', title: 'Scheduled research: village governance', research: { topicId: 'topic-4', since: 1758000000000 } };
+  const task = { id: 'task-research-4', title: 'Scheduled research: think tank governance', research: { topicId: 'topic-4', since: 1758000000000 } };
   await runResearchTask('dev', task);
 
   assert.ok(crawlArgs, 'expected a real crawlAndCollect call');

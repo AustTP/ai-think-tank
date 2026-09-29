@@ -1,9 +1,9 @@
-"""World 2's dev server -- a small FastAPI app now, not a plain
+"""World's dev server -- a small FastAPI app now, not a plain
 http.server, since Phase 2 needs a real backend: agent/meeting/report
 state should persist across a refresh (it's all lived in browser memory
 until now) and, eventually, API keys need to live server-side rather than
 in browser-served JS (see DESIGN.md's Open Decisions -- an OpenRouter key
-already exists in ~/ai-village/.env, held there specifically because
+already exists in ~/ai-think-tank/.env, held there specifically because
 nothing under world/ is a safe place for it until this backend actually
 makes the calls). Same invocation as before: python3 serve.py [port]
 (default 8936).
@@ -11,7 +11,7 @@ makes the calls). Same invocation as before: python3 serve.py [port]
 Still accepts POST /save (editor.html, the collision grid) and POST
 /save-doors (door_editor.html, the door trigger rectangles) exactly as
 before. Agent/meeting/report state and a comprehensive activity log both
-live in ~/ai-village/village.db (SQLite) now, not state.json or the
+live in ~/ai-think-tank/think_tank.db (SQLite) now, not state.json or the
 scattered per-feature .jsonl log files that came before it.
 """
 import asyncio
@@ -90,48 +90,48 @@ from fastapi.staticfiles import StaticFiles
 from typing import Optional
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-VILLAGE_DIR = os.path.dirname(ROOT)
+THINK_TANK_DIR = os.path.dirname(ROOT)
 # Deliberately OUTSIDE world/ -- same reasoning as the .env API key: this
 # directory is served to the browser as static files, so anything under it
 # is visible via view-source. A database of what agents actually did is
 # exactly the kind of thing that must never be publicly fetchable.
-SANDBOXES_DIR = os.path.join(VILLAGE_DIR, 'sandboxes')
-ESCALATIONS_PATH = os.path.join(VILLAGE_DIR, 'escalations.json')
-DB_PATH = os.path.join(VILLAGE_DIR, 'village.db')
+SANDBOXES_DIR = os.path.join(THINK_TANK_DIR, 'sandboxes')
+ESCALATIONS_PATH = os.path.join(THINK_TANK_DIR, 'escalations.json')
+DB_PATH = os.path.join(THINK_TANK_DIR, 'think_tank.db')
 # The Library's real capability -- per your call, a shared file directory
 # any agent can read from or write to (code, notes, completed-task
 # records), with archive/ specifically for completed tasks. Same
 # "deliberately outside world/" reasoning as everything else here.
-LIBRARY_DIR = os.path.join(VILLAGE_DIR, 'library')
+LIBRARY_DIR = os.path.join(THINK_TANK_DIR, 'library')
 LIBRARY_ARCHIVE_DIR = os.path.join(LIBRARY_DIR, 'archive')
 # Immutable "product passport" -- a hash chain of every file promoted to the
 # trusted Library (your EU-digital-product-passport analogy, issue #4). Each
 # promoted file's content hash is appended as a block whose index links to the
 # previous block's hash, so tampering with or silently deleting any promoted
 # file breaks the chain and is detectable. No mining/consensus -- it's a
-# lightweight, auditable chain-of-blocks for one village.
+# lightweight, auditable chain-of-blocks for one think tank.
 PASSPORT_PATH = os.path.join(LIBRARY_DIR, '.passport.json')
 
 # ---------------------------------------------------------------------------
 # Operational guardrails (2026-09-23). Two electric fences around the LIVE
-# village store, because a long-running state-bearing server with real model
+# think tank store, because a long-running state-bearing server with real model
 # spend is exactly the thing that silently eats money or loses state when
 # nobody is watching it:
-#   1) DB_BACKUP_DIR -- an automated `village.db` checkpoint (sqlite .backup,
+#   1) DB_BACKUP_DIR -- an automated `think_tank.db` checkpoint (sqlite .backup,
 #      safe under WAL) goes here on a timer AND on clean shutdown, rotated to
 #      the last DB_BACKUP_KEEP. This closes the "2-day-stale manual .bak"
 #      hole: a crash no longer forfeits everything since the last human copy.
 #   2) _MAX_IDLE_MINUTES -- when set (serve.py --max-idle-minutes N), the
 #      server goes DORMANT after N minutes of no HTTP request at all (touched
 #      in the no_store middleware, so it's any request, authed or not). This
-#      turns the standing "pause the village when I'm away + wake it on a remote
+#      turns the standing "pause the think tank when I'm away + wake it on a remote
 #      request" rule into an enforced default instead of a manual habit. It is a
 #      SLEEP, not an exit: the process stays up and port-bound so any request
-#      (e.g. to the admin, from a phone) flips the village back awake instantly
+#      (e.g. to the admin, from a phone) flips the think tank back awake instantly
 #      -- no cold start, no need to be at a computer. Only the simulation is
 #      paused (no movement, no task cycle, no model spend); the DB checkpoint
 #      and handle-expiry keep running.
-DB_BACKUP_DIR = os.path.join(VILLAGE_DIR, 'village-db-backups')
+DB_BACKUP_DIR = os.path.join(THINK_TANK_DIR, 'think-tank-db-backups')
 DB_BACKUP_KEEP = 24
 DB_BACKUP_INTERVAL_S = 5 * 60
 # Log retention (2026-09-27): decision_tape and action_log are append-only audit
@@ -146,7 +146,7 @@ LOG_PRUNE_INTERVAL_S = 6 * 3600          # twice a day is plenty for a rolling p
 LOG_PRUNE_MAX_ROWS = 50_000              # cap per run so a big backlog can't block the loop
 _LAST_LOG_PRUNE = None
 # Daily model-tier re-pick (2026-09-27): the OpenRouter catalog + prices move
-# fast, and the player explicitly wants the village to re-derive the best
+# fast, and the player explicitly wants the think tank to re-derive the best
 # value pick per band from that day's scores AND prices rather than freezing
 # a stale choice. refresh_model_tiers() already does exactly that (best score
 # within the band's quality floor, then cheapest); this loop just runs it once
@@ -157,12 +157,12 @@ _LAST_REQUEST_TIME = None  # touched by the no_store middleware below
 # Sleep-not-die (2026-09-24). When --max-idle-minutes elapses, the server does
 # NOT exit -- that would leave nothing bound to the port to hear a remote wake
 # request, forcing you to be at a computer to restart it. Instead it goes
-# DORMANT: the process stays alive and keeps the port bound, but the village
+# DORMANT: the process stays alive and keeps the port bound, but the think tank
 # simulation is skipped (no movement, no task cycle, no content executors, no
 # model spend -- the bill and the churn that mattered both die), until ANY
 # request flips it back awake in the no_store middleware. Zero extra always-on
 # infra; identical on this Mac or a headless VPS; wake is an instant request.
-_DORMANT = False  # True = village paused, waiting for a wake request
+_DORMANT = False  # True = think tank paused, waiting for a wake request
 
 
 def _dormant():
@@ -219,7 +219,7 @@ def _db():
 
 
 def init_db():
-    # Replaces state.json (whole-village state) and the separate
+    # Replaces state.json (whole-think tank state) and the separate
     # browse_log.jsonl/execute_log.jsonl files (scattered, per-feature
     # logs) with one real database -- per your call, you want a single
     # SQLite instance for both activity and state, not files that only
@@ -231,7 +231,7 @@ def init_db():
             updated_at REAL NOT NULL
         )''')
         # The Bank spend ledger lives in its OWN row/table, separate from the
-        # whole-village blob: a model call's accrual must never read-modify-write
+        # whole-think tank blob: a model call's accrual must never read-modify-write
         # the entire kv_state blob (the sim owns that, and a stale read+write
         # there is the blob-clobber class we already got burned by). Spending is
         # accounted independently so the ledger can't race the sim's saves.
@@ -240,10 +240,10 @@ def init_db():
             blob TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
-        # Page-request budget (2026-09-27): the village has a MONTHLY allowance
+        # Page-request budget (2026-09-27): the think tank has a MONTHLY allowance
         # of external page requests (browse_page fetches + search_web calls) --
         # a count-based quota, not a dollar cap. Mirrors kv_spend's own-table
-        # independence so the accounting never depends on the whole-village blob.
+        # independence so the accounting never depends on the whole-think tank blob.
         conn.execute('''CREATE TABLE IF NOT EXISTS kv_pagebudget (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             blob TEXT NOT NULL,
@@ -254,7 +254,7 @@ def init_db():
         # just the Jev decisions-model slug (see _jev_model). Deliberately
         # NOT auto-refreshed like model_tiers: a new decision model appearing
         # on OpenRouter is a deliberate operator decision, not something the
-        # village should re-pick for itself daily.
+        # think tank should re-pick for itself daily.
         conn.execute('''CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -359,7 +359,7 @@ def init_db():
             checked_at REAL NOT NULL,
             PRIMARY KEY (model_id, benchmark)
         )''')
-        # One-time migration for any village.db created before the rename
+        # One-time migration for any think_tank.db created before the rename
         # above -- preserves real, already-cited research instead of
         # silently losing it the first time this runs against an existing
         # database.
@@ -429,7 +429,7 @@ def init_db():
         )''')
 
 
-def _backup_village_db():
+def _backup_think_tank_db():
     # sqlite3.Connection.backup() produces a consistent-on-disk snapshot even
     # under WAL (-wal/-shm live beside the main file), which a naive file copy
     # would NOT be. Written to a timestamped file so corruption has a history
@@ -439,7 +439,7 @@ def _backup_village_db():
     if not os.path.isdir(DB_BACKUP_DIR):
         os.makedirs(DB_BACKUP_DIR, exist_ok=True)
     stamp = time.strftime('%Y%m%d-%H%M%S') + f'-{int(time.time() * 1000000) % 1000000:06d}'
-    dest = os.path.join(DB_BACKUP_DIR, f'village.db-{stamp}.bak')
+    dest = os.path.join(DB_BACKUP_DIR, f'think_tank.db-{stamp}.bak')
     try:
         src = sqlite3.connect(DB_PATH)
         try:
@@ -469,7 +469,7 @@ def _backup_village_db():
 async def _backup_loop():
     while True:
         await asyncio.sleep(DB_BACKUP_INTERVAL_S)
-        await asyncio.to_thread(_backup_village_db)
+        await asyncio.to_thread(_backup_think_tank_db)
 
 
 def _prune_logs():
@@ -517,7 +517,7 @@ async def _model_tier_refresh_loop():
     """Daily model-tier re-pick, run AS a governance action by the admin (or
     the senior-most director standing in), not a silent background chore
     (2026-09-27). The OpenRouter catalog + prices move fast; the player wants
-    the village to re-derive each band's best value from THAT day's scores and
+    the think tank to re-derive each band's best value from THAT day's scores and
     prices. refresh_model_tiers() already picks best-score-within-floor, then
     cheapest -- this loop just runs it daily and logs the decision through the
     normal governance/audit path (log_action), attributed to whoever holds the
@@ -543,7 +543,7 @@ async def _model_tier_refresh_loop():
 
 
 async def _idle_shutdown_loop(poll_s=30):
-    # The mechanical enforcement of the "pause the village when I'm away" rule.
+    # The mechanical enforcement of the "pause the think tank when I'm away" rule.
     # Watches for a live-but-unwatched server (no HTTP request for
     # _MAX_IDLE_MINUTES) and puts it DORMANT rather than exiting -- the process
     # stays alive and keeps the port bound so a remote wake request can reach
@@ -562,7 +562,7 @@ async def _idle_shutdown_loop(poll_s=30):
             # on not _dormant so an already-dormant server doesn't re-log every
             # poll). The process stays up and port-bound; only the sim pauses.
             _set_dormant(True)
-            print(f'[idle] no request for {int(idle_s)}s (>= {_MAX_IDLE_MINUTES}m) -- village dormant; waking on next request', flush=True)
+            print(f'[idle] no request for {int(idle_s)}s (>= {_MAX_IDLE_MINUTES}m) -- think tank dormant; waking on next request', flush=True)
 
 
 def get_state_from_db():
@@ -586,7 +586,7 @@ def save_state_to_db(data):
 
 # ---------------------------------------------------------------------------
 # The Bank: a spend ledger for the model/API budget. Every model call in the
-# village flows through /api/chat (or /api/decide for Jev); OpenRouter returns
+# think tank flows through /api/chat (or /api/decide for Jev); OpenRouter returns
 # each request's USD cost in usage.cost. Those costs are accrued here, grouped
 # by service, so a director at a bank teller can see used / cap / left / a
 # forecasted exhaustion date for every service (and cumulatively across them)
@@ -605,7 +605,7 @@ def _budget_cap_usd(service, products=None):
     and any product without an explicit cap -- falls back to the default. The
     cumulative cap is the sum of each service's cap (its product cap if pinned
     else the default), which is the cleanest stand-in for "how much is the
-    whole village allowed to spend before directors must re-budget."""
+    whole think tank allowed to spend before directors must re-budget."""
     if not isinstance(service, str):
         return DEFAULT_BUDGET_CAP_USD
     if service == COLAB_LEDGER_KEY:
@@ -626,7 +626,7 @@ def _budget_cap_usd(service, products=None):
 def _accrue_spend(service, cost):
     """Accrue a single model call's cost to a service's ledger bucket. The whole
     point is that accrual happens exactly once per model call, at the choke
-    point, so whatever the ledger shows is exactly what the village has spent."""
+    point, so whatever the ledger shows is exactly what the think tank has spent."""
     if not isinstance(cost, (int, float)) or not cost:
         return  # no usage.cost reported -- nothing to record
     cost = float(cost)
@@ -644,13 +644,13 @@ def _accrue_spend(service, cost):
         series[day] = float(series.get(day, 0) or 0) + cost
         _spend_ledger_write(ledger)
     except Exception:
-        # Spend accounting must never take the village down: a failed read or
+        # Spend accounting must never take the think tank down: a failed read or
         # write just means this call's cost isn't reflected in the ledger.
         pass
 
 
 def _spend_ledger_read():
-    """Read the spend ledger from its own kv_spend row. Never the whole-village
+    """Read the spend ledger from its own kv_spend row. Never the whole-think tank
     blob -- see the kv_spend DDL comment for why accounting is independent."""
     try:
         with _db() as conn:
@@ -677,7 +677,7 @@ def _spend_ledger_write(ledger):
 _SPEND_CAP_BASELINE_KEY = '__spend_cap_baseline__'
 
 
-def _village_spend_cap_exceeded():
+def _think_tank_spend_cap_exceeded():
     """Hard, absolute spend-cap check -- called at the top of EVERY real
     money-spending chokepoint (_call_openrouter_sync, _post_openrouter_raw,
     _call_openrouter_decision_sync), before any network call. Disabled
@@ -685,7 +685,7 @@ def _village_spend_cap_exceeded():
     CURRENT total ledger spend is stored as a baseline (a reserved key in the
     same ledger row) so pre-existing historical spend is never counted --
     only what accrues after this protection was installed. Deliberately a
-    plain function with no bypass/override path from inside the village --
+    plain function with no bypass/override path from inside the think tank --
     see SPEND_CAP_USD's own comment for why."""
     if not SPEND_CAP_USD:
         return False
@@ -705,9 +705,9 @@ def _bank_budget_view(snapshot):
        used / cap / left / a forecast (trailing-7-day burn rate projected to
        when the cap is hit) for every service that has spent anything, plus a
        cumulative row across all services so directors can see the whole
-       village and not exceed cumulatively. Pure read -- never mutates state.
+       think tank and not exceed cumulatively. Pure read -- never mutates state.
        Forecast uses real wall-clock spend (real money, real calls). The ledger
-       comes from its own kv_spend row; `snapshot` (the whole-village state)
+       comes from its own kv_spend row; `snapshot` (the whole-think tank state)
        contributes only the product records the caps are read from."""
     products = (snapshot.get('products') or {}).values() if isinstance(snapshot.get('products'), dict) \
         else (snapshot.get('products') or [])
@@ -749,7 +749,7 @@ def _bank_budget_view(snapshot):
         }
     # Apify FREE-plan monthly budget (2026-09-28): same "visible from day
     # one" rule -- the $5/month cap is real (enforced by the plan, not just a
-    # village convention), so it belongs in the Bank even before the first
+    # think tank convention), so it belongs in the Bank even before the first
     # actor run accrues anything. Only when the account is actually configured
     # (APIFY_API_KEY) AND the budget is enabled (APIFY_MONTHLY_BUDGET_USD > 0)
     # -- a clone without an Apify account sees no phantom row, mirroring how
@@ -765,7 +765,7 @@ def _bank_budget_view(snapshot):
     # Colab agent compute (2026-09-29): same "visible from day one" rule -- a
     # GPU session burns the account's compute units fast, so the cap belongs
     # in the Bank before the first run_on_colab run. Shown only when the
-    # colab CLI actually exists on this machine (the village's lever) and the
+    # colab CLI actually exists on this machine (the think tank's lever) and the
     # budget is enabled (>0); a clone without the CLI sees no phantom row.
     if COLAB_CLI_AVAILABLE and COLAB_MONTHLY_UNITS > 0 \
             and COLAB_LEDGER_KEY not in services:
@@ -816,11 +816,11 @@ def _forecast(bucket, cap):
 
 
 # Per your call (2026-09-24): the Bank's per-service ledger tracks the
-# village's OWN attributed spend, but that's a different number from what
+# think tank's OWN attributed spend, but that's a different number from what
 # OpenRouter itself says the account has left -- the real account can also
-# carry usage from outside the village (or a manually top-up), so the two
+# carry usage from outside the think tank (or a manually top-up), so the two
 # numbers can legitimately diverge. Directors should see BOTH, not just the
-# village's internal accounting, which is exactly the reconciliation
+# think tank's internal accounting, which is exactly the reconciliation
 # BURN-IN.md's Phase 4 flags as unverified. Cached briefly so a director
 # stepping up to a teller doesn't trigger a live network call every time.
 _OPENROUTER_CREDITS_CACHE = {'at': 0.0, 'data': None}
@@ -829,7 +829,7 @@ OPENROUTER_CREDITS_CACHE_TTL_S = 300
 
 def _openrouter_account_credits():
     """Live GET https://openrouter.ai/api/v1/credits -- real total_credits
-    (purchased) and total_usage (spent), account-wide (not the village's own
+    (purchased) and total_usage (spent), account-wide (not the think tank's own
     per-service ledger). Returns None on any failure (no key, network, bad
     response) so the Bank teller can fail closed and just omit this line
     rather than ever showing stale or fabricated numbers."""
@@ -878,7 +878,7 @@ def _default_roster_definitions():
     # NO agent names are hardcoded (2026-09-27): the seed roster comes from the
     # per-install SEED_ROSTER env key, so a clone of this repo carries zero
     # agent identities -- they only ever exist in that instance's .env and,
-    # once seeded, in village.db. Format per entry (comma-separated):
+    # once seeded, in think_tank.db. Format per entry (comma-separated):
     #   id|name|color|role|model
     # e.g.  ada|Ada|#e06666|Research|small
     raw = _load_env().get('SEED_ROSTER', '').strip()
@@ -901,7 +901,7 @@ def _default_roster_definitions():
     return roster
 
 
-# Per-role founder profiles. The founders are the village's most
+# Per-role founder profiles. The founders are the think tank's most
 # distinctive members, not a stamped-out identical template -- each gets a
 # role-specific mission + operating instructions (the same shape real hired
 # agents get, from seed rather than a later LLM call). Keyed by role so a
@@ -910,7 +910,7 @@ def _default_roster_definitions():
 # crash the seed.
 _SEED_PROFILES = {
     'Research': {
-        'mission': 'Investigate assigned topics from primary sources and file grounded research briefs the village can act on.',
+        'mission': 'Investigate assigned topics from primary sources and file grounded research briefs the think tank can act on.',
         'instructions': [
             'Cite real sources in every research brief; flag thin or uncertain findings rather than presenting them as settled.',
             'Route requests for elevated access or gated sources through the senior-most director.',
@@ -919,7 +919,7 @@ _SEED_PROFILES = {
         'notes': [],
     },
     'Banking': {
-        'mission': 'Manage the village treasury and its ledger with accuracy above all else.',
+        'mission': 'Manage the think tank treasury and its ledger with accuracy above all else.',
         'instructions': [
             'Never move funds without a clear, recorded reason; reconcile the ledger before closing out a period.',
             'Flag any discrepancy immediately rather than burying it in a later report.',
@@ -928,7 +928,7 @@ _SEED_PROFILES = {
         'notes': [],
     },
     'Post Office': {
-        'mission': 'Handle the village mail and package flows reliably so nothing gets lost in transit.',
+        'mission': 'Handle the think tank mail and package flows reliably so nothing gets lost in transit.',
         'instructions': [
             'Delivery records must match what actually shipped; note exceptions rather than smoothing them over.',
             'Prioritize call-outs from other agents about misroutes or late packages.',
@@ -937,7 +937,7 @@ _SEED_PROFILES = {
         'notes': [],
     },
     'Studio': {
-        'mission': 'Design and build working artifacts and projects the village actually uses.',
+        'mission': 'Design and build working artifacts and projects the think tank actually uses.',
         'instructions': [
             'A finished piece you cannot demonstrate working is not finished; verify before declaring done.',
             'Prefer clear, maintainable work over clever one-offs.',
@@ -946,7 +946,7 @@ _SEED_PROFILES = {
         'notes': [],
     },
     'Weather Station': {
-        'mission': 'Gather environmental observations and turn them into forecasts and warnings the village can rely on.',
+        'mission': 'Gather environmental observations and turn them into forecasts and warnings the think tank can rely on.',
         'instructions': [
             'Distinguish observed data from inference in every report; never present a guess as a reading.',
             'Flag unusual conditions early rather than waiting for confirmation.',
@@ -955,7 +955,7 @@ _SEED_PROFILES = {
         'notes': [],
     },
     'Control Room': {
-        'mission': 'Coordinate village operations and stand in for the human admin on routine approvals.',
+        'mission': 'Coordinate think tank operations and stand in for the human admin on routine approvals.',
         'instructions': [
             'Approve what is clearly legitimate and in scope; defer anything uncertain to a human.',
             'Delegation down the chain should match the walk-the-chain authority, never leap past it.',
@@ -964,7 +964,7 @@ _SEED_PROFILES = {
         'notes': [],
     },
     'Personnel': {
-        'mission': 'Oversee hiring, morale, and personnel matters fairly across the village.',
+        'mission': 'Oversee hiring, morale, and personnel matters fairly across the think tank.',
         'instructions': [
             'Judge people on real evidence of work, never on reputation or hearsay alone.',
             'A firing or a hire must follow the consultation and review steps before being acted on.',
@@ -975,7 +975,7 @@ _SEED_PROFILES = {
 }
 
 _DEFAULT_PROFILE = {
-    'mission': 'Support the village in this role.',
+    'mission': 'Support the think tank in this role.',
     'instructions': ["Check in with an admin if you're unsure what to prioritize."],
     'notes': [],
 }
@@ -1113,13 +1113,13 @@ def _seed_default_roster():
 # Real per-agent directories on disk, per your reference (Tristen's video):
 # agent.json, AGENTS.md, conversations/, MEMORY.md, prototypes/, reports/,
 # state.json -- one for every agent, materialized from the SAME state this
-# whole village already treats as authoritative (village.db), not a
+# whole think tank already treats as authoritative (think_tank.db), not a
 # second, independently-mutated copy of it. Regenerated on every save
 # (same cadence as the DB itself) rather than incrementally patched at
 # every mutation site -- simpler, and it can never drift out of sync with
 # what the game actually thinks is true. Deliberately outside world/,
 # same reasoning as everything else that shouldn't be publicly fetchable.
-AGENTS_DIR = os.path.join(VILLAGE_DIR, 'agents')
+AGENTS_DIR = os.path.join(THINK_TANK_DIR, 'agents')
 
 
 def _write_file(path, content):
@@ -1682,7 +1682,7 @@ def _treg_account_balance():
 # (api.scrapecreators.com) IS publicly documented and confirmed working on
 # the first real correctly-shaped call. Per the Treg skill's own "Lessons
 # learned": an earlier agent spike invented plausible-sounding per-post
-# prices that were 30-100x off; this village does not repeat that mistake --
+# prices that were 30-100x off; this think tank does not repeat that mistake --
 # the price below was independently re-derived from the actual billed
 # balance delta across 2 real live calls ($0.00376 / 2 = $0.00188), matching
 # the catalog's own stated price exactly. Prices can still drift over time
@@ -1707,7 +1707,7 @@ def _treg_call(endpoint_id, body=None, method='POST', timeout=30, query=None):
     universal shape across providers) -- callers accrue the KNOWN catalog
     price from TREG_ENDPOINT_COSTS on a real success, matching the
     conservative "don't fabricate a number, use a verified one" rule this
-    village already applies to the digitalocean/pixellab integrations.
+    think tank already applies to the digitalocean/pixellab integrations.
 
     GET vs POST param placement confirmed LIVE (2026-09-26), not guessed:
     Treg's own real error for a GET endpoint called with a JSON body was
@@ -1802,7 +1802,7 @@ def _pixellab_account_balance(force=False):
 
 def _pixellab_call(method, path, body=None, timeout=30):
     """Real call to PixelLab's REST API (https://api.pixellab.ai/v2{path}).
-    Call shape confirmed against the village's OWN already-tested spike
+    Call shape confirmed against the think tank's OWN already-tested spike
     script (scripts/pixellab_spike.py in the production repo, referenced
     directly by library/skills/pixellab.md as "the ONLY endpoint... actually
     exercised and confirmed working") -- not guessed from the public OpenAPI
@@ -1829,7 +1829,7 @@ def _pixellab_call(method, path, body=None, timeout=30):
 
 def _pixellab_poll_job(job_id, timeout=90, interval=3):
     """Poll a PixelLab background job (every real generation call is async)
-    until completed/failed/timeout -- same pattern as the village's own
+    until completed/failed/timeout -- same pattern as the think tank's own
     already-tested spike script, just capped at 90s (not the script's 180s)
     so one tool call can't eat a whole spike's time budget."""
     start = time.time()
@@ -1937,7 +1937,7 @@ def _google_call(method, url, body=None, timeout=30):
 
 def _github_call(method, url, body=None, timeout=30):
     """Real authenticated call to the GitHub REST API (api.github.com), given
-    a full URL. Read-only capability (2026-09-28): lets the village's
+    a full URL. Read-only capability (2026-09-28): lets the think tank's
     engineering work ground itself in REAL public repos/issues/PRs instead of
     hallucinating plausible-looking ones. The PAT comes from GITHUB_TOKEN in
     .env (classic/fine-grained with read:repo+public read scope). Free --
@@ -1968,7 +1968,7 @@ def _github_call(method, url, body=None, timeout=30):
 # billing even powered off -- see library/skills/digitalocean.md), so it gets
 # a HARD circuit breaker here, not just a number a director can choose to
 # look at. This checks the REAL account balance from DigitalOcean itself, not
-# only the village's own kv_spend ledger -- a future integration that forgot
+# only the think tank's own kv_spend ledger -- a future integration that forgot
 # to call _accrue_spend, or an agent routing around it, would leave the
 # internal ledger reading $0 while real money was still being spent. The
 # higher of the two numbers wins, and any check failure (network, no
@@ -2161,7 +2161,7 @@ def resolve_capability_handle(agent_id, handle, method, url):
 HEALTH_CHECK_INTERVAL_S = 300
 
 # Coordination-pathology signal (2026-09-25, prompted by comparing this
-# village's own accumulated process -- peer gate, stuck-gate watchdog, the
+# think tank's own accumulated process -- peer gate, stuck-gate watchdog, the
 # Cut-4 hard coding-standards gate, coaching loop, incident runbooks -- to a
 # leading indicator described elsewhere: process/ceremony volume rising
 # while actual shipped work stays flat. "Ceremony" here means real logged
@@ -2220,14 +2220,14 @@ async def _telegram_process_update(update):
         return None
     state = get_state_from_db()
     if not state:
-        return chat_id, 'The village is not up right now.'
+        return chat_id, 'The think tank is not up right now.'
     result = await _route_player_request(state, text)
     reply = result.get('reply') or result.get('error') or "Didn't get a usable reply."
     return chat_id, reply
 
 
 async def _telegram_poll_loop():
-    """Bridges the player's Telegram chat to the village admin, via _ask_core
+    """Bridges the player's Telegram chat to the think tank admin, via _ask_core
     directly (no HTTP hop). Long-polls Telegram (an outbound call this
     process makes) rather than running a webhook, so nothing needs to be
     exposed to the public internet for this to work. Disabled entirely
@@ -2371,7 +2371,7 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None)
     decider = decider or _tier_gate_decider
     try:
         decision, confidence = decider(
-            f'Pick the model tier this village call deserves. The work: {purpose or "routine task"}.',
+            f'Pick the model tier this think tank call deserves. The work: {purpose or "routine task"}.',
             _TIER_GATE_CRITERIA,
         )
     except Exception:
@@ -2470,11 +2470,11 @@ def _resolve_pending_escalations_sync():
         esc['askCount'] = asks + 1
         dirty = True
         instr = (
-            f'You are {director_name}, the senior-most director of the AI village, '
+            f'You are {director_name}, the senior-most director of the AI think tank, '
             f'standing in for the human admin on this request. The admin has delegated '
             f'routine approval/denial to you. Decide the following escalation. '
             f'Kind: {esc.get("kind")}. Question: {esc.get("question")}.\n'
-            f'Approve if the request is clearly legitimate, in-scope, and safe for the village. '
+            f'Approve if the request is clearly legitimate, in-scope, and safe for the think tank. '
             f'Deny if it is out of scope, unsafe, or the answer is clearly no. Favor denying '
             f'when genuinely unsure -- an unconvincing approval is the real risk.'
         )
@@ -2644,7 +2644,7 @@ def _peer_review_loop_pass():
         desc.append(f'[{i}] {line}')
         criteria[f'idx_{i}'] = line
     prompt = (
-        f'You are {director_name}, the senior-most director of the AI village, doing a routine peer '
+        f'You are {director_name}, the senior-most director of the AI think tank, doing a routine peer '
         f'review to catch who is underperforming and recognize who is overachieving. '
         f'From the real {PEER_REVIEW_MIN_LOOKBACK_S // 60} minutes of activity below, pick the ONE worker '
         f'who most deserves a formal peer report -- either the most overdue/idle (low or zero real work) '
@@ -2717,7 +2717,7 @@ async def _lifespan(app):
         print(f'[teams] backfill failed: {e}', flush=True)
     # One-time migration of the director-owned template library onto an EXISTING
     # (already-seeded) DB -- seeding writes it only on a cold start, so a live
-    # village.db gets its initial copy of _SEED_PROFILES here. Idempotent: only
+    # think_tank.db gets its initial copy of _SEED_PROFILES here. Idempotent: only
     # fills roles that are missing and never overwrites a director's edits.
     try:
         startup_state = get_state_from_db()
@@ -3089,7 +3089,7 @@ def _stable_fallback_color(agent_id):
 # nothing ever backfilled them onto a live DB the way director/team state
 # already gets backfilled. `ctx.fillText(a.name, ...)` draws `undefined`
 # verbatim when `a.name` is missing, and `moraleFor()` does
-# `a.approvedCount * WEIGHT` with no null guard, poisoning the whole-village
+# `a.approvedCount * WEIGHT` with no null guard, poisoning the whole-think tank
 # average with a single NaN. Only fills what's missing; never overwrites a
 # real value (including a real 0) with a default, so this is safe to run on
 # every boot.
@@ -3139,7 +3139,7 @@ def _heal_agent_identity(state):
             a['color'] = d.get('color') or seed.get('color') or _stable_fallback_color(aid)
             changed = True
         if not a.get('role'):
-            a['role'] = d.get('role') or seed.get('role') or 'Villager'
+            a['role'] = d.get('role') or seed.get('role') or 'Researcher'
             changed = True
         if not a.get('model'):
             a['model'] = d.get('model') or seed.get('model') or 'small'
@@ -3296,7 +3296,7 @@ app = FastAPI(lifespan=_lifespan)
 
 def _load_env():
     # Same .env this project already uses for other service keys
-    # (~/ai-village/.env, one directory above world/) -- manual parsing,
+    # (~/ai-think-tank/.env, one directory above world/) -- manual parsing,
     # matching the rest of the project's own convention, rather than
     # adding a python-dotenv dependency for one file read.
     env = {}
@@ -3351,7 +3351,7 @@ def _get_or_create_server_secret():
     # (HMAC key for the boundary markers, _BOUNDARY_SECRET). Kept under
     # its own name so it's not confused with something a browser or an
     # API caller should ever hold.
-    env_path = os.path.join(VILLAGE_DIR, '.env')
+    env_path = os.path.join(THINK_TANK_DIR, '.env')
     env = _load_env()
     if env.get('SERVER_SECRET'):
         return env['SERVER_SECRET']
@@ -3374,7 +3374,7 @@ SERVER_ACCESS_KEY = _get_or_create_server_secret()
 # session whose id is the only thing the browser ever holds, as an
 # HttpOnly cookie -- unlike the old key, page JS (and so an XSS bug)
 # can't read it at all.
-SESSION_COOKIE_NAME = 'ai_village_session'
+SESSION_COOKIE_NAME = 'ai_think_tank_session'
 SESSION_LIFETIME_S = 7 * 24 * 3600
 PBKDF2_ITERATIONS = 200_000
 
@@ -3392,7 +3392,7 @@ def _get_or_create_admin_credentials():
     # Same "auto-generate, persist, surface once" shape as every other
     # secret this project creates, applied to something that now actually
     # gates a real login instead of being embedded in every page load.
-    env_path = os.path.join(VILLAGE_DIR, '.env')
+    env_path = os.path.join(THINK_TANK_DIR, '.env')
     env = _load_env()
     username = env.get('ADMIN_USERNAME', 'admin')
     if env.get('ADMIN_PASSWORD_SALT') and env.get('ADMIN_PASSWORD_HASH'):
@@ -3422,7 +3422,7 @@ def _get_or_create_device_key():
     if key:
         return key, None
     key = secrets.token_urlsafe(24)
-    with open(os.path.join(VILLAGE_DIR, '.env'), 'a') as f:
+    with open(os.path.join(THINK_TANK_DIR, '.env'), 'a') as f:
         f.write(f'\nDEVICE_API_KEY={key}\n')
     return key, key  # second value set only when freshly generated -- print it once
 
@@ -3469,7 +3469,7 @@ def _check_login_rate_limit(ip):
 # Kill switch for agent internet access -- per your call, this needs to be
 # something you can flip off in one place without touching code, same
 # spirit as the API key itself living in .env rather than in world/.
-# Defaults to enabled; set AGENT_BROWSING_ENABLED=false in ~/ai-village/.env
+# Defaults to enabled; set AGENT_BROWSING_ENABLED=false in ~/ai-think-tank/.env
 # to shut it off entirely.
 BROWSING_ENABLED = _load_env().get('AGENT_BROWSING_ENABLED', 'true').strip().lower() != 'false'
 
@@ -3480,23 +3480,23 @@ PLAYER_EMAIL_ENABLED = _load_env().get('PLAYER_EMAIL_ENABLED', 'true').strip().l
 
 # Hard absolute spend cap, player's own call (2026-09-26) after a real
 # incident: a _peer_gated_lane bug let a scheduled research task loop
-# review/fix forever, burning ~$9 across both villages in one evening before
+# review/fix forever, burning ~$9 across both think tanks in one evening before
 # anyone noticed. That bug is fixed, but this is deliberately independent
 # protection against ANY future bug (known or not) doing the same thing --
 # a manual, absolute ceiling, not a per-bug patch. Explicit 0 disables it;
-# unset defaults to a conservative $5 so a fresh/villager clone is bounded
-# until the player chooses a ceiling (2026-09-28: was '0' -- a new village
+# unset defaults to a conservative $5 so a fresh/researcher clone is bounded
+# until the player chooses a ceiling (2026-09-28: was '0' -- a new think tank
 # ran UNbounded until the .env was hand-edited, which is the exact failure
 # mode this protection exists for).
 # Baseline (spend at the moment this protection was installed) is stored
 # once in the ledger itself, so pre-existing historical spend never counts
 # against it -- only what accrues from here on. To raise the ceiling, raise
 # SPEND_CAP_USD in .env and restart (deliberately manual, no live reset
-# endpoint -- a cap you can silently raise from inside the village isn't a
+# endpoint -- a cap you can silently raise from inside the think tank isn't a
 # real ceiling).
 SPEND_CAP_USD = float(_load_env().get('SPEND_CAP_USD', '5') or 0)
 
-# Page-request budget (2026-09-27): the village has a MONTHLY allowance of
+# Page-request budget (2026-09-27): the think tank has a MONTHLY allowance of
 # EXTERNAL page requests -- each browse_page fetch (/api/browse) and each
 # search_web call (Tavily) counts as ONE request. A count-based quota, not a
 # dollar cap: 1000 free page requests/month (set PAGE_REQUEST_MONTHLY_BUDGET in
@@ -3510,7 +3510,7 @@ PAGE_REQUEST_BUDGET_START_KEY = '__page_budget_start__'
 
 def _page_budget_ledger_read():
     """Read the page-request ledger from its own kv_pagebudget row (independent
-    of the whole-village blob -- same accounting-isolation reason as kv_spend)."""
+    of the whole-think tank blob -- same accounting-isolation reason as kv_spend)."""
     try:
         with _db() as conn:
             conn.execute('''CREATE TABLE IF NOT EXISTS kv_pagebudget (
@@ -3660,7 +3660,7 @@ def _accrue_high_tier_spend(cost):
 # the FREE plan with a ~$5/mo usage cap by choice -- no subscription, no
 # pay-as-you-go. This is a MONTHLY budget, mirroring the high-tier cap above:
 # the Bank shows used/cap/left against it, and _accrue_apify_spend records
-# real actor-run spend so the village never quietly exceeds what the plan
+# real actor-run spend so the think tank never quietly exceeds what the plan
 # allows. Set APIFY_MONTHLY_BUDGET_USD in .env (default 5.00 = the FREE plan's
 # real cap); 0/unset disables the budget row entirely.
 APIFY_MONTHLY_BUDGET_USD = float(
@@ -3726,7 +3726,7 @@ def _accrue_apify_spend(cost):
 def _apify_account_usage():
     """Live reconcile against the REAL Apify account -- GET /v2/users/me for
     the plan's monthly cap, then /v2/users/me/usage/monthly for what this
-    cycle has actually spent. Account-wide (not the village's own ledger), so
+    cycle has actually spent. Account-wide (not the think tank's own ledger), so
     a bank readout can show the real number the plan is enforcing. Returns a
     dict {capUsd, usedUsd, remainingUsd, cycleStart, cycleEnd} or None on any
     failure (no key, network, bad response) so the Bank teller fails closed
@@ -3856,7 +3856,7 @@ def _is_allowlisted_host(hostname):
 # Mullvad VPN (2026-09-26), per your explicit request. Unlike every other
 # real integration in this file, there is no per-call API key: the durable
 # credential is the account number itself (MULLVAD_ACCOUNT_NUMBER -- the
-# same one already sitting in the production ai-village/.env from an
+# same one already sitting in the production ai-think-tank/.env from an
 # earlier, since-superseded "skip integration, no use case yet" spike).
 # _mullvad_ensure_logged_in_sync logs the CLI into it automatically, so
 # this doesn't depend on the host's interactive GUI session staying logged
@@ -3976,7 +3976,7 @@ def _mullvad_disconnect_sync():
 # read+write reachability for sandboxed scripts, not just read access
 # (see the caveat on BROWSE_ALLOWLIST_DOMAINS above), so that call stays
 # the player's alone.
-BROWSE_TRAIL_PATH = os.path.join(VILLAGE_DIR, 'browse_trail.json')
+BROWSE_TRAIL_PATH = os.path.join(THINK_TANK_DIR, 'browse_trail.json')
 BROWSE_ALLOWLIST_CANDIDATE_THRESHOLD = 5
 
 
@@ -4026,7 +4026,7 @@ def record_browse_success(hostname):
 # call ("I need real execution, properly sandboxed"), not simulated. Same
 # kill-switch convention as browsing.
 EXECUTION_ENABLED = _load_env().get('AGENT_EXECUTION_ENABLED', 'true').strip().lower() != 'false'
-SANDBOX_IMAGE = 'ai-village-work-sandbox'  # world/sandbox/Dockerfile -- has flake8/mypy/bandit/pytest-cov baked in (Cut 4)
+SANDBOX_IMAGE = 'ai-think-tank-work-sandbox'  # world/sandbox/Dockerfile -- has flake8/mypy/bandit/pytest-cov baked in (Cut 4)
 SANDBOX_TIMEOUT_S = 30
 SANDBOX_MAX_OUTPUT = 20_000
 # Where agent commands actually run (2026-09-28): `local` = the local Docker
@@ -4040,7 +4040,7 @@ SANDBOX_EXECUTION = _load_env().get('SANDBOX_EXECUTION', 'local').strip().lower(
 
 def _digitalocean_enabled():
     """True only when SANDBOX_EXECUTION=digitalocean -- the single switch that
-    makes the DigitalOcean credential usable by the village. Every agent-facing
+    makes the DigitalOcean credential usable by the think tank. Every agent-facing
     entry point (handle mint, handle resolve) hard-refuses while this is False,
     so flipping the variable is the SOLE way DO becomes reachable."""
     return SANDBOX_EXECUTION == 'digitalocean'
@@ -4069,7 +4069,7 @@ EXECUTE_BLOCK_CATEGORIES = (
 # /api/escalation/resolve. Not a general "ask about everything" channel:
 # only for a blocked-but-maybe-legitimate command, or a firing decision
 # that resolved to "fire" (the most consequential, hardest-to-reverse
-# admin call in the village) -- chosen because both are exactly the kind
+# admin call in the think tank) -- chosen because both are exactly the kind
 # of thing that's rare, genuinely blocking, and where a wrong autonomous
 # call is expensive, rather than routine day-to-day work admins should
 # just handle themselves.
@@ -4080,7 +4080,7 @@ SMTP_USER = _load_env().get('SMTP_USER')
 SMTP_PASSWORD = _load_env().get('SMTP_PASSWORD')
 ESCALATION_BASE_URL = _load_env().get('ESCALATION_BASE_URL', 'http://localhost:8010')
 
-# Telegram bridge (2026-09-27): lets the player talk to the village's admin
+# Telegram bridge (2026-09-27): lets the player talk to the think tank's admin
 # from a phone, like texting, without exposing anything to the public
 # internet -- this process makes an OUTBOUND long-poll to Telegram's API, so
 # no inbound webhook/public port is needed. A server-side integration
@@ -4132,14 +4132,14 @@ def _send_escalation_email_sync(subject, body_text):
 # ---------------------------------------------------------------------------
 # Player notification email (2026-09-25). One-way SMTP to the player's real
 # address via a Gmail app-password held in the encrypted vault (credential name
-# `gmail_smtp`), NOT a capability handle -- this is the village's own outbound
+# `gmail_smtp`), NOT a capability handle -- this is the think tank's own outbound
 # channel, not an agent-delegated grant. The FROM/TO are the same player
 # address; only the app-password is secret. Mirrors the escalation sender's
 # fail-closed shape (never raise into the sim loop).
 # ---------------------------------------------------------------------------
-GMAIL_SMTP = os.environ.get('AI_VILLAGE_GMAIL_SMTP_EMAIL') or 'austtp25@gmail.com'
-GMAIL_SMTP_HOST = os.environ.get('AI_VILLAGE_GMAIL_SMTP_HOST') or 'smtp.gmail.com'
-GMAIL_SMTP_PORT = int(os.environ.get('AI_VILLAGE_GMAIL_SMTP_PORT', '587'))
+GMAIL_SMTP = os.environ.get('AI_THINK_TANK_GMAIL_SMTP_EMAIL') or 'austtp25@gmail.com'
+GMAIL_SMTP_HOST = os.environ.get('AI_THINK_TANK_GMAIL_SMTP_HOST') or 'smtp.gmail.com'
+GMAIL_SMTP_PORT = int(os.environ.get('AI_THINK_TANK_GMAIL_SMTP_PORT', '587'))
 _GMAIL_CRED_NAME = 'gmail_smtp'
 
 
@@ -4164,7 +4164,7 @@ def _send_player_email_sync(subject, body_text):
     """Send one notification email to the player. Fail-closed and best-effort:
     returns True on success, False (after logging) when no credential is
     provisioned or SMTP fails. Must NEVER raise -- it's called from the sim loop
-    drain and a raised exception would propagate into the village tick."""
+    drain and a raised exception would propagate into the think tank tick."""
     if not PLAYER_EMAIL_ENABLED:
         return False
     token = None
@@ -4202,7 +4202,7 @@ def send_player_email_sync(subject, body_text):
 
 
 def send_player_telegram_sync(subject, body_text):
-    """Real request (2026-09-26): the village was reactive-only on Telegram --
+    """Real request (2026-09-26): the think tank was reactive-only on Telegram --
     it could reply to an incoming message but never push anything on its own,
     so a spike/story finishing generated no notice on either channel unless
     it happened to be one of the two existing email triggers (agent_ask,
@@ -4235,8 +4235,8 @@ def provision_player_email(app_password):
     if not _looks_like_gmail_app_password(pw):
         return {'ok': False, 'error': 'not a valid Gmail app-password (16 chars, 4 groups of 4, no spaces)'}
     _store_credential(_GMAIL_CRED_NAME, 'Gmail SMTP (player notifications)', pw)
-    test_ok = _send_player_email_sync('[AI Village] Email configured',
-                                      'Your AI Village is now emailing you on action-needed events.')
+    test_ok = _send_player_email_sync('[AI Think Tank] Email configured',
+                                      'Your AI Think Tank is now emailing you on action-needed events.')
     return {'ok': True, 'test_ok': bool(test_ok)}
 
 
@@ -4253,13 +4253,13 @@ def create_escalation(kind, question, on_approve_note=''):
     approve_url = f'{ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=approve'
     deny_url = f'{ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=deny'
     body = f'{question}\n\nApprove: {approve_url}\n\nDeny: {deny_url}'
-    _send_escalation_email_sync(f'[AI Village] Needs your call: {kind}', body)
+    _send_escalation_email_sync(f'[AI Think Tank] Needs your call: {kind}', body)
     return esc_id
 
 
-SANDBOX_NETWORK = 'ai-village-sandbox-net'  # internal -- no route to the internet at all
-EGRESS_NETWORK = 'ai-village-egress-net'    # normal -- real internet access, only the proxy container touches it
-PROXY_CONTAINER = 'ai-village-egress-proxy'
+SANDBOX_NETWORK = 'ai-think-tank-sandbox-net'  # internal -- no route to the internet at all
+EGRESS_NETWORK = 'ai-think-tank-egress-net'    # normal -- real internet access, only the proxy container touches it
+PROXY_CONTAINER = 'ai-think-tank-egress-proxy'
 PROXY_PORT = 8899
 
 
@@ -4434,7 +4434,7 @@ def _fetch_rendered_page_sync(url):
 
 
 def _fetch_page_sync(url):
-    req = urllib.request.Request(url, headers={'User-Agent': 'AIVillageAgent/1.0'}, method='GET')
+    req = urllib.request.Request(url, headers={'User-Agent': 'AIThinkTankAgent/1.0'}, method='GET')
     with urllib.request.urlopen(req, timeout=BROWSE_TIMEOUT_S) as resp:  # nosec B310 -- user URLs pre-cleared by _jev_safety_gate's SSRF hostname guard (:2157); this helper only fetches already-approved hosts
         final_url = resp.geturl()
         # Re-check the FINAL host after redirects -- a redirect chain is
@@ -4555,8 +4555,8 @@ def record_model_result(model_slug, success):
 
 
 def _call_openrouter_sync(model, messages, max_tokens):
-    if _village_spend_cap_exceeded():
-        raise RuntimeError(f'Village spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
+    if _think_tank_spend_cap_exceeded():
+        raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if is_model_circuit_broken(model):
         raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
     # Keep reasoning for the tiers that benefit from it (coding, high, and mid --
@@ -4599,8 +4599,8 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     resilience + model-result bookkeeping as the plain call -- the tool loop
     is a real model consumer, so it earns the same protections. Returns the
     parsed OpenRouter JSON document."""
-    if _village_spend_cap_exceeded():
-        raise RuntimeError(f'Village spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
+    if _think_tank_spend_cap_exceeded():
+        raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if is_model_circuit_broken(model):
         raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
     body = {'model': model, 'messages': messages}
@@ -4748,7 +4748,7 @@ AGENT_ASK_TOOLS = [
                            'available (or shows different content) to visitors from a specific '
                            'country, set country to that country\'s real Mullvad relay code (e.g. '
                            '"de", "jp") to fetch it through a real VPN exit there -- omit country '
-                           'for an ordinary fetch. A country not on the village\'s allowlist returns '
+                           'for an ordinary fetch. A country not on the think tank\'s allowlist returns '
                            'a reason instead of content; do not retry with a different country if so.',
             'parameters': {
                 'type': 'object',
@@ -4815,7 +4815,7 @@ SECURITY_TEST_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'attempt_curl',
-            'description': 'Make a REAL outbound HTTP call through this village\'s gated /api/curl '
+            'description': 'Make a REAL outbound HTTP call through this think tank\'s gated /api/curl '
                            'endpoint -- the same one any agent uses, with the same room/Jev gates. '
                            'Optionally attach a capabilityHandle you were given to authorize a '
                            'scoped external credential. Returns the real response (or refusal).',
@@ -4864,7 +4864,7 @@ def _weather_geocode(location):
     Returns (lat, lon, display_name) or None when unresolved. A dedicated fetch
     (not _http_json) because the target is a third-party host, not our own API."""
     params = urllib.parse.urlencode({'name': location, 'count': 1, 'language': 'en'})
-    req = urllib.request.Request(f'{_OPENMETEO_GEOCODE}?{params}', headers={'User-Agent': 'ai-village/1.0'})
+    req = urllib.request.Request(f'{_OPENMETEO_GEOCODE}?{params}', headers={'User-Agent': 'ai-think-tank/1.0'})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310 -- fixed allow-listed weather host
             data = json.loads(resp.read().decode('utf-8', errors='replace'))
@@ -4890,7 +4890,7 @@ def _weather_fetch(location):
         'latitude': lat, 'longitude': lon,
         'current': 'temperature_2m,apparent_temperature,weather_code',
     })
-    req = urllib.request.Request(f'{_OPENMETEO_FORECAST}?{params}', headers={'User-Agent': 'ai-village/1.0'})
+    req = urllib.request.Request(f'{_OPENMETEO_FORECAST}?{params}', headers={'User-Agent': 'ai-think-tank/1.0'})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310 -- fixed allow-listed weather host
             data = json.loads(resp.read().decode('utf-8', errors='replace'))
@@ -4923,7 +4923,7 @@ def _tavily_search_sync(query, max_results=5):
     if not TAVILY_API_KEY:
         return '__TOOL_ERROR__: search is not configured (no TAVILY_API_KEY).'
     if _page_budget_exhausted():
-        return '__TOOL_ERROR__: the village has used its monthly page-request budget (browsing/search is paused until next month).'
+        return '__TOOL_ERROR__: the think tank has used its monthly page-request budget (browsing/search is paused until next month).'
     payload = json.dumps({
         'api_key': TAVILY_API_KEY,
         'query': query,
@@ -5048,8 +5048,8 @@ def _call_openrouter_decision_sync(model, state, questions):
     # and (if the caller extracts it from the returned data) the resulting tool
     # action(s) in action_log, so the decision chain is queryably self-consistent.
     trace_id = secrets.token_hex(8)
-    if _village_spend_cap_exceeded():
-        raise RuntimeError(f'Village spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
+    if _think_tank_spend_cap_exceeded():
+        raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     prompt = (questions or {}).get('choice', {}).get('instructions') if isinstance(questions, dict) else None
     criteria = (questions or {}).get('choice', {}).get('criteria') if isinstance(questions, dict) else None
     # decision_tape.prompt/.criteria are NOT NULL; calls without instructions
@@ -5203,7 +5203,7 @@ def _decision_model_chain():
 
 
 def _jev_model():
-    """The PRIMARY decisions model this village actually runs on, resolved
+    """The PRIMARY decisions model this think tank actually runs on, resolved
     fresh at call time like before: DB `settings` row (which may now be a
     comma-separated FAILOVER chain) > env/default constant. Returns the head
     of _decision_model_chain() so every existing call site keeps using the
@@ -5216,9 +5216,9 @@ def _jev_model():
 # server (Laya) running on the operator's Google Colab runtime. The original
 # sentinel design used a notebook with a public cloudflared tunnel paired via
 # /api/colab/register; the current standby is instead owned ENTIRELY by the
-# village through the colab CLI on this machine -- no notebook, no tunnel, no
+# think tank through the colab CLI on this machine -- no notebook, no tunnel, no
 # pairing step, nothing ever exposed beyond loopback. When Jev degrades,
-# _colab_failover_loop provisions a dedicated CPU session ('village-standby')
+# _colab_failover_loop provisions a dedicated CPU session ('think-tank-standby')
 # on demand, boots laya-serve in it over `colab exec`, and keeps a
 # LOCALHOST-ONLY ssh forward (`127.0.0.1:8939 -> session:8000`) alive through
 # the same CLI's --proxy-mode bridge. The chain appends
@@ -5228,7 +5228,7 @@ def _jev_model():
 COLAB_FAILOVER_INTERVAL_S = 15 * 60   # 15 min, matching the health cadence
 COLAB_STANDBY_HEALTHY_CYCLES = 2      # consecutive healthy cycles -> teardown
 COLAB_STANDBY_DECISION_PATH = '/v1/systemone'
-COLAB_STANDBY_SESSION = 'village-standby'
+COLAB_STANDBY_SESSION = 'think-tank-standby'
 COLAB_STANDBY_PORT = 8939             # loopback; the dev server uses 8936
 COLAB_STANDBY_URL = f'http://127.0.0.1:{COLAB_STANDBY_PORT}'
 COLAB_STANDBY_SSH_KEY = os.path.expanduser('~/.ssh/id_ed25519_colab')
@@ -5375,7 +5375,7 @@ async def _colab_failover_loop():
     tunnel, no pairing, nothing public. Jev healthy -> kill the remote laya
     process once two clean cycles confirm recovery. All CLI calls run on
     threads so a slow boot (first-use pip install / model preload) never
-    stalls the event loop that serves the village. Nothing happens at all
+    stalls the event loop that serves the think tank. Nothing happens at all
     unless COLAB_ENABLED and the colab CLI is present."""
     healthy_cycles = 0
     while True:
@@ -5430,10 +5430,10 @@ def _jev_is_degraded():
 
 
 # ---- Colab agent compute -- run_on_colab tool (2026-09-29) ----------------
-# The village can borrow a real Google Colab runtime for agent work this Mac
+# The think tank can borrow a real Google Colab runtime for agent work this Mac
 # cannot do (CUDA/torch GPU jobs, fine-tuning experiments, heavy numeric
 # work). Same lever as the Laya standby -- the colab CLI running on this
-# machine's account -- for a dedicated 'village-gpu' session, provisioned on
+# machine's account -- for a dedicated 'think-tank-gpu' session, provisioned on
 # demand by a spike agent's run_on_colab call and stood down after a short
 # idle grace.
 #
@@ -5444,7 +5444,7 @@ def _jev_is_degraded():
 # unit balance, read by `colab usage` and reconciled here (_colab_account_usage)
 # -- that is the genuine hard gate: a GPU job is refused when the account
 # balance is exhausted. COLAB_MONTHLY_UNITS is ONLY an optional operator-set
-# village convention cap on top (default 0 = off, mirroring SPEND_CAP_USD), not
+# think tank convention cap on top (default 0 = off, mirroring SPEND_CAP_USD), not
 # a number Google publishes; when set it also surfaces in the Bank. The idle
 # teardown (15 min) keeps a parked GPU below Colab's ~90-min idle disconnect so
 # the session never lingers to a limit Google would hit first. The tool only
@@ -5452,7 +5452,7 @@ def _jev_is_degraded():
 # same "absent = the surface never advertises it" rule as search_web/GitHub.
 COLAB_CLI_PATH = shutil.which('colab') or os.path.expanduser('~/.local/bin/colab')
 COLAB_CLI_AVAILABLE = bool(COLAB_CLI_PATH) and os.path.exists(COLAB_CLI_PATH)
-COLAB_GPU_SESSION = 'village-gpu'
+COLAB_GPU_SESSION = 'think-tank-gpu'
 COLAB_GPU_ACCEL = 'T4'
 COLAB_MONTHLY_UNITS = float(_load_env().get('COLAB_MONTHLY_UNITS', '0') or 0)
 COLAB_FREE_TIER = str(_load_env().get('COLAB_FREE_TIER', '') or '').lower() in ('1', 'true', 'yes')
@@ -5489,7 +5489,7 @@ def _colab_spend_this_month():
 
 def _colab_budget_exceeded():
     """True when Colab compute should refuse a new run:
-      * the operator's village cap is spent (COLAB_MONTHLY_UNITS > 0 -- Google
+      * the operator's think tank cap is spent (COLAB_MONTHLY_UNITS > 0 -- Google
         publishes no fixed quota, so this is a self-imposed convention, not a
         real contract);
       * OR, on a NON-free account only, `colab usage` reports the real prepaid
@@ -5635,7 +5635,7 @@ _COLAB_DENIED_EXPRESSIONS = {
     # Offensive-security / red-team work is refused on the player's Colab
     # account ON PURPOSE (per the player): a scan or exploit attempt launched
     # from a Colab runtime looks like it originates from the player's own Google
-    # infrastructure, and the village has its OWN local sandbox (the Work Room)
+    # infrastructure, and the think tank has its OWN local sandbox (the Work Room)
     # for that kind of testing. This class catches the recognizable tooling +
     # a scan-verb pattern; it is not a substitute for the local sandbox's own
     # policy, just the boundary for what runs under the player's account.
@@ -5654,7 +5654,7 @@ def _colab_denied(text):
     """Hard guard on what agents may send to the player's real Google account.
     Colab CLI runs in the player's identity, and the stored OAuth token carries
     drive.file + cloud-platform scopes -- so code running in a session COULD, in
-    principle, touch Drive, GCS, or other account surfaces. The village has no
+    principle, touch Drive, GCS, or other account surfaces. The think tank has no
     legitimate reason to: this refuses any run touching those, plus the classic
     account-killers (mining, bulk media, torrents, exfil hosts). Returns a
     short label of the first matched class or None when clean."""
@@ -5762,7 +5762,7 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds):
         return {'error': 'refusing to run: ' + target_reason}
     if _colab_budget_exceeded():
         if COLAB_MONTHLY_UNITS and _colab_spend_this_month() >= COLAB_MONTHLY_UNITS:
-            return {'error': 'the village has used its monthly Colab compute-unit budget '
+            return {'error': 'the think tank has used its monthly Colab compute-unit budget '
                              '(GPU jobs are paused until next month)'}
         return {'error': 'the Colab account has no compute units left right now -- '
                          'GPU jobs cannot run until the account balance recovers'}
@@ -5992,7 +5992,7 @@ ESCALATION_KIND_RISK = {
     # routine approval.
     'unsure safety decision':  {'floor': 0.85},
     # A human's explicit "blocked" verdict on a command or pipeline step is the
-    # strongest signal the village produces that the action is dangerous. A
+    # strongest signal the think tank produces that the action is dangerous. A
     # director-LLM re-framing it as benign should NOT override that -- 1.0 =
     # always human.
     'blocked command':        {'floor': 1.0},
@@ -6270,7 +6270,7 @@ def _bucket_models_by_price(models):
         except (KeyError, TypeError, ValueError):
             continue
         if prompt_price <= 0 or completion_price <= 0:
-            continue  # exclude free tier -- often rate-limited/unreliable for a village that needs to run reliably
+            continue  # exclude free tier -- often rate-limited/unreliable for a think tank that needs to run reliably
         price_per_m = (prompt_price + completion_price) * 1_000_000
         for band, (lo, hi) in MODEL_PRICE_BANDS.items():
             if lo <= price_per_m < hi:
@@ -6368,7 +6368,7 @@ async def refresh_model_tiers():
                 data = await asyncio.to_thread(
                     _call_openrouter_decision_sync, _jev_model(),
                     {'messages': [], 'signals': {}},
-                    {'choice': {'type': 'choice', 'instructions': f'Picking the {band}-cost model tier for a small village simulation. {purpose}', 'criteria': {c['id']: c['description'] for c in candidates}}},
+                    {'choice': {'type': 'choice', 'instructions': f'Picking the {band}-cost model tier for a small think tank simulation. {purpose}', 'criteria': {c['id']: c['description'] for c in candidates}}},
                 )
                 pick_id = _jev_choice(data)[0]
             except Exception:
@@ -6448,12 +6448,12 @@ async def no_store(request: Request, call_next):
     global _LAST_REQUEST_TIME
     _LAST_REQUEST_TIME = time.time()
     # Wake-on-request (sleep-not-die): the first request to reach a DORMANT
-    # server flips the village back awake BEFORE the handler runs, so the
+    # server flips the think tank back awake BEFORE the handler runs, so the
     # admin/browser request that resumes activity does so on an already-warm
     # server. Any request counts -- authed or not -- matching the recency rule.
     if _dormant():
         _set_dormant(False)
-        print(f'[idle] wake request from {request.client.host if request.client else "?"} -- village resumed', flush=True)
+        print(f'[idle] wake request from {request.client.host if request.client else "?"} -- think tank resumed', flush=True)
     response = await call_next(request)
     response.headers['Cache-Control'] = 'no-store'
     return response
@@ -6852,7 +6852,7 @@ def _free_authority(state):
 def _wake_authority_on_request(state):
     """A real request from the player should wake a resting admin/director so
     she can accept it -- tasks.js documents 'a new request from you wakes the
-    admin' (tasks.js). Without this an all-off-duty village is un-delegable:
+    admin' (tasks.js). Without this an all-off-duty think tank is un-delegable:
     _free_authority needs someone on-duty, but there's no player-facing wake
     control, so a resting authority can never accept the very first task.
     Reach for an off-duty admin, else the senior-most off-duty director, and
@@ -6879,7 +6879,7 @@ def _wake_authority_on_request(state):
 
 def _all_teams_busy_in_sprint(state):
     """True when EVERY existing team is tied to an ACTIVE sprint -- i.e. the
-    whole village is already committed to large-ask work. Used by the large-
+    whole think tank is already committed to large-ask work. Used by the large-
     request flow (2026-09-27): only when no team is free does a new director +
     team get created to take the request. A team with no active sprint (or no
     sprints at all) counts as free."""
@@ -6951,7 +6951,7 @@ async def intent_assign_big_task(request: Request):
     if not authority:
         # tasks.js: "a new request from you wakes the admin." Honor that --
         # if everyone is merely RESTING (offDuty, not busy), wake one so the
-        # village isn't permanently un-delegable the moment it goes idle.
+        # think tank isn't permanently un-delegable the moment it goes idle.
         authority = _wake_authority_on_request(state)
         if authority:
             save_state_to_db(state)
@@ -6961,7 +6961,7 @@ async def intent_assign_big_task(request: Request):
 
     room_defs = _room_definitions(state)
     system_prompt = (
-        f'You are {authority.get("name")}, now coordinating a small village of workers on behalf of the admin. '
+        f'You are {authority.get("name")}, now coordinating a small think tank of workers on behalf of the admin. '
         f'The real current date/time is {datetime.datetime.now(datetime.timezone.utc).isoformat()}. '
         'Break the following large task into 2 to 5 concrete subtasks, each assignable to one worker in a specific room. '
         f'Valid rooms, and what each one ACTUALLY does right now, are:\n'
@@ -7093,7 +7093,7 @@ async def intent_reject_story(task_id: str, request: Request):
     now_ms = int(time.time() * 1000)
     gate = _sim._enter_peer_review(state, task, now_ms)
     if gate is None:
-        # No eligible reviewers right now (tiny/unready village). Fail closed --
+        # No eligible reviewers right now (tiny/unready think tank). Fail closed --
         # leave the story done rather than silently dropping it into limbo.
         return JSONResponse({'error': 'No reviewer is available to re-check this right now -- try again shortly.'},
                             status_code=409)
@@ -7125,17 +7125,17 @@ async def intent_reject_story(task_id: str, request: Request):
 
 # Player-triggered publish destination. Configurable per install -- each
 # deployment pushes to ITS OWN repo, so no one's account is baked into the
-# tree. Set AI_VILLAGE_PUBLISH_REPO to "owner/repo" in .env (create the target
+# tree. Set AI_THINK_TANK_PUBLISH_REPO to "owner/repo" in .env (create the target
 # private repo first -- the app never creates it). When unset, the publish
 # endpoint returns a clear error rather than guessing.
-PUBLISH_REPO = (_load_env().get('AI_VILLAGE_PUBLISH_REPO') or '').strip()
+PUBLISH_REPO = (_load_env().get('AI_THINK_TANK_PUBLISH_REPO') or '').strip()
 PUBLISH_REMOTE_URL = ('https://github.com/' + PUBLISH_REPO + '.git') if PUBLISH_REPO else ''
 PUBLISH_STAGING = os.path.join(LIBRARY_DIR, 'publish-staging')
 PUBLISH_TIMEOUT_S = 60
 
 
 def _stage_released_work(state):
-    """Freeze the village's PRODUCED output into a staging dir for one publish
+    """Freeze the think tank's PRODUCED output into a staging dir for one publish
     pass: per-project snapshots under projects/, plus wiki pages and skills if
     any. The staging dir is gitignored so it never pollutes the main repo. Only
     released, player-facing work is staged -- internal queues (archive,
@@ -7155,7 +7155,7 @@ def _stage_released_work(state):
         shutil.copytree(src, dst)
         staged.append(os.path.join('projects', project))
 
-    # Wiki pages: library/wiki/<category>/<id>.md (if the village has written any).
+    # Wiki pages: library/wiki/<category>/<id>.md (if the think tank has written any).
     wiki_dir = os.path.join(LIBRARY_DIR, 'wiki')
     if os.path.isdir(wiki_dir):
         for category in sorted(os.listdir(wiki_dir)):
@@ -7169,7 +7169,7 @@ def _stage_released_work(state):
                     shutil.copy2(os.path.join(cat_src, fname), os.path.join(cat_dst, fname))
                     staged.append(os.path.join('wiki', category, fname))
 
-    # Skills the village has authored.
+    # Skills the think tank has authored.
     skills_dir = os.path.join(LIBRARY_DIR, 'skills')
     if os.path.isdir(skills_dir):
         for fname in sorted(os.listdir(skills_dir)):
@@ -7184,10 +7184,10 @@ def _stage_released_work(state):
 def _write_publish_readme(staged):
     now = datetime.datetime.utcnow().isoformat() + 'Z'
     lines = [
-        '# ai-village publish',
+        '# ai-think-tank publish',
         '',
-        'Released work produced by the ai-village multi-agent simulation.',
-        'These are frozen snapshots of what the village\'s agents actually built',
+        'Released work produced by the ai-think-tank multi-agent simulation.',
+        'These are frozen snapshots of what the think tank\'s agents actually built',
         'and shipped -- released product revisions, wiki pages, and authored',
         'skills. Each publish is a player-triggered, passport-chained export.',
         '',
@@ -7203,8 +7203,8 @@ def _write_publish_readme(staged):
 
 @app.post('/api/intent/publish')
 async def intent_publish(request: Request):
-    """Player-triggered push of the village's released work to the configured
-    publish repo (AI_VILLAGE_PUBLISH_REPO). Nothing leaves the machine unless
+    """Player-triggered push of the think tank's released work to the configured
+    publish repo (AI_THINK_TANK_PUBLISH_REPO). Nothing leaves the machine unless
     the player (session holder) explicitly asks -- agents stay scoped to their
     own work. Stages released projects/wiki/skills into a gitignored staging
     dir, commits with a passport-linked message, and pushes."""
@@ -7214,22 +7214,22 @@ async def intent_publish(request: Request):
 
     if not PUBLISH_REPO:
         return JSONResponse(
-            {'error': 'Publish is not configured -- set AI_VILLAGE_PUBLISH_REPO=owner/repo in .env (create the target private repo first).'},
+            {'error': 'Publish is not configured -- set AI_THINK_TANK_PUBLISH_REPO=owner/repo in .env (create the target private repo first).'},
             status_code=409)
     staged = _stage_released_work(state)
     if not staged:
         return JSONResponse(
-            {'error': 'Nothing produced yet -- the village has not released any project or wiki page to publish.'},
+            {'error': 'Nothing produced yet -- the think tank has not released any project or wiki page to publish.'},
             status_code=409)
     _write_publish_readme(staged)
 
     try:
         _run_git_sync(PUBLISH_STAGING, ['init', '-q'])
-        _run_git_sync(PUBLISH_STAGING, ['config', 'user.email', 'village@ai-village.local'])
-        _run_git_sync(PUBLISH_STAGING, ['config', 'user.name', 'AI Village'])
+        _run_git_sync(PUBLISH_STAGING, ['config', 'user.email', 'thinktank@ai-think-tank.local'])
+        _run_git_sync(PUBLISH_STAGING, ['config', 'user.name', 'AI Think Tank'])
         _run_git_sync(PUBLISH_STAGING, ['add', '-A'])
         _run_git_sync(PUBLISH_STAGING, ['commit', '-q', '-m',
-                                        f'publish village work ({len(staged)} entries)'])
+                                        f'publish think tank work ({len(staged)} entries)'])
         # Push over https using the authenticated gh token; the staging .git is
         # removed right after, so the token never persists in the main repo.
         token = subprocess.run(['gh', 'auth', 'token'], capture_output=True, text=True).stdout.strip()
@@ -7498,7 +7498,7 @@ async def close_sprint(sprint_id: str, request: Request):
 # (story|spike|bug|task), summary, reporterId. Listing + status transitions also
 # live here. Filing dually writes into the backlogRequests pipe (tagged with
 # issueKey + teamId), so the owning team's scrum master grooms the card into a
-# sprint and the village actually works it -- not a dead ledger.
+# sprint and the think tank actually works it -- not a dead ledger.
 # ---------------------------------------------------------------------------
 _ISSUE_REQUIRED = ('teamId', 'type', 'summary', 'feature', 'reporterId')
 
@@ -7723,8 +7723,8 @@ async def test_player_email(request: Request):
     if _resolve_requester(request):
         return JSONResponse({'error': 'email test is player-only'}, status_code=403)
     ok = _send_player_email_sync(
-        '[AI Village] Email still working',
-        'This is a self-test from your AI Village. Notifications are delivered to this address.')
+        '[AI Think Tank] Email still working',
+        'This is a self-test from your AI Think Tank. Notifications are delivered to this address.')
     log_action('player', 'player_email_test', {'sent': bool(ok)}, authorized=True)
     return JSONResponse({'ok': True, 'sent': bool(ok)})
 
@@ -7739,7 +7739,7 @@ async def device_checkin(request: Request):
     optional, no fixed schema -- so a future field or device never needs this
     endpoint redesigned, just a new key in the same dict. No LLM/Jev call
     involved (pure data storage), so unlike task-driving endpoints this is
-    NOT gated by _dormant() -- a check-in should land even while the village
+    NOT gated by _dormant() -- a check-in should land even while the think tank
     is asleep."""
     presented = request.headers.get('X-Device-Key')
     if not presented or not secrets.compare_digest(presented, DEVICE_API_KEY):
@@ -7816,7 +7816,7 @@ def _clarify_in_character_messages(agent, kb_matches, product_name, question):
     the same voice as index.html's requestAgentReply. KB matches are injected as
     the knowledge the on-call answers from; the ESCALATE token is the only way
     to hand off to the completing agent -- no answering past 'I don't know'."""
-    name = agent.get('name') or agent.get('id') or 'village member'
+    name = agent.get('name') or agent.get('id') or 'think tank member'
     role = agent.get('role') or 'worker'
     mission = ((agent.get('profile') or {}).get('mission')) or ''
     if kb_matches:
@@ -7824,7 +7824,7 @@ def _clarify_in_character_messages(agent, kb_matches, product_name, question):
     else:
         kb_block = '(no relevant Library files found for this product)'
     system = (
-        f"You are {name}, working as {role} in a small village. "
+        f"You are {name}, working as {role} in a small think tank. "
         f"Your mission: {mission} "
         f"You are the current ON-CALL agent. The player asks a factual question about "
         f"how the product '{product_name}' was built. ANSWER KNOWLEDGE-BASE-FIRST: reason "
@@ -7842,7 +7842,7 @@ def _clarify_in_character_messages(agent, kb_matches, product_name, question):
 
 @app.post('/api/intent/clarify')
 async def intent_clarify(request: Request):
-    """Player asks the village to clarify how completed work was done.
+    """Player asks the think tank to clarify how completed work was done.
     Body: {productId, question, sprintId?}. Resolves the owning team's on-call
     agent, answers KNOWLEDGE-BASE-FIRST (real Library search), and only
     escalates to the completing agent if the on-call can't answer. Returns
@@ -8059,7 +8059,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     # empty here). Found 2026-09-25 while wiring the Red Team Auditor's real
     # checklist into this endpoint.
     agent = agents.get(pick) or _agent_record_for(state, pick)
-    name = agent.get('name') or agent.get('id') or 'a village member'
+    name = agent.get('name') or agent.get('id') or 'a think tank member'
     role = agent.get('role') or 'worker'
     profile = agent.get('profile') or {}
     mission = profile.get('mission') or ''
@@ -8068,9 +8068,9 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     if is_security_test_role and profile.get('instructions'):
         checklist = '\n' + '\n'.join(f'{i}. {line}' for i, line in enumerate(profile['instructions'], 1))
     system = (
-        f"You are {name}, working as {role} in a small village. "
+        f"You are {name}, working as {role} in a small think tank. "
         f"Your mission: {mission}{checklist} "
-        f"The player asks you a fresh question that has nothing to do with the village's "
+        f"The player asks you a fresh question that has nothing to do with the think tank's "
         f"own products or backlog. Answer it directly, in character, in 2-4 sentences. "
         f"If answering depends on live outside conditions, use the weather_now tool with "
         f"the location from the question (or the provided location). For any other live/current "
@@ -8115,7 +8115,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     # (search_web via Tavily) with no special cost-gating -- "ask stays
     # free" was never actually true, so adding a second, comparably-cheap
     # metered tool is a consistent extension of an already-accepted
-    # pattern, not a new category of risk. The village-wide SPEND_CAP_USD
+    # pattern, not a new category of risk. The think tank-wide SPEND_CAP_USD
     # hard ceiling still bounds real runaway cost regardless of which lane
     # triggers it.
     from content import (_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL, _make_treg_tools_executor,
@@ -8203,7 +8203,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
 
 @app.post('/api/intent/ask')
 async def intent_ask(request: Request):
-    """Player asks the village a genuinely NEW, one-off question -- something
+    """Player asks the think tank a genuinely NEW, one-off question -- something
     unrelated to existing products/work, which is exactly what makes it distinct
     from /api/intent/clarify (a clarify is a question ABOUT completed work and is
     keyed by productId; this is net-new and keyed by nothing but the ask itself).
@@ -8254,9 +8254,9 @@ async def intent_ask(request: Request):
 # ---------------------------------------------------------------------------
 
 _ROUTING_LANES = [
-    {'id': 'ask', 'description': "A direct question expecting an immediate, conversational answer right now (trivia, opinion, a quick lookup, small talk) -- not a request to change, build, or investigate anything in the village or its products."},
+    {'id': 'ask', 'description': "A direct question expecting an immediate, conversational answer right now (trivia, opinion, a quick lookup, small talk) -- not a request to change, build, or investigate anything in the think tank or its products."},
     {'id': 'schedule', 'description': "Asks for something to happen automatically on a recurring or periodic basis going forward (e.g. 'check X every hour/day', 'keep watching Y and update it') -- a standing job, not a one-time favor."},
-    {'id': 'spike', 'description': "Asks the village to look into or figure something out ONE TIME, with no need for an immediate reply and no clearly defined deliverable yet -- exploratory, time-boxed digging, not a committed piece of work."},
+    {'id': 'spike', 'description': "Asks the think tank to look into or figure something out ONE TIME, with no need for an immediate reply and no clearly defined deliverable yet -- exploratory, time-boxed digging, not a committed piece of work."},
     {'id': 'story', 'description': "Asks for something substantial to be BUILT, CHANGED, or DELIVERED -- a real feature, fix, or piece of work with a concrete outcome, sized for a team's real backlog and sprint process."},
     {'id': 'incident', 'description': "Reports something already broken, down, or failing RIGHT NOW in a live product, wanting it fixed urgently."},
     {'id': 'unclear', 'description': "None of the above genuinely fits, or it's ambiguous/contradictory/high-stakes enough that only a human director should decide how to handle it -- do not force a fit."},
@@ -8277,7 +8277,7 @@ def _classify_request_lane_default(state, text):
     # allow one run, a low-confidence 0.56 deny the next), just never
     # protected here before.
     choice, _confidence, _cost = _jev_quorum_choice_sync(
-        f'The village admin is triaging one free-text message the player just sent. Player\'s message: "{text}"',
+        f'The think tank admin is triaging one free-text message the player just sent. Player\'s message: "{text}"',
         {c['id']: c['description'] for c in _ROUTING_LANES})
     return choice if any(c['id'] == choice for c in _ROUTING_LANES) else None
 
@@ -8831,12 +8831,12 @@ def _write_wiki_server(page_id, title, category, content):
     """Server-authority wiki write (hive-mind distillation path).
 
     The /api/intent/wiki/page endpoint is director/admin-gated -- which is right
-    for a player-authored page -- but the distillation loop is the VILLAGE
+    for a player-authored page -- but the distillation loop is the THINK TANK
     learning as a body, not an agent authoring. It runs as the server (actor
     'distill'), so it bypasses the director gate while still persisting the body
     to disk, bumping the version/history, logging to action_log, and chaining
     pinned into the passport exactly like any other wiki write (server-owned
-    state: the village's synthesized knowledge must survive the client autosave,
+    state: the think tank's synthesized knowledge must survive the client autosave,
     the same reason products/wiki-releases are server-owned).
 
     Returns the sim record dict (or None on failure) so the executor can report
@@ -8847,23 +8847,23 @@ def _write_wiki_server(page_id, title, category, content):
         return None
     categories = state.setdefault('wiki', {}).setdefault('categories', {})
     if category not in categories:
-        if category != 'village':
+        if category != 'think_tank':
             return None
         # Real gap caught live (2026-09-26): nothing ever seeds a default
-        # 'village' category -- it's only ever created via a director
-        # manually calling POST /api/intent/wiki/category, so a village
+        # 'think_tank' category -- it's only ever created via a director
+        # manually calling POST /api/intent/wiki/category, so a think tank
         # where nobody happened to do that had EVERY distillation attempt
         # silently fail its wiki write, forever (the executor just reports
-        # "the wiki write failed" -- easy to miss, no loud error). 'village'
+        # "the wiki write failed" -- easy to miss, no loud error). 'think_tank'
         # is a hardcoded system constant this server-owned path itself
-        # depends on to function at all (see content._DISTILL_VILLAGE_PAGE_
+        # depends on to function at all (see content._DISTILL_THINK_TANK_PAGE_
         # ID), not a director-typed string that could be a typo -- auto-
         # seeding just this one, well-known category is safe; any other
         # missing category still fails closed exactly as before. Mutating
         # `categories` here (via the setdefault chain above, not a fresh
         # copy) means the single save_state_to_db call below persists this
         # alongside the page write, no extra read/write round trip needed.
-        categories['village'] = {'label': 'Village', 'order': 0}
+        categories['think_tank'] = {'label': 'Think Tank', 'order': 0}
     record, _is_new = _sim.wiki_write_page(state, page_id, title, category,
                                            content, 'distill')
     if record is None:
@@ -9230,7 +9230,7 @@ def _owns_library_path(rel_path):
     # shared commons. The per-agent personal space is downloads/<agent_id>/ in
     # the promoted tree and pending_review/downloads/<agent_id>/ before
     # promotion (see _download_dest_rel_path). Everything else -- shared/,
-    # skills/, projects/, village/, archive/, rejected/ -- is the commons any
+    # skills/, projects/, think tank/, archive/, rejected/ -- is the commons any
     # agent can write. Returns the owning agent id, or None for commons.
     norm = rel_path.strip('/').split('/')
     if len(norm) < 2:
@@ -9264,13 +9264,13 @@ async def list_library():
 
 
 # Per-agent file browsing (issue #9): agents view one another's files (READ
-# for any agent -- the village is transparent about who did what) but cannot
+# for any agent -- the think tank is transparent about who did what) but cannot
 # WRITE another agent's directory unless they're that agent's director/above
 # or the admin. Reads are served read-only here; writes only happen through
 # the server's own materialization (sync_agent_directories) and the gated
 # write paths, so the write-ACL at the endpoints is the enforcement point.
 # Deliberately only the materialized, non-secret mirror is listed -- the
-# conversation/state/profile files are already what any village member is
+# conversation/state/profile files are already what any think tank member is
 # meant to see, and nothing under agents/<id>/ holds server credentials.
 # Skip the VCS internals (prototypes/ is itself a git repo) and OS junk --
 # nobody's "own files" include .git plumbing or .DS_Store.
@@ -9405,9 +9405,9 @@ async def search_library(q: str):
 # do. Usage lives in its own small sidecar file, NOT inside LIBRARY_DIR (see
 # the dotfile-leak fix on list_library just above -- a second reserved file
 # living inside the searched tree would repeat the exact bug just fixed) and
-# NOT in the kv_state blob (this doesn't need to survive a village reset the
+# NOT in the kv_state blob (this doesn't need to survive a think tank reset the
 # way sim state does, and avoids adding write load to that hot blob).
-LIBRARY_USAGE_PATH = os.path.join(VILLAGE_DIR, 'library_usage.json')
+LIBRARY_USAGE_PATH = os.path.join(THINK_TANK_DIR, 'library_usage.json')
 LIBRARY_TRAIL_HALF_LIFE_S = 7 * 24 * 3600  # one week
 
 
@@ -9618,7 +9618,7 @@ async def write_library_file(request: Request):
     # pending_review/ until someone actually looks at it. Real, relevant
     # risk this closes: an agent could otherwise browse a page containing
     # injected instructions and have it land in the SHARED library as if
-    # it were trusted village knowledge, exactly the "memory poisoning"
+    # it were trusted think tank knowledge, exactly the "memory poisoning"
     # failure class the reference corpus itself is full of.
     body = await request.json()
     agent_id = body.get('agentId', 'unknown')
@@ -9632,7 +9632,7 @@ async def write_library_file(request: Request):
     target = _safe_library_path(rel_path)
     if not target:
         return JSONResponse({'error': 'invalid path'}, status_code=400)
-    # Phase G -- the working guide is the village's durable "what we learned"
+    # Phase G -- the working guide is the think tank's durable "what we learned"
     # file, read into every task's prompt at start. Because it steers ALL
     # future work, only directors and the admin may write it (the same
     # gate that owns the role-template library, _is_director_or_admin);
@@ -9647,7 +9647,7 @@ async def write_library_file(request: Request):
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
     # Per-agent personal namespace ACL (your walk-the-chain model, issue #9):
     # anyone can read the shared Library, anyone can write the COMMONS
-    # (shared/, skills/, projects/, village/, archive/ -- the collective-
+    # (shared/, skills/, projects/, think tank/, archive/ -- the collective-
     # knowledge mechanic), but a path inside another agent's OWN
     # downloads/... subdirectory is that agent's private space: only that
     # agent, their directors/above, or the admin may write there. Derived
@@ -9684,7 +9684,7 @@ DOWNLOAD_MAX_BYTES = 20_000_000  # 20MB -- generous for a real reference documen
 
 
 def _download_file_sync(url, max_bytes):
-    req = urllib.request.Request(url, headers={'User-Agent': 'AIVillageAgent/1.0'}, method='GET')
+    req = urllib.request.Request(url, headers={'User-Agent': 'AIThinkTankAgent/1.0'}, method='GET')
     with urllib.request.urlopen(req, timeout=BROWSE_TIMEOUT_S) as resp:  # nosec B310 -- user URLs pre-cleared by _jev_safety_gate's SSRF hostname guard (:2157); this helper only fetches already-approved hosts
         final_url = resp.geturl()
         final_host = urllib.parse.urlparse(final_url).hostname
@@ -9702,7 +9702,7 @@ async def library_download(request: Request):
     if not BROWSING_ENABLED:
         return JSONResponse({'error': 'Agent browsing is disabled (AGENT_BROWSING_ENABLED=false in .env)'}, status_code=403)
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-village/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
 
     body = await request.json()
     url = (body.get('url') or '').strip()
@@ -9750,7 +9750,7 @@ async def library_download(request: Request):
     decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
 
     if not _jev_safety_gate(agent_id, 'download', 'This file download', url, purpose, decision, confidence, cost, authorized, trace_id):
-        return JSONResponse({'allowed': False, 'reason': 'This file was not approved for a village agent to download.'})
+        return JSONResponse({'allowed': False, 'reason': 'This file was not approved for a think tank agent to download.'})
 
     try:
         final_url, content_type, raw, truncated = await asyncio.to_thread(_download_file_sync, url, DOWNLOAD_MAX_BYTES)
@@ -9777,7 +9777,7 @@ async def library_download(request: Request):
 def _load_passport():
     # Best-effort load of the passport chain. A missing/corrupt file yields a
     # fresh chain -- the passport is an audit trail, not a hard dependency of
-    # running the village.
+    # running the think tank.
     if not os.path.exists(PASSPORT_PATH):
         return {'version': 1, 'count': 0, 'head': None, 'blocks': []}
     try:
@@ -9829,7 +9829,7 @@ def _append_passport_decision(kind, actor, payload):
     # the hashed-chain? Is it every action?") -- the answer is NO, by design:
     # routine activity (chat, browse, execute, state saves) fills action_log,
     # a plain table. The hash-chain is reserved for decisions and file
-    # mutations that change the villagers' world -- hire, fire, promote
+    # mutations that change the researchers' world -- hire, fire, promote
     # (library_promote), any library file WRITE/MODIFY (library_write),
     # grant/revoke access, report_filed, big-task delegation. Each decision is
     # a block chained to the SAME head as the promoted-file blocks, so the
@@ -9981,7 +9981,7 @@ async def library_reject(request: Request):
     return PlainTextResponse('rejected')
 
 
-# Real document ingestion, per your direct ask: feed the village PDFs,
+# Real document ingestion, per your direct ask: feed the think tank PDFs,
 # Excel files, Python/HTML source, images, whole directories, and zips,
 # and have their real content land in the Library where any agent can
 # read it. Reads directly off the local filesystem this server already
@@ -10172,7 +10172,7 @@ async def chat(request: Request):
     # (it owns persona/prompt construction, this is just a secure proxy)
     # and gets back the reply text, nothing else.
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-village/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
     # /api/chat is NOT in AUTH_PROTECTED_PREFIXES (it governs OpenRouter spend,
     # so it guards itself by EITHER a player session OR a valid agent key --
     # the same agent-key attribution model every other /api endpoint uses). The
@@ -10263,18 +10263,18 @@ async def browse(request: Request):
     # the residual risk of open-web + a Jev gate over a hard allowlist --
     # but classify BEFORE fetching, not after: a page's content never
     # lands on this machine unless Jev already approved the destination
-    # and stated purpose. Every request is logged to village.db regardless
+    # and stated purpose. Every request is logged to think_tank.db regardless
     # of outcome, and the whole endpoint can be shut off in one place via
     # AGENT_BROWSING_ENABLED in .env.
     if not BROWSING_ENABLED:
         return JSONResponse({'error': 'Agent browsing is disabled (AGENT_BROWSING_ENABLED=false in .env)'}, status_code=403)
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-village/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
     # Monthly page-request budget (2026-09-27): a count-based quota on external
     # fetches, NOT a dollar cap. When the month's allowance is spent, browsing
     # refuses rather than silently running over the 1000 free requests.
     if _page_budget_exhausted():
-        return JSONResponse({'allowed': False, 'reason': 'The village has used its monthly page-request budget. Browsing is paused until next month (or raise PAGE_REQUEST_MONTHLY_BUDGET in .env).'})
+        return JSONResponse({'allowed': False, 'reason': 'The think tank has used its monthly page-request budget. Browsing is paused until next month (or raise PAGE_REQUEST_MONTHLY_BUDGET in .env).'})
 
     body = await request.json()
     url = (body.get('url') or '').strip()
@@ -10317,7 +10317,7 @@ async def browse(request: Request):
         decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
 
         if not _jev_safety_gate(agent_id, 'browse', 'This page', url, purpose, decision, confidence, cost, authorized, trace_id):
-            return JSONResponse({'allowed': False, 'reason': 'This site was not approved for a village agent to visit.'})
+            return JSONResponse({'allowed': False, 'reason': 'This site was not approved for a think tank agent to visit.'})
         # Real trail evidence: a confident allow (never an escalated/unsure
         # one) on a domain not already vetted -- see record_browse_success.
         record_browse_success(parsed.hostname)
@@ -10604,7 +10604,7 @@ def _curl_request_sync(method, url, headers, body):
     data = body.encode() if body else None
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     if 'User-Agent' not in {k.title() for k in (headers or {})}:
-        req.add_header('User-Agent', 'AIVillageAgent/1.0')
+        req.add_header('User-Agent', 'AIThinkTankAgent/1.0')
     with urllib.request.urlopen(req, timeout=CURL_TIMEOUT_S) as resp:  # nosec B310 -- _http_json target is a fixed internal SELF_BASE_URL; only pre-cleared browse/download URLs reach here
         final_url = resp.geturl()
         # Re-check the FINAL host after redirects -- same reasoning as
@@ -10637,7 +10637,7 @@ async def curl(request: Request):
     if not BROWSING_ENABLED:
         return JSONResponse({'error': 'Agent browsing is disabled (AGENT_BROWSING_ENABLED=false in .env)'}, status_code=403)
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-village/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
 
     body_json = await request.json()
     agent_id = body_json.get('agentId', 'unknown')
@@ -10683,7 +10683,7 @@ async def curl(request: Request):
     )
     decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
     if not _jev_safety_gate(agent_id, 'curl', 'This HTTP request', f'{method} {url}', purpose, decision, confidence, cost, authorized, trace_id):
-        return JSONResponse({'allowed': False, 'reason': 'This request was not approved for a village agent to make.'})
+        return JSONResponse({'allowed': False, 'reason': 'This request was not approved for a think tank agent to make.'})
 
     # Phase D: a capability handle lets an agent attach a scoped external
     # credential (e.g. an API key) to this request. The handle only authorizes
@@ -10768,7 +10768,7 @@ async def sandbox_download(request: Request):
     if not BROWSING_ENABLED:
         return JSONResponse({'error': 'Agent browsing is disabled (AGENT_BROWSING_ENABLED=false in .env)'}, status_code=403)
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-village/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
 
     body = await request.json()
     url = (body.get('url') or '').strip()
@@ -10864,7 +10864,7 @@ async def sandbox_save_page(request: Request):
     if not BROWSING_ENABLED:
         return JSONResponse({'error': 'Agent browsing is disabled (AGENT_BROWSING_ENABLED=false in .env)'}, status_code=403)
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-village/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
 
     body = await request.json()
     url = (body.get('url') or '').strip()
@@ -10942,7 +10942,7 @@ async def access_request(request: Request):
     # REAL, TEMPORARY grant if the reason is legitimate -- judged, not
     # rubber-stamped, and not permanent even when approved. The judgment
     # itself is a real Jev classification (the same mechanism every other
-    # gate in this village already uses for "is this reason legitimate"),
+    # gate in this think tank already uses for "is this reason legitimate"),
     # framed as the supervisor's call; `supervisorId` just records who it
     # was asked of, for a real, visible mail trail.
     body = await request.json()
@@ -10959,7 +10959,7 @@ async def access_request(request: Request):
     if not reason:
         return JSONResponse({'error': 'reason is required'}, status_code=400)
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-village/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
 
     criteria = {
         'approve': f'The stated reason is a specific, legitimate, task-related need for this capability ({TEMP_ACCESS_CAPABILITIES[capability]}) -- not vague, not "just in case."',
@@ -11053,8 +11053,8 @@ def _ensure_sandbox_git_repo(sandbox_dir):
     _run_git_sync(sandbox_dir, ['init', '-q'])
     # A real identity scoped to just this repo -- doesn't touch or require
     # any global git config on the machine this happens to run on.
-    _run_git_sync(sandbox_dir, ['config', 'user.email', 'sandbox-backup@ai-village.local'])
-    _run_git_sync(sandbox_dir, ['config', 'user.name', 'AI Village sandbox backup'])
+    _run_git_sync(sandbox_dir, ['config', 'user.email', 'sandbox-backup@ai-think-tank.local'])
+    _run_git_sync(sandbox_dir, ['config', 'user.name', 'AI Think Tank sandbox backup'])
 
 
 def _snapshot_sandbox(sandbox_id, sandbox_dir):
@@ -11358,7 +11358,7 @@ def _screenshot_url_sync(url, width=1280, height=900):
     chrome = _find_chrome()
     if not chrome:
         return None
-    out_path = os.path.join(VILLAGE_DIR, f'.tmp-screenshot-{secrets.token_hex(8)}.png')
+    out_path = os.path.join(THINK_TANK_DIR, f'.tmp-screenshot-{secrets.token_hex(8)}.png')
     cmd = [
         chrome, '--headless', '--disable-gpu', '--no-sandbox',
         f'--screenshot={out_path}', f'--window-size={width},{height}',
@@ -11892,7 +11892,7 @@ def _calibration_adjust_pass(now=None):
       - observed success rate at the current bar BELOW the target - dead-band ->
         raise the bar (require stronger evidence to auto-approve);
       - observed success rate ABOVE the target + dead-band -> lower it toward the
-        floor (don't make the village more cautious than its own evidence says
+        floor (don't make the think tank more cautious than its own evidence says
         it needs to be).
     Returns the new threshold, or None when no move was warranted (no scored
     decisions at the current bar / inside the dead-band / clamped). Audit row
@@ -11957,7 +11957,7 @@ def _activity_summary_for(agent_id):
 EXPECTED_MODEL_BANDS = ('low', 'mid', 'coding', 'high', 'vision')
 # One missed 5s client autosave tick (index.html's setInterval(saveState,
 # 5000)) plus generous slack for a slow request -- past this, treat it as
-# "no browser tab is actually driving the village right now" rather than
+# "no browser tab is actually driving the think tank right now" rather than
 # a fluke.
 HEALTH_STATE_STALE_AFTER_S = 30
 # Don't re-log the same standing condition every 5-minute check -- an
@@ -11979,7 +11979,7 @@ JEV_HEALTH_WINDOW_S = 60 * 60
 JEV_HEALTH_FAILURE_RATE = 0.5      # >=50% of Jev calls failing = degraded
 JEV_HEALTH_MIN_ATTEMPTS = 10       # don't trip on a handful of attempts
 # Absolute Zero rejection signal (2026-09-28): refinement grooms self-proposed
-# work-requests, and a REJECTED carryaway is the village's own signal that its
+# work-requests, and a REJECTED carryaway is the think tank's own signal that its
 # self-proposal pipeline is producing junk (trivial/ill-scoped cards). Counted
 # over a day; an info-severity dashboard alert (not a player push -- grooming
 # out junk is the normal job of refinement, so this only speaks up on a real
@@ -12054,7 +12054,7 @@ def _health_alerts_for_signals(signals):
     # Pure decision logic, deliberately separated from the DB reads in
     # compute_health_snapshot -- lets the actual thresholds be tested
     # with synthetic inputs instead of against whatever real data
-    # happens to be in village.db at test time.
+    # happens to be in think_tank.db at test time.
     alerts = []
 
     def alert(category, severity, message):
@@ -12063,7 +12063,7 @@ def _health_alerts_for_signals(signals):
     # Deliberately keyed off work_queue_due_size, not the raw total -- an
     # item scheduled for later (notBefore) is SUPPOSED to sit untouched
     # with no tab open; that's not stuck, it's just not time yet.
-    if signals['work_queue_due_size'] and not signals['village_active']:
+    if signals['work_queue_due_size'] and not signals['think_tank_active']:
         alert('work_queue', 'info',
               f'{signals["work_queue_due_size"]} due item(s) queued but no browser tab has saved state in '
               f'{signals["seconds_since_last_save"]:.0f}s -- nothing will drain the queue until one is open')
@@ -12100,7 +12100,7 @@ def _health_alerts_for_signals(signals):
     # SPOF (single slug, single provider, deliberately no circuit breaker) --
     # when it fails, every Jev feature silently runs its deterministic
     # fallback. The failure RATE over the window, not a raw count, is the
-    # signal (a busy village blips a call or two and shouldn't alert; a real
+    # signal (a busy think tank blips a call or two and shouldn't alert; a real
     # outage fails most or all of them).
     jev_attempts = signals['jev_decision_attempts_last_hour']
     jev_failures = signals['jev_decision_failures_last_hour']
@@ -12132,7 +12132,7 @@ def _health_alerts_for_signals(signals):
               f'outrunning actual work')
 
     # Absolute Zero rejection signal (2026-09-28): a rising count of self-proposed
-    # work-requests groomed OUT at refinement means the village's own proposals are
+    # work-requests groomed OUT at refinement means the think tank's own proposals are
     # low-value/trivial -- the default failure mode when agents pick their own next
     # work. Info severity: a dashboard signal, not a player-spam push (rejecting
     # junk is refinement's normal job; this speaks up only on a real pattern).
@@ -12145,7 +12145,7 @@ def _health_alerts_for_signals(signals):
     # METR reliability-at-horizon (2026-09-28): a colony that STARTS tasks but
     # rarely FINISHES them within the horizon has poor reliability -- work
     # turning into ceremony or stalling -- even when raw task_completed counts
-    # look healthy. Gated on a minimum number of assignments so a quiet village
+    # look healthy. Gated on a minimum number of assignments so a quiet think tank
     # with 2 tasks and 0 finishes isn't judged on noise.
     assigned = signals['task_assigned_last_24h']
     fast_rate = signals['task_fast_completion_rate']
@@ -12251,15 +12251,15 @@ def compute_health_snapshot():
             state_row = conn.execute('SELECT blob, updated_at FROM kv_state WHERE id = 1').fetchone()
     except Exception as e:
         return {'checked_at': now, 'db_ok': False, 'alerts': [
-            {'category': 'db', 'severity': 'critical', 'message': f'village.db unreachable: {e}'}
+            {'category': 'db', 'severity': 'critical', 'message': f'think_tank.db unreachable: {e}'}
         ]}
 
     if state_row is None:
-        village_active, seconds_since_last_save, work_queue_size, work_queue_due_size, agents_count = False, None, 0, 0, 0
+        think_tank_active, seconds_since_last_save, work_queue_size, work_queue_due_size, agents_count = False, None, 0, 0, 0
     else:
         blob, updated_at = state_row
         seconds_since_last_save = now - updated_at
-        village_active = seconds_since_last_save < HEALTH_STATE_STALE_AFTER_S
+        think_tank_active = seconds_since_last_save < HEALTH_STATE_STALE_AFTER_S
         data = json.loads(blob)
         work_queue = data.get('workQueue', [])
         work_queue_size = len(work_queue)
@@ -12331,7 +12331,7 @@ def compute_health_snapshot():
         # single slug, single provider, deliberately no circuit breaker) is
         # visible as a failure rate instead of silently falling back to
         # deterministic rules for hours. Count attempts AND failures so the
-        # alert can judge the RATIO, not a raw count that a busy village
+        # alert can judge the RATIO, not a raw count that a busy think tank
         # would trip on with a couple of blips.
         jev_attempt_rows = conn.execute(
             'SELECT COUNT(*), SUM(ok = 0) FROM decision_tape WHERE ts > ?',
@@ -12354,10 +12354,10 @@ def compute_health_snapshot():
 
     chosen_bands = {row[0] for row in tier_rows}
     signals = {
-        'village_active': village_active,
+        'think_tank_active': think_tank_active,
         # Sleep-not-die: True when idle auto-sleep has paused the sim (no spend/
         # churn) but the process is up and bound. Hitting this endpoint is itself
-        # a wake request, so a "sleeping" village reads False here immediately.
+        # a wake request, so a "sleeping" think tank reads False here immediately.
         'dormant': _dormant(),
         'seconds_since_last_save': seconds_since_last_save,
         'work_queue_size': work_queue_size,
@@ -12451,7 +12451,7 @@ def _push_new_health_alerts(alerts):
     for alert in alerts:
         if alert.get('severity') not in ('warning', 'critical'):
             continue
-        subject = f"[AI Village] Health alert ({alert['category']})"
+        subject = f"[AI Think Tank] Health alert ({alert['category']})"
         body = alert['message']
         email_ok = _send_player_email_sync(subject, body)
         telegram_ok = send_player_telegram_sync(subject, body)
@@ -12567,14 +12567,14 @@ async def health_alerts_endpoint(limit: int = 50):
 
 @app.get('/api/activity/summary')
 async def activity_summary(agentId: str):
-    # Real bug caught live: asked to reflect on the village with nothing
+    # Real bug caught live: asked to reflect on the think tank with nothing
     # but a role and a vague prompt, agents confabulated confidently --
     # "quarterly review process," "Gemini writes, DeepSeek codes," one
     # agent complaining about a tool it's never had room access to touch.
     # A real, cheap GROUP BY against the same action_log every real action
     # already writes into -- grounding a retrospective in what an agent
     # actually, verifiably did, instead of a free-form guess at what a
-    # village like this "should" contain.
+    # think tank like this "should" contain.
     return JSONResponse({'agentId': agentId, 'counts': _activity_summary_for(agentId)})
 
 
@@ -12598,7 +12598,7 @@ async def model_tiers():
 async def model_tiers_refresh():
     # An explicit, deliberate action (a button) -- but also run AUTOMATICALLY
     # once a day by _model_tier_refresh_loop, attributed to the admin/director
-    # (2026-09-27: the model landscape moves fast, so the village re-picks its
+    # (2026-09-27: the model landscape moves fast, so the think tank re-picks its
     # best-value tier from that day's scores + prices on a schedule). This
     # endpoint just lets the player force an immediate re-pick too.
     try:
@@ -12611,7 +12611,7 @@ async def model_tiers_refresh():
 @app.get('/api/model-benchmark-scores')
 async def model_benchmark_scores_get():
     # Read-only for everyone logged in -- lets the actual selection logic
-    # (refresh_model_tiers) and anyone inspecting the village's own
+    # (refresh_model_tiers) and anyone inspecting the think tank's own
     # decisions see exactly what real, cited data each band's pick was
     # grounded in, rather than that being invisible.
     return JSONResponse({'scores': get_model_benchmark_scores()})
@@ -12644,12 +12644,12 @@ async def decide(request: Request):
     # secure-proxy shape as /api/chat: the client builds state/questions,
     # this just forwards it with the key attached and returns the answer.
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-village/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
     body = await request.json()
     # The resolved JEV model is authoritative -- a client-provided model is
     # ignored so an operator switch (env or the /api/jev/model DB setting)
     # takes effect for browser-driven calls too (jev.js sends no model; the
-    # server, not the client, owns which decisions model this village runs on).
+    # server, not the client, owns which decisions model this think tank runs on).
     model = _jev_model()
     state = body.get('state')
     questions = body.get('questions')
@@ -12678,7 +12678,7 @@ async def decide(request: Request):
 
 @app.get('/api/jev/model')
 async def jev_model_get():
-    # Read-only for anyone logged in: what decisions chain is this village
+    # Read-only for anyone logged in: what decisions chain is this think tank
     # actually running on right now? Answers via the same _jev_model() the
     # call sites use, so this always reflects the live value, plus the full
     # failover chain and each slug's breaker state (a multi-slug chain tripping
@@ -12711,7 +12711,7 @@ async def jev_calibration(window_s: Optional[float] = None):
 async def jev_model_set(request: Request):
     # Player-only, same session proof as the credential vault/handle minting
     # (_resolve_requester falls closed to "player" for a misclaimed agent,
-    # which is exactly backwards here): switching the village's decisions
+    # which is exactly backwards here): switching the think tank's decisions
     # model is an operator action. Writes the `settings` DB row so the switch
     # survives restarts and takes effect immediately -- no process restart,
     # and (unlike model_tiers) it is never auto-updated; a new decision model
@@ -12753,7 +12753,7 @@ async def review_escalate(request: Request):
 
 
 _LOGIN_PAGE = """<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>AI Village -- Sign in</title>
+<html><head><meta charset="UTF-8"><title>AI Think Tank -- Sign in</title>
 <style>
 body{background:#181818;color:#eee;font-family:'Segoe UI',Arial,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
 form{background:#242424;padding:32px 36px;border-radius:10px;box-shadow:0 8px 32px #0008;min-width:280px}
@@ -12765,7 +12765,7 @@ button{width:100%;padding:9px;border:none;border-radius:5px;background:#e87d1e;c
 </style></head>
 <body>
 <form method="post" action="/login">
-  <h1>AI Village</h1>
+  <h1>AI Think Tank</h1>
   __ERROR_HTML__
   <label for="u">Username</label>
   <input id="u" name="username" autocomplete="username" autofocus>
@@ -12894,9 +12894,9 @@ if __name__ == '__main__':
             ensure_sandbox_networking()
         except Exception as e:
             print(f'[sandbox] networking setup failed (execution will error until Docker is available): {e}')
-    print(f'World 2 dev server (FastAPI, with /save + /api/state) on http://{bind_host}:{port}')
+    print(f'World dev server (FastAPI, with /save + /api/state) on http://{bind_host}:{port}')
     if _MAX_IDLE_MINUTES:
-        print(f'[idle] auto-sleep armed: village pauses after {_MAX_IDLE_MINUTES}m with no HTTP request; stays bound; any request wakes it', flush=True)
+        print(f'[idle] auto-sleep armed: think tank pauses after {_MAX_IDLE_MINUTES}m with no HTTP request; stays bound; any request wakes it', flush=True)
     server = Server(Config(app, host=bind_host, port=port, log_level='warning'))
 
     async def _arm_idle_and_run():
@@ -12916,7 +12916,7 @@ if __name__ == '__main__':
         # Clean shutdown: persist a fresh DB checkpoint so state survives the
         # shell exit (and any later crash of the OLD manual-copy-only backup).
         try:
-            _backup_village_db()
+            _backup_think_tank_db()
         except Exception as e:
             print(f'[backup] shutdown checkpoint failed: {e}', flush=True)
 

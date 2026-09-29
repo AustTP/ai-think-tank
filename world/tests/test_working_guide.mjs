@@ -48,7 +48,7 @@ ok('prependWorkingGuide leaves prompt unchanged with no guide', plain === 'TASK 
 vm.runInContext('__lib_store["working-guide.md"] = "Lead with a concrete reader outcome.";', context);
 ok('readWorkingGuide returns the guide when present', (await readWorkingGuide()) === 'Lead with a concrete reader outcome.');
 const wrapped = prependWorkingGuide('TASK PROMPT', await readWorkingGuide());
-ok('prependWorkingGuide places the guide above the task', wrapped.startsWith('You carry the village\'s working guide'));
+ok('prependWorkingGuide places the guide above the task', wrapped.startsWith('You carry the think tank\'s working guide'));
 ok('prependWorkingGuide preserves the task prompt at the end', wrapped.endsWith('TASK PROMPT'));
 
 // 3. appendWorkingGuide creates the file on the first lesson.

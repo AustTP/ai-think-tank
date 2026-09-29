@@ -112,10 +112,10 @@ function whoNeedsReview() {
 // someone's morale is actually low enough to warrant a look.
 function attemptAutoFiringReview() {
   // Same idle rule as attemptAutoHire(): reviewing performance in a
-  // village where nobody has been asked to do anything is exactly the
+  // think tank where nobody has been asked to do anything is exactly the
   // "runs more often than the problem it's for" waste you identified --
   // 247 real reviews last session, every one of them a 'keep'.
-  if (!villageHasWork()) return false;
+  if (!thinkTankHasWork()) return false;
   const now = Date.now();
   if (now - lastFiringReviewAt < FIRING_COOLDOWN_MS) return false;
 
@@ -253,7 +253,7 @@ async function finishFiringReview(reviewer1Def, reviewer2Def, candidateDef) {
   ].join(' | ') || 'no one reported them and no one is currently working directly with them';
   const instructions = `${reviewer1Def.name} and ${reviewer2Def.name} are jointly reviewing ${candidate.name}'s (${candidate.role}) performance. ${reviewer1Def.name} is the admin; ${reviewer2Def.name} is the senior-most director standing in for the admin. Morale score: ${morale}/100. Approved work: ${candidate.approvedCount}. Dropped work: ${candidate.droppedCount}. Reports filed against them: ${reportQuotes}. ${candidate.name}'s own manager has already been notified of these reports. People consulted who have worked with or reported ${candidate.name}: ${consultantLine}. Decide whether to fire them or keep them on.`;
   const candidates = [
-    { id: 'fire', description: `End ${candidate.name}'s role in the village -- performance does not justify keeping them on, and the people who work with them don't outweigh the evidence.` },
+    { id: 'fire', description: `End ${candidate.name}'s role in the think tank -- performance does not justify keeping them on, and the people who work with them don't outweigh the evidence.` },
     { id: 'keep', description: `Keep ${candidate.name} on -- performance is acceptable, improving, or the evidence or the people who work with them don't support firing.` },
   ];
 
@@ -275,7 +275,7 @@ async function finishFiringReview(reviewer1Def, reviewer2Def, candidateDef) {
   // active collaborator, or only thin/unconfirmed evidence), they hold off
   // rather than act on weak signal.
   if (decision === 'fire' && consultationBlocksFiring(candidateDef, morale)) {
-    logVillageAction(reviewer1Def.id, 'firing_review', { about: candidateDef.id, decision: 'deferred_for_consultation', morale, reviewers: [reviewer1Def.id, reviewer2Def.id], consulted: { reporters: reporters.map(r => r.id), coworkers: coworkers.map(c => c.id) } });
+    logThinkTankAction(reviewer1Def.id, 'firing_review', { about: candidateDef.id, decision: 'deferred_for_consultation', morale, reviewers: [reviewer1Def.id, reviewer2Def.id], consulted: { reporters: reporters.map(r => r.id), coworkers: coworkers.map(c => c.id) } });
     candidate.lastFiringReview = undefined; // don't mark it reviewed -- a real change (collaboration ends, evidence grows) should re-open it
     return;
   }
@@ -288,7 +288,7 @@ async function finishFiringReview(reviewer1Def, reviewer2Def, candidateDef) {
   // avoid; bail without recording a verdict so this candidate is looked
   // at fresh next cycle rather than wrongly treated as a real "keep".
   if (candidate.busy || candidate.task || candidate.pairWith || candidate.handoff) {
-    logVillageAction(reviewer1Def.id, 'firing_review', { about: candidateDef.id, decision: 'deferred', reason: 'candidate became busy mid-review' });
+    logThinkTankAction(reviewer1Def.id, 'firing_review', { about: candidateDef.id, decision: 'deferred', reason: 'candidate became busy mid-review' });
     return;
   }
 
@@ -312,5 +312,5 @@ async function finishFiringReview(reviewer1Def, reviewer2Def, candidateDef) {
     candidate.lastFiringReview = { morale, reportCount: reportsAbout(candidateDef.id).length, verdict: decision, at: Date.now() };
     showToast(`${reviewer1.name} and ${reviewer2.name} reviewed ${candidate.name}'s performance and decided to keep them on.`, 5000);
   }
-  logVillageAction(reviewer1Def.id, 'firing_review', { about: candidateDef.id, decision, morale, reviewers: [reviewer1Def.id, reviewer2Def.id] });
+  logThinkTankAction(reviewer1Def.id, 'firing_review', { about: candidateDef.id, decision, morale, reviewers: [reviewer1Def.id, reviewer2Def.id] });
 }

@@ -1,10 +1,10 @@
-# AI Village
+# AI Think Tank
 
 A persistent, server-owned simulation where LLM agents walk between rooms,
 work tasks, refine backlogs, peer-review each other's deliverables, get hired
 and fired, and file reports — all driven by real model calls through
 OpenRouter, gated by a JEV policy classifier where decisions have
-consequences. Close the browser and the village keeps running; reopen it and
+consequences. Close the browser and the think tank keeps running; reopen it and
 you see what happened while you were away.
 
 See `DESIGN.md` for the full architecture documentation.
@@ -41,7 +41,7 @@ cd world && python3 -m pytest tests/
 
 ## What it is
 
-- A persistent village database (`village.db`, SQLite). Every action is
+- A persistent think tank database (`think_tank.db`, SQLite). Every action is
   logged; agent history is replayable. No state is lost on restart.
 - A FastAPI server (`world/serve.py`) that owns the simulation, the model
   calls (via OpenRouter), the shared Library, spend accounting, and session
@@ -53,7 +53,7 @@ cd world && python3 -m pytest tests/
 - Content executors (`world/content.py`) that run when an agent arrives at a
   task: research crawls, code writing and review, weather, distillation,
   media digests, bank reviews, and time-boxed investigations (spikes).
-- A single-page browser client (`world/index.html`) that renders the village
+- A single-page browser client (`world/index.html`) that renders the think tank
   as a pixel-art canvas and lets the player interact — but is now a pure
   viewport. The server owns every position, every task, every decision.
 - A JEV-gated model tier system: everything defaults to the cheap `low`
@@ -81,7 +81,7 @@ cd world && python3 -m pytest tests/
 
 - `world/` — the full implementation (server, sim, renderer, tests).
 - `agents/*` — per-agent identity files (`agent.json`, `AGENTS.md`,
-  `MEMORY.md`). **Regenerated mirrors of `village.db`**, never the source of
+  `MEMORY.md`). **Regenerated mirrors of `think_tank.db`**, never the source of
   truth. Gitignored.
 - `library/` — shared project Library (skills, archive, wiki). Skills are
   tracked; runtime content (archive, wiki, social) is gitignored and
@@ -92,9 +92,9 @@ cd world && python3 -m pytest tests/
 
 ## Notes
 
-- Agent identities live ONLY in `village.db`. The codebase has zero hardcoded
+- Agent identities live ONLY in `think_tank.db`. The codebase has zero hardcoded
   agent names — the roster is seeded from `.env` on a cold DB.
-- Governance is idle-quiet: an idle village spends no model budget.
+- Governance is idle-quiet: an idle think tank spends no model budget.
 - The high tier (the expensive one) is bounded twice: a per-model price
   ceiling ($5/M) and a monthly spend cap ($2/mo).
 - Room descriptions are director-editable; room geometry is not (it is a
