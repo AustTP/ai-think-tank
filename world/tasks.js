@@ -105,7 +105,7 @@ const TASK_POOL = [
 let lastTaskCompletedAt = {};
 
 // Per your explicit call: nothing should be working when there is nothing
-// to do, and no API calls should fire at all while the village is idle.
+// to do, and no API calls should fire at all while the think tank is idle.
 //
 // The old design made that impossible by construction -- TASK_POOL is a
 // fixed list that ALWAYS has entries, so pickNextTask() (now deleted)
@@ -154,7 +154,7 @@ function defineResearchTopic({ topic, startUrl, linkKeyword, pageKeyword, cadenc
 // Called once per tick, same interval as runTaskCycle (index.html) -- but
 // deliberately NOT folded into runTaskCycleBody itself, since that
 // function already short-circuits on an empty/not-due WORK_QUEUE (the
-// idle-village-spends-nothing contract, test_idle_quiet.mjs) and this
+// idle-think tank-spends-nothing contract, test_idle_quiet.mjs) and this
 // needs to run regardless of whether anything's already queued. Zero
 // calls of its own either way: an empty RESEARCH_TOPICS, or one where
 // nothing's due yet, costs exactly what an empty WORK_QUEUE already does
@@ -246,8 +246,8 @@ function _pickNextDueIndex(excludeItems) {
 
 // The single "is anything actually happening" test, shared by every
 // interval-driven mechanism so none of them can independently decide to
-// keep spending while the village is idle.
-function villageHasWork() {
+// keep spending while the think tank is idle.
+function thinkTankHasWork() {
   if (WORK_QUEUE.some(_isWorkItemDue)) return true;
   return Object.values(AGENTS).some(a => a.task || a.handoff || a.pairWith || a.busy);
 }
@@ -268,7 +268,7 @@ function _normalizePriority(p) {
   return WORK_PRIORITY.normal;
 }
 
-// Real requested work entering the village -- the only way anything gets
+// Real requested work entering the think tank -- the only way anything gets
 // queued now. `pair` is preserved from the admin's own plan so pair
 // programming survives the removal of the ambient pool (it used to come
 // from a hardcoded TASK_POOL flag). `notBefore` (a real epoch-ms
@@ -352,7 +352,7 @@ async function runTaskCycle() {
 }
 
 async function runTaskCycleBody() {
-  // The whole point of the queue: an idle village makes ZERO API calls.
+  // The whole point of the queue: an idle think tank makes ZERO API calls.
   // This returns before any Jev call, any chat call, anything -- not
   // "cheaply," but literally not at all. A queue that's non-empty but
   // has nothing DUE yet (every item scheduled for later) must be exactly
@@ -430,7 +430,7 @@ async function runTaskCycleBody() {
       if (pick.attempts < WORK_ITEM_MAX_ATTEMPTS) {
         WORK_QUEUE.push(pick);
       } else {
-        logVillageAction(null, 'work_item_abandoned', { title: pick.title, room: pick.room, attempts: pick.attempts });
+        logThinkTankAction(null, 'work_item_abandoned', { title: pick.title, room: pick.room, attempts: pick.attempts });
       }
     }
   }
@@ -727,7 +727,7 @@ function findPath(startX, startY, targetX, targetY, excludeAgentId) {
 // so overflow from one into the other is physically sensible, not just a
 // fallback hack -- scoped to just this one pair, per your call that this
 // is about keeping ongoing work unblocked, not a general room-load-
-// balancer, and that the village has enough rooms for now.
+// balancer, and that the think tank has enough rooms for now.
 const ROOM_OVERFLOW_TARGET = { pressoffice: 'observatory' };
 
 function _roomDeskCapacity(room) {
@@ -818,7 +818,7 @@ function assignTask(agentId, title, room, instructions, projectLabel, extra = {}
   a.stuckTimer = 0;
   a.replanCount = 0;
   a.respawnedForTask = false;
-  logVillageAction(agentId, 'task_assigned', { taskId: id, title, room });
+  logThinkTankAction(agentId, 'task_assigned', { taskId: id, title, room });
   return TASKS[id];
 }
 
@@ -926,13 +926,13 @@ async function assignBigTask(goal) {
 
   // Real ask: a subtask that can't start until a specific time (e.g. "log
   // tonight's weather at 9pm"). WORK_QUEUE items already support this
-  // (queueWork's notBefore, respected by runTaskCycleBody/villageHasWork
+  // (queueWork's notBefore, respected by runTaskCycleBody/thinkTankHasWork
   // -- a scheduled item makes zero real calls while it waits). The one
   // thing the model needs to actually use it correctly is the real
   // current time -- without it, "tomorrow at 3pm" has no fixed point to
   // compute from, and a model asked to invent one anyway is exactly the
   // kind of guess this whole project has been trying to eliminate.
-  const systemPrompt = `You are ${admin.name}, now coordinating a small village of workers on behalf of the admin. `
+  const systemPrompt = `You are ${admin.name}, now coordinating a small think tank of workers on behalf of the admin. `
     + `The real current date/time is ${new Date().toISOString()}. `
     + `Break the following large task into 2 to 5 concrete subtasks, each assignable to one worker in a specific room. `
     + `Valid rooms, and what each one ACTUALLY does right now, are:\n${DELEGATABLE_ROOMS.map(r => `- ${r}: ${ROOM_PURPOSES[r]}`).join('\n')}\n`
@@ -1027,9 +1027,9 @@ async function assignBigTask(goal) {
   // whoever is actually free, which keeps "who does what" in one place
   // and means a request made while everyone is busy waits its turn
   // instead of silently failing to assign. When the queue empties, the
-  // village goes fully quiet again on its own -- no timer keeps poking it.
+  // think tank goes fully quiet again on its own -- no timer keeps poking it.
   const queued = queueWork(subtasks);
-  logVillageAction(authorityDef.id, 'big_task_delegated', { goal, subtaskCount: subtasks.length, queueDepth: queued });
+  logThinkTankAction(authorityDef.id, 'big_task_delegated', { goal, subtaskCount: subtasks.length, queueDepth: queued });
   return { admin: authorityDef.id, subtasks, queued };
 }
 
@@ -1291,7 +1291,7 @@ function arriveAtTask(id) {
 // Pair programming -- per your call: two agents can share one
 // workstation, one driving (real execution) while the other navigates
 // (talks through the approach), discussing it together as it happens.
-// This is the village's first real multi-agent collaboration ON one
+// This is the think tank's first real multi-agent collaboration ON one
 // task -- everything else (the ambient cycle, assignBigTask's subtasks)
 // only ever gives you several agents on SEPARATE tasks in parallel.
 // Reuses the exact same movement machinery as a handoff (a.path/
@@ -1321,7 +1321,7 @@ async function assignPairTask(title, room, instructions, includeOffDuty = false,
   // this point, and tickAgentMovement skips invisible agents outright,
   // so without this she'd get a real path assigned that would simply
   // never move her. appearFromOutskirts (below) also places her at a
-  // free village spot first, so she's seen walking in, not popping up
+  // free think tank spot first, so she's seen walking in, not popping up
   // wherever her stale x/y happened to be left.
   if (AGENTS[driverId].offDuty) appearFromOutskirts(AGENTS[driverId]);
 
@@ -1390,7 +1390,7 @@ async function requestPairLine(speaker, other, taskTitle, lastLine, role) {
   const roleDesc = role === 'driver'
     ? 'You are DRIVING -- actually writing and running the work.'
     : 'You are NAVIGATING -- thinking out loud, reviewing, suggesting the approach, not typing it yourself.';
-  const systemPrompt = `You are ${speaker.name}, working as ${speaker.role} in a small village. `
+  const systemPrompt = `You are ${speaker.name}, working as ${speaker.role} in a small think tank. `
     + `You're pair programming with ${other.name} on "${taskTitle}". ${roleDesc} `
     + `Reply with ONE short, casual, in-character sentence continuing the conversation. Never mention you are an AI or a language model.`;
   try {
@@ -1449,7 +1449,7 @@ async function runPairProgrammingSession(driverId, navigatorId, task) {
   // exchange vanish into a toast and nothing else" principle as the
   // handoffs.js fix earlier this session.
   const fullLog = transcript.map(t => `${AGENTS[t.from] ? AGENTS[t.from].name : t.from}: ${t.text}`).join('\n');
-  logVillageAction(driverId, 'pair_programming', { with: navigatorId, taskId: task.id, title: task.title, transcript });
+  logThinkTankAction(driverId, 'pair_programming', { with: navigatorId, taskId: task.id, title: task.title, transcript });
   writeLibraryFile(driverId, `archive/${Date.now()}-pair-${task.id}.md`, `# Pair session -- ${task.title}\n\nDriver: ${driver.name}\nNavigator: ${nav.name}\n\n${fullLog}\n`);
 
   if (AGENTS[driverId]) {
@@ -2097,7 +2097,7 @@ async function escalateReviewRequirement(agentId, kind, question) {
   } catch (e) { /* email channel is best-effort -- never let escalation failure crash the review */ }
 }
 
-// Phase G -- the "working guide": the village's durable lessons file that
+// Phase G -- the "working guide": the think tank's durable lessons file that
 // every task reads at start so each correction is useful to the NEXT piece
 // (the article's accumulated-lessons memory). Read by all agents; written
 // only by directors/admin -- serve.py enforces that ACL server-side for the
@@ -2117,7 +2117,7 @@ async function readWorkingGuide() {
 // ABOVE the task so the agent reads it as durable standing guidance.
 function prependWorkingGuide(prompt, guide) {
   if (!guide) return prompt;
-  return `You carry the village's working guide -- hard-won lessons from past work. Follow them in ADDITION to your current task:\n\n${guide}\n\n----\n\n${prompt}`;
+  return `You carry the think tank's working guide -- hard-won lessons from past work. Follow them in ADDITION to your current task:\n\n${guide}\n\n----\n\n${prompt}`;
 }
 
 // Director/admin-led helper to append a single, GENERAL lesson to the
@@ -2499,7 +2499,7 @@ async function checkWeatherReference(agentId) {
       body: JSON.stringify({
         url: WEATHER_REFERENCE_URL,
         agentId,
-        purpose: 'Checking outside weather reference material for the village weather station.',
+        purpose: 'Checking outside weather reference material for the think tank weather station.',
       }),
     });
     const data = await res.json();
@@ -2588,7 +2588,7 @@ async function runMediaDigestTask(agentId) {
           const path = `media/digests/${Date.now()}-${slug}.md`;
           const content = `# Digest -- ${new Date().toISOString()}\n\nSource: ${url}\nBy: ${a.name}\n\n${summary}\n`;
           await writeLibraryFile(agentId, path, content, 'firsthand');
-          logVillageAction(agentId, 'media_digest_filed', { url, path });
+          logThinkTankAction(agentId, 'media_digest_filed', { url, path });
           note = `Filed a digest on ${url} for the player.`;
         }
       }
@@ -2666,7 +2666,7 @@ function finishTask(id) {
 
   showToast(`${a.name} finished: ${task ? task.title : 'a task'}.`, 4000);
   if (task) {
-    logVillageAction(id, 'task_completed', { taskId: task.id, title: task.title, room: task.room });
+    logThinkTankAction(id, 'task_completed', { taskId: task.id, title: task.title, room: task.room });
     // Per your call: completed tasks get archived in the Library's shared
     // directory, not just logged privately -- a real record other agents
     // (or you) could actually read later, not just a database row.
@@ -2709,7 +2709,7 @@ function canActivateAnother() {
 // Per your call (2026-09-20): the whole point of a larger hireable
 // roster with only some agents "active" at once is that calling someone
 // in is a real, visible event -- she appears at a free spot in the main
-// village (outskirts rooms are gone) and walks from there, not an instant
+// think tank (outskirts rooms are gone) and walks from there, not an instant
 // pop-in wherever her stale x/y happened to be left. Used by
 // assignTaskViaJev/assignPairTask whenever a wake actually happens; the
 // real walk to wherever she's needed is just assignTask's own ordinary
@@ -2748,7 +2748,7 @@ function sendAgentOffDuty(id) {
 }
 
 // The other half: standing up for the first time (a brand-new hire) or
-// coming back on duty appears at a free spot in the main village, not at
+// coming back on duty appears at a free spot in the main think tank, not at
 // a trailhead door (the outskirts rooms are gone). Mirrors the server's
 // appear_from_outskirts / pick_free_spot so the client and server wake an
 // agent identically. `occupied` is the same avoid-list shape pickFreeSpot()

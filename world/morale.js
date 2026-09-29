@@ -19,7 +19,7 @@ const MORALE_REPORT_WEIGHT = 10;
 const MORALE_NEGLECT_WEIGHT = 3, MORALE_NEGLECT_CAP = 30;
 // Real bug caught empirically, not by reading the code: droppedCount is
 // only ever set once, at hire time (seed flavor data for the original
-// six, or 0 for a real hire) -- nothing in the running village ever
+// six, or 0 for a real hire) -- nothing in the running think tank ever
 // increments OR decays it. For an agent whose real activity doesn't
 // otherwise clear the gap (Dev's seeded 6 drops cost a flat 36 points,
 // permanently), that made morale a ceiling, not a meter: 236 real firing
@@ -54,7 +54,7 @@ function moraleFor(agentId) {
   return Math.max(0, Math.min(100, Math.round(raw)));
 }
 
-function villageMorale() {
+function thinkTankMorale() {
   const scores = Object.keys(AGENTS).map(moraleFor).filter(v => v !== null);
   if (!scores.length) return null;
   return Math.round(scores.reduce((sum, v) => sum + v, 0) / scores.length);

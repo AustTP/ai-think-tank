@@ -2,7 +2,7 @@
 
 These exercise serve.py's team helpers and the /api/teams endpoints against a
 hermetic DB (temp dir, patched serve.DB_PATH) so they never touch the live
-village.db and make no network calls.
+think_tank.db and make no network calls.
 """
 import os
 import shutil
@@ -19,11 +19,11 @@ import serve
 
 class TeamsModel(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-teams-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-teams-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),

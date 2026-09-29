@@ -1,7 +1,7 @@
 // Real regression test for morale.js's dropped-work decay -- found
 // empirically, not by code review: droppedCount is only ever set once
 // (seed data at hire time, or 0 for a real hire) and nothing in the
-// running village ever incremented OR decayed it. For Dev (seeded with 6
+// running think tank ever incremented OR decayed it. For Dev (seeded with 6
 // drops), that made the dropped-work penalty a permanent, un-earnable-
 // back ceiling: 236 real firing reviews in one session, morale stuck at
 // 45-49 the whole time, because the one input actually holding the score

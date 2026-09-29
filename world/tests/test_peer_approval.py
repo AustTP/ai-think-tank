@@ -8,8 +8,8 @@ gate's pure helpers AND the _apply_content_result verdict folding, hermetic
 class below, which patches DB_PATH itself -- the other three classes call
 _apply_content_result/gate-entry paths that have inline `from serve import
 log_action` calls, a real side effect that wrote into whatever real
-village.db sits at serve.py's default path. Found 2026-09-25 via a live
-production village.db that picked up test fixture rows after a routine test
+think_tank.db sits at serve.py's default path. Found 2026-09-25 via a live
+production think_tank.db that picked up test fixture rows after a routine test
 run; module-level isolation below covers the whole file (Integration's own
 class-level patch still applies on top of it during its own tests).
 """
@@ -32,11 +32,11 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-peer-approval-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-peer-approval-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
@@ -317,11 +317,11 @@ class Integration(unittest.TestCase):
     def test_task_cycle_routes_deliverable_to_gate_and_closes_on_two_reviews(self):
         import tempfile, os, shutil
         import serve
-        self.tmp = tempfile.mkdtemp(prefix='village-peer-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-peer-')
         cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp, AGENTS_DIR=os.path.join(self.tmp, 'agents'),
+            THINK_TANK_DIR=self.tmp, AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
         )

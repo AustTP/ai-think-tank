@@ -1,6 +1,6 @@
 """Full-lifecycle integration test: the whole ship-path, headless and hermetic.
 
-From a seeded village, drive the complete loop seam (get_state_from_db ->
+From a seeded think tank, drive the complete loop seam (get_state_from_db ->
 SimEngine.tick -> save_state_to_db, the exact body of sim._sim_loop_pass) and
 follow one deliverable story all the way through:
 
@@ -98,11 +98,11 @@ def _seed(work_queue):
 
 class FullLifecycle(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-lifecycle-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-lifecycle-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),

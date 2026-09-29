@@ -42,13 +42,13 @@ _PATCHER = None
 def setUpModule():
     # _run_review_content hits serve.get_or_create_agent_key (a DB write);
     # redirect the DB like every other serve-touching suite so fixtures never
-    # land in a live village.db.
+    # land in a live think_tank.db.
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-checklist-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-checklist-test-')
     _PATCHER = mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),

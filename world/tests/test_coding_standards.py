@@ -1,6 +1,6 @@
 """Cut 4: the agent coding-standards gate.
 
-The village's Work Room (pressoffice) agents write and run real Python in a
+The think tank's Work Room (pressoffice) agents write and run real Python in a
 network-disabled Docker sandbox. This suite locks down that the standard is
 (a) instructed in the coding system prompt + room purpose, (b) baked into the
 sandbox image as a real toolchain, and (c) HARD-gated: no approval counts unless
@@ -188,11 +188,11 @@ class RunQualityPipeline(unittest.TestCase):
 
 class CodingExecutorQualityGate(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-cut4-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-cut4-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
@@ -315,7 +315,7 @@ class Wiring(unittest.TestCase):
         # The SANDBOX_IMAGE must be the baked image (world/sandbox/Dockerfile),
         # not the bare base image -- that is what makes the tools available in the
         # network-disabled sandbox WITHOUT a runtime pip install.
-        self.assertEqual(serve.SANDBOX_IMAGE, 'ai-village-work-sandbox')
+        self.assertEqual(serve.SANDBOX_IMAGE, 'ai-think-tank-work-sandbox')
 
     def test_dockerfile_installs_toolchain(self):
         dockerfile = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

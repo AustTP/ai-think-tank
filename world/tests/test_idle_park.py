@@ -37,7 +37,7 @@ def _state():
             'ben': agent('ben'),
             'owen': agent('owen'),
         },
-        # A genuinely quiet village: no standing work due (skill review stamped
+        # A genuinely quiet think tank: no standing work due (skill review stamped
         # at now), no research topics, no pending hire/onboard, no tasks.
         'researchTopics': [],
         'tasks': {},
@@ -48,7 +48,7 @@ _IDLE_AT_MS = 1_725_000_000_000  # matches _task_cycle(now=1_725_000_000.0)
 
 
 def _quiet(state):
-    """Stamp a village as having NOTHING due so the task cycle doesn't enqueue
+    """Stamp a think tank as having NOTHING due so the task cycle doesn't enqueue
     work in the same pass (a standing skill-review sweep would otherwise queue
     a task, keeping agents on duty for it -- which is correct, but not what
     these tests are isolating)."""
@@ -110,7 +110,7 @@ class IdlePark(unittest.TestCase):
         self.assertIs(out['agents']['faye']['offDuty'], False)
 
     def test_task_cycle_does_not_park_when_work_is_queued(self):
-        # A queued item means the village is not idle -- the wanderers should
+        # A queued item means the think tank is not idle -- the wanderers should
         # stay on duty to take it (they get picked round-robin by assignment).
         state = _quiet(_state())
         state['workQueue'] = [{'title': 'weather', 'room': 'weatherstation',

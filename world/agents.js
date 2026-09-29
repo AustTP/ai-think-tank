@@ -1,11 +1,11 @@
-// Stub agent roster for World 2 -- placeholder characters that exist so the
+// Stub agent roster for World -- placeholder characters that exist so the
 // Town Hall meeting mechanic (see meetings.js) is real, testable code today,
 // rather than a design doc waiting on Phase 2/3's actual agent behavior.
 // They stand still (no wander AI -- that's real agent behavior, out of
 // scope here) and reuse the player's own sprite set, tinted per agent via a
 // nameplate so they're distinguishable on the map and in the call UI.
 
-// The single live roster, hydrated entirely from the DATABASE (village.db's
+// The single live roster, hydrated entirely from the DATABASE (think_tank.db's
 // kv_state blob) via /api/state. Per your call (2026-09-21), there are no
 // static agent names in any JS file any more: the default roster is seeded
 // server-side in serve.py's _seed_default_roster(), and this global starts
@@ -192,7 +192,7 @@ function agentBlockedAt(box, excludeId = null, ignoreIds = null) {
 // simpler than diffing and costs nothing real.
 //
 // Meetings are NOT persisted -- they're treated as session-scoped, not
-// village-scoped. A meeting mid-call when the page closes has no way to
+// think tank-scoped. A meeting mid-call when the page closes has no way to
 // resume its chat UI meaningfully, so on load any agent left `busy`/
 // invisible from an abandoned call is force-reset instead (see below)
 // rather than trying to reconstruct a MEETINGS entry that no longer means
@@ -331,15 +331,15 @@ async function initAgents() {
     if (saved.nextReportId) nextReportId = saved.nextReportId;
     // Restored in place (not reassigned) so every file that already
     // holds a reference to the real WORK_QUEUE array (tasks.js's own
-    // runTaskCycleBody, queueWork, villageHasWork) sees the restored
+    // runTaskCycleBody, queueWork, thinkTankHasWork) sees the restored
     // contents rather than a new array only agents.js knows about.
     if (saved.workQueue) { WORK_QUEUE.length = 0; for (const item of saved.workQueue) WORK_QUEUE.push(item); }
     if (saved.researchTopics) { RESEARCH_TOPICS.length = 0; for (const t of saved.researchTopics) RESEARCH_TOPICS.push(t); }
     // The server owns the seed now (serve.py's _seed_default_roster), and a
-    // genuinely new village arrives with every agent at the same origin
+    // genuinely new think tank arrives with every agent at the same origin
     // (x=0, y=0). That stacked pile gets scattered the same way a hire-from-
     // scratch used to: pick a free walkable spot per agent in the main
-    // village (outskirts rooms are gone). A warm restore (agents already
+    // think tank (outskirts rooms are gone). A warm restore (agents already
     // placed in the DB from real priors) has distinct positions and is
     // left alone.
     const distinctCoords = new Set(Object.values(AGENTS).map(a => `${a.x},${a.y}`));
@@ -357,7 +357,7 @@ async function initAgents() {
   // Nothing saved AND /api/state unreachable -- the server seeds a fresh
   // database itself (serve.py's _seed_default_roster), so the client should
   // never invent identities. If the backend genuinely returned nothing, start
-  // with an empty village rather than fabricate names; the next /api/state
+  // with an empty think tank rather than fabricate names; the next /api/state
   // fetch will deliver the server-seeded roster. This branch is a resilience
   // guard (e.g. old plain-file serve, backend briefly down), not a code path
   // a normal first boot normally takes.
@@ -380,7 +380,7 @@ function sendMail(fromId, toId, text) {
   if (!to || !text) return false;
   const fromName = fromId === 'player' ? 'You' : (AGENTS[fromId] ? AGENTS[fromId].name : fromId);
   to.mailbox.push({ text: `${fromName}: ${text}`, read: false, ts: Date.now() });
-  logVillageAction(fromId, 'mail_sent', { to: toId, text });
+  logThinkTankAction(fromId, 'mail_sent', { to: toId, text });
   return true;
 }
 
@@ -393,7 +393,7 @@ function sendMail(fromId, toId, text) {
 // pre-existing string entries from state saved before this change -- into
 // {text, read, ts}. Legacy string entries are treated as already-read
 // (they were already visible under the old system) so migrating existing
-// saved village.db state doesn't suddenly flood the HUD with old "unread"
+// saved think_tank.db state doesn't suddenly flood the HUD with old "unread"
 // mail nobody actually missed.
 function normalizeMailEntry(msg) {
   if (typeof msg === 'string') return { text: msg, read: true, ts: 0 };

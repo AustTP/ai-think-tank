@@ -50,7 +50,7 @@ class DecisionTapeTests(unittest.TestCase):
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
         )
         self._cm.start()
         serve.init_db()
@@ -144,7 +144,7 @@ class DecisionTapeFeedTests(unittest.TestCase):
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
         )
         self._cm.start()
         serve.init_db()

@@ -25,11 +25,11 @@ Google OAuth credential (client id/secret + refresh token).
   vault indefinitely, same encrypted-credential + scoped-handle pattern as
   everything else external.
 
-## Policy for this village
+## Policy for this think tank
 1. Prefer read-only / low-frequency use (a shared roadmap sheet synced
    occasionally, a handful of real calendar events for real ceremonies) over any
    write-heavy or high-frequency automation -- there's no real need to get near
-   even Sheets' tighter per-minute limit for anything this village would
+   even Sheets' tighter per-minute limit for anything this think tank would
    plausibly do.
 2. Once 2026's overage pricing is published, re-check this file before assuming
    continued free usage.

@@ -35,7 +35,7 @@ import serve
 # (ActivitySummary, JevSafetyGate, TempAccessGrants) call serve.log_action /
 # serve.init_db directly with no isolation of their own, and were confirmed
 # writing real rows (a 'test-agent' browse/escalation trail, 'some-other-agent'
-# curl rows) into a live production village.db during a routine test run.
+# curl rows) into a live production think_tank.db during a routine test run.
 # This is the default so no class in this file can slip through that gap
 # again even if a future one forgets to isolate itself.
 _MODULE_TMP_DIR = None
@@ -44,11 +44,11 @@ _MODULE_PATCHER = None
 
 def setUpModule():
     global _MODULE_TMP_DIR, _MODULE_PATCHER
-    _MODULE_TMP_DIR = tempfile.mkdtemp(prefix='village-serve-test-module-')
+    _MODULE_TMP_DIR = tempfile.mkdtemp(prefix='think tank-serve-test-module-')
     _MODULE_PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_MODULE_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_MODULE_TMP_DIR,
+        THINK_TANK_DIR=_MODULE_TMP_DIR,
         AGENTS_DIR=os.path.join(_MODULE_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_MODULE_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_MODULE_TMP_DIR, 'library', '.passport.json'),
@@ -105,7 +105,7 @@ class LibraryTrailReinforcement(unittest.TestCase):
     own sidecar file (LIBRARY_USAGE_PATH), fully isolated per test here."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-library-trail-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-library-trail-')
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.lib_dir = os.path.join(self.tmp, 'library')
         os.makedirs(self.lib_dir, exist_ok=True)
@@ -382,7 +382,7 @@ class ModelBenchmarkScores(unittest.TestCase):
 
     def setUp(self):
         # Real cleanup, not mocked -- these tests write to the real
-        # village.db model_benchmark_scores table, same reasoning as the
+        # think_tank.db model_benchmark_scores table, same reasoning as the
         # AuthSessions tests above (destroy_session cleans up after
         # itself). Scoped to a test-only model id so a real run never
         # collides with genuine research data.
@@ -416,7 +416,7 @@ class ModelBenchmarkScores(unittest.TestCase):
 
     def test_migration_preserves_data_from_the_old_table_name(self):
         # Real regression guard for the model_coding_scores ->
-        # model_benchmark_scores rename in init_db() -- a village.db
+        # model_benchmark_scores rename in init_db() -- a think_tank.db
         # created before this rename must not silently lose its already-
         # cited research the first time the renamed server starts.
         with serve._db() as conn:
@@ -572,7 +572,7 @@ class AuthSessions(unittest.TestCase):
         # init_db() is normally gated behind `if __name__ == '__main__':`
         # (see the module docstring above) -- called explicitly here since
         # these tests need the real `sessions` table to exist. Idempotent
-        # (CREATE TABLE IF NOT EXISTS), safe against the real village.db.
+        # (CREATE TABLE IF NOT EXISTS), safe against the real think_tank.db.
         serve.init_db()
 
     def test_password_hash_is_deterministic_for_the_same_salt(self):
@@ -694,7 +694,7 @@ class TempAccessGrants(unittest.TestCase):
     # Real "ask your supervisor" flow -- an agent without standing access
     # (Sam, no Weather Station role) can be granted REAL, TEMPORARY access
     # to a gated capability. These test the grant/check mechanics directly
-    # (real village.db round-trips, real cleanup), not the Jev approval
+    # (real think_tank.db round-trips, real cleanup), not the Jev approval
     # judgment itself, which needs a live model call like every other gate.
     @classmethod
     def setUpClass(cls):
@@ -817,7 +817,7 @@ class SandboxBackups(unittest.TestCase):
 
 class ActivitySummary(unittest.TestCase):
     # Real fix for confabulated retrospectives: an agent asked to reflect
-    # on the village with nothing but a role and a vague prompt invented
+    # on the think tank with nothing but a role and a vague prompt invented
     # confident-sounding specifics that don't exist in the real code. This
     # grounds that in the same action_log every real action already
     # writes into, so a retrospective prompt can include what an agent
@@ -848,7 +848,7 @@ class ActivitySummary(unittest.TestCase):
 
 class CountDueWorkItems(unittest.TestCase):
     # _count_due_work_items is the one bit of compute_health_snapshot
-    # that's a pure function safe to test directly (no real village.db
+    # that's a pure function safe to test directly (no real think_tank.db
     # round-trip) -- and the one part most worth pinning down, since a
     # unit mismatch (epoch seconds vs. JS's epoch milliseconds) would
     # fail completely silently: it would just always or never count an
@@ -876,12 +876,12 @@ class CountDueWorkItems(unittest.TestCase):
 class HealthChecks(unittest.TestCase):
     # Tests the pure alert-decision function only (_health_alerts_for_signals),
     # not compute_health_snapshot itself -- that one hits the real,
-    # shared village.db, whose action_log/model_tiers content isn't
+    # shared think_tank.db, whose action_log/model_tiers content isn't
     # something a test should assume or reset. Built to close the "no
     # monitoring layer -- everything gets caught reactively" gap.
     def _signals(self, **overrides):
         base = {
-            'village_active': True,
+            'think_tank_active': True,
             'seconds_since_last_save': 2.0,
             'work_queue_size': 0,
             'work_queue_due_size': 0,
@@ -929,7 +929,7 @@ class HealthChecks(unittest.TestCase):
 
     def test_a_stale_queue_with_due_items_raises_an_info_alert(self):
         alerts = serve._health_alerts_for_signals(self._signals(
-            work_queue_due_size=3, village_active=False, seconds_since_last_save=90.0,
+            work_queue_due_size=3, think_tank_active=False, seconds_since_last_save=90.0,
         ))
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]['category'], 'work_queue')
@@ -938,7 +938,7 @@ class HealthChecks(unittest.TestCase):
     def test_a_nonempty_queue_with_an_active_tab_raises_nothing(self):
         # The queue having items is normal while something's actively
         # draining it -- only "queued AND nothing is running" is a signal.
-        alerts = serve._health_alerts_for_signals(self._signals(work_queue_due_size=3, village_active=True))
+        alerts = serve._health_alerts_for_signals(self._signals(work_queue_due_size=3, think_tank_active=True))
         self.assertEqual(alerts, [])
 
     def test_a_stale_queue_of_only_future_scheduled_items_raises_nothing(self):
@@ -947,7 +947,7 @@ class HealthChecks(unittest.TestCase):
         # an agent scheduled for later, sitting with no tab open, is
         # working as designed, not stuck.
         alerts = serve._health_alerts_for_signals(self._signals(
-            work_queue_size=2, work_queue_due_size=0, village_active=False, seconds_since_last_save=90.0,
+            work_queue_size=2, work_queue_due_size=0, think_tank_active=False, seconds_since_last_save=90.0,
         ))
         self.assertEqual(alerts, [])
 
@@ -987,14 +987,14 @@ class HealthChecks(unittest.TestCase):
 
     def test_jev_health_below_min_attempts_raises_nothing(self):
         # Fewer than the minimum attempts can't establish a failure rate --
-        # a quiet village with 2 blips out of 3 calls isn't a Jev outage.
+        # a quiet think tank with 2 blips out of 3 calls isn't a Jev outage.
         alerts = serve._health_alerts_for_signals(self._signals(
             jev_decision_attempts_last_hour=3, jev_decision_failures_last_hour=3,
         ))
         self.assertEqual(alerts, [])
 
     def test_jev_health_below_failure_rate_raises_nothing(self):
-        # A busy village blips a call or two without being down -- the RATE,
+        # A busy think tank blips a call or two without being down -- the RATE,
         # not the raw count, is the signal.
         alerts = serve._health_alerts_for_signals(self._signals(
             jev_decision_attempts_last_hour=100, jev_decision_failures_last_hour=30,
@@ -1037,7 +1037,7 @@ class HealthChecks(unittest.TestCase):
 
     def test_metr_too_few_assignments_raises_nothing(self):
         # Reliability-at-horizon is only judged with enough assigned tasks --
-        # a village with 3 assignments and 0 fast finishes is just quiet.
+        # a think tank with 3 assignments and 0 fast finishes is just quiet.
         alerts = serve._health_alerts_for_signals(self._signals(
             task_assigned_last_24h=serve.METR_MIN_ASSIGNED - 1,
             task_fast_completion_rate=0.0, task_median_completion_hours=12.0,
@@ -1077,7 +1077,7 @@ class HealthChecks(unittest.TestCase):
         self.assertEqual(alerts, [])
 
     def test_a_little_ceremony_with_no_progress_raises_nothing(self):
-        # Below the minimum-volume floor -- a quiet village with a couple of
+        # Below the minimum-volume floor -- a quiet think tank with a couple of
         # escalations and 0 releases isn't a coordination pathology, it's
         # just quiet. The imbalance score is only consulted once the decayed
         # ceremony SIGNAL clears the floor.
@@ -1266,7 +1266,7 @@ class TaskHorizonMetrics(unittest.TestCase):
 
 
 class HealthAlertPersistence(unittest.TestCase):
-    # The dedup/persistence half -- a real village.db round-trip (same
+    # The dedup/persistence half -- a real think_tank.db round-trip (same
     # convention as TempAccessGrants below), scoped to a distinctive
     # category so cleanup can't touch a real alert this table might
     # already hold.
@@ -1468,14 +1468,14 @@ class ServerOwnedSeed(unittest.TestCase):
     # file; serve.py seeds the default roster into an empty database on first
     # boot and stamps the director tier before any client reads it. These test
     # that against a THROWAWAY database (fresh temp file), never the real
-    # village.db.
+    # think_tank.db.
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-seed-test-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-seed-test-')
         # Redirect all state/disk side effects into the temp sandbox.
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
@@ -1681,10 +1681,10 @@ class DirectorOwnedTemplates(unittest.TestCase):
         self.assertEqual(s['templates']['Research']['mission'], 'edited by nora')
 
     def test_init_templates_runs_on_an_existing_db_state(self):
-        # A live village.db has no 'templates' key until the one-time startup
+        # A live think_tank.db has no 'templates' key until the one-time startup
         # migration adds it -- must backfill from seed without a seed event.
         s = self._state(templates=None)
-        self.assertNotIn('templates', s)  # simulates a pre-village DB without the key
+        self.assertNotIn('templates', s)  # simulates a pre-think tank DB without the key
         self.assertTrue(serve._init_templates_in_db(s))
         self.assertEqual(set(s['templates']), set(serve._SEED_PROFILES))
         # And it leaves unrelated state untouched.
@@ -1841,7 +1841,7 @@ class RoomDefinitions(unittest.TestCase):
         ], 'agents': {}}
 
     def test_room_definitions_backfills_all_seed_rooms_on_a_legacy_db(self):
-        # A live village.db predates roomDefinitions -- the lazy backfill must
+        # A live think_tank.db predates roomDefinitions -- the lazy backfill must
         # add every seed room (delegable work rooms PLUS the hangout, which is
         # enterable-but-not-delegable) without a seed event.
         s = {}
@@ -1920,11 +1920,11 @@ class AppSourceIsolation(unittest.TestCase):
     # itself": library reads are confined to LIBRARY_DIR, agent files to
     # AGENTS_DIR (both outside world/), and the sandbox mounts only the
     # sandbox dir. Verify the confinement helpers reject a path that would
-    # escape to serve.py / village.db / world2 JS.
+    # escape to serve.py / think_tank.db / world JS.
     def setUp(self):
         self.prev_db = serve.DB_PATH
         self.prev_agents = serve.AGENTS_DIR
-        self.tmp = tempfile.mkdtemp(prefix='village-appsrc-test-')
+        self.tmp = tempfile.mkdtemp(prefix='think-tank-appsrc-test-')
         serve.AGENTS_DIR = os.path.join(self.tmp, 'agents')
 
     def tearDown(self):
@@ -1937,14 +1937,14 @@ class AppSourceIsolation(unittest.TestCase):
         self.assertIsNone(serve._safe_library_path('../../../world/serve.py'))
         self.assertIsNone(serve._safe_library_path('../../.env'))
         self.assertIsNone(serve._safe_library_path('..'))
-        self.assertIsNone(serve._safe_library_path('../../village.db'))
+        self.assertIsNone(serve._safe_library_path('../../think_tank.db'))
 
     def test_agent_file_read_denies_traversal_to_server_source(self):
         # list/read containment is enforced via path normalization in the
         # handlers, but the visibility helper here confirms the valid-shaped
         # inputs that name app-source are not under any whitelisted agent path.
         self.assertFalse(serve._agent_rel_path_is_visible(['..', 'serve.py']))
-        self.assertFalse(serve._agent_rel_path_is_visible(['..', '..', 'world2', 'index.html']))
+        self.assertFalse(serve._agent_rel_path_is_visible(['..', '..', 'world', 'index.html']))
 
     def test_agent_folders_empty_until_state_saved(self):
         # Nothing under AGENTS_DIR is served by any public route -- the only
@@ -1960,11 +1960,11 @@ class ReportCrossWrite(unittest.TestCase):
     # self-referential writes). Pure-logic verification of the gating helpers
     # plus the materialization path via a temp DB.
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-report-test-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-report-test-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
@@ -2015,11 +2015,11 @@ class PassportDecisionChain(unittest.TestCase):
     # off the SAME head as promoted-file blocks, so the whole ledger is one
     # tamper-evident chain.
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-passport-test-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-passport-test-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
@@ -2371,7 +2371,7 @@ class GoogleOAuth(unittest.TestCase):
 
 class PixellabCall(unittest.TestCase):
     """_pixellab_call / _pixellab_poll_job: real API mechanics, matching the
-    village's own already-tested spike script (scripts/pixellab_spike.py)
+    think tank's own already-tested spike script (scripts/pixellab_spike.py)
     -- not guessed from the public OpenAPI spec, per the same "verify,
     don't assume" discipline as every other real integration tonight."""
 
@@ -2963,11 +2963,11 @@ class ResearchContentExecutor(unittest.TestCase):
     # the executor's store call -- no live network, no real Jev/rate-limit.
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-research-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-research-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
@@ -3080,11 +3080,11 @@ class RemainingExecutors(unittest.TestCase):
     # store call. No live network, no real Jev, no real rate-limiter.
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-exec-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-exec-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
@@ -3343,11 +3343,11 @@ class PressOfficeContentExecutors(unittest.TestCase):
     # No live network, no real Jev/rate-limit/execute.
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-pressoffice-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-pressoffice-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
@@ -3689,7 +3689,7 @@ class PlayerIntentEndpoints(unittest.TestCase):
     """End-to-end tests of the HTTP routes added in Phase 4/5 -- GET /api/rooms,
     POST /api/intent/assign-big-task, and POST /api/rooms/{room}/purpose --
     driven through TestClient with the DB, model, and identity seams patched so
-    nothing touches the real village.db or makes a real model call. TestClient
+    nothing touches the real think_tank.db or makes a real model call. TestClient
     is used WITHOUT a context manager so the app's lifespan (which starts the
     real sim/health/mail loops) never runs."""
 
@@ -3752,7 +3752,7 @@ class PlayerIntentEndpoints(unittest.TestCase):
              unittest.mock.patch.object(serve, 'log_action') as log, \
              unittest.mock.patch.object(serve, 'verify_session', return_value=True):
             c = TestClient(serve.app)
-            r = c.post('/api/intent/assign-big-task', json={'goal': 'make the village better'})
+            r = c.post('/api/intent/assign-big-task', json={'goal': 'make the think tank better'})
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertEqual(body['admin'], 'faye')
@@ -3799,7 +3799,7 @@ class PlayerIntentEndpoints(unittest.TestCase):
     def test_assign_big_task_wakes_resting_admin(self):
         # tasks.js: "a new request from you wakes the admin." With the admin
         # merely RESTING (offDuty, not busy) and no one else free, a delegation
-        # request should wake her and proceed -- otherwise an idle village is
+        # request should wake her and proceed -- otherwise an idle think tank is
         # permanently un-delegable. Contrast the busy case above, which must
         # still error (you can't interrupt real work).
         state = self._state()
@@ -3817,7 +3817,7 @@ class PlayerIntentEndpoints(unittest.TestCase):
              unittest.mock.patch.object(serve, 'log_action'), \
              unittest.mock.patch.object(serve, 'verify_session', return_value=True):
             c = TestClient(serve.app)
-            r = c.post('/api/intent/assign-big-task', json={'goal': 'make the village better'})
+            r = c.post('/api/intent/assign-big-task', json={'goal': 'make the think tank better'})
         self.assertEqual(r.status_code, 200, r.text)
         # Faye (the admin) was woken on-duty and carried out the breakdown.
         self.assertEqual(r.json()['admin'], 'faye')
@@ -4082,7 +4082,7 @@ class PlayerIntentEndpoints(unittest.TestCase):
         findings (source lists, CSVs, feasibility data) only ever lived in
         the Library file. Promoting a spike must pull the real content
         forward when its exact path was recorded, not just the pointer."""
-        tmp = tempfile.mkdtemp(prefix='village-promote-lib-')
+        tmp = tempfile.mkdtemp(prefix='think tank-promote-lib-')
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         os.makedirs(os.path.join(tmp, 'archive'), exist_ok=True)
         real_findings = ('# Spike: Can we use WebRTC?\n\nBy: ada\n\n'
@@ -4237,7 +4237,7 @@ class PlayerIntentEndpoints(unittest.TestCase):
         # A clean 3-block chain: two promoted FILES (real bytes on disk) plus
         # one DECISION. Returns (tmpdir, PASSPORT_PATH). Mirrors how
         # _append_passport / _append_passport_decision link blocks in serve.py.
-        tmp = tempfile.mkdtemp(prefix='village-passport-verify-')
+        tmp = tempfile.mkdtemp(prefix='think tank-passport-verify-')
         lib = os.path.join(tmp, 'library')
         os.makedirs(lib, exist_ok=True)
         f1 = os.path.join(lib, 'trust.md')
@@ -4313,7 +4313,7 @@ class PlayerIntentEndpoints(unittest.TestCase):
             # tampering of the FINAL block via links (that needs an externally-
             # pinned head); adding a follower makes the severed link observable.
             b4 = {'index': 4, 'kind': 'library_write', 'actor': 'player',
-                  'payload': {'path': 'village/x.md'}, 'prev': p['head'], 'ts': 4}
+                  'payload': {'path': 'think tank/x.md'}, 'prev': p['head'], 'ts': 4}
             p['blocks'].append(b4)
             p['count'] = 4
             p['head'] = serve._block_link_value(b4)
@@ -4496,9 +4496,9 @@ class ChatEndpointAuth(unittest.TestCase):
 
 class OperationalGuardrails(unittest.TestCase):
     def test_backup_creates_rotated_snapshots(self):
-        # _backup_village_db must snapshot the DB into DB_BACKUP_DIR with a .bak
+        # _backup_think_tank_db must snapshot the DB into DB_BACKUP_DIR with a .bak
         # extension and prune to DB_BACKUP_KEEP newest. Point both paths at a
-        # throwaway dir so the REAL village.db is never touched.
+        # throwaway dir so the REAL think_tank.db is never touched.
         with tempfile.TemporaryDirectory() as td:
             src = os.path.join(td, 'the.db')
             bakdir = os.path.join(td, 'backups')
@@ -4508,9 +4508,9 @@ class OperationalGuardrails(unittest.TestCase):
             with unittest.mock.patch.object(serve, 'DB_BACKUP_DIR', bakdir), \
                  unittest.mock.patch.object(serve, 'DB_BACKUP_KEEP', 2), \
                  unittest.mock.patch.object(serve, 'DB_PATH', src):
-                serve._backup_village_db()
-                serve._backup_village_db()
-                serve._backup_village_db()
+                serve._backup_think_tank_db()
+                serve._backup_think_tank_db()
+                serve._backup_think_tank_db()
             snaps = sorted(os.listdir(bakdir))
             self.assertEqual(len(snaps), 2, 'pruned to DB_BACKUP_KEEP')
             self.assertTrue(all(f.endswith('.bak') for f in snaps))
@@ -4521,7 +4521,7 @@ class OperationalGuardrails(unittest.TestCase):
 
     def test_idle_shutdown_goes_dormant_when_exceeded(self):
         # Sleep-not-die: once no request has arrived for >= _MAX_IDLE_MINUTES,
-        # the watcher must go DORMANT (village paused, process stays bound) --
+        # the watcher must go DORMANT (think tank paused, process stays bound) --
         # NOT exit, so a remote request can still wake it. Use a tiny poll so
         # the test returns fast; simulate "no request for a while" by backdating
         # _LAST_REQUEST_TIME. Runs to a timeout so the infinite poll loop exits.
@@ -4549,7 +4549,7 @@ class OperationalGuardrails(unittest.TestCase):
         finally:
             serve._LAST_REQUEST_TIME = old_last
             serve._set_dormant(old_poll)
-        self.assertTrue(went_dormant, 'idle watcher must put the village dormant, not exit')
+        self.assertTrue(went_dormant, 'idle watcher must put the think tank dormant, not exit')
 
 
 if __name__ == '__main__':

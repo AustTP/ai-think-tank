@@ -20,10 +20,10 @@ const worldDir = path.join(__dirname, '..');
 const context = { console, Math, Date, JSON, Array, Object };
 vm.createContext(context);
 
-// agents.js calls logVillageAction() (world.js) from sendMail() -- stub it
+// agents.js calls logThinkTankAction() (world.js) from sendMail() -- stub it
 // rather than pulling in the whole world.js network stack, since these
 // tests only care about mailbox state, not action-log side effects.
-vm.runInContext('function logVillageAction() {}', context);
+vm.runInContext('function logThinkTankAction() {}', context);
 
 const src = fs.readFileSync(path.join(worldDir, 'agents.js'), 'utf8');
 vm.runInContext(src, context, { filename: 'agents.js' });

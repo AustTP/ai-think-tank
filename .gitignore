@@ -13,8 +13,8 @@ __pycache__/
 .venv/
 
 # Live runtime state — authoritative state lives in SQLite and regenerates
-village.db
-village.db-*
+think_tank.db
+think_tank.db-*
 *.db
 *.db-wal
 *.db-shm
@@ -28,7 +28,7 @@ sandboxes/workroom-shared/
 # Per-agent project repos are independently versioned (gitlinks, not tracked content)
 agents/*/prototypes/
 
-# Per-agent activity logs regenerate from village.db and accumulate fast
+# Per-agent activity logs regenerate from think_tank.db and accumulate fast
 # (report-<ts>-<agent>.md per completion, one player.md per conversation) --
 # the durable identity files (agent.json/AGENTS.md/MEMORY.md/state.json)
 # are what's worth tracking, not the runtime trail.
@@ -53,7 +53,7 @@ library/publish-staging/
 # macOS
 .DS_Store
 # Per-agent identity files (2026-09-27): agent.json/AGENTS.md/MEMORY.md/state.json
-# are MATERIALIZED MIRRORS of village.db, regenerated on every save from the DB.
+# are MATERIALIZED MIRRORS of think_tank.db, regenerated on every save from the DB.
 # Agent identities live ONLY in the database -- never tracked, never pushed.
 agents/*/agent.json
 agents/*/AGENTS.md
@@ -61,14 +61,14 @@ agents/*/MEMORY.md
 agents/*/state.json
 
 # Runtime state (2026-09-27): live browse/search/usage trails and the action
-# passport hash-chain are regenerated from village.db at runtime -- never pushed.
+# passport hash-chain are regenerated from think_tank.db at runtime -- never pushed.
 browse_trail.json
 library_usage.json
 library/.passport.json
 
-# Runtime-generated village content (2026-09-27): spike findings, wiki pages,
+# Runtime-generated think tank content (2026-09-27): spike findings, wiki pages,
 # social/pending-review artifacts, and sandbox project dirs are all produced by
-# the running village and carry agent-authored/agent-named content. Only the
+# the running think tank and carry agent-authored/agent-named content. Only the
 # curated library/skills/ templates are tracked; these regenerate at runtime.
 library/archive/
 library/wiki/
@@ -77,4 +77,4 @@ library/pending_review/
 sandboxes/spike-task-*/
 sandboxes/sb-*/
 # Manual pre-cleanup DB backup (2026-09-27) -- a big one-off snapshot, not source
-village.db.pre-cleanup-*
+think_tank.db.pre-cleanup-*

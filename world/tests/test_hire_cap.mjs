@@ -1,6 +1,6 @@
-// Real regression test for the villager headcount cap (hiring.js) --
+// Real regression test for the researcher headcount cap (hiring.js) --
 // per your call on 2026-09-20: admin should know the current count and
-// visibly stop trying to hire once the village is at its max (25),
+// visibly stop trying to hire once the think tank is at its max (25),
 // rather than silently no-op forever. Covers both hiring entry points
 // (attemptAutoHire's autonomous path, hireSpecialist's direct path) and
 // the notice cooldown that keeps this from log-spamming every 5s poll.
@@ -60,21 +60,21 @@ function baseSetup(rosterSize) {
   for (const def of roster) agents[def.id] = { id: def.id, busy: false, offDuty: false, approvedCount: 0, droppedCount: 0 };
   setGlobal('AGENT_ROSTER', roster);
   setGlobal('AGENTS', agents);
-  setGlobal('villageHasWork', () => true);
+  setGlobal('thinkTankHasWork', () => true);
   // availableAuthority lives in agents.js (which this test, loading only
   // hiring.js, doesn't pull in) -- stub it to return the roster's admin, the
   // same authority figure the production function resolves.
   setGlobal('availableAuthority', () => roster.find(d => d.isAdmin) || null);
   const logged = [];
   const toasted = [];
-  setGlobal('logVillageAction', (agentId, action, details) => logged.push({ agentId, action, details }));
+  setGlobal('logThinkTankAction', (agentId, action, details) => logged.push({ agentId, action, details }));
   setGlobal('showToast', (msg) => toasted.push(msg));
   setGlobal('lastHireAt', 0);
   setGlobal('lastHireCapNoticeAt', 0);
   return { roster, agents, logged, toasted };
 }
 
-console.log('villager headcount cap (hiring.js)');
+console.log('researcher headcount cap (hiring.js)');
 
 await test('attemptAutoHire refuses once the roster is at MAX_TOTAL_AGENTS', async () => {
   const max = getGlobal('MAX_TOTAL_AGENTS');
@@ -141,7 +141,7 @@ console.log('\na fresh hire starts off-duty (dormant) when the active cap is alr
 await test('hireSpecialist creates the agent but does not walk her out when canActivateAnother() is false', async () => {
   // Real ask (2026-09-20): the total inventory (MAX_TOTAL_AGENTS) can be
   // much larger than the active ceiling (MAX_ACTIVE_AGENTS, tasks.js).
-  // Hiring someone new for a fresh skill set while the village is
+  // Hiring someone new for a fresh skill set while the think tank is
   // already at its active ceiling should still succeed -- she joins the
   // inventory -- but she must NOT walk out into an already-full active
   // roster. canActivateAnother() lives in tasks.js, not loaded into this

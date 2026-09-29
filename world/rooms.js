@@ -1,4 +1,4 @@
-// Interior rooms for World 2. Each active-room building maps to a room
+// Interior rooms for World. Each active-room building maps to a room
 // definition -- a whole-scene background image (see ../DESIGN.md, the room
 // design pass) plus hand-mapped blocking rectangles in the image's own
 // native (632x424) pixel coordinates. No extra scale factor here (unlike

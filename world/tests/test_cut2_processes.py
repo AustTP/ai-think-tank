@@ -18,8 +18,8 @@ pattern as test_refinement.py / test_social.py. NOT actually DB-free despite
 the plain-dict state: several of these code paths (task_peer_widened,
 task_review_requeued, runbook/roadmap logging) have inline `from serve import
 log_action` calls -- a real side effect, not a stub -- which write straight
-into whatever real village.db sits at serve.py's default path unless DB_PATH
-is redirected below. Found 2026-09-25 via a live production village.db that
+into whatever real think_tank.db sits at serve.py's default path unless DB_PATH
+is redirected below. Found 2026-09-25 via a live production think_tank.db that
 picked up test fixture rows after a routine `tests/run_all.sh` run.
 """
 import os
@@ -40,11 +40,11 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-cut2-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-cut2-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),

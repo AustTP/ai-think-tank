@@ -1,11 +1,11 @@
-// World 2 -- a completely separate, standalone map from the main game
+// World -- a completely separate, standalone map from the main game
 // (../web/). Nothing here is shared with ../web/world.js or ../web/index.html:
 // own HTML page, own script, own assets/ folder, own copy of the player
 // sprites. The two are independent pages you open separately; there is no
 // in-page link or toggle between them.
 //
-// The map itself is the whole-scene PixelLab village render (see
-// ../DESIGN.md, "Experiment -- whole-scene village generation") rather than
+// The map itself is the whole-scene PixelLab think tank render (see
+// ../DESIGN.md, "Experiment -- whole-scene think tank generation") rather than
 // individually-placed building sprites like the main game. Buildings are
 // solid obstacles only, no doors/interiors, per your call on scope.
 //
@@ -62,7 +62,7 @@ function agentFetch(url, agentId, options = {}) {
 // in the browser (no serve.py route makes the call itself), so without
 // this they'd be invisible to the one activity log you asked for.
 // Fire-and-forget -- a missed log entry shouldn't affect gameplay.
-function logVillageAction(agentId, action, details) {
+function logThinkTankAction(agentId, action, details) {
   apiFetch('/api/log', { method: 'POST', body: JSON.stringify({ agentId, action, details }) }).catch(() => {});
 }
 
@@ -170,7 +170,7 @@ async function reviewScreenshot(agentId, sandboxId, path, question) {
 
 // The Library's real capability -- a shared file directory any agent (or
 // the player) can write to, per your call. Fire-and-forget, same as
-// logVillageAction -- a missed archive write shouldn't block gameplay.
+// logThinkTankAction -- a missed archive write shouldn't block gameplay.
 // `source`: 'firsthand' (default -- an agent's own task output/reasoning)
 // or 'external' (picked up via /api/browse) -- serve.py enforces the
 // pending_review/ quarantine for 'external' regardless of what path is
@@ -533,7 +533,7 @@ async function requestPageProbe(agentId, sandboxId, path, actions, probes) {
 }
 
 // Renders a /api/page-probe result as the same real, readable fact-sheet
-// every probe call in this village produces -- real actions taken, real
+// every probe call in this think tank produces -- real actions taken, real
 // console/errors, the actual custom globals this page defines WITH their
 // real shape (not just a name to guess at), and the actual probe results.
 // Extracted from the original fixed default probe -- pulled out once
@@ -565,7 +565,7 @@ function formatPageProbeResult(data) {
   return lines.join('\n');
 }
 
-const BG_SPRITE = 'assets/village_background.png';
+const BG_SPRITE = 'assets/think_tank_background.png';
 const NATIVE_W = 688;
 const NATIVE_H = 384;
 const GROUND_W = NATIVE_W * SCALE;
@@ -602,5 +602,5 @@ function blockedAt(p) {
   return false;
 }
 
-// (Village-wide retrospective removed 2026-09-28 -- it had no caller; the
+// (Think Tank-wide retrospective removed 2026-09-28 -- it had no caller; the
 // player-facing activity feed covers the same ground without a model call.)

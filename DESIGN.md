@@ -1,12 +1,12 @@
-# AI Village — Architecture & Systems Design
+# AI Think Tank — Architecture & Systems Design
 
 ## 1. Overview
 
-A server-owned AI-agent village simulation. Agents autonomously file work
+A server-owned AI-agent think tank simulation. Agents autonomously file work
 requests, refine backlogs, execute tasks, peer-review deliverables, escalate
 blockers, and self-govern through ceremonies — all driven by real LLM calls
 through OpenRouter, gated by a JEV policy classifier where decisions have
-consequences. The server owns all state (`village.db`); the browser is a
+consequences. The server owns all state (`think_tank.db`); the browser is a
 read-view into it.
 
 **Codebase:**
@@ -37,8 +37,8 @@ background loops:
 | `_health_check_loop` | 300s | Compute health signals, persist new alerts (model tiers, coordination, runaway-tool churn) |
 | `_peer_review_loop` | 90s | Senior director files peer reports on low-activity workers |
 | `_director_approval_loop` | 30s | Resolve pending escalations via delegated JEV approvals |
-| `_telegram_poll_loop` | 25s | Poll Telegram for player messages, route into village |
-| `_backup_loop` | 5min | Snapshot village.db (keeps newest 24) |
+| `_telegram_poll_loop` | 25s | Poll Telegram for player messages, route into think tank |
+| `_backup_loop` | 5min | Snapshot think_tank.db (keeps newest 24) |
 | `_log_prune_loop` | 6h | Delete decision_tape/action_log rows older than retention (7d) |
 | `_model_tier_refresh_loop` | daily | Re-pick each band's best-value model from live catalog + prices |
 
@@ -46,7 +46,7 @@ Each loop runs as an independent asyncio task; the sim loop runs movement
 on a 2s tick and the task cycle on a 6s tick, both off-thread to avoid
 blocking HTTP.
 
-**Data model:** A `kv_state` blob in SQLite holds the authoritative village
+**Data model:** A `kv_state` blob in SQLite holds the authoritative think tank
 state (agents, teams, work queue, tasks, sprints, research topics, room
 definitions). Decision audit logs live in two append-only tables:
 `action_log` (human-readable, per-agent activity feed) and `decision_tape`
@@ -116,10 +116,10 @@ teams run with the director standing in as facilitator.
 
 ### Idle gate
 
-`village_has_work()` gates spend: if no due queue items AND no agent is
+`think_tank_has_work()` gates spend: if no due queue items AND no agent is
 mid-task/handoff/pair/busy, the task cycle returns early with zero mutations.
 Ceremonies (refinement, social, roadmap) run ungated but no-op without
-requests/eligible attendees — they never spend on an empty village.
+requests/eligible attendees — they never spend on an empty think tank.
 
 ---
 
@@ -287,7 +287,7 @@ session OR a valid agent key (so server-to-server loopback works).
 
 | Table | Purpose | Retention |
 |-------|---------|-----------|
-| `kv_state` | Single-row village state blob (agents, teams, tasks, queue, rooms) | Forever |
+| `kv_state` | Single-row think tank state blob (agents, teams, tasks, queue, rooms) | Forever |
 | `kv_spend` | Single-row spend ledger (per-service used/cap, byDay series) | Forever |
 | `model_tiers` | Per-band model slug, name, price, chosen_at | Active bands only |
 | `model_benchmark_scores` | Cited benchmark scores (model_id, benchmark, score, source_url) | Preserved |
@@ -303,7 +303,7 @@ session OR a valid agent key (so server-to-server loopback works).
 1. **Server-owned simulation** — the browser is a viewport, not a state
    machine. The server's `_task_cycle` drives everything; the client only
    renders what the server says.
-2. **DB as source of truth** — `village.db` is authoritative. Agents/*.json
+2. **DB as source of truth** — `think_tank.db` is authoritative. Agents/*.json
    files are regenerated mirrors, never independently mutated.
 3. **Failed closed, not open** — every JEV gate, budget cap, and circuit
    breaker defaults to the safe/conservative/cheap side. An outage never
@@ -317,8 +317,8 @@ session OR a valid agent key (so server-to-server loopback works).
 6. **Everything is a JEV gate** — from browsing to firing to model-tier
    selection, every consequential decision runs through the same typed-choice
    classifier with quorum sampling.
-7. **Idle is free** — `village_has_work()` gates spend before any ceremony
-   fires. An idle village spends nothing.
+7. **Idle is free** — `think_tank_has_work()` gates spend before any ceremony
+   fires. An idle think tank spends nothing.
 8. **High tier is bounded twice** — per-model price ceiling ($5/M) keeps the
    daily refresh from picking a $200/M monster; monthly spend cap ($2/mo)
    keeps the gate from escalating into the expensive tier more than a few

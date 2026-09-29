@@ -1,12 +1,12 @@
-# AI Village — Manual Test Checklist
+# AI Think Tank — Manual Test Checklist
 
-Hands-on checklist for testing the live village. Run the server first, then walk
+Hands-on checklist for testing the live think tank. Run the server first, then walk
 these in order. Mark each **PASS / FAIL / BLOCKED(why)**.
 
 ## Setup
 - [ ] Start server: `python serve.py` (port 8936) — or `python serve.py <port>`.
 - [ ] Confirm startup prints the admin account / "dev server ... on http://127.0.0.1:8936".
-- [ ] Open http://127.0.0.1:8936 in a browser; the village map renders with agents.
+- [ ] Open http://127.0.0.1:8936 in a browser; the think tank map renders with agents.
 - [ ] Confirm agents are moving between rooms (not all frozen at spawn).
 
 ---
@@ -66,7 +66,7 @@ Prereq: provision the credential once —
 - [ ] `POST /api/player-email/test` re-sends a test.
 - [ ] Wrong-format password (not 16 chars) is rejected with a clear error.
 - [ ] Agent-key call to the credential endpoint is **rejected** (player-only).
-- [ ] With the credential **absent/undecryptable**, the village keeps running (fail-closed; no crash, no Wedge) — check serve stdout for a logged skip.
+- [ ] With the credential **absent/undecryptable**, the think tank keeps running (fail-closed; no crash, no Wedge) — check serve stdout for a logged skip.
 
 ---
 
@@ -102,7 +102,7 @@ Prereq: provision the credential once —
 
 ## 9. Artifacts publish (Phase F)
 - [ ] Released work can be published from The House (`Publish to GitHub`).
-- [ ] Publish writes to the configured private repo (`AI_VILLAGE_PUBLISH_REPO` in `.env`, a NEW repo, not the village source).
+- [ ] Publish writes to the configured private repo (`AI_THINK_TANK_PUBLISH_REPO` in `.env`, a NEW repo, not the think tank source).
 
 ---
 
@@ -125,7 +125,7 @@ Prereq: provision the credential once —
 
 ## 12. Reliability surfaces
 - [ ] **Reload persistence**: refresh the browser mid-lifecycle → agents/state restore from DB (no double-spawn, no wedged busy).
-- [ ] **Dormancy**: with `--max-idle-minutes N` set, the village pauses after N min of no requests and any request wakes it (state intact).
+- [ ] **Dormancy**: with `--max-idle-minutes N` set, the think tank pauses after N min of no requests and any request wakes it (state intact).
 - [ ] **Concurrent meetings**: multiple rooms can hold meetings at once; a busy agent rebuffs a second invite; busy-state collision is safe.
 - [ ] **Room overflow**: a room at capacity doesn't hard-fail — agents reassign.
 

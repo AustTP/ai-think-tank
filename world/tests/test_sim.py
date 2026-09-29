@@ -2,7 +2,7 @@
 
 Mirrors the ServerOwnedSeed isolation pattern from test_serve.py: every test
 redirects state/disk side effects into a throwaway temp directory so the real
-village.db is never touched.
+think_tank.db is never touched.
 """
 import json
 import os
@@ -21,11 +21,11 @@ import sim
 
 class SimTick(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-sim-test-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-sim-test-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
@@ -118,11 +118,11 @@ class SimServerOwnedMovement(unittest.TestCase):
     # collision_grid.json/door_triggers.json via _load_outdoor_geometry.
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-sim-move-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-sim-move-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
@@ -275,16 +275,16 @@ class SimServerOwnedMovement(unittest.TestCase):
 class SimTaskLifecycle(unittest.TestCase):
     # Phase 3 slice 1: the server re-homes the task lifecycle -- queue
     # consumption, deterministic assignment, arrive/complete/off-duty -- so the
-    # village works tasks with no browser. Assignment is DETERMINISTIC (round-
+    # think tank works tasks with no browser. Assignment is DETERMINISTIC (round-
     # robin, zero JEV spend). Content execution is short-circuited (workUntil
     # budget); the per-room real executors are the next slice.
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-sim-task-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-sim-task-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
@@ -374,7 +374,7 @@ class SimTaskLifecycle(unittest.TestCase):
         self.assertEqual(state['workQueue'], [], 'queue drained after assignment')
 
     def test_task_cycle_idle_gate_spends_nothing(self):
-        # An idle village parks its idle wanderers off duty (2026-09-23: a
+        # An idle think tank parks its idle wanderers off duty (2026-09-23: a
         # woken-but-never-assigned agent must vanish, per the player's "no
         # unscheduled/active agent should appear" rule), which IS a state write.
         # What it must NOT do is enqueue work, assign anyone, run governance,
@@ -483,7 +483,7 @@ class SimTaskLifecycle(unittest.TestCase):
         self.assertFalse(any(a.get('task') for a in state['agents'].values()))
 
     def test_full_closed_loop_task_completes_and_agent_goes_off_duty(self):
-        # The Phase-3 acceptance seed: an empty village with ONE queued item and
+        # The Phase-3 acceptance seed: an empty think tank with ONE queued item and
         # one on-duty worker. Drive the ENGINE (movement + lifecycle) until the
         # task completes and the worker goes off duty.
         grid, doors = sim._load_outdoor_geometry()
@@ -577,11 +577,11 @@ class SimOffDutyWake(unittest.TestCase):
     # stranding at the map edge (ben at outskirts_south, faye at the corner).
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-sim-offduty-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-sim-offduty-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),

@@ -4,7 +4,7 @@ Every model call flows through /api/chat (or /api/decide for Jev, or the
 /api/intent/ask tool loop), and OpenRouter reports each call's USD cost in
 usage.cost. Those costs accrue to a per-service ledger (used / cap / left / a
 trailing-7-day burn forecast) so a director at a bank teller can see the whole
-village's spend and coordinate with the other directors not to exceed -- the
+think tank's spend and coordinate with the other directors not to exceed -- the
 teller is deliberately DIRECTORS-ONLY (workers are deflected to their director).
 
 Hermetic: the ledger lives in its own kv_spend row, which these tests replace
@@ -177,7 +177,7 @@ class SpendCap(unittest.TestCase):
         self._leak()
         serve._accrue_spend('alpha', 999.0)
         with unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 0.0):
-            self.assertFalse(serve._village_spend_cap_exceeded())
+            self.assertFalse(serve._think_tank_spend_cap_exceeded())
 
     def test_preexisting_historical_spend_never_counts_against_a_new_cap(self):
         # Real requirement: the cap protects the NEW balance going forward --
@@ -186,25 +186,25 @@ class SpendCap(unittest.TestCase):
         self._leak()
         serve._accrue_spend('AI regulation news', 8.5)  # pre-existing damage
         with unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 5.0):
-            self.assertFalse(serve._village_spend_cap_exceeded())  # baseline set, not tripped
-            self.assertFalse(serve._village_spend_cap_exceeded())  # still not tripped on re-check
+            self.assertFalse(serve._think_tank_spend_cap_exceeded())  # baseline set, not tripped
+            self.assertFalse(serve._think_tank_spend_cap_exceeded())  # still not tripped on re-check
 
     def test_trips_once_new_spend_since_baseline_reaches_the_cap(self):
         self._leak()
         serve._accrue_spend('alpha', 1.0)
         with unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 5.0):
-            self.assertFalse(serve._village_spend_cap_exceeded())  # sets baseline at 1.0
+            self.assertFalse(serve._think_tank_spend_cap_exceeded())  # sets baseline at 1.0
             serve._accrue_spend('alpha', 4.99)
-            self.assertFalse(serve._village_spend_cap_exceeded())  # 4.99 new < 5.0
+            self.assertFalse(serve._think_tank_spend_cap_exceeded())  # 4.99 new < 5.0
             serve._accrue_spend('alpha', 0.02)
-            self.assertTrue(serve._village_spend_cap_exceeded())  # 5.01 new >= 5.0
+            self.assertTrue(serve._think_tank_spend_cap_exceeded())  # 5.01 new >= 5.0
 
     def test_chat_completion_chokepoint_blocks_before_any_network_call(self):
         self._leak()
         serve._accrue_spend('alpha', 10.0)
         with unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 5.0), \
              unittest.mock.patch.object(serve, '_urlopen_with_resilience') as net:
-            serve._village_spend_cap_exceeded()  # sets baseline
+            serve._think_tank_spend_cap_exceeded()  # sets baseline
             serve._accrue_spend('alpha', 5.0)  # now over cap
             with self.assertRaises(RuntimeError):
                 serve._call_openrouter_sync('some-model', [], 100)
@@ -214,7 +214,7 @@ class SpendCap(unittest.TestCase):
         self._leak()
         with unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 5.0), \
              unittest.mock.patch.object(serve, '_urlopen_with_resilience') as net:
-            serve._village_spend_cap_exceeded()  # sets baseline at 0
+            serve._think_tank_spend_cap_exceeded()  # sets baseline at 0
             serve._accrue_spend('alpha', 5.0)
             with self.assertRaises(RuntimeError):
                 serve._post_openrouter_raw('some-model', [])
@@ -224,7 +224,7 @@ class SpendCap(unittest.TestCase):
         self._leak()
         with unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 5.0), \
              unittest.mock.patch.object(serve, '_urlopen_with_resilience') as net:
-            serve._village_spend_cap_exceeded()  # sets baseline at 0
+            serve._think_tank_spend_cap_exceeded()  # sets baseline at 0
             serve._accrue_spend('alpha', 5.0)
             with self.assertRaises(RuntimeError):
                 serve._call_openrouter_decision_sync('typesafe/jev-1.13', {}, {})
@@ -247,7 +247,7 @@ class SpendCap(unittest.TestCase):
         # baseline key (a float) must not be treated as a service bucket.
         self._leak()
         with unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 5.0):
-            serve._village_spend_cap_exceeded()  # writes the baseline key
+            serve._think_tank_spend_cap_exceeded()  # writes the baseline key
         serve._accrue_spend('alpha', 1.0)
         view = serve._bank_budget_view(_snapshot())  # must not raise
         self.assertIn('alpha', view)
@@ -449,7 +449,7 @@ class BankContent(unittest.TestCase):
 
     def test_worker_gets_readonly_cumulative_view(self):
         # A worker (non-director) gets a READ-ONLY cumulative summary -- hive-mind
-        # awareness of village spend (2026-09-24). Only reallocation AUTHORITY is
+        # awareness of think tank spend (2026-09-24). Only reallocation AUTHORITY is
         # director-only; visibility into "are we healthy" is not.
         snap = _snapshot()
         seen = self._store()
