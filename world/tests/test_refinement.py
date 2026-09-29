@@ -202,6 +202,50 @@ class RefinementResolve(unittest.TestCase):
         self.assertEqual(req['status'], 'rejected')
         self.assertEqual(state['workQueue'], [])
 
+    def test_decider_instructions_carry_medium_difficulty_guidance(self):
+        # Absolute Zero: the grooming prompt itself steers toward MEDIUM-
+        # difficulty cards and gives the reject criterion the trivial/filler
+        # case, so the decider's accept/reject read the guidance, not just the
+        # request's own wording.
+        state, _req = self._convened()
+        seen = {}
+
+        def capturing_decider(instructions, criteria):
+            seen['instructions'] = instructions
+            seen['criteria'] = criteria
+            return 'accept'
+
+        _step(state, None, sim.REFINEMENT_MEET_MS + 2_000_000, decider=capturing_decider)
+        self.assertIn('MEDIUM-difficulty', seen['instructions'])
+        self.assertIn(sim.ABSOLUTE_ZERO_SCOPING_GUIDANCE, seen['instructions'])
+        self.assertTrue(any('trivial/filler' in c['description'] for c in seen['criteria']))
+
+    def test_accept_carryaway_does_not_flag_rejection(self):
+        state, _req = self._convened()
+        with serve._db() as conn:
+            conn.execute("DELETE FROM action_log WHERE action = 'refinement_carryaway'")
+        _step(state, None, sim.REFINEMENT_MEET_MS + 2_000_000, decider=_stub_decider('accept'))
+        with serve._db() as conn:
+            rows = conn.execute(
+                "SELECT details FROM action_log WHERE action = 'refinement_carryaway'").fetchall()
+        self.assertTrue(rows, 'an accepted carryaway should still be logged')
+        self.assertFalse(any('"selfProposedRejected": true' in r[0] for r in rows))
+
+    def test_reject_carryaway_logs_self_proposed_rejected_signal(self):
+        # Absolute Zero rejection signal: a groomed-out self-proposal is logged
+        # with an explicit marker the health check counts (a rising reject rate
+        # = the village's own proposals trending trivial).
+        state, _req = self._convened()
+        with serve._db() as conn:
+            conn.execute("DELETE FROM action_log WHERE action = 'refinement_carryaway'")
+        _step(state, None, sim.REFINEMENT_MEET_MS + 2_000_000, decider=_stub_decider('reject'))
+        with serve._db() as conn:
+            rows = conn.execute(
+                "SELECT details FROM action_log WHERE action = 'refinement_carryaway'").fetchall()
+        self.assertTrue(rows, 'a rejected carryaway should still be logged')
+        self.assertTrue(any('"selfProposedRejected": true' in r[0] for r in rows),
+                        f'no flagged carryaway in {[r[0] for r in rows]}')
+
     def test_outage_fallback_accepts_real_gap(self):
         state, req = self._convened()
         _step(state, None, sim.REFINEMENT_MEET_MS + 2_000_000, decider=None)  # default None -> network
@@ -372,6 +416,17 @@ class RefinementSignalGenerator(unittest.TestCase):
         state = _seed()
         self.assertIsNone(sim.file_work_request(state, 'ben', 'X', 'hangout'))  # not delegatable
         self.assertEqual(state['backlogRequests'], [])
+
+    def test_followup_reason_carries_medium_difficulty_guidance(self):
+        # Absolute Zero: the filed follow-up itself steers toward a MEDIUM-
+        # difficulty next story (real, well-scoped, materially advancing the
+        # room), so the grooming decider reads the scoping nudge with the
+        # request, not just the ceremony's generic instructions.
+        state = _seed()
+        task = {'id': 'task-1', 'room': 'pressoffice', 'title': 'Build ledger tool', 'taskType': 'code'}
+        sim._maybe_file_followup(state, 'ben', task, 1_000_000)
+        req = state['backlogRequests'][0]
+        self.assertIn(sim.ABSOLUTE_ZERO_SCOPING_GUIDANCE, req['reason'])
 
 
 class RefinementCadence(unittest.TestCase):

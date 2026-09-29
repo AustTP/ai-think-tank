@@ -675,7 +675,7 @@ def _village_spend_cap_exceeded():
     """Hard, absolute spend-cap check -- called at the top of EVERY real
     money-spending chokepoint (_call_openrouter_sync, _post_openrouter_raw,
     _call_openrouter_decision_sync), before any network call. Disabled
-    (returns False) when SPEND_CAP_USD is 0/unset. On first real check, the
+    (returns False) when SPEND_CAP_USD is explicitly 0. On first real check, the
     CURRENT total ledger spend is stored as a baseline (a reserved key in the
     same ledger row) so pre-existing historical spend is never counted --
     only what accrues after this protection was installed. Deliberately a
@@ -2156,7 +2156,8 @@ async def _health_check_loop():
     while True:
         try:
             snapshot = await asyncio.to_thread(compute_health_snapshot)
-            await asyncio.to_thread(_persist_new_health_alerts, snapshot['alerts'])
+            new_alerts = await asyncio.to_thread(_persist_new_health_alerts, snapshot['alerts'])
+            await asyncio.to_thread(_push_new_health_alerts, new_alerts)
         except Exception as e:
             print(f'[health-check] loop error: {e}', flush=True)
         await asyncio.sleep(HEALTH_CHECK_INTERVAL_S)
@@ -3418,14 +3419,18 @@ PLAYER_EMAIL_ENABLED = _load_env().get('PLAYER_EMAIL_ENABLED', 'true').strip().l
 # review/fix forever, burning ~$9 across both villages in one evening before
 # anyone noticed. That bug is fixed, but this is deliberately independent
 # protection against ANY future bug (known or not) doing the same thing --
-# a manual, absolute ceiling, not a per-bug patch. 0/unset disables it.
+# a manual, absolute ceiling, not a per-bug patch. Explicit 0 disables it;
+# unset defaults to a conservative $5 so a fresh/villager clone is bounded
+# until the player chooses a ceiling (2026-09-28: was '0' -- a new village
+# ran UNbounded until the .env was hand-edited, which is the exact failure
+# mode this protection exists for).
 # Baseline (spend at the moment this protection was installed) is stored
 # once in the ledger itself, so pre-existing historical spend never counts
 # against it -- only what accrues from here on. To raise the ceiling, raise
 # SPEND_CAP_USD in .env and restart (deliberately manual, no live reset
 # endpoint -- a cap you can silently raise from inside the village isn't a
 # real ceiling).
-SPEND_CAP_USD = float(_load_env().get('SPEND_CAP_USD', '0') or 0)
+SPEND_CAP_USD = float(_load_env().get('SPEND_CAP_USD', '5') or 0)
 
 # Page-request budget (2026-09-27): the village has a MONTHLY allowance of
 # EXTERNAL page requests -- each browse_page fetch (/api/browse) and each
@@ -4994,31 +4999,39 @@ async def _jev_quorum_decision(instructions, criteria):
     sandbox_download, sandbox_save_page, access_request, execute/pipeline's
     _classify_command) -- replaces each site's own single
     _call_openrouter_decision_sync + _jev_choice call. Returns (decision,
-    confidence, total_cost), the same 3-tuple shape _jev_choice already
-    returns, so every existing call site's downstream _jev_safety_gate call
-    is unchanged. Fails closed exactly as every call site already did: an
-    unreachable classifier is not consent to skip the gate."""
+    confidence, total_cost, trace_id) -- the same tuple shape _jev_choice
+    returns plus the decision's trace_id (2026-09-28: so the caller can stamp
+    it on the resulting action_log rows, making the decision chain
+    queryable), so every existing call site's downstream _jev_safety_gate
+    call is unchanged except threading that trace_id. Fails closed exactly
+    as every call site already did: an unreachable classifier is not consent
+    to skip the gate."""
     async def sample():
         data = await asyncio.to_thread(
             _call_openrouter_decision_sync, _jev_model(),
             {'messages': [], 'signals': {}},
             {'choice': {'type': 'choice', 'instructions': instructions, 'criteria': criteria}},
         )
-        return _jev_choice(data)
+        decision, confidence, cost = _jev_choice(data)
+        # trace_id only exists on a real decision dict; a mocked/broken caller
+        # (tests, an upstream shape change) must never hand the gate a
+        # non-bindable trace_id -- None stamps nothing and still logs fine.
+        trace_id = data.get('trace_id') if isinstance(data, dict) else None
+        return decision, confidence, cost, trace_id
 
     try:
-        decision, confidence, cost = await sample()
+        decision, confidence, cost, trace_id = await sample()
     except Exception:
-        return None, 1.0, 0.0
+        return None, 1.0, 0.0, None
 
     if decision not in ('allow', 'approve') or confidence >= JEV_SAFETY_CONFIDENCE:
-        return decision, confidence, cost  # firm block, or already-confident -- one sample is enough
+        return decision, confidence, cost, trace_id  # firm block, or already-confident -- one sample is enough
 
     total_cost = cost
     votes = [(decision, confidence)]
     for _ in range(QUORUM_SAMPLE_SIZE - 1):
         try:
-            d, c, extra_cost = await sample()
+            d, c, extra_cost, _ = await sample()
         except Exception:
             continue  # a failed re-sample just isn't a vote either way
         total_cost += extra_cost
@@ -5029,11 +5042,11 @@ async def _jev_quorum_decision(instructions, criteria):
         # The strongest agreeing confidence, not a diluted average with the
         # votes that disagreed -- a real quorum forms around its scouts'
         # own assessed quality, not a blend against the ones who left.
-        return 'allow', max(agreeing), total_cost
+        return 'allow', max(agreeing), total_cost, trace_id
     # No quorum reached -- report the ORIGINAL low-confidence result so
     # _jev_safety_gate's escalation message stays accurate (this really was
     # sampled multiple times and stayed unsure, not a fabricated one-shot).
-    return decision, confidence, total_cost
+    return decision, confidence, total_cost, trace_id
 
 
 def _jev_quorum_choice_sync(instructions, criteria):
@@ -5179,19 +5192,21 @@ def _jev_directory_score(kind, confidence):
     return max(0.0, min(1.0, float(confidence) - penalty))
 
 
-def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confidence, cost, authorized):
+def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confidence, cost, authorized, trace_id=None):
     # Shared low-confidence handling for the Jev safety gates (browse,
     # download, curl/execute, sandbox download/save, temp access). A
     # confident allow passes through; a LOW-confidence allow is "unsure" --
     # escalated to a human rather than acted on, which is Jev's whole reason
     # to exist. Any non-allow is just a normal block. Returns True if the
     # request should be allowed, False if it was blocked (either firmly or
-    # because we escalated the uncertainty).
+    # because we escalated the uncertainty). `trace_id` (2026-09-28) is
+    # threaded from the quorum call that produced this decision so the gate's
+    # audit row links back to the exact decision_tape entry(s) it acted on.
     if decision != 'allow' and decision != 'approve':
-        log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'blocked', 'confidence': confidence, 'cost': cost, 'reason': 'jev: ' + (decision or 'classifier unavailable, failed closed')}, authorized=authorized)
+        log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'blocked', 'confidence': confidence, 'cost': cost, 'reason': 'jev: ' + (decision or 'classifier unavailable, failed closed')}, authorized=authorized, trace_id=trace_id)
         return False
     if confidence < JEV_SAFETY_CONFIDENCE:
-        log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'escalated_unsure', 'confidence': confidence, 'cost': cost, 'reason': 'jev allow at low confidence, escalated'}, authorized=authorized)
+        log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'escalated_unsure', 'confidence': confidence, 'cost': cost, 'reason': 'jev allow at low confidence, escalated'}, authorized=authorized, trace_id=trace_id)
         create_escalation(
             'unsure safety decision',
             f'{noun} looked potentially risky but was not clearly blocked (Jev confidence {confidence:.2f} < {JEV_SAFETY_CONFIDENCE}):\n\nTarget: {target}\nStated purpose: {purpose or "not given"}',
@@ -5199,7 +5214,7 @@ def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confiden
         return False
     # Confident allow -- passes. Log it so cost/confidence are visible in the
     # activity feed (Phase 2c: "log cost + confidence per decision").
-    log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'allowed', 'confidence': confidence, 'cost': cost, 'reason': 'jev allow'}, authorized=authorized)
+    log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'allowed', 'confidence': confidence, 'cost': cost, 'reason': 'jev allow'}, authorized=authorized, trace_id=trace_id)
     return True
 
 
@@ -8852,15 +8867,15 @@ async def library_download(request: Request):
         'block': 'The URL, domain, or stated purpose suggests: ' + '; '.join(BROWSE_BLOCK_CATEGORIES) + '.',
     }
     instructions = f'An in-game agent wants to DOWNLOAD this file: {url}\nStated reason: {purpose or "not given"}\nDecide allow or block based on the URL/domain and stated purpose alone (the file has not been fetched yet).'
-    decision, confidence, cost = await _jev_quorum_decision(instructions, criteria)
+    decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
 
-    if not _jev_safety_gate(agent_id, 'download', 'This file download', url, purpose, decision, confidence, cost, authorized):
+    if not _jev_safety_gate(agent_id, 'download', 'This file download', url, purpose, decision, confidence, cost, authorized, trace_id):
         return JSONResponse({'allowed': False, 'reason': 'This file was not approved for a village agent to download.'})
 
     try:
         final_url, content_type, raw, truncated = await asyncio.to_thread(_download_file_sync, url, DOWNLOAD_MAX_BYTES)
     except Exception as e:
-        log_action(agent_id, 'download', {'url': url, 'purpose': purpose, 'decision': 'allowed_but_fetch_failed', 'reason': str(e)}, authorized=authorized)
+        log_action(agent_id, 'download', {'url': url, 'purpose': purpose, 'decision': 'allowed_but_fetch_failed', 'reason': str(e)}, authorized=authorized, trace_id=trace_id)
         return JSONResponse({'allowed': True, 'ok': False, 'reason': str(e)})
 
     rel_path = _download_dest_rel_path(scope, agent_id, safe_name)
@@ -8874,7 +8889,7 @@ async def library_download(request: Request):
     log_action(agent_id, 'download', {
         'url': url, 'finalUrl': final_url, 'purpose': purpose, 'decision': 'allowed',
         'path': rel_path, 'bytes': len(raw), 'truncated': truncated, 'contentType': content_type,
-    }, authorized=authorized)
+    }, authorized=authorized, trace_id=trace_id)
     return JSONResponse({'allowed': True, 'ok': True, 'path': rel_path, 'bytes': len(raw), 'truncated': truncated, 'contentType': content_type})
 
 
@@ -9400,6 +9415,10 @@ async def browse(request: Request):
         log_action(agent_id, 'browse', {'url': url, 'purpose': purpose, 'decision': 'blocked', 'reason': 'private/internal host'}, authorized=authorized)
         return JSONResponse({'allowed': False, 'reason': 'That address resolves to a private or internal network location and cannot be reached.'})
 
+    # trace_id is only produced by the Jev gate branch below; the allowlist
+    # path has no decision to trace, so default to None before the branch
+    # (the outcome rows after it are threaded with whichever value applied).
+    trace_id = None
     if _is_allowlisted_host(parsed.hostname):
         # Player-vetted domain -- skip the Jev classify+escalate round trip
         # entirely (real gap caught live: the SAME url got a low-confidence
@@ -9415,9 +9434,9 @@ async def browse(request: Request):
             'block': 'The URL, domain, or stated purpose suggests: ' + '; '.join(BROWSE_BLOCK_CATEGORIES) + '.',
         }
         instructions = f'An in-game agent wants to visit this URL: {url}\nStated reason: {purpose or "not given"}\nDecide allow or block based on the URL/domain and stated purpose alone (the page has not been fetched yet).'
-        decision, confidence, cost = await _jev_quorum_decision(instructions, criteria)
+        decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
 
-        if not _jev_safety_gate(agent_id, 'browse', 'This page', url, purpose, decision, confidence, cost, authorized):
+        if not _jev_safety_gate(agent_id, 'browse', 'This page', url, purpose, decision, confidence, cost, authorized, trace_id):
             return JSONResponse({'allowed': False, 'reason': 'This site was not approved for a village agent to visit.'})
         # Real trail evidence: a confident allow (never an escalated/unsure
         # one) on a domain not already vetted -- see record_browse_success.
@@ -9476,7 +9495,7 @@ async def browse(request: Request):
                 vpn_ok, vpn_error = await asyncio.to_thread(_mullvad_connect_sync, via_vpn_country)
                 try:
                     if not vpn_ok:
-                        log_action(agent_id, 'browse', {'url': url, 'purpose': purpose, 'decision': 'allowed_but_vpn_failed', 'reason': vpn_error, 'viaVpnCountry': via_vpn_country}, authorized=authorized)
+                        log_action(agent_id, 'browse', {'url': url, 'purpose': purpose, 'decision': 'allowed_but_vpn_failed', 'reason': vpn_error, 'viaVpnCountry': via_vpn_country}, authorized=authorized, trace_id=trace_id)
                         return JSONResponse({'allowed': True, 'error': f'Approved, but could not connect via Mullvad ({via_vpn_country}): {vpn_error}'})
                     final_url, content_type, raw_body, truncated, last_modified, text, links = await _do_fetch()
                 finally:
@@ -9488,7 +9507,7 @@ async def browse(request: Request):
         else:
             final_url, content_type, raw_body, truncated, last_modified, text, links = await _do_fetch()
     except Exception as e:
-        log_action(agent_id, 'browse', {'url': url, 'purpose': purpose, 'decision': 'allowed_but_fetch_failed', 'reason': str(e), 'render': render, 'viaVpnCountry': via_vpn_country or None}, authorized=authorized)
+        log_action(agent_id, 'browse', {'url': url, 'purpose': purpose, 'decision': 'allowed_but_fetch_failed', 'reason': str(e), 'render': render, 'viaVpnCountry': via_vpn_country or None}, authorized=authorized, trace_id=trace_id)
         return JSONResponse({'allowed': True, 'error': f'Approved, but the page could not be loaded: {e}'})
     # `text` stays plain for human display (the Weather Station/Work Room
     # modals render this directly) -- `textForModel` is the boundary-
@@ -9516,7 +9535,7 @@ async def browse(request: Request):
         except Exception:
             image_b64 = None  # visual capture is best-effort -- text results above still stand either way
 
-    log_action(agent_id, 'browse', {'url': url, 'finalUrl': final_url, 'purpose': purpose, 'decision': 'allowed', 'contentType': content_type, 'bytes': len(raw_body), 'visual': bool(image_b64), 'render': render, 'viaVpnCountry': via_vpn_country or None}, authorized=authorized)
+    log_action(agent_id, 'browse', {'url': url, 'finalUrl': final_url, 'purpose': purpose, 'decision': 'allowed', 'contentType': content_type, 'bytes': len(raw_body), 'visual': bool(image_b64), 'render': render, 'viaVpnCountry': via_vpn_country or None}, authorized=authorized, trace_id=trace_id)
     # One real external fetch happened -- count it against the monthly page-
     # request budget (2026-09-27). Best-effort accounting, never blocks the
     # response (the pre-fetch check already refused if the budget was spent).
@@ -9726,8 +9745,8 @@ async def curl(request: Request):
         f'Headers: {json.dumps(req_headers)[:500]}\nBody: {(req_body or "")[:500]}\n'
         f'Stated reason: {purpose or "not given"}\nDecide allow or block based on the request and stated purpose alone (nothing has been sent yet).'
     )
-    decision, confidence, cost = await _jev_quorum_decision(instructions, criteria)
-    if not _jev_safety_gate(agent_id, 'curl', 'This HTTP request', f'{method} {url}', purpose, decision, confidence, cost, authorized):
+    decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
+    if not _jev_safety_gate(agent_id, 'curl', 'This HTTP request', f'{method} {url}', purpose, decision, confidence, cost, authorized, trace_id):
         return JSONResponse({'allowed': False, 'reason': 'This request was not approved for a village agent to make.'})
 
     # Phase D: a capability handle lets an agent attach a scoped external
@@ -9742,7 +9761,7 @@ async def curl(request: Request):
         grant = resolve_capability_handle(agent_id, capability_handle, method, url)
         if grant is None:
             log_action(agent_id, 'curl', {'url': url, 'method': method, 'purpose': purpose,
-                                          'decision': 'blocked', 'reason': 'capability handle invalid, expired, or out of scope'}, authorized=authorized)
+                                          'decision': 'blocked', 'reason': 'capability handle invalid, expired, or out of scope'}, authorized=authorized, trace_id=trace_id)
             return JSONResponse({'allowed': False, 'reason': 'That capability handle is not valid for this request (expired, wrong agent, or out-of-scope host/method).'})
         # Inject the real credential server-side. The secret never rides in the
         # response or logs. Every use is chained into the hashed-product-passport
@@ -9752,7 +9771,7 @@ async def curl(request: Request):
             req_headers.setdefault(hdr_name, hdr_value)
         log_action(agent_id, 'curl', {'url': url, 'method': method, 'purpose': purpose,
                                       'decision': 'allowed', 'credential': grant['credential_name'],
-                                      'scope': grant['purpose']}, authorized=authorized)
+                                      'scope': grant['purpose']}, authorized=authorized, trace_id=trace_id)
         _append_passport_decision('credential_used', agent_id, {
             'credential': grant['credential_name'], 'service': grant.get('service'),
             'scope': grant['purpose'], 'host': urllib.parse.urlparse(url).hostname,
@@ -9761,7 +9780,7 @@ async def curl(request: Request):
     try:
         result = await asyncio.to_thread(_curl_request_sync, method, url, req_headers, req_body)
     except Exception as e:
-        log_action(agent_id, 'curl', {'url': url, 'method': method, 'purpose': purpose, 'decision': 'allowed_but_failed', 'reason': str(e)}, authorized=authorized)
+        log_action(agent_id, 'curl', {'url': url, 'method': method, 'purpose': purpose, 'decision': 'allowed_but_failed', 'reason': str(e)}, authorized=authorized, trace_id=trace_id)
         return JSONResponse({'allowed': True, 'error': f'Approved, but the request failed: {e}'})
 
     # Real, if narrow, residual risk (2026-09-26 audit): a capability-handle-
@@ -9782,7 +9801,7 @@ async def curl(request: Request):
         result['headers'] = {k: (v.replace(secret, '[REDACTED]') if secret in v else v)
                              for k, v in result['headers'].items()}
 
-    log_action(agent_id, 'curl', {'url': url, 'method': method, 'finalUrl': result['finalUrl'], 'purpose': purpose, 'decision': 'allowed', 'status': result['status'], 'bytes': len(result['body'])}, authorized=authorized)
+    log_action(agent_id, 'curl', {'url': url, 'method': method, 'finalUrl': result['finalUrl'], 'purpose': purpose, 'decision': 'allowed', 'status': result['status'], 'bytes': len(result['body'])}, authorized=authorized, trace_id=trace_id)
     return JSONResponse({'allowed': True, **result})
 
 
@@ -9858,15 +9877,15 @@ async def sandbox_download(request: Request):
         f'An in-game agent wants to download this file DIRECTLY INTO their research sandbox, where it (or code reacting to it) will actually run: {url}\n'
         f'Stated reason: {purpose or "not given"}\nDecide allow or block based on the URL/domain and stated purpose alone (the file has not been fetched yet).'
     )
-    decision, confidence, cost = await _jev_quorum_decision(instructions, criteria)
+    decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
 
-    if not _jev_safety_gate(agent_id, 'sandbox_download', 'This sandbox download', url, purpose, decision, confidence, cost, authorized):
+    if not _jev_safety_gate(agent_id, 'sandbox_download', 'This sandbox download', url, purpose, decision, confidence, cost, authorized, trace_id):
         return JSONResponse({'allowed': False, 'reason': 'This file was not approved to download into the sandbox.'})
 
     try:
         final_url, content_type, raw, truncated = await asyncio.to_thread(_download_file_sync, url, SANDBOX_DOWNLOAD_MAX_BYTES)
     except Exception as e:
-        log_action(agent_id, 'sandbox_download', {'url': url, 'purpose': purpose, 'decision': 'allowed_but_fetch_failed', 'reason': str(e)}, authorized=authorized)
+        log_action(agent_id, 'sandbox_download', {'url': url, 'purpose': purpose, 'decision': 'allowed_but_fetch_failed', 'reason': str(e)}, authorized=authorized, trace_id=trace_id)
         return JSONResponse({'allowed': True, 'ok': False, 'reason': str(e)})
 
     sandbox_dir = _sandbox_dir_for(sandbox_id)
@@ -9880,7 +9899,7 @@ async def sandbox_download(request: Request):
     log_action(agent_id, 'sandbox_download', {
         'url': url, 'finalUrl': final_url, 'purpose': purpose, 'sandboxId': sandbox_id,
         'decision': 'allowed', 'path': rel_path, 'bytes': len(raw), 'truncated': truncated, 'contentType': content_type,
-    }, authorized=authorized)
+    }, authorized=authorized, trace_id=trace_id)
     return JSONResponse({'allowed': True, 'ok': True, 'path': rel_path, 'bytes': len(raw), 'truncated': truncated, 'contentType': content_type})
 
 
@@ -9960,9 +9979,9 @@ async def sandbox_save_page(request: Request):
         f'An in-game agent wants to save the text of this already-visited page into their sandbox: {url}\n'
         f'Stated reason: {purpose or "not given"}\nDecide allow or block based on the URL/domain and stated purpose alone.'
     )
-    decision, confidence, cost = await _jev_quorum_decision(instructions, criteria)
+    decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
 
-    if not _jev_safety_gate(agent_id, 'sandbox_save_page', 'This page save', url, purpose, decision, confidence, cost, authorized):
+    if not _jev_safety_gate(agent_id, 'sandbox_save_page', 'This page save', url, purpose, decision, confidence, cost, authorized, trace_id):
         return JSONResponse({'allowed': False, 'reason': 'This page was not approved to save into the sandbox.'})
 
     sandbox_dir = _sandbox_dir_for(sandbox_id)
@@ -9976,7 +9995,7 @@ async def sandbox_save_page(request: Request):
     log_action(agent_id, 'sandbox_save_page', {
         'url': url, 'purpose': purpose, 'sandboxId': sandbox_id,
         'decision': 'allowed', 'path': rel_path, 'bytes': len(raw), 'truncated': truncated,
-    }, authorized=authorized)
+    }, authorized=authorized, trace_id=trace_id)
     return JSONResponse({'allowed': True, 'ok': True, 'path': rel_path, 'bytes': len(raw), 'truncated': truncated})
 
 
@@ -10015,9 +10034,9 @@ async def access_request(request: Request):
         f'which they don\'t have by default. Stated reason: {reason}\n'
         f'Decide approve or deny based on whether this is a specific, legitimate, task-related need, not a blanket or unjustified request.'
     )
-    decision, confidence, cost = await _jev_quorum_decision(instructions, criteria)
+    decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
 
-    if not _jev_safety_gate(agent_id, 'access_request', 'This temp-access grant', f'capability: {capability}', reason, decision, confidence, cost, None):
+    if not _jev_safety_gate(agent_id, 'access_request', 'This temp-access grant', f'capability: {capability}', reason, decision, confidence, cost, None, trace_id):
         log_action(agent_id, 'access_request', {'capability': capability, 'reason': reason, 'supervisorId': supervisor_id, 'decision': 'denied'})
         return JSONResponse({'approved': False, 'reason': 'Not approved -- the stated reason did not justify temporary access.'})
 
@@ -10046,8 +10065,8 @@ async def _classify_command(command, purpose, agent_id='unknown'):
     # different, un-shared code path than every other Jev-gated action, so
     # a future fix to the shared gate (quorum sampling, right here) would
     # silently never have reached command execution.
-    decision, confidence, cost = await _jev_quorum_decision(instructions, criteria)
-    if not _jev_safety_gate(agent_id, 'execute_classify', 'This command', command, purpose, decision, confidence, cost, None):
+    decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
+    if not _jev_safety_gate(agent_id, 'execute_classify', 'This command', command, purpose, decision, confidence, cost, None, trace_id):
         if decision not in ('allow', 'approve'):
             return False, decision or 'classifier unavailable or gave no answer'
         return False, f'unsure (Jev confidence {confidence:.2f}), escalated'
@@ -10736,6 +10755,150 @@ async def decision_tape_feed(kind: Optional[str] = None, min_conf: Optional[floa
     ]})
 
 
+# Jev calibration (2026-09-28, CS329A takeaway #1): Jev reports a confidence
+# with every decision, and the whole low-confidence-escalation floor
+# (JEV_SAFETY_CONFIDENCE) is built on the assumption that high confidence
+# means high reliability -- but nothing here ever VERIFIED that. The safety
+# gates log confidence+decision, and the fetch outcomes log what actually
+# happened, but no code read the two together. This report does: it buckets
+# Jev's stated confidence and compares it against the real success rate of
+# the actions it allowed, so an overconfident classifier (says 0.9, succeeds
+# 60%) is visible instead of quietly eroding the safety floor. DB-only -- no
+# network, no LLM -- so it can be read as often as the player wants.
+#
+# Outcomes: an 'allowed' gate row is "scoreable" when a matching outcome row
+# follows it (browse/download/curl/sandbox rows log decision=allowed on
+# success, allowed_but_fetch_failed / allowed_but_vpn_failed /
+# allowed_but_failed on failure). Blocked and escalated_unsure rows have no
+# ground truth (we don't know what Jev "should" have said) so they're counted
+# but never scored. Matching prefers the trace_id threaded through the gate
+# (exact chain); when it's absent (older rows) it falls back to same
+# agent+action within a short window, taking the LAST outcome row as terminal
+# (a capability pre-check 'allowed' row precedes the real one).
+JEV_CALIBRATION_BINS = (
+    (0.0, 0.5, '0.00-0.50'),
+    (0.5, 0.6, '0.50-0.60'),
+    (0.6, 0.7, '0.60-0.70'),
+    (0.7, 0.8, '0.70-0.80'),
+    (0.8, 0.9, '0.80-0.90'),
+    (0.9, 1.01, '0.90-1.00'),
+)
+_JEV_SUCCESS_OUTCOMES = {'allowed'}
+_JEV_FAILURE_OUTCOMES = {'allowed_but_fetch_failed', 'allowed_but_vpn_failed', 'allowed_but_failed'}
+_JEV_OUTCOME_WINDOW_S = 300.0
+
+
+def _decision_calibration_report(window_s=7 * 86400):
+    now = time.time()
+    since = now - window_s
+    with _db() as conn:
+        gate_rows = conn.execute(
+            'SELECT agent_id, action, details, ts, trace_id FROM action_log '
+            'WHERE ts > ? AND details LIKE \'%"confidence"%\'',
+            (since,),
+        ).fetchall()
+        action_rows = conn.execute(
+            'SELECT agent_id, action, details, ts, trace_id FROM action_log WHERE ts > ?',
+            (since,),
+        ).fetchall()
+
+    # Index every scoreable outcome row: by trace_id (exact chain) and in a
+    # flat list for the heuristic fallback.
+    by_trace = {}
+    outcome_rows = []
+    for agent_id, action, details, ts, trace_id in action_rows:
+        if details is None:
+            continue
+        try:
+            d = json.loads(details)
+        except Exception:
+            continue
+        if d.get('decision') not in _JEV_SUCCESS_OUTCOMES | _JEV_FAILURE_OUTCOMES:
+            continue
+        row = (agent_id, action, d, ts, trace_id)
+        outcome_rows.append(row)
+        if trace_id:
+            by_trace.setdefault(trace_id, []).append(row)
+
+    buckets = [{'lo': lo, 'hi': hi, 'label': label,
+                'center': (lo + min(hi, 1.0)) / 2.0,
+                'n': 0, 'n_allowed': 0, 'n_blocked': 0, 'n_escalated': 0,
+                'n_outcome': 0, 'n_success': 0, 'n_failure': 0}
+               for lo, hi, label in JEV_CALIBRATION_BINS]
+
+    def _bin(confidence):
+        for b in buckets:
+            if b['lo'] <= confidence < b['hi']:
+                return b
+        return buckets[-1]  # >= 1.0 or missing -> top bin
+
+    def _outcome_for(agent_id, action, gate_ts, trace_id):
+        if trace_id:
+            for oa, oaction, od, ots, otid in by_trace.get(trace_id, []):
+                if oa == agent_id and oaction == action and ots > gate_ts:
+                    return od
+        candidates = [r for r in outcome_rows
+                      if r[0] == agent_id and r[1] == action and gate_ts < r[3] <= gate_ts + _JEV_OUTCOME_WINDOW_S]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda r: r[3])[2]
+
+    for agent_id, action, details, ts, trace_id in gate_rows:
+        if details is None:
+            continue
+        try:
+            d = json.loads(details)
+        except Exception:
+            continue
+        confidence = d.get('confidence')
+        decision = d.get('decision')
+        if not isinstance(confidence, (int, float)) or decision not in ('allowed', 'blocked', 'escalated_unsure'):
+            continue
+        b = _bin(float(confidence))
+        b['n'] += 1
+        if decision == 'blocked':
+            b['n_blocked'] += 1
+            continue
+        if decision == 'escalated_unsure':
+            b['n_escalated'] += 1
+            continue
+        b['n_allowed'] += 1
+        outcome = _outcome_for(agent_id, action, ts, trace_id)
+        if outcome is None:
+            continue
+        b['n_outcome'] += 1
+        if outcome.get('decision') in _JEV_SUCCESS_OUTCOMES:
+            b['n_success'] += 1
+        else:
+            b['n_failure'] += 1
+
+    total_scoreable = sum(b['n_outcome'] for b in buckets)
+    total_success = sum(b['n_success'] for b in buckets)
+    total_decisions = sum(b['n'] for b in buckets)
+    calibration_error = 0.0
+    for b in buckets:
+        if b['n_outcome']:
+            b['success_rate'] = round(b['n_success'] / b['n_outcome'], 4)
+            if total_scoreable:
+                calibration_error += (b['n_outcome'] / total_scoreable) * abs(b['center'] - b['success_rate'])
+        else:
+            b['success_rate'] = None
+    return {
+        'window_s': window_s,
+        'generated_at': now,
+        'total_decisions': total_decisions,
+        'scoreable': total_scoreable,
+        'scoreable_fraction': round(total_scoreable / total_decisions, 4) if total_decisions else 0.0,
+        'overall_success_rate': round(total_success / total_scoreable, 4) if total_scoreable else None,
+        'calibration_error': round(calibration_error, 4),
+        'buckets': [{'bin': b['label'], 'n': b['n'], 'n_allowed': b['n_allowed'],
+                     'n_blocked': b['n_blocked'], 'n_escalated': b['n_escalated'],
+                     'n_outcome': b['n_outcome'], 'n_success': b['n_success'],
+                     'n_failure': b['n_failure'], 'success_rate': b['success_rate']}
+                    for b in buckets],
+    }
+
+
 def _activity_summary_for(agent_id):
     with _db() as conn:
         rows = conn.execute(
@@ -10769,6 +10932,27 @@ ANOMALY_AGENT_TOOL_THRESHOLD = 60  # >60 tool calls / 15 min per agent
 JEV_HEALTH_WINDOW_S = 60 * 60
 JEV_HEALTH_FAILURE_RATE = 0.5      # >=50% of Jev calls failing = degraded
 JEV_HEALTH_MIN_ATTEMPTS = 10       # don't trip on a handful of attempts
+# Absolute Zero rejection signal (2026-09-28): refinement grooms self-proposed
+# work-requests, and a REJECTED carryaway is the village's own signal that its
+# self-proposal pipeline is producing junk (trivial/ill-scoped cards). Counted
+# over a day; an info-severity dashboard alert (not a player push -- grooming
+# out junk is the normal job of refinement, so this only speaks up on a real
+# pattern).
+SELF_PROPOSED_REJECT_WINDOW_S = 86400
+SELF_PROPOSED_REJECT_THRESHOLD = 5
+# METR reliability-at-horizon (2026-09-28): does the colony actually FINISH
+# the work it starts? Measured from the action_log's task_assigned ->
+# task_completed pairs (paired on the taskId the details JSON carries) over a
+# rolling window: the median completion time plus the fraction of assigned
+# tasks completed within the fast (1h) and full (24h) horizons. A colony that
+# starts lots of tasks but finishes few within the horizon has poor
+# reliability -- work turning into ceremony or stalling -- even if raw
+# "task_completed" counts look healthy.
+METR_HORIZON_S = 86400
+METR_FAST_HORIZON_S = 3600
+METR_MIN_ASSIGNED = 5             # don't judge reliability on a handful of tasks
+METR_FAST_COMPLETION_RATE = 0.3   # <30% of started tasks done within 1h = slow to finish
+METR_SLOW_MEDIAN_HOURS = 6.0      # median completion over 6h = work is stalling
 
 
 def _health_alerts_for_signals(signals):
@@ -10846,6 +11030,37 @@ def _health_alerts_for_signals(signals):
               f'{progress} shipped (task_completed/released/published) -- process may be '
               f'outrunning actual work')
 
+    # Absolute Zero rejection signal (2026-09-28): a rising count of self-proposed
+    # work-requests groomed OUT at refinement means the village's own proposals are
+    # low-value/trivial -- the default failure mode when agents pick their own next
+    # work. Info severity: a dashboard signal, not a player-spam push (rejecting
+    # junk is refinement's normal job; this speaks up only on a real pattern).
+    if signals['self_proposed_rejected_last_24h'] >= SELF_PROPOSED_REJECT_THRESHOLD:
+        alert('coordination', 'info',
+              f'{signals["self_proposed_rejected_last_24h"]} self-proposed work request(s) rejected at '
+              f'refinement in the last 24h -- proposals trending trivial/ill-scoped; '
+              f'coach medium-difficulty cards (Absolute Zero)')
+
+    # METR reliability-at-horizon (2026-09-28): a colony that STARTS tasks but
+    # rarely FINISHES them within the horizon has poor reliability -- work
+    # turning into ceremony or stalling -- even when raw task_completed counts
+    # look healthy. Gated on a minimum number of assignments so a quiet village
+    # with 2 tasks and 0 finishes isn't judged on noise.
+    assigned = signals['task_assigned_last_24h']
+    fast_rate = signals['task_fast_completion_rate']
+    median_h = signals['task_median_completion_hours']
+    if assigned >= METR_MIN_ASSIGNED:
+        if fast_rate is not None and fast_rate < METR_FAST_COMPLETION_RATE:
+            alert('throughput', 'warning',
+                  f'only {fast_rate * 100:.0f}% of {assigned} task(s) assigned in the last 24h finished within '
+                  f'{METR_FAST_HORIZON_S // 3600}h'
+                  + (f' (median completion {median_h:.1f}h)' if median_h is not None else '')
+                  + ' -- colony slow to finish work it starts')
+        elif median_h is not None and median_h > METR_SLOW_MEDIAN_HOURS:
+            alert('throughput', 'info',
+                  f'median task completion {median_h:.1f}h across {assigned} task(s) assigned in the last 24h '
+                  f'-- work taking unusually long to finish')
+
     return alerts
 
 
@@ -10858,6 +11073,69 @@ def _count_due_work_items(work_queue, now_ms):
     # epoch SECONDS, like everywhere else in serve.py) is something a
     # test can pin down directly, rather than trusting it inline.
     return sum(1 for item in work_queue if not item.get('notBefore') or item['notBefore'] <= now_ms)
+
+
+def _task_horizon_metrics(now):
+    """METR reliability-at-horizon, computed from action_log's
+    task_assigned -> task_completed pairs (joined in Python on the taskId the
+    details JSON carries -- no JSON SQL, matching the rest of this file). Pure
+    DB reads, no network. Returns a dict with the median completion time
+    (hours), and the fraction of tasks ASSIGNED in the window that were
+    completed within the fast (1h) and full (24h) horizons. Tasks still
+    in-flight or never completed count against the rates -- that is precisely
+    the reliability being measured."""
+    with _db() as conn:
+        assigns = conn.execute(
+            "SELECT details, ts FROM action_log WHERE action = 'task_assigned' AND ts > ?",
+            (now - METR_HORIZON_S,),
+        ).fetchall()
+        completions = conn.execute(
+            "SELECT details, ts FROM action_log WHERE action = 'task_completed' AND ts > ?",
+            (now - METR_HORIZON_S,),
+        ).fetchall()
+    done_at = {}
+    for details, ts in completions:
+        try:
+            tid = json.loads(details).get('taskId') if details else None
+        except Exception:
+            tid = None
+        if tid and tid not in done_at:
+            done_at[tid] = ts  # first completion wins for a re-assigned task
+    durations = []
+    assigned_count = 0
+    fast = full = 0
+    for details, ts in assigns:
+        try:
+            tid = json.loads(details).get('taskId') if details else None
+        except Exception:
+            tid = None
+        if not tid:
+            continue
+        assigned_count += 1
+        end = done_at.get(tid)
+        if end is None:
+            continue  # never completed / still in flight -- counts against the rates
+        dur = end - ts
+        durations.append(dur)
+        if dur <= METR_FAST_HORIZON_S:
+            fast += 1
+        if dur <= METR_HORIZON_S:
+            full += 1
+    sorted_durs = sorted(durations)
+    n = len(sorted_durs)
+    if n == 0:
+        median_h = None
+    elif n % 2 == 1:
+        median_h = sorted_durs[n // 2] / 3600.0
+    else:
+        median_h = (sorted_durs[n // 2 - 1] + sorted_durs[n // 2]) / 2 / 3600.0
+    return {
+        'assigned': assigned_count,
+        'completed': len(durations),
+        'median_completion_hours': round(median_h, 2) if median_h is not None else None,
+        'fast_completion_rate': round(fast / assigned_count, 4) if assigned_count else None,
+        'horizon_completion_rate': round(full / assigned_count, 4) if assigned_count else None,
+    }
 
 
 def compute_health_snapshot():
@@ -10943,6 +11221,20 @@ def compute_health_snapshot():
             'SELECT COUNT(*), SUM(ok = 0) FROM decision_tape WHERE ts > ?',
             (now - JEV_HEALTH_WINDOW_S,),
         ).fetchone()
+        # Absolute Zero rejection signal (2026-09-28): refinement carryaway rows
+        # whose details carry the selfProposedRejected marker (see
+        # sim._resolve_refinement). Like the blocked/failed LIKE checks above,
+        # a JSON-substring match on the marker, not a JSON query.
+        self_proposed_rejected = conn.execute(
+            "SELECT COUNT(*) FROM action_log WHERE action = 'refinement_carryaway' "
+            "AND details LIKE '%\"selfProposedRejected\": true%' AND ts > ?",
+            (now - SELF_PROPOSED_REJECT_WINDOW_S,),
+        ).fetchone()[0]
+        # METR reliability-at-horizon (2026-09-28): the action_log's
+        # task_assigned/task_completed pairs (see _task_horizon_metrics) --
+        # whether the colony finishes the work it starts, measured as a rate
+        # at 1h/24h, not a raw completion count.
+        metr = _task_horizon_metrics(now)
 
     chosen_bands = {row[0] for row in tier_rows}
     signals = {
@@ -10965,6 +11257,15 @@ def compute_health_snapshot():
         # instead of letting the colony run deterministic fallbacks for hours.
         'jev_decision_attempts_last_hour': jev_attempt_rows[0],
         'jev_decision_failures_last_hour': jev_attempt_rows[1],
+        'self_proposed_rejected_last_24h': self_proposed_rejected,
+        # METR reliability-at-horizon (2026-09-28): median completion time +
+        # the fraction of assigned tasks finished within 1h / 24h. None means
+        # too few completed tasks to judge (or no assignments at all).
+        'task_assigned_last_24h': metr['assigned'],
+        'task_completed_last_24h': metr['completed'],
+        'task_median_completion_hours': metr['median_completion_hours'],
+        'task_fast_completion_rate': metr['fast_completion_rate'],
+        'task_horizon_completion_rate': metr['horizon_completion_rate'],
         'model_tier_bands': {row[0]: {'chosen_at': row[1], 'age_hours': (now - row[1]) / 3600} for row in tier_rows},
         'missing_model_tier_bands': [b for b in EXPECTED_MODEL_BANDS if b not in chosen_bands],
         'ceremony_actions_last_24h': ceremony_count,
@@ -10979,9 +11280,14 @@ def compute_health_snapshot():
 
 
 def _persist_new_health_alerts(alerts):
+    """Persist each alert that isn't already standing within the dedup window,
+    and RETURN the newly-persisted ones so the health loop can push exactly
+    those to the player (never the repeated standing ones -- the dedup window
+    is what stops an hourly push from becoming a 5-min-spam)."""
     if not alerts:
-        return
+        return []
     now = time.time()
+    persisted = []
     with _db() as conn:
         for a in alerts:
             recent = conn.execute(
@@ -10994,6 +11300,27 @@ def _persist_new_health_alerts(alerts):
                 'INSERT INTO health_alerts (category, severity, message, ts) VALUES (?, ?, ?, ?)',
                 (a['category'], a['severity'], a['message'], now),
             )
+            persisted.append(a)
+    return persisted
+
+
+def _push_new_health_alerts(alerts):
+    """Best-effort outbound push of a newly-persisted health alert to the
+    player on both configured channels (email + Telegram), so an outage isn't
+    invisible until someone opens the dashboard. Fail-closed by construction:
+    each channel is a no-op when its integration isn't configured (returns
+    False, never raises), mirroring every other optional-integration gate in
+    this file. Only 'warning'/'critical' severities are pushed -- the 'info'
+    queue-nudge is dashboard-only on purpose (it would otherwise fire every
+    dedup window while idle)."""
+    for alert in alerts:
+        if alert.get('severity') not in ('warning', 'critical'):
+            continue
+        subject = f"[AI Village] Health alert ({alert['category']})"
+        body = alert['message']
+        email_ok = _send_player_email_sync(subject, body)
+        telegram_ok = send_player_telegram_sync(subject, body)
+        print(f"[health-check] pushed {alert['category']} alert: email={email_ok} telegram={telegram_ok}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -11221,6 +11548,16 @@ async def jev_model_get():
     # call sites use, so this always reflects the live value, plus the env/
     # default fallback for context.
     return JSONResponse({'model': _jev_model(), 'fallback': JEV_MODEL})
+
+
+@app.get('/api/jev/calibration')
+async def jev_calibration(window_s: Optional[float] = None):
+    # Read surface for _decision_calibration_report -- Jev's stated confidence
+    # vs its real success rate on safety-gated actions, so the "act when
+    # confident" contract is verifiable instead of assumed. `window_s` trims
+    # the lookback for a quick check; default is 7 days. DB-only, no model
+    # calls, so this is free to hit as often as the player wants.
+    return JSONResponse(_decision_calibration_report(window_s) if window_s else _decision_calibration_report())
 
 
 @app.post('/api/jev/model')
