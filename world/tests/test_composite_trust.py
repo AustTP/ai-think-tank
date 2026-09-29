@@ -28,6 +28,7 @@ default path. Found 2026-09-25: this file alone added 58 real rows (mostly
 during a routine test run.
 """
 
+import json
 import os
 import shutil
 import sys
@@ -240,6 +241,119 @@ class CircuitBreakerTests(unittest.TestCase):
             serve.record_model_result('m', success=False)
         self.assertEqual(serve._model_circuit_state['m']['consecutive_failures'],
                          serve.CIRCUIT_BREAKER_THRESHOLD)
+
+
+class JevFailoverTests(unittest.TestCase):
+    """_call_openrouter_decision_sync multi-model failover (2026-09-29): the
+    old policy was 'no circuit breaker for Jev -- only one slug exists, so
+    tripping it disables every decision'. That was a symptom of the single-slug
+    config. With a comma-separated chain the breaker arms per slug and a dead
+    leader FAILS OVER to the next candidate instead of silently degrading every
+    decision to deterministic fallbacks. When only ONE slug is configured the
+    legacy behavior is preserved exactly (no breaker, no failover)."""
+
+    def setUp(self):
+        serve._model_circuit_state.clear()
+        serve._set_setting('jev_model', '')  # tests set their own chain
+        with serve._db() as conn:
+            conn.execute('DELETE FROM decision_tape')
+            conn.execute("DELETE FROM settings WHERE key = 'jev_model'")
+
+    def _set_chain(self, *slugs):
+        serve._set_setting('jev_model', ','.join(slugs))
+
+    @staticmethod
+    def _ok_answer(choice='allow', confidence=0.95, cost=0.01):
+        return {'answers': {'choice': {'choice': choice, 'confidence': confidence,
+                                       'probabilities': {}}},
+                'usage': {'cost': cost}, 'vendor_reply': True}
+
+    def _transport(self, failures=()):
+        """A fake `_urlopen_with_resilience`: raises for the given slugs,
+        returns a canned decision for everyone else. Returns the mock."""
+        called = []
+
+        def handler(req, timeout):
+            body = json.loads(req.data.decode())
+            called.append(body['model'])
+            if body['model'] in failures:
+                raise ConnectionError(f'{body["model"]} down')
+            return json.dumps(self._ok_answer()).encode()
+
+        return unittest.mock.patch.object(serve, '_urlopen_with_resilience', side_effect=handler), called
+
+    def _chain_tape_rows(self):
+        with serve._db() as conn:
+            return conn.execute('SELECT model, ok FROM decision_tape ORDER BY ts').fetchall()
+
+    def test_failover_serves_the_second_slug_when_the_primary_raises(self):
+        self._set_chain('primary-x', 'fallback-y')
+        patcher, _ = self._transport(failures=('primary-x',))
+        with patcher:
+            data = serve._call_openrouter_decision_sync(
+                'primary-x', {'messages': []},
+                {'choice': {'type': 'choice', 'instructions': 'go', 'criteria': {'a': 'A'}}})
+        self.assertEqual(data['answers']['choice']['choice'], 'allow',
+                         'the fallback slug answered, not the dead primary')
+        rows = self._chain_tape_rows()
+        self.assertEqual(len(rows), 1, 'one decision = exactly one tape row')
+        self.assertEqual((rows[0][0], rows[0][1]), ('fallback-y', 1),
+                         'a fallback-recovered decision tapes the ANSWERING slug as ok')
+        self.assertEqual(serve._model_circuit_state.get('primary-x', {}).get('consecutive_failures'), 1,
+                         'the primary accumulates a breaker failure; the fallback got it right')
+
+    def test_cold_open_leader_is_skipped_and_never_called(self):
+        self._set_chain('primary-x', 'fallback-y')
+        serve._model_circuit_state['primary-x'] = {
+            'consecutive_failures': serve.CIRCUIT_BREAKER_THRESHOLD,
+            'open_until': time.time() + 1000, 'probing': False}
+        patcher, called = self._transport()
+        with patcher:
+            data = serve._call_openrouter_decision_sync('primary-x', {}, {'choice': {}})
+        self.assertEqual(called, ['fallback-y'],
+                         'a cold-open leader must be skipped, not hammered')
+        self.assertEqual(data['answers']['choice']['choice'], 'allow')
+
+    def test_single_slug_configuration_keeps_the_legacy_no_breaker_path(self):
+        self._set_chain('primary-x')
+        patcher, called = self._transport(failures=('primary-x',))
+        with patcher:
+            with self.assertRaises(ConnectionError):
+                serve._call_openrouter_decision_sync('primary-x', {}, {'choice': {}})
+        self.assertNotIn('primary-x', serve._model_circuit_state,
+                         'one slug = breaker NOT armed = nothing recorded')
+        rows = self._chain_tape_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0][0], rows[0][1]), ('primary-x', 0))
+
+    def test_all_open_fails_closed_without_calling_any_slug(self):
+        self._set_chain('primary-x', 'fallback-y')
+        for slug in ('primary-x', 'fallback-y'):
+            serve._model_circuit_state[slug] = {
+                'consecutive_failures': serve.CIRCUIT_BREAKER_THRESHOLD,
+                'open_until': time.time() + 1000, 'probing': False}
+        patcher, called = self._transport()
+        with patcher:
+            with self.assertRaisesRegex(RuntimeError, 'circuit-broken'):
+                serve._call_openrouter_decision_sync('primary-x', {}, {'choice': {}})
+        self.assertEqual(called, [], 'no spend on slugs whose breakers are cold-open')
+        rows = self._chain_tape_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], 0, 'the lost decision is taped for the failure-rate signal')
+
+    def test_chain_resolution_db_over_env_and_env_over_default(self):
+        self._set_chain('db-a', 'db-b')
+        self.assertEqual(serve._decision_model_chain(), ['db-a', 'db-b'])
+        self.assertEqual(serve._jev_model(), 'db-a')
+        # DB unset -> env JEV_MODELS wins.
+        with serve._db() as conn:
+            conn.execute("DELETE FROM settings WHERE key = 'jev_model'")
+        with unittest.mock.patch.object(serve, '_load_env',
+                                        return_value={'JEV_MODELS': 'env-a, env-b'}):
+            self.assertEqual(serve._decision_model_chain(), ['env-a', 'env-b'])
+        # Neither DB nor env -> the single default constant (no failover).
+        with unittest.mock.patch.object(serve, '_load_env', return_value={}):
+            self.assertEqual(serve._decision_model_chain(), [serve.JEV_MODEL])
 
 
 # ---------------------------------------------------------------------------
