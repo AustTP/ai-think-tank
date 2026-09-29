@@ -1303,16 +1303,34 @@ class HealthAlertPersistence(unittest.TestCase):
             rows = conn.execute('SELECT message FROM health_alerts WHERE category = ?', (self.CATEGORY,)).fetchall()
         self.assertEqual(len(rows), 2)
 
-    def test_persist_returns_only_the_newly_persisted_alerts(self):
-        # The health loop pushes what this returns, so it must return exactly
-        # the alerts it just inserted -- never the standing (deduped) ones.
-        fresh = {'category': self.CATEGORY, 'severity': 'warning', 'message': 'fresh'}
-        standing = {'category': self.CATEGORY, 'severity': 'warning', 'message': 'standing'}
-        serve._persist_new_health_alerts([standing])
-        first = serve._persist_new_health_alerts([fresh, standing])
-        self.assertEqual([a['message'] for a in first], ['fresh'])
-        second = serve._persist_new_health_alerts([fresh, standing])
-        self.assertEqual(second, [])
+    def test_a_volatile_message_does_not_spam_a_standing_incident(self):
+        # The 2026-09-29 Jev incident, made concrete: the alert message embeds
+        # rolling failure counts, so it CHANGES every cycle even though the
+        # incident is the same one. The dedup key is (category, severity), not
+        # the message -- the older exact-message key pushed a fresh alert every
+        # 5 minutes for the whole outage (53/98 -> 53/86 -> 44/68...).
+        serve._persist_new_health_alerts(
+            [{'category': self.CATEGORY, 'severity': 'warning', 'message': '44/68 Jev calls failed'}])
+        again = serve._persist_new_health_alerts(
+            [{'category': self.CATEGORY, 'severity': 'warning', 'message': '53/98 Jev calls failed'}])
+        self.assertEqual(again, [],
+                         'a same-severity standing category must not re-push because the counts moved')
+        with serve._db() as conn:
+            rows = conn.execute('SELECT message FROM health_alerts WHERE category = ?', (self.CATEGORY,)).fetchall()
+        self.assertEqual(len(rows), 1)
+
+    def test_severity_escalation_pushes_again_within_the_window(self):
+        # The same incident worsening from info to warning (or warning to
+        # critical) is a different row, so it IS re-persisted and re-pushed --
+        # dedup throttles repeats, not escalations.
+        serve._persist_new_health_alerts(
+            [{'category': self.CATEGORY, 'severity': 'info', 'message': 'mild'}])
+        escalated = serve._persist_new_health_alerts(
+            [{'category': self.CATEGORY, 'severity': 'warning', 'message': 'worse'}])
+        self.assertEqual([a['severity'] for a in escalated], ['warning'])
+        with serve._db() as conn:
+            rows = conn.execute('SELECT severity FROM health_alerts WHERE category = ?', (self.CATEGORY,)).fetchall()
+        self.assertEqual(sorted(r[0] for r in rows), ['info', 'warning'])
 
 
 class HealthAlertPush(unittest.TestCase):
