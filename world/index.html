@@ -335,16 +335,6 @@
       <button id="zoomAll" class="showall" title="Show whole map">SHOW&nbsp;ALL</button>
     </div>
   </div>
-  <p>Arrow keys / WASD to walk. This is the think tank -- a
-     whole-scene generated background image with collision auto-mapped by a
-     segmentation model. Walk into a building's entrance to step inside its room;
-     walk off the bottom edge of a room to leave it. Walk into Town Hall to call
-     a meeting -- everyone you invite (and you) vanishes from the map for
-     the duration, and reappears somewhere new when the call ends. Agents
-     are solid -- walk up to one and press B to talk. Press G to show the
-     walkability grid/collision boxes. Open editor.html to paint outdoor
-     collision corrections, or door_editor.html to reposition a building's
-     entrance trigger.</p>
 </div>
 
 <div id="hudBar">
@@ -3084,7 +3074,7 @@ async function main() {
   const roomImages = {};
   for (const building in ROOMS) {
     const path = ROOMS[building].image;
-    if (!roomImages[path]) roomImages[path] = await loadImage(path);
+    if (!roomImages[path]) roomImages[path] = await loadImage(path).catch(() => null);
   }
 
   window.addEventListener('keydown', e => {
