@@ -134,27 +134,23 @@ print("TUNNEL URL:", url)
 print("LAYA KEY:", open("/content/laya_key.txt").read().strip())
 ```
 
-## Cell 6 — pair with the village (run ONCE per notebook session)
+## Cell 6 — generate the pairing command (run on the Mac, not here)
 
-Copy the TUNNEL URL and LAYA KEY from Cell 5 and paste into this cell, then run
-it. The village then owns everything: stand up/tear down via `/control` and
-failover routing.
+Colab runs on Google's cloud, so it can't reach the village on `127.0.0.1`
+(the Mac). Paste the Device Key (from `world/.env` →
+`DEVICE_API_KEY=...`) plus Cells 5's URL and key into this cell, run it, and
+it prints the one command to paste into the Mac's terminal. That command
+registers this session with `POST /api/colab/register`, and the village then
+owns everything: stand up/tear down via `/control` and failover routing.
 
 ```python
-VILLAGE = "http://127.0.0.1:8936"          # the Mac runs the village on 8936
-VILLAGE_DEVICE_KEY = "PASTE_DEVICE_API_KEY" # from world/.env -> DEVICE_API_KEY=
+DEVICE_KEY = "PASTE_DEVICE_API_KEY"  # from .env on the Mac
 TUNNEL_URL = "https://PASTE-TRUNNEL-URL.trycloudflare.com"
 LAYA_KEY = "VJ-Laya-PASTE-KEY"
 
-import urllib.request, json
-req = urllib.request.Request(
-    VILLAGE + "/api/colab/register",
-    data=json.dumps({"url": TUNNEL_URL, "key": LAYA_KEY}).encode(),
-    headers={"Content-Type": "application/json", "X-Device-Key": VILLAGE_DEVICE_KEY},
-    method="POST",
-)
-with urllib.request.urlopen(req, timeout=15) as resp:
-    print(resp.read().decode())
+print(f'curl -s -X POST http://127.0.0.1:8936/api/colab/register '
+      f'-H "X-Device-Key: {DEVICE_KEY}" -H "Content-Type: application/json" '
+      f'-d \'{{"url":"{TUNNEL_URL}","key":"{LAYA_KEY}"}}\'')
 ```
 
 ---
@@ -166,7 +162,7 @@ with urllib.request.urlopen(req, timeout=15) as resp:
 - Colab Pro/Pro+ background execution keeps a session alive up to 24 h without
   you watching.
 - Each new session gets a fresh tunnel URL and a fresh Laya key — that is why
-  re-pairing (Cell 6) happens per session.
+  re-pairing (Cell 6's curl, run on the Mac) happens per session.
 - The village side needs nothing from Google: no OAuth, no Colab API, no
   cookies. If the sentinel is not running, the village just stays on
   deterministic fallbacks and you keep the normal health alert.
