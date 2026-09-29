@@ -1399,7 +1399,7 @@ def _grade_jev_requirement(req, review):
         choice, confidence, _cost = _serve._jev_choice(decision)
     except Exception:
         return GRADE_UNSURE, 0.0
-    if choice in (GRADE_MEETS, GRADE_FAILS) and confidence >= _serve.JEV_SAFETY_CONFIDENCE:
+    if choice in (GRADE_MEETS, GRADE_FAILS) and confidence >= _serve._effective_safety_confidence():
         return choice, confidence
     return GRADE_UNSURE, confidence
 

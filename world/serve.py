@@ -2478,7 +2478,7 @@ def _resolve_pending_escalations_sync():
         _escalation_jev_errors.reset(esc_kind)
         composite = _jev_directory_score(esc_kind, confidence)
         floor = _escalation_floor(esc_kind)
-        if composite < floor or confidence < JEV_SAFETY_CONFIDENCE:
+        if composite < floor or confidence < _effective_safety_confidence():
             # The director standing in for the admin is the clearest case for
             # Jev's "escalate when unsure": a low-trust auto-approval here is
             # exactly the risk the delegation exists to avoid, so leave it for
@@ -2714,6 +2714,7 @@ async def _lifespan(app):
     backup_task = asyncio.create_task(_backup_loop())
     prune_task = asyncio.create_task(_log_prune_loop())
     tier_refresh_task = asyncio.create_task(_model_tier_refresh_loop())
+    calibration_task = asyncio.create_task(_calibration_loop())
     telegram_task = None
     if TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS:
         telegram_task = asyncio.create_task(_telegram_poll_loop())
@@ -2739,6 +2740,7 @@ async def _lifespan(app):
     director_task.cancel()
     peer_task.cancel()
     backup_task.cancel()
+    calibration_task.cancel()
     prune_task.cancel()
     tier_refresh_task.cancel()
     if telegram_task is not None:
@@ -5045,7 +5047,7 @@ async def _jev_quorum_decision(instructions, criteria):
     except Exception:
         return None, 1.0, 0.0, None
 
-    if decision not in ('allow', 'approve') or confidence >= JEV_SAFETY_CONFIDENCE:
+    if decision not in ('allow', 'approve') or confidence >= _effective_safety_confidence():
         return decision, confidence, cost, trace_id  # firm block, or already-confident -- one sample is enough
 
     total_cost = cost
@@ -5109,7 +5111,7 @@ def _jev_quorum_choice_sync(instructions, criteria):
     except Exception:
         return None, 1.0, 0.0
 
-    if confidence >= JEV_SAFETY_CONFIDENCE:
+    if confidence >= _effective_safety_confidence():
         return decision, confidence, cost  # already confident -- one sample is enough
 
     total_cost = cost
@@ -5197,10 +5199,16 @@ _escalation_jev_errors = _thread_safe_counter()
 
 
 def _escalation_floor(kind):
-    """Per-kind composite floor (1.0 = never auto-approve). Unknown kind falls
-    back to the global default so a new escalation type can't silently widen
-    auto-approval authority."""
-    return ESCALATION_KIND_RISK.get(kind, {'floor': ESCALATION_DEFAULT_FLOOR})['floor']
+    """Per-kind composite floor (1.0 = never auto-approve). A known kind's fixed
+    risk floor wins (e.g. never auto-approve an explicit 'blocked' verdict); the
+    routine kinds (the base default and 'unresolved review requirement') resolve
+    through the LIVE calibration-adjusted threshold (_effective_safety_confidence)
+    so the feedback loop can raise/lower the whole routine bar without a restart
+    (see _calibration_adjust_pass)."""
+    entry = ESCALATION_KIND_RISK.get(kind)
+    if entry is None or entry.get('floor', JEV_SAFETY_CONFIDENCE) == JEV_SAFETY_CONFIDENCE:
+        return _effective_safety_confidence()
+    return entry['floor']
 
 
 def _jev_directory_score(kind, confidence):
@@ -5226,11 +5234,11 @@ def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confiden
     if decision != 'allow' and decision != 'approve':
         log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'blocked', 'confidence': confidence, 'cost': cost, 'reason': 'jev: ' + (decision or 'classifier unavailable, failed closed')}, authorized=authorized, trace_id=trace_id)
         return False
-    if confidence < JEV_SAFETY_CONFIDENCE:
+    if confidence < _effective_safety_confidence():
         log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'escalated_unsure', 'confidence': confidence, 'cost': cost, 'reason': 'jev allow at low confidence, escalated'}, authorized=authorized, trace_id=trace_id)
         create_escalation(
             'unsure safety decision',
-            f'{noun} looked potentially risky but was not clearly blocked (Jev confidence {confidence:.2f} < {JEV_SAFETY_CONFIDENCE}):\n\nTarget: {target}\nStated purpose: {purpose or "not given"}',
+            f'{noun} looked potentially risky but was not clearly blocked (Jev confidence {confidence:.2f} < {_effective_safety_confidence():.2f}):\n\nTarget: {target}\nStated purpose: {purpose or "not given"}',
         )
         return False
     # Confident allow -- passes. Log it so cost/confidence are visible in the
@@ -10920,6 +10928,102 @@ def _decision_calibration_report(window_s=7 * 86400):
     }
 
 
+# Feedback-loop actuator (2026-09-29): the calibration report is the SENSOR.
+# This is the actuator that turns "reliability below the stated bar" into a
+# threshold the gates actually enforce. The escalation floor assumed high
+# confidence == reliable; this pass checks that at the CURRENT threshold and
+# moves the bar so auto-approved actions historically succeed ~as claimed.
+# Deliberately conservative: DB-only (fit for a timer, no LLM/network), never
+# moves on noise (a minimum scored-decision count per bin + a dead-band), moves
+# by one fixed step per pass, and clamps to a sane operating range. The safety-
+# critical kinds ('blocked command'/'blocked pipeline step' at floor 1.0) are
+# untouched by design -- this bar only ever raises/lowers the routine default.
+JEV_CALIBRATION_TARGET_RELIABILITY = 0.9   # aim: >=90% of auto-approved actions succeed
+JEV_CALIBRATION_HYSTERESIS = 0.05          # dead-band: don't move unless off by > this
+JEV_CALIBRATION_MIN_OUTCOME = 10           # need >= this many scored decisions at the bar
+JEV_CALIBRATION_STEP = 0.05                # threshold moves in one fixed step per pass
+JEV_CALIBRATION_THRESHOLD_MIN = 0.5
+JEV_CALIBRATION_THRESHOLD_MAX = 0.95
+CALIBRATION_ADJUST_INTERVAL_S = 30 * 60    # own timer: not piggy-backed on the 5-min health loop
+
+
+def _effective_safety_confidence():
+    """The LIVE low-confidence floor, resolved fresh at call time like
+    _jev_model: a validated, range-clamped `settings` row (`jev_safety_confidence`,
+    written by _calibration_adjust_pass -- or by an operator) overrides the
+    process constant JEV_SAFETY_CONFIDENCE. Every gate that used to read the
+    constant now reads this, so a calibration move takes effect immediately."""
+    raw = _get_setting('jev_safety_confidence')
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return JEV_SAFETY_CONFIDENCE
+    if not (JEV_CALIBRATION_THRESHOLD_MIN <= value <= JEV_CALIBRATION_THRESHOLD_MAX):
+        return JEV_SAFETY_CONFIDENCE
+    return value
+
+
+def _calibration_adjust_pass(now=None):
+    """Close the calibration loop. Reads _decision_calibration_report and moves
+    the live threshold (settings `jev_safety_confidence`) so that decisions
+    auto-approved at ~the current confidence bar actually succeed at roughly the
+    claimed reliability:
+      - observed success rate at the current bar BELOW the target - dead-band ->
+        raise the bar (require stronger evidence to auto-approve);
+      - observed success rate ABOVE the target + dead-band -> lower it toward the
+        floor (don't make the village more cautious than its own evidence says
+        it needs to be).
+    Returns the new threshold, or None when no move was warranted (no scored
+    decisions at the current bar / inside the dead-band / clamped). Audit row
+    logged so the calibration history is visible in the action_log."""
+    now = time.time() if now is None else now
+    report = _decision_calibration_report()
+    threshold = _effective_safety_confidence()
+    # Which calibration bin does the LIVE bar actually sit in? The report's
+    # public buckets are keyed by LABEL, so resolve the label from the raw bin
+    # ranges first, then find the matching reported bucket.
+    current_label = None
+    for lo, hi, label in JEV_CALIBRATION_BINS:
+        if lo <= threshold < hi:
+            current_label = label
+            break
+    current_bin = next((b for b in report['buckets'] if b['bin'] == current_label), None)
+    if current_bin is None:
+        return None
+    rate = current_bin['success_rate']
+    if rate is None or current_bin['n_outcome'] < JEV_CALIBRATION_MIN_OUTCOME:
+        return None
+    deviation = JEV_CALIBRATION_TARGET_RELIABILITY - rate
+    if abs(deviation) <= JEV_CALIBRATION_HYSTERESIS:
+        return None
+    direction = 1 if deviation > 0 else -1  # reliability too low -> raise the bar
+    new_threshold = round(min(max(threshold + direction * JEV_CALIBRATION_STEP,
+                                  JEV_CALIBRATION_THRESHOLD_MIN),
+                              JEV_CALIBRATION_THRESHOLD_MAX), 2)
+    if new_threshold == threshold:
+        return None
+    _set_setting('jev_safety_confidence', str(new_threshold))
+    log_action('system', 'jev_calibration_adjust',
+               {'from': threshold, 'to': new_threshold, 'bin': current_bin['bin'],
+                'success_rate': rate, 'n_outcome': current_bin['n_outcome'],
+                'target': JEV_CALIBRATION_TARGET_RELIABILITY,
+                'reason': 'raised' if direction > 0 else 'lowered'}, authorized=None)
+    return new_threshold
+
+
+async def _calibration_loop():
+    # Runs on its own slow timer (not the 5-minute health loop -- the
+    # calibration report is an unindexed ts-window scan over the action_log,
+    # and the health loop is supposed to stay cheap). A thread keeps the loop
+    # from blocking the event loop during the DB scan.
+    while True:
+        try:
+            await asyncio.to_thread(_calibration_adjust_pass)
+        except Exception as e:
+            print(f'[calibration] loop error: {e}', flush=True)
+        await asyncio.sleep(CALIBRATION_ADJUST_INTERVAL_S)
+
+
 def _activity_summary_for(agent_id):
     with _db() as conn:
         rows = conn.execute(
@@ -11577,8 +11681,11 @@ async def jev_calibration(window_s: Optional[float] = None):
     # vs its real success rate on safety-gated actions, so the "act when
     # confident" contract is verifiable instead of assumed. `window_s` trims
     # the lookback for a quick check; default is 7 days. DB-only, no model
-    # calls, so this is free to hit as often as the player wants.
-    return JSONResponse(_decision_calibration_report(window_s) if window_s else _decision_calibration_report())
+    # calls, so this is free to hit as often as the player wants. Includes the
+    # LIVE feedback-loop threshold (the bar the gates actually enforce now),
+    # so the report shows the bar alongside the reliability at that bar.
+    report = _decision_calibration_report(window_s) if window_s else _decision_calibration_report()
+    return JSONResponse({'effective_safety_confidence': _effective_safety_confidence(), **report})
 
 
 @app.post('/api/jev/model')
