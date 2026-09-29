@@ -27,16 +27,16 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-browse-allowlist-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-browse-allowlist-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
         # BROWSE_TRAIL_PATH is a module-level constant computed once from the
-        # REAL VILLAGE_DIR at import time -- patching VILLAGE_DIR alone does
+        # REAL THINK_TANK_DIR at import time -- patching THINK_TANK_DIR alone does
         # NOT recompute it, so any test exercising a confident Jev allow
         # without explicitly mocking record_browse_success would otherwise
         # write a real browse_trail.json into the actual project directory
@@ -185,7 +185,7 @@ class BrowseTrailBuilding(unittest.TestCase):
     escalation once a domain crosses BROWSE_ALLOWLIST_CANDIDATE_THRESHOLD."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-browse-trail-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-browse-trail-')
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         patcher = unittest.mock.patch.multiple(
             serve, BROWSE_TRAIL_PATH=os.path.join(self.tmp, 'browse_trail.json'))
@@ -234,10 +234,10 @@ class AllowlistRequestEndpoint(unittest.TestCase):
             unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True),
             unittest.mock.patch.object(serve, '_send_escalation_email_sync'),
             unittest.mock.patch.object(serve, 'ensure_sandbox_networking'),
-            # ESCALATIONS_PATH is a module constant from the REAL VILLAGE_DIR
+            # ESCALATIONS_PATH is a module constant from the REAL THINK_TANK_DIR
             # at import time -- same pitfall as BROWSE_TRAIL_PATH, so any test
             # creating/resolving an escalation must pin it to the temp dir or
-            # it writes the live ~/ai-village/escalations.json.
+            # it writes the live ~/ai-think-tank/escalations.json.
             unittest.mock.patch.object(serve, 'ESCALATIONS_PATH',
                                        os.path.join(_TMP_DIR, 'escalations.json')),
         ]

@@ -1,7 +1,7 @@
 // Phase G -- the grading half of the self-improving revision loop.
 //
 // The article loop ("How to Build a Self-Improving AI Employee") is
-// create -> evaluate -> revise -> evaluate again. The village already
+// create -> evaluate -> revise -> evaluate again. The think tank already
 // creates and revises (tasks.js); this module supplies the EVALUATE step
 // that's missing: turn a deliverable (here, a review/QA write-up) into a
 // set of per-requirement Jev grades, each meets/fails/insufficient, so a

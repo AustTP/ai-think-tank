@@ -31,15 +31,15 @@ def setUpModule():
     # fix): this file was never DB-isolated -- FailClosed.
     # test_send_without_credential_fails_closed calls serve._delete_credential
     # directly, which would delete a REAL player's provisioned Gmail
-    # credential if this ever ran against a live village.db. Also not in
+    # credential if this ever ran against a live think_tank.db. Also not in
     # tests/run_all.sh, so it had never actually been exercised as part of
     # "the test suite" at all until now.
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-email-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-email-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
@@ -158,7 +158,7 @@ class EndpointAuth(unittest.TestCase):
     AUTH_PROTECTED_PREFIXES entirely -- that check was the ONLY gate, so a
     request with NO session cookie and NO agent key at all reached the
     handler and silently overwrote the player's real credential. Confirmed
-    live against a real village before this fix existed. Two-layer shape,
+    live against a real think tank before this fix existed. Two-layer shape,
     matching /api/keys: the middleware must see SOME valid auth first."""
 
     def _client(self):

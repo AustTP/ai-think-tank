@@ -13,17 +13,17 @@ this project spent an entire live-debugging session finding manually. This
 is the automated version of the checks a human was doing by eye.
 
 Read-only: never mutates state, so it's safe to run against the real
-village.db a developer cares about. Requires a server already running
+think_tank.db a developer cares about. Requires a server already running
 (default http://127.0.0.1:8936) and `playwright` with a Chromium install
 (`python3 -m playwright install chromium` once, if not already present).
 
 The app sits behind a login page -- this needs real credentials, supplied via
 env vars (never hardcoded into a committed test file):
-    AI_VILLAGE_TEST_USERNAME (defaults to 'admin')
-    AI_VILLAGE_TEST_PASSWORD (required -- the real admin password)
+    AI_THINK_TANK_TEST_USERNAME (defaults to 'admin')
+    AI_THINK_TANK_TEST_PASSWORD (required -- the real admin password)
 
 Usage:
-    AI_VILLAGE_TEST_PASSWORD=... python3 tests/test_visual_regression.py [base_url]
+    AI_THINK_TANK_TEST_PASSWORD=... python3 tests/test_visual_regression.py [base_url]
 
 Exits 0 on a clean pass, 1 if any check fails, 2 if the server/browser/login
 couldn't be reached at all (distinguished so a CI job can tell "the app is
@@ -46,10 +46,10 @@ def run(base_url):
               "python3 -m playwright install chromium)")
         return 2
 
-    username = os.environ.get('AI_VILLAGE_TEST_USERNAME', 'admin')
-    password = os.environ.get('AI_VILLAGE_TEST_PASSWORD')
+    username = os.environ.get('AI_THINK_TANK_TEST_USERNAME', 'admin')
+    password = os.environ.get('AI_THINK_TANK_TEST_PASSWORD')
     if not password:
-        print("SKIP: AI_VILLAGE_TEST_PASSWORD not set -- this app requires login, "
+        print("SKIP: AI_THINK_TANK_TEST_PASSWORD not set -- this app requires login, "
               "and a real password is never hardcoded into a committed test file.")
         return 2
 

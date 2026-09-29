@@ -1,6 +1,6 @@
 """Tests for the JIRA-like issue register (PREFIX-0128) (2026-09-25).
 
-The village gained a first-class, per-team-issued ticket store fed by
+The think tank gained a first-class, per-team-issued ticket store fed by
 POST /api/intent/issues. This covers the pure sim.py helpers:
 
 1. Required-field validation: `file_issue` refuses to file when any of

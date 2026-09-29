@@ -25,11 +25,11 @@ _NOW_MS = 1_725_000_000_000
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-device-checkin-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-device-checkin-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),

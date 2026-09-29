@@ -1,7 +1,7 @@
 """External-eval ports (2026-09-23): composite multi-signal trust gate + HALF_OPEN
 circuit-breaker probe.
 
-From the codebase eval (memory: project_external_eval_sep2026): the village's
+From the codebase eval (memory: project_external_eval_sep2026): the think tank's
 approval/escalation gates were single-signal and its circuit breaker had no
 recovery probe. Two sharp, contained ideas were pulled in:
 
@@ -22,9 +22,9 @@ Hermetic: pure functions + a mocked _call_openrouter_decision_sync; no live Jev,
 no network. The "no state mutation beyond the module counters" claim was
 wrong: is_model_circuit_broken/record_model_result log model_circuit_broken/
 model_circuit_recovered via a real `log_action` call, which -- unless DB_PATH
-is redirected below -- writes into whatever real village.db sits at serve.py's
+is redirected below -- writes into whatever real think_tank.db sits at serve.py's
 default path. Found 2026-09-25: this file alone added 58 real rows (mostly
-`model_circuit_broken` for a fake model "m") to a live production village.db
+`model_circuit_broken` for a fake model "m") to a live production think_tank.db
 during a routine test run.
 """
 
@@ -49,11 +49,11 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-composite-trust-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-composite-trust-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
@@ -372,7 +372,7 @@ class JevFailoverTests(unittest.TestCase):
 
 class ColabStandbyTests(unittest.TestCase):
     """The CLI-managed Colab/Laya standby (2026-09-29): a dedicated CPU Colab
-    session ('village-standby') owned via the colab CLI, laya-serve booted over
+    session ('think-tank-standby') owned via the colab CLI, laya-serve booted over
     `colab exec`, reached through a LOCALHOST-only ssh forward at
     127.0.0.1:8939, driven by the 15-min _colab_failover_loop. No sentinel
     notebook, no /api/colab/register, no pairing. Hermetic: _colab_cli /
@@ -478,8 +478,8 @@ class ColabStandbyTests(unittest.TestCase):
         with unittest.mock.patch.object(serve.subprocess, 'Popen', return_value=fake) as popen, \
              unittest.mock.patch('os.kill', return_value=None):
             serve._COLAB_STANDBY_FORWARD.clear()
-            first = serve._colab_standby_ensure_forward('village-standby')
-            second = serve._colab_standby_ensure_forward('village-standby')
+            first = serve._colab_standby_ensure_forward('think-tank-standby')
+            second = serve._colab_standby_ensure_forward('think-tank-standby')
         self.assertIs(first, second)
         self.assertEqual(popen.call_count, 1, 'a live forward is reused, not respawned')
         cmd = popen.call_args[0][0]
@@ -497,12 +497,12 @@ class ColabStandbyTests(unittest.TestCase):
         with unittest.mock.patch.object(serve.subprocess, 'Popen', return_value=fake) as popen, \
              unittest.mock.patch('os.kill', return_value=None):      # alive: reuse
             serve._COLAB_STANDBY_FORWARD.clear()
-            serve._colab_standby_ensure_forward('village-standby')
-            serve._colab_standby_ensure_forward('village-standby')
+            serve._colab_standby_ensure_forward('think-tank-standby')
+            serve._colab_standby_ensure_forward('think-tank-standby')
             self.assertEqual(popen.call_count, 1)
         with unittest.mock.patch.object(serve.subprocess, 'Popen', return_value=fake) as popen, \
              unittest.mock.patch('os.kill', side_effect=ProcessLookupError('gone')):  # dead: respawn
-            serve._colab_standby_ensure_forward('village-standby')
+            serve._colab_standby_ensure_forward('think-tank-standby')
             self.assertEqual(popen.call_count, 1, 'a dead forward is recognised and respawned')
         serve._colab_standby_stop_forward()
 
@@ -541,7 +541,7 @@ class ColabStandbyTests(unittest.TestCase):
 
 
 class ColabComputeTests(unittest.TestCase):
-    """run_on_colab agent compute (2026-09-29): the dedicated 'village-gpu'
+    """run_on_colab agent compute (2026-09-29): the dedicated 'think-tank-gpu'
     T4 session, provisioned/ran/stood-down through the colab CLI, metered as
     monthly compute units in the Bank. Hermetic: _colab_cli/_provision are
     mocked, so no CLI, no session, no network ever actually runs."""
@@ -633,7 +633,7 @@ class ColabComputeTests(unittest.TestCase):
             ok, msg = serve._colab_compute_provision()
         self.assertTrue(ok)
         new_call = next(a for a, _k in calls if a[0] == 'new')
-        self.assertEqual(new_call[1:], ('-s', 'village-gpu', '--gpu', 'T4'),
+        self.assertEqual(new_call[1:], ('-s', 'think-tank-gpu', '--gpu', 'T4'),
                          'the dedicated session is a T4 created on demand')
 
     def test_reuses_existing_session(self):
@@ -655,7 +655,7 @@ class ColabComputeTests(unittest.TestCase):
         self.assertEqual(result['stdout'], 'answer=42')
         self.assertGreaterEqual(result['units'], serve.COLAB_MIN_UNITS_PER_RUN)
         self.assertEqual(accrued['units'], result['units'])
-        self.assertEqual(result['session'], 'village-gpu')
+        self.assertEqual(result['session'], 'think-tank-gpu')
         exec_call = cli.call_args.args
         self.assertIn('exec', exec_call)
         self.assertIn('__COLAB_DONE__', cli.call_args.kwargs.get('input', ''))
@@ -775,7 +775,7 @@ class ColabComputeTests(unittest.TestCase):
              unittest.mock.patch.object(serve, '_colab_account_usage',
                                         return_value={'balance': 0.0, 'rate': 1.15, 'assignments': 1}):
             self.assertTrue(serve._colab_budget_exceeded(),
-                            'a genuinely exhausted paid account gates runs even with no village cap')
+                            'a genuinely exhausted paid account gates runs even with no think tank cap')
 
     def test_free_tier_zero_balance_is_not_a_gate(self):
         with unittest.mock.patch.object(serve, 'COLAB_MONTHLY_UNITS', 0.0), \
@@ -785,7 +785,7 @@ class ColabComputeTests(unittest.TestCase):
             self.assertFalse(serve._colab_budget_exceeded(),
                              'free tier has no prepaid wallet -- 0.00 balance must not block runs')
 
-    def test_budget_not_exceeded_when_balance_exists_and_no_village_cap(self):
+    def test_budget_not_exceeded_when_balance_exists_and_no_think_tank_cap(self):
         with unittest.mock.patch.object(serve, 'COLAB_MONTHLY_UNITS', 0.0), \
              unittest.mock.patch.object(serve, 'COLAB_FREE_TIER', False), \
              unittest.mock.patch.object(serve, '_colab_account_usage',

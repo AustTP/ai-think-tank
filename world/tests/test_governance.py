@@ -6,7 +6,7 @@ matching how test_sim.py tests the rest of the pure lifecycle. The decider
 replaces the Jev call so tests are deterministic and offline. The "no DB"
 claim above was wrong: _governance_pass has inline `from serve import
 log_action` calls, a real side effect that writes into whatever real
-village.db sits at serve.py's default path unless DB_PATH is redirected
+think_tank.db sits at serve.py's default path unless DB_PATH is redirected
 below. Found 2026-09-25, same class of bug as test_onboard.py/test_social.py/
 test_refinement.py/test_cut2_processes.py/test_oncall_escalation.py -- this
 file isn't even wired into tests/run_all.sh, but is fixed for the same reason
@@ -31,11 +31,11 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-governance-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-governance-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
@@ -93,7 +93,7 @@ def _seed(**over):
 
 
 def _idle_with_work(state):
-    """Give the village something to do so the idle-quiet gate won't no-op."""
+    """Give the think tank something to do so the idle-quiet gate won't no-op."""
     state.setdefault('workQueue', []).append({
         'title': 'Scheduled research: weather data', 'room': 'observatory',
         'instructions': 'crawl', 'pair': False, 'notBefore': None,
@@ -177,7 +177,7 @@ class AutoHire(unittest.TestCase):
                                  decider=decider)
         return state
 
-    def test_idle_village_hires_nothing(self):
+    def test_idle_think_tank_hires_nothing(self):
         # No work queue, nobody busy -> idle-quiet gate returns before anything.
         state = _seed()
         called = []
@@ -185,7 +185,7 @@ class AutoHire(unittest.TestCase):
             called.append(1)
             return 'ada'
         self._run_hire(state, decider)
-        self.assertEqual(called, [], 'idle village must not call the decider (no Jev spend)')
+        self.assertEqual(called, [], 'idle think tank must not call the decider (no Jev spend)')
         self.assertEqual(len(state.get('agentRoster')), 4, 'no hire happened')
 
     def test_nonidle_but_cooldown_blocks(self):
@@ -318,7 +318,7 @@ class FiringReview(unittest.TestCase):
             called.append(1)
             return 'fire'
         self._run(state, decider)
-        self.assertEqual(called, [], 'idle village must not run a firing review')
+        self.assertEqual(called, [], 'idle think tank must not run a firing review')
         self.assertIn('ben', state['agents'])
 
     def test_candidate_below_threshold_is_picked_and_fired(self):

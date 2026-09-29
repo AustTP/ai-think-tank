@@ -3,10 +3,10 @@ FROM python:3.12-slim
 # Agents write real code in a network-disabled Docker sandbox (/api/execute,
 # /api/pipeline). flake8/mypy/bandit/pytest-cov are installed HERE so the
 # quality gate runs offline, deterministically, at every agent build -- pinned
-# to the exact versions the village's own repo gate uses (world2/tests/run_all.sh).
+# to the exact versions the think tank's own repo gate uses (world/tests/run_all.sh).
 #
 # Build once on the host:
-#   docker build -t ai-village-work-sandbox world2/sandbox
+#   docker build -t ai-think-tank-work-sandbox world/sandbox
 # serve.py SANDBOX_IMAGE points at it.
 RUN python -m pip install --no-cache-dir \
     flake8==6.0.0 \

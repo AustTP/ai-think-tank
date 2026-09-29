@@ -8,9 +8,9 @@ after ONBOARD_MEET_DURATION_MS stages the new agent's AGENT.md progressively, an
 sync_agent_directories finalizes AGENTS.md. Deterministic -- no Jev spend.
 The "no serve import" claim above was wrong: _governance_pass's onboarding
 path has inline `from serve import log_action` calls, a real side effect
-that writes into whatever real village.db sits at serve.py's default path
+that writes into whatever real think_tank.db sits at serve.py's default path
 unless DB_PATH is redirected below. Found 2026-09-25 via a live production
-village.db that picked up test fixture rows (fake onboard meetings) after a
+think_tank.db that picked up test fixture rows (fake onboard meetings) after a
 routine `tests/run_all.sh` run.
 """
 import os
@@ -32,11 +32,11 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-onboard-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-onboard-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
@@ -88,7 +88,7 @@ def _seed(**over):
 
 
 def _idle_with_work(state):
-    """Give the village something to do so the idle-quiet gate won't no-op."""
+    """Give the think tank something to do so the idle-quiet gate won't no-op."""
     state.setdefault('workQueue', []).append({
         'title': 'Scheduled research: weather data', 'room': 'observatory',
         'instructions': 'crawl', 'pair': False, 'notBefore': None,
@@ -301,8 +301,8 @@ class OnboardCeremony(unittest.TestCase):
         # Clean up so 'ada' doesn't carry a phantom task into later assertions.
         state['agents']['ada']['task'] = None
 
-    def test_readiness_hold_timeout_finalizes_idle_village(self):
-        """An idle/empty village (workQueue drained; the user's current state)
+    def test_readiness_hold_timeout_finalizes_idle_think_tank(self):
+        """An idle/empty think tank (workQueue drained; the user's current state)
         never assigns the hire a task. The readiness hold must not strand the
         hire forever -- after ONBOARD_READINESS_TIMEOUT_MS full RT it completes
         anyway."""

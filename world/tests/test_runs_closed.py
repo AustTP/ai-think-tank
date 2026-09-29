@@ -1,6 +1,6 @@
 """Phase 5 acceptance: the simulation runs with NO browser.
 
-The village's whole tick used to live in index.html setInterval timers; closing
+The think tank's whole tick used to live in index.html setInterval timers; closing
 the tab froze it. After the migration the server IS the engine. This test is
 the "proof of runs-closed": it boots the real loop seam (get_state_from_db ->
 SimEngine.tick -> save_state_to_db, the exact body of sim._sim_loop_pass)
@@ -32,11 +32,11 @@ import serve
 
 class RunsClosed(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-runs-closed-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-runs-closed-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
@@ -69,7 +69,7 @@ class RunsClosed(unittest.TestCase):
         state = {
             'sim': {'owner': 'server'},
             'agentRoster': [
-                # Faye must be marked isAdmin (the village shape) so the gate's
+                # Faye must be marked isAdmin (the think tank shape) so the gate's
                 # reviewer-selection excludes her; a bare role='admin' would let
                 # her be pinned as a reviewer, and when her (busy) pin falls
                 # through the author gets wrongly self-assigned the review.
@@ -121,7 +121,7 @@ class RunsClosed(unittest.TestCase):
         # The observatory is a DELIVERABLE room, so under the Phase E addendum
         # peer-approval gate its story does NOT complete to 'done' -- it moves to
         # 'needs_review' and the loop enqueues review subtasks (which a real
-        # village resolves with two peer approvals). This test asserts the gated
+        # think tank resolves with two peer approvals). This test asserts the gated
         # lifecycle persists: primary work done -> needs_review + review subtasks
         # queued + author released off duty.
         #

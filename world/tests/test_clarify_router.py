@@ -9,12 +9,12 @@ back to the completing agent if the on-call genuinely can't answer.
 Two layers, hermetic:
   - sim.clarify_router_plan: the pure routing decision (no model, no DB).
   - the /api/intent/clarify endpoint: KB-first + in-character model call, with
-    the model + KB search + DB state all mocked so no live village is touched.
+    the model + KB search + DB state all mocked so no live think tank is touched.
 The "DB state...mocked" claim only covered the READ side (get_state_from_db
 is patched per-test); save_state_to_db and log_action were never mocked and
 go straight to serve.py's real DB_PATH via TestClient(serve.app), so a write
-during any of these tests landed in a real village.db. Found 2026-09-25 via a
-live production village.db that picked up "player clarify" log rows after a
+during any of these tests landed in a real think_tank.db. Found 2026-09-25 via a
+live production think_tank.db that picked up "player clarify" log rows after a
 routine test run; DB_PATH is now redirected below so even an unmocked write
 lands in a throwaway temp file.
 """
@@ -37,11 +37,11 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-clarify-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-clarify-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
@@ -73,7 +73,7 @@ def _state():
     return {
         'agentRoster': roster,
         'agents': {a['id']: {'id': a['id'], 'name': a['name'], 'role': a['role'],
-                             'offDuty': False, 'profile': {'mission': 'help the village'}}
+                             'offDuty': False, 'profile': {'mission': 'help the think tank'}}
                    for a in roster},
         'teams': [{'id': 'mayateam', 'directorId': 'maya', 'scrumMasterId': 'cora'}],
         'products': {'p1': {'id': 'p1', 'name': 'Parser', 'teamId': 'maya',
@@ -137,7 +137,7 @@ class ClarifyInCharacterMessagesTests(unittest.TestCase):
 
 class ClarifyEndpointTests(unittest.TestCase):
     """Endpoint via TestClient with a real player session, all live side effects
-    (DB state, model, KB search) mocked so a real village is never touched."""
+    (DB state, model, KB search) mocked so a real think tank is never touched."""
 
     def setUp(self):
         # Clarify shares the rate-limited ask lane (2026-09-28) -- clear the

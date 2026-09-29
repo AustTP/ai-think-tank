@@ -11,9 +11,9 @@ pattern as test_refinement.py / test_cut2_processes.py. NOT actually DB-free
 despite the state() helper's plain dicts: sim.py's escalation/refinement path
 has inline `from serve import log_action` calls (a real side effect, not a
 stub), which -- unless DB_PATH is redirected below -- write straight into
-whatever real village.db sits at serve.py's default path. Found 2026-09-25:
+whatever real think_tank.db sits at serve.py's default path. Found 2026-09-25:
 a real "Auth broken" task and an "esc-test" escalation from THIS file's own
-fixtures turned up in a live production village.db after a routine test run,
+fixtures turned up in a live production think_tank.db after a routine test run,
 because this file never isolated it.
 """
 import os
@@ -34,11 +34,11 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='village-oncall-escalation-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-oncall-escalation-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
-        VILLAGE_DIR=_TMP_DIR,
+        THINK_TANK_DIR=_TMP_DIR,
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
@@ -59,7 +59,7 @@ def _stub_escalate(choice='story'):
 
 
 def _state():
-    """A server-owned village: maya (admin director) -> ben (SM) with cora/zia
+    """A server-owned think tank: maya (admin director) -> ben (SM) with cora/zia
     as reports. One product owned by maya's team, one assigned bug task."""
     state = {
         'sim': {'owner': 'server'},

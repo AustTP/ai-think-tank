@@ -1,5 +1,5 @@
 // Real regression test for the single most expensive bug found in this
-// project: an idle village that never stopped spending. TASK_POOL is a
+// project: an idle think tank that never stopped spending. TASK_POOL is a
 // fixed list that ALWAYS has entries, so the old pickNextTask() always
 // found "work," every idle agent was always assigned something, and the
 // 6-second cycle burned 2-3 real Jev calls per agent indefinitely --
@@ -8,7 +8,7 @@
 //
 // The contract these tests lock in: an empty WORK_QUEUE means runTaskCycle
 // makes ZERO calls -- not fewer, not cheaper, none -- and the shared
-// villageHasWork() gate that hiring/firing also use agrees.
+// thinkTankHasWork() gate that hiring/firing also use agrees.
 //
 // Run: node tests/test_idle_quiet.mjs
 import vm from 'node:vm';
@@ -40,7 +40,7 @@ function getGlobal(name) {
 // tests specifically about the cap override this to a small number.
 setGlobal('MAX_ACTIVE_AGENTS', 1000);
 const runTaskCycle = () => vm.runInContext('runTaskCycle', context)();
-const villageHasWork = () => vm.runInContext('villageHasWork', context)();
+const thinkTankHasWork = () => vm.runInContext('thinkTankHasWork', context)();
 const queueWork = (...a) => vm.runInContext('queueWork', context)(...a);
 const spawnAgentAtFreeSpot = (...a) => vm.runInContext('spawnAgentAtFreeSpot', context)(...a);
 const sendAgentOffDuty = (...a) => vm.runInContext('sendAgentOffDuty', context)(...a);
@@ -79,7 +79,7 @@ function test(name, fn) {
 }
 
 // Every outbound call path the cycle could take, counted. If any of these
-// fires while the village is idle, the test fails -- which is the whole
+// fires while the think tank is idle, the test fails -- which is the whole
 // point, since "idle but cheap" was never the ask.
 let calls;
 function installCallCounters() {
@@ -87,7 +87,7 @@ function installCallCounters() {
   setGlobal('requestJevChoice', async () => { calls.jev++; return null; });
   setGlobal('assignTaskViaJev', async () => { calls.assignSolo++; return { assignedTo: 'someone' }; });
   setGlobal('assignPairTask', async () => { calls.assignPair++; return { assignedTo: 'someone' }; });
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
 }
 
 function setRoster(idleWorkerCount) {
@@ -100,7 +100,7 @@ function setRoster(idleWorkerCount) {
   setGlobal('AGENTS', agents);
 }
 
-console.log('idle village makes zero API calls (tasks.js)');
+console.log('idle think tank makes zero API calls (tasks.js)');
 
 await test('an empty queue means the cycle makes NO calls at all, however many agents are idle', async () => {
   installCallCounters();
@@ -112,26 +112,26 @@ await test('an empty queue means the cycle makes NO calls at all, however many a
   assert.equal(calls.assignPair, 0, 'expected zero pair assignments while idle');
 });
 
-await test('villageHasWork() is false when nothing is queued and nobody is working', async () => {
+await test('thinkTankHasWork() is false when nothing is queued and nobody is working', async () => {
   setRoster(5);
   setGlobal('WORK_QUEUE', []);
-  assert.equal(villageHasWork(), false);
+  assert.equal(thinkTankHasWork(), false);
 });
 
-await test('villageHasWork() is true as soon as real work is queued', async () => {
+await test('thinkTankHasWork() is true as soon as real work is queued', async () => {
   setRoster(5);
   setGlobal('WORK_QUEUE', []);
   queueWork([{ title: 'a real requested task', room: 'library' }]);
-  assert.equal(villageHasWork(), true);
+  assert.equal(thinkTankHasWork(), true);
 });
 
-await test('villageHasWork() is true while an agent is still mid-task, even with an empty queue', async () => {
+await test('thinkTankHasWork() is true while an agent is still mid-task, even with an empty queue', async () => {
   setRoster(2);
   setGlobal('WORK_QUEUE', []);
   const agents = getGlobal('AGENTS');
   agents.w0.task = { id: 'something-in-flight' };
   setGlobal('AGENTS', agents);
-  assert.equal(villageHasWork(), true);
+  assert.equal(thinkTankHasWork(), true);
 });
 
 await test('queued work IS assigned -- the gate stops idle spend, it does not stop real work', async () => {
@@ -165,7 +165,7 @@ await test('a failing item is only attempted ONCE per cycle, even with a large r
   // Real bug caught live: without excluding an already-attempted item
   // from _pickNextDueIndex, a failed-and-requeued item could be pulled
   // AGAIN within the same synchronous loop (bounded by rosterSize, often
-  // 15-20 in the real village) -- exhausting all WORK_ITEM_MAX_ATTEMPTS
+  // 15-20 in the real think tank) -- exhausting all WORK_ITEM_MAX_ATTEMPTS
   // retries in one burst with zero real wall-clock time for genuine
   // transient congestion (agents actually walking toward a contested
   // door) to clear. Confirmed live: 3 real subtasks all abandoned within
@@ -204,11 +204,11 @@ await test('a queued item scheduled for the future makes NO calls yet, even with
   assert.equal(getGlobal('WORK_QUEUE').length, 1, 'the scheduled item must still be sitting in the queue, untouched');
 });
 
-await test('villageHasWork() is false for a queue that only has future-scheduled items', async () => {
+await test('thinkTankHasWork() is false for a queue that only has future-scheduled items', async () => {
   setRoster(5);
   setGlobal('WORK_QUEUE', []);
   queueWork([{ title: 'do this later', room: 'library', notBefore: Date.now() + 3600000 }]);
-  assert.equal(villageHasWork(), false, 'nothing is actually workable yet, so this must read as idle');
+  assert.equal(thinkTankHasWork(), false, 'nothing is actually workable yet, so this must read as idle');
 });
 
 await test('an item scheduled for the past (its time has arrived) is assigned normally', async () => {
@@ -255,7 +255,7 @@ await test('a higher-priority item is picked before an earlier-queued normal one
   const assignedTitles = [];
   setGlobal('assignTaskViaJev', async (title) => { assignedTitles.push(title); return { assignedTo: 'someone' }; });
   setGlobal('assignPairTask', async () => ({ assignedTo: 'someone' }));
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
   setRoster(1); // one idle agent per tick, so order is unambiguous
   setGlobal('WORK_QUEUE', []);
   queueWork([
@@ -269,7 +269,7 @@ await test('a higher-priority item is picked before an earlier-queued normal one
 await test('equal-priority items still resolve in arrival order', async () => {
   const assignedTitles = [];
   setGlobal('assignTaskViaJev', async (title) => { assignedTitles.push(title); return { assignedTo: 'someone' }; });
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
   setRoster(1);
   setGlobal('WORK_QUEUE', []);
   queueWork([
@@ -289,7 +289,7 @@ await test('an unrecognized priority string is treated as normal, not rejected o
 await test('a low-priority item never jumps ahead of a due normal item, only the reverse', async () => {
   const assignedTitles = [];
   setGlobal('assignTaskViaJev', async (title) => { assignedTitles.push(title); return { assignedTo: 'someone' }; });
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
   setRoster(1);
   setGlobal('WORK_QUEUE', []);
   queueWork([
@@ -395,9 +395,9 @@ await test('one awake agent still only gets one item per tick even with a schedu
 
 console.log('\nspawnAgentAtFreeSpot places an agent at a free spot, on duty and visible');
 
-await test('it marks her on-duty/visible at a free village spot', () => {
+await test('it marks her on-duty/visible at a free think tank spot', () => {
   // The outskirts trailhead doors are gone (2026-09-22): a woken agent /
-  // new hire appears at a free spot in the main village, not at a door.
+  // new hire appears at a free spot in the main think tank, not at a door.
   setGlobal('pickFreeSpot', () => ({ x: 500, y: 500 }));
   const agents = { walker: { id: 'walker', visible: false, offDuty: false, inRoom: 'pressoffice' } };
   setGlobal('AGENTS', agents);
@@ -461,7 +461,7 @@ function baseFinishTaskSetup(extraAgentFields = {}) {
   });
   setGlobal('writeLibraryFile', () => {});
   setGlobal('showToast', () => {});
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
   setGlobal('lastTaskCompletedAt', {});
 }
 
@@ -523,7 +523,7 @@ await test('even when a handoff DOES trigger, she is visible for that walk too, 
 
 console.log('\nappearFromOutskirts places a called-in agent at a free spot, on duty/visible');
 
-await test('she is placed at a free village spot and marked on-duty/visible, not at a trailhead door', () => {
+await test('she is placed at a free think tank spot and marked on-duty/visible, not at a trailhead door', () => {
   // Real ask (2026-09-20): calling someone in should be a visible event --
   // she appears on the map and walks from there, not an instant pop-in
   // wherever her stale x/y happened to be left. With the outskirts trailhead
@@ -565,7 +565,7 @@ await test('a due SCHEDULED item still waits if waking someone would exceed the 
   // Real ask (2026-09-20): 25 (here, 1 for the test) is a hard ceiling on
   // who may be online or freshly called in for a scheduled item -- not a
   // preference. Even a genuinely scheduled item (which can normally
-  // always wake someone) must wait if the village is already at its
+  // always wake someone) must wait if the think tank is already at its
   // active ceiling, rather than pushing past it.
   installCallCounters();
   setGlobal('MAX_ACTIVE_AGENTS', 1);
@@ -619,7 +619,7 @@ await test('entryX/entryY match the path\'s own actual last waypoint, not the ra
   // The raw target would be (108, 124) -- deliberately return a path
   // whose LAST waypoint is somewhere else, simulating a relaxed route.
   setGlobal('findPath', () => [{ x: 50, y: 50 }, { x: 90, y: 108 }]);
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
   setGlobal('AGENTS', { dev: { id: 'dev', busy: false, task: null, x: 0, y: 0 } });
   const task = assignTask('dev', 'Digest a feed', 'library');
   assert.equal(task.entryX, 90, 'expected entryX to match the path\'s real last waypoint, not the raw 108');
@@ -636,7 +636,7 @@ await test('TASKS[id] stores instructions and projectLabel', () => {
   setGlobal('_resolveRoomWithOverflow', (room) => room);
   setGlobal('ROOM_DOOR_TRIGGERS', { library: { x: 100, y: 100, w: 16, h: 16 } });
   setGlobal('findPath', () => [{ x: 110, y: 120 }]);
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
   setGlobal('AGENTS', { dev: { id: 'dev', busy: false, task: null, x: 0, y: 0 } });
   const task = assignTask('dev', 'Digest a feed', 'library', 'Summarize the latest post for the player.', 'Build a small daily news digest');
   assert.ok(task);
@@ -687,7 +687,7 @@ await test('every queued subtask carries the real goal it came from', async () =
       { title: 'Write the page skeleton', room: 'pressoffice', instructions: 'Start with a basic layout.' },
     ] }) }),
   }));
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
   setGlobal('WORK_QUEUE', []);
   const result = await assignBigTask('Build a simple to-do list app');
   assert.ok(!result.error, `expected a real plan, got error: ${result.error}`);
@@ -713,7 +713,7 @@ await test('the planning prompt names pressoffice as the real coding room, not a
     capturedPrompt = body.messages[0].content;
     return { ok: true, json: async () => ({ reply: JSON.stringify({ subtasks: [{ title: 'x', room: 'pressoffice', instructions: 'y' }] }) }) };
   });
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
   setGlobal('WORK_QUEUE', []);
   await assignBigTask('Build a simple to-do list app');
   assert.ok(capturedPrompt, 'expected the planning call to actually happen');
@@ -770,7 +770,7 @@ function baseAssignTaskViaJevSetup(roster, agents) {
   setGlobal('_resolveRoomWithOverflow', (room) => room);
   setGlobal('ROOM_DOOR_TRIGGERS', { pressoffice: { x: 100, y: 100, w: 16, h: 16 } });
   setGlobal('findPath', () => [{ x: 90, y: 108 }]);
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
   setGlobal('appearFromOutskirts', () => {});
   setGlobal('requestJevChoice', async () => null); // forces the "fall back to candidates[0]" path -- proves who WAS a candidate
 }
@@ -792,7 +792,7 @@ await test('TASKS[id].taskType matches what was passed through', () => {
   setGlobal('_resolveRoomWithOverflow', (room) => room);
   setGlobal('ROOM_DOOR_TRIGGERS', { pressoffice: { x: 100, y: 100, w: 16, h: 16 } });
   setGlobal('findPath', () => [{ x: 90, y: 108 }]);
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
   setGlobal('AGENTS', { dev: { id: 'dev', busy: false, task: null, x: 0, y: 0 } });
   const task = assignTask('dev', 'Review the app', 'pressoffice', 'instructions', 'Build a to-do app', { taskType: 'review' });
   assert.equal(task.taskType, 'review');
@@ -929,7 +929,7 @@ await test('finishTask does not run until the real dispatched work actually reso
   setGlobal('sendAgentOffDuty', () => {});
   setGlobal('writeLibraryFile', () => {});
   setGlobal('showToast', () => {});
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
   setGlobal('lastTaskCompletedAt', {});
   setGlobal('TASKS', { 't1': { id: 't1', title: 'Slow real task', room: 'pressoffice', entryX: 50, entryY: 60 } });
   setGlobal('AGENTS', { worker: { id: 'worker', name: 'Worker', task: 't1', x: 0, y: 0, profile: { notes: [] }, approvedCount: 0 } });
@@ -961,7 +961,7 @@ await test('a minimum visual floor still applies even when the real work resolve
   setGlobal('sendAgentOffDuty', () => {});
   setGlobal('writeLibraryFile', () => {});
   setGlobal('showToast', () => {});
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
   setGlobal('lastTaskCompletedAt', {});
   setGlobal('TASKS', { 't2': { id: 't2', title: 'Instant real task', room: 'pressoffice', entryX: 50, entryY: 60 } });
   setGlobal('AGENTS', { worker: { id: 'worker', name: 'Worker', task: 't2', x: 0, y: 0, profile: { notes: [] }, approvedCount: 0 } });
@@ -986,7 +986,7 @@ await test('a genuinely hung dispatch is still cut off by TASK_DISPATCH_TIMEOUT_
   setGlobal('sendAgentOffDuty', () => {});
   setGlobal('writeLibraryFile', () => {});
   setGlobal('showToast', () => {});
-  setGlobal('logVillageAction', () => {});
+  setGlobal('logThinkTankAction', () => {});
   setGlobal('lastTaskCompletedAt', {});
   setGlobal('TASKS', { 't3': { id: 't3', title: 'Hung real task', room: 'pressoffice', entryX: 50, entryY: 60 } });
   setGlobal('AGENTS', { worker: { id: 'worker', name: 'Worker', task: 't3', x: 0, y: 0, profile: { notes: [] }, approvedCount: 0 } });
@@ -1032,15 +1032,15 @@ await test('nothing pending -- says so plainly, makes no judgment calls', async 
 });
 
 await test('a genuinely useful file is promoted, not rejected', async () => {
-  setGlobal('listLibraryFiles', async () => [{ path: 'pending_review/skills/village-governance.md' }]);
-  setGlobal('readLibraryFile', async () => '# Skill: Village Governance\n\nReal, specific, accurate content.');
+  setGlobal('listLibraryFiles', async () => [{ path: 'pending_review/skills/think tank-governance.md' }]);
+  setGlobal('readLibraryFile', async () => '# Skill: Think Tank Governance\n\nReal, specific, accurate content.');
   setGlobal("requestJevChoice", async () => ({ choice: "keep" }));
   let promoted = null, rejected = null;
   setGlobal('promoteLibraryFile', async (agentId, path) => { promoted = path; return true; });
   setGlobal('rejectLibraryFile', async (agentId, path) => { rejected = path; return true; });
   setGlobal('writeLibraryFile', async () => { throw new Error('a KEPT file should not be rewritten with rejection reasoning'); });
   const note = await runSkillReviewTask('rev');
-  assert.equal(promoted, 'pending_review/skills/village-governance.md');
+  assert.equal(promoted, 'pending_review/skills/think tank-governance.md');
   assert.equal(rejected, null);
   assert.ok(note.includes('1 promoted, 0 rejected'));
 });

@@ -1,4 +1,4 @@
-"""DB-backed Jev decisions-model setting (2026-09-28): the village's decisions
+"""DB-backed Jev decisions-model setting (2026-09-28): the think tank's decisions
 model slug resolves through the `settings` table first (switchable live via the
 player-only /api/jev/model endpoint, survives restarts, never auto-refreshed)
 and only falls back to the JEV_MODEL env/default constant. This closes the Jev
@@ -26,7 +26,7 @@ class JevModelSetting(unittest.TestCase):
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
         )
         self._cm.start()
         serve.init_db()
@@ -72,7 +72,7 @@ class JevModelEndpoint(unittest.TestCase):
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
         )
         self._cm.start()
         serve.init_db()

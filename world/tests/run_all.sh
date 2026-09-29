@@ -34,7 +34,7 @@ echo
 echo "== JS: firing-review backoff =="
 node tests/test_firing_backoff.mjs
 echo
-echo "== JS: villager headcount cap =="
+echo "== JS: researcher headcount cap =="
 node tests/test_hire_cap.mjs
 echo
 echo "== JS: morale dropped-work decay =="
@@ -43,7 +43,7 @@ echo
 echo "== JS: agentic probe-request parsing =="
 node tests/test_probe_request_parsing.mjs
 echo
-echo "== JS: idle village makes zero API calls =="
+echo "== JS: idle think tank makes zero API calls =="
 node tests/test_idle_quiet.mjs
 echo
 echo "== JS: smart render-fallback fetch =="
@@ -157,10 +157,10 @@ echo
 echo "== Python: self-heal -- orphaned tasks reclaimed + skill-review sentinel =="
 python3 tests/test_self_heal.py
 echo
-echo "== Python: hive-mind distillation -- archive findings merged into the village wiki =="
+echo "== Python: hive-mind distillation -- archive findings merged into the think tank wiki =="
 python3 tests/test_distill.py
 echo
-echo "== Python: sleep-not-die idle dormancy -- village pauses, stays bound, wakes on request =="
+echo "== Python: sleep-not-die idle dormancy -- think tank pauses, stays bound, wakes on request =="
 python3 tests/test_dormancy.py
 echo
 echo "== Python: round-robin on-call (Phase E2d) =="
@@ -183,7 +183,7 @@ python3 tests/test_full_lifecycle.py
 # own docstring). The visual regression check needs a REAL running server and
 # a real logged-in browser session, so it can't share that guarantee -- run it
 # explicitly and separately when you want it:
-#   AI_VILLAGE_TEST_PASSWORD=... python3 tests/test_visual_regression.py
+#   AI_THINK_TANK_TEST_PASSWORD=... python3 tests/test_visual_regression.py
 # (Borrowed from Hermes Town's verify:characters/verify:world, 2026-09-24 --
 # real automated checks for exactly the "undefined" nameplate / overlapping-
 # sprite class of bug found manually this session.)

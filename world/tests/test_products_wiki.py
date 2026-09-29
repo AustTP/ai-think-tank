@@ -5,7 +5,7 @@ next_product_revision / product_release_record / set_product_status /
 wiki_write_page / wiki_read_pages / inject_wiki_context / release_uses_handle),
 the server-owned merge carry, and the endpoint layer (create/release/status,
 wiki page/read/category) with real session auth. Runs against a hermetic temp
-DB and a temp sandbox directory -- never the live village.
+DB and a temp sandbox directory -- never the live think tank.
 """
 import os
 import shutil
@@ -137,7 +137,7 @@ class WikiHelpers(unittest.TestCase):
 
 class ProductEndpoints(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-products-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-products-')
         # A fake sandbox repo on disk for the release snapshot path.
         self.sb = os.path.join(self.tmp, 'sandboxes', 'workroom-shared')
         os.makedirs(self.sb, exist_ok=True)
@@ -146,7 +146,7 @@ class ProductEndpoints(unittest.TestCase):
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             SANDBOXES_DIR=os.path.join(self.tmp, 'sandboxes'),
@@ -254,11 +254,11 @@ class ProductEndpoints(unittest.TestCase):
 
 class WikiEndpoints(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-wiki-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-wiki-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             SANDBOXES_DIR=os.path.join(self.tmp, 'sandboxes'),
@@ -324,21 +324,21 @@ class WikiEndpoints(unittest.TestCase):
 
 
 class WriteWikiServerAutoSeed(unittest.TestCase):
-    """_write_wiki_server's 'village' auto-seed (2026-09-26): real gap caught
-    live -- distillation's server-owned write path required a 'village' wiki
+    """_write_wiki_server's 'think_tank' auto-seed (2026-09-26): real gap caught
+    live -- distillation's server-owned write path required a 'think_tank' wiki
     category to already exist, but nothing ever seeds one; it's only ever
     created via a director manually calling POST /api/intent/wiki/category.
-    A village where nobody happened to do that had every distillation
+    A think tank where nobody happened to do that had every distillation
     attempt silently fail its write, forever. Real function under test here
     (unlike test_distill.py's DistillExecutor, which mocks _write_wiki_server
     entirely) -- isolated the same way WikiEndpoints above is."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix='village-wiki-autoseed-')
+        self.tmp = tempfile.mkdtemp(prefix='think tank-wiki-autoseed-')
         self._cm = unittest.mock.patch.multiple(
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
-            VILLAGE_DIR=self.tmp,
+            THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             SANDBOXES_DIR=os.path.join(self.tmp, 'sandboxes'),
@@ -353,19 +353,19 @@ class WriteWikiServerAutoSeed(unittest.TestCase):
         self._cm.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_writes_successfully_when_village_category_is_missing_and_auto_seeds_it(self):
+    def test_writes_successfully_when_think_tank_category_is_missing_and_auto_seeds_it(self):
         state = _make_product_state()  # only has 'workroom'/'research' categories
         serve.save_state_to_db(state)
-        record = serve._write_wiki_server('state-of-knowledge', 'Village state of knowledge',
-                                          'village', 'Merged village knowledge.')
+        record = serve._write_wiki_server('state-of-knowledge', 'Think Tank state of knowledge',
+                                          'think_tank', 'Merged think tank knowledge.')
         self.assertIsNotNone(record, 'the write must succeed, not silently fail')
         persisted = serve.get_state_from_db()
-        self.assertIn('village', persisted['wiki']['categories'])
-        body_path = os.path.join(self.tmp, 'library', 'wiki', 'village', 'state-of-knowledge.md')
+        self.assertIn('think_tank', persisted['wiki']['categories'])
+        body_path = os.path.join(self.tmp, 'library', 'wiki', 'think_tank', 'state-of-knowledge.md')
         self.assertTrue(os.path.isfile(body_path))
 
     def test_does_not_auto_seed_an_arbitrary_missing_category(self):
-        # Only 'village' is special-cased (a hardcoded system constant the
+        # Only 'think_tank' is special-cased (a hardcoded system constant the
         # server-owned path itself depends on) -- any other missing category
         # still fails closed exactly as before, no silent auto-creation.
         state = _make_product_state()
@@ -375,18 +375,18 @@ class WriteWikiServerAutoSeed(unittest.TestCase):
         persisted = serve.get_state_from_db()
         self.assertNotIn('nonexistent-category', persisted['wiki']['categories'])
 
-    def test_does_not_overwrite_an_already_existing_village_category(self):
-        # A director may already have set a custom label/order for 'village'
+    def test_does_not_overwrite_an_already_existing_think_tank_category(self):
+        # A director may already have set a custom label/order for 'think_tank'
         # -- the auto-seed must only fire when truly missing, never clobber
         # an existing one back to the generic default.
         state = _make_product_state()
-        state['wiki']['categories']['village'] = {'label': 'Custom Village Label', 'order': 7}
+        state['wiki']['categories']['think_tank'] = {'label': 'Custom Think Tank Label', 'order': 7}
         serve.save_state_to_db(state)
-        record = serve._write_wiki_server('state-of-knowledge', 'T', 'village', 'body')
+        record = serve._write_wiki_server('state-of-knowledge', 'T', 'think_tank', 'body')
         self.assertIsNotNone(record)
         persisted = serve.get_state_from_db()
-        self.assertEqual(persisted['wiki']['categories']['village'],
-                         {'label': 'Custom Village Label', 'order': 7})
+        self.assertEqual(persisted['wiki']['categories']['think_tank'],
+                         {'label': 'Custom Think Tank Label', 'order': 7})
 
 
 if __name__ == '__main__':

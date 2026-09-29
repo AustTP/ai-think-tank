@@ -1,13 +1,13 @@
 # Burn-in checklist
 
-A supervised live-run checklist for the village, written 2026-09-24 after a
+A supervised live-run checklist for the think tank, written 2026-09-24 after a
 review found that ~20 commits of behavior (Cut 2, Cut 4, refinement, Knowledge
 Social, the Bank, clarify router, distillation, dormancy, and the skill-review
-fix itself) had never executed in a live village -- they were validated only by
+fix itself) had never executed in a live think tank -- they were validated only by
 unit tests with injected fakes and deterministic clocks.
 
 This is not generic test advice. Every item marked **⚠️** is a replay of
-something this village actually did, observed in `village.db` at the last real
+something this think tank actually did, observed in `think_tank.db` at the last real
 tick (2026-09-23 03:16 UTC), where the terminal state was:
 
 - 65 tasks, **all 65 titled "Review pending skill files"**, all in `observatory`
@@ -27,10 +27,10 @@ failed in the last live run.
 
 ## Phase 0 -- Before you start
 
-- [ ] **Back up `village.db`** and note the path. Automated backups exist
-      (`509173d`) -- confirm one actually lands in `ai-village-backups/` before
+- [ ] **Back up `think_tank.db`** and note the path. Automated backups exist
+      (`509173d`) -- confirm one actually lands in `ai-think-tank-backups/` before
       trusting it.
-- [ ] ⚠️ **Prove the suite can't touch the live DB.** Record `village.db` mtime,
+- [ ] ⚠️ **Prove the suite can't touch the live DB.** Record `think_tank.db` mtime,
       run `tests/run_all.sh`, confirm mtime is unchanged. Today it *will* change:
       `test_composite_trust.py` imports `serve` without repointing `DB_PATH`, so
       `record_model_result('m', ...)` writes phantom model `"m"` into the live
@@ -46,7 +46,7 @@ failed in the last live run.
 ```python
 # read-only. python3 health.py
 import sqlite3, json, time, collections
-s = json.loads(sqlite3.connect('village.db').execute(
+s = json.loads(sqlite3.connect('think_tank.db').execute(
     'select blob from kv_state where id=1').fetchone()[0])
 t = s.get('tasks') or {}
 inflight = [v for v in t.values() if v.get('status') not in ('done',)]
@@ -113,7 +113,7 @@ Test adversarially. A gate you have only seen pass has not been tested.
 
 ## Phase 4 -- Spend discipline
 
-- [ ] ⚠️ **Idle village = zero model calls.** Empty queue for 30+ minutes;
+- [ ] ⚠️ **Idle think tank = zero model calls.** Empty queue for 30+ minutes;
       `decide` and `chat` counts must not move. This is the failure that once
       burned 37,034 `decide` calls in a single day.
 - [ ] **Every `decide` carries a real `agent_id`.** Nulls mean unattributed spend
@@ -148,9 +148,9 @@ hardest.
 - [ ] Clarify router walks the real chain: on-call -> KB-first -> completing-agent
       fallback.
 - [ ] Player quality-veto returns a closed story to its author.
-- [ ] Publish-to-GitHub pushes to the repo named by `AI_VILLAGE_PUBLISH_REPO`
+- [ ] Publish-to-GitHub pushes to the repo named by `AI_THINK_TANK_PUBLISH_REPO`
       in `.env` -- **dry-run first**, it targets a real private repo.
-- [ ] Dormancy sleeps the village and **wakes it on request** without losing state.
+- [ ] Dormancy sleeps the think tank and **wakes it on request** without losing state.
 
 ---
 
@@ -165,7 +165,7 @@ A **pass** requires, after 24 hours unattended:
 5. **at least one artifact on disk containing real work product.**
 
 A **fail** on any Phase 2 item means stop and fix before adding anything else --
-those are the items that already took the village down once.
+those are the items that already took the think tank down once.
 
 Recommended before starting: fix the review-gate timeout, the grading
 `isinstance` bug, and test DB isolation. All three are cheap, and two of them

@@ -180,11 +180,11 @@ RENDER_FALLBACK_THRESHOLD_CHARS = 300  # world.js RENDER_FALLBACK_THRESHOLD_CHAR
 
 # Hive-mind distillation limits. Bounded reads keep the synthesis call from
 # being flooded: at most the newest archives since the last run, each excerpt
-# capped, plus the current village wiki so the merge is incremental.
+# capped, plus the current think tank wiki so the merge is incremental.
 _DISTILL_MAX_ARCHIVES = 25
 _DISTILL_ARCHIVE_EXCERPT_CHARS = 4000
 _DISTILL_WIKI_EXCERPT_CHARS = 6000
-_DISTILL_VILLAGE_PAGE_ID = 'state-of-knowledge'
+_DISTILL_THINK_TANK_PAGE_ID = 'state-of-knowledge'
 _DISTILL_CSV_MIN_LINES = 3
 
 
@@ -198,7 +198,7 @@ def _extract_csv_like_blocks(text):
     substring search.
 
     Deterministic safety net (2026-09-26): the distill synthesis prompt
-    explicitly tells the model to 'extract what the village NOW knows...
+    explicitly tells the model to 'extract what the think tank NOW knows...
     do not just re-print the raw archive files' -- exactly the summarize-
     don't-preserve instruction that already, twice tonight, caused a
     spike's real CSV to get flattened into prose instead of kept verbatim
@@ -249,7 +249,7 @@ def _run_weather_content(snapshot, agent_id, task, base_ctx=None):
     import sim as _sim_module
     base = _serve.SELF_BASE_URL
     key = _serve.get_or_create_agent_key(agent_id)
-    purpose = 'Checking outside weather reference material for the village weather station.'
+    purpose = 'Checking outside weather reference material for the think tank weather station.'
     data = _serve._http_json('POST', base, '/api/browse',
                       {'url': _WEATHER_REFERENCE_URL, 'agentId': agent_id, 'purpose': purpose}, key)
     if data.get('error'):
@@ -373,8 +373,8 @@ def _run_skill_review_content(snapshot, agent_id, task, base_ctx=None):
 
 def _run_distill_content(snapshot, agent_id, task, base_ctx=None):
     """The hive mind's merge step: read the archive findings written since the
-    last distillation, LLM-synthesize them into an updated village wiki page,
-    and write it back as server authority. This is what makes the village a
+    last distillation, LLM-synthesize them into an updated think tank wiki page,
+    and write it back as server authority. This is what makes the think tank a
     *body* that learns -- shared storage (archive/), merged knowledge (wiki),
     and read-before-act injection (inject_wiki_context) form the loop.
 
@@ -408,13 +408,13 @@ def _run_distill_content(snapshot, agent_id, task, base_ctx=None):
     archives.sort(key=lambda t: -t[0])
     archives = archives[:_DISTILL_MAX_ARCHIVES]
 
-    # 2. Pull the current village wiki page so the merge is incremental, not a
-    # from-scratch rewrite (what the village already "knows" is preserved).
+    # 2. Pull the current think tank wiki page so the merge is incremental, not a
+    # from-scratch rewrite (what the think tank already "knows" is preserved).
     current_wiki = ''
-    village_wiki_path = os.path.join(_serve.LIBRARY_DIR, 'wiki', 'village',
-                                     f'{_DISTILL_VILLAGE_PAGE_ID}.md')
+    think_tank_wiki_path = os.path.join(_serve.LIBRARY_DIR, 'wiki', 'think_tank',
+                                        f'{_DISTILL_THINK_TANK_PAGE_ID}.md')
     try:
-        with open(village_wiki_path, 'r', errors='replace') as f:
+        with open(think_tank_wiki_path, 'r', errors='replace') as f:
             current_wiki = f.read()
     except OSError:
         current_wiki = ''
@@ -422,10 +422,10 @@ def _run_distill_content(snapshot, agent_id, task, base_ctx=None):
     # Nothing new since the last distillation -> don't churn the wiki.
     if not archives:
         _sim_module._store_content_result(task.get('id'),
-                                          {'note': 'Distillation ran -- no new archive findings since the last pass, so the village knowledge is unchanged.', 'noop': True})
+                                          {'note': 'Distillation ran -- no new archive findings since the last pass, so the think tank knowledge is unchanged.', 'noop': True})
         return
 
-    tier_slug = _serve._resolve_model_tier('Distill recent archived village findings into the wiki, merging and de-duplicating what the village now knows')
+    tier_slug = _serve._resolve_model_tier('Distill recent archived think tank findings into the wiki, merging and de-duplicating what the think tank now knows')
     if not tier_slug:
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f'Found {len(archives)} new finding(s) to distill, but the synthesis call failed (no model tier).',
@@ -436,24 +436,24 @@ def _run_distill_content(snapshot, agent_id, task, base_ctx=None):
     sources_text = '\n\n'.join(
         f'### {fn}\n{body[:_DISTILL_ARCHIVE_EXCERPT_CHARS]}' for _t, fn, body in archives)
     sys_msg = (
-        'You are the distillation step of a village-wide knowledge base. Merge the '
-        'findings below -- and the current village knowledge, when provided -- into one '
-        f'updated page ({_DISTILL_VILLAGE_PAGE_ID}). Rules:\n'
+        'You are the distillation step of a think tank-wide knowledge base. Merge the '
+        'findings below -- and the current think tank knowledge, when provided -- into one '
+        f'updated page ({_DISTILL_THINK_TANK_PAGE_ID}). Rules:\n'
         '- Remove redundancy and contradiction; where findings disagree, keep the view '
         'with more supporting evidence and mark residual disagreement honestly.\n'
-        '- Extract what the village NOW knows as a body; do not just re-print the raw '
+        '- Extract what the think tank NOW knows as a body; do not just re-print the raw '
         'archive files.\n'
         '- Preserve citations to the source files you folded in.\n'
         '- If a current page is given, keep what still holds and fold in what is new.\n'
         'Write concrete, actionable markdown, not filler.' +
-        (f'\n\nCURRENT VILLAGE KNOWLEDGE (keep/merge):\n\n{current_wiki[:_DISTILL_WIKI_EXCERPT_CHARS]}'
-         if current_wiki else '\n\nNo current village page yet -- write one from scratch.'))
+        (f'\n\nCURRENT THINK TANK KNOWLEDGE (keep/merge):\n\n{current_wiki[:_DISTILL_WIKI_EXCERPT_CHARS]}'
+         if current_wiki else '\n\nNo current think tank page yet -- write one from scratch.'))
     reply = None
     try:
         r = _serve._http_json('POST', base, '/api/chat',
                               {'model': tier_slug,
                                'messages': [{'role': 'system', 'content': sys_msg},
-                                            {'role': 'user', 'content': f'Recent village findings:\n\n{sources_text}'}],
+                                            {'role': 'user', 'content': f'Recent think tank findings:\n\n{sources_text}'}],
                                'max_tokens': _serve.RESEARCH_SKILL_SYNTHESIS_TOKENS,
                                'agentId': agent_id}, key)
         if isinstance(r, dict) and not r.get('error') and r.get('reply'):
@@ -483,13 +483,13 @@ def _run_distill_content(snapshot, agent_id, task, base_ctx=None):
 
     # 5. Persist as server authority (chains the passport; survives autosave).
     record = _serve._write_wiki_server(
-        _DISTILL_VILLAGE_PAGE_ID, 'Village state of knowledge', 'village', reply)
+        _DISTILL_THINK_TANK_PAGE_ID, 'Think Tank state of knowledge', 'think_tank', reply)
     if record is None:
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f'Distilled {len(archives)} finding(s), but the wiki write failed.', 'noop': True})
         return
     _sim_module._store_content_result(task.get('id'),
-                                      {'note': f'Distilled {len(archives)} recent finding(s) into the village wiki ({record.get("title")}, v{record.get("version")}).',
+                                      {'note': f'Distilled {len(archives)} recent finding(s) into the think tank wiki ({record.get("title")}, v{record.get("version")}).',
                                        'distilled': len(archives), 'wikiPage': record.get('id')})
 
 
@@ -566,7 +566,7 @@ def _run_bank_content(snapshot, agent_id, task, base_ctx=None):
     """The Bank teller. A director (or the admin) gets the full readable
     readout: per-service used/cap/left, a burn-rate forecast, and reallocation
     authority. A non-director gets a real, READ-ONLY cumulative summary too --
-    per your call (2026-09-24): the village should have hive-mind awareness of
+    per your call (2026-09-24): the think tank should have hive-mind awareness of
     what its own actions cost, not just directors. Only the AUTHORITY to
     reallocate/raise caps stays director-only; visibility into "are we
     healthy" does not. Reports via the standard content-result note so the
@@ -584,7 +584,7 @@ def _run_bank_content(snapshot, agent_id, task, base_ctx=None):
             total_cap = sum(row['cap'] for row in view.values())
             over_any = any(row['over'] for row in view.values())
             pct = (100.0 * total_used / total_cap) if total_cap else 0.0
-            note = (f"{name} checked the bank: the village has used ${total_used:.2f} of "
+            note = (f"{name} checked the bank: the think tank has used ${total_used:.2f} of "
                      f"${total_cap:.2f} cumulative budget ({pct:.0f}%) across {len(view)} "
                      f"services. " + ("At least one service is OVER its cap -- work in that "
                      "area should slow down; only a director can reallocate or raise it."
@@ -612,14 +612,14 @@ def _run_bank_content(snapshot, agent_id, task, base_ctx=None):
                if over_any else
                "All services are within cap; directors can coordinate to keep it that way."))
     # Per your call (2026-09-24): reconcile against the REAL OpenRouter account
-    # balance too, not just the village's own internal ledger -- the two can
+    # balance too, not just the think tank's own internal ledger -- the two can
     # legitimately diverge (outside usage on the same key, manual top-ups).
     credits = _serve._openrouter_account_credits()
     if credits:
         note += (f" OpenRouter account (real): ${credits['totalCredits']:.2f} total credits, "
                  f"${credits['totalUsage']:.2f} used lifetime, ${credits['remaining']:.2f} remaining.")
     # Apify FREE-plan reconcile (2026-09-28): same live-account pattern -- show
-    # the REAL cycle spend/cap the plan is enforcing, not just the village's
+    # the REAL cycle spend/cap the plan is enforcing, not just the think tank's
     # own ledger, so the teller sees the $5/month wall it's actually against.
     apify_usage = _serve._apify_account_usage()
     if apify_usage:
@@ -684,7 +684,7 @@ def _run_research_bare_content(snapshot, agent_id, task, base_ctx=None):
 # --- Press Office content executors (Phase 3): runWorkroomTask/coding/review --
 # Ports of tasks.js runWorkroomTask + runCodingTask + runReviewTask and their
 # helpers, into the (snapshot, agent_id, task, base_ctx) executor shape. The
-# tasks.js versions were written specifically for the village's own shared
+# tasks.js versions were written specifically for the think tank's own shared
 # sandbox (WORKROOM_SANDBOX_ID), so these are a faithful pipeline: real
 # /api/execute calls (probe-before-writing, heredoc-continuation, orphaned and
 # phantom script detection) and /api/chat for the code itself.
@@ -1641,7 +1641,7 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
         suffix = 'queued a fix'
     # SWiRL: a review that VERIFIED a checklist requirement failed leaves a
     # process-trace lesson in pending_review/skills/ (bounded + deduped by the
-    # helper) so the village's skill-review sweep can promote it into reference
+    # helper) so the think tank's skill-review sweep can promote it into reference
     # material -- the review writes its own durable trace, no separate crawl.
     process_trace_count = 0
     if verdict == 'actionable' and any(g.get('verdict') == GRADE_FAILS for g in checklist_grades):
@@ -1684,7 +1684,7 @@ def _wiki_context_for_task(state, task):
 def _run_product_build_content(snapshot, agent_id, task, base_ctx=None):
     """Phase E: a pressoffice task targeting a PRODUCT (task['productId']).
     Reads the product's catalog record + sandbox, injects the wiki context so
-    the build reasons over village knowledge first, runs the real coding
+    the build reasons over think tank knowledge first, runs the real coding
     pipeline against the product's sandbox, and on success RELEASES a frozen
     revision (snapshot -> library/projects/<id>/v<N>/ + passport entry). Uses
     the SWE-bench coding tier, exactly like _run_coding_content; passes through
@@ -1717,7 +1717,7 @@ def _run_product_build_content(snapshot, agent_id, task, base_ctx=None):
                         key)
         if isinstance(ls, dict) and ls.get('allowed') and ls.get('stdout'):
             context_summary = f'Current files in the {project_label} sandbox:\n{ls["stdout"]}'
-    # Read-before-act: village knowledge for this task's room.
+    # Read-before-act: think tank knowledge for this task's room.
     wiki_ctx = _wiki_context_for_task(snapshot, task)
     if wiki_ctx:
         context_summary = f'{wiki_ctx}\n\n{context_summary}'
@@ -1855,7 +1855,7 @@ def _spike_wants_internal_review(backlog, instructions):
     the other plan-phase detectors above. Used to FORCE search_library as
     the first tool call, not just ask the PLAN prompt to suggest it: real
     gap caught LIVE (2026-09-26) -- a real spike asked to "review the
-    village's own prior research on DreyX.com" went straight to browse_page
+    think tank's own prior research on DreyX.com" went straight to browse_page
     and reported "no existing records" despite 7+ real matching entries
     already in the Library, because the PLAN prompt's own "search_library
     first" instruction was never reliably followed. This is the exact same
@@ -2081,13 +2081,13 @@ _COLAB_RUN_TOOL = {
         'name': 'run_on_colab',
         'description': (
             "Run real Python on a Google Colab GPU (T4) runtime -- for computation this "
-            "village's own machine cannot do: CUDA/torch GPU work, fine-tuning experiments, "
-            "large matrix/ML or numeric jobs. The village provisions a GPU session on demand, "
+            "think tank's own machine cannot do: CUDA/torch GPU work, fine-tuning experiments, "
+            "large matrix/ML or numeric jobs. The think tank provisions a GPU session on demand, "
             "executes your code, and returns exactly what it printed -- so your code MUST print "
             "everything you need to see. Use this when a plan step genuinely requires real "
             "computation (not for browsing/text questions, and not for anything the tiny local "
             "sandbox can already do). It runs on the player's real Colab account, metered against "
-            "whatever COLAB_MONTHLY_UNITS village cap is set, and it is the FREE tier: a run "
+            "whatever COLAB_MONTHLY_UNITS think tank cap is set, and it is the FREE tier: a run "
             "must finish in its own short timeout, sessions get torn down after idle, GPU slots "
             "are not guaranteed, keep runs small. HARD LIMIT: the code runs as the player's "
             "identity, so it may ONLY touch compute -- never Google Drive, GCS/cloud APIs, "
@@ -2175,10 +2175,10 @@ _LIBRARY_SEARCH_TOOL = {
     'function': {
         'name': 'search_library',
         'description': (
-            "Search the village's own Library -- real completed work from ANY team (finished "
+            "Search the think tank's own Library -- real completed work from ANY team (finished "
             "stories, past spikes, research, peer reviews, wiki merges). Use this BEFORE "
             "search_web when the investigation is about reviewing, comparing against, or building "
-            "on something already done inside this village (e.g. \"review Team A's approach before "
+            "on something already done inside this think tank (e.g. \"review Team A's approach before "
             "we build something similar\") -- guessing at another team's work instead of actually "
             "reading it produces a fabricated review. Returns matching file paths with a short real "
             "snippet around each hit; call read_library_file on a promising path for the full text."
@@ -2217,7 +2217,7 @@ _LIBRARY_READ_TOOL = {
 def _make_library_tools_executor(agent_id, struck_tools=None):
     """search_library / read_library_file for a spike reviewing another
     team's real prior work. Read-only, no ACL beyond what the Library
-    already applies to everyone (the village is transparent about who did
+    already applies to everyone (the think tank is transparent about who did
     what). Self-checks `struck_tools` (defense in depth, same shape as the
     other two executors) even though a read-only lookup failing is unlikely
     to ever be a POLICY denial rather than "no matches" -- kept consistent
@@ -2297,7 +2297,7 @@ _TREG_X_TRENDING_TOOL = {
         'name': 'x_trending_topics',
         'description': (
             "Get real, currently trending topics on X (Twitter) for a location, via Treg's real "
-            "X API proxy (a real ~$0.01 call against the village's Treg balance). Use this when "
+            "X API proxy (a real ~$0.01 call against the think tank's Treg balance). Use this when "
             "the investigation needs to know what is ACTUALLY trending right now -- never invent "
             "a plausible-sounding trend from training knowledge."
         ),
@@ -2318,7 +2318,7 @@ _TREG_LINKEDIN_SEARCH_TOOL = {
         'name': 'search_linkedin_posts',
         'description': (
             "Search real, recent public LinkedIn posts by keyword, via Treg's real LinkedIn API "
-            "proxy (a real ~$0.002 call against the village's Treg balance). Use this for a real, "
+            "proxy (a real ~$0.002 call against the think tank's Treg balance). Use this for a real, "
             "current view of what is actually being posted about a topic -- never invent a "
             "plausible-sounding LinkedIn post."
         ),
@@ -2370,7 +2370,7 @@ def _make_treg_tools_executor():
 
 # Real character-sprite generation (2026-09-26), per your explicit request
 # to wire up the remaining documented-but-unused APIs. Follows the SAME
-# call shape as the village's own already-tested spike script
+# call shape as the think tank's own already-tested spike script
 # (scripts/pixellab_spike.py), not a fresh guess at the public API. Real
 # cost tracked via a before/after balance delta (PixelLab has no per-call
 # price list the way Treg's catalog does -- see _pixellab_account_balance's
@@ -2383,8 +2383,8 @@ _PIXELLAB_CHARACTER_TOOL = {
         'name': 'generate_pixel_character',
         'description': (
             "Generate a real 4-direction pixel-art game character sprite from a text description, "
-            "via the village's real PixelLab account. This is a real, metered generation (billed "
-            "against the village's PixelLab balance or subscription allotment) and can take up to "
+            "via the think tank's real PixelLab account. This is a real, metered generation (billed "
+            "against the think tank's PixelLab balance or subscription allotment) and can take up to "
             "~90 real seconds -- only call this when the investigation genuinely needs a real "
             "generated sprite, not a description of what one might look like."
         ),
@@ -2454,7 +2454,7 @@ _GOOGLE_SHEETS_READ_TOOL = {
     'function': {
         'name': 'read_google_sheet',
         'description': (
-            "Read a real range of cells from a real Google Sheet, via the village's own Google "
+            "Read a real range of cells from a real Google Sheet, via the think tank's own Google "
             "account. Use this to check real, current spreadsheet data -- never invent plausible-"
             "looking cell values."
         ),
@@ -2474,7 +2474,7 @@ _GOOGLE_SHEETS_APPEND_TOOL = {
     'function': {
         'name': 'append_google_sheet_row',
         'description': (
-            "Append one real row to a real Google Sheet, via the village's own Google account. "
+            "Append one real row to a real Google Sheet, via the think tank's own Google account. "
             "Use this sparingly (occasional syncs, not a high-frequency loop) -- e.g. adding a "
             "finding to a shared roadmap sheet."
         ),
@@ -2495,7 +2495,7 @@ _GOOGLE_CALENDAR_LIST_TOOL = {
     'function': {
         'name': 'list_calendar_events',
         'description': (
-            "List real, real upcoming events on the village's own Google Calendar. Use this to "
+            "List real, real upcoming events on the think tank's own Google Calendar. Use this to "
             "check what's actually scheduled -- never invent a plausible-sounding event."
         ),
         'parameters': {
@@ -2513,7 +2513,7 @@ _GOOGLE_CALENDAR_CREATE_TOOL = {
     'function': {
         'name': 'create_calendar_event',
         'description': (
-            "Create one real event on the village's own Google Calendar -- e.g. for a real "
+            "Create one real event on the think tank's own Google Calendar -- e.g. for a real "
             "ceremony. Use this sparingly (a handful of real events, not a high-frequency loop)."
         ),
         'parameters': {
@@ -2583,7 +2583,7 @@ def _make_google_tools_executor():
     return execute_tool
 
 
-# GitHub read tools (2026-09-28), per the player's call: the village is an
+# GitHub read tools (2026-09-28), per the player's call: the think tank is an
 # engineering org that already PUBLISHES to GitHub, but had no READ access --
 # it could push real code yet could never ground its engineering work in real
 # repos/issues/PRs (it would hallucinate plausible-looking ones instead). These
@@ -2802,7 +2802,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     budget = task.get('budgetMs')
     # Real request (2026-09-26): the player asked whether they'd ever hear
     # about a spike finishing, on either channel -- they wouldn't have; the
-    # village was reactive-only. notifyPlayer is the (safe, indirect --
+    # think tank was reactive-only. notifyPlayer is the (safe, indirect --
     # _apply_content_result actually queues it) way any executor asks to be
     # notified on completion, success or failure alike, so silence never
     # reads as "still working" when it already gave up.
@@ -2818,7 +2818,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         _sim_module._store_content_result(task.get('id'), {
             'note': f'Spiked "{backlog}", but no model tier is configured yet.', 'ok': False,
             'notifyPlayer': {'kind': 'spike_done',
-                             'subject': f'[AI Village] Spike stalled: {backlog[:80]}',
+                             'subject': f'[AI Think Tank] Spike stalled: {backlog[:80]}',
                              'body': f'{name} tried to spike "{backlog}" but no model tier is configured yet -- nothing was actually attempted.'},
         })
         return
@@ -2844,7 +2844,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             'list of items (a directory, a catalog), include a step to sample a few individual item '
             'pages, not just the top-level listing.\n\n'
             'INTERNAL PRIOR ART -- if this question is about reviewing, comparing against, or '
-            'building on work already done inside this village (another team\'s finished story, an '
+            'building on work already done inside this think tank (another team\'s finished story, an '
             'earlier spike, prior research), the FIRST item must instead be a search_library query '
             '(not search_web) -- read what was actually done internally before looking externally, '
             'and follow a promising hit with read_library_file for the full content. If '
@@ -2894,7 +2894,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         'actual current content of a specific website or any other live/current fact you do not '
         'already know for certain, you MUST use the search_web/browse_page tools to actually look it '
         'up before answering. If the question is about reviewing or building on work another team '
-        'inside this village already did, use search_library/read_library_file to actually read '
+        'inside this think tank already did, use search_library/read_library_file to actually read '
         'their real findings first -- never describe another team\'s work from a guess; if '
         'search_library turns up nothing, say plainly that no internal record was found. Never '
         'invent specifics (numbers, names, sources, quotes) you did not '
@@ -2912,7 +2912,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         + ("If a plan step or the question genuinely needs real computation this machine cannot do "
             "-- CUDA/GPU work, a fine-tuning experiment, a heavy numeric job -- use run_on_colab to "
             "run complete Python on a real Colab GPU and read its output, rather than skipping it or "
-            "claiming the village can't do it. It is a metered cost against the village's Colab "
+            "claiming the think tank can't do it. It is a metered cost against the think tank's Colab "
             "compute budget shown in the Bank; the Colab here is the FREE tier, so keep runs small "
             "-- a run must finish within its own timeout, an idle session gets recycled, and GPU "
             "slots are not guaranteed. IT RUNS AS THE PLAYER'S IDENTITY: you must NEVER use it for "
@@ -3013,7 +3013,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # reliably followed in a real live run (see _spike_wants_internal_review's
     # own docstring for the exact incident). Checked before the search_web
     # default so an internal-review spike doesn't reach for the outside web
-    # before it has even looked at what the village already knows.
+    # before it has even looked at what the think tank already knows.
     #
     # Same fix, third application (2026-09-26): a real X-trending or
     # LinkedIn-search question needs its own specific tool forced first for
@@ -3047,7 +3047,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         _sim_module._store_content_result(task.get('id'), {
             'note': f'Spiked "{backlog}", but the investigation could not run (model call failed): {e}', 'ok': False,
             'notifyPlayer': {'kind': 'spike_done',
-                             'subject': f'[AI Village] Spike came up empty: {backlog[:80]}',
+                             'subject': f'[AI Think Tank] Spike came up empty: {backlog[:80]}',
                              'body': f'{name} tried to spike "{backlog}" but the model call failed: {e}'},
         })
         return
@@ -3061,7 +3061,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         _sim_module._store_content_result(task.get('id'), {
             'note': f'Spiked "{backlog}", but the model call returned nothing usable.', 'ok': False,
             'notifyPlayer': {'kind': 'spike_done',
-                             'subject': f'[AI Village] Spike came up empty: {backlog[:80]}',
+                             'subject': f'[AI Think Tank] Spike came up empty: {backlog[:80]}',
                              'body': f'{name} looked into "{backlog}" but the model call returned nothing usable. You may want to ask again or rephrase it.'},
         })
         return
@@ -3095,7 +3095,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         _sim_module._store_content_result(task.get('id'), {
             'note': f'Spiked "{backlog}", but the model call returned nothing usable.', 'ok': False,
             'notifyPlayer': {'kind': 'spike_done',
-                             'subject': f'[AI Village] Spike came up empty: {backlog[:80]}',
+                             'subject': f'[AI Think Tank] Spike came up empty: {backlog[:80]}',
                              'body': f'{name} looked into "{backlog}" but the model call returned nothing usable. You may want to ask again or rephrase it.'},
         })
         return
@@ -3154,7 +3154,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         # forward instead of a vague pointer.
         'libraryPath': library_path,
         'notifyPlayer': {'kind': 'spike_done',
-                         'subject': f'[AI Village] Spike done: {backlog[:80]}',
+                         'subject': f'[AI Think Tank] Spike done: {backlog[:80]}',
                          # 3600 (was 1500): a real list-style answer (e.g. "every
                          # source used") needs more room than a 2-4 sentence
                          # summary; kept under Telegram's 4096-char hard message

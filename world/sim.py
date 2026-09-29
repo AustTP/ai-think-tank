@@ -2,7 +2,7 @@
 #
 # Today the browser (index.html setInterval timers -> tasks.js) is the sole
 # writer of simulation state; the server is a passive store. Each phase of
-# this plan moves more of that engine server-side so the village runs even
+# this plan moves more of that engine server-side so the think tank runs even
 # with no browser open. This module is the foundation:
 #
 #   - `SimEngine.tick()` reads the authoritative kv_state blob and maintains a
@@ -861,7 +861,7 @@ def _reclaim_orphaned_walking_tasks(state):
             # with distill=False, letting it back into the peer-review gate
             # and re-triggering the identical infinite reject/re-fix loop
             # (live-caught again as task-236, ~35 duplicate "Distill recent
-            # village knowledge" queue entries). The comment above claiming
+            # think tank knowledge" queue entries). The comment above claiming
             # "the whitelist drops nothing assignment needs" was the same
             # false assumption both earlier instances of this bug shared.
             'distill': bool(task.get('distill')),
@@ -1074,7 +1074,7 @@ async def _sim_loop():
         except Exception as e:
             print(f'[sim] loop error: {e}', flush=True)
         # Drain any queued player emails OUTSIDE the tick (its own thread) so a
-        # slow SMTP round-trip never stalls the village tick. Best-effort -- the
+        # slow SMTP round-trip never stalls the think tank tick. Best-effort -- the
         # sender fail-closes and the drain clears the outbox regardless.
         try:
             await asyncio.to_thread(_drain_emails_from_db)
@@ -1117,14 +1117,14 @@ def _drain_emails_from_db():
 # assigned agents, nothing completed tasks. This section re-homes the LIFE-
 # CYCLE core -- queue consumption, deterministic assignment, arrive, complete,
 # off-duty -- into pure Python functions driven by a server loop, so the
-# village does tasks end-to-end with no browser.
+# think tank does tasks end-to-end with no browser.
 #
 # Scope discipline (confirmed with user): the per-room CONTENT executors
 # (runWorkroomTask/runResearchTask/runMediaDigestTask/...) are the NEXT slice.
 # Here, an arriving agent is marked working and, after a short simulated work
 # budget, completed -- a stub, replaced by real per-room execution later.
 # Assignment is DETERMINISTIC (round-robin over eligible candidates, zero JEV
-# spend), matching the "idle village spends nothing" ethos.
+# spend), matching the "idle think tank spends nothing" ethos.
 #
 # These are PURE / mutate-state: they take a `state` dict and return/log into
 # it, no DB, no serve import -- so they're unit-testable and run on a thread
@@ -1173,9 +1173,9 @@ def _team_under_cap(state, director_id, extra=0):
     return _team_member_count(state, director_id) + extra <= MAX_TEAM_MEMBERS
 SKILL_REVIEW_CADENCE_MS = 30 * 60 * 1000
 
-# Hive mind: how often the village distills recent archive findings into its
+# Hive mind: how often the think tank distills recent archive findings into its
 # wiki. Same cadence as skill-review -- a standing ceremony that runs only when
-# the village actually has work (the idle gate), costing ~1 mid-tier call each.
+# the think tank actually has work (the idle gate), costing ~1 mid-tier call each.
 DISTILL_CADENCE_MS = 30 * 60 * 1000
 
 # An EXPLICIT "this ceremony is never due" marker. Cadence stamps historically
@@ -1227,9 +1227,9 @@ FIRING_REVIEW_DURATION_MS = 10000  # deferral between start + resolution
 ONBOARD_MEET_DURATION_MS = 10000
 # Stage-3 readiness hold: onboarding stays open until the new hire has actually
 # claimed a real co-work task (a task HE holds, matching their helpFor overflow).
-# An idle/empty village (workQueue drained) will never assign one, so the hold is
+# An idle/empty think tank (workQueue drained) will never assign one, so the hold is
 # capped -- after this much wall-time the hire is finalized anyway rather than
-# stranded in limbo. 9x the ceremony; live villages observe readiness long before,
+# stranded in limbo. 9x the ceremony; live think tanks observe readiness long before,
 # offline/empty ones stop lingering within a bounded, testable window.
 ONBOARD_READINESS_TIMEOUT_MS = 15 * 60 * 1000
 
@@ -1282,7 +1282,7 @@ ESCALATION_MAX_OPEN = 3                 # cap concurrent escalations per owning 
 # turns the signal off entirely (opt-in per deployment).
 WORK_REQUEST_ROOM_THIN = 1
 # Hard cap of filed-but-not-yet-groomed requests in a single ceremony, so a
-# churny village can't convene a backlog-refinement meeting over a runaway list.
+# churny think tank can't convene a backlog-refinement meeting over a runaway list.
 REFINEMENT_MAX_REQUESTS = 20
 # SM-committed `blocked` FIELD on issues (2026-09-24). The scrum master is the
 # single authority who flips issue['blocked']; the judgment ALWAYS happened
@@ -1604,7 +1604,7 @@ def queue_work(state, items):
             'taskType': item.get('taskType') or 'code',
             'skillReview': bool(item.get('skillReview')),
             # Hive mind: a distillation content-task that merges recent archive
-            # findings into the village wiki (see _check_schedules's distill sweep).
+            # findings into the think tank wiki (see _check_schedules's distill sweep).
             'distill': bool(item.get('distill')),
             'distillSince': item.get('distillSince') or 0,
             # Phase E2b: a SPIKE's work-cycle time budget (ms). A spike has no
@@ -1622,13 +1622,13 @@ def queue_work(state, items):
             'directRoute': bool(item.get('directRoute')),
             # Real gap found 2026-09-25: filing a story against a specific
             # team never meant it would be WORKED by that team -- assignment
-            # (_assign_due_item) is village-wide round robin with zero team
+            # (_assign_due_item) is think tank-wide round robin with zero team
             # awareness, only reviewer selection (_pick_reviewer_ids) ever
             # preferred same-team. teamId is the director id owning this item
             # (the queue-item-level analog of a backlogRequest's teamId), used
             # by _assign_due_item to PREFER that team the same soft way
             # _pick_reviewer_ids already does -- never a hard lock like an
-            # incident's on-call pin, since a small village can't afford to
+            # incident's on-call pin, since a small think tank can't afford to
             # starve one team's queue while another sits idle.
             'teamId': item.get('teamId') or None,
             'sprintId': item.get('sprintId') or None,
@@ -1675,8 +1675,8 @@ def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructi
         'taskType': 'spike',
         'budgetMs': budget_ms or 60_000,
     }])
-def village_has_work(state, now_ms):
-    """Port of tasks.js villageHasWork: a due queue item, or any agent currently
+def think_tank_has_work(state, now_ms):
+    """Port of tasks.js thinkTankHasWork: a due queue item, or any agent currently
     task/handoff/pair/busy."""
     work_queue = state.get('workQueue') or []
     if any(is_work_item_due(item, now_ms) for item in work_queue):
@@ -2125,7 +2125,7 @@ WIKI_CATEGORY_ROOMS = {  # default category -> room affinity for read-before-act
     'workroom': 'pressoffice',
     'research': 'observatory',
     'ops': 'bank',
-    'village': None,
+    'think_tank': None,
     'product': None,
 }
 
@@ -2166,7 +2166,7 @@ def wiki_write_page(state, page_id, title, category, body, edited_by,
 
 def _page_room_affinity(state, page):
     """A task room matches a page's category via the default affinity map
-    (overridable per-category in state), else the page is village/product-wide."""
+    (overridable per-category in state), else the page is think tank/product-wide."""
     cat = (page or {}).get('category')
     mapping = (state.get('wiki') or {}).get('categoryRooms') or WIKI_CATEGORY_ROOMS
     return mapping.get(cat)
@@ -2174,7 +2174,7 @@ def _page_room_affinity(state, page):
 
 def wiki_read_pages(state, room, max_pages=3):
     """Pure: the subset of wiki pages relevant to a task in `room`, chosen by
-    category-room affinity. Only pages affined to THIS room or to the village as
+    category-room affinity. Only pages affined to THIS room or to the think tank as
     a whole (a None affinity) are injected -- a page affined to a DIFFERENT room
     is never pulled in; "read before acting" means reading the pages about the
     work you're about to do, not a random archive. Returns metadata-only records
@@ -2186,14 +2186,14 @@ def wiki_read_pages(state, room, max_pages=3):
         affinity = _page_room_affinity(state, rec)
         if affinity != room and affinity is not None:
             continue  # affined to another room -> irrelevant here
-        score = 0 if affinity == room else 1  # exact room beats village-wide
+        score = 0 if affinity == room else 1  # exact room beats think tank-wide
         scored.append((score, -(int(rec.get('editedAt') or 0)), page_id, rec))
     scored.sort()
     return [r for _s, _a, _pid, r in scored[:max_pages]]
 
 
 def inject_wiki_context(state, task):
-    """Pure: build the 'before you act, here's what the village knows' context
+    """Pure: build the 'before you act, here's what the think tank knows' context
     block for a task, from the wiki pages for its room. Returns a non-empty
     string only when there ARE relevant pages; empty when the wiki has none
     (caller still runs the executor with a blank context)."""
@@ -2207,7 +2207,7 @@ def inject_wiki_context(state, task):
         pages = wiki_read_pages(state, room)
     if not pages:
         return ''
-    lines = ['The village knowledge base has these entries relevant to this work:' , '']
+    lines = ['The think tank knowledge base has these entries relevant to this work:' , '']
     for rec in pages:
         lines.append(f"- {rec.get('title')} (category: {rec.get('category')}, v{rec.get('version')})")
     return '\n'.join(lines) + '\n'
@@ -2295,7 +2295,7 @@ def appear_from_outskirts(state, agent_id, doors=None, grid=None):
     """Wake an off-duty agent ANYWHERE there's free, reachable space. An agent
     waking up appears at a random free outdoor spot reachable from SPAWN
     (pick_free_spot's reachability guarantee) -- the outskirts trailhead doors
-    are gone, so she rests/wakes in the main village. `doors` is retained for
+    are gone, so she rests/wakes in the main think tank. `doors` is retained for
     call-compat (`_spawn_at_room_door` still prefers a room door for short
     reviewer walks); `grid` may be supplied or loaded lazily."""
     a = (state.get('agents') or {}).get(agent_id)
@@ -2326,7 +2326,7 @@ def _spawn_at_room_door(state, agent_id, room, agents, grid, doors):
     """Wake an off-duty agent (a gate reviewer) at the APPROACH of the target
     room's door, standing clear of the building edge -- the same spot assign_task
     walks an assigned agent to. Using the room's own door keeps the reviewer's
-    walk short and reliable regardless of the village's reachability gaps. Falls
+    walk short and reliable regardless of the think tank's reachability gaps. Falls
     back to appear_from_outskirts if the room has no door geometry."""
     a = (state.get('agents') or {}).get(agent_id)
     if not a:
@@ -2690,7 +2690,7 @@ def _check_schedules(state, now, now_ms):
         }])
     # Hive-mind distillation sweep. Same shape as the skill-review sweep: stamp
     # the marker BEFORE assignment (a due run mustn't be re-picked) and let the
-    # task-cycle's idle gate decide whether the village is even working right
+    # task-cycle's idle gate decide whether the think tank is even working right
     # now (no spend when idle). `since` is the previous run's stamp, so the
     # executor only folds in findings archived after the last distillation.
     # Also content-gated: due + nothing new since the last pass -> quiet, marker
@@ -2703,10 +2703,10 @@ def _check_schedules(state, now, now_ms):
         if _distill_has_new_archives(previous_distill_at):
             state['lastDistillAt'] = now_ms
             queue_work(state, [{
-                'title': 'Distill recent village knowledge',
+                'title': 'Distill recent think tank knowledge',
                 'room': 'observatory',
                 'instructions': ('Merge the findings archived since the last distillation into the '
-                                 'village wiki, removing redundancy and extracting what the village '
+                                 'think tank wiki, removing redundancy and extracting what the think tank '
                                  'now knows as a body.'),
                 'distill': True,
                 'distillSince': previous_distill_at,
@@ -2731,7 +2731,7 @@ def _check_schedules(state, now, now_ms):
 # hire for, who to fire -- silently died. This section re-homes them into a
 # single cadence pass, `_governance_pass`, folded into the SAME read-modify-
 # write as _task_cycle (called from _task_cycle, so it inherits the server-
-# owner gate, the village_has_work idle gate, and the process's single pass).
+# owner gate, the think_tank_has_work idle gate, and the process's single pass).
 # Pure state mutation only; the Jev decision is resolved through an injectable
 # `_governance_decider` so sim.py stays unit-testable with zero network.
 # ---------------------------------------------------------------------------
@@ -2962,7 +2962,7 @@ def _fire_decision(state, reviewers, candidate_def, now_ms, decider=None):
                     f'already been notified of these reports. People consulted who have worked with or reported '
                     f'{candidate.get("name")}: {consultant_line}. Decide whether to fire them or keep them on.')
     candidates = [
-        {'id': 'fire', 'description': f"End {candidate.get('name')}'s role in the village -- performance does not justify keeping them on, and the people who work with them don't outweigh the evidence."},
+        {'id': 'fire', 'description': f"End {candidate.get('name')}'s role in the think tank -- performance does not justify keeping them on, and the people who work with them don't outweigh the evidence."},
         {'id': 'keep', 'description': f"Keep {candidate.get('name')} on -- performance is acceptable, improving, or the evidence or the people who work with them don't support firing."},
     ]
     decision = (decider(state, instructions, candidates) if decider
@@ -3190,7 +3190,7 @@ def _sim_notify_author(state, parent, reviewer_id):
 
 def _peer_gate_should_close(gate, now_ms, entered_ms):
     """Close rule: two distinct clean approvals, OR -- after the review-timeout
-    window has elapsed -- a single clean approval. Guards against a small village
+    window has elapsed -- a single clean approval. Guards against a small think tank
     deadlocking on a second unreachable approver."""
     if gate['approvals'] >= 2:
         return True
@@ -3341,7 +3341,7 @@ def _sweep_stuck_gates(state, now_ms):
             if _gate_reviewer_reachable(state, d.get('id'), gate, now_ms):
                 fresh.append(d.get('id'))
         if not fresh:
-            continue  # genuinely nobody left (author-only village) -- nothing to do
+            continue  # genuinely nobody left (author-only think tank) -- nothing to do
         # Re-pin the still-queued review subtasks to the fresh reviewers, and re-
         # pin any already-assigned reviewer; then record the gate as rescued.
         repl = iter(fresh)
@@ -3420,7 +3420,7 @@ def _close_gated_story(state, parent):
     # indirection content executors need) since this already runs inside the
     # tick's real read-modify-write with live, mutable `state` in hand.
     title = parent.get('title') or parent.get('projectLabel') or 'a story'
-    _queue_player_email(state, 'story_done', f'[AI Village] Shipped: {title[:80]}',
+    _queue_player_email(state, 'story_done', f'[AI Think Tank] Shipped: {title[:80]}',
                         f'"{title}" just landed after {review_counts.get("approvals", 0)} peer approval(s).')
     return True
 
@@ -3463,7 +3463,7 @@ def _team_member_candidates(state, director_id, member_ids, now_ms):
 def _free_outdoor_spot(state, grid, rnd=random.random):
     """Place a new hire on foot. Mirrors the JS finishHire: a free outdoor spot
     (pick_free_spot, reachable from SPAWN). The outskirts trailhead doors are
-    gone, so a new hire simply appears at a free village spot."""
+    gone, so a new hire simply appears at a free think tank spot."""
     agents = (state.get('agents') or {})
     occupied = [{'x': a.get('x'), 'y': a.get('y')} for a in agents.values() if a.get('visible')]
     spot = pick_free_spot(grid, avoid_points=occupied, rnd=rnd)
@@ -3582,7 +3582,7 @@ def _complete_auto_hire(state, pending, grid, now_ms):
         'instructions': [
             f"Report to {pending['helpForName']} -- pick up whatever they flag as overloaded.",
             f"Your director is {pending['adminName']}; your work lands in the {director_id} team's shared space.",
-            "Hired via Command Center -- elevated access is scoped to what you're helping with, not village-wide.",
+            "Hired via Command Center -- elevated access is scoped to what you're helping with, not think tank-wide.",
         ],
         'notes': [f"Hired by {pending['adminName']} (director of the {director_id} team)."],
     }
@@ -3657,7 +3657,7 @@ def _next_hire_name(state):
 
 
 # Larger pool for spawning a BRAND-NEW team's director + members (2026-09-27).
-# Distinct from _next_hire_name's small assistant pool so a village whose hire
+# Distinct from _next_hire_name's small assistant pool so a think tank whose hire
 # pool is exhausted can still spin up a new team for an incoming large request.
 _NEW_TEAM_NAME_POOL = [
     'aria', 'briar', 'cairo', 'dune', 'elio', 'fawn', 'gull', 'hale',
@@ -3689,7 +3689,7 @@ def _spawn_team_agent(state, name, role, director_id, now_ms, grid, is_director=
     color_pool = HIRE_COLOR_POOL
     color = color_pool[random.randrange(len(color_pool))]
     profile = {
-        'mission': f"Part of the {director_id} team, taking on the village's newest large request.",
+        'mission': f"Part of the {director_id} team, taking on the think tank's newest large request.",
         'instructions': [
             f"Report to {director_id}; your work lands in the {director_id} team's shared space.",
             "You were brought in when every existing team was busy in a sprint -- your team owns the incoming large request.",
@@ -3826,7 +3826,7 @@ def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employee
 #   2 -> director has shared the concrete work to pick up.
 #   3 -> readiness hold: onboarding is NOT done until the hire has actually
 #        claimed a real task (observed), or a generous wall-time timeout elapses
-#        so an idle/empty village never strands a hire unfinalized.
+#        so an idle/empty think tank never strands a hire unfinalized.
 #   done -> profile['onboarding'] removed; AGENTS.md finalized on next sync.
 _ONBOARD_STAGES = (1, 2, 3)
 
@@ -3922,7 +3922,7 @@ def _complete_onboarding(state, onboard, reason):
     """Finalize a hire: drop the `onboarding` marker + the pending record so the
     next sync_agent_directories writes AGENTS.md. `reason` is logged on the
     governance log ('claimed' when the hire proved readiness with a real task,
-    'timeout' when an idle/empty village hit the readiness cap)."""
+    'timeout' when an idle/empty think tank hit the readiness cap)."""
     agents = state.get('agents') or {}
     profile = (agents.get(onboard.get('agentId')) or {}).get('profile') or {}
     profile.pop('onboarding', None)
@@ -3986,7 +3986,7 @@ def _resolve_onboard_meeting(state, onboard, now_ms):
         if held:
             _complete_onboarding(state, onboard, 'claimed')
         elif elapsed >= ONBOARD_READINESS_TIMEOUT_MS:
-            # No task appeared in time -- idle/empty village. Finalize anyway so
+            # No task appeared in time -- idle/empty think tank. Finalize anyway so
             # the hire isn't stranded; they'll take upstream work as it arrives.
             _complete_onboarding(state, onboard, 'timeout')
         else:
@@ -4028,7 +4028,7 @@ def _resolve_onboard_meeting(state, onboard, now_ms):
 #     eligibility is measured event-to-event.
 #
 # Runs UNGATED (from _task_cycle, not _governance_pass) because the conversation
-# is the point even on an otherwise-idle village.
+# is the point even on an otherwise-idle think tank.
 # ---------------------------------------------------------------------------
 def _social_decider_default(instructions, criteria):
     """Default Jev resolver for a single Knowledge Social 'what should I carry
@@ -4241,7 +4241,7 @@ def _resolve_social(state, pending, now_ms, decider=None):
 
 def _social_step(state, now, now_ms, decider=None):
     """One weekly-social pass, called from _task_cycle (ungated so it fires even
-    on an idle village). Schedules the next event on cadence; convenes eligible
+    on an idle think tank). Schedules the next event on cadence; convenes eligible
     present attendees when due; resolves when the 30 minutes elapse. `decider`
     injectable for tests (defaults to the Jev-backed _social_decider)."""
     pending = state.get('_pendingSocial')
@@ -4269,7 +4269,7 @@ def _social_step(state, now, now_ms, decider=None):
 # master with the filing agents at the Command Center, and at resolve the Jev
 # refinement decider grooms each request into a `queue_work` story (accept) or
 # back to the requester (reject). Runs ungated like the Social -- the ceremony
-# is the point even on a quiet village -- but no-ops when there are no pending
+# is the point even on a quiet think tank -- but no-ops when there are no pending
 # requests or no scrum master to run it, so we never convene an empty meeting.
 #
 # Human boundaries preserved: ceremony stories enter the workQueue tagged
@@ -4317,7 +4317,7 @@ def file_work_request(state, agent_id, title, room, reason=None):
 # `state['issueCounters']`, mirroring next_sprint_id/next_product_id so a cold
 # state starts at 1 and a hot one never collides. Filing an issue ALSO writes a
 # backlogRequests record tagged with its issueKey + teamId, routing it into the
-# owning team's scrum-master refinement ceremony (the village's proven path for
+# owning team's scrum-master refinement ceremony (the think tank's proven path for
 # turning a card into worked agent labor) -- it is not a dead ledger.
 # ---------------------------------------------------------------------------
 
@@ -4332,7 +4332,7 @@ ISSUE_TYPES = ('story', 'spike', 'bug', 'task')
 ISSUE_STATUSES = ('open', 'in_progress', 'done', 'closed')
 
 # Canonical Jira description blocks. A description, when supplied, must follow
-# one of the two templates the village understands:
+# one of the two templates the think tank understands:
 #   userStory          "As a <role>, I want to <action>, so that <value>"
 #   acceptanceCriteria "Given <context>, When <event>, Then <outcome>"
 _STORY_PARTICLES = ('as a', 'i want to', 'so that')
@@ -4433,7 +4433,7 @@ def _normalize_description(description):
     """A description dict {userStory, acceptanceCriteria} or a plain string is
     split into the two canonical description blocks. Returns
     (userStory, acceptanceCriteria) -- each normalized to its template, or None
-    when absent/malformed. The village understands exactly two Jira description
+    when absent/malformed. The think tank understands exactly two Jira description
     shapes: the user story ("As a..., I want to..., so that...") and the
     acceptance criteria ("Given..., When..., Then...")."""
     if isinstance(description, dict):
@@ -4470,7 +4470,7 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
     description/criteria; defaults to `summary` when omitted.
     Pure: mutates state['issues'], state['issueCounters'], and appends a
     backlogRequests record (tagged issueKey + teamId) so the owning scrum
-    master can groom the card into a sprint -- the village does the work."""
+    master can groom the card into a sprint -- the think tank does the work."""
     team_id = (team_id or '').strip() if isinstance(team_id, str) else team_id
     issue_type = (issue_type or '').strip().lower()
     summary = (summary or '').strip()
@@ -4736,7 +4736,7 @@ def _queue_player_email(state, kind, subject, body_text, now_ms=None):
 def _drain_email_outbox_sync(state):
     """Best-effort synchronous send of every queued player notification on
     this state's outbox, on BOTH channels (2026-09-26: was email-only --
-    the village had no proactive push at all before this, only a reactive
+    the think tank had no proactive push at all before this, only a reactive
     reply when the player texted in first). Clears the outbox regardless so
     a permanent SMTP/Telegram failure doesn't wedge the queue. Calls into
     serve lazily (side-effect), returns a list of (kind, emailOk, telegramOk)
@@ -4784,11 +4784,11 @@ def _deliver_player_ask(state, issue_key, agent_id, question, context):
     # Real-email: tell the player an agent is waiting on their answer.
     _queue_player_email(
         state, 'agent_ask',
-        f"[AI Village] {agent_id} has a question for you on {issue_key}",
+        f"[AI Think Tank] {agent_id} has a question for you on {issue_key}",
         (f"{agent_id} is waiting on your answer for {issue_key} "
          f"({issue.get('title') or issue.get('summary') or 'unknown story'}):\n\n"
          f"{question}\n\n"
-         f"Reply in the village player-inbox to unblock them."),
+         f"Reply in the think tank player-inbox to unblock them."),
         now_ms=now_ms)
     _block_agent_for_input(state, agent_id, issue_key, now_ms)
     return mid
@@ -5088,12 +5088,12 @@ def _block_step(state, now, now_ms):
             # Real-email: tell the player a story/spike they care about is blocked.
             _queue_player_email(
                 state, 'card_blocked',
-                f"[AI Village] {c['issueKey']} is blocked",
+                f"[AI Think Tank] {c['issueKey']} is blocked",
                 (f"{c['issueKey']} ({issue.get('title') or issue.get('summary') or 'unknown story'}) "
                  f"is blocked: {issue.get('blockedKind') or 'blocked'}.\n"
                  f"- Agent: {c.get('requesterId') or 'unknown'}\n"
                  f"- Reason: {c.get('reason') or 'no reason given'}\n"
-                 f"Take a look in the village issue register if this needs your input."),
+                 f"Take a look in the think tank issue register if this needs your input."),
                 now_ms=now_ms)
             # Store the block's provenance so a review detail can explain WHY the
             # card is blocked. `stuck_on_agent` also carries the dependency task id
@@ -5369,7 +5369,7 @@ def _room_backlog_count(state, room):
     return queued + in_flight
 
 
-# Absolute Zero scoping guidance (2026-09-28): when the village proposes its
+# Absolute Zero scoping guidance (2026-09-28): when the think tank proposes its
 # OWN next work (an agent filing a follow-up, and the grooming ceremony deciding
 # whether to accept it), the default failure mode is proposing TRIVIAL work --
 # cards easy to write and worth nothing. Guidance steers every self-proposed
@@ -5611,7 +5611,7 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
         if choice == 'reject':
             # Absolute Zero rejection signal: a self-proposed work-request was
             # groomed OUT. Durable, queryable (the health check counts these) --
-            # a rising reject rate is the village's own early warning that its
+            # a rising reject rate is the think tank's own early warning that its
             # proposals are trending trivial/ill-scoped.
             details['selfProposedRejected'] = True
         _log_governance(state, scrum_master_id, 'refinement_carryaway', details)
@@ -5668,7 +5668,7 @@ def kick_refinement_now(state, team_id, now_ms=None):
 
 def _refinement_step(state, now, now_ms, decider=None):
     """One backlog-refinement pass, called from _task_cycle ungated (each team's
-    ceremony is the point even on a quiet village). Per-team ceremonies now run
+    ceremony is the point even on a quiet think tank). Per-team ceremonies now run
     CONCURRENTLY (2026-09-27): each team has its OWN ceremony slot
     (`pendingRefinements[team_id]`), so one team no longer blocks another at the
     shared Command Center. A pass (a) advances every in-flight ceremony (embark
@@ -5962,7 +5962,7 @@ def _refocus_note_for(state, product_id):
     the sum of them may not still serve what the product was for). Returns
     None when there's no product record or no summary to anchor against, so
     this never fabricates a "why" that isn't actually on file.
-    2026-09-25: added after comparing this village's own accumulated review/
+    2026-09-25: added after comparing this think tank's own accumulated review/
     escalation machinery (see _CEREMONY_ACTIONS in serve.py) to a pattern
     seen elsewhere -- checking alignment against the stated goal specifically
     at the re-review moment, not on every fresh task, which would just be
@@ -6324,9 +6324,9 @@ def _governance_pass(state, now=None, now_ms=None, grid=None, decider=None):
         return state
     now = time.time() if now is None else now
     now_ms = int(now * 1000) if now_ms is None else now_ms
-    # Idle-quiet: both browser loops bailed early on !villageHasWork() and only
-    # made their Jev call after. Mirror that so an idle village spends nothing.
-    if not village_has_work(state, now_ms):
+    # Idle-quiet: both browser loops bailed early on !thinkTankHasWork() and only
+    # made their Jev call after. Mirror that so an idle think tank spends nothing.
+    if not think_tank_has_work(state, now_ms):
         return state
     decider = decider or _governance_decider
     if grid is None:
@@ -6473,7 +6473,7 @@ def _resolve_firing_review(state, pending, now_ms, decider=None):
 
 def _log_governance(state, agent_id, action, details):
     """Append to the durable state's activity log, the same place the browser's
-    logVillageAction wrote. No DB here -- state mutation only."""
+    logThinkTankAction wrote. No DB here -- state mutation only."""
     try:
         import serve
         serve.log_action(agent_id, action, details, authorized=True)
@@ -6557,32 +6557,32 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
 
     # 2026-09-23: reclaim a 'walking'/'working' task whose assignee no longer
     # holds it (the orphaned-fix wedge). Runs BEFORE the idle gate so a quiet
-    # village that simply has a stale in-flight task re-issues it rather than
-    # treating the village as done. Cheap: no-op unless such a task exists.
+    # think tank that simply has a stale in-flight task re-issues it rather than
+    # treating the think tank as done. Cheap: no-op unless such a task exists.
     _reclaim_orphaned_walking_tasks(state)
 
     # Weekly cross-team Knowledge Social: convene/resolve the 30-minute Hangout
     # conversation for eligible (week's-work) agents. Runs ungated -- the
-    # conversation is the point even on an otherwise-idle village, and must not
+    # conversation is the point even on an otherwise-idle think tank, and must not
     # be starved by the work gate below.
     _social_step(state, now, now_ms)
 
     # Backlog refinement: the scrum master grooms agent-filed work-requests into
     # real stories at the Command Center on a weekly cadence. Runs ungated like
-    # the Social (the ceremony is the point even on a quiet village) but no-ops
+    # the Social (the ceremony is the point even on a quiet think tank) but no-ops
     # when there are no pending requests or no scrum master to run it.
     _refinement_step(state, now, now_ms)
 
     # Cut 2 roadmap: weekly silent recompute of per-room priority from trailing
     # deliverable grades + delivery volume. Cheap (state-only, no ceremony, no
-    # Jev spend); runs before the gate so a quiet village still keeps its
+    # Jev spend); runs before the gate so a quiet think tank still keeps its
     # roadmap current for the next grooming.
     _roadmap_step(state, now_ms)
 
     # Cut 3 on-call escalation: advance an in-flight escalation ceremony, or
     # sweep open incident tasks past the restore window and hand the ones no
     # one could restore to the product team's scrum master. Ungated like its
-    # ceremony siblings -- an unrecovered outage is the point on an idle village.
+    # ceremony siblings -- an unrecovered outage is the point on an idle think tank.
     _escalation_step(state, now, now_ms)
 
     # SM-committed `blocked` field: the scrum master flips issue['blocked'] for
@@ -6622,7 +6622,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # to hand them. Nothing queued (or only not-yet-due work) + nobody active is
     # exactly the residue case: a woken-but-never-assigned agent lingers visible
     # with nothing to do, and the player just asked that only scheduled/active
-    # agents appear. Runs BEFORE the idle gate so a quiet village still re-parking
+    # agents appear. Runs BEFORE the idle gate so a quiet think tank still re-parking
     # its wanderers converges to zero visible idle sprites (assignment re-wakes
     # on demand, so this cannot deadlock the queue).
     if not work_queue:
@@ -6630,7 +6630,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     if not work_queue and not _any_agent_active(agents):
         # Nothing queued and nobody's mid-task: idle, don't even scan.
         return state
-    if not village_has_work(state, now_ms):
+    if not think_tank_has_work(state, now_ms):
         return state
 
     # Load geometry once per call for this pass (cheap; the movement tick has
@@ -6784,7 +6784,7 @@ def _park_idle_wanderers(state):
     ("unless he has scheduled work or is active, an agent should not appear"),
     park every fully-idle, on-duty, non-admin agent back off duty so it
     vanishes in place. Assignment still wakes it on demand, so this cannot
-    strand the village. Pure/mutating on `state`; no-op when nothing to park.
+    strand the think tank. Pure/mutating on `state`; no-op when nothing to park.
     Returns the number parked."""
     agents = state.get('agents')
     if not isinstance(agents, dict) or not agents:
@@ -6864,8 +6864,8 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # reviewer selection (_pick_reviewer_ids) ever preferred same-team.
         # SOFT preference only, same shape as that precedent: narrow to the
         # team's own free members when any exist, else fall back to the full
-        # village pool unchanged. Never a hard lock (unlike an incident's
-        # on-call pin) -- a small village can't afford to starve one team's
+        # think tank pool unchanged. Never a hard lock (unlike an incident's
+        # on-call pin) -- a small think tank can't afford to starve one team's
         # queue while another sits idle just because its own members are busy.
         team_id = pick.get('teamId')
         if team_id:

@@ -133,14 +133,14 @@ class SpikeContent(unittest.TestCase):
 
     def test_internal_review_question_forces_search_library_first(self):
         """Real gap caught LIVE (2026-09-26): a spike asked to "review the
-        village's own prior research on DreyX.com" went straight to
+        think tank's own prior research on DreyX.com" went straight to
         browse_page and reported "no existing records" despite 7+ real
         matching Library entries -- the PLAN prompt's own "search_library
         first" instruction was not reliably followed. Same fix as the
         earlier search_web gap: force the specific tool, don't just ask."""
         self._common_mocks(tavily=True)
         self._store()
-        task = {'id': 'spike-3', 'title': "Review the village's own prior research on X",
+        task = {'id': 'spike-3', 'title': "Review the think tank's own prior research on X",
                'budgetMs': 60000}
         with self._mock_loop('summary') as loop, \
              unittest.mock.patch.object(serve, '_call_openrouter_sync',
@@ -769,7 +769,7 @@ class LibraryReviewTools(unittest.TestCase):
         self.log_action.assert_called_once_with('cora', 'search_library', {'query': 'nonexistent thing', 'matches': 0}, authorized=True)
 
     def test_read_library_file_returns_real_content_and_records_a_trail_read(self):
-        tmp = tempfile.mkdtemp(prefix='village-lib-tool-')
+        tmp = tempfile.mkdtemp(prefix='think tank-lib-tool-')
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         with open(os.path.join(tmp, 'finding.md'), 'w') as f:
             f.write('Real findings from Team A.')
@@ -983,7 +983,7 @@ class SpikeTregWiring(unittest.TestCase):
 
 
 class PixellabCharacterTool(unittest.TestCase):
-    """generate_pixel_character: the SAME real call shape as the village's
+    """generate_pixel_character: the SAME real call shape as the think tank's
     own already-tested spike script (scripts/pixellab_spike.py), not a
     fresh guess -- create -> poll -> fetch -> real before/after balance
     delta as cost (PixelLab has no per-call price list the way Treg's
