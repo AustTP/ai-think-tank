@@ -2526,6 +2526,14 @@ async def _director_approval_loop():
 # reported-on in this window isn't re-reported until the next review.
 PEER_REVIEW_INTERVAL_S = 90
 PEER_REVIEW_MIN_LOOKBACK_S = 3600  # judge an hour of real activity, not 90 stray seconds
+# A worker already reported on WITHIN this window is not re-reported: the peer
+# review's job is to spread coverage across the roster, not hammer one worker.
+# Reports are never consumed (they feed morale + firing review), so a worker
+# only re-enters the pool after this window elapses (real gap caught live:
+# once every worker had a report, the old pool fell back to ALL candidates and
+# re-flagged the same lowest-real-work worker every PEER_REVIEW_INTERVAL_S --
+# ~560 reports about one idle worker in a night).
+PEER_REVIEW_REPORT_STALE_S = 6 * 3600
 
 
 def _peer_review_loop_pass():
@@ -2547,7 +2555,11 @@ def _peer_review_loop_pass():
     # Gather real activity from the action_log for every NON-director worker.
     now = time.time()
     cutoff = now - PEER_REVIEW_MIN_LOOKBACK_S  # action_log.ts is seconds (time.time())
-    existing_about = {r.get('aboutId') for r in reports}
+    # A worker counts as "already covered" only if a report about them was
+    # filed within the staleness window -- a stale report (long consumed by
+    # morale/firing or simply old) stops blocking a fresh review.
+    fresh_cutoff_ms = (now - PEER_REVIEW_REPORT_STALE_S) * 1000
+    existing_about = {r.get('aboutId') for r in reports if r.get('ts', 0) >= fresh_cutoff_ms}
     candidates = []
     for d in roster:
         aid = d.get('id')
@@ -2577,7 +2589,16 @@ def _peer_review_loop_pass():
     if not candidates:
         return 0
     # Pick the single most report-worthy worker via Jev, using REAL numbers.
-    cand_pool = [c for c in candidates if not c['already']] or candidates
+    # Dedup, not fallback: candidates already covered within the staleness
+    # window are excluded, and an ALL-covered pool files nothing. The old
+    # `or candidates` fallback was the live churn bug -- with reports never
+    # consumed 'already' honored no one, so the pool reverted to everyone and
+    # the deterministic lowest-real-work rule re-picked the SAME idle worker
+    # every 90 seconds forever. Staleness (not a fallback) is what lets a
+    # worker back into the pool for fresh review.
+    cand_pool = [c for c in candidates if not c['already']]
+    if not cand_pool:
+        return 0
     # Real gap caught live (2026-09-26): the criteria dict passed to Jev used
     # to be a single fixed key {'idx': 'The index of the worker to report
     # on'} -- the SAME bug class already found and fixed once for grading

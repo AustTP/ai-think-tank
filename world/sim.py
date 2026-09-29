@@ -1186,8 +1186,15 @@ DISTILL_CADENCE_MS = 30 * 60 * 1000
 # this named constant; see `_cadence_due`.
 CADENCE_NEVER = 9e18
 
+# Legacy far-future TEST-sentinel threshold (1e18 stamps leaked into live
+# state). Anything this far beyond now is treated as unset -- by _cadence_due
+# (a leaked sentinel must not mute a standing ceremony) and by the distill
+# content gate's `since` cutoff (a leaked sentinel must not gate the ceremony
+# out either). See _check_schedules.
+_CADENCE_LEGACY_FAR_FUTURE_MS = 10 * 365 * 24 * 3600 * 1000
 
-def _cadence_due(state, key, cadence_ms, now_ms=None, legacy_far_future_ms=10 * 365 * 24 * 3600 * 1000):
+
+def _cadence_due(state, key, cadence_ms, now_ms=None, legacy_far_future_ms=_CADENCE_LEGACY_FAR_FUTURE_MS):
     """Is a cadence ceremony (keyed by `key`) due? A stamp exactly equal to
     CADENCE_NEVER is INTENTIONALLY silent forever (explicit, not inferred). A
     legacy far-future stamp (the old 1e18 TEST macro that leaked into live
@@ -2601,10 +2608,58 @@ def record_device_checkin(state, fields, now_ms=None):
     return entry
 
 
+def _skill_review_has_pending():
+    """Content gate for the standing skill-review sweep: is anything actually
+    waiting under library/pending_review/skills/? Mirrors the executor's own
+    determinism (content.py `_run_skill_review_content` lists /api/library and
+    keeps paths whose first segment is pending_review/skills). When nothing is
+    waiting, the 30-minute ceremony must not queue a task -- picking an agent
+    and burning a Jev grade call against an empty queue is the waste this gate
+    closes. Traversal stays under pending_review/skills/ only (review-trace/,
+    the failed-review lessons, are included exactly as the executor includes
+    them)."""
+    import serve
+    pending_root = os.path.join(serve.LIBRARY_DIR, 'pending_review', 'skills')
+    if not os.path.isdir(pending_root):
+        return False
+    for _root, _dirs, filenames in os.walk(pending_root):
+        if any(fn for fn in filenames if not fn.startswith('.')):
+            return True
+    return False
+
+
+def _distill_has_new_archives(since_ms):
+    """Content gate for the standing distillation sweep: are there archive
+    findings newer than `since_ms`? Mirrors the executor's own archive scan
+    (content.py `_run_distill_content`: only plain files directly in
+    LIBRARY_ARCHIVE_DIR, strictly newer than the last distillation). Nothing
+    new since the last pass -> the ceremony stays quiet instead of re-picking
+    an agent to fold nothing in."""
+    import serve
+    archive_dir = serve.LIBRARY_ARCHIVE_DIR
+    if not os.path.isdir(archive_dir):
+        return False
+    try:
+        for fn in os.listdir(archive_dir):
+            full = os.path.join(archive_dir, fn)
+            if not os.path.isfile(full):
+                continue
+            if int(os.path.getmtime(full) * 1000) > since_ms:
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def _check_schedules(state, now, now_ms):
     """Port of tasks.js checkResearchSchedule + checkSkillReviewSchedule: queue
     due standing work, stamping lastRunAt/lastSkillReviewAt BEFORE assignment so
-    a due topic isn't re-picked. Mutates state['researchTopics'] in place."""
+    a due topic isn't re-picked. Mutates state['researchTopics'] in place.
+
+    The two standing ceremonies (skill review + distillation) are ALSO content-
+    gated: a due cadence only queues work when there is actually something to
+    review/merge. With no content the marker is deliberately NOT advanced, so
+    the sweep fires on the first later pass where content appears."""
     # Research topics.
     for topic in (state.get('researchTopics') or []):
         if now_ms - (topic.get('lastRunAt') or 0) < topic.get('cadenceMs', 0):
@@ -2621,8 +2676,11 @@ def _check_schedules(state, now, now_ms):
     # Skill review sweep. `_cadence_due` treats the explicit CADENCE_NEVER marker
     # as never-due and normalizes any legacy far-future TEST sentinel (1e18) that
     # leaked into live state, so the sweep can neither be muted by a real date nor
-    # disabled by a ghost of the old test macro.
-    if _cadence_due(state, 'lastSkillReviewAt', SKILL_REVIEW_CADENCE_MS, now_ms=now_ms):
+    # disabled by a ghost of the old test macro. Content-gated: nothing waiting in
+    # pending_review/skills/ -> no task queued and the marker NOT advanced (the
+    # sweep fires on a later pass the moment content appears).
+    if _cadence_due(state, 'lastSkillReviewAt', SKILL_REVIEW_CADENCE_MS, now_ms=now_ms) \
+            and _skill_review_has_pending():
         state['lastSkillReviewAt'] = now_ms
         queue_work(state, [{
             'title': 'Review pending skill files',
@@ -2635,18 +2693,24 @@ def _check_schedules(state, now, now_ms):
     # task-cycle's idle gate decide whether the village is even working right
     # now (no spend when idle). `since` is the previous run's stamp, so the
     # executor only folds in findings archived after the last distillation.
+    # Also content-gated: due + nothing new since the last pass -> quiet, marker
+    # kept (a leaked legacy 1e18 TEST sentinel is normalized to 0 so it doesn't
+    # poison the gate's comparison window and block the first real distillation).
     if _cadence_due(state, 'lastDistillAt', DISTILL_CADENCE_MS, now_ms=now_ms):
         previous_distill_at = state.get('lastDistillAt') or 0
-        state['lastDistillAt'] = now_ms
-        queue_work(state, [{
-            'title': 'Distill recent village knowledge',
-            'room': 'observatory',
-            'instructions': ('Merge the findings archived since the last distillation into the '
-                             'village wiki, removing redundancy and extracting what the village '
-                             'now knows as a body.'),
-            'distill': True,
-            'distillSince': previous_distill_at,
-        }])
+        if previous_distill_at - now_ms > _CADENCE_LEGACY_FAR_FUTURE_MS:
+            previous_distill_at = 0
+        if _distill_has_new_archives(previous_distill_at):
+            state['lastDistillAt'] = now_ms
+            queue_work(state, [{
+                'title': 'Distill recent village knowledge',
+                'room': 'observatory',
+                'instructions': ('Merge the findings archived since the last distillation into the '
+                                 'village wiki, removing redundancy and extracting what the village '
+                                 'now knows as a body.'),
+                'distill': True,
+                'distillSince': previous_distill_at,
+            }])
 
     # Director-gated player-ask / supervisor requirements-met sweeps. Unlike the
     # cadence markers above these run every _check_schedules pass: they spin a

@@ -23,6 +23,7 @@ Covered here:
    wiki write.
 """
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -58,7 +59,35 @@ def _distill_task(**over):
     return task
 
 
+def _seed_archive_file(archive_dir, name='finding.md', mtime_s=int(_NOW_MS / 1000) - 100):
+    os.makedirs(archive_dir, exist_ok=True)
+    p = os.path.join(archive_dir, name)
+    with open(p, 'w') as f:
+        f.write(f'{name} finding')
+    os.utime(p, (mtime_s, mtime_s))
+    return p
+
+
 class DistillCadenceSweep(unittest.TestCase):
+    # The distill sweep is content-gated: it fires only when archive files
+    # newer than the last distillation are actually waiting, so these cadence
+    # tests patch LIBRARY_DIR/ARCHIVE_DIR to a temp tree with one recent
+    # finding (hermetic -- no dependence on the live library on disk).
+    def setUp(self):
+        import serve as serve_mod
+        self._tmp = tempfile.mkdtemp()
+        self._archive = os.path.join(self._tmp, 'archive')
+        _seed_archive_file(self._archive)
+        self._patcher = mock.patch.multiple(
+            serve_mod,
+            LIBRARY_DIR=self._tmp,
+            LIBRARY_ARCHIVE_DIR=self._archive)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
     def test_queues_distill_when_due(self):
         state = _state()
         previous = _NOW_MS - sim.DISTILL_CADENCE_MS  # last run, now due
@@ -88,6 +117,49 @@ class DistillCadenceSweep(unittest.TestCase):
         kinds = {q.get('distill') for q in state['workQueue']}
         self.assertIn(True, kinds)
         self.assertEqual([q for q in state['workQueue'] if q.get('skillReview')], [])
+
+    def test_due_with_no_new_archives_stays_quiet_and_unstamped(self):
+        # Cadence due but no archive file newer than the last stamp -> the
+        # ceremony must not queue a task or advance the marker.
+        import serve as serve_mod
+        empty = os.path.join(self._tmp, 'empty-archive')
+        with mock.patch.object(serve_mod, 'LIBRARY_ARCHIVE_DIR', empty):
+            state = _state()
+            state['lastDistillAt'] = _NOW_MS - sim.DISTILL_CADENCE_MS
+            sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
+        self.assertEqual([q for q in state['workQueue'] if q.get('distill')], [],
+                         'an empty archive must not spawn a distillation task')
+        self.assertEqual(state['lastDistillAt'],
+                         _NOW_MS - sim.DISTILL_CADENCE_MS,
+                         'marker must NOT advance when there is nothing to merge')
+
+    def test_findings_appearing_later_fire_the_very_next_pass(self):
+        # No new findings on the first due pass -> quiet, unstamped. A finding
+        # appears; the next _check_schedules pass fires without a full cadence.
+        import serve as serve_mod
+        empty = os.path.join(self._tmp, 'empty-archive')
+        with mock.patch.object(serve_mod, 'LIBRARY_ARCHIVE_DIR', empty):
+            state = _state()
+            state['lastDistillAt'] = _NOW_MS - sim.DISTILL_CADENCE_MS
+            sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
+            self.assertEqual([q for q in state['workQueue'] if q.get('distill')], [])
+        _seed_archive_file(self._archive)
+        sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
+        self.assertEqual(len([q for q in state['workQueue'] if q.get('distill')]), 1,
+                         'findings arriving later must trigger the sweep promptly')
+
+    def test_leaked_distill_sentinel_still_fires_with_seeded_content(self):
+        # Self-heal parity with skill review: a leaked 1e18 distill stamp is
+        # normalized to unset, so the content gate compares against 0 and the
+        # loaded finding fires the first distillation.
+        state = _state()
+        state['lastDistillAt'] = 1_000_000_000_000_000_000
+        sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
+        distill = [q for q in state['workQueue'] if q.get('distill')]
+        self.assertEqual(len(distill), 1,
+                         'a leaked DISTILL sentinel must not gate the ceremony out')
+        self.assertEqual(distill[0]['distillSince'], 0,
+                         'sentinel normalized so the gate compares since the beginning')
 
 
 class DistillQueueWhitelist(unittest.TestCase):

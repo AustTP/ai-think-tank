@@ -365,6 +365,77 @@ class PeerReviewWorkerPickerTests(unittest.TestCase):
         self.assertEqual(len(reports), 1)
         self.assertEqual(reports[0]['aboutId'], 'ben')  # fallback: lowest real-work
 
+    def _seed_recent_report(self, about_id, ts_ms=None, severity='major'):
+        """Append a report about `about_id` to the stored state. ts_ms defaults
+        to 'now' (fresh inside the staleness window)."""
+        state = serve.get_state_from_db()
+        reports = state.get('reports') or []
+        reports.append({
+            'id': f'report-seed-{about_id}',
+            'aboutId': about_id,
+            'fromId': 'maya',
+            'quote': 'seeded for the dedup test',
+            'note': 'seeded',
+            'ts': int(time.time() * 1000) if ts_ms is None else ts_ms,
+            'severity': severity,
+        })
+        state['reports'] = reports
+        serve.save_state_to_db(state)
+
+    def test_does_not_re_report_a_worker_within_the_stale_window(self):
+        # Both workers covered by a FRESH report -> the loop files nothing and
+        # doesn't even call Jev. The old behavior fell back to the whole roster
+        # and re-flagged the same worker every cycle forever.
+        self._seed_roster_and_activity(time.time())
+        self._seed_recent_report('ada')
+        self._seed_recent_report('ben')
+        captured = {}
+        with unittest.mock.patch.object(
+                serve, '_call_openrouter_decision_sync',
+                side_effect=lambda *a, **k: captured.setdefault('called', True)):
+            n = serve._peer_review_loop_pass()
+        self.assertEqual(n, 0, 'an all-covered roster must not file another report')
+        self.assertNotIn('called', captured, 'no Jev call when no candidate is fresh')
+        saved = serve.get_state_from_db()
+        self.assertEqual(len(saved.get('reports') or []), 2)
+
+    def test_a_covered_worker_is_skipped_while_a_fresh_peer_is_flagged(self):
+        # ada already fresh-covered; ben is not -> the pool is ben ONLY
+        # (freshness-filtered, no `or candidates` fallback) and Jev flags him.
+        self._seed_roster_and_activity(time.time())
+        self._seed_recent_report('ada')
+
+        def fake_decision(model, state_arg, questions):
+            # Pool is exactly [ben]; a valid idx_0 answer must map to han... ben.
+            criteria = questions['choice']['criteria']
+            self.assertEqual(list(criteria), ['idx_0'])
+            return {'answers': {'choice': {'choice': 'idx_0', 'confidence': 0.9, 'probabilities': {}}},
+                   'usage': {'cost': 0.0}}
+
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync', side_effect=fake_decision):
+            serve._peer_review_loop_pass()
+        saved = serve.get_state_from_db()
+        reports = saved.get('reports') or []
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(reports[-1]['aboutId'], 'ben',
+                         'the fresh candidate, not the already-covered worker, gets the report')
+
+    def test_a_stale_report_allows_a_worker_back_into_the_pool(self):
+        # Both workers' only reports are OLDER than the staleness window, so
+        # both are fresh again and a new report may be filed.
+        self._seed_roster_and_activity(time.time())
+        stale_ms = int((time.time() - serve.PEER_REVIEW_REPORT_STALE_S - 60) * 1000)
+        self._seed_recent_report('ada', ts_ms=stale_ms)
+        self._seed_recent_report('ben', ts_ms=stale_ms)
+        with unittest.mock.patch.object(
+                serve, '_call_openrouter_decision_sync',
+                return_value={'answers': {'choice': {'choice': 'idx_0', 'confidence': 0.9, 'probabilities': {}}},
+                              'usage': {'cost': 0.0}}):
+            serve._peer_review_loop_pass()
+        saved = serve.get_state_from_db()
+        self.assertEqual(len(saved.get('reports') or []), 3,
+                         'staleness must let a worker back into the pool for a fresh review')
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

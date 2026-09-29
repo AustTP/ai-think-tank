@@ -12,8 +12,11 @@
    not permanently disable the standing skill-review sweep.
 """
 import os
+import shutil
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -129,7 +132,29 @@ class ReclaimOrphaned(unittest.TestCase):
         self.assertEqual(state['workQueue'], [])
 
 
+def _seed_pending_skill_file(library_dir, name='candidate.md', body='candidate reference material'):
+    pending = os.path.join(library_dir, 'pending_review', 'skills')
+    os.makedirs(pending, exist_ok=True)
+    with open(os.path.join(pending, name), 'w') as f:
+        f.write(body)
+    return pending
+
+
 class SkillReviewSentinel(unittest.TestCase):
+    # The sweep fires only when content is actually waiting, so these cadence-
+    # behavior tests patch LIBRARY_DIR to a temp tree with one pending file
+    # (hermetic -- no dependence on the live library on disk).
+    def setUp(self):
+        import serve as serve_mod
+        self._tmp = tempfile.mkdtemp()
+        _seed_pending_skill_file(self._tmp)
+        self._patcher = mock.patch.object(serve_mod, 'LIBRARY_DIR', self._tmp)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
     def test_leaked_test_sentinel_does_not_disable_standing_work(self):
         # A 1e18 (year ~33658) lastSkillReviewAt must be treated as unset so the
         # first skill review fires instead of never.
@@ -168,6 +193,64 @@ class SkillReviewSentinel(unittest.TestCase):
         sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
         self.assertEqual(len([q for q in state['workQueue'] if q.get('skillReview')]), 1,
                          'a far-future (non-never) stamp fires the first skill review')
+
+
+class SkillReviewContentGate(unittest.TestCase):
+    """The standing skill-review sweep is content-gated (2026-09-27): when the
+    cadence is due but nothing is waiting in pending_review/skills/, it must NOT
+    queue a task (no agent pick, no Jev grade call) and must NOT advance the
+    marker, so the sweep fires on the first later pass where content appears."""
+
+    def setUp(self):
+        import serve as serve_mod
+        self._tmp = tempfile.mkdtemp()
+        self._patcher = mock.patch.object(serve_mod, 'LIBRARY_DIR', self._tmp)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_due_with_no_pending_content_stays_quiet_and_unstamped(self):
+        state = _state()
+        state['lastSkillReviewAt'] = _NOW_MS - sim.SKILL_REVIEW_CADENCE_MS
+        sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
+        self.assertEqual([q for q in state['workQueue'] if q.get('skillReview')], [],
+                         'an empty pending queue must not spawn a review task')
+        self.assertEqual(state['lastSkillReviewAt'],
+                         _NOW_MS - sim.SKILL_REVIEW_CADENCE_MS,
+                         'marker must NOT advance when there is nothing to review')
+
+    def test_due_with_pending_content_queues_and_stamps(self):
+        _seed_pending_skill_file(self._tmp)
+        state = _state()
+        state['lastSkillReviewAt'] = _NOW_MS - sim.SKILL_REVIEW_CADENCE_MS
+        sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
+        queued = [q for q in state['workQueue'] if q.get('skillReview')]
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(state['lastSkillReviewAt'], _NOW_MS,
+                         'marker advances once real content is waiting')
+
+    def test_pending_file_appearing_later_fires_the_very_next_pass(self):
+        # No content on the first due pass -> quiet, unstamped. Content appears;
+        # the next _check_schedules pass fires without waiting a full cadence.
+        state = _state()
+        state['lastSkillReviewAt'] = _NOW_MS - sim.SKILL_REVIEW_CADENCE_MS
+        sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
+        self.assertEqual([q for q in state['workQueue'] if q.get('skillReview')], [])
+        _seed_pending_skill_file(self._tmp)
+        sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
+        self.assertEqual(len([q for q in state['workQueue'] if q.get('skillReview')]), 1,
+                         'content arriving later must trigger the sweep promptly')
+
+    def test_hidden_files_do_not_count_as_pending(self):
+        # Dotfiles are excluded by the /api/library listing the executor reads,
+        # so they must not trip the gate either.
+        _seed_pending_skill_file(self._tmp, name='.hidden.md')
+        state = _state()
+        state['lastSkillReviewAt'] = _NOW_MS - sim.SKILL_REVIEW_CADENCE_MS
+        sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
+        self.assertEqual([q for q in state['workQueue'] if q.get('skillReview')], [])
 
 
 if __name__ == '__main__':
