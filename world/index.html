@@ -25,8 +25,9 @@
     background: var(--bg);
     background-image: radial-gradient(1200px 800px at 50% -10%, #1a2430 0%, var(--bg) 60%);
     display: flex;
+    flex-direction: column;
     align-items: center;
-    justify-content: center;
+    justify-content: flex-start;
     font-family: var(--font-sans);
     color: var(--text);
     overflow: hidden;
@@ -37,14 +38,19 @@
     flex-direction: column;
     align-items: center;
     height: 100%;
-    padding: 76px 8px 8px 8px;
+    padding: 8px;
     box-sizing: border-box;
+  }
+  #stage {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
   }
   #viewport {
     position: relative;
     overflow: hidden;
     border: 1px solid var(--border);
-    border-radius: 10px;
+    border-radius: 0;
     background: #000;
     box-shadow: 0 10px 40px rgba(0, 0, 0, 0.45);
     flex: 0 0 auto;
@@ -190,7 +196,7 @@
   .roster-list { display: flex; flex-direction: column; gap: 4px; }
 
   #hudBar {
-    position: fixed; top: 0; left: 0; right: 0; height: 64px; z-index: 25;
+    position: relative; z-index: 25; height: 48px;
     background: linear-gradient(180deg, #151d28 0%, #10161f 100%);
     border-bottom: 1px solid var(--border);
     border-top: 2px solid var(--accent);
@@ -321,39 +327,35 @@
     .hud-brand { display: none; }
     .hud-pill { padding: 4px 9px; min-width: 44px; font-size: 10px; }
     .hud-pill .value { font-size: 12px; }
-    .hud-btn { padding: 7px 10px; font-size: 11px; }
+    .hud-btn { padding: 6px 9px; font-size: 11px; }
   }
 </style>
 </head>
 <body>
 <div id="wrap">
-  <div id="viewport">
-    <canvas id="game"></canvas>
-    <div id="zoom">
-      <button id="zoomIn" title="Zoom in">+</button>
-      <button id="zoomOut" title="Zoom out">&minus;</button>
-      <button id="zoomAll" class="showall" title="Show whole map">SHOW&nbsp;ALL</button>
+  <div id="stage">
+    <div id="hudBar">
+      <div class="hud-brand"><span class="hud-brand-title">AI THINK TANK</span><span class="hud-brand-sub">world</span></div>
+      <div class="hud-pill"><span class="label">RESEARCHERS</span><span class="value" id="hudResearchers">0</span></div>
+      <div class="hud-pill"><span class="label">WORKING</span><span class="value" id="hudWorking">0</span></div>
+      <div class="hud-pill"><span class="label">MORALE</span><span class="value" id="hudMorale">0</span></div>
+      <div class="hud-gap"></div>
+      <button class="hud-btn" id="hudCallMeetingBtn">Call Meeting</button>
+      <button class="hud-btn" id="hudCommandCenterBtn" title="Enter Control Room -- also where you can check on anyone using it">Command Center</button>
+      <button class="hud-btn" id="hudActivityBtn" title="Everything real that's happened, straight off the action log">Activity</button>
+      <button class="hud-btn" id="hudInboxBtn" title="Questions agents are blocked waiting on your answer for">Inbox<span id="hudInboxCount" class="inbox-count"></span></button>
+      <button class="hud-btn" id="hudPhoneBtn" title="Call anyone -- off duty or out of physical reach, mid-task">Phone Booth</button>
+      <button class="hud-btn" id="hudLogoutBtn" title="End your real login session">Log Out</button>
+    </div>
+    <div id="viewport">
+      <canvas id="game"></canvas>
+      <div id="zoom">
+        <button id="zoomIn" title="Zoom in">+</button>
+        <button id="zoomOut" title="Zoom out">&minus;</button>
+        <button id="zoomAll" class="showall" title="Show whole map">SHOW&nbsp;ALL</button>
+      </div>
     </div>
   </div>
-</div>
-
-<div id="hudBar">
-  <div class="hud-brand"><span class="hud-brand-title">AI THINK TANK</span><span class="hud-brand-sub">world</span></div>
-  <div class="hud-pill"><span class="label">RESEARCHERS</span><span class="value" id="hudResearchers">0</span></div>
-  <div class="hud-pill"><span class="label">WORKING</span><span class="value" id="hudWorking">0</span></div>
-  <div class="hud-pill" title="Tasks currently walking-to or working (tasks.js)"><span class="label">OPEN WORK</span><span class="value" id="hudOpenWork">0</span></div>
-  <div class="hud-pill"><span class="label">MORALE</span><span class="value" id="hudMorale">0</span></div>
-  <div class="hud-gap"></div>
-  <div class="hud-pill" title="Total unread across every agent's inbox -- open Post Office to read one"><span class="label">MAIL</span><span class="value" id="hudMail">0</span></div>
-  <div class="hud-pill" title="Filed reports (see any agent's profile)"><span class="label">REPORTS</span><span class="value" id="hudReports">0</span></div>
-  <button class="hud-btn" id="hudWhosWhoBtn">Who's Who</button>
-  <button class="hud-btn" id="hudLineUpBtn" disabled title="Not built yet">Line Up</button>
-  <button class="hud-btn" id="hudCallMeetingBtn">Call Meeting</button>
-  <button class="hud-btn" id="hudCommandCenterBtn" title="Enter Control Room -- also where you can check on anyone using it">Command Center</button>
-  <button class="hud-btn" id="hudActivityBtn" title="Everything real that's happened, straight off the action log">Activity</button>
-  <button class="hud-btn" id="hudInboxBtn" title="Questions agents are blocked waiting on your answer for">Inbox<span id="hudInboxCount" class="inbox-count"></span></button>
-  <button class="hud-btn" id="hudPhoneBtn" title="Call anyone -- off duty or out of physical reach, mid-task">Phone Booth</button>
-  <button class="hud-btn" id="hudLogoutBtn" title="End your real login session">Log Out</button>
 </div>
 
 <div id="phoneModal" class="modal hidden">
@@ -679,7 +681,7 @@
 <script src="templates.js?v=1"></script>
 <script src="sim_bridge.js?v=4"></script>
 <script>
-const VIEW_W = 960, VIEW_H = 680;
+const VIEW_W = 688, VIEW_H = 384;
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 canvas.width = VIEW_W;
@@ -687,13 +689,15 @@ canvas.height = VIEW_H;
 ctx.imageSmoothingEnabled = false;
 
 const viewport = document.getElementById('viewport');
+const stage = document.getElementById('stage');
+const HUD_H = 48;
 function fitViewport() {
   const ratio = VIEW_W / VIEW_H;
   const availW = window.innerWidth - 16;
-  const availH = window.innerHeight - 140;
+  const availH = window.innerHeight - HUD_H - 16;
   let w = availW, h = w / ratio;
   if (h > availH) { h = availH; w = h * ratio; }
-  viewport.style.width = w + 'px';
+  stage.style.width = w + 'px';
   viewport.style.height = h + 'px';
 }
 window.addEventListener('resize', fitViewport);
@@ -3224,7 +3228,6 @@ async function main() {
   document.getElementById('terminalInput').addEventListener('keydown', e => {
     if (e.key === 'Enter') handleTerminalSend();
   });
-  document.getElementById('hudWhosWhoBtn').addEventListener('click', openRosterList);
   document.getElementById('hudCallMeetingBtn').addEventListener('click', openMeetingUI);
   document.getElementById('hudCommandCenterBtn').addEventListener('click', () => enterRoom('commandcenter'));
   document.getElementById('hudActivityBtn').addEventListener('click', openActivity);
@@ -3263,9 +3266,6 @@ async function main() {
     document.getElementById('hudResearchers').textContent = activeAgentCount();
     document.getElementById('hudWorking').textContent = Object.values(AGENTS).filter(a => a.busy && a.visible).length;
     document.getElementById('hudMorale').textContent = thinkTankMorale();
-    document.getElementById('hudReports').textContent = REPORTS.length;
-    document.getElementById('hudMail').textContent = Object.values(AGENTS).reduce((sum, a) => sum + a.mailbox.filter(m => !m.read).length, 0);
-    document.getElementById('hudOpenWork').textContent = Object.values(TASKS).filter(t => t.status !== 'done').length;
   }
 
   function cameraFor(zoom, worldW, worldH, focusX, focusY) {
