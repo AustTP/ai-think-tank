@@ -899,6 +899,9 @@ class HealthChecks(unittest.TestCase):
             'ceremony_actions_last_24h': 0,
             'progress_actions_last_24h': 0,
             'ceremony_to_progress_ratio': None,
+            'ceremony_signal': 0.0,
+            'progress_signal': 0.0,
+            'ceremony_imbalance_score': 0.0,
         }
         base.update(overrides)
         return base
@@ -1071,36 +1074,139 @@ class HealthChecks(unittest.TestCase):
         self.assertEqual(alerts, [])
 
     def test_a_little_ceremony_with_no_progress_raises_nothing(self):
-        # Below the minimum-volume floor -- a quiet village with 2
+        # Below the minimum-volume floor -- a quiet village with a couple of
         # escalations and 0 releases isn't a coordination pathology, it's
-        # just quiet.
+        # just quiet. The imbalance score is only consulted once the decayed
+        # ceremony SIGNAL clears the floor.
         alerts = serve._health_alerts_for_signals(self._signals(
-            ceremony_actions_last_24h=2, progress_actions_last_24h=0, ceremony_to_progress_ratio=None,
+            ceremony_actions_last_24h=2, ceremony_signal=2.0, progress_actions_last_24h=0,
         ))
         self.assertEqual(alerts, [])
 
-    def test_heavy_ceremony_with_zero_shipped_work_raises_a_warning(self):
+    def test_fresh_ceremony_with_zero_shipped_work_raises_an_info_alert(self):
+        # 8 fresh ceremony actions vs 0 shipped: score log10(9) ~= 0.95 --
+        # clear of the INFO floor (0.5) but under the WARNING floor (1.0).
         alerts = serve._health_alerts_for_signals(self._signals(
-            ceremony_actions_last_24h=8, progress_actions_last_24h=0, ceremony_to_progress_ratio=None,
+            ceremony_actions_last_24h=8, ceremony_signal=8.0, progress_actions_last_24h=0,
         ))
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]['category'], 'coordination')
-        self.assertIn('8 review/escalation', alerts[0]['message'])
+        self.assertEqual(alerts[0]['severity'], 'info')
+        self.assertIn('imbalance', alerts[0]['message'])
 
-    def test_heavy_ceremony_well_above_shipped_work_raises_a_warning(self):
+    def test_the_sep26_restart_storm_shape_raises_a_warning(self):
+        # 79 fresh ceremony actions vs 3 shipped (the exact Sep 26 restart
+        # storm profile): score log10(80) - log10(4) ~= 1.30 -- WARNING.
         alerts = serve._health_alerts_for_signals(self._signals(
-            ceremony_actions_last_24h=15, progress_actions_last_24h=3, ceremony_to_progress_ratio=5.0,
+            ceremony_actions_last_24h=79, progress_actions_last_24h=3,
+            ceremony_signal=79.0, progress_signal=3.0,
         ))
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]['category'], 'coordination')
+        self.assertEqual(alerts[0]['severity'], 'warning')
+
+    def test_the_same_storm_three_days_stale_reads_quiet(self):
+        # The Sep 26 storm aged to 2026-09-29: 3 days = ~6 half-lives, every
+        # one of the 79 actions decayed ~64x => signal 1.2, under the 3.0
+        # floor. Nothing still in the last 24h's COUNT for the message. The
+        # old count-ratio would've screamed forever; the decayed scalar
+        # fades with its cause.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            ceremony_actions_last_24h=0, progress_actions_last_24h=0,
+            ceremony_signal=1.2, progress_signal=0.05,
+        ))
+        self.assertEqual(alerts, [])
 
     def test_heavy_ceremony_matched_by_real_progress_raises_nothing(self):
         # Lots of review activity is fine when shipped work keeps pace --
-        # the ratio, not the raw count, is the signal.
+        # the imbalance score (log10(13) - log10(11) ~= 0.07), not the raw
+        # count, is the signal.
         alerts = serve._health_alerts_for_signals(self._signals(
-            ceremony_actions_last_24h=12, progress_actions_last_24h=6, ceremony_to_progress_ratio=2.0,
+            ceremony_actions_last_24h=12, progress_actions_last_24h=6,
+            ceremony_signal=12.0, progress_signal=10.0,
         ))
         self.assertEqual(alerts, [])
+
+
+class CoordinationImbalanceScalar(unittest.TestCase):
+    """Direct tests of the Reddit-Hot-style decayed signals + imbalance score
+    (2026-09-29): the whole point of the scalar vs the old 24h COUNT ratio is
+    that a burst of ceremony is loud while FRESH and fades once it's stale --
+    the Sep 26 restart storm (79 escalations, 3 shipped, within an hour)
+    should have read loud on day 1 and gone quiet a few days later."""
+
+    NOW = 1_800_000_000.0  # pinned epoch for reproducible decay math
+
+    def test_fresh_events_sum_to_their_count(self):
+        self.assertEqual(serve._decayed_signal([self.NOW, self.NOW], self.NOW), 2.0)
+
+    def test_half_life_halves_the_weight(self):
+        one_half_life = serve._IMBALANCE_HALF_LIFE_S
+        fresh = serve._decayed_signal([self.NOW], self.NOW)
+        aged = serve._decayed_signal([self.NOW], self.NOW + one_half_life)
+        self.assertAlmostEqual(aged, fresh / 2, places=4)
+
+    def test_two_day_old_events_are_about_one_sixteenth_weight(self):
+        two_days = 2 * 86400
+        fresh = serve._decayed_signal([self.NOW], self.NOW)
+        aged = serve._decayed_signal([self.NOW], self.NOW + two_days)
+        self.assertAlmostEqual(aged / fresh, 1 / 16, places=3)
+
+    def test_events_beyond_the_horizon_are_excluded(self):
+        beyond = serve._IMBALANCE_HORIZON_S + 3600
+        self.assertEqual(serve._decayed_signal([self.NOW - beyond], self.NOW), 0.0)
+
+    def test_balanced_activity_scores_zero(self):
+        self.assertAlmostEqual(serve._imbalance_score(50.0, 50.0), 0.0, places=9)
+        self.assertAlmostEqual(serve._imbalance_score(0.0, 0.0), 0.0, places=9)
+
+    def test_scores_are_log_compressed_not_count_ratios(self):
+        # log10(80) - log10(4) ~= 1.30: a 26x count ratio reads as a single
+        # digit score, and the same RELATIVE imbalance at lower volume is
+        # smaller -- a 26x gap of 2-vs-0.08 events is noise.
+        self.assertAlmostEqual(serve._imbalance_score(79.0, 3.0), 1.30, places=2)
+        self.assertLess(serve._imbalance_score(2.0, 2.0 / 26), 0.5)
+
+    def test_decay_monotonically_lowers_the_score_toward_quiet(self):
+        # Two days of decay drops the storm's score from 1.30 (warning) to
+        # 0.70 (below the warning floor); it reaches true silence once the
+        # ceremony SIGNAL itself decays under the 3.0 floor (~3 days for the
+        # 79-event storm -- asserted via the snapshot test).
+        fresh = serve._imbalance_score(79.0, 3.0)
+        aged = serve._imbalance_score(79.0 / 16, 3.0 / 16)  # two days stale
+        self.assertGreaterEqual(fresh, serve._COORDINATION_WARNING_SCORE)
+        self.assertLess(aged, serve._COORDINATION_WARNING_SCORE)
+        self.assertLess(aged, fresh)
+
+    def test_snapshot_pairs_timestamps_with_counts(self):
+        # End-to-end through compute_health_snapshot: 5 FRESH ceremony rows
+        # (today) vs 0 shipped must produce a coordination alert; the same
+        # rows aged 3 days must not.
+        with serve._db() as conn:
+            conn.execute('DELETE FROM action_log')
+            now = time.time()
+            fresh_action = serve._CEREMONY_ACTIONS[0]
+            for i in range(5):
+                conn.execute(
+                    'INSERT INTO action_log (agent_id, action, details, authorized, ts, trace_id) '
+                    'VALUES (?, ?, ?, 1, ?, NULL)',
+                    ('ben', fresh_action, '{}', now - i * 60),
+                )
+        snap = serve.compute_health_snapshot()
+        self.assertGreaterEqual(snap['ceremony_imbalance_score'], serve._COORDINATION_INFO_SCORE)
+        self.assertTrue(any(a['category'] == 'coordination' for a in snap['alerts']))
+
+        with serve._db() as conn:
+            conn.execute('DELETE FROM action_log')
+            for i in range(5):
+                conn.execute(
+                    'INSERT INTO action_log (agent_id, action, details, authorized, ts, trace_id) '
+                    'VALUES (?, ?, ?, 1, ?, NULL)',
+                    ('ben', fresh_action, '{}', now - 3 * 86400 - i * 3600),
+                )
+        snap = serve.compute_health_snapshot()
+        self.assertLess(snap['ceremony_signal'], serve._COORDINATION_MIN_CEREMONY_SIGNAL)
+        self.assertFalse(any(a['category'] == 'coordination' for a in snap['alerts']))
 
 
 class TaskHorizonMetrics(unittest.TestCase):
