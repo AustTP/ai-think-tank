@@ -3808,11 +3808,49 @@ BROWSE_BLOCK_CATEGORIES = (
 # just read access, when deciding whether a domain belongs on this list.
 BROWSE_ALLOWLIST_DOMAINS = {d.strip().lower() for d in
                             _load_env().get('BROWSE_ALLOWLIST_DOMAINS', '').split(',') if d.strip()}
+# Human-approved runtime grants (2026-09-29): domains the player approved via
+# the '/api/allowlist/request' flow's email link, persisted in the DB settings
+# table so a restart keeps them (the .env list above is the code-reviewed
+# baseline; these are the approval-anchored additions on top of it). Merged
+# into _effective_allowlist_domains() below, which every gate reads -- so a
+# single runtime grant reaches /api/browse, the sandbox egress proxy, AND the
+# Colab URL gate alike. Same reachability semantics as the env list: full
+# read+write for a script, never terminated TLS, so approve wisely.
+ALLOWLIST_GRANTS_SETTING = 'allowlist_grants'
+
+
+def _runtime_allowlist_grants():
+    raw = _get_setting(ALLOWLIST_GRANTS_SETTING, '') or ''
+    return {d.strip().lower() for d in raw.split(',') if d.strip()}
+
+
+def _effective_allowlist_domains():
+    return BROWSE_ALLOWLIST_DOMAINS | _runtime_allowlist_grants()
+
+
+def _grant_allowlist(host):
+    """Persist a human-approved allowlist grant and refresh the egress proxy
+    so running sandbox scripts can actually reach it. Returns the normalized
+    host, or None when empty."""
+    host = (host or '').strip().lower()
+    if not host:
+        return None
+    grants = _runtime_allowlist_grants()
+    grants.add(host)
+    _set_setting(ALLOWLIST_GRANTS_SETTING, ','.join(sorted(grants)))
+    log_action('admin', 'allowlist_grant', {'host': host, 'via': 'escalation approval'}, authorized=True)
+    try:
+        ensure_sandbox_networking()
+    except Exception as e:
+        # A grant still persisted; a proxy refresh failure shouldn't VETO a
+        # human's explicit approval, it just means scripts wait until restart.
+        print(f'[allowlist] egress proxy refresh failed after grant: {e}', flush=True)
+    return host
 
 
 def _is_allowlisted_host(hostname):
     host = (hostname or '').lower()
-    return any(host == d or host.endswith('.' + d) for d in BROWSE_ALLOWLIST_DOMAINS)
+    return any(host == d or host.endswith('.' + d) for d in _effective_allowlist_domains())
 
 
 # Mullvad VPN (2026-09-26), per your explicit request. Unlike every other
@@ -4279,7 +4317,7 @@ def ensure_sandbox_networking():
     # different allowlist (BROWSE_ALLOWLIST_DOMAINS changed since it was last
     # created), recreate it so the running proxy never silently drifts from
     # the current config -- but only then, not on every ordinary restart.
-    desired_extra_hosts = ','.join(sorted(BROWSE_ALLOWLIST_DOMAINS))
+    desired_extra_hosts = ','.join(sorted(_effective_allowlist_domains()))
     if _docker_container_running(PROXY_CONTAINER):
         current_extra_hosts = _docker_container_env_value(PROXY_CONTAINER, 'SANDBOX_EGRESS_EXTRA_HOSTS')
         if current_extra_hosts != desired_extra_hosts:
@@ -4721,6 +4759,26 @@ AGENT_ASK_TOOLS = [
                     'country': {'type': 'string', 'description': 'A real two-letter Mullvad relay country code (e.g. "de", "jp", "br") to fetch this page through a real VPN exit in that country. Only set this when the page genuinely needs a foreign vantage point; omit it otherwise -- this is slower and only works for allowlisted countries.'},
                 },
                 'required': ['url', 'purpose'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'request_allowlist',
+            'description': 'Ask the player to permanently allow a domain you need to reach (browsing '
+                           'AND sandboxed scripts): supply the host or url and one short sentence of '
+                           'purpose. This is for when a real domain you legitimately need keeps coming '
+                           'up -- the player decides by email, and the director CANNOT auto-approve it. '
+                           'While a request is pending, keep using normal gates; do not retry/send a '
+                           'second request for the same host until you hear it was denied.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'host': {'type': 'string', 'description': 'The registrable domain you need reachable, e.g. "api.example.com" or a full url.'},
+                    'purpose': {'type': 'string', 'description': 'One short sentence: why agents need standing access to this domain.'},
+                },
+                'required': ['host', 'purpose'],
             },
         },
     },
@@ -5574,6 +5632,21 @@ _COLAB_DENIED_EXPRESSIONS = {
     'data exfiltration hosts': re.compile(
         r'webhook\.site|requestbin|pastebin\.com|transfer\.sh|file\.io|'
         r'0x0\.st|catbox\.moe|discord(app)?\.com|api\.telegram\.org', re.I),
+    # Offensive-security / red-team work is refused on the player's Colab
+    # account ON PURPOSE (per the player): a scan or exploit attempt launched
+    # from a Colab runtime looks like it originates from the player's own Google
+    # infrastructure, and the village has its OWN local sandbox (the Work Room)
+    # for that kind of testing. This class catches the recognizable tooling +
+    # a scan-verb pattern; it is not a substitute for the local sandbox's own
+    # policy, just the boundary for what runs under the player's account.
+    'offensive security / red team': re.compile(
+        r'\b(nmap|masscan|zenmap)\b|\b(metasploit|msfconsole|msfvenom)\b|'
+        r'\bsqlmap\b|\bnuclei\b|\bnikto\b|\bgobuster\b|\b(wpscan|joomscan)\b|'
+        r'\bhydra\b|\baircrack(-ng)?\b|\bhashcat\b|\bjohn\.?the\s?ripper\b|'
+        r'\b(impacket|evil-winrm|bloodhound)\b|\bcrackmapexec\b|\b(responder|smbclient)\b|'
+        r'\b(c2 |cobaltstrike|sliver|mythic)\b|'
+        r'exploit|shellcode|reverse\s?shell|remote\s?code\s?execution|privilege\s?escalation|'
+        r'directory\s?brute|subdomain\s?enum|port\s?scan|service\s?enumerat', re.I),
 }
 
 
@@ -5593,7 +5666,64 @@ def _colab_denied(text):
     return None
 
 
-def _colab_compute_run(code, purpose, packages, timeout_seconds):
+_COLAB_TARGET_RE = re.compile(r'https?://[^\s\'"<>)\]]+', re.I)
+
+
+def _colab_target_hosts(code, purpose):
+    """Best-effort literal-URL extraction from a Colab job's code + purpose,
+    returning the set of distinct hostnames it statically references. This is
+    deliberately the same class of guard as _colab_denied (regex on submitted
+    text): it catches what the agent literally asks to touch, which is exactly
+    the shape of a tool call -- an agent cannot seriously ask to "scan
+    example.com" without writing the hostname. A dynamically-constructed host
+    is opaque here just as it is to the deny regex, and the local
+    sandbox/proxy boundary still owns the enforcement post-fetch."""
+    hosts = set()
+    for text in (code, purpose):
+        if not text:
+            continue
+        for m in _COLAB_TARGET_RE.findall(text):
+            try:
+                host = urllib.parse.urlparse(m).hostname
+            except ValueError:
+                continue
+            if host:
+                hosts.add(host.lower())
+    return hosts
+
+
+def _colab_gate_urls(agent_id, code, purpose, authorized=None):
+    """Apply the SAME internet-location policy a local /api/browse would, to
+    every literal target URL in a Colab job -- this is what keeps a remote
+    Colab run from being a second, unvetted path to the internet:
+    allowlisted hosts pass (same skip-the-Jev round trip as browse), a
+    private/internal/SSRF target is refused, and everything else goes through
+    the same JEV allow/block classify + safety gate (low confidence escalates
+    to a human). Returns None when every target is cleared, else a short
+    refusal reason describing the first blocked target."""
+    for host in sorted(_colab_target_hosts(code, purpose)):
+        # Player-vetted domain -- skip the Jev round trip, exactly like browse.
+        if _is_allowlisted_host(host):
+            log_action(agent_id, 'colab_target', {'host': host, 'decision': 'allowed_by_allowlist'}, authorized=authorized)
+            continue
+        # Same SSRF/private-host boundary as /api/browse, never skipped.
+        if not _is_safe_public_host(host):
+            log_action(agent_id, 'colab_target', {'host': host, 'decision': 'blocked', 'reason': 'private/internal host'}, authorized=authorized)
+            return f'{host} resolves to a private or internal network location and cannot be reached from a Colab run.'
+        criteria = {
+            'allow': 'The URL/domain and stated purpose look like ordinary, legal network use (reference material, news, public APIs, general research).',
+            'block': 'The URL, domain, or stated purpose suggests a prohibited category: ' + '; '.join(BROWSE_BLOCK_CATEGORIES) + '.',
+        }
+        instructions = f'A Colab compute job (running as-the-player) wants to contact this host: {host}\nStated purpose: {purpose or "not given"}\nDecide allow or block based on the domain and stated purpose.'
+        decision, confidence, cost = _jev_quorum_choice_sync(instructions, criteria)
+        if not _jev_safety_gate(agent_id, 'colab_target', 'This host', host, purpose,
+                                decision, confidence, cost, bool(authorized)):
+            return f'{host} was not approved for a Colab run to contact.'
+        record_browse_success(host)
+    return None
+
+
+def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds):
     """Run `code` (Python) on the dedicated Colab GPU session and capture its
     output. Blocking -- the spike tool executor calls this on a worker thread
     like every other agent tool (see the ask lane's nested-call deadlock note).
@@ -5620,8 +5750,16 @@ def _colab_compute_run(code, purpose, packages, timeout_seconds):
         return {'error': 'refusing to run: it uses ' + blocked
                          + ', which is off-limits on the player\'s real Google '
                            'account (Drive/GCS/cloud creds, mining, bulk media, '
-                           'torrents, or exfil hosts). Run this as a plain local '
-                           'job instead.'}
+                           'torrents, exfil hosts, or offensive-security tooling). '
+                           'Red-team and scan work runs in the local Work Room '
+                           'sandbox instead, never on Colab.'}
+    # Same internet-location policy as local browse: every literal URL the
+    # job references must clear the player-vetted allowlist or a Jev
+    # allow/block gate (low confidence escalates to a human). A Colab run
+    # is NOT a second, unvetted path to the internet.
+    target_reason = _colab_gate_urls(agent_id, code, purpose)
+    if target_reason:
+        return {'error': 'refusing to run: ' + target_reason}
     if _colab_budget_exceeded():
         if COLAB_MONTHLY_UNITS and _colab_spend_this_month() >= COLAB_MONTHLY_UNITS:
             return {'error': 'the village has used its monthly Colab compute-unit budget '
@@ -5862,6 +6000,12 @@ ESCALATION_KIND_RISK = {
     # Agent-driven "could not resolve a review requirement": ordinary routine
     # approval/denial is fine at the default floor.
     'unresolved review requirement': {'floor': JEV_SAFETY_CONFIDENCE},
+    # Agent-requested internet-allowlist addition (2026-09-29): granting a
+    # domain is a PERMANENT capability change (full read+write reachability
+    # for sandboxed scripts, plus it skips every future Jev classify round
+    # trip), so it is human-only -- floor 1.0 means the director is never
+    # permitted to auto-approve it, only the player's email link can.
+    'allowlist request': {'floor': 1.0},
 }
 ESCALATION_DEFAULT_FLOOR = JEV_SAFETY_CONFIDENCE  # unknown kinds keep the old bar
 ESCALATION_ERROR_PENALTY_STEP = 0.10               # composite hit per consecutive Jev error
@@ -6320,7 +6464,7 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/execute', '/api/pipeline', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev')
 # Real gap found 2026-09-25: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
@@ -7801,6 +7945,18 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
         if struck_tools is not None and name in struck_tools:
             return (f'{name} was already blocked once this investigation (one-strike) -- do not '
                     'call it again, use a different tool or approach instead.')
+        if name == 'request_allowlist':
+            result = _http_json('POST', SELF_BASE_URL, '/api/allowlist/request', {
+                'agentId': agent_id,
+                'host': (args or {}).get('host') or '',
+                'purpose': (args or {}).get('purpose') or '',
+            }, agent_key)
+            if isinstance(result, dict) and not result.get('error'):
+                msg = result.get('message') or ''
+                return (f'{msg} [do not call request_allowlist again for this host -- one request is '
+                        f'pending until the player decides]' if result.get('requested')
+                        else f'{msg} [no further request needed]')
+            return f'Could not file the allowlist request: {result}'
         if name == 'weather_now':
             loc = (args or {}).get('location') or default_location or ''
             result = _weather_fetch(loc)
@@ -10276,6 +10432,62 @@ async def browse(request: Request):
     })
 
 
+@app.post('/api/allowlist/request')
+async def allowlist_request(request: Request):
+    # Agent-facing request to extend the player-vetted allowlist (2026-09-29).
+    # An allowlist entry means FULL read+write reachability for sandboxed
+    # scripts AND it skips every future Jev classify round trip -- a permanent
+    # capability grant, per your call that a worker can only get one through an
+    # explicit human approval, so this fires a floor-1.0 escalation that ONLY
+    # the player's email link can resolve (the director is never permitted to
+    # auto-approve it). Agents call this instead of editing .env; when the
+    # player approves, the host is granted to the runtime allowlist and the
+    # egress proxy is refreshed so already-running scripts can reach it too.
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'unknown')
+    target = (body.get('host') or body.get('url') or '').strip()
+    purpose = (body.get('purpose') or '').strip()
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'allowlist_request'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    if not target:
+        return JSONResponse({'error': 'a host or url is required'}, status_code=400)
+    # Normalize a full URL down to its hostname, a bare host is acceptable.
+    parsed = urllib.parse.urlparse(target if '://' in target else 'https://' + target)
+    host = (parsed.hostname or '').strip().lower()
+    if not host:
+        return JSONResponse({'error': 'could not read a hostname from that target'}, status_code=400)
+    # Same boundary as every other gate: private/internal targets are refused
+    # outright -- the allowlist extends PUBLIC reachability, never SSRF surface.
+    if not _is_safe_public_host(host):
+        return JSONResponse({'error': f'{host} is a private or internal host and can never be allowlisted'}, status_code=400)
+    if _is_allowlisted_host(host):
+        return JSONResponse({'allowlisted': True, 'host': host,
+                             'message': 'already on the allowlist -- new requests are not needed'})
+    # One pending request per host at a time -- no escalation spam from the
+    # same agent retrying a request that's already waiting on the player.
+    for esc_id, esc in _load_escalations().items():
+        if esc.get('kind') == 'allowlist request' and esc.get('status') == 'pending' \
+                and esc.get('note', '').strip().lower() == host:
+            return JSONResponse({'requested': True, 'host': host, 'escalationId': esc_id,
+                                 'message': 'an allowlist request for this host is already pending review'})
+    esc_id = create_escalation(
+        'allowlist request',
+        f'Agent {agent_id} requests {host} be added to the player-vetted allowlist.\n'
+        f'Stated purpose: {purpose or "not given"}\n\n'
+        f'Approving gives agents standing read+write reachability to {host} for sandboxed '
+        f'scripts, AND lets them reach it without a Jev classify round trip on every call. '
+        f'Only the player can approve or deny this -- the director is not allowed to.',
+        on_approve_note=host,
+    )
+    log_action(agent_id, 'allowlist_request', {'host': host, 'purpose': purpose[:200],
+                                               'escalationId': esc_id}, authorized=authorized)
+    return JSONResponse({'requested': True, 'host': host, 'escalationId': esc_id,
+                         'message': f'Allowlist request for {host} filed -- the player decides by email; '
+                                    f'until then {host} still goes through the normal Jev gate.'})
+
+
 CURL_METHODS = {'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'}
 CURL_MAX_BODY_BYTES = 200_000
 CURL_TIMEOUT_S = 15
@@ -11410,8 +11622,22 @@ async def resolve_escalation(id: str, token: str, decision: str):
         return HTMLResponse('<p>Invalid decision.</p>', status_code=400)
 
     esc['status'] = 'approved' if decision == 'approve' else 'denied'
+    esc['resolvedBy'] = 'admin'
+    esc['resolvedAt'] = time.time()
     escalations[id] = esc
     _save_escalations(escalations)
+    # Approval side-effect (2026-09-29): an approved 'allowlist request' turns
+    # the requested host into a REAL runtime allowlist grant -- this is the
+    # only path that can grant one, and it is this HTML link alone (the
+    # director loop is blocked from it by the floor-1.0 kind). The note field
+    # carries the hostname; on deny nothing is granted.
+    if decision == 'approve' and esc.get('kind') == 'allowlist request':
+        granted = _grant_allowlist(esc.get('note'))
+        if granted:
+            return HTMLResponse(f"<p>Recorded: <b>approved</b> for {esc['kind']}.</p>"
+                                f"<p>{html.escape(esc['question'])}</p>"
+                                f"<p>Allowlist grant applied: <b>{html.escape(granted)}</b> is now "
+                                f"reachable by agents (and the egress proxy has been refreshed).</p>")
     return HTMLResponse(f"<p>Recorded: <b>{esc['status']}</b> for {esc['kind']}.</p><p>{html.escape(esc['question'])}</p>")
 
 

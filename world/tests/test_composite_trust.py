@@ -79,6 +79,7 @@ class EscalationFloorTests(unittest.TestCase):
                            serve.JEV_SAFETY_CONFIDENCE)
         self.assertEqual(serve._escalation_floor('unresolved review requirement'),
                          serve.JEV_SAFETY_CONFIDENCE)                               # routine kind keeps the old bar
+        self.assertEqual(serve._escalation_floor('allowlist request'), 1.0)   # permanent capability grant -> always human
 
     def test_unknown_kind_falls_back_to_default(self):
         # A new escalation kind can't silently widen auto-approval authority.
@@ -551,14 +552,14 @@ class ColabComputeTests(unittest.TestCase):
     def test_operator_switch_off_refuses_runs(self):
         with unittest.mock.patch.object(serve, 'COLAB_ENABLED', False), \
              unittest.mock.patch.object(serve, '_colab_cli') as cli:
-            result = serve._colab_compute_run('print(1)', 'probe', [], 60)
+            result = serve._colab_compute_run('agent-0', 'print(1)', 'probe', [], 60)
         self.assertIn('disabled by the operator', result['error'])
         cli.assert_not_called()
 
     def test_drive_mount_code_is_refused(self):
         with unittest.mock.patch.object(serve, '_colab_cli') as cli:
             result = serve._colab_compute_run(
-                'from google.colab import drive\ndrive.mount("/content/drive")\n',
+                'agent-0', 'from google.colab import drive\ndrive.mount("/content/drive")\n',
                 'numeric job', [], 60)
         self.assertIn('refusing to run', result['error'])
         self.assertIn('off-limits', result['error'])
@@ -567,14 +568,14 @@ class ColabComputeTests(unittest.TestCase):
     def test_gcloud_and_mining_code_are_refused(self):
         for bad in ('gsutil cp local gs://bucket/x', 'nicehash miner loop', 'gdown 1abc'):
             with unittest.mock.patch.object(serve, '_colab_cli') as cli:
-                result = serve._colab_compute_run(bad, 'job', [], 60)
+                result = serve._colab_compute_run('agent-0', bad, 'job', [], 60)
             self.assertIn('refusing to run', result['error'], bad)
             cli.assert_not_called()
 
     def test_exfil_package_is_refused(self):
         with unittest.mock.patch.object(serve, '_colab_cli') as cli:
             result = serve._colab_compute_run(
-                'print(1)', 'job', ['gdown', 'requests'], 60)
+                'agent-0', 'print(1)', 'job', ['gdown', 'requests'], 60)
         self.assertIn('package', result['error'])
         self.assertIn('refusing to run', result['error'])
         cli.assert_not_called()
@@ -585,7 +586,7 @@ class ColabComputeTests(unittest.TestCase):
              unittest.mock.patch.object(serve, '_colab_account_usage', return_value=None), \
              unittest.mock.patch.object(serve, '_colab_compute_provision', return_value=(True, 'ok')), \
              unittest.mock.patch.object(serve, '_colab_cli', return_value=(0, '42\n__COLAB_DONE__\n')):
-            result = serve._colab_compute_run('a = 41\nprint(a + 1)', 'sum', [], 60)
+            result = serve._colab_compute_run('agent-0', 'a = 41\nprint(a + 1)', 'sum', [], 60)
         self.assertEqual(result['stdout'], '42')
 
     def test_budget_gate_refuses_when_gated_out(self):
@@ -593,7 +594,7 @@ class ColabComputeTests(unittest.TestCase):
              unittest.mock.patch.object(serve, '_colab_spend_this_month', return_value=25.0), \
              unittest.mock.patch.object(serve, '_colab_account_usage', return_value=None), \
              unittest.mock.patch.object(serve, '_colab_cli') as cli:
-            result = serve._colab_compute_run('print(1)', 'probe', [], 60)
+            result = serve._colab_compute_run('agent-0', 'print(1)', 'probe', [], 60)
         self.assertIn('monthly Colab compute-unit budget', result['error'])
         cli.assert_not_called(), 'gated out means no provisioning attempt at all'
 
@@ -603,7 +604,7 @@ class ColabComputeTests(unittest.TestCase):
              unittest.mock.patch.object(serve, '_colab_account_usage',
                                         return_value={'balance': 0.0, 'rate': 1.15, 'assignments': 1}), \
              unittest.mock.patch.object(serve, '_colab_cli') as cli:
-            result = serve._colab_compute_run('print(1)', 'probe', [], 60)
+            result = serve._colab_compute_run('agent-0', 'print(1)', 'probe', [], 60)
         self.assertIn('no compute units left', result['error'])
         cli.assert_not_called()
 
@@ -614,15 +615,15 @@ class ColabComputeTests(unittest.TestCase):
                                         return_value={'balance': 0.0, 'rate': 1.15, 'assignments': 2}), \
              unittest.mock.patch.object(serve, '_colab_compute_provision', return_value=(True, 'ok')) as prov, \
              unittest.mock.patch.object(serve, '_colab_cli', return_value=(0, '12\n__COLAB_DONE__\n')):
-            result = serve._colab_compute_run('print(1)', 'probe', [], 60)
+            result = serve._colab_compute_run('agent-0', 'print(1)', 'probe', [], 60)
         self.assertEqual(result['stdout'], '12')
         prov.assert_called_once()
 
     def test_empty_and_oversized_code_rejected_without_cli(self):
         with unittest.mock.patch.object(serve, '_colab_cli') as cli:
-            self.assertIn('code is required', serve._colab_compute_run('', 'probe', [], 60)['error'])
+            self.assertIn('code is required', serve._colab_compute_run('agent-0', '', 'probe', [], 60)['error'])
             big = 'x' * (serve.COLAB_CODE_MAX_CHARS + 1)
-            self.assertIn('under', serve._colab_compute_run(big, 'probe', [], 60)['error'])
+            self.assertIn('under', serve._colab_compute_run('agent-0', big, 'probe', [], 60)['error'])
         cli.assert_not_called()
 
     def test_provisions_gpu_session_with_t4_on_demand(self):
@@ -650,7 +651,7 @@ class ColabComputeTests(unittest.TestCase):
              unittest.mock.patch.object(serve, '_accrue_colab_units',
                                         side_effect=lambda u: accrued.setdefault('units', u)), \
              unittest.mock.patch.object(serve, 'log_action'):
-            result = serve._colab_compute_run('print("answer=42")', 'probe', [], 60)
+            result = serve._colab_compute_run('agent-0', 'print("answer=42")', 'probe', [], 60)
         self.assertEqual(result['stdout'], 'answer=42')
         self.assertGreaterEqual(result['units'], serve.COLAB_MIN_UNITS_PER_RUN)
         self.assertEqual(accrued['units'], result['units'])
@@ -665,7 +666,7 @@ class ColabComputeTests(unittest.TestCase):
              unittest.mock.patch.object(serve, '_colab_cli', return_value=(1, 'Traceback')), \
              unittest.mock.patch.object(serve, '_accrue_colab_units'), \
              unittest.mock.patch.object(serve, 'log_action'):
-            result = serve._colab_compute_run('1/0', 'probe', [], 60)
+            result = serve._colab_compute_run('agent-0', '1/0', 'probe', [], 60)
         self.assertIn('exit 1', result['error'])
 
     def test_executor_formats_error_for_the_model(self):
@@ -675,6 +676,87 @@ class ColabComputeTests(unittest.TestCase):
             out = executor('run_on_colab', {'code': 'print(1)'})
         self.assertIn('__TOOL_ERROR__', out)
         self.assertIn('boom', out)
+
+    def test_redteam_code_is_refused_on_colab(self):
+        # Per the player's call: offensive-security/scan work runs in the local
+        # Work Room sandbox, NEVER on the player's real Google Colab account.
+        for bad in ('nmap -sV example.com', 'msfconsole -q', 'sqlmap -u http://x/page?id=1',
+                    'hydra -l admin ssh://host', 'nuclei -u https://victim.dev',
+                    'exfiltrate / proc/self/maps over a reverse shell'):
+            with unittest.mock.patch.object(serve, '_colab_cli') as cli:
+                result = serve._colab_compute_run('agent-0', bad, 'probe', [], 60)
+            self.assertIn('refusing to run', result['error'], bad)
+            self.assertIn('off-limits', result['error'], bad)
+            cli.assert_not_called()
+
+    def test_colab_target_hosts_extracts_urls(self):
+        hosts = serve._colab_target_hosts(
+            'r = requests.get("https://api.example.com/v1/data")  # https://cdn.example.com/x.png\n',
+            'pull from https://finance.example.org quote page')
+        self.assertEqual(hosts, {'api.example.com', 'cdn.example.com', 'finance.example.org'})
+
+    def test_colab_gate_urls_allowlisted_host_skips_jev(self):
+        with unittest.mock.patch.object(serve, '_is_allowlisted_host', return_value=True), \
+             unittest.mock.patch.object(serve, '_jev_quorum_choice_sync') as jev:
+            reason = serve._colab_gate_urls('agent-0', 'https://dreyx.com/data', 'pull it')
+        self.assertIsNone(reason)
+        jev.assert_not_called()
+
+    def test_colab_gate_urls_private_host_is_refused(self):
+        with unittest.mock.patch.object(serve, '_is_allowlisted_host', return_value=False), \
+             unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=False), \
+             unittest.mock.patch.object(serve, '_jev_quorum_choice_sync') as jev:
+            reason = serve._colab_gate_urls('agent-0', 'https://10.0.0.5/secret', 'call it')
+        self.assertIn('private or internal', reason)
+        jev.assert_not_called()
+
+    def test_colab_gate_urls_low_confidence_jev_is_refused(self):
+        with unittest.mock.patch.object(serve, '_is_allowlisted_host', return_value=False), \
+             unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True), \
+             unittest.mock.patch.object(serve, '_jev_quorum_choice_sync',
+                                        return_value=(None, 1.0, 0.0)):
+            reason = serve._colab_gate_urls('agent-0', 'https://example.com/x', 'fetch it')
+        self.assertIsNotNone(reason)
+        self.assertIn('not approved', reason)
+
+    def test_colab_gate_urls_confident_allow_passes(self):
+        calls = {'n': 0}
+        def fake_gate(agent_id, action, noun, target, purpose, decision, confidence, cost, authorized, trace_id=None):
+            calls['n'] += 1
+            return True
+        with unittest.mock.patch.object(serve, '_is_allowlisted_host', return_value=False), \
+             unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True), \
+             unittest.mock.patch.object(serve, '_jev_quorum_choice_sync',
+                                        return_value=('allow', 0.95, 0.0)), \
+             unittest.mock.patch.object(serve, '_jev_safety_gate', side_effect=fake_gate), \
+             unittest.mock.patch.object(serve, 'record_browse_success'):
+            reason = serve._colab_gate_urls('agent-0', 'https://example.com/x', 'fetch it')
+        self.assertIsNone(reason)
+        self.assertEqual(calls['n'], 1)
+
+    def test_colab_gate_urls_denial_blocked_by_jev_categories(self):
+        # A host Jev says belongs to a blocked category never runs.
+        def fake_gate(agent_id, action, noun, target, purpose, decision, confidence, cost, authorized, trace_id=None):
+            return False
+        with unittest.mock.patch.object(serve, '_is_allowlisted_host', return_value=False), \
+             unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True), \
+             unittest.mock.patch.object(serve, '_jev_quorum_choice_sync',
+                                        return_value=('block', 0.9, 0.0)), \
+             unittest.mock.patch.object(serve, '_jev_safety_gate', side_effect=fake_gate):
+            reason = serve._colab_gate_urls('agent-0', 'https://archive.org/x', 'backup media')
+        self.assertIsNotNone(reason)
+        self.assertIn('not approved', reason)
+
+    def test_colab_compute_run_refuses_url_gated_job_before_provision(self):
+        with unittest.mock.patch.object(serve, '_colab_gate_urls',
+                                        return_value='host was blocked'), \
+             unittest.mock.patch.object(serve, '_colab_compute_provision') as prov, \
+             unittest.mock.patch.object(serve, '_colab_cli') as cli:
+            result = serve._colab_compute_run('agent-0', 'https://example.com/x', 'fetch it', [], 60)
+        self.assertIn('refusing to run', result['error'])
+        self.assertIn('host was blocked', result['error'])
+        prov.assert_not_called(), 'a gated job never provisions a session'
+        cli.assert_not_called()
 
     def test_account_usage_parses_colab_usage_output(self):
         raw = ('Current balance: 4.25 compute units\n'
