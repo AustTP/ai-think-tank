@@ -5284,6 +5284,7 @@ COLAB_GPU_SESSION = 'village-gpu'
 COLAB_GPU_ACCEL = 'T4'
 COLAB_MONTHLY_UNITS = float(_load_env().get('COLAB_MONTHLY_UNITS', '0') or 0)
 COLAB_FREE_TIER = str(_load_env().get('COLAB_FREE_TIER', '') or '').lower() in ('1', 'true', 'yes')
+COLAB_ENABLED = str(_load_env().get('COLAB_ENABLED', '1') or '1').lower() not in ('0', 'false', 'no')
 COLAB_LEDGER_KEY = '__colab_compute__'
 _COLAB_USAGE_CACHE = {'at': 0.0, 'data': None}
 _COLAB_USAGE_CACHE_TTL_S = 120
@@ -5439,6 +5440,45 @@ def _colab_compute_provision():
     return True, 'ok'
 
 
+_COLAB_DENIED_EXPRESSIONS = {
+    'drive access': re.compile(
+        r'google\.colab\.drive|drive\.mount|from google\.colab import drive|'
+        r'\bpydrive\b|\bdrive[a-z_]*\b.?mount|\bdrivemount\b|'
+        r'\bdrive_root\b|mounted_drive|/content/drive|\bgdown\b|'
+        r'\bfile\.id=|\bapplication/vnd\.google-apps|'
+        r'colab drivemount', re.I),
+    'google cloud / gcp credentials': re.compile(
+        r'\bgsutil\b|\bgcloud\b|storage\.client|storage\.bucket|blob\.upload|'
+        r'bigu?query|\bcolab auth\b|google\.oauth2|oauth2client|'
+        r'google\.auth|google_auth_httplib2', re.I),
+    'crypto mining / account-banned load': re.compile(
+        r'\bnicehash\b|\bxmrig\b|\bstratum\b|\bcryptonight\b|'
+        r'iminer|cryptocurrency|monero mining|ethash', re.I),
+    'bulk media / torrents': re.compile(
+        r'\b(yt.?dlp|youtube_dl)\b|\bdeezloader\b|\bpeerflix\b|'
+        r'\btorrent\b|\btransmission\b|rippedstreams', re.I),
+    'data exfiltration hosts': re.compile(
+        r'webhook\.site|requestbin|pastebin\.com|transfer\.sh|file\.io|'
+        r'0x0\.st|catbox\.moe|discord(app)?\.com|api\.telegram\.org', re.I),
+}
+
+
+def _colab_denied(text):
+    """Hard guard on what agents may send to the player's real Google account.
+    Colab CLI runs in the player's identity, and the stored OAuth token carries
+    drive.file + cloud-platform scopes -- so code running in a session COULD, in
+    principle, touch Drive, GCS, or other account surfaces. The village has no
+    legitimate reason to: this refuses any run touching those, plus the classic
+    account-killers (mining, bulk media, torrents, exfil hosts). Returns a
+    short label of the first matched class or None when clean."""
+    if not text:
+        return None
+    for label, rx in _COLAB_DENIED_EXPRESSIONS.items():
+        if rx.search(text):
+            return label
+    return None
+
+
 def _colab_compute_run(code, purpose, packages, timeout_seconds):
     """Run `code` (Python) on the dedicated Colab GPU session and capture its
     output. Blocking -- the spike tool executor calls this on a worker thread
@@ -5453,6 +5493,21 @@ def _colab_compute_run(code, purpose, packages, timeout_seconds):
         return {'error': 'code is required'}
     if len(code) > COLAB_CODE_MAX_CHARS:
         return {'error': f'code must be under {COLAB_CODE_MAX_CHARS} characters'}
+    if not COLAB_ENABLED:
+        return {'error': 'Colab compute is disabled by the operator (COLAB_ENABLED=0); '
+                         'do not try to run remote GPU jobs'}
+    blocked = _colab_denied(code) or _colab_denied(purpose or '')
+    if blocked is None:
+        for pkg in (packages or []):
+            if isinstance(pkg, str) and _colab_denied(pkg):
+                blocked = f"package '{pkg}'"
+                break
+    if blocked:
+        return {'error': 'refusing to run: it uses ' + blocked
+                         + ', which is off-limits on the player\'s real Google '
+                           'account (Drive/GCS/cloud creds, mining, bulk media, '
+                           'torrents, or exfil hosts). Run this as a plain local '
+                           'job instead.'}
     if _colab_budget_exceeded():
         if COLAB_MONTHLY_UNITS and _colab_spend_this_month() >= COLAB_MONTHLY_UNITS:
             return {'error': 'the village has used its monthly Colab compute-unit budget '
@@ -5495,6 +5550,7 @@ def _colab_compute_run(code, purpose, packages, timeout_seconds):
             'timeout': timeout,
             'units': units,
             'rc': rc,
+            'code': code[:2000],
         }, authorized=True)
         if rc != 0:
             return {'error': f'Colab run failed (exit {rc}): {out[-1500:]}', 'units': units}

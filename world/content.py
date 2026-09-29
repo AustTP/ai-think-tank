@@ -2087,10 +2087,12 @@ _COLAB_RUN_TOOL = {
             "everything you need to see. Use this when a plan step genuinely requires real "
             "computation (not for browsing/text questions, and not for anything the tiny local "
             "sandbox can already do). It runs on the player's real Colab account, metered against "
-            "whatever COLAB_MONTHLY_UNITS village cap is set. Remember it is the FREE tier: "
-            "limitations apply -- a run must finish in its own short timeout, sessions get torn "
-            "down after idle, GPU availability is not guaranteed, and a heavy job can fail if "
-            "the account has no quota left. Keep runs small and quick."
+            "whatever COLAB_MONTHLY_UNITS village cap is set, and it is the FREE tier: a run "
+            "must finish in its own short timeout, sessions get torn down after idle, GPU slots "
+            "are not guaranteed, keep runs small. HARD LIMIT: the code runs as the player's "
+            "identity, so it may ONLY touch compute -- never Google Drive, GCS/cloud APIs, "
+            "credentials, mining/bulk-media/torrents, or any exfil site; such a request is "
+            "refused up front."
         ),
         'parameters': {
             'type': 'object',
@@ -2910,10 +2912,11 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             "-- CUDA/GPU work, a fine-tuning experiment, a heavy numeric job -- use run_on_colab to "
             "run complete Python on a real Colab GPU and read its output, rather than skipping it or "
             "claiming the village can't do it. It is a metered cost against the village's Colab "
-            "compute budget shown in the Bank; use it only when the local sandbox genuinely cannot "
-            "handle the work. Colab here is the FREE tier -- a run must finish within its own "
-            "timeout (keep them small), a session idles out and gets recycled, GPU slots are not "
-            "guaranteed, and a job can fail if free quota is drained. " if _serve.COLAB_CLI_AVAILABLE else "")
+            "compute budget shown in the Bank; the Colab here is the FREE tier, so keep runs small "
+            "-- a run must finish within its own timeout, an idle session gets recycled, and GPU "
+            "slots are not guaranteed. IT RUNS AS THE PLAYER'S IDENTITY: you must NEVER use it for "
+            "Google Drive, GCS/cloud APIs, credentials, mining/bulk media/torrents, or any data "
+            "exfiltration site -- only raw compute. " if _serve.COLAB_CLI_AVAILABLE else "")
         + 'A spike never opens a peer-review gate, but it CAN still produce a real '
         'artifact -- if your plan has an execute_script/CSV step, that step is MANDATORY, not '
         'optional: you must actually call execute_script and write the real file. Describing what '
