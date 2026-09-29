@@ -2091,8 +2091,9 @@ _COLAB_RUN_TOOL = {
             "must finish in its own short timeout, sessions get torn down after idle, GPU slots "
             "are not guaranteed, keep runs small. HARD LIMIT: the code runs as the player's "
             "identity, so it may ONLY touch compute -- never Google Drive, GCS/cloud APIs, "
-            "credentials, mining/bulk-media/torrents, or any exfil site; such a request is "
-            "refused up front."
+            "credentials, mining/bulk-media/torrents, offensive-security tooling, or any exfil "
+            "site; and every literal URL the code references must clear the same allowlist/JEV "
+            "gate as local browsing (off-limits hosts are refused up front, before any run)."
         ),
         'parameters': {
             'type': 'object',
@@ -2137,7 +2138,7 @@ def _make_colab_compute_executor(agent_id, struck_tools=None):
         except (TypeError, ValueError):
             timeout = 300
         try:
-            result = _serve._colab_compute_run(code, purpose, packages, timeout)
+            result = _serve._colab_compute_run(agent_id, code, purpose, packages, timeout)
         except Exception as e:
             return f'__TOOL_ERROR__: Colab run crashed: {e}'
         if not isinstance(result, dict):

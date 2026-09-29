@@ -415,12 +415,14 @@ class AskEndpoint(unittest.TestCase):
             r = c.post('/api/intent/ask', json={'question': 'hi', 'agentId': 'ben'})
         self.assertEqual(r.status_code, 200, r.text)
         tool_names = {t['function']['name'] for t in seen['tools']}
-        # browse_page/search_web/x_trending_topics/search_linkedin_posts are
-        # general AGENT_ASK_TOOLS-adjacent capabilities, not security-role-
-        # gated -- only attempt_curl/request_capability_handle
-        # (SECURITY_TEST_TOOLS) are restricted to the Red Team Auditor role.
+        # browse_page/search_web/request_allowlist/x_trending_topics/
+        # search_linkedin_posts are general AGENT_ASK_TOOLS-adjacent
+        # capabilities, not security-role-gated -- only
+        # attempt_curl/request_capability_handle (SECURITY_TEST_TOOLS) are
+        # restricted to the Red Team Auditor role.
         # search_web only appears when TAVILY_API_KEY is actually configured.
-        expected = ({'weather_now', 'browse_page', 'x_trending_topics', 'search_linkedin_posts'}
+        expected = ({'weather_now', 'browse_page', 'request_allowlist',
+                     'x_trending_topics', 'search_linkedin_posts'}
                    | ({'search_web'} if serve.TAVILY_API_KEY else set()))
         self.assertEqual(tool_names, expected)
 
