@@ -484,6 +484,46 @@ class ColabComputeTests(unittest.TestCase):
     def setUp(self):
         serve._model_circuit_state.clear()
 
+    def test_operator_switch_off_refuses_runs(self):
+        with unittest.mock.patch.object(serve, 'COLAB_ENABLED', False), \
+             unittest.mock.patch.object(serve, '_colab_cli') as cli:
+            result = serve._colab_compute_run('print(1)', 'probe', [], 60)
+        self.assertIn('disabled by the operator', result['error'])
+        cli.assert_not_called()
+
+    def test_drive_mount_code_is_refused(self):
+        with unittest.mock.patch.object(serve, '_colab_cli') as cli:
+            result = serve._colab_compute_run(
+                'from google.colab import drive\ndrive.mount("/content/drive")\n',
+                'numeric job', [], 60)
+        self.assertIn('refusing to run', result['error'])
+        self.assertIn('off-limits', result['error'])
+        cli.assert_not_called()
+
+    def test_gcloud_and_mining_code_are_refused(self):
+        for bad in ('gsutil cp local gs://bucket/x', 'nicehash miner loop', 'gdown 1abc'):
+            with unittest.mock.patch.object(serve, '_colab_cli') as cli:
+                result = serve._colab_compute_run(bad, 'job', [], 60)
+            self.assertIn('refusing to run', result['error'], bad)
+            cli.assert_not_called()
+
+    def test_exfil_package_is_refused(self):
+        with unittest.mock.patch.object(serve, '_colab_cli') as cli:
+            result = serve._colab_compute_run(
+                'print(1)', 'job', ['gdown', 'requests'], 60)
+        self.assertIn('package', result['error'])
+        self.assertIn('refusing to run', result['error'])
+        cli.assert_not_called()
+
+    def test_plain_numeric_code_passes_the_guard(self):
+        with unittest.mock.patch.object(serve, 'COLAB_MONTHLY_UNITS', 0.0), \
+             unittest.mock.patch.object(serve, 'COLAB_FREE_TIER', True), \
+             unittest.mock.patch.object(serve, '_colab_account_usage', return_value=None), \
+             unittest.mock.patch.object(serve, '_colab_compute_provision', return_value=(True, 'ok')), \
+             unittest.mock.patch.object(serve, '_colab_cli', return_value=(0, '42\n__COLAB_DONE__\n')):
+            result = serve._colab_compute_run('a = 41\nprint(a + 1)', 'sum', [], 60)
+        self.assertEqual(result['stdout'], '42')
+
     def test_budget_gate_refuses_when_gated_out(self):
         with unittest.mock.patch.object(serve, 'COLAB_MONTHLY_UNITS', 20.0), \
              unittest.mock.patch.object(serve, '_colab_spend_this_month', return_value=25.0), \
