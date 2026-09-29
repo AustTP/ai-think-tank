@@ -123,7 +123,7 @@
   .chat-box { width: 640px; }
   .chat-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
   .chat-header h3 { margin: 0; font-size: 15px; }
-  .chat-body { display: flex; gap: 12px; height: 360px; }
+  .chat-body { display: flex; gap: 12px; height: min(360px, 55vh); }
   .chat-roster {
     width: 170px; flex: 0 0 auto; overflow-y: auto; border-right: 1px solid var(--border);
     padding-right: 10px; display: flex; flex-direction: column; gap: 4px;
@@ -159,7 +159,7 @@
     margin-bottom: 10px; color: #7fff7f; font-size: 13px;
   }
   .terminal-output {
-    height: 300px; overflow-y: auto; background: #050805; border: 1px solid #1a3a1a;
+    height: min(300px, 45vh); overflow-y: auto; background: #050805; border: 1px solid #1a3a1a;
     border-radius: 8px; padding: 8px; font-size: 13px; color: #7fff7f;
     white-space: pre-wrap; word-break: break-word;
   }
@@ -293,6 +293,36 @@
   .convo-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
   .convo-header h3 { margin: 0; font-size: 15px; }
   .convo-header .role { font-size: 11px; opacity: 0.65; display: block; }
+
+  /* Narrow screens: modals fill more of the width, chat panels stack
+     (roster above thread) instead of squeezing side by side, panel
+     heights track the viewport, and the HUD compacts so it fits without
+     horizontal scrolling. */
+  @media (max-width: 700px) {
+    .modal-box { max-width: 94vw; }
+    .chat-box, .terminal-box, .profile-box, .convo-box { width: 94vw; }
+
+    .chat-body {
+      flex-direction: column;
+      height: min(68vh, 540px);
+    }
+    .chat-roster {
+      width: 100%;
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+      padding-right: 0;
+      padding-bottom: 8px;
+      max-height: 140px;
+      flex: 0 1 auto;
+    }
+    .chat-thread { flex: 1 1 auto; min-height: 0; }
+
+    #hudBar { gap: 6px; padding: 0 8px; }
+    .hud-brand { display: none; }
+    .hud-pill { padding: 4px 9px; min-width: 44px; font-size: 10px; }
+    .hud-pill .value { font-size: 12px; }
+    .hud-btn { padding: 7px 10px; font-size: 11px; }
+  }
 </style>
 </head>
 <body>
