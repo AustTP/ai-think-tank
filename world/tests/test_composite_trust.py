@@ -42,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import serve  # noqa: E402  (sys.path insert above is the repo test convention)
 import sim  # noqa: E402
+import content  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 _TMP_DIR = None
@@ -472,6 +473,161 @@ class ColabStandbyTests(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
         self.assertEqual(serve._get_setting('colab_laya_url'), None,
                          'nothing is stored on invalid input')
+
+
+class ColabComputeTests(unittest.TestCase):
+    """run_on_colab agent compute (2026-09-29): the dedicated 'village-gpu'
+    T4 session, provisioned/ran/stood-down through the colab CLI, metered as
+    monthly compute units in the Bank. Hermetic: _colab_cli/_provision are
+    mocked, so no CLI, no session, no network ever actually runs."""
+
+    def setUp(self):
+        serve._model_circuit_state.clear()
+
+    def test_budget_gate_refuses_when_gated_out(self):
+        with unittest.mock.patch.object(serve, 'COLAB_MONTHLY_UNITS', 20.0), \
+             unittest.mock.patch.object(serve, '_colab_spend_this_month', return_value=25.0), \
+             unittest.mock.patch.object(serve, '_colab_account_usage', return_value=None), \
+             unittest.mock.patch.object(serve, '_colab_cli') as cli:
+            result = serve._colab_compute_run('print(1)', 'probe', [], 60)
+        self.assertIn('monthly Colab compute-unit budget', result['error'])
+        cli.assert_not_called(), 'gated out means no provisioning attempt at all'
+
+    def test_exhausted_paid_account_balance_refuses_run(self):
+        with unittest.mock.patch.object(serve, 'COLAB_MONTHLY_UNITS', 0.0), \
+             unittest.mock.patch.object(serve, 'COLAB_FREE_TIER', False), \
+             unittest.mock.patch.object(serve, '_colab_account_usage',
+                                        return_value={'balance': 0.0, 'rate': 1.15, 'assignments': 1}), \
+             unittest.mock.patch.object(serve, '_colab_cli') as cli:
+            result = serve._colab_compute_run('print(1)', 'probe', [], 60)
+        self.assertIn('no compute units left', result['error'])
+        cli.assert_not_called()
+
+    def test_free_tier_zero_balance_proceeds_to_provision(self):
+        with unittest.mock.patch.object(serve, 'COLAB_MONTHLY_UNITS', 0.0), \
+             unittest.mock.patch.object(serve, 'COLAB_FREE_TIER', True), \
+             unittest.mock.patch.object(serve, '_colab_account_usage',
+                                        return_value={'balance': 0.0, 'rate': 1.15, 'assignments': 2}), \
+             unittest.mock.patch.object(serve, '_colab_compute_provision', return_value=(True, 'ok')) as prov, \
+             unittest.mock.patch.object(serve, '_colab_cli', return_value=(0, '12\n__COLAB_DONE__\n')):
+            result = serve._colab_compute_run('print(1)', 'probe', [], 60)
+        self.assertEqual(result['stdout'], '12')
+        prov.assert_called_once()
+
+    def test_empty_and_oversized_code_rejected_without_cli(self):
+        with unittest.mock.patch.object(serve, '_colab_cli') as cli:
+            self.assertIn('code is required', serve._colab_compute_run('', 'probe', [], 60)['error'])
+            big = 'x' * (serve.COLAB_CODE_MAX_CHARS + 1)
+            self.assertIn('under', serve._colab_compute_run(big, 'probe', [], 60)['error'])
+        cli.assert_not_called()
+
+    def test_provisions_gpu_session_with_t4_on_demand(self):
+        calls = []
+        with unittest.mock.patch.object(serve, '_colab_session_exists', return_value=False), \
+             unittest.mock.patch.object(serve, '_colab_cli', side_effect=lambda *a, **k: calls.append((a, k)) or (0, '')):
+            ok, msg = serve._colab_compute_provision()
+        self.assertTrue(ok)
+        new_call = next(a for a, _k in calls if a[0] == 'new')
+        self.assertEqual(new_call[1:], ('-s', 'village-gpu', '--gpu', 'T4'),
+                         'the dedicated session is a T4 created on demand')
+
+    def test_reuses_existing_session(self):
+        with unittest.mock.patch.object(serve, '_colab_session_exists', return_value=True), \
+             unittest.mock.patch.object(serve, '_colab_cli') as cli:
+            ok, msg = serve._colab_compute_provision()
+        self.assertTrue(ok)
+        cli.assert_not_called(), 'an existing session is reused without any CLI call'
+
+    def test_successful_run_returns_stdout_and_accrues_units(self):
+        accrued = {}
+        with unittest.mock.patch.object(serve, '_colab_budget_exceeded', return_value=False), \
+             unittest.mock.patch.object(serve, '_colab_compute_provision', return_value=(True, 'ok')), \
+             unittest.mock.patch.object(serve, '_colab_cli', return_value=(0, 'answer=42\n__COLAB_DONE__')) as cli, \
+             unittest.mock.patch.object(serve, '_accrue_colab_units',
+                                        side_effect=lambda u: accrued.setdefault('units', u)), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            result = serve._colab_compute_run('print("answer=42")', 'probe', [], 60)
+        self.assertEqual(result['stdout'], 'answer=42')
+        self.assertGreaterEqual(result['units'], serve.COLAB_MIN_UNITS_PER_RUN)
+        self.assertEqual(accrued['units'], result['units'])
+        self.assertEqual(result['session'], 'village-gpu')
+        exec_call = cli.call_args.args
+        self.assertIn('exec', exec_call)
+        self.assertIn('__COLAB_DONE__', cli.call_args.kwargs.get('input', ''))
+
+    def test_failed_cli_run_returns_honest_error(self):
+        with unittest.mock.patch.object(serve, '_colab_budget_exceeded', return_value=False), \
+             unittest.mock.patch.object(serve, '_colab_compute_provision', return_value=(True, 'ok')), \
+             unittest.mock.patch.object(serve, '_colab_cli', return_value=(1, 'Traceback')), \
+             unittest.mock.patch.object(serve, '_accrue_colab_units'), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            result = serve._colab_compute_run('1/0', 'probe', [], 60)
+        self.assertIn('exit 1', result['error'])
+
+    def test_executor_formats_error_for_the_model(self):
+        with unittest.mock.patch.object(serve, '_colab_compute_run',
+                                        return_value={'error': 'boom'}):
+            executor = content._make_colab_compute_executor('a1')
+            out = executor('run_on_colab', {'code': 'print(1)'})
+        self.assertIn('__TOOL_ERROR__', out)
+        self.assertIn('boom', out)
+
+    def test_account_usage_parses_colab_usage_output(self):
+        raw = ('Current balance: 4.25 compute units\n'
+               'Usage rate: 1.15/hr\n'
+               'Active assignments: 2')
+        with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+             unittest.mock.patch.object(serve, '_colab_cli', return_value=(0, raw)):
+            usage = serve._colab_account_usage()
+        self.assertEqual(usage['balance'], 4.25)
+        self.assertEqual(usage['rate'], 1.15)
+        self.assertEqual(usage['assignments'], 2)
+
+    def test_budget_exceeded_when_real_account_balance_is_zero(self):
+        with unittest.mock.patch.object(serve, 'COLAB_MONTHLY_UNITS', 0.0), \
+             unittest.mock.patch.object(serve, 'COLAB_FREE_TIER', False), \
+             unittest.mock.patch.object(serve, '_colab_account_usage',
+                                        return_value={'balance': 0.0, 'rate': 1.15, 'assignments': 1}):
+            self.assertTrue(serve._colab_budget_exceeded(),
+                            'a genuinely exhausted paid account gates runs even with no village cap')
+
+    def test_free_tier_zero_balance_is_not_a_gate(self):
+        with unittest.mock.patch.object(serve, 'COLAB_MONTHLY_UNITS', 0.0), \
+             unittest.mock.patch.object(serve, 'COLAB_FREE_TIER', True), \
+             unittest.mock.patch.object(serve, '_colab_account_usage',
+                                        return_value={'balance': 0.0, 'rate': 1.15, 'assignments': 2}):
+            self.assertFalse(serve._colab_budget_exceeded(),
+                             'free tier has no prepaid wallet -- 0.00 balance must not block runs')
+
+    def test_budget_not_exceeded_when_balance_exists_and_no_village_cap(self):
+        with unittest.mock.patch.object(serve, 'COLAB_MONTHLY_UNITS', 0.0), \
+             unittest.mock.patch.object(serve, 'COLAB_FREE_TIER', False), \
+             unittest.mock.patch.object(serve, '_colab_account_usage',
+                                        return_value={'balance': 4.25, 'rate': 1.15, 'assignments': 2}):
+            self.assertFalse(serve._colab_budget_exceeded())
+        with unittest.mock.patch.object(serve, 'COLAB_MONTHLY_UNITS', 0.0), \
+             unittest.mock.patch.object(serve, 'COLAB_FREE_TIER', False), \
+             unittest.mock.patch.object(serve, '_colab_account_usage', return_value=None):
+            self.assertFalse(serve._colab_budget_exceeded(),
+                             'an unknown balance fails open to the operator cap alone')
+
+    def test_bank_view_seeds_colab_units_row(self):
+        with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+             unittest.mock.patch.object(serve, 'COLAB_MONTHLY_UNITS', 20.0), \
+             unittest.mock.patch.object(serve, '_colab_spend_this_month', return_value=3.0), \
+             unittest.mock.patch.object(serve, '_colab_account_usage',
+                                        return_value={'balance': 4.25, 'rate': 1.15, 'assignments': 2}):
+            services = serve._bank_budget_view({})
+        row = services[serve.COLAB_LEDGER_KEY]
+        self.assertEqual(row['used'], 3.0)
+        self.assertEqual(row['cap'], 20.0)
+        self.assertEqual(row['left'], 17.0)
+        self.assertEqual(row['balance_units'], 4.25)
+        self.assertFalse(row['over'])
+
+    def test_budget_cap_reads_units_not_usd(self):
+        self.assertEqual(serve._budget_cap_usd(serve.COLAB_LEDGER_KEY),
+                         serve.COLAB_MONTHLY_UNITS)
 
 
 # ---------------------------------------------------------------------------
