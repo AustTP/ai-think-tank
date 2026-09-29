@@ -1637,6 +1637,12 @@ def queue_work(state, items):
             # review-subtask creation) -- lets an actionable review pin the fix
             # back to the worker who built it.
             'reviewAuthorId': item.get('reviewAuthorId') or None,
+            # CS329A takeaway #2 (2026-09-28): the review checklist -- code/jev/
+            # human-typed requirement entries (see content.py's ensemble grading) --
+            # must survive the queue round trip or the Python review path can't
+            # grade per-requirement. Same class of gap as 'distill' below: a
+            # whitelist that silently drops a field its consumer needs.
+            'checklist': list(item.get('checklist') or []),
         })
     return len(work_queue)
 
@@ -2375,6 +2381,10 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'budgetMs': (extra or {}).get('budgetMs'),
         'reviewOf': (extra or {}).get('reviewOf'),
         'reviewAuthorId': (extra or {}).get('reviewAuthorId'),
+        # CS329A takeaway #2 (2026-09-28): checklist survives onto the task
+        # object itself (see _assign_due_item's extra dict) -- the review
+        # executor grades per-requirement from here.
+        'checklist': list((extra or {}).get('checklist') or []),
         'incident': bool((extra or {}).get('incident')),
         'productId': (extra or {}).get('productId'),
         'assignedTo': agent_id,
@@ -5295,6 +5305,20 @@ def _room_backlog_count(state, room):
     return queued + in_flight
 
 
+# Absolute Zero scoping guidance (2026-09-28): when the village proposes its
+# OWN next work (an agent filing a follow-up, and the grooming ceremony deciding
+# whether to accept it), the default failure mode is proposing TRIVIAL work --
+# cards easy to write and worth nothing. Guidance steers every self-proposed
+# card toward MEDIUM difficulty: a real, well-scoped story that materially
+# advances the room. Not a hard rule (the decider still owns accept/reject) --
+# it just stops the easy/hard extremes from being the default.
+ABSOLUTE_ZERO_SCOPING_GUIDANCE = (
+    "Scoping guidance: prefer a MEDIUM-difficulty story -- a real, well-scoped "
+    "piece of work that materially advances the room. Reject trivial/filler "
+    "proposals and over-ambitious un-scoped ones alike."
+)
+
+
 def _maybe_file_followup(state, agent_id, completed_task, now_ms):
     """Deterministic signal generator: an on-duty agent that just COMPLETED a
     task in a delegatable room files a follow-up work-request if that room's
@@ -5315,7 +5339,7 @@ def _maybe_file_followup(state, agent_id, completed_task, now_ms):
     title = f"Follow-up: further {room_label} work after completing '{completed_task.get('title') or 'previous task'}'"
     file_work_request(
         state, agent_id, title, room_label,
-        reason=f"Completed '{completed_task.get('title') or 'previous task'}' in {room_label} and the remaining backlog there has thinned to {_room_backlog_count(state, room_label)} item(s); this room can absorb another story.")
+        reason=f"Completed '{completed_task.get('title') or 'previous task'}' in {room_label} and the remaining backlog there has thinned to {_room_backlog_count(state, room_label)} item(s); this room can absorb another story. {ABSOLUTE_ZERO_SCOPING_GUIDANCE}")
 
 
 def _refinement_decider_default(instructions, criteria):
@@ -5489,10 +5513,11 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
         if ctx:
             instructions += f" Roadmap context for this room: {ctx}."
         instructions += (" Turn it into a real story (accept) or groom it back to the "
-                         "requester because it's not ready / not needed / doesn't fit the roadmap (reject).")
+                         "requester because it's not ready / not needed / doesn't fit the roadmap (reject). "
+                         + ABSOLUTE_ZERO_SCOPING_GUIDANCE)
         criteria = [
-            {'id': 'accept', 'description': f"Create '{req.get('title')}' as a real story in {req.get('room')} -- it's a genuine, well-scoped gap worth a card."},
-            {'id': 'reject', 'description': "Groom this request out -- it's a duplicate, low-value, out-of-scope, or the roadmap already covers it."},
+            {'id': 'accept', 'description': f"Create '{req.get('title')}' as a real story in {req.get('room')} -- it's a genuine, well-scoped, MEDIUM-difficulty gap worth a card."},
+            {'id': 'reject', 'description': "Groom this request out -- it's a duplicate, low-value, trivial/filler, over-ambitious/un-scoped, out-of-scope, or the roadmap already covers it."},
         ]
         choice = decider(instructions, criteria)
         if choice is None:
@@ -5517,9 +5542,15 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
             accepted.append(req)
         else:
             req['status'] = 'rejected'
-        _log_governance(state, scrum_master_id, 'refinement_carryaway',
-                        {'request': req['id'], 'choice': choice, 'filedBy': filed_by,
-                         'room': req['room'], 'title': req['title'][:120]})
+        details = {'request': req['id'], 'choice': choice, 'filedBy': filed_by,
+                   'room': req['room'], 'title': req['title'][:120]}
+        if choice == 'reject':
+            # Absolute Zero rejection signal: a self-proposed work-request was
+            # groomed OUT. Durable, queryable (the health check counts these) --
+            # a rising reject rate is the village's own early warning that its
+            # proposals are trending trivial/ill-scoped.
+            details['selfProposedRejected'] = True
+        _log_governance(state, scrum_master_id, 'refinement_carryaway', details)
     # Restore attendees; reset the cadence stamp event-to-event. Like the Social,
     # the work budget given back is the full ceremony length, so the meeting
     # burned none of a mid-task attendee's work time.
@@ -6799,6 +6830,11 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         'research': pick.get('research'),
         'taskType': pick.get('taskType'),
         'skillReview': pick.get('skillReview'),
+        # CS329A takeaway #2 (2026-09-28): thread the review checklist through
+        # to the assigned task so the Python review executor can grade each
+        # requirement (code/jev/human) instead of a single all-or-nothing
+        # verdict. Same class of gap as 'distill' two lines down.
+        'checklist': pick.get('checklist'),
         # Real bug caught live (2026-09-24): 'distill' was missing from this
         # whitelist entirely, same class of gap as skillReview -- a distill
         # sweep task assigned through here never carried the flag onto the

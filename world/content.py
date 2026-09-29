@@ -1269,6 +1269,180 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     return True
 
 
+GRADE_MEETS = 'meets_requirement'
+GRADE_FAILS = 'fails_requirement'
+GRADE_UNSURE = 'insufficient_evidence'
+
+# CS329A takeaway #2 (2026-09-28): Weaver-style verifier ensemble for grading.
+# The JS planning model emits a per-requirement CHECKLIST ({id, question,
+# section, type: code|jev|human}) that travels with a project's subtasks, but
+# the Python review executor (_run_review_content) only ever produced a single
+# holistic Jev actionable/clean verdict -- requirement-level grading existed
+# only in the browser (grading.js runGradedReviewLoop). This adds the Python
+# side: grade each checklist requirement with its OWN focused check, and let
+# the ensemble outvote the holistic verdict the way the article's verifier
+# ensemble does -- a mechanical 'code' requirement (ground truth = the quality
+# pipeline) or a confident focused 'jev' grade that fails is a REAL defect even
+# if the holistic call said clean; 'human' requirements and low-confidence
+# grades surface to the player instead of being auto-decided.
+#
+# A requirement whose question is about code health (pipeline/tests/lint/build)
+# is decided directly from the LIVE quality-pipeline result the executor
+# already ran -- the most objective evidence the review path has. Any other
+# 'code' requirement has no predicate that survives serialization (the JS
+# predicates are in-memory functions), so it degrades to insufficient_evidence
+# -- the same "absent predicate -> unsure" behavior as gradeCodeRequirement in
+# grading.js -- rather than guessing.
+_PIPELINE_HINT_WORDS = ('pipeline', 'flake8', 'mypy', 'bandit', 'pytest', 'test', 'lint', 'build', 'compile', 'ci', 'green')
+
+# Cap on per-review spend: each focused 'jev' grade is a real Jev call, and the
+# checklist is emitted for every subtask of a project -- grading five of them
+# costs real money. Five focused checks (the planner's own "2-5 subtasks" scale)
+# is a fair ensemble without letting a checklist turn one review into an
+# invoice.
+MAX_CHECKLIST_JEV_GRADES = 5
+# Cap on escalations per review -- an unsure-heavy checklist can't spam the
+# player; the first few real questions are enough to get the call.
+MAX_CHECKLIST_ESCALATIONS = 3
+# SWiRL-style process trace: when a review VERIFIES a checklist requirement
+# failed, the review writes a compact lesson file into pending_review/skills/
+# (auto-quarantined via source 'external'), where the existing skill-review
+# sweep later judges keep/promote vs reject. Bounded: at most a few per
+# review, short, and deduped on the requirement -- no repeat spam on re-review.
+MAX_CHECKLIST_TRACE_FILES = 3
+_PROCESS_TRACE_MAX_CHARS = 4000
+
+
+def _record_review_process_trace(base, key, agent_id, project_label, backlog, kind,
+                                 name, checklist_grades, full_review):
+    """Write the failed-requirement lessons from a review into
+    pending_review/skills/review-trace/ as compact process-trace files, one per
+    VERIFIED (GRADE_FAILS) checklist requirement, deduped on the requirement id
+    and bounded in count and size. Returns how many were actually written (0
+    when there is nothing new worth keeping -- the file already exists, or no
+    requirement failed)."""
+    written = 0
+    for g in checklist_grades:
+        if g.get('verdict') != GRADE_FAILS or written >= MAX_CHECKLIST_TRACE_FILES:
+            continue
+        req_id = g.get('id') or 'req'
+        section = g.get('section') or ''
+        question = g.get('question') or ''
+        slug = _skill_slug(f'{project_label or "project"}-{section}-{req_id}') or 'req'
+        path = f'pending_review/skills/review-trace/{_skill_slug(project_label or "project") or "project"}/{slug}.md'
+        existing = None
+        try:
+            r = _serve._http_json('GET', base, '/api/library/file?path=' + urllib.parse.quote(path))
+            existing = r.get('content') if isinstance(r, dict) else None
+        except Exception:
+            existing = None
+        if existing:
+            continue  # the requirement's lesson is already queued -- don't spam
+        conf = g.get('confidence')
+        body = (f'# Review trace: {question or req_id}\n\n'
+                f'- Project: {project_label or "(unnamed)"}\n'
+                f'- Requirement: "{question or req_id}"'
+                + (f' (section: {section})' if section else '')
+                + f' [{g.get("type", "")}]\n'
+                f'- Found during a {kind} of "{backlog}" by {name}\n'
+                f'- Verdict: verified FAILS'
+                + (f' (Jev confidence {conf:.2f})' if isinstance(conf, float) else '')
+                + '\n\n'
+                f'## What the reviewer saw\n\n{full_review[:1200]}\n\n'
+                f'## Lesson\n\n'
+                f'Future work on "{project_label or backlog}" must satisfy this requirement: "{question or req_id}".\n')
+        try:
+            _serve._http_json('POST', base, '/api/library/file',
+                       {'agentId': agent_id, 'path': path, 'content': body[:_PROCESS_TRACE_MAX_CHARS],
+                        'source': 'external'}, key)
+            written += 1
+        except Exception:
+            pass
+    return written
+
+
+def _grade_code_requirement(req, qp):
+    """Mechanical grade for a 'code'-type checklist requirement. Returns a
+    verdict string (GRADE_MEETS/GRADE_FAILS/GRADE_UNSURE) -- no Jev call, no
+    cost. Ground truth is the live quality-pipeline result where the
+    requirement is about code health; everything else is unknowable from the
+    evidence this executor holds and degrades to GRADE_UNSURE (surface to the
+    player), never a guess."""
+    text = f"{req.get('question', '')} {req.get('section', '')}".lower()
+    if any(word in text for word in _PIPELINE_HINT_WORDS):
+        return GRADE_MEETS if qp.get('ok') else GRADE_FAILS
+    return GRADE_UNSURE
+
+
+def _grade_jev_requirement(req, review):
+    """Focused Jev grade for a 'jev'-type checklist requirement -- a per-
+    requirement verifier, not the holistic verdict. Returns (verdict,
+    confidence). The Jev contract applies: a meets/fails grade is only acted on
+    at confidence >= JEV_SAFETY_CONFIDENCE; below it (or a failed call) the
+    requirement is insufficient_evidence and surfaces to the player instead of
+    driving an automatic revision on weak signal."""
+    try:
+        decision = _serve._call_openrouter_decision_sync(
+            _serve._jev_model(), {'messages': [], 'signals': {}},
+            {'choice': {'type': 'choice',
+                        'instructions': f'You are grading one specific requirement of a deliverable. '
+                                        f'Requirement: "{req.get("question", "")}". '
+                                        f'The section being checked is "{req.get("section", "")}". '
+                                        f'Relevant part of the deliverable: "{review[:1500]}" '
+                                        f'Answer whether THIS requirement is met by THIS deliverable.',
+                        'criteria': {GRADE_MEETS: 'The deliverable satisfies this specific requirement.',
+                                     GRADE_FAILS: 'The deliverable does not satisfy this specific requirement.',
+                                     GRADE_UNSURE: 'Not enough evidence in the deliverable to judge, or the question cannot be answered from it.'}}})
+        choice, confidence, _cost = _serve._jev_choice(decision)
+    except Exception:
+        return GRADE_UNSURE, 0.0
+    if choice in (GRADE_MEETS, GRADE_FAILS) and confidence >= _serve.JEV_SAFETY_CONFIDENCE:
+        return choice, confidence
+    return GRADE_UNSURE, confidence
+
+
+def _grade_review_checklist(checklist, review, qp, agent_id):
+    """Grade every non-'human' checklist requirement against the review, one
+    focused check each ('code' = mechanical/pipeline ground truth, 'jev' = a
+    confidence-gated focused Jev call). 'human' requirements are never graded
+    here -- they surface to the player. Returns a list of grade dicts shaped
+    like grading.js's, plus the checklist entries that need a human: {'grades':
+    [...], 'escalate': [(req, reason)]}."""
+    grades = []
+    escalate = []
+    jev_graded = 0
+    for req in checklist:
+        req_id = req.get('id') or 'req'
+        section = req.get('section') or ''
+        question = req.get('question') or ''
+        rtype = req.get('type')
+        if rtype == 'human':
+            escalate.append((req, 'review decision for you'))
+            continue
+        if rtype == 'code':
+            grades.append({'id': req_id, 'section': section, 'question': question,
+                           'type': 'code', 'verdict': _grade_code_requirement(req, qp),
+                           'confidence': 1.0})
+        elif rtype == 'jev':
+            if jev_graded >= MAX_CHECKLIST_JEV_GRADES:
+                grades.append({'id': req_id, 'section': section, 'question': question,
+                               'type': 'jev', 'verdict': GRADE_UNSURE,
+                               'confidence': None, 'skipped': True})
+                escalate.append((req, 'not graded this round (checklist spend cap)'))
+                continue
+            jev_graded += 1
+            verdict, confidence = _grade_jev_requirement(req, review)
+            grades.append({'id': req_id, 'section': section, 'question': question,
+                           'type': 'jev', 'verdict': verdict, 'confidence': confidence})
+            if verdict == GRADE_UNSURE:
+                escalate.append((req, f'uncertain review requirement (Jev confidence {confidence:.2f})'
+                                      if confidence else 'uncertain review requirement (Jev call failed)'))
+        else:
+            # Unknown type -- never auto-decide on it either.
+            escalate.append((req, 'review requirement with unrecognized type'))
+    return {'grades': grades, 'escalate': escalate}
+
+
 def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     """Port of tasks.js runReviewTask: a real review/QA pass -- gatherUnifiedContext,
     a skeptical critique call (probe-driven), a real screenshot visual pass, a Jev
@@ -1397,6 +1571,28 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     if not qp['ok']:
         verdict = 'actionable'
 
+    # CS329A takeaway #2 -- Weaver-style verifier ensemble: grade the project's
+    # checklist requirements with focused per-requirement checks (mechanical for
+    # 'code', a confidence-gated Jev call for 'jev'), and let a VERIFIED failure
+    # outvote the holistic verdict -- a requirement the verifier caught is a
+    # real defect even if the holistic call read clean. Unsure or 'human'
+    # requirements surface to the player, never auto-decided.
+    checklist_grades = []
+    escalated_reqs = []
+    checklist = task.get('checklist') or []
+    if checklist:
+        graded = _grade_review_checklist(checklist, full_review, qp, agent_id)
+        checklist_grades = graded['grades']
+        if any(g['verdict'] == GRADE_FAILS for g in checklist_grades):
+            verdict = 'actionable'
+        for req, reason in graded['escalate'][:MAX_CHECKLIST_ESCALATIONS]:
+            try:
+                _serve.create_escalation(reason,
+                                         f'{req.get("question", "")} ({req.get("section", "") or "deliverable"})')
+                escalated_reqs.append(req.get('id') or 'req')
+            except Exception:
+                pass
+
     queue_fix = None
     suffix = 'nothing actionable found'
     is_gate_review = bool(task.get('reviewOf'))
@@ -1428,13 +1624,31 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
             queue_fix['assignedTo'] = task.get('reviewAuthorId') or task.get('assignedTo')
             queue_fix['reviewOf'] = task.get('reviewOf')
         suffix = 'queued a fix'
+    # SWiRL: a review that VERIFIED a checklist requirement failed leaves a
+    # process-trace lesson in pending_review/skills/ (bounded + deduped by the
+    # helper) so the village's skill-review sweep can promote it into reference
+    # material -- the review writes its own durable trace, no separate crawl.
+    process_trace_count = 0
+    if verdict == 'actionable' and any(g.get('verdict') == GRADE_FAILS for g in checklist_grades):
+        try:
+            process_trace_count = _record_review_process_trace(
+                base, key, agent_id, project_label, backlog, kind, name,
+                checklist_grades, full_review)
+        except Exception:
+            process_trace_count = 0
     result = {'note': f'Filed a {kind} on "{backlog}" (text + visual), {suffix}',
               'ok': True,
               'pipelineOk': qp['ok'],
               'pipelineSummary': qp['note']}
+    if checklist_grades:
+        result['checklistGrades'] = checklist_grades
+    if escalated_reqs:
+        result['checklistEscalated'] = escalated_reqs
     if is_gate_review:
         # Relay the vote so _apply_content_result can count it on the parent.
         result['peerVerdict'] = verdict
+    if process_trace_count:
+        result['processTraceCount'] = process_trace_count
     if queue_fix:
         result['queueFix'] = queue_fix
     _sim_module._store_content_result(task.get('id'), result)
