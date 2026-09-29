@@ -2716,6 +2716,7 @@ async def _lifespan(app):
     prune_task = asyncio.create_task(_log_prune_loop())
     tier_refresh_task = asyncio.create_task(_model_tier_refresh_loop())
     calibration_task = asyncio.create_task(_calibration_loop())
+    colab_task = asyncio.create_task(_colab_failover_loop())
     telegram_task = None
     if TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS:
         telegram_task = asyncio.create_task(_telegram_poll_loop())
@@ -2742,6 +2743,7 @@ async def _lifespan(app):
     peer_task.cancel()
     backup_task.cancel()
     calibration_task.cancel()
+    colab_task.cancel()
     prune_task.cancel()
     tier_refresh_task.cancel()
     if telegram_task is not None:
@@ -4886,6 +4888,17 @@ def _weather_code_human(code):
 
 
 def _decision_request(model, state, questions):
+    # A '://' chain entry is a REMOTE Jev-compatible provider (the Colab/Laya
+    # sentinel) reached directly, not an OpenRouter slug: literally the URL,
+    # its own bearer key, the same {state, questions} wire format. No 'model'
+    # field -- laya routes internally on the Colab runtime.
+    if '://' in model:
+        src = json.dumps({'state': state, 'questions': questions}).encode()
+        headers = {'Content-Type': 'application/json'}
+        key = (_get_setting('colab_laya_key') or '').strip()
+        if key:
+            headers['Authorization'] = f'Bearer {key}'
+        return urllib.request.Request(model, data=src, headers=headers, method='POST')
     payload = json.dumps({'model': model, 'state': state, 'questions': questions}).encode()
     return urllib.request.Request(
         'https://openrouter.ai/api/alpha/decisions',
@@ -5080,17 +5093,31 @@ def _decision_model_chain():
     next candidate when the active one fails or its circuit breaker is open.
     Never auto-updated -- adding a decision model is deliberate, exactly like
     the model switch itself."""
+    chain = None
     saved = (_get_setting('jev_model') or '').strip()
     if saved:
-        chain = [s.strip() for s in saved.split(',') if s.strip()]
-        if chain:
-            return chain
-    env_models = (_load_env().get('JEV_MODELS', '') or '').strip()
-    if env_models:
-        chain = [s.strip() for s in env_models.split(',') if s.strip()]
-        if chain:
-            return chain
-    return [JEV_MODEL]
+        cand = [s.strip() for s in saved.split(',') if s.strip()]
+        if cand:
+            chain = cand
+    if chain is None:
+        env_models = (_load_env().get('JEV_MODELS', '') or '').strip()
+        if env_models:
+            cand = [s.strip() for s in env_models.split(',') if s.strip()]
+            if cand:
+                chain = cand
+    if chain is None:
+        chain = [JEV_MODEL]
+    # A registered Colab/Laya sentinel trails the chain as the LAST fallback:
+    # the primary slug still leads (and _jev_model() keeps returning it), the
+    # provider only ever answers when the remote decisions model is down. The
+    # standby loop decides when the sentinel's Laya is standing up; this just
+    # advertises it for the failover to find.
+    base, _key = _colab_standby()
+    if base:
+        provider = base.rstrip('/') + COLAB_STANDBY_DECISION_PATH
+        if provider not in chain:
+            chain.append(provider)
+    return chain
 
 
 def _jev_model():
@@ -5100,6 +5127,109 @@ def _jev_model():
     of _decision_model_chain() so every existing call site keeps using the
     primary slug unchanged while the chain handles failover internally."""
     return _decision_model_chain()[0]
+
+
+# ---- Colab/Laya standby (2026-09-29) ---------------------------------
+# The decisions-model backing layer can include a REMOTE Jev-compatible
+# server (Laya) running on a Google Colab runtime, reachable through the
+# sentinel notebook's public tunnel. The user starts the sentinel once (see
+# world/colab_standby_notebook.md); the notebook POSTs its tunnel base + key
+# to /api/colab/register, which lands in the same `settings` DB as
+# everything else. From there the village owns the lifecycle: the chain
+# appends the provider URL as the last failover candidate, and
+# _colab_failover_loop tells the notebook to stand Laya up when Jev degrades
+# and to tear it down once Jev is healthy again. The laptop never hosts the
+# model -- only the routing. No Google credential is involved anywhere: the
+# runtime is the user's own Colab session, and the notebook reports in over
+# the tunnel like any remote endpoint.
+COLAB_FAILOVER_INTERVAL_S = 15 * 60   # 15 min, matching the health cadence
+COLAB_STANDBY_HEALTHY_CYCLES = 2      # consecutive healthy cycles -> teardown
+COLAB_STANDBY_DECISION_PATH = '/v1/systemone'
+
+
+def _colab_standby():
+    """(base_url, key) of the registered Colab sentinel, or (None, None)."""
+    base = (_get_setting('colab_laya_url') or '').strip()
+    key = (_get_setting('colab_laya_key') or '').strip()
+    return base or None, key or None
+
+
+def _jev_health_window():
+    """(attempts, failures) over the same rolling window the health alert
+    uses, so the standby loop and the health page never disagree about
+    whether Jev is degraded."""
+    now = time.time()
+    with _db() as conn:
+        row = conn.execute(
+            'SELECT COUNT(*), SUM(ok = 0) FROM decision_tape WHERE ts > ?',
+            (now - JEV_HEALTH_WINDOW_S,),
+        ).fetchone()
+    return int(row[0] or 0), int(row[1] or 0)
+
+
+def _jev_is_degraded():
+    """True when the decisions model looks unavailable -- exactly the
+    predicate underlying the 'Jev decision call(s) failed' health alert."""
+    attempts, failures = _jev_health_window()
+    return (attempts >= JEV_HEALTH_MIN_ATTEMPTS
+            and failures >= attempts * JEV_HEALTH_FAILURE_RATE)
+
+
+def _colab_control(base, action, key):
+    """Ask the sentinel notebook to stand Laya up or tear it down. The
+    notebook is the authority on its own process tree (it runs on the Colab
+    runtime, where the model must load); the village only sends intent. The
+    notebook keeps laya-serve behind *its* tunnel, so this is a public URL
+    the registration vouched for."""
+    req = urllib.request.Request(f'{base}/control?action={action}')
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:  # nosec B310 -- registration-vouched public tunnel URL
+            body = resp.read().decode('utf-8', errors='replace')
+            return json.loads(body) if body else {'ok': True}
+    except Exception as e:
+        print(f'[colab-standby] {action} on {base} failed: {e}', flush=True)
+        return None
+
+
+def _colab_standup(base, key):
+    result = _colab_control(base, 'standup', key)
+    if result is None:
+        print('[colab-standby] standup failed -- sentinel unreachable?', flush=True)
+    return result
+
+
+def _colab_teardown(base, key):
+    result = _colab_control(base, 'teardown', key)
+    if result is None:
+        print('[colab-standby] teardown failed -- sentinel unreachable?', flush=True)
+    return result
+
+
+async def _colab_failover_loop():
+    """15-min poll: Jev degraded -> tell the sentinel notebook to stand Laya
+    up (preloads on the Colab runtime, never here); Jev healthy -> tell it to
+    stand down once two clean cycles confirm recovery. No sentinel registered
+    -> just log; the health alert already covers an uncovered outage."""
+    healthy_cycles = 0
+    while True:
+        try:
+            base, key = _colab_standby()
+            if _jev_is_degraded():
+                healthy_cycles = 0
+                if base:
+                    print('[colab-standby] Jev degraded; standing Laya up on Colab', flush=True)
+                    _colab_standup(base, key)
+                else:
+                    print('[colab-standby] Jev degraded but no Colab sentinel registered', flush=True)
+            elif base:
+                _colab_teardown(base, key)
+                healthy_cycles += 1
+                if healthy_cycles >= COLAB_STANDBY_HEALTHY_CYCLES:
+                    print('[colab-standby] Jev healthy; Colab standby stood down', flush=True)
+        except Exception as e:
+            print(f'[colab-standby] loop error: {e}', flush=True)
+        await asyncio.sleep(COLAB_FAILOVER_INTERVAL_S)
+
 
 # Any safety gate that gets a Jev "allow/approve" below this confidence is
 # treated as "unsure" and escalated to a human instead of acted on -- the
@@ -11910,6 +12040,41 @@ async def jev_model_set(request: Request):
     log_action('player', 'jev_model_set', {'model': model}, authorized=True)
     _append_passport_decision('jev_model_set', 'player', {'model': model})
     return JSONResponse({'ok': True, 'model': model})
+
+
+@app.post('/api/colab/register')
+async def colab_register(request: Request):
+    # Pairing point for the sentinel notebook (world/colab_standby_notebook.md).
+    # The notebook is a DEVICE in exactly the sense of the check-in endpoint:
+    # no player session, no agent_key -- so it authenticates with the same
+    # X-Device-Key bearer the iOS shortcut uses. It reports the public tunnel
+    # base + the key the notebook uses for both laya-serve bearer auth and the
+    # /control channel, and the village stores them in `settings` (persisted,
+    # applied instantly, replaced on every re-beacon -- each Colab session gets
+    # a fresh URL, so re-running the sentinel simply overwrites this row).
+    presented = request.headers.get('X-Device-Key')
+    if not presented or not secrets.compare_digest(presented, DEVICE_API_KEY):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    body = body or {}
+    url = (body.get('url') or '').strip()
+    key = (body.get('key') or '').strip()
+    if not url:
+        # empty url clears the pairing (e.g. operator wants the standby offline)
+        _set_setting('colab_laya_url', '')
+        _set_setting('colab_laya_key', '')
+        return JSONResponse({'ok': True, 'registered': False})
+    if len(url) > 500 or not re.match(r'^https?://', url):
+        return JSONResponse({'error': 'url must be http(s) and short'}, status_code=400)
+    if not key or len(key) > 256:
+        return JSONResponse({'error': 'key is required'}, status_code=400)
+    _set_setting('colab_laya_url', url)
+    _set_setting('colab_laya_key', key)
+    log_action(None, 'colab_standby_registered', {'url': url}, authorized=True)
+    return JSONResponse({'ok': True, 'registered': True, 'jev_degraded_now': _jev_is_degraded()})
 
 
 @app.post('/api/review/escalate')
