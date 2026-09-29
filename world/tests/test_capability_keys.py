@@ -19,6 +19,18 @@ import serve
 from fastapi.testclient import TestClient
 
 
+def setUpModule():
+    # Hermetic: single-slug decision chains. The CLI standby (enabled via the
+    # project .env) would append a provider, arming the shared-process breaker.
+    serve.COLAB_STANDBY_ENABLED = False
+
+
+def tearDownModule():
+    serve.COLAB_STANDBY_ENABLED = str(
+        serve._load_env().get('COLAB_STANDBY_ENABLED', '') or ''
+    ).lower() in ('1', 'true', 'yes')
+
+
 class CapabilityKeys(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='village-keys-')

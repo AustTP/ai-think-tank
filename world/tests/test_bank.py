@@ -63,6 +63,23 @@ def _last_n_days(n):
     return [(today - datetime.timedelta(days=i)).isoformat() for i in range(n)]
 
 
+def setUpModule():
+    # The CLI-run Laya standby appends a provider to every decision chain when
+    # enabled (it IS enabled in the project .env, which serve loads at import).
+    # Hermetic modules must keep decision chains single-slug by pinning the
+    # standby off: with two slugs the multi-slug circuit breaker arms, and its
+    # state leaks across modules in the shared test process (caught live: an
+    # 'all configured decision models are circuit-broken' RuntimeError in this
+    # file from breakers opened by earlier modules' collection-injections).
+    serve.COLAB_STANDBY_ENABLED = False
+
+
+def tearDownModule():
+    serve.COLAB_STANDBY_ENABLED = str(
+        serve._load_env().get('COLAB_STANDBY_ENABLED', '') or ''
+    ).lower() in ('1', 'true', 'yes')
+
+
 def json_copy(obj):
     import json
     return json.loads(json.dumps(obj))
