@@ -12753,25 +12753,93 @@ async def review_escalate(request: Request):
 
 
 _LOGIN_PAGE = """<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>AI Think Tank -- Sign in</title>
+<html><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Think Tank -- Sign in</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap" rel="stylesheet">
 <style>
-body{background:#181818;color:#eee;font-family:'Segoe UI',Arial,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
-form{background:#242424;padding:32px 36px;border-radius:10px;box-shadow:0 8px 32px #0008;min-width:280px}
-h1{font-size:1.2rem;margin:0 0 20px}
-label{display:block;font-size:0.85rem;opacity:0.8;margin-bottom:4px}
-input{width:100%;box-sizing:border-box;padding:8px 10px;margin-bottom:14px;border-radius:5px;border:1px solid #444;background:#141414;color:#eee}
-button{width:100%;padding:9px;border:none;border-radius:5px;background:#e87d1e;color:#fff;font-weight:bold;cursor:pointer}
-.err{color:#ff8080;font-size:0.85rem;margin-bottom:12px}
+  @keyframes blink { 50% { opacity: 0; } }
+  body {
+    margin: 0;
+    background: #05070d;
+    background-image:
+      radial-gradient(900px 700px at 50% -10%, #0d1526 0%, #05070d 65%),
+      repeating-linear-gradient(0deg, rgba(255,255,255,0.015) 0 1px, transparent 1px 28px),
+      repeating-linear-gradient(90deg, rgba(255,255,255,0.015) 0 1px, transparent 1px 28px);
+    color: #c8d2e2;
+    font-family: 'VT323', 'Courier New', monospace;
+    display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0;
+  }
+  form {
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.06) 0%, rgba(255,255,255,0) 50%),
+      linear-gradient(180deg, #283157 0%, #1b2242 55%, #141a33 100%);
+    border: 2px solid;
+    border-color: #4a5ba0 #0c1126 #0c1126 #4a5ba0;
+    box-shadow: 0 0 0 1px rgba(0,0,0,0.5), 0 10px 40px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.08);
+    padding: 30px 32px;
+    min-width: 300px;
+    text-align: center;
+  }
+  h1 {
+    margin: 0 0 6px;
+    font-family: 'Press Start 2P', monospace;
+    font-size: 15px; font-weight: 400;
+    color: #6ff0ff;
+    letter-spacing: 0.05em;
+    text-shadow: 0 0 8px rgba(111,240,255,0.55);
+  }
+  h1::after { content: '\\258C'; color: #ffd54a; animation: blink 1.1s steps(1) infinite; margin-left: 4px; }
+  .sub {
+    margin: 0 0 22px;
+    font-family: 'VT323', monospace;
+    font-size: 16px; letter-spacing: 0.18em; text-transform: uppercase; color: #8fa2d9;
+  }
+  label {
+    display: block; text-align: left;
+    font-family: 'VT323', monospace; font-size: 16px; letter-spacing: 0.12em;
+    text-transform: uppercase; color: #7d8ec0; margin-bottom: 2px;
+  }
+  input {
+    width: 100%; box-sizing: border-box;
+    padding: 9px 10px; margin-bottom: 16px;
+    border: 2px solid; border-radius: 0;
+    border-color: #0c1126 #5a6cab #5a6cab #0c1126;
+    background: #0a0e1c; color: #7dff9a;
+    font-family: 'VT323', monospace; font-size: 18px;
+    outline: none;
+  }
+  input:focus { border-color: #8ff6ff #0a3050 #0a3050 #8ff6ff; box-shadow: 0 0 12px rgba(111,240,255,0.4); }
+  button {
+    width: 100%; margin-top: 6px;
+    font-family: 'Press Start 2P', monospace; font-size: 10px; line-height: 1.2;
+    padding: 13px 12px; color: #eaf1ff; text-shadow: 0 1px 0 rgba(0,0,0,0.6);
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.24) 0%, rgba(255,255,255,0.04) 42%, rgba(255,255,255,0) 100%),
+      linear-gradient(180deg, #3d4c86 0%, #232c52 52%, #141a38 100%);
+    border: 2px solid; border-radius: 0;
+    border-color: #91a2e6 #0b1026 #0b1026 #7a8dce;
+    box-shadow: 0 2px 0 rgba(0,0,0,0.35), inset 0 1px 0 rgba(255,255,255,0.18);
+    cursor: pointer;
+    transition: color 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+  }
+  button:hover { color:#fff; border-color:#8ff6ff #0a3050 #0a3050 #5fd8f0; box-shadow: 0 0 14px rgba(111,240,255,0.6), inset 0 1px 0 rgba(255,255,255,0.28); }
+  button:active { transform: translateY(1px); box-shadow: inset 0 2px 4px rgba(0,0,0,0.5); }
+  .err { color:#ff7b72; font-family:'VT323',monospace; font-size:16px; margin:0 0 12px; text-align:left; }
+  .err::before { content: '\\26A0 '; }
 </style></head>
 <body>
 <form method="post" action="/login">
-  <h1>AI Think Tank</h1>
+  <h1>AI THINK TANK</h1>
+  <p class="sub">// secure access terminal</p>
   __ERROR_HTML__
   <label for="u">Username</label>
   <input id="u" name="username" autocomplete="username" autofocus>
   <label for="p">Password</label>
   <input id="p" name="password" type="password" autocomplete="current-password">
-  <button type="submit">Sign in</button>
+  <button type="submit">SIGN IN</button>
 </form>
 </body></html>"""
 
