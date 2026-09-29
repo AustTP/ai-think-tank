@@ -1311,6 +1311,9 @@ MAX_CHECKLIST_ESCALATIONS = 3
 # review, short, and deduped on the requirement -- no repeat spam on re-review.
 MAX_CHECKLIST_TRACE_FILES = 3
 _PROCESS_TRACE_MAX_CHARS = 4000
+# How many verified requirement FAILS the follow-up fix task names explicitly
+# (bounded -- the fix instruction is a pointer to the evidence, not a dump).
+MAX_QUEUE_FIX_REQUIREMENTS = 2
 
 
 def _record_review_process_trace(base, key, agent_id, project_label, backlog, kind,
@@ -1623,6 +1626,18 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
             # worker who BUILT the story, not on the reviewer.
             queue_fix['assignedTo'] = task.get('reviewAuthorId') or task.get('assignedTo')
             queue_fix['reviewOf'] = task.get('reviewOf')
+        # The ensemble's verified FAILS are the sharpest signal the fix has --
+        # name the top ones explicitly (bounded) so the fix task is steered at
+        # the actual requirement it missed, not just pointed at the Library.
+        failed_reqs = [g for g in checklist_grades if g.get('verdict') == GRADE_FAILS]
+        if failed_reqs:
+            reqs_text = '\n'.join(
+                f'- {g.get("question") or g.get("id") or "requirement"}'
+                + (f' (section: {g.get("section")})' if g.get('section') else '')
+                for g in failed_reqs[:MAX_QUEUE_FIX_REQUIREMENTS])
+            queue_fix['instructions'] += (
+                f'\n\nVerified failing requirements from the review checklist:\n{reqs_text}\n'
+                'Fix the work so each of these is met.')
         suffix = 'queued a fix'
     # SWiRL: a review that VERIFIED a checklist requirement failed leaves a
     # process-trace lesson in pending_review/skills/ (bounded + deduped by the
