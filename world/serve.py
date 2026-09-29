@@ -4997,9 +4997,19 @@ def _call_openrouter_decision_sync(model, state, questions):
     # row marks the decision as having been attempted and lost, so a gap in the
     # tape is distinguishable from a decision that never happened. Then re-raise;
     # the caller owns the recovery (deterministic fallback), exactly as before.
+    # Tape the failure WITH the concrete exception detail -- the Sep 2026
+    # outage showed that a bare 'decision call raised' is useless for
+    # triage (429 rate-limit vs 5xx outage vs timeout look identical on
+    # the tape). The ok=0 row is the incident record, so it should carry
+    # the kind/status/one-line detail that makes it diagnosable.
+    exc = 'none' if last_error is None else f'{type(last_error).__name__}: {str(last_error)[:160]}'
     _append_decision_tape(
         _decision_kind(prompt), ','.join(attempted or chain), prompt, criteria,
-        None, None, None, {'error': 'decision call raised', 'tried': attempted}, False,
+        None, None, None, {
+            'error': 'decision call raised', 'tried': attempted,
+            'kind': type(last_error).__name__ if last_error is not None else None,
+            'status': getattr(last_error, 'code', None), 'exc': exc,
+        }, False,
         trace_id=trace_id,
     )
     if last_error is not None:
@@ -11581,23 +11591,34 @@ def _persist_new_health_alerts(alerts):
     """Persist each alert that isn't already standing within the dedup window,
     and RETURN the newly-persisted ones so the health loop can push exactly
     those to the player (never the repeated standing ones -- the dedup window
-    is what stops an hourly push from becoming a 5-min-spam)."""
+    is what stops an hourly push from becoming a 5-min-spam).
+
+    The dedup key is (category, severity) within the window -- NOT the full
+    message. Exact-message dedup failed the day the first real outage hit:
+    the Jev alert embeds the rolling failure counts in its text, so every
+    5-min health cycle saw a 'new' message (53/98 -> 53/86 -> 44/68...) and
+    re-persisted + re-pushed it, spamming the player for the whole incident.
+    A standing (category, severity) row means that incident is already
+    announced; a severity ESCALATION within the window is a different row and
+    still pushes, so a worsening sub-cause is never swallowed."""
     if not alerts:
         return []
     now = time.time()
     persisted = []
     with _db() as conn:
+        prior = set(conn.execute(
+            'SELECT category, severity FROM health_alerts WHERE ts > ?',
+            (now - HEALTH_ALERT_DEDUP_WINDOW_S,),
+        ).fetchall())
         for a in alerts:
-            recent = conn.execute(
-                'SELECT 1 FROM health_alerts WHERE category = ? AND message = ? AND ts > ?',
-                (a['category'], a['message'], now - HEALTH_ALERT_DEDUP_WINDOW_S),
-            ).fetchone()
-            if recent:
+            key = (a['category'], a['severity'])
+            if key in prior:
                 continue
             conn.execute(
                 'INSERT INTO health_alerts (category, severity, message, ts) VALUES (?, ?, ?, ?)',
                 (a['category'], a['severity'], a['message'], now),
             )
+            prior.add(key)
             persisted.append(a)
     return persisted
 
