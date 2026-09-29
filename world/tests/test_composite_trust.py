@@ -28,6 +28,7 @@ default path. Found 2026-09-25: this file alone added 58 real rows (mostly
 during a routine test run.
 """
 
+import io
 import json
 import os
 import shutil
@@ -41,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import serve  # noqa: E402  (sys.path insert above is the repo test convention)
 import sim  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
 
 _TMP_DIR = None
 _PATCHER = None
@@ -258,6 +260,11 @@ class JevFailoverTests(unittest.TestCase):
         with serve._db() as conn:
             conn.execute('DELETE FROM decision_tape')
             conn.execute("DELETE FROM settings WHERE key = 'jev_model'")
+            # A standby pairing left behind by a previous test would append a
+            # provider URL to every chain here (and its _transport reads
+            # body['model']); make the failover tests hermetic against it.
+            for key in ('colab_laya_url', 'colab_laya_key'):
+                conn.execute('DELETE FROM settings WHERE key = ?', (key,))
 
     def _set_chain(self, *slugs):
         serve._set_setting('jev_model', ','.join(slugs))
@@ -359,6 +366,112 @@ class JevFailoverTests(unittest.TestCase):
         # Neither DB nor env -> the single default constant (no failover).
         with unittest.mock.patch.object(serve, '_load_env', return_value={}):
             self.assertEqual(serve._decision_model_chain(), [serve.JEV_MODEL])
+
+
+class ColabStandbyTests(unittest.TestCase):
+    """The Colab/Laya sentinel coupling (2026-09-29): a remote Jev-compatible
+    server on a Colab runtime, paired via /api/colab/register and driven by
+    the 15-min _colab_failover_loop. Hermetic: no tunnel, no network -- urlopen
+    is only inspected, never reached. The village only ever ROUTES to the
+    runtime; the model never loads on the laptop."""
+
+    def setUp(self):
+        serve._model_circuit_state.clear()
+        with serve._db() as conn:
+            conn.execute('DELETE FROM decision_tape')
+            for key in ('jev_model', 'colab_laya_url', 'colab_laya_key'):
+                conn.execute('DELETE FROM settings WHERE key = ?', (key,))
+
+    def _seed_jev(self, failures, successes):
+        for _ in range(failures):
+            serve._append_decision_tape('probe', 'typesafe/jev-1.13', '', '', None, None, None, {}, False)
+        for _ in range(successes):
+            serve._append_decision_tape('probe', 'typesafe/jev-1.13', '', '', None, None, None, {}, True)
+
+    def test_provider_chain_entry_appends_the_standby_url_last(self):
+        serve._set_setting('jev_model', 'primary-x')
+        serve._set_setting('colab_laya_url', 'https://tunnel.example')
+        self.assertEqual(serve._decision_model_chain(),
+                         ['primary-x', 'https://tunnel.example/v1/systemone'],
+                         'the sentinel trails the chain as the LAST fallback')
+        self.assertEqual(serve._jev_model(), 'primary-x',
+                         'the primary slug still leads; _jev_model is unchanged')
+        serve._set_setting('colab_laya_url', '')
+        self.assertEqual(serve._decision_model_chain(), ['primary-x'],
+                         'cleared pairing removes the provider from the chain')
+
+    def test_chain_dedupes_a_manually_configured_provider(self):
+        serve._set_setting('jev_model', 'primary-x,https://tunnel.example/v1/systemone')
+        serve._set_setting('colab_laya_url', 'https://tunnel.example')
+        self.assertEqual(serve._decision_model_chain(),
+                         ['primary-x', 'https://tunnel.example/v1/systemone'])
+
+    def test_provider_request_is_direct_not_openrouter(self):
+        serve._set_setting('colab_laya_key', 'laya-secret')
+        req = serve._decision_request(
+            'https://tunnel.example/v1/systemone', {'messages': []}, {'choice': {}})
+        self.assertEqual(req.full_url, 'https://tunnel.example/v1/systemone')
+        self.assertEqual(req.get_header('Authorization'), 'Bearer laya-secret')
+        body = json.loads(req.data.decode())
+        self.assertNotIn('model', body, 'layan routes internally; no slug is sent')
+        self.assertIn('state', body)
+        self.assertIn('questions', body)
+
+    def test_jev_is_degraded_reuses_the_health_predicate(self):
+        self._seed_jev(failures=6, successes=6)  # 12 attempts at exactly 50%
+        self.assertTrue(serve._jev_is_degraded())
+        with serve._db() as conn:
+            conn.execute('DELETE FROM decision_tape')
+        self._seed_jev(failures=6, successes=12)  # 33% -> healthy
+        self.assertFalse(serve._jev_is_degraded())
+        with serve._db() as conn:
+            conn.execute('DELETE FROM decision_tape')
+        self._seed_jev(failures=4, successes=0)  # all failed but sparse
+        self.assertFalse(serve._jev_is_degraded(),
+                         'a handful of attempts never trips the standby')
+
+    def test_control_requests_standup_and_teardown(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured['url'] = req.full_url
+            return io.BytesIO(b'{"ok": true}')
+
+        with unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=fake_urlopen):
+            self.assertEqual(serve._colab_standup('https://tunnel.example', 'k')['ok'], True)
+            self.assertEqual(captured['url'],
+                             'https://tunnel.example/control?action=standup')
+        with unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=fake_urlopen):
+            serve._colab_teardown('https://tunnel.example', 'k')
+            self.assertEqual(captured['url'],
+                             'https://tunnel.example/control?action=teardown')
+
+    def test_register_requires_the_device_key(self):
+        c = TestClient(serve.app)
+        r = c.post('/api/colab/register',
+                   json={'url': 'https://tunnel.example', 'key': 'k'})
+        self.assertEqual(r.status_code, 401)
+
+    def test_register_stores_and_clears_the_pairing(self):
+        c = TestClient(serve.app)
+        headers = {'X-Device-Key': serve.DEVICE_API_KEY}
+        r = c.post('/api/colab/register', headers=headers,
+                   json={'url': 'https://tunnel.example', 'key': 'laya-key'})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(serve._get_setting('colab_laya_url'), 'https://tunnel.example')
+        self.assertEqual(serve._get_setting('colab_laya_key'), 'laya-key')
+        r = c.post('/api/colab/register', headers=headers, json={'url': '', 'key': ''})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(serve._get_setting('colab_laya_url'), '', 'empty url clears the pairing')
+
+    def test_register_rejects_non_http_urls(self):
+        c = TestClient(serve.app)
+        r = c.post('/api/colab/register',
+                   headers={'X-Device-Key': serve.DEVICE_API_KEY},
+                   json={'url': 'file:///etc/passwd', 'key': 'k'})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(serve._get_setting('colab_laya_url'), None,
+                         'nothing is stored on invalid input')
 
 
 # ---------------------------------------------------------------------------
