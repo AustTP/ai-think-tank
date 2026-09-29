@@ -2619,6 +2619,104 @@ class DecisionCalibration(unittest.TestCase):
         self.assertGreater(report['calibration_error'], 0.4)
 
 
+class CalibrationLoop(unittest.TestCase):
+    """_calibration_adjust_pass + _effective_safety_confidence (2026-09-29,
+    feedback-loop actuator for takeaway #1): the calibration report is the
+    sensor -- the escalation threshold was never adjusted by it. This pass
+    moves the LIVE bar (settings row `jev_safety_confidence`) so decisions
+    auto-approved at ~the current confidence bar succeed at ~the claimed
+    reliability: below target -> raise the bar, above -> lower it, and never
+    move on noise. Safety-critical kinds ('blocked command' at floor 1.0)
+    are unaffected -- only the routine default bar moves."""
+
+    def setUp(self):
+        # Shared module DB: each test sees only its own calibration rows and no
+        # leftover threshold.
+        with serve._db() as conn:
+            conn.execute('DELETE FROM action_log')
+            conn.execute("DELETE FROM settings WHERE key = 'jev_safety_confidence'")
+
+    def _gate(self, confidence, ts, trace_id, ok_outcome=True):
+        serve.log_action('ada', 'browse', {'target': f'http://x/{ts}', 'purpose': 'p',
+                                           'decision': 'allowed', 'confidence': confidence, 'cost': 0.01},
+                         authorized=True, trace_id=trace_id)
+        serve.log_action('ada', 'browse', {'url': f'http://x/{ts}',
+                                           'decision': 'allowed' if ok_outcome else 'allowed_but_fetch_failed'},
+                         authorized=True, trace_id=trace_id)
+        with serve._db() as conn:
+            conn.execute("UPDATE action_log SET ts = ? WHERE id IN (SELECT id FROM action_log ORDER BY id DESC LIMIT 2)", (ts,))
+            # gate row must precede its outcome row
+            conn.execute("UPDATE action_log SET ts = ? WHERE id = (SELECT MIN(id) FROM action_log WHERE trace_id = ?)", (ts, trace_id))
+            conn.execute("UPDATE action_log SET ts = ? WHERE id = (SELECT MAX(id) FROM action_log WHERE trace_id = ?)", (ts + 0.1, trace_id))
+
+    def _seed_bin(self, confidence, total, failures, base=None):
+        base = time.time() - 3600 if base is None else base
+        for i in range(total):
+            self._gate(confidence, base + i, f'trace{i}', ok_outcome=(i >= failures))
+
+    def test_effective_confidence_defaults_to_the_constant_and_reflects_the_setting(self):
+        self.assertEqual(serve._effective_safety_confidence(), serve.JEV_SAFETY_CONFIDENCE)
+        serve._set_setting('jev_safety_confidence', '0.73')
+        self.assertEqual(serve._effective_safety_confidence(), 0.73)
+
+    def test_effective_confidence_rejects_out_of_range_values(self):
+        serve._set_setting('jev_safety_confidence', '0.99')
+        self.assertEqual(serve._effective_safety_confidence(), serve.JEV_SAFETY_CONFIDENCE,
+                         'above the clamp must fall back to the safe constant')
+        serve._set_setting('jev_safety_confidence', 'junk')
+        self.assertEqual(serve._effective_safety_confidence(), serve.JEV_SAFETY_CONFIDENCE)
+
+    def test_raises_the_bar_when_actions_at_it_succeed_below_target(self):
+        # Threshold baseline 0.6 sits in the 0.60-0.70 bin; half of the 20
+        # allowed actions it auto-approved failed -> 50% success at 90% target.
+        self._seed_bin(0.65, 20, failures=10)
+        new = serve._calibration_adjust_pass()
+        self.assertEqual(new, 0.65, 'a reliability shortfall must raise the bar one step')
+        self.assertEqual(serve._get_setting('jev_safety_confidence'), '0.65')
+        with serve._db() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM action_log WHERE action = 'jev_calibration_adjust'").fetchone()[0]
+        self.assertEqual(row, 1, 'the adjust must be audit-logged')
+
+    def test_lowers_the_bar_when_actions_at_it_succeed_well_above_target(self):
+        self._seed_bin(0.65, 10, failures=0)  # 100% success = over-target
+        new = serve._calibration_adjust_pass()
+        self.assertEqual(new, 0.55, 'reliability above target lets the bar come down one step')
+        self.assertEqual(serve._get_setting('jev_safety_confidence'), '0.55')
+
+    def test_dead_band_does_not_churn_the_bar(self):
+        # 13/15 succeed (0.867) -- within the 0.05 dead-band of the 0.9 target.
+        self._seed_bin(0.65, 15, failures=2)
+        new = serve._calibration_adjust_pass()
+        self.assertIsNone(new)
+        self.assertIsNone(serve._get_setting('jev_safety_confidence'),
+                          'inside the dead-band the bar must not move at all')
+
+    def test_no_move_without_enough_scored_decisions(self):
+        self._seed_bin(0.65, 3, failures=3)  # terrible rate, but only 3 samples
+        new = serve._calibration_adjust_pass()
+        self.assertIsNone(new, 'a handful of decisions must never move the safety bar')
+        self.assertIsNone(serve._get_setting('jev_safety_confidence'))
+
+    def test_raises_clamp_at_the_max_threshold(self):
+        serve._set_setting('jev_safety_confidence', '0.9')
+        self._seed_bin(0.95, 10, failures=10)  # all failed at the top bin
+        new = serve._calibration_adjust_pass()
+        self.assertEqual(new, 0.95, 'the raised bar must clamp at the max')
+        self.assertEqual(serve._get_setting('jev_safety_confidence'), '0.95')
+        # Already at max: another pass must not move (and not log a bogus adjust).
+        self.assertIsNone(serve._calibration_adjust_pass())
+
+    def test_gate_floors_track_the_live_threshold_but_risk_kinds_stay_fixed(self):
+        serve._set_setting('jev_safety_confidence', '0.75')
+        self.assertEqual(serve._escalation_floor('unresolved review requirement'), 0.75,
+                         'the routine floor must track the live calibration threshold')
+        self.assertEqual(serve._escalation_floor('brand new kind'), 0.75)
+        self.assertEqual(serve._escalation_floor('blocked command'), 1.0,
+                         "a human's own blocked verdict is never auto-approved")
+        self.assertEqual(serve._escalation_floor('unsure safety decision'), 0.85,
+                         'the risky kind keeps its own raised floor, fixed')
+
+
 class JevQuorumChoiceSync(unittest.TestCase):
     """_jev_quorum_choice_sync: real gap caught (2026-09-26) -- quorum
     sampling was only ever applied to safety gates, never to this module's
