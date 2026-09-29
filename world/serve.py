@@ -24,6 +24,7 @@ import hashlib
 import hmac
 import html
 import json
+import math
 import os
 import re
 import secrets
@@ -4420,6 +4421,12 @@ CIRCUIT_BREAKER_COOLDOWN_S = 300
 # cooldown elapses; only if it SUCCEEDS does the circuit close. The probe's
 # state is per-model, and while it is in flight no second caller rides through.
 _model_circuit_state: dict[str, dict[str, object]] = {}  # model_slug -> {'consecutive_failures': int, 'open_until': float, 'probing': bool}
+# The probe slot check-then-set above is a race without a lock, and Jev
+# decisions fire from several threads at once (content executors, governance
+# loops) -- a raw race here would let two callers ride a HALF_OPEN probe at the
+# same moment. Serialize the breaker's state machine (cheap; only touches this
+# dict, never the network).
+_model_circuit_lock = threading.Lock()
 
 
 def is_model_circuit_broken(model_slug):
@@ -4427,44 +4434,46 @@ def is_model_circuit_broken(model_slug):
     elapses the circuit moves to OPEN -> HALF_OPEN and EXACTLY ONE call is
     allowed through as a recovery probe; a second call while that probe is still
     unresolved is still rejected."""
-    state = _model_circuit_state.get(model_slug)
-    if not state or state.get('open_until', 0) == 0:
-        return False  # CLOSED
-    if time.time() >= state['open_until']:
-        # Cooldown elapsed -> HALF_OPEN. If we are not already probing, open the
-        # single probe slot; whether the probe is allowed depends on it being free.
-        if not state.get('probing'):
-            state['probing'] = True
-            return False  # allow the probe through
-        return True  # probe already in flight -- no second ride-along
-    return True  # still OPEN, cooldown not spent
+    with _model_circuit_lock:
+        state = _model_circuit_state.get(model_slug)
+        if not state or state.get('open_until', 0) == 0:
+            return False  # CLOSED
+        if time.time() >= state['open_until']:
+            # Cooldown elapsed -> HALF_OPEN. If we are not already probing, open the
+            # single probe slot; whether the probe is allowed depends on it being free.
+            if not state.get('probing'):
+                state['probing'] = True
+                return False  # allow the probe through
+            return True  # probe already in flight -- no second ride-along
+        return True  # still OPEN, cooldown not spent
 
 
 def record_model_result(model_slug, success):
     """Feed a call outcome back. In HALF_OPEN a probe SUCCESS closes the circuit
     (memory refreshed), a probe FAILURE re-opens it with a fresh cooldown."""
-    state = _model_circuit_state.setdefault(model_slug, {'consecutive_failures': 0, 'open_until': 0, 'probing': False})
-    if success:
-        if state.get('probing'):
-            # Probe succeeded -> CLOSED, exactly once.
-            state['consecutive_failures'] = 0
-            state['open_until'] = 0
-            state['probing'] = False
-            log_action(None, 'model_circuit_recovered', {'model': model_slug})
-        else:
-            # CLOSED path: a success clears the failure streak.
-            state['consecutive_failures'] = 0
-            state['probing'] = False
-        return
-    state['consecutive_failures'] += 1
-    state['probing'] = False
-    if state['consecutive_failures'] >= CIRCUIT_BREAKER_THRESHOLD:
-        # Re-open with a fresh cooldown; pin the streak at the threshold so it
-        # can't grow unboundedly across repeated probe failures (the circuit is
-        # already OPEN; only "< threshold" vs ">= threshold" matters).
-        state['consecutive_failures'] = CIRCUIT_BREAKER_THRESHOLD
-        state['open_until'] = time.time() + CIRCUIT_BREAKER_COOLDOWN_S
-        log_action(None, 'model_circuit_broken', {'model': model_slug, 'cooldown_s': CIRCUIT_BREAKER_COOLDOWN_S})
+    with _model_circuit_lock:
+        state = _model_circuit_state.setdefault(model_slug, {'consecutive_failures': 0, 'open_until': 0, 'probing': False})
+        if success:
+            if state.get('probing'):
+                # Probe succeeded -> CLOSED, exactly once.
+                state['consecutive_failures'] = 0
+                state['open_until'] = 0
+                state['probing'] = False
+                log_action(None, 'model_circuit_recovered', {'model': model_slug})
+            else:
+                # CLOSED path: a success clears the failure streak.
+                state['consecutive_failures'] = 0
+                state['probing'] = False
+            return
+        state['consecutive_failures'] += 1
+        state['probing'] = False
+        if state['consecutive_failures'] >= CIRCUIT_BREAKER_THRESHOLD:
+            # Re-open with a fresh cooldown; pin the streak at the threshold so it
+            # can't grow unboundedly across repeated probe failures (the circuit is
+            # already OPEN; only "< threshold" vs ">= threshold" matters).
+            state['consecutive_failures'] = CIRCUIT_BREAKER_THRESHOLD
+            state['open_until'] = time.time() + CIRCUIT_BREAKER_COOLDOWN_S
+            log_action(None, 'model_circuit_broken', {'model': model_slug, 'cooldown_s': CIRCUIT_BREAKER_COOLDOWN_S})
 
 
 def _call_openrouter_sync(model, messages, max_tokens):
@@ -4864,6 +4873,37 @@ def _weather_code_human(code):
     return _WMO_CODES.get(code, f'weather code {code}')
 
 
+def _decision_request(model, state, questions):
+    payload = json.dumps({'model': model, 'state': state, 'questions': questions}).encode()
+    return urllib.request.Request(
+        'https://openrouter.ai/api/alpha/decisions',
+        data=payload,
+        headers={
+            'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+            'Content-Type': 'application/json',
+        },
+        method='POST',
+    )
+
+
+def _finalize_decision(data, prompt, criteria, trace_id, model):
+    choice, confidence, cost = _jev_choice(data)
+    # Real gap caught live (2026-09-26): every OTHER real model call accrues
+    # into the spend ledger at its own chokepoint, but Jev's cost was only
+    # ever LOGGED per-call (log_action), never summed anywhere -- meaning a
+    # spend cap reading the ledger alone would undercount real spend by every
+    # Jev decision ever made. One dedicated bucket for the whole decisions
+    # model class, whichever slug in the failover chain answered.
+    _accrue_spend('__jev__', cost)
+    _append_decision_tape(
+        _decision_kind(prompt), model, prompt, criteria,
+        choice, confidence, cost, data, True,
+        trace_id=trace_id,
+    )
+    data['trace_id'] = trace_id
+    return data
+
+
 def _call_openrouter_decision_sync(model, state, questions):
     # Jev (TypeSafe's System One decision model) via OpenRouter -- a
     # genuinely different endpoint from chat completions, confirmed only
@@ -4872,19 +4912,29 @@ def _call_openrouter_decision_sync(model, state, questions):
     # calling this model on /chat/completions fails outright with a
     # pointer to this endpoint instead.
     #
-    # Gets the same transient-failure retry as chat completions, but
-    # deliberately NOT the circuit breaker -- there's only one Jev slug in
-    # this whole project, so blocking it for a cooldown after 3 failures
-    # would disable every Jev-dependent feature at once (task assignment,
-    # hiring, firing, report severity...), a much bigger blast radius than
-    # circuit-breaking one of several interchangeable chat-tier models.
+    # Multi-model failover + per-slug circuit breaker (2026-09-29): the old
+    # comment said "deliberately NOT the circuit breaker -- there's only one
+    # Jev slug in this whole project, so blocking it for a cooldown after 3
+    # failures would disable every Jev-dependent feature at once". That was a
+    # symptom of the SINGLE-SLUG configuration, not a need: the breaker is
+    # only dangerous when breaking the only slug == breaking all decisions.
+    # With a configured chain (_decision_model_chain, comma-separated), a dead
+    # slug is skipped for its cooldown and decisions FAIL OVER to the next
+    # candidate instead of degrading to deterministic fallbacks. When exactly
+    # one slug is configured the breaker is deliberately NOT armed and the
+    # legacy behavior is byte-for-byte: resilient retry, tape-on-failure,
+    # re-raise -- no blast-radius widening.
     #
     # Every Jev call lands here, so the decision tape is written here too -- the
     # caller's behavior is unchanged, but the model-facing side of the decision
     # (prompt, candidates, parsed choice/confidence/cost, full response) is
     # recorded before the caller throws the details away. `_jev_choice` is pure
     # (parses the same data the caller parses), so calling it for the tape adds
-    # no behavior beyond the row itself.
+    # no behavior beyond the row itself. On a healthy failover the tape records
+    # ONE row (the slug that answered); a total failure records one ok=0 row
+    # listing every slug actually attempted -- so the Jev-health failure RATE
+    # counts only decisions that genuinely lost (a hiccup recovered by the
+    # fallback is NOT a degraded decision).
     #
     # A single trace_id is generated per call and stamped on both the tape entry
     # and (if the caller extracts it from the returned data) the resulting tool
@@ -4894,45 +4944,55 @@ def _call_openrouter_decision_sync(model, state, questions):
         raise RuntimeError(f'Village spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     prompt = (questions or {}).get('choice', {}).get('instructions') if isinstance(questions, dict) else None
     criteria = (questions or {}).get('choice', {}).get('criteria') if isinstance(questions, dict) else None
-    payload = json.dumps({'model': model, 'state': state, 'questions': questions}).encode()
-    req = urllib.request.Request(
-        'https://openrouter.ai/api/alpha/decisions',
-        data=payload,
-        headers={
-            'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-            'Content-Type': 'application/json',
-        },
-        method='POST',
-    )
-    try:
-        data = json.loads(_urlopen_with_resilience(req, timeout=30))
-    except Exception:
-        # Tape the failure too -- an ok=0 row marks the call as having been
-        # attempted and failed, so a gap in the tape is distinguishable from a
-        # decision that never happened. Then re-raise exactly as before; the
-        # caller owns the recovery.
-        _append_decision_tape(
-            _decision_kind(prompt), model, prompt, criteria,
-            None, None, None, {'error': 'decision call raised'}, False,
-            trace_id=trace_id,
-        )
-        raise
-    choice, confidence, cost = _jev_choice(data)
-    # Real gap caught live (2026-09-26): every OTHER real model call accrues
-    # into the spend ledger at its own chokepoint, but Jev's cost was only
-    # ever LOGGED per-call (log_action), never summed anywhere -- meaning a
-    # spend cap reading the ledger alone would undercount real spend by every
-    # Jev decision ever made. One dedicated bucket for the whole model
-    # (there is only one Jev slug in this project, same reasoning as the
-    # circuit-breaker exemption above).
-    _accrue_spend('__jev__', cost)
+    # decision_tape.prompt/.criteria are NOT NULL; calls without instructions
+    # (health probes, pure escalation checks) would fail the row write silently.
+    prompt = prompt if prompt is not None else ''
+    criteria = criteria if criteria is not None else ''
+    chain = _decision_model_chain()
+    if model not in chain:
+        # An explicit model (tests, forwarders) leads the chain, fallbacks follow.
+        chain = [model] + [m for m in chain if m != model]
+    armed = len(chain) > 1  # the breaker only arms once a real fallback exists
+    if armed:
+        # Skip slugs whose breaker is OPEN (cooldown not spent); a HALF_OPEN
+        # slug is let through as its own recovery probe by the breaker itself.
+        probe_chain = [c for c in chain if not is_model_circuit_broken(c)]
+        if not probe_chain:
+            # Everything cold-open right now: probing happens on the NEXT call
+            # as cooldowns elapse, so mean 'no candidate available', fail closed.
+            _append_decision_tape(
+                _decision_kind(prompt), ','.join(chain), prompt, criteria,
+                None, None, None, {'error': 'all decision models circuit-broken', 'tried': chain}, False,
+                trace_id=trace_id,
+            )
+            raise RuntimeError('all configured decision models are circuit-broken')
+        chain = probe_chain
+    attempted = []
+    last_error = None
+    for slug in chain:
+        try:
+            data = json.loads(_urlopen_with_resilience(_decision_request(slug, state, questions), timeout=30))
+        except Exception as e:
+            attempted.append(slug)
+            last_error = e
+            if armed:
+                record_model_result(slug, False)
+            continue
+        if armed:
+            record_model_result(slug, True)
+        return _finalize_decision(data, prompt, criteria, trace_id, slug)
+    # All candidates failed (or were already open). Tape the failure -- an ok=0
+    # row marks the decision as having been attempted and lost, so a gap in the
+    # tape is distinguishable from a decision that never happened. Then re-raise;
+    # the caller owns the recovery (deterministic fallback), exactly as before.
     _append_decision_tape(
-        _decision_kind(prompt), model, prompt, criteria,
-        choice, confidence, cost, data, True,
+        _decision_kind(prompt), ','.join(attempted or chain), prompt, criteria,
+        None, None, None, {'error': 'decision call raised', 'tried': attempted}, False,
         trace_id=trace_id,
     )
-    data['trace_id'] = trace_id
-    return data
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError('all decision model calls failed')
 
 
 # Jev returns typed decisions with calibrated confidence (see DESIGN.md and
@@ -4989,12 +5049,35 @@ def _set_setting(key, value, conn=None):
     )
 
 
+def _decision_model_chain():
+    """Ordered Jev candidate slugs, primary first -- the failover chain
+    (2026-09-29). Resolution order: a comma-separated `settings` row
+    ('jev_model', the operator switch via /api/jev/model) > env `JEV_MODELS`
+    (comma list) > the JEV_MODEL default. A single slug means no failover; a
+    multi-slug value makes _call_openrouter_decision_sync fall through to the
+    next candidate when the active one fails or its circuit breaker is open.
+    Never auto-updated -- adding a decision model is deliberate, exactly like
+    the model switch itself."""
+    saved = (_get_setting('jev_model') or '').strip()
+    if saved:
+        chain = [s.strip() for s in saved.split(',') if s.strip()]
+        if chain:
+            return chain
+    env_models = (_load_env().get('JEV_MODELS', '') or '').strip()
+    if env_models:
+        chain = [s.strip() for s in env_models.split(',') if s.strip()]
+        if chain:
+            return chain
+    return [JEV_MODEL]
+
+
 def _jev_model():
-    """The decisions model this village actually runs on, resolved fresh at
-    call time: DB `settings` row > env/default constant. The DB row is the
-    operator switch (set via /api/jev/model, survives restarts, takes effect
-    immediately -- no process restart needed), and it is never auto-updated."""
-    return _get_setting('jev_model') or JEV_MODEL
+    """The PRIMARY decisions model this village actually runs on, resolved
+    fresh at call time like before: DB `settings` row (which may now be a
+    comma-separated FAILOVER chain) > env/default constant. Returns the head
+    of _decision_model_chain() so every existing call site keeps using the
+    primary slug unchanged while the chain handles failover internally."""
+    return _decision_model_chain()[0]
 
 # Any safety gate that gets a Jev "allow/approve" below this confidence is
 # treated as "unsure" and escalated to a human instead of acted on -- the
@@ -11080,6 +11163,55 @@ METR_FAST_COMPLETION_RATE = 0.3   # <30% of started tasks done within 1h = slow 
 METR_SLOW_MEDIAN_HOURS = 6.0      # median completion over 6h = work is stalling
 
 
+# Coordination-imbalance scalar (2026-09-29): Reddit's Hot ranking is one of
+# the few ranking formulas with a genuine DECAY built in -- a post's score is
+# (reaction signal) / age^decay, so it matters while fresh and fades over a
+# couple of days. The coordination check before this measured a raw 24h count
+# of review/escalation/re-queue actions vs shipped work as a RATIO -- so the
+# Sep 26 restart storm (79 escalations vs 3 shipped in the same hour) read as
+# an acute pathology even a week later, once every artifact was stale. The
+# decayed signals here borrow the half-life idea while staying NEGATIVE-safe
+# (cooperation can be net-good, so the imbalance is HALF of a log
+# COMPRESSION, not a division): each ceremony/progress action contributes
+# exp(-age * ln2 / half_life) over a week horizon, and
+# `imbalance = log10(1+C) - log10(1+P)` turns that into a continuous scalar.
+# 79 fresh vs 3 shipped reads ~1.30 (loud); the same burst two days old has
+# decayed every event ~16x and reads ~0.18 (quiet) -- the property the count
+# ratio could never express. The full horizon emits from the alert message,
+# decayed signals from the /api/health payload so a client can trend them.
+_IMBALANCE_HORIZON_S = 7 * 86400          # older than a week is noise, not a signal
+_IMBALANCE_HALF_LIFE_S = 12 * 3600        # Reddit uses ~45,000s; a day of age ~= 4x weight loss
+_COORDINATION_INFO_SCORE = 0.5
+_COORDINATION_WARNING_SCORE = 1.0
+_COORDINATION_MIN_CEREMONY_SIGNAL = 3.0  # find the imbalance within a real ceremony signal
+
+
+def _decayed_signal(timestamps, now, half_life_s=None, horizon_s=None):
+    """Sum of exponentially-decayed event weights: each event contributes
+    exp(-age * ln2 / half_life). `timestamps` is an iterable of epoch-SECOND
+    timestamps (this file's `now` everywhere is epoch seconds). Events older
+    than the horizon are excluded entirely; `now` is injected for pures
+    testability."""
+    half_life_s = half_life_s or _IMBALANCE_HALF_LIFE_S
+    horizon_s = horizon_s or _IMBALANCE_HORIZON_S
+    total = 0.0
+    for ts in timestamps:
+        age = now - ts
+        if age < 0 or age > horizon_s:
+            continue
+        total += math.exp(-age * math.log(2) / half_life_s)
+    return total
+
+
+def _imbalance_score(ceremony_signal, progress_signal):
+    """log10-compressed difference between ceremony weight and shipped-work
+    weight. 0.0 when balanced; >0 when ceremony outruns shipped work.
+    Fresh 79-vs-3 => log10(80) - log10(4) ~= 1.30; the same burst aged two
+    days (both signals ~16x lighter) => log10(6) - log10(1.25) ~= 0.68 --
+    steady-state imbalance decays with its cause."""
+    return math.log10(1.0 + max(0.0, ceremony_signal)) - math.log10(1.0 + max(0.0, progress_signal))
+
+
 def _health_alerts_for_signals(signals):
     # Pure decision logic, deliberately separated from the DB reads in
     # compute_health_snapshot -- lets the actual thresholds be tested
@@ -11140,19 +11272,25 @@ def _health_alerts_for_signals(signals):
               f'{jev_failures}/{jev_attempts} Jev decision call(s) failed in the last hour -- '
               f'the decisions model may be down, colony running deterministic fallbacks')
 
-    # Coordination-pathology check: a lot of review/escalation/re-queue
-    # activity with little or nothing actually shipped in the same window is
-    # the leading indicator of the village re-inventing bureaucracy on
-    # itself -- process work that LOOKS like progress but isn't. Gated on a
-    # minimum ceremony count so a quiet village (2 escalations, 0 releases)
-    # doesn't trip this on noise.
+    # Coordination-imbalance scalar (2026-09-29): replaced the raw 24h ceremony
+    # COUNT-ratio check -- {ceremony} and {progress} still read as the 24h
+    # counts for the message, but the TRIP is the decayed score (Reddit-Hot
+    # style, see _decayed_signal/_imbalance_score): a fresh burst where
+    # process outruns shipped work is loud, and the same artifacts two days
+    # old read quiet, instead of an eternal count-ratio alert.
     ceremony = signals['ceremony_actions_last_24h']
     progress = signals['progress_actions_last_24h']
-    ratio = signals['ceremony_to_progress_ratio']
-    if ceremony >= 5 and (ratio is None or ratio >= 3.0):
-        alert('coordination', 'warning',
-              f'{ceremony} review/escalation/re-queue action(s) in the last 24h against only '
-              f'{progress} shipped (task_completed/released/published) -- process may be '
+    ceremony_signal = signals['ceremony_signal']
+    progress_signal = signals['progress_signal']
+    # Derived here (not read from the payload) so this pure decision function
+    # stays self-contained and independently testable, like the rest of it.
+    score = _imbalance_score(ceremony_signal, progress_signal)
+    if ceremony_signal >= _COORDINATION_MIN_CEREMONY_SIGNAL and score >= _COORDINATION_INFO_SCORE:
+        severity = 'warning' if score >= _COORDINATION_WARNING_SCORE else 'info'
+        alert('coordination', severity,
+              f'coordination imbalance {score:.2f}: {ceremony_signal:.1f} review/escalation/re-queue '
+              f'vs {progress_signal:.1f} shipped action weight (decayed over a week) -- '
+              f'{ceremony} ceremony / {progress} shipped in the last 24h; process may be '
               f'outrunning actual work')
 
     # Absolute Zero rejection signal (2026-09-28): a rising count of self-proposed
@@ -11322,6 +11460,21 @@ def compute_health_snapshot():
             f"({','.join('?' for _ in _PROGRESS_ACTIONS)}) AND ts > ?",
             (*_PROGRESS_ACTIONS, now - 86400),
         ).fetchone()[0]
+        # Coordination-imbalance scalar (2026-09-29): raw TIMESTAMPS of
+        # ceremony/progress actions within the decay horizon, so the signals
+        # can weight events by freshness instead of counting a week of stale
+        # artifacts as if they happened now (the reason the old count-ratio
+        # stayed loud after the Sep 26 restart storm faded).
+        ceremony_ts = [r[0] for r in conn.execute(
+            f"SELECT ts FROM action_log WHERE action IN "
+            f"({','.join('?' for _ in _CEREMONY_ACTIONS)}) AND ts > ?",
+            (*_CEREMONY_ACTIONS, now - _IMBALANCE_HORIZON_S),
+        ).fetchall()]
+        progress_ts = [r[0] for r in conn.execute(
+            f"SELECT ts FROM action_log WHERE action IN "
+            f"({','.join('?' for _ in _PROGRESS_ACTIONS)}) AND ts > ?",
+            (*_PROGRESS_ACTIONS, now - _IMBALANCE_HORIZON_S),
+        ).fetchall()]
         # Behavioral anomaly signal (2026-09-28): per-agent tool-call volume in
         # a short window. A runaway loop or injection-driven tool churn shows
         # up as one agent firing an abnormal number of spend-inducing actions
@@ -11400,6 +11553,14 @@ def compute_health_snapshot():
         # for it; the alert check below treats that the same as a very high
         # ratio.
         'ceremony_to_progress_ratio': (ceremony_count / progress_count) if progress_count else None,
+        # Coordination-imbalance scalar (2026-09-29): the decayed signals and
+        # the log10-compressed score the coordination alert keys off. Sent for
+        # client-side trending; the 24h COUNT keys above remain for the alert
+        # message and for back-compat.
+        'ceremony_signal': _decayed_signal(ceremony_ts, now),
+        'progress_signal': _decayed_signal(progress_ts, now),
+        'ceremony_imbalance_score': _imbalance_score(
+            _decayed_signal(ceremony_ts, now), _decayed_signal(progress_ts, now)),
     }
     return {'checked_at': now, 'db_ok': True, 'alerts': _health_alerts_for_signals(signals), **signals}
 
@@ -11668,11 +11829,20 @@ async def decide(request: Request):
 
 @app.get('/api/jev/model')
 async def jev_model_get():
-    # Read-only for anyone logged in: what decisions model is this village
+    # Read-only for anyone logged in: what decisions chain is this village
     # actually running on right now? Answers via the same _jev_model() the
-    # call sites use, so this always reflects the live value, plus the env/
-    # default fallback for context.
-    return JSONResponse({'model': _jev_model(), 'fallback': JEV_MODEL})
+    # call sites use, so this always reflects the live value, plus the full
+    # failover chain and each slug's breaker state (a multi-slug chain tripping
+    # the leader over to a fallback is the whole point of the failover --
+    # visible here instead of silently degraded).
+    chain = _decision_model_chain()
+    if len(chain) <= 1:
+        states = {chain[0]: 'sole'}
+    else:
+        states = {slug: ('broken' if is_model_circuit_broken(slug) else 'available')
+                  for slug in chain}
+    return JSONResponse({'model': _jev_model(), 'primary': chain[0], 'chain': chain,
+                         'slugs': states, 'fallback': JEV_MODEL})
 
 
 @app.get('/api/jev/calibration')
