@@ -24,6 +24,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import serve  # noqa: E402  (sys.path insert above is the repo test convention)
 
 
+def setUpModule():
+    # Hermetic: single-slug decision chains only. The CLI standby appends a
+    # provider to the chain when enabled (it is, via the project .env), which
+    # would arm the shared-process breaker and leak open breakers across
+    # modules. Keep it off for the whole run of this module.
+    serve.COLAB_STANDBY_ENABLED = False
+
+
+def tearDownModule():
+    serve.COLAB_STANDBY_ENABLED = str(
+        serve._load_env().get('COLAB_STANDBY_ENABLED', '') or ''
+    ).lower() in ('1', 'true', 'yes')
+
+
 def _jev_response(choice='fire', confidence=0.9, cost=0.0001):
     """A fake /api/alpha/decisions response shaped like what _jev_choice expects."""
     return {'answers': {'q': {'choice': choice, 'confidence': confidence}},

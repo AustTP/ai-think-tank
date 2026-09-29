@@ -48,6 +48,9 @@ def setUpModule():
         AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
+        # Keep decision chains single-slug in the hermetic process: the
+        # standby provider would otherwise arm the multi-slug breaker here.
+        COLAB_STANDBY_ENABLED=False,
     )
     _PATCHER.start()
     serve.init_db()
