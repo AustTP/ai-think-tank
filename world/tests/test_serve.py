@@ -890,6 +890,12 @@ class HealthChecks(unittest.TestCase):
             'missing_model_tier_bands': [],
             'jev_decision_attempts_last_hour': 0,
             'jev_decision_failures_last_hour': 0,
+            'self_proposed_rejected_last_24h': 0,
+            'task_assigned_last_24h': 0,
+            'task_completed_last_24h': 0,
+            'task_median_completion_hours': None,
+            'task_fast_completion_rate': None,
+            'task_horizon_completion_rate': None,
             'ceremony_actions_last_24h': 0,
             'progress_actions_last_24h': 0,
             'ceremony_to_progress_ratio': None,
@@ -1006,6 +1012,64 @@ class HealthChecks(unittest.TestCase):
         ))
         self.assertEqual({a['category'] for a in alerts}, {'work_queue', 'security'})
 
+    def test_self_proposed_rejections_below_threshold_raise_nothing(self):
+        # A little grooming-out is refinement's normal job -- only a real
+        # pattern of rejected self-proposals is worth surfacing.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            self_proposed_rejected_last_24h=serve.SELF_PROPOSED_REJECT_THRESHOLD - 1,
+        ))
+        self.assertEqual(alerts, [])
+
+    def test_self_proposed_rejection_pattern_raises_coordination_info(self):
+        alerts = serve._health_alerts_for_signals(self._signals(
+            self_proposed_rejected_last_24h=serve.SELF_PROPOSED_REJECT_THRESHOLD,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['category'], 'coordination')
+        self.assertEqual(alerts[0]['severity'], 'info')
+        self.assertIn('rejected', alerts[0]['message'])
+
+    def test_metr_too_few_assignments_raises_nothing(self):
+        # Reliability-at-horizon is only judged with enough assigned tasks --
+        # a village with 3 assignments and 0 fast finishes is just quiet.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            task_assigned_last_24h=serve.METR_MIN_ASSIGNED - 1,
+            task_fast_completion_rate=0.0, task_median_completion_hours=12.0,
+        ))
+        self.assertEqual(alerts, [])
+
+    def test_metr_low_fast_completion_rate_raises_throughput_warning(self):
+        # Started-but-not-finished is the METR failure mode: few of the tasks
+        # assigned in the window completed within the fast horizon.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            task_assigned_last_24h=10, task_fast_completion_rate=0.2,
+            task_median_completion_hours=8.0, task_horizon_completion_rate=0.4,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['category'], 'throughput')
+        self.assertEqual(alerts[0]['severity'], 'warning')
+        self.assertIn('20%', alerts[0]['message'])
+
+    def test_metr_slow_median_with_ok_fast_rate_raises_throughput_info(self):
+        # Fast-enough start-to-finish on some, but the median is unusually
+        # long: a milder (info) signal -- work is getting done but slowly.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            task_assigned_last_24h=10, task_fast_completion_rate=0.6,
+            task_median_completion_hours=serve.METR_SLOW_MEDIAN_HOURS + 2.0,
+            task_horizon_completion_rate=0.9,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['category'], 'throughput')
+        self.assertEqual(alerts[0]['severity'], 'info')
+        self.assertIn('median', alerts[0]['message'])
+
+    def test_metr_healthy_rates_raise_nothing(self):
+        alerts = serve._health_alerts_for_signals(self._signals(
+            task_assigned_last_24h=20, task_fast_completion_rate=0.8,
+            task_median_completion_hours=0.5, task_horizon_completion_rate=0.95,
+        ))
+        self.assertEqual(alerts, [])
+
     def test_a_little_ceremony_with_no_progress_raises_nothing(self):
         # Below the minimum-volume floor -- a quiet village with 2
         # escalations and 0 releases isn't a coordination pathology, it's
@@ -1037,6 +1101,59 @@ class HealthChecks(unittest.TestCase):
             ceremony_actions_last_24h=12, progress_actions_last_24h=6, ceremony_to_progress_ratio=2.0,
         ))
         self.assertEqual(alerts, [])
+
+
+class TaskHorizonMetrics(unittest.TestCase):
+    # Direct test of _task_horizon_metrics -- the METR reliability-at-horizon
+    # pairing -- against the module's redirected DB with explicit timestamps
+    # (log_action stamps time.time() itself, so insert rows directly).
+
+    def setUp(self):
+        with serve._db() as conn:
+            conn.execute('DELETE FROM action_log')
+
+    def _insert(self, action, task_id, ts):
+        import json as _json
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO action_log (agent_id, action, details, authorized, ts, trace_id) '
+                'VALUES (?, ?, ?, 1, ?, NULL)',
+                ('ben', action, _json.dumps({'taskId': task_id}), ts),
+            )
+
+    def test_pairs_assigned_to_completed_and_computes_rates_and_median(self):
+        now = 1_000_000.0
+        # task-a: assigned 5k s ago, completed 4k s later (over the 1h fast
+        # horizon, inside the 24h horizon).
+        self._insert('task_assigned', 'task-a', now - 5000)
+        self._insert('task_completed', 'task-a', now - 1000)
+        # task-b: assigned 2k s ago, completed 1k s later (fast).
+        self._insert('task_assigned', 'task-b', now - 2000)
+        self._insert('task_completed', 'task-b', now - 1000)
+        # task-c: assigned but never completed -- must count AGAINST the rates.
+        self._insert('task_assigned', 'task-c', now - 500)
+        m = serve._task_horizon_metrics(now)
+        self.assertEqual(m['assigned'], 3)
+        self.assertEqual(m['completed'], 2)
+        self.assertAlmostEqual(m['fast_completion_rate'], 1 / 3, places=4)
+        self.assertAlmostEqual(m['horizon_completion_rate'], 2 / 3, places=4)
+        # Median of [1000, 4000] seconds = 2500s -> 0.69h (rounded to 2 dp).
+        self.assertAlmostEqual(m['median_completion_hours'], 0.69, places=2)
+
+    def test_no_completions_leaves_rates_at_zero_or_none(self):
+        now = 1_000_000.0
+        self._insert('task_assigned', 'task-a', now - 1000)
+        m = serve._task_horizon_metrics(now)
+        self.assertEqual(m['assigned'], 1)
+        self.assertEqual(m['completed'], 0)
+        self.assertIsNone(m['median_completion_hours'])
+        self.assertEqual(m['fast_completion_rate'], 0.0)
+        self.assertEqual(m['horizon_completion_rate'], 0.0)
+
+    def test_no_rows_yields_empty_metrics(self):
+        m = serve._task_horizon_metrics(1_000_000.0)
+        self.assertEqual(m['assigned'], 0)
+        self.assertIsNone(m['fast_completion_rate'])
 
 
 class HealthAlertPersistence(unittest.TestCase):
@@ -1079,6 +1196,59 @@ class HealthAlertPersistence(unittest.TestCase):
         with serve._db() as conn:
             rows = conn.execute('SELECT message FROM health_alerts WHERE category = ?', (self.CATEGORY,)).fetchall()
         self.assertEqual(len(rows), 2)
+
+    def test_persist_returns_only_the_newly_persisted_alerts(self):
+        # The health loop pushes what this returns, so it must return exactly
+        # the alerts it just inserted -- never the standing (deduped) ones.
+        fresh = {'category': self.CATEGORY, 'severity': 'warning', 'message': 'fresh'}
+        standing = {'category': self.CATEGORY, 'severity': 'warning', 'message': 'standing'}
+        serve._persist_new_health_alerts([standing])
+        first = serve._persist_new_health_alerts([fresh, standing])
+        self.assertEqual([a['message'] for a in first], ['fresh'])
+        second = serve._persist_new_health_alerts([fresh, standing])
+        self.assertEqual(second, [])
+
+
+class HealthAlertPush(unittest.TestCase):
+    # Outbound half (2026-09-28): newly-persisted warnings are pushed to the
+    # player on every configured channel; info stays dashboard-only and an
+    # unconfigured channel must fail closed, never raise.
+
+    def test_warning_alert_is_pushed_to_both_channels(self):
+        sent = []
+        with unittest.mock.patch.object(serve, '_send_player_email_sync',
+                                        side_effect=lambda s, b: sent.append(('email', s, b)) or True), \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync',
+                                        side_effect=lambda s, b: sent.append(('telegram', s, b)) or True):
+            serve._push_new_health_alerts(
+                [{'category': 'jev', 'severity': 'warning', 'message': '2/3 Jev calls failed'}])
+        self.assertEqual(len(sent), 2)
+        self.assertEqual(sent[0][0], 'email')
+        self.assertEqual(sent[1][0], 'telegram')
+        self.assertIn('jev', sent[0][1])
+        self.assertIn('2/3 Jev calls failed', sent[0][2])
+
+    def test_critical_alert_is_pushed(self):
+        sent = []
+        with unittest.mock.patch.object(serve, '_send_player_email_sync', side_effect=lambda s, b: sent.append(s) or True), \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync', side_effect=lambda s, b: True):
+            serve._push_new_health_alerts([{'category': 'security', 'severity': 'critical', 'message': 'intrusion'}])
+        self.assertEqual(len(sent), 1)
+
+    def test_info_alert_is_not_pushed(self):
+        with unittest.mock.patch.object(serve, '_send_player_email_sync') as email, \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync') as telegram:
+            serve._push_new_health_alerts([{'category': 'work_queue', 'severity': 'info', 'message': 'queue stalled'}])
+        email.assert_not_called()
+        telegram.assert_not_called()
+
+    def test_unconfigured_channels_fail_closed_without_raising(self):
+        # No channel configured (both return False, the same as when the
+        # bridge/credential is absent) -- must not raise and must log a line.
+        with unittest.mock.patch.object(serve, '_send_player_email_sync', return_value=False), \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync', return_value=False):
+            serve._push_new_health_alerts(
+                [{'category': 'jev', 'severity': 'warning', 'message': 'down'}])  # must not raise
 
 
 class LibraryIngest(unittest.TestCase):
@@ -2275,7 +2445,7 @@ class JevQuorumDecision(unittest.TestCase):
 
     def test_confident_allow_takes_exactly_one_sample(self):
         with self._mock_sample_sequence([self._answer('allow', 0.9)]) as mock_call:
-            decision, confidence, cost = asyncio.run(serve._jev_quorum_decision('i', {}))
+            decision, confidence, cost, _trace = asyncio.run(serve._jev_quorum_decision('i', {}))
         self.assertEqual(mock_call.call_count, 1)
         self.assertEqual((decision, confidence), ('allow', 0.9))
 
@@ -2284,7 +2454,7 @@ class JevQuorumDecision(unittest.TestCase):
         # ALLOW, not to second-guess a confident classifier that already
         # said no.
         with self._mock_sample_sequence([self._answer('block', 0.3)]) as mock_call:
-            decision, confidence, cost = asyncio.run(serve._jev_quorum_decision('i', {}))
+            decision, confidence, cost, _trace = asyncio.run(serve._jev_quorum_decision('i', {}))
         self.assertEqual(mock_call.call_count, 1)
         self.assertEqual(decision, 'block')
 
@@ -2299,7 +2469,7 @@ class JevQuorumDecision(unittest.TestCase):
             self._answer('allow', 0.85),  # agrees, confidently
             self._answer('block', 0.9),   # disagrees -- excluded from the agreeing set
         ]):
-            decision, confidence, cost = asyncio.run(serve._jev_quorum_decision('i', {}))
+            decision, confidence, cost, _trace = asyncio.run(serve._jev_quorum_decision('i', {}))
         self.assertEqual(decision, 'allow')
         self.assertAlmostEqual(confidence, 0.85)  # the strongest AGREEING vote, not an average
 
@@ -2309,7 +2479,7 @@ class JevQuorumDecision(unittest.TestCase):
             self._answer('block', 0.9),
             self._answer('block', 0.8),
         ]):
-            decision, confidence, cost = asyncio.run(serve._jev_quorum_decision('i', {}))
+            decision, confidence, cost, _trace = asyncio.run(serve._jev_quorum_decision('i', {}))
         # Only 1 agreeing vote (< QUORUM_MIN_AGREEING) -- stays the original
         # unsure result, not silently upgraded or downgraded.
         self.assertEqual((decision, confidence), ('allow', 0.4))
@@ -2320,7 +2490,7 @@ class JevQuorumDecision(unittest.TestCase):
             self._answer('allow', 0.5, cost=0.02),
             self._answer('block', 0.9, cost=0.03),
         ]):
-            _decision, _confidence, cost = asyncio.run(serve._jev_quorum_decision('i', {}))
+            _decision, _confidence, cost, _trace = asyncio.run(serve._jev_quorum_decision('i', {}))
         self.assertAlmostEqual(cost, 0.06)
 
     def test_a_failed_resample_is_skipped_not_fatal(self):
@@ -2329,17 +2499,124 @@ class JevQuorumDecision(unittest.TestCase):
             RuntimeError('network blip'),
             self._answer('allow', 0.85),
         ]):
-            decision, confidence, cost = asyncio.run(serve._jev_quorum_decision('i', {}))
+            decision, confidence, cost, _trace = asyncio.run(serve._jev_quorum_decision('i', {}))
         # Still reaches a quorum from the 2 real votes despite the blip.
         self.assertEqual(decision, 'allow')
         self.assertAlmostEqual(confidence, 0.85)
 
     def test_unreachable_classifier_on_the_first_call_fails_closed(self):
         with self._mock_sample_sequence([RuntimeError('down')]) as mock_call:
-            decision, confidence, cost = asyncio.run(serve._jev_quorum_decision('i', {}))
+            decision, confidence, cost, _trace = asyncio.run(serve._jev_quorum_decision('i', {}))
         self.assertEqual(mock_call.call_count, 1)
         self.assertIsNone(decision)
         self.assertEqual(confidence, 1.0)
+
+    def test_trace_id_is_propagated_from_the_decision_call(self):
+        # The decision_tape row's trace_id must reach the caller so it can be
+        # stamped on the resulting action_log rows (the calibration report's
+        # exact join key). The real _call_openrouter_decision_sync stamps it
+        # into the returned data; here we simulate that by including it.
+        with self._mock_sample_sequence([
+            {'answers': {'choice': {'choice': 'allow', 'confidence': 0.9, 'probabilities': {}}},
+             'usage': {'cost': 0.01}, 'trace_id': 'deadbeef'},
+        ]):
+            decision, confidence, _cost, trace_id = asyncio.run(serve._jev_quorum_decision('i', {}))
+        self.assertEqual((decision, confidence), ('allow', 0.9))
+        self.assertEqual(trace_id, 'deadbeef')
+
+
+class DecisionCalibration(unittest.TestCase):
+    """_decision_calibration_report (2026-09-28, takeaway #1): bucket Jev's
+    stated confidence against the real success rate of the actions it allowed,
+    so an overconfident classifier is visible instead of quietly eroding the
+    low-confidence-escalation floor. Reads only action_log (gate rows carry
+    confidence+decision, outcome rows carry success/failure) -- no model
+    calls, no network."""
+
+    def setUp(self):
+        # The module DB is shared across methods in this file, and the report
+        # reads a 7-day window -- clear the table so each test sees only its
+        # own rows.
+        with serve._db() as conn:
+            conn.execute('DELETE FROM action_log')
+
+    def _gate(self, agent, action, decision, confidence, ts, trace_id=None):
+        serve.log_action(agent, action, {'target': f'http://x/{ts}', 'purpose': 'p',
+                                         'decision': decision, 'confidence': confidence, 'cost': 0.01},
+                         authorized=True, trace_id=trace_id)
+        with serve._db() as conn:
+            conn.execute('UPDATE action_log SET ts = ? WHERE id = (SELECT MAX(id) FROM action_log)', (ts,))
+
+    def _log_outcome(self, agent, action, decision, ts, trace_id=None):
+        serve.log_action(agent, action, {'url': f'http://x/{ts}', 'decision': decision}, authorized=True, trace_id=trace_id)
+        with serve._db() as conn:
+            conn.execute('UPDATE action_log SET ts = ? WHERE id = (SELECT MAX(id) FROM action_log)', (ts,))
+
+    def test_successful_and_failed_allows_are_scored_per_bucket(self):
+        base = time.time()
+        tid = 0
+        for conf, outcome, n in [
+            (0.95, 'allowed', 4),   # high-confidence, mostly succeeds
+            (0.95, 'allowed_but_fetch_failed', 1),
+            (0.55, 'allowed', 1),   # low-confidence, fails -> below the safety floor
+            (0.55, 'allowed_but_fetch_failed', 1),
+        ]:
+            for _ in range(n):
+                tid += 1
+                self._gate('ada', 'browse', 'allowed', conf, base + 10 * tid, trace_id=f't{tid}')
+                self._log_outcome('ada', 'browse', outcome, base + 10 * tid + 1, trace_id=f't{tid}')
+        report = serve._decision_calibration_report(window_s=7 * 86400)
+        buckets = {b['bin']: b for b in report['buckets']}
+        hi = buckets['0.90-1.00']
+        self.assertEqual(hi['n_allowed'], 5)
+        self.assertEqual(hi['n_outcome'], 5)
+        self.assertEqual(hi['n_success'], 4)
+        self.assertEqual(hi['n_failure'], 1)
+        self.assertEqual(hi['success_rate'], 0.8)
+        lo = buckets['0.50-0.60']
+        self.assertEqual(lo['n_outcome'], 2)
+        self.assertEqual(lo['success_rate'], 0.5)
+
+    def test_blocked_and_escalated_are_counted_but_not_scored(self):
+        base = time.time()
+        self._gate('ada', 'browse', 'blocked', 0.9, base + 1)
+        self._gate('ada', 'download', 'escalated_unsure', 0.4, base + 2)
+        self._gate('ada', 'browse', 'allowed', 0.95, base + 3)
+        report = serve._decision_calibration_report()
+        buckets = {b['bin']: b for b in report['buckets']}
+        hi = buckets['0.90-1.00']
+        self.assertEqual(hi['n_blocked'], 1)
+        self.assertEqual(hi['n_allowed'], 1)
+        self.assertEqual(hi['n_outcome'], 0)  # no outcome row -> not scored
+        lo = buckets['0.00-0.50']
+        self.assertEqual(lo['n_escalated'], 1)
+        self.assertEqual(report['total_decisions'], 3)
+        self.assertEqual(report['scoreable'], 0)
+        self.assertEqual(report['scoreable_fraction'], 0.0)
+
+    def test_trace_id_outcome_match_wins_over_the_heuristic(self):
+        base = time.time()
+        # A gate with a threaded trace_id whose real outcome row is a failure;
+        # an UNRELATED later 'allowed' row (different agent) must NOT be picked.
+        self._gate('ada', 'browse', 'allowed', 0.9, base + 1, trace_id='t1')
+        self._log_outcome('ada', 'browse', 'allowed_but_fetch_failed', base + 2, trace_id='t1')
+        self._log_outcome('bob', 'browse', 'allowed', base + 3)  # unrelated, no trace
+        report = serve._decision_calibration_report()
+        hi = next(b for b in report['buckets'] if b['bin'] == '0.90-1.00')
+        self.assertEqual(hi['n_success'], 0)
+        self.assertEqual(hi['n_failure'], 1)
+        self.assertEqual(hi['success_rate'], 0.0)
+
+    def test_overconfident_classifier_shows_large_calibration_error(self):
+        base = time.time()
+        # Confident allows that only succeed half the time = overconfidence.
+        for i in range(6):
+            self._gate('ada', 'browse', 'allowed', 0.95, base + i, trace_id=f'o{i}')
+            self._log_outcome('ada', 'browse', 'allowed' if i % 2 == 0 else 'allowed_but_fetch_failed', base + i + 0.1, trace_id=f'o{i}')
+        report = serve._decision_calibration_report()
+        self.assertEqual(report['overall_success_rate'], 0.5)
+        # Weighted mismatch against the 0.95 center -> clearly > 0.
+        self.assertGreater(report['calibration_error'], 0.4)
 
 
 class JevQuorumChoiceSync(unittest.TestCase):
