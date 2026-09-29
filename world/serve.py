@@ -3303,6 +3303,18 @@ GITHUB_TOKEN = _load_env().get('GITHUB_TOKEN')
 # for the monthly cap surfaced in the Bank. Absent (blank) means the reconcile
 # line is omitted (fail closed), never fabricated.
 APIFY_API_KEY = _load_env().get('APIFY_API_KEY')
+# Higgsfield AI API key (2026-09-29): a two-part credential (key ID + shared
+# secret) for image/video generation + editing, stored in .env like the other
+# service keys. Loaded as module constants; _higgsfield_configured() is the
+# single availability gate (both halves present) a future feature checks --
+# the same "absent means the surface never advertises it" pattern as
+# TAVILY_API_KEY/GITHUB_TOKEN.
+HIGGSFIELD_API_KEY_ID = _load_env().get('HIGGSFIELD_API_KEY_ID')
+HIGGSFIELD_API_KEY_SECRET = _load_env().get('HIGGSFIELD_API_KEY_SECRET')
+
+
+def _higgsfield_configured():
+    return bool(HIGGSFIELD_API_KEY_ID and HIGGSFIELD_API_KEY_SECRET)
 
 
 def _get_or_create_server_secret():
