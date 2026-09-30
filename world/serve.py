@@ -2191,7 +2191,14 @@ def _telegram_api_sync(method, params=None, timeout=30):
     asyncio.to_thread deadlock risk here (that class of bug only applies to
     calls that loop back into THIS server). Returns the parsed `result` field
     on success, or None on any failure (fails closed/silent -- a transient
-    Telegram/network hiccup should not crash the poll loop)."""
+    Telegram/network hiccup should not crash the poll loop).
+
+    A Telegram 409 Conflict is NOT a transient hiccup -- it means ANOTHER
+    long-poll connection is already open on this bot token (a second instance
+    or the standby), and polling again just retriggers it. It is raised as
+    `_TelegramConflictError` so the poll loop can tell it apart from a mere
+    network blip and back off for a real window instead of hammering Telegram
+    every few seconds forever."""
     url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}'
     data = json.dumps(params or {}).encode()
     req = urllib.request.Request(url, data=data, method='POST',
@@ -2200,9 +2207,20 @@ def _telegram_api_sync(method, params=None, timeout=30):
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- fixed Telegram API host
             body = json.loads(resp.read().decode('utf-8', errors='replace'))
             return body.get('result') if body.get('ok') else None
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            raise _TelegramConflictError(str(e))
+        print(f'[telegram] {method} failed: {e}', flush=True)
+        return None
     except Exception as e:
         print(f'[telegram] {method} failed: {e}', flush=True)
         return None
+
+
+class _TelegramConflictError(Exception):
+    """Raised on a Telegram 409 Conflict -- another poller already holds the
+    long-poll on this bot token. Kept module-level so the poll loop can catch
+    it specifically and back off rather than retrying a 409 in a tight loop."""
 
 
 async def _telegram_process_update(update):
@@ -2248,6 +2266,14 @@ async def _telegram_poll_loop():
                 chat_id, reply = outcome
                 await asyncio.to_thread(_telegram_api_sync, 'sendMessage',
                                         {'chat_id': chat_id, 'text': reply})
+        except _TelegramConflictError:
+            # Another poller (a second instance / the standby) already holds
+            # the long-poll on this bot token, so getUpdates 409s. Retrying
+            # fast just re-triggers it; back off a full window before trying
+            # again so this instance stops hammering Telegram and lets the
+            # holder keep the connection.
+            print('[telegram] 409 conflict -- another poller holds this bot; backing off', flush=True)
+            await asyncio.sleep(60)
         except Exception as e:
             print(f'[telegram] loop error: {e}', flush=True)
             await asyncio.sleep(5)
@@ -2558,14 +2584,19 @@ PEER_REVIEW_MIN_LOOKBACK_S = 3600  # judge an hour of real activity, not 90 stra
 PEER_REVIEW_REPORT_STALE_S = 6 * 3600
 
 
-def _peer_review_loop_pass():
-    # Runs on the peer loop (a thread). Returns number of reports filed.
-    state = get_state_from_db()
-    if not state:
-        return 0
+def _peer_review_pass(state, now):
+    """Peer-review worker picker, run on the caller's in-hand `state` object
+    (mutated in place, no separate get/save of the whole blob). Returns the
+    number of reports filed. This is the CORE of the loop -- see
+    _peer_review_loop_pass (DB wrapper) and _peer_review_tick (cadence +
+    single-writer driver). Keeps the pass's own report list contract intact
+    (reports are never removed here -- staleness is a dedup window, see the
+    peer-review tests); the LIVE driver prunes old reports instead."""
     roster = state.get('agentRoster', [])
     live = state.get('agents', {})
     reports = state.get('reports', [])
+    if not isinstance(reports, list):
+        reports = state['reports'] = []
     director_id = _senior_most_director_id(state)
     if not director_id or director_id not in live:
         return 0
@@ -2575,7 +2606,6 @@ def _peer_review_loop_pass():
             director_name = d.get('name', director_id)
             break
     # Gather real activity from the action_log for every NON-director worker.
-    now = time.time()
     cutoff = now - PEER_REVIEW_MIN_LOOKBACK_S  # action_log.ts is seconds (time.time())
     # A worker counts as "already covered" only if a report about them was
     # filed within the staleness window -- a stale report (long consumed by
@@ -2609,6 +2639,19 @@ def _peer_review_loop_pass():
             'already': aid in existing_about,
         })
     if not candidates:
+        return 0
+    # EVIDENCE GATE (village): a peer report is a consequential claim about
+    # another worker's performance, so it must rest on solid evidence -- not a
+    # quiet baseline. If NO ONE in the think tank has done any real work in the
+    # lookback window, the whole village is simply idle: nobody is
+    # underperforming (everyone is equally quiet) and nobody is a standout, so
+    # there is nothing legitimate to report. Filing "Underperforming" against a
+    # village where every worker is at zero fabricates evidence. The user was
+    # explicit: a report should only fire when one worker is genuinely out of
+    # line with the rest, and only on solid evidence. So: no real work anywhere
+    # => file nothing, not even a Jev call.
+    group_activity = max((c['real'] for c in candidates), default=0)
+    if group_activity < 2:
         return 0
     # Pick the single most report-worthy worker via Jev, using REAL numbers.
     # Dedup, not fallback: candidates already covered within the staleness
@@ -2668,6 +2711,20 @@ def _peer_review_loop_pass():
         valid_idx = min(range(len(cand_pool)), key=lambda i: cand_pool[i]["real"])
     idx = valid_idx
     target = cand_pool[idx]
+    # EVIDENCE GATE (target): only file when the pick is backed by a genuine,
+    # evidence-based divergence -- either a clear underperformer (well behind
+    # while the rest of the village demonstrably worked) or a clear standout
+    # (doing far more real work than peers). A nominal "everyone performed
+    # about the same" pick is NOT a report: the user's rule is that a report is
+    # filed only when one worker is genuinely out of line with the others --
+    # performing well OR not well at all -- grounded in solid evidence, never
+    # "for the record" on a baseline. group_activity >= 2 is already guaranteed
+    # by the village gate above, so this reduces to: the target is genuinely
+    # behind (real < 2) or genuinely ahead (real >= 5, the group max).
+    is_underperformer = target['real'] < 2
+    is_standout = target['real'] >= 5 and target['real'] >= group_activity
+    if not (is_underperformer or is_standout):
+        return 0
     quote = f'Peer review of {target["name"]} ({target["role"]}): {target["actions"]} actions, {target["real"]} real work in the last {PEER_REVIEW_MIN_LOOKBACK_S // 60} minutes.'
     note = ('Underperforming -- well below expected output this period.' if target['real'] < 2 else
             'Standout performer -- doing the most real work this period.' if target['real'] >= 5 else
@@ -2679,7 +2736,6 @@ def _peer_review_loop_pass():
     }
     reports.append(report)
     state['reports'] = reports
-    save_state_to_db(state)
     log_action(director_id, 'report_filed', {'about': target['id'], 'real': target['real'], 'actions': target['actions']}, authorized=False)
     # An autonomous peer report is the same consequential class as a
     # client-filed one -- chain it into the passport too.
@@ -2687,11 +2743,64 @@ def _peer_review_loop_pass():
     return 1
 
 
+def _peer_review_loop_pass(state=None, now=None):
+    """DB-backed wrapper around _peer_review_pass: load the whole state, run
+    the pass on it, persist. Kept for the peer-review tests (which drive it as
+    a standalone read-modify-write). The LIVE path never calls this with
+    state=None -- the sim loop owns the single read-modify-write and calls
+    _peer_review_pass directly through _peer_review_tick, so no second thread
+    ever does its own get/save of the whole blob (that race clobbered freshly
+    filed reports before the staleness dedup could see them, re-filing the same
+    worker every PEER_REVIEW_INTERVAL_S forever)."""
+    if state is None:
+        state = get_state_from_db()
+        if not state:
+            return 0
+        n = _peer_review_pass(state, time.time() if now is None else now)
+        save_state_to_db(state)
+        return n
+    return _peer_review_pass(state, time.time() if now is None else now)
+
+
+def _peer_review_tick(state):
+    """Cadence + single-writer driver for the LIVE path. Called from inside the
+    sim loop's one read-modify-write (see _sim_loop_pass in sim.py) on the same
+    `state` object that is about to be saved, so the report it files can never
+    be clobbered by a concurrent whole-blob save -- the exact race that made
+    reports vanish and the loop re-file forever. Gated to the same cadence the
+    old standalone thread used, so it fires ~once per PEER_REVIEW_INTERVAL_S,
+    not on every 2s sim tick."""
+    now = time.time()
+    if now - (state.get('lastPeerReviewAt') or 0) < PEER_REVIEW_INTERVAL_S:
+        return 0
+    state['lastPeerReviewAt'] = now
+    # Prune stale reports on the LIVE path so the report list can't accumulate
+    # unbounded and permanently drag every worker's morale/firing signal down
+    # (each report is a fixed morale penalty that never decays). Reports older
+    # than the staleness window are already treated as "not fresh" by the dedup,
+    # so pruning them is safe for coverage; it only caps the pile. The pass's own
+    # report-list contract (see the peer-review tests) is untouched -- this runs
+    # in the single-writer driver, not in _peer_review_pass.
+    stale_cutoff_ms = (now - PEER_REVIEW_REPORT_STALE_S) * 1000
+    reports = state.get('reports')
+    if isinstance(reports, list):
+        pruned = [r for r in reports if (r.get('ts') or 0) >= stale_cutoff_ms]
+        if len(pruned) != len(reports):
+            state['reports'] = pruned
+    return _peer_review_pass(state, now)
+
+
+
 async def _peer_review_loop():
     while True:
         await asyncio.sleep(PEER_REVIEW_INTERVAL_S)
         try:
-            await asyncio.to_thread(_peer_review_loop_pass)
+            # Live peer reviews are folded into the sim loop's single
+            # read-modify-write (see _peer_review_tick) so no second thread
+            # races the sim's whole-blob save. This loop is retired from the
+            # lifespan; kept only as a back-compat stub so nothing references
+            # a now-deleted name.
+            await asyncio.sleep(0)
         except Exception as e:
             print(f'[peer] loop error: {e}', flush=True)
 
@@ -2732,7 +2841,6 @@ async def _lifespan(app):
         print(f'[identity] backfill failed: {e}', flush=True)
     health_task = asyncio.create_task(_health_check_loop())
     director_task = asyncio.create_task(_director_approval_loop())
-    peer_task = asyncio.create_task(_peer_review_loop())
     backup_task = asyncio.create_task(_backup_loop())
     prune_task = asyncio.create_task(_log_prune_loop())
     tier_refresh_task = asyncio.create_task(_model_tier_refresh_loop())
@@ -2763,7 +2871,6 @@ async def _lifespan(app):
     yield
     health_task.cancel()
     director_task.cancel()
-    peer_task.cancel()
     backup_task.cancel()
     calibration_task.cancel()
     colab_task.cancel()
