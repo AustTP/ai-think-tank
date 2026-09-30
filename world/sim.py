@@ -1313,7 +1313,6 @@ VALUED_QUEUE_ROOMS = frozenset(
 MORALE_APPROVED_WEIGHT = 0.5  # morale.js:16
 MORALE_APPROVED_CAP = 15
 MORALE_DROPPED_WEIGHT = 6
-MORALE_REPORT_WEIGHT = 10
 MORALE_NEGLECT_WEIGHT = 3
 MORALE_NEGLECT_CAP = 30
 MORALE_DROPPED_DECAY_DAYS = 14  # morale.js:33
@@ -2753,9 +2752,11 @@ def reports_about(state, about_id):
 
 def morale_for(state, agent_id, now_ms=None):
     """Port of morale.js moraleFor -- a pure, 0-100 score. Reads the agent's
-    approved/dropped/report/neglect signals off the durable state so future
-    passes re-derive it (no stored score to go stale). `now_ms` injectable for
-    deterministic tests (falls back to wall-clock)."""
+    approved/dropped/neglect signals off the durable state so future
+    passes re-derive it (no stored score to go stale). Mirrors the reference
+    video: the meter reacts to approved work, dropped work, and being spoken
+    to -- NOT to reports/notes (those feed firing review, not morale).
+    `now_ms` injectable for deterministic tests (falls back to wall-clock)."""
     now = int(time.time() * 1000) if now_ms is None else now_ms
     a = (state.get('agents') or {}).get(agent_id)
     if not a:
@@ -2764,11 +2765,10 @@ def morale_for(state, agent_id, now_ms=None):
     days_since_hire = days_since(a.get('hiredAt'), now)
     drop_decay = max(0.0, 1 - days_since_hire / MORALE_DROPPED_DECAY_DAYS)
     dropped_penalty = (a.get('droppedCount') or 0) * MORALE_DROPPED_WEIGHT * drop_decay
-    report_penalty = len(reports_about(state, agent_id)) * MORALE_REPORT_WEIGHT
     last_contacted = a.get('lastContactedAt')
     neglect_penalty = (min(days_since(last_contacted, now) * MORALE_NEGLECT_WEIGHT, MORALE_NEGLECT_CAP)
                        if last_contacted else MORALE_NEGLECT_CAP)
-    raw = 100 + approved_bonus - dropped_penalty - report_penalty - neglect_penalty
+    raw = 100 + approved_bonus - dropped_penalty - neglect_penalty
     return int(max(0, min(100, round(raw))))
 
 

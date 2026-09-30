@@ -46,23 +46,38 @@ const realGrid = JSON.parse(fs.readFileSync(path.join(worldDir, 'collision_grid.
 setGlobal('COLLISION_GRID', realGrid);
 setGlobal('AGENTS', {});
 
-function pythonFindPath(req) {
-  // execFileSync returns a Buffer; nonzero exit throws (checkExecSyncError),
-  // so a returned value means clean success.
+function pythonFindPaths(reqs) {
+  // ONE interpreter serves every request in the batch (line-oriented: one JSON
+  // request per stdin line, one JSON result per stdout line). The old
+  // per-request execFileSync spawned a fresh Python for every case -- 150+
+  // interpreter startups in the battery alone (~20s) that, under concurrent
+  // suite runs, compounded into an apparent hang. execFileSync returns clean
+  // output only on a zero exit; a nonzero exit throws.
+  const input = reqs.map(r => JSON.stringify(r)).join('\n') + '\n';
   const out = execFileSync('/usr/bin/env', ['python3', 'tests/_find_path_bridge.py'], {
-    input: JSON.stringify(req),
+    input,
     cwd: worldDir,
   });
-  return JSON.parse(out.toString());
+  const lines = out.toString().split('\n').filter(l => l.trim() !== '');
+  if (lines.length !== reqs.length) {
+    throw new Error(`bridge returned ${lines.length} results for ${reqs.length} requests`);
+  }
+  return lines.map(l => JSON.parse(l));
+}
+
+function pythonFindPath(req) {
+  return pythonFindPaths([req])[0];
 }
 
 // Everything the JS findPath reads is captured in the request object, so the
 // exact same object feeds both engines. Returns { js, py } both normalized to
-// null or a list of {x, y}.
-function runParity(req) {
+// null or a list of {x, y}. `pyResult` optionally supplies a precomputed
+// Python result (from a batched pythonFindPaths call); otherwise it shells out
+// for the single request.
+function runParity(req, pyResult) {
   setGlobal('AGENTS', req.agents);
   const js = jsFindPath(req.start[0], req.start[1], req.target[0], req.target[1], req.exclude);
-  const py = pythonFindPath({ ...req, grid: realGrid });
+  const py = pyResult !== undefined ? pyResult : pythonFindPath({ ...req, grid: realGrid });
   return { js, py };
 }
 
@@ -207,7 +222,7 @@ test('a second agent\'s already-chosen pathTarget claims a cell (sequential plan
 console.log(`\nRandomized battery against the real map (reproducible seed):`)
 const RANDOM_CASES = 150;
 test(`500 randomized start/target/agent-layout cases all match bit-for-bit`, () => {
-  let checked = 0;
+  const reqs = [];
   for (let i = 0; i < RANDOM_CASES; i++) {
     const s = freePoint(), t = freePoint();
     const layout = [];
@@ -220,9 +235,14 @@ test(`500 randomized start/target/agent-layout cases all match bit-for-bit`, () 
     }
     const agents = agentsWith(layout);
     agents.mover = { id: 'mover', x: s.x, y: s.y, visible: true, pathTarget: null };
-    const req = reqFor(s, t, agents, 'mover');
-    const { js, py } = runParity(req);
-    assert.equal(py === null, js === null, `case #${i}: null-vs-array mismatch (s=(${s.x},${s.y}) t=(${t.x},${t.y}))`);
+    reqs.push(reqFor(s, t, agents, 'mover'));
+  }
+  // Batch the whole battery into ONE bridge invocation (see pythonFindPaths).
+  const pyResults = pythonFindPaths(reqs.map(r => ({ ...r, grid: realGrid })));
+  let checked = 0;
+  for (let i = 0; i < RANDOM_CASES; i++) {
+    const { js, py } = runParity(reqs[i], pyResults[i]);
+    assert.equal(py === null, js === null, `case #${i}: null-vs-array mismatch (s=(${reqs[i].start[0]},${reqs[i].start[1]}) t=(${reqs[i].target[0]},${reqs[i].target[1]}))`);
     if (js !== null) {
       assert.equal(py.length, js.length, `case #${i}: waypoint count (js=${py.length}?? js=${js.length})`);
       for (let w = 0; w < js.length; w++) {

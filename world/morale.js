@@ -10,12 +10,14 @@
 // Deliberately NOT "more approved work = more morale": Greg does more work
 // than anyone and has the worst morale in the reference, which is the
 // whole point being made (burnout, not a leaderboard). Approved work gets
-// a small, capped nod; drops and being reported on cost real points; being
+// a small, capped nod; drops cost real points; being
 // neglected costs the most and is uncapped-feeling (never contacted is
-// worse than any measured number of days).
+// worse than any measured number of days). Reports/notes deliberately do
+// NOT move the meter: the reference video's meter reacts to approved work,
+// dropped work, and whether an agent is spoken to -- nothing else -- so a
+// note about an agent (good or bad) informs firing review, not morale.
 const MORALE_APPROVED_WEIGHT = 0.5, MORALE_APPROVED_CAP = 15;
 const MORALE_DROPPED_WEIGHT = 6;
-const MORALE_REPORT_WEIGHT = 10;
 const MORALE_NEGLECT_WEIGHT = 3, MORALE_NEGLECT_CAP = 30;
 // Real bug caught empirically, not by reading the code: droppedCount is
 // only ever set once, at hire time (seed flavor data for the original
@@ -46,11 +48,10 @@ function moraleFor(agentId) {
   const daysSinceHire = a.hiredAt ? daysSince(a.hiredAt) : 0;
   const dropDecay = Math.max(0, 1 - daysSinceHire / MORALE_DROPPED_DECAY_DAYS);
   const droppedPenalty = a.droppedCount * MORALE_DROPPED_WEIGHT * dropDecay;
-  const reportPenalty = reportsAbout(agentId).length * MORALE_REPORT_WEIGHT;
   const neglectPenalty = a.lastContactedAt
     ? Math.min(daysSince(a.lastContactedAt) * MORALE_NEGLECT_WEIGHT, MORALE_NEGLECT_CAP)
     : MORALE_NEGLECT_CAP;
-  const raw = 100 + approvedBonus - droppedPenalty - reportPenalty - neglectPenalty;
+  const raw = 100 + approvedBonus - droppedPenalty - neglectPenalty;
   return Math.max(0, Math.min(100, Math.round(raw)));
 }
 
