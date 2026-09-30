@@ -1062,6 +1062,17 @@ def _sim_loop_pass():
     if not state:
         return None
     state = _engine.tick(state)
+    # Peer reviews run INSIDE the sim's single read-modify-write -- on this
+    # same `state` object, right before the one save -- so the report it files
+    # can never be clobbered by a concurrent whole-blob save (the race that
+    # made freshly-filed reports vanish and the old standalone peer thread
+    # re-flag the same worker every 90s forever). Cadence-gated; no-op when not
+    # due. serve._peer_review_tick reads only this in-hand state + the
+    # action_log (read-only), then mutates state in place.
+    try:
+        serve._peer_review_tick(state)
+    except Exception as e:
+        print(f'[sim] peer review tick error: {e}', flush=True)
     serve.save_state_to_db(state)
     return state
 

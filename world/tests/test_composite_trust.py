@@ -871,6 +871,19 @@ class PeerReviewWorkerPickerTests(unittest.TestCase):
     deterministic "lowest real-work worker" rule, never actually asking Jev
     anything a real answer could satisfy."""
 
+    def setUp(self):
+        # These tests share one global DB, so isolate each one: clear the
+        # action_log rows (the evidence the picker reads) and the reports list
+        # (the dedup window) so a prior test can't leak its ada/ben activity or
+        # its filed reports into the next assertion. Each test then seeds its
+        # own exact activity baseline.
+        with serve._db() as conn:
+            conn.execute('DELETE FROM action_log')
+        state = serve.get_state_from_db()
+        if state is not None:
+            state['reports'] = []
+            serve.save_state_to_db(state)
+
     def _seed_roster_and_activity(self, now):
         state = {
             'agentRoster': [
@@ -1009,6 +1022,65 @@ class PeerReviewWorkerPickerTests(unittest.TestCase):
         saved = serve.get_state_from_db()
         self.assertEqual(len(saved.get('reports') or []), 3,
                          'staleness must let a worker back into the pool for a fresh review')
+
+    def test_a_quiet_village_files_no_report_on_a_baseline(self):
+        # EVIDENCE GATE: a village where NO ONE has done any real work is just
+        # idle -- nobody is underperforming (all equally quiet) and nobody is a
+        # standout, so there is nothing legitimate to report. The old behavior
+        # auto-filed "Underperforming" every cadence against this baseline,
+        # which fabricated evidence. No report must be filed and Jev must not
+        # even be called (nothing worth spending a decision on).
+        state = {
+            'agentRoster': [
+                {'id': 'maya', 'name': 'Maya', 'isDirector': True, 'isAdmin': False},
+                {'id': 'ada', 'name': 'Ada', 'director': 'maya'},
+                {'id': 'ben', 'name': 'Ben', 'director': 'maya'},
+            ],
+            'agents': {'maya': {'id': 'maya'}, 'ada': {'id': 'ada'}, 'ben': {'id': 'ben'}},
+            'reports': [],
+        }
+        serve.save_state_to_db(state)
+        # NOTE: deliberately NO real action_log rows -- a fully quiet village.
+        captured = {}
+        with unittest.mock.patch.object(
+                serve, '_call_openrouter_decision_sync',
+                side_effect=lambda *a, **k: captured.setdefault('called', True)):
+            n = serve._peer_review_loop_pass()
+        self.assertEqual(n, 0, 'a fully idle village must not auto-file a peer report')
+        self.assertNotIn('called', captured, 'no Jev call when there is no real activity to review')
+        saved = serve.get_state_from_db()
+        self.assertEqual(len(saved.get('reports') or []), 0)
+
+    def test_a_nominal_village_without_divergence_files_no_report(self):
+        # EVIDENCE GATE (target): even when the village is active, a worker at
+        # only nominal output (real in [2,4], comparable to peers) is NOT a
+        # report -- "for the record" filing was exactly what the user rejected.
+        # Only a genuine underperformer (<2 while peers demonstrably worked) or
+        # a standout (>=5, the group max) qualifies.
+        state = {
+            'agentRoster': [
+                {'id': 'maya', 'name': 'Maya', 'isDirector': True, 'isAdmin': False},
+                {'id': 'ada', 'name': 'Ada', 'director': 'maya'},
+                {'id': 'ben', 'name': 'Ben', 'director': 'maya'},
+            ],
+            'agents': {'maya': {'id': 'maya'}, 'ada': {'id': 'ada'}, 'ben': {'id': 'ben'}},
+            'reports': [],
+        }
+        serve.save_state_to_db(state)
+        # Both workers at nominal, comparable real work (2 and 3) -- active but
+        # with NO genuine divergence to report.
+        for _ in range(2):
+            serve.log_action('ada', 'task_completed', {}, authorized=True)
+        for _ in range(3):
+            serve.log_action('ben', 'task_completed', {}, authorized=True)
+        with unittest.mock.patch.object(
+                serve, '_call_openrouter_decision_sync',
+                return_value={'answers': {'choice': {'choice': 'idx_0', 'confidence': 0.9, 'probabilities': {}}},
+                              'usage': {'cost': 0.0}}):
+            n = serve._peer_review_loop_pass()
+        self.assertEqual(n, 0, 'comparable nominal output is not evidence for a peer report')
+        saved = serve.get_state_from_db()
+        self.assertEqual(len(saved.get('reports') or []), 0)
 
 
 if __name__ == '__main__':
