@@ -325,6 +325,30 @@ def init_db():
             price_per_m REAL NOT NULL,
             chosen_at REAL NOT NULL
         )''')
+        # Daily OpenRouter catalog snapshot -- the persistent record of "what
+        # models existed, at what price, on which day" that the live fetch
+        # (_fetch_openrouter_catalog_sync) otherwise leaves nowhere in the DB.
+        # model_tiers holds the DECISION; this table holds the market data the
+        # decision was grounded in. Synced by _sync_model_catalog() on every
+        # refresh: new models are inserted (first_seen set), known models get
+        # refreshed prices + carried-over benchmark scores, and models that
+        # vanished from the catalog are purged -- from BOTH model_catalog and
+        # model_benchmark_scores, so a removed model's stale score record can't
+        # linger and quietly mislead a future tier pick. `scores` mirrors the
+        # player-entered benchmark scores (JSON: benchmark -> score), so the
+        # snapshot carries the research context next to the price instead of
+        # only a bare slug.
+        conn.execute('''CREATE TABLE IF NOT EXISTS model_catalog (
+            model_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            prompt_price REAL NOT NULL,
+            completion_price REAL NOT NULL,
+            price_per_m REAL NOT NULL,
+            image_capable INTEGER NOT NULL DEFAULT 0,
+            scores TEXT,
+            first_seen REAL NOT NULL,
+            last_seen REAL NOT NULL
+        )''')
         # Real login sessions -- replaces the old "anyone who loads the
         # page gets the same baked-in key" model (see the removed
         # SERVER_ACCESS_KEY) now that you're considering a public
@@ -537,10 +561,43 @@ async def _model_tier_refresh_loop():
                            authorized=False)
             else:
                 print(f'[model-tiers] daily refresh ran, no admin/director to attribute to: {list(fresh)}', flush=True)
+            await _auto_failover_jev_if_gone(fresh, actor)
         except Exception as e:
             # A refresh failure is not fatal -- keep the previous tiers and
             # retry tomorrow (fails open to the last good choice).
             print(f'[model-tiers] daily refresh failed (keeping current tiers): {e}', flush=True)
+
+
+async def _auto_failover_jev_if_gone(fresh, actor):
+    """Jev's decision model is normally a deliberate, player-set choice that is
+    never auto-updated (see _decision_model_chain). The exception: the daily
+    tier refresh should auto-determine it when the CURRENT choice disappears
+    from availability -- if the primary slug no longer verifies AND no later
+    OpenRouter chain entry verifies either (the Colab/Laya standby is excluded:
+    it is a loopback that only serves when the CLI runs, not a real test here),
+    fall back to the freshly-picked 'high' (planning) model, which
+    refresh_model_tiers already live-verified. Logged through the same
+    governance path so it shows up in the activity feed, not a silent swap."""
+    current = _jev_model()
+    if not current or '://' in current:
+        return  # nothing to re-derive, or already pointing at the loopback standby
+    if await asyncio.to_thread(_verify_model_works_sync, current):
+        return  # still available; leave the player's deliberate choice alone
+    for slug in _decision_model_chain():
+        if slug == current or '://' in slug:
+            continue
+        if await asyncio.to_thread(_verify_model_works_sync, slug):
+            return  # an existing chain fallback still works; failover already covers it
+    replacement = fresh.get('high')
+    if not replacement or replacement['id'] == current:
+        return
+    _set_setting('jev_model', replacement['id'])
+    if actor:
+        log_action(actor, 'jev_model_auto_failover',
+                   {'from': current, 'to': replacement['id'],
+                    'note': 'daily refresh: current decision model no longer available; fell back to the verified planning-band pick'},
+                   authorized=False)
+    print(f'[model-tiers] Jev decision model {current} unavailable; auto-fell-back to {replacement["id"]}', flush=True)
 
 
 async def _idle_shutdown_loop(poll_s=30):
@@ -5564,6 +5621,12 @@ COLAB_CLI_PATH = shutil.which('colab') or os.path.expanduser('~/.local/bin/colab
 COLAB_CLI_AVAILABLE = bool(COLAB_CLI_PATH) and os.path.exists(COLAB_CLI_PATH)
 COLAB_GPU_SESSION = 'think-tank-gpu'
 COLAB_GPU_ACCEL = 'T4'
+# CPU is a first-class runtime option too, not a fallback: a large task that
+# is purely CPU-bound (no CUDA/torch-GPU call) should not have to rent a T4
+# at all -- free-tier CPU runtimes are more likely to be granted than a GPU
+# slot, so sharding a big numeric/data job across CPU runtimes is often the
+# more reliable path. Own session namespace so the two never collide.
+COLAB_CPU_SESSION = 'think-tank-cpu'
 COLAB_MONTHLY_UNITS = float(_load_env().get('COLAB_MONTHLY_UNITS', '0') or 0)
 COLAB_FREE_TIER = str(_load_env().get('COLAB_FREE_TIER', '') or '').lower() in ('1', 'true', 'yes')
 COLAB_ENABLED = str(_load_env().get('COLAB_ENABLED', '1') or '1').lower() not in ('0', 'false', 'no')
@@ -5572,9 +5635,16 @@ _COLAB_USAGE_CACHE = {'at': 0.0, 'data': None}
 _COLAB_USAGE_CACHE_TTL_S = 120
 COLAB_MIN_UNITS_PER_RUN = 1.0       # every run pays a floor, even a 5s one
 COLAB_UNITS_PER_MIN_GPU = 1.0       # T4 burn estimate per elapsed minute
+COLAB_UNITS_PER_MIN_CPU = 0.05      # CPU runtime burn estimate per elapsed minute
 COLAB_CODE_MAX_CHARS = 30000
 COLAB_TIMEOUT_MAX_S = 900
 COLAB_IDLE_GRACE_S = 15 * 60        # a parked GPU tears down after this idle
+# A single run_on_colab call may shard one computation across up to this many
+# named T4 runtimes (each gets its own provisioned session + shard env vars).
+# Free tier grants whatever it grants -- fewer runtimes than requested is
+# handled honestly (degrade to what provisioned, say so in the result), never
+# by lying about an account wallet being empty.
+COLAB_RUNTIMES_MAX = 5
 _COLAB_COMPUTE_LAST_USED = 0.0
 _COLAB_COMPUTE_LOCK = threading.Lock()
 
@@ -5707,16 +5777,23 @@ def _colab_account_usage():
     return data
 
 
-def _colab_compute_provision():
-    """Idempotent: ensure the dedicated GPU session exists. Returns (ok, msg).
-    No GPU-capacity check -- a 'colab new --gpu T4' that fails (quota/capacity)
-    just returns an honest per-run error the agent can retry later."""
+def _colab_compute_provision(session=None, kind='gpu'):
+    """Idempotent: ensure a Colab runtime with the given name exists
+    (defaults to the dedicated think-tank-gpu session; kind 'gpu' rents a T4,
+    'cpu' rents a CPU runtime -- CPU slots are more likely granted on the free
+    tier than a GPU, so CPU-bound work should not need to rent a T4). Returns
+    (ok, msg). No GPU-capacity check -- a 'colab new' that fails
+    (quota/capacity) just returns an honest per-run error the agent can retry
+    later."""
+    session = session or COLAB_GPU_SESSION
     if not COLAB_CLI_AVAILABLE:
         return False, 'the colab CLI is not installed on this machine'
-    if _colab_session_exists(COLAB_GPU_SESSION):
+    if _colab_session_exists(session):
         return True, 'ok'
-    rc, out = _colab_cli('new', '-s', COLAB_GPU_SESSION,
-                         '--gpu', COLAB_GPU_ACCEL, timeout=300)
+    cmd = ['new', '-s', session]
+    if kind == 'gpu':
+        cmd += ['--gpu', COLAB_GPU_ACCEL]
+    rc, out = _colab_cli(*cmd, timeout=300)
     if rc != 0:
         return False, f'provision failed: {out[-500:]}'
     return True, 'ok'
@@ -5833,16 +5910,36 @@ def _colab_gate_urls(agent_id, code, purpose, authorized=None):
     return None
 
 
-def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds):
-    """Run `code` (Python) on the dedicated Colab GPU session and capture its
-    output. Blocking -- the spike tool executor calls this on a worker thread
-    like every other agent tool (see the ask lane's nested-call deadlock note).
-    Returns a dict {stdout, units, elapsed_s, session} on success or {error,
-    ...} on any failure; the executor formats it for the model. Budget-gated:
-    an exhausted month is refused with the same tone as a metered-out search,
-    and the Bank shows used/cap/left. Every run accrues wall-clock compute
-    units (T4 estimate) against the monthly cap."""
+def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runtimes=1, kind='gpu'):
+    """Run `code` (Python) on Colab runtime(s) and capture the output.
+    Blocking -- the spike tool executor calls this on a worker thread like
+    every other agent tool (see the ask lane's nested-call deadlock note).
+
+    `kind` picks the runtime: 'gpu' rents T4 runtimes (for CUDA/torch/GPU
+    work), 'cpu' rents CPU runtimes -- a large task that is purely CPU-bound
+    should not have to rent a GPU, and CPU slots are more likely to be granted
+    on the free tier, so CPU is the better default for big shardable numeric/
+    data jobs. `runtimes` (1..COLAB_RUNTIMES_MAX) shards ONE computation
+    across that many runtimes: each named session runs the SAME `code`, with
+    COLAB_SHARD_INDEX (0-based) and COLAB_SHARD_COUNT env vars injected so the
+    code can partition its own work (map-reduce style) and print its slice.
+    This is the achievable form of "chain runtimes together" on the free tier:
+    free tier does NOT meter usage (no prepaid wallet, unlimited), it just
+    does not GUARANTEE a runtime -- so this provisions as many of the requested
+    runtimes as the account actually grants, degrades to fewer (round-robin
+    shards over whatever granted), and reports the honest grant count back.
+    Extra runtimes are torn down after the run; only the primary stays parked
+    for the idle loop to reap.
+
+    Returns a dict {stdout, units, elapsed_s, session} on success (single
+    runtime) or {stdout, units, elapsed_s, session, shards, runtimes} when
+    sharded, or {error, ...} on any failure. Budget-gated: the only hard gate
+    on the free tier is the operator-set COLAB_MONTHLY_UNITS convention cap --
+    the account balance is NOT a gate there (see _colab_budget_exceeded)."""
     global _COLAB_COMPUTE_LAST_USED
+    kind = 'gpu' if kind != 'cpu' else 'cpu'
+    primary_session = COLAB_GPU_SESSION if kind == 'gpu' else COLAB_CPU_SESSION
+    units_per_min = COLAB_UNITS_PER_MIN_GPU if kind == 'gpu' else COLAB_UNITS_PER_MIN_CPU
     if not code or not code.strip():
         return {'error': 'code is required'}
     if len(code) > COLAB_CODE_MAX_CHARS:
@@ -5850,6 +5947,10 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds):
     if not COLAB_ENABLED:
         return {'error': 'Colab compute is disabled by the operator (COLAB_ENABLED=0); '
                          'do not try to run remote GPU jobs'}
+    try:
+        runtimes = max(1, min(int(runtimes or 1), COLAB_RUNTIMES_MAX))
+    except (TypeError, ValueError):
+        runtimes = 1
     blocked = _colab_denied(code) or _colab_denied(purpose or '')
     if blocked is None:
         for pkg in (packages or []):
@@ -5872,68 +5973,131 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds):
         return {'error': 'refusing to run: ' + target_reason}
     if _colab_budget_exceeded():
         if COLAB_MONTHLY_UNITS and _colab_spend_this_month() >= COLAB_MONTHLY_UNITS:
-            return {'error': 'the think tank has used its monthly Colab compute-unit budget '
-                             '(GPU jobs are paused until next month)'}
-        return {'error': 'the Colab account has no compute units left right now -- '
-                         'GPU jobs cannot run until the account balance recovers'}
+            # On the free tier this is the ONLY hard gate, and it is a think
+            # tank convention cap (operator-set), NOT a Google limit -- say so
+            # plainly so the agent never mistakes it for "the account is out
+            # of money this month". T4 itself is unlimited; the operator can
+            # just raise the cap.
+            return {'error': 'the think tank has used its own monthly Colab unit cap '
+                             '(COLAB_MONTHLY_UNITS, an operator-set convention -- NOT a '
+                             'Google quota: free-tier T4 usage is unlimited, runtime is just '
+                             'not guaranteed). The operator can raise the cap; until then '
+                             'GPU jobs are paused.'}
+        return {'error': 'the Colab account has no prepaid compute units left right now -- '
+                         'GPU jobs cannot run until the account balance recovers '
+                         '(this only applies on a paid account; free tier never gates on this)'}
     try:
         timeout = max(1, min(int(timeout_seconds or 300), COLAB_TIMEOUT_MAX_S))
     except (TypeError, ValueError):
         timeout = 300
     with _COLAB_COMPUTE_LOCK:
         start = time.time()
-        ok, msg = _colab_compute_provision()
+        # Provision the primary (must succeed) plus best-effort extras. The
+        # account grants what it grants; anything less than requested is a
+        # graceful degradation, reported back, not an error.
+        sessions = []
+        ok, msg = _colab_compute_provision(primary_session, kind=kind)
         if not ok:
-            return {'error': f'could not provision a Colab GPU session: {msg}'}
+            return {'error': f'could not provision a Colab {kind} session: {msg}'}
+        sessions.append(primary_session)
+        for i in range(1, runtimes):
+            extra = f'{primary_session}-{i}'
+            ok, _msg = _colab_compute_provision(extra, kind=kind)
+            if ok:
+                sessions.append(extra)
+            else:
+                break  # account isn't granting more right now -- degrade
         if packages:
             clean = [re.sub(r'[^A-Za-z0-9._=-]', '', str(p))
                      for p in packages if isinstance(p, str)]
             pkg_line = ' '.join(p for p in clean if p)
             if pkg_line:
-                rc, out = _colab_cli(
-                    'exec', '-s', COLAB_GPU_SESSION, '--timeout', '600',
-                    '--env', f'COLAB_PKGS={pkg_line}',
-                    input=('import os, subprocess\n'
-                           'subprocess.run("pip install -q " + os.environ["COLAB_PKGS"], '
-                           'shell=True, timeout=540)\nprint("__COLAB_PKGS_INSTALLED__")\n'))
-                if rc != 0 or '__COLAB_PKGS_INSTALLED__' not in out:
-                    return {'error': f'package install failed on Colab: {out[-800:]}'}
-        rc, out = _colab_cli(
-            'exec', '-s', COLAB_GPU_SESSION, '--timeout', str(timeout + 30),
-            input=code + '\nprint("__COLAB_DONE__")\n')
-        elapsed = max(1, int(time.time() - start))
-        _COLAB_COMPUTE_LAST_USED = time.time()
-        units = max(COLAB_MIN_UNITS_PER_RUN,
-                    round(elapsed / 60.0 * COLAB_UNITS_PER_MIN_GPU, 3))
-        _accrue_colab_units(units)
+                for session in sessions:
+                    rc, out = _colab_cli(
+                        'exec', '-s', session, '--timeout', '600',
+                        '--env', f'COLAB_PKGS={pkg_line}',
+                        input=('import os, subprocess\n'
+                               'subprocess.run("pip install -q " + os.environ["COLAB_PKGS"], '
+                               'shell=True, timeout=540)\nprint("__COLAB_PKGS_INSTALLED__")\n'))
+                    if rc != 0 or '__COLAB_PKGS_INSTALLED__' not in out:
+                        return {'error': f'package install failed on Colab ({session}): {out[-800:]}'}
+        shards = []
+        total_units = 0.0
+        for shard_index in range(runtimes):
+            session = sessions[shard_index % len(sessions)]
+            shard_start = time.time()
+            rc, out = _colab_cli(
+                'exec', '-s', session, '--timeout', str(timeout + 30),
+                '--env', f'COLAB_SHARD_INDEX={shard_index}',
+                '--env', f'COLAB_SHARD_COUNT={runtimes}',
+                input=code + '\nprint("__COLAB_DONE__")\n')
+            elapsed = max(1, int(time.time() - shard_start))
+            _COLAB_COMPUTE_LAST_USED = time.time()
+            units = max(COLAB_MIN_UNITS_PER_RUN,
+                        round(elapsed / 60.0 * units_per_min, 3))
+            total_units += units
+            _accrue_colab_units(units)
+            out = '\n'.join(l for l in out.splitlines() if '__COLAB_DONE__' not in l)
+            shards.append({'index': shard_index, 'session': session, 'rc': rc,
+                           'stdout': out[-6000:], 'units': units, 'elapsed_s': elapsed})
         log_action('agent', 'colab_compute_run', {
             'purpose': (purpose or '')[:120],
-            'session': COLAB_GPU_SESSION,
+            'sessions': sessions,
+            'requested_runtimes': runtimes,
+            'granted_runtimes': len(sessions),
+            'kind': kind,
             'timeout': timeout,
-            'units': units,
-            'rc': rc,
+            'units': round(total_units, 3),
+            'shards': [{'index': s['index'], 'session': s['session'], 'rc': s['rc']} for s in shards],
             'code': code[:2000],
         }, authorized=True)
-        if rc != 0:
-            return {'error': f'Colab run failed (exit {rc}): {out[-1500:]}', 'units': units}
-        out = '\n'.join(l for l in out.splitlines() if '__COLAB_DONE__' not in l)
-        return {'stdout': out[-6000:], 'units': units, 'elapsed_s': elapsed,
-                'session': COLAB_GPU_SESSION}
+        # Reap the extra runtimes -- a parked T4 keeps burning units between
+        # agent jobs, and only the primary has an idle guard. Free tier burns
+        # unlimited but NOT nothing: every minute of GPU is still real usage.
+        for extra in sessions[1:]:
+            try:
+                _colab_cli('stop', '-s', extra, timeout=120)
+            except Exception:
+                pass
+        total_elapsed = max(1, int(time.time() - start))
+        if runtimes == 1:
+            shard = shards[0]
+            if shard['rc'] != 0:
+                return {'error': f"Colab run failed (exit {shard['rc']}): {shard['stdout'][-1500:]}",
+                        'units': shard['units']}
+            return {'stdout': shard['stdout'], 'units': shard['units'],
+                    'elapsed_s': shard['elapsed_s'], 'session': shard['session']}
+        # Sharded: combine per-runtime output, labeled, so the model can see
+        # which runtime produced what and honest grant count vs request.
+        parts = []
+        for s in shards:
+            tag = f'--- runtime {s["index"]} ({s["session"]}) ---'
+            if s['rc'] != 0:
+                parts.append(f'{tag}\nRUN FAILED (exit {s["rc"]})')
+            else:
+                parts.append(f'{tag}\n{s["stdout"]}')
+        combined = '\n'.join(parts)
+        return {'stdout': combined[-6000:], 'units': round(total_units, 3),
+                'elapsed_s': total_elapsed, 'session': sessions[0],
+                'shards': [{'index': s['index'], 'session': s['session'], 'rc': s['rc']}
+                           for s in shards],
+                'runtimes': len(sessions)}
 
 
 async def _colab_compute_idle_loop():
-    """Parked-GPU guard: every 5 min, stop the dedicated GPU session once it
-    has sat idle past COLAB_IDLE_GRACE_S, so a standing T4 stops burning the
-    account's compute units between agent jobs. Same lifecycle ownership as
-    the Jev standby, but for the agent-compute session and driven by an idle
-    timer rather than a health signal."""
+    """Parked-runtime guard: every 5 min, stop the dedicated GPU and CPU
+    sessions once they have sat idle past COLAB_IDLE_GRACE_S, so a standing
+    runtime stops burning the account's compute units between agent jobs.
+    Same lifecycle ownership as the Jev standby, but for the agent-compute
+    sessions and driven by an idle timer rather than a health signal."""
     while True:
         try:
             if _COLAB_COMPUTE_LAST_USED > 0 \
-                    and (time.time() - _COLAB_COMPUTE_LAST_USED) > COLAB_IDLE_GRACE_S \
-                    and _colab_session_exists(COLAB_GPU_SESSION):
-                print('[colab-compute] GPU session idle; tearing down', flush=True)
-                _colab_cli('stop', '-s', COLAB_GPU_SESSION, timeout=120)
+                    and (time.time() - _COLAB_COMPUTE_LAST_USED) > COLAB_IDLE_GRACE_S:
+                for session, label in ((COLAB_GPU_SESSION, 'GPU'), (COLAB_CPU_SESSION, 'CPU')):
+                    if _colab_session_exists(session):
+                        print(f'[colab-compute] {label} session idle; tearing down', flush=True)
+                        _colab_cli('stop', '-s', session, timeout=120)
         except Exception as e:
             print(f'[colab-compute] idle teardown error: {e}', flush=True)
         await asyncio.sleep(5 * 60)
@@ -6439,8 +6603,86 @@ def _apply_band_price_ceiling(band, candidate_pool):
     return candidate_pool
 
 
+def _sync_model_catalog(models):
+    """Persist the current OpenRouter catalog snapshot into model_catalog and
+    reconcile it against what the DB already knows:
+      * new models are inserted (first_seen = now)
+      * known models get refreshed prices + carried-over benchmark scores
+        (copied from model_benchmark_scores; nothing is scraped/fetched here,
+        the player's entered research stays the only score source)
+      * models that vanished from the live catalog are removed from BOTH
+        model_catalog and model_benchmark_scores -- a score record for a model
+        that no longer exists on OpenRouter is dead weight the value pick can
+        never use, and letting it accumulate would mislead later refreshes.
+    Returns the number of models purged (0 normally), so callers can surface
+    catalog churn."""
+    now = time.time()
+    seen_ids = set()
+    with _db() as conn:
+        for m in models:
+            mid = m['id']
+            seen_ids.add(mid)
+            try:
+                prompt_price = float(m['pricing']['prompt'])
+                completion_price = float(m['pricing']['completion'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            arch = m.get('architecture') or {}
+            image_capable = 1 if 'image' in (arch.get('input_modalities') or []) else 0
+            conn.execute(
+                'INSERT INTO model_catalog (model_id, name, prompt_price, completion_price, price_per_m, image_capable, first_seen, last_seen) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?) '
+                'ON CONFLICT(model_id) DO UPDATE SET name=excluded.name, prompt_price=excluded.prompt_price, '
+                'completion_price=excluded.completion_price, price_per_m=excluded.price_per_m, '
+                'image_capable=excluded.image_capable, last_seen=excluded.last_seen',
+                (mid, m.get('name', mid), prompt_price, completion_price,
+                 (prompt_price + completion_price) * 1_000_000, image_capable, now, now),
+            )
+        # Carry over each model's known benchmark scores into the catalog row.
+        known = {}
+        for r in conn.execute('SELECT model_id, benchmark, score FROM model_benchmark_scores').fetchall():
+            known.setdefault(r[0], {})[r[1]] = r[2]
+        for mid, bench_scores in known.items():
+            conn.execute(
+                'UPDATE model_catalog SET scores = ? WHERE model_id = ?',
+                (json.dumps(bench_scores), mid),
+            )
+        # Purge models that are gone from the live catalog -- both the catalog
+        # row and any player-entered benchmark scores for that model. Scanned
+        # from BOTH tables: a score row can exist for a model that was never
+        # inserted into model_catalog (e.g. pre-catalog research), so a purge
+        # keyed only on catalog rows would orphan it forever.
+        #
+        # One-cycle GRACE period before purging: a model absent for a single
+        # refresh is presumed a transient fetch gap (partial OpenRouter
+        # response), and its player-entered scores are research that cannot be
+        # re-created from a retry -- same "never cache a blip as permanent"
+        # rule as MODEL_VERIFY_ATTEMPTS. Only a model missing from TWO
+        # consecutive daily syncs (last_seen older than one refresh interval)
+        # is treated as genuinely removed.
+        grace_floor = now - MODEL_TIER_REFRESH_INTERVAL_S
+        placeholders = ','.join('?' * len(seen_ids)) if seen_ids else ''
+        if placeholders:
+            gone = {r[0] for r in conn.execute(
+                f'SELECT model_id FROM model_catalog WHERE model_id NOT IN ({placeholders}) AND last_seen < ?',
+                (grace_floor,) + tuple(seen_ids)).fetchall()}
+            gone |= {r[0] for r in conn.execute(
+                f'SELECT model_id FROM model_benchmark_scores WHERE model_id NOT IN ({placeholders}) AND checked_at < ?',
+                (grace_floor,) + tuple(seen_ids)).fetchall()}
+        else:
+            gone = {r[0] for r in conn.execute(
+                'SELECT model_id FROM model_catalog WHERE last_seen < ?', (grace_floor,)).fetchall()}
+            gone |= {r[0] for r in conn.execute(
+                'SELECT model_id FROM model_benchmark_scores WHERE checked_at < ?', (grace_floor,)).fetchall()}
+        for mid in gone:
+            conn.execute('DELETE FROM model_benchmark_scores WHERE model_id = ?', (mid,))
+            conn.execute('DELETE FROM model_catalog WHERE model_id = ?', (mid,))
+    return len(gone)
+
+
 async def refresh_model_tiers():
     models = await asyncio.to_thread(_fetch_openrouter_catalog_sync)
+    _sync_model_catalog(models)
     buckets = _bucket_models_by_price(models)
     all_benchmark_rows = get_model_benchmark_scores()
     chosen = {}
