@@ -324,7 +324,7 @@ class WikiEndpoints(unittest.TestCase):
 
 
 class WriteWikiServerAutoSeed(unittest.TestCase):
-    """_write_wiki_server's 'think_tank' auto-seed (2026-09-26): real gap caught
+    """_write_wiki_server's 'think_tank' auto-seed: a real gap --
     live -- distillation's server-owned write path required a 'think_tank' wiki
     category to already exist, but nothing ever seeds one; it's only ever
     created via a director manually calling POST /api/intent/wiki/category.

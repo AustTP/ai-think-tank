@@ -3,10 +3,10 @@ own long-lived Docker container, dual-homed on both the sandbox's fully
 isolated network (no route to the internet at all) and a real egress
 network. Sandbox containers reach the internet ONLY through this proxy,
 which only permits CONNECT/HTTP to a fixed set of known package-registry
-hosts, plus (2026-09-26) the player-vetted BROWSE_ALLOWLIST_DOMAINS a script
+hosts, plus the player-vetted BROWSE_ALLOWLIST_DOMAINS a script
 may need for real, systematic data work -- e.g. a spike's finding that
 one-URL-at-a-time browse_page tool calls can't do real multi-page crawling
-as efficiently as a script would. Confirmed live before this was written: a
+as efficiently as a script would. Confirmed before this was written: a
 container on the isolated network alone has zero direct route out (an
 `apk add` inside one failed outright), and this proxy container's second
 network attachment gives it real internet access to bridge the two.
@@ -56,7 +56,7 @@ def is_allowed(host):
 
 
 # Real constraint, found while auditing this for a possible GET-only
-# restriction on data-site hosts (2026-09-26): this proxy deliberately never
+# restriction on data-site hosts: this proxy deliberately never
 # terminates TLS (see the module docstring) -- CONNECT tunnels are relayed
 # byte-for-byte, so it cannot see or restrict the HTTP method inside HTTPS,
 # which is how virtually all real traffic works. A method restriction here
@@ -70,7 +70,7 @@ def is_allowed(host):
 # to it, not just reads -- this proxy cannot make that distinction for you.
 
 
-# Real gap flagged live (2026-09-26), same evening a scheduled-task bug (see
+# Gap flagged live, same evening a scheduled-task bug (see
 # _peer_gated_lane) burned ~$9 in an unrelated runaway loop: a script with
 # real egress but no request cap could hammer an allowlisted site far harder
 # than the deliberate, budget-capped browse_page tool loop ever would.

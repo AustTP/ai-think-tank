@@ -7,7 +7,7 @@
 // The map itself is the whole-scene PixelLab think tank render (see
 // ../DESIGN.md, "Experiment -- whole-scene think tank generation") rather than
 // individually-placed building sprites like the main game. Buildings are
-// solid obstacles only, no doors/interiors, per your call on scope.
+// solid obstacles only, no doors/interiors -- a deliberate scope decision.
 //
 // Collision is a per-cell grid (collision_grid.json), not hand-typed
 // rectangles -- the first version was hand-mapped by eye against a labeled
@@ -60,7 +60,7 @@ function agentFetch(url, agentId, options = {}) {
 
 // Hiring, firing, task assignment, and handoffs are all decided entirely
 // in the browser (no serve.py route makes the call itself), so without
-// this they'd be invisible to the one activity log you asked for.
+// this they'd be invisible to the one activity log.
 // Fire-and-forget -- a missed log entry shouldn't affect gameplay.
 function logThinkTankAction(agentId, action, details) {
   apiFetch('/api/log', { method: 'POST', body: JSON.stringify({ agentId, action, details }) }).catch(() => {});
@@ -87,7 +87,7 @@ async function loadModelTiers() {
   }
 }
 
-// Per your explicit call: agents should be able to switch model tiers
+// Agents should be able to switch model tiers
 // based on what they're actually doing, not stay pinned to their hire-
 // time default forever, and Jev should be the one deciding when. This is
 // deliberately scoped to real, higher-stakes actions (real code
@@ -98,7 +98,7 @@ async function loadModelTiers() {
 // /api/chat exactly like any other tier lookup, just per-action instead
 // of a fixed agent.model default.
 async function pickModelTierForAction(agent, actionDescription) {
-  // Real bug caught live: the first version of this criteria text let a
+  // Bug: the first version of this criteria text let a
   // coding task that LOOKED simple ("a minimal index.html") get picked
   // as 'low' anyway, and the cheap model genuinely mangled the output --
   // dropped the opening `<!DOCTYPE`/`<` entirely from the HTML it wrote.
@@ -125,13 +125,13 @@ async function pickModelTierForAction(agent, actionDescription) {
   return MODEL_TIERS[map[choice]] || MODEL_TIERS[agent.model] || MODEL_TIERS.small;
 }
 
-// Real visual review -- per your direct call after watching a stray note
-// element render invisibly wrong in a way no amount of reading the
+// Real visual review -- a stray note
+// element rendering invisibly wrong in a way no amount of reading the
 // source could have caught. Screenshots a sandboxed file (serve.py's
 // /api/screenshot, real headless Chrome) and hands the actual image to a
 // real vision-capable model. Uses MODEL_TIERS.vision, a real, separate,
 // benchmark-driven pick (serve.py's refresh_model_tiers) -- NOT premium.
-// Real bug caught live: this used to force `premium` on the assumption
+// Bug: this used to force `premium` on the assumption
 // that whichever model wins the coding-benchmark pick would also support
 // image input. It doesn't have to, and once premium became a genuine
 // text-only coding specialist (Qwen3-Coder-480B), every visual review
@@ -169,7 +169,7 @@ async function reviewScreenshot(agentId, sandboxId, path, question) {
 }
 
 // The Library's real capability -- a shared file directory any agent (or
-// the player) can write to, per your call. Fire-and-forget, same as
+// the player) can write to. Fire-and-forget, same as
 // logThinkTankAction -- a missed archive write shouldn't block gameplay.
 // `source`: 'firsthand' (default -- an agent's own task output/reasoning)
 // or 'external' (picked up via /api/browse) -- serve.py enforces the
@@ -215,7 +215,7 @@ async function listLibraryFiles() {
 // (serve.py): a real, deliberate promotion, never automatic. Only ever
 // call this after an agent has actually read the pending file and
 // judged it genuinely correct -- exactly the discipline
-// skill-update-verification.md describes in your bug_bounty framework.
+// skill-update-verification.md describes in the bug_bounty framework.
 // `pendingPath` must be the full path as returned by a download/write
 // call (starts with 'pending_review/').
 async function promoteLibraryFile(agentId, pendingPath) {
@@ -230,7 +230,7 @@ async function promoteLibraryFile(agentId, pendingPath) {
   }
 }
 
-// The other real outcome of the pending_review/ quarantine (2026-09-21):
+// The other real outcome of the pending_review/ quarantine:
 // not everything that lands there deserves to become trusted. Mirrors
 // promoteLibraryFile -- moves it to rejected/ instead of the promoted
 // destination, so it's out of the way but not silently lost.
@@ -246,8 +246,8 @@ async function rejectLibraryFile(agentId, pendingPath) {
   }
 }
 
-// Real ask: distilled, topic-level reference files agents can consult
-// before/during a task, the same role skills/*.md plays in your
+// Distilled, topic-level reference files agents can consult
+// before/during a task, the same role skills/*.md plays in the
 // bug_bounty framework -- built FROM real research/downloads, not
 // invented from a role description. Deliberately just a thin
 // convention over writeLibraryFile (one real fixed location, one
@@ -329,7 +329,7 @@ async function gatherUnifiedContext(agentId, sandboxId, topic) {
 // sees a page's INITIAL HTML. Reddit, Twitter/X, and any modern single-
 // page app render their actual content client-side via JS/AJAX, so a
 // plain fetch of one comes back as a near-empty shell -- exactly the
-// problem you flagged before feeding it real social sources.
+// problem this capability exists to solve.
 // `render: true` (serve.py's /api/browse, real headless Chrome) fixes
 // this, but it's real, meaningfully slower/costlier than a plain HTTP
 // GET, so it shouldn't be the default for every fetch, most of which are
@@ -370,15 +370,15 @@ async function fetchPageSmart(agentId, url, purpose) {
   return { ...renderData, rendered: true };
 }
 
-// Raw HTTP access -- a lower-level sibling to /api/browse, per your
-// explicit call: agents need the actual response (status, real headers,
+// Raw HTTP access -- a lower-level sibling to /api/browse: agents need
+// the actual response (status, real headers,
 // unprocessed HTML/JSON), which /api/browse's text-stripped output
 // deliberately never gives. Same Jev "classify before it goes out" gate
 // browse already has, PLUS a real room restriction browse doesn't:
 // serve.py itself checks the agent's last SAVED position and refuses
 // anything outside the Weather Station -- not just a client-side
 // convention, the server won't run the request either way.
-// Real fix for a real race (2026-09-21): the server-side room gates
+// Fix for a race: the server-side room gates
 // (curl / sandbox-download / sandbox-save-page) read an agent's `inRoom`
 // from the AUTOSAVED state, which lags real movement by up to 5s. An agent
 // that just arrived in a gated room could make its very first call before
@@ -415,7 +415,7 @@ async function savePageIntoSandbox(agentId, sandboxId, url, purpose, filename, c
   }
 }
 
-// Real ask (2026-09-21): a bug_bounty-style tool that visits SEVERAL
+// A bug_bounty-style tool that visits SEVERAL
 // pages from a site and saves the ones that matter, not just one. The
 // fetch side of this already existed -- /api/browse already Jev-
 // classifies + SSRF-checks + fetches + extracts text/links per URL, and
@@ -433,7 +433,7 @@ async function crawlAndCollect(agentId, sandboxId, startUrl, purpose, opts = {})
   const maxPages = Math.min(opts.maxPages || 6, CRAWL_MAX_PAGES);
   const linkKeyword = (opts.linkKeyword || '').toLowerCase();
   const pageKeyword = (opts.pageKeyword || '').toLowerCase();
-  // Real ask (2026-09-21): a recurring topic should only KEEP pages it
+  // A recurring topic should only KEEP pages it
   // hasn't already collected in a PRIOR run -- the caller passes back
   // whatever it already has on record (a topic's persisted seenUrls). This
   // deliberately only gates the SAVE step, not the fetch/BFS one: the
@@ -444,7 +444,7 @@ async function crawlAndCollect(agentId, sandboxId, startUrl, purpose, opts = {})
   // at all once that one URL is in seenUrls -- exactly the page most
   // likely to already be there after the very first run.
   const alreadyCollected = new Set(opts.skipUrls || []);
-  // Real ask (2026-09-21): "incremental" shouldn't just mean "never saw
+  // "Incremental" shouldn't just mean "never saw
   // this URL before" -- a page already collected in a prior run for this
   // topic can still have genuinely changed since then. `since` is that
   // prior run's own timestamp (epoch ms); /api/browse's `lastModified`
@@ -602,5 +602,5 @@ function blockedAt(p) {
   return false;
 }
 
-// (Think Tank-wide retrospective removed 2026-09-28 -- it had no caller; the
+// (Removed in an audit -- it had no caller; the
 // player-facing activity feed covers the same ground without a model call.)

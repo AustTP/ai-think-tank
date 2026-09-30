@@ -1,4 +1,4 @@
-// Agent-to-agent handoffs -- your call: agents should talk to each other
+// Agent-to-agent handoffs -- agents should talk to each other
 // for real reasons, not just chat with the player. First real trigger:
 // task dependency. When a task whose room other work DEPENDS ON finishes
 // (TASK_POOL's new `dependsOn` field, tasks.js), the agent who just
@@ -15,7 +15,7 @@
 // entering a room), so `a.handoff` (separate from `a.task`) is what
 // tickAgentMovement checks to decide which arrival/cancel path applies.
 //
-// Explicitly NOT covering every reason you named for agents to talk --
+// Explicitly NOT covering every reason agents might talk --
 // "discussing a third agent" maps onto the reports/performance-review
 // space and is a bigger, separate mechanic, deferred rather than crammed
 // in here.
@@ -47,8 +47,8 @@ async function requestHandoffLine(fromAgent, toAgent, taskTitle) {
   }
 }
 
-// The recipient's side of the exchange -- per your ask for a better
-// agent-to-agent conversation, a handoff was previously one-directional
+// The recipient's side of the exchange -- a handoff
+// was previously one-directional
 // (fromAgent narrates, toAgent silently receives). Same shape as
 // requestHandoffLine(), just the other agent's own model/voice replying
 // to the specific line just said, not a generic acknowledgment.
@@ -90,8 +90,8 @@ async function attemptHandoff(fromId, finishedRoom, finishedTitle) {
     .filter(d => { const a = AGENTS[d.id]; return a && a.visible && !a.busy && !a.task && !a.pairWith && !a.offDuty; })
     .map(d => ({ id: d.id, description: `${d.name}, ${d.role}. ${d.profile.mission}` }));
 
-  // Real gap caught live: if everyone eligible happens to be busy right
-  // now, this used to just silently give up. Per your call, mail
+  // Gap: if everyone eligible happens to be busy right
+  // now, this used to just silently give up. Mail
   // (agents.js's sendMail()) is exactly the channel for this -- it
   // reaches someone wherever they are, without needing them free.
   const anyCandidates = AGENT_ROSTER
@@ -123,7 +123,7 @@ async function attemptHandoff(fromId, finishedRoom, finishedTitle) {
   if (!from || !to || from.busy || to.busy || from.task || to.task || from.handoff || to.visible === false) return false;
 
   // The recipient's own exact position always fails findPath's target
-  // check -- real bug caught live: agentBlockedAt() correctly reports
+  // check -- bug: agentBlockedAt correctly reports
   // "someone's standing there," and that someone IS the recipient, so a
   // target of exactly (to.x, to.y) can never validate. Try a few points
   // just next to them instead (whichever direction has room), same idea

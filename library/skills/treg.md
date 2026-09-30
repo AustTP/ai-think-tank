@@ -42,11 +42,11 @@ platform Treg catalogs is worth using.
 - https://treg.to/catalog (3,684 total endpoints, free-credit + no-subscription
   pricing model)
 - https://orangebot.ai/product/treg ("OpenRouter for tools", 0% markup framing)
-- Verified live 2026-09-24 by the developer with real web search, correcting an
+- Verified by the developer with real web search, correcting an
   earlier agent spike (see Lessons learned below).
 
 ## Lessons learned
-- (2026-09-24) An earlier agent "spike" on Treg invented specific per-post prices
+- An earlier agent "spike" on Treg invented specific per-post prices
   ($0.03 for an X post, $0.10 for a LinkedIn post) that turned out to be roughly
   30-100x too high compared to the real ~$0.001/call figure found via an actual
   web search. The spike had no real internet access -- it was guessing a

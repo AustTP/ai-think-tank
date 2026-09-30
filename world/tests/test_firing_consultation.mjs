@@ -1,5 +1,5 @@
 // Regression tests for the anti-premature-firing consultation (firing.js).
-// Per your calls: a report must notify the candidate's OWN supervisor first
+// A report must notify the candidate's OWN supervisor first
 // (reports.js notifySupervisorOfReport), and reviewers should only fire
 // after consulting anyone who's worked with the candidate + the reporter.
 // Two guardrails: an ACTIVE collaborator blocks firing (would strand the

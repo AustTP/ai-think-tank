@@ -12,7 +12,7 @@ This suite validates the watchdog hermetically. Not actually DB-free:
 _sweep_stuck_gates' rescue path has inline `from serve import log_action`
 calls (task_peer_widened / task_review_requeued), a real side effect that
 writes into whatever real think_tank.db sits at serve.py's default path unless
-DB_PATH is redirected below. Found 2026-09-25 via a live production
+DB_PATH is redirected below. Found via a live production
 think_tank.db that picked up these exact fixture rows after a routine test run.
 """
 
@@ -209,8 +209,7 @@ class StuckGateSweep(unittest.TestCase):
         self.assertEqual(gate['enteredMs'], 40 * 60 * 1000)
 
     def test_repeated_no_verdict_rescues_freeze_after_the_bound(self):
-        # Bounded review-cycle escalation (2026-09-26): real gap caught live --
-        # this exact rescue path (a review consumed with no verdict, reachable
+        # Bounded review-cycle escalation: this exact rescue path (a review consumed with no verdict, reachable
         # pair, re-enqueue a fresh one) used to be able to fire once per
         # cooldown window FOREVER, with no overall cap. Sweep past the 30-min
         # cooldown MAX_REVIEW_CYCLES+1 times; it must stop re-enqueuing and

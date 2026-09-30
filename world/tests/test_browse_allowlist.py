@@ -1,4 +1,4 @@
-"""Player-vetted browse allowlist (2026-09-26): a small set of domains that
+"""Player-vetted browse allowlist: a small set of domains that
 skip Jev's classify+escalate round trip for /api/browse entirely, because the
 PLAYER already vetted them -- everything else still goes through full Jev
 policy-as-code, unchanged. Real request after a DreyX.com investigation got
@@ -40,7 +40,7 @@ def setUpModule():
         # NOT recompute it, so any test exercising a confident Jev allow
         # without explicitly mocking record_browse_success would otherwise
         # write a real browse_trail.json into the actual project directory
-        # (caught live running this exact suite).
+        # (running this exact suite).
         BROWSE_TRAIL_PATH=os.path.join(_TMP_DIR, 'browse_trail.json'),
         # The CLI-run Laya standby appends a provider to every decision chain
         # when enabled (it IS enabled in the project .env, which serves loads).

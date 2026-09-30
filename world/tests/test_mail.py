@@ -1,4 +1,4 @@
-"""Tests for wake-on-mail (2026-09-25): an off-duty agent woken by action-needed
+"""Tests for wake-on-mail: an off-duty agent woken by action-needed
 mail must come online, route to the referenced work, act, and only then return
 offline -- never parked-idle in the same tick before acting.
 
@@ -96,7 +96,7 @@ class DeliverMail(unittest.TestCase):
         self.assertEqual(mailbox[-1]['text'], f'mail {sim.MAILBOX_KEEP_COUNT + 24}')
 
     def test_peer_review_request_mailbox_is_trimmed_too(self):
-        # Regression (2026-09-28 audit): MAILBOX_KEEP_COUNT was only enforced in
+        # Regression (audit): MAILBOX_KEEP_COUNT was only enforced in
         # _deliver_mail -- the _enter_peer_review / _sim_notify_author / gate
         # re-pick append paths grew the mailbox unboundedly. Every append path
         # must trim to the same cap, so a busy reviewer's mailbox can't balloon.

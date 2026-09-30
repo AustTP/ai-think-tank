@@ -34,7 +34,7 @@ import time
 import urllib.parse
 from collections import deque
 
-# Pure, self-contained helpers extracted to their own module (2026-09-27) to
+# Pure, self-contained helpers extracted to their own module to
 # shrink the sim.py monolith. See sim_helpers.py.
 from sim_helpers import (  # noqa: E402, F401
     WORK_PRIORITY,
@@ -51,7 +51,7 @@ from sim_helpers import (  # noqa: E402, F401
     normalize_priority,
 )
 
-# 2026-09-23: 1.0s (was 2.0s). The server only PUBLISHES new positions ~once
+# 1.0s (was 2.0s). The server only PUBLISHES new positions ~once
 # per tick, and the client renders whatever the server last published -- so the
 # visible map animation is gated by SIM_TICK_S regardless of the client's 60fps
 # frame loop. Halving it makes agent movement + task/status changes display
@@ -163,7 +163,7 @@ def find_path(start_x, start_y, target_x, target_y, exclude_agent_id, agents, gr
     { cols, rows, cell, grid: [[0|1, ...], ...] }.
 
     This must remain byte-identical to the JS findPath it was ported from --
-    every branch below maps to a documented live-caught bug in tasks.js (the
+    every branch below maps to a documented bug in tasks.js (the
     co-located-overlap exemption, the centered-start/raw-target cell
     conversion, target ring relaxation, pathTarget claiming, 4-point
     transition sampling, the single-waypoint start==target return, and the
@@ -499,7 +499,7 @@ def step_agent_movement(dt, agents, grid, doors=None, walk_speed=TASK_WALK_SPEED
         dy = wp['y'] - a['y']
         dist = math.hypot(dx, dy)
         if dist < arrive_dist:
-            # Snap exactly onto the waypoint's clean coord (the live-caught
+            # Snap exactly onto the waypoint's clean coord (the
             # float-drift-across-a-cell-boundary bug).
             a['x'] = wp['x']
             a['y'] = wp['y']
@@ -529,7 +529,7 @@ def step_agent_movement(dt, agents, grid, doors=None, walk_speed=TASK_WALK_SPEED
 
         # Co-located overlap exemption: any OTHER visible agent whose box
         # overlaps the mover's own box is freed from agent-vs-agent blocking
-        # -- the live-caught deadlock where two agents legitimately share a
+        # -- the deadlock where two agents legitimately share a
         # door-front spot. Matched by overlap, not bit-equality.
         co_located = set()
         a_box = {'x': a['x'], 'y': a['y'], 'w': AGENT_W, 'h': AGENT_H}
@@ -588,7 +588,7 @@ def step_agent_movement(dt, agents, grid, doors=None, walk_speed=TASK_WALK_SPEED
 
 
 def _reconcile_stranded_agents(state, grid):
-    """2026-09-22: heal agents stranded in a reachability gap (the map has
+    """Heal agents stranded in a reachability gap (the map has
     occlusions that leave some outdoor cells unreachable from SPAWN, which used
     to strand agents who couldn't path to a trailhead door -- ben at the map
     edge, theo at the origin corner). A VISIBLE agent with no task,
@@ -631,7 +631,7 @@ def _reconcile_stranded_agents(state, grid):
 
 
 def _repair_stalled_walkers(state, grid, doors, now_ms=None):
-    """2026-09-22: an agent can be left HOLDING a 'walking' task with an EMPTY
+    """An agent can be left HOLDING a 'walking' task with an EMPTY
     path (busy cleared but task kept -- e.g. a save landed between path-clear and
     arrival, or a pinned spawn raced its assign). step_agent_movement skips any
     agent with no path, so once the path is gone nothing ever re-paths her, and
@@ -691,7 +691,7 @@ def _repair_stalled_walkers(state, grid, doors, now_ms=None):
 # path is lost or never set before the browser that started it closes/stalls
 # has no recovery path at all -- she freezes wherever she stopped, forever,
 # invisible to _reconcile_stranded_agents and _park_idle_wanderers too (both
-# also skip anyone holding pairWith/handoff). Live-caught (2026-09-24): two
+# also skip anyone holding pairWith/handoff): two
 # named agents frozen together, visible, in a doorway.
 def _repair_stalled_interactions(state):
     """Releases any VISIBLE agent holding `handoff`/`pairWith` with no active
@@ -724,7 +724,7 @@ def _repair_stalled_interactions(state):
     return released
 
 
-# Fault-aware routing memory (2026-09-26), ported from a real 2026 paper
+# Fault-aware routing memory, ported from a real 2026 paper
 # (StigmergyRouter, UC Berkeley/ACM CAIS): a lightweight pheromone-memory
 # layer that steers multi-agent routing away from an agent whose work just
 # failed, using only cheap local counters -- no re-classification, no LLM
@@ -772,7 +772,7 @@ def _agent_failure_score(state, agent_id, now_ms):
 
 
 def _reclaim_orphaned_walking_tasks(state):
-    """2026-09-23: a task left in 'walking'/'working' status whose assignee no
+    """A task left in 'walking'/'working' status whose assignee no
     longer holds it (agent.task != task_id, or the assignee vanished) will never
     resolve -- neither _task_cycle's completion loop (iterates AGENTS, so a task
     with no holder is invisible) nor _repair_stalled_walkers (guards on the agent
@@ -823,7 +823,7 @@ def _reclaim_orphaned_walking_tasks(state):
         # Orphaned: no agent is walking/working this. Re-queue it fresh (the
         # whitelist drops nothing assignment needs -- reviewOf/assignedTo pins a
         # re-opened fix to its author, incident to team on-call).
-        # Bound the reclaim re-queue (2026-09-27): a task that keeps getting
+        # Bound the reclaim re-queue: a task that keeps getting
         # orphaned by its assignee must not be re-issued forever. Carry the
         # task's own attempt history forward and shed the item once it hits the
         # same WORK_ITEM_MAX_ATTEMPTS cap the assignment loop enforces, so a
@@ -853,14 +853,14 @@ def _reclaim_orphaned_walking_tasks(state):
             'research': task.get('research') or None,
             'taskType': task.get('taskType') or 'code',
             'skillReview': bool(task.get('skillReview')),
-            # Real bug caught live (2026-09-24): 'distill' was missing from
+            # Bug: 'distill' was missing from
             # this whitelist -- the THIRD copy of the exact same gap already
             # fixed in _assign_due_item's `extra` dict and assign_task itself.
             # An orphaned distill-sweep task reclaimed through here lost the
             # flag on re-queue, so its re-assignment produced a fresh task
             # with distill=False, letting it back into the peer-review gate
             # and re-triggering the identical infinite reject/re-fix loop
-            # (live-caught again as task-236, ~35 duplicate "Distill recent
+            # (again as task-236, ~35 duplicate "Distill recent
             # think tank knowledge" queue entries). The comment above claiming
             # "the whitelist drops nothing assignment needs" was the same
             # false assumption both earlier instances of this bug shared.
@@ -908,7 +908,7 @@ class SimEngine:
 
         # Per-tick identity self-heal (see serve._heal_agent_identity): a
         # boot-only migration wasn't durable against a stale client tab's 5s
-        # autosave re-POSTing pre-fix agent records (confirmed live via a
+        # autosave re-POSTing pre-fix agent records (confirmed via a
         # save_state_to_db stack trace), so this runs every tick, same shape
         # as _reconcile_stranded_agents/_repair_stalled_walkers below.
         import serve
@@ -966,7 +966,7 @@ class SimEngine:
                     _task_cycle(state, now=now, grid=self._grid, doors=self._doors,
                                 task_id_holder=_TASK_ID_HOLDER)
 
-                # 2026-09-22: heal agents stranded in unreachable outdoor cells
+                # Heal agents stranded in unreachable outdoor cells
                 # (the reachability-gap bug). Runs AFTER movement + task cycle so
                 # it only moves genuinely idle, visible agents -- no-op once
                 # everyone is reachable.
@@ -1011,7 +1011,7 @@ class SimEngine:
                     'inRoom': agent.get('inRoom'),
                     'offDuty': off_duty,
                     'pathActive': bool(agent.get('path')),
-                    # Live-caught (2026-09-24): this snapshot never carried
+                    # This snapshot never carried
                     # `visible` at all, so applyServerPositions (sim_bridge.js)
                     # had nothing to sync it from -- a client's copy is set ONCE
                     # from the full /api/state GET at page load and then frozen
@@ -1137,11 +1137,11 @@ def _drain_emails_from_db():
 WORK_ITEM_MAX_ATTEMPTS = 3
 MAX_ACTIVE_AGENTS = 25  # hiring.js:41
 MAX_TOTAL_AGENTS = 500  # hiring.js:40 -- total inventory cap, vs MAX_ACTIVE_AGENTS
-# Per-team headcount cap (user call, 2026-09-22): a team may not exceed 6
+# Per-team headcount cap: a team may not exceed 6
 # members, NOT counting the scrum master. Team membership is DERIVED from the
 # `director` graph (see _derive_team_members), so this checks that derived set.
 MAX_TEAM_MEMBERS = 6
-# Scrum-master scaling (user call, 2026-09-27): a scrum master is a standing
+# Scrum-master scaling: a scrum master is a standing
 # facilitator a small team doesn't need yet -- only once a team reaches this
 # many workers does a dedicated scrum master become REQUIRED. Below it, the
 # team's director stands in as the groomer/facilitator for ceremonies.
@@ -1267,7 +1267,7 @@ ROADMAP_CADENCE_MS = 7 * 24 * 3600 * 1000   # weekly silent priority recompute
 # into every FUTURE incident task on that product as a "prior incident said:"
 # note, so handlers learn instead of re-discovering.
 RUNBOOK_MAX_ENTRIES_PER_PRODUCT = 20
-# Cut 3 (2026-09-23): on-call escalation. When the on-call agent CANNOT restore
+# Cut 3: on-call escalation. When the on-call agent CANNOT restore
 # a broken product's work -- an incident is repeatedly unassignable, or a picked
 # up bug stays open past the restore window -- the escalation hands the problem
 # to the owning team's scrum master, who files a backlog STORY (root cause
@@ -1284,7 +1284,7 @@ WORK_REQUEST_ROOM_THIN = 1
 # Hard cap of filed-but-not-yet-groomed requests in a single ceremony, so a
 # churny think tank can't convene a backlog-refinement meeting over a runaway list.
 REFINEMENT_MAX_REQUESTS = 20
-# SM-committed `blocked` FIELD on issues (2026-09-24). The scrum master is the
+# SM-committed `blocked` FIELD on issues. The scrum master is the
 # single authority who flips issue['blocked']; the judgment ALWAYS happened
 # upstream (supervisor/director Jev-pass for a set, or a deterministic
 # player-response / self-resolve for an unset), so the SM's commit is MECHANICAL --
@@ -1324,7 +1324,7 @@ TASK_CONTENT_TIMEOUT_S = 120.0
 # (index.html, 6s). Distinct from the movement tick (SIM_TICK_S=2).
 TASK_CYCLE_S = 6.0
 
-# Mailbox retention (2026-09-28): mail items live in kv_state, so an unbounded
+# Mailbox retention: mail items live in kv_state, so an unbounded
 # mailbox makes every save rewrite a bigger blob forever. Keep the most recent
 # entries per agent; anything older is dropped. Generous enough that a long
 # player 1:1 thread and pending review requests survive, tight enough that the
@@ -1354,8 +1354,8 @@ def _store_content_result(task_id, result):
         _content_results[task_id] = dict(result)
 
 
-# Bounded review-cycle escalation (2026-09-26): real gap caught live -- a
-# promoted follow-up story cycled through review->fix->review 45+ times in
+# Bounded review-cycle escalation: a promoted
+# follow-up story cycled through review->fix->review 45+ times in
 # under 20 minutes before settling on its own, with no bound at all. Two
 # SEPARATE mechanisms were each re-entering the gate with no shared cap: a
 # genuine 'actionable' rejection (_apply_content_result below) and
@@ -1402,7 +1402,7 @@ def _apply_content_result(state, task, result):
     note = result.get('note')
     if note:
         task['note'] = note
-    # Real gap caught live (2026-09-26): a spike's FULL findings only ever
+    # Gap: a spike's FULL findings only ever
     # lived in the Library file -- task.note is deliberately kept lean (a
     # short pointer, "see the Library entry just filed"), by design (see the
     # data-minimization comment in content.py's spike executor). But
@@ -1411,7 +1411,7 @@ def _apply_content_result(state, task, result):
     # handed the new story's author a vague pointer, never the actual
     # research (source lists, CSVs, feasibility data). Recording the exact
     # path here (not a task-id glob -- task ids get REUSED across unrelated
-    # investigations, confirmed live, so a glob could match the wrong
+    # investigations, confirmed, so a glob could match the wrong
     # finding) lets promotion pull the real content forward.
     library_path = result.get('libraryPath')
     if library_path:
@@ -1444,7 +1444,7 @@ def _apply_content_result(state, task, result):
         # A gate review that must go BACK to the same author + the same gate
         # carries the parent id; a free-form pressoffice fix does not.
         queue_work(state, [qf])
-    # Real request (2026-09-26): a content executor (currently just spikes)
+    # A content executor (currently just spikes)
     # can ask to notify the player when it lands, same safe indirection as
     # queueFix above -- executors run off-thread with only a read-oriented
     # snapshot, so they report the WISH here rather than calling
@@ -1616,11 +1616,11 @@ def queue_work(state, items):
             # Phase E2d: an INCIDENT (bug) is pinned to the owning team's on-call
             # and pin-woken even though it carries no reviewOf.
             'incident': bool(item.get('incident')),
-            # Theo routing (2026-09-25): a spike the classifier could attribute
+            # Theo routing: a spike the classifier could attribute
             # to a specific team is pinned to that team's on-call worker, same
             # pin-and-wake treatment as an incident -- see _assign_due_item.
             'directRoute': bool(item.get('directRoute')),
-            # Real gap found 2026-09-25: filing a story against a specific
+            # Gap: filing a story against a specific
             # team never meant it would be WORKED by that team -- assignment
             # (_assign_due_item) is think tank-wide round robin with zero team
             # awareness, only reviewer selection (_pick_reviewer_ids) ever
@@ -1644,7 +1644,7 @@ def queue_work(state, items):
             # review-subtask creation) -- lets an actionable review pin the fix
             # back to the worker who built it.
             'reviewAuthorId': item.get('reviewAuthorId') or None,
-            # CS329A takeaway #2 (2026-09-28): the review checklist -- code/jev/
+            # CS329A takeaway #2: the review checklist -- code/jev/
             # human-typed requirement entries (see content.py's ensemble grading) --
             # must survive the queue round trip or the Python review path can't
             # grade per-requirement. Same class of gap as 'distill' below: a
@@ -2388,7 +2388,7 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'budgetMs': (extra or {}).get('budgetMs'),
         'reviewOf': (extra or {}).get('reviewOf'),
         'reviewAuthorId': (extra or {}).get('reviewAuthorId'),
-        # CS329A takeaway #2 (2026-09-28): checklist survives onto the task
+        # CS329A takeaway #2: checklist survives onto the task
         # object itself (see _assign_due_item's extra dict) -- the review
         # executor grades per-requirement from here.
         'checklist': list((extra or {}).get('checklist') or []),
@@ -2588,7 +2588,7 @@ _DEVICE_CHECKIN_HISTORY_MAX = 50  # bounded ring buffer -- no consumer yet, but 
 
 def record_device_checkin(state, fields, now_ms=None):
     """Record one check-in from the player's phone (POST /api/device/checkin,
-    serve.py). Pure state mutation, no consumer wired up yet (2026-09-26) --
+    serve.py). Pure state mutation, no consumer wired up yet --
     the whole point was landing a clean, generic ingestion pipe first and
     deciding what to build on top once data is actually flowing. `fields`
     is whatever the caller received (location/battery/focus/wifi/trigger
@@ -2818,7 +2818,7 @@ def _review_is_stale(state, agent_id, now_ms):
 
 
 def _has_firing_signal(state, agent_id):
-    """2026-09-23 decouple: firing keys off a real, corroborated personnel
+    """Firing keys off a real, corroborated personnel
     problem, NOT the composite morale score. Morale folds in neglect (never
     contacted = low score) and approved-work noise that say 'send this agent
     help / they might be underutilized' -- the hiring/load-spreading concern --
@@ -2860,7 +2860,7 @@ def _firing_signal_strength(state, agent_id):
 def who_needs_review(state, now_ms):
     """firing.js whoNeedsReview: the worker (non-admin, non-director) with the
     strongest firing signal -- a negative report or a real drop-off -- who is
-    not already settled. 2026-09-23: re-keyed OFF the raw morale score (a
+    not already settled. Re-keyed OFF the raw morale score (a
     neglected-but-otherwise-fine agent is a hiring/help target, not a firing
     one); see _has_firing_signal. Among multiple signal-holders the review
     targets the strongest evidence first (_firing_signal_strength), not roster
@@ -2968,7 +2968,7 @@ def _fire_decision(state, reviewers, candidate_def, now_ms, decider=None):
     decision = (decider(state, instructions, candidates) if decider
                 else _governance_decider(state, instructions, candidates))
     if not decision:
-        # 2026-09-23: Jev-outage fallback re-keyed off the firing signal, not
+        # Jev-outage fallback re-keyed off the firing signal, not
         # the raw morale score. Firing requires a real corroborated problem:
         # a negative report AND a genuine drop-off (handed work, dropped more
         # than a third of what they approved). Either alone stays 'keep' --
@@ -3020,15 +3020,15 @@ def _peer_gated_lane(task):
     pending_review/skills/" or "crawl this site and update its skill file",
     so a reject just spawns a fix subtask whose completion unconditionally
     re-arms the SAME gate (_task_cycle's reviewOf/fix branch has no
-    _peer_gated_lane check, unlike the initial-entry branch). Live-caught
-    (2026-09-24): one skill-review sweep, routed through this same gate as
+    _peer_gated_lane check, unlike the initial-entry branch).
+    One skill-review sweep, routed through this same gate as
     real coding/research work, looped reviewer-reject/re-fix for over 20
     minutes straight, flooding the workQueue with 50+ duplicate 'Review:
     Review pending skill files' entries and sending the same handful of
     agents back to the observatory door over and over -- exempted then, but
     a scheduled research crawl (task['research'], also queued by
     _check_schedules, also landing in the observatory -- a deliverable room)
-    was missed. Confirmed live AGAIN (2026-09-26): a single "AI regulation
+    was missed. It recurred: a single "AI regulation
     news" schedule spiraled into 3,917 task assignments and 26,687
     escalations over one evening -- review found the crawl "actionable" (a
     scheduled crawl obviously has no passing flake8/mypy/pytest-cov suite to
@@ -3128,7 +3128,7 @@ def _enter_peer_review(state, task, now_ms, preferred=None):
     }
     task['status'] = 'needs_review'
     task['_peerGate'] = gate
-    # Per your call (2026-09-24): peer review is agent-to-agent -- the two
+    # Peer review is agent-to-agent -- the two
     # reviewers picked below (mailbox 'peer_review_request') handle it, so the
     # player doesn't need an email for every routine story entering review,
     # only for things that actually need player input (agent_ask, card_blocked
@@ -3413,8 +3413,8 @@ def _close_gated_story(state, parent):
                     'approvers': review_counts.get('approvers', [])}, authorized=True)
     except Exception:
         pass
-    # Real request (2026-09-26): entering review deliberately stays quiet
-    # (peer review is agent-to-agent, per the 2026-09-24 call) but a story
+    # Entering review deliberately stays quiet
+    # (peer review is agent-to-agent) but a story
     # actually SHIPPING is exactly the "you'll want to know this" moment the
     # player was asking about -- called directly (not via the notifyPlayer
     # indirection content executors need) since this already runs inside the
@@ -3503,7 +3503,7 @@ def _start_auto_hire(state, now_ms, grid, decider):
                    if agents.get(m)]
         if not members:
             continue
-        # Team-size cap (user 2026-09-22): a team may not grow past 6 members
+        # Team-size cap: a team may not grow past 6 members
         # (scrum master excluded). A hire will add one worker, so the check must
         # account for that extra member -- a team already at 6 cannot hire.
         if not _team_under_cap(state, did, extra=1):
@@ -3656,7 +3656,7 @@ def _next_hire_name(state):
     return None
 
 
-# Larger pool for spawning a BRAND-NEW team's director + members (2026-09-27).
+# Larger pool for spawning a BRAND-NEW team's director + members.
 # Distinct from _next_hire_name's small assistant pool so a think tank whose hire
 # pool is exhausted can still spin up a new team for an incoming large request.
 _NEW_TEAM_NAME_POOL = [
@@ -3681,7 +3681,7 @@ def _next_new_team_name(state):
 def _spawn_team_agent(state, name, role, director_id, now_ms, grid, is_director=False,
                       elevated=False):
     """Create one brand-new agent record (roster entry + live agent) for a team
-    spawned on a large-request (2026-09-27). Mirrors _complete_auto_hire's
+    spawned on a large-request. Mirrors _complete_auto_hire's
     structure: joins on foot at a free outdoor spot if the ACTIVE ceiling has
     room, else joins the dormant inventory. Returns the new agent id, or None
     if the name pool is exhausted."""
@@ -3726,7 +3726,7 @@ def _spawn_team_agent(state, name, role, director_id, now_ms, grid, is_director=
 
 def _estimate_employees_for_request(goal):
     """How many employees a new team should start with for a large request
-    (2026-09-27). Heuristic, not a science: breadth-of-ask signals (word count,
+    Heuristic, not a science: breadth-of-ask signals (word count,
     explicit scoping verbs like 'build/create/platform/website') scale the
     starting headcount so a genuinely large ask isn't bottlenecked by a single
     hire. Bounded to a sane small-team range (1..3) -- a big team grows via the
@@ -3748,7 +3748,7 @@ def _estimate_employees_for_request(goal):
 
 def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employees=None):
     """Create a brand-new team to take an incoming large request when every
-    existing team is already busy in a sprint (2026-09-27). Spawns a new
+    existing team is already busy in a sprint. Spawns a new
     DIRECTOR (reporting to the admin), a fresh team record, one EMPLOYEE (or
     `employees` if more help is needed), and leaves the scrum-master role to
     the size rule: a brand-new team is small, so the DIRECTOR stands in as the
@@ -4008,7 +4008,7 @@ def _resolve_onboard_meeting(state, onboard, now_ms):
 
 
 # ---------------------------------------------------------------------------
-# Weekly cross-team Knowledge Social (2026-09-23).
+# Weekly cross-team Knowledge Social.
 #
 # A scheduled 30-minute conversation in the Hangout where every agent that
 # produced an approved deliverable THIS WEEK gets to talk about it with agents
@@ -4262,7 +4262,7 @@ def _social_step(state, now, now_ms, decider=None):
 
 
 # ---------------------------------------------------------------------------
-# Backlog refinement (Cut 1, 2026-09-23). The scrum master -- a standing,
+# Backlog refinement (Cut 1). The scrum master -- a standing,
 # director-designated per-team role -- is RESPONSIBLE for turning agent-filed
 # work into real stories. Agents communicate what needs doing by FILING a
 # work-request; a ceremony (`pendingRefinements[team_id]`) convenes the scrum
@@ -4707,7 +4707,7 @@ def _player_ask_decider_default(state, issue_key, director_id, question, context
 
 
 # ---------------------------------------------------------------------------
-# Real-email outbox (2026-09-25). sim.py stays pure -- it only QUEUES a
+# Real-email outbox. sim.py stays pure -- it only QUEUES a
 # notification into state['emailOutbox']; serve.py drains the outbox each loop
 # pass and sends via SMTP (vault-backed Gmail app-password). This keeps network
 # + a real external credential out of the pure sim. Deduped per-kind so a burst
@@ -4735,7 +4735,7 @@ def _queue_player_email(state, kind, subject, body_text, now_ms=None):
 
 def _drain_email_outbox_sync(state):
     """Best-effort synchronous send of every queued player notification on
-    this state's outbox, on BOTH channels (2026-09-26: was email-only --
+    this state's outbox, on BOTH channels (was email-only --
     the think tank had no proactive push at all before this, only a reactive
     reply when the player texted in first). Clears the outbox regardless so
     a permanent SMTP/Telegram failure doesn't wedge the queue. Calls into
@@ -4863,7 +4863,7 @@ def _pending_player_ask_sweep(state, now_ms, decider=None):
 
 
 # ---------------------------------------------------------------------------
-# SM-committed `blocked` field (2026-09-24). issue['blocked'] is a single
+# SM-committed `blocked` field. issue['blocked'] is a single
 # player-facing boolean ONLY the owning team's scrum master flips. Every set and
 # clear funnels through a block-change REQUEST the SM ceremony commits:
 #   set (requirements-met) : agent claims -> supervisor Jev approves -> SM commits True
@@ -4919,7 +4919,7 @@ def _append_mailbox(agent, entry):
     Every mailbox write goes through here so retention is enforced on ALL
     append paths (peer-review requests, rejected-author notes, gate re-picks,
     wake-on-mail) -- not just _deliver_mail, which is what MAILBOX_KEEP_COUNT
-    originally forgot (2026-09-28 audit)."""
+    originally forgot (audit)."""
     mailbox = agent.setdefault('mailbox', [])
     mailbox.append(entry)
     if len(mailbox) > MAILBOX_KEEP_COUNT:
@@ -5369,7 +5369,7 @@ def _room_backlog_count(state, room):
     return queued + in_flight
 
 
-# Absolute Zero scoping guidance (2026-09-28): when the think tank proposes its
+# Absolute Zero scoping guidance: when the think tank proposes its
 # OWN next work (an agent filing a follow-up, and the grooming ceremony deciding
 # whether to accept it), the default failure mode is proposing TRIVIAL work --
 # cards easy to write and worth nothing. Guidance steers every self-proposed
@@ -5449,8 +5449,7 @@ def _refinement_team(state, req):
 def _refinement_scrum_master_for_team(state, team_id):
     """The effective scrum master of `team_id`: the designated scrum master, or
     -- for a team below SCRUM_MASTER_MIN_TEAM_SIZE workers -- the team director
-    standing in (a small team doesn't need a dedicated facilitator yet, per the
-    user's 2026-09-27 call). Returns None only for a big team that genuinely
+    standing in (a small team doesn't need a dedicated facilitator yet, by design). Returns None only for a big team that genuinely
     lacks a designated scrum master. Per-team ceremonies: only a team's OWN
     scrum master grooms that team's requests, never a cross-team stand-in
     (matches a real org where each team refines its own backlog)."""
@@ -5585,7 +5584,7 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
         ]
         choice = decider(instructions, criteria)
         if choice is None:
-            # 2026-09-23 outage fallback: accept only a request that names a real
+            # Outage fallback: accept only a request that names a real
             # delegatable-room gap (same determinism as the governance fallback --
             # better to ship one well-scoped card than to silently drop a filed gap).
             choice = 'accept' if req.get('room') in VALUED_QUEUE_ROOMS else 'reject'
@@ -5594,7 +5593,7 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
             # queue_work whitelists fields, so the provenance (filer/groomer/
             # room/title) lives on the durable `backlogRequests` record + the
             # digest -- not on the queue item. teamId is the one exception
-            # (2026-09-25): _assign_due_item needs it to PREFER this team at
+            # _assign_due_item needs it to PREFER this team at
             # assignment time (see queue_work's own comment on the field) --
             # req['teamId'] is already known here (the grooming ceremony
             # itself is per-team), it just never survived onto the real task.
@@ -5648,7 +5647,7 @@ def _refinement_cadence_due_for(state, team_id, now_ms, legacy=None):
 
 def kick_refinement_now(state, team_id, now_ms=None):
     """Make a team's backlog refinement due on the VERY next pass instead of
-    waiting for the weekly cadence (2026-09-27 -- large requests kick refinement
+    waiting for the weekly cadence -- large requests kick refinement
     the moment they arrive). Safe against the kick + weekly-cadence double-groom
     trap: it is a no-op if the team already has an in-flight ceremony (that
     ceremony will groom the new request) or its cadence is already due (the next
@@ -5669,7 +5668,7 @@ def kick_refinement_now(state, team_id, now_ms=None):
 def _refinement_step(state, now, now_ms, decider=None):
     """One backlog-refinement pass, called from _task_cycle ungated (each team's
     ceremony is the point even on a quiet think tank). Per-team ceremonies now run
-    CONCURRENTLY (2026-09-27): each team has its OWN ceremony slot
+    CONCURRENTLY: each team has its OWN ceremony slot
     (`pendingRefinements[team_id]`), so one team no longer blocks another at the
     shared Command Center. A pass (a) advances every in-flight ceremony (embark
     on one pass, RELEASE on the next -- no required fixed hold), and (b) convenes
@@ -5722,7 +5721,7 @@ def _refinement_step(state, now, now_ms, decider=None):
 
 
 # ---------------------------------------------------------------------------
-# Cut 2 (2026-09-23): three missing team processes -- deliverable grading +
+# Cut 2: three missing team processes -- deliverable grading +
 # director roadmap, the coaching loop (growth plan -> next task), and incident
 # runbooks. All follow the established pattern: injectable Jev decision +
 # deterministic outage fallback, fire-and-forget (never block the completion
@@ -5744,7 +5743,7 @@ def _grading_decider_default(state, instructions, task_title, room):
     """Default Jev resolver for grading a landed deliverable (0-10 score).
     Returns a float score or None on a Jev outage (-> deterministic fallback).
 
-    Real bug fixed (2026-09-24): Jev's real API (POST /api/alpha/decisions) is
+    Bug fixed: Jev's real API (POST /api/alpha/decisions) is
     a TYPED MULTIPLE-CHOICE system -- every other real call site in this file
     passes several named options and Jev picks one; it has no "give me a free
     number" mode. The original version here passed exactly ONE option keyed
@@ -5752,7 +5751,7 @@ def _grading_decider_default(state, instructions, task_title, room):
     hand that single key back verbatim, so `choice` was always the STRING
     '0-10', `isinstance(choice, (int, float))` was always False, and grading
     silently fell back to the deterministic default on every single call --
-    live-caught as every deliverable grading exactly 5.0. Fixed by actually
+    every deliverable graded exactly 5.0. Fixed by actually
     giving Jev several real, named score buckets to choose among (matching
     every other working choice call in this file), which restores real
     variance instead of a permanent, invisible fallback."""
@@ -5780,7 +5779,7 @@ def _runbook_decider_default(state, instructions, product_id, room, title, agent
     """Default resolver for an incident runbook: one line "what broke + how it
     was fixed". Returns a string, or None on a call failure -> fallback.
 
-    Real bug fixed (2026-09-24): this used to route through Jev's typed
+    Bug fixed: this used to route through Jev's typed
     multiple-choice decision endpoint with a single named option ('summary'),
     the same malformed shape _grading_decider_default had. Jev could only ever
     hand that one key back verbatim -- but here the `isinstance(choice, str)`
@@ -5824,7 +5823,7 @@ def _room_trailing_grade(state, room):
     (the signal the roadmap recompute keys on, and this room's own fallback
     when Jev can't grade a NEW deliverable). Returns a float or None.
 
-    Real bug fixed (2026-09-24, Hermes Town comparison -- "never invent an
+    Bug fixed (Hermes Town comparison -- "never invent an
     outcome, keep it visibly unresolved instead"): a fabricated fallback grade
     used to carry no marker distinguishing it from a real Jev judgment, so a
     string of Jev outages could compound -- each fallback's flat/room-mean
@@ -5874,7 +5873,7 @@ def _grade_completed_task(state, agent_id, task, now_ms):
     state.setdefault('completedDeliverables', []).append({
         'id': task.get('id'), 'room': room, 'title': title,
         'agentId': agent_id, 'grade': grade,
-        # Hermes Town lesson (2026-09-24): a fabricated fallback grade must be
+        # Hermes Town lesson: a fabricated fallback grade must be
         # distinguishable from a real Jev judgment, not silently identical --
         # see _room_trailing_grade's own comment for why this also matters
         # beyond just labeling (it stops fallback grades compounding into
@@ -5909,7 +5908,7 @@ def _runbook_task(state, task, now_ms):
     summary_is_real = bool(real_summary)
     summary = real_summary or f"{title} -- fixed by {a.get('name') or task.get('assignedTo')}"
     rb = state.setdefault('runbooks', {}).setdefault(product_id, [])
-    # Hermes Town lesson (2026-09-24): mark a fallback template line as such --
+    # Hermes Town lesson: mark a fallback template line as such --
     # a reader shouldn't mistake a generic "X -- fixed by Y" filler for a real,
     # model-written account of what actually broke and how.
     rb.append({'ts': now_ms, 'room': task.get('room'), 'summary': summary, 'summaryIsReal': summary_is_real})
@@ -5962,7 +5961,7 @@ def _refocus_note_for(state, product_id):
     the sum of them may not still serve what the product was for). Returns
     None when there's no product record or no summary to anchor against, so
     this never fabricates a "why" that isn't actually on file.
-    2026-09-25: added after comparing this think tank's own accumulated review/
+    Added after comparing this think tank's own accumulated review/
     escalation machinery (see _CEREMONY_ACTIONS in serve.py) to a pattern
     seen elsewhere -- checking alignment against the stated goal specifically
     at the re-review moment, not on every fresh task, which would just be
@@ -6050,7 +6049,7 @@ def _refinement_context_for_room(state, room):
 
 
 # ---------------------------------------------------------------------------
-# Cut 3 (2026-09-23): on-call escalation. The on-call agent tried to restore a
+# Cut 3: on-call escalation. The on-call agent tried to restore a
 # broken product and COULDN'T (assignment-abandoned, or the bug stayed open past
 # the restore window). Instead of the incident dying silently, the owning team's
 # scrum master grooms it into the backlog: a STORY when the root cause is scoped
@@ -6555,7 +6554,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         state['lastStuckGateSweep'] = now_ms
         _sweep_stuck_gates(state, now_ms)
 
-    # 2026-09-23: reclaim a 'walking'/'working' task whose assignee no longer
+    # Reclaim a 'walking'/'working' task whose assignee no longer
     # holds it (the orphaned-fix wedge). Runs BEFORE the idle gate so a quiet
     # think tank that simply has a stale in-flight task re-issues it rather than
     # treating the think tank as done. Cheap: no-op unless such a task exists.
@@ -6598,7 +6597,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     work_queue = state.get('workQueue')
     if not isinstance(work_queue, list):
         work_queue = state['workQueue'] = []
-    # 2026-09-22: repair stale busy tokens BEFORE the idle gate short-circuits.
+    # Repair stale busy tokens BEFORE the idle gate short-circuits.
     # A `busy` flag is a hold on an IN-FLIGHT ('working') task; if the referenced
     # task already ended (done / needs_review) or is missing, or the agent is
     # busy with no task at all, the hold is stale and -- left alone -- wedges the
@@ -6618,7 +6617,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         a['busy'] = False
         a['task'] = None
         a['inRoom'] = None
-    # 2026-09-23: park fully-idle on-duty wanderers once the queue has no work
+    # Park fully-idle on-duty wanderers once the queue has no work
     # to hand them. Nothing queued (or only not-yet-due work) + nobody active is
     # exactly the residue case: a woken-but-never-assigned agent lingers visible
     # with nothing to do, and the player just asked that only scheduled/active
@@ -6675,7 +6674,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                     elif parent is not None and _peer_gated_lane(parent):
                         # A fix subtask finished its (re)work -> re-arm the same
                         # gate so the fixed story gets re-review, not a done.
-                        # Real bug caught live (2026-09-24): this had no
+                        # Bug: this had no
                         # _peer_gated_lane guard at all, so a skillReview/distill
                         # parent that was ALREADY gated (e.g. from before the
                         # _peer_gated_lane exemption existed, or any other stale
@@ -6727,7 +6726,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         # (Off-duty walks that already ARRIVED were finalized by the movement
         # tick's ('arrive','offduty') dispatch; nothing left to do here.)
 
-    # A sprint whose every item is done AND approved closes itself (2026-09-27) --
+    # A sprint whose every item is done AND approved closes itself --
     # no need for the player to tap close once the whole sprint has landed.
     _auto_close_completed_sprints(state, now_ms)
 
@@ -6776,7 +6775,7 @@ def _any_agent_active(agents):
             return True
     return False
 def _park_idle_wanderers(state):
-    """2026-09-23: an agent is only woken by task assignment or the waking
+    """An agent is only woken by task assignment or the waking
     intents -- but a woken agent who is never *assigned* (e.g. the queue
     emptying between its wake and assignment, or a reload force-shadowing an
     on-duty agent via agents.js's `if (!offDuty) visible = true`) lingers
@@ -6832,7 +6831,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     # woken and the gate deadlocks at one approval.
     # Phase E2d: an INCIDENT (bug) is likewise pinned to the owning team's
     # on-call -- same wake semantics as a reviewer pin, even with no reviewOf.
-    # Theo routing (2026-09-25): directRoute is the same pin/wake treatment for
+    # Theo routing: directRoute is the same pin/wake treatment for
     # a spike the classifier attributed to a specific team's worker.
     pinned = pick.get('assignedTo') if (pick.get('reviewOf') or pick.get('incident')
                                          or pick.get('_mailResume') or pick.get('directRoute')) else None
@@ -6859,7 +6858,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         pointer = rr.get('task', 0)
         # First eligible index at/after the pointer.
         ordered = [cid for cid in candidates if cid in agents]
-        # Real gap found 2026-09-25: a story filed against a specific team
+        # Gap: a story filed against a specific team
         # (pick['teamId']) had zero team preference at assignment -- only
         # reviewer selection (_pick_reviewer_ids) ever preferred same-team.
         # SOFT preference only, same shape as that precedent: narrow to the
@@ -6875,7 +6874,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
                 ordered = team_ordered
         if not ordered:
             return None
-        # Fault-aware routing (2026-09-26): soft-prefer a candidate with no
+        # Fault-aware routing: soft-prefer a candidate with no
         # recent unfaded failure signal over the plain round-robin order --
         # same "soft preference, never a hard lock" shape as the team
         # preference just above. If EVERY eligible candidate is currently
@@ -6894,12 +6893,12 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         'research': pick.get('research'),
         'taskType': pick.get('taskType'),
         'skillReview': pick.get('skillReview'),
-        # CS329A takeaway #2 (2026-09-28): thread the review checklist through
+        # CS329A takeaway #2: thread the review checklist through
         # to the assigned task so the Python review executor can grade each
         # requirement (code/jev/human) instead of a single all-or-nothing
         # verdict. Same class of gap as 'distill' two lines down.
         'checklist': pick.get('checklist'),
-        # Real bug caught live (2026-09-24): 'distill' was missing from this
+        # Bug: 'distill' was missing from this
         # whitelist entirely, same class of gap as skillReview -- a distill
         # sweep task assigned through here never carried the flag onto the
         # real task object, so _peer_gated_lane's distill exemption (added to

@@ -3,7 +3,7 @@
 // fixed list that ALWAYS has entries, so the old pickNextTask() always
 // found "work," every idle agent was always assigned something, and the
 // 6-second cycle burned 2-3 real Jev calls per agent indefinitely --
-// confirmed live at 247 firing reviews and a continuous stream of
+// confirmed at 247 firing reviews and a continuous stream of
 // `decide` calls with nobody waiting on any of it.
 //
 // The contract these tests lock in: an empty WORK_QUEUE means runTaskCycle
@@ -162,13 +162,13 @@ await test('the cycle never assigns more items than there are idle agents', asyn
 });
 
 await test('a failing item is only attempted ONCE per cycle, even with a large roster (2026-09-21)', async () => {
-  // Real bug caught live: without excluding an already-attempted item
+  // Bug: without excluding an already-attempted item
   // from _pickNextDueIndex, a failed-and-requeued item could be pulled
   // AGAIN within the same synchronous loop (bounded by rosterSize, often
   // 15-20 in the real think tank) -- exhausting all WORK_ITEM_MAX_ATTEMPTS
   // retries in one burst with zero real wall-clock time for genuine
   // transient congestion (agents actually walking toward a contested
-  // door) to clear. Confirmed live: 3 real subtasks all abandoned within
+  // door) to clear. Confirmed: 3 real subtasks all abandoned within
   // about a second of each other, not spread across separate ticks.
   installCallCounters();
   let attemptCount = 0;
@@ -328,7 +328,7 @@ await test('a scheduled item whose time has come wakes a sleeping agent to take 
 });
 
 await test('ordinary (unscheduled) work wakes someone once every on-duty agent is off duty (the "call someone in" fallback)', async () => {
-  // Real ask (2026-09-20): a larger hireable "inventory" with only some
+  // A larger hireable "inventory" with only some
   // agents active only works as auto-scaling if ordinary backlog can
   // pull someone in when nobody active is free -- not just a genuinely
   // scheduled item. This is the reversal of the OLD policy this same
@@ -396,7 +396,7 @@ await test('one awake agent still only gets one item per tick even with a schedu
 console.log('\nspawnAgentAtFreeSpot places an agent at a free spot, on duty and visible');
 
 await test('it marks her on-duty/visible at a free think tank spot', () => {
-  // The outskirts trailhead doors are gone (2026-09-22): a woken agent /
+  // The outskirts trailhead doors are gone: a woken agent /
   // new hire appears at a free spot in the main think tank, not at a door.
   setGlobal('pickFreeSpot', () => ({ x: 500, y: 500 }));
   const agents = { walker: { id: 'walker', visible: false, offDuty: false, inRoom: 'pressoffice' } };
@@ -413,7 +413,7 @@ await test('it marks her on-duty/visible at a free think tank spot', () => {
 console.log('\nsendAgentOffDuty refuses to hijack an agent who is not actually idle');
 
 await test('a busy agent is left completely untouched', () => {
-  // Mirror of the server's send_agent_off_duty (2026-09-22): off-duty is an
+  // Mirror of the server's send_agent_off_duty: off-duty is an
   // in-place vanish, refused for anyone busy/mid-task so a bulk "send everyone
   // home" call can never hijack an agent who's genuinely still working.
   const original = { id: 'busyone', visible: true, busy: true, task: 'task-1', x: 10, y: 10, path: null, inRoom: null, offDuty: false };
@@ -476,7 +476,7 @@ await test('with no handoff dependency, she becomes visible again immediately', 
 });
 
 await test('two agents finishing the same room land on genuinely different spots, not the identical pixel', () => {
-  // Real deadlock caught live: two agents finishing the SAME task.room
+  // Deadlock: two agents finishing the SAME task.room
   // reset to the identical entryX/entryY -- tickAgentMovement's
   // co-located exemption only ever buys the FIRST one a single step of
   // separation, nowhere near enough to clear AGENT_W (20px) at real
@@ -524,10 +524,10 @@ await test('even when a handoff DOES trigger, she is visible for that walk too, 
 console.log('\nappearFromOutskirts places a called-in agent at a free spot, on duty/visible');
 
 await test('she is placed at a free think tank spot and marked on-duty/visible, not at a trailhead door', () => {
-  // Real ask (2026-09-20): calling someone in should be a visible event --
+  // Calling someone in should be a visible event --
   // she appears on the map and walks from there, not an instant pop-in
   // wherever her stale x/y happened to be left. With the outskirts trailhead
-  // doors gone (2026-09-22), the free spot IS the arrival point.
+  // doors gone, the free spot IS the arrival point.
   setGlobal('pickFreeSpot', () => ({ x: 300, y: 320 }));
   setGlobal('AGENTS', {});
   const agent = { id: 'w0', offDuty: true, visible: false, inRoom: 'somewhere-stale', x: 9999, y: 9999 };
@@ -562,7 +562,7 @@ await test('canActivateAnother is false once active count reaches the cap', () =
 console.log('\nMAX_ACTIVE_AGENTS is a hard ceiling on waking anyone, scheduled or not');
 
 await test('a due SCHEDULED item still waits if waking someone would exceed the active cap', async () => {
-  // Real ask (2026-09-20): 25 (here, 1 for the test) is a hard ceiling on
+  // 25 (here, 1 for the test) is a hard ceiling on
   // who may be online or freshly called in for a scheduled item -- not a
   // preference. Even a genuinely scheduled item (which can normally
   // always wake someone) must wait if the think tank is already at its
@@ -605,7 +605,7 @@ await test('the same scheduled item IS picked up once a slot frees (active count
 console.log('\nassignTask stores the REAL walk-in resting spot, not the pre-relaxation door target (2026-09-21)');
 
 await test('entryX/entryY match the path\'s own actual last waypoint, not the raw door target', () => {
-  // Real bug caught live: this used to store the RAW, pre-relaxation
+  // Bug: this used to store the RAW, pre-relaxation
   // door target (door.x+w/2, door.y+h+4) as entryX/entryY. findPath
   // itself already relaxes a contested/trap target cell to the nearest
   // one that actually passes cellFitsAgent -- but finishTask() later
@@ -629,7 +629,7 @@ await test('entryX/entryY match the path\'s own actual last waypoint, not the ra
 console.log('\nassignTask carries the real task content through, not just title/room');
 
 await test('TASKS[id] stores instructions and projectLabel', () => {
-  // Real fix (2026-09-21, hiring-to-shutdown audit): a subtask's own
+  // Fix (hiring-to-shutdown audit): a subtask's own
   // instructions used to be dropped after the Jev "who should do this"
   // call, and the broader goal it came from was never attached at all --
   // neither ever reached arriveAtTask's real-work dispatch.
@@ -699,9 +699,9 @@ await test('every queued subtask carries the real goal it came from', async () =
 console.log('\nassignBigTask tells the planner what each room actually does (2026-09-21)');
 
 await test('the planning prompt names pressoffice as the real coding room, not a bare key', async () => {
-  // Real bug caught live: the planner used to get nothing but bare room
+  // Bug: the planner used to get nothing but bare room
   // keys ("pressoffice, observatory, library, ...") with no indication
-  // of what any of them actually do -- confirmed live, it repeatedly
+  // of what any of them actually do -- confirmed, it repeatedly
   // assigned real coding work to library/observatory instead of
   // pressoffice, apparently guessing from the room name alone.
   setGlobal('AGENT_ROSTER', [{ id: 'faye', isAdmin: true }]);

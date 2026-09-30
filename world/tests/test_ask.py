@@ -12,7 +12,7 @@ so no live network/think tank is touched. The "DB...mocked" claim only covered
 the READ side (get_state_from_db is patched per-test); save_state_to_db and
 log_action were never mocked and go straight to serve.py's real DB_PATH via
 TestClient(serve.app), so a write during any of these tests landed in a real
-think_tank.db. Found 2026-09-25 via a live production think_tank.db that picked up
+think_tank.db. Found via a live production think_tank.db that picked up
 "player ask" log rows after a routine test run; DB_PATH is now redirected
 below so even an unmocked write lands in a throwaway temp file.
 """
@@ -174,7 +174,7 @@ class AskToolLoop(unittest.TestCase):
         self.assertEqual(reply, 'got the error and can retry')
 
     def test_force_first_tool_requires_a_tool_call_on_turn_one_only(self):
-        # Real bug (2026-09-26): a spike with real tool access still answered
+        # Bug: a spike with real tool access still answered
         # from training knowledge on turn one, calling no tool at all. This
         # makes turn one's tool_choice='required' so that can't happen;
         # later turns leave the model free to conclude.
@@ -208,7 +208,7 @@ class AskToolLoop(unittest.TestCase):
         self.assertEqual(seen_tool_choices, [None])
 
     def test_force_first_tool_by_name_forces_that_specific_tool(self):
-        # Real gap caught live (2026-09-26): force_first_tool=True (any tool)
+        # Gap: force_first_tool=True (any tool)
         # still always reached for browse_page and never called search_web,
         # missing facts that only exist in OTHER sites' coverage of the
         # target. A tool-name string forces that SPECIFIC tool on turn one.
@@ -232,7 +232,7 @@ class AskToolLoop(unittest.TestCase):
 
 
 class WebToolsExecutorBrowsePage(unittest.TestCase):
-    """Real gap caught live (2026-09-26): /api/browse extracts every real
+    """Gap: /api/browse extracts every real
     <a href> on a page specifically so an agent can follow a breadcrumb it
     doesn't already know the URL for, but the executor discarded that field
     entirely -- a DreyX.com spike guessed a plausible-looking url (got a
@@ -274,7 +274,7 @@ class AskEndpoint(unittest.TestCase):
     clarify endpoint suite's hermetic pattern."""
 
     def setUp(self):
-        # The ask lane is rate-limited (2026-09-28) -- clear the shared bucket
+        # The ask lane is rate-limited -- clear the shared bucket
         # so these tests (which fire many asks through one process) never hit
         # the 20/60s limit and get 429s that have nothing to do with behavior.
         serve._rate_limit_calls.pop(serve.ASK_LANE_RATE_LIMIT_KEY, None)
@@ -350,7 +350,7 @@ class AskEndpoint(unittest.TestCase):
         self.assertEqual(s.get('completedDeliverables'), [])
 
     def test_agentId_pins_a_specific_eligible_candidate(self):
-        # 2026-09-25: without this, the player could never deliberately
+        # Without this, the player could never deliberately
         # address a specific agent (e.g. the Red Team Auditor) -- only
         # whichever non-admin happened to be first in round-robin.
         s = _state()
@@ -379,7 +379,7 @@ class AskEndpoint(unittest.TestCase):
         self.assertIn(r.json()['agent'], ('ben', 'cora', 'dax'))
 
     def test_mission_and_instructions_pulled_from_live_agents_dict(self):
-        # Real bug fixed 2026-09-25: _agent_record_for checks the ROSTER
+        # Bug fixed: _agent_record_for checks the ROSTER
         # first, which never carries `profile` -- mission was always empty.
         # Confirm the live agents-dict profile actually reaches the prompt.
         s = _state()
@@ -427,11 +427,11 @@ class AskEndpoint(unittest.TestCase):
         self.assertEqual(tool_names, expected)
 
     def test_trending_question_forces_x_trending_topics_first(self):
-        # Real gap caught live (2026-09-26): "what's trending on X" correctly
+        # Gap: "what's trending on X" correctly
         # routes to the ask lane (a quick, immediate question), but the real
         # Treg tool was only ever wired into spikes -- prompt-only guidance
         # to prefer it here was not reliably followed, the same "offering a
-        # tool is not the same as using it" gap already fixed twice tonight
+        # tool is not the same as using it" gap already fixed twice
         # for search_web/search_library. Forcing the tool choice is the
         # proven fix.
         s = _state()
@@ -561,7 +561,7 @@ class AskEndpoint(unittest.TestCase):
         self.assertNotIn('SECRETS', r.json()['reply'])
 
     def test_ask_lane_is_rate_limited_shared_bucket(self):
-        # Regression (2026-09-28): /api/intent/ask and /api/intent/clarify were
+        # Regression: /api/intent/ask and /api/intent/clarify were
         # real-spend model lanes with NO rate limit -- the only spend paths
         # without one. Both must trip the same 20/60s bucket, so a runaway
         # caller can't hammer either lane past the tool endpoints' own cap.
@@ -620,7 +620,7 @@ class TelegramBridge(unittest.TestCase):
         self.assertIn('not up right now', outcome[1])
 
     def test_allowlisted_chat_reaches_the_admin_via_ask_core(self):
-        # Theo routing (2026-09-25): _telegram_process_update now goes through
+        # Theo routing: _telegram_process_update now goes through
         # _route_player_request's classifier before reaching _ask_core -- mock
         # the classifier to the 'ask' lane so this stays a hermetic unit test
         # of the dispatch wiring, not a real Jev call.

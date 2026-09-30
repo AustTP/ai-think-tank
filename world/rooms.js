@@ -6,7 +6,7 @@
 // size against the fixed 20x16 player hitbox, since they were generated
 // with a human-scale desk/counter/shelf already in mind.
 //
-// Per your call: the six-CRT-desk "workstations" image is shared by four
+// The six-CRT-desk "workstations" image is shared by four
 // buildings (Press Office, Media, Weather Station, Observatory) and uses
 // ONE collision definition, not four separate copies -- if you edit the
 // workstations layout later, it updates all four rooms at once.
@@ -40,7 +40,7 @@ const ROOM_COLLISIONS = {
     { x: 448, y: 212, w: 106, h: 122 },
   ],
   // Only the counters block -- the chains are a visual lane marker, not
-  // collision, per your explicit call: agents must not get stuck behind
+  // collision: agents must not get stuck behind
   // someone at a teller, so the queue dividers stay walk-through.
   bank: [
     { x: 60, y: 95, w: 85, h: 65 },

@@ -68,7 +68,7 @@ def setUpModule():
     # enabled (it IS enabled in the project .env, which serve loads at import).
     # Hermetic modules must keep decision chains single-slug by pinning the
     # standby off: with two slugs the multi-slug circuit breaker arms, and its
-    # state leaks across modules in the shared test process (caught live: an
+    # state leaks across modules in the shared test process: an
     # 'all configured decision models are circuit-broken' RuntimeError in this
     # file from breakers opened by earlier modules' collection-injections).
     serve.COLAB_STANDBY_ENABLED = False
@@ -152,7 +152,7 @@ class Ledger(unittest.TestCase):
 
 
 class SpendCap(unittest.TestCase):
-    """Hard absolute spend cap (2026-09-26): independent, general protection
+    """Hard absolute spend cap: independent, general protection
     against ANY future bug draining the balance -- not a fix for one specific
     bug (that's _peer_gated_lane's research exemption). Checked at the top of
     every real money-spending chokepoint, before any network call."""
@@ -231,7 +231,7 @@ class SpendCap(unittest.TestCase):
         net.assert_not_called()
 
     def test_jev_cost_is_now_accrued_into_the_ledger(self):
-        # Real gap caught live: Jev's cost used to be logged per-call but
+        # Gap: Jev's cost used to be logged per-call but
         # never summed anywhere, so a cap reading the ledger alone would
         # undercount real spend by every Jev decision ever made.
         self._leak()
@@ -301,7 +301,7 @@ class BudgetView(unittest.TestCase):
 
 
 class ApifyBudget(unittest.TestCase):
-    """The Apify FREE-plan ~$5/mo budget (2026-09-28): a real monthly cap the
+    """The Apify FREE-plan ~$5/mo budget: a real monthly cap the
     plan enforces, surfaced in the Bank as its own __apify__ row from day one
     (before any accrual) and reconciled live against the real account."""
 
@@ -449,7 +449,7 @@ class BankContent(unittest.TestCase):
 
     def test_worker_gets_readonly_cumulative_view(self):
         # A worker (non-director) gets a READ-ONLY cumulative summary -- hive-mind
-        # awareness of think tank spend (2026-09-24). Only reallocation AUTHORITY is
+        # awareness of think tank spend. Only reallocation AUTHORITY is
         # director-only; visibility into "are we healthy" is not.
         snap = _snapshot()
         seen = self._store()

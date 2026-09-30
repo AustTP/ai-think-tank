@@ -1,4 +1,4 @@
-"""Pure web/text/path/security helpers extracted from serve.py (2026-09-27).
+"""Pure web/text/path/security helpers extracted from serve.py.
 
 These are the small, self-contained utilities that serve.py used to define
 inline -- HTML stripping, link extraction, HTTP-date parsing, SSRF host
@@ -41,7 +41,7 @@ def _strip_html_to_text(raw_html):
 
 def _extract_links(raw_html, base_url):
     # Stripping tags for the reading view (above) throws away every
-    # <a href> along with them -- real gap you caught: an agent has no way
+    # <a href> along with them -- real gap: an agent has no way
     # to "follow a breadcrumb" to a page it doesn't already know the URL
     # for. Each extracted link still goes through the full /api/browse
     # gate independently when followed (classify, SSRF-check, log) -- this
@@ -50,7 +50,7 @@ def _extract_links(raw_html, base_url):
     links = []
     for m in _LINK_RE.finditer(raw_html):
         attrs, link_text = m.group(1), m.group(2)
-        # Real gap caught live: a language-alternate link (standard
+        # Gap: a language-alternate link (standard
         # hreflang attribute, not a Wikipedia-specific pattern) filled an
         # entire lower link-extraction budget on a real test page before
         # any actual article-body link was ever reached. hreflang is
@@ -73,7 +73,7 @@ def _extract_links(raw_html, base_url):
         clean_text = _ANY_TAG_RE.sub(' ', link_text)
         clean_text = re.sub(r'\s+', ' ', html.unescape(clean_text)).strip()
         links.append({'text': clean_text[:100] or abs_url, 'url': abs_url})
-        # Real gap caught live: a lower cap (40) was entirely consumed by
+        # Gap: a lower cap (40) was entirely consumed by
         # a link-dense page's own chrome (Wikipedia's nav sidebar plus its
         # ~300-language switcher) before reaching any actual article
         # content, so the multi-hop "follow toward a goal" helper below
@@ -84,7 +84,7 @@ def _extract_links(raw_html, base_url):
 
 
 def _parse_http_date_ms(value):
-    # Real ask (2026-09-21): "date-aware" incremental research needs SOME
+    # "Date-aware" incremental research needs SOME
     # real signal that a page's content actually changed, not just that
     # its URL was already seen -- Last-Modified is the one plain HTTP
     # already carries, imperfect as it is (plenty of sites never set it,

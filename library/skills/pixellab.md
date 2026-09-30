@@ -10,7 +10,7 @@ product).
   The key is vault-held under credential name `pixellab` -- request a scoped
   capability handle (host `api.pixellab.ai`, methods GET+POST) rather than
   asking for the raw key.
-- **Account status verified live 2026-09-24**: $7.41 in pay-as-you-go credits,
+- **Account status verified**: $7.41 in pay-as-you-go credits,
   plus an active "Tier 1: Pixel Apprentice" subscription (2000 generations/mo
   included, 21 used so far this period). Tier 1 also unlocks the
   skeleton-driven animation endpoint (see below), which is gated to tier-1+.
@@ -58,11 +58,11 @@ product).
 - https://www.pixellab.ai/docs/options/animation and
   https://www.pixellab.ai/docs/tools/animation-to-animation (animation
   endpoints/options)
-- `GET /balance` on the account itself, checked live 2026-09-24 by the
+- `GET /balance` on the account itself, checked live by the
   developer (not a spike) -- $7.41 credits, Tier 1 subscription active.
 
 ## Lessons learned
-- (2026-09-24) Written from a REAL account balance check and the project's own
+- Written from a REAL account balance check and the project's own
   already-working spike script, not an agent spike -- unlike several other
   skill files in this directory, there was no ungrounded-guess version of this
   one to correct.

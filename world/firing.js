@@ -1,4 +1,4 @@
-// Firing, gated on a joint review -- per your call, "firing is something
+// Firing, gated on a joint review -- "firing is something
 // that should only be done after two admin agents have discussed the
 // performance of an agent." Mirrors hiring.js's shape deliberately (same
 // two-phase busy/invisible pattern, same Control Room location, same
@@ -7,7 +7,7 @@
 // free at once, not just one, and resolves via a real Jev decision
 // instead of always firing whoever's worst off.
 //
-// Architecture (2026-09-21): the new approval model has a SINGLE admin
+// Architecture: the new approval model has a SINGLE admin
 // (Theo) who passes personnel/approval matters down to the directors,
 // and the senior-most director (Nora) approves/denies on the admin's
 // behalf. Admin/director identity lives in the DATABASE and reaches this
@@ -21,7 +21,7 @@
 const FIRING_COOLDOWN_MS = 60000;
 const FIRING_REVIEW_DURATION_MS = 10000;
 
-// 2026-09-23: no FIRING_MORALE_THRESHOLD constant anymore -- morale is the
+// No FIRING_MORALE_THRESHOLD constant anymore -- morale is the
 // load-spreading/help signal, not a firing gate. Firing keys off
 // hasFiringSignal() (a negative report or a real drop-off) so it stays "only
 // after discussion of real evidence," never "fires as often as hiring."
@@ -50,7 +50,7 @@ function firingReviewers() {
 // dropped-work penalty permanently keeps it just under the threshold).
 // The morale gate is real, but nothing stopped it from re-litigating the
 // exact same evidence forever once it had already been looked at and
-// found not to warrant firing. Per your explicit call: unless something
+// found not to warrant firing. Unless something
 // is actually found to be wrong, or something has genuinely changed since
 // the last look, this shouldn't run again -- a "keep" verdict now skips
 // this candidate until their morale score or their report count actually
@@ -113,8 +113,8 @@ function whoNeedsReview() {
 function attemptAutoFiringReview() {
   // Same idle rule as attemptAutoHire(): reviewing performance in a
   // think tank where nobody has been asked to do anything is exactly the
-  // "runs more often than the problem it's for" waste you identified --
-  // 247 real reviews last session, every one of them a 'keep'.
+  // "runs more often than the problem it's for" failure mode --
+  // 247 consecutive real reviews, every one of them a 'keep'.
   if (!thinkTankHasWork()) return false;
   const now = Date.now();
   if (now - lastFiringReviewAt < FIRING_COOLDOWN_MS) return false;
@@ -123,7 +123,7 @@ function attemptAutoFiringReview() {
   if (reviewers.length < 2) return false;
   const [reviewer1Def, reviewer2Def] = reviewers;
   const reviewer1 = AGENTS[reviewer1Def.id], reviewer2 = AGENTS[reviewer2Def.id];
-  // Real bug caught live: this never checked offDuty, only busy -- an
+  // Bug: this never checked offDuty, only busy -- an
   // off-duty approver (not busy, just resting) was treated as available,
   // and finishFiringReview() unconditionally sets visible=true on
   // completion without ever restoring offDuty, leaving her stuck in an
@@ -155,7 +155,7 @@ function attemptAutoFiringReview() {
 }
 
 // Who has firsthand, day-to-day knowledge of the candidate's work, beyond
-// the two reviewers? Per your two calls: a report should notify the
+// the two reviewers? A report should notify the
 // candidate's OWN supervisor first (reports.js notifySupervisorOfReport),
 // and a firing should only happen after the reviewers have consulted
 // anyone who's actually worked with them AND the person who reported them.
@@ -197,15 +197,15 @@ function isNegativeSeverity(severity) {
   return s.includes('severe') || s.includes('serious') || s.includes('major');
 }
 
-// Two independent guardrails, both learned from your two calls (supervisor
-// notified first; don't fire prematurely without consulting people who've
+// Two independent guardrails against premature firing (supervisor
+// notified first; don't fire without consulting people who've
 // worked with them). If EITHER holds, the reviewers refrain from firing:
 //   (1) the candidate has an ACTIVE collaborator (pair/handoff right now) --
 //       firing them would strand that collaboration and suggests the
 //       reviewers don't have the full picture of current work;
 //   (2) there is no corroborated NEGATIVE report -- i.e. no severe/serious/
 //       major evidence, or only a single uncorroborated voice, which is the
-//       "premature" case you flagged. Positive/neutral peer-reviews do NOT
+//       "premature" case. Positive/neutral peer-reviews do NOT
 //       count as evidence for firing. Firing stays possible when there is
 //       real, corroborated negative evidence.
 function consultationBlocksFiring(candidateDef, morale) {
@@ -242,7 +242,7 @@ async function finishFiringReview(reviewer1Def, reviewer2Def, candidateDef) {
 
   // Real evidence, the same signals morale.js itself weighs, laid out for
   // Jev rather than re-deriving its own judgment call -- this is exactly
-  // the classifier "pick one of N" decision your Jev note describes, not
+  // the classifier's "pick one of N" decision shape, not
   // a reasoning task.
   const morale = moraleFor(candidateDef.id);
   const reportQuotes = reportsAbout(candidateDef.id).map(r => `"${r.quote}" -- ${r.note} (severity: ${r.severity || 'unclassified'})`).join(' | ') || 'none filed';
@@ -265,7 +265,7 @@ async function finishFiringReview(reviewer1Def, reviewer2Def, candidateDef) {
     // (see hasFiringSignal) not the raw morale score: a corroborated
     // negative report AND a real drop record together justify letting
     // them go; either alone stays 'keep' (that agent needs help, not
-    // firing). 2026-09-23 morale decouple.
+    // firing). Firing is decoupled from raw morale.
     decision = (hasFiringSignal(candidateDef) && candidate.droppedCount > candidate.approvedCount * 0.3) ? 'fire' : 'keep';
   }
 

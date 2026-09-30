@@ -1,4 +1,4 @@
-"""Fault-aware routing memory (2026-09-26), ported from a real 2026 paper
+"""Fault-aware routing memory, ported from a real 2026 paper
 (StigmergyRouter, UC Berkeley/ACM CAIS): a lightweight pheromone-memory layer
 that steers _assign_due_item's round-robin away from an agent whose work was
 just orphaned/reclaimed, using only cheap local counters (no re-classification,

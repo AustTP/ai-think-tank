@@ -1,19 +1,19 @@
-// Autonomous hiring in Control Room. Per your call: this is agent-
-// initiated, not something you fill out a form for -- an authority figure
+// Autonomous hiring in Control Room. This is agent-
+// initiated, not something the player fills out a form for -- an authority figure
 // (see agents.js's availableAuthority: the admin, or the senior-most
 // director) periodically hires someone to help whoever's struggling most,
 // with no player action required. Under the single-admin model the admin
 // passes day-to-day personnel work down to the directors, so the senior
 // director is a legitimate hirer too, not just Theo. House (a separate,
-// physical building) is "just the board" for you; Control Room (reachable
-// only via the HUD's Command Center button, see rooms.js) is where this
+// physical building) only shows the hire board; Control Room (reachable
+// only via the HUD's Command Center button, see rooms.js) is where hiring
 // actually happens.
 //
-// You need to be able to monitor this, not just see a toast after the
-// fact -- so hiring is two real phases, not one instant background event.
-// While it's running, the hirer is busy/invisible on the outdoor map (same
-// as being in a Town Hall call) but genuinely present and visible if you
-// walk into Control Room yourself during that window
+// Hiring must be monitorable, not just a toast after the fact -- so it
+// is two real phases, not one instant background event. While it's
+// running, the hirer is busy/invisible on the outdoor map (same
+// as being in a Town Hall call) but genuinely present and visible in
+// Control Room during that window
 // (renderAgentsInRoom(), agents.js). A room nobody can observe is also a
 // room where elevated access could be misused without anyone noticing --
 // noted as a real design tension, not resolved here (no actual misuse
@@ -24,9 +24,9 @@ const HIRE_COLOR_POOL = ['#f6b26b', '#76a5af', '#a4c2f4', '#d5a6bd', '#b6d7a8', 
 const HIRE_COOLDOWN_MS = 45000;
 const HIRE_DURATION_MS = 8000;
 
-// Real budget protection, per your call -- autonomous hiring with no cap
+// Real budget protection: autonomous hiring with no cap
 // would grow unbounded (and once real model calls exist, so would spend).
-// Split into two separate numbers per your explicit call on 2026-09-20:
+// Split into two separate numbers:
 // a large TOTAL inventory (agents hired for a skill set, most of them
 // fully offline/dormant most of the time -- MAX_TOTAL_AGENTS, a budget
 // backstop against a runaway hiring bug, not a real constraint on
@@ -43,8 +43,8 @@ const MAX_ACTIVE_AGENTS = 25;
 // How often to actually log/toast "we're at the cap" while blocked --
 // attemptAutoHire() is polled every 5s (index.html), so without a
 // separate, longer-lived cooldown here, being at the cap would log the
-// exact same fact hundreds of times an hour. This is a "so you actually
-// notice" cadence, not a real hire attempt, so it doesn't need to be
+// exact same fact hundreds of times an hour. This is a "make the cap
+// noticeable" cadence, not a real hire attempt, so it doesn't need to be
 // anywhere near as frequent as HIRE_COOLDOWN_MS.
 const HIRE_CAP_NOTICE_COOLDOWN_MS = 30 * 60 * 1000;
 let lastHireCapNoticeAt = 0;
@@ -60,32 +60,32 @@ function noteHireBlockedAtCap(adminId) {
 // Model tier metadata -- wired for real via /api/chat (serve.py) and
 // requestAgentReply() (index.html) for 1:1 conversations. All three slugs
 // below confirmed against OpenRouter's live /api/v1/models catalog. Per
-// your call: most agents don't need a powerful model, so 'small' is the
+// Most agents don't need a powerful model, so 'small' is the
 // default for both the original roster and every new hire; only the
 // admin (and her senior-most director, who inherits the judgment tier for
 // these decisions) get a step up, since hiring decisions involve more
 // judgment than routine work.
-// Per your call: these shouldn't be three slugs frozen in code -- Jev
+// These shouldn't be three slugs frozen in code -- Jev
 // picks them from OpenRouter's real, current catalog by price band (see
 // serve.py's refresh_model_tiers()). Static fallback values here only
 // matter for the brief window before loadModelTiers() (world.js)
 // resolves at startup, or if that fetch ever fails outright.
 const MODEL_TIERS = {
   small: { label: 'loading...', slug: 'amazon/nova-micro-v1' },
-  // Per your call (2026-09-25): mid and high/planning replaced with the low
+  // Mid and high/planning replaced with the low
   // band's model -- most agent work doesn't need more than that. Old values
   // commented out (and preserved in think_tank.db's model_tiers.previous_* columns,
   // same rows) so this is a one-line revert if you change your mind:
   // mid: { label: 'loading...', slug: 'deepseek/deepseek-v4-flash-0731' },
   mid: { label: 'loading...', slug: 'deepseek/deepseek-v4-flash' },
-  // Split out of a single overloaded 'premium' tier, per your call:
+  // Split out of a single overloaded 'premium' tier,
   // writing code and planning work are different jobs. `coding` is what
   // every real code-generation path uses; `planning` is the expensive
   // one, used once per request to decompose it (assignBigTask).
   coding: { label: 'loading...', slug: 'qwen/qwen3-coder' },
   // planning: { label: 'loading...', slug: 'deepseek/deepseek-v4-pro-0813' },
   planning: { label: 'loading...', slug: 'deepseek/deepseek-v4-flash' },
-  // Real bug caught live: reviewScreenshot()/researchVisually() (world.js)
+  // Bug: reviewScreenshot/researchVisually (world.js)
   // used to hardcode `premium` for vision calls, on the assumption that
   // whatever wins the coding-benchmark-driven 'premium' pick will also
   // happen to support image input. It doesn't -- once 'premium' became
@@ -101,12 +101,12 @@ const MODEL_TIERS = {
 
 let lastHireAt = 0;
 
-// Real bug caught live (2026-09-21): this fixed 10-name list was the
+// Bug: this fixed 10-name list was the
 // ONLY name source, and it was already fully exhausted at 17 real
 // hires (7 original + all 10 pool names) -- every hire attempt from
 // then on silently returned null and failed, regardless of
-// MAX_TOTAL_AGENTS (raised to 500 the same day, which changes nothing
-// if hiring can't actually produce a new name). Per your call, names
+// MAX_TOTAL_AGENTS (raised to 500, which changes nothing
+// if hiring can't actually produce a new name). Names
 // are now generated by the same LLM call that already writes the
 // onboarding profile (generateHireProfile, one call, not two) -- this
 // pool is now only the FALLBACK for when that call fails outright
@@ -142,7 +142,7 @@ function pickFallbackHireName() {
 // mixed case the way a human reviewer would, same shape as firing's
 // evidence-driven decision.
 //
-// Per your call: directors/admins need help too, so they're legitimate
+// Directors/admins need help too, so they're legitimate
 // hire targets -- the only person excluded is the one currently doing the
 // hiring (you don't hire someone to help the hirer mid-hire). `hirerId`
 // is the admin/director running attemptAutoHire; it's excluded from the
@@ -181,7 +181,7 @@ async function whoNeedsHelp(hirerId) {
 // hire just started (useful for tests/verification), not the hire itself
 // -- the new agent doesn't exist until finishHire() runs.
 async function attemptAutoHire() {
-  // Per your call that an idle think tank should make no API calls at all:
+  // Because an idle think tank should make no API calls at all:
   // hiring help for a think tank with nothing to do is spend with no
   // possible payoff. whoNeedsHelp() below is a real Jev call, so this
   // check has to come before it, not after.
@@ -196,7 +196,7 @@ async function attemptAutoHire() {
   }
 
   const admin = adminDef && AGENTS[adminDef.id];
-  // Real bug caught live: this never checked offDuty, only busy -- an
+  // Bug: this never checked offDuty, only busy -- an
   // off-duty admin (not busy, just resting) was treated as available,
   // and finishHire() unconditionally sets visible=true on completion
   // without ever restoring offDuty, leaving her stuck in an impossible
@@ -244,14 +244,14 @@ const THINK_TANK_REAL_MECHANISMS = `Real facts about how work actually happens i
   + `research and reviews get filed as real files in a shared Library, not a wiki or ticket; `
   + `agents send each other real in-think tank mail, not chat messages on an external tool.`;
 
-// Per your call: the admin who hires someone should be the one who
+// The admin who hires someone should be the one who
 // writes their AGENTS.md-equivalent file, not a fixed template -- and if
 // there's a specific reason for the hire (helping a specific agent with
 // a specific kind of work), that should shape what gets written, not be
 // discarded. Falls back to the old templated profile if the model call
 // fails or comes back malformed, so a bad response never blocks a hire
 // that's already otherwise committed to happening.
-// Real fix (2026-09-21): generates the new hire's NAME in this same
+// Fix: generates the new hire's NAME in this same
 // call now, not from a separate fixed pool -- see pickFallbackHireName's
 // own comment for why. The model is told exactly which names are
 // already taken, but "asked nicely" isn't "verified": a hallucinated or
@@ -272,7 +272,7 @@ async function generateHireProfile(admin, role, helpFor) {
     const res = await agentFetch('/api/chat', admin.id, {
       method: 'POST',
       body: JSON.stringify({
-        // Real call (2026-09-21): picking a name and writing a couple of
+        // Picking a name and writing a couple of
         // one-sentence template fields is routine work, not the actual
         // hiring judgment call (that already happened via whoNeedsHelp()'s
         // own Jev call) -- it doesn't need the admin's own 'mid' tier.
@@ -329,11 +329,11 @@ async function finishHire(adminDef, helpFor) {
   const def = {
     id, name, color, role,
     // Every new hire defaults to the small tier -- overflow/assistant work
-    // doesn't need a bigger model, per your call.
+    // doesn't need a bigger model.
     model: 'small',
     approvedCount: 0, droppedCount: 0,
     mailbox: [`Welcome aboard -- you're here to help ${helpFor.name} with ${helpFor.role.toLowerCase()} work.`],
-    // Per your call: Command-Center hires get access the original six
+    // Command-Center hires get access the original six
     // don't. This is flavor/data for now, not a wired permissions system
     // (that's Phase 3 territory) -- but it's real data other UI can read,
     // not a hardcoded string only shown here.
@@ -358,8 +358,8 @@ async function finishHire(adminDef, helpFor) {
   // into existence at a random valid outdoor spot -- x/y above is only
   // the fallback now. Standing up for the first time should look real,
   // same as everyone else who's ever gone off duty and come back -- but
-  // only if there's actually room for her to be active. Per your call on
-  // 2026-09-20: a large total inventory (MAX_TOTAL_AGENTS) is fine, but
+  // only if there's actually room for her to be active.
+  // A large total inventory (MAX_TOTAL_AGENTS) is fine, but
   // only MAX_ACTIVE_AGENTS may be online/awaiting scheduled work at once.
   // Hiring someone new for overflow help while the think tank is already at
   // its active ceiling means she joins the inventory dormant, not walking
@@ -381,7 +381,7 @@ async function finishHire(adminDef, helpFor) {
 // flow (fixed role string, always the small tier). Real project roles
 // (coder, UI researcher, QA) need a specific role AND a specific default
 // model tier picked for what the job actually needs -- coding gets
-// 'premium' by default, per your call that agents who code need a
+// 'premium' by default, because agents who code need a
 // better model, still subject to pickModelTierForAction() overriding it
 // per-action same as anyone else. Still goes through an admin authoring
 // the onboarding file for real, same "admins write the AGENTS.md when
@@ -394,7 +394,7 @@ async function hireSpecialist(adminId, role, model, missionHint) {
   const admin = AGENTS[adminId];
   if (!admin) return null;
 
-  // Real fix (2026-09-21): name now comes from this same call (a small-
+  // Fix: name now comes from this same call (a small-
   // tier model, since picking a name + writing one-sentence template
   // fields is routine work, not a judgment call), checked against the
   // real roster for collisions -- see generateHireProfile's identical

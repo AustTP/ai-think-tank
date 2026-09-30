@@ -1,5 +1,5 @@
 """CS329A takeaway #2 -- Weaver-style verifier ensemble for grading
-(2026-09-28).
+
 
 The planner emits a per-requirement checklist ({id, question, section, type:
 code|jev|human}) that travels with a project's subtasks, but the Python review

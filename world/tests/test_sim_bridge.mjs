@@ -122,8 +122,8 @@ test('applyServerPositions lerps toward server truth and snaps logical state', (
   const state = { ada: { x: 100, y: 100, dir: 'north', busy: true, inRoom: null, offDuty: false } };
   applyServerPositions(state);
   const a = state.ada;
-  // Lerp factor 0.45 (sim_bridge.js SERVER_LERP, raised from 0.25 on
-  // 2026-09-24): x moves toward 200 by 45% of the gap.
+  // Lerp factor 0.45 (sim_bridge.js SERVER_LERP, raised from 0.25):
+  // x moves toward 200 by 45% of the gap.
   assert.ok(a.x > 100 && a.x < 200, `x lerped toward 200, got ${a.x}`);
   assert.ok(Math.abs(a.x - (100 + 0.45 * 100)) < 1e-6, 'x applies exponential lerp exactly');
   assert.equal(a.y, 100, 'y already at target, unchanged');

@@ -15,7 +15,7 @@ or any future work that creates or manages a repository.
   agents never push on their own.
 - There is currently **no code path that creates a new repository** anywhere in
   the think tank. This policy is for if/when that capability gets built.
-- The vault-held `GITHUB_TOKEN` was checked live (2026-09-24) and its actual
+- The vault-held `GITHUB_TOKEN` was checked live and its actual
   granted scopes are **very broad**: `admin:org, admin:org_hook,
   admin:public_key, admin:repo_hook, delete:packages, delete_repo, gist,
   notifications, project, repo, user, workflow, write:packages`. That includes

@@ -1,5 +1,5 @@
 // Real regression test for the firing-review backoff (firing.js) --
-// empirically caught live: one long session ran 236 real firing reviews,
+// empirically: one long session ran 236 real firing reviews,
 // all about the same agent, all landing on "keep," because nothing
 // stopped the exact same unchanged evidence from being re-litigated every
 // cooldown period forever. reviewIsStale()/whoNeedsReview() should skip a
@@ -43,7 +43,7 @@ async function test(name, fn) {
   }
 }
 
-// 2026-09-23: firing keys off the firing SIGNAL (a negative report or a real
+// Firing keys off the firing SIGNAL (a negative report or a real
 // drop-off), not the raw morale score. `setup` models the agent + its signal;
 // `hasFiringSignal` reads reportsAbout(def.id) (negative severity) and
 // droppedCount > approvedCount*0.3.
@@ -140,7 +140,7 @@ await test('a candidate with NO signal stays ineligible even when idle', () => {
 console.log('\nan off-duty admin is not treated as available for a firing review');
 
 await test('attemptAutoFiringReview does not start while one admin is off duty, even though she is not busy', async () => {
-  // Real bug caught live: this only checked .busy, so an off-duty admin
+  // Bug: this only checked .busy, so an off-duty admin
   // (resting, not busy) was treated as available. finishFiringReview()
   // unconditionally sets visible=true on completion without ever
   // restoring offDuty, leaving her stuck offDuty=true/visible=true

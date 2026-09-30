@@ -8,7 +8,7 @@ gate's pure helpers AND the _apply_content_result verdict folding, hermetic
 class below, which patches DB_PATH itself -- the other three classes call
 _apply_content_result/gate-entry paths that have inline `from serve import
 log_action` calls, a real side effect that wrote into whatever real
-think_tank.db sits at serve.py's default path. Found 2026-09-25 via a live
+think_tank.db sits at serve.py's default path. Found via a live
 production think_tank.db that picked up test fixture rows after a routine test
 run; module-level isolation below covers the whole file (Integration's own
 class-level patch still applies on top of it during its own tests).
@@ -452,8 +452,8 @@ class Integration(unittest.TestCase):
 
 
 class BoundedReviewEscalation(unittest.TestCase):
-    """Bounded review-cycle escalation (2026-09-26): real gap caught live --
-    a promoted follow-up story cycled through review->fix->review 45+ times
+    """Bounded review-cycle escalation: a promoted
+    follow-up story cycled through review->fix->review 45+ times
     in under 20 minutes with no bound at all. sim._maybe_escalate_stuck_gate
     is the shared counter checked from both re-entry mechanisms
     (_apply_content_result's 'actionable' fold here, and

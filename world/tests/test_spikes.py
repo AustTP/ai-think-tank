@@ -67,7 +67,7 @@ class SpikeLane(unittest.TestCase):
             self.assertFalse(sim._peer_gated_lane(t))
 
     def test_scheduled_research_never_gates_even_in_a_deliverable_room(self):
-        # Real bug, confirmed live 2026-09-26: task['research'] (the marker
+        # Bug, confirmed: task['research'] (the marker
         # _check_schedules sets on a scheduled crawl) is NOT a taskType, and
         # observatory IS a deliverable room -- so a scheduled research task
         # slipped past the taskType-only NON_GATED_LANES check and entered

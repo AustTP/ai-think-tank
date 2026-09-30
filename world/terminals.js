@@ -2,9 +2,9 @@
 // Room, Weather Station, Studio, Control Room, Research Center, every room
 // built on the shared six-desk "workstations" layout, see rooms.js) and
 // grew to cover Post Office's mailbox wall, the Bank's three tellers, and
-// (per your call) the Library's bookshelves -- walking up to any shelf
+// the Library's bookshelves -- walking up to any shelf
 // opens the same file-review modal the Library building already wired up.
-// Per your call, the terminal itself is the same everywhere for now; what
+// The terminal itself is the same everywhere for now; what
 // each room's terminal actually has access to (room-gated tools) is a
 // later pass.
 //

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Real automated regression tests, added after finding several real bugs
-# manually this session that a test suite would have caught (empty-vs-null
+# manually that a test suite would have caught (empty-vs-null
 # paths, an agent blocking her own escape, camera clamping, activity-log
 # dedup). No framework/dependencies -- Node's built-in assert/vm, Python's
 # built-in unittest. Run before trusting a change to tasks.js, agents.js,
@@ -184,9 +184,9 @@ python3 tests/test_full_lifecycle.py
 # a real logged-in browser session, so it can't share that guarantee -- run it
 # explicitly and separately when you want it:
 #   AI_THINK_TANK_TEST_PASSWORD=... python3 tests/test_visual_regression.py
-# (Borrowed from Hermes Town's verify:characters/verify:world, 2026-09-24 --
+# (Borrowed from Hermes Town's verify:characters/verify:world,
 # real automated checks for exactly the "undefined" nameplate / overlapping-
-# sprite class of bug found manually this session.)
+# sprite class of bug.)
 
 # ---------------------------------------------------------------------------
 # Summary: with `set -e` off, every test above ran to completion even if some

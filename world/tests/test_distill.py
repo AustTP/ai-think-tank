@@ -1,4 +1,4 @@
-"""Tests for the hive-mind distillation loop (2026-09-25).
+"""Tests for the hive-mind distillation loop.
 
 The think tank shares storage (library/archive/) and injects wiki context before a
 task acts, but had no step that *merges* many past findings into living,
@@ -294,7 +294,7 @@ class DistillExecutor(unittest.TestCase):
 
 class CsvLikeBlockExtraction(unittest.TestCase):
     """content._extract_csv_like_blocks: the pure detector behind the
-    distill CSV-preservation safety net (2026-09-26). Lazily imports content
+    distill CSV-preservation safety net. Lazily imports content
     (matching this file's own established convention, see DistillExecutor
     and DistillCsvPreservation's local imports below) -- a top-level `import
     content` here, ahead of any `import serve`, hits a pre-existing circular
@@ -329,7 +329,7 @@ class CsvLikeBlockExtraction(unittest.TestCase):
         self.assertEqual(self.content._extract_csv_like_blocks(text), [])
 
     def test_three_comma_bearing_sentences_with_varying_comma_counts_not_flagged(self):
-        # Real gap fixed (2026-09-26): the ORIGINAL loose scan only checked
+        # Gap fixed: the ORIGINAL loose scan only checked
         # "any comma present" -- three ordinary prose sentences in a row,
         # each with at least one comma, would have false-positived as a
         # CSV. Real CSV rows share their header's column count; these three
@@ -353,7 +353,7 @@ class CsvLikeBlockExtraction(unittest.TestCase):
 
 
 class DistillCsvPreservation(unittest.TestCase):
-    """Deterministic safety net (2026-09-26): the synthesis prompt tells the
+    """Deterministic safety net: the synthesis prompt tells the
     model to summarize, not re-print, the archives it merges -- the same
     instruction that already flattened a spike's real CSV into prose during
     its OWN synthesis. This is the same failure one step downstream: a

@@ -11,7 +11,7 @@
 // Jev is a classifier over a candidate list (jev.js) -- perfect for
 // "this specific requirement: met or not?"; NOT for "is this whole thing
 // good?" (that bundles idea + evidence + writing together and is the
-// player's call, exactly like the article's "i still decide whether the
+// Exactly like the article's "i still decide whether the
 // idea is interesting enough to publish").
 
 // A checklist requirement the planning model can emit for a big task:

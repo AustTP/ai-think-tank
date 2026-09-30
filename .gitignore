@@ -52,7 +52,7 @@ library/publish-staging/
 
 # macOS
 .DS_Store
-# Per-agent identity files (2026-09-27): agent.json/AGENTS.md/MEMORY.md/state.json
+# Per-agent identity files: agent.json/AGENTS.md/MEMORY.md/state.json
 # are MATERIALIZED MIRRORS of think_tank.db, regenerated on every save from the DB.
 # Agent identities live ONLY in the database -- never tracked, never pushed.
 agents/*/agent.json
@@ -60,13 +60,13 @@ agents/*/AGENTS.md
 agents/*/MEMORY.md
 agents/*/state.json
 
-# Runtime state (2026-09-27): live browse/search/usage trails and the action
+# Runtime state: live browse/search/usage trails and the action
 # passport hash-chain are regenerated from think_tank.db at runtime -- never pushed.
 browse_trail.json
 library_usage.json
 library/.passport.json
 
-# Runtime-generated think tank content (2026-09-27): spike findings, wiki pages,
+# Runtime-generated think tank content: spike findings, wiki pages,
 # social/pending-review artifacts, and sandbox project dirs are all produced by
 # the running think tank and carry agent-authored/agent-named content. Only the
 # curated library/skills/ templates are tracked; these regenerate at runtime.
@@ -76,5 +76,5 @@ library/social/
 library/pending_review/
 sandboxes/spike-task-*/
 sandboxes/sb-*/
-# Manual pre-cleanup DB backup (2026-09-27) -- a big one-off snapshot, not source
+# Manual pre-cleanup DB backup -- a big one-off snapshot, not source
 think_tank.db.pre-cleanup-*
