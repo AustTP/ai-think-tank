@@ -85,11 +85,26 @@ const jsCellFits = (gx, gy, cell) => vm.runInContext('cellFitsAgent', context)(g
 const jsOnDoor = (x, y) => vm.runInContext('isOnADoorTile', context)(x, y);
 const jsAgentBlocked = (box, ex, ig) => vm.runInContext('agentBlockedAt', context)(box, ex, ig);
 
-function py(req) {
+function pyMany(reqs) {
+  // ONE interpreter serves every request in the batch (line-oriented: one JSON
+  // request per stdin line, one JSON result per stdout line). The old
+  // per-request execFileSync spawned a fresh Python for every case -- hundreds
+  // of interpreter startups across the batteries that, under concurrent suite
+  // runs, compounded into an apparent hang. execFileSync returns clean output
+  // only on a zero exit; a nonzero exit throws.
+  const input = reqs.map(r => JSON.stringify(r)).join('\n') + '\n';
   const out = execFileSync('/usr/bin/env', ['python3', 'tests/_movement_bridge.py'], {
-    input: JSON.stringify(req), cwd: worldDir,
+    input, cwd: worldDir,
   });
-  return JSON.parse(out.toString());
+  const lines = out.toString().split('\n').filter(l => l.trim() !== '');
+  if (lines.length !== reqs.length) {
+    throw new Error(`bridge returned ${lines.length} results for ${reqs.length} requests`);
+  }
+  return lines.map(l => JSON.parse(l));
+}
+
+function py(req) {
+  return pyMany([req])[0];
 }
 
 let passed = 0, failed = 0;
@@ -122,21 +137,30 @@ test('blockedAt battery (walls, doors, OB, floor) + 300 random', () => {
     assert.equal(R(py({ op: 'blocked_at', grid: realGrid, box })), R(jsBlockedAt(box)),
       `blockedAt ${JSON.stringify(box)}`);
   }
+  const randomBoxes = [];
   for (let i = 0; i < 300; i++) {
-    const box = { x: Math.random() * 1400, y: Math.random() * 800, w: 10 + Math.random() * 60, h: 10 + Math.random() * 50 };
-    assert.equal(R(py({ op: 'blocked_at', grid: realGrid, box })), R(jsBlockedAt(box)),
-      `blockedAt random #${i} ${JSON.stringify(box)}`);
+    randomBoxes.push({ x: Math.random() * 1400, y: Math.random() * 800, w: 10 + Math.random() * 60, h: 10 + Math.random() * 50 });
   }
+  // Batch the whole random battery into one bridge invocation (see pyMany).
+  const pyRes = pyMany(randomBoxes.map(box => ({ op: 'blocked_at', grid: realGrid, box })));
+  randomBoxes.forEach((box, i) => {
+    assert.equal(R(pyRes[i]), R(jsBlockedAt(box)),
+      `blockedAt random #${i} ${JSON.stringify(box)}`);
+  });
 });
 
 test('cellFitsAgent battery (200 random cells)', () => {
   const cell = realGrid.cell;
+  const cells = [];
   for (let i = 0; i < 200; i++) {
-    const gx = Math.floor(Math.random() * realGrid.cols);
-    const gy = Math.floor(Math.random() * realGrid.rows);
-    assert.equal(R(py({ op: 'cell_fits_agent', grid: realGrid, gx, gy })), R(jsCellFits(gx, gy, cell)),
-      `cellFitsAgent (${gx},${gy})`);
+    cells.push([Math.floor(Math.random() * realGrid.cols), Math.floor(Math.random() * realGrid.rows)]);
   }
+  // Batch the whole battery into one bridge invocation (see pyMany).
+  const pyRes = pyMany(cells.map(([gx, gy]) => ({ op: 'cell_fits_agent', grid: realGrid, gx, gy })));
+  cells.forEach(([gx, gy], i) => {
+    assert.equal(R(pyRes[i]), R(jsCellFits(gx, gy, cell)),
+      `cellFitsAgent (${gx},${gy})`);
+  });
 });
 
 test('isOnADoorTile battery', () => {
