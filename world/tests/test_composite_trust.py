@@ -595,7 +595,7 @@ class ColabComputeTests(unittest.TestCase):
              unittest.mock.patch.object(serve, '_colab_account_usage', return_value=None), \
              unittest.mock.patch.object(serve, '_colab_cli') as cli:
             result = serve._colab_compute_run('agent-0', 'print(1)', 'probe', [], 60)
-        self.assertIn('monthly Colab compute-unit budget', result['error'])
+        self.assertIn('COLAB_MONTHLY_UNITS', result['error'])
         cli.assert_not_called(), 'gated out means no provisioning attempt at all'
 
     def test_exhausted_paid_account_balance_refuses_run(self):
@@ -605,7 +605,7 @@ class ColabComputeTests(unittest.TestCase):
                                         return_value={'balance': 0.0, 'rate': 1.15, 'assignments': 1}), \
              unittest.mock.patch.object(serve, '_colab_cli') as cli:
             result = serve._colab_compute_run('agent-0', 'print(1)', 'probe', [], 60)
-        self.assertIn('no compute units left', result['error'])
+        self.assertIn('no prepaid compute units left', result['error'])
         cli.assert_not_called()
 
     def test_free_tier_zero_balance_proceeds_to_provision(self):
