@@ -581,12 +581,12 @@ async def _auto_failover_jev_if_gone(fresh, actor):
     current = _jev_model()
     if not current or '://' in current:
         return  # nothing to re-derive, or already pointing at the loopback standby
-    if await asyncio.to_thread(_verify_model_works_sync, current):
+    if await asyncio.to_thread(_verify_decision_model_works_sync, current):
         return  # still available; leave the player's deliberate choice alone
     for slug in _decision_model_chain():
         if slug == current or '://' in slug:
             continue
-        if await asyncio.to_thread(_verify_model_works_sync, slug):
+        if await asyncio.to_thread(_verify_decision_model_works_sync, slug):
             return  # an existing chain fallback still works; failover already covers it
     replacement = fresh.get('high')
     if not replacement or replacement['id'] == current:
@@ -2412,11 +2412,11 @@ def _reasoning_tier_slug():
 #     everything downstream (the assign-big-task case). High is a RARE upgrade.
 # Fails CLOSED to low: on any JEV outage/error the call stays on the cheap
 # tier rather than spending up on a guess. Returns a resolved model slug.
-_TIER_GATE_CRITERIA = [
-    {'id': 'high', 'description': 'High-stakes, one-shot planning or decomposition where getting it wrong wastes every downstream step (e.g. breaking one large vague request into the subtasks everything else depends on).'},
-    {'id': 'mid', 'description': 'Needs real multi-step reasoning or judgment: synthesis, classification, summarization of gathered material, a considered in-character reply. Routine but non-trivial thinking.'},
-    {'id': 'low', 'description': 'Routine, cheap work: a short reply, simple extraction, or a one-line note where the cheap tier is plenty.'},
-]
+_TIER_GATE_CRITERIA = {
+    'high': 'High-stakes, one-shot planning or decomposition where getting it wrong wastes every downstream step (e.g. breaking one large vague request into the subtasks everything else depends on).',
+    'mid': 'Needs real multi-step reasoning or judgment: synthesis, classification, summarization of gathered material, a considered in-character reply. Routine but non-trivial thinking.',
+    'low': 'Routine, cheap work: a short reply, simple extraction, or a one-line note where the cheap tier is plenty.',
+}
 # A genuinely low JEV confidence should not trigger a spend-up -- require the
 # chosen escalation to carry at least this confidence (mirrors JEV_SAFETY_CONFIDENCE's
 # own "don't act on weak signal" bar).
@@ -6601,6 +6601,37 @@ def _verify_model_works_sync(model_id):
             pass
         if attempt + 1 < MODEL_VERIFY_ATTEMPTS:
             time.sleep(1)  # a blip and a rate-limit both clear on their own; a dead model won't
+    return False
+
+
+def _verify_decision_model_works_sync(model_id):
+    """Decision-model-aware sibling of _verify_model_works_sync. Jev-class
+    slugs are TYPED decisions models: they answer only on /api/alpha/decisions
+    and REJECT /v1/chat/completions outright ("use the decisions endpoint
+    instead"), so a chat-completions probe would call a healthy Jev 'dead'
+    and the daily auto-failover would wrongly replace it. Probes the real
+    decisions wire format instead: a one-question multiple-choice call that
+    must come back with a parseable answer, not an error."""
+    if '://' in model_id:
+        # Loopback/standby (Colab/Laya) entries can't be probed from here --
+        # they only answer while the CLI forward is up, which is not what this
+        # check is for. Treat them as reachable-by-construction (failover
+        # already handles them) so the daily loop never 'fixes' the chain by
+        # dropping them.
+        return True
+    for attempt in range(MODEL_VERIFY_ATTEMPTS):
+        try:
+            req = _decision_request(model_id, {'messages': [], 'signals': {}},
+                                    {'choice': {'type': 'choice',
+                                                'instructions': 'Reply with one of the given options.',
+                                                'criteria': {'a': 'first option', 'b': 'second option'}}})
+            data = json.loads(_urlopen_with_resilience(req, timeout=30))
+            if data.get('answers', {}).get('choice', {}).get('choice'):
+                return True
+        except Exception:
+            pass
+        if attempt + 1 < MODEL_VERIFY_ATTEMPTS:
+            time.sleep(1)
     return False
 
 
