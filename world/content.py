@@ -2072,26 +2072,37 @@ def _make_spike_sandbox_executor(agent_id, agent_key, sandbox_id, struck_tools=N
 # Google Colab T4 runtime, provisioned on demand by the spike toolchain and
 # budgeted as compute units in the Bank. run_on_colab mirrors execute_script
 # (a spike agent hands real code, gets real stdout back) but for a remote GPU
-# session instead of the tiny local sandbox. Budget-gated by serve's monthly
-# COLAB_MONTHLY_UNITS cap; only offered when the colab CLI is actually
-# installed on the machine (see COLAB_CLI_AVAILABLE).
+# session instead of the tiny local sandbox. Budget-gated only by serve's
+# optional COLAB_MONTHLY_UNITS convention cap -- free tier T4 usage is
+# unlimited, runtime just isn't guaranteed (see _colab_budget_exceeded);
+# only offered when the colab CLI is actually installed on the machine (see
+# COLAB_CLI_AVAILABLE).
 _COLAB_RUN_TOOL = {
     'type': 'function',
     'function': {
         'name': 'run_on_colab',
         'description': (
-            "Run real Python on a Google Colab GPU (T4) runtime -- for computation this "
+            "Run real Python on a Google Colab runtime -- for computation this "
             "think tank's own machine cannot do: CUDA/torch GPU work, fine-tuning experiments, "
-            "large matrix/ML or numeric jobs. The think tank provisions a GPU session on demand, "
-            "executes your code, and returns exactly what it printed -- so your code MUST print "
+            "large matrix/ML or numeric jobs. The think tank provisions runtime(s) on demand, "
+            "executes your code, and returns exactly what each printed -- so your code MUST print "
             "everything you need to see. Use this when a plan step genuinely requires real "
             "computation (not for browsing/text questions, and not for anything the tiny local "
-            "sandbox can already do). It runs on the player's real Colab account, metered against "
-            "whatever COLAB_MONTHLY_UNITS think tank cap is set, and it is the FREE tier: a run "
-            "must finish in its own short timeout, sessions get torn down after idle, GPU slots "
-            "are not guaranteed, keep runs small. HARD LIMIT: the code runs as the player's "
-            "identity, so it may ONLY touch compute -- never Google Drive, GCS/cloud APIs, "
-            "credentials, mining/bulk-media/torrents, offensive-security tooling, or any exfil "
+            "sandbox can already do). runtime=\"gpu\" rents a T4 (needed for CUDA/torch GPU work); "
+            "runtime=\"cpu\" rents a CPU runtime -- prefer cpu for large tasks that are purely "
+            "CPU-bound (big numeric/data/parsing jobs), which should not rent a GPU: CPU slots are "
+            "more likely granted on the free tier. It runs on the player's real Colab account, "
+            "which is the FREE tier: usage is UNLIMITED (no monthly meter/wallet -- the only hard "
+            "cap is the operator-set COLAB_MONTHLY_UNITS convention), but a runtime is NOT "
+            "guaranteed -- provisioning can be refused (availability/cooldown), so keep runs small "
+            "and retry later if a slot is refused. Sessions get torn down after idle, GPU slots are "
+            "not guaranteed. To shard ONE computation across MULTIPLE runtimes (chain runtimes for a "
+            "single task), pass runtimes>1: the same code then runs on each granted runtime with "
+            "COLAB_SHARD_INDEX (0-based) and COLAB_SHARD_COUNT env vars so it can split work and "
+            "print its slice; the account grants whatever it grants (may be fewer than requested, "
+            "reported honestly back), extra runtimes are torn down after. HARD LIMIT: the code runs "
+            "as the player's identity, so it may ONLY touch compute -- never Google Drive, GCS/cloud "
+            "APIs, credentials, mining/bulk-media/torrents, offensive-security tooling, or any exfil "
             "site; and every literal URL the code references must clear the same allowlist/JEV "
             "gate as local browsing (off-limits hosts are refused up front, before any run)."
         ),
@@ -2106,6 +2117,10 @@ _COLAB_RUN_TOOL = {
                              'description': 'Optional pip package names to install before running (e.g. ["transformers", "sentencepiece"]). torch/cuda come preinstalled.'},
                 'timeout_seconds': {'type': 'integer',
                                     'description': 'Optional execution timeout in seconds (default 300, hard max 900).'},
+                'runtimes': {'type': 'integer',
+                             'description': 'Optional number of runtimes to shard this ONE computation across (default 1; max 5). Each granted runtime runs the same code with COLAB_SHARD_INDEX and COLAB_SHARD_COUNT env vars so it can split the work and print its slice. The account grants whatever it grants -- fewer than requested is reported back, not an error; extra runtimes are torn down after.'},
+                'runtime': {'type': 'string', 'enum': ['gpu', 'cpu'],
+                            'description': 'Optional runtime kind (default "gpu"). "gpu" rents a T4 (required for CUDA/torch/GPU work). "cpu" rents a CPU runtime -- use it for large tasks that are purely CPU-bound (big numeric/data/parsing jobs), which should NOT rent a GPU: CPU slots are more likely granted on the free tier, so CPU sharding is often the more reliable path for big shardable work.'},
             },
             'required': ['code'],
         },
@@ -2138,7 +2153,12 @@ def _make_colab_compute_executor(agent_id, struck_tools=None):
         except (TypeError, ValueError):
             timeout = 300
         try:
-            result = _serve._colab_compute_run(agent_id, code, purpose, packages, timeout)
+            runtimes = int(args.get('runtimes') or 1)
+        except (TypeError, ValueError):
+            runtimes = 1
+        kind = args.get('runtime') or 'gpu'
+        try:
+            result = _serve._colab_compute_run(agent_id, code, purpose, packages, timeout, runtimes, kind)
         except Exception as e:
             return f'__TOOL_ERROR__: Colab run crashed: {e}'
         if not isinstance(result, dict):
@@ -2147,6 +2167,9 @@ def _make_colab_compute_executor(agent_id, struck_tools=None):
             return f'__TOOL_ERROR__: {result["error"]}'
         parts = [f'Colab GPU run OK (session: {result.get("session") or "colab"}, '
                  f'{result.get("elapsed_s", 0)}s, {result.get("units", 0)} compute units):']
+        if result.get('runtimes'):
+            parts.insert(0, f'Colab sharded GPU run OK across {result["runtimes"]} runtime(s) '
+                            f'({result.get("elapsed_s", 0)}s, {result.get("units", 0)} compute units total):')
         stdout = (result.get('stdout') or '').strip()
         if stdout:
             parts.append(f'output:\n{stdout}')
