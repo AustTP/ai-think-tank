@@ -1,10 +1,10 @@
 # Burn-in checklist
 
-A supervised live-run checklist for the think tank, written 2026-09-24 after a
-review found that ~20 commits of behavior (Cut 2, Cut 4, refinement, Knowledge
-Social, the Bank, clarify router, distillation, dormancy, and the skill-review
-fix itself) had never executed in a live think tank -- they were validated only by
-unit tests with injected fakes and deterministic clocks.
+A supervised live-run checklist for the think tank. Much of the behavior
+(Cut 2, Cut 4, refinement, Knowledge Social, the Bank, clarify router,
+distillation, dormancy, and the skill-review fix itself) had never executed in a
+live think tank -- it was validated only by unit tests with injected fakes and
+deterministic clocks.
 
 This is not generic test advice. Every item marked **⚠️** is a replay of
 something this think tank actually did, observed in `think_tank.db` at the last real
@@ -31,7 +31,7 @@ failed in the last live run.
       (`509173d`) -- confirm one actually lands in `ai-think-tank-backups/` before
       trusting it.
 - [ ] ⚠️ **Prove the suite can't touch the live DB.** Record `think_tank.db` mtime,
-      run `tests/run_all.sh`, confirm mtime is unchanged. Today it *will* change:
+      run `tests/run_all.sh`, confirm mtime is unchanged. Currently it *will* change:
       `test_composite_trust.py` imports `serve` without repointing `DB_PATH`, so
       `record_model_result('m', ...)` writes phantom model `"m"` into the live
       audit log (1,980 such rows already there). Until that's fixed, **never run
@@ -118,7 +118,7 @@ Test adversarially. A gate you have only seen pass has not been tested.
       burned 37,034 `decide` calls in a single day.
 - [ ] **Every `decide` carries a real `agent_id`.** Nulls mean unattributed spend
       is back.
-- [ ] **`kv_spend` actually accrues** (zero rows today) and the Bank's
+- [ ] **`kv_spend` actually accrues** (zero rows as of the last check) and the Bank's
       used/left/forecast reconciles against OpenRouter's own dashboard.
 - [ ] **No circuit breaks on slugs that aren't real models.** A `"m"` means test
       code reached live state.
@@ -133,7 +133,7 @@ hardest.
 - [ ] ⚠️ **Open a completion artifact.** It must contain the deliverable, not a
       receipt. Current median: 501 bytes of title/author/timestamp.
 - [ ] ⚠️ **Median artifact size climbs meaningfully** above that baseline.
-- [ ] ⚠️ **Process-to-product ratio improves.** Today: 795 archive receipts + 131
+- [ ] ⚠️ **Process-to-product ratio improves.** Last check: 795 archive receipts + 131
       refinement + 56 social + 44 escalation records, against one real product
       (finger-drums, 4 files).
 - [ ] **Follow one deliverable end to end** -- request -> story -> build -> peer

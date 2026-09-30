@@ -1,9 +1,9 @@
-"""Decision tape (2026-09-24): every Jev decision the chokepoint makes is recorded
+"""Decision tape: every Jev decision the chokepoint makes is recorded
 as a raw model-facing row -- prompt, candidates, parsed choice/confidence/cost,
 and the full response -- before the caller discards them. Complements the state-side
 audit (action_log + passport hash-chain) with the observed-answer side.
 
-Scope (user's call): raw model-facing only. Implemented entirely at the chokepoint
+Scope: raw model-facing only. Implemented entirely at the chokepoint
 `_call_openrouter_decision_sync`; zero behavior change to call sites. Outcomes stay
 in action_log/passport; the tape is correlatable to those by ts + agent_id.
 

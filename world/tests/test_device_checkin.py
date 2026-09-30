@@ -1,4 +1,4 @@
-"""Tests for the phone check-in feature (2026-09-26): POST /api/device/checkin
+"""Tests for the phone check-in feature: POST /api/device/checkin
 lets a device (an iOS Shortcut, to start) report location/battery/Focus/Wi-Fi.
 See sim.record_device_checkin and serve.device_checkin.
 

@@ -1,4 +1,4 @@
-"""Tests for Cut 3 -- on-call escalation (2026-09-23).
+"""Tests for Cut 3 -- on-call escalation.
 
 When the on-call agent CANNOT restore a broken product's work -- an incident is
 repeatedly unassignable (assignment abandonment) OR a picked-up bug stays open
@@ -11,7 +11,7 @@ pattern as test_refinement.py / test_cut2_processes.py. NOT actually DB-free
 despite the state() helper's plain dicts: sim.py's escalation/refinement path
 has inline `from serve import log_action` calls (a real side effect, not a
 stub), which -- unless DB_PATH is redirected below -- write straight into
-whatever real think_tank.db sits at serve.py's default path. Found 2026-09-25:
+whatever real think_tank.db sits at serve.py's default path. Found:
 a real "Auth broken" task and an "esc-test" escalation from THIS file's own
 fixtures turned up in a live production think_tank.db after a routine test run,
 because this file never isolated it.

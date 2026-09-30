@@ -53,12 +53,12 @@ charging real money after you think you've stopped.
   billing, the 672-hour monthly cap, powered-off Droplets still billed)
 - https://www.digitalocean.com/community/questions/powered-off-droplets-bill
   (community confirmation: destroy or snapshot+delete to actually stop billing)
-- Verified live 2026-09-24 by the developer (not by an agent spike -- a spike has
+- Verified by the developer (not by an agent spike -- a spike has
   no real internet access and an earlier ungrounded spike on this same topic got a
   comparable fact wrong for a different service, Mullvad's token TTL).
 
 ## Lessons learned
-- (2026-09-24) An early agent "spike" on DigitalOcean correctly guessed the general
+- An early agent "spike" on DigitalOcean correctly guessed the general
   shape (pay for infra, not calls) but never surfaced the powered-off-still-bills
   trap at all -- the single most costly thing to get wrong here. Spikes are a single
   ungrounded model call with no browsing; don't trust one for anything with a real

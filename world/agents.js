@@ -6,7 +6,7 @@
 // nameplate so they're distinguishable on the map and in the call UI.
 
 // The single live roster, hydrated entirely from the DATABASE (think_tank.db's
-// kv_state blob) via /api/state. Per your call (2026-09-21), there are no
+// kv_state blob) via /api/state. There are no
 // static agent names in any JS file any more: the default roster is seeded
 // server-side in serve.py's _seed_default_roster(), and this global starts
 // empty and is filled from /api/state on every load. Nothing here carries a
@@ -45,7 +45,7 @@ let AGENTS = {}; // id -> { id, name, color, x, y, dir, visible, busy, meetingId
 // first call since the grid doesn't change at runtime.
 //
 // Real bug in the first version of this fix, caught from an actual
-// screenshot after you refreshed: it flood-filled the raw per-cell
+// screenshot: it flood-filled the raw per-cell
 // boolean, which only asks "is this one 8px cell blocked," not "does an
 // agent's real 20x16 footprint fit here." A single unblocked cell right
 // next to a building can still be too narrow a sliver for the actual box
@@ -101,7 +101,7 @@ function pickFreeSpot(avoidPoints = []) {
     const x = Math.random() * (GROUND_W - AGENT_W);
     const y = Math.random() * (GROUND_H - AGENT_H);
     if (blockedAt({ x, y, w: AGENT_W, h: AGENT_H })) continue;
-    // Real bug caught live (2026-09-21, hiring-to-shutdown audit): this
+    // Bug (hiring-to-shutdown audit): this
     // originally checked reachability at the agent's CENTER
     // (x+AGENT_W/2, y+AGENT_H/2), which disagreed with findPath's own
     // start-validity check at the time (which used the box's raw
@@ -112,7 +112,7 @@ function pickFreeSpot(avoidPoints = []) {
     // bug (cellWorldPos centers every real waypoint on a cell, and
     // AGENT_W (20) doesn't evenly divide cell*SCALE (16), so reversing a
     // waypoint's OWN position with a plain floor division doesn't
-    // recover the same cell -- confirmed live: an agent resting at her
+    // recover the same cell -- confirmed: an agent resting at her
     // own real task.entryX/entryY, itself a real waypoint, could not
     // pathfind anywhere from her own position). findPath's start-cell
     // computation now correctly centers too, so THIS is the right
@@ -124,7 +124,7 @@ function pickFreeSpot(avoidPoints = []) {
   return { x: SPAWN.x, y: SPAWN.y }; // pathological fallback, shouldn't hit on a real map
 }
 
-// Real bug caught live: an agent that goes idle (task finished/cancelled,
+// Bug: an agent that goes idle (task finished/cancelled,
 // off-duty, a handoff that never got picked back up) simply stays wherever
 // she physically was, forever -- nothing ever re-examines a resting
 // agent's position. When that resting spot happens to be a door tile (a
@@ -162,7 +162,7 @@ function isOnADoorTile(x, y) {
 // static map connects, not who else happens to be standing somewhere
 // right now.
 //
-// `ignoreIds` (optional Set): real bug caught live -- two agents can
+// `ignoreIds` (optional Set): bug -- two agents can
 // legitimately end up standing on the EXACT same spot in real gameplay
 // (finishTask() resets both to the same task.entryX/entryY door-front
 // point if they worked the same room), and findPath's own planning
@@ -171,7 +171,7 @@ function isOnADoorTile(x, y) {
 // one pixel away from a neighbor occupying the identical start position
 // still fully overlaps that neighbor's identical box, so EVERY direction
 // (tryBoth/tryX/tryY) reported blocked forever, with neither agent ever
-// able to take the first step needed to separate. Confirmed live:
+// able to take the first step needed to separate. Confirmed:
 // stuckTimer cycled 0->1.2->0 indefinitely, replanning to the same
 // nearby cell every time, position never changing by even 0.01px.
 function agentBlockedAt(box, excludeId = null, ignoreIds = null) {
@@ -236,7 +236,7 @@ async function saveState() {
         agents: agentsPayload,
         reports: REPORTS,
         nextReportId,
-        // Real gap caught live: everything else here survives a reload;
+        // Gap: everything else here survives a reload;
         // WORK_QUEUE (tasks.js) didn't, so a real request queued via
         // assignBigTask and not yet fully drained would just silently
         // vanish if the page reloaded mid-flight -- the exact opposite of
@@ -284,7 +284,7 @@ async function initAgents() {
     // "anything in progress is abandoned."
     for (const id in AGENTS) {
       AGENTS[id].busy = false;
-      // Real ask (2026-09-21): a reload should restore whatever was
+      // A reload should restore whatever was
       // actually saved, not force everyone back on duty -- offDuty is a
       // deliberate rest state (sendAgentOffDuty), and someone genuinely
       // resting stays invisible and off duty across a reload exactly like
@@ -299,7 +299,7 @@ async function initAgents() {
       AGENTS[id].inRoom = null;
       AGENTS[id].task = null;
       AGENTS[id].handoff = null; // an in-progress handoff (handoffs.js) is just as abandoned as an in-progress task
-      // Real bug caught live: an agent mid pair-programming session
+      // Bug: an agent mid pair-programming session
       // (pairWith/pairTaskId, tasks.js) when the page reloaded stayed
       // stuck that way FOREVER -- the async runPairProgrammingSession()
       // that would eventually have released her was just abandoned
@@ -371,7 +371,7 @@ function markContacted(agentId, ts) {
   if (a) a.lastContactedAt = ts;
 }
 
-// Per your call: an agent (or the player) should be able to send mail to
+// An agent (or the player) should be able to send mail to
 // another agent from ANY location, not just walk up to them -- exactly
 // the channel that's missing when the recipient is busy and a live
 // conversation or handoff (handoffs.js) isn't possible right now.
@@ -416,7 +416,7 @@ function markMailRead(agentId) {
 // Speech bubbles: agent-to-agent dialogue (handoff exchanges, pair-programming
 // announcements) used to go through the single global showToast() banner --
 // not positioned over the speaker, and with no length limit at all, so a long
-// model-generated line just overflowed the banner. Per your call (2026-09-24):
+// model-generated line just overflowed the banner.
 // a real bubble drawn over the speaking agent, and the text must be truncated.
 const SPEECH_MAX_CHARS = 80;
 const SPEECH_BUBBLE_DURATION_MS = 4500;
@@ -545,7 +545,7 @@ function renderAgents(ctx, toScreen, zoom, playerSprites) {
 
 // Agents "in" a specific room (hiring.js, while Control Room is in use) --
 // only ever drawn if the player is currently inside that same room, so
-// this doubles as the monitoring you asked for: walk in and see who's
+// this doubles as the monitoring: walk in and see who's
 // actually there.
 function renderAgentsInRoom(ctx, toScreen, zoom, playerSprites, building) {
   for (const id in AGENTS) {

@@ -193,7 +193,7 @@ class SimServerOwnedMovement(unittest.TestCase):
                                 'x must reach the near waypoint or beyond on arrival')
 
     def test_server_tick_substeps_so_no_waypoint_overshoot_oscillation(self):
-        # REGRESSION (caught live with probe_1): a single SIM_TICK_S (2s) step
+        # REGRESSION (with probe_1): a single SIM_TICK_S (2s) step
         # at 60px/s moves a walker 120px -- far past a grid cell and past
         # TASK_ARRIVE_DIST -- so she overshoots her first waypoint and bounces
         # forever (x oscillating start<->start+step, pathIndex frozen). The fix
@@ -374,7 +374,7 @@ class SimTaskLifecycle(unittest.TestCase):
         self.assertEqual(state['workQueue'], [], 'queue drained after assignment')
 
     def test_task_cycle_idle_gate_spends_nothing(self):
-        # An idle think tank parks its idle wanderers off duty (2026-09-23: a
+        # An idle think tank parks its idle wanderers off duty (a
         # woken-but-never-assigned agent must vanish, per the player's "no
         # unscheduled/active agent should appear" rule), which IS a state write.
         # What it must NOT do is enqueue work, assign anyone, run governance,
@@ -571,7 +571,7 @@ class SimTaskLifecycle(unittest.TestCase):
 
 
 class SimOffDutyWake(unittest.TestCase):
-    # 2026-09-22 redesign (user's call): agents VANISH WHERE THEY STAND when
+    # Redesign: agents VANISH WHERE THEY STAND when
     # going off-duty (no trek to an outskirts door), and WAKE ANYWHERE there's
     # free, reachable space (not at outskirts_east/south). This fixes agents
     # stranding at the map edge (ben at outskirts_south, faye at the corner).

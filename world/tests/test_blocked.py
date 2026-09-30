@@ -1,4 +1,4 @@
-"""Tests for the SM-committed `blocked` bool field on issues (2026-09-24).
+"""Tests for the SM-committed `blocked` bool field on issues.
 
 The think tank gained a single player-facing `blocked` field (NOT a status), flipped
 only by the owning team's scrum master via `_file_block_change` + `_block_step`.

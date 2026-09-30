@@ -1,4 +1,4 @@
-"""The spike content executor's plan-execute-synthesize pipeline (2026-09-26).
+"""The spike content executor's plan-execute-synthesize pipeline.
 
 History: this started as a single free-text /api/chat completion with NO tool
 access at all -- the model just guessed from training knowledge and called it
@@ -55,7 +55,7 @@ class SpikeContent(unittest.TestCase):
     def _common_mocks(self, tavily=True):
         # Real network boundaries every test must stub: agent-key lookup, the
         # model tiers, and the library-file write (a real _http_json call).
-        # The JEV tier gate (2026-09-27) is stubbed deterministically to 'mid'
+        # The JEV tier gate is stubbed deterministically to 'mid'
         # so a spike (an investigation) exercises the mid path -- and the
         # underlying tier slugs are pinned so no real model resolution happens.
         patchers = [
@@ -88,8 +88,8 @@ class SpikeContent(unittest.TestCase):
         """The tool-access fix: the executor must call _call_agent_tool_loop
         with AGENT_ASK_TOOLS (browse_page/search_web), return_transcript=True
         (needed for synthesis), and force search_web SPECIFICALLY as the
-        first tool (not just force_first_tool=True's "any tool") -- real gap
-        caught live: "any tool" alone always reached for browse_page and
+        first tool (not just force_first_tool=True's "any tool") -- real gap:
+        any tool alone always reached for browse_page and
         never called search_web, missing facts that only exist in OTHER
         sites' coverage of the target."""
         self._common_mocks(tavily=True)
@@ -107,7 +107,7 @@ class SpikeContent(unittest.TestCase):
         tool_names = {t['function']['name'] for t in tools}
         self.assertIn('browse_page', tool_names)
         # Spikes can produce a real deliverable now, not just prose --
-        # real request (2026-09-26): "there might be a deliverable although
+        # "There might be a deliverable although
         # it is a spike" (a CSV of sources, a processed dataset, etc.).
         self.assertIn('execute_script', tool_names)
         # Chunked into rounds now (reflection/replan, ported from the user's
@@ -132,7 +132,7 @@ class SpikeContent(unittest.TestCase):
         self.assertIs(loop.call_args.kwargs.get('force_first_tool'), True)
 
     def test_internal_review_question_forces_search_library_first(self):
-        """Real gap caught LIVE (2026-09-26): a spike asked to "review the
+        """Gap: a spike asked to "review the
         think tank's own prior research on DreyX.com" went straight to
         browse_page and reported "no existing records" despite 7+ real
         matching Library entries -- the PLAN prompt's own "search_library
@@ -179,7 +179,7 @@ class SpikeContent(unittest.TestCase):
         self.assertIn('never invent', system_text.lower())
 
     def test_plan_prompt_requires_a_mandatory_csv_step_for_enumerable_questions(self):
-        """Real refinement (2026-09-26): a plan that only SUGGESTS a CSV lets
+        """Real refinement: a plan that only SUGGESTS a CSV lets
         the model describe one in prose instead of building it. The PLAN
         step's own instructions must make that step explicit, mandatory, and
         concrete (real filename/columns), never just an optional nicety."""
@@ -196,7 +196,7 @@ class SpikeContent(unittest.TestCase):
         self.assertIn('does NOT satisfy', plan_system_text)
 
     def test_plan_prompt_requires_verification_honesty_for_judgment_columns(self):
-        """Real refinement (2026-09-26), caught reviewing an actual spike's
+        """Real refinement, caught reviewing an actual spike's
         output: a feasibility CSV looked equally authoritative whether each
         row was really checked or just guessed from training knowledge --
         no way to tell which from the report alone. The PLAN must require an
@@ -239,7 +239,7 @@ class SpikeContent(unittest.TestCase):
         self.assertIn('verified vs estimated', synth_user_text)
 
     def test_missing_basis_column_gets_a_disclaimer_prepended(self):
-        """Deterministic safety net (2026-09-26): confirmed live that the
+        """Deterministic safety net: confirmed that the
         model doesn't reliably follow through on the basis-column plan
         requirement even when the plan itself calls for it. Rather than
         trying to block a non-compliant CSV mid-flight (fragile), catch it
@@ -319,7 +319,7 @@ class SpikeContent(unittest.TestCase):
         self.assertEqual(content._extract_execute_script_outputs(transcript), ['final line, no stderr block'])
 
     def test_missing_raw_output_gets_appended_automatically(self):
-        """Second deterministic safety net (2026-09-26), caught in the SAME
+        """Second deterministic safety net, caught in the SAME
         real investigation as the basis-column one: a real file got cat'd
         into the transcript, but synthesis summarized it in prose instead
         of including it verbatim -- the real data never reached the report."""
@@ -528,7 +528,7 @@ class InternalReviewDetection(unittest.TestCase):
 
 class SpikeSandboxExecutor(unittest.TestCase):
     """_make_spike_sandbox_executor: the real request behind execute_script --
-    "there might be a deliverable although it is a spike" (2026-09-26)."""
+    "there might be a deliverable although it is a spike"."""
 
     def test_successful_command_reports_exit_code_and_stdout(self):
         executor = content._make_spike_sandbox_executor('cora', 'key-123', 'spike-1')
@@ -725,7 +725,7 @@ class ReflectionAndReplan(unittest.TestCase):
 
 
 class LibraryReviewTools(unittest.TestCase):
-    """search_library / read_library_file (2026-09-26): the inverse of
+    """search_library / read_library_file: the inverse of
     promote-spike's fix -- a spike reviewing another team's real completed
     work, instead of guessing at it, needs a way to actually search and
     read the Library. In-process, mirrors _library_search_matches /
@@ -853,7 +853,7 @@ class TrendForcedToolDetection(unittest.TestCase):
 
 class TregToolsExecutor(unittest.TestCase):
     """_make_treg_tools_executor: real Treg API mechanics (POST /call/{id},
-    X-Treg-Token), confirmed live against Treg's own docs and the actual
+    X-Treg-Token), confirmed against Treg's own docs and the actual
     upstream provider -- not guessed (see the Treg skill's own "Lessons
     learned" about an earlier agent inventing wrong prices)."""
 
@@ -862,7 +862,7 @@ class TregToolsExecutor(unittest.TestCase):
         with unittest.mock.patch.object(serve, '_treg_call', return_value=({'trends': ['ai']}, None)) as call, \
              unittest.mock.patch.object(serve, '_accrue_spend') as accrue:
             out = executor('x_trending_topics', {'woeid': 1})
-        # method='GET' confirmed live (2026-09-26): Treg's own real error for
+        # method='GET' confirmed: Treg's own real error for
         # the first (POST) attempt was explicit -- "x.x.get-trends-by-woeid
         # is GET -- add --method GET", then "needs --query woeid=<value>".
         call.assert_called_once_with('x.x.get-trends-by-woeid', {'woeid': 1}, method='GET')
@@ -885,7 +885,7 @@ class TregToolsExecutor(unittest.TestCase):
         self.assertIn('Could not get trending topics', out)
 
     def test_search_linkedin_posts_builds_the_real_live_verified_request_shape(self):
-        # Real gap caught live (2026-09-26): the originally planned endpoint
+        # Gap: the originally planned endpoint
         # (harvestapi.linkedin.post.search) failed closed on the first real
         # call -- its declared query params were never published anywhere
         # findable, and Treg's own error gave no field names. Switched to
@@ -1082,8 +1082,8 @@ class PixellabCharacterTool(unittest.TestCase):
 
 class GoogleToolsExecutor(unittest.TestCase):
     """read_google_sheet / append_google_sheet_row / list_calendar_events /
-    create_calendar_event -- real OAuth call mechanics confirmed live
-    (2026-09-26) against a real refresh token minted through a real
+    create_calendar_event -- real OAuth call mechanics confirmed
+    against a real refresh token minted through a real
     installed-app consent flow, before anything was built on top of it."""
 
     def test_read_google_sheet_builds_the_real_url_and_returns_data(self):
@@ -1191,7 +1191,7 @@ class GoogleToolsExecutor(unittest.TestCase):
 
 class GitHubToolsExecutor(unittest.TestCase):
     """github_get_repo / github_list_issues / github_get_issue /
-    github_search_code -- real read-only GitHub API calls (2026-09-28) so
+    github_search_code -- real read-only GitHub API calls so
     engineering work grounds itself in real public code instead of
     hallucinating plausible-looking repos/issues."""
 

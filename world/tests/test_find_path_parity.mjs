@@ -1,6 +1,6 @@
 // Differential parity test for the Phase-2 server-side-simulation port of
 // findPath (tasks.js) into sim.py. The Python `sim.find_path` is a fork-lift
-// of the JS `findPath`; every corner case in that function is a live-caught
+// of the JS `findPath`; every corner case in that function is a
 // production bug, so "close enough" is not acceptable -- this test feeds the
 // REAL tasks.js findPath (loaded into a vm with the real production files)
 // and the REAL sim.find_path (shelled out through tests/_find_path_bridge.py)

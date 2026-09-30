@@ -16,7 +16,7 @@ Not actually hermetic against the real DB despite the plain-dict states used
 throughout: _assign_due_item's assignment path has an inline `from serve
 import log_action` call, a real side effect that writes into whatever real
 think_tank.db sits at serve.py's default path unless DB_PATH is redirected
-below. Found 2026-09-25 via a live production think_tank.db that picked up a
+below. Found via a live production think_tank.db that picked up a
 test fixture row after a routine test run.
 """
 

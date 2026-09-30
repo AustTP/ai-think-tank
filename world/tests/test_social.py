@@ -1,4 +1,4 @@
-"""Tests for the weekly cross-team Knowledge Social (2026-09-23).
+"""Tests for the weekly cross-team Knowledge Social.
 
 A weekly 30-minute conversation in the Hangout for agents that PRODUCED an
 approved deliverable this week (weekApprovals > 0). Attendees return exactly to
@@ -9,7 +9,7 @@ think tank). Deterministic -- no Jev, direct _social_step calls. NOT actually
 DB-free: the carry-away/digest logging path has inline `from serve import
 log_action` calls, a real side effect that writes into whatever real
 think_tank.db sits at serve.py's default path unless DB_PATH is redirected
-below. Found 2026-09-25 via a live production think_tank.db that picked up test
+below. Found via a live production think_tank.db that picked up test
 fixture rows after a routine `tests/run_all.sh` run.
 """
 import os

@@ -2,7 +2,7 @@
 // otherwise only exercised transitively through runTaskCycleBody (which is
 // heavily mocked and async): _isWorkItemDue, _normalizePriority, and
 // _pickNextDueIndex's determinism / exclusion logic (the attemptedThisCycle
-// fix from the 2026-09-21 audit). Room-capacity overflow and the full queue
+// fix from the audit). Room-capacity overflow and the full queue
 // cycle are covered by test_room_overflow.mjs and test_idle_quiet.mjs
 // respectively, so those aren't re-tested here.
 //

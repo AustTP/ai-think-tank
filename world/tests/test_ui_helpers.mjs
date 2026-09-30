@@ -34,12 +34,13 @@ function extractFunction(src, name) {
 }
 
 function extractConst(src, name) {
-  // Matches both `const NAME = N` and a second declarator in the same
-  // statement (`const VIEW_W = 960, VIEW_H = 680;`), which is how these
-  // two are actually declared.
-  const m = src.match(new RegExp(`(?:const\\s+)?\\b${name}\\s*=\\s*(\\d+)`));
+  // Matches `const NAME = N`, `const NAME = Math.round(...)`, or a second
+  // declarator in the same statement (e.g. `const VIEW_W = 1024, VIEW_H = Math.round(...)`),
+  // which is how these two are actually declared. The expression after `=` is
+  // evaluated so a derived constant like VIEW_H resolves to its real value.
+  const m = src.match(new RegExp(`(?:const\\s+)?\\b${name}\\s*=\\s*([^,;]+)`));
   if (!m) throw new Error(`const ${name} not found in index.html`);
-  return Number(m[1]);
+  return Function(`"use strict"; return (${m[1].trim()})`)();
 }
 
 const VIEW_W = extractConst(html, 'VIEW_W');

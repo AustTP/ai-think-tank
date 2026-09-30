@@ -1,4 +1,4 @@
-"""Tests for Cut 2 -- the three missing team processes (2026-09-23):
+"""Tests for Cut 2 -- the three missing team processes:
 
 1. Deliverable grading + director roadmap: a completed deliverable is graded
    (injectable Jev, deterministic fallback on outage); the weekly roadmap step
@@ -19,7 +19,7 @@ the plain-dict state: several of these code paths (task_peer_widened,
 task_review_requeued, runbook/roadmap logging) have inline `from serve import
 log_action` calls -- a real side effect, not a stub -- which write straight
 into whatever real think_tank.db sits at serve.py's default path unless DB_PATH
-is redirected below. Found 2026-09-25 via a live production think_tank.db that
+is redirected below. Found via a live production think_tank.db that
 picked up test fixture rows after a routine `tests/run_all.sh` run.
 """
 import os
@@ -268,7 +268,7 @@ class Runbook(unittest.TestCase):
 
 
 class Refocus(unittest.TestCase):
-    # 2026-09-25: a reminder of the product's stated purpose, injected only
+    # A reminder of the product's stated purpose, injected only
     # when a task is REVISITING existing work (a review/revision or an
     # incident), not on every fresh assignment -- that would just be more of
     # the ceremony this is meant to counter.

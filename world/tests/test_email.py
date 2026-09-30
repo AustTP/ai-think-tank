@@ -1,4 +1,4 @@
-"""Tests for real player-notification email (2026-09-25). An action-needed event
+"""Tests for real player-notification email. An action-needed event
 (agent asks a question / a card gets blocked / a story lands for review) queues a
 one-way notification that serve.py drains and emails to the player via SMTP using
 a vault-held Gmail app-password.
@@ -27,7 +27,7 @@ _PATCHER = None
 
 
 def setUpModule():
-    # Real gap found 2026-09-25 (same class as test_composite_trust.py's own
+    # Gap (same class as test_composite_trust.py's own
     # fix): this file was never DB-isolated -- FailClosed.
     # test_send_without_credential_fails_closed calls serve._delete_credential
     # directly, which would delete a REAL player's provisioned Gmail
@@ -130,7 +130,7 @@ class TriggerSites(unittest.TestCase):
         self.assertIn('card_blocked', kinds)
 
     def test_peer_review_queues_email(self):
-        # Peer review is agent-to-agent (2026-09-24): entering review notifies
+        # Peer review is agent-to-agent: entering review notifies
         # the picked reviewers via their MAILBOX, not the player -- the player
         # only hears about a story when it actually SHIPS (story_done). This
         # asserts both halves: the reviewers got their mailbox notice, and no
@@ -152,7 +152,7 @@ class TriggerSites(unittest.TestCase):
 
 
 class EndpointAuth(unittest.TestCase):
-    """Real gap found live 2026-09-25: /api/player-email/credential's handler
+    """Gap: /api/player-email/credential's handler
     checks _resolve_requester to reject an agent that explicitly self-
     identifies (?requesterId=<id>), but the path was missing from
     AUTH_PROTECTED_PREFIXES entirely -- that check was the ONLY gate, so a
@@ -218,7 +218,7 @@ class FailClosed(unittest.TestCase):
 
 
 class PlayerEmailDisabled(unittest.TestCase):
-    """Player's call (2026-09-26): Telegram only, no more email. Same
+    """Telegram only, no more email. Same
     kill-switch shape as AGENT_BROWSING_ENABLED -- flips the send off without
     touching the credential/outbox machinery."""
 

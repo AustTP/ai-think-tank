@@ -1,6 +1,6 @@
 """Tests for parking idle (on-duty-but-unoccupied) agents off duty.
 
-2026-09-23: a woken-but-never-assigned agent lingers on-duty and visible
+A woken-but-never-assigned agent lingers on-duty and visible
 forever (nothing re-parks it until a task completes). The player's rule is
 "unless an agent has scheduled work or is active, they should not appear."
 _park_idle_wanderers sends every fully-idle, on-duty, non-admin agent back

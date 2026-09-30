@@ -1,4 +1,4 @@
-"""Pure, self-contained helpers extracted from sim.py (2026-09-27).
+"""Pure, self-contained helpers extracted from sim.py.
 
 These are the tiny utilities sim.py used to define inline -- priority
 normalization, work-item due-ness, sprint/product id generation, team row

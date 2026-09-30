@@ -8,7 +8,7 @@
 //      the server loop is alive: tick increasing with no browser attached.
 //   2. Exposes the latest status globally + via an event, so a future HUD can
 //      render it and tests can assert convergence without UI intrusions.
-// 2026-09-23: 1000 (was 2000) to match the finer SIM_TICK_S=1.0s server
+// 1000 (was 2000) to match the finer SIM_TICK_S=1.0s server
 // heartbeat -- status/positions displayed ~2x sooner on the map.
 const SIM_POLL_MS = 1000;
 
@@ -46,7 +46,7 @@ async function refreshServerPositions() {
 // every SIM_TICK_S (1.0s, sim.py) and the poll refreshes faster; a small lerp
 // makes agents glide toward the latest authoritative position instead of
 // snapping, converging without a fixed interpolation buffer.
-// 2026-09-24 (player call: "I feel there is a slight delay"): 0.25 meant it
+// (player call: "I feel there is a slight delay"): 0.25 meant it
 // took ~2s of real time (4 polls at the old 500ms rate) to close 68% of any
 // gap -- noticeably laggy. Raised to 0.45 alongside the faster 250ms poll
 // below; the tradeoff is a slightly less silky glide on a big jump, which is
@@ -73,7 +73,7 @@ function applyServerPositions(state) {
     if (typeof sp.busy === 'boolean') a.busy = sp.busy;
     if (typeof sp.inRoom !== 'undefined') a.inRoom = sp.inRoom;
     if (typeof sp.offDuty === 'boolean') a.offDuty = sp.offDuty;
-    // Real bug caught live (2026-09-24): this snapshot never carried
+    // Bug: this snapshot never carried
     // `visible` before, so a client's copy stayed frozen at whatever it was
     // on page load -- an agent who went invisible afterward (entering a
     // room, being parked off duty) kept rendering as a "ghost" at her last
@@ -90,7 +90,7 @@ async function startSimPoll() {
   setInterval(refreshSimStatus, SIM_POLL_MS);
   // Positions refresh slightly faster than the status poll so a fresh server
   // tick lands in the renderer without waiting the full poll interval.
-  // 2026-09-24 (was 500ms): halved again, paired with the higher SERVER_LERP
+  // (was 500ms): halved again, paired with the higher SERVER_LERP
   // above, so a real 1.0s server tick shows up on the map much sooner instead
   // of visibly lagging behind.
   setInterval(refreshServerPositions, 250);

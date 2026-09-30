@@ -1,7 +1,7 @@
-// Real regression test for room-capacity overflow (tasks.js), added
-// after a direct ask: "if the work room is full, they can use the
-// observatory to do the same work... I don't want to limit if we have
-// tasks ongoing." Work Room (pressoffice) and Research Center
+// Real regression test for room-capacity overflow (tasks.js): when the
+// work room is full, agents use the observatory to do the same work, so
+// ongoing tasks aren't limited by a single room's capacity. Work Room
+// (pressoffice) and Research Center
 // (observatory) share the exact same six-desk 'workstations' layout
 // (ROOM_COLLISIONS/ROOM_INTERACTABLES, rooms.js/terminals.js), so
 // overflow from one into the other is physically sensible.

@@ -197,10 +197,10 @@ def _extract_csv_like_blocks(text):
     tool than the problem needs' reasoning as the Library's own plain
     substring search.
 
-    Deterministic safety net (2026-09-26): the distill synthesis prompt
+    Deterministic safety net: the distill synthesis prompt
     explicitly tells the model to 'extract what the think tank NOW knows...
     do not just re-print the raw archive files' -- exactly the summarize-
-    don't-preserve instruction that already, twice tonight, caused a
+    don't-preserve instruction that already, twice, caused a
     spike's real CSV to get flattened into prose instead of kept verbatim
     during ITS OWN synthesis step. This is the same failure one step
     downstream, when a spike's archived findings get folded into the wiki."""
@@ -213,7 +213,7 @@ def _extract_csv_like_blocks(text):
     # consecutive non-empty lines with a CONSISTENT comma count (matching
     # their header's column count), not just "any comma present."
     #
-    # Real gap flagged (2026-09-26): the original check (>=1 comma, no
+    # Gap flagged: the original check (>=1 comma, no
     # consistency requirement) could false-positive on ordinary prose -- 3
     # consecutive comma-bearing sentences is rare but not impossible. A
     # blanket higher minimum (e.g. >=2 commas) was considered and rejected:
@@ -465,7 +465,7 @@ def _run_distill_content(snapshot, agent_id, task, base_ctx=None):
                                           {'note': f'Distilled {len(archives)} finding(s), but the synthesis call returned nothing usable.', 'noop': True})
         return
 
-    # 4. Deterministic safety net (2026-09-26): the synthesis prompt above
+    # 4. Deterministic safety net: the synthesis prompt above
     # explicitly tells the model to summarize, not re-print, the archives --
     # the same instruction that already flattened a spike's real CSV into
     # prose during ITS OWN synthesis, one step upstream of here. Any real
@@ -496,7 +496,7 @@ def _run_distill_content(snapshot, agent_id, task, base_ctx=None):
 def _run_observatory_content(snapshot, agent_id, task, base_ctx=None):
     """Observatory's own executor choice branches on which flag the task
     carries, not a fixed 1:1 key like every other room -- pulled out of the
-    dispatcher (2026-09-25, registry conversion) so it reads and tests the
+    dispatcher (registry conversion) so it reads and tests the
     same way every other _run_*_content executor does."""
     if task.get('distill'):
         _run_distill_content(snapshot, agent_id, task, base_ctx)
@@ -517,7 +517,7 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
     (bank / library / postoffice / unset) are NOT dispatched -- those fall back
     to the slice-1 workUntil placeholder.
 
-    Registry conversion (2026-09-25): was a single if/elif chain: taskType
+    Registry conversion: was a single if/elif chain: taskType
     checked before room (a review/spike overrides whatever room it's queued
     into -- see each branch's own reasoning below), room itself a flat match
     except observatory's flag-based sub-dispatch (now _run_observatory_content,
@@ -566,7 +566,7 @@ def _run_bank_content(snapshot, agent_id, task, base_ctx=None):
     """The Bank teller. A director (or the admin) gets the full readable
     readout: per-service used/cap/left, a burn-rate forecast, and reallocation
     authority. A non-director gets a real, READ-ONLY cumulative summary too --
-    per your call (2026-09-24): the think tank should have hive-mind awareness of
+    The think tank should have hive-mind awareness of
     what its own actions cost, not just directors. Only the AUTHORITY to
     reallocate/raise caps stays director-only; visibility into "are we
     healthy" does not. Reports via the standard content-result note so the
@@ -611,14 +611,14 @@ def _run_bank_content(snapshot, agent_id, task, base_ctx=None):
             + ("WARNING: at least one service is over its cap - directors should re-allocate or raise a cap."
                if over_any else
                "All services are within cap; directors can coordinate to keep it that way."))
-    # Per your call (2026-09-24): reconcile against the REAL OpenRouter account
+    # Reconcile against the REAL OpenRouter account
     # balance too, not just the think tank's own internal ledger -- the two can
     # legitimately diverge (outside usage on the same key, manual top-ups).
     credits = _serve._openrouter_account_credits()
     if credits:
         note += (f" OpenRouter account (real): ${credits['totalCredits']:.2f} total credits, "
                  f"${credits['totalUsage']:.2f} used lifetime, ${credits['remaining']:.2f} remaining.")
-    # Apify FREE-plan reconcile (2026-09-28): same live-account pattern -- show
+    # Apify FREE-plan reconcile: same live-account pattern -- show
     # the REAL cycle spend/cap the plan is enforcing, not just the think tank's
     # own ledger, so the teller sees the $5/month wall it's actually against.
     apify_usage = _serve._apify_account_usage()
@@ -1273,7 +1273,7 @@ GRADE_MEETS = 'meets_requirement'
 GRADE_FAILS = 'fails_requirement'
 GRADE_UNSURE = 'insufficient_evidence'
 
-# CS329A takeaway #2 (2026-09-28): Weaver-style verifier ensemble for grading.
+# CS329A takeaway #2: Weaver-style verifier ensemble for grading.
 # The JS planning model emits a per-requirement CHECKLIST ({id, question,
 # section, type: code|jev|human}) that travels with a project's subtasks, but
 # the Python review executor (_run_review_content) only ever produced a single
@@ -1606,7 +1606,7 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                                       f'"{backlog}" -- fix them. Build on the existing files.'
                                       + (f'\n\nQuality pipeline is red: {qp["note"]}' if not qp['ok'] else '')),
                      'goal': project_label,
-                     # Real bug caught live (2026-09-24): this never carried
+                     # Bug: this never carried
                      # productId, so every fix cycle after a rejection fell
                      # through _run_workroom_content's dispatcher (which checks
                      # productId FIRST) into the generic _run_coding_content --
@@ -1828,7 +1828,7 @@ def _plan_requires_verification_basis(plan_text):
     estimated) column was needed for a judgment CSV -- used as the trigger
     for the post-hoc disclaimer below, since the plan saying the right thing
     is not the same as the final report actually containing it (real gap
-    caught live, 2026-09-26)."""
+    ."""
     t = (plan_text or '').lower()
     return 'basis' in t and ('verified' in t or 'estimated' in t)
 
@@ -1854,12 +1854,12 @@ def _spike_wants_internal_review(backlog, instructions):
     same 'don't reach for a heavier tool than the problem needs' style as
     the other plan-phase detectors above. Used to FORCE search_library as
     the first tool call, not just ask the PLAN prompt to suggest it: real
-    gap caught LIVE (2026-09-26) -- a real spike asked to "review the
+    gap -- a real spike asked to "review the
     think tank's own prior research on DreyX.com" went straight to browse_page
     and reported "no existing records" despite 7+ real matching entries
     already in the Library, because the PLAN prompt's own "search_library
     first" instruction was never reliably followed. This is the exact same
-    failure class already fixed once tonight for search_web (force_first_
+    failure class already fixed once for search_web (force_first_
     tool=True alone always still reached for browse_page) -- the SAME
     proven fix: force the specific tool by name, don't just ask nicely."""
     text = f'{backlog or ""} {instructions or ""}'.lower()
@@ -1903,7 +1903,7 @@ def _spike_wants_github(backlog, instructions):
 def _extract_execute_script_outputs(transcript):
     """Pull the stdout of every execute_script tool call out of a real
     _call_agent_tool_loop transcript (matching each tool_call_id to its
-    result). Used as a deterministic safety net (2026-09-26): confirmed
+    result). Used as a deterministic safety net: confirmed
     live that a spike can cat a real produced file into its own transcript
     and then still summarize it in prose during synthesis instead of
     including it verbatim -- the real data existed, it just never made it
@@ -1927,7 +1927,7 @@ def _extract_execute_script_outputs(transcript):
     return outputs
 
 
-# Reflection/replan (2026-09-26), ported (design, not code) from the user's
+# Reflection/replan, ported (design, not code) from the user's
 # own MAGI framework's react_engine.py ReflectionEngine -- a real gap: the
 # EXECUTE tool loop ran as ONE flat call for its whole iteration budget,
 # with no mid-run check on whether it was actually still on track. This
@@ -1979,7 +1979,7 @@ def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, to
     return execute_text, current_messages
 
 
-# Real request (2026-09-26): "no committed deliverable" (a spike's actual
+# "No committed deliverable" (a spike's actual
 # defining property -- it never opens a peer gate, see _peer_gated_lane)
 # got conflated with "no code execution." Sometimes the honest answer to an
 # investigation needs to DO something with what was found -- write a CSV of
@@ -2067,7 +2067,7 @@ def _make_spike_sandbox_executor(agent_id, agent_key, sandbox_id, struck_tools=N
     return execute_tool
 
 
-# Real request (2026-09-29): agent work this Mac cannot do -- CUDA/torch GPU
+# Agent work the host machine cannot do -- CUDA/torch GPU
 # jobs, fine-tuning experiments, heavy numeric work -- now runs on a real
 # Google Colab T4 runtime, provisioned on demand by the spike toolchain and
 # budgeted as compute units in the Bank. run_on_colab mirrors execute_script
@@ -2156,7 +2156,7 @@ def _make_colab_compute_executor(agent_id, struck_tools=None):
     return execute_tool
 
 
-# Real request (2026-09-26): the inverse of promote-spike's fix (a spike's
+# The inverse of promote-spike's fix (a spike's
 # real findings now flow FORWARD into a new story) is a spike whose job is
 # to review work another team already did (a finished story, an earlier
 # spike, a distilled wiki page) BEFORE this team builds something similar
@@ -2223,13 +2223,13 @@ def _make_library_tools_executor(agent_id, struck_tools=None):
     to ever be a POLICY denial rather than "no matches" -- kept consistent
     so a future caller that adds a gate here for free gets one-strike too.
 
-    Logs via log_action (2026-09-26, added after a live burn-in): these two
+    Logs via log_action (added after a live burn-in): these two
     tools are in-process (no /api/browse-style HTTP hop), so unlike every
     other tool they had ZERO observability -- when a real live run's report
     claimed "no existing records" despite matching entries already in the
     Library, there was no way to directly confirm whether search_library
     was ever actually called at all versus just never finding a match. This
-    closes that gap for good, not just for tonight's one-off check."""
+    closes that gap for good, not just for a one-off check."""
     def execute_tool(name, args):
         if struck_tools is not None and name in struck_tools:
             return (f'{name} was already blocked once this investigation (one-strike) -- '
@@ -2244,7 +2244,7 @@ def _make_library_tools_executor(agent_id, struck_tools=None):
                               {'query': query, 'matches': len(matches)}, authorized=True)
             if not matches:
                 return f'No Library matches for "{query}" -- no internal record of this was found.'
-            # Real gap caught live (2026-09-26): the top-ranked match isn't
+            # Gap: the top-ranked match isn't
             # always the most substantial one -- a live run read the first
             # (most recent) result, which happened to be a prior attempt's
             # OWN thin, inconclusive finding, while richer earlier
@@ -2271,7 +2271,7 @@ def _make_library_tools_executor(agent_id, struck_tools=None):
                     content_text = f.read(20_000)
             except OSError:
                 return f'Could not read {path}'
-            # Trail reinforcement (2026-09-26): a real, actual read of this
+            # Trail reinforcement: a real, actual read of this
             # finding by another team's investigation is exactly the signal
             # that should make it rank higher in future search_library calls.
             _serve.record_library_read(path)
@@ -2282,8 +2282,8 @@ def _make_library_tools_executor(agent_id, struck_tools=None):
     return execute_tool
 
 
-# Real, on-demand social/trend monitoring (2026-09-26), per your explicit
-# request. Deliberately on-demand only, not a recurring cadence -- real
+# Real, on-demand social/trend monitoring.
+# Deliberately on-demand only, not a recurring cadence -- real
 # per-call cost against Treg's own $10+ balance (separate from the
 # OpenRouter spend cap), and the discipline established this same evening
 # was "no more building beyond what's needed, watch spend closely." These
@@ -2368,7 +2368,7 @@ def _make_treg_tools_executor():
     return execute_tool
 
 
-# Real character-sprite generation (2026-09-26), per your explicit request
+# Real character-sprite generation,
 # to wire up the remaining documented-but-unused APIs. Follows the SAME
 # call shape as the think tank's own already-tested spike script
 # (scripts/pixellab_spike.py), not a fresh guess at the public API. Real
@@ -2376,7 +2376,7 @@ def _make_treg_tools_executor():
 # price list the way Treg's catalog does -- see _pixellab_account_balance's
 # own docstring for why a forced, uncached read is required on both sides
 # of the call), matching the "don't fabricate a number, use a verified one"
-# rule already applied to every other real integration tonight.
+# rule already applied to every other real integration.
 _PIXELLAB_CHARACTER_TOOL = {
     'type': 'function',
     'function': {
@@ -2442,7 +2442,7 @@ def _make_pixellab_tools_executor():
     return execute_tool
 
 
-# Google Sheets/Calendar (2026-09-26), per your explicit request. Both APIs
+# Google Sheets/Calendar. Both APIs
 # are free today (quota, not cost -- see library/skills/google-sheets-
 # calendar.md), so unlike Treg/PixelLab there's no spend to accrue; the
 # real constraint here is quota, and the skill doc's own stated policy is
@@ -2583,7 +2583,7 @@ def _make_google_tools_executor():
     return execute_tool
 
 
-# GitHub read tools (2026-09-28), per the player's call: the think tank is an
+# GitHub read tools: the think tank is an
 # engineering org that already PUBLISHES to GitHub, but had no READ access --
 # it could push real code yet could never ground its engineering work in real
 # repos/issues/PRs (it would hallucinate plausible-looking ones instead). These
@@ -2776,7 +2776,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     a content result. A spike never opens a peer gate and never releases a
     product -- it answers a question, that's all.
 
-    2026-09-26: this used to be a single free-text /api/chat completion with
+    This used to be a single free-text /api/chat completion with
     NO tool access at all -- the model just guessed from training knowledge
     and called it "findings" (see the SECURITY_TEST_TOOLS comment in serve.py
     for the fabricated-report incident that exact pattern already caused
@@ -2786,7 +2786,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     used, assess replicating each daily") showed the NEXT gap: a single
     non-reasoning model in one flat tool loop settles too early on genuinely
     open-ended, multi-step work, because it can't reliably judge "have I
-    covered this exhaustively." Real, explicit fix, per your call: PLAN
+    covered this exhaustively." Real, explicit fix, PLAN
     (reasoning tier, one call, a concrete checklist) -> EXECUTE (mid tier,
     the existing many-iteration tool loop, now following that checklist) ->
     SYNTHESIZE (reasoning tier, one call, given the FULL gathered transcript,
@@ -2800,15 +2800,14 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     backlog = task.get('title') or ''
     instructions = task.get('instructions')
     budget = task.get('budgetMs')
-    # Real request (2026-09-26): the player asked whether they'd ever hear
-    # about a spike finishing, on either channel -- they wouldn't have; the
+    # A spike finishing used to generate no notice on either channel; the
     # think tank was reactive-only. notifyPlayer is the (safe, indirect --
     # _apply_content_result actually queues it) way any executor asks to be
     # notified on completion, success or failure alike, so silence never
     # reads as "still working" when it already gave up.
     tier_slug = _serve._resolve_model_tier(f'Run a time-boxed web investigation (spike): {backlog[:200]}')
     # The plan/synthesize bookends do the genuine reasoning of a spike. No
-    # separate reasoning band needed (2026-09-27): the JEV tier gate already
+    # separate reasoning band needed: the JEV tier gate already
     # routes consequential work to mid/high, whose models are reasoning-
     # capable. Gate with allow_high so a hard investigation can spend up.
     reasoning_slug = _serve._resolve_model_tier(
@@ -2961,12 +2960,12 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                                             _PIXELLAB_CHARACTER_TOOL,
                                             _GOOGLE_SHEETS_READ_TOOL, _GOOGLE_SHEETS_APPEND_TOOL,
                                             _GOOGLE_CALENDAR_LIST_TOOL, _GOOGLE_CALENDAR_CREATE_TOOL]
-    # GitHub read tools (2026-09-28): offered only when GITHUB_TOKEN is set --
+    # GitHub read tools: offered only when GITHUB_TOKEN is set --
     # same conditional-availability rule as search_web (unset = tool simply
     # absent, so the surface never advertises something that would fail).
     if _serve.GITHUB_TOKEN:
         spike_tools += [_GITHUB_REPO_TOOL, _GITHUB_ISSUES_TOOL, _GITHUB_ISSUE_TOOL, _GITHUB_SEARCH_TOOL]
-    # Colab agent compute (2026-09-29): offered only when the colab CLI is
+    # Colab agent compute: offered only when the colab CLI is
     # actually installed on this machine -- same conditional-availability rule.
     if _serve.COLAB_CLI_AVAILABLE:
         spike_tools += [_COLAB_RUN_TOOL]
@@ -2994,20 +2993,20 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         return web_tool(tool_name, args)
 
     # 18/900 (was 10/600): a "list every X across the whole site" question
-    # (real request, 2026-09-26 -- "a full list of sources ever used on
+    # (real request, "a full list of sources ever used on
     # DreyX") needs many more browse_page round trips than a single-fact
     # lookup. This turn's own text no longer has to BE the final report
     # (synthesize does that from the full transcript below), so its token
     # budget stays modest -- it only needs room for a working summary plus
     # each tool call's own arguments.
     # Forcing search_web specifically (not just force_first_tool=True's
-    # "any tool") -- real gap caught live: force_first_tool=True alone still
+    # "any tool") -- gap: force_first_tool=True alone still
     # ALWAYS reached for browse_page on the target's own pages and never
     # called search_web at all, missing facts that only live in OTHER sites'
     # coverage of the target (a manual search surfaced DreyX's named upstream
     # sources that 3 rounds of browsing dreyx.com itself never found).
     #
-    # Same fix, second application (2026-09-26): an internal-prior-art
+    # Same fix, second application: an internal-prior-art
     # question needs search_library forced first for the identical reason --
     # a PLAN-prompt instruction to "search the library first" was NOT
     # reliably followed in a real live run (see _spike_wants_internal_review's
@@ -3015,7 +3014,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # default so an internal-review spike doesn't reach for the outside web
     # before it has even looked at what the think tank already knows.
     #
-    # Same fix, third application (2026-09-26): a real X-trending or
+    # Same fix, third application: a real X-trending or
     # LinkedIn-search question needs its own specific tool forced first for
     # the identical reason -- built preemptively this time, on day one,
     # rather than after a live miss, now that the pattern is proven twice.
@@ -3031,7 +3030,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         first_tool = 'search_web' if _serve.TAVILY_API_KEY else True
     # Chunked into rounds of 4 with a reflection self-check between them
     # (see _run_spike_tool_loop_with_reflection) -- same 50-call total
-    # budget (raised 18->30->50, 2026-09-27), just spent with a chance to
+    # budget (raised 18->30->50, just spent with a chance to
     # course-correct partway through instead of only finding out it went
     # sideways at the end.
     try:
@@ -3042,7 +3041,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         # A model-call failure (circuit-breaker RuntimeError, a 4xx, a network
         # blip) must never crash the spike executor or leave a half-baked
         # result -- record an honest not-ok like the empty-investigation path
-        # below does, and bail. (2026-09-27: without this, a tripped circuit
+        # below does, and bail. (without this, a tripped circuit
         # breaker propagated out of the tool loop and blew up the whole task.)
         _sim_module._store_content_result(task.get('id'), {
             'note': f'Spiked "{backlog}", but the investigation could not run (model call failed): {e}', 'ok': False,
@@ -3099,7 +3098,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                              'body': f'{name} looked into "{backlog}" but the model call returned nothing usable. You may want to ask again or rephrase it.'},
         })
         return
-    # Deterministic safety net (2026-09-26), not a prompt: confirmed live
+    # Deterministic safety net, not a prompt: confirmed
     # that the model doesn't reliably follow through on the VERIFICATION
     # HONESTY plan requirement above even when the plan itself calls for
     # it -- a per-item judgment CSV can still come back with no basis
@@ -3116,7 +3115,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             'below as UNVERIFIED -- general knowledge, not independently checked this run -- unless '
             'stated otherwise.\n\n' + finding
         )
-    # Second deterministic safety net (2026-09-26): confirmed live in the
+    # Second deterministic safety net: confirmed in the
     # SAME investigation -- a real file got cat'd into the transcript (a
     # genuine execute_script result, real data), but synthesis summarized it
     # in prose instead of including it verbatim, so the actual produced
@@ -3133,7 +3132,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                 'path': library_path,
                 'content': f'# Spike: {backlog}\n\nBy: {name}\n\n{finding}\n',
                 'source': 'firsthand'}, key)
-    # Data-minimization audit finding (2026-09-24, Hermes Town comparison):
+    # Data-minimization audit finding (Hermes Town comparison):
     # this was the ONE content executor (of 13) that duplicated the FULL
     # finding text into the task note -- which _apply_content_result (sim.py)
     # copies verbatim onto the durable task record AND the agent's own
@@ -3147,7 +3146,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # task record staying lean, not a regression of the same bug.
     _sim_module._store_content_result(task.get('id'), {
         'note': f'{name} spiked "{backlog}" -- see the Library entry just filed.', 'ok': True,
-        # Real gap caught live (2026-09-26): /api/intent/spike/{id}/promote
+        # Gap: /api/intent/spike/{id}/promote
         # (turning a spike into a real followup story) only ever had the
         # short note above to work with -- recording the exact path lets it
         # pull the REAL findings (source lists, CSVs, feasibility data)

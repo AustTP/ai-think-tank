@@ -23,7 +23,7 @@ const MORALE_NEGLECT_WEIGHT = 3, MORALE_NEGLECT_CAP = 30;
 // increments OR decays it. For an agent whose real activity doesn't
 // otherwise clear the gap (Dev's seeded 6 drops cost a flat 36 points,
 // permanently), that made morale a ceiling, not a meter: 236 real firing
-// reviews this session, stuck at 45-49 the entire time, because the one
+// reviews, stuck at 45-49 the entire time, because the one
 // input actually holding the score down could never move. A burnout
 // meter that can't recover isn't a meter, it's a label. Real fix: the
 // dropped-work penalty now fades out over MORALE_DROPPED_DECAY_DAYS of no

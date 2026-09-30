@@ -864,8 +864,7 @@ function openTerminal(item) {
   // outside/internet access -- do not share that access outside this
   // room") -- every other workstations-layout room (Media, Research
   // Center) keeps the generic stub terminal below. Press Office is
-  // labeled "Work Room" (ROOMS.pressoffice) -- real sandboxed execution,
-  // per your explicit call.
+  // labeled "Work Room" (ROOMS.pressoffice) -- real sandboxed execution.
   if (state.location.building === 'weatherstation') { openBrowser(item); return; }
   if (state.location.building === 'pressoffice') { openWorkroom(item); return; }
   if (state.location.building === 'observatory') { openResearch(item); return; }
@@ -923,8 +922,8 @@ function closeBrowser() {
 
 const BROWSE_MAX_HOPS = 3;
 
-// Follows breadcrumbs toward a stated goal, not just one fixed URL -- per
-// your call: an agent may not know in advance which page actually has
+// Follows breadcrumbs toward a stated goal, not just one fixed URL --
+// An agent may not know in advance which page actually has
 // what it's looking for. At each stop, Jev picks whichever link on the
 // CURRENT page gets closer to the goal (or says to stop here), the same
 // classifier "pick one of N" shape as everything else Jev does in this
@@ -1032,7 +1031,7 @@ async function handleBrowserCurl() {
 // /api/pipeline. Every command is classified by Jev before it runs and
 // then actually executes inside an isolated, resource-capped Docker
 // container with allowlisted egress. One shared sandbox for the whole
-// Work Room, not a fresh one per visit -- per your call, agents (and you)
+// Work Room, not a fresh one per visit -- agents (and you)
 // should be able to step out to the Weather Station or Library and come
 // back to find things exactly as they left them. serve.py's own
 // `_sandbox_dir_for()` handles the other half of that: it only wipes this
@@ -1121,9 +1120,9 @@ async function handleWorkroomRun() {
   runBtn.disabled = false;
 }
 
-// Research Center -- Observatory's real capability, per Phase 24's redesign
-// ("active investigative work," deliberately given the Work Room's exact
-// visual layout by your own choice). Mechanically that means the same
+// Research Center -- Observatory's real capability ("active investigative
+// work," deliberately given the same visual layout as the Work Room).
+// Mechanically that means the same
 // class of capability as the Press Office's Work Room (real sandboxed
 // execution), NOT the internet-access tool -- that one stays exclusive to
 // Weather Station per Eli's own profile line. A SEPARATE persistent
@@ -1213,13 +1212,13 @@ async function handleResearchRun() {
 }
 
 // The Library's real capability -- a shared file directory any agent (or
-// you) can read from or write to, per your call: code, notes, completed-
+// you) can read from or write to: code, notes, completed-
 // task records. Deliberately NOT injected into any agent's prompt
 // automatically -- reading a file here is an explicit action (a real
 // fetch someone chose to make), the same "memory as something you
 // retrieve on demand, not something prepended to every run regardless"
 // principle that keeps this from becoming the exact shared-notes cost
-// problem you flagged.
+// problem flagged earlier.
 let libraryActiveFile = null;
 
 function openLibrary(item) {
@@ -1388,7 +1387,7 @@ async function handleLibraryWrite() {
   btn.disabled = false;
 }
 
-// Real document ingestion -- per your ask, feed PDFs/Excel/code/HTML/
+// Real document ingestion: feed PDFs/Excel/code/HTML/
 // images/directories/zips straight off your own machine into the
 // Library. Player-only server-side (serve.py enforces this too, not just
 // the UI) -- a human pointing the server at their own file is a
@@ -1453,7 +1452,7 @@ function closeMailbox() {
 }
 
 // Bank teller -- no real currency/economy system exists anywhere in
-// World (confirmed: nothing tracks a balance), so per your call for
+// World (confirmed: nothing tracks a balance), so for now,
 // "multiple options," Check Balance and Make a Deposit are honest flavor
 // text rather than a fake ledger. Report Irregular Activity is the one
 // genuinely mechanical option -- it logs a real, timestamped entry to the
@@ -1534,7 +1533,7 @@ function showTellerReportForm() {
   });
 }
 
-// Defensive cap (2026-09-24): the toast is a single fixed-position banner
+// Defensive cap: the toast is a single fixed-position banner
 // with no built-in length limit -- most real dialogue now goes through a
 // real, truncated speech bubble instead (agents.js saySpeech), but this stays
 // as a backstop for the paths that still fall back to a toast (e.g. a
@@ -1557,7 +1556,7 @@ function showBusyToast(agent) {
   showToast(`${agent.name} is busy right now.`);
 }
 
-// House, for the player, is "literally just the board" -- per your call,
+// House, for the player, is "literally just the board" --
 // distinct from Command Center's admin-only hiring use (hiring.js), which
 // is a different room entirely, reached only via the HUD button below.
 let boardRefreshTimer = null;
@@ -1951,7 +1950,7 @@ function closeActivity() {
   activityRefreshTimer = null;
 }
 
-// Player Inbox (2026-09-28): the one place agents can genuinely block the
+// Player Inbox: the one place agents can genuinely block the
 // think tank waiting on YOU -- a director-gated question the agent couldn't
 // resolve internally (sim.py _deliver_player_ask). Until this panel existed
 // the questions were filed server-side and the player was emailed, but the
@@ -2078,7 +2077,7 @@ async function refreshInboxCount() {
   el.style.background = n > 0 ? '#c34f1f' : 'transparent';
 }
 
-// Per your call: give an admin a large task and let THEM break it down
+// Give an admin a large task and let THEM break it down
 // and delegate it, rather than you hand-assigning individual TASK_POOL
 // entries yourself. See assignBigTask() (tasks.js) for the actual
 // breakdown-then-Jev-assign flow -- this is just the UI wiring.
@@ -2350,7 +2349,7 @@ async function handleConversationSend() {
     input.focus();
   }
 
-  // Per your call: agents should be able to update their own notes as
+  // Agents should be able to update their own notes as
   // they see fit, and a conversation is exactly the kind of moment that
   // might warrant it. Fire-and-forget -- doesn't block the UI, and
   // conversations already work from anywhere on the map (proximity-
@@ -2370,7 +2369,7 @@ async function maybeUpdateNotesFromConversation(agentId) {
       method: 'POST',
       body: JSON.stringify({
         model: (MODEL_TIERS[a.model] || MODEL_TIERS.small).slug,
-        // Real bug caught live: this always ends on the agent's own last
+        // Bug: this always ends on the agent's own last
         // reply (an 'assistant' turn), and Nova Micro (and likely others)
         // silently returns null content when a call ends that way instead
         // of on a 'user' turn -- confirmed by isolating the exact same
@@ -2724,9 +2723,9 @@ function renderPresetButtons() {
   }
 }
 
-// Suggests, doesn't decide -- per the same "you need to be able to
-// monitor this" principle hiring/firing were built on, this only checks
-// boxes; you still press Start Call yourself. Iterative "pick one more,
+// Suggests, doesn't decide -- same player-in-control principle as
+// hiring/firing: this only checks
+// boxes; the player still presses Start Call themselves. Iterative "pick one more,
 // or stop" Jev calls (same shape as browseTowardGoal's link-following),
 // since Jev is a one-of-N classifier, not a pick-a-subset tool.
 async function suggestMeetingAttendees(topic) {
@@ -2981,7 +2980,7 @@ function update(dt) {
 
 function updateOutside(dt) {
   // Frozen while the Town Hall call-setup modal is open, or while the
-  // player is themselves a meeting participant (vanished, per your call --
+  // player is themselves a meeting participant (vanished:
   // someone in a call doesn't get pulled away by walking, they're just not
   // on the map to move).
   if (state.ui || state.location.kind === 'meeting') return;
@@ -3015,8 +3014,8 @@ function updateOutside(dt) {
   }
 
   // Walking onto a building's door tile prompts entry, Pokemon-style -- no
-  // separate interact key. Town Hall is now a MULTI-OPTION building (per your
-  // call): its door opens a menu letting you choose between the physical
+  // separate interact key. Town Hall is now a MULTI-OPTION building:
+  // its door opens a menu letting you choose between the physical
   // Hangout room and starting a meeting. House keeps opening the board.
   for (const building in ROOM_DOOR_TRIGGERS) {
     if (overlaps(p, ROOM_DOOR_TRIGGERS[building])) {
@@ -3028,7 +3027,7 @@ function updateOutside(dt) {
   }
 
   // Standing next to a (now-solid) agent shows a "press B to talk" prompt
-  // rather than opening the conversation automatically -- per your call,
+  // rather than opening the conversation automatically --
   // you decide when the dialog pops up, walking up to someone shouldn't be
   // enough by itself. Busy agents (in a Town Hall call right now; the only
   // real busy-state that exists today) get a toast instead of a prompt --
@@ -3231,7 +3230,7 @@ async function main() {
   // Tasks (tasks.js), a few seconds after load so everything else has
   // settled first, then on a recurring cycle -- a single one-shot demo
   // task meant only ever ONE agent ever moved; everyone else (Omar
-  // included, per your catch) just stood still forever with nothing to
+  // included) just stood still forever with nothing to
   // do. Jev (jev.js) picks who does each one from whoever's idle.
   if (!serverDrivesTasks) {
     setTimeout(runTaskCycle, 3000);
@@ -3310,7 +3309,7 @@ async function main() {
   }
 
   function renderHud() {
-    // Per your call (2026-09-20): this counts who's actually ACTIVE right
+    // This counts who's actually ACTIVE right
     // now (activeAgentCount(), tasks.js -- capped at MAX_ACTIVE_AGENTS,
     // hiring.js), not the total hired roster -- the whole point of a much
     // larger hireable inventory with only some agents present at once is
@@ -3427,7 +3426,7 @@ async function main() {
   function frame(now) {
     const dt = Math.min(0.05, (now - last) / 1000);
     last = now;
-    // Real bug found and fixed this session: an uncaught exception
+    // Bug found and fixed: an uncaught exception
     // anywhere in update()/render() used to mean the requestAnimationFrame
     // call below never ran, freezing the ENTIRE game dead, silently, with
     // nothing visible anywhere but the browser console. That specific bug

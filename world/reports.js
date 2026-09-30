@@ -1,16 +1,14 @@
-// Agent-on-agent reports, modeled on the reference screenshots you shared
-// (Tristen's "report-greg.md -- wes", quoting greg's own AGENTS.md as
-// evidence, stamped CAUGHT). Not a per-agent file everyone has -- reports
-// are filed conditionally, only when something's flagged, same as the
-// reference.
+// Agent-on-agent reports, modeled on a real reference report (a file that
+// quotes the subject's own AGENTS.md as evidence, stamped CAUGHT). Not a
+// per-agent file everyone has -- reports are filed conditionally, only
+// when something's flagged.
 //
-// There's no real agent reasoning yet (Phase 3, not started) to notice a
-// violation on its own, so filing is a player-driven action for now: you
-// review an agent's profile, pick one of their own operating-instruction
-// lines as the quoted evidence, choose who's filing it (any other agent,
-// or yourself), and add a note. The reference's "742 notes about each
-// other" were emergent; this is the same mechanic without the emergent
-// part -- Phase 3 territory once agents can actually catch each other.
+// There's no real agent reasoning yet to notice a violation on its own, so
+// filing is a player-driven action for now: the player reviews an agent's
+// profile, picks one of their own operating-instruction lines as the
+// quoted evidence, chooses who's filing it (any other agent, or the
+// player), and adds a note. Automated reporting is Phase 3 territory once
+// agents can actually catch each other.
 
 let REPORTS = []; // { id, aboutId, fromId, quote, note, ts, severity }
 let nextReportId = 1;
@@ -41,7 +39,7 @@ function fileReport(aboutId, fromId, quote, note) {
   return report;
 }
 
-// Per your call: a report shouldn't silently pile up into a firing review --
+// A report shouldn't silently pile up into a firing review --
 // the SUBJECT'S OWN MANAGER has to be notified first. Reaching the manager
 // also fixes an asymmetry: the queued firing review only ever hears about a
 // candidate from the Jev prompt (firer's say-so + the peer review), never

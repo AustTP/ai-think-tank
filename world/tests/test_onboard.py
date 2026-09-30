@@ -9,7 +9,7 @@ sync_agent_directories finalizes AGENTS.md. Deterministic -- no Jev spend.
 The "no serve import" claim above was wrong: _governance_pass's onboarding
 path has inline `from serve import log_action` calls, a real side effect
 that writes into whatever real think_tank.db sits at serve.py's default path
-unless DB_PATH is redirected below. Found 2026-09-25 via a live production
+unless DB_PATH is redirected below. Found via a live production
 think_tank.db that picked up test fixture rows (fake onboard meetings) after a
 routine `tests/run_all.sh` run.
 """
@@ -123,7 +123,7 @@ def _fresh_hire(state, decider):
     Still the ONLY hire: block further hires (cooldown) so the ceremony under
     test is that single new agent's, not a later hire's. Returns the new agent's
     id (the onboard ceremony's subject)."""
-    _run_governance(state, 12, decider)  # 2026-09-23: was 6 @ 2s tick (12s wall); keeps same wall-time @ 1s
+    _run_governance(state, 12, decider)  # was 6 @ 2s tick (12s wall); keeps same wall-time @ 1s
     roster = state.get('agentRoster') or []
     new_ids = [d['id'] for d in roster if d.get('director') == 'faye'
                and d['id'] not in ('faye', 'nora', 'ada', 'ben')]
@@ -214,7 +214,7 @@ class OnboardCeremony(unittest.TestCase):
         state = _idle_with_work(_seed())
         state['lastHireAt'] = 0
         new_id = _fresh_hire(state, self.decider_ben())
-        # Run through the ceremony stages (meeting elapsed). 2026-09-23: was 40 @
+        # Run through the ceremony stages (meeting elapsed). Was 40 @
         # 2s tick (80s wall); 80 @ 1s keeps the same wall-time.
         state, now = _run_governance(state, 80, self.decider_ben())
         new_agent = state['agents'][new_id]
