@@ -41,11 +41,11 @@ Google OAuth credential (client id/secret + refresh token).
   note)
 - https://developers.google.com/calendar/api/guides/quota (Calendar quotas +
   daily threshold + 2026 pricing note)
-- Verified live 2026-09-24 by the developer with real web search, correcting an
+- Verified by the developer with real web search, correcting an
   earlier agent spike (see Lessons learned below).
 
 ## Lessons learned
-- (2026-09-24) An earlier agent "spike" claimed Sheets/Calendar used a "daily
+- An earlier agent "spike" claimed Sheets/Calendar used a "daily
   project-level" quota and that Calendar's quota was lower than Sheets'. Both
   claims were wrong once checked against Google's real docs: the quotas are
   per-minute, and Calendar's is far HIGHER than Sheets', not lower. Same root

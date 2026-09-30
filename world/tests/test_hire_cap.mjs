@@ -1,5 +1,5 @@
 // Real regression test for the researcher headcount cap (hiring.js) --
-// per your call on 2026-09-20: admin should know the current count and
+// Admin should know the current count and
 // visibly stop trying to hire once the think tank is at its max (25),
 // rather than silently no-op forever. Covers both hiring entry points
 // (attemptAutoHire's autonomous path, hireSpecialist's direct path) and
@@ -120,7 +120,7 @@ await test('hireSpecialist also refuses and notes the cap, without calling any h
 console.log('\nan off-duty admin is not treated as available');
 
 await test('attemptAutoHire does not start a hire for an off-duty admin, even though she is not busy', async () => {
-  // Real bug caught live: this check only looked at .busy, so an
+  // Bug: this check only looked at .busy, so an
   // off-duty (resting) admin -- not busy, just asleep -- was treated as
   // available. finishHire() then unconditionally sets visible=true on
   // completion without ever restoring offDuty, leaving her stuck
@@ -139,7 +139,7 @@ await test('attemptAutoHire does not start a hire for an off-duty admin, even th
 console.log('\na fresh hire starts off-duty (dormant) when the active cap is already full');
 
 await test('hireSpecialist creates the agent but does not walk her out when canActivateAnother() is false', async () => {
-  // Real ask (2026-09-20): the total inventory (MAX_TOTAL_AGENTS) can be
+  // The total inventory (MAX_TOTAL_AGENTS) can be
   // much larger than the active ceiling (MAX_ACTIVE_AGENTS, tasks.js).
   // Hiring someone new for a fresh skill set while the think tank is
   // already at its active ceiling should still succeed -- she joins the

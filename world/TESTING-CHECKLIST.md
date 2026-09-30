@@ -59,7 +59,7 @@ Prereq: provision the credential once —
 → expect a **self-test email** back immediately (verified, not assumed).
 - [ ] **Agent asks a question** → you get an email with the issue key + question.
 - [ ] **Card gets blocked** → you get an email naming the card + reason.
-- [ ] **Story lands for review** → NO player email (2026-09-24 call: peer review is
+- [ ] **Story lands for review** → NO player email (by design: peer review is
       agent-to-agent, the two picked reviewers handle it via their own mailbox;
       the player only hears about things that actually need player input).
 - [ ] Email arrives at austtp25@gmail.com (check spam/junk too).

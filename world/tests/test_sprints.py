@@ -183,7 +183,7 @@ class ScrumMasterCondition(unittest.TestCase):
 
     def test_teams_missing_scrum_master(self):
         state = serve.get_state_from_db()
-        # Scrum masters scale with team size (2026-09-27): both teams here are
+        # Scrum masters scale with team size: both teams here are
         # below SCRUM_MASTER_MIN_TEAM_SIZE (faye has 1 worker, dev has 2), so
         # neither REQUIRES a designated scrum master -- the director stands in.
         missing = serve._teams_missing_scrum_master(state, ['faye', 'dev'])

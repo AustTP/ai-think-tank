@@ -13,7 +13,7 @@ Two layers, hermetic:
 The "DB state...mocked" claim only covered the READ side (get_state_from_db
 is patched per-test); save_state_to_db and log_action were never mocked and
 go straight to serve.py's real DB_PATH via TestClient(serve.app), so a write
-during any of these tests landed in a real think_tank.db. Found 2026-09-25 via a
+during any of these tests landed in a real think_tank.db. via a
 live production think_tank.db that picked up "player clarify" log rows after a
 routine test run; DB_PATH is now redirected below so even an unmocked write
 lands in a throwaway temp file.
@@ -140,7 +140,7 @@ class ClarifyEndpointTests(unittest.TestCase):
     (DB state, model, KB search) mocked so a real think tank is never touched."""
 
     def setUp(self):
-        # Clarify shares the rate-limited ask lane (2026-09-28) -- clear the
+        # Clarify shares the rate-limited ask lane -- clear the
         # bucket per test so this suite is hermetic regardless of order.
         serve._rate_limit_calls.pop(serve.ASK_LANE_RATE_LIMIT_KEY, None)
 

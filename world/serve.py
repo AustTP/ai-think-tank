@@ -41,7 +41,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-# Pure web/text/path/security helpers extracted to their own module (2026-09-27)
+# Pure web/text/path/security helpers extracted to their own module
 # to shrink the serve.py monolith. See web_helpers.py.
 from web_helpers import (  # noqa: E402
     _block_link_value,
@@ -98,14 +98,14 @@ THINK_TANK_DIR = os.path.dirname(ROOT)
 SANDBOXES_DIR = os.path.join(THINK_TANK_DIR, 'sandboxes')
 ESCALATIONS_PATH = os.path.join(THINK_TANK_DIR, 'escalations.json')
 DB_PATH = os.path.join(THINK_TANK_DIR, 'think_tank.db')
-# The Library's real capability -- per your call, a shared file directory
+# The Library's real capability -- a shared file directory
 # any agent can read from or write to (code, notes, completed-task
 # records), with archive/ specifically for completed tasks. Same
 # "deliberately outside world/" reasoning as everything else here.
 LIBRARY_DIR = os.path.join(THINK_TANK_DIR, 'library')
 LIBRARY_ARCHIVE_DIR = os.path.join(LIBRARY_DIR, 'archive')
 # Immutable "product passport" -- a hash chain of every file promoted to the
-# trusted Library (your EU-digital-product-passport analogy, issue #4). Each
+# trusted Library (modeled on an EU digital product passport). Each
 # promoted file's content hash is appended as a block whose index links to the
 # previous block's hash, so tampering with or silently deleting any promoted
 # file breaks the chain and is detectable. No mining/consensus -- it's a
@@ -113,7 +113,7 @@ LIBRARY_ARCHIVE_DIR = os.path.join(LIBRARY_DIR, 'archive')
 PASSPORT_PATH = os.path.join(LIBRARY_DIR, '.passport.json')
 
 # ---------------------------------------------------------------------------
-# Operational guardrails (2026-09-23). Two electric fences around the LIVE
+# Operational guardrails. Two electric fences around the LIVE
 # think tank store, because a long-running state-bearing server with real model
 # spend is exactly the thing that silently eats money or loses state when
 # nobody is watching it:
@@ -124,8 +124,8 @@ PASSPORT_PATH = os.path.join(LIBRARY_DIR, '.passport.json')
 #   2) _MAX_IDLE_MINUTES -- when set (serve.py --max-idle-minutes N), the
 #      server goes DORMANT after N minutes of no HTTP request at all (touched
 #      in the no_store middleware, so it's any request, authed or not). This
-#      turns the standing "pause the think tank when I'm away + wake it on a remote
-#      request" rule into an enforced default instead of a manual habit. It is a
+#      turns the standing "pause the think tank when idle + wake it on a remote
+#      request" requirement into an enforced default instead of a manual habit. It is a
 #      SLEEP, not an exit: the process stays up and port-bound so any request
 #      (e.g. to the admin, from a phone) flips the think tank back awake instantly
 #      -- no cold start, no need to be at a computer. Only the simulation is
@@ -134,7 +134,7 @@ PASSPORT_PATH = os.path.join(LIBRARY_DIR, '.passport.json')
 DB_BACKUP_DIR = os.path.join(THINK_TANK_DIR, 'think-tank-db-backups')
 DB_BACKUP_KEEP = 24
 DB_BACKUP_INTERVAL_S = 5 * 60
-# Log retention (2026-09-27): decision_tape and action_log are append-only audit
+# Log retention: decision_tape and action_log are append-only audit
 # tables whose heavy columns (prompt/raw/details) ballooned the DB to ~1 GB. The
 # /api/decisions feed and activity feed only ever READ the recent window, so old
 # rows are pure bloat -- prune to a rolling retention window on a coarse cadence
@@ -145,7 +145,7 @@ LOG_RETENTION_DAYS_DEFAULT = 7
 LOG_PRUNE_INTERVAL_S = 6 * 3600          # twice a day is plenty for a rolling prune
 LOG_PRUNE_MAX_ROWS = 50_000              # cap per run so a big backlog can't block the loop
 _LAST_LOG_PRUNE = None
-# Daily model-tier re-pick (2026-09-27): the OpenRouter catalog + prices move
+# Daily model-tier re-pick: the OpenRouter catalog + prices move
 # fast, and the player explicitly wants the think tank to re-derive the best
 # value pick per band from that day's scores AND prices rather than freezing
 # a stale choice. refresh_model_tiers() already does exactly that (best score
@@ -154,9 +154,9 @@ _LAST_LOG_PRUNE = None
 MODEL_TIER_REFRESH_INTERVAL_S = 24 * 3600  # daily
 _MAX_IDLE_MINUTES = 0.0  # 0 = disabled; set via --max-idle-minutes (float: allows <1m)
 _LAST_REQUEST_TIME = None  # touched by the no_store middleware below
-# Sleep-not-die (2026-09-24). When --max-idle-minutes elapses, the server does
+# Sleep-not-die. When --max-idle-minutes elapses, the server does
 # NOT exit -- that would leave nothing bound to the port to hear a remote wake
-# request, forcing you to be at a computer to restart it. Instead it goes
+# request, forcing someone to be physically present to restart it. Instead it goes
 # DORMANT: the process stays alive and keeps the port bound, but the think tank
 # simulation is skipped (no movement, no task cycle, no content executors, no
 # model spend -- the bill and the churn that mattered both die), until ANY
@@ -175,7 +175,7 @@ def _set_dormant(value):
     return _DORMANT
 
 # ---------------------------------------------------------------------------
-# JEV decide throttle (2026-09-21). The live action_log showed ~48.9k
+# JEV decide throttle. The live action_log showed ~48.9k
 # unattributed 'decide' rows over ~50h -- a sustained ~0.3/s spend with no
 # responsible agent. Every decide now REQUIRES an agentId (attribution), and
 # each agent is rate-limited by a sliding window: a real task tick may make a
@@ -221,7 +221,7 @@ def _db():
 def init_db():
     # Replaces state.json (whole-think tank state) and the separate
     # browse_log.jsonl/execute_log.jsonl files (scattered, per-feature
-    # logs) with one real database -- per your call, you want a single
+    # logs) with one real database -- you want a single
     # SQLite instance for both activity and state, not files that only
     # cover whichever feature happened to add one.
     with _db() as conn:
@@ -233,14 +233,14 @@ def init_db():
         # The Bank spend ledger lives in its OWN row/table, separate from the
         # whole-think tank blob: a model call's accrual must never read-modify-write
         # the entire kv_state blob (the sim owns that, and a stale read+write
-        # there is the blob-clobber class we already got burned by). Spending is
+#         there is the blob-clobber class that has already caused data loss). Spending is
         # accounted independently so the ledger can't race the sim's saves.
         conn.execute('''CREATE TABLE IF NOT EXISTS kv_spend (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             blob TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
-        # Page-request budget (2026-09-27): the think tank has a MONTHLY allowance
+        # Page-request budget: the think tank has a MONTHLY allowance
         # of external page requests (browse_page fetches + search_web calls) --
         # a count-based quota, not a dollar cap. Mirrors kv_spend's own-table
         # independence so the accounting never depends on the whole-think tank blob.
@@ -249,7 +249,7 @@ def init_db():
             blob TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
-        # Runtime-switchable settings (2026-09-28): a small key/value table
+        # Runtime-switchable settings: a small key/value table
         # for values that must change without a server restart -- currently
         # just the Jev decisions-model slug (see _jev_model). Deliberately
         # NOT auto-refreshed like model_tiers: a new decision model appearing
@@ -274,7 +274,7 @@ def init_db():
             ts REAL NOT NULL,
             trace_id TEXT
         )''')
-        # Audit trace linkage (2026-09-28): trace_id ties a JEV decision
+        # Audit trace linkage: trace_id ties a JEV decision
         # (decision_tape) to the resulting tool outcomes (action_log) in a
         # single queryable chain, so "what decision led to this action" is
         # explicit rather than relying on a loose (ts, agent_id) heuristic.
@@ -282,7 +282,7 @@ def init_db():
             conn.execute('ALTER TABLE action_log ADD COLUMN trace_id TEXT')
         except Exception:
             pass  # column already exists (idempotent)
-        # index drug (2026-09-27): per-agent lookups (peer review, firing
+        # index drug: per-agent lookups (peer review, firing
         # review, passport audit) scan the whole table otherwise -- with no
         # index action_log grew to 295MB/216k rows and every agent query was a
         # full b-tree scan + temp-sort, pinning a CPU core.
@@ -336,7 +336,7 @@ def init_db():
             created_at REAL NOT NULL,
             expires_at REAL NOT NULL
         )''')
-        # Per your call: model-tier selection for EVERY band -- not just
+        # Model-tier selection for EVERY band -- not just
         # 'high' (coding) -- needs to be grounded in real, published
         # benchmark scores across the WHOLE real candidate pool, every
         # vendor in the current OpenRouter catalog, not just whichever
@@ -372,7 +372,7 @@ def init_db():
                 'SELECT model_id, benchmark, score, source_url, checked_at FROM model_coding_scores'
             )
             conn.execute('DROP TABLE model_coding_scores')
-        # Per your explicit call: an agent without standing access to
+        # An agent without standing access to
         # something (e.g. an agent with no Weather Station curl access)
         # should be able to ask their supervisor for it, and get REAL,
         # TEMPORARY access if the reason is legitimate -- not permanent,
@@ -474,7 +474,7 @@ async def _backup_loop():
 
 def _prune_logs():
     """Rolling retention prune for the two heavy append-only tables
-    (decision_tape, action_log) -- 2026-09-27. Deletes rows older than the
+    (decision_tape, action_log). Deletes rows older than the
     retention window (default 7 days; override LOG_RETENTION_DAYS in .env),
     capped per run so a large pre-existing backlog is drained over a few runs
     instead of one giant delete. Best-effort: a prune failure must never take
@@ -516,7 +516,7 @@ async def _log_prune_loop():
 async def _model_tier_refresh_loop():
     """Daily model-tier re-pick, run AS a governance action by the admin (or
     the senior-most director standing in), not a silent background chore
-    (2026-09-27). The OpenRouter catalog + prices move fast; the player wants
+    The OpenRouter catalog + prices move fast; the player wants
     the think tank to re-derive each band's best value from THAT day's scores and
     prices. refresh_model_tiers() already picks best-score-within-floor, then
     cheapest -- this loop just runs it daily and logs the decision through the
@@ -543,7 +543,7 @@ async def _model_tier_refresh_loop():
 
 
 async def _idle_shutdown_loop(poll_s=30):
-    # The mechanical enforcement of the "pause the think tank when I'm away" rule.
+    # The mechanical enforcement of the "pause the think tank when idle" rule.
     # Watches for a live-but-unwatched server (no HTTP request for
     # _MAX_IDLE_MINUTES) and puts it DORMANT rather than exiting -- the process
     # stays alive and keeps the port bound so a remote wake request can reach
@@ -731,7 +731,7 @@ def _bank_budget_view(snapshot):
         }
         service_row['burnPerDay'], service_row['daysLeft'] = _forecast(bucket, cap)
         services[svc] = service_row
-    # Per your call (2026-09-24): a director-set budget (e.g. DigitalOcean's
+    # A director-set budget (e.g. DigitalOcean's
     # $25/mo cap) should be visible to a teller from the moment it's set, not
     # only after the service's first real charge lands in the ledger -- a cap
     # nobody can see until it's already being spent against isn't much of a
@@ -747,7 +747,7 @@ def _bank_budget_view(snapshot):
             'over': False, 'calls': 0, 'lastAt': None,
             'burnPerDay': 0.0, 'daysLeft': None,
         }
-    # Apify FREE-plan monthly budget (2026-09-28): same "visible from day
+    # Apify FREE-plan monthly budget: same "visible from day
     # one" rule -- the $5/month cap is real (enforced by the plan, not just a
     # think tank convention), so it belongs in the Bank even before the first
     # actor run accrues anything. Only when the account is actually configured
@@ -762,7 +762,7 @@ def _bank_budget_view(snapshot):
             'left': float(APIFY_MONTHLY_BUDGET_USD), 'over': False,
             'calls': 0, 'lastAt': None, 'burnPerDay': 0.0, 'daysLeft': None,
         }
-    # Colab agent compute (2026-09-29): same "visible from day one" rule -- a
+    # Colab agent compute: same "visible from day one" rule -- a
     # GPU session burns the account's compute units fast, so the cap belongs
     # in the Bank before the first run_on_colab run. Shown only when the
     # colab CLI actually exists on this machine (the think tank's lever) and the
@@ -815,7 +815,7 @@ def _forecast(bucket, cap):
     return round(burn, 6), max(0.0, left / burn)
 
 
-# Per your call (2026-09-24): the Bank's per-service ledger tracks the
+# The Bank's per-service ledger tracks the
 # think tank's OWN attributed spend, but that's a different number from what
 # OpenRouter itself says the account has left -- the real account can also
 # carry usage from outside the think tank (or a manually top-up), so the two
@@ -857,7 +857,7 @@ def _openrouter_account_credits():
 
 
 # ---------------------------------------------------------------------------
-# Server-owned seed (your 2026-09-21 call: no static agent names in any JS
+# Server-owned seed (no static agent names in any JS
 # file -- the roster lives in the database). The seed that used to live in
 # agents.js's AGENT_ROSTER now lives HERE, on the server, and is pushed into
 # villa.db on a genuinely empty boot, so a fresh database comes up with real
@@ -875,7 +875,7 @@ def _default_roster_definitions():
     # purely descriptive and the authority graph moves with the DB constants,
     # not with this literal.
     #
-    # NO agent names are hardcoded (2026-09-27): the seed roster comes from the
+    # NO agent names are hardcoded: the seed roster comes from the
     # per-install SEED_ROSTER env key, so a clone of this repo carries zero
     # agent identities -- they only ever exist in that instance's .env and,
     # once seeded, in think_tank.db. Format per entry (comma-separated):
@@ -1110,7 +1110,7 @@ def _seed_default_roster():
     return True
 
 
-# Real per-agent directories on disk, per your reference (Tristen's video):
+# Real per-agent directories on disk (the standard agent-folder convention):
 # agent.json, AGENTS.md, conversations/, MEMORY.md, prototypes/, reports/,
 # state.json -- one for every agent, materialized from the SAME state this
 # whole think tank already treats as authoritative (think_tank.db), not a
@@ -1138,8 +1138,8 @@ def _render_agents_md(name, role, profile):
     return '\n'.join(lines) + '\n'
 
 
-# Solves the exact problem you quoted ("I don't have a good rule for
-# which notes deserve to survive that cap") -- researched against MAGI's
+# Solves the exact problem "which notes deserve to survive that cap" --
+# researched against MAGI's
 # own memory_trust.py decay formula rather than guessed at. Fully
 # portable to plain SQLite: no embeddings, no vector search, just
 # arithmetic over what action_log already has. Records past
@@ -1277,7 +1277,7 @@ def sync_prototypes(agent_id, sandbox_dir):
 
 
 def log_action(agent_id, action, details=None, authorized=None, trace_id=None):
-    # The single, comprehensive activity log -- per your call to log all
+    # The single, comprehensive activity log that records all
     # actions, not just the ones a specific feature happened to write to
     # its own file. `authorized` is None for actions that have no
     # per-agent-key concept at all (state saves, the collision/door
@@ -1327,7 +1327,7 @@ def _decision_kind(instructions):
 def _append_decision_tape(kind, model, prompt, criteria, choice, confidence, cost, raw, ok, trace_id=None):
     # Best-effort, bounded record of a Jev decision call. A tape-write failure
     # must never fail the caller (the decision already happened), so swallow it.
-    # `trace_id` (2026-09-28): correlates this decision with the resulting
+    # `trace_id`: correlates this decision with the resulting
     # action_log entry(s) for the same execution chain. Auto-generated here if
     # the caller didn't supply one; the caller should pass it through to
     # log_action so actions are traceable back to this decision.
@@ -1673,7 +1673,7 @@ def _treg_account_balance():
         return None
 
 
-# Real endpoint mechanics (2026-09-26), confirmed with REAL live calls
+# Real endpoint mechanics, confirmed with REAL live calls
 # through the actual account, not guessed from docs alone -- Treg's catalog
 # page doesn't show per-endpoint param schemas, and the first real attempt
 # at harvestapi.linkedin.post.search failed closed (400, uncharged) because
@@ -1687,7 +1687,7 @@ def _treg_account_balance():
 # balance delta across 2 real live calls ($0.00376 / 2 = $0.00188), matching
 # the catalog's own stated price exactly. Prices can still drift over time
 # without this constant being updated -- re-verify before relying on it long
-# after 2026-09-26.
+# after.
 TREG_ENDPOINT_COSTS = {
     'x.x.get-trends-by-woeid': 0.01,
     'scrapecreators.x.v1-linkedin-search-posts': 0.00188,
@@ -1709,7 +1709,7 @@ def _treg_call(endpoint_id, body=None, method='POST', timeout=30, query=None):
     conservative "don't fabricate a number, use a verified one" rule this
     think tank already applies to the digitalocean/pixellab integrations.
 
-    GET vs POST param placement confirmed LIVE (2026-09-26), not guessed:
+    GET vs POST param placement confirmed LIVE, not guessed:
     Treg's own real error for a GET endpoint called with a JSON body was
     explicit -- "x.x.get-trends-by-woeid is GET -- add --method GET", then
     "needs --query woeid=<value> (a path parameter of /2/trends/by/woeid/
@@ -1717,7 +1717,7 @@ def _treg_call(endpoint_id, body=None, method='POST', timeout=30, query=None):
     never a request body; a POST call's params are the JSON body, as
     originally assumed and confirmed working for the LinkedIn search call.
 
-    `query` (2026-09-27, also confirmed live): some POST endpoints STILL
+    `query` (also confirmed): some POST endpoints STILL
     need URL query params on top of a JSON body -- Apify-backed calls
     (e.g. apify.linkedin.search.jobs) rejected a plain JSON body with
     "Apify platform calls take maxTotalChargeUsd... /timeout...", and
@@ -1762,7 +1762,7 @@ PIXELLAB_BALANCE_CACHE_TTL_S = 300
 
 def _pixellab_account_balance(force=False):
     """Live real spend for the PixelLab account. Its GET /v2/balance reports
-    remaining USD credits (verified live 2026-09-24 in
+    remaining USD credits (verified in
     library/skills/pixellab.md), not spend-to-date, and PixelLab has no
     separate 'starting balance' endpoint -- so this tracks DEPLETION since the
     first observed balance this process has seen, seeded via the config-time
@@ -1807,7 +1807,7 @@ def _pixellab_call(method, path, body=None, timeout=30):
     directly by library/skills/pixellab.md as "the ONLY endpoint... actually
     exercised and confirmed working") -- not guessed from the public OpenAPI
     spec alone, per the same "verify, don't assume" discipline applied to
-    every other real integration tonight. Same vault pattern as every other
+    every other real integration. Same vault pattern as every other
     external credential: the caller never holds the raw key. Returns
     (data, error), same 2-tuple shape as _treg_call."""
     token = _open_secret(_credential_token('pixellab') or '')
@@ -1846,7 +1846,7 @@ def _pixellab_poll_job(job_id, timeout=90, interval=3):
     return None, 'PixelLab job timed out'
 
 
-# Google Sheets/Calendar (2026-09-26), per your explicit request to wire up
+# Google Sheets/Calendar: wire up
 # the remaining documented-but-unused APIs. Real OAuth refresh_token minted
 # live (a real installed-app consent flow, one-time, run by the player --
 # this server-side chokepoint only ever holds/refreshes it from here on),
@@ -1911,7 +1911,7 @@ def _google_call(method, url, body=None, timeout=30):
     token refresh on a 401 (an access token can expire mid-session; that's
     not a real failure, just an expected refresh point). Returns
     (data, error), same 2-tuple shape as every other real integration
-    tonight."""
+    """
     token, error = _google_access_token()
     if error:
         return None, error
@@ -1937,7 +1937,7 @@ def _google_call(method, url, body=None, timeout=30):
 
 def _github_call(method, url, body=None, timeout=30):
     """Real authenticated call to the GitHub REST API (api.github.com), given
-    a full URL. Read-only capability (2026-09-28): lets the think tank's
+    a full URL. Read-only capability: lets the think tank's
     engineering work ground itself in REAL public repos/issues/PRs instead of
     hallucinating plausible-looking ones. The PAT comes from GITHUB_TOKEN in
     .env (classic/fine-grained with read:repo+public read scope). Free --
@@ -1963,7 +1963,7 @@ def _github_call(method, url, body=None, timeout=30):
         return None, f'GitHub call failed: {e}'
 
 
-# Per your call (2026-09-24): DigitalOcean is the one external credential
+# DigitalOcean is the one external credential
 # where a mistake is real, hard-to-reverse money (a created Droplet keeps
 # billing even powered off -- see library/skills/digitalocean.md), so it gets
 # a HARD circuit breaker here, not just a number a director can choose to
@@ -1982,10 +1982,10 @@ _HARD_CAPPED_CREDENTIALS = {
 # A real capability handle only gets an agent as far as a decrypted secret --
 # HOW that secret is attached to the outbound request still differs per
 # service. DigitalOcean and PixelLab both take a standard
-# `Authorization: Bearer <token>` (confirmed live against both APIs); Treg
+# `Authorization: Bearer <token>` (confirmed against both APIs); Treg
 # does not -- its real API takes `X-Treg-Token: <token>` (see
 # _treg_account_balance / library/skills/treg.md), and would silently 401 if
-# handed a Bearer header instead. Found 2026-09-24 while wiring up the first
+# handed a Bearer header instead.
 # real handle-authenticated action: /api/curl's injection line was hardcoded
 # to Bearer, which is correct for DO/PixelLab but WRONG for Treg. Anything
 # not listed here defaults to Bearer, the common case.
@@ -2039,7 +2039,7 @@ def mint_capability_handle(agent_id, credential_name, purpose, allowed_hosts,
                            (credential_name,)).fetchone()
         if not row:
             return None, 'unknown credential'
-        # Master gate for the DigitalOcean credential (2026-09-28): the DO
+        # Master gate for the DigitalOcean credential: the DO
         # token is only reachable when SANDBOX_EXECUTION=digitalocean. While
         # the switch reads `local` (the default), NO handle for it can even be
         # minted -- an agent can never get a DO handle to try, matching the
@@ -2116,7 +2116,7 @@ def resolve_capability_handle(agent_id, handle, method, url):
         if not row:
             return None
         credential_name, purpose, allowed_hosts, allowed_methods, expires_at = row
-        # Defense-in-depth on top of the mint gate (2026-09-28): a handle
+        # Defense-in-depth on top of the mint gate: a handle
         # minted while SANDBOX_EXECUTION=digitalocean must NOT keep working if
         # the switch is later flipped back to `local`. The mint gate stops new
         # DO handles; this stops a leftover one from resolving, so DO stays
@@ -2160,7 +2160,7 @@ def resolve_capability_handle(agent_id, handle, method, url):
 # surfaced visibly.
 HEALTH_CHECK_INTERVAL_S = 300
 
-# Coordination-pathology signal (2026-09-25, prompted by comparing this
+# Coordination-pathology signal (prompted by comparing this
 # think tank's own accumulated process -- peer gate, stuck-gate watchdog, the
 # Cut-4 hard coding-standards gate, coaching loop, incident runbooks -- to a
 # leading indicator described elsewhere: process/ceremony volume rising
@@ -2268,20 +2268,20 @@ def _mid_tier_slug():
     # table -- a real mistake made building this exact feature: an
     # earlier test inserted a fake row directly and never restored it,
     # corrupting the live app's actual mid-tier pick (a nonexistent
-    # model slug, confirmed live as a real 400 from OpenRouter) until it
+    # model slug, confirmed as a real 400 from OpenRouter) until it
     # was caught and the tier had to be genuinely re-researched to fix.
     return _model_tier_slug('mid')
 
 
 def _low_tier_slug():
-    # The default tier for routine work (2026-09-27): cheap above all else.
+    # The default tier for routine work: cheap above all else.
     # Kept as its own accessor (like _mid_tier_slug) so tests can mock it and
     # the JEV tier gate can fail closed to it.
     return _model_tier_slug('low')
 
 
 def _high_tier_slug():
-    # The high tier for genuinely hard, high-stakes planning work (2026-09-27).
+    # The high tier for genuinely hard, high-stakes planning work.
     # Used by the JEV tier gate; kept as an accessor so tests can mock it.
     return _model_tier_slug('high')
 
@@ -2302,7 +2302,7 @@ def _vision_tier_slug():
 
 
 def _reasoning_tier_slug():
-    # A genuine extended-reasoning model (2026-09-26, real request: open-
+    # A genuine extended-reasoning model (open-
     # ended multi-step investigations -- "list every source on a site and
     # assess replication feasibility" -- kept settling too early on the mid
     # tier, a non-reasoning model that can't reliably judge "have I actually
@@ -2315,7 +2315,7 @@ def _reasoning_tier_slug():
     return _model_tier_slug('reasoning') or _coding_tier_slug()
 
 
-# JEV-gated tier escalation (2026-09-27). Policy, per the player: by default
+# JEV-gated tier escalation: by default
 # EVERYTHING uses the cheap LOW tier; only a real need escalates. Coding is
 # DETERMINISTIC (a code/review/qa task always uses the coding tier -- it's
 # easy to tell when code is being written, and correctness there doesn't scale
@@ -2356,7 +2356,7 @@ _tier_gate_decider = _tier_gate_decider_default
 
 def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None):
     """Pick which model tier a call deserves, under the JEV-gated escalation
-    policy (2026-09-27). Returns a resolved model slug (never None).
+    policy. Returns a resolved model slug (never None).
 
     `task_type` 'code'/'review'/'qa' -> deterministic CODING tier (no JEV).
     `allow_high` -> JEV may pick HIGH; otherwise the decision is low-or-mid.
@@ -2390,8 +2390,7 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None)
     return _low_tier_slug() or _mid_tier_slug()
 
 
-# Real ask (2026-09-21): "multiple directors under the admin with the senior
-# most director approving and denying requests on my behalf." An admin decision
+# An admin decision
 # should not always have to wait for the human to tap the email link -- the
 # senior-most director (a director no other director supervises) stands in,
 # resolving pending escalations with the same real Jev judgment every other
@@ -2403,7 +2402,7 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None)
 DIRECTOR_APPROVAL_INTERVAL_S = 30
 
 # Re-ask policy for the director's delegated approvals (added after the
-# 2026-09-27 escalation storm -- ~204k Jev calls in 24h, 161k of them
+# Escalation storm -- ~204k Jev calls in 24h, 161k of them
 # "escalation_unsure" dead-ends): a pending escalation Jev can't resolve
 # confidently is left for the human, but it must NOT be re-queried every
 # tick forever. Back off between attempts, and stop entirely after a cap
@@ -2538,7 +2537,7 @@ async def _director_approval_loop():
 
 
 # --- autonomous peer reviews (issue #5) ------------------------------------
-# Per your call: "are agents writing reports about other agents when some of
+# "Are agents writing reports about other agents when some of
 # them aren't doing work, or when some are doing the most?" They now do, on a
 # real cadence, server-side -- the senior-most director reviews the ACTUAL
 # action_log (real work vs. silence), picks the one non-director agent most
@@ -2552,7 +2551,7 @@ PEER_REVIEW_MIN_LOOKBACK_S = 3600  # judge an hour of real activity, not 90 stra
 # A worker already reported on WITHIN this window is not re-reported: the peer
 # review's job is to spread coverage across the roster, not hammer one worker.
 # Reports are never consumed (they feed morale + firing review), so a worker
-# only re-enters the pool after this window elapses (real gap caught live:
+# only re-enters the pool after this window elapses (gap:
 # once every worker had a report, the old pool fell back to ALL candidates and
 # re-flagged the same lowest-real-work worker every PEER_REVIEW_INTERVAL_S --
 # ~560 reports about one idle worker in a night).
@@ -2622,7 +2621,7 @@ def _peer_review_loop_pass():
     cand_pool = [c for c in candidates if not c['already']]
     if not cand_pool:
         return 0
-    # Real gap caught live (2026-09-26): the criteria dict passed to Jev used
+    # Gap: the criteria dict passed to Jev used
     # to be a single fixed key {'idx': 'The index of the worker to report
     # on'} -- the SAME bug class already found and fixed once for grading
     # (_grading_decider_default's own docstring): Jev's real API is a typed
@@ -2651,7 +2650,7 @@ def _peer_review_loop_pass():
         f'or the standout high performer (far above the rest). Prefer a genuine concern if one exists.\n'
         + '\n'.join(desc)
     )
-    # Real gap caught (2026-09-26): quorum sampling (see _jev_quorum_choice_
+    # Gap caught: quorum sampling (see _jev_quorum_choice_
     # sync's own docstring) was only ever applied to safety gates -- this
     # routine-but-real routing decision gets the same protection now that
     # it's an actual working Jev call for the first time.
@@ -2699,7 +2698,7 @@ async def _peer_review_loop():
 
 @asynccontextmanager
 async def _lifespan(app):
-    # Your call (2026-09-21): the admin/manager/director information should
+    # The admin/manager/director information should
     # live in the DATABASE, not be baked into a JS file. It does -- the
     # kv_state blob is authoritative and agents/*.json are only materialized
     # mirrors of it. This migration is the one-time backfill that gets the
@@ -2792,7 +2791,7 @@ async def _lifespan(app):
 #   theo -> sam -> maya
 # and the rest of the roster reports straight up to a director.
 def _director_backfill_map():
-    # NO agent names hardcoded (2026-09-27): the director reporting map comes
+    # NO agent names hardcoded: the director reporting map comes
     # from the per-install SEED_DIRECTOR_MAP env key so a cloned repo carries
     # zero identities. Format: comma-separated  id:directorId  pairs,
     # e.g.  ada:theo,dev:theo,eli:theo,ben:nora
@@ -2817,8 +2816,7 @@ def _director_backfill_map():
 # (agents.js carries no isAdmin/isDirector/director fields on purpose -- see
 # its header comment).
 #
-# Per your 2026-09-21 call: ONE admin agent ("let's just make that one admin
-# -- change either theo or nora to a director"). The admin approves/denies
+# ONE admin agent. The admin approves/denies
 # requests and passes everything else down to the directors; the senior-most
 # director approves/denies on the admin's behalf. So:
 #   - Theo (renamed from Faye, its original id/name) stays the single admin (isAdmin: true). He is
@@ -2827,7 +2825,7 @@ def _director_backfill_map():
 #   - Nora is demoted from admin to the SENIOR-MOST DIRECTOR (isDirector: true,
 #     no isAdmin, no own `director`), standing in for Theo on approvals.
 #   - Everything below reports up to a director.
-# NO agent identities hardcoded (2026-09-27): the single admin and the
+# NO agent identities hardcoded: the single admin and the
 # senior-most director come from the per-install SEED_ADMIN_IDS /
 # SEED_SENIOR_DIRECTOR env keys, so a cloned repo carries zero agent names.
 # They are only evaluated at backfill time (via the helpers below), not at
@@ -2870,7 +2868,7 @@ def _backfill_directors_in_db():
 
 
 # ---------------------------------------------------------------------------
-# Walk-the-chain director model (your 2026-09-21 call: "admin -> director ->
+# Walk-the-chain director model ("admin -> director ->
 # director -> employee"). Authority is NOT a boolean stamped per-agent; it is
 # DERIVED from the `director` reporting pointers the backfill above assigns.
 # ANY agent who has one or more direct reports (someone whose `director`
@@ -3056,12 +3054,12 @@ def _backfill_teams_in_db():
         save_state_to_db(state)
 
 
-_TEAM_FUNNY_NAMES = {}  # no agent-identity literals (2026-09-27) -- team names derive from the roster below
+_TEAM_FUNNY_NAMES = {}  # no agent-identity literals -- team names derive from the roster below
 
 
 def _default_team_names():
     # Deterministic, identity-free team display names. NO agent names are
-    # hardcoded (2026-09-27): the fallback uses the roster's own role label
+    # hardcoded: the fallback uses the roster's own role label
     # (or a generic name) so a cloned repo carries zero identities.
     return dict(_TEAM_FUNNY_NAMES)
 
@@ -3081,7 +3079,7 @@ def _stable_fallback_color(agent_id):
 
 
 # Idempotent boot migration, same shape as _backfill_directors_in_db/
-# _backfill_teams_in_db above. Caught live (2026-09-24): Theo's nameplate on
+# _backfill_teams_in_db above. Theo's nameplate on
 # the map rendered as the literal text "undefined" and the HUD's morale meter
 # read NaN. Both traced to the same root cause -- the original three seeded
 # agents (theo, ada, ben) predate `name`/`color`/`role`/`approvedCount`/
@@ -3100,7 +3098,7 @@ def _heal_agent_identity(state):
     pure function (state in, bool out, no DB I/O) so BOTH the one-time boot
     migration below AND SimEngine.tick() (sim.py) can call it -- a boot-only
     fix wasn't durable: something (a stale open browser tab's 5s autosave,
-    confirmed live via a save_state_to_db stack trace) kept re-POSTing an
+    confirmed via a save_state_to_db stack trace) kept re-POSTing an
     old, pre-fix snapshot over the top. Running this as a per-tick invariant
     (same shape as _reconcile_stranded_agents/_repair_stalled_walkers already
     do for other drift) makes it self-healing regardless of the source."""
@@ -3271,7 +3269,7 @@ def _teams_missing_scrum_master(state, team_ids):
     a list of {id, name} for enforcement at sprint creation, so a caller can
     tell the player exactly which teams to fix first.
 
-    Scrum masters scale with team size (user call, 2026-09-27): a team below
+    Scrum masters scale with team size: a team below
     SCRUM_MASTER_MIN_TEAM_SIZE workers doesn't need a dedicated facilitator yet
     -- its director stands in -- so it is NOT flagged. Only teams at/above the
     threshold that still lack a designated scrum master block a sprint."""
@@ -3295,7 +3293,7 @@ app = FastAPI(lifespan=_lifespan)
 
 
 def _load_env():
-    # Same .env this project already uses for other service keys
+    # Loads the same .env the CLI already uses for other service keys
     # (~/ai-think-tank/.env, one directory above world/) -- manual parsing,
     # matching the rest of the project's own convention, rather than
     # adding a python-dotenv dependency for one file read.
@@ -3312,26 +3310,26 @@ def _load_env():
 
 
 OPENROUTER_API_KEY = _load_env().get('OPENROUTER_API_KEY')
-# Tavily search (2026-09-25): browse_page alone can only fetch a URL the model
+# Tavily search: browse_page alone can only fetch a URL the model
 # already guessed -- real web/search-engine scraping hits a bot-detection
-# CAPTCHA wall on every major engine (confirmed live against both Google and
+# CAPTCHA wall on every major engine (confirmed against both Google and
 # DuckDuckGo). Tavily is a real API built for exactly this (AI-agent search),
 # returns clean {title, url, content} results, no scraping/CAPTCHA involved.
 # search_web is simply absent from AGENT_ASK_TOOLS when this is unset.
 TAVILY_API_KEY = _load_env().get('TAVILY_API_KEY')
-# GitHub PAT (2026-09-28): read-only access to real public repos/issues/PRs
+# GitHub PAT: read-only access to real public repos/issues/PRs
 # so engineering work grounds itself in real code. Loaded as a module constant
 # like TAVILY/OPENROUTER keys; _github_call reads it for every request. Absent
 # (blank) means the GitHub tools are simply NOT offered to agents -- same
 # pattern as search_web, so the surface never advertises an unusable tool.
 GITHUB_TOKEN = _load_env().get('GITHUB_TOKEN')
-# Apify API key (2026-09-28): real account access for web scraping/automation
+# Apify API key: real account access for web scraping/automation
 # (running actors, fetching datasets). The account is on the FREE plan with a
 # ~$5/mo usage cap by the player's choice -- see the Apify budget block below
 # for the monthly cap surfaced in the Bank. Absent (blank) means the reconcile
 # line is omitted (fail closed), never fabricated.
 APIFY_API_KEY = _load_env().get('APIFY_API_KEY')
-# Higgsfield AI API key (2026-09-29): a two-part credential (key ID + shared
+# Higgsfield AI API key: a two-part credential (key ID + shared
 # secret) for image/video generation + editing, stored in .env like the other
 # service keys. Loaded as module constants; _higgsfield_configured() is the
 # single availability gate (both halves present) a future feature checks --
@@ -3363,13 +3361,13 @@ def _get_or_create_server_secret():
 
 SERVER_ACCESS_KEY = _get_or_create_server_secret()
 
-# Real authentication -- per your call, once you're considering a public
+# Real authentication -- once you're considering a public
 # deployment, the old model (anyone who loads the page learns the same
 # bearer key everyone else does, straight out of the page's own source)
 # stops being acceptable. This is a real login: a single admin account
-# (this is your own personal tool, not a multi-tenant service -- a second
-# real user account is a real feature to add later if you ever actually
-# need one, not a default to build speculatively now), a salted PBKDF2
+# (single-tenant by design -- a second
+# real user account is only worth adding if a real need appears,
+# not as a default to build speculatively now), a salted PBKDF2
 # password hash (stdlib only, no new dependency), and a server-side
 # session whose id is the only thing the browser ever holds, as an
 # HttpOnly cookie -- unlike the old key, page JS (and so an XSS bug)
@@ -3390,7 +3388,7 @@ def _get_or_create_admin_credentials():
     # forget to change), store only its salted hash, and print the
     # PLAINTEXT once -- the only time it's ever available in the clear.
     # Same "auto-generate, persist, surface once" shape as every other
-    # secret this project creates, applied to something that now actually
+    # secret the server creates, applied to something that now actually
     # gates a real login instead of being embedded in every page load.
     env_path = os.path.join(THINK_TANK_DIR, '.env')
     env = _load_env()
@@ -3408,7 +3406,7 @@ ADMIN_USERNAME, ADMIN_PASSWORD_SALT, ADMIN_PASSWORD_HASH, _GENERATED_PASSWORD = 
 
 
 def _get_or_create_device_key():
-    # Real request (2026-09-26): a device (an iOS Shortcut, to start) that
+    # A device (an iOS Shortcut, to start) that
     # isn't a player browser session (no cookie support) and isn't an AI
     # agent (agent_keys are per-agent, not per-device) needs its own bearer
     # credential. One player, one phone today -- a single token, not a
@@ -3466,26 +3464,26 @@ def _check_login_rate_limit(ip):
     attempts.append(now)
     return True
 
-# Kill switch for agent internet access -- per your call, this needs to be
+# Kill switch for agent internet access -- this needs to be
 # something you can flip off in one place without touching code, same
 # spirit as the API key itself living in .env rather than in world/.
 # Defaults to enabled; set AGENT_BROWSING_ENABLED=false in ~/ai-think-tank/.env
 # to shut it off entirely.
 BROWSING_ENABLED = _load_env().get('AGENT_BROWSING_ENABLED', 'true').strip().lower() != 'false'
 
-# Same kill-switch pattern, player's own call (2026-09-26): Telegram only,
+# Same kill-switch pattern: Telegram only,
 # no more email. Keeps the credential/outbox machinery intact (so flipping
 # it back on needs no re-provisioning) -- this just gates the actual send.
 PLAYER_EMAIL_ENABLED = _load_env().get('PLAYER_EMAIL_ENABLED', 'true').strip().lower() != 'false'
 
-# Hard absolute spend cap, player's own call (2026-09-26) after a real
+# Hard absolute spend cap, added after a real
 # incident: a _peer_gated_lane bug let a scheduled research task loop
 # review/fix forever, burning ~$9 across both think tanks in one evening before
 # anyone noticed. That bug is fixed, but this is deliberately independent
 # protection against ANY future bug (known or not) doing the same thing --
 # a manual, absolute ceiling, not a per-bug patch. Explicit 0 disables it;
 # unset defaults to a conservative $5 so a fresh/researcher clone is bounded
-# until the player chooses a ceiling (2026-09-28: was '0' -- a new think tank
+# until the player chooses a ceiling (was '0' -- a new think tank
 # ran UNbounded until the .env was hand-edited, which is the exact failure
 # mode this protection exists for).
 # Baseline (spend at the moment this protection was installed) is stored
@@ -3496,7 +3494,7 @@ PLAYER_EMAIL_ENABLED = _load_env().get('PLAYER_EMAIL_ENABLED', 'true').strip().l
 # real ceiling).
 SPEND_CAP_USD = float(_load_env().get('SPEND_CAP_USD', '5') or 0)
 
-# Page-request budget (2026-09-27): the think tank has a MONTHLY allowance of
+# Page-request budget: the think tank has a MONTHLY allowance of
 # EXTERNAL page requests -- each browse_page fetch (/api/browse) and each
 # search_web call (Tavily) counts as ONE request. A count-based quota, not a
 # dollar cap: 1000 free page requests/month (set PAGE_REQUEST_MONTHLY_BUDGET in
@@ -3585,7 +3583,7 @@ def _accrue_page_request():
         pass  # accounting never breaks a real fetch
     return True
 
-# HIGH-tier spend cap (2026-09-27): the high tier is the expensive one (a
+# HIGH-tier spend cap: the high tier is the expensive one (a
 # stronger model for high-stakes planning), and the player wants its USE kept
 # very limited -- a dollar budget, not a confidence one. This is a MONTHLY cap
 # on total high-tier model spend: once the month's allowance is consumed, the
@@ -3596,7 +3594,7 @@ def _accrue_page_request():
 # _accrue_high_tier_spend), the single place every model call's real cost is
 # known.
 HIGH_TIER_MONTHLY_BUDGET_USD = float(_load_env().get('HIGH_TIER_MONTHLY_BUDGET_USD', '0') or 0)
-# Highest per-million-token price the HIGH tier will even CONSIDER (2026-09-27):
+# Highest per-million-token price the HIGH tier will even CONSIDER:
 # the daily refresh only offers Jev/score-pick candidates priced at or below
 # this, so a $210/M model can never win the high tier no matter its score.
 # This is a per-call price ceiling (models under it), distinct from the monthly
@@ -3656,7 +3654,7 @@ def _accrue_high_tier_spend(cost):
         pass  # accounting never blocks a real call
 
 
-# Apify FREE-plan monthly budget (2026-09-28): the player's Apify account is on
+# Apify FREE-plan monthly budget: the player's Apify account is on
 # the FREE plan with a ~$5/mo usage cap by choice -- no subscription, no
 # pay-as-you-go. This is a MONTHLY budget, mirroring the high-tier cap above:
 # the Bank shows used/cap/left against it, and _accrue_apify_spend records
@@ -3791,7 +3789,7 @@ BROWSE_BLOCK_CATEGORIES = (
     'pirated copyrighted media distribution',
 )
 
-# Explicit allowlist -- player's own call (2026-09-26): a small, deliberately
+# Explicit allowlist -- player's own call: a small, deliberately
 # curated set of domains the PLAYER has already vetted, so an agent never has
 # to re-litigate them through Jev every single visit. Everything else still
 # goes through the full Jev classify + confidence-gated escalation above --
@@ -3808,7 +3806,7 @@ BROWSE_BLOCK_CATEGORIES = (
 # just read access, when deciding whether a domain belongs on this list.
 BROWSE_ALLOWLIST_DOMAINS = {d.strip().lower() for d in
                             _load_env().get('BROWSE_ALLOWLIST_DOMAINS', '').split(',') if d.strip()}
-# Human-approved runtime grants (2026-09-29): domains the player approved via
+# Human-approved runtime grants: domains the player approved via
 # the '/api/allowlist/request' flow's email link, persisted in the DB settings
 # table so a restart keeps them (the .env list above is the code-reviewed
 # baseline; these are the approval-anchored additions on top of it). Merged
@@ -3853,14 +3851,14 @@ def _is_allowlisted_host(hostname):
     return any(host == d or host.endswith('.' + d) for d in _effective_allowlist_domains())
 
 
-# Mullvad VPN (2026-09-26), per your explicit request. Unlike every other
+# Mullvad VPN,. Unlike every other
 # real integration in this file, there is no per-call API key: the durable
 # credential is the account number itself (MULLVAD_ACCOUNT_NUMBER -- the
 # same one already sitting in the production ai-think-tank/.env from an
 # earlier, since-superseded "skip integration, no use case yet" spike).
 # _mullvad_ensure_logged_in_sync logs the CLI into it automatically, so
 # this doesn't depend on the host's interactive GUI session staying logged
-# in -- confirmed live that `mullvad account get`/`account login` are real
+# in -- confirmed that `mullvad account get`/`account login` are real
 # CLI subcommands, not guessed from docs. Mullvad's real REST API
 # (api.mullvad.net, POST /auth/v1/token) mints a token from this same
 # number but only for account/device management -- it cannot proxy a fetch
@@ -3911,7 +3909,7 @@ def _mullvad_ensure_logged_in_sync():
     credential in .env, like every other integration here, not on this
     host's interactive GUI session staying logged in forever. `mullvad
     account get` prints "Mullvad account:   <number>" on its own line when
-    logged in (confirmed live) -- checked with a substring match rather
+    logged in (confirmed) -- checked with a substring match rather
     than parsing further, since only "is it OUR account" matters here.
     Returns (ok, error)."""
     if not MULLVAD_ACCOUNT_NUMBER:
@@ -3964,7 +3962,7 @@ def _mullvad_disconnect_sync():
         print(f'[mullvad] disconnect failed -- host may still be VPN-connected: {e}')
 
 
-# Allowlist trail-building (2026-09-26), ported from real ant pheromone-
+# Allowlist trail-building, ported from real ant pheromone-
 # trail biology: BROWSE_ALLOWLIST_DOMAINS above is itself a hand-placed
 # trail (built for DreyX -- skip Jev's classify+escalate round trip for a
 # player-vetted domain). A real trail strengthens with traffic; a domain
@@ -4022,14 +4020,14 @@ def record_browse_success(hostname):
     _browse_trail_write(trail)
 
 
-# Real sandboxed command execution for the Work Room -- per your explicit
-# call ("I need real execution, properly sandboxed"), not simulated. Same
+# Real sandboxed command execution for the Work Room -- real
+# execution, properly sandboxed, not simulated. Same
 # kill-switch convention as browsing.
 EXECUTION_ENABLED = _load_env().get('AGENT_EXECUTION_ENABLED', 'true').strip().lower() != 'false'
 SANDBOX_IMAGE = 'ai-think-tank-work-sandbox'  # world/sandbox/Dockerfile -- has flake8/mypy/bandit/pytest-cov baked in (Cut 4)
 SANDBOX_TIMEOUT_S = 30
 SANDBOX_MAX_OUTPUT = 20_000
-# Where agent commands actually run (2026-09-28): `local` = the local Docker
+# Where agent commands actually run: `local` = the local Docker
 # sandbox (the default and only tested backend); `digitalocean` = a provisioned
 # DigitalOcean Droplet. This ALSO serves as the master gate for the DO
 # credential -- see _digitalocean_enabled / the mint+resolve refusals below:
@@ -4063,7 +4061,7 @@ EXECUTE_BLOCK_CATEGORIES = (
     'deliberate attempts to reach destinations other than well-known package registries (pip, npm, apt, git), such as arbitrary URLs, IP addresses, or exfiltration endpoints',
 )
 
-# Fired whenever Jev blocks a command, per your call that admins (and this
+# Fired whenever Jev blocks a command, because admins (and this
 # feature) should be able to escalate something to you rather than just
 # silently refusing forever -- see _send_escalation_email_sync /
 # /api/escalation/resolve. Not a general "ask about everything" channel:
@@ -4080,7 +4078,7 @@ SMTP_USER = _load_env().get('SMTP_USER')
 SMTP_PASSWORD = _load_env().get('SMTP_PASSWORD')
 ESCALATION_BASE_URL = _load_env().get('ESCALATION_BASE_URL', 'http://localhost:8010')
 
-# Telegram bridge (2026-09-27): lets the player talk to the think tank's admin
+# Telegram bridge: lets the player talk to the think tank's admin
 # from a phone, like texting, without exposing anything to the public
 # internet -- this process makes an OUTBOUND long-poll to Telegram's API, so
 # no inbound webhook/public port is needed. A server-side integration
@@ -4130,7 +4128,7 @@ def _send_escalation_email_sync(subject, body_text):
 
 
 # ---------------------------------------------------------------------------
-# Player notification email (2026-09-25). One-way SMTP to the player's real
+# Player notification email. One-way SMTP to the player's real
 # address via a Gmail app-password held in the encrypted vault (credential name
 # `gmail_smtp`), NOT a capability handle -- this is the think tank's own outbound
 # channel, not an agent-delegated grant. The FROM/TO are the same player
@@ -4202,7 +4200,7 @@ def send_player_email_sync(subject, body_text):
 
 
 def send_player_telegram_sync(subject, body_text):
-    """Real request (2026-09-26): the think tank was reactive-only on Telegram --
+    """The think tank was reactive-only on Telegram --
     it could reply to an incoming message but never push anything on its own,
     so a spike/story finishing generated no notice on either channel unless
     it happened to be one of the two existing email triggers (agent_ask,
@@ -4296,7 +4294,7 @@ def ensure_sandbox_networking():
     #
     # Real fix for "the sandbox needs to install packages," not just
     # flipping the network back on: the sandbox network is INTERNAL (no
-    # route out at all -- confirmed live, an `apk add` inside a container
+    # route out at all -- confirmed, an `apk add` inside a container
     # on this network alone fails outright). The only way out is through
     # `PROXY_CONTAINER`, which is dual-homed on both this network and
     # `EGRESS_NETWORK` (which has real internet access) and only forwards
@@ -4308,7 +4306,7 @@ def ensure_sandbox_networking():
         subprocess.run(['docker', 'network', 'create', '--internal', SANDBOX_NETWORK], capture_output=True)
     if not _docker_network_exists(EGRESS_NETWORK):
         subprocess.run(['docker', 'network', 'create', EGRESS_NETWORK], capture_output=True)
-    # Player-vetted data sites (2026-09-26): the SAME BROWSE_ALLOWLIST_DOMAINS
+    # Player-vetted data sites: the SAME BROWSE_ALLOWLIST_DOMAINS
     # /api/browse skips Jev for, passed into the proxy so agent-run SCRIPTS
     # can do real systematic crawling against them too, not just one-URL-at-
     # a-time browse_page calls -- see sandbox_proxy.py's own module docstring
@@ -4335,7 +4333,7 @@ def ensure_sandbox_networking():
 
 
 def _run_in_sandbox_sync(sandbox_dir, command):
-    # Backend dispatch (2026-09-28): SANDBOX_EXECUTION chooses WHERE agent
+    # Backend dispatch: SANDBOX_EXECUTION chooses WHERE agent
     # commands run. `local` (default) -> the local Docker sandbox below;
     # `digitalocean` -> a provisioned Droplet. The digitalocean branch FAILS
     # CLOSED with an explicit error until a remote executor is actually
@@ -4359,7 +4357,7 @@ def _run_in_sandbox_sync(sandbox_dir, command):
     # relaxation of the isolation itself. --memory/--cpus/--pids-limit cap
     # resource usage; --rm means nothing lingers after; only `sandbox_dir`
     # is mounted, so nothing outside /workspace is reachable even from
-    # inside the container -- confirmed live (an `ls /Users` from inside
+    # inside the container -- confirmed (an `ls /Users` from inside
     # an identical container found nothing there at all).
     proxy_url = f'http://{PROXY_CONTAINER}:{PROXY_PORT}'
     docker_cmd = [
@@ -4486,12 +4484,12 @@ def _urlopen_with_resilience(req, timeout, max_attempts=3, base_delay=0.5):
 # `CIRCUIT_BREAKER_THRESHOLD` times in a row, stop spending calls on it
 # for a cooldown window instead of hammering something known-broken on
 # every subsequent request. This is exactly what would have limited the
-# damage from this session's three real dead/broken-model bugs if they'd
+# damage from the three real dead/broken-model bugs if they'd
 # occurred during live play instead of during the pre-flight verification
 # that was built specifically to catch them before caching a pick.
 CIRCUIT_BREAKER_THRESHOLD = 3
 CIRCUIT_BREAKER_COOLDOWN_S = 300
-# Half-open probe (see memory: external codebase eval 2026-09-23 -- magi
+# Half-open probe (see memory: external codebase eval magi
 # circuit_breaker). The old breaker was OPEN-or-CLOSED: after the cooldown
 # expired, the very next call went straight through, and if it happened to
 # fail (a transient blip right at recovery) it re-tripped immediately. That
@@ -4640,15 +4638,15 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
 
     `return_transcript=True` returns `(text_or_None, current_messages)`
     instead of just the text -- the plan/execute/synthesize spike pipeline
-    (2026-09-26) needs the FULL gathered tool-call transcript (every page
+    Needs the FULL gathered tool-call transcript (every page
     actually fetched) to hand to a separate, stronger synthesis call, not
     just whatever short text this loop's own final turn happened to settle
     on.
 
-    `force_first_tool` sets tool_choice on the FIRST call only (2026-09-26,
+    `force_first_tool` sets tool_choice on the FIRST call only (
     real bug: a spike given real browse_page/search_web access still just
     answered from training knowledge on its first turn, calling no tool at
-    all -- confirmed live via the action log showing zero browse calls for a
+    all -- confirmed via the action log showing zero browse calls for a
     DreyX.com investigation. Offering tools is not the same as the model
     choosing to use them. This makes at least one real lookup mandatory
     before the model may settle). `True` forces tool_choice='required' (any
@@ -4656,13 +4654,13 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
     added after a second real gap: even with force_first_tool=True, a spike
     always reached for browse_page on the target's own pages and never
     called search_web at all, missing facts that only exist in OTHER sites'
-    coverage of the target (confirmed live: a manual search surfaced named
+    coverage of the target (confirmed: a manual search surfaced named
     sources for DreyX that 3 rounds of browsing the site itself never found).
     Spikes always opt in (guaranteed investigation); the ask lane leaves this
     off for most questions (plenty genuinely need no tool at all) but opts in
-    conditionally too, 2026-09-26, specifically when the question detectably
+    conditionally too, specifically when the question detectably
     wants x_trending_topics/search_linkedin_posts -- the exact same "offering
-    a tool is not the same as using it" gap, confirmed live for THIS lane
+    a tool is not the same as using it" gap, confirmed for THIS lane
     too: a natural "what's trending on X" question, correctly routed to the
     ask lane, still reached for search_web instead of the real tool it was
     just given access to.
@@ -4803,7 +4801,7 @@ AGENT_ASK_TOOLS = [
 }] if TAVILY_API_KEY else [])
 
 # Additional tools offered to /api/intent/ask ONLY when the dispatched agent's
-# role is Red Team Auditor (2026-09-25) -- real calls through the SAME gated
+# role is Red Team Auditor -- real calls through the SAME gated
 # endpoints any agent goes through (/api/curl, /api/keys/handles), never a
 # shortcut around them. Built after the spike task type (a single free-text
 # completion with no tool access at all) produced two independently
@@ -4910,7 +4908,7 @@ _TAVILY_SEARCH_URL = 'https://api.tavily.com/search'
 def _tavily_search_sync(query, max_results=5):
     """Real web search via Tavily (an API built for AI-agent search -- not
     scraping a search engine's own results page, which every major engine
-    CAPTCHA-blocks for automated traffic; confirmed live against both Google
+    CAPTCHA-blocks for automated traffic; confirmed against both Google
     and DuckDuckGo before adding this). Returns a plain-text summary (Tavily's
     own synthesized answer, when it has one, plus each result's title/url/
     snippet so the caller has real URLs to follow with browse_page), or a
@@ -4918,7 +4916,7 @@ def _tavily_search_sync(query, max_results=5):
     caller before it ever reaches a model, same as every other tool here.
 
     Each call is ONE external page-request against the monthly budget
-    (2026-09-27) -- search_web is a real network round trip, so it counts the
+    -- Search_web is a real network round trip, so it counts the
     same as a browse_page fetch."""
     if not TAVILY_API_KEY:
         return '__TOOL_ERROR__: search is not configured (no TAVILY_API_KEY).'
@@ -4996,7 +4994,7 @@ def _decision_request(model, state, questions):
 
 def _finalize_decision(data, prompt, criteria, trace_id, model):
     choice, confidence, cost = _jev_choice(data)
-    # Real gap caught live (2026-09-26): every OTHER real model call accrues
+    # Gap: every OTHER real model call accrues
     # into the spend ledger at its own chokepoint, but Jev's cost was only
     # ever LOGGED per-call (log_action), never summed anywhere -- meaning a
     # spend cap reading the ledger alone would undercount real spend by every
@@ -5020,7 +5018,7 @@ def _call_openrouter_decision_sync(model, state, questions):
     # calling this model on /chat/completions fails outright with a
     # pointer to this endpoint instead.
     #
-    # Multi-model failover + per-slug circuit breaker (2026-09-29): the old
+    # Multi-model failover + per-slug circuit breaker: the old
     # comment said "deliberately NOT the circuit breaker -- there's only one
     # Jev slug in this whole project, so blocking it for a cooldown after 3
     # failures would disable every Jev-dependent feature at once". That was a
@@ -5134,7 +5132,7 @@ def _jev_choice(data):
     return choice, confidence, float(cost) if isinstance(cost, (int, float)) else 0.0
 
 
-# The single decisions-type model this project uses (see
+# The single decisions-type model uses (see
 # _call_openrouter_decision_sync for why there's exactly one). The env var /
 # default here is the FALLBACK; the runtime value resolves through _jev_model(),
 # which checks the `settings` DB table first (switchable live via the
@@ -5169,7 +5167,7 @@ def _set_setting(key, value, conn=None):
 
 def _decision_model_chain():
     """Ordered Jev candidate slugs, primary first -- the failover chain
-    (2026-09-29). Resolution order: a comma-separated `settings` row
+    Resolution order: a comma-separated `settings` row
     ('jev_model', the operator switch via /api/jev/model) > env `JEV_MODELS`
     (comma list) > the JEV_MODEL default. A single slug means no failover; a
     multi-slug value makes _call_openrouter_decision_sync fall through to the
@@ -5211,7 +5209,7 @@ def _jev_model():
     return _decision_model_chain()[0]
 
 
-# ---- Colab/Laya standby (2026-09-29) ---------------------------------
+# ---- Colab/Laya standby ---------------------------------
 # The decisions-model backing layer can include a REMOTE Jev-compatible
 # server (Laya) running on the operator's Google Colab runtime. The original
 # sentinel design used a notebook with a public cloudflared tunnel paired via
@@ -5286,7 +5284,7 @@ _COLAB_STANDBY_BOOT_CODE = (
 def _colab_standby_ensure_service(session=None):
     """Idempotent laya boot over `colab exec`: installs laya on first use,
     preloads the model on the CPU runtime, and leaves laya-serve running
-    detached (verified live: a backgrounded child survives the exec call that
+    detached (verified: a backgrounded child survives the exec call that
     spawned it). Returns the exec tail for the loop's log line."""
     session = session or COLAB_STANDBY_SESSION
     rc, out = _colab_cli('exec', '-s', session, '--timeout', '600',
@@ -5429,7 +5427,7 @@ def _jev_is_degraded():
             and failures >= attempts * JEV_HEALTH_FAILURE_RATE)
 
 
-# ---- Colab agent compute -- run_on_colab tool (2026-09-29) ----------------
+# ---- Colab agent compute -- run_on_colab tool ----------------
 # The think tank can borrow a real Google Colab runtime for agent work this Mac
 # cannot do (CUDA/torch GPU jobs, fine-tuning experiments, heavy numeric
 # work). Same lever as the Laya standby -- the colab CLI running on this
@@ -5633,7 +5631,7 @@ _COLAB_DENIED_EXPRESSIONS = {
         r'webhook\.site|requestbin|pastebin\.com|transfer\.sh|file\.io|'
         r'0x0\.st|catbox\.moe|discord(app)?\.com|api\.telegram\.org', re.I),
     # Offensive-security / red-team work is refused on the player's Colab
-    # account ON PURPOSE (per the player): a scan or exploit attempt launched
+    # account ON PURPOSE: a scan or exploit attempt launched
     # from a Colab runtime looks like it originates from the player's own Google
     # infrastructure, and the think tank has its OWN local sandbox (the Work Room)
     # for that kind of testing. This class catches the recognizable tooling +
@@ -5835,7 +5833,7 @@ async def _colab_compute_idle_loop():
 # record confidence for observability.
 JEV_SAFETY_CONFIDENCE = 0.6
 
-# Quorum sensing (2026-09-26), ported from real Temnothorax ant nest-site
+# Quorum sensing, ported from real Temnothorax ant nest-site
 # selection: colonies pool multiple independent scouts' judgments SPECIFICALLY
 # to overcome errors inherent in any one individual's decision -- and this is
 # a documented, LIVE-confirmed problem here, not a hypothetical one: the same
@@ -5856,7 +5854,7 @@ async def _jev_quorum_decision(instructions, criteria):
     _classify_command) -- replaces each site's own single
     _call_openrouter_decision_sync + _jev_choice call. Returns (decision,
     confidence, total_cost, trace_id) -- the same tuple shape _jev_choice
-    returns plus the decision's trace_id (2026-09-28: so the caller can stamp
+    returns plus the decision's trace_id (so the caller can stamp
     it on the resulting action_log rows, making the decision chain
     queryable), so every existing call site's downstream _jev_safety_gate
     call is unchanged except threading that trace_id. Fails closed exactly
@@ -5906,7 +5904,7 @@ async def _jev_quorum_decision(instructions, criteria):
 
 
 def _jev_quorum_choice_sync(instructions, criteria):
-    """Real gap caught (2026-09-26): quorum sampling above only ever covered
+    """gap caught: quorum sampling above only ever covered
     the SAFETY gates (a confirmed real problem -- the same DreyX URL got a
     confident 0.87 allow one run, a low-confidence 0.56 escalate-and-deny
     another). The exact same single-noisy-sample problem applies equally to
@@ -5969,7 +5967,7 @@ def _jev_quorum_choice_sync(instructions, criteria):
 
 
 # Composite multi-signal trust gate for the DIRECTOR auto-approval path (see
-# memory: external codebase eval 2026-09-23 -- magi hitl_engine.ConfidenceAssessor).
+# memory: external codebase eval magi hitl_engine.ConfidenceAssessor).
 # The old check was single-signal: a lone Jev `confidence` above the floor let the
 # delegated director auto-approve/deny ANY pending escalation. That gave a
 # high-confidence Jev answer the same authority regardless of (a) how risky the
@@ -6000,7 +5998,7 @@ ESCALATION_KIND_RISK = {
     # Agent-driven "could not resolve a review requirement": ordinary routine
     # approval/denial is fine at the default floor.
     'unresolved review requirement': {'floor': JEV_SAFETY_CONFIDENCE},
-    # Agent-requested internet-allowlist addition (2026-09-29): granting a
+    # Agent-requested internet-allowlist addition: granting a
     # domain is a PERMANENT capability change (full read+write reachability
     # for sandboxed scripts, plus it skips every future Jev classify round
     # trip), so it is human-only -- floor 1.0 means the director is never
@@ -6067,7 +6065,7 @@ def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confiden
     # escalated to a human rather than acted on, which is Jev's whole reason
     # to exist. Any non-allow is just a normal block. Returns True if the
     # request should be allowed, False if it was blocked (either firmly or
-    # because we escalated the uncertainty). `trace_id` (2026-09-28) is
+    # because we escalated the uncertainty). `trace_id` is
     # threaded from the quorum call that produced this decision so the gate's
     # audit row links back to the exact decision_tape entry(s) it acted on.
     if decision != 'allow' and decision != 'approve':
@@ -6086,7 +6084,7 @@ def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confiden
     return True
 
 
-# Per your call: model tiers shouldn't be three slugs frozen in code --
+# Model tiers shouldn't be three slugs frozen in code --
 # Jev should pick them from OpenRouter's real, current catalog. Jev is a
 # classifier over a short candidate list, not something that should sift
 # 447 raw models with pricing math itself, so the actual price
@@ -6104,8 +6102,8 @@ MODEL_PRICE_BANDS = {
 MODEL_BAND_PURPOSE = {
     'low': 'Routine, high-volume work: short in-character replies, simple task narration. Needs to be cheap above all else, but still coherent -- not a model too weak to follow basic instructions.',
     'mid': 'Judgment calls: classifying report severity, generating a new hire\'s onboarding file, deciding what belongs in an agent\'s own notes. Needs real reasoning, moderate cost is fine.',
-    # Split out of what used to be one overloaded 'high' band, per your
-    # call: writing code and planning work are different jobs that reward
+    # Split out of what used to be one overloaded 'high' band:
+    # writing code and planning work are different jobs that reward
     # different models, and collapsing them meant whichever benchmark won
     # the band silently decided both. Now each is chosen on a benchmark
     # that actually measures its own job.
@@ -6113,14 +6111,14 @@ MODEL_BAND_PURPOSE = {
     'high': 'Breaking a large, vague request into 2-5 concrete, well-scoped subtasks and deciding how work is distributed (assignBigTask). Runs once per real request, and every downstream call depends on this one being right -- a bad decomposition wastes everything after it, so this is the band to spend on.',
 }
 
-# Per your explicit call: EVERY band's pick has to be grounded in a real,
+# EVERY band's pick has to be grounded in a real,
 # published benchmark score across the WHOLE catalog, not a hardcoded
 # shortlist of familiar names (a first version of the 'high'/coding band
 # used a fixed 3-model list that, on inspection, was entirely Anthropic --
 # exactly the brand-recognition bias this is supposed to replace) and not
 # Jev's own generic classifier either, which has no benchmark data in its
 # decision context, just each candidate's name and price -- a live run of
-# this exact system on 2026-09-19 confirmed that's unreliable: it picked
+# this exact system on confirmed that's unreliable: it picked
 # GPT-4 Turbo ($40/M) over several cheaper, real-benchmark-stronger
 # candidates sitting in the very same shortlist.
 #
@@ -6160,10 +6158,10 @@ BAND_BENCHMARK = {
 }
 # How many points below the single best score on file, FOR THAT BAND'S OWN
 # BENCHMARK, still counts as "good enough" to let price break the tie --
-# picked to match your explicit choice on 2026-09-19 for the coding band:
+# picked for the coding band:
 # Qwen3-Coder-480B (72.5%, $1.30/M) over Claude Sonnet 4.5 (77.2%, $18/M),
 # a 4.7-point gap. Set with a little headroom above that exact gap. Score keeps
-# its place (2026-09-27): a meaningfully worse model does NOT win on price.
+# its place: a meaningfully worse model does NOT win on price.
 BENCHMARK_QUALITY_FLOOR_GAP = 6
 # ...except the planning band, where the player is willing to spend a
 # lot. Operationalized as a TIGHTER quality floor rather than "ignore
@@ -6194,7 +6192,7 @@ def set_model_benchmark_score(model_id, benchmark, score, source_url):
 
 
 async def _best_value_pick(candidates, scores, floor_gap=None):
-    # Shared by every band (2026-09-27, restored): score keeps its place. Among
+    # Shared by every band (restored): score keeps its place. Among
     # candidates with a real stored score, keep only those within the band's
     # quality floor of the best score present, then take the cheapest of those
     # that actually still work (live-verified, same as every other pick here).
@@ -6226,7 +6224,7 @@ def _fetch_openrouter_catalog_sync():
 def _bucket_models_by_price(models):
     buckets = {band: [] for band in MODEL_PRICE_BANDS}
     for m in models:
-        # Real bug caught live: ":batch" variants (e.g. gpt-5.6-sol-pro:batch)
+        # Bug: ":batch" variants (e.g. gpt-5.6-sol-pro:batch)
         # are only usable through OpenRouter's separate Batch API (24h+
         # turnaround), not real-time chat completions -- confirmed by a
         # direct call returning a 404 pointing at /api/v1/batches instead.
@@ -6234,7 +6232,7 @@ def _bucket_models_by_price(models):
         # valid candidates regardless of price.
         if ':batch' in m['id']:
             continue
-        # Real bug caught live: a "mid" pick (Qwen3-30B-A3B) returned null
+        # Bug: a "mid" pick (Qwen3-30B-A3B) returned null
         # content on a completely ordinary single-turn prompt. Traced to
         # the model's own catalog entry: `reasoning: {default_enabled:
         # True}` -- it spends tokens on hidden reasoning before ever
@@ -6251,7 +6249,7 @@ def _bucket_models_by_price(models):
         # nothing gets spent unless a request explicitly turns it on, which
         # this system never does. That blanket exclusion was silently
         # hiding the Claude 4.5/5 family, GPT-5.1, DeepSeek V3.2 and others
-        # from every price band -- confirmed live: with the old rule, the
+        # from every price band -- confirmed: with the old rule, the
         # "high" band's actual best-available pick was GPT-4.1 (48.6% on
         # SWE-bench Verified) while Claude Haiku 4.5, cheaper at $6 vs
         # GPT-4.1's $10/M, was invisible to Jev despite scoring 73.3% on
@@ -6281,7 +6279,7 @@ def _bucket_models_by_price(models):
     return buckets
 
 
-# Real bug caught live: the old probe asked for max_tokens=5, which any
+# Bug: the old probe asked for max_tokens=5, which any
 # model that does hidden reasoning before answering will fail by
 # construction -- it spends the whole budget thinking and returns
 # content: None with a perfectly successful HTTP 200. Confirmed against
@@ -6290,7 +6288,7 @@ def _bucket_models_by_price(models):
 # model for a limit no real call here would ever impose on it.
 MODEL_VERIFY_MAX_TOKENS = 64
 # And a transient failure must not be cached as a permanent verdict. Also
-# caught live: deepseek-v4-flash verified fine three times, failed once
+# Deepseek-v4-flash verified fine three times, failed once
 # mid-refresh (a blip/rate-limit), and that single failure silently
 # downgraded the whole 'low' band for the rest of the session, because
 # the fallback result is what gets written to model_tiers. One retry is
@@ -6301,10 +6299,10 @@ MODEL_VERIFY_ATTEMPTS = 2
 def _verify_model_works_sync(model_id):
     # Catalog metadata alone can't catch this -- a model can be listed
     # with valid pricing and architecture yet have zero actual serving
-    # endpoints behind it right now (confirmed live: openai/gpt-5.2-chat
+    # endpoints behind it right now (confirmed: openai/gpt-5.2-chat
     # 404'd with "No endpoints found" despite a perfectly normal-looking
     # catalog entry). A real test call is the only real authority, same
-    # lesson as Jev's own routing earlier in this project.
+    # lesson as Jev's own routing earlier in.
     for attempt in range(MODEL_VERIFY_ATTEMPTS):
         try:
             data = _call_openrouter_sync(model_id, [{'role': 'user', 'content': 'hi'}], MODEL_VERIFY_MAX_TOKENS)
@@ -6319,7 +6317,7 @@ def _verify_model_works_sync(model_id):
 
 
 def _apply_band_price_ceiling(band, candidate_pool):
-    """The high tier carries a per-model PRICE CEILING (2026-09-27): the
+    """The high tier carries a per-model PRICE CEILING: the
     expensive tier is bounded, so the daily refresh only presents candidates
     at or below HIGH_TIER_MAX_PRICE_USD. A model over the ceiling is never
     offered, even if it tops the score table -- price is a hard bound for
@@ -6392,7 +6390,7 @@ async def refresh_model_tiers():
     # ladder -- it's gated on a real, catalog-verifiable capability
     # (architecture.input_modalities includes 'image') that a coding/chat/
     # judgment benchmark says nothing about, so it needs its own candidate
-    # pool. Per your explicit call: not just "cheapest that technically
+    # pool. not just "cheapest that technically
     # supports images" either -- same real MMMU vision-benchmark grounding
     # and same value policy (_best_value_pick) as every other band, so a
     # vision model that's cheap but bad at actually reading a screenshot
@@ -6465,7 +6463,7 @@ async def no_store(request: Request, call_next):
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
 AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev')
-# Real gap found 2026-09-25: /api/player-email/credential's OWN handler
+# Gap: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
 # with NO session cookie and NO agent key at all reached the handler and
@@ -6584,7 +6582,7 @@ _SERVER_OWNED_AGENT_FIELDS = (
     'x', 'y', 'dir', 'path', 'path_index', 'pathIndex', 'path_target',
     'pathTarget', 'stuckTimer', 'stuck_timer', 'replanCount', 'replan_count',
     'respawnedForTask', 'respawned_for_task',
-    # 2026-09-23: on/off duty is server-authoritative under the flip. The
+    # On/off duty is server-authoritative under the flip. The
     # server parks idle wanderers off duty (_park_idle_wanderers) and wakes
     # them on assignment; the client's 5s autosave and reload reload path
     # (`if (!offDuty) visible = true`) must not resurrect an idle agent the
@@ -6709,7 +6707,7 @@ async def api_log(request: Request):
     # A generic logging endpoint for decisions made entirely in the
     # browser (hiring, firing, task assignment, handoffs) -- those aren't
     # behind their own serve.py route, so without this they'd be invisible
-    # to the one activity log you asked for. Not itself a sensitive
+    # to the one activity log. Not itself a sensitive
     # action, just a record of one that already happened client-side.
     body = await request.json()
     action = body.get('action', 'unknown')
@@ -6729,7 +6727,7 @@ async def api_log(request: Request):
 @app.post('/api/reports')
 async def post_report(request: Request):
     # Agent-filed report into ANOTHER agent's reports/ directory (your
-    # 2026-09-21 call: "agents should be able to write reports in the
+    # Call: "agents should be able to write reports in the
     # directories of other agents, if they see fit" -- and the flip side,
     # that an agent must not be able to view or modify its OWN reports dir).
     # Attribution-gated: the filer must present a real agent key for its
@@ -6880,7 +6878,7 @@ def _wake_authority_on_request(state):
 def _all_teams_busy_in_sprint(state):
     """True when EVERY existing team is tied to an ACTIVE sprint -- i.e. the
     whole think tank is already committed to large-ask work. Used by the large-
-    request flow (2026-09-27): only when no team is free does a new director +
+    request flow: only when no team is free does a new director +
     team get created to take the request. A team with no active sprint (or no
     sprints at all) counts as free."""
     teams = (state.get('teams') or []) if state else []
@@ -6923,7 +6921,7 @@ async def intent_assign_big_task(request: Request):
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
 
-    # Large-request routing (2026-09-27): backlog refinement should start the
+    # Large-request routing: backlog refinement should start the
     # moment a large request is sent, and when EVERY existing team is already
     # committed to an active sprint, a new director + team is created to take
     # the ask (with an employee; the director stands in as scrum master while
@@ -6984,7 +6982,7 @@ async def intent_assign_big_task(request: Request):
     # model"). Off-thread so the worker stays free to answer itself, and with a
     # long timeout: a 4000-token decomposition on a cold model can legally take
     # well over the default 30s.
-    # High-stakes planning tier, JEV-gated (2026-09-27): a large-request
+    # High-stakes planning tier, JEV-gated: a large-request
     # decomposition is exactly the "damn good reason to use high" case -- the
     # whole downstream depends on this one call. JEV decides whether it's truly
     # high-worthy; a routine request stays on a cheaper tier.
@@ -7035,7 +7033,7 @@ async def intent_assign_big_task(request: Request):
     import sim as _sim
     queued = _sim.queue_work(state, subtasks)
     # Kick the receiving team's backlog refinement to run on the very next pass
-    # (2026-09-27): a large request should start refinement immediately, not
+    # A large request should start refinement immediately, not
     # wait for the weekly cadence. The team id is the free authority's own id
     # (the team a director leads is keyed by their id -- see _promote_to_director).
     _sim.kick_refinement_now(state, admin_id)
@@ -7301,7 +7299,7 @@ async def intent_promote_spike(task_id: str, request: Request):
     room = (body.get('room') or 'pressoffice').strip()
     if room not in _DELEGATABLE_ROOMS:
         room = 'pressoffice'
-    # Real gap caught live (2026-09-26): this used to default a missing
+    # Gap: this used to default a missing
     # taskType to 'code' -- a real test promotion of a purely informational
     # finding (no concrete "build X" recommendation at all) got silently
     # promoted into a taskType='code' story anyway, and burned 45+ review/
@@ -7323,7 +7321,7 @@ async def intent_promote_spike(task_id: str, request: Request):
 
     import sim as _sim
     spike_title = task.get('title') or 'spike'
-    # Real gap caught live (2026-09-26): task.note is deliberately a SHORT
+    # Gap: task.note is deliberately a SHORT
     # pointer ("see the Library entry just filed"), by design -- the FULL
     # findings (source lists, CSVs, feasibility data) only ever lived in the
     # Library file. Promoting a spike used to hand the new story's author
@@ -7923,7 +7921,7 @@ async def intent_clarify(request: Request):
 
 def _make_web_tools_executor(agent_id, agent_key, default_location=None, default_query=None, struck_tools=None):
     """Shared weather_now/search_web/browse_page tool executor for any
-    AGENT_ASK_TOOLS-driven tool-calling loop. Extracted 2026-09-26 so the
+    AGENT_ASK_TOOLS-driven tool-calling loop. Extracted so the
     spike content executor can reuse the exact same gated fetch/wrap logic
     _ask_core uses, instead of the single free-text completion with NO tool
     access it used before -- see the SECURITY_TEST_TOOLS comment above about
@@ -7977,13 +7975,13 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 'viaVpnCountry': country,
             }, agent_key, timeout=60 if not country else 60 + MULLVAD_CONNECT_TIMEOUT_S)
             if isinstance(result, dict) and result.get('allowed') and result.get('textForModel'):
-                # Real gap caught live (2026-09-26): /api/browse already
+                # Gap: /api/browse already
                 # extracts every real <a href> on the page (_extract_links)
                 # specifically so an agent can "follow a breadcrumb" to a
                 # page it doesn't already know the URL for -- but this
                 # executor was discarding that field entirely, so the model
                 # had no real links to follow and had to GUESS the next URL
-                # (confirmed live: guessed /ai-news-feed on dreyx.com, got a
+                # (confirmed: guessed /ai-news-feed on dreyx.com, got a
                 # 404, gave up instead of picking a real link off the page
                 # it just fetched). Surface a capped list of real
                 # {text, url} pairs so multi-page investigation actually
@@ -8055,9 +8053,8 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     else:
         pick = candidates[0]
     # The live agents dict (not _agent_record_for, which checks the roster
-    # FIRST -- a roster entry never carries `profile`, so mission was always
-    # empty here). Found 2026-09-25 while wiring the Red Team Auditor's real
-    # checklist into this endpoint.
+    # FIRST -- a roster entry never carries `profile`, so mission is always
+    # empty here).
     agent = agents.get(pick) or _agent_record_for(state, pick)
     name = agent.get('name') or agent.get('id') or 'a think tank member'
     role = agent.get('role') or 'worker'
@@ -8104,7 +8101,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
 
     _web_tool = _make_web_tools_executor(
         pick, agent_key, default_location=(location or '').strip() or question, default_query=question)
-    # Real gap caught live (2026-09-26): a natural question like "what's
+    # Gap: a natural question like "what's
     # trending on X" correctly classifies into the ASK lane (a quick,
     # immediate-answer question, per _ROUTING_LANES' own definition), not
     # spike -- but the real Treg tools were only ever wired into the spike
@@ -8121,7 +8118,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     from content import (_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL, _make_treg_tools_executor,
                         _spike_wants_x_trending, _spike_wants_linkedin_search)
     _treg_tool = _make_treg_tools_executor()
-    # Same proven fix as search_web/search_library before it (twice tonight):
+    # Same proven fix as search_web/search_library before it (twice):
     # prompt-only guidance to prefer a specific tool was NOT reliably
     # followed live -- forcing the tool choice is the only mechanism that
     # actually worked. Reusing the exact same detectors the spike pipeline
@@ -8172,14 +8169,14 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
             + (SECURITY_TEST_TOOLS if is_security_test_role else []))
     try:
         if model:
-            # Self-loopback deadlock (same class fixed 2026-09-22 in the
+            # Self-loopback deadlock (same class fixed in the
             # content executors): the security-test tools make a real nested
             # HTTP call back into THIS server. Run the whole (blocking)
             # tool loop in a thread so that nested call actually reaches the
             # event loop instead of waiting on the very request that's
-            # blocking it -- confirmed live: without this, every
+            # blocking it -- confirmed: without this, every
             # attempt_curl/request_capability_handle call timed out at 30s.
-            # 50 (was 4/5): raised 2026-09-27 so one request can touch many
+            # 50 (was 4/5): raised so one request can touch many
             # pages (browse_page + search_web) for real multi-site research.
             reply = await asyncio.to_thread(
                 _call_agent_tool_loop, model, messages, tools,
@@ -8211,8 +8208,8 @@ async def intent_ask(request: Request):
     Body: {question, location?, agentId?}. The question is required; `location`
     is a hint for location-bearing asks (e.g. dressing advice) though the agent
     can also derive it. A free, non-admin agent is dispatched round-robin
-    unless `agentId` names a specific eligible candidate to pin instead (added
-    2026-09-25 so the player can deliberately address one agent, e.g. the Red
+    unless `agentId` names a specific eligible candidate to pin instead (so
+    the player can deliberately address one agent, e.g. the Red
     Team Auditor role's live security checks, rather than whoever's next). It
     may call tools (weather; plus real curl/capability-handle tools when the
     dispatched agent's role is Red Team Auditor) mid-turn via an agentic tool
@@ -8225,7 +8222,7 @@ async def intent_ask(request: Request):
     agent reasons about weather as DATA, never as instructions it must follow.
 
     Thin wrapper: all real behavior lives in _ask_core (also called directly
-    by the Telegram bridge, added 2026-09-27, with no HTTP hop in between).
+    by the Telegram bridge, added with no HTTP hop in between).
     """
     if not check_rate_limit(ASK_LANE_RATE_LIMIT_KEY):
         return JSONResponse({'error': 'Rate limit hit -- too many questions at once. Wait a minute and try again.'}, status_code=429)
@@ -8244,13 +8241,13 @@ async def intent_ask(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Theo request routing (2026-09-25): classify a free-text player request
+# Theo request routing: classify a free-text player request
 # (today only reached from the Telegram bridge) into one of six lanes, using
 # the same Jev N-way choice pattern the rest of the codebase already uses for
 # judgment calls (sim._governance_decider_default; the model-tier picker
 # above). Every lane wires into machinery that already existed but had no
 # real caller (sim.queue_spike, sim.queue_bug) or no creation path at all
-# (researchTopics) -- see /Users/poole86/.claude/plans/tidy-doodling-storm.md.
+# (researchTopics).
 # ---------------------------------------------------------------------------
 
 _ROUTING_LANES = [
@@ -8271,7 +8268,7 @@ def _classify_request_lane_default(state, text):
     with a test that monkeypatches one of sim.py's own ceremony deciders.
     Returns a lane id, or None on a Jev outage or an unrecognized choice --
     the caller treats None as 'unclear', this function never guesses."""
-    # Quorum-sampled (2026-09-26) -- routing story vs spike (peer-gated or
+    # Quorum-sampled -- routing story vs spike (peer-gated or
     # not) off a single noisy Jev sample is the same class of real problem
     # already confirmed for safety gates (the same URL, a confident 0.87
     # allow one run, a low-confidence 0.56 deny the next), just never
@@ -8849,7 +8846,7 @@ def _write_wiki_server(page_id, title, category, content):
     if category not in categories:
         if category != 'think_tank':
             return None
-        # Real gap caught live (2026-09-26): nothing ever seeds a default
+        # Gap: nothing ever seeds a default
         # 'think_tank' category -- it's only ever created via a director
         # manually calling POST /api/intent/wiki/category, so a think tank
         # where nobody happened to do that had EVERY distillation attempt
@@ -9247,7 +9244,7 @@ async def list_library():
     os.makedirs(LIBRARY_ARCHIVE_DIR, exist_ok=True)
     files = []
     for root, _dirs, filenames in os.walk(LIBRARY_DIR):
-        # Real gap caught 2026-09-26 (found while adding trail-based ranking
+        # Gap (found while adding trail-based ranking
         # to search): nothing here skipped dotfiles, so .passport.json (the
         # hash-chain ledger, LIBRARY_DIR's own reserved file) was listed and
         # content-searched right alongside real agent-authored knowledge --
@@ -9302,7 +9299,7 @@ def is_under_reports(rel_path):
 
 
 def _owns_reports_dir(agent_id, requester_id):
-    # Per your call (2026-09-21): an agent must NOT be able to view or modify
+    # An agent must NOT be able to view or modify
     # its OWN reports/ directory -- peer reports about it are for others to
     # read, not for it to sanitize or delete. The target agent whose reports/
     # is being requested is 'agent_id'; 'requester_id' is the identity behind
@@ -9397,7 +9394,7 @@ async def search_library(q: str):
     return JSONResponse({'query': query, 'matches': matches[:50]})
 
 
-# Library trail reinforcement/decay (2026-09-26), ported from real ant
+# Library trail reinforcement/decay, ported from real ant
 # pheromone-trail biology: a trail that's actually walked stays strong; one
 # nobody follows fades. search_library used to rank purely by file mtime, so
 # "written 2 minutes ago" always beat "read 40 times, hugely validated, but
@@ -9468,7 +9465,7 @@ def _library_search_matches(query):
     paths that were never read via a tracked path (both score 0.0), so a
     fresh, never-yet-read file is not buried by this change.
 
-    Each match also carries `size` (real byte length, 2026-09-26) -- a cheap,
+    Each match also carries `size` (real byte length) -- a cheap,
     mechanical signal for a caller choosing among several matches (the
     top-ranked one isn't always the most substantial; see the spike
     library-review tool's own use of this)."""
@@ -9534,7 +9531,7 @@ def _redact_secrets(content):
     return content
 
 
-# Per your call, from the MAGI research: content fetched via /api/browse
+# From the MAGI research: content fetched via /api/browse
 # is untrusted by construction (Jev only judges the destination and
 # stated purpose before fetching -- it never inspects what's actually on
 # the page). Nothing currently feeds browsed text into an agent's own
@@ -9580,7 +9577,7 @@ def verify_boundary_intact(content, nonce, tag):
 # Per the MAGI tool_governance.py research: /api/execute, /api/browse, and
 # /api/pipeline are logged and Jev-classified, but nothing previously
 # bounded how OFTEN a given identity could call them at all -- a genuine
-# gap, not a hypothetical one, given this project has already found
+# gap, not a hypothetical one, given past work already found
 # several real bugs where something looped or retried more than intended.
 # Applied per-endpoint rather than as generic middleware: reading the
 # request body in middleware to get agentId would consume the stream
@@ -9663,14 +9660,14 @@ async def write_library_file(request: Request):
         f.write(content[:200_000])
     log_action(agent_id, 'library_write', {'path': rel_path, 'bytes': len(content), 'source': source}, authorized=authorized)
     # Every time an agent writes or modifies a file, it's chained into the
-    # passport (your 2026-09-21 call) -- so the immutable ledger records not
+    # passport -- so the immutable ledger records not
     # just promotes but the actual act of writing, and any later tampering
     # with a written file is detectable against it.
     _append_passport_decision('library_write', agent_id, {'path': rel_path, 'source': source})
     return PlainTextResponse('saved')
 
 
-# Real ask: agents should be able to download actual files (a dataset, a
+# Agents should be able to download actual files (a dataset, a
 # PDF, real reference material) into the shared Library, not just
 # extract page TEXT the way /api/browse does. Same real safety gates as
 # browse -- Jev classifies the URL+purpose BEFORE anything is fetched,
@@ -9709,7 +9706,7 @@ async def library_download(request: Request):
     agent_id = body.get('agentId', 'unknown')
     purpose = (body.get('purpose') or '').strip()
     filename = (body.get('filename') or '').strip()
-    # Per your call: a download only the requesting agent needs stays in
+    # A download only the requesting agent needs stays in
     # their own directory (downloads/<agentId>/, which is also exactly
     # what stays browsable after they're fired -- see firing.js). Anything
     # OTHER agents need goes to shared/ instead, once promoted -- a real,
@@ -9825,7 +9822,7 @@ def _append_passport(rel_path, owner, promoted_by):
 
 
 def _append_passport_decision(kind, actor, payload):
-    # Chained key-decisions ledger (your 2026-09-21 call: "what is logged to
+    # Chained key-decisions ledger: "what is logged to
     # the hashed-chain? Is it every action?") -- the answer is NO, by design:
     # routine activity (chat, browse, execute, state saves) fills action_log,
     # a plain table. The hash-chain is reserved for decisions and file
@@ -9858,7 +9855,7 @@ def _append_passport_decision(kind, actor, payload):
 
 
 def verify_passport():
-    # Tamper-evidence watchdog (2026-09-22 hardening, plan Part B): walk the
+    # Tamper-evidence watchdog (hardening, plan Part B): walk the
     # whole chain and confirm (a) every block's `prev` links to the previous
     # block's content hash, and (b) every promoted-FILE block still matches the
     # CURRENT bytes of its file on disk. Returns a summary dict -- the viliage
@@ -9942,7 +9939,7 @@ async def library_promote(request: Request):
     os.makedirs(os.path.dirname(dest_target), exist_ok=True)
     shutil.move(source_target, dest_target)
     # Promote = a file becomes TRUSTED -- that's exactly the point to append
-    # it to the immutable product passport (issue #4). Chained so any later
+    # it to the immutable product passport. Chained so any later
     # tampering with a promoted file is detectable.
     _append_passport(dest_rel, owner=_owns_library_path(dest_rel) or agent_id, promoted_by=agent_id)
     log_action(agent_id, 'library_promote', {'from': pending_path, 'to': dest_rel}, authorized=authorized)
@@ -9954,8 +9951,8 @@ async def library_promote(request: Request):
 
 @app.post('/api/library/reject')
 async def library_reject(request: Request):
-    # The other real outcome of the pending_review/ quarantine, per your
-    # explicit call (2026-09-21): not everything that lands there deserves
+    # The other real outcome of the pending_review/ quarantine: not everything
+    # that lands there deserves
     # to become trusted. Mirrors library_promote almost exactly -- same
     # path validation, same shutil.move -- just to a rejected/ archive
     # instead of the promoted destination, so a rejected file is kept out
@@ -9981,7 +9978,7 @@ async def library_reject(request: Request):
     return PlainTextResponse('rejected')
 
 
-# Real document ingestion, per your direct ask: feed the think tank PDFs,
+# Real document ingestion: feed the think tank PDFs,
 # Excel files, Python/HTML source, images, whole directories, and zips,
 # and have their real content land in the Library where any agent can
 # read it. Reads directly off the local filesystem this server already
@@ -10092,8 +10089,8 @@ def _ingest_one_file(src_path, dest_rel_dir, results: list[dict[str, object]]):
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, 'wb') as f:
             f.write(raw)
-        # Copied as-is, not auto-described -- per the earlier cost-
-        # conscious call, an eager vision call on every ingested image
+        # Copied as-is, not auto-described -- per an earlier cost-
+        # conscious decision, an eager vision call on every ingested image
         # would spend money whether or not anyone ever needed it. An
         # agent can call the same real vision review on it later, on
         # demand, exactly when a task actually needs to look at it.
@@ -10191,7 +10188,7 @@ async def chat(request: Request):
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
     if not model or not messages:
         return JSONResponse({'error': 'model and messages are required'}, status_code=400)
-    # Input pattern guard (2026-09-28): fast, deterministic injection-vector
+    # Input pattern guard: fast, deterministic injection-vector
     # check BEFORE the call reaches the model. Scans the concatenated message
     # text for known prompt-injection patterns (ignore previous instructions,
     # tone override, system-prompt extraction, role-play inversion). A match
@@ -10210,8 +10207,8 @@ async def chat(request: Request):
                        {'model': model, 'patterns_matched': [str(p) for p in _INPUT_GUARD_PATTERNS if re.search(p, text)]},
                        authorized=authorized)
             return JSONResponse({'error': 'Blocked by input guard (potential prompt injection)'}, status_code=400)
-    # 300 was sized for a short in-character 1:1 reply -- real gap caught
-    # live: assignBigTask()'s structured multi-subtask JSON breakdown got
+    # 300 was sized for a short in-character 1:1 reply -- real gap:
+    # assignBigTask()'s structured multi-subtask JSON breakdown got
     # silently truncated mid-response by this same cap, producing invalid
     # JSON. 600 covered that without meaningfully changing the cost
     # profile of routine short replies, which never asked for anywhere
@@ -10243,10 +10240,10 @@ async def chat(request: Request):
         if isinstance(usage_cost, (int, float)) and usage_cost:
             _accrue_spend(service, usage_cost)
             # High-tier calls accrue against the dedicated high-tier monthly
-            # budget too (2026-09-27) so the JEV gate can fail closed when the
+            # budget too so the JEV gate can fail closed when the
             # month's high-tier allowance is spent. Single accrual point -- this
             # is the one place the expensive tier's cost is counted (was doubled
-            # by a duplicate block 2026-09-28, halving the effective budget).
+            # by a duplicate block halving the effective budget).
             if model == _high_tier_slug():
                 _accrue_high_tier_spend(usage_cost)
         log_action(agent_id, 'chat', {'model': model, 'service': service, 'cost': float(usage_cost) if isinstance(usage_cost, (int, float)) else 0.0}, authorized=authorized)
@@ -10259,7 +10256,7 @@ async def chat(request: Request):
 
 @app.post('/api/browse')
 async def browse(request: Request):
-    # Real internet access for agents, per your explicit call to accept
+    # Real internet access for agents: accept
     # the residual risk of open-web + a Jev gate over a hard allowlist --
     # but classify BEFORE fetching, not after: a page's content never
     # lands on this machine unless Jev already approved the destination
@@ -10270,7 +10267,7 @@ async def browse(request: Request):
         return JSONResponse({'error': 'Agent browsing is disabled (AGENT_BROWSING_ENABLED=false in .env)'}, status_code=403)
     if not OPENROUTER_API_KEY:
         return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
-    # Monthly page-request budget (2026-09-27): a count-based quota on external
+    # Monthly page-request budget: a count-based quota on external
     # fetches, NOT a dollar cap. When the month's allowance is spent, browsing
     # refuses rather than silently running over the 1000 free requests.
     if _page_budget_exhausted():
@@ -10301,7 +10298,7 @@ async def browse(request: Request):
     trace_id = None
     if _is_allowlisted_host(parsed.hostname):
         # Player-vetted domain -- skip the Jev classify+escalate round trip
-        # entirely (real gap caught live: the SAME url got a low-confidence
+        # entirely (gap: the SAME url got a low-confidence
         # 'escalated_unsure' from Jev on one run and a clean allow on
         # another, purely from classifier variance on a site the player had
         # already decided was fine). SSRF/private-network protection above
@@ -10333,7 +10330,7 @@ async def browse(request: Request):
     # different WAY to read an already-cleared page, not a second,
     # unvetted path to one.
     render = bool(body.get('render'))
-    # Optional real VPN exit for geo-restricted content (2026-09-26). This
+    # Optional real VPN exit for geo-restricted content. This
     # only replaces WHICH network path the fetch below takes -- the URL has
     # already been through the exact same SSRF check and Jev/allowlist gate
     # above either way; a country never grants a second, unvetted path to a
@@ -10397,7 +10394,7 @@ async def browse(request: Request):
     # default rather than by whoever remembers to wrap it.
     wrapped, nonce, tag, model_instruction = wrap_external_content(text, source_label=f'a page at {final_url}')
 
-    # Real UI/visual research, per your direct call: text extraction alone
+    # Real UI/visual research: text extraction alone
     # throws away the actual design of a page -- exactly the kind of thing
     # a UI/UX researcher needs to SEE (layouts, note-highway designs,
     # visual style), not read a stripped-text summary of. Reuses the
@@ -10417,7 +10414,7 @@ async def browse(request: Request):
 
     log_action(agent_id, 'browse', {'url': url, 'finalUrl': final_url, 'purpose': purpose, 'decision': 'allowed', 'contentType': content_type, 'bytes': len(raw_body), 'visual': bool(image_b64), 'render': render, 'viaVpnCountry': via_vpn_country or None}, authorized=authorized, trace_id=trace_id)
     # One real external fetch happened -- count it against the monthly page-
-    # request budget (2026-09-27). Best-effort accounting, never blocks the
+    # request budget. Best-effort accounting, never blocks the
     # response (the pre-fetch check already refused if the budget was spent).
     _accrue_page_request()
     return JSONResponse({
@@ -10434,10 +10431,10 @@ async def browse(request: Request):
 
 @app.post('/api/allowlist/request')
 async def allowlist_request(request: Request):
-    # Agent-facing request to extend the player-vetted allowlist (2026-09-29).
+    # Agent-facing request to extend the player-vetted allowlist.
     # An allowlist entry means FULL read+write reachability for sandboxed
     # scripts AND it skips every future Jev classify round trip -- a permanent
-    # capability grant, per your call that a worker can only get one through an
+    # capability grant, because a worker can only get one through an
     # explicit human approval, so this fires a floor-1.0 escalation that ONLY
     # the player's email link can resolve (the director is never permitted to
     # auto-approve it). Agents call this instead of editing .env; when the
@@ -10492,12 +10489,12 @@ CURL_METHODS = {'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'}
 CURL_MAX_BODY_BYTES = 200_000
 CURL_TIMEOUT_S = 15
 
-# Per your explicit call: an agent without standing access to something
+# An agent without standing access to something
 # (e.g. an agent with no Weather Station curl access) should be able to
 # ask their supervisor for it and get REAL, TEMPORARY access if the reason
 # is legitimate -- a real, gated, expiring exception layered on top of the
 # existing room check, not a way around it. Starts
-# with curl (the concrete case you named); the mechanism generalizes to
+# with curl; the mechanism generalizes to
 # any future room/role-gated capability by just adding it here.
 TEMP_ACCESS_CAPABILITIES = {
     'curl': 'Real HTTP requests to the open internet -- normally restricted to inside the Weather Station.',
@@ -10530,7 +10527,7 @@ def _grant_temp_access(agent_id, capability, granted_by, reason):
 
 
 def _agent_is_in_weatherstation(agent_id, live_room=None):
-    # Real server-side room gate, per your explicit call -- curl only
+    # Real server-side room gate: curl only
     # from the Weather Station, same exclusivity Eli's own profile already
     # states for outside/internet access generally (Studio's screenshot-
     # based visual research is the one other exception, and that goes
@@ -10540,7 +10537,7 @@ def _agent_is_in_weatherstation(agent_id, live_room=None):
     # could lie about its own location, but it can't rewrite what was
     # already saved to the server's own database.
     #
-    # Real race fixed (2026-09-21, reported live): an agent's `inRoom` is
+    # Race fixed: an agent's `inRoom` is
     # maintained in the browser in real-time but only persisted to the DB
     # on the client's 5s autosave. So an agent arriving in the Weather
     # Station and making its very first curl call within those 5 seconds
@@ -10577,8 +10574,8 @@ SANDBOX_DOWNLOAD_ROOMS = ('observatory', 'pressoffice')
 
 
 def _agent_is_in_sandbox_room(agent_id, live_room=None):
-    # Real server-side room gate, per your call (2026-09-20, extended to
-    # the Work Room the same day): downloading directly into a sandbox
+    # Real server-side room gate, extended to
+    # the Work Room: downloading directly into a sandbox
     # only works from inside a room that actually has one -- Observatory
     # (RESEARCH_SANDBOX_ID) or Work Room (WORKROOM_SANDBOX_ID) -- same
     # exclusivity curl draws around the Weather Station
@@ -10627,7 +10624,7 @@ def _curl_request_sync(method, url, headers, body):
 
 @app.post('/api/curl')
 async def curl(request: Request):
-    # A lower-level sibling to /api/browse -- per your call, agents need
+    # A lower-level sibling to /api/browse -- agents need
     # raw HTTP access (real status codes, real headers, unprocessed
     # HTML/JSON) that /api/browse's text-stripped, human-readable output
     # deliberately never gives. Same "classify before the request goes
@@ -10719,7 +10716,7 @@ async def curl(request: Request):
         log_action(agent_id, 'curl', {'url': url, 'method': method, 'purpose': purpose, 'decision': 'allowed_but_failed', 'reason': str(e)}, authorized=authorized, trace_id=trace_id)
         return JSONResponse({'allowed': True, 'error': f'Approved, but the request failed: {e}'})
 
-    # Real, if narrow, residual risk (2026-09-26 audit): a capability-handle-
+    # Real, if narrow, residual risk (audit): a capability-handle-
     # authenticated request's response used to go back to the agent
     # completely raw. If the target API ever echoes the injected credential
     # (some do, in error/debug responses), that secret would land in the
@@ -10741,7 +10738,7 @@ async def curl(request: Request):
     return JSONResponse({'allowed': True, **result})
 
 
-# Real ask (2026-09-20): "can the sandbox download files from websites,
+# "Can the sandbox download files from websites,
 # with Jev as judge?" -- yes, but NOT by giving the sandbox itself
 # network access. SANDBOX_NETWORK is created `--internal` specifically
 # so sandboxed code has no route to the internet at all -- reusing that
@@ -10758,7 +10755,7 @@ async def curl(request: Request):
 # purpose) is legitimate, not what's actually inside the file, which
 # isn't something a classifier can meaningfully do for arbitrary content
 # before it's even been fetched. Works from either sandboxed room --
-# Observatory (research) or Work Room (per your same-day follow-up) --
+# Observatory (research) or Work Room --
 # `sandboxId` just says which one to write into.
 SANDBOX_DOWNLOAD_MAX_BYTES = 20_000_000
 
@@ -10844,8 +10841,8 @@ SANDBOX_SAVE_MAX_BYTES = 2_000_000  # a page's extracted text, not a binary down
 
 @app.post('/api/sandbox-save-page')
 async def sandbox_save_page(request: Request):
-    # The persist half of a real multi-page "collect and save" tool, per
-    # your ask (2026-09-21) for something like your Desktop bug_bounty's
+    # The persist half of a real multi-page "collect and save" tool, modeled on
+    # the Desktop bug_bounty's
     # page-collection feature. The FETCH half already exists and stays
     # untouched -- /api/browse already Jev-classifies each URL, SSRF-checks
     # it, fetches it, and extracts text/links -- so this only adds the
@@ -10937,7 +10934,7 @@ async def sandbox_save_page(request: Request):
 
 @app.post('/api/access/request')
 async def access_request(request: Request):
-    # Real "ask your supervisor" flow, per your explicit call: an agent
+    # Real "ask your supervisor" flow: an agent
     # without standing access to something can ask for it, and gets a
     # REAL, TEMPORARY grant if the reason is legitimate -- judged, not
     # rubber-stamped, and not permanent even when approved. The judgment
@@ -10994,7 +10991,7 @@ async def _classify_command(command, purpose, agent_id='unknown'):
         'block': 'The command, or its stated purpose, suggests: ' + '; '.join(EXECUTE_BLOCK_CATEGORIES) + '.',
     }
     instructions = f'An in-game agent in the Work Room wants to run this command: {command}\nStated reason: {purpose or "not given"}\nDecide allow or block.'
-    # Real gap fixed 2026-09-26: this used to hand-duplicate _jev_safety_
+    # Gap fixed: this used to hand-duplicate _jev_safety_
     # gate's own low-confidence-escalation logic (and its own separate,
     # non-quorum-sampled single Jev call) instead of sharing it -- the
     # riskiest primitive in the system (arbitrary shell execution) was on a
@@ -11023,8 +11020,8 @@ def _sandbox_dir_for(sandbox_id):
 # make; having no way to undo it is the actual, real gap.
 #
 # Local git, not a full-directory-copy-per-snapshot (the first version of
-# this) and not a GitHub remote (your question, and a real one) -- per
-# your explicit call, weighed on real numbers: the copy approach measured
+# this) and not a GitHub remote (a real trade-off) --
+# weighed on real numbers: the copy approach measured
 # at 868KB for 8 snapshots of the one sandbox that's seen real work, which
 # isn't a problem YET, but it's linear in sandbox size with no way to
 # store less than a full copy per snapshot. Git's content-addressed
@@ -11144,8 +11141,8 @@ async def add_handle(request: Request):
     # own HTTP client already needed a valid X-Agent-Key just to clear the
     # global auth middleware, and could reach this handler by simply
     # omitting `requesterId` -- which _resolve_requester would then read as
-    # "not an agent" and let mint a handle for itself. Found 2026-09-24
-    # while wiring up the first real handle-authenticated action; require an
+    # "not an agent" and let mint a handle for itself.
+    # Real handle-authenticated actions require an
     # actual verified player session instead.
     if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
         return JSONResponse({'error': 'handles are player-only'}, status_code=403)
@@ -11194,12 +11191,12 @@ async def delete_handle(handle: str, request: Request):
 
 @app.post('/api/execute')
 async def execute(request: Request):
-    # Real sandboxed execution for the Work Room -- per your explicit
-    # call, not simulated. Every command is classified BEFORE it runs
+    # Real sandboxed execution for the Work Room -- real
+    # execution, not simulated. Every command is classified BEFORE it runs
     # (same "classify the request, not the result" shape as /api/browse),
     # then actually runs inside an isolated, network-disabled, resource-
     # capped Docker container with only its own scratch directory mounted
-    # -- confirmed live before any of this was wired up: no network
+    # -- confirmed before any of this was wired up: no network
     # access, no host filesystem access, resource limits all hold.
     if not EXECUTION_ENABLED:
         return JSONResponse({'error': 'Agent execution is disabled (AGENT_EXECUTION_ENABLED=false in .env)'}, status_code=403)
@@ -11218,8 +11215,8 @@ async def execute(request: Request):
 
     allowed, reason = await _classify_command(command, purpose, agent_id)
     if not allowed:
-        # Blocked commands escalate rather than just vanishing -- per your
-        # call that admins (and this feature) need a way to reach you for
+        # Blocked commands escalate rather than just vanishing --
+        # admins (and this feature) need a way to reach you for
         # something genuinely necessary. You decide by tapping a link in
         # the email; nothing runs automatically just because you were
         # asked.
@@ -11319,9 +11316,9 @@ async def sandbox_backups_restore(request: Request):
     return JSONResponse({'ok': True})
 
 
-# Real gap you caught live: a developer/reviewer agent writing real HTML/
+# Gap: a developer/reviewer agent writing real HTML/
 # CSS only ever sees its own source text, never what it actually looks
-# like rendered -- confirmed directly this session, a stray note element
+# like rendered -- confirmed directly: a stray note element
 # rendering well outside its container was completely invisible from
 # reading the code, only showed up in an actual screenshot. Headless
 # Chrome (already installed for this machine's own tooling, no new
@@ -11509,7 +11506,7 @@ def _page_probe_sync(file_path, actions, probes):
                 except Exception as e:
                     results[expr] = f'ERROR: {e}'
 
-            # One level deeper than just names: real bug caught live
+            # One level deeper than just names: a bug found
             # building this exact tool -- a fix correctly found and used
             # window._fdGameState (a real global this inventory surfaced),
             # but then guessed at a `.playing` property on it that doesn't
@@ -11529,7 +11526,7 @@ def _page_probe_sync(file_path, actions, probes):
                             try { keys = Object.keys(v); } catch (e) {}
                             return { name, type: 'object', keys };
                         }
-                        // Real bug caught live building this tool: a fix
+                        // A bug found building this tool: a fix
                         // re-used a guard flag (_fdMenuDupPatched) an
                         // EARLIER fix attempt had already set true, so its
                         // own genuinely-correct removal logic short-
@@ -11626,7 +11623,7 @@ async def resolve_escalation(id: str, token: str, decision: str):
     esc['resolvedAt'] = time.time()
     escalations[id] = esc
     _save_escalations(escalations)
-    # Approval side-effect (2026-09-29): an approved 'allowlist request' turns
+    # Approval side-effect: an approved 'allowlist request' turns
     # the requested host into a REAL runtime allowlist grant -- this is the
     # only path that can grant one, and it is this HTML link alone (the
     # director loop is blocked from it by the floor-1.0 kind). The note field
@@ -11705,7 +11702,7 @@ async def decision_tape_feed(kind: Optional[str] = None, min_conf: Optional[floa
     ]})
 
 
-# Jev calibration (2026-09-28, CS329A takeaway #1): Jev reports a confidence
+# Jev calibration (CS329A takeaway #1): Jev reports a confidence
 # with every decision, and the whole low-confidence-escalation floor
 # (JEV_SAFETY_CONFIDENCE) is built on the assumption that high confidence
 # means high reliability -- but nothing here ever VERIFIED that. The safety
@@ -11849,7 +11846,7 @@ def _decision_calibration_report(window_s=7 * 86400):
     }
 
 
-# Feedback-loop actuator (2026-09-29): the calibration report is the SENSOR.
+# Feedback-loop actuator: the calibration report is the SENSOR.
 # This is the actuator that turns "reliability below the stated bar" into a
 # threshold the gates actually enforce. The escalation floor assumed high
 # confidence == reliable; this pass checks that at the CURRENT threshold and
@@ -11963,14 +11960,14 @@ HEALTH_STATE_STALE_AFTER_S = 30
 # Don't re-log the same standing condition every 5-minute check -- an
 # alert this old is either already seen or already acted on.
 HEALTH_ALERT_DEDUP_WINDOW_S = 3600
-# Behavioral anomaly detection (2026-09-28): an agent firing more than this
+# Behavioral anomaly detection: an agent firing more than this
 # many spend-inducing tool calls (browse/execute/curl/chat) within this
 # window is treated as a likely runaway loop / injection-driven churn -- the
-# same shape as the escalation storm this project survived. The health check
+# same shape as an escalation storm the project survived. The health check
 # flags it so it's caught while it's happening, not after the budget's gone.
 ANOMALY_WINDOW_S = 15 * 60
 ANOMALY_AGENT_TOOL_THRESHOLD = 60  # >60 tool calls / 15 min per agent
-# Jev availability (2026-09-28): how far back to measure Jev decision
+# Jev availability: how far back to measure Jev decision
 # failures, and what failure RATE (not raw count) trips the degraded alert.
 # Jev is a single-model/single-provider SPOF with deliberately no circuit
 # breaker, so the health check is what surfaces an outage instead of the
@@ -11978,7 +11975,7 @@ ANOMALY_AGENT_TOOL_THRESHOLD = 60  # >60 tool calls / 15 min per agent
 JEV_HEALTH_WINDOW_S = 60 * 60
 JEV_HEALTH_FAILURE_RATE = 0.5      # >=50% of Jev calls failing = degraded
 JEV_HEALTH_MIN_ATTEMPTS = 10       # don't trip on a handful of attempts
-# Absolute Zero rejection signal (2026-09-28): refinement grooms self-proposed
+# Absolute Zero rejection signal: refinement grooms self-proposed
 # work-requests, and a REJECTED carryaway is the think tank's own signal that its
 # self-proposal pipeline is producing junk (trivial/ill-scoped cards). Counted
 # over a day; an info-severity dashboard alert (not a player push -- grooming
@@ -11986,7 +11983,7 @@ JEV_HEALTH_MIN_ATTEMPTS = 10       # don't trip on a handful of attempts
 # pattern).
 SELF_PROPOSED_REJECT_WINDOW_S = 86400
 SELF_PROPOSED_REJECT_THRESHOLD = 5
-# METR reliability-at-horizon (2026-09-28): does the colony actually FINISH
+# METR reliability-at-horizon: does the colony actually FINISH
 # the work it starts? Measured from the action_log's task_assigned ->
 # task_completed pairs (paired on the taskId the details JSON carries) over a
 # rolling window: the median completion time plus the fraction of assigned
@@ -12001,7 +11998,7 @@ METR_FAST_COMPLETION_RATE = 0.3   # <30% of started tasks done within 1h = slow 
 METR_SLOW_MEDIAN_HOURS = 6.0      # median completion over 6h = work is stalling
 
 
-# Coordination-imbalance scalar (2026-09-29): Reddit's Hot ranking is one of
+# Coordination-imbalance scalar: Reddit's Hot ranking is one of
 # the few ranking formulas with a genuine DECAY built in -- a post's score is
 # (reaction signal) / age^decay, so it matters while fresh and fades over a
 # couple of days. The coordination check before this measured a raw 24h count
@@ -12080,7 +12077,7 @@ def _health_alerts_for_signals(signals):
         if count >= 10:
             alert('capability', 'warning', f'{count} blocked/failed "{action_name}" call(s) in the last hour')
 
-    # Behavioral anomaly (2026-09-28): an agent firing an abnormal volume of
+    # Behavioral anomaly: an agent firing an abnormal volume of
     # tool calls in the window is a likely runaway loop / injection-driven
     # churn -- surface it while it's happening, not after the budget's gone.
     # The threshold is re-checked here (not just in the query) so the pure
@@ -12096,7 +12093,7 @@ def _health_alerts_for_signals(signals):
               f'no chosen model for band(s): {", ".join(signals["missing_model_tier_bands"])} -- '
               f'refresh_model_tiers may not have found a working candidate')
 
-    # Jev availability (2026-09-28): a degraded/absent decisions model is a
+    # Jev availability: a degraded/absent decisions model is a
     # SPOF (single slug, single provider, deliberately no circuit breaker) --
     # when it fails, every Jev feature silently runs its deterministic
     # fallback. The failure RATE over the window, not a raw count, is the
@@ -12110,7 +12107,7 @@ def _health_alerts_for_signals(signals):
               f'{jev_failures}/{jev_attempts} Jev decision call(s) failed in the last hour -- '
               f'the decisions model may be down, colony running deterministic fallbacks')
 
-    # Coordination-imbalance scalar (2026-09-29): replaced the raw 24h ceremony
+    # Coordination-imbalance scalar: replaced the raw 24h ceremony
     # COUNT-ratio check -- {ceremony} and {progress} still read as the 24h
     # counts for the message, but the TRIP is the decayed score (Reddit-Hot
     # style, see _decayed_signal/_imbalance_score): a fresh burst where
@@ -12131,7 +12128,7 @@ def _health_alerts_for_signals(signals):
               f'{ceremony} ceremony / {progress} shipped in the last 24h; process may be '
               f'outrunning actual work')
 
-    # Absolute Zero rejection signal (2026-09-28): a rising count of self-proposed
+    # Absolute Zero rejection signal: a rising count of self-proposed
     # work-requests groomed OUT at refinement means the think tank's own proposals are
     # low-value/trivial -- the default failure mode when agents pick their own next
     # work. Info severity: a dashboard signal, not a player-spam push (rejecting
@@ -12142,7 +12139,7 @@ def _health_alerts_for_signals(signals):
               f'refinement in the last 24h -- proposals trending trivial/ill-scoped; '
               f'coach medium-difficulty cards (Absolute Zero)')
 
-    # METR reliability-at-horizon (2026-09-28): a colony that STARTS tasks but
+    # METR reliability-at-horizon: a colony that STARTS tasks but
     # rarely FINISHES them within the horizon has poor reliability -- work
     # turning into ceremony or stalling -- even when raw task_completed counts
     # look healthy. Gated on a minimum number of assignments so a quiet think tank
@@ -12298,7 +12295,7 @@ def compute_health_snapshot():
             f"({','.join('?' for _ in _PROGRESS_ACTIONS)}) AND ts > ?",
             (*_PROGRESS_ACTIONS, now - 86400),
         ).fetchone()[0]
-        # Coordination-imbalance scalar (2026-09-29): raw TIMESTAMPS of
+        # Coordination-imbalance scalar: raw TIMESTAMPS of
         # ceremony/progress actions within the decay horizon, so the signals
         # can weight events by freshness instead of counting a week of stale
         # artifacts as if they happened now (the reason the old count-ratio
@@ -12313,11 +12310,11 @@ def compute_health_snapshot():
             f"({','.join('?' for _ in _PROGRESS_ACTIONS)}) AND ts > ?",
             (*_PROGRESS_ACTIONS, now - _IMBALANCE_HORIZON_S),
         ).fetchall()]
-        # Behavioral anomaly signal (2026-09-28): per-agent tool-call volume in
+        # Behavioral anomaly signal: per-agent tool-call volume in
         # a short window. A runaway loop or injection-driven tool churn shows
         # up as one agent firing an abnormal number of spend-inducing actions
         # (browse/execute/curl/chat) in a few minutes -- the same shape as the
-        # escalation storm this project actually survived. Detected here, not
+        # escalation storm the project actually survived. Detected here, not
         # reactively after the budget is gone.
         tool_volume_rows = conn.execute(
             "SELECT agent_id, COUNT(*) FROM action_log "
@@ -12326,7 +12323,7 @@ def compute_health_snapshot():
             "GROUP BY agent_id HAVING COUNT(*) >= ?",
             (now - ANOMALY_WINDOW_S, ANOMALY_AGENT_TOOL_THRESHOLD),
         ).fetchall()
-        # Jev availability (2026-09-28): decision_tape records every Jev call
+        # Jev availability: decision_tape records every Jev call
         # with its ok flag, so a degrading/absent decisions model (the SPOF --
         # single slug, single provider, deliberately no circuit breaker) is
         # visible as a failure rate instead of silently falling back to
@@ -12337,7 +12334,7 @@ def compute_health_snapshot():
             'SELECT COUNT(*), SUM(ok = 0) FROM decision_tape WHERE ts > ?',
             (now - JEV_HEALTH_WINDOW_S,),
         ).fetchone()
-        # Absolute Zero rejection signal (2026-09-28): refinement carryaway rows
+        # Absolute Zero rejection signal: refinement carryaway rows
         # whose details carry the selfProposedRejected marker (see
         # sim._resolve_refinement). Like the blocked/failed LIKE checks above,
         # a JSON-substring match on the marker, not a JSON query.
@@ -12346,7 +12343,7 @@ def compute_health_snapshot():
             "AND details LIKE '%\"selfProposedRejected\": true%' AND ts > ?",
             (now - SELF_PROPOSED_REJECT_WINDOW_S,),
         ).fetchone()[0]
-        # METR reliability-at-horizon (2026-09-28): the action_log's
+        # METR reliability-at-horizon: the action_log's
         # task_assigned/task_completed pairs (see _task_horizon_metrics) --
         # whether the colony finishes the work it starts, measured as a rate
         # at 1h/24h, not a raw completion count.
@@ -12374,7 +12371,7 @@ def compute_health_snapshot():
         'jev_decision_attempts_last_hour': jev_attempt_rows[0],
         'jev_decision_failures_last_hour': jev_attempt_rows[1],
         'self_proposed_rejected_last_24h': self_proposed_rejected,
-        # METR reliability-at-horizon (2026-09-28): median completion time +
+        # METR reliability-at-horizon: median completion time +
         # the fraction of assigned tasks finished within 1h / 24h. None means
         # too few completed tasks to judge (or no assignments at all).
         'task_assigned_last_24h': metr['assigned'],
@@ -12391,7 +12388,7 @@ def compute_health_snapshot():
         # for it; the alert check below treats that the same as a very high
         # ratio.
         'ceremony_to_progress_ratio': (ceremony_count / progress_count) if progress_count else None,
-        # Coordination-imbalance scalar (2026-09-29): the decayed signals and
+        # Coordination-imbalance scalar: the decayed signals and
         # the log10-compressed score the coordination alert keys off. Sent for
         # client-side trending; the 24h COUNT keys above remain for the alert
         # message and for back-compat.
@@ -12475,7 +12472,7 @@ def _push_new_health_alerts(alerts):
 # not a re-implementation of browse/save/chat internals.
 SELF_BASE_URL = _load_env().get('SELF_BASE_URL', 'http://localhost:8010')
 _SANDBOX_RESEARCH_ID = 'research-shared'  # index.html: RESEARCH_SANDBOX_ID
-RESEARCH_CRAWL_MAX_PAGES = 50             # tasks.js crawlAndCollect -- raised 6->30->50 (2026-09-27) for deeper research
+RESEARCH_CRAWL_MAX_PAGES = 50             # tasks.js crawlAndCollect -- raised 6->30->50 for deeper research
 RESEARCH_SKILL_SYNTHESIS_TOKENS = 900     # runResearchTask /api/chat max_tokens
 
 
@@ -12567,7 +12564,7 @@ async def health_alerts_endpoint(limit: int = 50):
 
 @app.get('/api/activity/summary')
 async def activity_summary(agentId: str):
-    # Real bug caught live: asked to reflect on the think tank with nothing
+    # Bug: asked to reflect on the think tank with nothing
     # but a role and a vague prompt, agents confabulated confidently --
     # "quarterly review process," "Gemini writes, DeepSeek codes," one
     # agent complaining about a tool it's never had room access to touch.
@@ -12598,7 +12595,7 @@ async def model_tiers():
 async def model_tiers_refresh():
     # An explicit, deliberate action (a button) -- but also run AUTOMATICALLY
     # once a day by _model_tier_refresh_loop, attributed to the admin/director
-    # (2026-09-27: the model landscape moves fast, so the think tank re-picks its
+    # (The model landscape moves fast, so the think tank re-picks its
     # best-value tier from that day's scores + prices on a schedule). This
     # endpoint just lets the player force an immediate re-pick too.
     try:
@@ -12847,7 +12844,7 @@ _LOGIN_PAGE = """<!DOCTYPE html>
 @app.get('/', response_class=HTMLResponse)
 @app.get('/index.html', response_class=HTMLResponse)
 async def serve_index(request: Request):
-    # Real login gate, per your call once a public deployment became a
+    # Real login gate, once a public deployment became a
     # real possibility -- no valid session, no game page at all, not even
     # a read-only peek. Nothing embedded in this page is a secret anymore
     # (the old SERVER_ACCESS_KEY-in-<script> approach is gone); every API
@@ -12921,7 +12918,7 @@ if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8936
     # --max-idle-minutes N: exit the server after N minutes with no HTTP
     # request at all (any request, authed or not -- touched in middleware).
-    # The enforced form of "kill the server when I'm away"; 0 = disabled.
+    # The enforced form of "kill the server when idle"; 0 = disabled.
     _idle_arg = [a for a in sys.argv if a.startswith('--max-idle-minutes')]
     if _idle_arg:
         try:

@@ -1,5 +1,5 @@
 """ensure_sandbox_networking() -- the Work Room sandbox's Docker network/proxy
-setup. Player-vetted data sites (2026-09-26): BROWSE_ALLOWLIST_DOMAINS is now
+setup. Player-vetted data sites: BROWSE_ALLOWLIST_DOMAINS is now
 passed into the egress proxy container (SANDBOX_EGRESS_EXTRA_HOSTS) so agent-
 run scripts can do real systematic crawling against them, not just one-URL-
 at-a-time browse_page calls. These tests cover the create/recreate-on-drift

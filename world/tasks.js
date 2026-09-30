@@ -1,5 +1,5 @@
 // A small, real task system -- just enough to give an agent somewhere to
-// walk to and something to do when they arrive. Per your call: agents had
+// walk to and something to do when they arrive. Agents had
 // no incentive to go anywhere until they had a task. Not a project-
 // management system -- one task per agent at a time, a fixed target room,
 // a fixed work duration. This is the first thing all session that makes
@@ -22,7 +22,7 @@
 
 const TASK_WALK_SPEED = 60; // world-space px/sec -- a bit slower than the player's 90
 const TASK_ARRIVE_DIST = 12;
-// Real fix (2026-09-21): this used to be the WHOLE duration -- a fixed
+// Fix: this used to be the WHOLE duration -- a fixed
 // setTimeout fired finishTask() regardless of whether the real dispatched
 // work (checkWeatherReference/runWorkroomTask/runResearchTask/
 // runMediaDigestTask, all real async calls -- a model call, a crawl, a
@@ -41,7 +41,7 @@ const TASK_ARRIVE_DIST = 12;
 // multi-second delay every run.
 let MIN_TASK_VISUAL_MS = 2000;
 
-// Real ask (2026-09-21): removing the old fixed timer above also removed
+// Removing the old fixed timer above also removed
 // an accidental backstop against a genuinely hung dispatch -- nothing now
 // bounds how long a single real call can leave an agent "busy." Sized
 // from the real worst cases already in this codebase: _urlopen_with_
@@ -65,12 +65,12 @@ let nextTaskId = 1;
 // A small rotating pool of demo tasks -- the original ask was "give
 // agents an incentive to go somewhere," which the very first version
 // satisfied with exactly one hardcoded task, ever, for one agent. Real
-// gap you caught live: everyone else (Omar included) then just stands
+// gap: everyone else (Omar included) then just stands
 // still forever with nothing to do. Cycling through a few room-appropriate
 // tasks keeps the whole roster actually moving, not just whoever Jev
 // picked once at boot.
 const TASK_POOL = [
-  // `pair: true` -- per your call, these two can be worked as a real pair
+  // `pair: true` -- these two can be worked as a real pair
   // (one drives, one navigates, sharing one workstation) instead of
   // always solo. See assignPairTask()/runPairProgrammingSession() below.
   { title: "Review this week's research findings", room: 'observatory', instructions: "Pick whoever is best suited to review this week's research findings in the Research Center.", pair: true },
@@ -82,7 +82,7 @@ const TASK_POOL = [
   { title: 'Sort the incoming mail queue', room: 'postoffice', instructions: 'Pick whoever is best suited to sort the incoming mail at the Post Office.' },
   { title: "Log today's weather readings", room: 'weatherstation', instructions: 'Pick whoever is best suited to log readings at the Weather Station.' },
   { title: 'Catalog new library arrivals', room: 'library', instructions: 'Pick whoever is best suited to catalog new arrivals at the Library.' },
-  // `dependsOn` (see handoffs.js): per your call, agents should talk to
+  // `dependsOn` (see handoffs.js): agents should talk to
   // each other for real reasons -- a real dependency between two rooms'
   // work is the first one. Broadcast prep needs the day's press briefing
   // filed first; the ledger reconciliation needs the day's mail (invoices,
@@ -91,7 +91,7 @@ const TASK_POOL = [
   // the dependency being invisible plumbing nobody ever sees play out.
   { title: "Prep tonight's broadcast segment", room: 'media', dependsOn: 'pressoffice', instructions: 'Pick whoever is best suited to prep tonight\'s broadcast segment at Media.' },
   { title: 'Reconcile the daily ledger', room: 'bank', dependsOn: 'postoffice', instructions: 'Pick whoever is best suited to reconcile the daily ledger at the Bank.' },
-  // Real gap caught live: every task above maps to one named specialist
+  // Gap: every task above maps to one named specialist
   // (weather -> Eli, banking -> Ben, etc.), so Dev's four assistants --
   // whose whole job is "overflow support," nobody's specialty -- could
   // never win a best-fit call against the actual specialist. This is the
@@ -104,14 +104,14 @@ const TASK_POOL = [
 // is no longer an ambient "pick something to do" step at all.
 let lastTaskCompletedAt = {};
 
-// Per your explicit call: nothing should be working when there is nothing
+// Nothing should be working when there is nothing
 // to do, and no API calls should fire at all while the think tank is idle.
 //
 // The old design made that impossible by construction -- TASK_POOL is a
 // fixed list that ALWAYS has entries, so pickNextTask() (now deleted)
 // always found "work," every idle agent always got assigned something,
 // and the 6-second cycle burned 2-3 real Jev calls per agent forever,
-// long after you'd stopped asking for anything. Confirmed live: 247
+// long after the player stopped asking for anything. Confirmed: 247
 // firing reviews and a continuous stream of `decide` calls with nobody
 // actually waiting on any of it.
 //
@@ -125,7 +125,7 @@ let lastTaskCompletedAt = {};
 let WORK_QUEUE = [];
 const WORK_ITEM_MAX_ATTEMPTS = 3;
 
-// Real ask (2026-09-21): research on a topic should be able to run on a
+// Research on a topic should be able to run on a
 // recurring cadence (daily/weekly/etc.), not just once. Each entry is a
 // standing request, not a queued task -- it only ever turns INTO a real
 // WORK_QUEUE item (via checkResearchSchedule/queueWork below) once its own
@@ -160,14 +160,14 @@ function defineResearchTopic({ topic, startUrl, linkKeyword, pageKeyword, cadenc
 // nothing's due yet, costs exactly what an empty WORK_QUEUE already does
 // -- nothing. lastRunAt is stamped BEFORE the resulting task is even
 // assigned, same reasoning as every other "mark it taken up front" fix
-// this session (WORK_QUEUE's own attemptedThisCycle) -- a topic due at
+// (WORK_QUEUE's own attemptedThisCycle) -- a topic due at
 // the same instant runTaskCycleBody happens to take a while to actually
 // assign it must not be picked up a second time on the very next tick.
 function checkResearchSchedule() {
   const now = Date.now();
   for (const topic of RESEARCH_TOPICS) {
     if (now - (topic.lastRunAt || 0) < topic.cadenceMs) continue;
-    // Real ask (2026-09-21): "date aware... if it has run previously" --
+    // "Date aware... if it has run previously" --
     // captured BEFORE topic.lastRunAt gets overwritten below, since that's
     // the real point in time this topic was last actually checked.
     // previousRunAt === 0 for a genuinely first-ever run, which is exactly
@@ -229,13 +229,13 @@ function _pickNextDueIndex(excludeItems) {
     const item = WORK_QUEUE[i];
     if (!_isWorkItemDue(item)) continue;
     // excludeItems (runTaskCycleBody's own attemptedThisCycle set): real
-    // fix, 2026-09-21 audit -- without this, a failed item gets re-queued
+    // fix from an audit -- without this, a failed item gets re-queued
     // at the BACK, but this SAME synchronous loop (bounded by rosterSize,
     // often 15-20) can still reach it again before returning, exhausting
     // all WORK_ITEM_MAX_ATTEMPTS retries within one call and giving real
     // transient congestion (agents genuinely walking toward a contested
     // door) zero actual wall-clock time to clear before abandoning.
-    // Confirmed live: 3 real subtasks all abandoned within about a
+    // Confirmed: 3 real subtasks all abandoned within about a
     // second of each other, not spread across separate scheduled ticks.
     if (excludeItems && excludeItems.has(item)) continue;
     const priority = item.priority ?? WORK_PRIORITY.normal;
@@ -252,7 +252,7 @@ function thinkTankHasWork() {
   return Object.values(AGENTS).some(a => a.task || a.handoff || a.pairWith || a.busy);
 }
 
-// Real ask: let the player mark some queued work as more important than
+// Let the player mark some queued work as more important than
 // other work, so it gets picked before older but less important items
 // instead of everything processing in strict arrival order regardless of
 // how much it actually matters. Named levels, not a raw number a caller
@@ -273,7 +273,7 @@ function _normalizePriority(p) {
 // programming survives the removal of the ambient pool (it used to come
 // from a hardcoded TASK_POOL flag). `notBefore` (a real epoch-ms
 // timestamp, e.g. Date.now() + 3600000 for "in an hour") is optional --
-// per your ask for agents that can't start something until a specific
+// for agents that can't start something until a specific
 // time. An item with it sits inertly in the queue, untouched and not
 // burning retry attempts, until that time actually arrives (see
 // _isWorkItemDue / runTaskCycleBody). `priority` (a WORK_PRIORITY name or
@@ -289,7 +289,7 @@ function queueWork(items) {
       pair: !!item.pair,
       notBefore: item.notBefore || null,
       priority: _normalizePriority(item.priority),
-      // Real fix (2026-09-21, hiring-to-shutdown audit): queueWork()
+      // Fix (hiring-to-shutdown audit): queueWork()
       // whitelists its fields defensively, which is right in general,
       // but it was silently dropping the broader goal a subtask came
       // from (assignBigTask) -- the ONE thing that would have told
@@ -321,9 +321,9 @@ function queueWork(items) {
   return WORK_QUEUE.length;
 }
 
-// Called on an interval (index.html). Real gap caught live: assigning
+// Called on an interval (index.html). Gap: assigning
 // exactly one task per call meant only ever one agent was walking at a
-// time even with nine others standing idle -- per your call, they should
+// time even with nine others standing idle -- they should
 // all be able to work in parallel, not queue for a turn. Loops one
 // assignment per currently-idle agent instead, each a fresh Jev call
 // (since who's idle shrinks after every assignment in the loop).
@@ -378,7 +378,7 @@ async function runTaskCycleBody() {
   // recomputed live each iteration since who's awake/idle changes as
   // assignments land within the same tick.
   const rosterSize = AGENT_ROSTER.filter(d => !d.isAdmin).length;
-  // Real fix (2026-09-21, hiring-to-shutdown audit): tracks which items
+  // Fix (hiring-to-shutdown audit): tracks which items
   // THIS call has already attempted, so a failed-and-requeued item can't
   // be pulled again within the same synchronous cycle -- see
   // _pickNextDueIndex's own comment for the real failure this closes.
@@ -402,8 +402,8 @@ async function runTaskCycleBody() {
     // someone, the way a real on-call rotation works. Ordinary ambient
     // work can ALSO wake someone, but only as a real fallback -- when
     // every on-duty agent is already busy, not preferentially over one
-    // who's simply idle and available. Either way, per your explicit
-    // call on 2026-09-20, waking anyone is still capped by
+    // who's simply idle and available. Either way, waking
+    // anyone is still capped by
     // MAX_ACTIVE_AGENTS (canActivateAnother()) -- 25 active/awaiting-
     // scheduled-work is a hard ceiling, not a preference, so a due item
     // that would need to exceed it just waits (re-queued, retried next
@@ -466,7 +466,7 @@ function findPath(startX, startY, targetX, targetY, excludeAgentId) {
   // whoever is co-located with her (not everyone nearby, just whoever is
   // at the exact same spot) keeps her from being deadlocked in place by
   // someone standing on top of her.
-  // Real deadlock caught live (2026-09-21): two agents landing a FRACTION
+  // Deadlock: two agents landing a FRACTION
   // of a pixel apart (float drift from independent walk calculations, not
   // an exact re-park) never match this exact-equality check, yet their
   // 20px-wide boxes still fully overlap -- each then blocks EVERY cell
@@ -509,7 +509,7 @@ function findPath(startX, startY, targetX, targetY, excludeAgentId) {
   // agents converging on the same doorway in quick succession each find
   // somewhere real to stand rather than rejecting the whole request.
   const TARGET_RELAX_RADIUS = 3;
-  // Real bug caught live, one layer deeper than the relaxation above:
+  // Bug, one layer deeper than the relaxation above:
   // two agents planned in the SAME synchronous batch (a mass "send
   // everyone home") start from the same/near-identical position, so
   // neither sees the other as a live obstacle yet -- both independently
@@ -558,7 +558,7 @@ function findPath(startX, startY, targetX, targetY, excludeAgentId) {
   // enough when the agent's box (20px) is wider than one cell (16px
   // world-space) -- two adjacent centers can each individually fit while
   // the straight line BETWEEN them still clips an obstacle somewhere in
-  // between. A single midpoint sample wasn't enough either -- caught live
+  // between. A single midpoint sample wasn't enough either --
   // via Playwright: a transition passed its midpoint check at
   // computation time, then froze a live agent at a point 25% of the way
   // along that same segment, well off-center. Sampling several points
@@ -573,8 +573,8 @@ function findPath(startX, startY, targetX, targetY, excludeAgentId) {
     return true;
   }
 
-  // Real bug caught live (2026-09-21, hiring-to-shutdown audit, a layer
-  // deeper than the pickFreeSpot fix earlier the same day): cellWorldPos
+  // Bug (hiring-to-shutdown audit, a layer
+  // deeper than the pickFreeSpot fix earlier): cellWorldPos
   // returns a box's top-left CENTERED on a cell (offset by -AGENT_W/2,
   // -AGENT_H/2 from the cell's own corner) -- which is exactly what
   // a.x/a.y become after ANY real walk, since tickAgentMovement snaps
@@ -584,9 +584,9 @@ function findPath(startX, startY, targetX, targetY, excludeAgentId) {
   // because AGENT_W (20) doesn't evenly divide cell*SCALE (16): the
   // reverse formula is off by exactly one cell in X for any position
   // that came from a real waypoint (Y happens to divide evenly, so it
-  // was never visibly broken there). Confirmed live: an agent resting at
+  // was never visibly broken there). Confirmed: an agent resting at
   // her own real, valid task.entryX/entryY (itself a real waypoint,
-  // after the entryX/entryY fix earlier the same day) could not
+  // after the entryX/entryY fix earlier) could not
   // pathfind ANYWHERE from her own position -- findPath was checking
   // one cell to the left of where she actually was. The START must be
   // read as the box's CENTER (matching cellFitsAgent/computeReachable-
@@ -603,10 +603,10 @@ function findPath(startX, startY, targetX, targetY, excludeAgentId) {
   // `visited[targetGy][targetGx]` after the BFS with targetGy/targetGx
   // beyond the `visited` array's own bounds -- `visited[targetGy]` is
   // undefined, and indexing into that throws, which (per the frame-freeze
-  // bug fixed earlier this session) is exactly the class of error that
+  // bug fixed) is exactly the class of error that
   // must never surface uncaught from here.
   if (targetGx < 0 || targetGy < 0 || targetGx >= cols || targetGy >= rows) return null;
-  // Real crash caught live building the outskirts exit-room doors: an
+  // Crash building the outskirts exit-room doors: an
   // earlier version of a door's approach-point math (since fixed) landed
   // one row past the bottom of the grid, which corrupted that agent's
   // OWN x/y the moment it was written before the crash -- so on the
@@ -618,7 +618,7 @@ function findPath(startX, startY, targetX, targetY, excludeAgentId) {
   if (startGx < 0 || startGy < 0 || startGx >= cols || startGy >= rows) return null;
 
   // The START cell only needs the STATIC check, not agentBlockedAt --
-  // real bug caught live tonight, directly from the new "reappear at the
+  // Bug, directly from the new "reappear at the
   // door you entered" fix: two agents finishing tasks at the same room
   // now land on the exact same spot, and the second one's own occupied
   // cell was failing agentBlockedAt against the first, permanently
@@ -633,7 +633,7 @@ function findPath(startX, startY, targetX, targetY, excludeAgentId) {
 
   if (!startCellIsFree(startGx, startGy)) return null;
 
-  // Real root cause, confirmed live: a fixed approach point in front of a
+  // Root cause, confirmed: a fixed approach point in front of a
   // door/desk (assignTask's door-front target, etc.) is exactly one cell --
   // the instant ANY agent is standing on or near it, cellIsFree() on the
   // exact target cell returns false and
@@ -667,7 +667,7 @@ function findPath(startX, startY, targetX, targetY, excludeAgentId) {
     [targetGx, targetGy] = relaxed;
   }
 
-  // Real bug caught live: an agent re-assigned to the exact room she's
+  // Bug: an agent re-assigned to the exact room she's
   // already resting at (parked right on that room's own door-front
   // arrival point from a previous task) has start cell === target cell,
   // so the BFS below never runs and the backtrack loop below THAT never
@@ -721,11 +721,11 @@ function findPath(startX, startY, targetX, targetY, excludeAgentId) {
   }));
 }
 
-// Real ask: don't let a room's fixed desk count become a hard limit on
+// Don't let a room's fixed desk count become a hard limit on
 // getting work done. Work Room and Research Center share the exact same
 // six-desk layout (ROOM_COLLISIONS.workstations via ROOM_INTERACTABLES),
 // so overflow from one into the other is physically sensible, not just a
-// fallback hack -- scoped to just this one pair, per your call that this
+// fallback hack -- scoped to just this one pair, because this
 // is about keeping ongoing work unblocked, not a general room-load-
 // balancer, and that the think tank has enough rooms for now.
 const ROOM_OVERFLOW_TARGET = { pressoffice: 'observatory' };
@@ -757,7 +757,7 @@ function _resolveRoomWithOverflow(room) {
 // Town Hall, House, or Command Center -- those are special-cased
 // elsewhere and an agent can't "walk to" a button-only room).
 //
-// Real refactor (2026-09-21): projectLabel, then research, then taskType
+// Refactor: projectLabel, then research, then taskType
 // each arrived as one more trailing positional parameter -- a skillReview
 // flag would have made an 8th. Bundled the newer, sparser ones into one
 // `extra` object instead (projectLabel stays its own named param since
@@ -791,17 +791,17 @@ function assignTask(agentId, title, room, instructions, projectLabel, extra = {}
 
   const id = 'task-' + (nextTaskId++);
   // entryX/entryY: exactly where she walked in from, so finishTask() can
-  // put her back there rather than a random spot on the map -- per your
-  // call, she should walk back out of the door she used, not teleport
+  // put her back there rather than a random spot on the map -- she should
+  // walk back out of the door she used, not teleport
   // somewhere arbitrary.
   //
-  // Real bug caught live (2026-09-21, hiring-to-shutdown audit): this
+  // Bug (hiring-to-shutdown audit): this
   // used to store the RAW, pre-relaxation targetX/targetY -- fine for
   // findPath's OWN routing (which relaxes a contested/trap target cell
   // to the nearest one that actually passes cellFitsAgent internally),
   // but finishTask() later teleports her EXACTLY to entryX/entryY with
   // no such check. If the door's raw "+door.h+4" target happened to
-  // land in a cell that fails cellFitsAgent (confirmed live: this
+  // land in a cell that fails cellFitsAgent (confirmed: this
   // affects real doors, not a hypothetical), every agent who ever
   // finished a task there got teleported straight into the same
   // permanent trap findPath itself had already correctly routed AROUND
@@ -828,7 +828,7 @@ function assignTask(agentId, title, room, instructions, projectLabel, extra = {}
 // Falls back to the first eligible candidate if the Jev call fails, so an
 // API outage doesn't mean tasks simply never get assigned.
 //
-// `includeOffDuty`: real gap caught live testing assignBigTask() below --
+// `includeOffDuty`: gap testing assignBigTask() below --
 // a player-initiated, meaningful task has no eligible candidates at all
 // once the ambient TASK_POOL cycle has run everyone off-duty, even though
 // off-duty was only ever meant to bound the AUTOMATIC busywork loop, not
@@ -843,7 +843,7 @@ function assignTask(agentId, title, room, instructions, projectLabel, extra = {}
 async function assignTaskViaJev(title, room, instructions, includeOffDuty = false, projectLabel, extra) {
   const candidates = AGENT_ROSTER
     .filter(d => !d.isAdmin)
-    // !a.pairWith -- real race caught live: without it, the ambient cycle
+    // !a.pairWith -- race: without it, the ambient cycle
     // (this function, on its own 6s timer) could scoop up an agent mid-
     // walk toward a pair session (assignPairTask has already committed
     // her via pairWith, but her .task/.busy don't flip until she actually
@@ -906,7 +906,7 @@ async function loadRoomPurposes() {
   }
 }
 
-// Per your call: give an admin a large, free-form task and have THEM
+// Give an admin a large, free-form task and have THEM
 // break it into real subtasks and delegate them -- not you hand-picking
 // individual TASK_POOL entries yourself. The breakdown itself needs a
 // real reasoning model (Jev is a classifier, not a planner -- picking who
@@ -924,7 +924,7 @@ async function assignBigTask(goal) {
   if (!authorityDef) return { error: 'No admin or director is free right now -- try again shortly.' };
   const admin = AGENTS[authorityDef.id];
 
-  // Real ask: a subtask that can't start until a specific time (e.g. "log
+  // A subtask that can't start until a specific time (e.g. "log
   // tonight's weather at 9pm"). WORK_QUEUE items already support this
   // (queueWork's notBefore, respected by runTaskCycleBody/thinkTankHasWork
   // -- a scheduled item makes zero real calls while it waits). The one
@@ -963,7 +963,7 @@ async function assignBigTask(goal) {
         // bit: a model that reasons before answering spends real budget
         // doing it, and how much depends on how long/complex the goal
         // is, not just a fixed amount. 400 -> null. 1200 was enough for
-        // a short goal but, confirmed live, still came back null for a
+        // a short goal but, confirmed, still came back null for a
         // longer, more detailed one; 4000 produced a clean plan for that
         // same goal. This call runs ONCE per request and every
         // downstream call depends on it, so generous headroom here is
@@ -994,7 +994,7 @@ async function assignBigTask(goal) {
   // as soon as possible) rather than dropping the subtask entirely --
   // same "degrade, don't discard" discipline as everywhere else a real
   // model output gets converted into something the queue can act on.
-  // Real fix (2026-09-21, hiring-to-shutdown audit): the subtask's own
+  // Fix (hiring-to-shutdown audit): the subtask's own
   // instructions were already dropped after the Jev "who should do
   // this" call (assignTaskViaJev never passed them on to assignTask),
   // and the broader goal a subtask came FROM was never attached at all.
@@ -1015,7 +1015,7 @@ async function assignBigTask(goal) {
     // subtask was asked to satisfy. Ambient queueWork items without a goal
     // carry an empty checklist, which grading treats as "grade nothing".
     s.checklist = checklist;
-    // Real fix (2026-09-21): only meaningful for pressoffice (runWorkroomTask
+    // Fix: only meaningful for pressoffice (runWorkroomTask
     // is the only dispatch that reads it) -- an invalid value, or one on a
     // subtask that isn't even pressoffice, degrades to the safe default
     // rather than silently threading a nonsense value all the way to
@@ -1054,7 +1054,7 @@ function tickAgentMovement(dt) {
     if (dist < TASK_ARRIVE_DIST) {
       // Snap exactly onto the waypoint's own clean coordinate, not
       // wherever accumulated float error left her "close enough" --
-      // the real bug, caught live: 512 sits exactly on a grid-cell
+      // the bug: 512 sits exactly on a grid-cell
       // boundary, and tiny per-frame rounding drift left her at
       // 511.99999999999983, one row below where findPath's own
       // idealized cell-center math placed the walkable path. That's
@@ -1091,7 +1091,7 @@ function tickAgentMovement(dt) {
     const tryX = { x: a.x + stepDx, y: a.y, w: AGENT_W, h: AGENT_H };
     const tryY = { x: a.x, y: a.y + stepDy, w: AGENT_W, h: AGENT_H };
     const beforeX = a.x, beforeY = a.y;
-    // Real deadlock caught live: two agents can legitimately end up on
+    // Deadlock: two agents can legitimately end up on
     // the EXACT same spot (finishTask resets both to the same door-front
     // point if they worked the same room) -- without this, EVERY
     // direction reports blocked forever, since a box moving even one
@@ -1119,7 +1119,7 @@ function tickAgentMovement(dt) {
     if (!blockedAt(tryBoth) && !agentBlockedAt(tryBoth, id, coLocatedIds)) { a.x = tryBoth.x; a.y = tryBoth.y; }
     else if (!blockedAt(tryX) && !agentBlockedAt(tryX, id, coLocatedIds)) { a.x = tryX.x; }
     else if (!blockedAt(tryY) && !agentBlockedAt(tryY, id, coLocatedIds)) { a.y = tryY.y; }
-    // Real bug caught live: when a step is nearly axis-aligned (e.g.
+    // Bug: when a step is nearly axis-aligned (e.g.
     // dy~=0 walking due east), a blocked X-slide falls through to the
     // Y-only branch, which "succeeds" -- but its step size is also
     // ~0, so it's a no-op dressed up as progress. That kept resetting
@@ -1133,7 +1133,7 @@ function tickAgentMovement(dt) {
       continue;
     }
 
-    // Genuinely stalled, not just one bad frame -- per your call, she
+    // Genuinely stalled, not just one bad frame -- she
     // needs to learn to take another path rather than freeze forever.
     // Most likely cause is another agent now standing on the planned
     // route (the path was only pre-validated against the static map and
@@ -1144,7 +1144,7 @@ function tickAgentMovement(dt) {
       a.stuckTimer = 0;
       const target = a.pathTarget;
       const newPath = target && findPath(a.x, a.y, target.x, target.y, id);
-      // Real bug caught live: BFS validates the START cell using its own
+      // Bug: BFS validates the START cell using its own
       // idealized, grid-snapped center (cellWorldPos()), not the agent's
       // actual real position -- for an arbitrary non-grid-aligned start
       // point (a handoff target next to another agent, not a clean door
@@ -1164,8 +1164,8 @@ function tickAgentMovement(dt) {
       }
 
       // No route from exactly where she's standing (or BFS keeps
-      // nominally succeeding without her ever actually moving). Per your
-      // call: don't give up yet -- drop her fresh somewhere else
+      // nominally succeeding without her ever actually moving). Rather
+      // than giving up immediately, drop her fresh somewhere else
       // reachable on the map and let her try navigating from there, once,
       // before actually cancelling. Guards against the ONE spot she's
       // wedged into being the whole problem (e.g. boxed in by other
@@ -1262,7 +1262,7 @@ function arriveAtTask(id) {
   let minVisualTimeoutId, dispatchTimeoutId;
   const minVisualDelay = new Promise(resolve => { minVisualTimeoutId = setTimeout(resolve, MIN_TASK_VISUAL_MS); });
   const workAndFloor = Promise.all([dispatchPromise, minVisualDelay]);
-  // Real backstop (2026-09-21, TASK_DISPATCH_TIMEOUT_MS's own comment) --
+  // Backstop (TASK_DISPATCH_TIMEOUT_MS's own comment) --
   // races the real work against a generous ceiling so a genuinely hung
   // call can't leave her busy forever. `settled` ensures only the FIRST
   // of (real completion) or (timeout) ever calls finishTask -- if the
@@ -1288,7 +1288,7 @@ function arriveAtTask(id) {
   workAndFloor.catch(() => {});
 }
 
-// Pair programming -- per your call: two agents can share one
+// Pair programming -- two agents can share one
 // workstation, one driving (real execution) while the other navigates
 // (talks through the approach), discussing it together as it happens.
 // This is the think tank's first real multi-agent collaboration ON one
@@ -1338,8 +1338,8 @@ async function assignPairTask(title, room, instructions, includeOffDuty = false,
   const door = ROOM_DOOR_TRIGGERS[room];
   const baseX = door.x + door.w / 2, baseY = door.y + door.h + 4;
   // Right next to the driver's own arrival point, not on top of her --
-  // same "+door.h+4" convention as assignTask()'s own target. Real bug
-  // caught live: a fixed +26 sideways offset worked for some doors but
+  // same "+door.h+4" convention as assignTask()'s own target.
+  // A fixed +26 sideways offset worked for some doors but
   // walked straight off the narrow walkable strip in front of others
   // (confirmed: +20 already failed for the Work Room's own door, which
   // is exactly as wide as the room behind it, no margin to spare). Try
@@ -1447,7 +1447,7 @@ async function runPairProgrammingSession(driverId, navigatorId, task) {
 
   // The actual conversation, persisted -- same "don't let the real
   // exchange vanish into a toast and nothing else" principle as the
-  // handoffs.js fix earlier this session.
+  // handoffs.js fix.
   const fullLog = transcript.map(t => `${AGENTS[t.from] ? AGENTS[t.from].name : t.from}: ${t.text}`).join('\n');
   logThinkTankAction(driverId, 'pair_programming', { with: navigatorId, taskId: task.id, title: task.title, transcript });
   writeLibraryFile(driverId, `archive/${Date.now()}-pair-${task.id}.md`, `# Pair session -- ${task.title}\n\nDriver: ${driver.name}\nNavigator: ${nav.name}\n\n${fullLog}\n`);
@@ -1526,7 +1526,7 @@ function _heredocBalance(command) {
 // Real fix for a real, corroborated complaint -- three of five agent
 // retrospectives independently named being "forced into awkward chunks"
 // as a frustration (they blamed the model tier; the actual cause is this
-// max_tokens ceiling, confirmed live the same day: a real generation cut
+// max_tokens ceiling, confirmed: a real generation cut
 // off mid-heredoc, executed anyway, produced a genuinely broken file).
 // The old fix (reject and give up) was safe but still left the agent's
 // work half-finished. This is the real fix: when a generation looks
@@ -1651,7 +1651,7 @@ async function runCodingTask(agentId, sandboxId, backlogItem, contextSummary, pr
     return { ok: false, note: 'execute failed: ' + e.message, command, tier: tier.label };
   }
 
-  // Real mistake class caught live: a fix wrote a genuinely correct new
+  // Mistake class: a fix wrote a genuinely correct new
   // .js file, using
   // real property names verified against the actual running page, and it
   // had zero effect anyway -- because it was never referenced by a
@@ -1671,7 +1671,7 @@ async function runCodingTask(agentId, sandboxId, backlogItem, contextSummary, pr
       }
     }
 
-    // The mirror-image mistake, caught live the same night: a rebuild
+    // The mirror-image mistake: a rebuild
     // task, WITH the complete real file inventory already in its own
     // context (verified directly -- every real filename was present,
     // either in full or as a budget-skip notice), still fabricated three
@@ -1740,7 +1740,7 @@ async function _findUnlinkedJsFiles(agentId, sandboxId, jsFiles) {
   }
 }
 
-// Real gap found running this for real: settings.js got auto-linked into
+// Gap found: settings.js got auto-linked into
 // index.html by blind default, even though the sandbox already had a
 // real settings.html it obviously belonged to instead. Linking it into
 // the wrong page doesn't make it work -- it just moves where the dead
@@ -2215,14 +2215,14 @@ async function runGradedReviewLoop(agentId, task, projectLabel, isQA, hooks) {
   }
 }
 
-// Real fix (2026-09-21, hiring-to-shutdown audit): this used to run the
+// Fix (hiring-to-shutdown audit): this used to run the
 // exact SAME fixed helper.py health-check every single time, completely
-// ignoring whatever the assigned task actually said -- confirmed live,
+// ignoring whatever the assigned task actually said -- confirmed,
 // a real coding subtask generated from assignBigTask (e.g. "build a
 // simple to-do list page") arrived here and produced nothing resembling
 // it, because nothing about the task's own title/instructions was ever
 // read. Uses the SAME shared sandbox every time (WORKROOM_SANDBOX_ID,
-// index.html) -- per your call, agents should reuse it, not each get a
+// index.html) -- agents should reuse it, not each get a
 // throwaway one, so real work persists across visits. When the task
 // actually came from a real project (projectLabel set -- see
 // assignBigTask), this now calls the same real coding pipeline
@@ -2286,7 +2286,7 @@ async function runWorkroomTask(agentId, task) {
   }
 }
 
-// Real ask (2026-09-21): "a research agent will need to review the skill
+// "A research agent will need to review the skill
 // files and determine which are relevant and which should stick." Lists
 // the real Library (listLibraryFile, world.js) rather than trusting any
 // in-memory record of what's pending -- pending_review/skills/*.md is the
@@ -2327,14 +2327,14 @@ async function runSkillReviewTask(agentId) {
   return `Reviewed ${pending.length} pending skill file(s): ${kept} promoted, ${rejected} rejected.`;
 }
 
-// Real fix (2026-09-21, hiring-to-shutdown audit): this used to run the
+// Fix (hiring-to-shutdown audit): this used to run the
 // exact SAME fixed log-and-tally action every time, regardless of what
 // the assigned task actually asked for -- same gap class as
 // runWorkroomTask's own fix. checkWeatherReference (weatherstation) is
 // deliberately left as-is: that room's whole identity is one specific
 // external reference, not a general-purpose room the way Research
 // Center is framed to be. Uses the SAME persistent sandbox every time
-// (RESEARCH_SANDBOX_ID) -- per your call, agents should reuse it, not
+// (RESEARCH_SANDBOX_ID) -- agents should reuse it, not
 // each get a throwaway one. When the task has real project lineage
 // (projectLabel set), this now makes a real model call reasoning about
 // the SPECIFIC subtask and writes a genuine finding -- to findings.log
@@ -2352,12 +2352,12 @@ async function runResearchTask(agentId, task) {
   const projectLabel = task && task.projectLabel;
   let note;
   if (task && task.skillReview) {
-    // The skill-curation sweep (2026-09-21) -- see runSkillReviewTask
+    // The skill-curation sweep -- see runSkillReviewTask
     // below. Checked ahead of task.research: this is its own standing
     // job, unrelated to any specific research topic.
     note = await runSkillReviewTask(agentId);
   } else if (task && task.research) {
-    // The scheduled-topic path (2026-09-21): crawlAndCollect/writeSkillFile/
+    // The scheduled-topic path: crawlAndCollect/writeSkillFile/
     // readLibraryFile/skillSlug/SKILL_FILE_FORMAT_GUIDE all live in
     // world.js, loaded before tasks.js (index.html) -- real globals by the
     // time this ever runs, not a forward reference.
@@ -2522,7 +2522,7 @@ async function checkWeatherReference(agentId) {
   }
 }
 
-// Studio's real capability, per your call: you tell it what outside
+// Studio's real capability: you tell it what outside
 // sources to watch (media/feeds.md, edited via the same Library UI as
 // anything else -- no new config surface needed), and an agent assigned
 // here fetches one, boils it down to a few honest sentences, and files the
@@ -2610,7 +2610,7 @@ function finishTask(id) {
   a.task = null;
   a.busy = false;
   a.inRoom = null;
-  // Real bug caught live tonight: arriveAtTask() sets a.visible = false
+  // Bug: arriveAtTask() sets a.visible = false
   // on arrival (she's "inside" working, so the map shouldn't show her
   // outdoors) and nothing ever set it back. Since tickAgentMovement skips
   // invisible agents outright, that left EVERY agent who ever finished a
@@ -2624,18 +2624,18 @@ function finishTask(id) {
   a.approvedCount++; // real completed work feeds morale, same signal as everything else
 
   // Reappear right where she walked in, not a random reachable spot --
-  // per your call, she should walk out of the door she used. Falls back
+  // She should walk out of the door she used. Falls back
   // to pickFreeSpot() only if this task somehow has no recorded entry
   // point (shouldn't happen via assignTask, but arriveAtTask() can still
   // be reached with a stale/missing task in edge cases).
   if (task && task.entryX != null) {
-    // Real deadlock caught live: two agents finishing the SAME room's
+    // Deadlock: two agents finishing the SAME room's
     // task land on the identical entryX/entryY pixel. tickAgentMovement's
     // co-located exemption (agentBlockedAt) only ever buys the first one
     // a single step of separation -- nowhere near enough to clear
     // AGENT_W (20px) at real per-frame movement speed, so a SUBSEQUENT
     // walk from that exact shared point (off duty, a handoff) can
-    // genuinely deadlock for real: confirmed live, stuckTimer cycling
+    // genuinely deadlock for real: confirmed, stuckTimer cycling
     // 0->TASK_STUCK_TIMEOUT->0 forever, replanning to the same nearby
     // cell every time, real position never moving. Checking for a real
     // occupant here and stepping aside by a full agent-width closes this
@@ -2657,7 +2657,7 @@ function finishTask(id) {
     a.x = spot.x; a.y = spot.y;
   }
 
-  // A plain local log entry, not a model call -- per your cost concern,
+  // A plain local log entry, not a model call --
   // this shouldn't spend anything.
   if (task) {
     a.profile.notes.push(`${task.title} -- completed and logged.`);
@@ -2667,14 +2667,14 @@ function finishTask(id) {
   showToast(`${a.name} finished: ${task ? task.title : 'a task'}.`, 4000);
   if (task) {
     logThinkTankAction(id, 'task_completed', { taskId: task.id, title: task.title, room: task.room });
-    // Per your call: completed tasks get archived in the Library's shared
+    // Completed tasks get archived in the Library's shared
     // directory, not just logged privately -- a real record other agents
     // (or you) could actually read later, not just a database row.
     const record = `# ${task.title}\n\nCompleted by: ${a.name} (${id})\nRoom: ${task.room}\nCompleted: ${new Date().toISOString()}\n`;
     writeLibraryFile(id, `archive/${Date.now()}-${task.id}.md`, record);
   }
 
-  // Per your call: after logging it, she clocks off for the rest of this
+  // After logging it, she clocks off for the rest of this
   // session rather than immediately queuing for another task -- UNLESS
   // this task's room is something else's dependency (handoffs.js), in
   // which case she walks over and hands it off FIRST, staying visible and
@@ -2691,7 +2691,7 @@ function finishTask(id) {
   }
 }
 
-// Per your explicit call on 2026-09-20: 25 (MAX_ACTIVE_AGENTS, hiring.js)
+// 25 (MAX_ACTIVE_AGENTS, hiring.js)
 // is a hard ceiling on how many agents may be online or freshly called
 // in for a scheduled item AT ONCE -- not on the total inventory
 // (MAX_TOTAL_AGENTS, which can be much larger, e.g. 100+, since most of
@@ -2706,7 +2706,7 @@ function canActivateAnother() {
   return activeAgentCount() < MAX_ACTIVE_AGENTS;
 }
 
-// Per your call (2026-09-20): the whole point of a larger hireable
+// The whole point of a larger hireable
 // roster with only some agents "active" at once is that calling someone
 // in is a real, visible event -- she appears at a free spot in the main
 // think tank (outskirts rooms are gone) and walks from there, not an instant
@@ -2724,7 +2724,7 @@ function appearFromOutskirts(agent) {
   agent.y = spot.y;
 }
 
-// Per your call (2026-09-22): an agent going off duty VANISHES WHERE SHE
+// An agent going off duty VANISHES WHERE SHE
 // STANDS -- no trek to a trailhead door (the outskirts rooms are gone).
 // Mirrors the server's send_agent_off_duty so the client and server agree:
 // an idle agent rests in place, invisible, inRoom cleared so she can't

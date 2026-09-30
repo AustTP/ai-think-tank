@@ -1,4 +1,4 @@
-"""Tests for the 2026-09-23 self-healing additions to world/sim.py.
+"""Tests for the self-healing additions to world/sim.py.
 
 1. _reclaim_orphaned_walking_tasks: a task left in 'walking'/'working' status
    whose assignee no longer holds it (agent.task != task_id) will NEVER resolve
@@ -196,7 +196,7 @@ class SkillReviewSentinel(unittest.TestCase):
 
 
 class SkillReviewContentGate(unittest.TestCase):
-    """The standing skill-review sweep is content-gated (2026-09-27): when the
+    """The standing skill-review sweep is content-gated: when the
     cadence is due but nothing is waiting in pending_review/skills/, it must NOT
     queue a task (no agent pick, no Jev grade call) and must NOT advance the
     marker, so the sweep fires on the first later pass where content appears."""

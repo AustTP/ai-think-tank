@@ -1,4 +1,4 @@
-"""Tests for the JIRA-like issue register (PREFIX-0128) (2026-09-25).
+"""Tests for the JIRA-like issue register (PREFIX-0128).
 
 The think tank gained a first-class, per-team-issued ticket store fed by
 POST /api/intent/issues. This covers the pure sim.py helpers:

@@ -7,7 +7,7 @@ replaces the Jev call so tests are deterministic and offline. The "no DB"
 claim above was wrong: _governance_pass has inline `from serve import
 log_action` calls, a real side effect that writes into whatever real
 think_tank.db sits at serve.py's default path unless DB_PATH is redirected
-below. Found 2026-09-25, same class of bug as test_onboard.py/test_social.py/
+below. Same class of bug as test_onboard.py/test_social.py/
 test_refinement.py/test_cut2_processes.py/test_oncall_escalation.py -- this
 file isn't even wired into tests/run_all.sh, but is fixed for the same reason
 those were: it pollutes the real DB the moment anyone runs it directly.
@@ -166,7 +166,7 @@ class AutoHire(unittest.TestCase):
         return decider
 
     def _run_hire(self, state, decider, ticks=16):
-        # 2026-09-23: was 8 ticks @ SIM_TICK_S=2.0 (=16s wall); with the finer
+        # Was 8 ticks @ SIM_TICK_S=2.0 (=16s wall); with the finer
         # 1.0s tick, 8 ticks is only 8s -- not enough to cross the hire/ceremony
         # wall-time intervals. Doubled so the same wall-time elapses.
         now = 1000.0
@@ -296,7 +296,7 @@ class FiringReview(unittest.TestCase):
         return 'keep'
 
     def _run(self, state, decider, ticks=16):
-        # 2026-09-23: was 8 ticks @ 2s tick (=16s wall); doubled for the 1.0s
+        # Was 8 ticks @ 2s tick (=16s wall); doubled for the 1.0s
         # tick so the same wall-time (and the same firing intervals) elapse.
         now = 1000.0
         grid, doors = sim._load_outdoor_geometry()
@@ -414,7 +414,7 @@ class FiringReview(unittest.TestCase):
         self._run(state, self.decider_fire)
         self.assertIn('ben', state['agents'], 'off-duty admin blocks review')
 
-    # --- 2026-09-23 morale decouple: firing keys off the firing SIGNAL, not
+    # --- morale decouple: firing keys off the firing SIGNAL, not
     # the composite morale score. Low morale from neglect alone (no negative
     # report, no drop-off) makes an agent a HELP/hiring target, not a firing
     # one. Dropped-work overload alone IS a signal.
@@ -457,7 +457,7 @@ class FiringReview(unittest.TestCase):
 
 class WhoNeedsReview(unittest.TestCase):
     """who_needs_review picks the STRONGEST firing signal among candidates,
-    not the first in roster order (2026-09-28 audit: the severity weighting
+    not the first in roster order (audit: the severity weighting
     was documented in a comment but never actually computed)."""
 
     def _idle(self, state):
@@ -511,7 +511,7 @@ class WhoNeedsReview(unittest.TestCase):
 
 class FiringFallback(unittest.TestCase):
     """Jev-outage fallback in _fire_decision requires BOTH a negative report
-    AND a genuine drop-off to fire -- either alone stays 'keep' (2026-09-28
+    AND a genuine drop-off to fire -- either alone stays 'keep' (
     audit: the OR inside _has_firing_signal collapsed the AND to fire on
     drop-off alone, contradicting the documented rule)."""
 

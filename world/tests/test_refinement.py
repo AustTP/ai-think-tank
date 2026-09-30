@@ -1,4 +1,4 @@
-"""Tests for scheduled Backlog Refinement (Cut 1, 2026-09-23).
+"""Tests for scheduled Backlog Refinement (Cut 1).
 
 The scrum master -- a standing, director-designated per-team role -- is
 responsible for turning agent-filed work into REAL stories. Agents communicate
@@ -11,7 +11,7 @@ but no-ops with no pending requests or no scrum master. Deterministic -- no
 Jev, direct _refinement_step calls. NOT actually DB-free: _refinement_step's
 carry-away/logging path has inline `from serve import log_action` calls, a
 real side effect that writes into whatever real think_tank.db sits at serve.py's
-default path unless DB_PATH is redirected below. Found 2026-09-25 via a live
+default path unless DB_PATH is redirected below. Found via a live
 production think_tank.db that picked up test fixture rows after a routine
 `tests/run_all.sh` run.
 """

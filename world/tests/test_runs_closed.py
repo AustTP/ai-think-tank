@@ -127,7 +127,7 @@ class RunsClosed(unittest.TestCase):
         #
         # A genuine authored deliverable (taskType='code', no `research` marker)
         # -- NOT a scheduled research task. That used to be this fixture's shape
-        # until a real, confirmed production bug (2026-09-26): task['research']
+        # until a real, confirmed production bug: task['research']
         # is exempt from the peer gate now (see _peer_gated_lane), because a
         # scheduled crawl has no real "fix" a reviewer can send back -- its
         # "review" always found it actionable (no passing flake8/mypy/pytest-cov

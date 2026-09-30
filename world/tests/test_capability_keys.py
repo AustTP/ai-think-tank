@@ -148,8 +148,8 @@ class CapabilityKeys(unittest.TestCase):
     def test_capability_auth_headers_are_per_service(self):
         # /api/curl injects whatever this returns into the outbound request.
         # DigitalOcean and PixelLab both take a standard Bearer token; Treg's
-        # real API does not (X-Treg-Token instead) -- found live 2026-09-24
-        # while wiring up the first real handle-authenticated action.
+        # real API does not (X-Treg-Token instead) --
+        # Real handle-authenticated action.
         self.assertEqual(serve._capability_auth_headers('digitalocean', 's3cret'),
                           {'Authorization': 'Bearer s3cret'})
         self.assertEqual(serve._capability_auth_headers('pixellab', 's3cret'),
@@ -161,7 +161,7 @@ class CapabilityKeys(unittest.TestCase):
                           {'Authorization': 'Bearer s3cret'})
 
     def test_mint_refused_when_hard_cap_exceeded(self):
-        # The hard circuit breaker (2026-09-24): a credential in
+        # The hard circuit breaker: a credential in
         # _HARD_CAPPED_CREDENTIALS with a configured budgetCapUsd on its
         # product must refuse EVEN the mint step once real usage is at/over
         # cap -- the agent never even gets a handle to try. Runs with the
@@ -188,7 +188,7 @@ class CapabilityKeys(unittest.TestCase):
         self.assertIsNone(reason)
 
     def test_digitalocean_master_switch_blocks_mint_while_local(self):
-        # The player's rule (2026-09-28): DigitalOcean must be UNREACHABLE
+        # The player's rule: DigitalOcean must be UNREACHABLE
         # unless SANDBOX_EXECUTION=digitalocean. While the switch reads
         # `local` (the default), even a provisioned DO credential and a
         # healthy balance must NOT yield a handle -- the switch is the sole
@@ -298,7 +298,7 @@ class CapabilityKeys(unittest.TestCase):
 
 
 class CurlCredentialEcho(unittest.TestCase):
-    """Real, narrow gap found in a security audit (2026-09-26): a capability-
+    """Real, narrow gap found in a security audit: a capability-
     handle-authenticated /api/curl response used to go back to the agent
     completely raw. If the target API ever echoed the injected credential
     back (some APIs do, in error/debug responses), that secret would land in
@@ -389,7 +389,7 @@ class CurlCredentialEcho(unittest.TestCase):
 class HandlesEndpointAuth(unittest.TestCase):
     """HTTP-level test of POST/DELETE /api/keys/handles' 'player-only' gate.
 
-    Found 2026-09-24, while wiring up the first real handle-authenticated
+    Real handle-authenticated
     action, that the gate used _resolve_requester(request) -- which reads
     "player" from the ABSENCE of a self-declared `requesterId` query param,
     not from a verified player session. An agent's own HTTP client already

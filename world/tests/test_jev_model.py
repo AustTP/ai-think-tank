@@ -1,4 +1,4 @@
-"""DB-backed Jev decisions-model setting (2026-09-28): the think tank's decisions
+"""DB-backed Jev decisions-model setting: the think tank's decisions
 model slug resolves through the `settings` table first (switchable live via the
 player-only /api/jev/model endpoint, survives restarts, never auto-refreshed)
 and only falls back to the JEV_MODEL env/default constant. This closes the Jev

@@ -29,7 +29,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import serve
 
-# Module-wide safety net (2026-09-25): most classes below already redirect
+# Module-wide safety net: most classes below already redirect
 # DB_PATH themselves in their own setUp (their own temp dir layers on top of
 # this one and is torn down first, same as before). But a few classes here
 # (ActivitySummary, JevSafetyGate, TempAccessGrants) call serve.log_action /
@@ -98,7 +98,7 @@ class SafeLibraryPath(unittest.TestCase):
 
 
 class LibraryTrailReinforcement(unittest.TestCase):
-    """Stigmergic trail reinforcement/decay (2026-09-26), ported from real ant
+    """Stigmergic trail reinforcement/decay, ported from real ant
     pheromone-trail biology: search_library used to rank purely by file
     mtime, so a file read/cited 40 times but written 2 weeks ago always lost
     to one written 2 minutes ago and never read at all. Usage lives in its
@@ -180,7 +180,7 @@ class LibraryTrailReinforcement(unittest.TestCase):
         self.assertEqual([m['path'] for m in matches], ['newer.md', 'older.md'])
 
     def test_search_matches_carry_a_real_file_size(self):
-        # Real gap caught live (2026-09-26): the top-ranked match isn't
+        # Gap: the top-ranked match isn't
         # always the most substantial one -- a cheap, real, mechanical
         # signal (file size) lets a caller judge substance directly, rather
         # than trusting rank alone or hoping a model "tries harder."
@@ -228,7 +228,7 @@ class SanitizeDownloadFilename(unittest.TestCase):
 
 class ParseHttpDateMs(unittest.TestCase):
     # Real, if imperfect, "did this page actually change" signal for
-    # date-aware incremental research (2026-09-21) -- Last-Modified is
+    # date-aware incremental research -- Last-Modified is
     # standard HTTP-date format (RFC 7231), the same format email headers
     # use, which is why this reuses email.utils rather than hand-rolling
     # a parser.
@@ -440,7 +440,7 @@ class ModelBenchmarkScores(unittest.TestCase):
 
 
 class JevTierGate(unittest.TestCase):
-    # JEV-gated tier escalation (2026-09-27): everything defaults to LOW; coding
+    # JEV-gated tier escalation: everything defaults to LOW; coding
     # is deterministic; mid is lightly gated; high is heavily gated. Fails
     # CLOSED to low on any outage or low-confidence escalation.
 
@@ -667,7 +667,7 @@ class CurlRoomGate(unittest.TestCase):
 
 class SandboxDownloadRoomGate(unittest.TestCase):
     # Mirrors CurlRoomGate exactly, for the sandbox-download endpoint's
-    # own room restriction (2026-09-20, extended same-day to cover the
+    # own room restriction (extended to cover the
     # Work Room alongside the Observatory -- both are real sandboxed
     # rooms, RESEARCH_SANDBOX_ID and WORKROOM_SANDBOX_ID respectively).
     def test_player_is_always_allowed(self):
@@ -736,7 +736,7 @@ class SandboxBackups(unittest.TestCase):
     # Real incident this exists to prevent from ever being unrecoverable
     # again: a coding task overwrote a real sandbox file with no way to
     # undo it -- no git repo, no .bak, no OS-level snapshot existed for
-    # this project. Rebuilt on local git per your explicit call (weighed
+    # Rebuilt on local git (weighed
     # against a GitHub remote and against the original full-directory-copy
     # version, which measured at 868KB for 8 snapshots of one real
     # sandbox -- not a problem yet, but linear in sandbox size with no way
@@ -1109,7 +1109,7 @@ class HealthChecks(unittest.TestCase):
         self.assertEqual(alerts[0]['severity'], 'warning')
 
     def test_the_same_storm_three_days_stale_reads_quiet(self):
-        # The Sep 26 storm aged to 2026-09-29: 3 days = ~6 half-lives, every
+        # The Sep 26 storm aged to 3 days = ~6 half-lives, every
         # one of the 79 actions decayed ~64x => signal 1.2, under the 3.0
         # floor. Nothing still in the last 24h's COUNT for the message. The
         # old count-ratio would've screamed forever; the decayed scalar
@@ -1133,7 +1133,7 @@ class HealthChecks(unittest.TestCase):
 
 class CoordinationImbalanceScalar(unittest.TestCase):
     """Direct tests of the Reddit-Hot-style decayed signals + imbalance score
-    (2026-09-29): the whole point of the scalar vs the old 24h COUNT ratio is
+    The whole point of the scalar vs the old 24h COUNT ratio is
     that a burst of ceremony is loud while FRESH and fades once it's stale --
     the Sep 26 restart storm (79 escalations, 3 shipped, within an hour)
     should have read loud on day 1 and gone quiet a few days later."""
@@ -1307,7 +1307,7 @@ class HealthAlertPersistence(unittest.TestCase):
         self.assertEqual(len(rows), 2)
 
     def test_a_volatile_message_does_not_spam_a_standing_incident(self):
-        # The 2026-09-29 Jev incident, made concrete: the alert message embeds
+        # The Jev incident, made concrete: the alert message embeds
         # rolling failure counts, so it CHANGES every cycle even though the
         # incident is the same one. The dedup key is (category, severity), not
         # the message -- the older exact-message key pushed a fresh alert every
@@ -1337,7 +1337,7 @@ class HealthAlertPersistence(unittest.TestCase):
 
 
 class HealthAlertPush(unittest.TestCase):
-    # Outbound half (2026-09-28): newly-persisted warnings are pushed to the
+    # Outbound half: newly-persisted warnings are pushed to the
     # player on every configured channel; info stays dashboard-only and an
     # unconfigured channel must fail closed, never raise.
 
@@ -1387,7 +1387,7 @@ class LibraryIngest(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         # Anything actually written into the real Library by these tests
         # needs real cleanup too -- same discipline as every other real-
-        # file-touching test this project has run.
+        # file-touching test has run.
         for r in self.results:
             if r.get('ok') and r.get('path'):
                 target = serve._safe_library_path(r['path'])
@@ -1464,7 +1464,7 @@ class LibraryIngest(unittest.TestCase):
 
 
 class ServerOwnedSeed(unittest.TestCase):
-    # Server-owned roster (2026-09-21): no static agent names live in any JS
+    # Server-owned roster: no static agent names live in any JS
     # file; serve.py seeds the default roster into an empty database on first
     # boot and stamps the director tier before any client reads it. These test
     # that against a THROWAWAY database (fresh temp file), never the real
@@ -1482,7 +1482,7 @@ class ServerOwnedSeed(unittest.TestCase):
         )
         self._cm.start()
         # Seed identities are config-driven (SEED_ROSTER / SEED_DIRECTOR_MAP /
-        # SEED_ADMIN_IDS / SEED_SENIOR_DIRECTOR in .env, 2026-09-27), so this
+        # SEED_ADMIN_IDS / SEED_SENIOR_DIRECTOR in .env, so this
         # hermetic test injects them rather than relying on a real .env.
         self._env_patch = unittest.mock.patch.object(
             serve, '_load_env', return_value={
@@ -1724,7 +1724,7 @@ class DirectorOwnedTemplates(unittest.TestCase):
         self.assertEqual(merged['templates']['X']['mission'], 'm', 'client-provided templates replace')
 
     def test_autosave_merge_server_cadence_stamp_wins_over_stale_client(self):
-        # The 2026-09-23 sentinel return: a stale /api/state POST (an old tab
+        # The sentinel return: a stale /api/state POST (an old tab
         # with pre-fix clients.js) carries lastSkillReviewAt: 1e18 in its copy
         # of the blob. _merge_server_owned previously accepted the client's copy
         # (top-level keys the client SENDS win), so the server's corrected
@@ -1884,7 +1884,7 @@ class RoomDefinitions(unittest.TestCase):
 
 
 class AgentFileVisibility(unittest.TestCase):
-    # Self-reports rule (2026-09-21): an agent must NOT be able to view or
+    # Self-reports rule: an agent must NOT be able to view or
     # modify its OWN reports/ directory, but can write into others'. Also: no
     # app source visible, dotfiles/hidden filtered, traversal contained.
     def test_visible_plain_path(self):
@@ -2010,7 +2010,7 @@ class ReportCrossWrite(unittest.TestCase):
 
 
 class PassportDecisionChain(unittest.TestCase):
-    # Hash-chain covers CHAINED KEY DECISIONS (2026-09-21): consequential
+    # Hash-chain covers CHAINED KEY DECISIONS: consequential
     # actions (hire, fire, promote, grant, report_filed) append decision blocks
     # off the SAME head as promoted-file blocks, so the whole ledger is one
     # tamper-evident chain.
@@ -2064,7 +2064,7 @@ class PassportDecisionChain(unittest.TestCase):
         self.assertIn('hire', serve._HASHED_ACTIONS)
         self.assertIn('firing_review', serve._HASHED_ACTIONS)
         self.assertIn('grant_access', serve._HASHED_ACTIONS)
-        # File writes/modifies chain too (your 2026-09-21 call on hashing
+        # File writes/modifies chain too (on hashing
         # every file write) -- both the write and its promotion.
         self.assertIn('library_write', serve._HASHED_ACTIONS)
         self.assertIn('library_promote', serve._HASHED_ACTIONS)
@@ -2275,7 +2275,7 @@ class DecideRateLimiter(unittest.TestCase):
 
 class GoogleOAuth(unittest.TestCase):
     """_google_access_token / _google_call: real OAuth mechanics confirmed
-    live (2026-09-26) against a real refresh token minted through a real
+    live against a real refresh token minted through a real
     installed-app consent flow (accounts.google.com -> oauth2.googleapis.com
     token exchange), before anything was built on top of it."""
 
@@ -2373,7 +2373,7 @@ class PixellabCall(unittest.TestCase):
     """_pixellab_call / _pixellab_poll_job: real API mechanics, matching the
     think tank's own already-tested spike script (scripts/pixellab_spike.py)
     -- not guessed from the public OpenAPI spec, per the same "verify,
-    don't assume" discipline as every other real integration tonight."""
+    don't assume" discipline as every other real integration."""
 
     def _resp(self, body):
         class R:
@@ -2451,10 +2451,10 @@ class PixellabCall(unittest.TestCase):
 
 
 class TregCall(unittest.TestCase):
-    """_treg_call: real API mechanics confirmed live against Treg's own docs
+    """_treg_call: real API mechanics confirmed against Treg's own docs
     (POST https://treg.to/call/{endpoint_id}, header X-Treg-Token) -- built
-    per your explicit request for real X-trending/LinkedIn-search tools,
-    2026-09-26."""
+    for real X-trending/LinkedIn-search tools.
+    """
 
     def _resp(self, body):
         class R:
@@ -2495,7 +2495,7 @@ class TregCall(unittest.TestCase):
         self.assertEqual(json.loads(captured['body']), {'targets': ['moz.com']})
 
     def test_get_call_sends_params_as_a_query_string_not_a_body(self):
-        # Confirmed LIVE (2026-09-26): a GET endpoint's params belong in the
+        # A GET endpoint's params belong in the
         # URL query string, never a request body -- Treg's own real error
         # for the opposite mistake was explicit ("is GET -- add --method
         # GET", then "needs --query woeid=<value>").
@@ -2553,7 +2553,7 @@ class TregCall(unittest.TestCase):
 
 
 class JevQuorumDecision(unittest.TestCase):
-    """Quorum sensing (2026-09-26), ported from real Temnothorax ant nest-site
+    """Quorum sensing, ported from real Temnothorax ant nest-site
     selection: pool multiple independent Jev samples specifically to overcome
     errors inherent in any ONE sample -- live-confirmed problem here (the
     same URL got a confident 0.87 allow one run, a low-confidence 0.56
@@ -2653,7 +2653,7 @@ class JevQuorumDecision(unittest.TestCase):
 
 
 class DecisionCalibration(unittest.TestCase):
-    """_decision_calibration_report (2026-09-28, takeaway #1): bucket Jev's
+    """_decision_calibration_report (takeaway #1): bucket Jev's
     stated confidence against the real success rate of the actions it allowed,
     so an overconfident classifier is visible instead of quietly eroding the
     low-confidence-escalation floor. Reads only action_log (gate rows carry
@@ -2747,7 +2747,7 @@ class DecisionCalibration(unittest.TestCase):
 
 
 class CalibrationLoop(unittest.TestCase):
-    """_calibration_adjust_pass + _effective_safety_confidence (2026-09-29,
+    """_calibration_adjust_pass + _effective_safety_confidence (
     feedback-loop actuator for takeaway #1): the calibration report is the
     sensor -- the escalation threshold was never adjusted by it. This pass
     moves the LIVE bar (settings row `jev_safety_confidence`) so decisions
@@ -2845,7 +2845,7 @@ class CalibrationLoop(unittest.TestCase):
 
 
 class JevQuorumChoiceSync(unittest.TestCase):
-    """_jev_quorum_choice_sync: real gap caught (2026-09-26) -- quorum
+    """_jev_quorum_choice_sync: gap caught -- quorum
     sampling was only ever applied to safety gates, never to this module's
     own routine-but-consequential multi-way routing deciders (request lane,
     team, room, product, the peer-report worker picker, the escalation
@@ -3280,7 +3280,7 @@ class RemainingExecutors(unittest.TestCase):
         # A spike (Phase E2b) is room-agnostic and files a findings artifact --
         # never a product release. Route it straight through the dispatcher to
         # prove the room-agnostic dispatch happens. Hermetic against the
-        # tool-loop spike executor (2026-09-27): the executor calls the model
+        # tool-loop spike executor: the executor calls the model
         # DIRECTLY (_call_openrouter_sync for plan/synthesize, _post_openrouter_raw
         # for the tool loop), not through _http_json -- so both are mocked here.
         self._patch_store()
@@ -3314,7 +3314,7 @@ class RemainingExecutors(unittest.TestCase):
         posts = [p for p in self.http_log if p[1] == '/api/library/file' and p[0] == 'POST']
         self.assertEqual(1, len(posts), 'a spike must file a findings artifact')
         self.assertTrue(self.stored['sp1'].get('ok'), 'a successful spike commits a real finding')
-        # The full finding lives in the library file (data-minimization, 2026-09-24),
+        # The full finding lives in the library file (data-minimization,
         # not the short note -- the note points at the artifact instead.
         self.assertIsNotNone(self.stored['sp1'].get('libraryPath'))
 
@@ -4077,7 +4077,7 @@ class PlayerIntentEndpoints(unittest.TestCase):
         save.assert_not_called()
 
     def test_promote_with_library_path_embeds_the_real_findings_not_the_short_note(self):
-        """Real gap caught live (2026-09-26): task.note is a deliberately
+        """Gap: task.note is a deliberately
         short pointer ("see the Library entry just filed"); the FULL
         findings (source lists, CSVs, feasibility data) only ever lived in
         the Library file. Promoting a spike must pull the real content
@@ -4331,7 +4331,7 @@ class PlayerIntentEndpoints(unittest.TestCase):
 
 
 class PromoteSpikeTaskType(unittest.TestCase):
-    """Real gap caught live (2026-09-26): promote-spike used to silently
+    """Gap: promote-spike used to silently
     default a missing taskType to 'code' -- a real test promotion of a
     purely informational finding got promoted into taskType='code' anyway
     and burned 45+ review/fix cycles because no reviewer could approve
@@ -4447,7 +4447,7 @@ class ChatEndpointAuth(unittest.TestCase):
         self.assertEqual(r2.status_code, 401, 'no session and no key fails closed')
 
     def test_decisions_and_player_inbox_require_credentials(self):
-        # Regression (2026-09-28): /api/decisions (JEV decision tape) and
+        # Regression: /api/decisions (JEV decision tape) and
         # /api/player-inbox (read + the responding WRITE) were absent from
         # AUTH_PROTECTED_PREFIXES, so anonymous callers could read the tape and
         # -- worse -- the respond endpoint could mutate state with no auth at
@@ -4470,7 +4470,7 @@ class ChatEndpointAuth(unittest.TestCase):
         self.assertEqual(r.status_code, 401, 'an agent key is not a player credential here')
 
     def test_high_tier_chat_call_accrues_monthly_budget_exactly_once(self):
-        # Regression (2026-09-28): the /api/chat choke point accrued a high-tier
+        # Regression: the /api/chat choke point accrued a high-tier
         # call to the monthly budget TWICE via two duplicate blocks, so a $2/mo
         # allowance was exhausted in half the intended calls. A single high-tier
         # call must land exactly once in the kv_spend high-tier monthly series.

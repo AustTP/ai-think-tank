@@ -1,7 +1,7 @@
-// Real regression test (2026-09-21): scheduled research topics, the
+// Real regression test: scheduled research topics, the
 // synthesis step that turns collected pages into a real skill file, and
 // the incremental "only what's new since last time" mechanism. Follows
-// the idle-quiet contract this project already locks in for WORK_QUEUE
+// the idle-quiet contract already locks in for WORK_QUEUE
 // (test_idle_quiet.mjs) -- an empty or not-yet-due RESEARCH_TOPICS must
 // cost exactly nothing.
 //

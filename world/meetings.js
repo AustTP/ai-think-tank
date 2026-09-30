@@ -1,6 +1,6 @@
 // Meeting manager for Town Hall's chat-interface "call" mechanic.
 //
-// Per your rules: any number of independent meetings can run at the same
+// Any number of independent meetings can run at the same
 // time (one person calling three others doesn't block someone else from
 // immediately calling two different people); an agent already in a meeting
 // is "busy" and is never pulled out of their current call into a new one;

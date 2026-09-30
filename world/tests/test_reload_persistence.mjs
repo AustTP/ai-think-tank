@@ -1,7 +1,7 @@
-// Real regression test (2026-09-21): a page reload used to force every
+// Real regression test: a page reload used to force every
 // agent back on duty (offDuty = false, visible = true) and, for anyone who
-// was genuinely resting, walk them out of the outskirts door too -- per
-// your explicit call, resting across a reload should now behave like every
+// was genuinely resting, walk them out of the outskirts door too --
+// Resting across a reload should now behave like every
 // other persisted field: restored as saved, not reset. Meanwhile anything
 // that genuinely CAN'T be resumed after a reload (a busy call, a mid-task
 // walk, a mid-handoff) still needs to be abandoned exactly as before --
@@ -93,7 +93,7 @@ await test('initAgents: an agent genuinely mid-task when the page closed still h
 
 await test('initAgents: a stale legacy headingOffDuty field is cleared on reload', async () => {
   // headingOffDuty is a retired field from the old walk-to-the-trailhead
-  // off-duty mechanic (removed 2026-09-22). An agent saved under that old
+  // off-duty mechanic (removed). An agent saved under that old
   // regime carries it forward; a reload must clear it so it can't linger,
   // and must leave her resting state (offDuty) untouched.
   mockSavedState({

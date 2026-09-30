@@ -1,5 +1,5 @@
 // Real automated regression tests for the pathfinding functions that have
-// broken in production multiple times this project (float-boundary drift,
+// broken in production multiple times (float-boundary drift,
 // cell-center-vs-box mismatches, an agent blocking her own start cell, and
 // most recently findPath() returning a truthy-but-empty array for an
 // already-there start==target cell, which crashed the whole game's render
@@ -123,7 +123,7 @@ test('blockedAt: wall cell is blocked', () => {
 });
 
 test('findPath: real regression -- start cell === target cell returns a single waypoint, never an empty array', () => {
-  // This is the exact bug found live this session: an agent re-assigned
+  // This is the exact bug: an agent re-assigned
   // to the room she's already parked in has start===target, and the old
   // code returned `[]` (truthy, but empty) instead of null -- which
   // crashed tickAgentMovement() reading path[0].x off undefined, which in
@@ -155,7 +155,7 @@ test('findPath: genuinely unreachable target (outside grid bounds) returns null'
 });
 
 test('findPath: an out-of-bounds START (not just target) returns null instead of throwing', () => {
-  // Real crash caught live: an earlier bug elsewhere left an agent's own
+  // Crash: an earlier bug elsewhere left an agent's own
   // x/y corrupted to a coordinate one row past the bottom of the grid.
   // The target-bounds check above didn't catch it, because THIS call's
   // out-of-bounds coordinate was the start, not the target -- the
@@ -172,7 +172,7 @@ test('findPath: an out-of-bounds START (not just target) returns null instead of
 });
 
 test('findPath: another agent standing on the mover\'s own start cell does not block her', () => {
-  // Real bug caught live earlier this project: two agents landing on the
+  // Bug: two agents landing on the
   // exact same door-front resting spot used to permanently block the
   // second one from ever being assigned anywhere else.
   setGlobal('COLLISION_GRID', makeGrid());
@@ -183,7 +183,7 @@ test('findPath: another agent standing on the mover\'s own start cell does not b
 });
 
 test('findPath: another agent a fraction of a pixel from the mover\'s own start still counts as co-located', () => {
-  // Real deadlock caught live (2026-09-21): two agents from independent
+  // Deadlock: two agents from independent
   // walk calculations landed 0.3-0.7px apart, not bit-exact -- the
   // co-located exemption above only matched exact x/y equality, so each
   // agent's overlapping 20px-wide box (AGENT_W > one 16px-world cell)
@@ -199,7 +199,7 @@ test('findPath: another agent a fraction of a pixel from the mover\'s own start 
 });
 
 test('findPath: another agent standing exactly on the destination relaxes to the nearest free cell instead of rejecting the whole request', () => {
-  // Real root cause, confirmed live tonight: this used to return null
+  // Root cause, confirmed: this used to return null
   // outright the instant anyone stood on the exact target cell -- not a
   // slower route, a hard rejection before BFS even ran. That's the actual
   // mechanism behind "agent X is blocking the door": a fixed door/desk
@@ -245,7 +245,7 @@ test('findPath: a destination surrounded by agents beyond the relax radius still
 });
 
 test('findPath: an idle agent resting exactly on a door tile does not permanently block the only route through it', () => {
-  // Real bug caught live: an agent going idle (task done, off-duty, an
+  // Bug: an agent going idle (task done, off-duty, an
   // abandoned handoff) never moves again on her own. If that resting spot
   // is a door -- a real single-file chokepoint -- every other agent whose
   // only route runs through it gets stuck forever, which looks exactly
@@ -265,13 +265,13 @@ test('findPath: an idle agent resting exactly on a door tile does not permanentl
 console.log('\nfindPath: a second agent planned right after the first does not claim the identical destination');
 
 test('two agents planned sequentially from the same start toward the same raw target land on genuinely different cells', () => {
-  // Real bug caught live, one layer deeper than the single-cell
+  // Bug, one layer deeper than the single-cell
   // relaxation above: relaxation alone isn't enough when TWO agents are
   // planned in the same synchronous batch (a mass "send everyone home")
   // from the same/near-identical start -- neither sees the other as a
   // live obstacle yet, so both independently relax to the exact same
   // nearest free cell (a deterministic search from identical inputs
-  // always picks the identical answer). Confirmed live: after the
+  // always picks the identical answer). Confirmed: after the
   // co-located movement fix let them separate by one step, they
   // re-gridlocked almost immediately, just fractionally apart, because
   // AGENT_W (20) is wider than a single step. The real fix has to happen
@@ -349,12 +349,12 @@ test('neither one freezes, once they start a real agent-width apart (what finish
 console.log('\npickFreeSpot never returns a spot findPath would reject as an invalid start (2026-09-21)');
 
 test('every spot pickFreeSpot returns, over many trials against the REAL map, is a usable findPath START', () => {
-  // Real bug caught live, TWICE the same day, each fix revealing the
+  // Bug, TWICE, each fix revealing the
   // next layer: pickFreeSpot and findPath's own start-validity check
   // (startCellIsFree) each convert a world position to a grid cell
   // differently depending on which convention (raw top-left vs. box
   // CENTER) they use, and cellWorldPos's own centered waypoints mean the
-  // "correct" convention is the CENTERED one -- confirmed live, an agent
+  // "correct" convention is the CENTERED one -- confirmed, an agent
   // resting at her own real task.entryX/entryY (itself a real waypoint)
   // could not pathfind anywhere from her own position, because the
   // reverse conversion used elsewhere didn't recover the same cell
@@ -376,7 +376,7 @@ test('every spot pickFreeSpot returns, over many trials against the REAL map, is
   let violations = 0;
   for (let i = 0; i < 500; i++) {
     const spot = pickFreeSpot([]);
-    // Real bug found investigating a flake in THIS test (2026-09-21): a
+    // Bug found investigating a flake in THIS test: a
     // self-to-self call (start === target, same raw numbers) isn't a
     // faithful stand-in for "is this a valid place to stand" -- findPath's
     // START conversion is CENTERED but its TARGET conversion is
@@ -385,7 +385,7 @@ test('every spot pickFreeSpot returns, over many trials against the REAL map, is
     // Feeding the SAME numeric value through both conventions can land on
     // two DIFFERENT cells purely from that asymmetry, occasionally (~1 in
     // 700 real trials) landing the raw side on a cell that doesn't fit an
-    // agent -- not because the spot itself is bad (confirmed live: the
+    // agent -- not because the spot itself is bad (confirmed: the
     // exact failing spot pathed fine to a real, different nearby target),
     // but because this specific self-referential probe isn't something
     // any real caller ever actually does. A real target a real caller
@@ -401,14 +401,14 @@ test('every spot pickFreeSpot returns, over many trials against the REAL map, is
 });
 
 test('a real path\'s own final waypoint, used later as a fresh start, can still plan a new path over many trials', () => {
-  // The exact scenario caught live: assignTask() now stores the path's
+  // The exact scenario: assignTask() now stores the path's
   // real final waypoint as task.entryX/entryY (a separate fix, the same
   // day, for a different bug -- see assignTask's own comment), and
   // finishTask() later resets a.x/a.y to exactly that. If findPath's
   // start-cell conversion doesn't agree with cellWorldPos's own centered
   // convention, an agent resting at her own perfectly valid former
   // waypoint could not plan ANY new path from her own position --
-  // confirmed live against a real door (postoffice). Whether this
+  // confirmed against a real door (postoffice). Whether this
   // manifests for any ONE door/spawn pair depends on whether the
   // off-by-one cell happens to also be free, so this checks many real
   // doors, not just one -- a single hand-picked pair could get lucky and
@@ -427,7 +427,7 @@ test('a real path\'s own final waypoint, used later as a fresh start, can still 
     const doorTarget = { x: door.x + door.w / 2, y: door.y + door.h + 4 }; // same "+door.h+4" convention assignTask itself uses
     const firstPath = findPath(spawn.x, spawn.y, doorTarget.x, doorTarget.y, 'mover');
     if (!firstPath) continue; // not every door is reachable from this one spawn point in this synthetic setup -- not what this test is about
-    const restingSpot = firstPath[firstPath.length - 1]; // exactly what assignTask now stores as entryX/entryY
+    const restingSpot = firstPath[firstPath.length - 1]; // exactly what assignTask() now stores as entryX/entryY
     if (!findPath(restingSpot.x, restingSpot.y, spawn.x, spawn.y, 'mover')) violations++;
   }
   assert.equal(violations, 0, `expected an agent resting at her own real former waypoint to always be able to plan a new path, got ${violations} real door(s) where she could not`);

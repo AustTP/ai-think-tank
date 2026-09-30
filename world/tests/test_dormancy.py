@@ -1,4 +1,4 @@
-"""Tests for sleep-not-die idle dormancy (2026-09-24).
+"""Tests for sleep-not-die idle dormancy.
 
 Previously the idle watcher (`--max-idle-minutes`) EXITED the server, which
 left nothing port-bound to hear a remote wake request -- so resuming the

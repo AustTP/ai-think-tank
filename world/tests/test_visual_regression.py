@@ -6,10 +6,10 @@ server/DB/browser (see test_bank.py's own docstring on why). This one can't
 be: the whole point is to look at what the renderer actually draws in a real
 browser, which no unit test can see.
 
-Borrowed from a real comparison against Hermes Town (2026-09-24), which runs
+Borrowed from a real comparison against Hermes Town, which runs
 `verify:characters`/`verify:world` as real Playwright checks in CI, catching
 exactly the class of bug ("undefined" nameplates, overlapping sprites) that
-this project spent an entire live-debugging session finding manually. This
+A human once spent an entire live-debugging session finding manually. This
 is the automated version of the checks a human was doing by eye.
 
 Read-only: never mutates state, so it's safe to run against the real
@@ -96,13 +96,13 @@ def run(base_url):
 
         # Check 1: no agent that's actually being drawn has an undefined/empty name.
         # This is the exact bug ("undefined" rendered over an agent's head) found
-        # and fixed live this session.
+        # and fixed in live debugging.
         for a in agents:
             if not a.get('name') or a['name'] == 'undefined':
                 failures.append(f"agent {a['id']} is drawn with no real name: {a.get('name')!r}")
 
         # Check 2: no two DRAWN agents occupy overlapping ground -- the doorway
-        # pileup bug found and fixed live this session.
+        # pileup bug found and fixed in live debugging.
         for i in range(len(agents)):
             for j in range(i + 1, len(agents)):
                 if _bounding_boxes_overlap(agents[i], agents[j]):

@@ -1,4 +1,4 @@
-"""External-eval ports (2026-09-23): composite multi-signal trust gate + HALF_OPEN
+"""External-eval ports: composite multi-signal trust gate + HALF_OPEN
 circuit-breaker probe.
 
 From the codebase eval (memory: project_external_eval_sep2026): the think tank's
@@ -23,7 +23,7 @@ no network. The "no state mutation beyond the module counters" claim was
 wrong: is_model_circuit_broken/record_model_result log model_circuit_broken/
 model_circuit_recovered via a real `log_action` call, which -- unless DB_PATH
 is redirected below -- writes into whatever real think_tank.db sits at serve.py's
-default path. Found 2026-09-25: this file alone added 58 real rows (mostly
+default path. Found: this file alone added 58 real rows (mostly
 `model_circuit_broken` for a fake model "m") to a live production think_tank.db
 during a routine test run.
 """
@@ -123,12 +123,12 @@ class DirectorAutoApprovalTests(unittest.TestCase):
         it with a raised exception (fail-closed path). The esc dict is mutated in
         place by the resolver.
 
-        Real gap caught (2026-09-26): this used to assign serve.get_state_from_db /
+        Gap caught: this used to assign serve.get_state_from_db /
         _load_escalations / _save_escalations directly (`serve.x = Mock(...)`),
         with NO restoration afterward -- once any test in this class ran, those
         three stayed permanently mocked for the rest of the process, breaking any
         LATER test (in this file or another) that needed the real functions.
-        Found live via PeerReviewWorkerPickerTests failing only when run as part
+        Seen via PeerReviewWorkerPickerTests failing only when run as part
         of the whole file, never in isolation. Now properly scoped + auto-restored
         via addCleanup, same as every other mock in this codebase."""
         pending_id = 'esc-test'
@@ -152,7 +152,7 @@ class DirectorAutoApprovalTests(unittest.TestCase):
 
     def test_blocked_command_never_auto_approved(self):
         # A human's own "blocked command" verdict is 1.0 floor: the director is
-        # not permitted to resolve it AT ALL (2026-09-27). It's skipped before
+        # not permitted to resolve it AT ALL. It's skipped before
         # any Jev call -- stays pending for the human, and no auto-approval
         # (or even an unsure-decision log) happens for it.
         esc = {'status': 'pending', 'kind': 'blocked command', 'question': 'run rm -rf'}
@@ -246,7 +246,7 @@ class CircuitBreakerTests(unittest.TestCase):
 
 
 class JevFailoverTests(unittest.TestCase):
-    """_call_openrouter_decision_sync multi-model failover (2026-09-29): the
+    """_call_openrouter_decision_sync multi-model failover: the
     old policy was 'no circuit breaker for Jev -- only one slug exists, so
     tripping it disables every decision'. That was a symptom of the single-slug
     config. With a comma-separated chain the breaker arms per slug and a dead
@@ -371,7 +371,7 @@ class JevFailoverTests(unittest.TestCase):
 
 
 class ColabStandbyTests(unittest.TestCase):
-    """The CLI-managed Colab/Laya standby (2026-09-29): a dedicated CPU Colab
+    """The CLI-managed Colab/Laya standby: a dedicated CPU Colab
     session ('think-tank-standby') owned via the colab CLI, laya-serve booted over
     `colab exec`, reached through a LOCALHOST-only ssh forward at
     127.0.0.1:8939, driven by the 15-min _colab_failover_loop. No sentinel
@@ -541,7 +541,7 @@ class ColabStandbyTests(unittest.TestCase):
 
 
 class ColabComputeTests(unittest.TestCase):
-    """run_on_colab agent compute (2026-09-29): the dedicated 'think-tank-gpu'
+    """run_on_colab agent compute: the dedicated 'think-tank-gpu'
     T4 session, provisioned/ran/stood-down through the colab CLI, metered as
     monthly compute units in the Bank. Hermetic: _colab_cli/_provision are
     mocked, so no CLI, no session, no network ever actually runs."""
@@ -678,7 +678,7 @@ class ColabComputeTests(unittest.TestCase):
         self.assertIn('boom', out)
 
     def test_redteam_code_is_refused_on_colab(self):
-        # Per the player's call: offensive-security/scan work runs in the local
+        # Offensive-security/scan work runs in the local
         # Work Room sandbox, NEVER on the player's real Google Colab account.
         for bad in ('nmap -sV example.com', 'msfconsole -q', 'sqlmap -u http://x/page?id=1',
                     'hydra -l admin ssh://host', 'nuclei -u https://victim.dev',
@@ -856,7 +856,7 @@ class FreshnessProvenanceTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Peer-report worker picker -- real Jev bug found live (2026-09-26)
+# Peer-report worker picker -- real Jev bug
 # ---------------------------------------------------------------------------
 
 class PeerReviewWorkerPickerTests(unittest.TestCase):
