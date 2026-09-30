@@ -92,5 +92,15 @@ test('an agent with no hiredAt at all (pre-migration data) is NOT treated as ful
   assert.equal(moraleFor('dev'), 64);
 });
 
+test('reports/notes do NOT move the morale meter (they feed firing review instead)', () => {
+  setGlobal('AGENTS', { dev: agent({}) });
+  const base = moraleFor('dev');
+  setGlobal('reportsAbout', () => [{ quote: 'x', severity: 'major' }, { quote: 'y', severity: 'minor' }]);
+  // Same agent, two negative reports filed against them: morale must be
+  // identical -- the reference video's meter reacts to approved/dropped/
+  // neglected signals only, never to notes.
+  assert.equal(moraleFor('dev'), base);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

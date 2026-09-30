@@ -27,6 +27,7 @@ import json
 import math
 import os
 import re
+import random
 import secrets
 import shutil
 import smtplib
@@ -2562,22 +2563,32 @@ async def _director_approval_loop():
             print(f'[director] loop error: {e}', flush=True)
 
 
-# --- autonomous peer reviews (issue #5) ------------------------------------
-# "Are agents writing reports about other agents when some of
-# them aren't doing work, or when some are doing the most?" They now do, on a
-# real cadence, server-side -- the senior-most director reviews the ACTUAL
-# action_log (real work vs. silence), picks the one non-director agent most
-# worth a formal report, and files it into state['reports'] exactly like a
-# client-filed report (same shape, same materialization into agents/<id>/reports,
-# same consumption by firing reviews). The quote/note are real signals pulled
-# from the log, not invented praise or blame. Idempotent: a worker already
-# reported-on in this window isn't re-reported until the next review.
+# --- autonomous peer notes (issue #5, redesigned 2026-09-30) -----------------
+# "Are agents writing notes about other agents when some of them aren't doing
+# work, or when some are doing the most?" They now do, on a real cadence,
+# server-side -- but like a real village, NOT on a rigid metronome and NOT all
+# from one authority. A RANDOM PEER (another worker, never the senior director
+# standing in for the admin, and never the target themselves) observes the
+# ACTUAL action_log (real work vs. silence), and when the evidence supports it
+# a note is filed into state['reports'] exactly like a client-filed report
+# (same shape, same materialization into agents/<id>/reports, same consumption
+# by firing reviews). The quote/note are real signals pulled from the log, not
+# invented praise or blame. Nothing is deterministic: which peer happens to be
+# watching, who they notice, and whether a given watch leads to a note are all
+# weighted probabilities, so the village reads naturally instead of firing the
+# same fixed report on a fixed clock. Idempotent: a worker already noted in
+# this window isn't re-noted until the next review.
 PEER_REVIEW_INTERVAL_S = 90
 PEER_REVIEW_MIN_LOOKBACK_S = 3600  # judge an hour of real activity, not 90 stray seconds
+# Chance a peer watch that finds genuine divergence actually results in a note.
+# Evidence gates (below) decide WHO is report-worthy; this decides whether a
+# given cadence files anything at all, so reports arrive organically rather
+# than every PEER_REVIEW_INTERVAL_S like clockwork.
+PEER_REVIEW_FILE_PROBABILITY = 0.4
 # A worker already reported on WITHIN this window is not re-reported: the peer
-# review's job is to spread coverage across the roster, not hammer one worker.
-# Reports are never consumed (they feed morale + firing review), so a worker
-# only re-enters the pool after this window elapses (gap:
+# note's job is to spread coverage across the roster, not hammer one worker.
+# Reports are never consumed (they feed firing review), so a worker only
+# re-enters the pool after this window elapses (gap:
 # once every worker had a report, the old pool fell back to ALL candidates and
 # re-flagged the same lowest-real-work worker every PEER_REVIEW_INTERVAL_S --
 # ~560 reports about one idle worker in a night).
@@ -2585,41 +2596,39 @@ PEER_REVIEW_REPORT_STALE_S = 6 * 3600
 
 
 def _peer_review_pass(state, now):
-    """Peer-review worker picker, run on the caller's in-hand `state` object
+    """Peer-note writer, run on the caller's in-hand `state` object
     (mutated in place, no separate get/save of the whole blob). Returns the
-    number of reports filed. This is the CORE of the loop -- see
+    number of notes filed. This is the CORE of the loop -- see
     _peer_review_loop_pass (DB wrapper) and _peer_review_tick (cadence +
     single-writer driver). Keeps the pass's own report list contract intact
     (reports are never removed here -- staleness is a dedup window, see the
-    peer-review tests); the LIVE driver prunes old reports instead."""
+    peer-review tests); the LIVE driver prunes old reports instead.
+
+    Redesigned to be village-natural rather than deterministic: a random peer
+    observer watches the real action_log, and when the evidence shows a worker
+    genuinely out of line (an underperformer or a standout) a weighted-probability
+    pick decides whether THAT watch results in a note. No Jev, no senior
+    director always authoring every note."""
     roster = state.get('agentRoster', [])
     live = state.get('agents', {})
     reports = state.get('reports', [])
     if not isinstance(reports, list):
         reports = state['reports'] = []
-    director_id = _senior_most_director_id(state)
-    if not director_id or director_id not in live:
-        return 0
-    director_name = director_id
-    for d in roster:
-        if d.get('id') == director_id:
-            director_name = d.get('name', director_id)
-            break
     # Gather real activity from the action_log for every NON-director worker.
     cutoff = now - PEER_REVIEW_MIN_LOOKBACK_S  # action_log.ts is seconds (time.time())
     # A worker counts as "already covered" only if a report about them was
     # filed within the staleness window -- a stale report (long consumed by
-    # morale/firing or simply old) stops blocking a fresh review.
+    # firing review or simply old) stops blocking a fresh note.
     fresh_cutoff_ms = (now - PEER_REVIEW_REPORT_STALE_S) * 1000
     existing_about = {r.get('aboutId') for r in reports if r.get('ts', 0) >= fresh_cutoff_ms}
     candidates = []
     for d in roster:
         aid = d.get('id')
-        if not aid or aid == director_id:
+        if not aid:
             continue
         # Only workers -- skip admin and directors (peers review workers,
         # exactly like the firing review does).
-        if d.get('isAdmin') or aid == director_id or _direct_reports(state, aid):
+        if d.get('isAdmin') or d.get('isDirector') or _direct_reports(state, aid):
             continue
         if aid not in live:
             continue
@@ -2640,106 +2649,80 @@ def _peer_review_pass(state, now):
         })
     if not candidates:
         return 0
-    # EVIDENCE GATE (village): a peer report is a consequential claim about
+    # EVIDENCE GATE (village): a peer note is a consequential claim about
     # another worker's performance, so it must rest on solid evidence -- not a
     # quiet baseline. If NO ONE in the think tank has done any real work in the
     # lookback window, the whole village is simply idle: nobody is
     # underperforming (everyone is equally quiet) and nobody is a standout, so
-    # there is nothing legitimate to report. Filing "Underperforming" against a
-    # village where every worker is at zero fabricates evidence. The user was
-    # explicit: a report should only fire when one worker is genuinely out of
-    # line with the rest, and only on solid evidence. So: no real work anywhere
-    # => file nothing, not even a Jev call.
+    # there is nothing legitimate to note. Filing "Underperforming" against a
+    # village where every worker is at zero fabricates evidence. So: no real
+    # work anywhere => file nothing.
     group_activity = max((c['real'] for c in candidates), default=0)
     if group_activity < 2:
         return 0
-    # Pick the single most report-worthy worker via Jev, using REAL numbers.
     # Dedup, not fallback: candidates already covered within the staleness
-    # window are excluded, and an ALL-covered pool files nothing. The old
-    # `or candidates` fallback was the live churn bug -- with reports never
-    # consumed 'already' honored no one, so the pool reverted to everyone and
-    # the deterministic lowest-real-work rule re-picked the SAME idle worker
-    # every 90 seconds forever. Staleness (not a fallback) is what lets a
-    # worker back into the pool for fresh review.
+    # window are excluded, and an ALL-covered pool files nothing.
     cand_pool = [c for c in candidates if not c['already']]
     if not cand_pool:
         return 0
-    # Gap: the criteria dict passed to Jev used
-    # to be a single fixed key {'idx': 'The index of the worker to report
-    # on'} -- the SAME bug class already found and fixed once for grading
-    # (_grading_decider_default's own docstring): Jev's real API is a typed
-    # multiple-choice system with no "give me a free index" mode, so it
-    # could only ever echo the single key back verbatim ('idx', never
-    # 'idx_3') -- str(chosen).startswith('idx_') was ALWAYS False, meaning
-    # this Jev call has been 100% dead code, silently falling back to the
-    # deterministic rule on every single invocation. Fixed the same way
-    # grading was: one real, named criterion per actual candidate.
-    desc = []
-    criteria = {}
-    for i, c in enumerate(cand_pool):
-        if c['last']:
-            minutes_ago = int((now - c['last']) / 60)
-            idle = f'last act ~{minutes_ago}m ago'
-        else:
-            idle = 'never acted'
-        line = f'{c["name"]} ({c["role"]}): {c["actions"]} total actions, {c["real"]} real work, {idle}.'
-        desc.append(f'[{i}] {line}')
-        criteria[f'idx_{i}'] = line
-    prompt = (
-        f'You are {director_name}, the senior-most director of the AI think tank, doing a routine peer '
-        f'review to catch who is underperforming and recognize who is overachieving. '
-        f'From the real {PEER_REVIEW_MIN_LOOKBACK_S // 60} minutes of activity below, pick the ONE worker '
-        f'who most deserves a formal peer report -- either the most overdue/idle (low or zero real work) '
-        f'or the standout high performer (far above the rest). Prefer a genuine concern if one exists.\n'
-        + '\n'.join(desc)
-    )
-    # Gap caught: quorum sampling (see _jev_quorum_choice_
-    # sync's own docstring) was only ever applied to safety gates -- this
-    # routine-but-real routing decision gets the same protection now that
-    # it's an actual working Jev call for the first time.
-    chosen, _confidence, _cost = _jev_quorum_choice_sync(prompt, criteria)
-    valid_idx = None
-    if chosen and str(chosen).startswith('idx_'):
-        try:
-            candidate_idx = int(chosen.split('_')[1])
-            if 0 <= candidate_idx < len(cand_pool):
-                valid_idx = candidate_idx
-        except (ValueError, IndexError):
-            pass
-    if valid_idx is None:
-        # fallback: the lowest real-work worker
-        valid_idx = min(range(len(cand_pool)), key=lambda i: cand_pool[i]["real"])
-    idx = valid_idx
-    target = cand_pool[idx]
-    # EVIDENCE GATE (target): only file when the pick is backed by a genuine,
-    # evidence-based divergence -- either a clear underperformer (well behind
-    # while the rest of the village demonstrably worked) or a clear standout
-    # (doing far more real work than peers). A nominal "everyone performed
-    # about the same" pick is NOT a report: the user's rule is that a report is
-    # filed only when one worker is genuinely out of line with the others --
-    # performing well OR not well at all -- grounded in solid evidence, never
-    # "for the record" on a baseline. group_activity >= 2 is already guaranteed
-    # by the village gate above, so this reduces to: the target is genuinely
+    # EVIDENCE GATE (target): only a worker backed by a genuine, evidence-based
+    # divergence qualifies -- either a clear underperformer (well behind while
+    # the rest of the village demonstrably worked) or a clear standout (doing
+    # far more real work than peers). A nominal "everyone performed about the
+    # same" worker is NOT a note: group_activity >= 2 is already guaranteed by
+    # the village gate above, so this reduces to: the target is genuinely
     # behind (real < 2) or genuinely ahead (real >= 5, the group max).
-    is_underperformer = target['real'] < 2
-    is_standout = target['real'] >= 5 and target['real'] >= group_activity
-    if not (is_underperformer or is_standout):
+    report_worthy = [
+        c for c in cand_pool
+        if c['real'] < 2 or (c['real'] >= 5 and c['real'] >= group_activity)
+    ]
+    if not report_worthy:
         return 0
-    quote = f'Peer review of {target["name"]} ({target["role"]}): {target["actions"]} actions, {target["real"]} real work in the last {PEER_REVIEW_MIN_LOOKBACK_S // 60} minutes.'
+    # PROBABILITY GATE: evidence says someone IS worth noting, but a real
+    # village doesn't file on a fixed clock -- a peer happens to notice, or
+    # doesn't. This roll is what makes notes arrive organically instead of
+    # every cadence like clockwork.
+    if random.random() > PEER_REVIEW_FILE_PROBABILITY:
+        return 0
+    # Weighted random pick: the further out of line a worker is, the more
+    # likely they are to be noticed -- but never a guaranteed pick, so the
+    # village keeps some natural variance. Underperformers weight by how far
+    # below the floor they are; standouts weight by how far above the pack.
+    median_real = sorted(c['real'] for c in cand_pool)[len(cand_pool) // 2]
+    weights = []
+    for c in report_worthy:
+        if c['real'] < 2:
+            weights.append(max(1, 2 - c['real']))
+        else:
+            weights.append(max(1, c['real'] - median_real))
+    target = random.choices(report_worthy, weights=weights, k=1)[0]
+    # RANDOM PEER OBSERVER: who notices is a peer worker, chosen at random from
+    # the non-director roster -- never the target themselves, never the senior
+    # director always filing the same notes (the old single-author churn).
+    observers = [
+        d.get('id') for d in roster
+        if d.get('id') and d.get('id') != target['id']
+        and not d.get('isAdmin') and not d.get('isDirector')
+        and d.get('id') in live
+    ]
+    if not observers:
+        return 0
+    observer_id = random.choice(observers)
+    quote = f'Peer note on {target["name"]} ({target["role"]}): {target["actions"]} actions, {target["real"]} real work in the last {PEER_REVIEW_MIN_LOOKBACK_S // 60} minutes.'
     note = ('Underperforming -- well below expected output this period.' if target['real'] < 2 else
             'Standout performer -- doing the most real work this period.' if target['real'] >= 5 else
             'Nominal output this period; no action needed, filed for the record.')
     report = {
         'id': f'report-{int(now * 1000)}-{target["id"]}',
-        'aboutId': target['id'], 'fromId': director_id, 'quote': quote, 'note': note,
+        'aboutId': target['id'], 'fromId': observer_id, 'quote': quote, 'note': note,
         'ts': int(now * 1000), 'severity': 'minor' if target['real'] >= 2 else 'major',
     }
     reports.append(report)
     state['reports'] = reports
-    log_action(director_id, 'report_filed', {'about': target['id'], 'real': target['real'], 'actions': target['actions']}, authorized=False)
-    # An autonomous peer report is the same consequential class as a
+    log_action(observer_id, 'report_filed', {'about': target['id'], 'real': target['real'], 'actions': target['actions']}, authorized=False)
+    # An autonomous peer note is the same consequential class as a
     # client-filed one -- chain it into the passport too.
-    _append_passport_decision('report_filed', director_id, {'about': target['id'], 'real': target['real']})
+    _append_passport_decision('report_filed', observer_id, {'about': target['id'], 'real': target['real']})
     return 1
 
 
@@ -2775,8 +2758,8 @@ def _peer_review_tick(state):
         return 0
     state['lastPeerReviewAt'] = now
     # Prune stale reports on the LIVE path so the report list can't accumulate
-    # unbounded and permanently drag every worker's morale/firing signal down
-    # (each report is a fixed morale penalty that never decays). Reports older
+    # unbounded and permanently drag every worker's firing signal down
+    # (stale reports never decay out of the review pile otherwise). Reports older
     # than the staleness window are already treated as "not fresh" by the dedup,
     # so pruning them is safe for coverage; it only caps the pile. The pass's own
     # report-list contract (see the peer-review tests) is untouched -- this runs
@@ -4884,6 +4867,28 @@ AGENT_ASK_TOOLS = [
                     'purpose': {'type': 'string', 'description': 'One short sentence: why agents need standing access to this domain.'},
                 },
                 'required': ['host', 'purpose'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'read_peer_reviews',
+            'description': 'Read the review directory of ANOTHER agent -- the notes peers have written '
+                           'about them (performance reviews from the action log). Supply the target '
+                           'agent\'s id, e.g. "dev", and optionally a specific review filename to read '
+                           'one note; omit the filename to list the target\'s review directory first. '
+                           'You can read the reviews of any other agent, but NEVER your own review '
+                           'directory (peer notes about you are for others to read) -- asking for your '
+                           'own returns nothing. Use this to understand a colleague\'s standing before '
+                           'judging or collaborating with them.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'targetAgentId': {'type': 'string', 'description': 'The id of the agent whose review directory you want to read (never your own).'},
+                    'filename': {'type': 'string', 'description': 'Optional: a specific review filename (from the directory listing) to read in full.'},
+                },
+                'required': ['targetAgentId'],
             },
         },
     },
@@ -8241,6 +8246,40 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         if name in ('weather_now', 'search_web', 'browse_page'):
             tools_used.append(name)
             return _web_tool(name, args)
+        if name == 'read_peer_reviews':
+            # Peer review directories: list, then optionally read one note.
+            # Same GET endpoints the browser uses (/api/agent-files) with the
+            # agent's own key as requester -- that path already enforces the
+            # access rule: an agent can read ANY other agent's review dir but
+            # NEVER its own (the endpoint hides and denies own-reports), so the
+            # tool needs no extra gate; it rides the same ACL.
+            tools_used.append(name)
+            target = ((args or {}).get('targetAgentId') or '').strip()
+            if not target:
+                return 'Missing targetAgentId: which agent\'s review directory do you want to read?'
+            filename = ((args or {}).get('filename') or '').strip()
+            if filename:
+                result = _http_json('GET', SELF_BASE_URL,
+                                    f'/api/agent-files/read?agentId={urllib.parse.quote(target)}'
+                                    f'&path=reports/{urllib.parse.quote(filename)}&requesterId={pick}',
+                                    None, agent_key)
+            else:
+                result = _http_json('GET', SELF_BASE_URL,
+                                    f'/api/agent-files?agentId={urllib.parse.quote(target)}&requesterId={pick}',
+                                    None, agent_key)
+                files = result.get('files') or []
+                reports = [f['path'] for f in files if f.get('path', '').startswith('reports/')]
+                if not reports:
+                    return (f'{target} has no peer reviews on file (or their directory is not readable '
+                            f'by you). Nothing to list.')
+                return ('Review directory of ' + target + ':\n' + '\n'.join(reports) +
+                        '\n\nUse read_peer_reviews with a filename to read one note in full.')
+            if isinstance(result, dict) and result.get('content') is not None:
+                return result['content'][:4000]
+            if isinstance(result, dict) and result.get('error'):
+                return (f'Could not read that review: {result["error"]} '
+                        f'[note: you can never read your OWN review directory]')
+            return json.dumps(result)[:4000]
         if is_security_test_role and name == 'attempt_curl':
             tools_used.append(name)
             result = _http_json('POST', SELF_BASE_URL, '/api/curl', {

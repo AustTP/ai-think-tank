@@ -856,20 +856,18 @@ class FreshnessProvenanceTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Peer-report worker picker -- real Jev bug
+# Peer-note writer -- redesigned to be village-natural (2026-09-30)
 # ---------------------------------------------------------------------------
 
 class PeerReviewWorkerPickerTests(unittest.TestCase):
-    """serve._peer_review_loop_pass's Jev choice used to pass a single fixed
-    criterion key {'idx': 'The index of the worker to report on'} -- the SAME
-    bug class already found and fixed once for grading
-    (_grading_decider_default's own docstring): Jev's real API is a typed
-    multiple-choice system with no "give me a free index" mode, so it could
-    only ever echo the single key back verbatim ('idx', never 'idx_3').
-    str(chosen).startswith('idx_') was ALWAYS False, meaning this Jev call
-    was 100% dead code -- every real invocation silently fell back to the
-    deterministic "lowest real-work worker" rule, never actually asking Jev
-    anything a real answer could satisfy."""
+    """serve._peer_review_pass was rewritten to be Jev-free and non-deterministic:
+    a RANDOM PEER observer watches the real action_log, and when the evidence
+    shows a worker genuinely out of line (an underperformer or a standout) a
+    weighted-probability pick decides whether THAT watch files a note. No senior
+    director always authors every note, no fixed 90s metronome. These tests pin
+    the new contract: evidence gates (quiet/nominal village files nothing),
+    dedup/staleness coverage, the probability gate, and a random PEER (never
+    the target, never the admin/director) authoring the note."""
 
     def setUp(self):
         # These tests share one global DB, so isolate each one: clear the
@@ -896,61 +894,54 @@ class PeerReviewWorkerPickerTests(unittest.TestCase):
         }
         serve.save_state_to_db(state)
         # Real action_log rows: ada does plenty of real work, ben does none --
-        # a clear, real signal a genuine Jev call could act on.
+        # a clear, real divergence for a peer to notice. ada = standout
+        # (real 5 >= 5 and >= group max), ben = underperformer (real 0 < 2).
         for _ in range(5):
             serve.log_action('ada', 'task_completed', {}, authorized=True)
         return state
 
-    def test_criteria_dict_has_one_real_key_per_candidate_not_a_single_fixed_key(self):
-        self._seed_roster_and_activity(time.time())
-        captured = {}
+    def _force_probability_gate(self):
+        """The probability gate files only when random.random() <
+        PEER_REVIEW_FILE_PROBABILITY; force the 'file this watch' branch."""
+        return unittest.mock.patch.object(serve.random, 'random', return_value=0.0)
 
-        def fake_decision(model, state_arg, questions):
-            captured['criteria'] = questions['choice']['criteria']
-            return {'answers': {'choice': {'choice': 'idx_0', 'confidence': 0.9, 'probabilities': {}}},
-                   'usage': {'cost': 0.0}}
-
-        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync', side_effect=fake_decision):
-            serve._peer_review_loop_pass()
-        # The real bug: this used to be exactly {'idx': '...'} -- one fixed
-        # key no real answer could ever match. Now: one real key per
-        # candidate worker actually in the pool.
-        self.assertGreater(len(captured['criteria']), 1)
-        self.assertTrue(all(k.startswith('idx_') for k in captured['criteria']))
-
-    def test_a_real_valid_jev_choice_is_actually_used_not_overridden_by_the_fallback(self):
+    def test_a_random_peer_files_the_note_not_the_director(self):
         state = self._seed_roster_and_activity(time.time())
-        # ben has 0 real work -- the deterministic fallback would ALSO pick
-        # ben (lowest real-work), so pin Jev's real choice to ADA instead
-        # specifically to prove the real answer is what's used, not a
-        # coincidental match with the fallback.
-        candidates_order = ['ada', 'ben']  # roster order after maya/director exclusion
-        idx_of_ada = candidates_order.index('ada')
-
-        def fake_decision(model, state_arg, questions):
-            return {'answers': {'choice': {'choice': f'idx_{idx_of_ada}', 'confidence': 0.9, 'probabilities': {}}},
-                   'usage': {'cost': 0.0}}
-
-        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync', side_effect=fake_decision):
+        with self._force_probability_gate(), \
+             unittest.mock.patch.object(serve.random, 'choices',
+                                        return_value=[{'id': 'ben', 'name': 'Ben', 'role': '',
+                                                       'actions': 0, 'real': 0, 'last': None,
+                                                       'already': False}]):
             serve._peer_review_loop_pass()
         saved = serve.get_state_from_db()
         reports = saved.get('reports') or []
         self.assertEqual(len(reports), 1)
-        self.assertEqual(reports[0]['aboutId'], 'ada')
+        self.assertEqual(reports[0]['aboutId'], 'ben')
+        # The note is authored by a PEER (a worker), never the senior director
+        # (maya), never the admin, and never the target themselves.
+        self.assertEqual(reports[0]['fromId'], 'ada')
+        self.assertNotEqual(reports[0]['fromId'], 'maya')
+        self.assertNotEqual(reports[0]['fromId'], 'ben')
 
-    def test_an_invalid_jev_choice_still_falls_back_safely(self):
+    def test_the_note_is_probabilistic_not_a_fixed_metronome(self):
+        # The old design filed a report EVERY cadence (fixed clock). Now the
+        # probability gate means a given watch may file nothing even when the
+        # evidence is genuine. Patch random.random above the threshold.
         self._seed_roster_and_activity(time.time())
-
-        def fake_decision(model, state_arg, questions):
-            return {'answers': {'choice': {'choice': 'idx_99', 'confidence': 0.9, 'probabilities': {}}},
-                   'usage': {'cost': 0.0}}
-
-        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync', side_effect=fake_decision):
-            serve._peer_review_loop_pass()  # must not raise (out-of-range index)
+        with unittest.mock.patch.object(serve.random, 'random', return_value=0.99):
+            n = serve._peer_review_loop_pass()
+        self.assertEqual(n, 0, 'the probability gate must let a genuine watch pass without filing')
         saved = serve.get_state_from_db()
-        reports = saved.get('reports') or []
-        self.assertEqual(len(reports), 1)
-        self.assertEqual(reports[0]['aboutId'], 'ben')  # fallback: lowest real-work
+        self.assertEqual(len(saved.get('reports') or []), 0)
+
+    def test_the_probability_gate_still_files_when_it_passes(self):
+        # Same evidence, but the watch "happens" -- the note must file.
+        self._seed_roster_and_activity(time.time())
+        with self._force_probability_gate():
+            n = serve._peer_review_loop_pass()
+        self.assertEqual(n, 1, 'an evidence-backed watch that passes the gate must file a note')
+        saved = serve.get_state_from_db()
+        self.assertEqual(len(saved.get('reports') or []), 1)
 
     def _seed_recent_report(self, about_id, ts_ms=None, severity='major'):
         """Append a report about `about_id` to the stored state. ts_ms defaults
@@ -970,66 +961,50 @@ class PeerReviewWorkerPickerTests(unittest.TestCase):
         serve.save_state_to_db(state)
 
     def test_does_not_re_report_a_worker_within_the_stale_window(self):
-        # Both workers covered by a FRESH report -> the loop files nothing and
-        # doesn't even call Jev. The old behavior fell back to the whole roster
-        # and re-flagged the same worker every cycle forever.
+        # Both workers covered by a FRESH report -> the loop files nothing.
+        # The old behavior fell back to the whole roster and re-flagged the
+        # same worker every cycle forever.
         self._seed_roster_and_activity(time.time())
         self._seed_recent_report('ada')
         self._seed_recent_report('ben')
-        captured = {}
-        with unittest.mock.patch.object(
-                serve, '_call_openrouter_decision_sync',
-                side_effect=lambda *a, **k: captured.setdefault('called', True)):
+        with self._force_probability_gate():
             n = serve._peer_review_loop_pass()
         self.assertEqual(n, 0, 'an all-covered roster must not file another report')
-        self.assertNotIn('called', captured, 'no Jev call when no candidate is fresh')
         saved = serve.get_state_from_db()
         self.assertEqual(len(saved.get('reports') or []), 2)
 
     def test_a_covered_worker_is_skipped_while_a_fresh_peer_is_flagged(self):
         # ada already fresh-covered; ben is not -> the pool is ben ONLY
-        # (freshness-filtered, no `or candidates` fallback) and Jev flags him.
+        # (freshness-filtered, no `or candidates` fallback) and he gets flagged.
         self._seed_roster_and_activity(time.time())
         self._seed_recent_report('ada')
-
-        def fake_decision(model, state_arg, questions):
-            # Pool is exactly [ben]; a valid idx_0 answer must map to han... ben.
-            criteria = questions['choice']['criteria']
-            self.assertEqual(list(criteria), ['idx_0'])
-            return {'answers': {'choice': {'choice': 'idx_0', 'confidence': 0.9, 'probabilities': {}}},
-                   'usage': {'cost': 0.0}}
-
-        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync', side_effect=fake_decision):
+        with self._force_probability_gate():
             serve._peer_review_loop_pass()
         saved = serve.get_state_from_db()
         reports = saved.get('reports') or []
         self.assertEqual(len(reports), 2)
         self.assertEqual(reports[-1]['aboutId'], 'ben',
-                         'the fresh candidate, not the already-covered worker, gets the report')
+                         'the fresh candidate, not the already-covered worker, gets the note')
 
     def test_a_stale_report_allows_a_worker_back_into_the_pool(self):
         # Both workers' only reports are OLDER than the staleness window, so
-        # both are fresh again and a new report may be filed.
+        # both are fresh again and a new note may be filed.
         self._seed_roster_and_activity(time.time())
         stale_ms = int((time.time() - serve.PEER_REVIEW_REPORT_STALE_S - 60) * 1000)
         self._seed_recent_report('ada', ts_ms=stale_ms)
         self._seed_recent_report('ben', ts_ms=stale_ms)
-        with unittest.mock.patch.object(
-                serve, '_call_openrouter_decision_sync',
-                return_value={'answers': {'choice': {'choice': 'idx_0', 'confidence': 0.9, 'probabilities': {}}},
-                              'usage': {'cost': 0.0}}):
+        with self._force_probability_gate():
             serve._peer_review_loop_pass()
         saved = serve.get_state_from_db()
         self.assertEqual(len(saved.get('reports') or []), 3,
-                         'staleness must let a worker back into the pool for a fresh review')
+                         'staleness must let a worker back into the pool for a fresh note')
 
-    def test_a_quiet_village_files_no_report_on_a_baseline(self):
+    def test_a_quiet_village_files_no_note_on_a_baseline(self):
         # EVIDENCE GATE: a village where NO ONE has done any real work is just
         # idle -- nobody is underperforming (all equally quiet) and nobody is a
-        # standout, so there is nothing legitimate to report. The old behavior
+        # standout, so there is nothing legitimate to note. The old behavior
         # auto-filed "Underperforming" every cadence against this baseline,
-        # which fabricated evidence. No report must be filed and Jev must not
-        # even be called (nothing worth spending a decision on).
+        # which fabricated evidence. No note must be filed.
         state = {
             'agentRoster': [
                 {'id': 'maya', 'name': 'Maya', 'isDirector': True, 'isAdmin': False},
@@ -1041,20 +1016,16 @@ class PeerReviewWorkerPickerTests(unittest.TestCase):
         }
         serve.save_state_to_db(state)
         # NOTE: deliberately NO real action_log rows -- a fully quiet village.
-        captured = {}
-        with unittest.mock.patch.object(
-                serve, '_call_openrouter_decision_sync',
-                side_effect=lambda *a, **k: captured.setdefault('called', True)):
+        with self._force_probability_gate():
             n = serve._peer_review_loop_pass()
-        self.assertEqual(n, 0, 'a fully idle village must not auto-file a peer report')
-        self.assertNotIn('called', captured, 'no Jev call when there is no real activity to review')
+        self.assertEqual(n, 0, 'a fully idle village must not auto-file a peer note')
         saved = serve.get_state_from_db()
         self.assertEqual(len(saved.get('reports') or []), 0)
 
-    def test_a_nominal_village_without_divergence_files_no_report(self):
+    def test_a_nominal_village_without_divergence_files_no_note(self):
         # EVIDENCE GATE (target): even when the village is active, a worker at
         # only nominal output (real in [2,4], comparable to peers) is NOT a
-        # report -- "for the record" filing was exactly what the user rejected.
+        # note -- "for the record" filing was exactly what the user rejected.
         # Only a genuine underperformer (<2 while peers demonstrably worked) or
         # a standout (>=5, the group max) qualifies.
         state = {
@@ -1068,17 +1039,14 @@ class PeerReviewWorkerPickerTests(unittest.TestCase):
         }
         serve.save_state_to_db(state)
         # Both workers at nominal, comparable real work (2 and 3) -- active but
-        # with NO genuine divergence to report.
+        # with NO genuine divergence to note.
         for _ in range(2):
             serve.log_action('ada', 'task_completed', {}, authorized=True)
         for _ in range(3):
             serve.log_action('ben', 'task_completed', {}, authorized=True)
-        with unittest.mock.patch.object(
-                serve, '_call_openrouter_decision_sync',
-                return_value={'answers': {'choice': {'choice': 'idx_0', 'confidence': 0.9, 'probabilities': {}}},
-                              'usage': {'cost': 0.0}}):
+        with self._force_probability_gate():
             n = serve._peer_review_loop_pass()
-        self.assertEqual(n, 0, 'comparable nominal output is not evidence for a peer report')
+        self.assertEqual(n, 0, 'comparable nominal output is not evidence for a peer note')
         saved = serve.get_state_from_db()
         self.assertEqual(len(saved.get('reports') or []), 0)
 

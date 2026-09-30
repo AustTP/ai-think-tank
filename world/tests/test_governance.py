@@ -134,14 +134,18 @@ class MoraleFor(unittest.TestCase):
         a['hiredAt'] = now - 30 * 24 * 3600 * 1000
         self.assertEqual(sim.morale_for(state, 'ada', now_ms=now), 100)
 
-    def test_report_penalty(self):
+    def test_report_penalty_removed_from_morale(self):
         state = _seed()
         now, lc = _fresh()
         state['reports'] = [{'aboutId': 'ada', 'fromId': 'ben', 'quote': 'x', 'severity': 'minor'}]
         a = state['agents']['ada']
         a.update({'approvedCount': 0, 'droppedCount': 0, 'lastContactedAt': lc,
                   'hiredAt': now})
-        self.assertEqual(sim.morale_for(state, 'ada', now_ms=now), 90)  # 100 - 10
+        # Reports/notes deliberately do NOT move the morale meter (the video's
+        # meter reacts to approved/dropped/neglect only); they feed firing
+        # review instead. A fresh hire with nothing else wrong reads as 100
+        # regardless of reports filed against them.
+        self.assertEqual(sim.morale_for(state, 'ada', now_ms=now), 100)
 
     def test_neglect_cap_and_decay(self):
         state = _seed()

@@ -35,7 +35,7 @@ background loops:
 |------|---------|-------------|
 | `_sim_loop` | 6s task cycle | Drive the simulation: movement, task lifecycle, ceremonies |
 | `_health_check_loop` | 300s | Compute health signals, persist new alerts (model tiers, coordination, runaway-tool churn) |
-| `_peer_review_loop` | 90s | Senior director files peer reports on low-activity workers |
+| `_peer_review_loop` | 90s | A random peer observes the action log and files a note on an out-of-line worker (probabilistic) |
 | `_director_approval_loop` | 30s | Resolve pending escalations via delegated JEV approvals |
 | `_telegram_poll_loop` | 25s | Poll Telegram for player messages, route into think tank |
 | `_backup_loop` | 5min | Snapshot think_tank.db (keeps newest 24) |
