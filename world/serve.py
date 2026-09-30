@@ -5951,6 +5951,18 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runti
         runtimes = max(1, min(int(runtimes or 1), COLAB_RUNTIMES_MAX))
     except (TypeError, ValueError):
         runtimes = 1
+    # Sharding is deliberately gated on the decisions model being healthy.
+    # Each shard's job still gets URL-gated through the Jev decision chain
+    # (_colab_gate_urls -> _jev_quorum_choice_sync), so a sharded run fans
+    # several concurrent decisions through the SAME decision path that is
+    # already failing -- exactly the wrong time to multiply work that depends
+    # on it. While Jev is degraded (fallback/standby active), sharding is
+    # refused with an honest, retry-able reason; a single runtime stays open.
+    if runtimes > 1 and _jev_is_degraded():
+        return {'error': 'Jev\'s decisions model is currently degraded (fallback active) -- '
+                         'sharding is disabled while it is down, because every shard\'s URL gate '
+                         'depends on the same decision path that is already failing. '
+                         'Re-run with runtimes=1, or retry sharding once Jev recovers.'}
     blocked = _colab_denied(code) or _colab_denied(purpose or '')
     if blocked is None:
         for pkg in (packages or []):
