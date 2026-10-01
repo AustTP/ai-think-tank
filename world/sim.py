@@ -1605,6 +1605,14 @@ def queue_work(state, items):
             'title': item['title'],
             'room': item['room'],
             'instructions': item.get('instructions') or f"Pick whoever is best suited for: {item['title']}",
+            # A player-filed JIRA card's contract: the normalized user story +
+            # acceptance criteria survive the queue round trip onto the real task
+            # (see _resolve_refinement -> _assign_due_item -> assign_task), so the
+            # coding executor's backlog line carries the full spec, not just the
+            # one-line summary. Same class of gap as 'checklist'/'distill' below:
+            # a whitelist that silently drops a field its consumer needs.
+            'userStory': item.get('userStory') or None,
+            'acceptanceCriteria': item.get('acceptanceCriteria') or None,
             'pair': bool(item.get('pair')),
             'notBefore': item.get('notBefore') or None,
             'priority': normalize_priority(item.get('priority')),
@@ -2404,6 +2412,12 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'checklist': list((extra or {}).get('checklist') or []),
         'incident': bool((extra or {}).get('incident')),
         'productId': (extra or {}).get('productId'),
+        # A player-filed card's contract: the user story + acceptance criteria
+        # ride onto the task so the coding executor's prompt includes the full
+        # spec (content.py folds them into the backlog line it builds from
+        # task.instructions).
+        'userStory': (extra or {}).get('userStory'),
+        'acceptanceCriteria': (extra or {}).get('acceptanceCriteria'),
         'assignedTo': agent_id,
         'status': 'walking',
         'createdAt': now_ms,
@@ -3122,8 +3136,8 @@ def _enter_peer_review(state, task, now_ms, preferred=None):
     is the one who can confirm it was fixed. Fall back to a fresh pick if the
     prior pair is unavailable."""
     author = task.get('assignedTo')
+    prior = task.get('_peerGate') or {}
     if preferred is None:
-        prior = task.get('_peerGate') or {}
         preferred = prior.get('reviewerIds') or None
     reviewers = _pick_reviewer_ids(state, author, task_room=task.get('room'), preferred=preferred)
     if not reviewers:
@@ -3136,6 +3150,15 @@ def _enter_peer_review(state, task, now_ms, preferred=None):
         'enteredMs': now_ms,
         # review subtask ids appended as they're enqueued (for board surfacing)
         'reviewedTaskIds': [],
+        # Fail-closed gate: a story that has already cycled (a rejected review
+        # or a failed-pipeline send-back) carries its prior cycle count + freeze
+        # flag into the fresh gate, so the shared MAX_REVIEW_CYCLES cap is never
+        # reset by a re-entry -- the total review/fix loops stay bounded no
+        # matter WHICH mechanism keeps re-arming the gate. A frozen (escalated)
+        # gate stays frozen: it re-arms here only as a fresh needs_review entry
+        # for display, never to restart the loop (callers guard on `escalated`).
+        'cycleCount': prior.get('cycleCount') or 0,
+        'escalated': bool(prior.get('escalated')),
     }
     task['status'] = 'needs_review'
     task['_peerGate'] = gate
@@ -3199,6 +3222,72 @@ def _sim_notify_author(state, parent, reviewer_id):
         'text': f'A reviewer{(" (" + reviewer_id + ")") if reviewer_id else ""} sent your work on "{parent.get("title")}" back -- it needs a fix before it can close. Fix it and it will be reviewed again.'})
 
 
+def _sim_notify_author_failed(state, task):
+    """Fail-closed send-back signal: tell the author their deliverable was sent
+    back because it FAILED the quality pipeline (a red flake8/mypy/bandit/
+    pytest-cov run -- see content.py's coding executor), and a fix is queued
+    back to them. Mirrors _sim_notify_author's mailbox shape."""
+    author = task.get('assignedTo')
+    if not author:
+        return
+    _append_mailbox((state.get('agents') or {}).get(author, {}), {
+        'kind': 'peer_review_rejected',
+        'about': task.get('id'),
+        'title': task.get('title'),
+        'text': f'Your work on "{task.get("title")}" failed the quality pipeline and was sent back -- it needs a fix before it can be reviewed. Fix it and it will be reviewed again.'})
+
+
+def _send_back_after_failure(state, task, fail_note=None):
+    """Fail-closed quality-gate send-back. A deliverable (or a fix of one) whose
+    content result failed the pipeline is marked `failed` -- deliberately NOT
+    'needs_review', because _sweep_stuck_gates only processes needs_review and
+    would otherwise re-pin fresh reviewers onto a card whose pipeline is red.
+    The author is notified (mailbox) -- this is the one send-back path that
+    MUST tell the worker, whether the story can be fixed or has escalated.
+    Under the shared review-cycle cap a fix is queued back to the original
+    author (pinned + high priority); once the cap is crossed the story
+    escalates (create_escalation) and stays frozen -- no further fix cycling.
+    Pure state mutation; called from _task_cycle's content-result branch. The
+    prior gate (if any) is kept so _maybe_escalate_stuck_gate's shared cap and
+    _enter_peer_review's carry-over both see it."""
+    author = task.get('assignedTo')
+    note = (fail_note or task.get('note') or 'the pipeline did not pass').strip()
+    _sim_notify_author_failed(state, task)
+    if not task.get('_peerGate'):
+        # Seed a real (empty) gate: _resolve_review_parent requires a truthy
+        # _peerGate to resolve a later fix's completion, and the cycle cap needs
+        # somewhere to count.
+        task['_peerGate'] = {'approvals': 0, 'approvers': [],
+                             'reviewerIds': [], 'enteredMs': 0}
+    gate = task['_peerGate']
+    task['status'] = 'failed'
+    task['failedAt'] = int(time.time() * 1000)
+    task['failNote'] = note[:300]
+    if _maybe_escalate_stuck_gate(task, gate, 'quality pipeline keeps failing'):
+        return  # frozen -- escalated + player notified; no further fix cycling
+    instructions = (f"Your work on '{task.get('title')}' failed the quality pipeline: "
+                    f"{note}. Fix it so the pipeline passes clean, then it will be re-reviewed.")
+    if task.get('userStory'):
+        instructions += f"\n\nUser story: {task['userStory']}"
+    if task.get('acceptanceCriteria'):
+        instructions += f"\n\nAcceptance criteria:\n{task['acceptanceCriteria']}"
+    queue_work(state, [{
+        'title': f'Fix: {task.get("title")}',
+        'room': task.get('room'),
+        'instructions': instructions,
+        'goal': task.get('projectLabel') or task.get('goal'),
+        'projectLabel': task.get('projectLabel') or task.get('title'),
+        'taskType': 'code',
+        'reviewOf': task.get('id'),
+        'reviewAuthorId': author,
+        'assignedTo': author,
+        'productId': task.get('productId'),
+        'userStory': task.get('userStory'),
+        'acceptanceCriteria': task.get('acceptanceCriteria'),
+        'priority': WORK_PRIORITY['high'],
+    }])
+
+
 def _peer_gate_should_close(gate, now_ms, entered_ms):
     """Close rule: two distinct clean approvals, OR -- after the review-timeout
     window has elapsed -- a single clean approval. Guards against a small think tank
@@ -3249,6 +3338,27 @@ def _release_agent_gated(state, agent_id, grid):
     a['weekApprovals'] = (a.get('weekApprovals') or 0) + 1
     _note_completed_room(state, agent_id, completed)
     _maybe_file_followup(state, agent_id, completed, int(time.time() * 1000))
+
+
+def _release_agent_after_failure(state, agent_id, task):
+    """Release an agent whose deliverable work FAILED the quality pipeline (or
+    whose fix subtask failed it). Unlike _release_agent_gated / finish_task this
+    does NOT bump approvals, record a completed room, grade the deliverable, or
+    file a follow-up -- a red-pipeline result is not shipped work and must not
+    count as one (a fabricated 0.0 trailing grade would otherwise pollute the
+    roadmap signal and a follow-up would propose more work off a failure). The
+    completed task is marked 'done' so _reclaim_orphaned_walking_tasks never
+    re-issues it. Pure state mutation."""
+    agents = state.get('agents') or {}
+    a = agents.get(agent_id)
+    if not a:
+        return
+    if task:
+        task['status'] = 'done'
+    a['task'] = None
+    a['busy'] = False
+    a['inRoom'] = None
+    a['visible'] = True
 
 
 def _gate_reviewer_reachable(state, rid, gate, now_ms):
@@ -4440,16 +4550,26 @@ def next_issue_key(state, team_id):
     return f"{prefix}-{n}"
 
 
+def _as_block_text(value):
+    """Coerce a description block (string, or list of strings as sent by a JSON
+    client for acceptanceCriteria) into a single text blob for normalization."""
+    if isinstance(value, list):
+        return '\n'.join(str(item) for item in value if item is not None)
+    return value
+
+
 def _normalize_description(description):
     """A description dict {userStory, acceptanceCriteria} or a plain string is
     split into the two canonical description blocks. Returns
     (userStory, acceptanceCriteria) -- each normalized to its template, or None
     when absent/malformed. The think tank understands exactly two Jira description
     shapes: the user story ("As a..., I want to..., so that...") and the
-    acceptance criteria ("Given..., When..., Then...")."""
+    acceptance criteria ("Given..., When..., Then..."). `acceptanceCriteria`
+    may arrive as a list of criteria strings (the natural JSON shape); the list
+    is joined into one block before normalization."""
     if isinstance(description, dict):
-        return (normalize_story_block(description.get('userStory')),
-                normalize_gwt_block(description.get('acceptanceCriteria')))
+        return (normalize_story_block(_as_block_text(description.get('userStory'))),
+                normalize_gwt_block(_as_block_text(description.get('acceptanceCriteria'))))
     text = (description or '').strip()
     if not text:
         return None, None
@@ -4531,6 +4651,13 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         'issueKey': key,
         'teamId': team_id,
         'issueType': issue_type,
+        # The player-facing contract: the normalized user story + acceptance
+        # criteria travel with the backlog request so the refinement ceremony can
+        # hand the WORKER the full spec, not just the one-line summary (see
+        # _resolve_refinement, which embeds them into the coding task's
+        # instructions).
+        'userStory': story,
+        'acceptanceCriteria': criteria,
     }
     state.setdefault('backlogRequests', []).append(req)
     # Kick this team's refinement to be immediately due (next pass), not
@@ -5618,10 +5745,25 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
             # assignment time (see queue_work's own comment on the field) --
             # req['teamId'] is already known here (the grooming ceremony
             # itself is per-team), it just never survived onto the real task.
+            # A player-filed JIRA card (req carries the normalized userStory +
+            # acceptanceCriteria from file_issue) is handed to the WORKER as the
+            # full contract: the story and criteria are embedded in the task's
+            # instructions (the coding executor builds its backlog line from
+            # them), and forwarded as structured fields through queue_work /
+            # _assign_due_item / assign_task so they survive onto the task.
+            story = req.get('userStory')
+            criteria = req.get('acceptanceCriteria')
+            instructions = (f"Filed by {filed_by} during backlog refinement. {req.get('reason')}")
+            if story:
+                instructions += f"\n\nUser story: {story}"
+            if criteria:
+                instructions += f"\n\nAcceptance criteria:\n{criteria}"
             queue_work(state, [{
                 'title': req['title'], 'room': req['room'], 'goal': req.get('title'),
-                'instructions': (f"Filed by {filed_by} during backlog refinement. {req.get('reason')}"),
+                'instructions': instructions,
                 'teamId': req.get('teamId'),
+                'userStory': story,
+                'acceptanceCriteria': criteria,
             }])
             accepted.append(req)
         else:
@@ -6682,6 +6824,13 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 # as the real work resolves (the min-visual floor is satisfied by
                 # the network round-trips), not when the timeout ceiling hits.
                 _apply_content_result(state, task, result)
+                # Fail-closed quality gate: a content result that FAILED the
+                # quality pipeline (the coding executor stores ok=False on a red
+                # flake8/mypy/bandit/pytest-cov run) must NEVER advance to peer
+                # review or re-arm a gate. A review executor always reports
+                # ok=True (its verdict rides in peerVerdict), so this check never
+                # disturbs a normal gate vote.
+                result_ok = bool(result.get('ok', True))
                 # Phase E addendum: completion is gated for deliverable rooms.
                 # A review/fix subtask (has reviewOf) folds its vote already in
                 # _apply_content_result; a primary deliverable task that has NEVER
@@ -6692,21 +6841,23 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                         # Vote worker finished; close the parent if 2 clean votes
                         # (or 1 + timeout) are in.
                         _parent_close_from_vote(state, parent, now_ms)
+                    elif parent is not None and _peer_gated_lane(parent) and result_ok:
+                        # A fix subtask finished its (re)work and the pipeline is
+                        # clean -> re-arm the same gate so the fixed story gets
+                        # re-review, not a done. Never re-arms a FROZEN (already
+                        # escalated) gate -- an escalated story stays paused for
+                        # manual attention, not silently re-entered.
+                        if not (parent.get('_peerGate') or {}).get('escalated'):
+                            _enter_peer_review(state, parent, now_ms)
                     elif parent is not None and _peer_gated_lane(parent):
-                        # A fix subtask finished its (re)work -> re-arm the same
-                        # gate so the fixed story gets re-review, not a done.
-                        # Bug: this had no
-                        # _peer_gated_lane guard at all, so a skillReview/distill
-                        # parent that was ALREADY gated (e.g. from before the
-                        # _peer_gated_lane exemption existed, or any other stale
-                        # _peerGate) kept getting re-armed forever every time its
-                        # fix subtask completed -- the exact same infinite loop
-                        # the exemption was meant to close, just entered from a
-                        # different door. Same fix, applied here too: a
-                        # non-gated-lane task never gets its gate re-armed,
-                        # period, regardless of how it got a _peerGate in the
-                        # first place.
-                        _enter_peer_review(state, parent, now_ms)
+                        # Fail-closed: the FIX itself failed the pipeline. Do NOT
+                        # re-arm the gate; the story stays 'failed' and another
+                        # fix is queued back to the author (or it escalates once
+                        # the shared cycle cap is hit).
+                        _release_agent_after_failure(state, aid, task)
+                        _send_back_after_failure(state, parent, fail_note=task.get('note'))
+                        send_agent_off_duty(state, aid, doors, grid)
+                        continue
                     elif parent is not None:
                         # Parent isn't supposed to be gated (skillReview/distill)
                         # but somehow already has a stale _peerGate -- clear it
@@ -6717,7 +6868,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                             parent['status'] = 'working'
                     finish_task(state, aid, grid)
                     send_agent_off_duty(state, aid, doors, grid)
-                elif _peer_gated_lane(task) and not task.get('_peerGate'):
+                elif _peer_gated_lane(task) and not task.get('_peerGate') and result_ok:
                     gate = _enter_peer_review(state, task, now_ms)
                     if gate:
                         # Story now waits on peer approval; release the author
@@ -6727,6 +6878,15 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                     else:
                         finish_task(state, aid, grid)
                         send_agent_off_duty(state, aid, doors, grid)
+                elif _peer_gated_lane(task) and not task.get('_peerGate'):
+                    # Fail-closed: a red-pipeline primary deliverable must NOT
+                    # enter the peer gate. Release the agent (no approval/grade)
+                    # and send the story back -- or escalate once the shared
+                    # cycle cap is hit. (_send_back_after_failure notifies the
+                    # author.)
+                    _release_agent_after_failure(state, aid, task)
+                    _send_back_after_failure(state, task, fail_note=task.get('note'))
+                    send_agent_off_duty(state, aid, doors, grid)
                 else:
                     finish_task(state, aid, grid)
                     send_agent_off_duty(state, aid, doors, grid)
@@ -6937,6 +7097,9 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # the cap can be enforced against the open task set).
         'incident': bool(pick.get('incident')),
         'productId': pick.get('productId'),
+        # A player-filed card's contract survives onto the task (see assign_task).
+        'userStory': pick.get('userStory'),
+        'acceptanceCriteria': pick.get('acceptanceCriteria'),
     }
     # Cut 2 coaching + runbook injection: append the chosen agent's pending
     # growth-plan note (applied once) and any product runbook knowledge to the
