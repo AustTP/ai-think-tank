@@ -199,6 +199,46 @@ class SpendCap(unittest.TestCase):
             serve._accrue_spend('alpha', 0.02)
             self.assertTrue(serve._think_tank_spend_cap_exceeded())  # 5.01 new >= 5.0
 
+    def test_cap_resets_at_each_month_boundary(self):
+        # The cap is a MONTHLY budget: at the first check of a new UTC month
+        # the baseline rolls forward to the current ledger total, so spend
+        # from a previous month never counts against the new month's cap.
+        self._leak()
+        serve._accrue_spend('alpha', 4.0)  # prior-month spend
+        with unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 5.0):
+            with unittest.mock.patch.object(serve, '_spend_cap_period', return_value='2026-09'):
+                self.assertFalse(serve._think_tank_spend_cap_exceeded())  # Sep baseline set at 4.0
+                serve._accrue_spend('alpha', 5.0)  # Sep now 9.0 total, 5.0 new
+                self.assertTrue(serve._think_tank_spend_cap_exceeded())  # 5.0 new >= 5.0
+            with unittest.mock.patch.object(serve, '_spend_cap_period', return_value='2026-10'):
+                # Oct: baseline rolls to the current total (9.0); fresh $5 budget.
+                self.assertFalse(serve._think_tank_spend_cap_exceeded())
+                serve._accrue_spend('alpha', 1.0)
+                self.assertFalse(serve._think_tank_spend_cap_exceeded())  # 1.0 new < 5.0
+                serve._accrue_spend('alpha', 4.1)
+                self.assertTrue(serve._think_tank_spend_cap_exceeded())  # 5.1 new >= 5.0
+
+    def test_legacy_float_baseline_is_adopted_for_current_month(self):
+        # Pre-monthly ledgers stored the baseline as a bare float (spend at
+        # install time). It must be adopted as the CURRENT month's baseline --
+        # not re-rolled to today's total -- so spend accrued since install
+        # keeps counting against the cap exactly as it did before the upgrade.
+        self._leak()
+        serve._accrue_spend('alpha', 7.0)  # 3.0 since the old 4.0 baseline
+        holder = {'ledger': serve._spend_ledger_read()}
+        holder['ledger'][serve._SPEND_CAP_BASELINE_KEY] = 4.0  # legacy bare-float baseline
+        with unittest.mock.patch.object(serve, '_spend_ledger_read', return_value=holder['ledger']), \
+             unittest.mock.patch.object(serve, '_spend_ledger_write',
+                                        side_effect=lambda l: holder.__setitem__('ledger', l)):
+            with unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 5.0), \
+                 unittest.mock.patch.object(serve, '_spend_cap_period', return_value='2026-09'):
+                self.assertFalse(serve._think_tank_spend_cap_exceeded())  # adopts 4.0; 3.0 new < 5.0
+                serve._accrue_spend('alpha', 2.0)
+                self.assertTrue(serve._think_tank_spend_cap_exceeded())  # 5.0 new >= 5.0
+            with unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 5.0), \
+                 unittest.mock.patch.object(serve, '_spend_cap_period', return_value='2026-10'):
+                self.assertFalse(serve._think_tank_spend_cap_exceeded())  # new month: baseline rolls to 9.0
+
     def test_chat_completion_chokepoint_blocks_before_any_network_call(self):
         self._leak()
         serve._accrue_spend('alpha', 10.0)
