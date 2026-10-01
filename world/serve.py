@@ -7111,7 +7111,7 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev')
 # Gap: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
@@ -9226,6 +9226,59 @@ async def intent_schedule(request: Request):
     log_action('player', 'schedule_created', {'topicId': record['id'], 'topic': record['topic']}, authorized=True)
     _append_passport_decision('schedule_created', 'player', {'topicId': record['id']})
     return JSONResponse({'ok': True, 'topic': record})
+
+
+@app.post('/api/pipelines')
+async def pipelines_create(request: Request):
+    """The player-facing ORDERED-pipeline lane: POST {name, cadenceMs, steps}.
+    Each step is {title, room, offsetMs, instructions, tool, args}. Steps fire
+    in strict sequence -- step N+1 waits for step N's task to complete -- on a
+    cadence floored to MIN_PIPELINE_CADENCE_MS (1h). Same structured-parity
+    relationship to _check_pipelines that /api/intent/schedule has to
+    add_research_topic: this takes already-structured fields, no free-text
+    extraction."""
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    import sim as _sim
+    record = _sim.add_pipeline(state, body.get('name'), body.get('cadenceMs'), body.get('steps'))
+    if not record:
+        return JSONResponse({'error': 'name, a non-empty steps list (each with title and room), and cadenceMs are required'}, status_code=400)
+    save_state_to_db(state)
+    log_action('player', 'pipeline_created', {'pipelineId': record['id'], 'name': record['name'], 'steps': len(record['steps'])}, authorized=True)
+    _append_passport_decision('pipeline_created', 'player', {'pipelineId': record['id']})
+    return JSONResponse({'ok': True, 'pipeline': record})
+
+
+@app.get('/api/pipelines')
+async def pipelines_list(request: Request):
+    """List the ordered pipelines currently scheduled, newest first."""
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    pipelines = list(reversed(state.get('pipelines') or []))
+    return JSONResponse({'ok': True, 'pipelines': pipelines})
+
+
+@app.delete('/api/pipelines/{pipeline_id}')
+async def pipelines_delete(request: Request, pipeline_id: str):
+    """Delete one scheduled pipeline (and its unscheduled steps)."""
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    before = len(state.get('pipelines') or [])
+    state['pipelines'] = [p for p in (state.get('pipelines') or []) if p.get('id') != pipeline_id]
+    after = len(state.get('pipelines') or [])
+    if before == after:
+        return JSONResponse({'error': 'no such pipeline'}, status_code=404)
+    save_state_to_db(state)
+    log_action('player', 'pipeline_deleted', {'pipelineId': pipeline_id}, authorized=True)
+    _append_passport_decision('pipeline_deleted', 'player', {'pipelineId': pipeline_id})
+    return JSONResponse({'ok': True})
 
 
 @app.post('/api/intent/incidents')

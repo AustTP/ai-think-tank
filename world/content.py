@@ -549,8 +549,64 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
         # library / postoffice / unset -> no entry -> placeholder (unchanged).
     }
     executor = task_type_executors.get(task.get('taskType')) or room_executors.get(task.get('room'))
+    if task.get('pipelineStep'):
+        executor = _run_pipeline_step_content
     if executor:
         executor(snapshot, agent_id, task, base_ctx)
+
+
+def _run_pipeline_step_content(snapshot, agent_id, task, base_ctx=None):
+    """The executor for an ORDERED-pipeline step (sim.add_pipeline /
+    _check_pipelines): a scheduled, single-shot step with an optional tool +
+    args. Resolves the step's definition from the snapshot's pipelines (the
+    pipelineStep marker on the task carries pipelineId + stepIndex), then:
+      - with a `tool`, runs the real upstream tool (Treg LinkedIn search /
+        x_trending_topics today) and stores the raw result as the note;
+      - without a tool, falls back to the generic research-center pass so the
+        step still lands a real content result (the pipeline's strict-order
+        gate advances on the task's 'done' status, so a step MUST complete to
+        release its successor -- never a placeholder no-op that looks done).
+    Executed on a background thread by sim._dispatch_content_work; stores its
+    result via sim._store_content_result for the next task_cycle pass."""
+    import sim as _sim_module
+    marker = task.get('pipelineStep') or {}
+    pipeline_id = marker.get('pipelineId')
+    step_index = marker.get('stepIndex')
+    step = None
+    for p in (snapshot.get('pipelines') or []):
+        if p.get('id') == pipeline_id:
+            steps = p.get('steps') or []
+            if 0 <= (step_index or 0) < len(steps):
+                step = steps[step_index]
+            break
+    if step is None:
+        # Pipeline vanished since scheduling: report, don't wedge the agent.
+        _sim_module._store_content_result(task.get('id'),
+                                          {'note': 'Pipeline step arrived with no matching pipeline record.'})
+        return
+    tool = (step.get('tool') or '').strip()
+    args = dict(step.get('args') or {})
+    if tool:
+        try:
+            if tool in ('x_trending_topics', 'search_linkedin_posts'):
+                executor = _make_treg_tools_executor()
+            elif tool in _APIFY_TOOL_NAMES:
+                executor = _make_apify_tools_executor()
+            elif tool == 'generate_pixel_character':
+                executor = _make_pixellab_tools_executor()
+            else:
+                executor = None
+            if executor is None:
+                out = f'unknown tool for pipeline step: {tool}'
+            else:
+                out = executor(tool, args)
+            _sim_module._store_content_result(task.get('id'), {'note': out})
+            return
+        except Exception as e:
+            _sim_module._store_content_result(task.get('id'),
+                                              {'note': f'Pipeline step tool failed: {e}'})
+            return
+    _run_research_bare_content(snapshot, agent_id, task, base_ctx)
 
 
 def _agent_name(snapshot, agent_id):
