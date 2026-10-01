@@ -1,13 +1,13 @@
 """Tests for the YouTube transcript tool: URL gating (_is_youtube_url),
-the VTT/SRT cleaning (_clean_subtitle_file), the local yt-dlp captions path
-(_youtube_transcript), and the Colab whisper fallback
-(_youtube_transcript_colab).
+the VTT/SRT cleaning (_clean_subtitle_file), the local yt-dlp captions
+utility (_youtube_transcript), and the serving route
+(_youtube_transcript_colab) -- which ALWAYS downloads the audio via the
+Apify actor and transcribes it with faster-whisper on the Colab runtime
+(every video treated the same; no captions fast-path).
 
 The two real-network boundaries (yt-dlp subprocess, Colab runtime) are
 mocked so nothing touches the network. The fallback's budget/availability
-gates are exercised deterministically; a video with no captions routes to
-the fallback only when the captions path returns a no-captions signal.
-"""
+gates are exercised deterministically."""
 import os
 import shutil
 import sys
@@ -125,6 +125,9 @@ class LocalCaptionsPath(unittest.TestCase):
 
 
 class ColabFallback(unittest.TestCase):
+    """The serving route: ALWAYS downloads the audio via the Apify actor on
+    the Colab runtime and transcribes it with faster-whisper there."""
+
     def test_returns_error_when_colab_disabled(self):
         with unittest.mock.patch.object(serve, 'COLAB_ENABLED', False):
             text, err = serve._youtube_transcript_colab('https://youtu.be/abc')
@@ -141,27 +144,76 @@ class ColabFallback(unittest.TestCase):
         self.assertIn('Colab usage cap reached', err)
         run.assert_not_called()
 
+    def test_missing_apify_key_fails_fast(self):
+        with unittest.mock.patch.object(serve, 'COLAB_ENABLED', True), \
+             unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+             unittest.mock.patch.object(serve, '_colab_budget_exceeded', return_value=False), \
+             unittest.mock.patch.object(serve, 'APIFY_API_KEY', ''), \
+             unittest.mock.patch.object(serve, '_colab_compute_run') as run:
+            text, err = serve._youtube_transcript_colab('https://youtu.be/abc')
+        self.assertIsNone(text)
+        self.assertIn('APIFY_API_KEY is not configured', err)
+        run.assert_not_called()
+
     def test_success_returns_transcribed_text(self):
         with unittest.mock.patch.object(serve, 'COLAB_ENABLED', True), \
              unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
              unittest.mock.patch.object(serve, '_colab_budget_exceeded', return_value=False), \
+             unittest.mock.patch.object(serve, 'APIFY_API_KEY', 'test-key'), \
              unittest.mock.patch.object(serve, '_colab_compute_run',
-                                        return_value={'stdout': 'first line\nsecond line\n',
+                                        return_value={'stdout': 'first line\nsecond line\n__TRANSCRIPT_END__\n',
                                                       'units': 1, 'elapsed_s': 30,
                                                       'session': 'colab'}) as run:
             text, err = serve._youtube_transcript_colab('https://youtu.be/abc')
         self.assertIsNone(err)
         self.assertEqual(text, 'first line\nsecond line')
-        # The code sent to Colab must include the URL and whisper imports.
+        # The code sent to Colab must include the Apify actor URL + whisper
+        # imports, must NOT reference yt-dlp or a cookies file, and the key
+        # must travel via the env dict, not the code text.
         code = run.call_args.args[1]
         self.assertIn('faster_whisper', code)
-        self.assertIn('yt_dlp', code)
+        self.assertIn('IHDsaLO64Wge9wSWx', code)
         self.assertIn('https://youtu.be/abc', code)
+        self.assertIn('__TRANSCRIPT_END__', code)
+        self.assertNotIn('yt_dlp', code)
+        self.assertNotIn('cookiefile', code)
+        self.assertNotIn('test-key', code)
+        self.assertEqual(run.call_args.kwargs.get('env'), {'APIFY_API_KEY': 'test-key'})
+        self.assertEqual(run.call_args.kwargs.get('packages'), ['faster-whisper', 'av==13.1.0'])
+
+    def test_no_end_marker_is_an_honest_failure(self):
+        # A run that dies partway (traceback instead of a marked transcript)
+        # must NEVER be returned as text -- fail closed.
+        with unittest.mock.patch.object(serve, 'COLAB_ENABLED', True), \
+             unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+             unittest.mock.patch.object(serve, '_colab_budget_exceeded', return_value=False), \
+             unittest.mock.patch.object(serve, 'APIFY_API_KEY', 'test-key'), \
+             unittest.mock.patch.object(serve, '_colab_compute_run',
+                                        return_value={'stdout': 'Traceback (most recent call last):\n'
+                                                               'ExtractorError: Sign in to confirm',
+                                                      'units': 1, 'elapsed_s': 30, 'session': 'colab'}):
+            text, err = serve._youtube_transcript_colab('https://youtu.be/abc')
+        self.assertIsNone(text)
+        self.assertIn('no end marker', err)
+
+    def test_explicit_error_marker_is_an_honest_failure(self):
+        with unittest.mock.patch.object(serve, 'COLAB_ENABLED', True), \
+             unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+             unittest.mock.patch.object(serve, '_colab_budget_exceeded', return_value=False), \
+             unittest.mock.patch.object(serve, 'APIFY_API_KEY', 'test-key'), \
+             unittest.mock.patch.object(serve, '_colab_compute_run',
+                                        return_value={'stdout': '__ERROR__: actor start failed: boom',
+                                                      'units': 1, 'elapsed_s': 30, 'session': 'colab'}):
+            text, err = serve._youtube_transcript_colab('https://youtu.be/abc')
+        self.assertIsNone(text)
+        self.assertIn('could not download or transcribe', err)
+        self.assertIn('boom', err)
 
     def test_error_from_colab_surface(self):
         with unittest.mock.patch.object(serve, 'COLAB_ENABLED', True), \
              unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
              unittest.mock.patch.object(serve, '_colab_budget_exceeded', return_value=False), \
+             unittest.mock.patch.object(serve, 'APIFY_API_KEY', 'test-key'), \
              unittest.mock.patch.object(serve, '_colab_compute_run',
                                         return_value={'error': 'runtime not granted'}):
             text, err = serve._youtube_transcript_colab('https://youtu.be/abc')
@@ -169,26 +221,116 @@ class ColabFallback(unittest.TestCase):
         self.assertIn('runtime not granted', err)
 
 
-class ColabDenyExemption(unittest.TestCase):
-    """The Colab whisper fallback is the sanctioned exception to the yt-dlp /
-    bulk-media-download deny class (one validated YouTube URL, audio-only,
-    transcribed to text), and the exemption must be exactly that narrow:
-    agent-facing Colab runs that use yt-dlp stay refused, torrents stay refused
-    unconditionally, and every other deny class still fires for the
-    transcription path."""
+class YouTubeVideoId(unittest.TestCase):
+    def test_extracts_id_from_watch_url(self):
+        self.assertEqual(serve._youtube_video_id('https://www.youtube.com/watch?v=dQw4w9WgXcQ'),
+                         'dQw4w9WgXcQ')
 
-    def test_transcription_passes_the_bulk_media_skip_label(self):
+    def test_extracts_id_from_youtu_be(self):
+        self.assertEqual(serve._youtube_video_id('https://youtu.be/dQw4w9WgXcQ'),
+                         'dQw4w9WgXcQ')
+
+    def test_extracts_id_from_shorts(self):
+        self.assertEqual(serve._youtube_video_id('https://www.youtube.com/shorts/abcdefghijk'),
+                         'abcdefghijk')
+
+    def test_rejects_non_youtube(self):
+        self.assertIsNone(serve._youtube_video_id('https://evil.com/watch?v=dQw4w9WgXcQ'))
+
+
+class FileYoutubeTranscript(unittest.TestCase):
+    """Every successful extraction is filed into the shared Library's media/
+    transcripts/ tree (YOUTUBE_TRANSCRIPTS_DIR) so ANY agent can read it via
+    /api/library/file. A write failure must never fail the request."""
+
+    def test_writes_transcript_into_shared_transcripts_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = os.path.join(tmp, 'library')
+            with unittest.mock.patch.object(serve, 'LIBRARY_DIR', lib), \
+                 unittest.mock.patch.object(serve, 'YOUTUBE_TRANSCRIPTS_DIR',
+                                            os.path.join(lib, 'media', 'transcripts')):
+                rel = serve._file_youtube_transcript('https://youtu.be/dQw4w9WgXcQ',
+                                                     'hello world', 'captions')
+            self.assertEqual(rel, os.path.join('media', 'transcripts', 'dQw4w9WgXcQ.txt'))
+            target = os.path.join(lib, 'media', 'transcripts', 'dQw4w9WgXcQ.txt')
+            self.assertTrue(os.path.isfile(target))
+            content = open(target).read()
+            self.assertIn('hello world', content)
+            self.assertIn('dQw4w9WgXcQ', content)
+            self.assertIn('captions', content)
+
+    def test_updates_same_file_in_place_on_refetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = os.path.join(tmp, 'library')
+            with unittest.mock.patch.object(serve, 'LIBRARY_DIR', lib), \
+                 unittest.mock.patch.object(serve, 'YOUTUBE_TRANSCRIPTS_DIR',
+                                            os.path.join(lib, 'media', 'transcripts')):
+                serve._file_youtube_transcript('https://youtu.be/dQw4w9WgXcQ', 'first', 'captions')
+                serve._file_youtube_transcript('https://youtu.be/dQw4w9WgXcQ', 'second', 'colab-whisper')
+            target = os.path.join(lib, 'media', 'transcripts', 'dQw4w9WgXcQ.txt')
+            self.assertEqual(open(target).read().count('first'), 0)
+            self.assertIn('second', open(target).read())
+
+    def test_invalid_url_is_a_silent_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = os.path.join(tmp, 'library')
+            with unittest.mock.patch.object(serve, 'LIBRARY_DIR', lib), \
+                 unittest.mock.patch.object(serve, 'YOUTUBE_TRANSCRIPTS_DIR',
+                                            os.path.join(lib, 'media', 'transcripts')):
+                rel = serve._file_youtube_transcript('https://evil.com/x', 'text', 'captions')
+            self.assertIsNone(rel)
+            self.assertEqual(os.listdir(lib) if os.path.exists(lib) else [], [])
+
+
+class ColabSessionExists(unittest.TestCase):
+    """The colab CLI exits 0 even for a missing session (it prints 'Session 'X'
+    not found.' to stderr) -- the existence check must read the output, not
+    just the exit code, or provision skips `colab new` and exec fails against a
+    phantom session."""
+
+    def test_missing_session_prints_not_found_is_not_existing(self):
+        with unittest.mock.patch.object(serve, '_colab_cli',
+                                        return_value=(0, "[colab] Session 'think-tank-gpu' not found.")):
+            self.assertFalse(serve._colab_session_exists('think-tank-gpu'))
+
+    def test_no_active_sessions_is_not_existing(self):
+        with unittest.mock.patch.object(serve, '_colab_cli',
+                                        return_value=(0, '[colab] No active sessions found on server.')):
+            self.assertFalse(serve._colab_session_exists('think-tank-gpu'))
+
+    def test_real_session_is_existing(self):
+        with unittest.mock.patch.object(serve, '_colab_cli',
+                                        return_value=(0, '[think-tank-gpu] gpu-t4-s-abc | Status: IDLE')):
+            self.assertTrue(serve._colab_session_exists('think-tank-gpu'))
+
+    def test_nonzero_exit_is_not_existing(self):
+        with unittest.mock.patch.object(serve, '_colab_cli',
+                                        return_value=(1, 'some error')):
+            self.assertFalse(serve._colab_session_exists('think-tank-gpu'))
+
+
+class ColabDenyExemption(unittest.TestCase):
+    """The transcription route no longer needs any deny-class exemption: it
+    downloads via the Apify actor on the runtime (no yt-dlp), so agent-facing
+    Colab runs that use yt-dlp stay refused, torrents stay refused
+    unconditionally, and every other deny class still fires."""
+
+    def test_transcription_needs_no_skip_label_and_uses_apify(self):
         with unittest.mock.patch.object(serve, 'COLAB_ENABLED', True), \
              unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
              unittest.mock.patch.object(serve, '_colab_budget_exceeded', return_value=False), \
+             unittest.mock.patch.object(serve, 'APIFY_API_KEY', 'test-key'), \
              unittest.mock.patch.object(serve, '_colab_gate_urls', return_value=None), \
              unittest.mock.patch.object(serve, '_colab_compute_run',
-                                        return_value={'stdout': 'hi there\n', 'units': 1,
+                                        return_value={'stdout': 'hi there\n__TRANSCRIPT_END__\n', 'units': 1,
                                                       'elapsed_s': 30, 'session': 'colab'}) as run:
             text, err = serve._youtube_transcript_colab('https://youtu.be/abc')
         self.assertIsNone(err)
         kwargs = run.call_args.kwargs
-        self.assertEqual(kwargs.get('skip_deny_labels'), ('bulk media download',))
+        self.assertNotIn('skip_deny_labels', kwargs)
+        self.assertEqual(kwargs.get('packages'), ['faster-whisper', 'av==13.1.0'])
+        self.assertEqual(kwargs.get('env'), {'APIFY_API_KEY': 'test-key'})
+        self.assertNotIn('yt_dlp', run.call_args.args[1])
 
     def test_agent_facing_run_with_yt_dlp_is_still_refused(self):
         code = "import yt_dlp\nydl_opts = {}\n"

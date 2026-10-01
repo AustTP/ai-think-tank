@@ -1870,17 +1870,22 @@ def _treg_call(endpoint_id, body=None, method='POST', timeout=30, query=None):
         return None, f'Treg call failed: {e}'
 
 
-# Real YouTube transcript extraction via the locally-installed yt-dlp
-# binary -- free (no API key, no per-call charge), and the target is a
-# FIXED set of hosts (youtube.com / youtu.be / m.youtube.com), so like the
-# Treg tools this needs no Jev-gating: there is no arbitrary URL for Jev to
-# judge, the tool only ever reaches YouTube itself. yt-dlp downloads the
-# video's OWN subtitles/auto-captions (never the audio/video), writes the
-# .vtt/.srt to a temp dir, and we return the clean plain text. Fail-closed
-# on any error (subprocess missing, network failure, no captions).
+# YouTube transcript support. The serving endpoint (_youtube_transcript_colab)
+# always downloads the audio via the Apify actor and transcribes it on the
+# Colab runtime -- every video treated the same. The local yt-dlp captions
+# helper below (_youtube_transcript) is kept as a tested utility: it reads a
+# video's OWN subtitles/auto-captions (never the audio/video) when present,
+# free of any metered API, and is where a no-captions signal can be observed
+# without spending Colab time.
 _YOUTUBE_HOST_RE = re.compile(r'^(?:[a-z0-9-]+\.)*youtu(?:\.be|be\.com)$')
 YOUTUBE_TRANSCRIPT_MAX_CHARS = 50000
 YOUTUBE_TRANSCRIPT_MAX_SEGMENTS = 800
+# Where extracted transcripts are filed so ANY agent can read them: the shared
+# Library's media/ area (same tree as media/feeds.md and media/digests/ the
+# Studio room reads and writes). One plain-text file per video, named by its
+# video id -- searchable via /api/library/search and readable by any agent via
+# /api/library/file. Written by the endpoint after a successful extraction.
+YOUTUBE_TRANSCRIPTS_DIR = os.path.join(LIBRARY_DIR, 'media', 'transcripts')
 
 
 def _is_youtube_url(url):
@@ -1894,6 +1899,58 @@ def _is_youtube_url(url):
     except Exception:
         return False
     return bool(_YOUTUBE_HOST_RE.match(host))
+
+
+def _youtube_video_id(url):
+    """Extract the 11-char video id from a youtube.com / youtu.be URL, or
+    None. Matches watch?v=, /shorts/, /live/, embed/ and youtu.be/ forms."""
+    url = (url or '').strip()
+    if not _is_youtube_url(url):
+        return None
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return None
+    if parsed.netloc and parsed.netloc.startswith('youtu.be'):
+        return (parsed.path or '').strip('/')[:11] or None
+    qs = urllib.parse.parse_qs(parsed.query)
+    v = (qs.get('v') or [None])[0]
+    if v and len(v) == 11:
+        return v
+    for prefix in ('/shorts/', '/live/', '/embed/'):
+        if (parsed.path or '').startswith(prefix):
+            return (parsed.path or '').split(prefix, 1)[1].strip('/')[:11] or None
+    return None
+
+
+def _file_youtube_transcript(url, text, source):
+    """Persist an extracted transcript to the shared Library's media/
+    transcripts/ tree (YOUTUBE_TRANSCRIPTS_DIR) so ANY agent can read it via
+    /api/library/file and find it via /api/library/search -- the Studio's
+    media-building lane reads this same media/ area. Writes one plain-text
+    file per video id (the id that a re-fetch updates in place), prefixed
+    with a small header of when/what fetched it. Never raises; returns the
+    Library-relative path on success or None on any failure -- the transcript
+    is already returned to the caller regardless, so a write failure must not
+    fail the request."""
+    vid = _youtube_video_id(url)
+    if not vid:
+        return None
+    try:
+        os.makedirs(YOUTUBE_TRANSCRIPTS_DIR, exist_ok=True)
+        rel = os.path.join('media', 'transcripts', f'{vid}.txt')
+        target = _safe_library_path(rel)
+        if not target:
+            return None
+        header = (f'# YouTube transcript\n\n'
+                  f'- Video: {url}\n'
+                  f'- Video id: {vid}\n'
+                  f'- Fetched: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n'
+                  f'- Source: {source}\n\n')
+        _write_file(target, header + text)
+        return rel
+    except Exception:
+        return None
 
 
 def _clean_subtitle_file(path):
@@ -1973,76 +2030,158 @@ def _youtube_transcript(url, lang='en', timeout=90):
         return None, f'YouTube transcript fetch failed: {e}'
 
 
-# Colab fallback for videos with NO captions/transcript enabled -- the one
-# case the local yt-dlp path (captions only) genuinely cannot serve. This
-# downloads the audio stream on a real Colab T4/CPU runtime and runs
-# faster-whisper to transcribe it into plain text. Budget-gated by the same
-# _colab_budget_exceeded guard the run_on_colab tool uses; runs as the
-# player's own Colab account on the free tier (unlimited usage, not
-# runtime-guaranteed -- a refused/cooldown slot returns an honest error,
-# never a fabricated transcript). The youtube.com host is allowlisted (see
-# BROWSE_ALLOWLIST_DOMAINS) so the Colab URL gate passes without a Jev
-# round trip, exactly like dreyx.com before it. Returns (text, None) or
-# (None, error-string); falls back to error on any failure -- the endpoint
-# only routes here after the captions path has already failed with a
-# no-captions signal, so a failure here is reported honestly rather than
-# silently degrading to a guess.
+# The one route that actually serves every /api/youtube-transcript request.
+# Per the player's decision ("force it to always download ... treat them all
+# the same") the endpoint no longer special-cases videos with captions: every
+# video is treated the same, always downloading the audio and transcribing it.
+# The download runs through the Apify youtube-link actor (IHDsaLO64Wge9wSWx),
+# and the WHOLE orchestration -- start the actor run, poll it to SUCCEEDED,
+# fetch the dataset item, download the audio, run faster-whisper -- executes
+# INSIDE the Colab runtime, never on the host: no video audio ever touches
+# this machine, and the host only sends code + the APIFY_API_KEY env var and
+# reads stdout. Budget-gated by the same _colab_budget_exceeded guard the
+# run_on_colab tool uses; runs as the player's own Colab account on the free
+# tier (unlimited usage, not runtime-guaranteed -- a refused/cooldown slot
+# returns an honest error, never a fabricated transcript). The api.apify.com
+# host is allowlisted (see BROWSE_ALLOWLIST_DOMAINS) so the Colab URL gate
+# passes without a Jev round trip, exactly like dreyx.com before it. Returns
+# (text, None) or (None, error-string); fails closed on any failure.
 def _youtube_transcript_colab(url, lang='en', model_size='small'):
-    """Whisper-transcribe a YouTube video on a Colab runtime via faster-whisper."""
+    """Whisper-transcribe a YouTube video on a Colab runtime: the Apify actor
+    downloads the audio, faster-whisper transcribes it -- all on the runtime."""
     url = (url or '').strip()
     if not _is_youtube_url(url):
         return None, f'Not a YouTube URL (only youtube.com / youtu.be are allowed): {url}'
     if not COLAB_ENABLED:
-        return None, 'Colab is disabled (COLAB_ENABLED=0) and this video has no captions to fetch.'
+        return None, 'Colab is disabled (COLAB_ENABLED=0) -- cannot download and transcribe the audio.'
     if not COLAB_CLI_AVAILABLE:
-        return None, 'Colab CLI is not installed, and this video has no captions to fetch.'
+        return None, 'Colab CLI is not installed -- cannot download and transcribe the audio.'
     if _colab_budget_exceeded():
-        return None, 'Colab usage cap reached for this period, and this video has no captions to fetch.'
-    # The code runs inside the Colab runtime, not on the host. It installs
-    # faster-whisper + yt-dlp on the runtime (packages arg), downloads the
-    # audio-only stream, transcribes, and prints the plain text -- everything
-    # the endpoint needs must be printed, exactly like the run_on_colab tool.
+        return None, 'Colab usage cap reached for this period -- cannot download and transcribe the audio.'
+    if not APIFY_API_KEY:
+        return None, ('APIFY_API_KEY is not configured -- it is required to download the audio '
+                      'on the Colab runtime (the Apify actor does the YouTube download).')
+    # Everything runs INSIDE the Colab runtime, never on the host: the runtime
+    # starts the Apify actor run with APIFY_API_KEY (passed via env), polls it
+    # to SUCCEEDED, fetches the dataset item's downloadUrl, downloads the audio
+    # (retrying with a token-suffixed URL for private KV stores), and runs
+    # faster-whisper on it. Fail-closed: any failure prints __ERROR__ and the
+    # run is only accepted as a transcript when it ends with the
+    # __TRANSCRIPT_END__ marker -- a mid-run crash can never masquerade as text.
     code = (
-        "import os, sys\n"
-        "import yt_dlp\n"
+        "import os, sys, json, time, urllib.request, urllib.error\n"
         "from faster_whisper import WhisperModel\n"
+        "api_key = os.environ.get('APIFY_API_KEY', '')\n"
         "url = %r\n"
         "lang = %r\n"
-        "out_dir = '/content/yt_audio'\n"
-        "os.makedirs(out_dir, exist_ok=True)\n"
-        "opts = {'format': 'bestaudio/best', 'outtmpl': os.path.join(out_dir, 'audio.%%(ext)s'),\n"
-        "        'quiet': True, 'no_warnings': True, 'noplaylist': True}\n"
-        "with yt_dlp.YoutubeDL(opts) as ydl:\n"
-        "    info = ydl.extract_info(url, download=True)\n"
-        "    audio_path = ydl.prepare_filename(info)\n"
-        "if not os.path.exists(audio_path):\n"
-        "    import glob\n"
-        "    cands = glob.glob(os.path.join(out_dir, 'audio.*'))\n"
-        "    audio_path = cands[0] if cands else None\n"
-        "if not audio_path:\n"
-        "    print('__ERROR__: could not locate downloaded audio')\n"
+        "out_path = '/content/yt_audio.webm'\n"
+        "def api(path, method='GET', body=None):\n"
+        "    req = urllib.request.Request('https://api.apify.com/v2' + path,\n"
+        "        data=json.dumps(body).encode('utf-8') if body is not None else None,\n"
+        "        method=method,\n"
+        "        headers={'Authorization': 'Bearer ' + api_key, 'Content-Type': 'application/json'})\n"
+        "    with urllib.request.urlopen(req, timeout=120) as resp:\n"
+        "        return json.loads(resp.read().decode('utf-8', errors='replace'))\n"
+        "if not api_key:\n"
+        "    print('__ERROR__: APIFY_API_KEY not set on the runtime')\n"
         "    sys.exit(1)\n"
-        "model = WhisperModel(%r, device='cuda' if os.path.exists('/usr/local/cuda') else 'cpu',\n"
-        "                     compute_type='float16' if os.path.exists('/usr/local/cuda') else 'int8')\n"
-        "segments, info_out = model.transcribe(audio_path, language=lang if lang != 'en' else None,\n"
+        "try:\n"
+        "    run = api('/acts/IHDsaLO64Wge9wSWx/runs', 'POST',\n"
+        "              {'videos': [{'url': url}], 'audioQuality': 'best'})\n"
+        "except Exception as e:\n"
+        "    print('__ERROR__: actor start failed: ' + repr(e)[:300])\n"
+        "    sys.exit(1)\n"
+        "run = run.get('data') if isinstance(run, dict) else run\n"
+        "run_id = run.get('id') if isinstance(run, dict) else None\n"
+        "dataset_id = run.get('defaultDatasetId') if isinstance(run, dict) else None\n"
+        "if not run_id or not dataset_id:\n"
+        "    print('__ERROR__: actor run response missing id/defaultDatasetId: ' + repr(run)[:300])\n"
+        "    sys.exit(1)\n"
+        "status = ''\n"
+        "deadline = time.time() + 300\n"
+        "while time.time() < deadline:\n"
+        "    try:\n"
+        "        poll = api('/actor-runs/' + str(run_id))\n"
+        "        status = (poll.get('data') if isinstance(poll, dict) else {}).get('status', '')\n"
+        "    except Exception:\n"
+        "        status = ''\n"
+        "    if status == 'SUCCEEDED':\n"
+        "        break\n"
+        "    if status in ('FAILED', 'ABORTED', 'TIMED-OUT'):\n"
+        "        print('__ERROR__: Apify actor run ended ' + status)\n"
+        "        sys.exit(1)\n"
+        "    time.sleep(4)\n"
+        "else:\n"
+        "    print('__ERROR__: Apify actor run did not finish in time')\n"
+        "    sys.exit(1)\n"
+        "try:\n"
+        "    items = api('/datasets/' + str(dataset_id) + '/items?limit=1')\n"
+        "except Exception as e:\n"
+        "    print('__ERROR__: could not fetch dataset items: ' + repr(e)[:300])\n"
+        "    sys.exit(1)\n"
+        "if not isinstance(items, list):\n"
+        "    items = (items.get('data') if isinstance(items, dict) else None) or []\n"
+        "download_url = None\n"
+        "if isinstance(items, list):\n"
+        "    for item in items:\n"
+        "        if isinstance(item, dict):\n"
+        "            download_url = item.get('downloadUrl') or item.get('download_url')\n"
+        "            if download_url:\n"
+        "                break\n"
+        "if not download_url:\n"
+        "    print('__ERROR__: no downloadUrl in the actor dataset output')\n"
+        "    sys.exit(1)\n"
+        "try:\n"
+        "    with urllib.request.urlopen(download_url, timeout=300) as resp:\n"
+        "        data = resp.read()\n"
+        "except urllib.error.HTTPError:\n"
+        "    try:\n"
+        "        with urllib.request.urlopen(download_url + '?token=' + api_key, timeout=300) as resp:\n"
+        "            data = resp.read()\n"
+        "    except Exception as e:\n"
+        "        print('__ERROR__: could not download the audio: ' + repr(e)[:300])\n"
+        "        sys.exit(1)\n"
+        "except Exception as e:\n"
+        "    print('__ERROR__: could not download the audio: ' + repr(e)[:300])\n"
+        "    sys.exit(1)\n"
+        "with open(out_path, 'wb') as f:\n"
+        "    f.write(data)\n"
+        "if not data or os.path.getsize(out_path) < 1000:\n"
+        "    print('__ERROR__: downloaded audio is empty or too small')\n"
+        "    sys.exit(1)\n"
+        "import traceback\n"
+        "try:\n"
+        "    import glob\n"
+        "    if os.path.exists('/usr/local/cuda'):\n"
+        "        for base in ('libcublas', 'libcublasLt', 'libcudart'):\n"
+        "            link = '/usr/lib64-nvidia/' + base + '.so.12'\n"
+        "            if os.path.lexists(link):\n"
+        "                continue\n"
+        "            matches = sorted(glob.glob('/usr/local/cuda*/lib64/' + base + '.so'))\n"
+        "            if matches and os.path.isdir('/usr/lib64-nvidia'):\n"
+        "                try:\n"
+        "                    os.symlink(matches[-1], link)\n"
+        "                except Exception:\n"
+        "                    pass\n"
+        "    model = WhisperModel(%r, device='cuda' if os.path.exists('/usr/local/cuda') else 'cpu',\n"
+        "                         compute_type='float16' if os.path.exists('/usr/local/cuda') else 'int8')\n"
+        "    segments, _info = model.transcribe(out_path, language=(lang if lang != 'en' else None),\n"
         "                                        beam_size=3)\n"
-        "for seg in segments:\n"
-        "    print(seg.text.strip())\n"
+        "    for seg in segments:\n"
+        "        print(seg.text.strip())\n"
+        "    print('__TRANSCRIPT_END__')\n"
+        "except Exception:\n"
+        "    print('__ERROR__: whisper failed:')\n"
+        "    traceback.print_exc()\n"
+        "    sys.exit(1)\n"
     ) % (url, lang, model_size)
-    purpose = 'transcribe a YouTube video that has no captions'
-    # The bulk-media download deny class would otherwise refuse this (the code
-    # imports yt_dlp, which the guard treats as a bulk-download signal). That
-    # guard exists to keep AGENT-facing Colab runs off account-killer patterns;
-    # this is the sanctioned internal path -- one validated youtube.com/youtu.be
-    # URL, audio-only, transcribed to text -- so it passes the narrow exemption
-    # (yt-dlp class only; torrents, drive/gcp/mining/exfil/offensive-security
-    # checks, and the URL allowlist gate below all still apply unchanged).
+    purpose = 'transcribe a YouTube video by downloading its audio'
     try:
         result = _colab_compute_run('player', code, purpose,
-                                    packages=['yt-dlp', 'faster-whisper'],
+                                    packages=['faster-whisper', 'av==13.1.0'],
                                     timeout_seconds=min(600, COLAB_TIMEOUT_MAX_S),
                                     runtimes=1, kind='gpu',
-                                    skip_deny_labels=('bulk media download',))
+                                    env={'APIFY_API_KEY': APIFY_API_KEY or ''})
     except Exception as e:
         return None, f'Colab transcription run crashed: {e}'
     if not isinstance(result, dict):
@@ -2051,8 +2190,14 @@ def _youtube_transcript_colab(url, lang='en', model_size='small'):
         return None, f'Colab transcription failed: {result["error"]}'
     stdout = (result.get('stdout') or '').strip()
     if '__ERROR__' in stdout:
-        return None, 'Colab ran but could not download/transcribe the audio.'
-    lines = [l.strip() for l in stdout.splitlines() if l.strip()]
+        detail = next((line.split('__ERROR__:', 1)[1].strip() for line in stdout.splitlines()
+                       if '__ERROR__' in line), '')
+        return None, ('Colab could not download or transcribe the audio on the runtime'
+                      + (f': {detail[:200]}' if detail else '.') + '.')
+    if '__TRANSCRIPT_END__' not in stdout:
+        return None, 'Colab transcription did not complete (no end marker) -- the run died partway.'
+    lines = [l.strip() for l in stdout.splitlines()
+             if l.strip() and l.strip() != '__TRANSCRIPT_END__']
     if not lines:
         return None, 'Colab transcription returned no text.'
     text = '\n'.join(lines)
@@ -6064,10 +6209,17 @@ def _colab_cli(*args, timeout=120, input=None):
 
 
 def _colab_session_exists(session):
-    """True when a colab CLI session with this name is currently provisioned
-    (status exits 0)."""
-    rc, _out = _colab_cli('status', '-s', session, timeout=90)
-    return rc == 0
+    """True when a colab CLI session with this name is currently provisioned.
+    The CLI exits 0 even for a missing session -- it prints "Session 'X' not
+    found." to stderr with a 0 exit code -- so the exit code alone is not
+    enough: a stale/phantom registration would make provision skip `colab new`
+    and every later exec fail against a session that does not exist. "not
+    found" / "no active sessions" in the output therefore means not-existing."""
+    rc, out = _colab_cli('status', '-s', session, timeout=90)
+    if rc != 0:
+        return False
+    low = (out or '').lower()
+    return 'not found' not in low and 'no active sessions' not in low
 
 
 def _colab_account_usage():
@@ -6153,9 +6305,9 @@ _COLAB_DENIED_EXPRESSIONS = {
         r'\bdeezloader\b|\bpeerflix\b|'
         r'\btorrent\b|\btransmission\b|rippedstreams', re.I),
     # yt-dlp / youtube_dl in their own class, separate from torrents: the
-    # single-video YouTube transcription fallback (_youtube_transcript_colab)
-    # is a SANCTIONED exception that may touch yt-dlp (one validated
-    # youtube.com/youtu.be URL, audio-only, transcribed to text), while
+    # YouTube transcription path (_youtube_transcript_colab) no longer touches
+    # yt-dlp at all -- the Apify actor downloads the audio and it is refused
+    # here for agent-facing runs just like any other bulk-download tooling;
     # torrent/mass-download tooling stays refused unconditionally.
     'bulk media download': re.compile(
         r'\b(yt.?dlp|youtube_dl)\b', re.I),
@@ -6189,12 +6341,12 @@ def _colab_denied(text, skip_labels=()):
     account-killers (mining, bulk media, torrents, exfil hosts). Returns a
     short label of the first matched class or None when clean.
 
-    `skip_labels` exempts specific classes. Used ONLY by the sanctioned
-    single-video YouTube transcription path (_youtube_transcript_colab), which
-    may touch yt-dlp because it downloads exactly ONE validated youtube.com /
-    youtu.be URL's audio to transcribe it to text -- never bulk media or a
-    torrent (both still fully refused, and the URL gate below still applies).
-    Agent-facing Colab runs (_COLAB_RUN_TOOL) never pass a skip label."""
+    `skip_labels` exempts specific classes. Historically used ONLY by the
+    sanctioned single-video YouTube transcription path (which previously
+    touched yt-dlp). That path now downloads via the Apify actor on the
+    runtime, so it needs no exemption -- agent-facing Colab runs
+    (_COLAB_RUN_TOOL) never pass a skip label, and the parameter remains for
+    any future sanctioned internal path that must clear a specific class."""
     if not text:
         return None
     for label, rx in _COLAB_DENIED_EXPRESSIONS.items():
@@ -6262,7 +6414,7 @@ def _colab_gate_urls(agent_id, code, purpose, authorized=None):
     return None
 
 
-def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runtimes=1, kind='gpu', skip_deny_labels=()):
+def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runtimes=1, kind='gpu', skip_deny_labels=(), env=None):
     """Run `code` (Python) on Colab runtime(s) and capture the output.
     Blocking -- the spike tool executor calls this on a worker thread like
     every other agent tool (see the ask lane's nested-call deadlock note).
@@ -6387,6 +6539,13 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runti
                         return {'error': f'package install failed on Colab ({session}): {out[-800:]}'}
         shards = []
         total_units = 0.0
+        # Optional caller-supplied env vars (e.g. APIFY_API_KEY for the
+        # YouTube transcription run), emitted as --env KEY=VALUE flags exactly
+        # like the injected shard vars below. Values are secrets only the
+        # runtime needs; they never appear in the logged code/action rows.
+        env_flags = []
+        for env_key, env_val in (env or {}).items():
+            env_flags += ['--env', f'{env_key}={env_val}']
         for shard_index in range(runtimes):
             session = sessions[shard_index % len(sessions)]
             shard_start = time.time()
@@ -6394,6 +6553,7 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runti
                 'exec', '-s', session, '--timeout', str(timeout + 30),
                 '--env', f'COLAB_SHARD_INDEX={shard_index}',
                 '--env', f'COLAB_SHARD_COUNT={runtimes}',
+                *env_flags,
                 input=code + '\nprint("__COLAB_DONE__")\n')
             elapsed = max(1, int(time.time() - shard_start))
             _COLAB_COMPUTE_LAST_USED = time.time()
@@ -12233,13 +12393,14 @@ async def pipeline(request: Request):
 
 @app.post('/api/youtube-transcript')
 async def youtube_transcript(request: Request):
-    # Real YouTube transcript extraction via local yt-dlp -- FREE (no API
-    # key, no per-call charge), so unlike the Treg/Apify/PixelLab tools there
-    # is no spend to accrue or budget gate. The target host set is fixed by
-    # the tool itself (youtube.com / youtu.be only -- see _is_youtube_url),
-    # the same "no URL for Jev to judge" reasoning that keeps weather_now
-    # and the Treg tools ungated. Blocks run in a worker thread so the
-    # blocking yt-dlp subprocess (up to 90s) doesn't stall the event loop.
+    # Real YouTube transcript extraction, always via the download-and-transcribe
+    # route: per the player's decision ("force it to always download ... treat
+    # them all the same") there is no captions fast-path special-casing -- every
+    # video is treated the same. The Apify actor downloads the audio and
+    # faster-whisper transcribes it, both on the Colab runtime
+    # (_youtube_transcript_colab); no video audio ever touches this machine.
+    # Blocks run in a worker thread so the blocking Colab call (Apify actor +
+    # whisper) doesn't stall the event loop.
     body = await request.json()
     agent_id = body.get('agentId', 'unknown')
     url = (body.get('url') or '').strip()
@@ -12250,20 +12411,20 @@ async def youtube_transcript(request: Request):
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
     if not _is_youtube_url(url):
         return JSONResponse({'error': 'a valid youtube.com or youtu.be URL is required'}, status_code=400)
-    # Two-tier: local captions fast-path first (free, instant), then Colab
-    # whisper fallback ONLY for the no-captions case the captions path cannot
-    # serve -- never for a network/transient error, which is retryable as-is.
-    text, error = await asyncio.to_thread(_youtube_transcript, url, lang)
-    if error:
-        no_captions = ('no captions' in error or 'no subtitle files' in error
-                       or 'produced no readable' in error or 'did not produce any readable' in error)
-        if no_captions:
-            text, error = await asyncio.to_thread(_youtube_transcript_colab, url, lang)
+    source = 'colab-whisper'
+    text, error = await asyncio.to_thread(_youtube_transcript_colab, url, lang)
     if error:
         log_action(agent_id, 'youtube_transcript', {'url': url, 'decision': 'failed', 'error': error[:200]}, authorized=authorized)
         return JSONResponse({'error': error}, status_code=422)
+    # File the extracted transcript into the shared Library's media/
+    # transcripts/ tree so ANY agent can read it later (the Studio's
+    # media-building lane reads this same media/ area). Best-effort: the
+    # transcript is returned to the caller regardless, and a write failure
+    # must never fail the request.
+    filed_path = _file_youtube_transcript(url, text, source)
     log_action(agent_id, 'youtube_transcript', {'url': url, 'decision': 'ok', 'chars': len(text)}, authorized=authorized)
-    return JSONResponse({'ok': True, 'url': url, 'transcript': text, 'chars': len(text)})
+    return JSONResponse({'ok': True, 'url': url, 'transcript': text, 'chars': len(text),
+                         'filed': filed_path})
 
 
 @app.get('/api/sandbox-backups')
