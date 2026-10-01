@@ -2533,29 +2533,29 @@ _TREG_LINKEDIN_SEARCH_TOOL = {
     },
 }
 
-# Real YouTube transcript extraction via the host's local yt-dlp binary --
-# FREE (no API key, no per-call spend, so nothing accrues against any
-# balance -- same cost profile as weather_now), and the target host set is
-# FIXED by the tool itself (youtube.com / youtu.be only, enforced by
-# _serve._is_youtube_url), so there is no arbitrary URL for Jev to judge --
-# same "no domain to gate" reasoning that keeps the Treg tools and
-# weather_now ungated. Deliberately on-demand only: an agent fetches a
-# transcript when an investigation genuinely needs a video's content --
-# never an invented-looking answer from training knowledge.
+# Real YouTube transcript extraction via the download-and-transcribe route:
+# every video is treated the same (the player's call -- "force it to always
+# download") -- the Apify youtube-link actor downloads the audio and
+# faster-whisper transcribes it, both on the think tank's Colab runtime, so
+# the extraction is metered against the Colab compute budget. The target host
+# set is FIXED by the tool itself (youtube.com / youtu.be only, enforced by
+# _serve._is_youtube_url), so there is no arbitrary URL for Jev to judge.
+# Deliberately on-demand only: an agent fetches a transcript when an
+# investigation genuinely needs a video's content -- never an invented-looking
+# answer from training knowledge.
 _YOUTUBE_TRANSCRIPT_TOOL = {
     'type': 'function',
     'function': {
         'name': 'youtube_transcript',
         'description': (
-            "Fetch the real transcript of a YouTube video as plain text -- the video's OWN "
-            "captions/auto-captions when they exist (free, instant, via the locally-installed "
-            "yt-dlp), and if the video has NO captions enabled, falls back to a real whisper "
-            "speech-to-text transcription of the audio on the think tank's Colab runtime (metered "
-            "against the Colab compute budget). Give a youtube.com or youtu.be URL (you can paste "
-            "the watch?v=, /shorts/, or youtu.be link). Returns the full transcript text "
-            "(truncated at ~50k chars). Use this when an investigation needs what a video actually "
-            "says -- e.g. to analyze a claimed method, pull quoted claims, or research a tutorial "
-            "-- never invent a plausible-sounding video summary."
+            "Fetch the real transcript of a YouTube video as plain text, by downloading the "
+            "video's audio (via the Apify youtube-link actor) and transcribing it with whisper "
+            "on the think tank's Colab runtime -- every video is treated the same, no captions "
+            "shortcut (metered against the Colab compute budget). Give a youtube.com or youtu.be "
+            "URL (you can paste the watch?v=, /shorts/, or youtu.be link). Returns the full "
+            "transcript text (truncated at ~50k chars). Use this when an investigation needs what "
+            "a video actually says -- e.g. to analyze a claimed method, pull quoted claims, or "
+            "research a tutorial -- never invent a plausible-sounding video summary."
         ),
         'parameters': {
             'type': 'object',
@@ -2604,11 +2604,12 @@ def _make_treg_tools_executor():
 
 def _make_youtube_transcript_executor(agent_id, agent_key):
     """youtube_transcript -- thin wrapper over the host's /api/youtube-transcript
-    endpoint (local yt-dlp, free). Same shape as the Treg executor: no
-    struck_tools tracking because there is no policy gate here to deny
-    anything -- a failure is a real API/network/captions issue, always worth
-    a caller retrying once rather than being refused locally on a second
-    attempt. Cost is zero, so nothing is accrued against any balance."""
+    endpoint (always the download-and-transcribe route on the Colab runtime).
+    Same shape as the Treg executor: no struck_tools tracking because there is
+    no policy gate here to deny anything -- a failure is a real API/network/
+    transcription issue, always worth a caller retrying once rather than being
+    refused locally on a second attempt. Cost is metered against the Colab
+    compute budget, never accrued against an agent spend balance."""
     def execute_tool(name, args):
         if name != 'youtube_transcript':
             raise ValueError(f'unknown tool: {name}')
@@ -2617,9 +2618,12 @@ def _make_youtube_transcript_executor(agent_id, agent_key):
         if not url:
             return 'url is required: paste the YouTube video link to transcribe.'
         lang = (args.get('lang') or 'en').strip() or 'en'
+        # Apify actor + whisper on a cold Colab runtime can take a few minutes;
+        # 600s matches the Colab-side ceiling so a slow-but-healthy run is not
+        # cut short by this loopback's own timeout.
         result = _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/youtube-transcript', {
             'agentId': agent_id, 'url': url, 'lang': lang,
-        }, agent_key, timeout=120)
+        }, agent_key, timeout=600)
         if not isinstance(result, dict):
             return 'Could not fetch that transcript (unexpected response).'
         if result.get('error'):
@@ -2627,7 +2631,10 @@ def _make_youtube_transcript_executor(agent_id, agent_key):
         text = result.get('transcript') or ''
         if not text:
             return 'Transcript fetched but empty (no captions on this video?).'
-        return f"Transcript of {result.get('url')} ({result.get('chars')} chars):\n\n{text}"
+        filed = result.get('filed')
+        where = (f'\n\nFiled to Library: media/transcripts/ (read it with '
+                 f'read_library_file path={filed})' if filed else '')
+        return f"Transcript of {result.get('url')} ({result.get('chars')} chars):\n\n{text}{where}"
     return execute_tool
 
 
@@ -3356,10 +3363,15 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         colab_compute_tool = _make_colab_compute_executor(agent_id, struck_tools=struck_tools)
     spike_tools = _serve.AGENT_ASK_TOOLS + [_SPIKE_SANDBOX_TOOL, _LIBRARY_SEARCH_TOOL, _LIBRARY_READ_TOOL,
                                             _TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL,
-                                            _YOUTUBE_TRANSCRIPT_TOOL,
                                             _PIXELLAB_CHARACTER_TOOL,
                                             _GOOGLE_SHEETS_READ_TOOL, _GOOGLE_SHEETS_APPEND_TOOL,
                                             _GOOGLE_CALENDAR_LIST_TOOL, _GOOGLE_CALENDAR_CREATE_TOOL]
+    # YouTube transcripts: offered only when APIFY_API_KEY is set -- the route
+    # ALWAYS downloads the audio via the Apify actor on the Colab runtime (no
+    # captions fast-path), so unset = tool simply absent, same
+    # conditional-availability rule as the Apify scraping tools below.
+    if _serve.APIFY_API_KEY:
+        spike_tools += [_YOUTUBE_TRANSCRIPT_TOOL]
     # GitHub read tools: offered only when GITHUB_TOKEN is set --
     # same conditional-availability rule as search_web (unset = tool simply
     # absent, so the surface never advertises something that would fail).
