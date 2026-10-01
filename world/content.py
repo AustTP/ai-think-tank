@@ -2509,6 +2509,140 @@ def _make_treg_tools_executor():
     return execute_tool
 
 
+# Real Apify scraping/automation, wired to the same budget chokepoint the
+# Bank already reconciles against. Deliberately on-demand only (an agent
+# calls these when an investigation genuinely needs real scraped data --
+# never an invented-looking answer). Cost is accrued from the actor run's own
+# reported usageTotalUsd (a real, Apify-verified number, matching the "don't
+# fabricate a number, use a verified one" rule), and apify_run_actor refuses
+# to START a run once _apify_budget_exceeded() -- the same fail-closed budget
+# guard the Bank teller uses. Gated on APIFY_API_KEY: absent means the tools
+# are simply not offered (same conditional-availability rule as search_web /
+# the GitHub tools), so the surface never advertises an unusable tool.
+_APIFY_RUN_ACTOR_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'apify_run_actor',
+        'description': (
+            "Start a real Apify actor (a web scraper/automation) with the think tank's real Apify "
+            "account, sending it the given input. This is a real, metered run against the "
+            "think tank's Apify FREE-plan budget (fail-closed: the run is refused if the monthly "
+            "budget is spent). Use this when the investigation needs ACTUAL scraped data from a "
+            "site -- never invent a plausible-sounding scrape result. Waits up to waitSeconds for "
+            "the run to finish and returns the run's status, its dataset id, and the scraped items "
+            "if it succeeded."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'actorId': {'type': 'string',
+                            'description': 'The Apify actor id, e.g. "apify/website-content-crawler".'},
+                'input': {'type': 'object',
+                          'description': ('The actor\'s input JSON (startUrls, maxCrawledPages, etc.) '
+                                          '-- varies per actor; check the actor\'s docs.')},
+                'waitSeconds': {'type': 'integer',
+                                'description': ('How long to wait (seconds) for the run to finish '
+                                                'before returning its current status. Max 60.')},
+            },
+            'required': ['actorId', 'input'],
+        },
+    },
+}
+
+_APIFY_GET_DATASET_ITEMS_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'apify_get_dataset_items',
+        'description': (
+            "Fetch items from a real Apify dataset (the output of a previous apify_run_actor call), "
+            "using the datasetId that call returned. Returns up to `limit` raw items."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'datasetId': {'type': 'string',
+                              'description': 'The Apify dataset id returned by apify_run_actor.'},
+                'limit': {'type': 'integer',
+                          'description': 'Maximum number of items to fetch (default 10, max 50).'},
+            },
+            'required': ['datasetId'],
+        },
+    },
+}
+
+_APIFY_TOOL_NAMES = ('apify_run_actor', 'apify_get_dataset_items')
+
+
+def _make_apify_tools_executor():
+    """apify_run_actor / apify_get_dataset_items -- thin wrappers over
+    _serve._apify_call. No one-strike/struck_tools tracking here (same
+    reasoning as the treg/pixellab executors): those track POLICY denials
+    from a real gate, and there is no such gate here -- an error from Apify
+    is a real API/network failure or the budget gate, never a per-call
+    policy decision, so it's always worth a caller retrying once. Budget
+    enforcement happens BEFORE any real run starts (_apify_budget_exceeded
+    fails closed), and real cost is accrued from the run's own usageTotalUsd
+    when it settles."""
+    def execute_tool(name, args):
+        args = args or {}
+        if name == 'apify_run_actor':
+            actor_id = (args.get('actorId') or '').strip()
+            if not actor_id:
+                return 'actorId is required'
+            if _serve._apify_budget_exceeded():
+                return ('Apify monthly budget is exhausted -- refusing to start this actor run '
+                        '(fail closed). Do not retry; say so in your findings.')
+            inp = args.get('input') or {}
+            wait = min(int(args.get('waitSeconds') or 30), 60)
+            query = {'timeout': str(max(60, wait + 30))}
+            data, error = _serve._apify_call(
+                f'/actors/{actor_id}/runs', method='POST', body=inp,
+                query=query, timeout=max(60, wait + 30))
+            if error:
+                return f'Could not start Apify actor: {error}'
+            run = (data or {}).get('data') or {}
+            run_id = run.get('id')
+            dataset_id = run.get('defaultDatasetId')
+            status = run.get('status') or 'RUNNING'
+            elapsed = 0.0
+            while status in ('READY', 'RUNNING') and elapsed < wait:
+                time.sleep(3)
+                elapsed += 3
+                data, error = _serve._apify_call(f'/actor-runs/{run_id}', timeout=20)
+                if error:
+                    break
+                run = (data or {}).get('data') or {}
+                status = run.get('status') or 'RUNNING'
+                dataset_id = run.get('defaultDatasetId') or dataset_id
+            cost = run.get('usageTotalUsd') or 0.0
+            if cost:
+                _serve._accrue_apify_spend(cost)
+            result = {'runId': run_id, 'datasetId': dataset_id, 'status': status,
+                      'usageTotalUsd': cost}
+            if status == 'SUCCEEDED' and dataset_id:
+                items, error = _serve._apify_call(
+                    f'/datasets/{dataset_id}/items',
+                    query={'format': 'json', 'clean': '1', 'limit': '10'}, timeout=20)
+                if error:
+                    result['itemsError'] = error
+                else:
+                    result['items'] = items
+            return json.dumps(result)[:6000]
+        if name == 'apify_get_dataset_items':
+            dataset_id = (args.get('datasetId') or '').strip()
+            if not dataset_id:
+                return 'datasetId is required'
+            limit = max(1, min(int(args.get('limit') or 10), 50))
+            data, error = _serve._apify_call(
+                f'/datasets/{dataset_id}/items',
+                query={'format': 'json', 'clean': '1', 'limit': str(limit)}, timeout=30)
+            if error:
+                return f'Could not fetch Apify dataset items: {error}'
+            return json.dumps(data)[:6000]
+        raise ValueError(f'unknown tool: {name}')
+    return execute_tool
+
+
 # Real character-sprite generation,
 # to wire up the remaining documented-but-unused APIs. Follows the SAME
 # call shape as the think tank's own already-tested spike script
@@ -3091,6 +3225,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     pixellab_tool = _make_pixellab_tools_executor()
     google_tool = _make_google_tools_executor()
     github_tool = _make_github_tools_executor()
+    apify_tool = _make_apify_tools_executor()
     # Colab agent compute (run_on_colab) -- offered only when the colab CLI
     # is actually on this machine; absent means the tool is simply absent.
     colab_compute_tool = None
@@ -3106,6 +3241,10 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # absent, so the surface never advertises something that would fail).
     if _serve.GITHUB_TOKEN:
         spike_tools += [_GITHUB_REPO_TOOL, _GITHUB_ISSUES_TOOL, _GITHUB_ISSUE_TOOL, _GITHUB_SEARCH_TOOL]
+    # Apify scraping tools: offered only when APIFY_API_KEY is set --
+    # same conditional-availability rule (unset = tool simply absent).
+    if _serve.APIFY_API_KEY:
+        spike_tools += [_APIFY_RUN_ACTOR_TOOL, _APIFY_GET_DATASET_ITEMS_TOOL]
     # Colab agent compute: offered only when the colab CLI is
     # actually installed on this machine -- same conditional-availability rule.
     if _serve.COLAB_CLI_AVAILABLE:
@@ -3129,6 +3268,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             return google_tool(tool_name, args)
         if tool_name in _GITHUB_TOOL_NAMES:
             return github_tool(tool_name, args)
+        if tool_name in _APIFY_TOOL_NAMES:
+            return apify_tool(tool_name, args)
         if tool_name == 'run_on_colab' and colab_compute_tool is not None:
             return colab_compute_tool(tool_name, args)
         return web_tool(tool_name, args)

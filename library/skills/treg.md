@@ -24,6 +24,15 @@ platform Treg catalogs is worth using.
   different X endpoints from different scrapers may not all be exactly $0.001) --
   the catalog shows the exact price for a given endpoint before it's called; don't
   assume every call costs the same without checking.
+- **OVERLAP WITH APIFY (checked 2026-09-30): Treg's X/Twitter and LinkedIn
+  endpoints are sourced from Apify actors** (per Treg's catalog listings).
+  The think tank holds an `APIFY_API_KEY` too (see library/skills/apify.md),
+  and both paths draw on the SAME underlying account/budget -- Treg's own $10
+  balance pays Treg per call, but the Apify platform usage behind it shares
+  Apify's ~$5/month free-credit cap. Agent-driven Apify runs can silently
+  deplete the same credits Treg's tools rely on. Check
+  `GET /v2/users/me/usage/monthly` before big work and prefer whichever path
+  is cheaper per endpoint.
 
 ## Policy for this think tank
 1. Same vault pattern as everything else external: the Treg API key lives

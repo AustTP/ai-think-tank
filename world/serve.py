@@ -3988,6 +3988,47 @@ def _apify_account_usage():
         return None
 
 
+def _apify_call(path, method='GET', body=None, query=None, timeout=30):
+    """Real call against the Apify platform API: https://api.apify.com/v2{path}
+    with the player's APIFY_API_KEY as a Bearer token. Returns (data, error) --
+    error is a human-readable string, data is the parsed JSON response (or a
+    truncated raw-text fallback if the response isn't JSON). Same vault pattern
+    as _treg_call/_pixellab_call/_google_call: the caller (a spike tool
+    executor) never holds the raw key, only this server-side chokepoint does.
+    Never raises -- any failure (no key, network, bad response, non-2xx) is
+    returned as (None, error) so callers fail closed.
+
+    GET vs POST placement mirrors _treg_call's live-confirmed rule: a POST
+    call's params that Apify wants on the query string (timeout,
+    maxTotalChargeUsd) go in `query`, while the actor's input JSON goes in the
+    body. Cost is accrued by the caller from the run object's usageTotalUsd --
+    a real, Apify-reported number, matching the think tank's "don't fabricate a
+    number, use a verified one" rule."""
+    if not APIFY_API_KEY:
+        return None, 'Apify is not configured (no APIFY_API_KEY in the vault)'
+    url = f'https://api.apify.com/v2{path}'
+    headers = {'Authorization': f'Bearer {APIFY_API_KEY}'}
+    data_bytes = None
+    if method in ('POST', 'PUT', 'PATCH'):
+        headers['Content-Type'] = 'application/json'
+        data_bytes = json.dumps(body or {}).encode('utf-8')
+    if query:
+        url += '?' + urllib.parse.urlencode(query)
+    try:
+        req = urllib.request.Request(url, data=data_bytes, method=method, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- fixed Apify API host
+            raw = resp.read().decode('utf-8', errors='replace')
+        try:
+            return json.loads(raw), None
+        except ValueError:
+            return {'_raw': raw[:5000]}, None
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode('utf-8', errors='replace')[:500]
+        return None, f'Apify call failed ({e.code}): {detail}'
+    except Exception as e:
+        return None, f'Apify call failed: {e}'
+
+
 BROWSE_MAX_BYTES = 200_000
 BROWSE_TIMEOUT_S = 10
 

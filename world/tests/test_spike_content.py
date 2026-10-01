@@ -1329,5 +1329,118 @@ class GitHubToolsExecutor(unittest.TestCase):
             self.assertNotIn(name, tool_names)
 
 
+class ApifyToolsExecutor(unittest.TestCase):
+    """_make_apify_tools_executor: real Apify platform mechanics (POST
+    /actors/{id}/runs, GET /actor-runs/{id}, GET /datasets/{id}/items) with
+    the think tank's own Bearer token held server-side, spend-guarded by the
+    FREE-plan monthly budget chokepoint (fail closed before any real run
+    starts) and cost accrued from the run's own reported usageTotalUsd -- not
+    a fabricated number."""
+
+    def test_run_actor_success_accrues_reported_cost_and_fetches_items(self):
+        executor = content._make_apify_tools_executor()
+        started = {'data': {'id': 'run-1', 'status': 'RUNNING',
+                            'defaultDatasetId': 'ds-1', 'usageTotalUsd': 0.0}}
+        settled = {'data': {'id': 'run-1', 'status': 'SUCCEEDED',
+                            'defaultDatasetId': 'ds-1', 'usageTotalUsd': 0.0042}}
+        items = [{'url': 'https://example.com', 'title': 'Example'}]
+        calls = {'n': 0}
+
+        def fake_apify_call(path, **kw):
+            if path.startswith('/actors/') and path.endswith('/runs'):
+                return started, None
+            if path == '/actor-runs/run-1':
+                return settled, None
+            if path == '/datasets/ds-1/items':
+                return items, None
+            return {}, None
+
+        with unittest.mock.patch.object(serve, '_apify_budget_exceeded', return_value=False) as gate, \
+             unittest.mock.patch.object(serve, '_apify_call', side_effect=fake_apify_call) as call, \
+             unittest.mock.patch.object(serve, '_accrue_apify_spend') as accrue, \
+             unittest.mock.patch('time.sleep'):
+            out = executor('apify_run_actor',
+                           {'actorId': 'apify/website-content-crawler',
+                            'input': {'startUrls': [{'url': 'https://example.com'}]},
+                            'waitSeconds': 5})
+        gate.assert_called_once()
+        call.assert_any_call('/actors/apify/website-content-crawler/runs', method='POST',
+                             body={'startUrls': [{'url': 'https://example.com'}]},
+                             query={'timeout': '60'}, timeout=60)
+        call.assert_any_call('/actor-runs/run-1', timeout=20)
+        call.assert_any_call('/datasets/ds-1/items', query={'format': 'json', 'clean': '1', 'limit': '10'},
+                             timeout=20)
+        accrue.assert_called_once_with(0.0042)
+        self.assertIn('SUCCEEDED', out)
+        self.assertIn('run-1', out)
+        self.assertIn('https://example.com', out)
+
+    def test_run_actor_refuses_when_budget_exceeded_without_any_network_call(self):
+        executor = content._make_apify_tools_executor()
+        with unittest.mock.patch.object(serve, '_apify_budget_exceeded', return_value=True), \
+             unittest.mock.patch.object(serve, '_apify_call') as call, \
+             unittest.mock.patch.object(serve, '_accrue_apify_spend') as accrue:
+            out = executor('apify_run_actor', {'actorId': 'apify/website-content-crawler',
+                                               'input': {'startUrls': []}})
+        call.assert_not_called()
+        accrue.assert_not_called()
+        self.assertIn('budget is exhausted', out)
+
+    def test_run_actor_error_is_returned_without_accruing(self):
+        executor = content._make_apify_tools_executor()
+        with unittest.mock.patch.object(serve, '_apify_budget_exceeded', return_value=False), \
+             unittest.mock.patch.object(serve, '_apify_call', return_value=(None, 'Apify call failed (403): denied')), \
+             unittest.mock.patch.object(serve, '_accrue_apify_spend') as accrue:
+            out = executor('apify_run_actor', {'actorId': 'x', 'input': {}})
+        accrue.assert_not_called()
+        self.assertIn('Could not start Apify actor', out)
+
+    def test_get_dataset_items_fetches_clean_json(self):
+        executor = content._make_apify_tools_executor()
+        with unittest.mock.patch.object(serve, '_apify_call',
+                                        return_value=([{'a': 1}], None)) as call:
+            out = executor('apify_get_dataset_items', {'datasetId': 'ds-9'})
+        call.assert_called_once_with('/datasets/ds-9/items',
+                                     query={'format': 'json', 'clean': '1', 'limit': '10'}, timeout=30)
+        self.assertIn('"a"', out)
+
+    def test_unknown_tool_name_raises(self):
+        executor = content._make_apify_tools_executor()
+        with self.assertRaises(ValueError):
+            executor('some_other_tool', {})
+
+    def test_wired_into_spike_tool_list_only_when_apify_key_set(self):
+        self._common_mocks = SpikeContent._common_mocks.__get__(self)
+        self._store = SpikeContent._store.__get__(self)
+        self._common_mocks()
+        self._store()
+        task = {'id': 'spike-apify-1', 'title': 'Scrape a website', 'budgetMs': 60000}
+        with unittest.mock.patch.object(serve, 'APIFY_API_KEY', 'fake-apify-key'), \
+             unittest.mock.patch.object(serve, '_call_agent_tool_loop') as loop, \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                         side_effect=[_completion('plan'), _completion('report')]):
+            loop.return_value = ('done', [{'role': 'system', 'content': 's'}])
+            content._run_spike_content(_snapshot(), 'cora', task)
+        tool_names = {t['function']['name'] for t in loop.call_args.args[2]}
+        for name in ('apify_run_actor', 'apify_get_dataset_items'):
+            self.assertIn(name, tool_names)
+
+    def test_apify_tools_absent_when_key_unset(self):
+        self._common_mocks = SpikeContent._common_mocks.__get__(self)
+        self._store = SpikeContent._store.__get__(self)
+        self._common_mocks()
+        self._store()
+        task = {'id': 'spike-apify-2', 'title': 'Scrape a website', 'budgetMs': 60000}
+        with unittest.mock.patch.object(serve, 'APIFY_API_KEY', ''), \
+             unittest.mock.patch.object(serve, '_call_agent_tool_loop') as loop, \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                         side_effect=[_completion('plan'), _completion('report')]):
+            loop.return_value = ('done', [{'role': 'system', 'content': 's'}])
+            content._run_spike_content(_snapshot(), 'cora', task)
+        tool_names = {t['function']['name'] for t in loop.call_args.args[2]}
+        for name in ('apify_run_actor', 'apify_get_dataset_items'):
+            self.assertNotIn(name, tool_names)
+
+
 if __name__ == '__main__':
     unittest.main()
