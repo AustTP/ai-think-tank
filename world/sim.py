@@ -872,6 +872,7 @@ def _reclaim_orphaned_walking_tasks(state):
             'reviewOf': task.get('reviewOf') or None,
             'reviewAuthorId': task.get('reviewAuthorId') or None,
             'checklist': task.get('checklist') or None,
+            'pipelineStep': task.get('pipelineStep') or None,
             'attempts': attempts,
         })
         # Fault-aware routing memory: this agent's work attempt just failed
@@ -1668,6 +1669,13 @@ def queue_work(state, items):
             # grade per-requirement. Same class of gap as 'distill' below: a
             # whitelist that silently drops a field its consumer needs.
             'checklist': list(item.get('checklist') or []),
+            # Ordered-pipeline marker (see _check_pipelines / add_pipeline): which
+            # pipeline + step index this work item belongs to, so the strict-order
+            # sweep can read completion back off the durable task mirror. Must
+            # survive the round trip or _pipeline_step_task can never match the
+            # step and the pipeline wedges on step 0 forever -- the exact same
+            # class of whitelist gap 'distill'/'checklist' both hit.
+            'pipelineStep': item.get('pipelineStep') or None,
         })
     return len(work_queue)
 
@@ -2418,6 +2426,7 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         # task.instructions).
         'userStory': (extra or {}).get('userStory'),
         'acceptanceCriteria': (extra or {}).get('acceptanceCriteria'),
+        'pipelineStep': (extra or {}).get('pipelineStep'),
         'assignedTo': agent_id,
         'status': 'walking',
         'createdAt': now_ms,
@@ -2561,6 +2570,7 @@ def send_agent_off_duty(state, agent_id, doors, grid):
 
 
 MIN_RESEARCH_CADENCE_MS = 5 * 60 * 1000  # floor: a misparsed "every second" can't spam the queue
+MIN_PIPELINE_CADENCE_MS = 60 * 60 * 1000  # floor for an ordered pipeline: a misparsed "every second" can't spam the queue
 
 
 def next_topic_id(state):
@@ -2604,6 +2614,72 @@ def add_research_topic(state, topic, start_url, cadence_ms, now_ms=None,
         'pageKeyword': page_keyword or None,
     }
     state.setdefault('researchTopics', []).append(record)
+    return record
+
+
+def next_pipeline_id(state):
+    """Server-side monotonic counter for pipelines (pl-1, pl-2, ...), mirroring
+    next_topic_id's cold-starts-at-1/never-collides shape. Pipelines aren't
+    team-scoped, so this is one global counter, not per-prefix."""
+    n = (state.get('pipelineCounter') or 0) + 1
+    state['pipelineCounter'] = n
+    return f'pl-{n}'
+
+
+def add_pipeline(state, name, cadence_ms, steps, now_ms=None):
+    """The creator side of an ORDERED pipeline: a named sequence of steps that
+    fires in strict order, each step gated on its predecessor's completion (the
+    player-facing scheduling lane -- see _check_pipelines below). This is the
+    write path _check_schedules has always been able to FIRE for (the
+    research-topic lane) but nothing ever appended for a multi-step sequence.
+
+    Fails closed rather than guessing: rejects an empty name, a non-list or
+    empty `steps`, and any step without a title/room, and clamps cadence_ms to
+    MIN_PIPELINE_CADENCE_MS so a bad interval can't turn into a queue-flood.
+    Each step may carry {title, room, offsetMs, instructions, tool, args};
+    offsetMs is a minimum delay AFTER the previous step's completion (not from
+    the run's start -- strict ordering dominates timing). Returns the new
+    record, or None if rejected. `lastRunAt` starts at 0 so the first step
+    fires on the very next _check_schedules pass."""
+    name = (name or '').strip()
+    if not name or not isinstance(steps, list) or not steps:
+        return None
+    clean_steps = []
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        title = (s.get('title') or '').strip()
+        room = (s.get('room') or '').strip()
+        if not title or not room:
+            continue
+        try:
+            offset_ms = max(0, int(s.get('offsetMs') or 0))
+        except (TypeError, ValueError):
+            offset_ms = 0
+        clean_steps.append({
+            'title': title,
+            'room': room,
+            'offsetMs': offset_ms,
+            'instructions': (s.get('instructions') or '').strip() or title,
+            'tool': (s.get('tool') or '').strip() or None,
+            'args': dict(s.get('args') or {}),
+        })
+    if not clean_steps:
+        return None
+    cadence_ms = max(int(cadence_ms or 0), MIN_PIPELINE_CADENCE_MS)
+    record = {
+        'id': next_pipeline_id(state),
+        'name': name,
+        'cadenceMs': cadence_ms,
+        'lastRunAt': 0,
+        'createdAt': now_ms if now_ms is not None else int(time.time() * 1000),
+        'steps': clean_steps,
+        'runId': 0,          # incremented at each run start; disambiguates the
+                             # same stepIndex across runs (old done tasks persist)
+        'runStepIndex': 0,   # next step index to fire in the current run
+        'lastStepCompletedAt': None,
+    }
+    state.setdefault('pipelines', []).append(record)
     return record
 
 
@@ -2736,6 +2812,12 @@ def _check_schedules(state, now, now_ms):
                 'distillSince': previous_distill_at,
             }])
 
+    # Ordered pipelines (the player-facing scheduling lane): fire the next step
+    # of each due pipeline in strict sequence, gating step N+1 on step N's
+    # completion. Stamps the run's cadence marker at the START of a run (not per
+    # step) so a multi-step sequence gets its full cadence window before re-running.
+    _check_pipelines(state, now_ms)
+
     # Director-gated player-ask / supervisor requirements-met sweeps. Unlike the
     # cadence markers above these run every _check_schedules pass: they spin a
     # PENDING gate (a blocked agent waiting on a verdict), which must resolve as
@@ -2744,6 +2826,98 @@ def _check_schedules(state, now, now_ms):
     # is actually old enough to decide.
     _pending_player_ask_sweep(state, now_ms)
     _supervisor_block_vote_sweep(state, now_ms)
+
+
+def _pipeline_step_task(state, pipeline_id, run_id, step_index):
+    """The live task mirror carrying this pipeline's step marker, or None.
+    `run_id` disambiguates the same stepIndex across runs (old 'done' tasks
+    persist in state, so a fresh run must not mistake a previous run's task for
+    its own)."""
+    for t in (state.get('tasks') or {}).values():
+        marker = t.get('pipelineStep') or {}
+        if (marker.get('pipelineId') == pipeline_id
+                and marker.get('runId') == run_id
+                and marker.get('stepIndex') == step_index):
+            return t
+    return None
+
+
+def _check_pipelines(state, now_ms):
+    """The creator-visible scheduled-pipeline sweep, ported into the same
+    _check_schedules pass as the research-topic cadence. Each pipeline is an
+    ORDERED sequence: step N+1 fires only after step N's task reaches 'done'
+    (strict ordering -- a pending/active predecessor suppresses every later
+    step, never skipped). Steps ride the normal queue_work -> assign -> content
+    lifecycle; completion is read back from the durable task mirror by matching
+    the pipelineStep marker each step was queued with.
+
+    Cadence: `lastRunAt` is stamped at the START of a run (when step 0 fires,
+    or when a completed run re-arms), so a multi-step pipeline gets a full
+    cadenceMs window between runs -- the run start, not each step, advances the
+    marker. `runStepIndex` tracks the next step to fire; a pipeline whose steps
+    are all done waits out the remainder of the window.
+
+    Offset: each step's offsetMs is a MINIMUM delay -- for step 0, from the
+    run's start; for every later step, after the PREVIOUS step's completion
+    (tracked in `lastStepCompletedAt`). Strict ordering dominates timing -- a
+    large offset can delay a later step, but never lets it leapfrog an
+    unfinished predecessor."""
+    for p in (state.get('pipelines') or []):
+        steps = p.get('steps') or []
+        if not steps:
+            continue
+        cadence_ms = max(p.get('cadenceMs') or 0, MIN_PIPELINE_CADENCE_MS)
+        step_index = p.get('runStepIndex') or 0
+        run_id = p.get('runId') or 0
+        # Pipeline run complete (all steps fired) and waiting out the cadence
+        # window before the next run -- idle, no work.
+        if step_index >= len(steps):
+            if now_ms - (p.get('lastRunAt') or 0) < cadence_ms:
+                continue
+            # Re-arm the next run: advance the run counter so this run's step
+            # markers can never be confused with a previous run's 'done' tasks.
+            run_id += 1
+            p['runId'] = run_id
+            p['runStepIndex'] = 0
+            p['lastRunAt'] = now_ms
+            p['lastStepCompletedAt'] = None
+            step_index = 0
+        else:
+            # Running (or about to begin). A never-started pipeline is due
+            # immediately: stamp the run's start (and its run id) so step 0's
+            # own offset floor is measured from now, not from the epoch.
+            if not p.get('lastRunAt'):
+                p['lastRunAt'] = now_ms
+            if not run_id:
+                run_id += 1
+                p['runId'] = run_id
+        # The current step may already be queued/active (queued last pass).
+        task = _pipeline_step_task(state, p.get('id'), run_id, step_index)
+        if task is not None:
+            if task.get('status') != 'done':
+                continue  # predecessor in flight -> hold the sequence
+            # Done: advance past this step and start the next one's offset
+            # clock from this completion.
+            step_index += 1
+            p['runStepIndex'] = step_index
+            p['lastStepCompletedAt'] = now_ms
+            if step_index >= len(steps):
+                continue  # run complete; next pass gates the cadence window
+            task = _pipeline_step_task(state, p.get('id'), run_id, step_index)
+        if task is not None:
+            continue  # next step already queued/active
+        step = steps[step_index]
+        # Offset floor: step 0 from the run's start, later steps from the
+        # predecessor's completion.
+        base_at = p.get('lastRunAt') if step_index == 0 else (p.get('lastStepCompletedAt') or p.get('lastRunAt'))
+        if now_ms - (base_at or now_ms) < (step.get('offsetMs') or 0):
+            continue
+        queue_work(state, [{
+            'title': f"[{p.get('name')}] {step.get('title')}",
+            'room': step.get('room'),
+            'instructions': step.get('instructions') or step.get('title'),
+            'pipelineStep': {'pipelineId': p.get('id'), 'runId': run_id, 'stepIndex': step_index},
+        }])
 
 
 # ---------------------------------------------------------------------------
@@ -7119,6 +7293,10 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # A player-filed card's contract survives onto the task (see assign_task).
         'userStory': pick.get('userStory'),
         'acceptanceCriteria': pick.get('acceptanceCriteria'),
+        # Ordered-pipeline marker (see queue_work / assign_task): threads the
+        # pipelineStep onto the real task so the strict-order sweep can read
+        # completion back (and the content dispatcher can route the step).
+        'pipelineStep': pick.get('pipelineStep'),
     }
     # Cut 2 coaching + runbook injection: append the chosen agent's pending
     # growth-plan note (applied once) and any product runbook knowledge to the
