@@ -2533,6 +2533,43 @@ _TREG_LINKEDIN_SEARCH_TOOL = {
     },
 }
 
+# Real YouTube transcript extraction via the host's local yt-dlp binary --
+# FREE (no API key, no per-call spend, so nothing accrues against any
+# balance -- same cost profile as weather_now), and the target host set is
+# FIXED by the tool itself (youtube.com / youtu.be only, enforced by
+# _serve._is_youtube_url), so there is no arbitrary URL for Jev to judge --
+# same "no domain to gate" reasoning that keeps the Treg tools and
+# weather_now ungated. Deliberately on-demand only: an agent fetches a
+# transcript when an investigation genuinely needs a video's content --
+# never an invented-looking answer from training knowledge.
+_YOUTUBE_TRANSCRIPT_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'youtube_transcript',
+        'description': (
+            "Fetch the real transcript of a YouTube video as plain text -- the video's OWN "
+            "captions/auto-captions when they exist (free, instant, via the locally-installed "
+            "yt-dlp), and if the video has NO captions enabled, falls back to a real whisper "
+            "speech-to-text transcription of the audio on the think tank's Colab runtime (metered "
+            "against the Colab compute budget). Give a youtube.com or youtu.be URL (you can paste "
+            "the watch?v=, /shorts/, or youtu.be link). Returns the full transcript text "
+            "(truncated at ~50k chars). Use this when an investigation needs what a video actually "
+            "says -- e.g. to analyze a claimed method, pull quoted claims, or research a tutorial "
+            "-- never invent a plausible-sounding video summary."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'url': {'type': 'string',
+                        'description': 'The YouTube video URL, e.g. "https://youtu.be/NSuMfeTVHqY" or a youtube.com/watch?v= link.'},
+                'lang': {'type': 'string',
+                         'description': 'Subtitle language code (e.g. "en" for English). Defaults to "en".'},
+            },
+            'required': ['url'],
+        },
+    },
+}
+
 
 def _make_treg_tools_executor():
     """x_trending_topics / search_linkedin_posts -- thin
@@ -2562,6 +2599,35 @@ def _make_treg_tools_executor():
             _serve._accrue_spend('treg', _serve.TREG_ENDPOINT_COSTS['scrapecreators.x.v1-linkedin-search-posts'])
             return json.dumps(data)[:4000]
         raise ValueError(f'unknown tool: {name}')
+    return execute_tool
+
+
+def _make_youtube_transcript_executor(agent_id, agent_key):
+    """youtube_transcript -- thin wrapper over the host's /api/youtube-transcript
+    endpoint (local yt-dlp, free). Same shape as the Treg executor: no
+    struck_tools tracking because there is no policy gate here to deny
+    anything -- a failure is a real API/network/captions issue, always worth
+    a caller retrying once rather than being refused locally on a second
+    attempt. Cost is zero, so nothing is accrued against any balance."""
+    def execute_tool(name, args):
+        if name != 'youtube_transcript':
+            raise ValueError(f'unknown tool: {name}')
+        args = args or {}
+        url = (args.get('url') or '').strip()
+        if not url:
+            return 'url is required: paste the YouTube video link to transcribe.'
+        lang = (args.get('lang') or 'en').strip() or 'en'
+        result = _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/youtube-transcript', {
+            'agentId': agent_id, 'url': url, 'lang': lang,
+        }, agent_key, timeout=120)
+        if not isinstance(result, dict):
+            return 'Could not fetch that transcript (unexpected response).'
+        if result.get('error'):
+            return f'Could not fetch transcript: {result["error"]} [may be a transient network error -- may retry once]'
+        text = result.get('transcript') or ''
+        if not text:
+            return 'Transcript fetched but empty (no captions on this video?).'
+        return f"Transcript of {result.get('url')} ({result.get('chars')} chars):\n\n{text}"
     return execute_tool
 
 
@@ -3282,6 +3348,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     google_tool = _make_google_tools_executor()
     github_tool = _make_github_tools_executor()
     apify_tool = _make_apify_tools_executor()
+    youtube_tool = _make_youtube_transcript_executor(agent_id, key)
     # Colab agent compute (run_on_colab) -- offered only when the colab CLI
     # is actually on this machine; absent means the tool is simply absent.
     colab_compute_tool = None
@@ -3289,6 +3356,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         colab_compute_tool = _make_colab_compute_executor(agent_id, struck_tools=struck_tools)
     spike_tools = _serve.AGENT_ASK_TOOLS + [_SPIKE_SANDBOX_TOOL, _LIBRARY_SEARCH_TOOL, _LIBRARY_READ_TOOL,
                                             _TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL,
+                                            _YOUTUBE_TRANSCRIPT_TOOL,
                                             _PIXELLAB_CHARACTER_TOOL,
                                             _GOOGLE_SHEETS_READ_TOOL, _GOOGLE_SHEETS_APPEND_TOOL,
                                             _GOOGLE_CALENDAR_LIST_TOOL, _GOOGLE_CALENDAR_CREATE_TOOL]
@@ -3318,6 +3386,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             return library_tool(tool_name, args)
         if tool_name in ('x_trending_topics', 'search_linkedin_posts'):
             return treg_tool(tool_name, args)
+        if tool_name == 'youtube_transcript':
+            return youtube_tool(tool_name, args)
         if tool_name == 'generate_pixel_character':
             return pixellab_tool(tool_name, args)
         if tool_name in _GOOGLE_TOOL_NAMES:
