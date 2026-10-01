@@ -3,6 +3,9 @@
 .env.*
 *.bak
 *.bak.*
+# An exported YouTube cookies.txt for the sandbox's yt-dlp -- a full session
+# credential, never tracked.
+.youtube-cookies.txt
 
 # Fernet key store for external credentials (Phase D) -- never commit keys
 .secret_keys/
@@ -75,6 +78,10 @@ library/wiki/
 library/social/
 library/pending_review/
 library/refinement/
+# Endpoint-extracted YouTube transcripts land in the shared media/transcripts/
+# tree at runtime (readable by any agent via /api/library/file) -- generated
+# content, like the other runtime dirs above, never tracked.
+library/media/transcripts/
 sandboxes/spike-task-*/
 sandboxes/sb-*/
 # Manual pre-cleanup DB backup -- a big one-off snapshot, not source
