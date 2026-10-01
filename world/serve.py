@@ -754,16 +754,29 @@ def _spend_ledger_write(ledger):
 _SPEND_CAP_BASELINE_KEY = '__spend_cap_baseline__'
 
 
+def _spend_cap_period():
+    """The current UTC month window for the spend cap, e.g. '2026-10'. The
+    cap is a MONTHLY budget: at each month boundary the baseline rolls
+    forward to the current ledger total, so only spend accrued WITHIN the
+    current month counts against SPEND_CAP_USD. Rollover happens lazily on
+    the first check of a new month, so there is no timer to drift or die
+    with a restart."""
+    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
+
+
 def _think_tank_spend_cap_exceeded():
-    """Hard, absolute spend-cap check -- called at the top of EVERY real
-    money-spending chokepoint (_call_openrouter_sync, _post_openrouter_raw,
+    """Hard, absolute MONTHLY spend-cap check -- called at the top of EVERY
+    real money-spending chokepoint (_call_openrouter_sync, _post_openrouter_raw,
     _call_openrouter_decision_sync), before any network call. Disabled
-    (returns False) when SPEND_CAP_USD is explicitly 0. On first real check, the
-    CURRENT total ledger spend is stored as a baseline (a reserved key in the
-    same ledger row) so pre-existing historical spend is never counted --
-    only what accrues after this protection was installed. Deliberately a
-    plain function with no bypass/override path from inside the think tank --
-    see SPEND_CAP_USD's own comment for why."""
+    (returns False) when SPEND_CAP_USD is explicitly 0. The baseline (a
+    reserved key in the same ledger row) is per-month: on the first real check
+    in a month the CURRENT total ledger spend is stored as that month's
+    baseline, so spend from previous months is never counted -- only what
+    accrues within the current month counts against the monthly budget. The
+    rollover is lazy (first check of the new month) and the period rides the
+    real ledger, so it survives restarts. Deliberately a plain function with
+    no bypass/override path from inside the think tank -- see SPEND_CAP_USD's
+    own comment for why."""
     if not SPEND_CAP_USD:
         return False
     ledger = _spend_ledger_read()
@@ -777,9 +790,25 @@ def _think_tank_spend_cap_exceeded():
     excluded = {_SPEND_CAP_BASELINE_KEY, COLAB_LEDGER_KEY}
     total = sum(float(v.get('used') or 0) for k, v in ledger.items()
                if k not in excluded and isinstance(v, dict))
-    baseline = ledger.get(_SPEND_CAP_BASELINE_KEY)
+    period = _spend_cap_period()
+    rec = ledger.get(_SPEND_CAP_BASELINE_KEY)
+    # Legacy migration: the old format stored a bare float (the baseline at
+    # install time). Adopt it as this month's baseline so pre-existing
+    # historical spend still never counts -- same guarantee, same month.
+    if not isinstance(rec, dict):
+        baseline = rec if isinstance(rec, (int, float)) else total
+        ledger[_SPEND_CAP_BASELINE_KEY] = {'period': period, 'baseline': baseline}
+        _spend_ledger_write(ledger)
+        return False
+    if rec.get('period') != period:
+        # New month: roll the baseline forward to the current total so only
+        # this month's accrual counts against the monthly budget.
+        ledger[_SPEND_CAP_BASELINE_KEY] = {'period': period, 'baseline': total}
+        _spend_ledger_write(ledger)
+        return False
+    baseline = rec.get('baseline')
     if not isinstance(baseline, (int, float)):
-        ledger[_SPEND_CAP_BASELINE_KEY] = total
+        ledger[_SPEND_CAP_BASELINE_KEY] = {'period': period, 'baseline': total}
         _spend_ledger_write(ledger)
         return False
     return (total - baseline) >= SPEND_CAP_USD
@@ -3701,17 +3730,20 @@ PLAYER_EMAIL_ENABLED = _load_env().get('PLAYER_EMAIL_ENABLED', 'true').strip().l
 # anyone noticed. That bug is fixed, but this is deliberately independent
 # protection against ANY future bug (known or not) doing the same thing --
 # a manual, absolute ceiling, not a per-bug patch. Explicit 0 disables it;
-# unset defaults to a conservative $5 so a fresh/researcher clone is bounded
-# until the player chooses a ceiling (was '0' -- a new think tank
+# unset defaults to a conservative $50/MONTH so a fresh/researcher clone is
+# bounded until the player chooses a ceiling (was '0' -- a new think tank
 # ran UNbounded until the .env was hand-edited, which is the exact failure
-# mode this protection exists for).
+# mode this protection exists for; was '5' as a cumulative ceiling before the
+# cap became a per-month budget that resets at each UTC month boundary).
 # Baseline (spend at the moment this protection was installed) is stored
-# once in the ledger itself, so pre-existing historical spend never counts
-# against it -- only what accrues from here on. To raise the ceiling, raise
+# once in the ledger itself, per month, so pre-existing historical spend never
+# counts against it -- only what accrues within the current month does, and a
+# new month starts with a fresh allowance (see _think_tank_spend_cap_exceeded).
+# To raise the ceiling, raise
 # SPEND_CAP_USD in .env and restart (deliberately manual, no live reset
 # endpoint -- a cap you can silently raise from inside the think tank isn't a
 # real ceiling).
-SPEND_CAP_USD = float(_load_env().get('SPEND_CAP_USD', '5') or 0)
+SPEND_CAP_USD = float(_load_env().get('SPEND_CAP_USD', '50') or 0)
 
 # Page-request budget: the think tank has a MONTHLY allowance of
 # EXTERNAL page requests -- each browse_page fetch (/api/browse) and each
