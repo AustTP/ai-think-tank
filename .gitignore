@@ -74,6 +74,7 @@ library/archive/
 library/wiki/
 library/social/
 library/pending_review/
+library/refinement/
 sandboxes/spike-task-*/
 sandboxes/sb-*/
 # Manual pre-cleanup DB backup -- a big one-off snapshot, not source
