@@ -1870,6 +1870,197 @@ def _treg_call(endpoint_id, body=None, method='POST', timeout=30, query=None):
         return None, f'Treg call failed: {e}'
 
 
+# Real YouTube transcript extraction via the locally-installed yt-dlp
+# binary -- free (no API key, no per-call charge), and the target is a
+# FIXED set of hosts (youtube.com / youtu.be / m.youtube.com), so like the
+# Treg tools this needs no Jev-gating: there is no arbitrary URL for Jev to
+# judge, the tool only ever reaches YouTube itself. yt-dlp downloads the
+# video's OWN subtitles/auto-captions (never the audio/video), writes the
+# .vtt/.srt to a temp dir, and we return the clean plain text. Fail-closed
+# on any error (subprocess missing, network failure, no captions).
+_YOUTUBE_HOST_RE = re.compile(r'^(?:[a-z0-9-]+\.)*youtu(?:\.be|be\.com)$')
+YOUTUBE_TRANSCRIPT_MAX_CHARS = 50000
+YOUTUBE_TRANSCRIPT_MAX_SEGMENTS = 800
+
+
+def _is_youtube_url(url):
+    """True only for a real youtube.com / youtu.be URL (the fixed host set
+    yt-dlp is allowed to touch). Never an arbitrary user-supplied host."""
+    url = (url or '').strip()
+    if not url.lower().startswith(('https://', 'http://')):
+        return False
+    try:
+        host = urllib.parse.urlparse(url).hostname or ''
+    except Exception:
+        return False
+    return bool(_YOUTUBE_HOST_RE.match(host))
+
+
+def _clean_subtitle_file(path):
+    """Strip VTT/SRT timing + markup into deduped plain text. YouTube's
+    aligned VTT repeats each caption frame across every cue line, so the
+    dedup step (collapse consecutive identical lines) is what turns the
+    noisy ~1MB file into readable transcript text."""
+    try:
+        raw = open(path, encoding='utf-8', errors='replace').read()
+    except Exception:
+        return None
+    lines = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or '-->' in stripped or stripped.isdigit():
+            continue
+        text = re.sub(r'<[^>]+>', '', stripped)
+        if not text.strip():
+            continue
+        if lines and text == lines[-1]:
+            continue
+        lines.append(text)
+    # Second pass: collapse N>1 consecutive repeats that survived the first
+    # pass (some captioners emit two identical lines that differ only in
+    # trailing spaces/tags that stripping already normalized).
+    clean = []
+    for text in lines:
+        if clean and text == clean[-1]:
+            continue
+        clean.append(text)
+    return '\n'.join(clean)
+
+
+def _youtube_transcript(url, lang='en', timeout=90):
+    """Fetch the transcript of a YouTube video via local yt-dlp. Returns
+    (text, None) on success or (None, error-string) on failure. Free -- no
+    metered API involved, so nothing is accrued against any balance (the
+    same reason weather_now needs no budget gate)."""
+    url = (url or '').strip()
+    if not _is_youtube_url(url):
+        return None, f'Not a YouTube URL (only youtube.com / youtu.be are allowed): {url}'
+    try:
+        with tempfile.TemporaryDirectory(prefix='yt_transcript_') as tmp:
+            tmpl = os.path.join(tmp, 'yt_sub')
+            cmd = [
+                'yt-dlp', '--skip-download', '--no-playlist',
+                '--write-auto-subs', '--write-subs',
+                '--sub-langs', f'{lang}.*',
+                '--sub-format', 'vtt/srt/best',
+                '-o', tmpl, url,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if result.returncode != 0:
+                # yt-dlp exits non-zero for "no subtitles" too -- surface its
+                # own last line (the actual reason) rather than guessing.
+                tail = (result.stderr or result.stdout or '').strip().splitlines()
+                reason = (tail[-1] if tail else 'yt-dlp failed').strip()
+                return None, f'yt-dlp could not fetch subtitles ({result.returncode}): {reason[:300]}'
+            subs = sorted(f for f in os.listdir(tmp)
+                          if f.startswith('yt_sub') and f.endswith(('.vtt', '.srt')))
+            if not subs:
+                return None, 'yt-dlp succeeded but produced no subtitle files (no captions for this video).'
+            text = _clean_subtitle_file(os.path.join(tmp, subs[0]))
+            if not text:
+                return None, 'Subtitle file downloaded but produced no readable text.'
+            segments = text.splitlines()
+            if len(segments) > YOUTUBE_TRANSCRIPT_MAX_SEGMENTS:
+                text = '\n'.join(segments[:YOUTUBE_TRANSCRIPT_MAX_SEGMENTS])
+            if len(text) > YOUTUBE_TRANSCRIPT_MAX_CHARS:
+                text = text[:YOUTUBE_TRANSCRIPT_MAX_CHARS]
+            return text, None
+    except subprocess.TimeoutExpired:
+        return None, f'yt-dlp timed out after {timeout}s (video too long or network stalled).'
+    except FileNotFoundError:
+        return None, 'yt-dlp is not installed on the host (need `pip install yt-dlp`).'
+    except Exception as e:
+        return None, f'YouTube transcript fetch failed: {e}'
+
+
+# Colab fallback for videos with NO captions/transcript enabled -- the one
+# case the local yt-dlp path (captions only) genuinely cannot serve. This
+# downloads the audio stream on a real Colab T4/CPU runtime and runs
+# faster-whisper to transcribe it into plain text. Budget-gated by the same
+# _colab_budget_exceeded guard the run_on_colab tool uses; runs as the
+# player's own Colab account on the free tier (unlimited usage, not
+# runtime-guaranteed -- a refused/cooldown slot returns an honest error,
+# never a fabricated transcript). The youtube.com host is allowlisted (see
+# BROWSE_ALLOWLIST_DOMAINS) so the Colab URL gate passes without a Jev
+# round trip, exactly like dreyx.com before it. Returns (text, None) or
+# (None, error-string); falls back to error on any failure -- the endpoint
+# only routes here after the captions path has already failed with a
+# no-captions signal, so a failure here is reported honestly rather than
+# silently degrading to a guess.
+def _youtube_transcript_colab(url, lang='en', model_size='small'):
+    """Whisper-transcribe a YouTube video on a Colab runtime via faster-whisper."""
+    url = (url or '').strip()
+    if not _is_youtube_url(url):
+        return None, f'Not a YouTube URL (only youtube.com / youtu.be are allowed): {url}'
+    if not COLAB_ENABLED:
+        return None, 'Colab is disabled (COLAB_ENABLED=0) and this video has no captions to fetch.'
+    if not COLAB_CLI_AVAILABLE:
+        return None, 'Colab CLI is not installed, and this video has no captions to fetch.'
+    if _colab_budget_exceeded():
+        return None, 'Colab usage cap reached for this period, and this video has no captions to fetch.'
+    # The code runs inside the Colab runtime, not on the host. It installs
+    # faster-whisper + yt-dlp on the runtime (packages arg), downloads the
+    # audio-only stream, transcribes, and prints the plain text -- everything
+    # the endpoint needs must be printed, exactly like the run_on_colab tool.
+    code = (
+        "import os, sys\n"
+        "import yt_dlp\n"
+        "from faster_whisper import WhisperModel\n"
+        "url = %r\n"
+        "lang = %r\n"
+        "out_dir = '/content/yt_audio'\n"
+        "os.makedirs(out_dir, exist_ok=True)\n"
+        "opts = {'format': 'bestaudio/best', 'outtmpl': os.path.join(out_dir, 'audio.%%(ext)s'),\n"
+        "        'quiet': True, 'no_warnings': True, 'noplaylist': True}\n"
+        "with yt_dlp.YoutubeDL(opts) as ydl:\n"
+        "    info = ydl.extract_info(url, download=True)\n"
+        "    audio_path = ydl.prepare_filename(info)\n"
+        "if not os.path.exists(audio_path):\n"
+        "    import glob\n"
+        "    cands = glob.glob(os.path.join(out_dir, 'audio.*'))\n"
+        "    audio_path = cands[0] if cands else None\n"
+        "if not audio_path:\n"
+        "    print('__ERROR__: could not locate downloaded audio')\n"
+        "    sys.exit(1)\n"
+        "model = WhisperModel(%r, device='cuda' if os.path.exists('/usr/local/cuda') else 'cpu',\n"
+        "                     compute_type='float16' if os.path.exists('/usr/local/cuda') else 'int8')\n"
+        "segments, info_out = model.transcribe(audio_path, language=lang if lang != 'en' else None,\n"
+        "                                        beam_size=3)\n"
+        "for seg in segments:\n"
+        "    print(seg.text.strip())\n"
+    ) % (url, lang, model_size)
+    purpose = 'transcribe a YouTube video that has no captions'
+    # The bulk-media download deny class would otherwise refuse this (the code
+    # imports yt_dlp, which the guard treats as a bulk-download signal). That
+    # guard exists to keep AGENT-facing Colab runs off account-killer patterns;
+    # this is the sanctioned internal path -- one validated youtube.com/youtu.be
+    # URL, audio-only, transcribed to text -- so it passes the narrow exemption
+    # (yt-dlp class only; torrents, drive/gcp/mining/exfil/offensive-security
+    # checks, and the URL allowlist gate below all still apply unchanged).
+    try:
+        result = _colab_compute_run('player', code, purpose,
+                                    packages=['yt-dlp', 'faster-whisper'],
+                                    timeout_seconds=min(600, COLAB_TIMEOUT_MAX_S),
+                                    runtimes=1, kind='gpu',
+                                    skip_deny_labels=('bulk media download',))
+    except Exception as e:
+        return None, f'Colab transcription run crashed: {e}'
+    if not isinstance(result, dict):
+        return None, 'Unexpected Colab transcription response.'
+    if result.get('error'):
+        return None, f'Colab transcription failed: {result["error"]}'
+    stdout = (result.get('stdout') or '').strip()
+    if '__ERROR__' in stdout:
+        return None, 'Colab ran but could not download/transcribe the audio.'
+    lines = [l.strip() for l in stdout.splitlines() if l.strip()]
+    if not lines:
+        return None, 'Colab transcription returned no text.'
+    text = '\n'.join(lines)
+    if len(text) > YOUTUBE_TRANSCRIPT_MAX_CHARS:
+        text = text[:YOUTUBE_TRANSCRIPT_MAX_CHARS]
+    return text, None
+
+
 _PIXELLAB_BALANCE_CACHE = {'at': 0.0, 'data': None}
 PIXELLAB_BALANCE_CACHE_TTL_S = 300
 
@@ -5959,8 +6150,15 @@ _COLAB_DENIED_EXPRESSIONS = {
         r'\bnicehash\b|\bxmrig\b|\bstratum\b|\bcryptonight\b|'
         r'iminer|cryptocurrency|monero mining|ethash', re.I),
     'bulk media / torrents': re.compile(
-        r'\b(yt.?dlp|youtube_dl)\b|\bdeezloader\b|\bpeerflix\b|'
+        r'\bdeezloader\b|\bpeerflix\b|'
         r'\btorrent\b|\btransmission\b|rippedstreams', re.I),
+    # yt-dlp / youtube_dl in their own class, separate from torrents: the
+    # single-video YouTube transcription fallback (_youtube_transcript_colab)
+    # is a SANCTIONED exception that may touch yt-dlp (one validated
+    # youtube.com/youtu.be URL, audio-only, transcribed to text), while
+    # torrent/mass-download tooling stays refused unconditionally.
+    'bulk media download': re.compile(
+        r'\b(yt.?dlp|youtube_dl)\b', re.I),
     'data exfiltration hosts': re.compile(
         r'webhook\.site|requestbin|pastebin\.com|transfer\.sh|file\.io|'
         r'0x0\.st|catbox\.moe|discord(app)?\.com|api\.telegram\.org', re.I),
@@ -5982,17 +6180,26 @@ _COLAB_DENIED_EXPRESSIONS = {
 }
 
 
-def _colab_denied(text):
+def _colab_denied(text, skip_labels=()):
     """Hard guard on what agents may send to the player's real Google account.
     Colab CLI runs in the player's identity, and the stored OAuth token carries
     drive.file + cloud-platform scopes -- so code running in a session COULD, in
     principle, touch Drive, GCS, or other account surfaces. The think tank has no
     legitimate reason to: this refuses any run touching those, plus the classic
     account-killers (mining, bulk media, torrents, exfil hosts). Returns a
-    short label of the first matched class or None when clean."""
+    short label of the first matched class or None when clean.
+
+    `skip_labels` exempts specific classes. Used ONLY by the sanctioned
+    single-video YouTube transcription path (_youtube_transcript_colab), which
+    may touch yt-dlp because it downloads exactly ONE validated youtube.com /
+    youtu.be URL's audio to transcribe it to text -- never bulk media or a
+    torrent (both still fully refused, and the URL gate below still applies).
+    Agent-facing Colab runs (_COLAB_RUN_TOOL) never pass a skip label."""
     if not text:
         return None
     for label, rx in _COLAB_DENIED_EXPRESSIONS.items():
+        if label in skip_labels:
+            continue
         if rx.search(text):
             return label
     return None
@@ -6055,7 +6262,7 @@ def _colab_gate_urls(agent_id, code, purpose, authorized=None):
     return None
 
 
-def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runtimes=1, kind='gpu'):
+def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runtimes=1, kind='gpu', skip_deny_labels=()):
     """Run `code` (Python) on Colab runtime(s) and capture the output.
     Blocking -- the spike tool executor calls this on a worker thread like
     every other agent tool (see the ask lane's nested-call deadlock note).
@@ -6108,10 +6315,10 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runti
                          'sharding is disabled while it is down, because every shard\'s URL gate '
                          'depends on the same decision path that is already failing. '
                          'Re-run with runtimes=1, or retry sharding once Jev recovers.'}
-    blocked = _colab_denied(code) or _colab_denied(purpose or '')
+    blocked = _colab_denied(code, skip_deny_labels) or _colab_denied(purpose or '', skip_deny_labels)
     if blocked is None:
         for pkg in (packages or []):
-            if isinstance(pkg, str) and _colab_denied(pkg):
+            if isinstance(pkg, str) and _colab_denied(pkg, skip_deny_labels):
                 blocked = f"package '{pkg}'"
                 break
     if blocked:
@@ -7111,7 +7318,7 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev')
 # Gap: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
@@ -12022,6 +12229,41 @@ async def pipeline(request: Request):
 
     sync_prototypes(agent_id, sandbox_dir)
     return JSONResponse({'sandboxId': sandbox_id, 'results': results, 'failedStep': None})
+
+
+@app.post('/api/youtube-transcript')
+async def youtube_transcript(request: Request):
+    # Real YouTube transcript extraction via local yt-dlp -- FREE (no API
+    # key, no per-call charge), so unlike the Treg/Apify/PixelLab tools there
+    # is no spend to accrue or budget gate. The target host set is fixed by
+    # the tool itself (youtube.com / youtu.be only -- see _is_youtube_url),
+    # the same "no URL for Jev to judge" reasoning that keeps weather_now
+    # and the Treg tools ungated. Blocks run in a worker thread so the
+    # blocking yt-dlp subprocess (up to 90s) doesn't stall the event loop.
+    body = await request.json()
+    agent_id = body.get('agentId', 'unknown')
+    url = (body.get('url') or '').strip()
+    lang = (body.get('lang') or 'en').strip() or 'en'
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'youtube-transcript'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    if not _is_youtube_url(url):
+        return JSONResponse({'error': 'a valid youtube.com or youtu.be URL is required'}, status_code=400)
+    # Two-tier: local captions fast-path first (free, instant), then Colab
+    # whisper fallback ONLY for the no-captions case the captions path cannot
+    # serve -- never for a network/transient error, which is retryable as-is.
+    text, error = await asyncio.to_thread(_youtube_transcript, url, lang)
+    if error:
+        no_captions = ('no captions' in error or 'no subtitle files' in error
+                       or 'produced no readable' in error or 'did not produce any readable' in error)
+        if no_captions:
+            text, error = await asyncio.to_thread(_youtube_transcript_colab, url, lang)
+    if error:
+        log_action(agent_id, 'youtube_transcript', {'url': url, 'decision': 'failed', 'error': error[:200]}, authorized=authorized)
+        return JSONResponse({'error': error}, status_code=422)
+    log_action(agent_id, 'youtube_transcript', {'url': url, 'decision': 'ok', 'chars': len(text)}, authorized=authorized)
+    return JSONResponse({'ok': True, 'url': url, 'transcript': text, 'chars': len(text)})
 
 
 @app.get('/api/sandbox-backups')
