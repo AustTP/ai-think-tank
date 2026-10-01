@@ -452,6 +452,25 @@ def init_db():
             message TEXT NOT NULL,
             ts REAL NOT NULL
         )''')
+        # Judge-vs-anchor calibration samples (self-evolve
+        # selfdeception.py -- "judge the judge"). One row per review-checklist
+        # grade where Jev's SUBJECTIVE verdict (meets/fails) can be checked
+        # against the MECHANICAL code-pipeline verdict (the anchor) for the same
+        # requirement section; agree=1 when they match. The report aggregates
+        # these into an agreement rate that drives the review-grade confidence
+        # bar (_review_grade_calibration_pass) -- an overconfident grader shows
+        # up here as a low agreement rate, not as confidence that was never
+        # checked. Indexed on ts because the report is a time-windowed scan.
+        conn.execute('''CREATE TABLE IF NOT EXISTS review_judge_calibration (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            section TEXT NOT NULL,
+            judge_verdict TEXT NOT NULL,
+            judge_confidence REAL NOT NULL,
+            anchor_verdict TEXT NOT NULL,
+            agree INTEGER NOT NULL
+        )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_review_calibration_ts ON review_judge_calibration(ts)')
 
 
 def _backup_think_tank_db():
@@ -748,8 +767,16 @@ def _think_tank_spend_cap_exceeded():
     if not SPEND_CAP_USD:
         return False
     ledger = _spend_ledger_read()
+    # The spend cap is a USD ceiling on real money, so only dollar-
+    # denominated service buckets count. COLAB_LEDGER_KEY carries Colab
+    # COMPUTE UNITS, not dollars -- it has its own budget gate
+    # (COLAB_MONTHLY_UNITS) and its own Bank row, so counting it here
+    # would trip the USD cap on a currency that isn't money (a single T4
+    # run accruing ~4 units looked like $4 of spend and failed every
+    # classifier call closed).
+    excluded = {_SPEND_CAP_BASELINE_KEY, COLAB_LEDGER_KEY}
     total = sum(float(v.get('used') or 0) for k, v in ledger.items()
-               if k != _SPEND_CAP_BASELINE_KEY and isinstance(v, dict))
+               if k not in excluded and isinstance(v, dict))
     baseline = ledger.get(_SPEND_CAP_BASELINE_KEY)
     if not isinstance(baseline, (int, float)):
         ledger[_SPEND_CAP_BASELINE_KEY] = total
@@ -2539,6 +2566,13 @@ def _resolve_pending_escalations_sync():
         # wait for the human's email link.
         if _escalation_floor(esc_kind) >= 1.0:
             continue
+        # Heterogeneous-judge drift circuit: a kind whose judge cross-check has
+        # repeatedly failed closed (judge down, disagreeing, or colluding) is
+        # taken out of the director's delegation entirely and waits for the
+        # human's link, exactly like the floor-1.0 kinds. Checked BEFORE the
+        # primary Jev call so a tripped circuit doesn't burn model spend.
+        if _escalation_judge_drift(esc_kind) >= ESCALATION_JUDGE_DRIFT_CIRCUIT:
+            continue
         # Re-ask backoff: don't hit Jev again until the cooldown has elapsed,
         # and stop asking entirely once this escalation has exceeded the
         # attempt cap -- the human's email link is the remaining path. Without
@@ -2595,6 +2629,42 @@ def _resolve_pending_escalations_sync():
                         'confidence': confidence, 'composite': round(composite, 3), 'floor': floor,
                         'reason': 'below-kind-floor' if composite < floor else 'low-confidence'}, authorized=False)
             continue
+        # Heterogeneous-judge cross-check: the director's auto-approval now has
+        # to survive a SECOND, different decisions model independently agreeing
+        # with the primary (self-evolve judges.py). Fail-closed by construction:
+        #   - judge unavailable / non-binary / call failed -> human, bump drift;
+        #   - judge disagrees with the primary -> human, bump drift (a
+        #     confident-but-wrong primary must not win against a real objection);
+        #   - both models answer the SAME way at high confidence WHILE this kind
+        #     is already drifting -> suspected collusion ("confident but wrong
+        #     together"), human, bump drift.
+        judge_model = _jev_judge_model()
+        if judge_model:
+            judge_decision, judge_conf, _judge_cost = _escalation_judge_crosscheck(instr, criteria)
+            if judge_decision is None:
+                _bump_escalation_judge_drift(esc_kind)
+                log_action(director_id, 'escalation_judge_unavailable',
+                           {'escalationId': esc_id, 'kind': esc_kind, 'judge': judge_model,
+                            'primary': decision, 'primary_confidence': confidence},
+                           authorized=False)
+                continue
+            if judge_decision != decision:
+                _bump_escalation_judge_drift(esc_kind)
+                log_action(director_id, 'escalation_judge_disagree',
+                           {'escalationId': esc_id, 'kind': esc_kind, 'judge': judge_model,
+                            'primary': decision, 'judge_decision': judge_decision,
+                            'primary_confidence': confidence, 'judge_confidence': judge_conf},
+                           authorized=False)
+                continue
+            if (confidence >= ESCALATION_JUDGE_ALPHA_HIGH
+                    and judge_conf >= ESCALATION_JUDGE_ALPHA_HIGH
+                    and _escalation_judge_drift(esc_kind) > 0):
+                _bump_escalation_judge_drift(esc_kind)
+                log_action(director_id, 'escalation_judge_collusion',
+                           {'escalationId': esc_id, 'kind': esc_kind, 'judge': judge_model,
+                            'decision': decision, 'confidence': confidence, 'judge_confidence': judge_conf},
+                           authorized=False)
+                continue
         esc['status'] = 'approved' if decision == 'approve' else 'denied'
         esc['resolvedBy'] = f'{director_name} ({director_id})'
         esc['resolvedAt'] = time.time()
@@ -2602,9 +2672,11 @@ def _resolve_pending_escalations_sync():
         # Re-apply whatever the approval was for, if the note says so (mirrors
         # how the human's approve/deny link mutates the record). The note string
         # is opaque here; the important, auditable change is the status itself.
+        judge_note = {'judge': judge_model, 'judge_confidence': judge_conf} if judge_model else {}
         log_action(director_id, 'escalation_' + ('approve' if bloom else 'deny'),
                    {'escalationId': esc_id, 'kind': esc_kind, 'question': esc.get('question'),
-                    'confidence': confidence, 'composite': round(composite, 3), 'floor': floor}, authorized=False)
+                    'confidence': confidence, 'composite': round(composite, 3), 'floor': floor,
+                    **judge_note}, authorized=False)
         resolved += 1
     if dirty:
         _save_escalations(escalations)
@@ -6298,6 +6370,21 @@ ESCALATION_ERROR_PENALTY_STEP = 0.10               # composite hit per consecuti
 ESCALATION_ERROR_PENALTY_CAP = 0.40                # ... capped so one bad streak can't zero a confident call
 
 
+# Heterogeneous-judge cross-check (external codebase eval: self-evolve
+# tools/sie/judges.py + selfdeception.py). The composite gate above still
+# trusts ONE decisions model to stand in for the admin. When the think tank
+# runs a SECOND, DIFFERENT decisions model, the director's auto-approval also
+# asks that model the same escalation question, and the primary only wins if
+# the judge independently agrees (or the judge is unavailable to ask).
+# JEV_JUDGE_MODEL here is only the env fallback; the live value resolves
+# through _jev_judge_model() (settings `jev_judge_model` wins), and it must
+# differ from the primary or the gate is disabled -- a second judge that is
+# literally the same model is a retry, not independent evidence.
+ESCALATION_JUDGE_ALPHA_HIGH = 0.9   # both models >= this confidence while drifting = suspected collusion
+ESCALATION_JUDGE_DRIFT_CIRCUIT = 4  # drift hits this -> kind becomes human-only
+JEV_JUDGE_MODEL = (_load_env().get('JEV_JUDGE_MODEL') or '').strip() or None
+
+
 class _thread_safe_counter:
     """Minimal thread-safe dict-of-counters for consecutive Jev decision errors
     per escalation kind (the error_history signal). A fresh process starts at
@@ -6344,6 +6431,98 @@ def _jev_directory_score(kind, confidence):
     penalty = min(ESCALATION_ERROR_PENALTY_CAP,
                   ESCALATION_ERROR_PENALTY_STEP * _escalation_jev_errors.get(kind))
     return max(0.0, min(1.0, float(confidence) - penalty))
+
+
+def _jev_judge_model():
+    """The heterogeneous second-decisions model for the director escalation
+    cross-check. Resolution: settings `jev_judge_model` (operator switch, same
+    live-editable pattern as `jev_model`) > env JEV_JUDGE_MODEL > None. Returns
+    None when none is configured or when it is not actually different from the
+    primary -- a judge that is the primary model adds no independent evidence,
+    so the gate is disabled rather than pretending to double-check."""
+    saved = (_get_setting('jev_judge_model') or '').strip()
+    judge = saved or JEV_JUDGE_MODEL
+    if not judge:
+        return None
+    primary = _jev_model()
+    if not primary or judge == primary:
+        return None
+    return judge
+
+
+def _escalation_judge_crosscheck(instr, criteria):
+    """Ask the heterogeneous judge the SAME escalation question the primary just
+    answered -- a fresh, independent judgment that sees ONLY the original
+    question and criteria, never the primary's decision or confidence (the
+    self-deception rule: an agreeing answer is two genuinely independent reads,
+    not the second model echoing the first). Returns (decision, confidence,
+    cost) on a clean approve/deny, or (None, None, cost) when the gate is
+    disabled, the judge call failed, or the judge's answer was non-binary.
+    Never raises; cost is already accrued by _call_openrouter_decision_sync."""
+    judge = _jev_judge_model()
+    if not judge:
+        return None, None, 0.0
+    try:
+        data = _call_openrouter_decision_sync(
+            judge, {'messages': [], 'signals': {}},
+            {'choice': {'type': 'choice', 'instructions': instr, 'criteria': criteria}},
+        )
+    except Exception:
+        return None, None, 0.0
+    decision, confidence, cost = _jev_choice(data)
+    if decision not in ('approve', 'deny'):
+        return None, None, float(cost)
+    return decision, float(confidence), float(cost)
+
+
+def _escalation_judge_drift(kind):
+    """Per-kind drift counter for the judge cross-check. Persisted in the
+    settings JSON row `escalation_judge_drift` so a tripped circuit survives a
+    process restart (the in-memory _escalation_jev_errors streak does not)."""
+    try:
+        raw = _get_setting('escalation_judge_drift') or '{}'
+        return int((json.loads(raw) or {}).get(kind, 0))
+    except Exception:
+        return 0
+
+
+def _bump_escalation_judge_drift(kind):
+    """Record one judge-gate failure-closed event for this escalation kind."""
+    try:
+        raw = _get_setting('escalation_judge_drift') or '{}'
+        try:
+            data = json.loads(raw) or {}
+        except Exception:
+            data = {}
+        data[kind] = int(data.get(kind, 0)) + 1
+        _set_setting('escalation_judge_drift', json.dumps(data))
+    except Exception:
+        pass
+
+
+def _reset_escalation_judge_drift(kind):
+    """A human resolving an escalation of this kind clears its drift circuit --
+    the director's delegation for that kind is actionable again."""
+    try:
+        raw = _get_setting('escalation_judge_drift') or '{}'
+        try:
+            data = json.loads(raw) or {}
+        except Exception:
+            data = {}
+        if data.pop(kind, None) is not None:
+            _set_setting('escalation_judge_drift', json.dumps(data))
+    except Exception:
+        pass
+
+
+def _escalation_judge_drift_summary():
+    """The full per-kind drift map, for the /api/jev/model read surface."""
+    try:
+        raw = _get_setting('escalation_judge_drift') or '{}'
+        data = json.loads(raw) or {}
+        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, int)}
+    except Exception:
+        return {}
 
 
 def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confidence, cost, authorized, trace_id=None):
@@ -12054,6 +12233,11 @@ async def resolve_escalation(id: str, token: str, decision: str):
     esc['resolvedAt'] = time.time()
     escalations[id] = esc
     _save_escalations(escalations)
+    # A human resolving this kind clears its judge cross-check drift circuit --
+    # the director's delegation for that kind is actionable again (a tripped
+    # circuit had routed it all to the human's link; a real human answer resets
+    # that signal, exactly like a repair of the underlying failure).
+    _reset_escalation_judge_drift(esc.get('kind') or 'unknown')
     # Approval side-effect: an approved 'allowlist request' turns
     # the requested host into a REAL runtime allowlist grant -- this is the
     # only path that can grant one, and it is this HTML link alone (the
@@ -12360,14 +12544,128 @@ def _calibration_adjust_pass(now=None):
     return new_threshold
 
 
+# Review-grade calibration (self-evolve selfdeception.py -- "judge the judge").
+# Jev grades review-checklist requirements subjectively (content.py
+# _grade_review_checklist); when a requirement is 'code'-type, the quality
+# pipeline also produces a MECHANICAL meets/fails verdict that is ground truth
+# the subjective grader never sees. Every such anchored grade is recorded in
+# review_judge_calibration; the agreement rate between Jev's verdict and the
+# pipeline anchor calibrates the review-grade confidence bar exactly the way
+# _calibration_adjust_pass calibrates the safety bar -- an overconfident grader
+# (says MEETS confidently, pipeline says FAILS) gets a RAISED bar so fewer
+# unchecked grades slip through on weak signal.
+REVIEW_GRADE_CALIBRATION_TARGET = 0.9    # aim: >=90% agreement with the mechanical anchor
+REVIEW_GRADE_CALIBRATION_HYSTERESIS = 0.05  # dead-band: don't move unless off by > this
+REVIEW_GRADE_CALIBRATION_MIN_SAMPLES = 10   # need >= this many anchored grades before moving
+REVIEW_GRADE_CALIBRATION_STEP = 0.05        # the bar moves in one fixed step per pass
+
+
+def _insert_review_calibration_sample(section, judge_verdict, judge_confidence, anchor_verdict):
+    """Best-effort recorder for one anchored review grade -- a write failure must
+    never break the grading path it is called from, so any DB error is swallowed."""
+    try:
+        agree = 1 if judge_verdict == anchor_verdict else 0
+        confidence = float(judge_confidence) if isinstance(judge_confidence, (int, float)) else 0.0
+        with _db() as conn:
+            conn.execute(
+                'INSERT INTO review_judge_calibration (ts, section, judge_verdict, judge_confidence, anchor_verdict, agree) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (time.time(), section, judge_verdict, confidence, anchor_verdict, agree),
+            )
+    except Exception:
+        pass
+
+
+def _review_grade_calibration_report(window_s=7 * 86400):
+    """Aggregate anchored review grades over the window: total samples, total
+    agreement, agreement rate, and the per-section breakdown -- the sensor the
+    _review_grade_calibration_pass actuator reads. DB-only, no network."""
+    now = time.time()
+    with _db() as conn:
+        rows = conn.execute(
+            'SELECT section, agree FROM review_judge_calibration WHERE ts > ?',
+            (now - window_s,),
+        ).fetchall()
+    total = len(rows)
+    agreed = sum(r[1] for r in rows)
+    by_section = {}
+    for section, agree in rows:
+        s = by_section.setdefault(section, {'samples': 0, 'agreed': 0})
+        s['samples'] += 1
+        s['agreed'] += int(agree)
+    return {
+        'window_s': window_s,
+        'generated_at': now,
+        'samples': total,
+        'agreed': agreed,
+        'agreement_rate': round(agreed / total, 4) if total else None,
+        'sections': [{'section': k, 'samples': v['samples'], 'agreed': v['agreed'],
+                      'agreement_rate': round(v['agreed'] / v['samples'], 4) if v['samples'] else None}
+                     for k, v in sorted(by_section.items())],
+    }
+
+
+def _effective_review_grade_confidence():
+    """The LIVE review-grade confidence bar, resolved fresh at call time like
+    _effective_safety_confidence: a validated, range-clamped `settings` row
+    (`jev_review_grade_confidence`, written by _review_grade_calibration_pass --
+    or by an operator) overrides the process constant JEV_SAFETY_CONFIDENCE, so
+    a calibration move takes effect on the next grade."""
+    raw = _get_setting('jev_review_grade_confidence')
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return JEV_SAFETY_CONFIDENCE
+    if not (JEV_CALIBRATION_THRESHOLD_MIN <= value <= JEV_CALIBRATION_THRESHOLD_MAX):
+        return JEV_SAFETY_CONFIDENCE
+    return value
+
+
+def _review_grade_calibration_pass(now=None):
+    """Close the review-grade calibration loop. Reads
+    _review_grade_calibration_report and moves the live review-grade confidence
+    bar (settings `jev_review_grade_confidence`) so Jev's subjective review
+    grades agree with the mechanical pipeline anchor at roughly the claimed
+    rate. Deliberately conservative, mirroring _calibration_adjust_pass:
+    DB-only, never moves on noise (minimum sample count + dead-band), moves by
+    one fixed step per pass, clamps to the operating range. Returns the new
+    bar, or None when no move was warranted."""
+    now = time.time() if now is None else now
+    report = _review_grade_calibration_report()
+    if report['samples'] < REVIEW_GRADE_CALIBRATION_MIN_SAMPLES:
+        return None
+    rate = report['agreement_rate']
+    if rate is None:
+        return None
+    deviation = REVIEW_GRADE_CALIBRATION_TARGET - rate
+    if abs(deviation) <= REVIEW_GRADE_CALIBRATION_HYSTERESIS:
+        return None
+    direction = 1 if deviation > 0 else -1  # agreement too low -> raise the bar
+    threshold = _effective_review_grade_confidence()
+    new_threshold = round(min(max(threshold + direction * REVIEW_GRADE_CALIBRATION_STEP,
+                                  JEV_CALIBRATION_THRESHOLD_MIN),
+                              JEV_CALIBRATION_THRESHOLD_MAX), 2)
+    if new_threshold == threshold:
+        return None
+    _set_setting('jev_review_grade_confidence', str(new_threshold))
+    log_action('system', 'review_grade_calibration_adjust',
+               {'from': threshold, 'to': new_threshold, 'samples': report['samples'],
+                'agreement_rate': rate, 'target': REVIEW_GRADE_CALIBRATION_TARGET,
+                'reason': 'raised' if direction > 0 else 'lowered'}, authorized=None)
+    return new_threshold
+
+
 async def _calibration_loop():
     # Runs on its own slow timer (not the 5-minute health loop -- the
     # calibration report is an unindexed ts-window scan over the action_log,
     # and the health loop is supposed to stay cheap). A thread keeps the loop
-    # from blocking the event loop during the DB scan.
+    # from blocking the event loop during the DB scan. Runs BOTH calibration
+    # passes -- the safety-bar pass (_calibration_adjust_pass) and the
+    # review-grade pass (_review_grade_calibration_pass) -- on the same cadence.
     while True:
         try:
             await asyncio.to_thread(_calibration_adjust_pass)
+            await asyncio.to_thread(_review_grade_calibration_pass)
         except Exception as e:
             print(f'[calibration] loop error: {e}', flush=True)
         await asyncio.sleep(CALIBRATION_ADJUST_INTERVAL_S)
@@ -13118,8 +13416,11 @@ async def jev_model_get():
     else:
         states = {slug: ('broken' if is_model_circuit_broken(slug) else 'available')
                   for slug in chain}
+    judge = _jev_judge_model()
     return JSONResponse({'model': _jev_model(), 'primary': chain[0], 'chain': chain,
-                         'slugs': states, 'fallback': JEV_MODEL})
+                         'slugs': states, 'fallback': JEV_MODEL,
+                         'judge_model': judge,
+                         'judge_drift': _escalation_judge_drift_summary()})
 
 
 @app.get('/api/jev/calibration')
@@ -13132,7 +13433,10 @@ async def jev_calibration(window_s: Optional[float] = None):
     # LIVE feedback-loop threshold (the bar the gates actually enforce now),
     # so the report shows the bar alongside the reliability at that bar.
     report = _decision_calibration_report(window_s) if window_s else _decision_calibration_report()
-    return JSONResponse({'effective_safety_confidence': _effective_safety_confidence(), **report})
+    review_report = _review_grade_calibration_report(window_s) if window_s else _review_grade_calibration_report()
+    return JSONResponse({'effective_safety_confidence': _effective_safety_confidence(),
+                         'effective_review_grade_confidence': _effective_review_grade_confidence(),
+                         'review_grade': review_report, **report})
 
 
 @app.post('/api/jev/model')

@@ -130,6 +130,9 @@ echo
 echo "== Python: DB-backed Jev decisions-model setting -- live switch via /api/jev/model =="
 python3 tests/test_jev_model.py
 echo
+echo "== Python: heterogeneous-judge escalation cross-check + drift circuit + review-grade calibration =="
+python3 tests/test_judge_gate_calibration.py
+echo
 echo "== Python: clarify router -- player ask -> on-call -> KB-first -> completing agent =="
 python3 tests/test_clarify_router.py
 echo
