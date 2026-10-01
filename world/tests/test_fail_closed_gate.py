@@ -509,6 +509,58 @@ class FailClosedTaskCycle(unittest.TestCase):
         self.assertIsNotNone(next_fix, 'a fresh fix must follow the failed one')
         self.assertEqual(next_fix['assignedTo'], 'ben')
 
+    def test_quality_gate_reject_writes_red_pipeline_telemetry(self):
+        # The fail-closed send-back must leave a durable, queryable marker so the
+        # health check can count red-pipeline rejects vs. escapes (the
+        # selfProposedRejected pattern). A red primary deliverable logs a
+        # quality_gate_reject row with redPipelineEscaped=False; an escalated
+        # send-back logs redPipelineEscalated=True on the same marker.
+        task = _task(assignedTo='ada', status='working', _contentInFlight=True)
+        state, now_ms = self._quiet_base(task)
+        task['workUntil'] = now_ms / 1000.0 + 10
+        sim._store_content_result(task['id'], {'note': 'flake8 failed', 'ok': False})
+        grid, doors = sim._load_outdoor_geometry()
+        sim._task_cycle(state, now=now_ms / 1000.0, grid=grid, doors=doors,
+                        task_id_holder=[100])
+        self.assertEqual(task['status'], 'failed')
+        rows = []
+        with serve._db() as conn:
+            rows = conn.execute(
+                "SELECT details FROM action_log WHERE action = 'quality_gate_reject' "
+                "ORDER BY id").fetchall()
+        self.assertTrue(rows, 'a failed deliverable must log a quality_gate_reject row')
+        import json as _json
+        latest = _json.loads(rows[-1][0])
+        self.assertEqual(latest.get('redPipelineEscaped'), False,
+                         'a caught red result must never be flagged escaped')
+        self.assertEqual(latest.get('taskId'), task['id'])
+        self.assertFalse(latest.get('redPipelineEscalated'),
+                         'first cycle is not the escalation')
+
+    def test_escalated_send_back_marks_red_pipeline_escalated(self):
+        # Once the shared cycle cap is hit, the send-back escalates and the same
+        # marker records it -- so the health signal can separate routine rejects
+        # from cap-escalations.
+        parent = _task(assignedTo='ben', status='needs_review',
+                       _peerGate={'approvals': 0, 'approvers': [],
+                                  'reviewerIds': ['ada', 'cora'], 'enteredMs': 0,
+                                  'cycleCount': sim.MAX_REVIEW_CYCLES,
+                                  'escalated': False})
+        state, now_ms = self._quiet_base(parent, agent_id='ben')
+        sim._send_back_after_failure(state, parent,
+                                     fail_note='red flake8, cycle cap crossed')
+        self.assertTrue(parent['_peerGate']['escalated'])
+        rows = []
+        with serve._db() as conn:
+            rows = conn.execute(
+                "SELECT details FROM action_log WHERE action = 'quality_gate_reject' "
+                "ORDER BY id").fetchall()
+        self.assertTrue(rows)
+        import json as _json
+        latest = _json.loads(rows[-1][0])
+        self.assertEqual(latest.get('redPipelineEscalated'), True)
+        self.assertEqual(latest.get('redPipelineEscaped'), False)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
