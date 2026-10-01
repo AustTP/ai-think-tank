@@ -4533,6 +4533,11 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         'issueType': issue_type,
     }
     state.setdefault('backlogRequests', []).append(req)
+    # Kick this team's refinement to be immediately due (next pass), not
+    # weekly -- a freshly-filed JIRA issue shouldn't wait out the cadence
+    # stamp a previous grooming just set. No-op if the team already has an
+    # in-flight ceremony (it will groom this card) or its cadence is due.
+    kick_refinement_now(state, team_id, now_ms)
     return issue
 
 
@@ -5476,21 +5481,26 @@ def _refinement_scrum_master_for_team(state, team_id):
 
 
 def _refinement_attendees(state, req_ids, scrum_master_id):
-    """The ceremony's attendees: the scrum master + every agent who FILED a
+    """The ceremony's attendees: the scrum master + every AGENT who FILED a
     pending request this round (req_ids are work-request ids; the filers are
-    resolved through the backlogRequests records). All must be free + on-duty
-    to convene; a busy/off-duty filer defers the whole meeting so we never
-    pull an agent out of a live collaboration."""
+    resolved through the backlogRequests records). Non-agent filers (e.g. the
+    player filing a JIRA issue) cannot attend a room ceremony and must not
+    stall it -- they are dropped from the attendee list, and the scrum master
+    still grooms their card. Only a BUSY attendee defers the whole meeting so
+    we never pull an agent out of a live collaboration; an off-duty attendee
+    is parked and free, and _start_refinement wakes her (snapshot + restore,
+    exactly like the Social's off-duty Hangout attendees)."""
+    agents = state.get('agents') or {}
     filer_ids = []
     for rid in req_ids:
         r = next((x for x in (state.get('backlogRequests') or []) if x.get('id') == rid), None)
-        if r and r.get('filedBy') and r['filedBy'] not in filer_ids:
+        if r and r.get('filedBy') and r['filedBy'] not in filer_ids \
+                and r['filedBy'] in agents:
             filer_ids.append(r['filedBy'])
     ids = [scrum_master_id] + [f for f in filer_ids if f != scrum_master_id]
-    agents = state.get('agents') or {}
     for aid in ids:
         a = agents.get(aid)
-        if not a or a.get('busy') or a.get('offDuty'):
+        if not a or a.get('busy'):
             return None
     return ids
 
