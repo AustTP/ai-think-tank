@@ -691,6 +691,7 @@ def _run_research_bare_content(snapshot, agent_id, task, base_ctx=None):
 WORKROOM_SANDBOX_ID = 'workroom-shared'      # index.html WORKROOM_SANDBOX_ID
 CODE_CONTINUATION_ATTEMPTS = 2               # tasks.js
 MAX_CODE_PROBE_ROUNDS = 3                    # tasks.js
+MAX_CODE_COLAB_ROUNDS = 3                    # code-lane Colab compute rounds (mirrors probe rounds)
 MAX_REVIEW_PROBE_ROUNDS = 2                  # tasks.js
 _CODE_MAX_TOKENS = 3500                      # runCodingTask /api/chat
 _REVIEW_MAX_TOKENS = 900                     # runReviewTask /api/chat
@@ -726,6 +727,67 @@ def _parse_probe_request(reply):
     return {'path': req.get('path') or 'index.html',
             'actions': req.get('actions') or [],
             'probes': req.get('probes') or []}
+
+
+def _parse_colab_run_request(reply):
+    """Mirror of _parse_probe_request for the code lane: a Colab run request
+    is a JSON object whose ONLY recognized key is colabRun {code, purpose,
+    packages, timeout_seconds, runtimes, runtime}; anything else (an ordinary
+    shell command or a probeRequest) returns None and falls through. Narrow on
+    purpose so a real command is never mistaken for a Colab request."""
+    if not reply:
+        return None
+    import json as _json
+    try:
+        parsed = _json.loads(reply.strip().replace('```json', '').replace('```', '').strip())
+    except Exception:
+        return None
+    req = parsed.get('colabRun') if isinstance(parsed, dict) else None
+    if not isinstance(req, dict):
+        return None
+    code = (req.get('code') or '').strip()
+    if not code:
+        return None
+    try:
+        timeout = int(req.get('timeout_seconds') or 300)
+    except (TypeError, ValueError):
+        timeout = 300
+    try:
+        runtimes = int(req.get('runtimes') or 1)
+    except (TypeError, ValueError):
+        runtimes = 1
+    kind = (req.get('runtime') or 'cpu').strip()
+    if kind not in ('gpu', 'cpu'):
+        kind = 'cpu'
+    return {'code': code,
+            'purpose': (req.get('purpose') or 'story computation').strip(),
+            'packages': [p for p in (req.get('packages') or [])
+                         if isinstance(p, str) and p.strip()][:12],
+            'timeout_seconds': timeout,
+            'runtimes': runtimes,
+            'runtime': kind}
+
+
+def _format_colab_run_result(result):
+    """Format a _serve._colab_compute_run result the way the spike toolchain's
+    run_on_colab executor does, so the story agent sees the same exit/units/
+    stdout shape (including sharding over multiple runtimes) and an honest
+    note when the run was refused or printed nothing."""
+    if not isinstance(result, dict):
+        return '(Colab run returned no usable response)'
+    if result.get('error'):
+        return f'(Colab run refused: {result["error"]})'
+    parts = [f'Colab run OK (session: {result.get("session") or "colab"}, '
+             f'{result.get("elapsed_s", 0)}s, {result.get("units", 0)} compute units):']
+    if result.get('runtimes'):
+        parts.insert(0, f'Colab sharded run OK across {result["runtimes"]} runtime(s) '
+                        f'({result.get("elapsed_s", 0)}s, {result.get("units", 0)} compute units total):')
+    stdout = (result.get('stdout') or '').strip()
+    if stdout:
+        parts.append(f'output:\n{stdout}')
+    if not stdout:
+        parts.append('(no output -- your code printed nothing)')
+    return '\n\n'.join(parts)
 
 
 def _format_page_probe_result(data):
@@ -1124,6 +1186,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
                                           {'note': 'Tried to work on it, but no coding model tier is configured yet.',
                                            'ok': False})
         return False
+    colab_available = bool(_serve.COLAB_CLI_AVAILABLE and _serve.COLAB_ENABLED)
 
     system_prompt = (f'You are {name}, a developer on a small team building {project_label or "a real, working small web application for the team"}. '
                      f'Current project state:\n{context_summary or "(nothing written yet -- you may be starting the first file.)"}\n\n'
@@ -1136,7 +1199,19 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
                      '{"type":"keydown","key":"q"}], "probes": ["document.body.className", "typeof window.SomeGlobal"]}}\n'
                      'Action types are click ({selector}), keydown ({key}), wait ({ms}), eval ({code}). '
                      f'You can do this up to {MAX_CODE_PROBE_ROUNDS} times if you genuinely need to. '
-                     'When ready to write the actual fix, respond with ONLY a single shell command, no explanation, no markdown fences, '
+                     + ('You may also offload real computation to a Google Colab runtime when this task genuinely needs compute your '
+                        'sandbox cannot do -- heavy data parsing/analysis, numeric or ML work. To do that, respond with ONLY a JSON '
+                        'object, no shell command, no markdown fences, no explanation, in exactly this shape: '
+                        '{"colabRun": {"code": "print(...)", "purpose": "why you are computing this", "packages": [], '
+                        '"timeout_seconds": 300, "runtimes": 1, "runtime": "cpu"}}\n'
+                        'Your code MUST print everything you need to see. It runs on the Colab free tier, so keep runs small; a slot '
+                        'may be refused (provisioning/availability), in which case you may retry once or fall back to a sandbox '
+                        'command. To shard ONE computation across multiple runtimes, pass runtimes>1 (up to 5): the same code then runs '
+                        'on each granted runtime with COLAB_SHARD_INDEX and COLAB_SHARD_COUNT env vars so it can split the work and '
+                        'print its slice. It runs as the player\'s identity -- ONLY raw compute, never Google Drive/GCS/cloud APIs, '
+                        'credentials, mining/bulk media, or any exfiltration site. '
+                        f'You can do this up to {MAX_CODE_COLAB_ROUNDS} times if you genuinely need to. ' if colab_available else '')
+                     + 'When ready to write the actual fix, respond with ONLY a single shell command, no explanation, no markdown fences, '
                      'that writes or updates the necessary file(s) using one or more heredocs, e.g.:\ncat > index.html << \'EOF\'\n<contents>\nEOF\n'
                      'Write real, complete, working code for this specific piece -- no placeholders, no "TODO," no stubs. '
                      'Keep it focused on just this task, building on what already exists rather than starting over. '
@@ -1148,6 +1223,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     command = ''
     attempts = 0
     probe_rounds = 0
+    colab_rounds = 0
     while attempts <= CODE_CONTINUATION_ATTEMPTS:
         reply = None
         r = _serve._http_json('POST', base, '/api/chat',
@@ -1171,6 +1247,19 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
             feedback = _format_page_probe_result(probe_data)
             if probe_rounds >= MAX_CODE_PROBE_ROUNDS:
                 feedback += f'\n\nYou have used all {MAX_CODE_PROBE_ROUNDS} probe rounds. Respond now with ONLY your final shell command.'
+            messages.append({'role': 'user', 'content': feedback})
+            continue  # does not count against continuation attempts -- a different failure mode
+
+        colab_req = (_parse_colab_run_request(reply)
+                     if colab_available and colab_rounds < MAX_CODE_COLAB_ROUNDS else None)
+        if colab_req:
+            colab_rounds += 1
+            messages.append({'role': 'assistant', 'content': reply})
+            feedback = _format_colab_run_result(_serve._colab_compute_run(
+                agent_id, colab_req['code'], colab_req['purpose'], colab_req['packages'],
+                colab_req['timeout_seconds'], colab_req['runtimes'], colab_req['runtime']))
+            if colab_rounds >= MAX_CODE_COLAB_ROUNDS:
+                feedback += f'\n\nYou have used all {MAX_CODE_COLAB_ROUNDS} Colab rounds. Respond now with ONLY your final shell command.'
             messages.append({'role': 'user', 'content': feedback})
             continue  # does not count against continuation attempts -- a different failure mode
 
@@ -1399,7 +1488,7 @@ def _grade_jev_requirement(req, review):
         choice, confidence, _cost = _serve._jev_choice(decision)
     except Exception:
         return GRADE_UNSURE, 0.0
-    if choice in (GRADE_MEETS, GRADE_FAILS) and confidence >= _serve._effective_safety_confidence():
+    if choice in (GRADE_MEETS, GRADE_FAILS) and confidence >= _serve._effective_review_grade_confidence():
         return choice, confidence
     return GRADE_UNSURE, confidence
 
@@ -1414,6 +1503,26 @@ def _grade_review_checklist(checklist, review, qp, agent_id):
     grades = []
     escalate = []
     jev_graded = 0
+    # Judge-vs-anchor calibration (self-deception check, ported in spirit from
+    # self-evolve's selfdeception.py): a 'code'-type requirement's verdict is
+    # MECHANICAL ground truth (the live quality pipeline), so a section whose
+    # code requirements are UNANIMOUS is a real anchor for judging the
+    # subjective 'jev' grades in that same section. The Jev grader never sees
+    # the pipeline result, so agreement/disagreement is a genuine measurement
+    # of the grader, not the grader echoing ground truth back. A section whose
+    # code verdicts disagree is ambiguous and is NOT used as an anchor.
+    code_anchors = {}
+    code_verdicts = {}
+    for req in checklist:
+        if req.get('type') != 'code':
+            continue
+        section = req.get('section') or ''
+        verdict = _grade_code_requirement(req, qp)
+        if verdict in (GRADE_MEETS, GRADE_FAILS):
+            code_verdicts.setdefault(section, set()).add(verdict)
+    for section, verdicts in code_verdicts.items():
+        if len(verdicts) == 1:
+            code_anchors[section] = next(iter(verdicts))
     for req in checklist:
         req_id = req.get('id') or 'req'
         section = req.get('section') or ''
@@ -1437,6 +1546,12 @@ def _grade_review_checklist(checklist, review, qp, agent_id):
             verdict, confidence = _grade_jev_requirement(req, review)
             grades.append({'id': req_id, 'section': section, 'question': question,
                            'type': 'jev', 'verdict': verdict, 'confidence': confidence})
+            # Record the anchored sample: only definite verdicts count (an
+            # UNSURE grade is the judge declining, not a wrong answer), and
+            # only when the section has a unanimous mechanical anchor.
+            if verdict in (GRADE_MEETS, GRADE_FAILS) and section in code_anchors:
+                _serve._insert_review_calibration_sample(
+                    section, verdict, confidence, code_anchors[section])
             if verdict == GRADE_UNSURE:
                 escalate.append((req, f'uncertain review requirement (Jev confidence {confidence:.2f})'
                                       if confidence else 'uncertain review requirement (Jev call failed)'))
