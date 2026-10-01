@@ -12712,6 +12712,13 @@ JEV_HEALTH_MIN_ATTEMPTS = 10       # don't trip on a handful of attempts
 # pattern).
 SELF_PROPOSED_REJECT_WINDOW_S = 86400
 SELF_PROPOSED_REJECT_THRESHOLD = 5
+# red_pipeline telemetry: quality_gate_reject rows (see _log_quality_gate_reject
+# in sim.py) mark every fail-closed quality-gate send-back. Counted over a day
+# so the health check can see rejects (the gate catching red content) vs.
+# escapes (a red result that completed anyway -- the fail-closed invariant
+# broken; any escape is a real regression). Mirrors the selfProposedRejected
+# pattern: a JSON-substring match on the marker, not a JSON query.
+RED_PIPELINE_WINDOW_S = 86400
 # METR reliability-at-horizon: does the colony actually FINISH
 # the work it starts? Measured from the action_log's task_assigned ->
 # task_completed pairs (paired on the taskId the details JSON carries) over a
@@ -12867,6 +12874,21 @@ def _health_alerts_for_signals(signals):
               f'{signals["self_proposed_rejected_last_24h"]} self-proposed work request(s) rejected at '
               f'refinement in the last 24h -- proposals trending trivial/ill-scoped; '
               f'coach medium-difficulty cards (Absolute Zero)')
+
+    # red_pipeline telemetry: the fail-closed quality gate caught N red content
+    # results in the last 24h (that's the gate working -- routine, info level
+    # only) -- but ANY red result that ESCAPED to done means the fail-closed
+    # invariant broke (a regression in the gate), so a single escape is a
+    # warning, not a trend signal.
+    if signals['red_pipeline_escapes_last_24h']:
+        alert('quality_gate', 'warning',
+              f'{signals["red_pipeline_escapes_last_24h"]} red-pipeline result(s) ESCAPED the '
+              f'fail-closed quality gate in the last 24h -- a red result completed as done; '
+              f'check _task_cycle fail-closed branches immediately')
+    elif signals['red_pipeline_rejects_last_24h']:
+        alert('quality_gate', 'info',
+              f'{signals["red_pipeline_rejects_last_24h"]} red-pipeline result(s) caught and sent '
+              f'back by the fail-closed quality gate in the last 24h')
 
     # METR reliability-at-horizon: a colony that STARTS tasks but
     # rarely FINISHES them within the horizon has poor reliability -- work
@@ -13072,6 +13094,21 @@ def compute_health_snapshot():
             "AND details LIKE '%\"selfProposedRejected\": true%' AND ts > ?",
             (now - SELF_PROPOSED_REJECT_WINDOW_S,),
         ).fetchone()[0]
+        # red_pipeline telemetry: every fail-closed quality-gate reject (the
+        # gate catching red content), and the subset that ESCAPED to done
+        # anyway -- a broken invariant, so any nonzero escape count is the
+        # regression signal. The gate logs both caught + escaped in the same
+        # row (redPipelineEscaped flag), so two LIKE counts over one action.
+        red_rejects = conn.execute(
+            "SELECT COUNT(*) FROM action_log WHERE action = 'quality_gate_reject' "
+            "AND ts > ?",
+            (now - RED_PIPELINE_WINDOW_S,),
+        ).fetchone()[0]
+        red_escapes = conn.execute(
+            "SELECT COUNT(*) FROM action_log WHERE action = 'quality_gate_reject' "
+            "AND details LIKE '%\"redPipelineEscaped\": true%' AND ts > ?",
+            (now - RED_PIPELINE_WINDOW_S,),
+        ).fetchone()[0]
         # METR reliability-at-horizon: the action_log's
         # task_assigned/task_completed pairs (see _task_horizon_metrics) --
         # whether the colony finishes the work it starts, measured as a rate
@@ -13100,6 +13137,12 @@ def compute_health_snapshot():
         'jev_decision_attempts_last_hour': jev_attempt_rows[0],
         'jev_decision_failures_last_hour': jev_attempt_rows[1],
         'self_proposed_rejected_last_24h': self_proposed_rejected,
+        # red_pipeline telemetry: rejects = the fail-closed gate catching red
+        # content results; escapes = red results that completed anyway (broken
+        # invariant -- any nonzero escape is a regression). Mirror of the
+        # self_proposed_rejected counter, same JSON-substring marker method.
+        'red_pipeline_rejects_last_24h': red_rejects,
+        'red_pipeline_escapes_last_24h': red_escapes,
         # METR reliability-at-horizon: median completion time +
         # the fraction of assigned tasks finished within 1h / 24h. None means
         # too few completed tasks to judge (or no assignments at all).

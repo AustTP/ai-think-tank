@@ -894,6 +894,8 @@ class HealthChecks(unittest.TestCase):
             'jev_decision_attempts_last_hour': 0,
             'jev_decision_failures_last_hour': 0,
             'self_proposed_rejected_last_24h': 0,
+            'red_pipeline_rejects_last_24h': 0,
+            'red_pipeline_escapes_last_24h': 0,
             'task_assigned_last_24h': 0,
             'task_completed_last_24h': 0,
             'task_median_completion_hours': None,
@@ -911,6 +913,27 @@ class HealthChecks(unittest.TestCase):
 
     def test_nominal_state_raises_no_alerts(self):
         self.assertEqual(serve._health_alerts_for_signals(self._signals()), [])
+
+    def test_red_pipeline_rejects_raise_only_info(self):
+        # The fail-closed gate catching red content is the gate WORKING --
+        # an info signal, never a warning.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            red_pipeline_rejects_last_24h=6,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['category'], 'quality_gate')
+        self.assertEqual(alerts[0]['severity'], 'info')
+
+    def test_red_pipeline_escape_raises_a_warning(self):
+        # ANY red result that escaped to done means the fail-closed invariant
+        # broke -- a single escape is a warning, even with zero rejects logged.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            red_pipeline_escapes_last_24h=1,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['category'], 'quality_gate')
+        self.assertEqual(alerts[0]['severity'], 'warning')
+        self.assertIn('ESCAPED', alerts[0]['message'])
 
     def test_agent_tool_volume_anomaly_raises_behavior_alert(self):
         # An agent firing >threshold spend-inducing tool calls in the window

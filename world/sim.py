@@ -3237,6 +3237,23 @@ def _sim_notify_author_failed(state, task):
         'text': f'Your work on "{task.get("title")}" failed the quality pipeline and was sent back -- it needs a fix before it can be reviewed. Fix it and it will be reviewed again.'})
 
 
+def _log_quality_gate_reject(state, task, note, escalated):
+    """red_pipeline telemetry: a durable, queryable marker for every fail-closed
+    quality-gate send-back (a red flake8/mypy/bandit/pytest-cov content result
+    that was CAUGHT and never marked done). Mirrors the selfProposedRejected
+    marker pattern (_resolve_refinement) so the health check can count rejects
+    vs. escapes with a JSON-substring LIKE instead of a JSON query. The gate is
+    fail-closed, so `redPipelineEscaped` is always false today -- the counter's
+    job is to trip loudly if a regression ever lets a red result complete."""
+    details = {'taskId': task.get('id'),
+               'author': task.get('assignedTo'),
+               'title': (task.get('title') or '')[:120],
+               'note': (note or '')[:120],
+               'redPipelineEscaped': False,
+               'redPipelineEscalated': bool(escalated)}
+    _log_governance(state, task.get('assignedTo'), 'quality_gate_reject', details)
+
+
 def _send_back_after_failure(state, task, fail_note=None):
     """Fail-closed quality-gate send-back. A deliverable (or a fix of one) whose
     content result failed the pipeline is marked `failed` -- deliberately NOT
@@ -3263,7 +3280,9 @@ def _send_back_after_failure(state, task, fail_note=None):
     task['status'] = 'failed'
     task['failedAt'] = int(time.time() * 1000)
     task['failNote'] = note[:300]
-    if _maybe_escalate_stuck_gate(task, gate, 'quality pipeline keeps failing'):
+    escalated = _maybe_escalate_stuck_gate(task, gate, 'quality pipeline keeps failing')
+    _log_quality_gate_reject(state, task, note, escalated=escalated)
+    if escalated:
         return  # frozen -- escalated + player notified; no further fix cycling
     instructions = (f"Your work on '{task.get('title')}' failed the quality pipeline: "
                     f"{note}. Fix it so the pipeline passes clean, then it will be re-reviewed.")
