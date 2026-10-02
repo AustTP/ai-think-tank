@@ -175,10 +175,14 @@ class AutoHire(unittest.TestCase):
         # wall-time intervals. Doubled so the same wall-time elapses.
         now = 1000.0
         grid, doors = sim._load_outdoor_geometry()
-        for _ in range(ticks):
-            now += sim.SIM_TICK_S
-            sim._governance_pass(state, now=now, now_ms=int(now * 1000), grid=grid,
-                                 decider=decider)
+        # A hire that completes names its employee via the default
+        # _hire_name_chooser -- a REAL model call. Stub it deterministic (like
+        # the injected `decider`) so these tests stay offline and hermetic.
+        with unittest.mock.patch('sim._hire_name_chooser', return_value='Rowan'):
+            for _ in range(ticks):
+                now += sim.SIM_TICK_S
+                sim._governance_pass(state, now=now, now_ms=int(now * 1000), grid=grid,
+                                     decider=decider)
         return state
 
     def test_idle_think_tank_hires_nothing(self):
