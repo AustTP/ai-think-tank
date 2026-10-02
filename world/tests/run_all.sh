@@ -79,6 +79,12 @@ echo
 echo "== Python: sim.py =="
 python3 tests/test_sim.py
 echo
+echo "== Python: shadow/dry-run mode (Bot Ops -- work happens, world doesn't move) =="
+python3 tests/test_shadow_mode.py
+echo
+echo "== Python: weekly diff-against-expectation review (Bot Ops -- ground truth, not self-report) =="
+python3 tests/test_weekly_review.py
+echo
 echo "== Python: teams data model (Phase A) =="
 python3 tests/test_teams.py
 echo

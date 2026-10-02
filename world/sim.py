@@ -1676,6 +1676,13 @@ def queue_work(state, items):
             # step and the pipeline wedges on step 0 forever -- the exact same
             # class of whitelist gap 'distill'/'checklist' both hit.
             'pipelineStep': item.get('pipelineStep') or None,
+            # Bot Ops / shadow mode: a SHADOW work item does the work but changes
+            # nothing -- on completion its outcome is captured to the append-only
+            # state['shadowLedger'] draft instead of shipping (no peer gate, no
+            # approvals/credits/completedDeliverables). Survives the queue round
+            # trip so the real task knows it's a dry run (same whitelist contract
+            # as 'distill'/'checklist').
+            'shadow': bool(item.get('shadow')),
         })
     return len(work_queue)
 
@@ -1981,7 +1988,19 @@ def sprint_progress(state, sprint_id):
         return None
     items = record.get('items') or []  # list of (title, room) tuples
     open_tasks = state.get('tasks') or {}
-    still_queued = set(_sprint_item_id(it) for it in (state.get('workQueue') or []))
+    # Bot Ops / shadow mode: shadow (dry-run) work must not count toward a
+    # sprint -- it ships nothing. Exclude shadow queue items from the still-queued
+    # set and shadow tasks from the done/in-progress match.
+    still_queued = set(_sprint_item_id(it) for it in (state.get('workQueue') or [])
+                       if not it.get('shadow'))
+    # Bot Ops / shadow mode: a purely-shadow (dry-run) item must not count toward
+    # the sprint at all -- not queued, not in-progress, not done. Track which item
+    # ids have ONLY a shadow representation so the fallback below can skip them.
+    shadow_ids = set(_sprint_item_id(it) for it in (state.get('workQueue') or [])
+                     if it.get('shadow'))
+    for t in (state.get('tasks') or {}).values():
+        if t.get('shadow'):
+            shadow_ids.add((t.get('title') or '', t.get('room') or ''))
     done = in_progress = queued = 0
     landed = []
     for pair in items:
@@ -1991,6 +2010,7 @@ def sprint_progress(state, sprint_id):
         ident = (title, room)
         if ident in still_queued and not any(
                 t.get('status') == 'done' and t.get('title') == title and t.get('room') == room
+                and not t.get('shadow')
                 for t in open_tasks.values()):
             # Still in the queue, not yet assigned: queued.
             queued += 1
@@ -1998,6 +2018,8 @@ def sprint_progress(state, sprint_id):
         matched_done = matched_active = False
         for t in open_tasks.values():
             if t.get('title') != title or t.get('room') != room:
+                continue
+            if t.get('shadow'):
                 continue
             if t.get('status') == 'done':
                 matched_done = True
@@ -2008,6 +2030,10 @@ def sprint_progress(state, sprint_id):
             landed.append(title)
         elif matched_active:
             in_progress += 1
+        elif ident in shadow_ids:
+            # The only representation of this item is shadow (dry-run) work --
+            # it ships nothing, so it is invisible to the sprint.
+            continue
         else:
             queued += 1
     total = len(items)
@@ -2427,6 +2453,10 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'userStory': (extra or {}).get('userStory'),
         'acceptanceCriteria': (extra or {}).get('acceptanceCriteria'),
         'pipelineStep': (extra or {}).get('pipelineStep'),
+        # Bot Ops / shadow mode: a dry-run task (see queue_work). Stamped so the
+        # completion path (_task_cycle) captures to the shadow ledger instead of
+        # shipping.
+        'shadow': bool((extra or {}).get('shadow')),
         'assignedTo': agent_id,
         'status': 'walking',
         'createdAt': now_ms,
@@ -2567,6 +2597,43 @@ def send_agent_off_duty(state, agent_id, doors, grid):
     a['replanCount'] = 0
     a['offDuty'] = True
     a['visible'] = False
+
+
+def _complete_shadow_task(state, agent_id, task, now_ms, grid=None):
+    """Bot Ops / shadow mode completion: the dry-run task did its work, so capture
+    its outcome to the append-only state['shadowLedger'] draft -- then release the
+    agent WITHOUT any real-world side effect. Nothing ships: no peer gate, no
+    approvedCount/weekApprovals bump, no completedDeliverables entry, no
+    completedRooms/grade/runbook, no follow-up filing, no dependency unblock. The
+    work happened; the world didn't move. Returns the ledger entry."""
+    task['status'] = 'done'
+    task['shadowDoneAt'] = now_ms
+    entry = {
+        'title': task.get('title'),
+        'room': task.get('room'),
+        'instructions': task.get('instructions'),
+        'projectLabel': task.get('projectLabel'),
+        'taskType': task.get('taskType'),
+        'note': task.get('note'),
+        'libraryPath': task.get('libraryPath'),
+        'agentId': agent_id,
+        'completedAt': now_ms,
+        'promoted': False,
+    }
+    state.setdefault('shadowLedger', []).append(entry)
+    a = (state.get('agents') or {}).get(agent_id)
+    if a:
+        a['task'] = None
+        a['busy'] = False
+        a['inRoom'] = None
+        a['visible'] = True
+    try:
+        from serve import log_action
+        log_action(agent_id, 'shadow_task_completed',
+                   {'taskId': task.get('id'), 'title': task.get('title')}, authorized=True)
+    except Exception:
+        pass
+    return entry
 
 
 MIN_RESEARCH_CADENCE_MS = 5 * 60 * 1000  # floor: a misparsed "every second" can't spam the queue
@@ -7017,6 +7084,13 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 # as the real work resolves (the min-visual floor is satisfied by
                 # the network round-trips), not when the timeout ceiling hits.
                 _apply_content_result(state, task, result)
+                # Bot Ops / shadow mode: a dry-run task ships nothing. Capture the
+                # outcome to the shadow ledger and release the agent, skipping the
+                # peer gate / quality gate / credits entirely.
+                if task.get('shadow'):
+                    _complete_shadow_task(state, aid, task, now_ms, grid)
+                    send_agent_off_duty(state, aid, doors, grid)
+                    continue
                 # Fail-closed quality gate: a content result that FAILED the
                 # quality pipeline (the coding executor stores ok=False on a red
                 # flake8/mypy/bandit/pytest-cov run) must NEVER advance to peer
@@ -7086,6 +7160,12 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
             elif now >= task['workUntil']:
                 # No content result within the budget (timeout OR the slice-1
                 # placeholder) -- fallback completion. Same gate branching.
+                # Bot Ops / shadow mode: capture the dry-run outcome to the shadow
+                # ledger and release, never entering a gate.
+                if task.get('shadow'):
+                    _complete_shadow_task(state, aid, task, now_ms, grid)
+                    send_agent_off_duty(state, aid, doors, grid)
+                    continue
                 if task.get('reviewOf') or not _peer_gated_lane(task):
                     finish_task(state, aid, grid)
                     send_agent_off_duty(state, aid, doors, grid)
@@ -7297,6 +7377,9 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # pipelineStep onto the real task so the strict-order sweep can read
         # completion back (and the content dispatcher can route the step).
         'pipelineStep': pick.get('pipelineStep'),
+        # Bot Ops / shadow mode: thread the dry-run flag onto the assigned task
+        # (see assign_task) -- same class of whitelist as 'distill'/'checklist'.
+        'shadow': pick.get('shadow'),
     }
     # Cut 2 coaching + runbook injection: append the chosen agent's pending
     # growth-plan note (applied once) and any product runbook knowledge to the
