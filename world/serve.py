@@ -9013,7 +9013,24 @@ async def intent_clarify(request: Request):
     # KB-first: the same library search the agents use, on the product + question.
     kb_query = f'{product_name} {question}'[:200]
     kb_matches = _library_search_matches(kb_query)
-    messages = _clarify_in_character_messages(agent, kb_matches, product_name, question)
+
+    completing = plan.get('completing')
+    escalated_to = None
+    # Grounding: with ZERO knowledge-base matches the on-call would be
+    # answering from memory alone (a hallucination window). When a DIFFERENT
+    # agent actually landed the work, skip the router and ask that agent
+    # directly -- they are strictly more grounded. (Same-agent case: the
+    # on-call IS the completing agent, so their knowledge is first-hand.)
+    if not kb_matches and completing and completing != on_call:
+        escalated_to = completing
+        agent = _agent_record_for(state, completing)
+        comp_name = (agent.get('name') or completing)
+        messages = _clarify_in_character_messages(
+            agent, kb_matches, product_name,
+            f'{question}\n\n(The on-call agent had no knowledge-base material to '
+            f'answer from; you landed the work so the player is asking you directly.)')
+    else:
+        messages = _clarify_in_character_messages(agent, kb_matches, product_name, question)
 
     # Clarify is an in-character answer about completed work -- judgment-heavy
     # but not code, so it goes through the JEV gate (default low, light mid).
@@ -9028,14 +9045,20 @@ async def intent_clarify(request: Request):
         _accrue_spend('__clarify__', ((data or {}).get('usage') or {}).get('cost', 0.0))
         reply = (data['choices'][0]['message']['content'] or '').strip()
     except Exception as e:
+        if escalated_to:
+            comp_name = (agent.get('name') or completing)
+            reply = (f"I couldn't reach {comp_name}, who landed this work. "
+                     f"Ask again shortly or check with the admin.")
+            return JSONResponse({
+                'reply': reply, 'onCall': on_call,
+                'completing': completing, 'escalatedTo': escalated_to,
+                'onCallFallback': plan.get('onCallFallback', False)})
         return JSONResponse({'error': f'clarify failed: {e}'}, status_code=500)
 
     # Escalation: on-call explicitly can't answer -> hand off to the completing
     # agent (whether they worked on it or not is the on-call's routing; the
     # completing agent actually landed it). Never leak the token into the reply.
-    escalated_to = None
-    if _CLARIFY_ESCALATE_TOKEN in reply:
-        completing = plan.get('completing')
+    if not escalated_to and _CLARIFY_ESCALATE_TOKEN in reply:
         if completing and completing != on_call:
             comp_agent = _agent_record_for(state, completing)
             comp_name = (comp_agent.get('name') or completing)
@@ -9064,7 +9087,7 @@ async def intent_clarify(request: Request):
     return JSONResponse({
         'reply': reply, 'onCall': on_call,
         'completing': plan.get('completing'), 'escalatedTo': escalated_to,
-    })
+        'onCallFallback': plan.get('onCallFallback', False)})
 
 
 def _make_web_tools_executor(agent_id, agent_key, default_location=None, default_query=None, struck_tools=None):
