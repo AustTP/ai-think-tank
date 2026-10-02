@@ -271,6 +271,115 @@ class SimServerOwnedMovement(unittest.TestCase):
         self.assertEqual(state2['agents']['ada']['path'], [],
                          'a taskless agent must not be path-warped')
 
+    def _walking_task_state(self, **over):
+        """A minimal walking-task holder for the cancel/release tests."""
+        state = {'sim': {'owner': 'server'},
+                 'agents': {'ada': {'id': 'ada', 'x': sim.SPAWN['x'], 'y': sim.SPAWN['y'],
+                                    'dir': 'south', 'visible': True, 'busy': False,
+                                    'task': 'task-1', 'inRoom': None, 'offDuty': False,
+                                    'path': [{'x': 1, 'y': 1}], 'pathIndex': 0,
+                                    'pathTarget': {'x': 1, 'y': 1},
+                                    'stuckTimer': 0, 'replanCount': 0,
+                                    'respawnedForTask': False}},
+                 'tasks': {'task-1': {'id': 'task-1', 'title': 't', 'room': 'pressoffice',
+                                      'status': 'walking', 'assignedTo': 'ada'}}}
+        for key, value in over.items():
+            state[key] = value
+        return state
+
+    def test_cancel_at_task_releases_agent_and_marks_cancelled(self):
+        # Port of tasks.js cancelTask: task -> 'cancelled', agent fully
+        # released (task/path/pathTarget/respawn cleared, replan counter reset).
+        state = self._walking_task_state()
+        task = sim._cancel_at_task(state, 'ada')
+        self.assertEqual(task['id'], 'task-1')
+        self.assertEqual(state['tasks']['task-1']['status'], 'cancelled')
+        a = state['agents']['ada']
+        self.assertIsNone(a['task'])
+        self.assertIsNone(a['path'])
+        self.assertIsNone(a['pathTarget'])
+        self.assertEqual(a['replanCount'], 0)
+        self.assertFalse(a.get('respawnedForTask'))
+        # No-ops for a missing or taskless agent.
+        self.assertIsNone(sim._cancel_at_task(state, 'ghost'))
+        state['agents']['ben'] = {'id': 'ben', 'task': None}
+        self.assertIsNone(sim._cancel_at_task(state, 'ben'))
+
+    def test_tick_dispatches_task_cancel_release(self):
+        # REGRESSION (vela, replanCount 55,350): a walking-task agent whose walk
+        # can't progress emits a 'cancel' every tick, and the tick previously
+        # only LOGGED it -- she kept task/path/respawn and looped forever,
+        # flooding the action_log with sim_cancel rows. The dispatch must now
+        # release her exactly like tasks.js cancelTask.
+        state = self._walking_task_state()
+        engine = sim.SimEngine()
+        with unittest.mock.patch('sim.step_agent_movement',
+                                 return_value=[('cancel', 'task', 'ada')]):
+            out = engine.tick(state, now=100.0)
+        a = out['agents']['ada']
+        self.assertIsNone(a['task'],
+                          'a cancelled task-walk must release the agent, not keep her task')
+        self.assertIsNone(a['path'])
+        self.assertIsNone(a['pathTarget'])
+        self.assertFalse(a.get('respawnedForTask'))
+        self.assertEqual(out['tasks']['task-1']['status'], 'cancelled',
+                         'the gave-up task must be marked cancelled, mirroring cancelTask')
+
+    def test_tick_cancel_releases_stalled_handoff_session(self):
+        # A client-owned handoff/pair session that cancels (the client that
+        # owned it is gone) must be released to off-duty, like
+        # _repair_stalled_interactions -- not left frozen holding the session.
+        state = self._walking_task_state()
+        a = state['agents']['ada']
+        a['task'] = None
+        a['handoff'] = {'to': 'ben'}
+        a['path'] = [{'x': 1, 'y': 1}]
+        engine = sim.SimEngine()
+        with unittest.mock.patch('sim.step_agent_movement',
+                                 return_value=[('cancel', 'handoff', 'ada')]):
+            out = engine.tick(state, now=100.0)
+        a = out['agents']['ada']
+        self.assertIsNone(a.get('handoff'))
+        self.assertTrue(a.get('offDuty'))
+        self.assertFalse(a.get('visible'))
+
+    def test_repair_releases_pathological_stuck_walker(self):
+        # The replanned-50k-times case: a walking-task holder whose replanCount
+        # has blown past the sane budget is released (task cancelled) instead of
+        # being re-pathed or left looping -- even though she HAS a path.
+        state = self._walking_task_state()
+        state['agents']['ada']['replanCount'] = 100
+        grid, doors = sim._load_outdoor_geometry()
+        sim._repair_stalled_walkers(state, grid, doors)
+        a = state['agents']['ada']
+        self.assertIsNone(a['task'],
+                          'a pathologically-stuck walker must be released, not re-pathed')
+        self.assertEqual(state['tasks']['task-1']['status'], 'cancelled')
+
+    def test_repair_releases_unreachable_only_after_respawn(self):
+        # A fresh BFS that finds no route is release-worthy ONLY once the agent
+        # has already used her one relocation (JS: "Even a fresh spot can't
+        # reach it"). Before respawn it must keep the task -- a single failed
+        # BFS can be a transient pile-up, and the movement cancel path grants
+        # the grace instead.
+        def _state(respawned):
+            s = self._walking_task_state()
+            s['agents']['ada']['path'] = []  # no path -> repair computes one
+            s['agents']['ada']['respawnedForTask'] = respawned
+            return s
+        grid, doors = sim._load_outdoor_geometry()
+        pre = _state(respawned=False)
+        with unittest.mock.patch('sim.find_path', return_value=None):
+            sim._repair_stalled_walkers(pre, grid, doors)
+        self.assertEqual(pre['agents']['ada']['task'], 'task-1',
+                         'a pre-respawn unreachable walker keeps her task (grace)')
+        post = _state(respawned=True)
+        with unittest.mock.patch('sim.find_path', return_value=None):
+            sim._repair_stalled_walkers(post, grid, doors)
+        self.assertIsNone(post['agents']['ada']['task'],
+                          'a post-respawn unreachable walker is released')
+        self.assertEqual(post['tasks']['task-1']['status'], 'cancelled')
+
 
 class SimTaskLifecycle(unittest.TestCase):
     # Phase 3 slice 1: the server re-homes the task lifecycle -- queue

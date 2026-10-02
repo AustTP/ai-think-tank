@@ -116,6 +116,12 @@ PLACEMENT_MIN_DIST = 60
 TASK_WALK_SPEED = 60.0
 TASK_ARRIVE_DIST = 12.0
 TASK_STUCK_TIMEOUT = 1.2
+# A task-walk that can't make progress is released once replanCount blows past
+# this sane budget. Healthy movement resets replanCount to 0 on every step and
+# emits a cancel (which clears it) within a few replans; a count above this
+# means the target is unwalkable and the cancel isn't reaching a dispatcher --
+# a stuck-loop (seen live: vela, replanCount 55,350, cancelling forever).
+TASK_CANCEL_REPLAN_CEILING = 15
 
 
 def _overlaps(a, b):
@@ -660,6 +666,17 @@ def _repair_stalled_walkers(state, grid, doors, now_ms=None):
         # remained invisible stays frozen (movement skips pathless-only AND
         # invisible-only).
         a['visible'] = True
+        # Pathological stuck: a walking-task holder whose replan counter has
+        # blown past the sane budget has been re-pathing toward an unwalkable
+        # target for a long time (healthy movement resets replanCount on every
+        # step and a give-up cancel clears it within a few replans -- a huge
+        # count means cancels are being dropped or the target can't be reached
+        # at all). Release her rather than let the loop run forever; this is
+        # the same give-up cancelTask() performs, called directly so a leaked
+        # cancel can never wedge an agent indefinitely.
+        if (a.get('replanCount') or 0) >= TASK_CANCEL_REPLAN_CEILING:
+            _cancel_at_task(state, aid)
+            continue
         if a.get('path'):
             continue  # already has a walk to the door -- just needed to be seen
         room = resolve_room_with_overflow(state, task.get('room'))
@@ -670,7 +687,18 @@ def _repair_stalled_walkers(state, grid, doors, now_ms=None):
         ty = door['y'] + door['h'] + 4
         path = find_path(a['x'], a['y'], tx, ty, aid, agents, grid)
         if not path:
-            continue  # genuinely unreachable -> leave to the cancel path, not hudged
+            # A fresh BFS from her spot finds no route at all -- JS's exact
+            # "give up" condition ("Even a fresh spot can't reach it", reached
+            # only AFTER a respawn). If she's already used her one relocation
+            # and STILL can't route, release now instead of waiting for the slow
+            # cancel path (stuck-timeout + 3 replans + respawn) to emit one --
+            # with the dispatch wired, that path converges here anyway, just
+            # slower. Without the respawn guard this would drop a task during a
+            # transient pile-up (an agent momentarily boxed by neighbours), so
+            # the grace is deliberate.
+            if a.get('respawnedForTask'):
+                _cancel_at_task(state, aid)
+            continue
         a['path'] = path
         a['pathIndex'] = 0
         a['pathTarget'] = {'x': tx, 'y': ty}
@@ -693,6 +721,30 @@ def _repair_stalled_walkers(state, grid, doors, now_ms=None):
 # invisible to _reconcile_stranded_agents and _park_idle_wanderers too (both
 # also skip anyone holding pairWith/handoff): two
 # named agents frozen together, visible, in a doorway.
+def _release_stalled_interaction(state, aid):
+    """Release a VISIBLE agent holding `handoff`/`pairWith`: park her off duty
+    (invisible, in place) rather than resume a conversation whose other half
+    and content live only in a client that may not be open any more. Shared by
+    _repair_stalled_interactions (the no-path stall sweep) and the movement
+    cancel dispatch (a handoff/pair session that got stuck and cancelled).
+    Mirrors cancelHandoff/arriveAtPair's release shape."""
+    agents = state.get('agents') or {}
+    a = agents.get(aid)
+    if not isinstance(a, dict):
+        return False
+    a['handoff'] = None
+    a['pairWith'] = None
+    a['pairTaskId'] = None
+    a['pathTarget'] = None
+    a['stuckTimer'] = 0
+    a['replanCount'] = 0
+    a['respawnedForTask'] = False
+    a['busy'] = False
+    a['offDuty'] = True
+    a['visible'] = False
+    return True
+
+
 def _repair_stalled_interactions(state):
     """Releases any VISIBLE agent holding `handoff`/`pairWith` with no active
     path -- she can only be in that combination if the session stalled before
@@ -710,17 +762,8 @@ def _repair_stalled_interactions(state):
             continue
         if not a.get('handoff') and not a.get('pairWith'):
             continue
-        a['handoff'] = None
-        a['pairWith'] = None
-        a['pairTaskId'] = None
-        a['pathTarget'] = None
-        a['stuckTimer'] = 0
-        a['replanCount'] = 0
-        a['respawnedForTask'] = False
-        a['busy'] = False
-        a['offDuty'] = True
-        a['visible'] = False
-        released += 1
+        if _release_stalled_interaction(state, aid):
+            released += 1
     return released
 
 
@@ -941,16 +984,35 @@ class SimEngine:
                                                   self._grid, doors=self._doors)
                 # Phase-3 dispatch: arrival/cancel events now feed the task
                 # lifecycle (the Phase-2 boundary closed). An agent arriving at
-                # a task's door gets marked working (busy/inRoom/workUntil).
+                # a task's door gets marked working (busy/inRoom/workUntil);
+                # a cancel (stuck, gave up) releases the agent via _cancel_at_task
+                # (or _release_stalled_interaction for a client-owned handoff/
+                # pair session) so a walk that can't finish never wedges her.
                 # (Off-duty is immediate and in-place now -- see
                 # send_agent_off_duty -- so there is no off-duty ARRIVAL event;
-                # an idle agent vanishes where she stands.) Cancels are still
-                # just logged this slice.
+                # an idle agent vanishes where she stands.)
                 if events:
                     import serve
                     for kind, sub, aid in events:
                         if kind == 'arrive' and sub == 'task':
                             _arrive_at_task(state, aid, now)
+                        elif kind == 'cancel':
+                            # Dispatch the cancel instead of dropping it on the
+                            # floor. A stuck task-walk that was only logged left
+                            # the agent holding task/path/respawn forever: she
+                            # re-walked the same unwalkable route and emitted a
+                            # cancel every tick (seen live: vela, replanCount
+                            # 55,350, one sim_cancel row ~every 1.5s for 36h).
+                            # tasks.js calls cancelTask()/cancelHandoff() here;
+                            # port that release so a gave-up agent frees her
+                            # task and goes idle again. Handoff/pair sessions are
+                            # client-owned, so a cancel means that client is
+                            # gone -- release her the same way
+                            # _repair_stalled_interactions does (park off duty).
+                            if sub == 'task':
+                                _cancel_at_task(state, aid)
+                            elif sub in ('handoff', 'pair'):
+                                _release_stalled_interaction(state, aid)
                         serve.log_action(None, 'sim_arrive' if kind == 'arrive'
                                          else 'sim_cancel', {'kind': sub, 'agent': aid},
                                          authorized=True)
@@ -2505,6 +2567,38 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
     from serve import log_action
     log_action(agent_id, 'task_assigned',
                {'taskId': task_id, 'title': title, 'room': room}, authorized=True)
+    return task
+
+
+def _cancel_at_task(state, agent_id):
+    """Port of tasks.js cancelTask (tasks.js:1197): an agent whose task-walk is
+    genuinely impossible gives up -- task marked 'cancelled', agent fully
+    released (task/path/respawn cleared) so she goes idle and is available for
+    the next assignment instead of looping forever on a route that can't work.
+    This is the dispatch half of the movement 'cancel' event (previously logged
+    and dropped, leaving the agent stuck -- vela, replanCount 55,350), and the
+    terminal release for _repair_stalled_walkers' unreachable cases. Unlike
+    finish_task/_release_agent_gated it does NOT bump approvals or record a
+    completed room -- a gave-up walk is not shipped work. Mirrors the JS: the
+    cancelled task is NOT requeued (a human can re-file it; requeueing an
+    unwalkable task would just churn agents into the same wall). Idempotent,
+    pure on `state`. Returns the cancelled task (or None)."""
+    agents = state.get('agents') or {}
+    a = agents.get(agent_id)
+    if not a:
+        return None
+    task_id = a.get('task')
+    tasks = state.get('tasks') or {}
+    task = tasks.get(task_id) if task_id else None
+    if task:
+        task['status'] = 'cancelled'
+    a['task'] = None
+    a['path'] = None
+    a['pathIndex'] = 0
+    a['pathTarget'] = None
+    a['stuckTimer'] = 0
+    a['replanCount'] = 0
+    a['respawnedForTask'] = False
     return task
 
 
