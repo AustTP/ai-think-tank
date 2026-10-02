@@ -85,6 +85,9 @@ echo
 echo "== Python: weekly diff-against-expectation review (Bot Ops -- ground truth, not self-report) =="
 python3 tests/test_weekly_review.py
 echo
+echo "== Python: spend accrual (every real model call is accounted to the cap/Bank) =="
+python3 tests/test_spend_accrual.py
+echo
 echo "== Python: teams data model (Phase A) =="
 python3 tests/test_teams.py
 echo
