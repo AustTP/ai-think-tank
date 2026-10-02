@@ -194,9 +194,13 @@ class ClarifyEndpointTests(unittest.TestCase):
         c, state_patch = self._client(s)
         first = {'choices': [{'message': {'content': serve._CLARIFY_ESCALATE_TOKEN}}]}
         second = {'choices': [{'message': {'content': 'I landed that. It relies on the parser spec.'}}]}
+        # Non-empty KB so the on-call's KB-grounded read runs first (an EMPTY
+        # KB skips the router entirely -- see the KB-empty direct-escalation
+        # test -- which would make this a one-call flow).
         with state_patch, \
              self._decider_patch(), \
-             unittest.mock.patch.object(serve, '_library_search_matches', return_value=[]):
+             unittest.mock.patch.object(serve, '_library_search_matches',
+                                        return_value=[{'path': 'projects/p1/README.md', 'snippet': 'parser spec'}]):
             with unittest.mock.patch.object(serve, '_call_openrouter_sync',
                                             side_effect=[first, second]) as mc:
                 resp = self._post(c, None, {'productId': 'p1', 'question': 'q'})
@@ -221,6 +225,59 @@ class ClarifyEndpointTests(unittest.TestCase):
         j = resp.json()
         self.assertEqual(mc.call_count, 1)  # no second call -- nobody to escalate to
         self.assertFalse(serve._CLARIFY_ESCALATE_TOKEN in (j['reply'] or ''))  # token never leaks
+
+    def test_empty_kb_skips_oncall_and_asks_completing_agent(self):
+        # Grounding: zero knowledge-base matches means the on-call has nothing
+        # to answer from -- skip the router (and its wasted mid-tier read of an
+        # empty KB) and ask the agent who actually landed the work directly.
+        s = _state()
+        # Completing agent is the admin (never in the on-call pool) so the
+        # on-call is guaranteed to be a DIFFERENT agent.
+        s['completedDeliverables'] = [
+            {'id': 't1', 'title': 'Refactor the Parser', 'room': 'pressoffice',
+             'agentId': 'maya', 'grade': 8.0, 'gradedAt': 1000, 'lastReviewed': '2026-09-01T00:00:00Z'}]
+        c, state_patch = self._client(s)
+        fake = {'choices': [{'message': {'content': 'I landed that.'}}]}
+        with state_patch, \
+             self._decider_patch(), \
+             unittest.mock.patch.object(serve, '_library_search_matches', return_value=[]), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync', return_value=fake) as mc:
+            resp = self._post(c, None, {'productId': 'p1', 'question': 'q'})
+        self.assertEqual(resp.status_code, 200)
+        j = resp.json()
+        self.assertEqual(mc.call_count, 1)          # no wasted on-call read
+        self.assertEqual(j['escalatedTo'], 'maya')  # straight to the completer
+        self.assertIn('Maya', mc.call_args.args[1][0]['content'])  # completer speaks
+        self.assertFalse(j['onCallFallback'])
+
+    def test_empty_pool_falls_back_to_director(self):
+        # A team with nobody rousable for the standing rotation must not 404 a
+        # player question: the owning team's own director answers as the
+        # last-resort on-call (flagged so the client can show who answered).
+        s = _state()
+        # Only the admin (maya) + her scrum master (dax) remain.
+        s['agentRoster'] = [
+            _director('maya', is_admin=True, name='Maya', director='maya'),
+            _director('dax', name='Dax', director='maya'),
+        ]
+        s['agents'] = {a['id']: {'id': a['id'], 'name': a['name'], 'role': a['role'],
+                                 'offDuty': False, 'profile': {'mission': 'help the think tank'}}
+                       for a in s['agentRoster']}
+        s['teams'] = [{'id': 'mayateam', 'directorId': 'maya', 'scrumMasterId': 'dax'}]
+        s['completedDeliverables'] = []
+        c, state_patch = self._client(s)
+        fake = {'choices': [{'message': {'content': 'Maya here -- let me check.'}}]}
+        with state_patch, \
+             self._decider_patch(), \
+             unittest.mock.patch.object(serve, '_library_search_matches',
+                                        return_value=[{'path': 'projects/p1/README.md', 'snippet': 'x'}]), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync', return_value=fake) as mc:
+            resp = self._post(c, None, {'productId': 'p1', 'question': 'q'})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        j = resp.json()
+        self.assertEqual(j['onCall'], 'maya')       # the director stepped in
+        self.assertTrue(j['onCallFallback'])
+        self.assertIn('Maya', mc.call_args.args[1][0]['content'])
 
     def test_missing_body_fields_are_rejected(self):
         c, state_patch = self._client(_state())
