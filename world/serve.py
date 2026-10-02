@@ -7229,6 +7229,11 @@ def _verify_model_works_sync(model_id):
             data = _call_openrouter_sync(model_id, [{'role': 'user', 'content': 'hi'}], MODEL_VERIFY_MAX_TOKENS)
             content = data['choices'][0]['message']['content']
             if content and content.strip():
+                # Housekeeping spend is real spend: the daily tier-refresh
+                # probes hit the live API, so they must accrue like every
+                # other model call -- otherwise the cap and the Bank would
+                # undercount the "just existing" cost of these probes.
+                _accrue_spend('__model_verify__', ((data or {}).get('usage') or {}).get('cost', 0.0))
                 return True
         except Exception:
             pass
@@ -7260,6 +7265,10 @@ def _verify_decision_model_works_sync(model_id):
                                                 'criteria': {'a': 'first option', 'b': 'second option'}}})
             data = json.loads(_urlopen_with_resilience(req, timeout=30))
             if data.get('answers', {}).get('choice', {}).get('choice'):
+                # Same accrual rule as the chat probe above: a real API call,
+                # so its cost belongs in the ledger (visible in the Bank,
+                # counted against the monthly cap) -- never silently free.
+                _accrue_spend('__model_verify__', ((data or {}).get('usage') or {}).get('cost', 0.0))
                 return True
         except Exception:
             pass
@@ -9012,6 +9021,11 @@ async def intent_clarify(request: Request):
     try:
         data = await asyncio.to_thread(_call_openrouter_sync, model, messages,
                                        int(body.get('max_tokens', 300)))
+        # The clarify lane spends real model money (mid tier, one or two calls
+        # per question) but was never accrued -- the cap and the Bank were
+        # undercounting every clarify answer. Dedicated bucket so its cost is
+        # visible separately from the ask lane.
+        _accrue_spend('__clarify__', ((data or {}).get('usage') or {}).get('cost', 0.0))
         reply = (data['choices'][0]['message']['content'] or '').strip()
     except Exception as e:
         return JSONResponse({'error': f'clarify failed: {e}'}, status_code=500)
@@ -9032,6 +9046,7 @@ async def intent_clarify(request: Request):
             try:
                 cdata = await asyncio.to_thread(_call_openrouter_sync, model, comp_messages,
                                                 int(body.get('max_tokens', 300)))
+                _accrue_spend('__clarify__', ((cdata or {}).get('usage') or {}).get('cost', 0.0))
                 reply = (cdata['choices'][0]['message']['content'] or '').strip()
                 escalated_to = completing
             except Exception:
