@@ -121,6 +121,9 @@ echo
 echo "== Python: per-team Backlog Refinement (scrum master creates stories) =="
 python3 tests/test_refinement.py
 echo
+echo "== Python: WS-14 -- shared backlog + features + sprint retrospectives (room-free cards) =="
+python3 tests/test_shared_backlog.py
+echo
 echo "== Python: Cut 2 -- grading + roadmap, coaching loop, incident runbooks =="
 python3 tests/test_cut2_processes.py
 echo
