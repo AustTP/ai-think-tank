@@ -7728,6 +7728,14 @@ def _merge_server_owned(existing, incoming):
         for _k in ('products', 'wiki'):
             if _k in existing:
                 merged[_k] = existing[_k]
+        # WS-14: features + the shared backlog + retrospectives are server-owned
+        # -- a pull assigns teamId/storyKey and a retro lands at sprint close,
+        # and the client's autosave holds neither, so its stale copies must not
+        # revert them (same hazard as products/wiki/teams above).
+        for _k in ('features', 'backlog', 'retrospectives',
+                   'pendingRetrospectives', 'pendingSprintRetros'):
+            if _k in existing:
+                merged[_k] = existing[_k]
         # Server cadence stamps are server-authoritative (see the _check_schedules
         # sentinel guard in sim.py). The client's autosave may still carry a stale
         # copy -- most dangerously the 1e18 TEST sentinel a pre-server-owned
@@ -7737,6 +7745,13 @@ def _merge_server_owned(existing, incoming):
         # client's copy win here.
         for _c in ('lastSkillReviewAt', 'lastStuckGateSweep', 'lastRunAt',
                    'lastGovernancePass', 'lastAutoHireAt', 'lastFiringReviewAt'):
+            if _c in existing:
+                merged[_c] = existing[_c]
+        # WS-14: monotonic counters for shared-backlog items and features are
+        # server-authoritative -- a stale client counter could otherwise make a
+        # hot state re-derive an id it already handed out (same hazard as the
+        # cadence stamps above).
+        for _c in ('featureCounter', 'backlogCounter'):
             if _c in existing:
                 merged[_c] = existing[_c]
     return merged
@@ -7957,6 +7972,76 @@ def _all_teams_busy_in_sprint(state):
     return True
 
 
+def _breakdown_into_shared_backlog(state, goal, admin_id):
+    """WS-14: when every team is busy in a sprint, break a large ask into 2-5
+    stories/spikes and file them in the SHARED unassigned backlog under a
+    feature (reusing the feature by name when one already exists). Returns
+    {'feature': <record>, 'items': [...]}, or None if the model call fails /
+    yields nothing usable -- the caller then falls back to spawning a team.
+    The breakdown is attributed to the admin (the standing authority); a team
+    pulls the items first-come when a sprint closes. BLOCKING urllib call --
+    callers must run it off-thread (asyncio.to_thread) so the /api/chat
+    loopback never deadlocks the single-worker event loop."""
+    if not admin_id:
+        return None
+    import sim as _sim
+    system_prompt = (
+        f'You are the admin of a small think tank. A large task just arrived, but every '
+        f'team is already committed to an active sprint, so the task cannot be staffed right now. '
+        'Break it into 2 to 5 concrete stories (or spikes for investigation-first work), each a single '
+        'worker-sized card to be filed in the shared backlog and pulled by a team when its sprint closes. '
+        'Do NOT assign a room to a card -- the rooms are shared across teams and the agent who picks a '
+        'card up figures out where the work needs to happen. '
+        'Give a short FEATURE name (3-6 words) that groups these cards under one initiative. '
+        'Keep every title to ONE short sentence. For each card set "type" to "story" (deliverable work) '
+        'or "spike" (an investigation with no committed deliverable -- use it when the right approach is '
+        'not yet known), a one-line "acceptanceCriteria" when the story has a clear test of done, and a '
+        '"sizeEstimate" of S/M/L. '
+        'Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: '
+        '{"feature":"short feature name","items":[{"title":"short title","type":"story|spike","acceptanceCriteria":"one line or omitted","sizeEstimate":"S|M|L"}]}'
+    )
+    key = get_or_create_agent_key(admin_id)
+    # High-stakes planning tier, JEV-gated: a large-request breakdown is exactly
+    # the "damn good reason to use high" case -- the whole downstream depends on
+    # this one call (same gate as the staffable path below).
+    plan_tier = _resolve_model_tier(
+        f'Breaking an unstaffable large request into shared-backlog stories: {goal[:200]}',
+        allow_high=True)
+    r = _http_json('POST', SELF_BASE_URL, '/api/chat',
+                   {'model': plan_tier,
+                    'messages': [{'role': 'system', 'content': system_prompt},
+                                 {'role': 'user', 'content': goal}],
+                    'max_tokens': _big_task_max_tokens,
+                    'agentId': admin_id}, key, timeout=90)
+    if not isinstance(r, dict) or r.get('error') or not r.get('reply'):
+        return None
+    cleaned = r['reply'].strip()
+    cleaned = re.sub(r'^```json\s*|^```\s*|```\s*$', '', cleaned)
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        return None
+    items = [s for s in (parsed.get('items') or [])
+             if isinstance(s, dict) and s.get('title')]
+    if not items:
+        return None
+    now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+    feature = _sim.create_or_reuse_feature(state, parsed.get('feature') or goal[:60],
+                                           now_ms, created_by=admin_id)
+    out = []
+    for s in items:
+        item = _sim.add_backlog_item(
+            state, s['title'], feature['id'], admin_id, now_ms,
+            item_type=s.get('type') or 'story',
+            acceptance_criteria=s.get('acceptanceCriteria'),
+            size_estimate=s.get('sizeEstimate'))
+        if item:
+            out.append(item)
+    if not out:
+        return None
+    return {'feature': feature, 'items': out}
+
+
 @app.post('/api/intent/assign-big-task')
 async def intent_assign_big_task(request: Request):
     """Player intent: 'delegate / big task'. Server-side assignBigTask. Requires
@@ -7981,17 +8066,34 @@ async def intent_assign_big_task(request: Request):
 
     # Large-request routing: backlog refinement should start the
     # moment a large request is sent, and when EVERY existing team is already
-    # committed to an active sprint, a new director + team is created to take
-    # the ask (with an employee; the director stands in as scrum master while
-    # the team is small). That new team's refinement is kicked to run on the
-    # very next pass, so it starts grooming the request immediately instead of
-    # waiting for the weekly cadence.
+    # committed to an active sprint, the ask is broken down into stories/spikes
+    # filed in the SHARED backlog under a feature -- any team pulls from it
+    # (first-come) when a sprint closes, so the work is captured without
+    # spawning an unbounded number of teams. If the breakdown fails (model
+    # outage), we fall back to the original behavior: spawn a new director +
+    # team to take the ask (with an employee; the director stands in as scrum
+    # master while the team is small), and kick its refinement to run on the
+    # very next pass so it starts grooming immediately.
     import sim as _sim
     if _all_teams_busy_in_sprint(state):
-        goal_for_team = goal
         admin_id_for_new = next((d.get('id') for d in (state.get('agentRoster') or [])
                                  if d.get('isAdmin')), None)
-        new_team = _sim.spawn_new_team_for_request(state, goal_for_team, admin_id=admin_id_for_new)
+        backlogged = await asyncio.to_thread(_breakdown_into_shared_backlog,
+                                             state, goal, admin_id_for_new)
+        if backlogged:
+            save_state_to_db(state)
+            log_action(player_id, 'big_task_backlogged',
+                       {'goal': goal[:200],
+                        'feature': backlogged['feature'].get('id'),
+                        'items': [b.get('id') for b in backlogged['items']]},
+                       authorized=True)
+            return JSONResponse({'ok': True, 'backlogged': True,
+                                 'feature': backlogged['feature'].get('id'),
+                                 'featureName': backlogged['feature'].get('name'),
+                                 'items': len(backlogged['items']),
+                                 'note': 'Every existing team was busy in a sprint, so this request was broken down and filed in the shared backlog under a feature. A team pulls from it (first-come) when a sprint closes.'})
+        # Fallback: the model couldn't break it down -- spawn a fresh team.
+        new_team = _sim.spawn_new_team_for_request(state, goal, admin_id=admin_id_for_new)
         if new_team:
             save_state_to_db(state)
             log_action(player_id, 'big_task_new_team',
@@ -10270,6 +10372,26 @@ async def list_teams(request: Request):
         }
         out.append(tcopy)
     return JSONResponse({'teams': out})
+
+
+@app.get('/api/backlog')
+async def list_backlog(request: Request):
+    """WS-14 read view: the shared backlog board -- features, unassigned/picked
+    items, and completed retrospectives -- so the player can see what a
+    saturated think tank captured and which teams pulled what."""
+    state = get_state_from_db() or {}
+    backlog = []
+    roster = {d.get('id'): d.get('name') for d in (state.get('agentRoster') or [])}
+    for b in (state.get('backlog') or []):
+        copy = dict(b)
+        tid = copy.get('teamId')
+        copy['teamName'] = roster.get(tid) if isinstance(tid, str) else None
+        backlog.append(copy)
+    return JSONResponse({
+        'features': list((state.get('features') or {}).values()),
+        'backlog': backlog,
+        'retrospectives': list((state.get('retrospectives') or {}).values()),
+    })
 
 
 @app.put('/api/teams/{team_id}')

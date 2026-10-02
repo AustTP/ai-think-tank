@@ -1358,6 +1358,14 @@ WORK_REQUEST_ROOM_THIN = 1
 # Hard cap of filed-but-not-yet-groomed requests in a single ceremony, so a
 # churny think tank can't convene a backlog-refinement meeting over a runaway list.
 REFINEMENT_MAX_REQUESTS = 20
+# WS-14 (shared backlog + sprint retrospectives): when every team is committed
+# to an active sprint, extra large asks are broken down into stories/spikes in a
+# SHARED unassigned backlog under a FEATURE; a team pulls the first eligible item
+# (first-come) when a sprint closes, runs a START/STOP/CONTINUE retrospective
+# (scrum master + team, director excluded), and refines its backlog at close.
+RETRO_MEET_MS = 10_000           # brief decision horizon (never a required wait)
+MAX_BACKLOG_ITEMS = 200          # hard cap on shared unassigned stories
+BACKLOG_PULLS_PER_CLOSE = 1      # items a closing sprint pulls per team
 # SM-committed `blocked` FIELD on issues. The scrum master is the
 # single authority who flips issue['blocked']; the judgment ALWAYS happened
 # upstream (supervisor/director Jev-pass for a set, or a deterministic
@@ -1662,11 +1670,14 @@ def queue_work(state, items):
     if not isinstance(work_queue, list):
         work_queue = state['workQueue'] = []
     for item in items:
-        if not item or not item.get('title') or not item.get('room'):
+        # A room-less card is legitimate: a shared-backlog card is room-free on
+        # purpose, and the ASSIGNED agent resolves the room at assignment
+        # (_assign_due_item). Every other caller supplies a room.
+        if not item or not item.get('title'):
             continue
         work_queue.append({
             'title': item['title'],
-            'room': item['room'],
+            'room': item.get('room') or None,
             'instructions': item.get('instructions') or f"Pick whoever is best suited for: {item['title']}",
             # A player-filed JIRA card's contract: the normalized user story +
             # acceptance criteria survive the queue round trip onto the real task
@@ -1713,6 +1724,14 @@ def queue_work(state, items):
             # starve one team's queue while another sits idle.
             'teamId': item.get('teamId') or None,
             'sprintId': item.get('sprintId') or None,
+            # WS-14: a story pulled from the shared backlog keeps its provenance
+            # -- the FEATURE it belongs to and the SHARED-BACKLOG item id it was
+            # claimed from -- so the sprint digest and backlog board can read
+            # completion back off the durable task mirror (same whitelist
+            # contract as 'distill'/'checklist': silently dropping a field its
+            # consumer needs breaks the pull loop).
+            'featureId': item.get('featureId') or None,
+            'backlogItemId': item.get('backlogItemId') or None,
             # Phase E: a pressoffice task may target a product (its build
             # releases the artifact) and carry optional pre-injected wiki pages.
             'productId': item.get('productId') or None,
@@ -2158,16 +2177,218 @@ def _auto_close_completed_sprints(state, now_ms=None):
     the player to tap close. Returns the list of sprint ids closed."""
     sprints = state.get('sprints') or {}
     closed = []
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
     for sid, record in list(sprints.items()):
         if record.get('status') != 'active':
             continue
         progress = sprint_progress(state, sid)
         if progress and progress.get('total') and progress['done'] >= progress['total']:
             close_sprint(state, sid)
-            record['closedAt'] = (time.time() * 1000) if now_ms is None else now_ms
+            record['closedAt'] = now_ms
             record['autoClosed'] = True
             closed.append(sid)
+            # WS-14 sprint-close ceremony: retrospective + shared-backlog pull +
+            # refinement kick happen the moment the sprint fully lands.
+            _on_sprint_closed(state, record, now_ms)
     return closed
+# ---------------------------------------------------------------------------
+# WS-14: shared backlog + features. When every team is already committed to an
+# active sprint, extra large asks are broken down by an authority into STORIES /
+# SPIKES filed in a SHARED unassigned backlog under a FEATURE (created when none
+# exists). Any team is eligible to pull at sprint close (first-come); the pull
+# claims the item for the team with a team-scoped story key (reusing the JIRA
+# issue counters) and queues it as real work. Pure state mutation -- serve.py
+# does the model-call breakdown and keeps the decoupled constants.
+# ---------------------------------------------------------------------------
+
+
+def _next_feature_id(state):
+    """Monotonic feature id (feat-1, feat-2, ...), so a cold state starts at 1
+    and a hot one never collides (mirrors next_sprint_id / next_product_id)."""
+    n = int(state.get('featureCounter') or 0) + 1
+    state['featureCounter'] = n
+    return f'feat-{n}'
+
+
+def _next_backlog_id(state):
+    """Monotonic shared-backlog item id (bl-1, bl-2, ...)."""
+    n = int(state.get('backlogCounter') or 0) + 1
+    state['backlogCounter'] = n
+    return f'bl-{n}'
+
+
+def _find_feature(state, name):
+    """The feature whose name matches `name` (case-insensitive), or None."""
+    name = (name or '').strip()
+    if not name:
+        return None
+    for f in (state.get('features') or {}).values():
+        if f.get('name') and f['name'].lower() == name.lower():
+            return f
+    return None
+
+
+def create_or_reuse_feature(state, name, now_ms, quarter=None, target_date_ms=None,
+                            created_by=None):
+    """Pure: the feature record for `name`, reusing the existing one when a
+    feature by that name is already on the board (a feature groups the backlog
+    stories of one initiative; breakdowns of the same initiative share it).
+    Returns the record. Mutates state['features'] + state['featureCounter']."""
+    f = _find_feature(state, name)
+    if f:
+        return f
+    fid = _next_feature_id(state)
+    f = {
+        'id': fid,
+        'name': (name or '').strip() or f'Feature {fid}',
+        'quarter': quarter or None,
+        'targetDate': target_date_ms or None,
+        'status': 'open',  # open / in_progress / done
+        'storyIds': [],
+        'createdAt': now_ms,
+        'createdBy': created_by or None,
+    }
+    state.setdefault('features', {})[fid] = f
+    return f
+
+
+def add_backlog_item(state, title, feature_id, created_by, now_ms,
+                     item_type='story', acceptance_criteria=None,
+                     size_estimate=None, goal=None, instructions=None,
+                     blocked_by=None):
+    """Pure: file one unassigned STORY/SPIKE in the SHARED backlog under
+    `feature_id`. Returns the item dict, or None if the cap is reached or the
+    item is malformed. Mutates state['backlog'] + state['backlogCounter'] +
+    the feature's storyIds. Unassigned until a team pulls it (teamId + storyKey
+    are assigned at pickup).
+
+    A card carries NO room: the buildings are shared across teams, so the room
+    is an EXECUTION detail -- the agent who picks the card up figures out where
+    the work needs to happen (_assign_due_item resolves it at assignment)."""
+    title = (title or '').strip()
+    if not title:
+        return None
+    backlog = state.setdefault('backlog', [])
+    if len(backlog) >= MAX_BACKLOG_ITEMS:
+        return None
+    bid = _next_backlog_id(state)
+    item = {
+        'id': bid,
+        'title': title,
+        'type': 'spike' if item_type == 'spike' else 'story',
+        'featureId': feature_id or None,
+        'status': 'blocked' if blocked_by else 'ready',  # ready / blocked / picked
+        'blockedBy': blocked_by or None,
+        'acceptanceCriteria': acceptance_criteria or None,
+        'sizeEstimate': size_estimate or None,
+        'goal': goal or None,
+        'instructions': instructions or None,
+        'createdBy': created_by or None,
+        'createdAt': now_ms,
+        'teamId': None,   # assigned at pickup
+        'storyKey': None, # assigned at pickup (DEV-1, ...)
+    }
+    backlog.append(item)
+    if item['featureId']:
+        f = (state.get('features') or {}).get(item['featureId'])
+        if f:
+            f.setdefault('storyIds', []).append(bid)
+    return item
+
+
+def backlog_ready_items(state):
+    """Eligible shared-backlog items: READY (not blocked-by-dependency) and
+    unassigned (no teamId yet), in FIFO order. A blocked item waits for its
+    dependency to clear."""
+    return [b for b in (state.get('backlog') or [])
+            if b.get('status') == 'ready' and not b.get('teamId')]
+
+
+def pull_backlog_item(state, team_id, now_ms):
+    """Atomic first-come pull for `team_id`: claim the oldest eligible item,
+    assign teamId + a team-scoped story key, flip status -> 'picked'. Returns
+    the claimed item, or None if nothing is eligible."""
+    ready = backlog_ready_items(state)
+    if not ready:
+        return None
+    item = ready[0]
+    item['teamId'] = team_id
+    item['storyKey'] = next_issue_key(state, team_id)
+    item['status'] = 'picked'
+    item['pickedAt'] = now_ms
+    return item
+
+
+def _resolve_assignment_room(pick):
+    """The room a ROOM-LESS work card is routed to when an agent picks it up.
+    A shared-backlog card is room-free on purpose (the buildings are shared; the
+    room is an execution detail), so the ASSIGNED AGENT figures out where the
+    work needs to happen -- realized deterministically by the card's nature: an
+    investigation spike goes to the observatory, a deliverable story to the
+    press office (real files get written there)."""
+    return 'observatory' if pick.get('taskType') == 'spike' else 'pressoffice'
+
+
+def _pull_backlog_for_team(state, team_id, now_ms):
+    """Pull the first eligible shared-backlog card for `team_id` and queue it as
+    real work, tagged with its feature + backlog item + team so the sprint digest
+    and backlog board can read completion back off the durable task mirror. The
+    card is queued ROOM-LESS on purpose: the agent who picks it up figures out
+    where the work needs to happen (_assign_due_item resolves the room at
+    assignment). Returns the pulled card, or None when nothing is eligible."""
+    item = pull_backlog_item(state, team_id, now_ms)
+    if not item:
+        return None
+    is_spike = item.get('type') == 'spike'
+    instructions = item.get('instructions')
+    if not instructions:
+        instructions = (f"({item.get('storyKey') or item['id']}) {item.get('title')}")
+        if item.get('acceptanceCriteria'):
+            instructions += f"\n\nAcceptance criteria:\n{item['acceptanceCriteria']}"
+    queue_work(state, [{
+        'title': item['title'],
+        'room': None,  # the assigned agent decides where the work happens
+        'instructions': instructions,
+        'goal': item.get('goal'),
+        'teamId': team_id,
+        'taskType': 'spike' if is_spike else 'code',
+        'budgetMs': 60_000 if is_spike else None,
+        'featureId': item.get('featureId'),
+        'backlogItemId': item['id'],
+    }])
+    _log_governance(state, team_id, 'backlog_pull',
+                    {'item': item['id'], 'storyKey': item.get('storyKey'),
+                     'feature': item.get('featureId'), 'team': team_id})
+    return item
+
+
+def _team_in_active_sprint(state, team_id):
+    """True when `team_id` is tied to any ACTIVE sprint. WS-14: a team refines
+    its backlog at sprint close, never mid-sprint -- the active sprint is the
+    committed work, and refinement waits until the team is free."""
+    for s in (state.get('sprints') or {}).values():
+        if s.get('status') == 'active' and team_id in (s.get('teamIds') or []):
+            return True
+    return False
+
+
+def _on_sprint_closed(state, record, now_ms):
+    """WS-14 sprint-close ceremony, run the moment a sprint auto-closes: queue
+    the team's START/STOP/CONTINUE retrospective (a ceremony on a later pass),
+    pull the first eligible shared-backlog item for each team that sprint
+    touched (first-come), and kick each team's backlog refinement so the scrum
+    master re-plans at close. Pure state mutation; nothing here blocks."""
+    team_ids = [t for t in (record.get('teamIds') or []) if _team_row(state, t)]
+    retros = state.setdefault('pendingSprintRetros', [])
+    if record['id'] not in retros:
+        retros.append(record['id'])
+    for tid in team_ids:
+        for _ in range(BACKLOG_PULLS_PER_CLOSE):
+            _pull_backlog_for_team(state, tid, now_ms)
+        kick_refinement_now(state, tid, now_ms)
+
+
 # ---------------------------------------------------------------------------
 # Phase E: products + wiki. A PRODUCT is a named, director-authored artifact
 # with a spec/owner/contributors/revision log whose "release" freezes its
@@ -6344,6 +6565,12 @@ def _refinement_step(state, now, now_ms, decider=None):
         scrum_master_id = _refinement_scrum_master_for_team(state, team_id)
         if not scrum_master_id:
             continue  # this team has no (effective) scrum master designated yet
+        if _team_in_active_sprint(state, team_id):
+            # WS-14: a team in an active sprint refines at CLOSE, never
+            # mid-sprint -- the sprint is the committed work. The cadence stamp
+            # is deliberately NOT advanced, so the moment the sprint closes the
+            # next pass finds the team due and convenes immediately.
+            continue
         if not _refinement_cadence_due_for(state, team_id, now_ms,
                                            legacy=state.get('lastBacklogRefinementAt')):
             continue
@@ -6365,6 +6592,210 @@ def _refinement_step(state, now, now_ms, decider=None):
             'teamId': team_id, 'people': {},
         }
         slot += 1  # only to spread simultaneous ceremonies apart in the room
+
+
+# ---------------------------------------------------------------------------
+# WS-14: sprint retrospective (START / STOP / CONTINUE). When a sprint closes,
+# its team meets at the Command Center -- the scrum master + the team's
+# non-director members, with the DIRECTOR explicitly excluded (a retrospective
+# is the team's own reflection, per the player's design) -- and records what to
+# start, stop, and keep doing. Same convene-then-resolve ceremony shape as
+# backlog refinement; the decider is injectable like every other Jev decision.
+# ---------------------------------------------------------------------------
+
+
+def _retro_scrum_master(state, team_ids):
+    """The agent who facilitates a sprint's retrospective: the first team in the
+    sprint's team list with a NON-DIRECTOR effective scrum master. Returns None
+    for a small team whose only effective scrum master is its director (a retro
+    must exclude the director, so it waits until the team has a real scrum
+    master)."""
+    teams = {t.get('id'): t for t in (state.get('teams') or [])}
+    for tid in team_ids or []:
+        sm = _refinement_scrum_master_for_team(state, tid)
+        if sm and sm != (teams.get(tid) or {}).get('directorId'):
+            return sm
+    return None
+
+
+def _retro_attendees(state, team_ids, scrum_master_id):
+    """The retrospective's attendees: the scrum master + every non-director
+    member of the sprint's teams, with the DIRECTOR excluded. A busy attendee
+    defers the whole meeting (never pull an agent out of a live collaboration);
+    an off-duty attendee is parked and free, and the convene wakes her. Returns
+    the attendee ids, or None if any attendee is busy."""
+    agents = state.get('agents') or {}
+    ids = [scrum_master_id]
+    for tid in team_ids or []:
+        t = next((x for x in (state.get('teams') or []) if x.get('id') == tid), None)
+        if not t:
+            continue
+        director_id = t.get('directorId')
+        for aid in _sim_direct_reports(state, director_id):
+            if aid not in ids and aid != director_id:
+                ids.append(aid)
+    for aid in ids:
+        a = agents.get(aid)
+        if not a or a.get('busy'):
+            return None
+    return ids
+
+
+def _start_retrospective(state, sprint_id, team_ids, scrum_master_id, now_ms, pos_offset=0):
+    """Convene the sprint retrospective at the Command Center: snapshot each
+    attendee's prior state into `pending['people']`, mark them busy at a spread,
+    and schedule the resolve RETRO_MEET_MS later. Returns True if convened
+    (attendees healthy), False to defer and retry next pass."""
+    ids = _retro_attendees(state, team_ids, scrum_master_id)
+    if not ids:
+        return False
+    agents = state.get('agents') or {}
+    snap = {}
+    base_x = 315 + (pos_offset * 460)
+    for i, aid in enumerate(ids):
+        a = agents.get(aid)
+        snap[aid] = {k: a.get(k) for k in ('offDuty', 'visible', 'x', 'y', 'dir',
+                                           'task', 'busy', 'inRoom', 'pairWith', 'handoff', 'workUntil')}
+        a['busy'] = True
+        a['visible'] = True
+        a['offDuty'] = False
+        a['task'] = None
+        a['inRoom'] = 'commandcenter'
+        a['dir'] = 'south'
+        a['roomX'] = base_x + (i * 85)
+        a['roomY'] = 155
+    state.setdefault('pendingRetrospectives', {})[sprint_id] = {
+        'at': now_ms + RETRO_MEET_MS, 'embarked': True,
+        'sprintId': sprint_id, 'scrumMasterId': scrum_master_id,
+        'teamIds': team_ids, 'people': snap,
+    }
+    _log_governance(state, scrum_master_id, 'retrospective',
+                    {'action': 'meeting_start', 'sprint': sprint_id})
+    return True
+
+
+def _resolve_retrospective(state, pending, now_ms, decider=None):
+    """When the retrospective window elapses, the scrum master records the
+    just-closed sprint's START / STOP / CONTINUE reflections via the injectable
+    decider, everyone returns to their prior state, and the record lands in
+    state['retrospectives'][sprint_id]. Idempotent if the sprint vanished."""
+    decider = decider or _retro_decider
+    sprint_id = pending.get('sprintId')
+    agents = state.get('agents') or {}
+    scrum_master_id = pending.get('scrumMasterId')
+    scrum_master = (agents.get(scrum_master_id) or {})
+    sm_def = next((d for d in (state.get('agentRoster') or []) if d.get('id') == scrum_master_id), {})
+    sm_name = sm_def.get('name') or scrum_master.get('name') or scrum_master_id
+    record = (state.get('sprints') or {}).get(sprint_id) or {}
+    progress = sprint_progress(state, sprint_id) or {}
+    landed = progress.get('landed') or []
+    landed_text = ', '.join(landed) if landed else '(nothing landed)'
+    instructions = (
+        f"{sm_name} is the scrum master facilitating the retrospective for the just-closed sprint "
+        f"'{record.get('name') or sprint_id}' (goal: {record.get('goal') or 'none'}). "
+        f"What landed this sprint: {landed_text}. "
+        "Name concrete, honest START / STOP / CONTINUE items for the team. START = something the team "
+        "should begin doing (a new habit). STOP = something that wasted effort or didn't work. "
+        "CONTINUE = something that worked and should be kept. 2-4 terse items per bucket; every item must be "
+        "a specific behavior the team controls, never a vague compliment. Respond with ONLY valid JSON, no "
+        "markdown fences: {\"start\":[\"...\"],\"stop\":[\"...\"],\"continue\":[\"...\"]}"
+    )
+    data = decider(state, instructions, sprint_id, landed)
+    buckets = {'start': [], 'stop': [], 'continue': []}
+    if isinstance(data, dict):
+        for k in buckets:
+            v = data.get(k)
+            if isinstance(v, list):
+                buckets[k] = [str(x).strip()[:160] for x in v if str(x).strip()][:4]
+    # Restore attendees; the meeting burned none of a mid-task attendee's time.
+    for aid, snap in (pending.get('people') or {}).items():
+        _restore_refinement_agent(state, aid, snap, now_ms, RETRO_MEET_MS)
+    state.setdefault('retrospectives', {})[sprint_id] = {
+        'id': sprint_id,
+        'sprintId': sprint_id,
+        'sprintName': record.get('name') or sprint_id,
+        'landed': landed,
+        'teamIds': pending.get('teamIds') or [],
+        'attendees': list((pending.get('people') or {}).keys()),
+        'completedAt': now_ms,
+        'start': buckets['start'],
+        'stop': buckets['stop'],
+        'continue': buckets['continue'],
+    }
+    _log_governance(state, scrum_master_id, 'retrospective',
+                    {'action': 'meeting_end', 'sprint': sprint_id,
+                     'start': len(buckets['start']), 'stop': len(buckets['stop']),
+                     'continue': len(buckets['continue'])})
+    state.setdefault('pendingRetrospectives', {}).pop(sprint_id, None)
+
+
+def _retro_decider_default(state, instructions, sprint_id, landed):
+    """Default resolver for a sprint retrospective: a low-tier chat call that
+    returns a START / STOP / CONTINUE JSON object, accrued to its own spend
+    bucket. Returns the parsed dict, or an empty dict on a model outage (an
+    empty retro is recorded rather than blocking the sprint's close)."""
+    try:
+        import serve
+    except Exception:
+        return {}
+    try:
+        model = serve._low_tier_slug()
+        data = serve._call_openrouter_sync(
+            model,
+            [{'role': 'system', 'content': instructions},
+             {'role': 'user', 'content': f"Run the retrospective for sprint {sprint_id}."}],
+            max_tokens=200)
+        cost = (data.get('usage') or {}).get('cost', 0.0)
+        if isinstance(cost, (int, float)) and cost:
+            serve._accrue_spend('__retrospectives__', cost)
+        reply = ((data.get('choices') or [{}])[0].get('message') or {}).get('content') or ''
+        start = reply.find('{')
+        end = reply.rfind('}')
+        if start != -1 and end > start:
+            reply = reply[start:end + 1]
+        parsed = json.loads(reply)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {}
+
+
+# Injectable for tests (mirrors _refinement_decider / _governance_decider); the
+# live loop uses the low-tier default. The retro NEVER holds the sprint's close
+# -- it is a ceremony on a later pass, so an outage costs nothing but the text.
+_retro_decider = _retro_decider_default
+
+
+def _retro_step(state, now, now_ms, decider=None):
+    """One sprint-retrospective pass, called from _task_cycle ungated (the retro
+    is the point even on a quiet think tank, and must not be starved by the work
+    gate). A pass (a) advances every in-flight retrospective (embark on one pass,
+    RELEASE on the next -- same no-required-wait as refinement), and (b) convenes
+    a retrospective for every sprint queued in pendingSprintRetros whose team has
+    a non-director scrum master + healthy attendees; a sprint whose team isn't
+    ready yet stays queued for the next pass."""
+    pending_map = state.setdefault('pendingRetrospectives', {})
+    for sid in list(pending_map.keys()):
+        pending = pending_map[sid]
+        if not pending.get('embarked'):
+            _start_retrospective(state, sid, pending.get('teamIds', []),
+                                 pending.get('scrumMasterId'), now_ms)
+        else:
+            _resolve_retrospective(state, pending, now_ms, decider=decider)
+    slot = 0
+    queued = state.get('pendingSprintRetros') or []
+    for sid in list(queued):
+        if sid in pending_map:
+            continue  # this sprint already has an in-flight retrospective
+        record = (state.get('sprints') or {}).get(sid) or {}
+        scrum_master_id = _retro_scrum_master(state, record.get('teamIds') or [])
+        if not scrum_master_id:
+            continue  # small team whose only SM is the director -- retro waits
+        team_ids = [t for t in (record.get('teamIds') or []) if _team_row(state, t)]
+        if _start_retrospective(state, sid, team_ids, scrum_master_id, now_ms, pos_offset=slot):
+            queued.remove(sid)
+            slot += 1
 
 
 # ---------------------------------------------------------------------------
@@ -7227,6 +7658,11 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # when there are no pending requests or no scrum master to run it.
     _refinement_step(state, now, now_ms)
 
+    # WS-14: sprint retrospectives -- a just-closed sprint's team meets to capture
+    # START / STOP / CONTINUE (director excluded) on a later pass. Runs ungated
+    # like the Social / refinement, so a closed sprint never strands its retro.
+    _retro_step(state, now, now_ms)
+
     # Cut 2 roadmap: weekly silent recompute of per-room priority from trailing
     # deliverable grades + delivery volume. Cheap (state-only, no ceremony, no
     # Jev spend); runs before the gate so a quiet think tank still keeps its
@@ -7508,6 +7944,12 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     assign. Returns the task dict or None. Mirrors assignTaskViaJev's
     fallback-to-first-eligible but replaces JEV with a deterministic pick."""
     agents = state.get('agents') or {}
+    # A shared-backlog card is queued ROOM-LESS on purpose: the ASSIGNED agent
+    # figures out where the work needs to happen. Resolve the room here, at the
+    # moment of assignment, and persist it onto the pick so the walk/gate/grade
+    # lifecycle (which routes by task['room']) sees a concrete room.
+    if not pick.get('room'):
+        pick['room'] = _resolve_assignment_room(pick)
     candidates = _eligible_candidates(state, can_wake_off_duty)
     # Phase E addendum: a re-opened fix may be pinned to its original author, and
     # a gate review is pinned to its reviewer (pick['assignedTo']). Honor that --
