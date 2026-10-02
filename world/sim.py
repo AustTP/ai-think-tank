@@ -1742,18 +1742,30 @@ def _team_oncall_members(state, director_id):
     return pool
 
 
-def on_call_agent(state, director_id, sprint_id=None):
+def on_call_agent(state, director_id, sprint_id=None, now_ms=None):
     """Phase E2d: which agent on `director_id`'s team is on-call right now.
     Deterministic per-sprint rotation over the team's non-scrum-master, non-admin
     members -- derived, not stored (same precedent as sprint_progress). The
     rotation uses a stable hash of the sprint id so the same sprint id always
     hands back the same on-call across restarts, and shifts across sprints.
-    Among the base pick we prefer an ACTIVE member (on-duty, not off-duty) over a
-    resting one; deadfall back to the rotation slot so the role is never empty.
+
+    Within a rotation the pager prefers an AVAILABLE member (on-duty and not
+    mid-work): if the primary is busy, the BACKUP is the next slot in rotation
+    order and the second backup the slot after that -- so an on-call who is
+    already working hands the pager to her backup instead of double-booking
+    her. A question/incident NOT tied to a sprint has no natural advance point
+    (the sprint counter is static), so the slot also shifts with the UTC day --
+    the pager actually moves even on a sprint-less team.
+
+    Deadfalls back to the primary slot when the whole team is unavailable, so
+    the pin still names a concrete owner (assignment re-derives if it can and
+    otherwise falls back to the team's best free worker).
     Returns an agent id or None if the team has no rousable members."""
     pool = _team_oncall_members(state, director_id)
     if not pool:
         return None
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
     seed = sprint_id or 'default'
     # stable hash across restarts; fold in a running sprint counter so rotations
     # actually advance even if sprint ids were reused.
@@ -1763,19 +1775,23 @@ def on_call_agent(state, director_id, sprint_id=None):
     for ch in str(seed):
         h = (h * 31 + ord(ch)) & 0xffffffff
     idx = (h + counter) % len(pool)
-    pick = pool[idx]
+    if not sprint_id:
+        # No sprint anchor (player question, unscheduled incident) -> shift the
+        # slot by the UTC day so the pager moves even when a team's sprint list
+        # is static. Still derived: a pure function of state + now_ms.
+        idx = (idx + now_ms // 86400000) % len(pool)
     agents = state.get('agents') or {}
-    def _active(aid):
+    def _available(aid):
         a = agents.get(aid)
-        return bool(a) and not a.get('offDuty')
-    # Prefer an active member among the pool before falling back to the bare
-    # rotation slot; if the computed slot is off-duty but an active teammate
-    # exists, take the active teammate in roster order.
-    if not _active(pick):
-        actives = [m for m in pool if _active(m)]
-        if actives:
-            return actives[0]
-    return pick
+        return bool(a) and not a.get('offDuty') and not a.get('busy') \
+            and not a.get('task') and not a.get('pairWith')
+    # Prefer an available member in ROTATION order: the primary slot, then its
+    # backup (next slot), then the second backup (the one after that), ...
+    for i in range(len(pool)):
+        cand = pool[(idx + i) % len(pool)]
+        if _available(cand):
+            return cand
+    return pool[idx]
 
 
 def queue_bug(state, product_id, title, now_ms=None, room=None, reported_by=None,
@@ -1793,7 +1809,7 @@ def queue_bug(state, product_id, title, now_ms=None, room=None, reported_by=None
     director_id = prod.get('teamId')
     if not director_id:
         return None
-    oc = on_call_agent(state, director_id, sprint_id)
+    oc = on_call_agent(state, director_id, sprint_id, now_ms)
     if not oc:
         return None
     # One-in-flight cap per owning team + product: a gutted on-call must not
@@ -1862,6 +1878,8 @@ def clarify_router_plan(state, product_id, question, sprint_id=None):
         {'onCall': agent_id,            # answers first (KB-first)
          'completing': agent_id|None,   # fallback if on-call can't answer
          'product': {...}               # the product record (may be {})
+         'onCallFallback': bool         # True when the director answered in
+                                        # the on-call's place (empty pool)
     }
     `completing` is the most recent agent who landed a deliverable matching the
     product name/alias -- derived from completedDeliverables. None on-call => no
@@ -1870,13 +1888,26 @@ def clarify_router_plan(state, product_id, question, sprint_id=None):
     prod = products.get(product_id) or {}
     director_id = prod.get('teamId')
     oc = None
+    fallback = False
     if director_id:
         oc = on_call_agent(state, director_id, sprint_id)
+    if not oc and director_id:
+        # Last resort: nobody on the owning team is rousable for the standing
+        # rotation (e.g. a team of just an admin + scrum master). A PLAYER
+        # question is worth the team's own director answering even though
+        # admins never join the rotation -- admins don't do the work, but an
+        # unanswered question is worse than an admin answer. Incident routing
+        # keeps the stricter rule (queue_bug never falls back like this).
+        director = (state.get('agents') or {}).get(director_id)
+        if director and not director.get('offDuty'):
+            oc = director_id
+            fallback = True
     completing = _completing_agent_for_product(state, product_id, prod)
     return {
         'onCall': oc,
         'completing': completing,
         'product': prod,
+        'onCallFallback': fallback,
     }
 
 
@@ -7300,6 +7331,21 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
                 _spawn_at_room_door(state, pinned, pick.get('room'), agents, grid, doors)
         elif pinned in candidates:
             chosen_id = pinned
+        elif pick.get('incident'):
+            # The on-call is mid-work (busy/task/pairWith) so the pin can't be
+            # honored. Re-derive the owning team's current on-call -- the
+            # rotation already fell through to the backup / second backup -- so
+            # the incident stays on the owning team instead of leaking to a
+            # global round-robin pick on an unrelated team. Falls to None
+            # (generic round-robin) only when the whole team is unavailable.
+            chosen_id = None
+            director_id = _product_director(state, pick.get('productId'))
+            if director_id:
+                backup = on_call_agent(state, director_id, pick.get('sprintId'), now_ms)
+                if backup and backup != pinned and agents.get(backup):
+                    chosen_id = backup
+                    if agents.get(backup).get('offDuty'):
+                        _spawn_at_room_door(state, backup, pick.get('room'), agents, grid, doors)
         else:
             chosen_id = None
     else:

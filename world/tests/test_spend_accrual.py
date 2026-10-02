@@ -156,7 +156,8 @@ class ClarifyLaneAccrual(unittest.TestCase):
         with state_patch, \
              unittest.mock.patch.object(serve, '_tier_gate_decider',
                                         lambda purpose, criteria: ('low', 1.0)), \
-             unittest.mock.patch.object(serve, '_library_search_matches', return_value=[]), \
+             unittest.mock.patch.object(serve, '_library_search_matches',
+                                        return_value=[{'path': 'projects/p1/README.md', 'snippet': 'input'}]), \
              unittest.mock.patch.object(serve, '_call_openrouter_sync', return_value=fake), \
              unittest.mock.patch.object(serve, '_accrue_spend',
                                         side_effect=lambda s2, c2: calls.append((s2, c2))):
@@ -180,10 +181,14 @@ class ClarifyLaneAccrual(unittest.TestCase):
         second = {'choices': [{'message': {'content': 'I landed that.'}}],
                   'usage': {'cost': 0.0222}}
         calls = []
+        # Non-empty KB so the on-call's grounded read runs first and the
+        # explicit-refusal token path fires (an empty KB would skip the on-call
+        # entirely -- see test_empty_kb_direct_escalation_accrues_single_call).
         with state_patch, \
              unittest.mock.patch.object(serve, '_tier_gate_decider',
                                         lambda purpose, criteria: ('low', 1.0)), \
-             unittest.mock.patch.object(serve, '_library_search_matches', return_value=[]), \
+             unittest.mock.patch.object(serve, '_library_search_matches',
+                                        return_value=[{'path': 'projects/p1/README.md', 'snippet': 'x'}]), \
              unittest.mock.patch.object(serve, '_call_openrouter_sync',
                                         side_effect=[first, second]), \
              unittest.mock.patch.object(serve, '_accrue_spend',
@@ -194,6 +199,33 @@ class ClarifyLaneAccrual(unittest.TestCase):
         self.assertEqual(resp.json()['escalatedTo'], 'maya')
         self.assertEqual(calls, [('__clarify__', 0.0111), ('__clarify__', 0.0222)],
                          'BOTH clarify calls (on-call answer + escalation) must accrue')
+
+    def test_empty_kb_direct_escalation_accrues_single_call(self):
+        # Zero KB matches skips the on-call router entirely (grounding: nothing
+        # to answer from) and asks the completing agent directly -- exactly ONE
+        # mid-tier call, and that single call must still accrue.
+        s = _state()
+        s['completedDeliverables'] = [
+            {'id': 't1', 'title': 'Refactor the Parser', 'room': 'pressoffice',
+             'agentId': 'maya', 'grade': 8.0, 'gradedAt': 1000, 'lastReviewed': '2026-09-01T00:00:00Z'}]
+        c, state_patch = self._client(s)
+        fake = {'choices': [{'message': {'content': 'I landed that.'}}],
+                'usage': {'cost': 0.01}}
+        calls = []
+        with state_patch, \
+             unittest.mock.patch.object(serve, '_tier_gate_decider',
+                                        lambda purpose, criteria: ('low', 1.0)), \
+             unittest.mock.patch.object(serve, '_library_search_matches', return_value=[]), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync', return_value=fake) as mc, \
+             unittest.mock.patch.object(serve, '_accrue_spend',
+                                        side_effect=lambda s2, c2: calls.append((s2, c2))):
+            resp = c.post('/api/intent/clarify',
+                          json={'productId': 'p1', 'question': 'q'})
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(mc.call_count, 1)
+        self.assertEqual(resp.json()['escalatedTo'], 'maya')
+        self.assertEqual(calls, [('__clarify__', 0.01)],
+                         'the completing agent\'s single call must still accrue')
 
 
 if __name__ == '__main__':

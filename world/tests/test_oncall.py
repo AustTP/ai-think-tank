@@ -127,6 +127,39 @@ class OnCallRotation(unittest.TestCase):
         state['teams'] = [{'directorId': 'maya', 'scrumMasterId': 'dax'}]
         self.assertIsNone(sim.on_call_agent(state, 'maya'))
 
+    def test_no_sprint_rotates_daily(self):
+        # A question/incident NOT tied to a sprint has no natural advance point
+        # (the sprint counter is static), so the slot shifts with the UTC day --
+        # the pager actually moves even on a sprint-less team.
+        state = _state()
+        day_ms = 24 * 60 * 60 * 1000
+        self.assertEqual(sim.on_call_agent(state, 'maya', None, now_ms=0),
+                         sim.on_call_agent(state, 'maya', None, now_ms=0))  # deterministic within a day
+        self.assertNotEqual(sim.on_call_agent(state, 'maya', None, now_ms=0),
+                            sim.on_call_agent(state, 'maya', None, now_ms=day_ms))
+        # Sprint-linked calls stay per-sprint even across days (restart-stable).
+        self.assertEqual(sim.on_call_agent(state, 'maya', 'sprint-7', now_ms=0),
+                         sim.on_call_agent(state, 'maya', 'sprint-7', now_ms=999 * day_ms))
+
+    def test_busy_oncall_falls_through_to_backup_then_second_backup(self):
+        state = _state()
+        primary = sim.on_call_agent(state, 'maya', None, now_ms=1000)
+        # The primary is mid-story: the pager must hand off to her backup --
+        # the NEXT slot in rotation order, never double-booking her.
+        state['agents'][primary]['busy'] = True
+        backup = sim.on_call_agent(state, 'maya', None, now_ms=1000)
+        self.assertNotEqual(backup, primary)
+        self.assertFalse(state['agents'][backup]['busy'])
+        # Backup busy too -> the second backup (the slot after the backup).
+        state['agents'][backup]['busy'] = True
+        second = sim.on_call_agent(state, 'maya', None, now_ms=1000)
+        self.assertNotEqual(second, primary)
+        self.assertNotEqual(second, backup)
+        self.assertFalse(state['agents'][second]['busy'])
+        # Whole team busy -> deadfall back to the primary slot (never empty).
+        state['agents'][second]['busy'] = True
+        self.assertEqual(sim.on_call_agent(state, 'maya', None, now_ms=1000), primary)
+
 
 class QueueBug(unittest.TestCase):
     def test_routes_to_owning_team_oncall_as_high_priority_gated_out(self):
@@ -140,8 +173,9 @@ class QueueBug(unittest.TestCase):
         self.assertEqual(item['priority'], sim.WORK_PRIORITY['high'])
         self.assertTrue(item['incident'])
         self.assertEqual(item['room'], 'pressoffice')
-        # Pinned to the owning team's on-call.
-        self.assertEqual(item['assignedTo'], sim.on_call_agent(state, 'maya', None))
+        # Pinned to the owning team's on-call (same now_ms the bug used, so the
+        # day-rotation base matches exactly).
+        self.assertEqual(item['assignedTo'], sim.on_call_agent(state, 'maya', None, now_ms=1000))
         # Non-gated: a bug never opens a peer gate.
         self.assertFalse(sim._peer_gated_lane(item))
 
@@ -171,6 +205,68 @@ class QueueBug(unittest.TestCase):
         self.assertTrue(item.get('incident'))
         self.assertEqual(item.get('productId'), 'prod-1')
 
+    def _assign_first_bug(self, state, now_ms=10_000):
+        grid, doors = sim._load_outdoor_geometry()
+        holder = {0: 0}
+        item = state['workQueue'][0]
+        return sim._assign_due_item(state, item, True, grid, doors, now_ms,
+                                    task_id_holder=holder)
+
+    @staticmethod
+    def _place_at_door(state, agent_id, room, doors):
+        # The bare test grid has no walkable tile at the (0,0) spawn point, so
+        # place the expected assignee EXACTLY on the door approach assign_task
+        # targets (start == target -> trivial valid path). The live sim never
+        # hits this: its agents already stand on walkable tiles.
+        door = doors[room]
+        a = state['agents'][agent_id]
+        a['x'] = door['x'] + door['w'] / 2
+        a['y'] = door['y'] + door['h'] + 4
+
+    def test_busy_oncall_incident_repins_to_team_backup(self):
+        # The on-call is mid-story by the time the incident lands: the pin must
+        # re-derive the owning team's current on-call (her backup) instead of
+        # leaking the incident to a global round-robin pick on another team.
+        state = _state()
+        _product(state)
+        sim.queue_bug(state, 'prod-1', 'Auth broken', now_ms=1000)
+        item = state['workQueue'][0]
+        on_call = item['assignedTo']
+        state['agents'][on_call]['busy'] = True  # starts work before assignment
+        backup = sim.on_call_agent(state, 'maya', None, now_ms=1000)
+        self.assertNotEqual(backup, on_call)
+        grid, doors = sim._load_outdoor_geometry()
+        self._place_at_door(state, backup, item['room'], doors)
+        task = self._assign_first_bug(state)
+        self.assertIsNotNone(task)
+        self.assertEqual(task.get('assignedTo'), backup)  # the team's backup, same team
+        self.assertEqual(task.get('taskType'), 'bug')
+
+    def test_whole_team_busy_incident_lands_on_any_free_worker(self):
+        # Last resort: the whole owning team is mid-story, so the re-derive has
+        # nobody to hand off to -- the incident must still be picked up by SOME
+        # eligible worker (generic round-robin) rather than dropped.
+        state = _state()
+        _product(state)
+        state['agentRoster'] += [_director('nadia', is_admin=True),
+                                 _director('omar', director='nadia')]
+        state['agents']['omar'] = {'id': 'omar', 'name': 'Omar', 'x': 0, 'y': 0,
+                                   'busy': False, 'visible': True, 'offDuty': False,
+                                   'inRoom': None}
+        state['teams'].append({'directorId': 'nadia', 'scrumMasterId': None})
+        sim.queue_bug(state, 'prod-1', 'Auth broken', now_ms=1000)
+        for aid in ('ben', 'cora', 'zia'):
+            state['agents'][aid]['busy'] = True  # entire owning team mid-story
+        grid, doors = sim._load_outdoor_geometry()
+        room = state['workQueue'][0]['room']
+        # Either free candidate may take it: the owning team's scrum master
+        # (dax -- first eligible in roster order) or the foreign worker (omar).
+        for free_id in ('dax', 'omar'):
+            self._place_at_door(state, free_id, room, doors)
+        task = self._assign_first_bug(state)
+        self.assertIsNotNone(task)  # never dropped
+        self.assertIn(task.get('assignedTo'), ('dax', 'omar'))  # some free worker took it
+
 
 class PinWakeBug(unittest.TestCase):
     def _assign(self, state, can_wake=True, now_ms=10_000):
@@ -184,7 +280,7 @@ class PinWakeBug(unittest.TestCase):
     def test_bug_pin_selects_offduty_oncall_over_round_robin(self):
         state = _state()
         _product(state)
-        oc = sim.on_call_agent(state, 'maya', None)
+        oc = sim.on_call_agent(state, 'maya', None, now_ms=1000)
         sim.queue_bug(state, 'prod-1', 'Auth broken', now_ms=1000)
         # The on-call is off-duty (resting); the generic wake rule might skip
         # her, but the incident pin must wake her and select her.
