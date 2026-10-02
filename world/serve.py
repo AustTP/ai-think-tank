@@ -5444,6 +5444,25 @@ AGENT_ASK_TOOLS = [
             },
         },
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'team_digest',
+            'description': 'Read-only summary of how the whole team is doing right now: the latest '
+                           'weekly review -- ground-truth per-agent activity and shipped-work '
+                           'counts, a decision-by-kind breakdown and spend, built from the action '
+                           'log, never from anyone\'s self-report -- plus a live count of Jev '
+                           'decisions logged in the last 24h. Use this when a question is about the '
+                           'team\'s overall progress, what got shipped recently, or how everyone is '
+                           'doing, so you answer from shared ground truth instead of guessing from '
+                           'your own work alone.',
+            'parameters': {
+                'type': 'object',
+                'properties': {},
+                'required': [],
+            },
+        },
+    },
 ] + ([{
     'type': 'function',
     'function': {
@@ -9305,6 +9324,12 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         if name in ('weather_now', 'search_web', 'browse_page'):
             tools_used.append(name)
             return _web_tool(name, args)
+        if name == 'team_digest':
+            # Read-only DB digest (weekly review + recent decision count).
+            # Not external data, but same wrap discipline for consistency;
+            # never an agent self-report, never an instruction source.
+            tools_used.append(name)
+            return _team_digest_text()
         if name == 'read_peer_reviews':
             # Peer review directories: list, then optionally read one note.
             # Same GET endpoints the browser uses (/api/agent-files) with the
@@ -9401,6 +9426,38 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     _append_passport_decision('ask', pick, {
         'question': question[:200], 'tools': tools_used})
     return {'reply': reply, 'agent': pick, 'tools': tools_used}
+
+
+def _team_digest_text(max_markdown_chars=1400, tape_window_s=86400):
+    """Read-only, DB-only ground-truth digest of how the team is doing: the
+    newest weekly review (built from the action log + decision tape, never an
+    agent's self-report) plus a live count of Jev decisions logged in the
+    window. No LLM, no network -- safe to call as often as agents want, and
+    it directly answers the isolation complaint ('I can't see what the team
+    shipped or how my work fits the bigger picture')."""
+    now = time.time()
+    with _db() as conn:
+        row = conn.execute(
+            'SELECT period_start, markdown FROM weekly_reviews '
+            'ORDER BY period_start DESC LIMIT 1',
+        ).fetchone()
+        n, n_ok = conn.execute(
+            'SELECT COUNT(*), COALESCE(SUM(CASE WHEN ok=1 THEN 1 ELSE 0 END), 0) '
+            'FROM decision_tape WHERE ts > ?',
+            (now - tape_window_s,),
+        ).fetchone()
+    parts = []
+    if row:
+        _period_start_ms, markdown = row
+        if markdown:
+            parts.append(markdown[:max_markdown_chars])
+        else:
+            parts.append('No weekly review has been written yet.')
+    else:
+        parts.append('No weekly review has been generated yet -- the weekly ceremony '
+                     'builds the first one.')
+    parts.append(f'Live signal (last 24h): {n} Jev decisions logged, {n_ok} ok.')
+    return '\n\n'.join(parts)
 
 
 @app.post('/api/intent/ask')
