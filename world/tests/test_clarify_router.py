@@ -295,5 +295,34 @@ class ClarifyEndpointTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 404)
 
 
+class TeamDigestTests(unittest.TestCase):
+    def test_ask_tools_expose_team_digest_schema(self):
+        names = [t['function']['name'] for t in serve.AGENT_ASK_TOOLS]
+        self.assertIn('team_digest', names)
+        tool = next(t for t in serve.AGENT_ASK_TOOLS
+                    if t['function']['name'] == 'team_digest')
+        self.assertEqual(tool['function']['parameters'],
+                         {'type': 'object', 'properties': {}, 'required': []})
+
+    def test_team_digest_text_returns_latest_review_and_live_signal(self):
+        with serve._db() as conn:
+            conn.execute(
+                'DELETE FROM weekly_reviews')
+            conn.execute(
+                'INSERT INTO weekly_reviews (period_start, generated_at, digest, markdown) '
+                'VALUES (?, ?, ?, ?)',
+                (1000, 2000, '{}', 'WEEKLY-MARKDOWN'),
+            )
+        text = serve._team_digest_text(max_markdown_chars=100)
+        self.assertIn('WEEKLY-MARKDOWN', text)
+        self.assertIn('Live signal (last 24h):', text)
+
+    def test_team_digest_text_no_review_says_none_yet(self):
+        with serve._db() as conn:
+            conn.execute('DELETE FROM weekly_reviews')
+        text = serve._team_digest_text()
+        self.assertIn('No weekly review has been generated yet', text)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
