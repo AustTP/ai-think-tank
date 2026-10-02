@@ -411,9 +411,12 @@ class DirectorNameChooser(unittest.TestCase):
         def chooser(_s, who, used, role):
             return {'Director': 'Elio', 'Engineer': 'Nadia'}[role]
 
-        team = sim.spawn_new_team_for_request(
-            state, 'Build the full platform end-to-end now', now_ms=1000,
-            admin_id='faye', employees=1, chooser=chooser)
+        # _log_governance writes to the live DB via serve.log_action -- this is
+        # a pure-sim test (no temp DB), so stub it to keep the run hermetic.
+        with unittest.mock.patch('sim._log_governance'):
+            team = sim.spawn_new_team_for_request(
+                state, 'Build the full platform end-to-end now', now_ms=1000,
+                admin_id='faye', employees=1, chooser=chooser)
         self.assertEqual(team['id'], 'elio')
         self.assertEqual(state['agents']['nadia']['name'], 'Nadia')
         self.assertIn('elio', state['_usedNames'])
