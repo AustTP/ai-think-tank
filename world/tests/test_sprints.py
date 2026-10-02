@@ -430,6 +430,9 @@ class DirectorNameChooser(unittest.TestCase):
         # seeded into _usedNames on the first pass so those names stay reserved.
         state = self._hire_state()
         state['lastHireAt'] = 1000  # inside cooldown: no new hire starts
+        # No pending hire: this test only checks the backfill, and _governance_pass
+        # would otherwise complete the hire via the DEFAULT (network) chooser.
+        state.pop('_pendingHire', None)
         sim._governance_pass(state, now=1.0, now_ms=1000, grid={})
         self.assertIn('faye', state['_usedNames'])
         self.assertIn('w0', state['_usedNames'])
