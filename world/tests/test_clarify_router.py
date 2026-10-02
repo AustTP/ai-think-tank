@@ -154,11 +154,21 @@ class ClarifyEndpointTests(unittest.TestCase):
     def _post(self, client, patches, body):
         return client.post('/api/intent/clarify', json=body)
 
+    @staticmethod
+    def _decider_patch():
+        # The handler resolves its model TIER via the live Jev tier-gate
+        # decider (_resolve_model_tier -> _tier_gate_decider_default -> real
+        # decisions call). Patch it so these endpoint tests never spend on the
+        # live decisions API; low + full confidence keeps the cheap tier.
+        return unittest.mock.patch.object(
+            serve, '_tier_gate_decider', lambda purpose, criteria: ('low', 1.0))
+
     def test_kb_first_answer_returned_without_escalation(self):
         s = _state()
         c, state_patch = self._client(s)
         fake = {'choices': [{'message': {'content': 'We streamed the input in two phases.'}}]}
         with state_patch, \
+             self._decider_patch(), \
              unittest.mock.patch.object(serve, '_library_search_matches',
                                         return_value=[{'path': 'projects/p1/README.md', 'snippet': 'two phases'}]):
             with unittest.mock.patch.object(serve, '_call_openrouter_sync', return_value=fake) as mc:
@@ -185,6 +195,7 @@ class ClarifyEndpointTests(unittest.TestCase):
         first = {'choices': [{'message': {'content': serve._CLARIFY_ESCALATE_TOKEN}}]}
         second = {'choices': [{'message': {'content': 'I landed that. It relies on the parser spec.'}}]}
         with state_patch, \
+             self._decider_patch(), \
              unittest.mock.patch.object(serve, '_library_search_matches', return_value=[]):
             with unittest.mock.patch.object(serve, '_call_openrouter_sync',
                                             side_effect=[first, second]) as mc:
@@ -202,6 +213,7 @@ class ClarifyEndpointTests(unittest.TestCase):
         c, state_patch = self._client(s)
         first = {'choices': [{'message': {'content': serve._CLARIFY_ESCALATE_TOKEN}}]}
         with state_patch, \
+             self._decider_patch(), \
              unittest.mock.patch.object(serve, '_library_search_matches', return_value=[]):
             with unittest.mock.patch.object(serve, '_call_openrouter_sync', return_value=first) as mc:
                 resp = self._post(c, None, {'productId': 'p1', 'question': 'q'})
