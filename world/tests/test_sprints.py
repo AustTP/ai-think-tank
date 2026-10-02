@@ -337,5 +337,100 @@ class TeamSizeCap(unittest.TestCase):
         self.assertIn('_pendingHire', state)
 
 
+@unittest.mock.patch('sim._free_outdoor_spot', return_value={'x': 5, 'y': 5})
+class DirectorNameChooser(unittest.TestCase):
+    """Hiring DIRECTORS choose each new employee's name (no predetermined names),
+    and a name can never be re-used across the think tank's whole history --
+    not just while its owner is employed."""
+
+    def _hire_state(self):
+        """A minimal server-owned state with faye as an admin/director and one
+        worker, plus a pending hire set to complete."""
+        roster = [
+            {'id': 'faye', 'name': 'Faye', 'role': 'admin', 'isAdmin': True, 'isDirector': True},
+            {'id': 'w0', 'name': 'W0', 'role': 'engineer', 'director': 'faye'},
+        ]
+        agents = {
+            'faye': {'id': 'faye', 'name': 'Faye', 'busy': True, 'offDuty': False},
+            'w0': {'id': 'w0', 'name': 'W0', 'busy': True, 'offDuty': False, 'role': 'engineer'},
+        }
+        state = {
+            'sim': {'owner': 'server'},
+            'agentRoster': roster, 'agents': agents,
+            'teams': [{'id': 'faye', 'name': 'Faye Team', 'directorId': 'faye',
+                       'scrumMasterId': 'faye'}],
+            'reports': [], 'workQueue': [], 'tasks': {}, 'sprints': {},
+            '_pendingHire': {
+                'adminId': 'faye', 'adminName': 'Faye', 'directorId': 'faye',
+                'helpForId': 'w0', 'helpForName': 'W0', 'at': 0,
+            },
+        }
+        return state
+
+    def test_hire_uses_director_chosen_name(self, _spot):
+        state = self._hire_state()
+        with unittest.mock.patch('sim._hire_name_chooser', return_value='Nadia'):
+            new_id = sim._complete_auto_hire(state, state['_pendingHire'], {}, 1000)
+        self.assertEqual(new_id, 'nadia')
+        self.assertEqual(state['agents']['nadia']['name'], 'Nadia')
+        self.assertIn('nadia', [d['id'] for d in state['agentRoster']])
+
+    def test_hire_chooser_name_reserved_all_time(self, _spot):
+        state = self._hire_state()
+        with unittest.mock.patch('sim._hire_name_chooser', return_value='Nadia'):
+            sim._complete_auto_hire(state, state['_pendingHire'], {}, 1000)
+        self.assertIn('nadia', state['_usedNames'])
+
+    def test_hire_rejects_chooser_used_name(self, _spot):
+        # Defense-in-depth: a chooser returning an all-time-used name is not
+        # trusted -- the hire falls back to the pool instead of colliding.
+        state = self._hire_state()
+        state['_usedNames'] = ['nadia']
+        with unittest.mock.patch('sim._hire_name_chooser', return_value='Nadia'):
+            new_id = sim._complete_auto_hire(state, state['_pendingHire'], {}, 1000)
+        self.assertEqual(new_id, 'maya')
+        self.assertIn('maya', state['_usedNames'])
+
+    def test_hire_falls_back_to_pool_on_chooser_outage(self, _spot):
+        state = self._hire_state()
+        with unittest.mock.patch('sim._hire_name_chooser', return_value=None):
+            new_id = sim._complete_auto_hire(state, state['_pendingHire'], {}, 1000)
+        self.assertEqual(new_id, 'maya')
+
+    def test_hire_never_reuses_retired_name(self, _spot):
+        # maya was fired long ago and reserved forever -- the pool skips her.
+        state = self._hire_state()
+        state['_usedNames'] = ['maya']
+        with unittest.mock.patch('sim._hire_name_chooser', return_value=None):
+            new_id = sim._complete_auto_hire(state, state['_pendingHire'], {}, 1000)
+        self.assertEqual(new_id, 'leo')
+
+    def test_new_team_admin_names_director_director_names_employees(self, _spot):
+        state = self._hire_state()
+
+        def chooser(_s, who, used, role):
+            return {'Director': 'Elio', 'Engineer': 'Nadia'}[role]
+
+        team = sim.spawn_new_team_for_request(
+            state, 'Build the full platform end-to-end now', now_ms=1000,
+            admin_id='faye', employees=1, chooser=chooser)
+        self.assertEqual(team['id'], 'elio')
+        self.assertEqual(state['agents']['nadia']['name'], 'Nadia')
+        self.assertIn('elio', state['_usedNames'])
+        self.assertIn('nadia', state['_usedNames'])
+        # Team ownership still resolves upward to the admin.
+        dir_roster = next(d for d in state['agentRoster'] if d['id'] == 'elio')
+        self.assertEqual(dir_roster['director'], 'faye')
+
+    def test_governance_pass_backfills_roster_names(self, _spot):
+        # A pre-existing roster (hired before all-time tracking shipped) is
+        # seeded into _usedNames on the first pass so those names stay reserved.
+        state = self._hire_state()
+        state['lastHireAt'] = 1000  # inside cooldown: no new hire starts
+        sim._governance_pass(state, now=1.0, now_ms=1000, grid={})
+        self.assertIn('faye', state['_usedNames'])
+        self.assertIn('w0', state['_usedNames'])
+
+
 if __name__ == '__main__':
     unittest.main()

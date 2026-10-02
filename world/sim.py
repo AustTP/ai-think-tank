@@ -4076,10 +4076,23 @@ def _complete_auto_hire(state, pending, grid, now_ms):
     # created. Falls back to the hiring admin id only if not stamped.
     director_id = pending.get('directorId') or pending.get('adminId')
     role = f"Assistant to {pending['helpForName']}"
-    name = _next_hire_name(state)
+    # The hiring DIRECTOR (pending['adminName']) names the new employee via a
+    # real generative call -- no predetermined names. All-time uniqueness is
+    # enforced against _all_used_names (roster + every name ever reserved), and
+    # a model outage or invalid candidate falls back to the fixed pool, which
+    # itself skips all-time-used names.
+    name = _hire_name_chooser(
+        state, pending.get('adminName') or pending.get('adminId'),
+        _all_used_names(state), role)
+    # Defense in depth: the default chooser validates uniqueness itself, but a
+    # substituted/test chooser must not be able to collide -- re-check against
+    # the all-time set before trusting it, else fall back to the pool.
+    if not name or name.lower() in _all_used_names(state):
+        name = _next_hire_name(state)
     if not name:
         state.pop('_pendingHire', None)
         return None
+    _remember_name(state, name)
     color_pool = HIRE_COLOR_POOL
     color = color_pool[random.randrange(len(color_pool))]
     access_grant = f"Read/write access to {pending['helpForName']}'s {help_for.get('role', '')} files and tooling."
@@ -4151,11 +4164,13 @@ def _complete_auto_hire(state, pending, grid, now_ms):
 
 
 def _next_hire_name(state):
-    """A deterministic-ish unique first name for a hire. The JS uses an LLM to
-    generate + validate a real unused name; here (no network in sim.py) we take
-    a small pool of ordinary names not already in the roster, else None."""
+    """A deterministic-ish unique first name for a hire, used only as a
+    fail-closed FALLBACK when the director's generative name chooser is
+    unavailable. The live path is _hire_name_chooser (a real LLM call that
+    makes the hire feel directed); this pool only steps in on a model outage.
+    Never collides with any name the think tank has ever used, else None."""
     pool = ['maya', 'leo', 'zara', 'owen', 'lyra', 'ida', 'vela']
-    used = {d.get('name', '').lower() for d in (state.get('agentRoster') or [])}
+    used = _all_used_names(state)
     for n in pool:
         if n not in used:
             return n
@@ -4175,13 +4190,86 @@ _NEW_TEAM_NAME_POOL = [
 
 def _next_new_team_name(state):
     """A unique name for a new-team director or member, drawn from
-    _NEW_TEAM_NAME_POOL. Never collides with the existing roster (including
-    names already taken from the hire pool). Returns None when exhausted."""
-    used = {d.get('name', '').lower() for d in (state.get('agentRoster') or [])}
+    _NEW_TEAM_NAME_POOL. Never collides with any name the think tank has ever
+    used (_all_used_names includes retired/fired names, so a new team never
+    re-takes one). Returns None when exhausted."""
+    used = _all_used_names(state)
     for n in _NEW_TEAM_NAME_POOL:
         if n not in used:
             return n
     return None
+
+
+def _all_used_names(state):
+    """Every first name the think tank has EVER used: the current roster plus
+    `_usedNames`, the durable all-time accumulation (fired/retired agents keep
+    their name reserved forever, so a director never re-hires a 'jane' after
+    jane was let go). Lowered for collision-safe comparisons."""
+    used = {str(d.get('name', '')).lower() for d in (state.get('agentRoster') or [])}
+    used.update(state.get('_usedNames') or [])
+    return used
+
+
+def _remember_name(state, name):
+    """Durably reserve a first name forever (all-time uniqueness). Called at
+    every server-side creation AND when an agent is fired, so a retired name is
+    never offered to a director again. Roster-only checks would forget a fired
+    agent's name the moment it left the roster -- this list does not."""
+    if not name:
+        return
+    low = name.strip().lower()
+    if not low:
+        return
+    state.setdefault('_usedNames', [])
+    if low not in state['_usedNames']:
+        state['_usedNames'].append(low)
+
+
+def _name_chooser_default(state, chooser_name, used_names, for_role):
+    """Default generative name chooser for a hire, late-importing serve.py so
+    sim.py stays unit-testable offline. The hiring DIRECTOR (`chooser_name`,
+    persona) picks a real, ordinary first name for the new agent (`for_role`),
+    told exactly which names are already taken all-time. "Asked nicely" isn't
+    "verified": the returned name is only trusted if it is a plain ASCII
+    alphabetic word AND genuinely absent from `used_names` -- anything else
+    returns None so the caller falls back to a pool name instead of risking an
+    id collision. Mirrors hiring.js generateHireProfile's shape, but name-only
+    (no profile fields) so a hire stays one cheap small-tier call. The call's
+    cost is accrued to its own service bucket like every other model call."""
+    import serve
+    try:
+        model = serve._low_tier_slug()
+        listed = ', '.join(sorted(str(u) for u in used_names)) or '(none)'
+        prompt = (
+            f"You are {chooser_name}, a director at a think tank who just hired "
+            f"someone as \"{for_role}\". Pick a real, ordinary first name for them "
+            f"-- it must NOT be any of these already-used names: {listed}. "
+            "Respond with ONLY the name: a single word, alphabetic characters only, no punctuation."
+        )
+        data = serve._call_openrouter_sync(
+            model,
+            [{'role': 'system', 'content': prompt},
+             {'role': 'user', 'content': 'Pick the name.'}],
+            max_tokens=10)
+        cost = (data.get('usage') or {}).get('cost', 0.0)
+        if isinstance(cost, (int, float)) and cost:
+            serve._accrue_spend('__hire_names__', cost)
+        reply = ((data.get('choices') or [{}])[0].get('message') or {}).get('content') or ''
+        token = reply.strip().strip('"').split()[0] if reply.strip() else ''
+        token = token.strip('.,;:!?')
+        if token.isalpha() and token.isascii():
+            name = token.capitalize()
+            if name.lower() not in used_names:
+                return name
+        return None
+    except Exception:
+        return None
+
+
+# Injectable so tests substitute a deterministic chooser; the live loop uses
+# the default (the hiring director names the hire via a real model call).
+# Mirrors how _governance_decider is injected.
+_hire_name_chooser = _name_chooser_default
 
 
 def _spawn_team_agent(state, name, role, director_id, now_ms, grid, is_director=False,
@@ -4252,7 +4340,8 @@ def _estimate_employees_for_request(goal):
     return n
 
 
-def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employees=None):
+def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employees=None,
+                               chooser=None):
     """Create a brand-new team to take an incoming large request when every
     existing team is already busy in a sprint. Spawns a new
     DIRECTOR (reporting to the admin), a fresh team record, one EMPLOYEE (or
@@ -4263,8 +4352,12 @@ def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employee
     handle ceremonies until the team grows. Then files the goal as a pending
     backlog request for the new team and kicks its refinement to be due on the
     very next pass, so the new team starts refining the large ask immediately
-    rather than waiting for the weekly cadence. Returns the new team record, or
-    None if the name pool / agent caps are exhausted."""
+    rather than waiting for the weekly cadence. Names come from `chooser`
+    (defaults to _hire_name_chooser): the ADMIN names the new director, and the
+    new DIRECTOR names each employee -- no predetermined names, all-time
+    unique. Returns the new team record, or None if the name pool / agent caps
+    are exhausted."""
+    chooser = chooser or _hire_name_chooser
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     roster = state.get('agentRoster') or []
     if len(roster) >= MAX_TOTAL_AGENTS:
@@ -4272,9 +4365,12 @@ def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employee
     admin_id = admin_id or next((d.get('id') for d in roster if d.get('isAdmin')), None)
     if not admin_id:
         return None
-    director_name = _next_new_team_name(state)
+    admin_def = next((d for d in roster if d.get('id') == admin_id), {})
+    admin_name = admin_def.get('name') or admin_id
+    director_name = chooser(state, admin_name, _all_used_names(state), 'Director') or _next_new_team_name(state)
     if not director_name:
         return None
+    _remember_name(state, director_name)
     director_id = director_name.lower()
     grid, _doors = _load_outdoor_geometry()
     _spawn_team_agent(state, director_name, 'Director', director_id, now_ms, grid,
@@ -4298,9 +4394,12 @@ def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employee
     member_ids = []
     emp_count = _estimate_employees_for_request(goal) if employees is None else max(1, int(employees or 1))
     for i in range(emp_count):
-        emp_name = _next_new_team_name(state)
+        # The new DIRECTOR names each employee (they're the authority for the
+        # team) -- chooser falls back to the pool on a model outage.
+        emp_name = chooser(state, director_name, _all_used_names(state), 'Engineer') or _next_new_team_name(state)
         if not emp_name:
             break
+        _remember_name(state, emp_name)
         emp_id = _spawn_team_agent(state, emp_name, 'Engineer', director_id, now_ms, grid)
         member_ids.append(emp_id)
     team['members'] = member_ids
@@ -6879,6 +6978,13 @@ def _governance_pass(state, now=None, now_ms=None, grid=None, decider=None):
     if grid is None:
         grid, _ = _load_outdoor_geometry()
 
+    # All-time name reserve: backfill once from the roster so every pre-existing
+    # name (including any a browser-client hired before this shipped) is
+    # reserved forever, not only while that agent is employed.
+    if not state.get('_usedNames'):
+        for _d in (state.get('agentRoster') or []):
+            _remember_name(state, _d.get('name'))
+
     # --- Auto-hire: complete a pending hire whose duration elapsed, then start
     # a new one if eligible.
     pending = state.get('_pendingHire')
@@ -6993,6 +7099,7 @@ def _resolve_firing_review(state, pending, now_ms, decider=None):
             state.pop('_pendingFiringReview', None)
             return
         # Fire: remove from both the live map and the roster.
+        _remember_name(state, candidate_def.get('name'))
         agents.pop(pending['candidateId'], None)
         roster = state.get('agentRoster') or []
         state['agentRoster'] = [d for d in roster if d.get('id') != pending['candidateId']]
