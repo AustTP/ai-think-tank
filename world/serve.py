@@ -471,6 +471,18 @@ def init_db():
             agree INTEGER NOT NULL
         )''')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_review_calibration_ts ON review_judge_calibration(ts)')
+        # Bot Ops / weekly review. A recurring diff-against-expectation report:
+        # every real change the think tank made in a window (from action_log +
+        # decision_tape -- GROUND TRUTH, never an agent's self-reported summary)
+        # plus the prior-week comparison, so the player reviews what actually
+        # happened vs. what was asked, rather than trusting a bot's write-up.
+        # `period_start` is the week's UTC start (epoch ms); one row per week.
+        conn.execute('''CREATE TABLE IF NOT EXISTS weekly_reviews (
+            period_start INTEGER PRIMARY KEY,
+            generated_at REAL NOT NULL,
+            digest TEXT NOT NULL,
+            markdown TEXT NOT NULL
+        )''')
 
 
 def _backup_think_tank_db():
@@ -3322,6 +3334,7 @@ async def _lifespan(app):
     prune_task = asyncio.create_task(_log_prune_loop())
     tier_refresh_task = asyncio.create_task(_model_tier_refresh_loop())
     calibration_task = asyncio.create_task(_calibration_loop())
+    weekly_review_task = asyncio.create_task(_weekly_review_loop())
     colab_task = asyncio.create_task(_colab_failover_loop())
     colab_compute_task = asyncio.create_task(_colab_compute_idle_loop()) \
         if COLAB_CLI_AVAILABLE else None
@@ -3350,6 +3363,7 @@ async def _lifespan(app):
     director_task.cancel()
     backup_task.cancel()
     calibration_task.cancel()
+    weekly_review_task.cancel()
     colab_task.cancel()
     if colab_compute_task is not None:
         colab_compute_task.cancel()
@@ -7478,7 +7492,7 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews')
 # Gap: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
@@ -8392,6 +8406,109 @@ async def intent_promote_spike(task_id: str, request: Request):
     return JSONResponse({'ok': True, 'queued': {
         'title': new_item['title'], 'room': room, 'taskType': task_type,
         'goal': task.get('goal') or spike_title,
+    }})
+
+
+# ---------------------------------------------------------------------------
+# Bot Ops / shadow mode. A shadow (dry-run) work item does its work but ships
+# nothing: on completion its outcome lands in the append-only state['shadowLedger']
+# draft (see sim._complete_shadow_task) with NO peer gate, credits, deliverable,
+# or dependency unblock. The PLAYER reviews the draft and, when satisfied, promotes
+# an entry into REAL queued work -- the loop-closing link mirroring spike->triage.
+# The player is the principal; agents never self-promote their own drafts.
+# ---------------------------------------------------------------------------
+@app.get('/api/shadow')
+async def get_shadow_ledger(request: Request):
+    """Read the shadow-mode draft ledger: every dry-run outcome captured, newest
+    first, with its promotion status. Read-only review surface."""
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    entries = list(reversed(state.get('shadowLedger') or []))
+    return JSONResponse({'ok': True, 'shadow': entries, 'count': len(entries)})
+
+
+@app.post('/api/shadow/{idx}/promote')
+async def promote_shadow_entry(idx: str, request: Request):
+    """Promote one shadow-ledger draft into a REAL, queued deliverable story. The
+    dry-run outcome (its note/libraryPath) becomes the new task's instructions, so
+    the follow-up rides the normal peer-gate path -- same quality bar as any
+    committed work, not a silent pass. The ledger entry stays (marked 'promoted',
+    an immutable record of the dry run); a NEW task is queued. Only a non-promoted
+    entry is promotable; a 409 keeps the player from double-queueing the same draft.
+    Body (optional): {'room', 'taskType'} to override the dry-run's defaults."""
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    ledger = state.get('shadowLedger') or []
+    try:
+        index = int(idx)
+    except (TypeError, ValueError):
+        return JSONResponse({'error': f'bad shadow index: {idx}'}, status_code=400)
+    if index < 0 or index >= len(ledger):
+        return JSONResponse({'error': f'unknown shadow entry: {idx}'}, status_code=404)
+    entry = ledger[index]
+    if entry.get('promoted'):
+        return JSONResponse({'error': f'Shadow draft "{entry.get("title")}" was already promoted -- it is already real work.'}, status_code=409)
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    room = (body.get('room') or entry.get('room') or 'pressoffice').strip()
+    if room not in _DELEGATABLE_ROOMS:
+        room = 'pressoffice'
+    task_type = (body.get('taskType') or entry.get('taskType') or 'code').strip()
+    if task_type not in ('code', 'review', 'qa', 'spike'):
+        task_type = 'code'
+    finding = (entry.get('note') or '').strip()
+    library_path = entry.get('libraryPath')
+    if library_path:
+        target = _safe_library_path(library_path)
+        if target and os.path.isfile(target):
+            try:
+                with open(target, 'r', errors='replace') as f:
+                    finding = f.read(20_000).strip()
+            except OSError:
+                finding = None
+    if not finding:
+        finding = '(the shadow run recorded no written findings)'
+
+    import sim as _sim
+    if task_type == 'spike':
+        new_item = {
+            'title': f'Follow up: {entry.get("title")}',
+            'room': room,
+            'instructions': (f'This is the real follow-up to a shadow dry-run of "{entry.get("title")}". '
+                             f'Its draft finding was: {finding}. Investigate further -- this does not need '
+                             'to produce a deliverable.'),
+            'goal': entry.get('projectLabel') or entry.get('title'),
+            'taskType': 'spike',
+            'budgetMs': 60_000,
+        }
+    else:
+        new_item = {
+            'title': f'Follow up: {entry.get("title")}',
+            'room': room,
+            'instructions': (f'This is the real follow-up to a shadow dry-run of "{entry.get("title")}". '
+                             f'Its draft finding was: {finding}. Pursue the recommendation into real work.'),
+            'goal': entry.get('projectLabel') or entry.get('title'),
+            'taskType': task_type,
+        }
+    _sim.queue_work(state, [new_item])
+    entry['promoted'] = True
+    entry['promotedAt'] = int(time.time() * 1000)
+    save_state_to_db(state)
+    player_id = 'player'
+    log_action(player_id, 'shadow_promoted',
+               {'shadowIndex': index, 'title': (entry.get('title') or '')[:200],
+                'queuedTitle': new_item['title'], 'room': room, 'taskType': task_type},
+               authorized=True)
+    _append_passport_decision('shadow_promoted', player_id,
+                              {'shadowIndex': index, 'title': (entry.get('title') or '')[:200],
+                               'queuedTitle': new_item['title'], 'room': room})
+    return JSONResponse({'ok': True, 'promoted': index, 'queued': {
+        'title': new_item['title'], 'room': room, 'taskType': task_type,
     }})
 
 
@@ -12846,6 +12963,27 @@ async def decision_tape_feed(kind: Optional[str] = None, min_conf: Optional[floa
     ]})
 
 
+@app.get('/api/reviews')
+async def get_weekly_reviews(request: Request):
+    """Read the weekly review ledger: every persisted diff-against-expectation
+    report, newest period first. `?generate=1` forces a fresh build of the
+    current week (idempotent per week) so the player can review live without
+    waiting for the weekly cadence. Returns {ok, reviews, count}."""
+    force = (request.query_params.get('generate') or '').strip() in ('1', 'true', 'yes')
+    if force:
+        await asyncio.to_thread(_generate_weekly_review)
+    with _db() as conn:
+        rows = conn.execute(
+            'SELECT period_start, generated_at, digest, markdown FROM weekly_reviews '
+            'ORDER BY period_start DESC',
+        ).fetchall()
+    return JSONResponse({'ok': True, 'count': len(rows), 'reviews': [
+        {'periodStartMs': r[0], 'generatedAt': r[1],
+         'digest': json.loads(r[2]), 'markdown': r[3]}
+        for r in rows
+    ]})
+
+
 # Jev calibration (CS329A takeaway #1): Jev reports a confidence
 # with every decision, and the whole low-confidence-escalation floor
 # (JEV_SAFETY_CONFIDENCE) is built on the assumption that high confidence
@@ -13182,6 +13320,175 @@ def _review_grade_calibration_pass(now=None):
                 'agreement_rate': rate, 'target': REVIEW_GRADE_CALIBRATION_TARGET,
                 'reason': 'raised' if direction > 0 else 'lowered'}, authorized=None)
     return new_threshold
+
+
+# Bot Ops / weekly review cadence: one report per UTC week. The review is the
+# diff-against-expectation surface -- it reads GROUND TRUTH (action_log +
+# decision_tape) for the window, never an agent's self-reported summary, so
+# what the player reviews is what actually happened.
+WEEKLY_REVIEW_INTERVAL_S = 7 * 86400
+# Actions that count as SHIPPED work vs. process/ceremony, for the same
+# ceremony-vs-progress lens the health check already uses (see _CEREMONY_ACTIONS).
+_WEEKLY_REVIEW_WINDOW_S = 7 * 86400
+
+
+def _weekly_period_start(now=None):
+    """The UTC start of the current review window, epoch milliseconds -- the
+    dedup key: the weekly_reviews table stores one row per period, so the loop
+    (and the manual generate endpoint) never write two reports for the same
+    week. Matches the kv_state/queue epoch-ms convention."""
+    now = time.time() if now is None else now
+    start = now - (now % WEEKLY_REVIEW_INTERVAL_S)
+    return int(start * 1000)
+
+
+def _build_weekly_review(now=None):
+    """Assemble one weekly review from GROUND-TRUTH tables (action_log +
+    decision_tape), not agent self-reports. `now` is injected for pure
+    testability (epoch seconds). Returns a dict with the digest + a markdown
+    report, or None if there's nothing to review. Reads two windows -- the
+    current one and the immediately prior week -- so the report carries
+    week-over-week deltas."""
+    now = time.time() if now is None else now
+    week = _WEEKLY_REVIEW_WINDOW_S
+    since = now - week
+    prior_since = since - week
+    prior_until = since
+    with _db() as conn:
+        actions = conn.execute(
+            'SELECT agent_id, action, ts FROM action_log WHERE ts > ? AND ts <= ?',
+            (since, now),
+        ).fetchall()
+        prior_actions = conn.execute(
+            'SELECT action, ts FROM action_log WHERE ts > ? AND ts <= ?',
+            (prior_since, prior_until),
+        ).fetchall()
+        decisions = conn.execute(
+            'SELECT kind, ok, confidence, cost FROM decision_tape WHERE ts > ? AND ts <= ?',
+            (since, now),
+        ).fetchall()
+        prior_decisions = conn.execute(
+            'SELECT ok, cost FROM decision_tape WHERE ts > ? AND ts <= ?',
+            (prior_since, prior_until),
+        ).fetchall()
+
+    # Digest: per-agent action tallies, total action count, decision stats.
+    per_agent: dict = {}
+    action_counts: dict = {}
+    for agent_id, action, _ts in actions:
+        action_counts[action] = action_counts.get(action, 0) + 1
+        if not agent_id or agent_id == 'player' or agent_id == 'system':
+            continue
+        bucket = per_agent.setdefault(agent_id, {'actions': 0, 'shipped': 0})
+        bucket['actions'] += 1
+        if action in _PROGRESS_ACTIONS:
+            bucket['shipped'] += 1
+    shipped_actions = sum(b.get('shipped', 0) for b in per_agent.values())
+    ceremony_count = sum(v for k, v in action_counts.items() if k in _CEREMONY_ACTIONS)
+
+    n_decisions = len(decisions)
+    ok_decisions = sum(1 for d in decisions if d[1])
+    jep_cost = sum(float(d[3] or 0) for d in decisions)
+    per_kind: dict = {}
+    for kind, ok, _conf, _cost in decisions:
+        kb = per_kind.setdefault(kind, {'n': 0, 'ok': 0})
+        kb['n'] += 1
+        kb['ok'] += int(ok)
+
+    # Prior-week deltas (ground-truth comparison).
+    prior_actions_n = len(prior_actions)
+    prior_shipped_n = sum(1 for a in prior_actions if a[0] in _PROGRESS_ACTIONS)
+    prior_ceremony_n = sum(1 for a in prior_actions if a[0] in _CEREMONY_ACTIONS)
+    prior_decisions_n = len(prior_decisions)
+    prior_cost = sum(float(d[1] or 0) for d in prior_decisions)
+
+    def _delta(cur, prior):
+        return round(cur - prior, 1)
+
+    digest = {
+        'period_start_ms': _weekly_period_start(now),
+        'window_s': week,
+        'generated_at': now,
+        'total_actions': len(actions),
+        'shipped_actions': shipped_actions,
+        'ceremony_actions': ceremony_count,
+        'decisions': n_decisions,
+        'decisions_ok': ok_decisions,
+        'decision_cost_usd': round(jep_cost, 4),
+        'decision_kinds': {k: v for k, v in sorted(per_kind.items())},
+        'per_agent': {aid: v for aid, v in sorted(per_agent.items())},
+        'deltas': {
+            'actions': _delta(len(actions), prior_actions_n),
+            'shipped': _delta(shipped_actions, prior_shipped_n),
+            'ceremony': _delta(ceremony_count, prior_ceremony_n),
+            'decisions': _delta(n_decisions, prior_decisions_n),
+            'decision_cost_usd': round(jep_cost - prior_cost, 4),
+        },
+    }
+
+    if not actions and not decisions:
+        return None
+
+    stamp = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(now))
+    lines = [
+        f'# Weekly Review -- {stamp}',
+        '',
+        'Ground truth for this window (from the action_log + decision tape, not',
+        'agent self-reports):',
+        '',
+        f'- Actions logged: **{len(actions)}** ({_delta(len(actions), prior_actions_n):+d} vs prior week)',
+        f'- Shipped work (deliverables/approvals): **{shipped_actions}** ({_delta(shipped_actions, prior_shipped_n):+d})',
+        f'- Ceremony/process actions: **{ceremony_count}** ({_delta(ceremony_count, prior_ceremony_n):+d})',
+        f'- Jev decisions: **{n_decisions}** ({ok_decisions} ok)',
+        f'- Decision-model spend: **${round(jep_cost, 4):.4f}** ({round(jep_cost - prior_cost, 4):+.4f})',
+        '',
+        '## Per-agent activity',
+        '',
+    ]
+    if per_agent:
+        for aid, b in sorted(per_agent.items(), key=lambda kv: -kv[1]['shipped']):
+            lines.append(f'- **{aid}**: {b["actions"]} action(s), {b["shipped"]} shipped')
+    else:
+        lines.append('(no per-agent activity recorded in this window)')
+    if per_kind:
+        lines += ['', '## Decisions by kind', '']
+        for kind, v in sorted(per_kind.items()):
+            lines.append(f'- {kind}: {v["n"]} ({v["ok"]} ok)')
+    return {'digest': digest, 'markdown': '\n'.join(lines) + '\n'}
+
+
+def _generate_weekly_review(now=None):
+    """Build + persist one weekly review, idempotently (one row per UTC week).
+    Returns the stored (digest, markdown) or None if there was nothing to
+    review. Best-effort and thread-safe: a DB failure never raises."""
+    review = _build_weekly_review(now=now)
+    if review is None:
+        return None
+    try:
+        with _db() as conn:
+            conn.execute(
+                'INSERT INTO weekly_reviews (period_start, generated_at, digest, markdown) '
+                'VALUES (?, ?, ?, ?) '
+                'ON CONFLICT(period_start) DO UPDATE SET generated_at=excluded.generated_at, '
+                'digest=excluded.digest, markdown=excluded.markdown',
+                (review['digest']['period_start_ms'], review['digest']['generated_at'],
+                 json.dumps(review['digest']), review['markdown']),
+            )
+    except Exception as e:
+        print(f'[weekly-review] persist failed: {e}', flush=True)
+    return review
+
+
+async def _weekly_review_loop():
+    # Own slow timer (not piggy-backed on the health loop -- this is a weekly
+    # scan over the two heavy tables, and the health loop must stay cheap).
+    # Runs in a thread so the DB scan never blocks the event loop.
+    while True:
+        await asyncio.sleep(WEEKLY_REVIEW_INTERVAL_S)
+        try:
+            await asyncio.to_thread(_generate_weekly_review)
+        except Exception as e:
+            print(f'[weekly-review] loop error: {e}', flush=True)
 
 
 async def _calibration_loop():
