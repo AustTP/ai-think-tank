@@ -2108,6 +2108,14 @@ async function handleBigTaskDelegate() {
     }
     if (result.error) {
       statusEl.textContent = result.error;
+    } else if (result.staffed) {
+      // Server-owned sim, sprint staffing: the ask is filed with a free team,
+      // whose scrum master + workers break it into concrete stories at their
+      // next planning session (the breakdown ceremony). Nothing is predicted
+      // or queued up front -- the team plans its own work, like a real org.
+      statusEl.textContent = result.note ||
+        `${AGENTS[result.admin] ? AGENTS[result.admin].name : result.admin} filed this with the ${result.teamName || result.team} team to break into stories at its next planning session.`;
+      input.value = '';
     } else {
       // Reports what was QUEUED, not what was assigned: assignBigTask no
       // longer assigns inline. The admin plans, the work lands in
@@ -2257,6 +2265,11 @@ function closeConversation() {
   activeConversationAgent = null;
 }
 
+// Compaction for the per-agent player chat log: the model only ever sees
+// the last few exchanges, and the full log is persisted into agent state on
+// every autosave, so bound it like the other decay-scored memory records.
+const CONVERSATION_LOG_CAP = 400;
+
 function renderConversationLog() {
   const log = document.getElementById('convoLog');
   log.innerHTML = '';
@@ -2339,6 +2352,7 @@ async function handleConversationSend() {
 
   const replyText = await requestAgentReply(a, a.conversationLog);
   a.conversationLog.push({ fromId: agentId, text: replyText, ts: Date.now() });
+  a.conversationLog = a.conversationLog.slice(-CONVERSATION_LOG_CAP);
 
   input.disabled = false;
   document.getElementById('convoSendBtn').disabled = false;

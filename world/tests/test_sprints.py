@@ -337,6 +337,46 @@ class TeamSizeCap(unittest.TestCase):
         self.assertIn('_pendingHire', state)
 
 
+class EffectiveScrumMaster(unittest.TestCase):
+    """The scrum-master/director duty split (_refinement_scrum_master_for_team):
+    a designated scrum master ALWAYS wins over the director stand-in; a small
+    team without one uses its OWN director as the effective SM; a big team
+    (>= SCRUM_MASTER_MIN_TEAM_SIZE workers) with none has NO effective scrum
+    master at all -- its ceremony is deferred/blocked rather than improvised
+    (see _teams_missing_scrum_master + the sprint-create gate)."""
+
+    @staticmethod
+    def _grow_dev(state):
+        import sim as _sim
+        for i in range(3):
+            aid = f'w{i}'
+            state['agentRoster'].append({'id': aid, 'name': aid, 'role': 'engineer', 'director': 'dev'})
+            state['agents'][aid] = {'id': aid, 'name': aid, 'busy': False, 'offDuty': False}
+        return state
+
+    def test_designated_scrum_master_wins_over_director_stand_in(self):
+        state = _make_team_state()
+        t = next(x for x in state['teams'] if x['id'] == 'dev')
+        t['scrumMasterId'] = 'ben'
+        self.assertEqual(sim._refinement_scrum_master_for_team(state, 'dev'), 'ben',
+                         'a designated SM is preferred over the director stand-in')
+
+    def test_small_team_director_stands_in(self):
+        state = _make_team_state()
+        # dev's team (ben + ada = 2 workers) is below SCRUM_MASTER_MIN_TEAM_SIZE.
+        self.assertEqual(sim._refinement_scrum_master_for_team(state, 'dev'), 'dev',
+                         'the own director stands in as effective SM for a small team')
+
+    def test_big_team_without_scrum_master_has_none(self):
+        state = self._grow_dev(_make_team_state())
+        import sim as _sim
+        self.assertGreaterEqual(_sim._team_member_count(state, 'dev'),
+                                _sim.SCRUM_MASTER_MIN_TEAM_SIZE,
+                                'dev must actually be at/beyond the threshold')
+        self.assertIsNone(sim._refinement_scrum_master_for_team(state, 'dev'),
+                          'a big team without a designated SM has no effective SM')
+
+
 @unittest.mock.patch('sim._free_outdoor_spot', return_value={'x': 5, 'y': 5})
 class DirectorNameChooser(unittest.TestCase):
     """Hiring DIRECTORS choose each new employee's name (no predetermined names),
@@ -436,6 +476,207 @@ class DirectorNameChooser(unittest.TestCase):
         sim._governance_pass(state, now=1.0, now_ms=1000, grid={})
         self.assertIn('faye', state['_usedNames'])
         self.assertIn('w0', state['_usedNames'])
+
+
+class TeamBorrow(unittest.TestCase):
+    """Cross-team borrowing: a team that needs help borrows an INACTIVE agent
+    from ANOTHER team (for the borrower's sprint) instead of hiring a clone.
+    The loan is recorded on the roster entry, ends at the borrower's sprint
+    close, and persists while the borrower still has pending work."""
+
+    def _state(self, sam_off_duty=False, dev_free=False, **over):
+        state = _make_team_state()
+        if sam_off_duty:
+            state['agents']['sam']['offDuty'] = True
+        if dev_free:
+            state['agents']['dev']['busy'] = False
+        state.update(over)
+        return state
+
+    def test_borrow_inactive_agent_from_other_team(self):
+        state = self._state(sam_off_duty=True)
+        with unittest.mock.patch('sim._log_governance'):
+            loan_id = sim._borrow_inactive_agent_for_team(state, 'dev', now_ms=5000)
+        self.assertEqual(loan_id, 'sam')
+        self.assertEqual(state['agentRoster'][4]['loan'],
+                         {'teamId': 'dev', 'since': 5000, 'reason': 'sprint_borrow'})
+        self.assertFalse(state['agents']['sam']['offDuty'], 'loan wakes the agent')
+        self.assertTrue(state['agents']['sam']['visible'])
+        self.assertEqual(state['agentRoster'][4]['director'], 'faye',
+                         'home director + authority chain preserved')
+
+    def test_borrow_returns_none_when_no_inactive_agent(self):
+        state = self._state()  # everyone on-duty
+        with unittest.mock.patch('sim._log_governance'):
+            loan_id = sim._borrow_inactive_agent_for_team(state, 'dev', now_ms=5000)
+        self.assertIsNone(loan_id)
+        self.assertTrue(all('loan' not in d for d in state['agentRoster']))
+
+    def test_borrow_skips_borrower_own_members_and_admin(self):
+        state = self._state(sam_off_duty=True)
+        state['agents']['faye']['offDuty'] = True  # admin off-duty, still skipped
+        state['agents']['ben']['offDuty'] = True   # dev's own report, never borrowed
+        with unittest.mock.patch('sim._log_governance'):
+            loan_id = sim._borrow_inactive_agent_for_team(state, 'dev', now_ms=5000)
+        self.assertEqual(loan_id, 'sam', 'borrower members + admin are ineligible')
+
+    def test_borrow_prefers_idle_home_team_over_active_sprint_team(self):
+        state = self._state(sam_off_duty=True)  # sam's home (faye) is idle
+        # rob reports to zel, whose team is mid-sprint -> busy-home candidate.
+        state['agentRoster'].append({'id': 'rob', 'name': 'Rob', 'role': 'engineer',
+                                     'director': 'zel'})
+        state['agents']['rob'] = {'id': 'rob', 'busy': False, 'offDuty': True,
+                                  'visible': False}
+        state['teams'].append({'id': 'zel', 'name': "Zel's Crew", 'directorId': 'zel'})
+        state['sprints']['spr-9'] = {'id': 'spr-9', 'status': 'active',
+                                     'teamIds': ['zel']}
+        with unittest.mock.patch('sim._log_governance'):
+            loan_id = sim._borrow_inactive_agent_for_team(state, 'dev', now_ms=5000)
+        self.assertEqual(loan_id, 'sam',
+                         'least-disruptive first: idle home team preferred')
+
+    def test_start_auto_hire_borrows_instead_of_hiring(self):
+        state = self._state(sam_off_duty=True, dev_free=True)
+        state['lastHireAt'] = 0
+        def decider(*a, **k):
+            self.fail('borrow-first path must not consult the hire decider')
+        with unittest.mock.patch('sim._log_governance'):
+            started = sim._start_auto_hire(state, now_ms=1000, grid={}, decider=decider)
+        self.assertTrue(started)
+        self.assertIsNone(state.get('_pendingHire'), 'no new hire started')
+        self.assertEqual(state['agentRoster'][4]['loan']['teamId'], 'dev')
+        self.assertEqual(state['lastHireAt'], 1000)
+
+    def test_start_auto_hire_falls_through_to_hire_without_borrowable(self):
+        state = self._state(dev_free=True)  # sam NOT off-duty -> no borrowable
+        state['lastHireAt'] = 0
+        picks = []
+        def decider(state, instructions, candidates):
+            picks.append([c['id'] for c in candidates])
+            return picks[0][0]
+        with unittest.mock.patch('sim._log_governance'):
+            started = sim._start_auto_hire(state, now_ms=1000, grid={}, decider=decider)
+        self.assertTrue(started)
+        self.assertIsNotNone(state.get('_pendingHire'), 'hire path used as fallback')
+        self.assertTrue(all('loan' not in d for d in state['agentRoster']))
+
+    def test_sprint_close_ends_loan_without_pending_work(self):
+        state = self._state()
+        state['agentRoster'][4]['loan'] = {'teamId': 'dev', 'since': 1000,
+                                           'reason': 'sprint_borrow'}
+        state['backlogRequests'] = []
+        with unittest.mock.patch('sim._log_governance'):
+            sim._end_loans_for_team(state, 'dev', now_ms=9000)
+        self.assertNotIn('loan', state['agentRoster'][4], 'loan returned at sprint close')
+
+    def test_sprint_close_keeps_loan_with_pending_work(self):
+        state = self._state()
+        state['agentRoster'][4]['loan'] = {'teamId': 'dev', 'since': 1000,
+                                           'reason': 'sprint_borrow'}
+        state['backlogRequests'] = [{'id': 'req-1', 'status': 'pending',
+                                     'teamId': 'dev', 'title': 'Build the platform'}]
+        with unittest.mock.patch('sim._log_governance'):
+            sim._end_loans_for_team(state, 'dev', now_ms=9000)
+        loan = state['agentRoster'][4].get('loan')
+        self.assertEqual(loan['teamId'], 'dev', 'feature need keeps the loan')
+        self.assertEqual(loan['since'], 9000, 'loan refreshed while need persists')
+
+
+class SprintRollover(unittest.TestCase):
+    """Sprint rollover: closing a sprint records the still-waiting cards as
+    `rolledOver`, and a follow-up sprint for the same team carries them into its
+    own scope (re-tagged + folded into its items). Refinement re-plans rolled
+    cards by pinning them to the team's least-loaded free member."""
+
+    ROOMS = ['pressoffice', 'observatory']
+
+    def _state(self, **over):
+        state = _make_team_state()
+        state.update(over)
+        return state
+
+    def _sprint(self, state, name='S1', items=None, team_ids=None):
+        sid = sim.next_sprint_id(state)
+        return sim.queue_sprint(
+            state, sid, name, f'{name} goal', 'faye',
+            items or [{'title': 'Build A', 'room': 'pressoffice'}],
+            self.ROOMS, team_ids=team_ids or ['dev'])
+
+    def test_close_records_unfinished_cards_as_rolled_over(self):
+        state = self._state()
+        self._sprint(state, items=[
+            {'title': 'Build A', 'room': 'pressoffice'},
+            {'title': 'Build B', 'room': 'observatory'}])
+        sim.close_sprint(state, 'spr-1')
+        rec = state['sprints']['spr-1']
+        self.assertEqual(sorted(x['title'] for x in rec['rolledOver']),
+                         ['Build A', 'Build B'])
+        # Closing doesn't cancel work -- the cards stay queued.
+        self.assertEqual(len(state['workQueue']), 2)
+
+    def test_close_records_only_cards_still_waiting(self):
+        state = self._state()
+        self._sprint(state, items=[
+            {'title': 'Build A', 'room': 'pressoffice'},
+            {'title': 'Build B', 'room': 'observatory'}])
+        state['tasks'] = {'t-1': {'id': 't-1', 'title': 'Build B',
+                                  'room': 'observatory', 'status': 'done',
+                                  'assignedTo': 'ada'}}
+        sim.close_sprint(state, 'spr-1')
+        self.assertEqual([x['title'] for x in state['sprints']['spr-1']['rolledOver']],
+                         ['Build A'])
+
+    def test_new_sprint_carries_over_prior_unfinished_cards(self):
+        state = self._state()
+        self._sprint(state, items=[{'title': 'Build A', 'room': 'pressoffice'}])
+        sim.close_sprint(state, 'spr-1')
+        record = self._sprint(state, name='S2',
+                              items=[{'title': 'Build C', 'room': 'observatory'}])
+        self.assertEqual(record['id'], 'spr-2')
+        # The carried-over card is re-tagged to the new sprint + counted in it.
+        tagged = [it for it in state['workQueue'] if it.get('sprintId') == 'spr-2']
+        self.assertEqual(sorted(it['title'] for it in tagged),
+                         ['Build A', 'Build C'])
+        self.assertIn(('Build A', 'pressoffice'), record['items'])
+
+    def test_no_carry_over_without_prior_closed_sprint(self):
+        state = self._state()
+        record = self._sprint(state, items=[{'title': 'Build C', 'room': 'observatory'}])
+        self.assertEqual(len(record['items']), 1)
+
+    def test_carry_over_skips_done_cards(self):
+        state = self._state()
+        self._sprint(state, items=[
+            {'title': 'Build A', 'room': 'pressoffice'},
+            {'title': 'Build B', 'room': 'observatory'}])
+        state['tasks'] = {'t-1': {'id': 't-1', 'title': 'Build B',
+                                  'room': 'observatory', 'status': 'done',
+                                  'assignedTo': 'ada'}}
+        sim.close_sprint(state, 'spr-1')
+        record = self._sprint(state, name='S2',
+                              items=[{'title': 'Build C', 'room': 'observatory'}])
+        tagged = [it for it in state['workQueue'] if it.get('sprintId') == 'spr-2']
+        self.assertEqual(sorted(it['title'] for it in tagged), ['Build A', 'Build C'])
+        self.assertNotIn(('Build B', 'observatory'), record['items'])
+
+    def test_reassign_rolled_over_cards_pins_least_loaded_free_member(self):
+        state = self._state()
+        self._sprint(state, items=[{'title': 'Build A', 'room': 'pressoffice'}])
+        sim.close_sprint(state, 'spr-1')
+        self.assertEqual(state['workQueue'][0]['sprintId'], 'spr-1')
+        # ben is busy; ada is free -> ada is the least-loaded free member.
+        state['agents']['ben']['busy'] = True
+        state['agents']['ben']['task'] = 't-b'
+        state['tasks'] = {'t-b': {'id': 't-b', 'status': 'working', 'assignedTo': 'ben'}}
+        count = sim._reassign_rolled_over_cards(state, 'dev')
+        self.assertEqual(count, 1)
+        self.assertEqual(state['workQueue'][0]['_reassignedTo'], 'ada')
+
+    def test_reassign_returns_zero_with_no_rolled_cards(self):
+        state = self._state()
+        self._sprint(state, items=[{'title': 'Build A', 'room': 'pressoffice'}])
+        self.assertEqual(sim._reassign_rolled_over_cards(state, 'dev'), 0,
+                         'no closed sprint yet -> nothing to re-plan')
 
 
 if __name__ == '__main__':

@@ -22,6 +22,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -127,6 +128,61 @@ class WeatherFetch(unittest.TestCase):
         with unittest.mock.patch.object(serve.urllib.request, 'urlopen', side_effect=fake_urlopen):
             out = serve._weather_fetch('Nowhereville')
         self.assertIn('Could not resolve', out)
+
+
+class WeatherStationLiveReadings(unittest.TestCase):
+    """The Weather Station logs LIVE readings for the think tank's configured
+    location (WEATHER_LOCATION, default Charlotte, NC) -- real Open-Meteo data
+    through serve's own fetcher, never a hard-coded forecast or a fixed
+    reference page."""
+
+    def _client(self):
+        from starlette.testclient import TestClient
+        c = TestClient(serve.app)
+        c.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
+        return c
+
+    def test_weather_now_endpoint_reads_the_configured_location(self):
+        captured = {}
+        def fake_fetch(loc):
+            captured['loc'] = loc
+            return '28.4C, moderate rain'
+        with unittest.mock.patch.object(serve, 'WEATHER_LOCATION', 'Raleigh, NC'), \
+             unittest.mock.patch.object(serve, '_weather_fetch', side_effect=fake_fetch):
+            r = self._client().get('/api/weather/now')
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(captured['loc'], 'Raleigh, NC', 'the configurable location is what gets fetched')
+        self.assertEqual(body['location'], 'Raleigh, NC')
+        self.assertIn('28.4C', body['reading'])
+
+    def test_weather_now_endpoint_wraps_external_data(self):
+        with unittest.mock.patch.object(serve, '_weather_fetch', return_value='15C, clear sky'):
+            r = self._client().get('/api/weather/now')
+        body = r.json()
+        self.assertIn('15C', body['reading'])
+        self.assertIn('<<<EXTERNAL_DATA', body['forModel'])
+        self.assertIn('<<<END_EXTERNAL_DATA', body['forModel'])
+
+    def test_run_weather_content_logs_live_reading(self):
+        import content
+        import sim
+        captured = {}
+        stored = {}
+        def fake_fetch(loc):
+            captured['loc'] = loc
+            return '31C, partly cloudy'
+        def fake_store(task_id, result):
+            stored['task_id'] = task_id
+            stored['note'] = result.get('note')
+        with unittest.mock.patch.object(serve, 'WEATHER_LOCATION', 'Charlotte, NC'), \
+             unittest.mock.patch.object(serve, '_weather_fetch', side_effect=fake_fetch), \
+             unittest.mock.patch.object(sim, '_store_content_result', side_effect=fake_store):
+            content._run_weather_content(None, 'eli', {'id': 'task-7'})
+        self.assertEqual(captured['loc'], 'Charlotte, NC')
+        self.assertEqual(stored['task_id'], 'task-7')
+        self.assertIn('Charlotte, NC', stored['note'])
+        self.assertIn('31C', stored['note'])
 
 
 class AskToolLoop(unittest.TestCase):
@@ -309,15 +365,26 @@ class AskEndpoint(unittest.TestCase):
         r = c.post('/api/intent/ask', json={'location': 'Charlotte, NC'})
         self.assertEqual(r.status_code, 400)
 
-    def test_ask_409_when_no_agent_free(self):
+    def test_ask_parked_when_no_agent_free(self):
+        # Ask-lane parking: when EVERY eligible agent is busy, the ask is
+        # QUEUED (never rejected) -- {'queued': True} + a state['_pendingAsks']
+        # record (server-owned) for the drain loop to answer with the first
+        # agent that frees up. The player's deliberate pin rides along.
         busy = _state()
         for d in busy['agentRoster']:
             if not d.get('isAdmin'):
                 busy['agents'][d['id']]['busy'] = True
                 busy['agents'][d['id']]['task'] = 't-x'
         c = self._client(busy)
-        r = c.post('/api/intent/ask', json={'question': 'hi'})
-        self.assertEqual(r.status_code, 409)
+        r = c.post('/api/intent/ask', json={'question': 'hi', 'agentId': 'dax'})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body['queued'])
+        self.assertIn('queued', body['reply'])
+        parked = busy.get('_pendingAsks') or []
+        self.assertEqual(len(parked), 1)
+        self.assertEqual(parked[0]['question'], 'hi')
+        self.assertEqual(parked[0]['agentId'], 'dax')  # pin preserved for the drain
 
     def test_ask_tool_closes_and_does_not_mutate_pipeline(self):
         # Model uses weather_now then answers; assert workQueue/tasks/products
@@ -609,6 +676,117 @@ class AskEndpoint(unittest.TestCase):
         gsd.assert_not_called()  # rate-limited BEFORE any state read or spend
 
 
+class AskParking(unittest.TestCase):
+    """The parked-ask drain: _pending_ask_drain_pass answers the oldest parked
+    ask with the first agent that frees up (honoring a non-admin pin, never the
+    admin), and _apply_pending_ask_results delivers the reply into the player
+    inbox + email queue inside the sim's single read-modify-write. The drain
+    runs the real _ask_core on its own thread via asyncio.run -- mocked here so
+    no model/network is touched; the result is stashed in the same in-memory
+    holder the sim pass consumes."""
+
+    def setUp(self):
+        serve._pending_ask_inflight.clear()
+        with serve._pending_ask_results_lock:
+            serve._pending_ask_results.clear()
+
+    def _all_busy(self, state):
+        for d in state['agentRoster']:
+            if not d.get('isAdmin'):
+                state['agents'][d['id']]['busy'] = True
+                state['agents'][d['id']]['task'] = 't-x'
+
+    def _parked(self, state, question='hi', agent_id=None):
+        state.setdefault('_pendingAsks', []).append({
+            'id': 'ask-111', 'question': question, 'location': None,
+            'agentId': agent_id, 'ts': int(time.time() * 1000)})
+
+    def _drain_and_wait(self, state, timeout=5.0):
+        serve._pending_ask_drain_pass(state)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with serve._pending_ask_results_lock:
+                if serve._pending_ask_results:
+                    return list(serve._pending_ask_results.values())[0]
+            time.sleep(0.02)
+        return None
+
+    def test_drain_skips_when_everyone_still_busy(self):
+        s = _state()
+        self._all_busy(s)
+        self._parked(s)
+        result = self._drain_and_wait(s, timeout=0.5)
+        self.assertIsNone(result)  # nothing stashed -- no agent freed up yet
+        self.assertEqual(serve._pending_ask_inflight, set())
+
+    def test_drain_picks_first_freed_agent_and_honors_non_admin_pin(self):
+        s = _state()
+        self._all_busy(s)
+        # Player pinned dax (non-admin) when everyone was busy; dax frees up.
+        self._parked(s, agent_id='dax')
+        s['agents']['dax']['busy'] = False
+        s['agents']['dax']['task'] = None
+        seen = {}
+        async def fake_ask_core(state, question, agent_id_hint=None, location=None,
+                                max_tokens=300, allow_admin_pin=False, allow_park=True):
+            seen['agent'] = agent_id_hint
+            seen['allow_park'] = allow_park
+            return {'reply': 'Here is your answer.', 'agent': agent_id_hint, 'tools': []}
+        with unittest.mock.patch.object(serve, '_ask_core', side_effect=fake_ask_core):
+            result = self._drain_and_wait(s)
+        self.assertIsNotNone(result)
+        self.assertEqual(seen['agent'], 'dax')  # the player's pin is honored
+        self.assertFalse(seen['allow_park'])  # the drain's inner call must not re-park
+        self.assertEqual(result['agentId'], 'dax')
+
+    def test_drain_never_uses_the_admin(self):
+        s = _state()
+        self._all_busy(s)
+        self._parked(s, agent_id='maya')  # pin to the ADMIN is ignored
+        s['agents']['ben']['busy'] = False
+        s['agents']['ben']['task'] = None
+        seen = {}
+        async def fake_ask_core(state, question, agent_id_hint=None, location=None,
+                                max_tokens=300, allow_admin_pin=False, allow_park=True):
+            seen['agent'] = agent_id_hint
+            return {'reply': 'ok', 'agent': agent_id_hint, 'tools': []}
+        with unittest.mock.patch.object(serve, '_ask_core', side_effect=fake_ask_core):
+            result = self._drain_and_wait(s)
+        self.assertIsNotNone(result)
+        self.assertEqual(seen['agent'], 'ben')  # first eligible worker, not maya
+
+    def test_apply_delivers_inbox_and_email_and_drops_ask(self):
+        s = _state()
+        self._parked(s, question='what should I wear?')
+        serve._store_pending_ask_result({'askId': 'ask-111', 'reply': 'Wear shorts.',
+                                         'agentId': 'ben', 'tools': []})
+        delivered = serve._apply_pending_ask_results(s)
+        self.assertEqual(delivered, 1)
+        self.assertEqual(s.get('_pendingAsks'), [])  # the ask is dropped
+        inbox = s.get('playerInbox') or []
+        self.assertEqual(len(inbox), 1)
+        self.assertEqual(inbox[0]['status'], 'answered')
+        self.assertTrue(inbox[0]['queued'])
+        self.assertEqual(inbox[0]['question'], 'what should I wear?')
+        self.assertEqual(inbox[0]['answer'], 'Wear shorts.')
+        self.assertEqual(inbox[0]['agentId'], 'ben')
+        outbox = s.get('emailOutbox') or []
+        self.assertTrue(any(e.get('kind') == 'ask_answered' for e in outbox))
+
+    def test_apply_keeps_ask_parked_on_transient_busy(self):
+        s = _state()
+        self._parked(s)
+        # The drain's inner call found everyone busy again -- the ask must stay
+        # parked for the next pass, not be dropped.
+        serve._store_pending_ask_result({'askId': 'ask-111',
+                                         'error': 'No agent is free to answer right now. Try again shortly.',
+                                         'status': 409})
+        delivered = serve._apply_pending_ask_results(s)
+        self.assertEqual(delivered, 0)
+        self.assertEqual(len(s.get('_pendingAsks') or []), 1)
+        self.assertEqual(s.get('playerInbox') or [], [])
+
+
 class AdminAgentId(unittest.TestCase):
     def test_finds_the_admin(self):
         s = _state()
@@ -674,6 +852,95 @@ class TelegramBridge(unittest.TestCase):
         self.assertEqual(seen['question'], 'status?')
         self.assertEqual(seen['agent_id_hint'], 'maya')  # pinned to the ADMIN, not round-robin
         self.assertTrue(seen['allow_admin_pin'])  # the internal ask lane trusts this pin
+
+    def test_multi_intent_request_routes_to_the_senior_director_escape_hatch(self):
+        # Multi-category request: a message bundling several unrelated asks
+        # ("fix the outage AND set up a nightly check AND how tall is Everest?")
+        # cannot be force-fit into one lane -- the classifier routes it to the
+        # 'unclear' lane, whose handler pins the senior-most free authority (the
+        # admin here) so a HUMAN director splits it instead of the think tank
+        # silently executing one half and dropping the rest.
+        s = _state()
+        s['agentRoster'][0]['isAdmin'] = True  # maya
+        seen = {}
+        async def fake_ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False):
+            seen['question'] = question
+            seen['agent_id_hint'] = agent_id_hint
+            seen['allow_admin_pin'] = allow_admin_pin
+            return {'reply': 'That is several things at once -- let me take them one at a time.', 'agent': 'maya', 'tools': []}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=s), \
+             unittest.mock.patch.object(serve, '_lane_decider', return_value='unclear'), \
+             unittest.mock.patch.object(serve, '_ask_core', side_effect=fake_ask_core):
+            outcome = asyncio.run(serve._telegram_process_update(
+                self._update(text='Fix the outage, set up a nightly check, and how tall is Everest?')))
+        self.assertEqual(outcome[0], '111')
+        # The 'unclear' lane answers via the senior-most free authority, never
+        # dispatching to a team or round-robin worker.
+        self.assertEqual(seen['agent_id_hint'], 'maya')
+        self.assertTrue(seen['allow_admin_pin'])
+
+    def test_unrecognized_lane_falls_back_to_unclear_never_crashes(self):
+        # Defense-in-depth: a classifier returning a bogus/unknown lane id
+        # (e.g. a stale lane removed from _ROUTING_LANES) must degrade to the
+        # 'unclear' handler -- the request is still answered by a human
+        # director, never dropped or 500'd.
+        s = _state()
+        s['agentRoster'][0]['isAdmin'] = True  # maya
+        seen = {}
+        async def fake_ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False):
+            seen['question'] = question
+            seen['agent_id_hint'] = agent_id_hint
+            return {'reply': 'Let me get a director on that.', 'agent': 'maya', 'tools': []}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=s), \
+             unittest.mock.patch.object(serve, '_lane_decider', return_value='totally-bogus-lane'), \
+             unittest.mock.patch.object(serve, '_ask_core', side_effect=fake_ask_core):
+            outcome = asyncio.run(serve._telegram_process_update(self._update(text='weird request')))
+        self.assertEqual(outcome, ('111', 'Let me get a director on that.'))
+        self.assertEqual(seen['question'], 'weird request')
+        self.assertEqual(seen['agent_id_hint'], 'maya')  # unclear fallback: the free authority
+
+    def test_unclear_lane_prefers_senior_most_director_over_admin(self):
+        # Routing reconciliation: an 'unclear' lane ask is a director's
+        # judgment call -- the SENIOR-MOST director answers first, the admin
+        # only as fallback. With a senior-most director (nora, a non-admin
+        # director with no own director) free, she must be pinned, not maya.
+        s = _state()
+        s['agentRoster'][0]['isAdmin'] = True  # maya
+        s['agentRoster'].append({'id': 'nora', 'name': 'Nora', 'role': 'Personnel',
+                                 'isDirector': True, 'director': None})
+        s['agents']['nora'] = {'id': 'nora', 'name': 'Nora', 'role': 'Personnel',
+                               'offDuty': False, 'busy': False, 'task': None,
+                               'pairWith': None, 'profile': {'mission': 'run personnel'}}
+        seen = {}
+        async def fake_ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False):
+            seen['agent_id_hint'] = agent_id_hint
+            return {'reply': 'Let me split that up for you.', 'agent': 'nora', 'tools': []}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=s), \
+             unittest.mock.patch.object(serve, '_lane_decider', return_value='unclear'), \
+             unittest.mock.patch.object(serve, '_ask_core', side_effect=fake_ask_core):
+            outcome = asyncio.run(serve._telegram_process_update(
+                self._update(text='fix the outage and also how tall is Everest?')))
+        self.assertEqual(outcome[0], '111')
+        self.assertEqual(seen['agent_id_hint'], 'nora',
+                         'senior-most director, not the admin, answers the unclear lane')
+        # Busy senior-most director -> the admin is the fallback authority.
+        s2 = _state()
+        s2['agentRoster'][0]['isAdmin'] = True
+        s2['agentRoster'].append({'id': 'nora', 'name': 'Nora', 'role': 'Personnel',
+                                  'isDirector': True, 'director': None})
+        s2['agents']['nora'] = {'id': 'nora', 'name': 'Nora', 'role': 'Personnel',
+                                'offDuty': False, 'busy': True, 'task': None,
+                                'pairWith': None, 'profile': {'mission': 'run personnel'}}
+        seen2 = {}
+        async def fake_ask_core2(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False):
+            seen2['agent_id_hint'] = agent_id_hint
+            return {'reply': 'On it.', 'agent': 'maya', 'tools': []}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=s2), \
+             unittest.mock.patch.object(serve, '_lane_decider', return_value='unclear'), \
+             unittest.mock.patch.object(serve, '_ask_core', side_effect=fake_ask_core2):
+            asyncio.run(serve._telegram_process_update(self._update(text='weird bundle')))
+        self.assertEqual(seen2['agent_id_hint'], 'maya',
+                         'busy senior-most director defers to the admin fallback')
 
 
 if __name__ == '__main__':

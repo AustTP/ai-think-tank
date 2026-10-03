@@ -194,14 +194,32 @@ class DependencyPath(unittest.TestCase):
         self.assertIs(st['issues'][issue['key']]['blocked'], False)
         self.assertIsNone(st['issues'][issue['key']].get('dependsOnTask'))
 
-    def test_dependency_block_defers_without_sm(self):
+    def test_dependency_block_defers_without_effective_sm(self):
+        # A dependency block can only be FILED through an owning team (the
+        # request routes through it), so a team always has at least its director
+        # as the effective SM fallback. The deferral path that matters: the
+        # effective SM (designated OR director stand-in) is unavailable at
+        # commit time -> still pending, not dropped, not committed.
+        st = _state()
+        st['teams'][0]['scrumMasterId'] = None
+        st['agents']['dev']['busy'] = True  # director stand-in unavailable
+        issue = _file(st)
+        sim.request_block_dependency(st, issue['key'], 'nadia', 'task-9')
+        self.assertIsNone(sim._block_step(st, 0, _NOW_MS + 10_000))
+        self.assertEqual(len(sim._pending_block_changes(st, issue['key'])), 1)
+
+    def test_dependency_block_director_signs_as_effective_sm(self):
+        # The commit is MECHANICAL (judgment is upstream), so a team with no
+        # designated SM but a director may still sign -- the same fallback
+        # refinement uses.
         st = _state()
         st['teams'][0]['scrumMasterId'] = None
         issue = _file(st)
         sim.request_block_dependency(st, issue['key'], 'nadia', 'task-9')
-        # No SM designated -> still pending, not dropped, not committed.
-        self.assertIsNone(sim._block_step(st, 0, _NOW_MS + 10_000))
-        self.assertEqual(len(sim._pending_block_changes(st, issue['key'])), 1)
+        rec = sim._block_step(st, 0, _NOW_MS + 10_000)
+        self.assertIsNotNone(rec, 'the director must stand in as effective SM')
+        self.assertEqual(rec.get('committedBy'), 'dev')
+        self.assertIs(st['issues'][issue['key']]['blocked'], True)
 
 
 class ScrumMasterCommitGate(unittest.TestCase):

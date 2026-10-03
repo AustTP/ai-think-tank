@@ -425,5 +425,80 @@ class DistillCsvPreservation(unittest.TestCase):
         self.assertEqual(body, '## Merged\n\nProse.')
 
 
+class SkillReviewStagger(unittest.TestCase):
+    """Stagger gate for the standing skill-review ceremony: at most ONE
+    skill-review task may be queued or in flight at a time, so the whole think
+    tank never runs overlapping reviews at once. A queued skillReview work item,
+    or any live (non-'done') skillReview task, blocks the next sweep even when
+    the cadence is due and content is pending."""
+
+    def setUp(self):
+        import serve as serve_mod
+        self._tmp = tempfile.mkdtemp()
+        pending = os.path.join(self._tmp, 'pending_review', 'skills')
+        os.makedirs(pending)
+        with open(os.path.join(pending, 'review-me.md'), 'w') as f:
+            f.write('# Pending skill review\n')
+        self._patcher = mock.patch.multiple(serve_mod, LIBRARY_DIR=self._tmp)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _state(self, **over):
+        state = {
+            'sim': {'owner': 'server'},
+            'agentRoster': [{'id': 'ada'}, {'id': 'ben'}],
+            'agents': {'ada': {'id': 'ada'}, 'ben': {'id': 'ben'}},
+            'researchTopics': [],
+            'tasks': {},
+            'workQueue': [],
+            'lastSkillReviewAt': _NOW_MS - sim.SKILL_REVIEW_CADENCE_MS,
+        }
+        state.update(over)
+        return state
+
+    def _reviews(self, state):
+        return [q for q in state['workQueue'] if q.get('skillReview')]
+
+    def test_queues_review_when_due_and_pending(self):
+        state = self._state()
+        sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
+        self.assertEqual(len(self._reviews(state)), 1)
+        self.assertEqual(state['lastSkillReviewAt'], _NOW_MS)
+
+    def test_no_review_while_one_already_queued(self):
+        state = self._state()
+        sim.queue_work(state, [{'title': 'Review pending skill files', 'room': 'observatory',
+                                'instructions': 'review', 'skillReview': True}])
+        sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
+        self.assertEqual(len(self._reviews(state)), 1,
+                         'a queued review blocks a second, overlapping review')
+
+    def test_no_review_while_one_in_flight(self):
+        state = self._state()
+        state['tasks'] = {'t-1': {'id': 't-1', 'title': 'Review pending skill files',
+                                  'status': 'working', 'skillReview': True,
+                                  'assignedTo': 'ada'}}
+        sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
+        self.assertEqual(len(self._reviews(state)), 0,
+                         'an in-progress review blocks the next sweep')
+
+    def test_queues_fresh_review_once_prior_review_is_done(self):
+        state = self._state()
+        state['tasks'] = {'t-1': {'id': 't-1', 'title': 'Review pending skill files',
+                                  'status': 'done', 'skillReview': True,
+                                  'assignedTo': 'ada'}}
+        sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
+        self.assertEqual(len(self._reviews(state)), 1,
+                         'a completed review no longer blocks a fresh one')
+
+    def test_recent_review_not_rerun(self):
+        state = self._state(lastSkillReviewAt=_NOW_MS)
+        sim._check_schedules(state, now=_NOW_MS / 1000, now_ms=_NOW_MS)
+        self.assertEqual(self._reviews(state), [])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -172,7 +172,6 @@ def _skill_file_format_guide():
 # heavy pressoffice/coding/review executors (runCodingTask/runReviewTask) are a
 # separate larger slice and are NOT dispatched here -- those rooms keep the
 # slice-1 workUntil placeholder for now.
-_WEATHER_REFERENCE_URL = 'https://en.wikipedia.org/wiki/Weather_forecasting'
 _MEDIA_FEEDS_PATH = 'media/feeds.md'
 _MEDIA_DIGEST_TOKENS = 200            # runMediaDigestTask /api/chat max_tokens
 _SKILL_REVIEW_MAX_PER_SWEEP = 5       # tasks.js SKILL_REVIEW_MAX_PER_SWEEP
@@ -242,24 +241,16 @@ def _extract_csv_like_blocks(text):
 
 
 def _run_weather_content(snapshot, agent_id, task, base_ctx=None):
-    """Port of tasks.js checkWeatherReference: browse one FIXED well-known
-    reference page through the full /api/browse gate and note the headline.
-    The Weather Station's whole identity is one external reference, so this is
-    deliberately not content-aware -- same as the browser's version."""
+    """The Weather Station logs LIVE readings for the think tank's configured
+    location (serve.WEATHER_LOCATION, default Charlotte, NC -- overridable via
+    WEATHER_LOCATION env). Real Open-Meteo data through serve's own fetcher,
+    never a hard-coded forecast or a fixed reference page."""
     import sim as _sim_module
-    base = _serve.SELF_BASE_URL
-    key = _serve.get_or_create_agent_key(agent_id)
-    purpose = 'Checking outside weather reference material for the think tank weather station.'
-    data = _serve._http_json('POST', base, '/api/browse',
-                      {'url': _WEATHER_REFERENCE_URL, 'agentId': agent_id, 'purpose': purpose}, key)
-    if data.get('error'):
-        note = 'Tried to check an outside reference, but the request failed.'
-    elif data.get('allowed') and data.get('text'):
-        note = f'Checked outside weather reference -- noted: "{data["text"][:140].strip()}..."'
-    elif data.get('allowed'):
-        note = 'Checked outside weather reference, but the page came back empty.'
+    reading = _serve._weather_fetch(_serve.WEATHER_LOCATION)
+    if reading.startswith('__TOOL_ERROR__'):
+        note = f'Could not log live weather readings: {reading}'
     else:
-        note = f"Tried to check an outside reference, but it wasn't approved: {data.get('reason') or 'no reason given'}"
+        note = f'Logged live weather for {_serve.WEATHER_LOCATION}: {reading}'
     _sim_module._store_content_result(task.get('id'), {'note': note})
 
 
@@ -3174,6 +3165,72 @@ def _make_github_tools_executor():
     return execute_tool
 
 
+_SPIKE_ISSUE_PROBLEM_SIGNALS = (
+    'gap', 'problem', 'missing', 'broken', 'needs', 'fails', 'failed', 'unable',
+    'should', 'recommend', 'issue', 'risk', 'limitation', 'error', 'bug',
+    'outdated', 'stale', 'vulnerability', 'unmet', 'incomplete', 'crashed',
+    'crash', 'not work', 'doesn\'t work', 'can\'t', 'inconsisten', 'incorrect',
+    'defect', 'regression', 'worrying', 'concern', 'concerned', 'critical',
+)
+
+
+def _spike_file_issue_wish(finding, task, name, backlog):
+    """W3: does this spike's finding identify a real, actionable gap worth
+    filing as an issue, and if so, what should the wish look like?
+
+    Workers have almost no autonomous self-proposal path (file_issue is
+    HTTP-endpoint-only). A worker who spots a real gap mid-spike currently has
+    no model-driven way to propose it. This is the model-driven probe: run in
+    the executor thread against the snapshot, it returns a fileIssue WISH dict
+    -- it NEVER files anything itself (file_issue mutates shared state and must
+    only run inside the tick's single read-modify-write, in sim.py). The sim
+    side resolves the owning team against LIVE state, dedups, and files.
+
+    Cheap first: a deterministic problem-signal pre-filter on the finding
+    text. No signal -> 'none' -> no Jev spend at all (most spikes are
+    informational and should stay that way -- a spike worker who files on
+    every investigation would be spamming the backlog). Only when a signal is
+    present do we ask Jev for an explicit file/no-file verdict (file_bug /
+    file_story / none)."""
+    signals = _SPIKE_ISSUE_PROBLEM_SIGNALS
+    if not (finding or '').strip():
+        return None
+    haystack = ' '.join((finding or '').split()).lower()
+    if not any(sig in haystack for sig in signals):
+        return None
+    headline = next((line.strip() for line in (finding or '').splitlines() if line.strip()), None)
+    if not headline:
+        headline = (backlog or '').strip() or 'gap found during spike'
+    prompt = (
+        f'{name} just finished a time-boxed spike on "{backlog}" and reported this '
+        f'finding:\n\n"{finding[:1500]}"\n\n'
+        f'Does this finding identify at least one concrete, real, actionable gap '
+        f'-- a bug, a missing capability, a broken integration, or a real '
+        f'limitation worth filing as a backlog issue? Or is it just an '
+        f'informational investigation into something that is actually fine?')
+    decision = _serve._call_openrouter_decision_sync(
+        _serve._jev_model(), {'messages': [], 'signals': {}},
+        {'choice': {'type': 'choice', 'instructions': prompt,
+                    'criteria': {
+                        'file_bug': 'Yes -- it names a concrete defect or breakage that should be FIXED (something behaves wrongly or not at all).',
+                        'file_story': 'Yes -- it names a real missing capability or gap worth BUILDING or adding (not a defect, but something that should exist).',
+                        'none': 'No -- the finding is informational, says things are fine, or only surfaces expected limitations with nothing worth filing.'}}})
+    choice, _, _ = _serve._jev_choice(decision)
+    if choice not in ('file_bug', 'file_story'):
+        return None
+    feature = (task.get('projectLabel') or task.get('productId') or task.get('room') or 'pressoffice') or 'pressoffice'
+    title = headline[:140]
+    summary = f'{name} ({backlog[:120]}): {headline}'[:300]
+    return {
+        'issueType': 'bug' if choice == 'file_bug' else 'story',
+        'summary': summary,
+        'title': title,
+        'feature': feature,
+        'description': (finding or '')[:3000],
+        'teamId': task.get('teamId'),
+    }
+
+
 def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     """Phase E2b: a SPIKE is a time-boxed investigation with no committed
     deliverable. Writes a concise findings artifact to the Library and stores
@@ -3546,6 +3603,18 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         if len(output) > 40 and output[:80] not in finding:
             finding += (f'\n\n---\n\nRaw output from execute_script (added automatically -- not '
                        f'already included in the report above):\n\n```\n{output[:4000]}\n```')
+    # W3: a spike worker who spots a real gap now has a model-driven path to
+    # propose it. This is only a WISH -- the executor thread runs against a
+    # snapshot and must never mutate shared state, so _spike_file_issue_wish
+    # returns a fileIssue wish dict (or None) and the sim side (inside the
+    # tick's single read-modify-write) does the real filing. Most spikes are
+    # informational, so the deterministic pre-filter + Jev verdict means no
+    # wish (and no Jev spend) for the common "investigated, all fine" case.
+    file_issue_wish = None
+    try:
+        file_issue_wish = _spike_file_issue_wish(finding, task, name, backlog)
+    except Exception:
+        file_issue_wish = None
     library_path = f"archive/{int(time.time() * 1000)}-spike-{task.get('id') or 'adhoc'}.md"
     _serve._http_json('POST', base, '/api/library/file',
                {'agentId': agent_id,
@@ -3572,6 +3641,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         # pull the REAL findings (source lists, CSVs, feasibility data)
         # forward instead of a vague pointer.
         'libraryPath': library_path,
+        'fileIssue': file_issue_wish,
         'notifyPlayer': {'kind': 'spike_done',
                          'subject': f'[AI Think Tank] Spike done: {backlog[:80]}',
                          # 3600 (was 1500): a real list-style answer (e.g. "every

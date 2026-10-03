@@ -411,9 +411,39 @@ def init_db():
             granted_by TEXT NOT NULL,
             reason TEXT,
             granted_at REAL NOT NULL,
-            expires_at REAL NOT NULL,
+            expires_at REAL,
+            task_id TEXT,
             PRIMARY KEY (agent_id, capability)
         )''')
+        # Migration for DBs created before the per-story grant existed: the
+        # grant carries the task_id (the specific story it was granted for), so
+        # it can be revoked the moment that story ships instead of riding a
+        # timer alone.
+        _cols = {r[1] for r in conn.execute('PRAGMA table_info(temp_access_grants)')}
+        if 'task_id' not in _cols:
+            conn.execute('ALTER TABLE temp_access_grants ADD COLUMN task_id TEXT')
+        # Migration for DBs created before story-scoped grants stopped riding a
+        # clock: SQLite can't relax a NOT NULL column in place, so rebuild the
+        # table with a nullable expires_at. NULL = "no timer -- this grant lives
+        # until its story ships" (revoke_task_access on completion); only a
+        # grant with no story keeps the finite window.
+        _exp_notnull = any(r[1] == 'expires_at' and bool(r[3])
+                           for r in conn.execute('PRAGMA table_info(temp_access_grants)'))
+        if _exp_notnull:
+            conn.execute('ALTER TABLE temp_access_grants RENAME TO temp_access_grants_old')
+            conn.execute('''CREATE TABLE temp_access_grants (
+                agent_id TEXT NOT NULL,
+                capability TEXT NOT NULL,
+                granted_by TEXT NOT NULL,
+                reason TEXT,
+                granted_at REAL NOT NULL,
+                expires_at REAL,
+                task_id TEXT,
+                PRIMARY KEY (agent_id, capability)
+            )''')
+            conn.execute('''INSERT INTO temp_access_grants (agent_id, capability, granted_by, reason, granted_at, expires_at, task_id)
+                            SELECT agent_id, capability, granted_by, reason, granted_at, expires_at, task_id FROM temp_access_grants_old''')
+            conn.execute('DROP TABLE temp_access_grants_old')
         # Phase D external-credential vault (confused-deputy). Two tables:
         #   external_credentials -- the real secrets, encrypted at rest with a
         #     server-side Fernet key; never readable back, only decrypted in
@@ -1258,6 +1288,10 @@ def _render_agents_md(name, role, profile):
     lines = [f'# {name} -- {role}', '', '## Mission', '', profile.get('mission', ''), '', '## Instructions', '']
     for instr in profile.get('instructions', []):
         lines.append(f'- {instr}')
+    agreement = profile.get('workAgreement')
+    if isinstance(agreement, dict) and agreement.get('text'):
+        lines += ['', '## Work Agreement', '', agreement['text'], '',
+                  '_Drafted by the agent, empowered by the admin._']
     lines += ['', '## Notes', '']
     for note in profile.get('notes', []):
         lines.append(f'- {note}')
@@ -2621,6 +2655,11 @@ def resolve_capability_handle(agent_id, handle, method, url):
 # was that nothing got noticed until a human looked or a browser-side bug
 # surfaced visibly.
 HEALTH_CHECK_INTERVAL_S = 300
+# Admin gap 1: how often the periodic health DIGEST (a readable markdown
+# combining alerts + Bank + aging work + escalations) is written to the shared
+# library -- an inspectable record an admin reads, distinct from the 5-min
+# alert push that only fires on new warnings.
+HEALTH_DIGEST_INTERVAL_S = 6 * 3600
 
 # Coordination-pathology signal (prompted by comparing this
 # think tank's own accumulated process -- peer gate, stuck-gate watchdog, the
@@ -2643,6 +2682,7 @@ async def _health_check_loop():
             snapshot = await asyncio.to_thread(compute_health_snapshot)
             new_alerts = await asyncio.to_thread(_persist_new_health_alerts, snapshot['alerts'])
             await asyncio.to_thread(_push_new_health_alerts, new_alerts)
+            await asyncio.to_thread(_write_health_digest, snapshot)
         except Exception as e:
             print(f'[health-check] loop error: {e}', flush=True)
         await asyncio.sleep(HEALTH_CHECK_INTERVAL_S)
@@ -3342,6 +3382,7 @@ async def _lifespan(app):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS:
         telegram_task = asyncio.create_task(_telegram_poll_loop())
         print(f'[telegram] bridge active for {len(TELEGRAM_ALLOWED_CHAT_IDS)} allowlisted chat(s)', flush=True)
+    ask_drain_task = asyncio.create_task(_pending_ask_drain_loop())
     sim_task = None
     try:
         import sim as _sim_module
@@ -3371,6 +3412,7 @@ async def _lifespan(app):
     tier_refresh_task.cancel()
     if telegram_task is not None:
         telegram_task.cancel()
+    ask_drain_task.cancel()
     if sim_task is not None:
         sim_task.cancel()
 
@@ -3781,15 +3823,6 @@ def _backfill_agent_identity_in_db():
         save_state_to_db(state)
 
 
-def _team_for_agent(state, agent_id):
-    """The team whose reporting tree agent_id belongs to, or None."""
-    teams = state.get('teams', []) if state else []
-    for t in teams:
-        if agent_id in (t.get('members') or []):
-            return t
-    return None
-
-
 def _promote_to_director(state, promotee_id, promoter_id):
     """Promote an employee to director: they stop reporting into the old team's
     daily work and instead become the director of a NEW team they can hire for.
@@ -4147,13 +4180,6 @@ def _page_budget_used(now=None):
     month = _page_budget_month()
     bucket = ledger.get(month) or {}
     return int(bucket.get('used', 0) or 0)
-
-
-def _page_budget_remaining():
-    """Page requests left this month. None means the budget is disabled."""
-    if not PAGE_REQUEST_MONTHLY_BUDGET:
-        return None
-    return max(0, PAGE_REQUEST_MONTHLY_BUDGET - _page_budget_used())
 
 
 def _page_budget_exhausted():
@@ -4527,8 +4553,19 @@ def _is_allowlisted_host(hostname):
 # is empty (feature off) until that exclusion is confirmed in place.
 MULLVAD_BIN = shutil.which('mullvad')
 MULLVAD_ACCOUNT_NUMBER = _load_env().get('MULLVAD_ACCOUNT_NUMBER')
+# A broad, safe default set of exit countries the agents may browse through
+# when MULLVAD_COUNTRY_ALLOWLIST is not set in .env. The env var, when present,
+# is authoritative (an empty env string would otherwise silently disable
+# VPN browsing entirely); operators trim this list to what their account plan
+# actually covers. ISO 3166-1 alpha-2, lowercase (Mullvad's relay syntax).
+_MULLVAD_DEFAULT_COUNTRIES = {
+    'us', 'gb', 'de', 'nl', 'se', 'ch', 'fr', 'ca', 'jp', 'au', 'sg', 'no',
+    'fi', 'dk', 'is', 'pl', 'es', 'it', 'at', 'be', 'ie', 'pt',
+}
 MULLVAD_COUNTRY_ALLOWLIST = {c.strip().lower() for c in
                              _load_env().get('MULLVAD_COUNTRY_ALLOWLIST', '').split(',') if c.strip()}
+if not MULLVAD_COUNTRY_ALLOWLIST:
+    MULLVAD_COUNTRY_ALLOWLIST = set(_MULLVAD_DEFAULT_COUNTRIES)
 MULLVAD_CONNECT_TIMEOUT_S = 20
 MULLVAD_STATUS_POLL_S = 1
 _MULLVAD_LOCK = asyncio.Lock()
@@ -4781,16 +4818,6 @@ GMAIL_SMTP = os.environ.get('AI_THINK_TANK_GMAIL_SMTP_EMAIL') or 'austtp25@gmail
 GMAIL_SMTP_HOST = os.environ.get('AI_THINK_TANK_GMAIL_SMTP_HOST') or 'smtp.gmail.com'
 GMAIL_SMTP_PORT = int(os.environ.get('AI_THINK_TANK_GMAIL_SMTP_PORT', '587'))
 _GMAIL_CRED_NAME = 'gmail_smtp'
-
-
-def _player_email_configured():
-    """True when a Gmail app-password is provisioned in the vault AND it
-    decrypts. Missing crypto/dead key -> False (fail closed, email off)."""
-    try:
-        token = _credential_token(_GMAIL_CRED_NAME)
-        return bool(token and _open_secret(token))
-    except Exception:
-        return False
 
 
 def _credential_token(name):
@@ -5540,6 +5567,12 @@ _OPENMETEO_GEOCODE = 'https://geocoding-api.open-meteo.com/v1/search'
 _OPENMETEO_FORECAST = 'https://api.open-meteo.com/v1/forecast'
 
 
+# The think tank's live-weather location for the Weather Station's autonomous
+# readings: real Open-Meteo data via _weather_fetch, never a hard-coded
+# forecast. Defaults to Charlotte, NC; override with WEATHER_LOCATION.
+WEATHER_LOCATION = os.environ.get('WEATHER_LOCATION', '').strip() or 'Charlotte, NC'
+
+
 def _weather_geocode(location):
     """Resolve a free-form place name to lat/lon via Open-Meteo geocoding.
     Returns (lat, lon, display_name) or None when unresolved. A dedicated fetch
@@ -5650,6 +5683,17 @@ _WMO_CODES = {
 
 def _weather_code_human(code):
     return _WMO_CODES.get(code, f'weather code {code}')
+
+
+@app.get('/api/weather/now')
+async def weather_now():
+    """Live weather for the think tank's configured location (WEATHER_LOCATION,
+    default Charlotte, NC). The Weather Station's autonomous readings use this
+    instead of any hard-coded forecast -- real Open-Meteo data, wrapped at the
+    same injection boundary every other external-data tool uses."""
+    result = _weather_fetch(WEATHER_LOCATION)
+    wrapped, _nonce, _tag, instruction = wrap_external_content(result, 'a live weather service')
+    return JSONResponse({'location': WEATHER_LOCATION, 'reading': result, 'forModel': f"{instruction}\n\n{wrapped}"})
 
 
 def _decision_request(model, state, questions):
@@ -7048,7 +7092,7 @@ MODEL_BAND_PURPOSE = {
     # the band silently decided both. Now each is chosen on a benchmark
     # that actually measures its own job.
     'coding': 'Writing and reviewing real code (Code Reviewer, and any role that writes code). Correctness of generated code is the whole job here.',
-    'high': 'Breaking a large, vague request into 2-5 concrete, well-scoped subtasks and deciding how work is distributed (assignBigTask). Runs once per real request, and every downstream call depends on this one being right -- a bad decomposition wastes everything after it, so this is the band to spend on.',
+    'high': 'Breaking a large, vague request into as many concrete, well-scoped subtasks as the work actually requires (never a fixed count -- a small ask may be one card, a sprawling one many) and deciding how work is distributed (assignBigTask). Runs once per real request, and every downstream call depends on this one being right -- a bad decomposition wastes everything after it, so this is the band to spend on.',
 }
 
 # EVERY band's pick has to be grounded in a real,
@@ -7494,6 +7538,41 @@ def get_cached_model_tiers():
     return {band: {'slug': slug, 'name': name, 'price': price} for band, slug, name, price in rows}
 
 
+# Read-only board/status GETs must NOT wake a dormant tank: the browser polls
+# state/health/sim continuously, and an open tab would otherwise defeat
+# sleep-not-die dormancy (each poll would flip it awake). Pure telemetry
+# (device check-in) is likewise non-waking -- it must land while asleep. Waking
+# is reserved for anything that produces work, writes state, or is an explicit
+# player command (non-GET), plus /api/escalation/resolve -- a GET that MUTATES
+# (the player approving a pending escalation must wake the tank so the grant
+# actually lands and the egress proxy refreshes).
+_NON_WAKING_READS = {
+    '/api/state', '/api/health', '/api/health/alerts', '/api/sim/status',
+    '/api/sim/agents', '/api/activity', '/api/activity/summary', '/api/decisions',
+    '/api/reviews', '/api/backlog', '/api/rooms', '/api/teams', '/api/library',
+    '/api/library/search', '/api/library/file', '/api/library/passport',
+    '/api/agent-files', '/api/agent-files/read', '/api/model-tiers',
+    '/api/model-benchmark-scores', '/api/jev/model', '/api/jev/calibration',
+    '/api/intent/sprints', '/api/intent/issues', '/api/intent/products',
+    '/api/intent/wiki', '/api/passport/verify', '/api/player-inbox',
+    '/api/pipelines', '/api/keys/credentials', '/api/sandbox-backups',
+    '/api/shadow', '/api/device/checkin', '/', '/index.html',
+}
+
+
+def _should_wake(request):
+    """True when a request should flip a dormant tank back awake: any write
+    (non-GET) or any GET outside the read-only board/status/telemetry set."""
+    if request.method != 'GET':
+        return True
+    path = request.url.path
+    if path in _NON_WAKING_READS:
+        return False
+    if path.startswith('/api/escalation/') and path != '/api/escalation/resolve':
+        return False
+    return True
+
+
 @app.middleware('http')
 async def no_store(request: Request, call_next):
     # Local dev server for actively-edited files -- a cached stale
@@ -7506,8 +7585,9 @@ async def no_store(request: Request, call_next):
     # Wake-on-request (sleep-not-die): the first request to reach a DORMANT
     # server flips the think tank back awake BEFORE the handler runs, so the
     # admin/browser request that resumes activity does so on an already-warm
-    # server. Any request counts -- authed or not -- matching the recency rule.
-    if _dormant():
+    # server. Read-only board/status GETs and pure telemetry do NOT wake
+    # (see _NON_WAKING_READS) -- an open tab must not defeat dormancy.
+    if _dormant() and _should_wake(request):
         _set_dormant(False)
         print(f'[idle] wake request from {request.client.host if request.client else "?"} -- think tank resumed', flush=True)
     response = await call_next(request)
@@ -7733,7 +7813,8 @@ def _merge_server_owned(existing, incoming):
         # and the client's autosave holds neither, so its stale copies must not
         # revert them (same hazard as products/wiki/teams above).
         for _k in ('features', 'backlog', 'retrospectives',
-                   'pendingRetrospectives', 'pendingSprintRetros'):
+                   'pendingRetrospectives', 'pendingSprintRetros',
+                   '_oncallOrder', '_oncallServed', '_pendingAsks'):
             if _k in existing:
                 merged[_k] = existing[_k]
         # Server cadence stamps are server-authoritative (see the _check_schedules
@@ -7948,6 +8029,24 @@ def _wake_authority_on_request(state):
     return None
 
 
+def _staffing_team_for_authority(state, authority_id):
+    """The receiving team for a staffable large ask, picked by the free
+    authority from the ask alone: the authority's OWN team when that team is
+    free (not in an active sprint), else the first existing team that is free.
+    The ask is then filed to that team's breakdown ceremony (scrum master +
+    workers card it into stories) -- the authority never predicts subtasks up
+    front. Returns the team dict, or None when no team is free."""
+    import sim as _sim
+    teams = state.get('teams') or []
+    own = next((t for t in teams if t.get('directorId') == authority_id), None)
+    if own and not _sim._team_in_active_sprint(state, own.get('id') or own.get('directorId')):
+        return own
+    for t in teams:
+        if not _sim._team_in_active_sprint(state, t.get('id') or t.get('directorId')):
+            return t
+    return None
+
+
 def _all_teams_busy_in_sprint(state):
     """True when EVERY existing team is tied to an ACTIVE sprint -- i.e. the
     whole think tank is already committed to large-ask work. Used by the large-
@@ -7973,8 +8072,9 @@ def _all_teams_busy_in_sprint(state):
 
 
 def _breakdown_into_shared_backlog(state, goal, admin_id):
-    """WS-14: when every team is busy in a sprint, break a large ask into 2-5
-    stories/spikes and file them in the SHARED unassigned backlog under a
+    """WS-14: when every team is busy in a sprint, break a large ask into as
+    many stories/spikes as the work actually requires (never a fixed count --
+    a small ask may be a single card) and file them in the SHARED unassigned backlog under a
     feature (reusing the feature by name when one already exists). Returns
     {'feature': <record>, 'items': [...]}, or None if the model call fails /
     yields nothing usable -- the caller then falls back to spawning a team.
@@ -7988,8 +8088,10 @@ def _breakdown_into_shared_backlog(state, goal, admin_id):
     system_prompt = (
         f'You are the admin of a small think tank. A large task just arrived, but every '
         f'team is already committed to an active sprint, so the task cannot be staffed right now. '
-        'Break it into 2 to 5 concrete stories (or spikes for investigation-first work), each a single '
-        'worker-sized card to be filed in the shared backlog and pulled by a team when its sprint closes. '
+        'Break it into as many concrete stories (or spikes for investigation-first work) as the work actually '
+        'requires -- at least one, never a fixed count: a small ask may be a single card, a sprawling one may need '
+        'many. Each card is a single worker-sized card to be filed in the shared backlog and pulled by a team when '
+        'its sprint closes. '
         'Do NOT assign a room to a card -- the rooms are shared across teams and the agent who picks a '
         'card up figures out where the work needs to happen. '
         'Give a short FEATURE name (3-6 words) that groups these cards under one initiative. '
@@ -8117,97 +8219,31 @@ async def intent_assign_big_task(request: Request):
         return JSONResponse({'error': 'No admin or director is free right now -- try again shortly.'})
     admin_id = authority['id']
 
-    room_defs = _room_definitions(state)
-    system_prompt = (
-        f'You are {authority.get("name")}, now coordinating a small think tank of workers on behalf of the admin. '
-        f'The real current date/time is {datetime.datetime.now(datetime.timezone.utc).isoformat()}. '
-        'Break the following large task into 2 to 5 concrete subtasks, each assignable to one worker in a specific room. '
-        f'Valid rooms, and what each one ACTUALLY does right now, are:\n'
-        + '\n'.join(f'- {r} ({room_defs[r]["label"]}): {room_defs[r]["purpose"]}' for r in _DELEGATABLE_ROOMS)
-        + '\nPick the room whose real capability actually matches each subtask -- most subtasks that need a real file written should go to pressoffice specifically, not wherever the room\'s name merely sounds plausible. '
-        'Keep every title and instructions field to ONE short sentence -- brevity matters more than detail here. '
-        'Set "pair": true on a subtask only if it genuinely benefits from two workers at one workstation (one driving, one reviewing as they go); otherwise omit it. '
-        'If the request says a subtask can\'t start until a specific time (e.g. "at 9pm," "tomorrow," "in an hour"), compute the real ISO 8601 timestamp from the current date/time above and set "notBefore" to it; otherwise omit "notBefore" entirely -- do not invent a time that wasn\'t actually implied. '
-        'Set "priority" to one of low/normal/high/urgent based on how the request itself signals importance -- default to "normal" if nothing implies otherwise. '
-        'For a pressoffice subtask ONLY, set "taskType" to "code" (write/build/fix something -- the default), "review" (a genuine code review of something already built), or "qa" (a real playtester/QA pass). A request that wants something BUILT AND THEN CHECKED should produce separate subtasks. '
-        'Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: '
-        '{"subtasks":[{"title":"short title","room":"one of the valid rooms","instructions":"one short sentence","pair":false,"notBefore":"2026-01-01T21:00:00.000Z or omitted","priority":"low|normal|high|urgent","taskType":"code|review|qa, pressoffice only, omit elsewhere"}]}'
-    )
-
-    key = get_or_create_agent_key(admin_id)
-    # _http_json is a BLOCKING urllib call -- running it in the handler on the
-    # single-worker event loop would deadlock the server's own /api/chat
-    # loopback (the loop is busy serving THIS request and can't accept the
-    # child one, so it hangs to the timeout and reports "couldn't reach a
-    # model"). Off-thread so the worker stays free to answer itself, and with a
-    # long timeout: a 4000-token decomposition on a cold model can legally take
-    # well over the default 30s.
-    # High-stakes planning tier, JEV-gated: a large-request
-    # decomposition is exactly the "damn good reason to use high" case -- the
-    # whole downstream depends on this one call. JEV decides whether it's truly
-    # high-worthy; a routine request stays on a cheaper tier.
-    plan_tier = _resolve_model_tier(
-        f'Decomposing a large request into concrete subtasks: {goal[:200]}',
-        allow_high=True)
-    r = await asyncio.to_thread(_http_json, 'POST', SELF_BASE_URL, '/api/chat',
-                                {'model': plan_tier,
-                                 'messages': [{'role': 'system', 'content': system_prompt},
-                                              {'role': 'user', 'content': goal}],
-                                 'max_tokens': _big_task_max_tokens,
-                                 'agentId': admin_id}, key, timeout=90)
-    if not isinstance(r, dict) or r.get('error') or not r.get('reply'):
-        return JSONResponse({'error': f'{authority.get("name")} couldn\'t reach a model to plan this right now.'},
-                            status_code=502)
-    cleaned = r['reply'].strip()
-    cleaned = re.sub(r'^```json\s*|^```\s*|```\s*$', '', cleaned)
-    try:
-        parsed = json.loads(cleaned)
-    except Exception:
-        return JSONResponse({'error': f'{authority.get("name")} tried to break this down but the plan came back malformed. Try rephrasing the task.'},
-                            status_code=502)
-
-    subtasks = [s for s in (parsed.get('subtasks') or [])
-                if isinstance(s, dict) and s.get('title') and s.get('room') in _DELEGATABLE_ROOMS]
-    if not subtasks:
-        return JSONResponse({'error': f'{authority.get("name")} couldn\'t turn that into any concrete subtasks.'})
-
-    for s in subtasks:
-        # notBefore: ISO 8601 (or numeric) -> epoch ms; malformed fails open to
-        # None (as-soon-as-possible), same "degrade, don't discard" as tasks.js.
-        before = s.get('notBefore')
-        if before:
-            try:
-                if isinstance(before, (int, float)):
-                    s['notBefore'] = int(before)
-                else:
-                    dt = datetime.datetime.fromisoformat(before.replace('Z', '+00:00'))
-                    s['notBefore'] = int(dt.timestamp() * 1000)
-            except Exception:
-                s['notBefore'] = None
-        else:
-            s['notBefore'] = None
-        s['goal'] = goal
-        tt = s.get('taskType')
-        s['taskType'] = tt if (s['room'] == 'pressoffice' and tt in ('code', 'review', 'qa')) else 'code'
-
-    import sim as _sim
-    queued = _sim.queue_work(state, subtasks)
-    # Kick the receiving team's backlog refinement to run on the very next pass
-    # A large request should start refinement immediately, not
-    # wait for the weekly cadence. The team id is the free authority's own id
-    # (the team a director leads is keyed by their id -- see _promote_to_director).
-    _sim.kick_refinement_now(state, admin_id)
+    # Sprint staffing: the free authority picks the receiving team from the ask
+    # alone -- her OWN team when it's free, else the first free team -- and the
+    # ask is filed as a pending large-request breakdown for that team's
+    # breakdown ceremony (scrum master + workers) to card into stories/spikes on
+    # the next pass. No sprint record is created and no subtasks are predicted
+    # up front: the receiving team plans its own work, like a real org.
+    team = _staffing_team_for_authority(state, admin_id)
+    if not team:
+        return JSONResponse({'error': 'No free team is available to take this request right now -- try again shortly.'})
+    team_id = team.get('id') or team.get('directorId')
+    now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+    req = _sim.file_large_request(state, admin_id, goal, team_id, now_ms)
+    if not req:
+        return JSONResponse({'error': "Couldn't file the request -- try again shortly."}, status_code=500)
     save_state_to_db(state)
-    log_action(player_id, 'big_task_delegated',
-               {'admin': admin_id, 'goal': goal[:200], 'subtaskCount': queued}, authorized=True)
-    return JSONResponse({'ok': True,
+    log_action(player_id, 'big_task_staffed',
+               {'admin': admin_id, 'goal': goal[:200], 'team': team_id,
+                'request': req['id']}, authorized=True)
+    team_name = team.get('name') or team_id
+    return JSONResponse({'ok': True, 'staffed': True,
                          'admin': admin_id,
-                         'subtasks': [{'title': s['title'], 'room': s['room'],
-                                       'instructions': s.get('instructions'),
-                                       'pair': bool(s.get('pair')),
-                                       'notBefore': s.get('notBefore'),
-                                       'priority': s.get('priority', 'normal'),
-                                       'taskType': s.get('taskType')} for s in subtasks]})
+                         'team': team_id,
+                         'teamName': team_name,
+                         'request': req['id'],
+                         'note': f'{authority.get("name")} filed this with the {team_name} team. Its scrum master and workers will break it into concrete stories at their next planning session.'})
 
 
 @app.post('/api/intent/story/{task_id}/reject')
@@ -8256,6 +8292,11 @@ async def intent_reject_story(task_id: str, request: Request):
         return JSONResponse({'error': 'No reviewer is available to re-check this right now -- try again shortly.'},
                             status_code=409)
 
+    # Ripple re-review (dependency cascade): the veto re-opened a DELIVERED
+    # story, so any story that DEPENDED on it was built on the now-questioned
+    # output. Send shipped dependents back through their own peer gates too.
+    cascaded = _sim._cascade_rereview(state, task_id, now_ms)
+
     # Veto is a first-class actor action: file a mailbox note to the author so
     # they know it's the PLAYER (not a peer) sending their work back, and chain
     # the veto into the passport alongside sprint/product actions.
@@ -8272,13 +8313,15 @@ async def intent_reject_story(task_id: str, request: Request):
     player_id = 'player'
     log_action(player_id, 'story_vetoed',
                {'taskId': task_id, 'title': (task.get('title') or '')[:200],
-                'author': author, 'reason': reason[:300]}, authorized=True)
+                'author': author, 'reason': reason[:300], 'cascaded': cascaded},
+               authorized=True)
     _append_passport_decision('story_vetoed', player_id,
                               {'taskId': task_id, 'title': (task.get('title') or '')[:200],
-                               'author': author, 'reason': reason[:300]})
+                               'author': author, 'reason': reason[:300], 'cascaded': cascaded})
     return JSONResponse({'ok': True, 'taskId': task_id,
                          'author': author,
-                         'reviewers': gate['reviewerIds']})
+                         'reviewers': gate['reviewerIds'],
+                         'cascaded': cascaded})
 
 
 # Player-triggered publish destination. Configurable per install -- each
@@ -9303,13 +9346,22 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
     return execute_tool
 
 
-async def _ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False):
+async def _ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True):
     """The real logic behind /api/intent/ask, pulled out so a non-HTTP caller
     (the Telegram bridge) can invoke it directly -- no fake Request object,
     no self-loopback HTTP hop, no auth dance for an already-trusted in-process
     caller. Returns {'reply', 'agent', 'tools'} on success or {'error', status}
     on failure, the same shape the endpoint returns as JSON. See intent_ask
-    for the full behavior description; this function IS that behavior."""
+    for the full behavior description; this function IS that behavior.
+
+    Ask-lane parking (allow_park=True): when NO agent is free to answer right
+    now, the ask is QUEUED rather than rejected -- a {'queued': True, 'askId',
+    'reply'} result with the record appended to state['_pendingAsks'] (server-
+    owned state, so it survives the client autosave merge). The drain loop
+    (_pending_ask_drain_loop) answers it with the first agent that frees up and
+    delivers the reply to the player inbox + email. allow_park=False preserves
+    the old hard 409 for callers that must not queue (the drain's own inner
+    call, which has already picked a candidate)."""
     question = (question or '').strip()
     if not question:
         return {'error': 'a question is required', 'status': 400}
@@ -9341,7 +9393,22 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     if requested_agent and requested_is_valid_pin:
         pick = requested_agent
     elif not candidates:
-        return {'error': 'No agent is free to answer right now. Try again shortly.', 'status': 409}
+        if not allow_park:
+            return {'error': 'No agent is free to answer right now. Try again shortly.', 'status': 409}
+        # Ask-lane parking: when every eligible agent is busy, the ask is QUEUED
+        # (never rejected) -- the first agent to free up answers it and the reply
+        # lands in the player's inbox + email (see _pending_ask_drain_loop /
+        # _apply_pending_ask_results). A player's deliberate pin rides along on
+        # the record (honored by the drain only for a non-admin; an admin pin is
+        # ignored so a drained reply never makes the admin do routine ask-
+        # answering she didn't opt into).
+        now_ms = int(time.time() * 1000)
+        parked = {'id': f'ask-{now_ms}', 'question': question,
+                  'location': (location or '').strip() or None,
+                  'agentId': requested_agent or None, 'ts': now_ms}
+        state.setdefault('_pendingAsks', []).append(parked)
+        return {'queued': True, 'askId': parked['id'],
+                'reply': 'Every agent is busy right now, so your question has been queued -- the first one to free up will answer it in your inbox shortly.'}
     else:
         pick = candidates[0]
     # The live agents dict (not _agent_record_for, which checks the roster
@@ -9530,6 +9597,154 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     return {'reply': reply, 'agent': pick, 'tools': tools_used}
 
 
+# ---------------------------------------------------------------------------
+# Ask-lane parking drain. _ask_core QUEUES an ask into state['_pendingAsks']
+# (server-owned state) when no agent is free; this section answers those asks
+# with the first agent that frees up and delivers the reply to the player
+# inbox + email. Two-phase content-executor discipline (same as _content_results
+# in sim.py): the model call runs OFF the sim's single read-modify-write -- a
+# slow LLM answer must never stall the tick or race a whole-blob save -- and the
+# result is stashed in-memory, then _apply_pending_ask_results (called by the
+# sim pass inside its one read-modify-write) delivers it durably.
+# ---------------------------------------------------------------------------
+PENDING_ASK_DRAIN_INTERVAL_S = 20
+
+_pending_ask_results = {}
+_pending_ask_results_lock = threading.Lock()
+_pending_ask_inflight = set()
+
+
+def _store_pending_ask_result(result):
+    with _pending_ask_results_lock:
+        _pending_ask_results[result.get('askId')] = dict(result)
+
+
+def _take_pending_ask_results():
+    with _pending_ask_results_lock:
+        out = list(_pending_ask_results.values())
+        _pending_ask_results.clear()
+        return out
+
+
+def _pending_ask_drain_pass(state):
+    """Answer the oldest parked ask (state['_pendingAsks'][0]) with the first
+    eligible agent that frees up. Runs on the drain loop's thread; mutates only
+    the passed-in state's read view + the in-memory result holder, NEVER the DB
+    -- _apply_pending_ask_results does the durable write inside the sim tick's
+    read-modify-write. A parked ask's deliberate pin is honored only for a NON-
+    admin (a player specifically addressed one agent); an admin pin is ignored
+    so the drained reply never assigns routine ask-answering to the admin. The
+    inner _ask_core call runs in its own fresh thread (asyncio.run around the
+    async function), so a slow model call blocks nothing."""
+    import sim as _sim
+    import asyncio
+    pending = state.get('_pendingAsks') or []
+    if not pending:
+        return
+    ask = pending[0]
+    if ask.get('id') in _pending_ask_inflight:
+        return
+    agents = state.get('agents') or {}
+    requested = ask.get('agentId')
+    candidates = [aid for aid in _sim._eligible_candidates(state, include_off_duty=True)
+                  if agents.get(aid)]
+    if requested and requested in candidates:
+        pick = requested
+    elif candidates:
+        pick = candidates[0]
+    else:
+        return  # everyone still busy -- try again next drain pass
+    _pending_ask_inflight.add(ask['id'])
+
+    def _run():
+        try:
+            import serve as _serve
+            result = asyncio.run(_serve._ask_core(
+                state, ask.get('question'), pick, ask.get('location'),
+                allow_admin_pin=False, allow_park=False))
+            result['askId'] = ask['id']
+            result['agentId'] = pick
+            _store_pending_ask_result(result)
+        except Exception as e:
+            _store_pending_ask_result({'askId': ask['id'], 'error': f'ask drain failed: {e}'})
+        finally:
+            _pending_ask_inflight.discard(ask['id'])
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+async def _pending_ask_drain_loop():
+    """Standing loop (created in _lifespan): every PENDING_ASK_DRAIN_INTERVAL_S,
+    load fresh state and run one drain pass. Slow model answers run on their own
+    threads inside the pass; results are applied by _apply_pending_ask_results on
+    the next sim tick."""
+    import asyncio
+    import serve as _serve
+    while True:
+        await asyncio.sleep(PENDING_ASK_DRAIN_INTERVAL_S)
+        try:
+            state = _serve.get_state_from_db()
+            if state:
+                await asyncio.to_thread(_pending_ask_drain_pass, state)
+        except Exception as e:
+            print(f'[ask] drain loop error: {e}', flush=True)
+
+
+def _apply_pending_ask_results(state):
+    """Deliver finished drained asks inside the sim tick's single read-modify-write:
+    file the reply into the player's inbox (status 'answered', queued marker) and
+    queue a real email, then drop the ask. A transient 409 (everyone got busy
+    again) leaves the ask parked for the next pass; a real failure drops it and
+    tells the player instead of retrying forever. Returns the number of asks
+    delivered."""
+    import sim as _sim
+    results = _take_pending_ask_results()
+    if not results:
+        return 0
+    now_ms = int(time.time() * 1000)
+    delivered = 0
+    for r in results:
+        ask_id = r.get('askId')
+        ask = next((a for a in (state.get('_pendingAsks') or []) if a.get('id') == ask_id), None)
+        if not ask:
+            continue
+        if 'error' in r:
+            if r.get('status') == 409:
+                continue  # transiently busy again -- keep it parked, retry next pass
+            state['_pendingAsks'] = [a for a in (state.get('_pendingAsks') or [])
+                                     if a.get('id') != ask_id]
+            reply = r['error']
+            agent_id = None
+        else:
+            state['_pendingAsks'] = [a for a in (state.get('_pendingAsks') or [])
+                                     if a.get('id') != ask_id]
+            reply = r.get('reply') or ''
+            agent_id = r.get('agentId')
+        inbox = state.setdefault('playerInbox', [])
+        inbox.append({
+            'id': ask_id,
+            'agentId': agent_id,
+            'question': (ask.get('question') or '')[:500],
+            'answer': reply,
+            'status': 'answered',
+            'answeredAt': now_ms,
+            'createdAt': ask.get('ts') or now_ms,
+            'queued': True,
+        })
+        _sim._queue_player_email(
+            state, 'ask_answered',
+            '[AI Think Tank] Your question was answered',
+            (f'You asked: {(ask.get("question") or "")[:300]}\n\n'
+             f'{agent_id or "No agent"} answered:\n{reply}'))
+        log_action('player', 'ask_answered',
+                   {'askId': ask_id, 'agent': agent_id}, authorized=True)
+        _append_passport_decision('ask_answered', agent_id or 'player',
+                                  {'askId': ask_id,
+                                   'question': (ask.get('question') or '')[:200]})
+        delivered += 1
+    return delivered
+
+
 def _team_digest_text(max_markdown_chars=1400, tape_window_s=86400):
     """Read-only, DB-only ground-truth digest of how the team is doing: the
     newest weekly review (built from the action log + decision tape, never an
@@ -9601,6 +9816,8 @@ async def intent_ask(request: Request):
                              body.get('location'), body.get('max_tokens', 300))
     if 'error' in result:
         return JSONResponse({'error': result['error']}, status_code=result.get('status', 500))
+    if result.get('queued'):
+        save_state_to_db(state)
     return JSONResponse(result)
 
 
@@ -9620,7 +9837,7 @@ _ROUTING_LANES = [
     {'id': 'spike', 'description': "Asks the think tank to look into or figure something out ONE TIME, with no need for an immediate reply and no clearly defined deliverable yet -- exploratory, time-boxed digging, not a committed piece of work."},
     {'id': 'story', 'description': "Asks for something substantial to be BUILT, CHANGED, or DELIVERED -- a real feature, fix, or piece of work with a concrete outcome, sized for a team's real backlog and sprint process."},
     {'id': 'incident', 'description': "Reports something already broken, down, or failing RIGHT NOW in a live product, wanting it fixed urgently."},
-    {'id': 'unclear', 'description': "None of the above genuinely fits, or it's ambiguous/contradictory/high-stakes enough that only a human director should decide how to handle it -- do not force a fit."},
+    {'id': 'unclear', 'description': "None of the above genuinely fits, or the message BUNDLES MULTIPLE UNRELATED REQUESTS at once (one message asking for two or more different things), or it's ambiguous/contradictory/high-stakes enough that only a human director should decide how to handle it -- do not force a single-lane fit or silently drop the rest."},
 ]
 
 
@@ -9749,16 +9966,44 @@ async def _route_lane_ask(state, text, admin_id):
     # (the admin) is who answers -- allow_admin_pin=True is safe here in a
     # way it is not for the public /api/intent/ask endpoint's raw player-
     # submitted agentId (see _ask_core's own comment on the parameter).
-    return await _ask_core(state, text, admin_id, allow_admin_pin=True)
+    result = await _ask_core(state, text, admin_id, allow_admin_pin=True)
+    if result.get('queued'):
+        save_state_to_db(state)
+    return result
 
 
 async def _route_lane_unclear(state, text, admin_id):
-    # Pinning to _free_authority (admin first, else senior-most director)
-    # instead of a random free agent IS the "needs a director's judgment
-    # call" behavior -- the senior-most available director personally
-    # answers in character rather than whoever's next in round robin.
-    authority = _free_authority(state)
-    return await _ask_core(state, text, (authority or {}).get('id') or admin_id, allow_admin_pin=True)
+    # Routing reconciliation (REQUEST_PROCESSES.md appendix): the 'unclear'
+    # lane -- a multi-intent bundle or an ask no classifier can pin -- is a
+    # director's judgment call. The SENIOR-MOST director answers directly,
+    # with the admin as fallback (the admin is herself a director, but she
+    # doesn't delegate to herself first). Pinning a specific authority instead
+    # of a random free agent IS the "needs a director's judgment" behavior.
+    authority = _unclear_lane_authority(state)
+    result = await _ask_core(state, text, (authority or {}).get('id') or admin_id, allow_admin_pin=True)
+    if result.get('queued'):
+        save_state_to_db(state)
+    return result
+
+
+def _unclear_lane_authority(state):
+    """The authority who answers an 'unclear' lane ask: the senior-most
+    non-admin director if free, else the admin if free, else None (ask_core
+    degrades to a round-robin agent / parking). Mirrors _free_authority's
+    free/on-duty gate but flips the priority -- a multi-intent bundle is a
+    director judgment call, so the senior-most director speaks first."""
+    roster = state.get('agentRoster') or []
+    agents = state.get('agents') or {}
+    def _free(d):
+        a = agents.get(d.get('id'))
+        return a is not None and not a.get('busy') and not a.get('offDuty')
+    for d in roster:
+        if d.get('isDirector') and not d.get('isAdmin') and not d.get('director') and _free(d):
+            return d
+    for d in roster:
+        if d.get('isAdmin') and _free(d):
+            return d
+    return None
 
 
 async def _route_lane_schedule(state, text, admin_id):
@@ -10239,6 +10484,190 @@ async def write_wiki_page(request: Request):
     _append_passport_decision('wiki_page_written', actor,
                               {'id': page_id, 'category': category, 'version': record.get('version'), 'isNew': is_new})
     return JSONResponse({'ok': True, 'page': record, 'isNew': is_new})
+
+
+# --- Wiki agent-propose lane (quarantine) -----------------------------------
+# A non-director agent has NO wiki-write rights (director/admin gated above) --
+# but the think tank's knowledge layer is exactly where a researcher's findings
+# should be able to land. The propose lane gives ANY agent a real path: the
+# proposal sits in library/pending_review/wiki/ (the same quarantine that holds
+# untrusted downloads and skill candidates), and a director/admin approves it
+# into the LIVE wiki (wiki_write_page + disk + passport, exactly like a direct
+# write) or rejects it to rejected/wiki/. Until approval the live wiki is
+# untouched -- no content can enter the trusted knowledge layer without a
+# director reviewing it, the same "promotion is never automatic" discipline as
+# library_promote.
+
+
+@app.post('/api/intent/wiki/propose')
+async def propose_wiki_page(request: Request):
+    """Agent-propose a wiki page: {id, title?, category, body, summary?}. Any
+    authenticated agent may propose; the proposal lands in
+    pending_review/wiki/<category>/<id>.json and the LIVE wiki is untouched.
+    A director/admin approves or rejects it via the proposal endpoints below."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    actor = _resolve_requester(request)
+    if not actor:
+        return JSONResponse({'error': 'an agent key is required to propose a wiki page'}, status_code=403)
+    page_id = (body.get('id') or '').strip()
+    title = (body.get('title') or '').strip() or page_id
+    category = (body.get('category') or '').strip()
+    content = body.get('body') or ''
+    summary = (body.get('summary') or '').strip()
+    if not page_id or not category:
+        return JSONResponse({'error': 'id and category are required'}, status_code=400)
+    if any(ch in page_id for ch in '/\\'):
+        return JSONResponse({'error': 'invalid page id'}, status_code=400)
+    if not content.strip():
+        return JSONResponse({'error': 'body is required'}, status_code=400)
+    if len(content) > 200_000:
+        return JSONResponse({'error': 'body too large (max 200k)'}, status_code=400)
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    categories = (state.get('wiki') or {}).get('categories') or {}
+    if category not in categories:
+        return JSONResponse({'error': f'unknown category: {category}'}, status_code=400)
+    proposal = {
+        'id': page_id, 'title': title, 'category': category,
+        'body': content, 'summary': summary,
+        'proposedBy': actor, 'proposedAt': int(time.time() * 1000),
+    }
+    rel_path = f'pending_review/wiki/{category}/{page_id}.json'
+    target = _safe_library_path(rel_path)
+    if not target:
+        return JSONResponse({'error': 'invalid destination'}, status_code=400)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, 'w') as f:
+        json.dump(proposal, f)
+    log_action(actor, 'wiki_proposed',
+               {'id': page_id, 'category': category, 'path': rel_path}, authorized=True)
+    return JSONResponse({'ok': True, 'proposal': {
+        'id': page_id, 'title': title, 'category': category,
+        'path': rel_path, 'proposedBy': actor}})
+
+
+@app.get('/api/intent/wiki/proposals')
+async def list_wiki_proposals(request: Request):
+    """Read-only listing of pending wiki proposals (metadata only -- bodies stay
+    in the quarantine file until approved). Open to any authenticated client."""
+    base = os.path.join(LIBRARY_DIR, 'pending_review', 'wiki')
+    proposals = []
+    if os.path.isdir(base):
+        for root, _dirs, filenames in os.walk(base):
+            for fn in filenames:
+                if not fn.endswith('.json'):
+                    continue
+                full = os.path.join(root, fn)
+                try:
+                    with open(full, 'r') as f:
+                        p = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                proposals.append({'id': p.get('id'), 'title': p.get('title'),
+                                  'category': p.get('category'),
+                                  'summary': p.get('summary') or '',
+                                  'proposedBy': p.get('proposedBy'),
+                                  'proposedAt': p.get('proposedAt')})
+    proposals.sort(key=lambda p: str(p.get('proposedAt')))
+    return JSONResponse({'proposals': proposals})
+
+
+def _find_wiki_proposal(category, page_id):
+    rel = f'pending_review/wiki/{category}/{page_id}.json'
+    target = _safe_library_path(rel)
+    if not target or not os.path.isfile(target):
+        return None, rel
+    try:
+        with open(target, 'r') as f:
+            return json.load(f), rel
+    except (OSError, ValueError):
+        return None, rel
+
+
+@app.post('/api/intent/wiki/proposal/{page_id}/approve')
+async def approve_wiki_proposal(page_id: str, request: Request):
+    """Approve a pending wiki proposal: {category}. Director/admin gated (the
+    same authority a direct wiki write needs). Promotes the proposal into the
+    live wiki exactly like a direct write (version bump + history, body on disk,
+    passport chain), then archives the proposal for provenance."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    category = (body.get('category') or '').strip()
+    if not category:
+        return JSONResponse({'error': 'category is required'}, status_code=400)
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    actor = _resolve_requester(request)
+    if not actor or not _is_director_or_admin(state, actor):
+        return JSONResponse({'error': 'only a director or the admin may approve a wiki proposal'}, status_code=403)
+    proposal, rel_path = _find_wiki_proposal(category, page_id)
+    if proposal is None:
+        return JSONResponse({'error': f'no pending proposal for {page_id} in {category}'}, status_code=404)
+    import sim as _sim
+    record, is_new = _sim.wiki_write_page(state, page_id, proposal.get('title') or page_id,
+                                          category, proposal.get('body') or '', actor)
+    if record is None:
+        return JSONResponse({'error': 'could not write wiki page'}, status_code=400)
+    cat_dir = os.path.join(LIBRARY_DIR, 'wiki', category)
+    os.makedirs(cat_dir, exist_ok=True)
+    _write_file(os.path.join(cat_dir, f'{page_id}.md'), proposal.get('body') or '')
+    save_state_to_db(state)
+    log_action(actor, 'wiki_page_written', {'id': page_id, 'category': category,
+                                            'version': record.get('version'),
+                                            'fromProposal': True}, authorized=True)
+    _append_passport_decision('wiki_page_written', actor,
+                              {'id': page_id, 'category': category,
+                               'version': record.get('version'), 'isNew': is_new})
+    src = _safe_library_path(rel_path)
+    if src:
+        archive_rel = f'archive/wiki-proposals/{category}/{page_id}.json'
+        archive_target = _safe_library_path(archive_rel)
+        if archive_target:
+            os.makedirs(os.path.dirname(archive_target), exist_ok=True)
+            shutil.move(src, archive_target)
+    return JSONResponse({'ok': True, 'page': record, 'isNew': is_new,
+                         'proposedBy': proposal.get('proposedBy')})
+
+
+@app.post('/api/intent/wiki/proposal/{page_id}/reject')
+async def reject_wiki_proposal(page_id: str, request: Request):
+    """Reject a pending wiki proposal: {category}. Director/admin gated. Moves
+    the proposal to rejected/wiki/ -- kept out of the way but not silently
+    lost, exactly like library_reject."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    category = (body.get('category') or '').strip()
+    if not category:
+        return JSONResponse({'error': 'category is required'}, status_code=400)
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    actor = _resolve_requester(request)
+    if not actor or not _is_director_or_admin(state, actor):
+        return JSONResponse({'error': 'only a director or the admin may reject a wiki proposal'}, status_code=403)
+    proposal, rel_path = _find_wiki_proposal(category, page_id)
+    if proposal is None:
+        return JSONResponse({'error': f'no pending proposal for {page_id} in {category}'}, status_code=404)
+    src = _safe_library_path(rel_path)
+    dest_rel = f'rejected/wiki/{category}/{page_id}.json'
+    dest = _safe_library_path(dest_rel)
+    if not src or not dest:
+        return JSONResponse({'error': 'invalid destination'}, status_code=400)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    shutil.move(src, dest)
+    log_action(actor, 'wiki_proposal_rejected',
+               {'id': page_id, 'category': category, 'to': dest_rel}, authorized=True)
+    return JSONResponse({'ok': True, 'rejected': {'id': page_id, 'category': category,
+                                                  'to': dest_rel}})
 
 
 def _write_wiki_server(page_id, title, category, content):
@@ -11078,6 +11507,17 @@ async def write_library_file(request: Request):
         st = get_state_from_db()
         if not _is_director_or_admin(st, agent_id):
             return JSONResponse({'error': 'Only a director or the admin may write the working guide.'}, status_code=403)
+    # The LIVE wiki tree (wiki/ in the library) is the curated, director-gated
+    # knowledge layer: it is written ONLY through write_wiki_page, which version-
+    # bumps and passport-chains every change. This generic write endpoint must
+    # not become a back door for an agent to overwrite or blank a live wiki page
+    # (and pending_review/wiki/ is the propose lane's own reserved namespace,
+    # populated via /api/intent/wiki/propose -- junk dropped here through the
+    # generic endpoint would dodge that endpoint's id/path validation).
+    norm_segments = rel_path.strip('/').split('/')
+    if norm_segments and (norm_segments[0] == 'wiki'
+                          or (norm_segments[0] == 'pending_review' and len(norm_segments) > 1 and norm_segments[1] == 'wiki')):
+        return JSONResponse({'error': 'The wiki is director-gated; use the wiki write endpoint.'}, status_code=403)
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
     # Per-agent personal namespace ACL (your walk-the-chain model, issue #9):
     # anyone can read the shared Library, anyone can write the COMMONS
@@ -11373,6 +11813,15 @@ async def library_promote(request: Request):
         if state and not _can_write_agent(state, agent_id, own):
             log_action(agent_id, 'library_promote_denied', {'to': dest_rel, 'owner': own}, authorized=authorized)
             return JSONResponse({'error': f'Only {own}, {own}\'s director, or the admin may write to that agent\'s files.'}, status_code=403)
+    # shutil.move silently OVERWRITES an existing destination file, so promoting
+    # into the live wiki tree (wiki/) would let an agent clobber a curated wiki
+    # page's body without ever touching write_wiki_page's versioning/passport
+    # chain. The wiki propose lane owns wiki promotion (director-gated); block
+    # it here.
+    dest_top = dest_rel.strip('/').split('/')[0]
+    if dest_top == 'wiki':
+        log_action(agent_id, 'library_promote_denied', {'to': dest_rel, 'reason': 'wiki is director-gated'}, authorized=authorized)
+        return JSONResponse({'error': 'The wiki is director-gated; promote via the wiki proposal lane.'}, status_code=403)
     os.makedirs(os.path.dirname(dest_target), exist_ok=True)
     shutil.move(source_target, dest_target)
     # Promote = a file becomes TRUSTED -- that's exactly the point to append
@@ -11948,19 +12397,39 @@ def _has_active_temp_access(agent_id, capability):
             'SELECT expires_at FROM temp_access_grants WHERE agent_id = ? AND capability = ?',
             (agent_id, capability),
         ).fetchone()
-    return bool(row and row[0] > time.time())
+    # NULL expires_at = a story-scoped grant: no timer, active until its story
+    # ships (revoke_task_access on completion). Anything else must still be
+    # inside its window.
+    return bool(row and (row[0] is None or row[0] > time.time()))
 
 
-def _grant_temp_access(agent_id, capability, granted_by, reason):
+def _grant_temp_access(agent_id, capability, granted_by, reason, task_id=None):
     now = time.time()
-    expires_at = now + TEMP_ACCESS_DURATION_S
+    # A story-scoped grant rides NO clock: it lives until the story it was
+    # granted for ships (revoke_task_access on completion). Only a grant with
+    # no story keeps the finite window, so nothing is ever permanent.
+    expires_at = None if task_id else now + TEMP_ACCESS_DURATION_S
     with _db() as conn:
         conn.execute(
-            'INSERT INTO temp_access_grants (agent_id, capability, granted_by, reason, granted_at, expires_at) VALUES (?, ?, ?, ?, ?, ?) '
-            'ON CONFLICT(agent_id, capability) DO UPDATE SET granted_by=excluded.granted_by, reason=excluded.reason, granted_at=excluded.granted_at, expires_at=excluded.expires_at',
-            (agent_id, capability, granted_by, reason, now, expires_at),
+            'INSERT INTO temp_access_grants (agent_id, capability, granted_by, reason, granted_at, expires_at, task_id) VALUES (?, ?, ?, ?, ?, ?, ?) '
+            'ON CONFLICT(agent_id, capability) DO UPDATE SET granted_by=excluded.granted_by, reason=excluded.reason, granted_at=excluded.granted_at, expires_at=excluded.expires_at, task_id=excluded.task_id',
+            (agent_id, capability, granted_by, reason, now, expires_at, task_id),
         )
     return expires_at
+
+
+def revoke_task_access(task_id):
+    """Per-story capability grant lifecycle: a temp grant is tied to the SPECIFIC
+    story it was granted for (task_id), so the moment that story ships the grant
+    dies with it -- capability access never outlives the work that justified it.
+    Best-effort (a missing DB must never break a completion path)."""
+    if not task_id:
+        return
+    try:
+        with _db() as conn:
+            conn.execute('DELETE FROM temp_access_grants WHERE task_id = ?', (task_id,))
+    except Exception:
+        pass
 
 
 def _agent_is_in_weatherstation(agent_id, live_room=None):
@@ -12384,6 +12853,7 @@ async def access_request(request: Request):
     supervisor_id = body.get('supervisorId', 'unknown')
     capability = body.get('capability')
     reason = (body.get('reason') or '').strip()
+    task_id = (body.get('taskId') or '').strip() or None
 
     if not check_rate_limit(agent_id):
         log_action(agent_id, 'rate_limited', {'endpoint': 'access-request'})
@@ -12392,6 +12862,18 @@ async def access_request(request: Request):
         return JSONResponse({'error': f'capability must be one of {sorted(TEMP_ACCESS_CAPABILITIES)}'}, status_code=400)
     if not reason:
         return JSONResponse({'error': 'reason is required'}, status_code=400)
+    # Per-story capability grant: a temp grant must name the SPECIFIC story it's
+    # for, and that story must be the agent's own live task (the server checks
+    # the real persisted state, not the client's word) -- so the grant dies with
+    # the story (revoke_task_access on completion) instead of riding the timer
+    # alone. An agent with no live task cannot get a story-scoped grant.
+    if task_id:
+        st = get_state_from_db()
+        live_task = None
+        if st:
+            live_task = (st.get('agents') or {}).get(agent_id, {}).get('task')
+        if live_task != task_id:
+            return JSONResponse({'error': 'taskId must be the story the agent is currently working on'}, status_code=400)
     if not OPENROUTER_API_KEY:
         return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
 
@@ -12410,12 +12892,16 @@ async def access_request(request: Request):
         log_action(agent_id, 'access_request', {'capability': capability, 'reason': reason, 'supervisorId': supervisor_id, 'decision': 'denied'})
         return JSONResponse({'approved': False, 'reason': 'Not approved -- the stated reason did not justify temporary access.'})
 
-    expires_at = _grant_temp_access(agent_id, capability, supervisor_id, reason)
-    log_action(agent_id, 'access_request', {'capability': capability, 'reason': reason, 'supervisorId': supervisor_id, 'decision': 'approved', 'expiresAt': expires_at})
+    expires_at = _grant_temp_access(agent_id, capability, supervisor_id, reason, task_id=task_id)
+    # A story-scoped grant reports "until the story ships", not a timestamp --
+    # it dies with revoke_task_access on completion (or with the agent, on
+    # firing), never on a clock.
+    story_scoped = bool(task_id)
+    log_action(agent_id, 'access_request', {'capability': capability, 'reason': reason, 'supervisorId': supervisor_id, 'decision': 'approved', 'expiresAt': expires_at, 'taskId': task_id, 'untilStoryComplete': story_scoped})
     # Approving temporary access is a consequential (privilege) decision --
     # chain it, same ledger as hires/fires/promotions.
-    _append_passport_decision('grant_access', supervisor_id, {'agent': agent_id, 'capability': capability, 'reason': reason, 'expiresAt': expires_at})
-    return JSONResponse({'approved': True, 'capability': capability, 'expiresAt': expires_at, 'durationS': TEMP_ACCESS_DURATION_S})
+    _append_passport_decision('grant_access', supervisor_id, {'agent': agent_id, 'capability': capability, 'reason': reason, 'expiresAt': expires_at, 'taskId': task_id})
+    return JSONResponse({'approved': True, 'capability': capability, 'expiresAt': expires_at, 'untilStoryComplete': story_scoped, 'durationS': None if story_scoped else TEMP_ACCESS_DURATION_S, 'taskId': task_id})
 
 
 async def _classify_command(command, purpose, agent_id='unknown'):
@@ -13963,6 +14449,33 @@ def _health_alerts_for_signals(signals):
                   f'median task completion {median_h:.1f}h across {assigned} task(s) assigned in the last 24h '
                   f'-- work taking unusually long to finish')
 
+    # Admin gap 1: aging in-flight work. A non-bug card wedged past its budget
+    # (walking forever, or still working long after workUntil) is the stale-work
+    # sweep's domain -- but its PRESENCE here means the sweep hasn't re-planned
+    # it yet, so the digest speaks up instead of waiting for a later pass.
+    if signals.get('aging_in_flight_work'):
+        alert('work_queue', 'warning',
+              f'{signals["aging_in_flight_work"]} in-flight task(s) wedged past their work budget '
+              f'-- the stale-work sweep will re-plan them; check why work is not resolving')
+
+    # Open escalations: an incident the on-call hasn't put to bed yet. A single
+    # pending escalation is normal incident response; a stack of unresolved
+    # products is a signal the pipeline is backing up.
+    if signals.get('open_escalations', 0) >= 2:
+        alert('escalations', 'warning',
+              f'{signals["open_escalations"]} open escalation(s) -- more than one incident '
+              f'awaiting an on-call restore')
+
+    # Bank over-cap: a service spent past its cap -- the director teller's
+    # warning, surfaced to the admin digest (not just the bank room readout a
+    # director has to open on purpose). Spend is real money, so this rides
+    # 'warning' and pushes like the other spend-facing signals.
+    if signals.get('bank_over_cap'):
+        alert('bank', 'warning',
+              f'over-cap spend on: {", ".join(signals["bank_over_cap"])} -- '
+              f'${signals.get("bank_used", 0.0):.2f} of ${signals.get("bank_cap", 0.0):.2f} '
+              f'cumulative; directors should reallocate or raise a cap')
+
     return alerts
 
 
@@ -13975,6 +14488,41 @@ def _count_due_work_items(work_queue, now_ms):
     # epoch SECONDS, like everywhere else in serve.py) is something a
     # test can pin down directly, rather than trusting it inline.
     return sum(1 for item in work_queue if not item.get('notBefore') or item['notBefore'] <= now_ms)
+
+
+def _aging_in_flight_work(data, now_ms):
+    """Count non-bug tasks wedged in 'walking'/'working' past any legitimate
+    budget -- the health-snapshot mirror of sim's stale-work sweep (SM gap 1),
+    so the periodic admin digest surfaces the same wedged work the sweep will
+    re-plan, instead of only the queue-length/abandoned signals. Mirrors the
+    sweep's own thresholds: 'walking' older than STALE_WORK_TIMEOUT_MS, or
+    'working' still working more than STALE_WORK_BUDGET_GRACE_S past workUntil.
+    Pure read over the state blob -- no DB, no network, testable directly."""
+    import sim as _sim
+    tasks = data.get('tasks') or {}
+    if not isinstance(tasks, dict):
+        return 0
+    now = now_ms / 1000
+    n = 0
+    for task in tasks.values():
+        if not isinstance(task, dict):
+            continue
+        if task.get('status') not in ('walking', 'working'):
+            continue
+        if task.get('taskType') == 'bug' or task.get('incident') or task.get('shadow') or task.get('reviewOf'):
+            continue  # bugs own an alarm; shadows/reviews are other watchdogs' domain
+        opened = task.get('openedAt') or task.get('assignedAt') or task.get('createdAt')
+        if opened is None:
+            continue
+        if task.get('status') == 'walking':
+            if now_ms - opened < _sim.STALE_WORK_TIMEOUT_MS:
+                continue
+        else:
+            work_until = task.get('workUntil') or 0
+            if now <= work_until + _sim.STALE_WORK_BUDGET_GRACE_S:
+                continue
+        n += 1
+    return n
 
 
 def _task_horizon_metrics(now):
@@ -14057,6 +14605,7 @@ def compute_health_snapshot():
 
     if state_row is None:
         think_tank_active, seconds_since_last_save, work_queue_size, work_queue_due_size, agents_count = False, None, 0, 0, 0
+        aging_in_flight, open_escalations, bank_over_cap, bank_used, bank_cap = 0, 0, [], 0.0, 0.0
     else:
         blob, updated_at = state_row
         seconds_since_last_save = now - updated_at
@@ -14066,6 +14615,22 @@ def compute_health_snapshot():
         work_queue_size = len(work_queue)
         work_queue_due_size = _count_due_work_items(work_queue, now * 1000)
         agents_count = len(data.get('agents', {}))
+        # Admin gap 1: aging in-flight work -- a non-bug task wedged past its
+        # budget (the stale-work sweep's domain, SM gap 1) is a health signal
+        # here too: it means the sweep hasn't re-planned it yet, so the digest
+        # surfaces it instead of waiting for a later pass.
+        aging_in_flight = _aging_in_flight_work(data, now * 1000)
+        # Open escalations: a pending one, plus products with an unresolved
+        # escalation record -- an incident the on-call hasn't put to bed yet.
+        open_escalations = (1 if data.get('_pendingEscalation') else 0) + len(
+            data.get('_escalatedProducts') or {})
+        # Bank over-cap: any service at or past its spend cap (the director
+        # teller's warning, surfaced to the admin digest -- not just the bank
+        # room readout a director has to open on purpose).
+        bank_view = _bank_budget_view(data)
+        bank_over_cap = [row['service'] for row in bank_view.values() if row['over']]
+        bank_used = sum(row['used'] for row in bank_view.values())
+        bank_cap = sum(row['cap'] for row in bank_view.values())
 
     with _db() as conn:
         abandoned = conn.execute(
@@ -14221,6 +14786,14 @@ def compute_health_snapshot():
         'progress_signal': _decayed_signal(progress_ts, now),
         'ceremony_imbalance_score': _imbalance_score(
             _decayed_signal(ceremony_ts, now), _decayed_signal(progress_ts, now)),
+        # Admin gap 1: the digest's standing signals -- aging in-flight work,
+        # open escalations, and Bank over-cap -- so the periodic health digest
+        # covers money + wedged work + incidents, not just queue/alerts.
+        'aging_in_flight_work': aging_in_flight,
+        'open_escalations': open_escalations,
+        'bank_over_cap': bank_over_cap,
+        'bank_used': bank_used,
+        'bank_cap': bank_cap,
     }
     return {'checked_at': now, 'db_ok': True, 'alerts': _health_alerts_for_signals(signals), **signals}
 
@@ -14278,6 +14851,70 @@ def _push_new_health_alerts(alerts):
         email_ok = _send_player_email_sync(subject, body)
         telegram_ok = send_player_telegram_sync(subject, body)
         print(f"[health-check] pushed {alert['category']} alert: email={email_ok} telegram={telegram_ok}", flush=True)
+
+
+# Admin gap 1: periodic health DIGEST. The alert push above fires only on NEW
+# warnings; an admin also wants a readable periodic record of the whole picture
+# -- alerts + Bank + aging work + escalations -- even when nothing is new. This
+# writes a markdown digest to the shared library on HEALTH_DIGEST_INTERVAL_S
+# (a cadence guard via the settings table, so a restart doesn't reset the clock
+# into spamming a digest every loop). Never load-bearing (a write failure must
+# not crash the health loop)."""
+_DIGEST_LOCK = threading.Lock()
+_DIGEST_STAMP_KEY = 'last_health_digest_at'
+
+
+def _write_health_digest(snapshot):
+    with _DIGEST_LOCK:
+        now = time.time()
+        with _db() as conn:
+            row = conn.execute('SELECT value FROM settings WHERE key = ?', (_DIGEST_STAMP_KEY,)).fetchone()
+            last = float(row[0]) if row and row[0] else 0.0
+            if now - last < HEALTH_DIGEST_INTERVAL_S:
+                return
+            conn.execute(
+                'INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) '
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
+                (_DIGEST_STAMP_KEY, str(now), now))
+        try:
+            os.makedirs(os.path.join(LIBRARY_DIR, 'admin'), exist_ok=True)
+            path = os.path.join(LIBRARY_DIR, 'admin', f'health-{int(now)}.md')
+            with open(path, 'w') as f:
+                f.write(_health_digest_markdown(snapshot))
+        except Exception:
+            pass
+
+
+def _health_digest_markdown(snapshot):
+    """Build the readable health digest body from a computed snapshot. Pure text
+    assembly -- separately testable with a synthetic snapshot (no DB/files)."""
+    stamp = time.strftime('%Y-%m-%d %H:%M', time.localtime(snapshot.get('checked_at') or time.time()))
+    lines = [f'# Think Tank Health Digest -- {stamp}', '']
+    alerts = snapshot.get('alerts') or []
+    if alerts:
+        lines.append(f'{len(alerts)} active alert(s):')
+        for a in alerts:
+            lines.append(f'- **[{a.get("severity")}] {a.get("category")}** -- {a.get("message")}')
+    else:
+        lines.append('No active alerts.')
+    lines.append('')
+    # Bank
+    used = snapshot.get('bank_used', 0.0)
+    cap = snapshot.get('bank_cap', 0.0)
+    over = snapshot.get('bank_over_cap') or []
+    bank_line = f'Cumulative spend: ${used:.2f} of ${cap:.2f}'
+    if over:
+        bank_line += f' -- OVER CAP on {", ".join(over)}'
+    lines.append(f'**Bank:** {bank_line}')
+    # Aging work
+    aging = snapshot.get('aging_in_flight_work', 0)
+    lines.append(f'**Aging in-flight work:** {aging} non-bug task(s) wedged past their budget')
+    # Escalations
+    esc = snapshot.get('open_escalations', 0)
+    lines.append(f'**Open escalations:** {esc}')
+    lines.append('')
+    lines.append('_Periodic server-side digest; alerts push on new warnings between digests._')
+    return '\n'.join(lines) + '\n'
 
 
 # ---------------------------------------------------------------------------

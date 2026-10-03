@@ -302,7 +302,7 @@ class Retrospective(unittest.TestCase):
         sim._retro_step(state, 1000.0, 2_000_000, decider=_stub_retro())
         self.assertEqual(state['retrospectives']['spr-1']['start'], ['Ship smaller slices'])
 
-    def test_retro_defers_for_small_team_with_director_only_sm(self):
+    def test_retro_uses_own_director_then_borrows_when_no_sm(self):
         state = _seed()
         del state['teams'][1]['scrumMasterId']  # dev's crew has no real scrum master
         state['sprints']['spr-1'] = {
@@ -311,12 +311,43 @@ class Retrospective(unittest.TestCase):
             'status': 'closed', 'closedAt': 1_000_000, 'items': [],
         }
         sim._on_sprint_closed(state, state['sprints']['spr-1'], 1_000_000)
-        # Small team: the only effective SM is the director (dev) -- the retro
-        # must exclude the director, so it waits rather than running without one.
-        self.assertIsNone(sim._retro_scrum_master(state, ['dev']))
+        # Small team with a director-only SM: the team's OWN director (dev)
+        # stands in as facilitator -- the retro is the team's own reflection,
+        # run by someone the team works with, never an outsider by default.
+        self.assertEqual(sim._retro_scrum_master(state, ['dev']), 'dev')
         sim._retro_step(state, 1000.0, 1_000_001, decider=_stub_retro())
-        self.assertNotIn('spr-1', state.get('pendingRetrospectives', {}))
-        self.assertIn('spr-1', state['pendingSprintRetros'])  # still queued
+        self.assertIn('spr-1', state['pendingRetrospectives'])
+        pend = state['pendingRetrospectives']['spr-1']
+        self.assertIn('dev', pend['people'])  # own director facilitates
+        self.assertIn('ada', pend['people'])
+        # When the OWN director is busy, a NON-BUSY director from ANOTHER team
+        # (faye) is borrowed in, so the team still gets its retro.
+        state1 = _seed()
+        del state1['teams'][1]['scrumMasterId']
+        state1['agents']['dev']['busy'] = True  # own director busy
+        state1['sprints']['spr-1'] = {
+            'id': 'spr-1', 'name': 'Launch', 'goal': 'g', 'ownerId': 'faye',
+            'createdAt': 900_000, 'targetDate': None, 'teamIds': ['dev'],
+            'status': 'closed', 'closedAt': 1_000_000, 'items': [],
+        }
+        sim._on_sprint_closed(state1, state1['sprints']['spr-1'], 1_000_000)
+        self.assertEqual(sim._retro_scrum_master(state1, ['dev']), 'faye')
+        # When BOTH the own director and every other free director are busy, the
+        # retro waits rather than running without a facilitator.
+        state2 = _seed()
+        del state2['teams'][1]['scrumMasterId']
+        state2['agents']['dev']['busy'] = True   # own director busy
+        state2['agents']['faye']['busy'] = True  # the only other director busy
+        state2['sprints']['spr-1'] = {
+            'id': 'spr-1', 'name': 'Launch', 'goal': 'g', 'ownerId': 'faye',
+            'createdAt': 900_000, 'targetDate': None, 'teamIds': ['dev'],
+            'status': 'closed', 'closedAt': 1_000_000, 'items': [],
+        }
+        sim._on_sprint_closed(state2, state2['sprints']['spr-1'], 1_000_000)
+        self.assertIsNone(sim._retro_scrum_master(state2, ['dev']))
+        sim._retro_step(state2, 1000.0, 1_000_001, decider=_stub_retro())
+        self.assertNotIn('spr-1', state2.get('pendingRetrospectives', {}))
+        self.assertIn('spr-1', state2['pendingSprintRetros'])  # still queued
 
 
 class RefinementGate(unittest.TestCase):
@@ -342,6 +373,105 @@ class RefinementGate(unittest.TestCase):
         sim._refinement_step(state, 1000.0, sim.REFINEMENT_CADENCE_MS + 1_000_001,
                              decider=lambda ins, crit: 'accept')
         self.assertIn('dev', state['pendingRefinements'])
+
+
+class BreakdownCeremony(unittest.TestCase):
+    """Sprint-staffing breakdown ceremony: a staffable large ask is filed as a
+    pending breakdown request for a team, whose scrum master + workers card it
+    into stories/spikes at the Command Center. Never predicts subtasks up front;
+    on a model outage a single card titled the goal is queued so the ask is
+    never dropped. The breakdown ceremony's requests are never groomed by the
+    refinement ceremony (two ceremonies, two kinds)."""
+
+    def _stub_breakdown(self):
+        def decider(state, instructions, goal):
+            return {'items': [
+                {'title': 'Lay the foundation', 'type': 'story',
+                 'acceptanceCriteria': 'Foundation is level'},
+                {'title': 'Study the soil', 'type': 'spike'},
+            ]}
+        return decider
+
+    def test_breakdown_convenes_and_queues_stories_from_decider(self):
+        state = _seed()
+        sim.file_large_request(state, 'faye', 'Build a new wing', 'dev', 1_000_000)
+        # Pass 1: convene at the Command Center -- the scrum master (ada) +
+        # the team's workers (ben); the director (dev) is excluded unless she
+        # IS the effective scrum master.
+        sim._breakdown_step(state, 1000.0, 1_000_001, decider=self._stub_breakdown())
+        self.assertIn('dev', state['pendingBreakdowns'])
+        pend = state['pendingBreakdowns']['dev']
+        self.assertIn('ada', pend['people'])
+        self.assertIn('ben', pend['people'])
+        self.assertNotIn('dev', pend['people'])
+        for aid in pend['people']:
+            self.assertTrue(state['agents'][aid]['busy'])
+            self.assertEqual(state['agents'][aid]['inRoom'], 'commandcenter')
+        self.assertEqual(state['backlogRequests'][0]['status'], 'pending')
+        # Pass 2: resolve -- the pieces are queued as real work for the team.
+        sim._breakdown_step(state, 1000.0, 1_000_001 + sim.BREAKDOWN_MEET_MS + 1,
+                            decider=self._stub_breakdown())
+        self.assertNotIn('dev', state.get('pendingBreakdowns', {}))
+        req = state['backlogRequests'][0]
+        self.assertEqual(req['status'], 'accepted')
+        self.assertEqual(req['brokenDown'], True)
+        self.assertEqual(len(state['workQueue']), 2)
+        story, spike = state['workQueue']
+        self.assertEqual(story['title'], 'Lay the foundation')
+        self.assertEqual(story['teamId'], 'dev')
+        self.assertEqual(story['taskType'], 'code')
+        self.assertIsNone(story['room'])  # room resolved at assignment
+        self.assertIn('Acceptance criteria:\nFoundation is level', story['instructions'])
+        self.assertEqual(spike['title'], 'Study the soil')
+        self.assertEqual(spike['taskType'], 'spike')
+        self.assertEqual(spike['teamId'], 'dev')
+        # Attendees were restored to their prior (idle) state.
+        for aid in ('ada', 'ben'):
+            self.assertFalse(state['agents'][aid]['busy'])
+
+    def test_breakdown_outage_queues_single_card_never_drops_ask(self):
+        state = _seed()
+        sim.file_large_request(state, 'faye', 'Build a new wing', 'dev', 1_000_000)
+
+        def outage(state, instructions, goal):
+            return None
+
+        sim._breakdown_step(state, 1000.0, 1_000_001, decider=outage)
+        sim._breakdown_step(state, 1000.0, 1_000_001 + sim.BREAKDOWN_MEET_MS + 1,
+                            decider=outage)
+        self.assertEqual(len(state['workQueue']), 1)
+        card = state['workQueue'][0]
+        self.assertEqual(card['title'], 'Build a new wing')
+        self.assertEqual(card['taskType'], 'code')
+        self.assertEqual(card['teamId'], 'dev')
+        self.assertEqual(state['backlogRequests'][0]['status'], 'accepted')
+
+    def test_refinement_skips_breakdown_requests(self):
+        state = _seed()
+        # A normal agent-filed request AND a large-request breakdown for dev.
+        sim.file_work_request(state, 'ben', 'Groom me', 'pressoffice', reason='A gap')
+        sim.file_large_request(state, 'faye', 'Build a new wing', 'dev', 1_000_000)
+        # Refinement is due (cadence elapsed) and the team is not in a sprint.
+        sim._refinement_step(state, 1000.0, sim.REFINEMENT_CADENCE_MS + 1_000_000,
+                             decider=lambda ins, crit: 'accept')
+        self.assertIn('dev', state.get('pendingRefinements', {}))
+        req_ids = state['pendingRefinements']['dev']['reqIds']
+        self.assertEqual(req_ids, ['wrq-1'])  # ONLY the normal request is groomed
+        self.assertNotIn('wrq-2', req_ids)  # the breakdown waits for its own ceremony
+
+    def test_breakdown_defers_team_in_active_sprint(self):
+        state = _seed()
+        state['sprints']['spr-1'] = {
+            'id': 'spr-1', 'name': 'Active', 'goal': 'g', 'ownerId': 'faye',
+            'createdAt': 800_000, 'targetDate': None, 'teamIds': ['dev'],
+            'status': 'active', 'items': [('In flight', 'pressoffice')],
+        }
+        sim.file_large_request(state, 'faye', 'Build a new wing', 'dev', 1_000_000)
+        sim._breakdown_step(state, 1000.0, 1_000_001,
+                            decider=lambda s, i, g: {'items': []})
+        # The team is committed to a sprint -> no ceremony; the ask stays queued.
+        self.assertNotIn('dev', state.get('pendingBreakdowns', {}))
+        self.assertEqual(state['backlogRequests'][0]['status'], 'pending')
 
 
 class MergeAndWhitelist(unittest.TestCase):
@@ -375,6 +505,86 @@ class MergeAndWhitelist(unittest.TestCase):
         self.assertEqual(item['featureId'], 'feat-1')
         self.assertEqual(item['backlogItemId'], 'bl-2')
         self.assertEqual(item['teamId'], 'dev')
+
+
+class SizeEstimateCarry(unittest.TestCase):
+    """The breakdown story's S/M/L size estimate survives every queue round
+    trip onto the real work card and orders same-priority scheduling (an L
+    story starts before an S story -- it needs more wall-time)."""
+
+    def test_queue_work_normalizes_size_estimate(self):
+        state = {'workQueue': []}
+        sim.queue_work(state, [
+            {'title': 'Big', 'sizeEstimate': 'L'},
+            {'title': 'med', 'sizeEstimate': 'm'},
+            {'title': 'tiny', 'sizeEstimate': '  s  '},
+            {'title': 'junk', 'sizeEstimate': 'XL'},
+            {'title': 'none', 'sizeEstimate': None},
+        ])
+        sizes = {i['title']: i.get('sizeEstimate') for i in state['workQueue']}
+        self.assertEqual(sizes['Big'], 'L')
+        self.assertEqual(sizes['med'], 'M')
+        self.assertEqual(sizes['tiny'], 'S')
+        self.assertIsNone(sizes['junk'], 'unknown size is not a scheduling signal')
+        self.assertIsNone(sizes['none'])
+
+    def test_breakdown_queues_stories_with_their_size(self):
+        state = _seed()
+        sim.file_large_request(state, 'faye', 'Build a new wing', 'dev', 1_000_000)
+
+        def decider(state, instructions, goal):
+            return {'items': [
+                {'title': 'Lay the foundation', 'type': 'story',
+                 'acceptanceCriteria': 'Foundation is level', 'sizeEstimate': 'L'},
+                {'title': 'Study the soil', 'type': 'spike', 'sizeEstimate': 'S'},
+            ]}
+
+        sim._breakdown_step(state, 1000.0, 1_000_001, decider=decider)
+        sim._breakdown_step(state, 1000.0, 1_000_001 + sim.BREAKDOWN_MEET_MS + 1,
+                            decider=decider)
+        story, spike = state['workQueue']
+        self.assertEqual(story['sizeEstimate'], 'L')
+        self.assertEqual(spike['sizeEstimate'], 'S')
+
+    def test_shared_backlog_pull_keeps_size(self):
+        state = _seed()
+        sim.create_or_reuse_feature(state, 'Summer Summit', 1_000_000)
+        sim.add_backlog_item(state, 'Land a launch page', 'feat-1',
+                             'faye', 1_000_000, size_estimate='L')
+        sim._pull_backlog_for_team(state, 'dev', 1_000_001)
+        card = state['workQueue'][-1]
+        self.assertEqual(card['sizeEstimate'], 'L',
+                         'the shared-backlog pull keeps the estimate on the card')
+
+    def test_pick_next_due_index_uses_size_as_equal_priority_tiebreak(self):
+        now = 10 ** 12
+        q = [
+            {'title': 'small story', 'priority': sim.WORK_PRIORITY['normal'],
+             'sizeEstimate': 'S'},
+            {'title': 'big story', 'priority': sim.WORK_PRIORITY['normal'],
+             'sizeEstimate': 'L'},
+        ]
+        idx = sim.pick_next_due_index(q, now, set())
+        self.assertEqual(q[idx]['title'], 'big story',
+                         'at equal priority the larger story starts first')
+        # Priority always outranks size: a small URGENT story beats a big normal one.
+        q2 = [
+            {'title': 'big normal', 'priority': sim.WORK_PRIORITY['normal'],
+             'sizeEstimate': 'L'},
+            {'title': 'small urgent', 'priority': sim.WORK_PRIORITY['urgent'],
+             'sizeEstimate': 'S'},
+        ]
+        idx2 = sim.pick_next_due_index(q2, now, set())
+        self.assertEqual(q2[idx2]['title'], 'small urgent',
+                         'urgency outranks size -- size is never an urgency override')
+        # Unknown size sorts last among equal-priority work.
+        q3 = [
+            {'title': 'no size', 'priority': sim.WORK_PRIORITY['normal']},
+            {'title': 'sized', 'priority': sim.WORK_PRIORITY['normal'],
+             'sizeEstimate': 'M'},
+        ]
+        idx3 = sim.pick_next_due_index(q3, now, set())
+        self.assertEqual(q3[idx3]['title'], 'sized')
 
 
 if __name__ == '__main__':

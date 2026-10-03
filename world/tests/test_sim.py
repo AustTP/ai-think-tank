@@ -636,6 +636,70 @@ class SimTaskLifecycle(unittest.TestCase):
         self.assertFalse(task.get('_contentInFlight'),
                          'no content dispatch without an executor')
 
+    def test_content_result_without_note_is_evidence_gap(self):
+        # Completion evidence is mandatory: a content result that reports
+        # success but carries NO note (no evidence of what was done) must not
+        # silently complete -- the card goes back as a gap (failed + fix queued),
+        # never a clean 'done' with an empty record.
+        sim._content_executor = None
+        with sim._content_results_lock:
+            sim._content_results.clear()
+
+        # The executor normally runs on a bg thread; to stay deterministic we
+        # store the (empty-note, ok) result ourselves the moment dispatch lands.
+        def fake_executor(snapshot, agent_id, task, base_ctx):
+            pass
+
+        sim._content_executor = fake_executor
+        grid, doors = sim._load_outdoor_geometry()
+        state = self._base_state(work_queue=[{
+            'title': 'Scheduled research: x', 'room': 'observatory',
+            'instructions': 'crawl', 'goal': 'x', 'priority': sim.WORK_PRIORITY['normal'],
+            'notBefore': 0,
+            'research': {'topicId': 't1', 'since': 0}}])
+        state['researchTopics'] = [{'id': 't1', 'topic': 'x', 'seenUrls': [],
+                                    'cadenceMs': 3600000, 'lastRunAt': 0}]
+        engine = sim.SimEngine()
+        engine._grid, engine._doors = grid, doors
+        now = 1000.0
+        done = None
+        result_sent = False
+        for _ in range(300):
+            now += sim.SIM_TICK_S
+            state = engine.tick(state, now=now)
+            tasks = state.get('tasks') or {}
+            task = next((t for t in tasks.values() if t.get('research')), None)
+            if task and task.get('_contentInFlight') and not result_sent:
+                sim._store_content_result(task['id'], {'ok': True, 'note': ''})
+                result_sent = True
+            if task and task.get('status') == 'failed':
+                done = task
+                break
+        sim._content_executor = None
+        self.assertTrue(result_sent, 'the task must be dispatched for content work')
+        self.assertIsNotNone(done, 'empty-note success must be sent back, not done')
+        self.assertIn('missing completion evidence', done.get('failNote', ''),
+                      'the gap must name the missing evidence')
+        self.assertFalse(any(t.get('status') == 'done' for t in (state.get('tasks') or {}).values()),
+                         'the empty-evidence task must never land as done')
+        reworks = [q for q in (state.get('workQueue') or []) if q.get('title', '').startswith('Fix:')]
+        rework_tasks = [t for t in (state.get('tasks') or {}).values()
+                        if (t.get('title') or '').startswith('Fix:')]
+        self.assertTrue(reworks or rework_tasks,
+                        'a rework card is queued for the gap')
+
+    def test_kb_class_survives_queue_round_trip(self):
+        # The knowledge-base class flag is part of the queue_work whitelist, so
+        # a 'changes how we work' ceremony keeps its KB mandate through the
+        # queue (the same contract as distill/skillReview).
+        state = self._base_state()
+        sim.queue_work(state, [{
+            'title': 'Distill recent think tank knowledge', 'room': 'observatory',
+            'instructions': 'merge', 'distill': True, 'distillSince': 5,
+            'kbClass': 'changes_how_we_work'}])
+        self.assertEqual(state['workQueue'][0]['kbClass'], 'changes_how_we_work')
+        self.assertEqual(state['workQueue'][0]['distillSince'], 5)
+
     def test_research_arrival_with_executor_dispatches_and_result_completes(self):
         # With a content executor registered, an arriving task gets the long
         # content timeout + _contentInFlight; a completed result is merged
@@ -803,6 +867,206 @@ class SimOffDutyWake(unittest.TestCase):
                          (sim.SPAWN['x'], sim.SPAWN['y']))
 
 
+class ServerOwnedPairingHandoff(unittest.TestCase):
+    """W1: server-owned pairing/handoff. The movement engine already emits
+    ('arrive','pair'/'handoff') events but the server dispatch dropped them
+    (only ('arrive','task') resolved), and a `pair` card was assigned SOLO. Now
+    the server recruits a navigator for a `pair` card, resolves pair/handoff
+    arrivals, and releases a pair's navigator when the driver's task ships."""
+
+    def _state(self):
+        far_future = int(time.time() * 1000) + 60 * 60 * 24 * 365 * 10
+        return {
+            'sim': {'owner': 'server'},
+            'agentRoster': [
+                {'id': 'ada', 'name': 'Ada', 'role': 'Research', 'isAdmin': False},
+                {'id': 'ben', 'name': 'Ben', 'role': 'Banking', 'isAdmin': False},
+                {'id': 'faye', 'name': 'Faye', 'role': 'Admin', 'isAdmin': True},
+            ],
+            'agents': {
+                'ada': {'id': 'ada', 'x': sim.SPAWN['x'], 'y': sim.SPAWN['y'],
+                        'dir': 'south', 'visible': True, 'busy': False, 'task': None,
+                        'inRoom': None, 'offDuty': False,
+                        'stuckTimer': 0, 'replanCount': 0, 'approvedCount': 0},
+                'ben': {'id': 'ben', 'x': sim.SPAWN['x'] + 30, 'y': sim.SPAWN['y'],
+                        'dir': 'south', 'visible': True, 'busy': False, 'task': None,
+                        'inRoom': None, 'offDuty': False,
+                        'stuckTimer': 0, 'replanCount': 0, 'approvedCount': 0},
+                'faye': {'id': 'faye', 'x': sim.SPAWN['x'], 'y': sim.SPAWN['y'],
+                         'dir': 'south', 'visible': True, 'busy': False, 'task': None,
+                         'inRoom': None, 'offDuty': False,
+                         'stuckTimer': 0, 'replanCount': 0, 'approvedCount': 0},
+            },
+            'lastSkillReviewAt': far_future,
+            'lastStuckGateSweep': far_future,
+            'lastSocialAt': far_future,
+            'lastDistillAt': far_future,
+            'workQueue': [],
+        }
+
+    def test_pair_arrival_resolves_the_navigator_into_the_session(self):
+        # A pair session's navigator reaching the driver's door must RESOLVE
+        # (navigator joins the driver's workstation), not be dropped -- she
+        # would otherwise stand frozen at the door forever.
+        state = self._state()
+        state['tasks'] = {'task-1': {'id': 'task-1', 'room': 'pressoffice',
+                                     'status': 'working', 'title': 'Pair me'}}
+        a = state['agents']['ada']
+        a['pairWith'] = 'ben'
+        a['pairTaskId'] = 'task-1'
+        a['path'] = [{'x': 1, 'y': 1}]
+        driver = state['agents']['ben']
+        driver['busy'] = True
+        driver['inRoom'] = 'pressoffice'
+        driver['roomX'] = 84
+        driver['roomY'] = 200
+        self.assertTrue(sim._arrive_at_pair(state, 'ada', now=100.0))
+        self.assertFalse(a['visible'])
+        self.assertTrue(a['busy'])
+        self.assertEqual(a['inRoom'], 'pressoffice')
+        self.assertEqual(a['roomX'], 84 + 25, 'navigator sits beside the driver')
+        self.assertIsNone(a['path'], 'arrived navigator clears her path')
+
+    def test_pair_arrival_with_missing_other_half_releases_cleanly(self):
+        # The session's other half gone (driver released / task vanished) must
+        # release the navigator off-duty, never park her holding the session.
+        state = self._state()
+        state['tasks'] = {}
+        a = state['agents']['ada']
+        a['pairWith'] = 'ghost'
+        a['pairTaskId'] = 'task-9'
+        a['path'] = [{'x': 1, 'y': 1}]
+        self.assertFalse(sim._arrive_at_pair(state, 'ada', now=100.0))
+        self.assertIsNone(a.get('pairWith'))
+        self.assertIsNone(a.get('pairTaskId'))
+        self.assertTrue(a.get('offDuty'))
+        self.assertFalse(a.get('visible'))
+
+    def test_handoff_arrival_delivers_and_clocks_off(self):
+        # A handoff walker reaching her recipient delivers the handoff (the
+        # finished title as the message) and clocks off -- previously the
+        # arrival was dropped and she froze beside the recipient.
+        state = self._state()
+        a = state['agents']['ada']
+        a['handoff'] = {'toId': 'ben', 'title': 'The report', 'fromId': 'ada'}
+        a['path'] = [{'x': 1, 'y': 1}]
+        a['visible'] = True
+        self.assertTrue(sim._arrive_at_handoff(state, 'ada', now=100.0))
+        self.assertIsNone(a.get('handoff'))
+        self.assertTrue(a.get('offDuty'))
+        self.assertFalse(a.get('visible'))
+        self.assertEqual(len(state['handoffs']), 1)
+        self.assertEqual(state['handoffs'][0]['title'], 'The report')
+        self.assertEqual(state['handoffs'][0]['toId'], 'ben')
+        self.assertEqual(state['agents']['ben'].get('contactedAt'), 100000)
+
+    def _walking_task_state(self):
+        state = {'sim': {'owner': 'server'},
+                 'agents': {'ada': {'id': 'ada', 'x': sim.SPAWN['x'], 'y': sim.SPAWN['y'],
+                                    'dir': 'south', 'visible': True, 'busy': False,
+                                    'task': None, 'inRoom': None, 'offDuty': False,
+                                    'path': [{'x': 1, 'y': 1}], 'pathIndex': 0,
+                                    'pathTarget': {'x': 1, 'y': 1},
+                                    'stuckTimer': 0, 'replanCount': 0,
+                                    'respawnedForTask': False}},
+                 'tasks': {'task-1': {'id': 'task-1', 'title': 't', 'room': 'pressoffice',
+                                      'status': 'walking', 'assignedTo': 'ada'}}}
+        return state
+
+    def test_tick_dispatches_pair_arrival_to_the_session(self):
+        # REGRESSION (W1): a pair session's navigator arriving was DROPPED by
+        # the movement dispatch (only ('arrive','task') resolved), so she stood
+        # frozen at the door. The tick must route it to _arrive_at_pair.
+        state = self._walking_task_state()
+        a = state['agents']['ada']
+        a['task'] = None
+        a['pairWith'] = 'ben'
+        a['pairTaskId'] = 'task-1'
+        a['path'] = [{'x': 1, 'y': 1}]
+        state['tasks']['task-1']['room'] = 'pressoffice'
+        state['tasks']['task-1']['status'] = 'working'
+        state['agents']['ben'] = {'id': 'ben', 'x': 0, 'y': 0, 'busy': True,
+                                  'inRoom': 'pressoffice', 'roomX': 84, 'roomY': 200}
+        engine = sim.SimEngine()
+        with unittest.mock.patch('sim.step_agent_movement',
+                                 return_value=[('arrive', 'pair', 'ada')]):
+            out = engine.tick(state, now=100.0)
+        a = out['agents']['ada']
+        self.assertFalse(a.get('visible'))
+        self.assertTrue(a.get('busy'))
+        self.assertEqual(a.get('inRoom'), 'pressoffice')
+        self.assertEqual(a.get('roomX'), 84 + 25)
+
+    def test_tick_dispatches_handoff_arrival_to_delivery(self):
+        # REGRESSION (W1): a handoff walker arriving was DROPPED -- she froze
+        # beside the recipient, handoff never delivered. The tick must route it
+        # to _arrive_at_handoff.
+        state = self._walking_task_state()
+        a = state['agents']['ada']
+        a['task'] = None
+        a['handoff'] = {'toId': 'ben', 'title': 'The report', 'fromId': 'ada'}
+        a['path'] = [{'x': 1, 'y': 1}]
+        engine = sim.SimEngine()
+        with unittest.mock.patch('sim.step_agent_movement',
+                                 return_value=[('arrive', 'handoff', 'ada')]):
+            out = engine.tick(state, now=100.0)
+        a = out['agents']['ada']
+        self.assertIsNone(a.get('handoff'))
+        self.assertTrue(a.get('offDuty'))
+        self.assertFalse(a.get('visible'))
+        self.assertEqual(len(out.get('handoffs', [])), 1)
+        self.assertEqual(out['handoffs'][0]['title'], 'The report')
+
+    def test_pair_card_recruits_a_navigator_server_side(self):
+        # A `pair` card assigned server-side must recruit a navigator (walking
+        # her over) instead of being assigned solo -- the driver still goes
+        # alone when no second eligible hand exists.
+        state = self._state()
+        grid, doors = sim._load_outdoor_geometry()
+        item = {'title': 'Maintain tooling', 'room': 'pressoffice',
+                'instructions': 'Go.', 'pair': True, 'notBefore': None,
+                'priority': sim.WORK_PRIORITY['normal'], 'goal': None,
+                'research': None, 'taskType': 'code', 'skillReview': False}
+        state['workQueue'] = [item]
+        sim._task_cycle(state, now=time.time(), grid=grid, doors=doors,
+                        task_id_holder=[0])
+        tasks = [t for t in state['tasks'].values() if t.get('title') == 'Maintain tooling']
+        self.assertEqual(len(tasks), 1)
+        task = tasks[0]
+        self.assertEqual(task['status'], 'walking')
+        driver = state['agents'][task['assignedTo']]
+        self.assertTrue(driver.get('path'))
+        nav_id = task.get('pairWith')
+        self.assertIsNotNone(nav_id, 'a pair card recruits a navigator')
+        self.assertNotEqual(nav_id, task['assignedTo'])
+        nav = state['agents'][nav_id]
+        self.assertEqual(nav.get('pairWith'), task['assignedTo'])
+        self.assertEqual(nav.get('pairTaskId'), task['id'])
+        self.assertTrue(nav.get('path'), 'the navigator walks over to pair')
+
+    def test_pair_task_completion_releases_the_navigator(self):
+        # When the driver's pair task ships, the navigator must be released
+        # back to the pool -- she'd otherwise sit busy at the desk forever.
+        state = self._state()
+        state['tasks'] = {'task-1': {'id': 'task-1', 'room': 'pressoffice',
+                                     'title': 'Pair me', 'entryX': 10, 'entryY': 20,
+                                     'pairWith': 'ben'}}
+        driver = state['agents']['ada']
+        driver['task'] = 'task-1'
+        driver['busy'] = True
+        nav = state['agents']['ben']
+        nav['pairWith'] = 'ada'
+        nav['pairTaskId'] = 'task-1'
+        nav['busy'] = True
+        nav['inRoom'] = 'pressoffice'
+        sim.finish_task(state, 'ada')
+        self.assertIsNone(nav.get('pairWith'))
+        self.assertIsNone(nav.get('pairTaskId'))
+        self.assertFalse(nav.get('busy'))
+        self.assertIsNone(nav.get('inRoom'))
+        self.assertTrue(nav.get('visible'))
+
+
 class SimMergeInvariant(unittest.TestCase):
     # The client autosave (agents.js saveState) posts a fixed field list every
     # 5s and does NOT include the server-owned `sim` section. The autosave merge
@@ -821,6 +1085,221 @@ class SimMergeInvariant(unittest.TestCase):
         self.assertEqual(merged['sim']['tick'], 9)
         # Non-sim keys are replaced exactly as before.
         self.assertEqual(merged['agents']['ada']['x'], 12)
+
+
+class WorkerSpikeIssueFiling(unittest.TestCase):
+    """W3: autonomous issue filing. A spike worker's executor reports a `fileIssue`
+    WISH (it runs off-thread against a snapshot); the tick consumes it inside
+    _apply_content_result -> _file_spike_issue, which resolves the owning team
+    (wish teamId -> task teamId -> product director -> roster director, each
+    matched by id OR directorId), dedups against an already-open issue by the
+    same reporter + summary, files via the real file_issue, and logs governance.
+    Fail safe: no filing on unknown team / malformed wish / missing reporter.
+    Purely state-based -- no Jev, no network."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='think tank-sim-file-issue-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            THINK_TANK_DIR=self.tmp,
+            AGENTS_DIR=os.path.join(self.tmp, 'agents'),
+            LIBRARY_DIR=os.path.join(self.tmp, 'library'),
+            PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
+        )
+        self._cm.start()
+        serve.init_db()
+
+    def tearDown(self):
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _state(self, teams=None, with_director=True):
+        roster = [{'id': 'ada', 'name': 'Ada', 'role': 'Research', 'isAdmin': False}]
+        if with_director:
+            roster[0]['director'] = 'zoe'
+        return {
+            'sim': {'owner': 'server'},
+            'agentRoster': roster,
+            'agents': {
+                'ada': {'id': 'ada', 'x': sim.SPAWN['x'], 'y': sim.SPAWN['y'],
+                        'dir': 'south', 'visible': True, 'busy': True,
+                        'task': 'task-1', 'inRoom': 'pressoffice', 'offDuty': False},
+            },
+            'teams': teams if teams is not None else [
+                {'id': 'dev', 'directorId': 'zoe', 'scrumMasterId': 'ben',
+                 'room': 'pressoffice'},
+            ],
+            'products': {},
+            'tasks': {'task-1': {'id': 'task-1', 'title': 'Spike: investigate auth',
+                                 'room': 'pressoffice', 'status': 'working',
+                                 'assignedTo': 'ada'}},
+            'workQueue': [],
+        }
+
+    def _wish(self, **over):
+        wish = {
+            'issueType': 'story',
+            'summary': 'Auth flow silently drops logins',
+            'title': 'Auth: surface login failures',
+            'feature': 'Library Tools',
+            'description': {'userStory': 'As a user, I want to know why login '
+                                         'failed, so that I can fix it.'},
+        }
+        wish.update(over)
+        return wish
+
+    def _task(self, **over):
+        task = {'id': 'task-1', 'title': 'Spike: investigate auth',
+                'room': 'pressoffice', 'status': 'working', 'assignedTo': 'ada'}
+        task.update(over)
+        return task
+
+    def test_verdict_wish_files_issue_and_kicks_refinement(self):
+        # A well-formed fileIssue wish files a real issue: the backlogRequests
+        # pipe record is appended AND the team's refinement is kicked to due on
+        # the next pass -- the worker's finding becomes real queue-able work.
+        state = self._state()
+        self.assertTrue(sim._file_spike_issue(state, self._wish(), self._task(),
+                                              now_ms=1000))
+        issues = list((state.get('issues') or {}).values())
+        self.assertEqual(len(issues), 1)
+        issue = issues[0]
+        self.assertEqual(issue['key'], 'DEV-1')
+        self.assertEqual(issue['teamId'], 'dev')
+        self.assertEqual(issue['type'], 'story')
+        self.assertEqual(issue['reporterId'], 'ada')
+        self.assertEqual(issue['feature'], 'Library Tools')
+        self.assertEqual(issue['title'], 'Auth: surface login failures')
+        self.assertTrue(state.get('backlogRequests'),
+                        'filing feeds the backlog pipe')
+        self.assertEqual((state.get('teamRefinementAt') or {}).get('dev'), 0,
+                         'filing kicks the owning team\'s refinement to due')
+
+    def test_team_resolved_by_director_id_when_wish_carries_director(self):
+        # The wish may name the team's DIRECTOR id (the other key teams records
+        # use) rather than the team record's `id` -- resolve to the real team.
+        state = self._state()
+        wish = self._wish(teamId='zoe')
+        self.assertTrue(sim._file_spike_issue(state, wish, self._task(),
+                                              now_ms=1000))
+        issues = list((state.get('issues') or {}).values())
+        self.assertEqual(issues[0]['teamId'], 'dev',
+                         'a director-id wish must file under the real team id')
+
+    def test_team_resolved_from_task_team_id(self):
+        # No teamId on the wish itself: fall back to the task's teamId.
+        state = self._state()
+        wish = self._wish(teamId=None)
+        self.assertTrue(sim._file_spike_issue(state, wish,
+                                              self._task(teamId='dev'),
+                                              now_ms=1000))
+        issues = list((state.get('issues') or {}).values())
+        self.assertEqual(issues[0]['teamId'], 'dev')
+
+    def test_product_director_resolution_when_no_team_id(self):
+        # No teamId on wish OR task: the task's productId resolves its owning
+        # team's director, which matches the team record by directorId.
+        state = self._state()
+        state['products'] = {'prod-1': {'id': 'prod-1', 'name': 'Library Tools',
+                                        'teamId': 'zoe'}}
+        wish = self._wish(teamId=None)
+        self.assertTrue(sim._file_spike_issue(state, wish,
+                                              self._task(teamId=None,
+                                                         productId='prod-1'),
+                                              now_ms=1000))
+        issues = list((state.get('issues') or {}).values())
+        self.assertEqual(issues[0]['teamId'], 'dev')
+
+    def test_roster_director_last_resort_team_source(self):
+        # Nothing on the wish/task: the worker's roster `director` pointer is the
+        # last-resort team source -- the finding still lands on the right team.
+        state = self._state()
+        wish = self._wish(teamId=None)
+        self.assertTrue(sim._file_spike_issue(state, wish,
+                                              self._task(teamId=None,
+                                                         productId=None),
+                                              now_ms=1000))
+        issues = list((state.get('issues') or {}).values())
+        self.assertEqual(issues[0]['teamId'], 'dev')
+
+    def test_no_resolvable_team_files_nothing(self):
+        # A worker with no team anywhere in the chain must never file -- a stray
+        # idea can't wedge the backlog under a phantom owner.
+        state = self._state(teams=[], with_director=False)
+        self.assertFalse(sim._file_spike_issue(state, self._wish(teamId=None),
+                                               self._task(teamId=None,
+                                                          productId=None),
+                                               now_ms=1000))
+        self.assertFalse(state.get('issues'), 'no team -> no filing')
+
+    def test_open_duplicate_same_reporter_summary_skipped(self):
+        # The same gap reported by the same worker (same summary) that has NOT
+        # reached a terminal state must not be re-filed every spike re-run.
+        state = self._state()
+        state['issues'] = {
+            'DEV-1': {'key': 'DEV-1', 'teamId': 'dev', 'reporterId': 'ada',
+                      'status': 'open', 'summary': 'Auth flow silently drops logins'},
+        }
+        self.assertFalse(sim._file_spike_issue(state, self._wish(), self._task(),
+                                               now_ms=1000))
+        self.assertEqual(len(state.get('issues')), 1,
+                         'an open duplicate is never re-filed')
+
+    def test_refile_allowed_after_terminal_status(self):
+        # A terminal ('done'/'closed') issue is a resolved gap -- the spike may
+        # legitimately file a fresh one for the same summary.
+        state = self._state()
+        state['issues'] = {
+            'DEV-1': {'key': 'DEV-1', 'teamId': 'dev', 'reporterId': 'ada',
+                      'status': 'done', 'summary': 'Auth flow silently drops logins'},
+        }
+        state['issueCounters'] = {'DEV': 1}  # next key is DEV-2, not a re-file
+        self.assertTrue(sim._file_spike_issue(state, self._wish(), self._task(),
+                                              now_ms=1000))
+        self.assertEqual(len(state.get('issues')), 2,
+                         'a terminal prior issue does not block re-filing')
+        self.assertIn('DEV-2', state.get('issues'), 'the fresh filing gets its own key')
+
+    def test_malformed_wish_fails_safe_no_filing(self):
+        # Empty summary / empty feature / unknown issue type must all fail safe
+        # to no filing (never a backlog wedge from a half-shaped wish).
+        state = self._state()
+        for bad in (self._wish(summary=''),
+                    self._wish(feature=''),
+                    self._wish(issueType='epic')):
+            sim._file_spike_issue(state, bad, self._task(), now_ms=1000)
+        self.assertFalse(state.get('issues'),
+                         'malformed wishes must never file anything')
+
+    def test_missing_reporter_fails_safe(self):
+        # No reporter (task.assignedTo) -> nothing to attribute the card to.
+        state = self._state()
+        self.assertFalse(sim._file_spike_issue(state, self._wish(),
+                                               self._task(assignedTo=None),
+                                               now_ms=1000))
+        self.assertFalse(state.get('issues'))
+
+    def test_apply_content_result_consumes_fileissue_wish(self):
+        # The tick integration: a content result carrying a fileIssue wish is
+        # filed against the live state inside _apply_content_result.
+        state = self._state()
+        result = {'note': 'investigated; login failures are silently dropped',
+                  'fileIssue': self._wish()}
+        sim._apply_content_result(state, self._task(), result, now_ms=1000)
+        issues = list((state.get('issues') or {}).values())
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]['summary'], 'Auth flow silently drops logins')
+        self.assertEqual(issues[0]['reporterId'], 'ada')
+
+    def test_apply_content_result_without_wish_files_nothing(self):
+        # A content result that found nothing actionable carries no fileIssue
+        # wish -- the note lands, no issue is filed.
+        state = self._state()
+        sim._apply_content_result(state, self._task(),
+                                  {'note': 'no actionable gap found'},
+                                  now_ms=1000)
+        self.assertFalse(state.get('issues'), 'no wish -> no filing')
 
 
 if __name__ == '__main__':

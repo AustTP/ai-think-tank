@@ -218,5 +218,78 @@ class KnowledgeSocial(unittest.TestCase):
         self.assertNotIn('_pendingSocial', state)
 
 
+class SocialAdoptLands(unittest.TestCase):
+    """W2: a Knowledge Social 'adopt' carry-away must LAND -- it routes a
+    coaching note through the growth-plan loop to the worker's NEXT task, so the
+    adoption changes execution instead of staying a logged tape line. A fresh
+    weekly adopt is a new commitment (repeat=True), so it re-lands even when an
+    older note of the same kind is still queued."""
+
+    def _resolve(self, choice, confidence):
+        # Drive schedule -> convene -> resolve with the given decision.
+        state = _seed()
+        sim._social_step(state, 1000.0, 1_000_000 + sim.SOCIAL_CADENCE_MS,
+                         decider=_stub_decider(choice, confidence))
+        sim._social_step(state, 1000.0, 1_000_000 + sim.SOCIAL_CADENCE_MS + 1,
+                         decider=_stub_decider(choice, confidence))
+        sim._social_step(state, 1000.0,
+                         1_000_000 + sim.SOCIAL_CADENCE_MS + sim.SOCIAL_MEET_MS + 2,
+                         decider=_stub_decider(choice, confidence))
+        return state
+
+    def test_confident_adopt_lands_a_coaching_note(self):
+        state = self._resolve('adopt', 0.9)
+        plans = state.get('growthPlans', {}).get('ada')
+        self.assertIsNotNone(plans, 'an adopt must write a growth plan')
+        self.assertTrue(any(p.get('kind') == 'social_adopt' for p in plans),
+                        'the note is tagged social_adopt')
+        note = next(p for p in plans if p.get('kind') == 'social_adopt')
+        self.assertIn('trying/applying', note['note'])
+        self.assertFalse(note['applied'], 'queued for the worker\'s NEXT task')
+
+    def test_repeated_weekly_adopts_re_land(self):
+        # A fresh adopt each week is a NEW commitment: repeat=True lets it land
+        # even though a social_adopt plan already exists for the worker.
+        state = self._resolve('adopt', 0.9)
+        # The first resolve reset weekApprovals; give everyone week work again
+        # so the second event has eligible attendees.
+        for a in state['agents'].values():
+            a['weekApprovals'] = 2
+        # Simulate a second weekly event: another adopt at a later cadence.
+        sim._social_step(state, 1000.0, 1_000_000 + 2 * sim.SOCIAL_CADENCE_MS,
+                         decider=_stub_decider('adopt', 0.9))
+        sim._social_step(state, 1000.0, 1_000_000 + 2 * sim.SOCIAL_CADENCE_MS + 1,
+                         decider=_stub_decider('adopt', 0.9))
+        sim._social_step(state, 1000.0,
+                         1_000_000 + 2 * sim.SOCIAL_CADENCE_MS + sim.SOCIAL_MEET_MS + 2,
+                         decider=_stub_decider('adopt', 0.9))
+        social_plans = [p for p in state.get('growthPlans', {}).get('ada', [])
+                        if p.get('kind') == 'social_adopt']
+        self.assertGreaterEqual(len(social_plans), 2,
+                                'each weekly adopt re-lands (repeat, not deduped)')
+
+    def test_low_confidence_adopt_does_not_land(self):
+        # A wavering adopt (below SOCIAL_ADOPT_CONFIDENCE) stays a tape line.
+        state = self._resolve('adopt', 0.4)
+        self.assertEqual(state.get('growthPlans', {}).get('ada'), None,
+                          'a low-confidence adopt does not write a coaching note')
+
+    def test_note_and_skip_never_land(self):
+        for choice in ('note', 'skip'):
+            state = self._resolve(choice, 0.9)
+            self.assertEqual(state.get('growthPlans', {}).get('ada'), None,
+                              f'{choice} carry-away must not land a coaching note')
+
+    def test_adopt_note_is_appended_to_next_task(self):
+        # The landed note flows through the existing loop: _coaching_note_for
+        # pops it onto the worker's next assigned task, exactly once.
+        state = self._resolve('adopt', 0.9)
+        coaching = sim._coaching_note_for(state, 'ada')
+        self.assertIsNotNone(coaching, 'the adopt note is served to the next task')
+        self.assertIn('trying/applying', coaching)
+        self.assertIsNone(sim._coaching_note_for(state, 'ada'),
+                          'each note is applied exactly once')
+
+
 if __name__ == '__main__':
     unittest.main()
