@@ -503,6 +503,92 @@ class SpikeContent(unittest.TestCase):
         self.assertNotIn(call.args[3]['sandboxId'], ('workroom-shared', 'research-shared'))
 
 
+class SpikeFileIssueWish(unittest.TestCase):
+    """content._spike_file_issue_wish (W3): the model-driven probe that turns
+    a spike finding into a fileIssue WISH. Hermetic -- Jev's decision call is
+    mocked. The function must NEVER file anything itself (it returns a wish
+    dict the sim side consumes inside the tick's read-modify-write), and it
+    must spend no Jev at all when the deterministic problem-signal pre-filter
+    finds nothing -- most spikes are informational."""
+
+    _TASK = {'id': 'spike-wish-1', 'title': 'Check the auth flow',
+             'projectLabel': 'Library Tools', 'teamId': 'dev'}
+
+    def _decision(self, choice, confidence=0.9):
+        return {'answers': {'q1': {'choice': choice, 'confidence': confidence}},
+                'usage': {'cost': 0.0}}
+
+    def _call_wish(self, finding, task=None, name='Cora', backlog='Check the auth flow'):
+        return content._spike_file_issue_wish(finding, task or self._TASK, name, backlog)
+
+    def test_no_problem_signal_returns_none_without_spending_jev(self):
+        # An informational finding ("everything is fine") must never call Jev.
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as decider, \
+             unittest.mock.patch.object(serve, '_jev_choice') as choice:
+            wish = self._call_wish('The auth flow works correctly in all tested browsers.')
+        self.assertIsNone(wish)
+        decider.assert_not_called()
+        choice.assert_not_called()
+
+    def test_empty_finding_returns_none(self):
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as decider:
+            self.assertIsNone(self._call_wish('   '))
+            self.assertIsNone(self._call_wish(''))
+        decider.assert_not_called()
+
+    def test_problem_signal_with_file_bug_verdict_returns_a_bug_wish(self):
+        finding = ('Gap found: login failures are silently dropped. The error is '
+                   'swallowed before it reaches the UI.')
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                        return_value=self._decision('file_bug')) as decider:
+            wish = self._call_wish(finding)
+        self.assertIsNotNone(wish)
+        self.assertEqual(wish['issueType'], 'bug')
+        self.assertIn('login failures are silently dropped', wish['summary'])
+        self.assertEqual(wish['feature'], 'Library Tools')
+        self.assertEqual(wish['teamId'], 'dev')
+        self.assertIn('swallowed', wish['description'])
+        decider.assert_called_once()
+
+    def test_problem_signal_with_file_story_verdict_returns_a_story_wish(self):
+        finding = ('The dashboard is missing a way to export the data; it needs a '
+                   'CSV download button.')
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                        return_value=self._decision('file_story')):
+            wish = self._call_wish(finding)
+        self.assertIsNotNone(wish)
+        self.assertEqual(wish['issueType'], 'story')
+
+    def test_none_verdict_returns_no_wish(self):
+        finding = 'Noted a limitation, but it is expected behavior -- nothing to fix.'
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                        return_value=self._decision('none')):
+            wish = self._call_wish(finding)
+        self.assertIsNone(wish)
+
+    def test_feature_falls_back_across_task_fields(self):
+        # feature is task.projectLabel -> productId -> room -> pressoffice.
+        for task, expected in (({'id': 't', 'projectLabel': 'P', 'teamId': 'dev'}, 'P'),
+                               ({'id': 't', 'productId': 'prod-1', 'teamId': 'dev'}, 'prod-1'),
+                               ({'id': 't', 'room': 'observatory', 'teamId': 'dev'}, 'observatory'),
+                               ({'id': 't', 'teamId': 'dev'}, 'pressoffice')):
+            with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                            return_value=self._decision('file_bug')):
+                wish = self._call_wish('Found a broken integration.', task=task)
+            self.assertEqual(wish['feature'], expected)
+
+    def test_wish_never_mutates_shared_state(self):
+        # The executor thread runs against a snapshot -- the wish is a pure
+        # return value, never a file_issue call on the live state.
+        import sim as _sim
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                        return_value=self._decision('file_bug')), \
+             unittest.mock.patch.object(_sim, 'file_issue') as file_issue:
+            wish = self._call_wish('Gap: the export endpoint fails on empty input.')
+        self.assertIsNotNone(wish)
+        file_issue.assert_not_called()
+
+
 class InternalReviewDetection(unittest.TestCase):
     """content._spike_wants_internal_review: the pure keyword heuristic
     behind the search_library-forcing fix above."""

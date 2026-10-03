@@ -161,6 +161,109 @@ class OnCallRotation(unittest.TestCase):
         self.assertEqual(sim.on_call_agent(state, 'maya', None, now_ms=1000), primary)
 
 
+class OnCallRotationPersistence(unittest.TestCase):
+    """WS-15: on-call rotation is now a PERSISTENT per-team order (state
+    ['_oncallOrder']) instead of a pure re-derivation -- a backup who actually
+    SERVED a sprint's pages is rotated to the END of the queue at sprint close
+    (_rotate_served_oncalls) so she isn't paged again next sprint before the
+    rotation catches up."""
+
+    def test_order_is_persistent_and_roster_shaped(self):
+        state = _state()
+        order = sim._oncall_order(state, 'maya')
+        self.assertEqual(order, ['ben', 'cora', 'zia'])  # roster order, SM+admin out
+        # Second call is stable (no churn), still the same order.
+        self.assertEqual(sim._oncall_order(state, 'maya'), order)
+
+    def test_served_backup_tracked_only_for_sprint_anchored_pages(self):
+        # A backup who actually SERVES a sprint-anchored page is recorded in
+        # state['_oncallServed'] so the sprint-close ceremony can rotate her to
+        # the END of the queue. Sprint-less pages (player questions) have no
+        # sprint anchor, so they never mutate state.
+        state = _state()
+        sim.on_call_agent(state, 'maya', None, now_ms=1000)
+        self.assertEqual(state.get('_oncallServed'), None)  # no sprint -> no record
+        primary = sim.on_call_agent(state, 'maya', 'sprint-1', now_ms=1000)
+        state['agents'][primary]['busy'] = True  # force the backup to serve
+        sim.on_call_agent(state, 'maya', 'sprint-1', now_ms=1000)
+        self.assertIsNotNone(state.get('_oncallServed'))  # sprint anchor -> tracked
+
+    def test_served_backup_rotates_to_end_at_sprint_close(self):
+        state = _state()
+        # A sprint-anchored page while the primary is busy: the pager falls
+        # through to the backup, who is recorded as having SERVED.
+        primary = sim.on_call_agent(state, 'maya', 'sprint-1', now_ms=1000)
+        state['agents'][primary]['busy'] = True
+        served = sim.on_call_agent(state, 'maya', 'sprint-1', now_ms=1000)
+        self.assertNotEqual(served, primary)
+        self.assertEqual(state['_oncallServed']['maya'], [served])
+        order = sim._oncall_order(state, 'maya')
+        sim._rotate_served_oncalls(state, ['maya'])
+        rotated = sim._oncall_order(state, 'maya')
+        # The served backup moved to the END; everyone else's relative order kept.
+        self.assertEqual(rotated, [a for a in order if a != served] + [served])
+        # The served ledger is cleared so a later close doesn't re-rotate her.
+        self.assertEqual(state['_oncallServed']['maya'], [])
+
+    def test_primary_serving_does_not_rotate(self):
+        state = _state()
+        primary = sim.on_call_agent(state, 'maya', 'sprint-1', now_ms=1000)
+        # Primary is available and chosen: NOT a backup, so NOT recorded as served.
+        self.assertEqual(primary, sim.on_call_agent(state, 'maya', 'sprint-1', now_ms=1000))
+        served = (state.get('_oncallServed') or {}).get('maya') or []
+        self.assertEqual(served, [])
+        before = sim._oncall_order(state, 'maya')
+        sim._rotate_served_oncalls(state, ['maya'])
+        self.assertEqual(sim._oncall_order(state, 'maya'), before)
+
+    def test_rotate_only_touches_existing_agents(self):
+        state = _state()
+        state['teams'][0]['id'] = 'team-x'
+        # A fired agent lingers in the recorded order; rotation drops them.
+        sim._oncall_order(state, 'maya')
+        state['_oncallOrder']['maya'] = ['ben', 'ghost', 'cora', 'zia']
+        state.setdefault('_oncallServed', {})['maya'] = ['ghost']
+        sim._rotate_served_oncalls(state, ['team-x'])
+        order = sim._oncall_order(state, 'maya')
+        self.assertNotIn('ghost', order)
+        self.assertEqual(order, ['ben', 'cora', 'zia'])
+
+    def test_new_hire_appends_to_end_as_backup(self):
+        state = _state()
+        sim._oncall_order(state, 'maya')
+        state['agentRoster'].append(_director('yara', director='maya'))
+        state['agents']['yara'] = {'id': 'yara', 'name': 'Yara', 'x': 0, 'y': 0,
+                                   'busy': False, 'visible': True, 'offDuty': False,
+                                   'inRoom': None}
+        order = sim._oncall_order(state, 'maya')
+        self.assertEqual(order, ['ben', 'cora', 'zia', 'yara'])
+
+    def test_fired_agent_removed_from_order(self):
+        state = _state()
+        sim._oncall_order(state, 'maya')
+        state['agentRoster'] = [d for d in state['agentRoster'] if d['id'] != 'zia']
+        state['agents'].pop('zia', None)
+        order = sim._oncall_order(state, 'maya')
+        self.assertNotIn('zia', order)
+
+    def test_sprint_close_wires_rotation_via_on_sprint_closed(self):
+        state = _state()
+        state['teams'][0]['id'] = 'team-x'
+        # Set up an active sprint record + served ledger, then close it: the
+        # rotation must run as part of the ceremony (before retro/pull/refinement).
+        record = {'id': 'sprint-1', 'teamIds': ['team-x']}
+        sim._oncall_order(state, 'maya')
+        served = 'zia'
+        state.setdefault('_oncallServed', {})['maya'] = [served]
+        sim._on_sprint_closed(state, record, now_ms=10_000)
+        order = sim._oncall_order(state, 'maya')
+        self.assertEqual(order, ['ben', 'cora', 'zia'].remove(served) and None or
+                                [a for a in ['ben', 'cora', 'zia'] if a != served] + [served])
+        self.assertEqual(state['_oncallServed']['maya'], [])
+        # Retro + refinement were kicked too (the ceremony still did its job).
+        self.assertIn('sprint-1', state['pendingSprintRetros'])
+
+
 class QueueBug(unittest.TestCase):
     def test_routes_to_owning_team_oncall_as_high_priority_gated_out(self):
         state = _state()

@@ -324,5 +324,85 @@ class OnboardCeremony(unittest.TestCase):
         # is what the assertions above cover.)
 
 
+class WorkAgreementEmpowered(unittest.TestCase):
+    """Todo 17 (as the user re-scoped it): the work agreement is DRAFTED BY THE
+    AGENTS -- the new hire, from their own role/mission/access, not a director's
+    instructions -- and then EMPOWERED by the admin before the hire is released
+    into readiness."""
+
+    def decider_ben(self):
+        def decider(state, instructions, candidates):
+            for c in candidates:
+                if c['id'] == 'ben':
+                    return 'ben'
+            return candidates[0]['id'] if candidates else None
+        return decider
+
+    def _stage3_hire(self):
+        state = _idle_with_work(_seed())
+        state['lastHireAt'] = 0
+        new_id = _fresh_hire(state, self.decider_ben())
+        self.assertIsNotNone(new_id, 'a hire completed')
+        state, now = _run_governance(state, 80, self.decider_ben())
+        self.assertEqual(state['agents'][new_id]['profile']['onboarding']['stage'], 3,
+                         'the agreement drafts on the way into the readiness hold')
+        return state, new_id
+
+    def test_hire_drafts_own_agreement_and_admin_empowers_it(self):
+        state, new_id = self._stage3_hire()
+        new_agent = state['agents'][new_id]
+        agreement = new_agent['profile'].get('workAgreement')
+        self.assertIsNotNone(agreement, 'the hire leaves onboarding with a work agreement')
+        self.assertEqual(agreement['draftedBy'], new_id,
+                         'the agreement is the hire\'s OWN draft, not the director\'s')
+        self.assertEqual(agreement['empoweredBy'], 'faye',
+                         'the admin (faye) empowers the draft')
+        # The text is built from the hire's own self-description, not a director
+        # template -- the role phrase "Assistant to" comes from the hire itself.
+        self.assertIn('Assistant to', agreement['text'])
+        self.assertIn('My mission', agreement['text'])
+
+    def test_drafting_logs_agent_and_admin_actions(self):
+        # The module DB is shared across the ceremony tests AND the fixed-name
+        # fallback reuses hire ids, so scope the query to rows appended after
+        # this test's start (by rowid, not ts -- same-second writes collide):
+        # this hire's agreement logs exactly once each.
+        with serve._db() as conn:
+            before = conn.execute('SELECT COALESCE(MAX(rowid), 0) FROM action_log').fetchone()[0]
+        state, new_id = self._stage3_hire()
+        with serve._db() as conn:
+            rows = conn.execute(
+                "SELECT agent_id, details FROM action_log WHERE action='onboard' "
+                "AND rowid > ? AND details LIKE ?", (before, f'%{new_id}%')).fetchall()
+        drafted = [r for r in rows if 'agreement_drafted' in r[1]]
+        empowered = [r for r in rows if 'agreement_empowered' in r[1]]
+        self.assertEqual(len(drafted), 1, 'the hire\'s self-draft is logged once')
+        self.assertEqual(len(empowered), 1, 'the admin\'s empower is logged once')
+        self.assertEqual(drafted[0][0], new_id, 'the draft is attributed to the hire')
+        self.assertEqual(empowered[0][0], 'faye', 'the empower is attributed to the admin')
+
+    def test_agents_md_renders_the_empowered_agreement(self):
+        profile = {
+            'mission': 'Help my team.',
+            'instructions': [],
+            'workAgreement': {'text': 'I am the Assistant to Ben. I agree to work cleanly.',
+                              'draftedBy': 'zoe', 'empoweredBy': 'faye'},
+        }
+        md = serve._render_agents_md('Zoe', 'Assistant to Ben', profile)
+        self.assertIn('## Work Agreement', md)
+        self.assertIn('I am the Assistant to Ben.', md)
+        self.assertIn('empowered by the admin', md)
+
+    def test_no_admin_means_agreement_recorded_but_not_empowered(self):
+        state, new_id = self._stage3_hire()
+        for d in state.get('agentRoster') or []:
+            d['isAdmin'] = False
+        sim._empower_work_agreement(state, state.get('_pendingOnboard') or {
+            'agentId': new_id, 'directorId': 'faye'}, now_ms=5_000)
+        agreement = state['agents'][new_id]['profile']['workAgreement']
+        self.assertIsNone(agreement['empoweredBy'],
+                          'no admin to empower -> attribution is empty, draft still recorded')
+
+
 if __name__ == '__main__':
     unittest.main()

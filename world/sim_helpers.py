@@ -27,6 +27,28 @@ def normalize_priority(p):
     return WORK_PRIORITY['normal']
 
 
+# A breakdown story's size estimate (S/M/L) is an EFFORT signal, carried onto
+# the queued item, the assigned task, and used as a scheduling TIEBREAK at
+# equal priority (an L story starts before an S story -- it needs more
+# wall-time). It never inflates urgency (an S story filed as urgent still
+# wins); it only orders same-priority work.
+_SIZE_WEIGHT = {'L': 3, 'M': 2, 'S': 1}
+
+
+def normalize_size_estimate(size):
+    """S/M/L (case-insensitive, whitespace-tolerant) -> the canonical letter;
+    anything else -> None (unknown size is not a scheduling signal)."""
+    if not size:
+        return None
+    key = str(size).strip().upper()
+    return key if key in _SIZE_WEIGHT else None
+
+
+def size_estimate_weight(size):
+    """Ordering weight for a normalized size estimate: L=3, M=2, S=1, unknown=0."""
+    return _SIZE_WEIGHT.get(normalize_size_estimate(size), 0)
+
+
 def is_work_item_due(item, now_ms):
     """Port of tasks.js _isWorkItemDue."""
     return not item.get('notBefore') or now_ms >= item['notBefore']
