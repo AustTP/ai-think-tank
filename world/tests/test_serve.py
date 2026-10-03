@@ -4824,6 +4824,57 @@ class ChatEndpointAuth(unittest.TestCase):
             r = c.post('/api/player-inbox/ask-1/respond', json={'answer': 'x'})
         self.assertEqual(r.status_code, 401, 'an agent key is not a player credential here')
 
+    def test_player_intent_surface_rejects_valid_agent_key(self):
+        # Regression: every /api/intent/* write handler (plus the team-prefix
+        # endpoint) hardcodes actor 'player' -- a valid agent key must NOT let an
+        # agent create/close a sprint, trigger a publish push, release a product,
+        # veto a story, promote a spike, file new work, or answer questions as the
+        # player. The middleware accepts a key (loopback grant for content
+        # executors), but each handler's own _require_player_session gate must
+        # reject it. The gate fires before any body parsing or state access, so a
+        # bare POST with a bogus path param is still 401.
+        c = TestClient(serve.app)
+        paths = [
+            ('/api/intent/assign-big-task', {}),
+            ('/api/intent/story/story-1/reject', {}),
+            ('/api/intent/publish', {}),
+            ('/api/intent/spike/spike-done/promote', {}),
+            ('/api/intent/sprint', {}),
+            ('/api/intent/sprint/spr-1/close', {}),
+            ('/api/intent/issues', {}),
+            ('/api/intent/issues/KEY-1/status', {}),
+            ('/api/intent/clarify', {}),
+            ('/api/intent/ask', {}),
+            ('/api/intent/schedule', {}),
+            ('/api/intent/incidents', {}),
+            ('/api/intent/product', {}),
+            ('/api/intent/product/p1/release', {}),
+            ('/api/teams/dev/prefix', {}),
+        ]
+        for path, body in paths:
+            with self.subTest(path=path), \
+                 unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
+                 unittest.mock.patch.object(serve, '_valid_agent_key_presented', return_value=True):
+                r = c.post(path, json=body)
+            self.assertEqual(r.status_code, 401,
+                             f'{path} must reject a valid agent key as a player credential')
+            self.assertIn('log in', r.json()['error'])
+
+    def test_require_player_session_accepts_only_a_real_session(self):
+        # The gate is exactly "a valid session cookie", nothing else: an agent
+        # key is never consulted by the handler-level check, and a missing/
+        # unverifiable cookie fails closed.
+        req = unittest.mock.Mock()
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=False):
+            self.assertFalse(serve._require_player_session(req))
+            req.cookies.get.assert_called_once_with(serve.SESSION_COOKIE_NAME)
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=True):
+            self.assertTrue(serve._require_player_session(req))
+        # A valid key presented in the header is irrelevant to this check.
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_valid_agent_key_presented', return_value=True):
+            self.assertFalse(serve._require_player_session(req))
+
     def test_high_tier_chat_call_accrues_monthly_budget_exactly_once(self):
         # Regression: the /api/chat choke point accrued a high-tier
         # call to the monthly budget TWICE via two duplicate blocks, so a $2/mo

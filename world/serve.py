@@ -4076,6 +4076,18 @@ def verify_session(session_id):
     return bool(row and row[0] > time.time())
 
 
+def _require_player_session(request):
+    """Player-only gate for the /api/intent/* write surface (and the team
+    prefix endpoint). The AUTH_PROTECTED_PREFIXES middleware accepts EITHER a
+    real session OR a valid agent key (server content executors loopback with
+    only a key), but these handlers are the PLAYER's controls -- they hardcode
+    actor 'player', and a valid agent key must not let an agent create or close
+    a sprint, trigger a publish push, release a product, veto a story, promote
+    a spike, or file new work as the player. A session is the only credential
+    that satisfies them. Fail closed (False) on anything else."""
+    return verify_session(request.cookies.get(SESSION_COOKIE_NAME))
+
+
 def destroy_session(session_id):
     with _db() as conn:
         conn.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
@@ -8149,6 +8161,8 @@ async def intent_assign_big_task(request: Request):
     """Player intent: 'delegate / big task'. Server-side assignBigTask. Requires
     a logged-in session (the player). Returns {admin, subtasks:[...]} like the
     client's assignBigTask, so the UI can report what was queued."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -8262,6 +8276,8 @@ async def intent_reject_story(task_id: str, request: Request):
     veto). This is a rare, heavy principal signal -- the player is the EXTERNAL
     gauge the internal peer gate can never be, since agents only approve agents.
     """
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -8409,6 +8425,8 @@ async def intent_publish(request: Request):
     the player (session holder) explicitly asks -- agents stay scoped to their
     own work. Stages released projects/wiki/skills into a gitignored staging
     dir, commits with a passport-linked message, and pushes."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     state = get_state_from_db()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -8481,6 +8499,8 @@ async def intent_promote_spike(task_id: str, request: Request):
     (a working one isn't finished); 409 otherwise keeps the player from half-baking
     an investigation into real work.
     """
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     state = get_state_from_db()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -8699,6 +8719,8 @@ async def promote_shadow_entry(idx: str, request: Request):
 async def intent_sprint(request: Request):
     """Seed a new sprint: {name?, goal, items:[...], targetDate?}. Returns the
     sprint record + per-item queue confirmations so the UI can report."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -8742,11 +8764,26 @@ async def intent_sprint(request: Request):
     else:
         target_date = None
     import sim as _sim
+    # workerCount: the director's chosen sprint headcount (1..MAX_TEAM_MEMBERS),
+    # strictly staffed -- only this many of the sprint's team members may take
+    # its cards (see _sprint_worker_pool in sim.py). Optional: absent/legacy
+    # defaults to the team's full complement. Must be a whole number in range;
+    # anything else is a 400. (queue_sprint clamps as defense in depth; the
+    # strict check here gives the player a clean error.)
+    worker_count = body.get('workerCount')
+    if worker_count is not None:
+        try:
+            worker_count = int(worker_count)
+        except (TypeError, ValueError):
+            return JSONResponse({'error': f'workerCount must be a whole number from 1 to {_sim.MAX_TEAM_MEMBERS}'}, status_code=400)
+        if worker_count < 1 or worker_count > _sim.MAX_TEAM_MEMBERS:
+            return JSONResponse({'error': f'workerCount must be a whole number from 1 to {_sim.MAX_TEAM_MEMBERS}'}, status_code=400)
     from sim import next_sprint_id
     sprint_id = next_sprint_id(state)
     sprint = _sim.queue_sprint(
         state, sprint_id, (body.get('name') or '').strip(), goal, owner_id,
-        items, _DELEGATABLE_ROOMS, target_date_ms=target_date, team_ids=team_ids)
+        items, _DELEGATABLE_ROOMS, target_date_ms=target_date, team_ids=team_ids,
+        worker_count=worker_count)
     if sprint is None:
         return JSONResponse({'error': 'No sprint item had a valid title and a delegatable room, so nothing was queued.'}, status_code=400)
     save_state_to_db(state)
@@ -8782,6 +8819,8 @@ async def get_sprints(request: Request):
 async def close_sprint(sprint_id: str, request: Request):
     """Close a sprint container. Queued items keep flowing; close is a status,
     not a cancel. Chains the close into the product-passport."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     state = get_state_from_db()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -8804,7 +8843,7 @@ async def close_sprint(sprint_id: str, request: Request):
 # issueKey + teamId), so the owning team's scrum master grooms the card into a
 # sprint and the think tank actually works it -- not a dead ledger.
 # ---------------------------------------------------------------------------
-_ISSUE_REQUIRED = ('teamId', 'type', 'summary', 'feature', 'reporterId')
+_ISSUE_REQUIRED = ('teamId', 'type', 'summary', 'feature')
 
 
 @app.get('/api/intent/issues')
@@ -8821,10 +8860,14 @@ async def get_issues(request: Request):
 @app.post('/api/intent/issues')
 async def create_issue(request: Request):
     """File a JIRA-style issue for a team. Required: teamId, type, summary,
-    feature, reporterId. Returns the issue record (key TEAM-0128) + the linked
+    feature. reporterId is OPTIONAL (this endpoint is player-only, so it
+    defaults to 'player' -- an agent never files issues as itself here).
+    Returns the issue record (key TEAM-0128) + the linked
     backlog-request id. Issue type/storyPoints pass through; `description` is
     optional but structured when present -- pass {'userStory': ..., 'acceptance
     Criteria': ...} or a string following one of those two templates."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -8865,6 +8908,8 @@ async def create_issue(request: Request):
 async def set_issue_status(key: str, request: Request):
     """Transition an issue's status (open/in_progress/done/closed). Mirrors the
     change onto any linked pending backlog request."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -9077,6 +9122,8 @@ async def device_checkin(request: Request):
 async def set_team_prefix(team_id: str, request: Request):
     """Set (or clear via empty string) an explicit issue prefix for a team.
     Director/admin-only. Returns the applied prefix."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -9151,6 +9198,8 @@ async def intent_clarify(request: Request):
     agent, answers KNOWLEDGE-BASE-FIRST (real Library search), and only
     escalates to the completing agent if the on-call can't answer. Returns
     {reply, onCall, completing, escalatedTo}."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     if not check_rate_limit(ASK_LANE_RATE_LIMIT_KEY):
         return JSONResponse({'error': 'Rate limit hit -- too many questions at once. Wait a minute and try again.'}, status_code=429)
     state = get_state_from_db()
@@ -9803,6 +9852,8 @@ async def intent_ask(request: Request):
     Thin wrapper: all real behavior lives in _ask_core (also called directly
     by the Telegram bridge, added with no HTTP hop in between).
     """
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     if not check_rate_limit(ASK_LANE_RATE_LIMIT_KEY):
         return JSONResponse({'error': 'Rate limit hit -- too many questions at once. Wait a minute and try again.'}, status_code=429)
     state = get_state_from_db()
@@ -10137,6 +10188,8 @@ async def intent_schedule(request: Request):
     (_extract_schedule_fields_sync) is exclusive to the Telegram routing
     layer; this takes already-structured fields -- the same relationship
     /api/intent/ask already has to _ask_core."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     state = get_state_from_db()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -10210,6 +10263,8 @@ async def pipelines_delete(request: Request, pipeline_id: str):
 @app.post('/api/intent/incidents')
 async def intent_incidents(request: Request):
     """Structured parity endpoint for the incident lane: POST {productId, title}."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     state = get_state_from_db()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -10270,6 +10325,8 @@ async def intent_product(request: Request):
     contributorIds?, handles?}. The player (session holder) seeds on behalf of
     an acting authority (admin, else senior-most director) -- identical to
     sprint create. Chains product_created into the passport."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -10347,6 +10404,8 @@ async def release_product(product_id: str, request: Request):
     library/projects/<id>/v<N>/ (RELEASE.md + a frozen copy), flip status ->
     'released', chain product_released into the passport. The release is run by
     the senior-most free authority; revision content is never returned."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     try:
         body = await request.json() or {}
     except Exception:

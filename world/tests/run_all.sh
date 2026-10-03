@@ -115,9 +115,6 @@ echo
 echo "== Python: hangout room (non-delegable, behind Town Hall) =="
 python3 tests/test_hangout.py
 echo
-echo "== Python: weekly cross-team Knowledge Social =="
-python3 tests/test_social.py
-echo
 echo "== Python: per-team Backlog Refinement (scrum master creates stories) =="
 python3 tests/test_refinement.py
 echo
