@@ -73,6 +73,12 @@ class JevModelEndpoint(unittest.TestCase):
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
             THINK_TANK_DIR=self.tmp,
+            # Hermetic lifespan: with TELEGRAM_BOT_TOKEN unset, the app's
+            # _telegram_poll_loop never starts, so TestClient's __enter__/__exit__
+            # (which runs the real lifespan) doesn't block on a 25s long-poll
+            # during shutdown. No live network, no real credentials.
+            TELEGRAM_BOT_TOKEN=None,
+            TELEGRAM_ALLOWED_CHAT_IDS=[],
         )
         self._cm.start()
         serve.init_db()

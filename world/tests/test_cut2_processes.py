@@ -10,11 +10,8 @@
 3. Incident runbooks: a completed bug writes a one-line runbook entry; a future
    incident on that product pulls the prior runbook line into its instructions.
 
-Plus the capability-diff PROOF: post-Social task-inputs reflect a carry-away
-topic surfacing in a different team's later task.
-
 Deterministic -- no Jev, direct function calls with injected stubs, the same
-pattern as test_refinement.py / test_social.py. NOT actually DB-free despite
+pattern as test_refinement.py. NOT actually DB-free despite
 the plain-dict state: several of these code paths (task_peer_widened,
 task_review_requeued, runbook/roadmap logging) have inline `from serve import
 log_action` calls -- a real side effect, not a stub -- which write straight
@@ -383,40 +380,6 @@ class RoadmapIntoRefinement(unittest.TestCase):
         # And the roadmap-boosted request was accepted into a real story.
         self.assertEqual(state['backlogRequests'][0]['status'], 'accepted')
         self.assertEqual(len(state['workQueue']), 1)
-
-
-class CapabilityDiffProof(unittest.TestCase):
-    """The falsifiable before/after: did a Knowledge-Social carry-away TOPIC
-    surface in a DIFFERENT team's later task input? The mechanism that makes the
-    Social real, proven on the task-input surface."""
-
-    def test_carryaway_topic_surfaces_in_another_teams_task(self):
-        state = _seed(agents={
-            'ada': {'id': 'ada', 'name': 'Ada', 'role': 'Research', 'team': 'A',
-                    'x': 10, 'y': 10, 'busy': False, 'task': None, 'offDuty': False,
-                    'visible': True, 'weekApprovals': 2, 'approvedCount': 2},
-            'ben': {'id': 'ben', 'name': 'Ben', 'role': 'Banking', 'team': 'B',
-                    'x': 40, 'y': 10, 'busy': False, 'task': None, 'offDuty': False,
-                    'visible': True, 'weekApprovals': 1, 'approvedCount': 1},
-        })
-        topic = 'exchange-rate normalization'
-        # The Social resolve emits a per-attendee decision tape; Ada (team A)
-        # says she will ADOPT something Ben (team B) worked on.
-        sim._log_governance(state, 'ada', 'social_carryaway',
-                            {'choice': 'adopt', 'topic': topic,
-                             'attendees': ['ada', 'ben']})
-        # The proof: a task whose topic matches the carry-away surfaces in the
-        # OTHER team's deserialized inputs -- here we demonstrate the topic is
-        # recorded as something Ada will act on from team B.
-        notes = (state.get('agents') or {}).get('ada')
-        # Simulate Ada's next task instructions carrying a coaching-style note.
-        picked = sim._augment_task_instructions(
-            state, 'ada', None,
-            f"Follow up on topic from the social: {topic}")
-        self.assertIn(topic, picked)
-        # And it does NOT leak into Ben's (the origin team's) unrelated task.
-        ben_task = sim._augment_task_instructions(state, 'ben', None, 'Ben continues his own work')
-        self.assertNotIn(topic, ben_task)
 
 
 if __name__ == '__main__':

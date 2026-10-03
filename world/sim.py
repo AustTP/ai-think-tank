@@ -2318,16 +2318,19 @@ def _completing_agent_for_product(state, product_id, prod=None):
 # unit-testable, run through the serve.py wrapper like everything else.
 # ---------------------------------------------------------------------------
 def queue_sprint(state, sprint_id, name, goal, owner_id, items, valid_rooms,
-                 target_date_ms=None, now_ms=None, team_ids=None):
+                 target_date_ms=None, now_ms=None, team_ids=None, worker_count=None):
     """Create a sprint record and append its valid items to the workQueue, each
     tagged with sprintId. `items` are dicts shaped like queue_work items. Only
     items whose room is in `valid_rooms` (the caller supplies the delegatable
     set -- sim.py stays decoupled from serve.py's constant) are kept; a sprint
     with zero retainable items is not created. `team_ids` records which teams
     the sprint touches (the scrum-master gate is enforced by the CALLER before
-    calling here; this just persists the association). Returns the sprint
-    record dict, or None if nothing was created. Mutates state['sprints'] +
-    state['workQueue']."""
+    calling here; this just persists the association). `worker_count` is the
+    director's chosen sprint headcount (1..MAX_TEAM_MEMBERS): the pool of
+    people ALLOWED to work this sprint's cards, enforced strictly at assignment
+    (_assign_due_item) -- no pool fallback. Absent/legacy -> the team's full
+    complement. Returns the sprint record dict, or None if nothing was created.
+    Mutates state['sprints'] + state['workQueue']."""
     valid = {r for r in (valid_rooms or [])}
     kept = []
     for it in items or []:
@@ -2348,6 +2351,10 @@ def queue_sprint(state, sprint_id, name, goal, owner_id, items, valid_rooms,
         'createdAt': now_ms,
         'targetDate': target_date_ms or None,
         'teamIds': list(dict.fromkeys(team_ids or [])),
+        # The director-chosen sprint headcount (1..MAX_TEAM_MEMBERS). Strictly
+        # staffed: only this many workers may take this sprint's cards, and
+        # only from the sprint's teams (see _sprint_worker_pool).
+        'workerCount': max(1, min(MAX_TEAM_MEMBERS, int(worker_count or MAX_TEAM_MEMBERS))),
         'status': 'active',
         'items': [_sprint_item_id(it) for it in kept],
     }
@@ -7047,28 +7054,64 @@ def _refinement_scrum_master_for_team(state, team_id):
     return None
 
 
+def _ceremony_facilitator(state, team_id):
+    """A FREE, ON-DUTY facilitator for `team_id`'s ceremony -- the one change
+    that makes scrum-master absence never block a ceremony. Mirrors the retro's
+    fallback ladder (_retro_scrum_master): the effective scrum master when
+    free+on-duty (a small team's own director standing in, per
+    _refinement_scrum_master_for_team), else the team's OWN director, else a
+    non-busy director borrowed from ANOTHER team (the OWN director is preferred
+    over a borrowed one -- a team's grooming should be run by someone it works
+    with). Returns None only when no facilitator can be found at all (the
+    ceremony then waits for a later pass)."""
+    teams = {t.get('id'): t for t in (state.get('teams') or [])}
+    agents = state.get('agents') or {}
+
+    def _free(aid):
+        a = agents.get(aid)
+        return bool(a) and not a.get('busy') and not a.get('offDuty')
+
+    sm = _refinement_scrum_master_for_team(state, team_id)
+    if sm and _free(sm):
+        return sm
+    did = (teams.get(team_id) or {}).get('directorId')
+    if did and _free(did):
+        return did
+    # Borrow a free director from another team rather than leaving the team's
+    # grooming (or breakdown) stranded on a busy/off-duty own facilitator.
+    for t in (state.get('teams') or []):
+        other = t.get('directorId')
+        if not other or other == did:
+            continue
+        if _free(other):
+            return other
+    return None
+
+
 def _refinement_attendees(state, req_ids, scrum_master_id):
     """The ceremony's attendees: the scrum master + every AGENT who FILED a
     pending request this round (req_ids are work-request ids; the filers are
     resolved through the backlogRequests records). Non-agent filers (e.g. the
     player filing a JIRA issue) cannot attend a room ceremony and must not
     stall it -- they are dropped from the attendee list, and the scrum master
-    still grooms their card. Only a BUSY attendee defers the whole meeting so
-    we never pull an agent out of a live collaboration; an off-duty attendee
-    is parked and free, and _start_refinement wakes her (snapshot + restore,
-    exactly like the Social's off-duty Hangout attendees)."""
+    still grooms their card. ONLY the scrum master must be free to convene: a
+    BUSY filer's card is still groomed this round but she does not attend (her
+    card's acceptance never needed her in the room), so one busy worker can no
+    longer stall the whole team's grooming. An off-duty attendee is parked and
+    free, and _start_refinement wakes her (snapshot + restore, exactly like the
+    Social's off-duty Hangout attendees)."""
     agents = state.get('agents') or {}
+    sm = agents.get(scrum_master_id)
+    if not sm or sm.get('busy'):
+        return None  # the facilitator must be free to run the meeting
     filer_ids = []
     for rid in req_ids:
         r = next((x for x in (state.get('backlogRequests') or []) if x.get('id') == rid), None)
         if r and r.get('filedBy') and r['filedBy'] not in filer_ids \
                 and r['filedBy'] in agents:
             filer_ids.append(r['filedBy'])
-    ids = [scrum_master_id] + [f for f in filer_ids if f != scrum_master_id]
-    for aid in ids:
-        a = agents.get(aid)
-        if not a or a.get('busy'):
-            return None
+    ids = [scrum_master_id] + [f for f in filer_ids if f != scrum_master_id
+                               and not (agents.get(f) or {}).get('busy')]
     return ids
 
 
@@ -7339,44 +7382,48 @@ def kick_refinement_now(state, team_id, now_ms=None):
 
 def _refinement_step(state, now, now_ms, decider=None):
     """One backlog-refinement pass, called from _task_cycle ungated (each team's
-    ceremony is the point even on a quiet think tank). Per-team ceremonies now run
-    CONCURRENTLY: each team has its OWN ceremony slot
-    (`pendingRefinements[team_id]`), so one team no longer blocks another at the
-    shared Command Center. A pass (a) advances every in-flight ceremony (embark
-    on one pass, RELEASE on the next -- no required fixed hold), and (b) convenes
-    a new ceremony for every team whose cadence is due AND has pending requests
-    AND a free+on-duty scrum master and filers. Never convenes an empty meeting;
-    defers a team if its scrum master or filers are busy/off-duty."""
+    ceremony is the point even on a quiet think tank). EVENT-DRIVEN: there is no
+    weekly cadence gate -- a ceremony convenes as soon as a team has pending
+    requests, a free+on-duty facilitator (see _ceremony_facilitator), and no
+    active sprint. Per-team ceremonies run CONCURRENTLY: each team has its OWN
+    ceremony slot (`pendingRefinements[team_id]`), so one team no longer blocks
+    another at the shared Command Center. A pass (a) advances every in-flight
+    ceremony (embark on one pass, RELEASE on the next -- no required fixed
+    hold; the facilitator is RE-RESOLVED at embark so a stored id that has gone
+    busy never blocks), and (b) convenes a new ceremony for every team with
+    pending requests AND a free facilitator. Never convenes an empty meeting;
+    defers a team in an active sprint (it refines at close)."""
     pending_map = state.setdefault('pendingRefinements', {})
     # (a) Advance every in-flight ceremony. Embark on one pass, then RELEASE on
     # the immediately-following pass -- the scrum master groomed everything
-    # synchronously in the resolve, so there's no clock to wait out.
+    # synchronously in the resolve, so there's no clock to wait out. The
+    # facilitator is re-resolved HERE so a stored scrum master who has gone
+    # busy/off-duty is swapped for the team's own/borrowed director instead of
+    # stranding the embarked meeting.
     for team_id in list(pending_map.keys()):
         pending = pending_map[team_id]
         if not pending.get('embarked'):
+            facilitator = _ceremony_facilitator(state, team_id)
+            if not facilitator:
+                continue  # no free+on-duty facilitator right now -- defer a pass
             _start_refinement(state, team_id, pending.get('reqIds', []),
-                              pending.get('scrumMasterId'), now_ms)
+                              facilitator, now_ms)
         else:
             _resolve_refinement(state, pending, now_ms, decider=decider)
-    # (b) Convene a ceremony for every team that is due and has groomable
-    # requests and whose scrum master is free. Each team gets its own slot, so
-    # multiple teams can refine in the same pass (spread apart in the room).
+    # (b) Convene a ceremony for every team that has groomable requests and a
+    # free facilitator. Each team gets its own slot, so multiple teams can
+    # refine in the same pass (spread apart in the room).
     slot = 0
     for team in (state.get('teams') or []):
         team_id = team.get('id') or team.get('directorId')
         if team_id in pending_map:
             continue  # this team already has an in-flight ceremony
-        scrum_master_id = _refinement_scrum_master_for_team(state, team_id)
-        if not scrum_master_id:
-            continue  # this team has no (effective) scrum master designated yet
+        facilitator = _ceremony_facilitator(state, team_id)
+        if not facilitator:
+            continue  # this team has no free+on-duty facilitator right now
         if _team_in_active_sprint(state, team_id):
             # WS-14: a team in an active sprint refines at CLOSE, never
-            # mid-sprint -- the sprint is the committed work. The cadence stamp
-            # is deliberately NOT advanced, so the moment the sprint closes the
-            # next pass finds the team due and convenes immediately.
-            continue
-        if not _refinement_cadence_due_for(state, team_id, now_ms,
-                                           legacy=state.get('lastBacklogRefinementAt')):
+            # mid-sprint -- the sprint is the committed work.
             continue
         # This team's OWN pending requests -- a ceremony must never groom a
         # request that isn't filed by one of THIS team's members (per-team
@@ -7397,7 +7444,7 @@ def _refinement_step(state, now, now_ms, decider=None):
         state.setdefault('teamRefinementAt', {})[team_id] = now_ms
         pending_map[team_id] = {
             'at': now_ms + REFINEMENT_MEET_MS, 'embarked': False,
-            'scrumMasterId': scrum_master_id, 'reqIds': req_ids,
+            'scrumMasterId': facilitator, 'reqIds': req_ids,
             'teamId': team_id, 'people': {},
         }
         slot += 1  # only to spread simultaneous ceremonies apart in the room
@@ -7602,17 +7649,22 @@ def _breakdown_step(state, now, now_ms, decider=None):
     """One large-request breakdown pass, called from _task_cycle ungated (a
     staffed large ask is the point even on a quiet think tank). A pass
     (a) advances every in-flight breakdown ceremony (embark on one pass,
-    RELEASE on the next -- no required fixed hold), and (b) convenes a breakdown
-    for every team that has pending large-request breakdowns AND a free scrum
-    master + healthy attendees. Never convenes an empty meeting; a team in an
-    active sprint is deferred (the sprint is the committed work, and the pending
+    RELEASE on the next -- no required fixed hold; the facilitator is
+    RE-RESOLVED at embark so a stored id that has gone busy never blocks), and
+    (b) convenes a breakdown for every team that has pending large-request
+    breakdowns AND a free+on-duty facilitator (see _ceremony_facilitator) +
+    healthy attendees. Never convenes an empty meeting; a team in an active
+    sprint is deferred (the sprint is the committed work, and the pending
     breakdown request is carded once the team is free)."""
     pending_map = state.setdefault('pendingBreakdowns', {})
     for team_id in list(pending_map.keys()):
         pending = pending_map[team_id]
         if not pending.get('embarked'):
+            facilitator = _ceremony_facilitator(state, team_id)
+            if not facilitator:
+                continue  # no free+on-duty facilitator right now -- defer a pass
             _start_breakdown(state, team_id, pending.get('reqIds', []),
-                             pending.get('scrumMasterId'), now_ms)
+                             facilitator, now_ms)
         else:
             _resolve_breakdown(state, pending, now_ms, decider=decider)
     slot = 0
@@ -7628,11 +7680,11 @@ def _breakdown_step(state, now, now_ms, decider=None):
             # stays queued and is carded once the team is free (same rule as a
             # team in an active sprint not refining mid-sprint).
             continue
-        scrum_master_id = _refinement_scrum_master_for_team(state, team_id)
-        if not scrum_master_id:
-            continue  # this team has no (effective) scrum master designated yet
+        facilitator = _ceremony_facilitator(state, team_id)
+        if not facilitator:
+            continue  # this team has no free+on-duty facilitator right now
         req_ids = req_ids[:BREAKDOWN_MAX_REQUESTS]
-        if _start_breakdown(state, team_id, req_ids, scrum_master_id, now_ms, pos_offset=slot):
+        if _start_breakdown(state, team_id, req_ids, facilitator, now_ms, pos_offset=slot):
             slot += 1  # only to spread simultaneous ceremonies apart in the room
 
 
@@ -9069,16 +9121,12 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # unless someone is still under the floor).
     _coaching_loop_step(state, now_ms)
 
-    # Weekly cross-team Knowledge Social: convene/resolve the 30-minute Hangout
-    # conversation for eligible (week's-work) agents. Runs ungated -- the
-    # conversation is the point even on an otherwise-idle think tank, and must not
-    # be starved by the work gate below.
-    _social_step(state, now, now_ms)
-
     # Backlog refinement: the scrum master grooms agent-filed work-requests into
-    # real stories at the Command Center on a weekly cadence. Runs ungated like
-    # the Social (the ceremony is the point even on a quiet think tank) but no-ops
-    # when there are no pending requests or no scrum master to run it.
+    # real stories at the Command Center. EVENT-DRIVEN (no cadence): convenes
+    # whenever a team has pending requests, a free+on-duty facilitator, and no
+    # active sprint. Runs ungated like the other ceremonies (the grooming is the
+    # point even on a quiet think tank) but no-ops when there's nothing to groom
+    # or no facilitator to run it.
     _refinement_step(state, now, now_ms)
 
     # Sprint staffing: the breakdown ceremony -- a staffable large ask filed by
@@ -9316,6 +9364,13 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # no need for the player to tap close once the whole sprint has landed.
     _auto_close_completed_sprints(state, now_ms)
 
+    # Sprint staffing expansion: an active sprint below the six-worker cap whose
+    # cards are queued while every pool member is busy grows its staff by one
+    # (the director's "agents need help" signal, deterministic -- see
+    # _sprint_staffing_step). Runs before assignment so the grown pool can take
+    # cards this same pass.
+    _sprint_staffing_step(state, now_ms)
+
     # Assignment loop (bounded by roster size, like the JS runTaskCycleBody).
     roster = state.get('agentRoster') or []
     roster_size = sum(1 for d in roster if not d.get('isAdmin'))
@@ -9331,7 +9386,11 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         # (wake only enough agents to keep one awake-idle) would skip the second
         # of a pair of off-duty reviewers. So a reviewOf item is ALWAYS
         # wakeable -- its pinned agent is woken inside _assign_due_item.
-        _pinned_review = bool(pick.get('reviewOf'))
+        # Sprint staffing: a sprint card is likewise always wakeable -- its pool
+        # is a specific set (see _sprint_worker_pool), and off-duty pool members
+        # must be woken to staff the sprint even when the generic wake rule
+        # would otherwise keep the think tank thin.
+        _pinned_review = bool(pick.get('reviewOf') or pick.get('sprintId'))
         can_wake_off_duty = (_pinned_review or bool(pick.get('notBefore')) or _awake_idle_count(state) == 0) \
             and can_activate_another(state)
         if _awake_idle_count(state) == 0 and not (can_wake_off_duty and _any_available_including_off_duty(state)):
@@ -9344,7 +9403,11 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
             # abandon it on the normal attempt cap (which exists to shed stray
             # normal work). It retries until a reviewer is assignable; the
             # needs_review timeout is the safety net if a reviewer never can be.
-            if pick.get('reviewOf') or pick['attempts'] < WORK_ITEM_MAX_ATTEMPTS:
+            # Sprint staffing: a sprint card is STRICTLY staffed -- it waits
+            # (forever, if need be) for a member of its chosen pool to free up
+            # and is never shed to the think-tank-wide fallback or abandoned.
+            if pick.get('reviewOf') or pick.get('sprintId') \
+                    or pick['attempts'] < WORK_ITEM_MAX_ATTEMPTS:
                 work_queue.append(pick)
             else:
                 from serve import log_action
@@ -9539,6 +9602,107 @@ def _recruit_pair_navigator(state, driver_id, task, can_wake_off_duty, grid, doo
     return None
 
 
+def _sprint_worker_pool(state, sprint_id, worker_count=None):
+    """The STRICT assignment pool for a sprint's cards: the non-admin members of
+    the sprint's teams -- roster order, deduped across teams -- capped at the
+    sprint's `workerCount` (the director chose 1-6 workers; the cap picks which
+    of a team's members staff THIS sprint). The designated scrum master is
+    excluded from the pool when the chosen headcount is below
+    SCRUM_MASTER_MIN_TEAM_SIZE (on a lean sprint the facilitator is not a
+    counted worker); at or above that size the scrum master IS a working member
+    of the pool. Legacy sprints (no workerCount) default to the team's full
+    complement with the scrum master counted. Returns None when `sprint_id` is
+    absent (a non-sprint card has no pool), else the pool list -- possibly
+    empty, which makes the sprint's cards WAIT (strict staffing: no fallback to
+    the think tank at large). `worker_count` overrides the record's stored
+    value (used by the staffing-expansion probe to preview a larger pool)."""
+    if not sprint_id:
+        return None
+    record = (state.get('sprints') or {}).get(sprint_id)
+    if not record:
+        return []
+    if worker_count is None:
+        worker_count = int(record.get('workerCount') or MAX_TEAM_MEMBERS)
+    worker_count = max(1, min(MAX_TEAM_MEMBERS, worker_count))
+    # Team ids on a sprint record may be keyed by the team's `id` OR its
+    # director's id (the two keyings team records use) -- resolve each to a
+    # director id so _sim_direct_reports can list its members.
+    directors = []
+    for tid in (record.get('teamIds') or []):
+        t = _team_row(state, tid)
+        directors.append(t.get('directorId') if t else tid)
+    if not directors:
+        return []
+    # A lean sprint (below the SM-size floor) is worked by the team's workers,
+    # never the dedicated facilitator -- she runs ceremonies, not cards. A
+    # sprint at/above the floor counts the scrum master as a working member.
+    excluded = set()
+    if worker_count < SCRUM_MASTER_MIN_TEAM_SIZE:
+        for d in directors:
+            t = next((x for x in (state.get('teams') or []) if x.get('directorId') == d), None)
+            if t and t.get('scrumMasterId'):
+                excluded.add(t['scrumMasterId'])
+    pool = []
+    for d in (state.get('agentRoster') or []):
+        if d.get('isAdmin'):
+            continue
+        if d.get('director') not in directors:
+            continue
+        if d['id'] in excluded:
+            continue
+        pool.append(d['id'])
+    # The headcount cap picks WHICH members staff the sprint, stable roster
+    # order (deterministic -- same sprint always names the same pool).
+    return pool[:worker_count]
+
+
+def _sprint_staffing_step(state, now_ms=None):
+    """Sprint staffing expansion: a director grows an ACTIVE sprint's staff when
+    the agents need help. "Needs help" is modeled deterministically (no JEV
+    spend, per the keep-deterministic-things-deterministic rule): a sprint below
+    the six-worker cap whose cards are STILL queued while every current pool
+    member is busy (task/pair/busy -- even a member who could otherwise be woken)
+    gets ONE more worker, on each pass it stays saturated, until the queue drains
+    or the cap is hit. The next member in roster order joins the pool (at the
+    SCRUM_MASTER_MIN_TEAM_SIZE threshold the scrum master becomes a counted
+    worker). A team with fewer real members than the target can't expand further.
+    Pure state mutation; returns the sprint ids expanded this pass."""
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    sprints = state.get('sprints') or {}
+    agents = state.get('agents') or {}
+    expanded = []
+    for sid, record in sprints.items():
+        if record.get('status') != 'active':
+            continue
+        wc = int(record.get('workerCount') or MAX_TEAM_MEMBERS)
+        if wc >= MAX_TEAM_MEMBERS:
+            continue  # already at the six-worker cap -- nothing to add
+        # Can the pool actually grow? The next count must name a real member
+        # beyond the current pool (a team with only 3 members can't staff 6).
+        next_pool = _sprint_worker_pool(state, sid, wc + 1)
+        if not next_pool or len(next_pool) <= len(_sprint_worker_pool(state, sid, wc)):
+            continue
+        # Sprint cards still waiting to be handed out (done cards left the
+        # queue; sprint-tagged queue entries are exactly the unfinished set).
+        if not [it for it in (state.get('workQueue') or []) if it.get('sprintId') == sid]:
+            continue
+        # "Agents need help": every current pool member is occupied. Off-duty
+        # members still count as available (a sprint card is always wakeable),
+        # so expansion only fires when nobody in the pool can take work at all.
+        available = [m for m in _sprint_worker_pool(state, sid, wc)
+                     if not (agents.get(m) or {}).get('busy')
+                     and not (agents.get(m) or {}).get('task')
+                     and not (agents.get(m) or {}).get('pairWith')]
+        if available:
+            continue
+        record['workerCount'] = wc + 1
+        _log_governance(state, record.get('ownerId') or sid, 'sprint_staffing',
+                        {'sprint': sid, 'workers': wc + 1, 'action': 'expanded'})
+        expanded.append(sid)
+    return expanded
+
+
 def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_id_holder=None):
     """Deterministic assignment of one due queue item: pick the most-idle
     eligible candidate (round-robin, zero JEV spend), wake her if off-duty,
@@ -9552,6 +9716,16 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     if not pick.get('room'):
         pick['room'] = _resolve_assignment_room(pick)
     candidates = _eligible_candidates(state, can_wake_off_duty)
+    # Sprint staffing: a sprint card is assigned ONLY to the sprint's chosen
+    # worker pool (the director's 1-6). This is a HARD restriction, not the
+    # soft team preference below -- a lean sprint's cards wait (empty pool ->
+    # None -> the caller requeues) rather than leaking to the think tank at
+    # large, by design. `sprint_pool` is None for non-sprint cards (no pool).
+    sprint_pool = _sprint_worker_pool(state, pick.get('sprintId'))
+    if sprint_pool is not None:
+        candidates = [cid for cid in candidates if cid in sprint_pool]
+        if not candidates:
+            return None
     # Phase E addendum: a re-opened fix may be pinned to its original author, and
     # a gate review is pinned to its reviewer (pick['assignedTo']). Honor that --
     # and WAKE an off-duty pinned agent even when the generic wake rule (which
@@ -9568,6 +9742,12 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
                 or pick.get('_mailResume') or pick.get('directRoute')
                 or pick.get('_reassignedTo'))
     pinned = (pick.get('assignedTo') or pick.get('_reassignedTo')) if pin_kind else None
+    # Sprint staffing: a pin to someone OUTSIDE the sprint's worker pool is
+    # dropped -- strict staffing wins over the soft reassignment pin (a card
+    # re-planned by refinement pins to the team's least-loaded member, but if
+    # that member isn't on this sprint's roster, the card waits for the pool).
+    if pinned and sprint_pool is not None and pinned not in sprint_pool:
+        pinned = None
     if pinned and agents.get(pinned):
         pinned_agent = agents.get(pinned)
         if not pinned_agent.get('busy') and not pinned_agent.get('task') and not pinned_agent.get('pairWith'):
@@ -9666,6 +9846,13 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         idx = pointer % len(ordered)
         chosen_id = ordered[idx]
         rr['task'] = (pointer + 1) % max(1, len(ordered))
+    # Sprint staffing invariant: whoever was chosen must be inside the sprint's
+    # pool. Candidates were already narrowed above, so this only trips for a
+    # path that bypassed the narrowed list (e.g. an incident backup re-derive);
+    # returning None makes the card wait rather than hand a sprint card to a
+    # non-staffed worker.
+    if sprint_pool is not None and chosen_id not in sprint_pool:
+        return None
     chosen = agents.get(chosen_id)
     if chosen and chosen.get('offDuty'):
         appear_from_outskirts(state, chosen_id, doors)
