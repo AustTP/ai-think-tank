@@ -679,5 +679,191 @@ class SprintRollover(unittest.TestCase):
                          'no closed sprint yet -> nothing to re-plan')
 
 
+class SprintWorkerPool(unittest.TestCase):
+    """The STRICT assignment pool for a sprint's cards: the non-admin members of
+    the sprint's teams, capped at the director's `workerCount` (1-6). Lean
+    sprints below SCRUM_MASTER_MIN_TEAM_SIZE exclude the designated scrum
+    master (she runs ceremonies, not cards); at/above the floor she is a counted
+    worker. A sprint card is assigned ONLY from this pool (no fallback)."""
+
+    ROOMS = ['pressoffice', 'observatory']
+
+    def _state(self, scrum_master_id='ada', **over):
+        state = _make_team_state()
+        t = next(x for x in state['teams'] if x['id'] == 'dev')
+        if scrum_master_id:
+            t['scrumMasterId'] = scrum_master_id
+        state.update(over)
+        return state
+
+    def _sprint(self, state, worker_count=None, team_ids=None):
+        return sim.queue_sprint(
+            state, sim.next_sprint_id(state), 'S', 'g', 'faye',
+            [{'title': 'Build A', 'room': 'pressoffice'}],
+            self.ROOMS, team_ids=team_ids or ['dev'], worker_count=worker_count)
+
+    def test_no_sprint_id_has_no_pool(self):
+        state = self._state()
+        self.assertIsNone(sim._sprint_worker_pool(state, None))
+        self.assertIsNone(sim._sprint_worker_pool(state, ''))
+
+    def test_unknown_sprint_has_empty_pool(self):
+        state = self._state()
+        self.assertEqual(sim._sprint_worker_pool(state, 'spr-99'), [])
+
+    def test_worker_count_persisted_and_clamped(self):
+        state = self._state()
+        rec = self._sprint(state, worker_count=2)
+        self.assertEqual(rec['workerCount'], 2)
+        state2 = self._state()
+        self._sprint(state2, worker_count=99)
+        self.assertEqual(state2['sprints']['spr-1']['workerCount'], sim.MAX_TEAM_MEMBERS)
+        state3 = self._state()
+        self._sprint(state3, worker_count=0)
+        # A falsy/absent count means "no cap" -- the team's full complement.
+        self.assertEqual(state3['sprints']['spr-1']['workerCount'], sim.MAX_TEAM_MEMBERS)
+
+    def test_pool_is_team_members_capped_in_roster_order(self):
+        state = self._state(scrum_master_id=None)
+        self._sprint(state, worker_count=1)
+        # dev's team = [ben, ada] in roster order; a 1-worker sprint names ben.
+        self.assertEqual(sim._sprint_worker_pool(state, 'spr-1'), ['ben'])
+        self._sprint(state, worker_count=2)
+        self.assertEqual(sim._sprint_worker_pool(state, 'spr-2'), ['ben', 'ada'])
+
+    def test_legacy_sprint_defaults_to_full_complement(self):
+        state = self._state()
+        self._sprint(state)  # no workerCount -> full complement
+        self.assertEqual(sim._sprint_worker_pool(state, 'spr-1'), ['ben', 'ada'])
+
+    def test_scrum_master_excluded_below_threshold_counted_at_it(self):
+        state = self._state(scrum_master_id='ada')
+        # Lean sprint (2 workers < SCRUM_MASTER_MIN_TEAM_SIZE): ada the SM is
+        # not a counted worker.
+        self._sprint(state, worker_count=2)
+        self.assertEqual(sim._sprint_worker_pool(state, 'spr-1'), ['ben'])
+        # At/above the floor (4): ada is a working member of the pool.
+        self._sprint(state, worker_count=sim.SCRUM_MASTER_MIN_TEAM_SIZE)
+        self.assertEqual(sim._sprint_worker_pool(state, 'spr-2'), ['ben', 'ada'])
+
+    def test_worker_count_override_probes_a_larger_pool(self):
+        state = self._state(scrum_master_id=None)
+        self._sprint(state, worker_count=1)
+        self.assertEqual(sim._sprint_worker_pool(state, 'spr-1'), ['ben'])
+        self.assertEqual(sim._sprint_worker_pool(state, 'spr-1', 2), ['ben', 'ada'])
+
+    def test_cross_team_members_excluded_from_other_teams_pool(self):
+        state = self._state()
+        # faye's report (sam) must never appear in dev's sprint pool.
+        self._sprint(state, worker_count=6)
+        self.assertEqual(sim._sprint_worker_pool(state, 'spr-1'), ['ben', 'ada'])
+
+    def test_assign_due_item_narrows_to_sprint_pool(self):
+        state = self._state(scrum_master_id=None)
+        self._sprint(state, worker_count=1)  # pool [ben]
+        pick = state['workQueue'][0]
+        # ada/sam are eligible think-tank-wide but NOT in the pool -- the card
+        # must not leak to a non-staffed worker (strict staffing).
+        with unittest.mock.patch.object(sim, '_eligible_candidates',
+                                        return_value=['ben', 'ada', 'sam']), \
+             unittest.mock.patch.object(sim, 'assign_task') as assign_mock:
+            sim._assign_due_item(state, pick, True, {}, {}, 1_000)
+            chosen = assign_mock.call_args[0][1]
+        self.assertEqual(chosen, 'ben')
+
+    def test_sprint_card_waits_when_pool_unavailable(self):
+        state = self._state(scrum_master_id=None)
+        self._sprint(state, worker_count=1)
+        pick = state['workQueue'][0]
+        state['agents']['ben']['busy'] = True  # the only pool member is busy
+        with unittest.mock.patch.object(sim, '_eligible_candidates',
+                                        return_value=['ada', 'sam']):
+            result = sim._assign_due_item(state, pick, True, {}, {}, 1_000)
+        self.assertIsNone(result)  # ada is eligible but NOT in the pool -> wait
+
+
+@unittest.mock.patch('sim._log_governance')
+class SprintStaffing(unittest.TestCase):
+    """The director's "add more workers when the agents need help" signal: an
+    ACTIVE sprint below the six-worker cap whose cards are still queued while
+    every current pool member is busy grows its staff by one, on each pass it
+    stays saturated, until the queue drains or the cap is hit."""
+
+    ROOMS = ['pressoffice', 'observatory']
+
+    def _state(self, **over):
+        state = _make_team_state()
+        state.update(over)
+        return state
+
+    def _sprint(self, state, worker_count=1, status='active'):
+        rec = sim.queue_sprint(
+            state, sim.next_sprint_id(state), 'S', 'g', 'faye',
+            [{'title': 'Build A', 'room': 'pressoffice'}],
+            self.ROOMS, team_ids=['dev'], worker_count=worker_count)
+        rec['status'] = status
+        return rec
+
+    def _make_pool_busy(self, state):
+        for m in sim._sprint_worker_pool(state, 'spr-1'):
+            state['agents'][m]['busy'] = True
+            state['agents'][m]['task'] = f'task-{m}'
+
+    def test_expands_saturated_sprint_by_one(self, _log):
+        state = self._state()
+        self._sprint(state, worker_count=1)  # pool [ben]
+        self._make_pool_busy(state)
+        expanded = sim._sprint_staffing_step(state, now_ms=1_000_000)
+        self.assertEqual(expanded, ['spr-1'])
+        self.assertEqual(state['sprints']['spr-1']['workerCount'], 2)
+
+    def test_no_expansion_while_pool_member_available(self, _log):
+        state = self._state()
+        self._sprint(state, worker_count=1)
+        # ben is idle -> "agents need help" is false -> no expansion.
+        self.assertEqual(sim._sprint_staffing_step(state, now_ms=1_000_000), [])
+        self.assertEqual(state['sprints']['spr-1']['workerCount'], 1)
+
+    def test_no_expansion_when_no_cards_queued(self, _log):
+        state = self._state()
+        self._sprint(state, worker_count=1)
+        self._make_pool_busy(state)
+        state['workQueue'] = []  # every card assigned/done -- nothing waiting
+        self.assertEqual(sim._sprint_staffing_step(state, now_ms=1_000_000), [])
+        self.assertEqual(state['sprints']['spr-1']['workerCount'], 1)
+
+    def test_no_expansion_when_pool_cannot_grow(self, _log):
+        state = self._state()
+        # workerCount=2 already names the whole team (ben + ada) -- a 3rd
+        # worker doesn't exist, so the pool can't grow.
+        self._sprint(state, worker_count=2)
+        self._make_pool_busy(state)
+        self.assertEqual(sim._sprint_staffing_step(state, now_ms=1_000_000), [])
+        self.assertEqual(state['sprints']['spr-1']['workerCount'], 2)
+
+    def test_no_expansion_at_the_cap(self, _log):
+        state = self._state()
+        self._sprint(state, worker_count=sim.MAX_TEAM_MEMBERS)
+        self._make_pool_busy(state)
+        self.assertEqual(sim._sprint_staffing_step(state, now_ms=1_000_000), [])
+        self.assertEqual(state['sprints']['spr-1']['workerCount'], sim.MAX_TEAM_MEMBERS)
+
+    def test_no_expansion_for_a_closed_sprint(self, _log):
+        state = self._state()
+        self._sprint(state, worker_count=1, status='closed')
+        self._make_pool_busy(state)
+        self.assertEqual(sim._sprint_staffing_step(state, now_ms=1_000_000), [])
+        self.assertEqual(state['sprints']['spr-1']['workerCount'], 1)
+
+    def test_off_duty_pool_member_counts_as_available(self, _log):
+        state = self._state()
+        self._sprint(state, worker_count=1)
+        # A sprint card is always wakeable, so an off-duty pool member is not
+        # "needs help" -- the staffing signal only fires when nobody can take work.
+        state['agents']['ben']['offDuty'] = True
+        self.assertEqual(sim._sprint_staffing_step(state, now_ms=1_000_000), [])
+        self.assertEqual(state['sprints']['spr-1']['workerCount'], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

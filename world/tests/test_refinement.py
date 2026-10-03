@@ -153,13 +153,27 @@ class RefinementEntry(unittest.TestCase):
         self.assertIn('dev', state['teamRefinementAt'])
         self.assertGreaterEqual(state['teamRefinementAt']['dev'], 0)
 
-    def test_busy_filer_defers_convene(self):
+    def test_busy_filer_does_not_block_convene(self):
         state, req = _seed_with_request()
-        req['filedBy'] = 'faye'  # faye is busy -> cannot convene
+        req['filedBy'] = 'faye'  # faye is busy mid-task
+        # Make faye a member of dev's crew (the seed's faye is a free-floating
+        # admin; without a director her card could never be claimed by the team).
+        state['agentRoster'][0]['director'] = 'dev'
         _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=_stub_decider())
-        self.assertEqual(state.get('pendingRefinements') or {}, {})
-        # Not stamped so a later pass can retry once faye is free.
-        self.assertEqual(state['lastBacklogRefinementAt'], 0)
+        # Event-driven + busy-filer drop: a busy filer's card is still groomed,
+        # she just doesn't attend -- the ceremony convenes for the free scrum
+        # master instead of deferring the whole team on one busy worker.
+        self.assertIn('dev', state.get('pendingRefinements') or {})
+        # Embark on the next pass: only the free scrum master is pulled in, and
+        # faye stays mid-task (never yanked out of her collaboration).
+        _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=_stub_decider())
+        self.assertTrue(state['agents']['faye']['busy'])
+        self.assertEqual(state['agents']['faye']['task'], 'task-1')
+        self.assertTrue(state['agents']['ada']['busy'])
+        # Resolve on the following pass: faye's request was still groomed.
+        _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=_stub_decider())
+        self.assertEqual(req['status'], 'accepted')
+        self.assertEqual(len(state['workQueue']), 1)
 
 
 class RefinementResolve(unittest.TestCase):
@@ -429,18 +443,26 @@ class RefinementSignalGenerator(unittest.TestCase):
         self.assertIn(sim.ABSOLUTE_ZERO_SCOPING_GUIDANCE, req['reason'])
 
 
-class RefinementCadence(unittest.TestCase):
-    def test_not_due_before_cadence(self):
+class RefinementEventDriven(unittest.TestCase):
+    def test_convenes_immediately_when_request_pending(self):
+        # EVENT-DRIVEN: there is no weekly cadence anymore. A pending request
+        # with a free facilitator convenes on the very next pass, even 1ms after
+        # the previous ceremony's stamp.
         state, _req = _seed_with_request()
         state['lastBacklogRefinementAt'] = 1_000_000
-        # 1 second before the weekly window elapses -> no ceremony.
-        _step(state, None, 1_000_000 + sim.REFINEMENT_CADENCE_MS - 1, decider=_stub_decider())
-        self.assertEqual(state.get('pendingRefinements') or {}, {})
+        _step(state, None, 1_000_000 + 1, decider=_stub_decider())
+        self.assertIn('dev', state.get('pendingRefinements') or {})
 
-    def test_due_after_cadence(self):
+    def test_active_sprint_defers_ceremony(self):
+        # A team inside an ACTIVE sprint does not hold a ceremony; the moment the
+        # sprint closes, the same pending request convenes.
         state, _req = _seed_with_request()
-        state['lastBacklogRefinementAt'] = 1_000_000
-        _step(state, None, 1_000_000 + sim.REFINEMENT_CADENCE_MS + 1, decider=_stub_decider())
+        state['sprints'] = {'s-1': {'id': 's-1', 'status': 'active',
+                                    'teamIds': ['dev'], 'items': []}}
+        _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=_stub_decider())
+        self.assertEqual(state.get('pendingRefinements') or {}, {})
+        state['sprints']['s-1']['status'] = 'closed'
+        _step(state, None, sim.REFINEMENT_CADENCE_MS + 1_000_000, decider=_stub_decider())
         self.assertIn('dev', state.get('pendingRefinements') or {})
 
 
