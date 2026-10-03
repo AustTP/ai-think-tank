@@ -49,6 +49,8 @@ from sim_helpers import (  # noqa: E402, F401
     next_product_id,
     next_sprint_id,
     normalize_priority,
+    normalize_size_estimate,
+    size_estimate_weight,
 )
 
 # 1.0s (was 2.0s). The server only PUBLISHES new positions ~once
@@ -745,6 +747,29 @@ def _release_stalled_interaction(state, aid):
     return True
 
 
+def _release_pair_navigator(state, navigator_id, task_id):
+    """W1: release a PAIR task's navigator once the driver's task ships. The
+    navigator rides along on the driver's task (busy/inRoom at the shared desk,
+    no task of her own); when the driver finishes, she must be released back to
+    the pool -- pairWith/pairTaskId/busy/inRoom cleared -- or she'd sit busy at
+    the desk forever. Mirrors the client's runPairProgrammingSession teardown.
+    Idempotent, pure on `state`. Returns True when a navigator was released."""
+    agents = state.get('agents') or {}
+    n = agents.get(navigator_id)
+    if not isinstance(n, dict):
+        return False
+    if n.get('pairTaskId') != task_id:
+        return False
+    n['pairWith'] = None
+    n['pairTaskId'] = None
+    n['busy'] = False
+    n['inRoom'] = None
+    n['visible'] = True
+    n['x'] = (n.get('x') or 0)
+    n['y'] = (n.get('y') or 0) + 20  # walks out beside the driver, not on top
+    return True
+
+
 def _repair_stalled_interactions(state):
     """Releases any VISIBLE agent holding `handoff`/`pairWith` with no active
     path -- she can only be in that combination if the session stalled before
@@ -996,6 +1021,17 @@ class SimEngine:
                     for kind, sub, aid in events:
                         if kind == 'arrive' and sub == 'task':
                             _arrive_at_task(state, aid, now)
+                        elif kind == 'arrive' and sub == 'pair':
+                            # W1: a pair session's navigator reaching the
+                            # driver's door resolves here (navigator joins the
+                            # driver's workstation). Previously dropped -- the
+                            # navigator stood frozen beside the door forever.
+                            _arrive_at_pair(state, aid, now)
+                        elif kind == 'arrive' and sub == 'handoff':
+                            # W1: a handoff walker reaching her recipient
+                            # delivers the handoff and clocks off. Previously
+                            # dropped -- the walker froze beside the recipient.
+                            _arrive_at_handoff(state, aid, now)
                         elif kind == 'cancel':
                             # Dispatch the cancel instead of dropping it on the
                             # floor. A stuck task-walk that was only logged left
@@ -1125,6 +1161,14 @@ def _sim_loop_pass():
     if not state:
         return None
     state = _engine.tick(state)
+    # Deliver any finished drained player-ask answers INSIDE this single
+    # read-modify-write (same two-phase discipline as _content_results: the
+    # model call ran on its own thread and stashed an in-memory result; this
+    # pass delivers it durably). No-op when nothing finished.
+    try:
+        serve._apply_pending_ask_results(state)
+    except Exception as e:
+        print(f'[sim] ask apply error: {e}', flush=True)
     # Peer reviews run INSIDE the sim's single read-modify-write -- on this
     # same `state` object, right before the one save -- so the report it files
     # can never be clobbered by a concurrent whole-blob save (the race that
@@ -1318,6 +1362,12 @@ ONBOARD_READINESS_TIMEOUT_MS = 15 * 60 * 1000
 # event resolves, so "worked during the week" is measured between events.
 SOCIAL_CADENCE_MS = 7 * 24 * 3600 * 1000      # weekly (stamped + cadence)
 SOCIAL_MEET_MS = 30 * 60 * 1000               # 30-minute conversation
+# W2: a Knowledge Social 'adopt' carry-away ("I will actually try/apply this")
+# is only a logged tape today -- it never changes next execution. A decision of
+# 'adopt' at or above this confidence lands as a coaching note routed to that
+# worker's NEXT task (via the growth-plan/_coaching_note_for loop), so the
+# adoption actually steers behavior instead of staying a digest line.
+SOCIAL_ADOPT_CONFIDENCE = 0.6
 # Backlog refinement: a weekly ceremony where the team's scrum master grooms
 # the work-requests agents filed into real stories. Cadence is event-to-event
 # (stamp advances when a ceremony starts), never a wall-clock ipso. `REFINEMENT
@@ -1350,6 +1400,40 @@ RUNBOOK_MAX_ENTRIES_PER_PRODUCT = 20
 RESTORE_TIMEOUT_MS = 24 * 3600 * 1000   # open bug older than this -> unrestored
 ESCALATION_MEET_MS = 10_000             # brief decision horizon (never a required wait)
 ESCALATION_MAX_OPEN = 3                 # cap concurrent escalations per owning team
+# Stale in-flight work (SM gap 1): a NON-bug task wedged in 'walking'/'working'
+# has no age alarm (bugs have RESTORE_TIMEOUT_MS). A coarse sweep re-plans it:
+# re-queue once for a fast re-issue, then route the repeat offender to the owning
+# team's scrum master (SM gap 1's "SM re-plan") instead of letting it wedge forever.
+STALE_WORK_CADENCE_MS = 20_000          # coarse sweep cadence (like STUCK_GATE)
+STALE_WORK_TIMEOUT_MS = 3 * 3600 * 1000 # 'walking' older than this -> never arrived
+STALE_WORK_BUDGET_GRACE_S = 900         # 'working' still working this far past workUntil -> wedged
+STALE_WORK_MAX_REPLANS = 2              # re-queues per (title,room) before the SM re-plan
+# Worker stuck/help signal (W4): a worker whose content execution keeps FAILING
+# (a content-executor crash, or a red-pipeline ok=False) is genuinely stuck, and
+# today has no signal -- a crash is swallowed into a note. Count CONSECUTIVE
+# content failures per worker; once the streak crosses this threshold, route a
+# help signal to the owning team's scrum master (file_work_request +
+# kick_refinement_now, the same SM-routing path as the stale-work sweep) so the
+# SM re-plans or helps instead of the worker silently churning. A clean result
+# resets the streak. Dovetails with SM gap 1: stale work is a wedged CARD, W4 is
+# a wedged WORKER.
+WORKER_HELP_AFTER_FAILS = 2
+# W1: server-owned pairing/handoff. The client's assignPairTask/attemptHandoff
+# own these interactions entirely; server-side, the movement engine emits
+# ('arrive','pair'/'handoff') events but the task dispatch dropped them, and a
+# `pair` card was assigned SOLO (no navigator ever recruited). Offsets tried
+# when walking a navigator/handoff-walker up beside someone, mirrors the
+# client's own "try several offsets that clear the walkable strip" loop.
+PAIR_WALK_OFFSETS = [10, -10, 6, -6, 0]
+# Coaching loop (W5): _write_growth_plan dedups by kind, so a worker who closes
+# BELOW the floor repeatedly was coached ONCE and then silently absorbed the
+# same note forever -- no re-coach, no escalation. Round-aware re-coaching:
+# each low close re-lands a fresh, escalating note (repeat=True) up to
+# COACHING_MAX_ROUNDS; past that the problem escalates to the owning director
+# (a work-request + governance entry) so a weak worker can't just keep
+# absorbing identical coaching -- either the coaching works or it surfaces.
+COACHING_MAX_ROUNDS = 3
+COACHING_LOOP_CADENCE_MS = 24 * 3600 * 1000  # daily catch-up sweep (like stale work)
 # An on-duty agent that just completed a task in a delegatable room files a
 # follow-up work-request when the room's queued/in-flight backlog has at most
 # this many items left -- "we finished X, and the room is thinning out". Zero
@@ -1358,6 +1442,15 @@ WORK_REQUEST_ROOM_THIN = 1
 # Hard cap of filed-but-not-yet-groomed requests in a single ceremony, so a
 # churny think tank can't convene a backlog-refinement meeting over a runaway list.
 REFINEMENT_MAX_REQUESTS = 20
+# Sprint staffing: a staffable large ask is filed as a pending BREAKDOWN request
+# for the receiving team's own breakdown ceremony (scrum master + workers) to
+# card into stories/spikes on the next pass -- the free authority picks the team
+# from the ask alone, never predicting subtasks up front. `BREAKDOWN_MEET_MS` is
+# the convene-to-resolve gap (brief decision horizon, never a required wait, like
+# refinement); `BREAKDOWN_MAX_REQUESTS` caps how many pending large asks one
+# ceremony cards at once.
+BREAKDOWN_MEET_MS = 10_000
+BREAKDOWN_MAX_REQUESTS = 3
 # WS-14 (shared backlog + sprint retrospectives): when every team is committed
 # to an active sprint, extra large asks are broken down into stories/spikes in a
 # SHARED unassigned backlog under a FEATURE; a team pulls the first eligible item
@@ -1474,12 +1567,92 @@ def _maybe_escalate_stuck_gate(parent, gate, reason):
     return True
 
 
-def _apply_content_result(state, task, result):
+def _resolve_worker_issue_team(state, wish, task):
+    """W3: the owning team RECORD (matched by its `id`) for a spike-filed issue
+    wish, or None. `file_issue` requires the team `id` and _team_row only ever
+    matches that key, but teams are keyed two ways in the codebase (by `id` and
+    by `directorId` -- see _refinement_scrum_master_for_team). Candidate chain:
+    the wish's teamId -> the task's teamId -> the task's productId (via
+    _product_director) -> the worker's own roster `director` pointer (serve.py
+    sets it at roster build; _sim_direct_reports reads it). Each candidate is
+    matched against the team list by id OR directorId. Returns the team dict
+    (its `id` is what file_issue wants), or None."""
+    candidates = []
+    if wish.get('teamId'):
+        candidates.append(wish['teamId'])
+    if task.get('teamId'):
+        candidates.append(task['teamId'])
+    if task.get('productId'):
+        director = _product_director(state, task.get('productId'))
+        if director:
+            candidates.append(director)
+    roster = next((d for d in (state.get('agentRoster') or [])
+                   if d.get('id') == task.get('assignedTo')), None)
+    if roster and roster.get('director'):
+        candidates.append(roster['director'])
+    for cand in candidates:
+        if not cand:
+            continue
+        team = _team_row(state, cand)
+        if team:
+            return team
+        team = next((t for t in (state.get('teams') or [])
+                     if t.get('directorId') == cand), None)
+        if team:
+            return team
+    return None
+
+
+def _file_spike_issue(state, wish, task, now_ms):
+    """W3: file the issue a spike worker proposed, against the LIVE state inside
+    the tick's single read-modify-write. The executor thread only ever reported
+    a WISH (it runs against a snapshot); THIS is where the real filing happens.
+    Resolves the owning team from the wish (or the task), dedups against an
+    already-open issue by the same reporter + same summary, files via the same
+    file_issue the player/telegram endpoints use (which also appends the
+    backlogRequests record + kicks refinement now), and logs governance. Fail
+    safe to no-filing on any inconsistency (unknown team, malformed wish,
+    duplicate) -- a worker's stray idea must never wedge the backlog."""
+    reporter = task.get('assignedTo')
+    issue_type = (wish.get('issueType') or '').strip().lower()
+    summary = (wish.get('summary') or '').strip()
+    feature = (wish.get('feature') or '').strip()
+    if not reporter or issue_type not in ISSUE_TYPES or not summary or not feature:
+        return False
+    team = _resolve_worker_issue_team(state, wish, task)
+    if not team:
+        return False
+    team_id = team.get('id')
+    # Dedup: don't re-file the same gap every time its spike re-runs. An issue
+    # by the same reporter with the same summary that has NOT reached a
+    # terminal state is the same finding.
+    for issue in (state.get('issues') or {}).values():
+        if (issue.get('reporterId') == reporter
+                and issue.get('status') not in ('done', 'closed')
+                and (issue.get('summary') or '') == summary):
+            return False
+    issue = file_issue(state, team_id, issue_type, summary, feature, reporter,
+                       description=wish.get('description') or '',
+                       title=wish.get('title') or None,
+                       now_ms=now_ms)
+    if not issue:
+        return False
+    _log_governance(state, reporter, 'worker_filed_issue',
+                    {'issue': issue.get('key'), 'team': team_id,
+                     'type': issue_type, 'summary': summary[:120],
+                     'fromTask': task.get('id')})
+    return True
+
+
+def _apply_content_result(state, task, result, now_ms=None):
     """Merge a completed content-executor result into the durable state, inside
     the task_cycle's single read-modify-write. Writes the research topic's
     grown seenUrls back (so a future run dedups against it) and records the
     agent's real note (mirrors runResearchTask's notes.push). Mutates `state`;
-    the note is attached to the task record so the board/UI can surface it."""
+    the note is attached to the task record so the board/UI can surface it.
+    `now_ms` is threaded from the caller (the tick already has it); a caller
+    that omits it falls back to wall-clock so the function stays standalone."""
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     note = result.get('note')
     if note:
         task['note'] = note
@@ -1525,6 +1698,16 @@ def _apply_content_result(state, task, result):
         # A gate review that must go BACK to the same author + the same gate
         # carries the parent id; a free-form pressoffice fix does not.
         queue_work(state, [qf])
+    # W3: a worker's spike can PROPOSE an issue (a Jev verdict that the spike's
+    # finding names a real, actionable gap). The executor reports a WISH -- the
+    # same safe indirection as queueFix/notifyPlayer: it runs off-thread against
+    # a read-only snapshot, so it must never call file_issue directly. Filing
+    # happens HERE, inside the tick's single read-modify-write, where `state`
+    # is live and the owning team is resolved fresh (wish teamId -> task teamId
+    # -> product director -> roster director, each matched by id OR directorId).
+    wish = result.get('fileIssue')
+    if wish:
+        _file_spike_issue(state, wish, task, now_ms)
     # A content executor (currently just spikes)
     # can ask to notify the player when it lands, same safe indirection as
     # queueFix above -- executors run off-thread with only a read-oriented
@@ -1549,7 +1732,7 @@ def _apply_content_result(state, task, result):
                 if not _maybe_escalate_stuck_gate(parent, gate, 'repeated rejections'):
                     gate['approvals'] = 0
                     gate['approvers'] = []
-                    _sim_notify_author(state, parent, reviewer)
+                    _sim_notify_author(state, parent, reviewer, rationale=task.get('note'))
             elif verdict == 'clean':
                 # Cut 4 hard gate: a review that finds the work clean can only
                 # count as an APPROVAL if its quality pipeline objectively
@@ -1564,7 +1747,7 @@ def _apply_content_result(state, task, result):
                     if not _maybe_escalate_stuck_gate(parent, gate, 'repeated red-pipeline rejections'):
                         gate['approvals'] = 0
                         gate['approvers'] = []
-                        _sim_notify_author(state, parent, reviewer)
+                        _sim_notify_author(state, parent, reviewer, rationale=task.get('note'))
                 elif reviewer and reviewer not in gate['approvers']:
                     gate['approvers'].append(reviewer)
                     gate['approvals'] += 1
@@ -1610,7 +1793,11 @@ def _dispatch_content_work(executor, state, agent_id, task, now):
         try:
             executor(snapshot, agent_id, task, base_ctx={})
         except Exception as e:  # never let a content failure strand the agent
-            _store_content_result(task_id, {'note': f'Content execution failed: {e}', 'seenUrls': (task.get('research') or {}).get('seenUrls') or []})
+            # W4: a crashed content run is a FAILURE, not a silent success.
+            # Mark ok=False so the fail-closed quality gate treats it like a red
+            # pipeline (card sent back / fix re-issued), and the worker-stuck
+            # help signal can see it -- a crash must never complete as 'done'.
+            _store_content_result(task_id, {'ok': False, 'note': f'Content execution failed: {e}', 'seenUrls': (task.get('research') or {}).get('seenUrls') or []})
 
     threading.Thread(target=_run, daemon=True).start()
     return True
@@ -1690,6 +1877,12 @@ def queue_work(state, items):
             'pair': bool(item.get('pair')),
             'notBefore': item.get('notBefore') or None,
             'priority': normalize_priority(item.get('priority')),
+            # A breakdown story's size estimate (S/M/L) survives the queue round
+            # trip onto the real task and orders same-priority work (an L story
+            # starts before an S story -- see pick_next_due_index). Same class
+            # of gap as 'userStory'/'distill' below: a whitelist that silently
+            # dropped a field its consumer needs.
+            'sizeEstimate': normalize_size_estimate(item.get('sizeEstimate')),
             'goal': item.get('goal') or None,
             'projectLabel': item.get('projectLabel') or None,
             'research': item.get('research') or None,
@@ -1757,6 +1950,19 @@ def queue_work(state, items):
             # step and the pipeline wedges on step 0 forever -- the exact same
             # class of whitelist gap 'distill'/'checklist' both hit.
             'pipelineStep': item.get('pipelineStep') or None,
+            # Phase E3.6: a task's knowledge-base class. `changes_how_we_work`
+            # marks the standing ceremonies whose WHOLE job is maintaining the
+            # shared knowledge base (research crawl -> skill file, skill-review
+            # curation, distillation -> wiki). Only THAT class carries a KB-write
+            # mandate; ordinary deliverables are required to land a completion
+            # NOTE (evidence of what was done) but never a KB write.
+            'kbClass': item.get('kbClass') or None,
+            # Dependency cascade (ripple re-review): the task A this card is
+            # blocked on (issue['dependsOnTask'], filed via
+            # request_block_dependency). When A is re-opened (player veto) the
+            # 'done' dependents carry this onto their task so the cascade can
+            # re-review them too.
+            'dependsOn': item.get('dependsOn') or None,
             # Bot Ops / shadow mode: a SHADOW work item does the work but changes
             # nothing -- on completion its outcome is captured to the append-only
             # state['shadowLedger'] draft instead of shipping (no peer gate, no
@@ -1823,12 +2029,63 @@ def _team_oncall_members(state, director_id):
     return pool
 
 
+def _oncall_order(state, director_id):
+    """The persistent on-call rotation ORDER for director_id's team. Seeded from
+    the derived roster order on first use; a backup who actually served a sprint
+    is rotated to the END of this order at sprint close (_rotate_served_oncalls)
+    so she does not get paged again next sprint before the rotation catches up.
+    New hires are appended at the end (they start as backups); fired agents are
+    dropped. Mutates state['_oncallOrder'] only on seed/reconcile."""
+    orders = state.setdefault('_oncallOrder', {})
+    order = orders.get(director_id)
+    pool = _team_oncall_members(state, director_id)
+    if not order:
+        orders[director_id] = list(pool)
+        return orders[director_id]
+    alive = [a for a in order if a in (state.get('agents') or {})]
+    for a in pool:
+        if a not in alive:
+            alive.append(a)
+    orders[director_id] = alive
+    return alive
+
+
+def _rotate_served_oncalls(state, team_ids):
+    """At sprint close: any on-call BACKUP who actually served this sprint's
+    pages is rotated to the END of her team's on-call queue, so a backup who
+    covered does not get paged again next sprint before the rotation catches up.
+    Mutates state['_oncallOrder'] and clears state['_oncallServed'].
+    A team is matched by its `id` or its director's id (the two keyings teams
+    records use in the codebase); a sprint record's teamIds may carry either."""
+    teams = {t.get('id'): t for t in (state.get('teams') or [])}
+    served = state.get('_oncallServed') or {}
+    orders = state.setdefault('_oncallOrder', {})
+    for tid in team_ids or []:
+        t = teams.get(tid)
+        if t is None:
+            t = next((x for x in (state.get('teams') or [])
+                      if x.get('directorId') == tid), None)
+        if not t:
+            continue
+        director_id = t.get('directorId') or t.get('id')
+        if not director_id:
+            continue
+        for aid in served.get(director_id) or []:
+            order = orders.get(director_id)
+            if order and aid in order:
+                order.remove(aid)
+                order.append(aid)
+        served[director_id] = []
+
+
 def on_call_agent(state, director_id, sprint_id=None, now_ms=None):
     """Phase E2d: which agent on `director_id`'s team is on-call right now.
     Deterministic per-sprint rotation over the team's non-scrum-master, non-admin
-    members -- derived, not stored (same precedent as sprint_progress). The
-    rotation uses a stable hash of the sprint id so the same sprint id always
-    hands back the same on-call across restarts, and shifts across sprints.
+    members -- derived from the persistent on-call ORDER (_oncall_order, seeded
+    from roster order), so the same sprint id always hands back the same on-call
+    across restarts and the order shifts across sprints. A backup who actually
+    served a sprint is rotated to the end of the order at sprint close
+    (_rotate_served_oncalls) rather than paged again next sprint.
 
     Within a rotation the pager prefers an AVAILABLE member (on-duty and not
     mid-work): if the primary is busy, the BACKUP is the next slot in rotation
@@ -1842,7 +2099,7 @@ def on_call_agent(state, director_id, sprint_id=None, now_ms=None):
     the pin still names a concrete owner (assignment re-derives if it can and
     otherwise falls back to the team's best free worker).
     Returns an agent id or None if the team has no rousable members."""
-    pool = _team_oncall_members(state, director_id)
+    pool = _oncall_order(state, director_id)
     if not pool:
         return None
     if now_ms is None:
@@ -1868,11 +2125,21 @@ def on_call_agent(state, director_id, sprint_id=None, now_ms=None):
             and not a.get('task') and not a.get('pairWith')
     # Prefer an available member in ROTATION order: the primary slot, then its
     # backup (next slot), then the second backup (the one after that), ...
+    chosen = None
     for i in range(len(pool)):
         cand = pool[(idx + i) % len(pool)]
         if _available(cand):
-            return cand
-    return pool[idx]
+            chosen = cand
+            break
+    if chosen is None:
+        chosen = pool[idx]
+    # Track a BACKUP who actually served a sprint-anchored page, so the sprint-
+    # close ceremony can rotate her to the end of the queue.
+    if sprint_id and chosen != pool[idx]:
+        served = state.setdefault('_oncallServed', {}).setdefault(director_id, [])
+        if chosen not in served:
+            served.append(chosen)
+    return chosen
 
 
 def queue_bug(state, product_id, title, now_ms=None, room=None, reported_by=None,
@@ -1925,10 +2192,13 @@ def queue_bug(state, product_id, title, now_ms=None, room=None, reported_by=None
 
 
 def pick_next_due_index(work_queue, now_ms, exclude_items):
-    """Port of tasks.js _pickNextDueIndex: highest due priority wins; strict >
-    preserves arrival order at equal priority; skip items in exclude_items
-    (this call's attemptedThisCycle). Returns index or -1."""
-    best_index, best_priority = -1, float('-inf')
+    """Port of tasks.js _pickNextDueIndex: highest due priority wins; at EQUAL
+    priority, the larger size estimate (L > M > S) starts first -- an L story
+    needs more wall-time than an S story, so it is pulled ahead of same-priority
+    siblings (effort is a tiebreak, never an urgency override). strict >
+    preserves arrival order at equal priority + equal size; skip items in
+    exclude_items (this call's attemptedThisCycle). Returns index or -1."""
+    best_index, best_score = -1, None
     for i, item in enumerate(work_queue):
         if not is_work_item_due(item, now_ms):
             continue
@@ -1937,8 +2207,9 @@ def pick_next_due_index(work_queue, now_ms, exclude_items):
         if exclude_items and id(item) in exclude_items:
             continue
         priority = item.get('priority', WORK_PRIORITY['normal'])
-        if priority > best_priority:
-            best_priority, best_index = priority, i
+        score = (priority, size_estimate_weight(item.get('sizeEstimate')))
+        if best_score is None or score > best_score:
+            best_score, best_index = score, i
     return best_index
 
 
@@ -2084,6 +2355,10 @@ def queue_sprint(state, sprint_id, name, goal, owner_id, items, valid_rooms,
     for it in kept:
         it['sprintId'] = sprint_id
     queue_work(state, kept)
+    # Sprint rollover: carry the prior closed sprint's unfinished cards into the
+    # new sprint (re-tag their queue items + fold their ids into this sprint's
+    # items) so the un-landed scope explicitly continues.
+    _carry_over_sprint_work(state, record, team_ids)
     return record
 
 
@@ -2156,14 +2431,79 @@ def sprint_progress(state, sprint_id):
 
 def close_sprint(state, sprint_id):
     """Mark a sprint closed (a container action -- already-queued items finish
-    or age out normally; closing doesn't cancel work). Returns the updated
-    record, or None if the sprint doesn't exist."""
+    or age out normally; closing doesn't cancel work). Sprint ROLLOVER: any card
+    still waiting in the queue (tagged with this sprint, not yet done) is
+    recorded on the record as `rolledOver` (id + title), so a follow-up sprint
+    created for the same team carries it over explicitly instead of silently
+    losing the un-landed scope. Returns the updated record, or None if the
+    sprint doesn't exist."""
     sprints = state.get('sprints') or {}
     record = sprints.get(sprint_id)
     if not record:
         return None
+    if record.get('status') != 'closed':
+        record['rolledOver'] = [
+            {'id': _sprint_item_id(it), 'title': it.get('title')}
+            for it in _unfinished_sprint_items(state, sprint_id)]
     record['status'] = 'closed'
     return record
+
+
+def _unfinished_sprint_items(state, sprint_id):
+    """The sprint's cards still waiting in the queue (not yet done): queued
+    workQueue items tagged with this sprint that have no matching 'done' task.
+    These are exactly what a sprint close carries over into the next sprint
+    (in-flight cards keep flowing -- closing never cancels work -- and are not
+    re-planned)."""
+    tasks = state.get('tasks') or {}
+    unfinished = []
+    for it in (state.get('workQueue') or []):
+        if it.get('sprintId') != sprint_id:
+            continue
+        if any(t.get('status') == 'done' and t.get('title') == it.get('title')
+               and t.get('room') == it.get('room')
+               for t in tasks.values()):
+            continue
+        unfinished.append(it)
+    return unfinished
+
+
+def _carry_over_sprint_work(state, record, team_ids):
+    """Sprint rollover: when a new sprint is created, carry the PRIOR closed
+    sprint's unfinished cards (its `rolledOver` set) into the new sprint. Their
+    queued items are re-tagged with the new sprint_id and their ids are added to
+    the new sprint's `items`, so the next sprint's scope and progress include the
+    work that didn't land last time. First-come: the most recent closed sprint
+    whose teams overlap the new sprint is the carry source. Pure state mutation;
+    returns the count of cards carried over."""
+    if not team_ids:
+        return 0
+    prior = None
+    for s in (state.get('sprints') or {}).values():
+        if s.get('id') == record.get('id') or s.get('status') != 'closed':
+            continue
+        if not (s.get('teamIds') or []) or not any(t in s['teamIds'] for t in team_ids):
+            continue
+        if prior is None or (prior.get('createdAt') or 0) < (s.get('createdAt') or 0):
+            prior = s
+    if not prior:
+        return 0
+    rolled = {r.get('id') for r in (prior.get('rolledOver') or [])}
+    if not rolled:
+        return 0
+    items = record.setdefault('items', [])
+    carried = 0
+    for it in (state.get('workQueue') or []):
+        if it.get('sprintId') != prior.get('id'):
+            continue
+        ident = _sprint_item_id(it)
+        if ident not in rolled:
+            continue
+        it['sprintId'] = record['id']
+        if ident not in items:
+            items.append(ident)
+        carried += 1
+    return carried
 
 
 def _auto_close_completed_sprints(state, now_ms=None):
@@ -2354,6 +2694,9 @@ def _pull_backlog_for_team(state, team_id, now_ms):
         'teamId': team_id,
         'taskType': 'spike' if is_spike else 'code',
         'budgetMs': 60_000 if is_spike else None,
+        # A breakdown story's size estimate survives the shared backlog onto the
+        # pulled card (same contract as _resolve_breakdown's direct queue path).
+        'sizeEstimate': item.get('sizeEstimate'),
         'featureId': item.get('featureId'),
         'backlogItemId': item['id'],
     }])
@@ -2378,15 +2721,26 @@ def _on_sprint_closed(state, record, now_ms):
     the team's START/STOP/CONTINUE retrospective (a ceremony on a later pass),
     pull the first eligible shared-backlog item for each team that sprint
     touched (first-come), and kick each team's backlog refinement so the scrum
-    master re-plans at close. Pure state mutation; nothing here blocks."""
+    master re-plans at close. Any on-call backup who actually SERVED pages this
+    sprint is rotated to the end of her team's on-call queue so she isn't paged
+    again next sprint before the rotation catches up. Pure state mutation;
+    nothing here blocks."""
     team_ids = [t for t in (record.get('teamIds') or []) if _team_row(state, t)]
+    _rotate_served_oncalls(state, team_ids)
     retros = state.setdefault('pendingSprintRetros', [])
     if record['id'] not in retros:
         retros.append(record['id'])
     for tid in team_ids:
+        # Cross-team borrowing: loans to this team end at sprint close unless
+        # the team still has pending work (the feature-need case keeps them).
+        _end_loans_for_team(state, tid, now_ms)
         for _ in range(BACKLOG_PULLS_PER_CLOSE):
             _pull_backlog_for_team(state, tid, now_ms)
         kick_refinement_now(state, tid, now_ms)
+    # Director gap 1: team-health review at sprint close -- each director grades
+    # the trailing health of the workers under them and coaches anyone below the
+    # delivery floor (never directors). Pure, cheap, idempotent.
+    _team_health_review(state, team_ids, now_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -2751,7 +3105,10 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'taskType': (extra or {}).get('taskType', 'code'),
         'skillReview': bool((extra or {}).get('skillReview')),
         'distill': bool((extra or {}).get('distill')),
+        'kbClass': (extra or {}).get('kbClass') or None,
+        'dependsOn': (extra or {}).get('dependsOn') or None,
         'budgetMs': (extra or {}).get('budgetMs'),
+        'sizeEstimate': (extra or {}).get('sizeEstimate'),
         'reviewOf': (extra or {}).get('reviewOf'),
         'reviewAuthorId': (extra or {}).get('reviewAuthorId'),
         # CS329A takeaway #2: checklist survives onto the task
@@ -2870,6 +3227,117 @@ def _arrive_at_task(state, agent_id, now=None):
         task['workUntil'] = now + TASK_WORK_DURATION_S
 
 
+def _arrive_at_pair(state, agent_id, now=None):
+    """W1: server-owned pair arrival. The movement engine already emits
+    ('arrive','pair',aid) when a navigator holding `pairWith` reaches her
+    path's end -- but the server dispatch dropped it (only ('arrive','task')
+    resolved), so a pair session's navigator simply never joined the driver:
+    she stood at the door-front forever, invisible to the park/heal sweeps
+    (which skip pairWith holders). Mirrors the client's arriveAtPair: the
+    navigator arrives at the shared workstation, becomes busy beside the
+    driver, and the driver's task is what she rides along on. Idempotent,
+    pure on `state`. Returns True when the pair session actually resolved."""
+    agents = state.get('agents') or {}
+    a = agents.get(agent_id)
+    if not a:
+        return False
+    driver_id = a.get('pairWith')
+    task_id = a.get('pairTaskId')
+    task = (state.get('tasks') or {}).get(task_id) if task_id else None
+    driver = agents.get(driver_id) if driver_id else None
+    a['path'] = None
+    a['pathIndex'] = 0
+    a['pathTarget'] = None
+    a['stuckTimer'] = 0
+    a['replanCount'] = 0
+    a['respawnedForTask'] = False
+    if not driver or not task:
+        # The session's other half is gone (driver released / task vanished);
+        # release the navigator cleanly instead of parking her forever.
+        _release_stalled_interaction(state, agent_id)
+        return False
+    a['visible'] = False
+    a['busy'] = True
+    a['inRoom'] = task.get('room')
+    # Right beside the driver at the same desk -- mirrors arriveAtPair's own
+    # "nav.roomX = driver.roomX + 25" convention.
+    a['roomX'] = (driver.get('roomX') or 0) + 25
+    a['roomY'] = driver.get('roomY') or 0
+    a['dir'] = 'south'
+    try:
+        from serve import log_action
+        log_action(agent_id, 'pair_arrived', {'taskId': task_id, 'driver': driver_id},
+                   authorized=True)
+    except Exception:
+        pass
+    return True
+
+
+def _arrive_at_handoff(state, agent_id, now=None):
+    """W1: server-owned handoff arrival. The movement engine already emits
+    ('arrive','handoff',aid) when a walker holding `handoff` reaches her
+    recipient -- but the server dispatch dropped it, so a client-started (or
+    server-started) handoff walk arriving server-side was never delivered: the
+    walker froze beside the recipient, invisible to the heal sweeps (which skip
+    handoff holders). Mirrors the client's arriveAtHandoff's release half:
+    the walker delivers the handoff (recorded, the finished-title line as the
+    message), then clocks off duty. Idempotent, pure on `state`. Returns True
+    when the handoff was actually delivered."""
+    agents = state.get('agents') or {}
+    a = agents.get(agent_id)
+    if not a:
+        return False
+    handoff = a.get('handoff')
+    a['path'] = None
+    a['pathIndex'] = 0
+    a['pathTarget'] = None
+    a['stuckTimer'] = 0
+    a['replanCount'] = 0
+    a['respawnedForTask'] = False
+    a['handoff'] = None
+    a['dir'] = 'south'
+    # Clocking off is what finishTask defers to let the handoff play out --
+    # happens regardless of whether the recipient is still around.
+    a['offDuty'] = True
+    a['visible'] = False
+    if not isinstance(handoff, dict):
+        return False
+    recipient_id = handoff.get('toId')
+    title = handoff.get('title') or 'handoff'
+    recipient = agents.get(recipient_id) if recipient_id else None
+    # The delivered line is the finished-title (the client would run a model
+    # call to phrase it; the server records the deterministic same fact, so the
+    # dependency IS the message -- no invented phrasing).
+    delivered = {
+        'fromId': agent_id, 'toId': recipient_id, 'title': title,
+        'ts': int((now if now is not None else time.time()) * 1000),
+    }
+    state.setdefault('handoffs', []).append(delivered)
+    if recipient and isinstance(recipient, dict):
+        recipient['contactedAt'] = int((now if now is not None else time.time()) * 1000)
+    try:
+        from serve import log_action
+        log_action(agent_id, 'handoff_delivered',
+                   {'to': recipient_id, 'title': (title or '')[:120]}, authorized=True)
+    except Exception:
+        pass
+    return True
+
+
+
+
+def _revoke_task_access(task_id):
+    """Best-effort per-story capability-grant cleanup: when a story ships, the
+    temp access grant tied to it dies with it. Mirrors _revoke_agent_credentials'
+    lazy serve import so sim.py stays unit-testable offline; a DB failure must
+    never block the completion path."""
+    if not task_id:
+        return
+    try:
+        import serve
+        serve.revoke_task_access(task_id)
+    except Exception:
+        pass
 
 
 def finish_task(state, agent_id, grid=None):
@@ -2888,12 +3356,19 @@ def finish_task(state, agent_id, grid=None):
         # SM's auto-unblock so the cards that were waiting on this work free up.
         _auto_clear_dependency_blocks(state, task.get('id'),
                                       now_ms=int(time.time() * 1000))
+    # W1: a PAIR task's navigator rides along on the driver's task -- when the
+    # driver finishes, release her too (pairWith/pairTaskId/busy/inRoom) so she
+    # doesn't sit busy at the shared desk forever after the work shipped.
+    if task and task.get('pairWith'):
+        _release_pair_navigator(state, task.get('pairWith'), task.get('id'))
     a['task'] = None
     a['busy'] = False
     a['inRoom'] = None
     a['visible'] = True
     a['approvedCount'] = (a.get('approvedCount') or 0) + 1
     a['weekApprovals'] = (a.get('weekApprovals') or 0) + 1
+    # The story shipped: any per-story capability grant dies with it.
+    _revoke_task_access(task.get('id') if task else None)
     _note_completed_room(state, agent_id, task)
     # Backlog refinement intake: the agent just shipped a real deliverable and
     # saw whether its room still has work. If the room is thinning, file a
@@ -3141,6 +3616,25 @@ def _skill_review_has_pending():
     return False
 
 
+def _skill_review_in_flight(state):
+    """Stagger gate for the standing skill-review ceremony: at most ONE
+    skill-review task may be queued or in progress at a time, so the ceremony
+    never stacks overlapping reviews for the whole think tank at once. Any
+    queued work item carrying `skillReview`, or any live task (not 'done')
+    carrying `skillReview`, blocks the next sweep."""
+
+    def _active(t):
+        return bool(t.get('skillReview')) and t.get('status') != 'done'
+
+    for item in (state.get('workQueue') or []):
+        if item.get('skillReview'):
+            return True
+    for t in (state.get('tasks') or {}).values():
+        if _active(t):
+            return True
+    return False
+
+
 def _distill_has_new_archives(since_ms):
     """Content gate for the standing distillation sweep: are there archive
     findings newer than `since_ms`? Mirrors the executor's own archive scan
@@ -3185,6 +3679,7 @@ def _check_schedules(state, now, now_ms):
             'instructions': f'Crawl starting from {topic.get("startUrl")} and update the "{topic.get("topic")}" skill file with anything genuinely new since last time.',
             'goal': topic.get('topic'),
             'research': {'topicId': topic.get('id'), 'since': previous_run_at},
+            'kbClass': 'changes_how_we_work',
         }])
     # Skill review sweep. `_cadence_due` treats the explicit CADENCE_NEVER marker
     # as never-due and normalizes any legacy far-future TEST sentinel (1e18) that
@@ -3193,13 +3688,14 @@ def _check_schedules(state, now, now_ms):
     # pending_review/skills/ -> no task queued and the marker NOT advanced (the
     # sweep fires on a later pass the moment content appears).
     if _cadence_due(state, 'lastSkillReviewAt', SKILL_REVIEW_CADENCE_MS, now_ms=now_ms) \
-            and _skill_review_has_pending():
+            and _skill_review_has_pending() and not _skill_review_in_flight(state):
         state['lastSkillReviewAt'] = now_ms
         queue_work(state, [{
             'title': 'Review pending skill files',
             'room': 'observatory',
             'instructions': 'Review whatever is waiting in pending_review/skills/ and decide, file by file, whether each one is accurate and worth keeping as real reference material.',
             'skillReview': True,
+            'kbClass': 'changes_how_we_work',
         }])
     # Hive-mind distillation sweep. Same shape as the skill-review sweep: stamp
     # the marker BEFORE assignment (a due run mustn't be re-picked) and let the
@@ -3223,6 +3719,7 @@ def _check_schedules(state, now, now_ms):
                                  'now knows as a body.'),
                 'distill': True,
                 'distillSince': previous_distill_at,
+                'kbClass': 'changes_how_we_work',
             }])
 
     # Ordered pipelines (the player-facing scheduling lane): fire the next step
@@ -3783,6 +4280,36 @@ def _enter_peer_review(state, task, now_ms, preferred=None):
     return gate
 
 
+def _cascade_rereview(state, reopened_task_id, now_ms=None):
+    """Todo: ripple re-review via the dependency cascade. When a DELIVERED
+    story is re-opened (player veto -- the only path a 'done' story can return
+    to review), any story that DEPENDED on it (task['dependsOn'] = the reopened
+    id, plumbed from the blocked card's issue) was built on the now-questioned
+    output. A shipped dependent is sent back through the SAME peer gate --
+    preferring the reviewers who already know it -- so the ripple gets
+    re-verified too, not just the directly-flagged story. Fail-closed guards:
+    only gated lanes, never an escalated (frozen) gate, and a dependent with no
+    eligible reviewers right now stays 'done' rather than dropping to limbo.
+    Returns the number of dependents re-opened."""
+    if not reopened_task_id:
+        return 0
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    reopened = 0
+    for task in (state.get('tasks') or {}).values():
+        if not isinstance(task, dict) or task.get('dependsOn') != reopened_task_id:
+            continue
+        if task.get('status') != 'done':
+            continue
+        if not _peer_gated_lane(task):
+            continue
+        prior = task.get('_peerGate') or {}
+        if prior.get('escalated'):
+            continue
+        if _enter_peer_review(state, task, now_ms) is not None:
+            reopened += 1
+    return reopened
+
+
 def _resolve_review_parent(state, review_task):
     """The parent task a gate-review subtask voted on (by its `reviewOf` id), or
     None. A parent already closed or no longer gated is skipped."""
@@ -3795,10 +4322,14 @@ def _resolve_review_parent(state, review_task):
     return parent
 
 
-def _sim_notify_author(state, parent, reviewer_id):
+def _sim_notify_author(state, parent, reviewer_id, rationale=None):
     """On an 'actionable' verdict the gate re-opens: notify the author that their
     work was sent back for a fix (and who rejected it). The actual fix task is
-    queued by the executor's queueFix; here we just file the mailbox note."""
+    queued by the executor's queueFix; here we just file the mailbox note. W6:
+    the rejection RATIONALE also lands as a growth-plan note (kind
+    'review_denial', repeat=True) routed to the author's NEXT task, so a peer
+    denial changes the author's next execution -- not just a one-time mailbox
+    message."""
     author = parent.get('assignedTo')
     if not author:
         return
@@ -3807,6 +4338,16 @@ def _sim_notify_author(state, parent, reviewer_id):
         'about': parent.get('id'),
         'title': parent.get('title'),
         'text': f'A reviewer{(" (" + reviewer_id + ")") if reviewer_id else ""} sent your work on "{parent.get("title")}" back -- it needs a fix before it can close. Fix it and it will be reviewed again.'})
+    # W6: a denial is actionable coaching, not just a message. The reviewer's
+    # rationale (the review subtask's note) is carried onto the author's next
+    # task so the fix starts from the actual problem raised.
+    if rationale:
+        _write_growth_plan(
+            state, author, parent.get('room') or 'pressoffice',
+            'review_denial', int(time.time() * 1000),
+            f"Peer review of '{parent.get('title')}' was sent back for a fix. "
+            f"What the reviewer said: {(rationale or '')[:400]}. Address this on "
+            f"your next pass.", repeat=True)
 
 
 def _sim_notify_author_failed(state, task):
@@ -4132,6 +4673,8 @@ def _close_gated_story(state, parent):
     review_counts = parent.get('_peerGate') or {}
     review_counts['closed'] = True
     parent['status'] = 'done'
+    # The gated story shipped: its per-story capability grant dies with it.
+    _revoke_task_access(parent.get('id'))
     try:
         from serve import log_action
         log_action(None, 'task_peer_approved',
@@ -4197,6 +4740,82 @@ def _free_outdoor_spot(state, grid, rnd=random.random):
     return spot
 
 
+def _borrow_inactive_agent_for_team(state, borrower_director_id, now_ms=None):
+    """Cross-team borrowing: when a team needs help, borrow an INACTIVE
+    (off-duty, dormant-inventory) agent from ANOTHER team for the borrower
+    team's sprint instead of hiring a brand-new clone. The loan is recorded on
+    the roster entry (`loan: {teamId, since, reason}`) and ends when the
+    borrower's sprint closes -- unless the borrower still has pending work (a
+    queued large-request breakdown or any pending backlog request), in which
+    case the loan persists: that's the 'feature need -> agent may change teams'
+    case. The borrowed agent keeps her home director and authority chain
+    ('teams stay somewhat consistent'); only her work-assignment preference
+    shifts to the borrower team for the loan's duration (see _assign_due_item's
+    soft team preference). Returns the borrowed agent id, or None when no
+    inactive agent from another team is available."""
+    roster = state.get('agentRoster') or []
+    agents = state.get('agents') or {}
+    borrower_members = set(_sim_direct_reports(state, borrower_director_id))
+    idle_home = []
+    busy_home = []
+    for d in roster:
+        if d.get('id') in borrower_members:
+            continue  # already on the borrower team
+        if d.get('isAdmin'):
+            continue  # the admin is never loaned out
+        if d.get('loan'):
+            continue  # already on loan elsewhere
+        a = agents.get(d.get('id'))
+        if not a or not a.get('offDuty'):
+            continue  # only INACTIVE (off-duty, dormant) agents are borrowed
+        home = d.get('director')
+        if not home or home == borrower_director_id:
+            continue
+        # Least-disruptive first: borrow from a home team with no active sprint
+        # (its people aren't committed to anything right now).
+        (busy_home if _team_in_active_sprint(state, home) else idle_home).append(d)
+    pick = (idle_home or busy_home or [None])[0]
+    if not pick:
+        return None
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    loan_id = pick['id']
+    pick['loan'] = {'teamId': borrower_director_id, 'since': now_ms, 'reason': 'sprint_borrow'}
+    a = agents[loan_id]
+    a['offDuty'] = False
+    a['visible'] = True
+    _log_governance(state, borrower_director_id, 'team_borrow',
+                    {'borrowed': loan_id, 'team': borrower_director_id,
+                     'home': pick.get('director'), 'action': 'loaned'})
+    return loan_id
+
+
+def _end_loans_for_team(state, team_id, now_ms=None):
+    """End cross-team loans to a team whose sprint just closed -- unless the
+    borrower still has pending work (a queued large-request breakdown or any
+    pending backlog request), in which case the loan persists: that's the
+    'feature need -> agent may change teams' case, and the need is ongoing. The
+    borrowed agent keeps her home director; only the loan tag is cleared, so
+    her assignment preference returns to her home team."""
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    pending = [r for r in (state.get('backlogRequests') or [])
+               if r.get('status') == 'pending' and r.get('teamId') == team_id]
+    ongoing = bool(pending)
+    for d in (state.get('agentRoster') or []):
+        loan = d.get('loan') or {}
+        if loan.get('teamId') != team_id:
+            continue
+        if ongoing:
+            loan['since'] = now_ms  # refresh the loan while the need persists
+            _log_governance(state, team_id, 'team_borrow',
+                            {'borrowed': d['id'], 'team': team_id,
+                             'home': d.get('director'), 'action': 'extended'})
+            continue
+        d.pop('loan', None)
+        _log_governance(state, team_id, 'team_borrow',
+                        {'borrowed': d['id'], 'team': team_id,
+                         'home': d.get('director'), 'action': 'returned'})
+
+
 def _start_auto_hire(state, now_ms, grid, decider):
     """hiring.js attemptAutoHire, team-scoped: each TEAM DIRECTOR hires for
     their own team (not one global admin hiring anyone). If a director is free
@@ -4240,6 +4859,15 @@ def _start_auto_hire(state, now_ms, grid, decider):
     if not pool_by_director:
         state['lastHireAt'] = 0  # nothing to decide
         return False
+
+    # Cross-team borrowing comes FIRST: before a director spends a hire (a Jev
+    # decision + a brand-new clone's onboarding), try to borrow an INACTIVE
+    # agent from another team for the borrower team's sprint. Only when no
+    # inactive agent is available do we fall through to hiring a new assistant.
+    for did in pool_by_director:
+        if _borrow_inactive_agent_for_team(state, did, now_ms):
+            state['lastHireAt'] = now_ms
+            return True
 
     state['lastHireAt'] = now_ms
     # Flat candidate list for the decider: each entry says which team + member.
@@ -4759,6 +5387,72 @@ def _complete_onboarding(state, onboard, reason):
     state.pop('_pendingOnboard', None)
 
 
+def _sim_admin_id(state):
+    """The admin (the single roster entry with isAdmin=True), or None."""
+    for d in (state.get('agentRoster') or []):
+        if d.get('isAdmin'):
+            return d.get('id')
+    return None
+
+
+def _work_agreement_text(state, agent):
+    """The NEW HIRE drafts their own work agreement -- their words about how
+    they'll work, derived from THEIR OWN profile (role, mission, access grant),
+    NOT a director's instructions. This is the user's todo-17 shape: the work
+    agreement is drafted BY the agents (the new hire), then EMPOWERED by the
+    admin. Cheap + deterministic (no model call), mirroring the staged AGENT.md
+    drafting. Returns a short plain-text agreement or None if the hire has no
+    self-description to build from."""
+    if not isinstance(agent, dict):
+        return None
+    profile = agent.get('profile') or {}
+    role = agent.get('role') or ''
+    mission = (profile.get('mission') or '').strip()
+    grant = (agent.get('accessGrant') or '').strip()
+    parts = []
+    if role:
+        parts.append(f"I am the {role}.")
+    if mission:
+        parts.append(f"My mission: {mission}")
+    if grant:
+        parts.append(f"My access: {grant}")
+    if not parts:
+        return None
+    parts.append("I agree to work inside this scope: support my team's shared "
+                 "space, surface what I learn, and hand work back cleanly.")
+    return ' '.join(parts)
+
+
+def _empower_work_agreement(state, onboard, now_ms):
+    """The admin empowers the hire's drafted work agreement. Recorded on the
+    hire's profile (workAgreement) + the governance log so the empower is
+    durable and attributable. Returns (text, empowered_by) or (None, None) if
+    there is no hire or no admin."""
+    agents = state.get('agents') or {}
+    new_agent = agents.get(onboard.get('agentId'))
+    if not isinstance(new_agent, dict):
+        return None, None
+    admin_id = _sim_admin_id(state)
+    text = _work_agreement_text(state, new_agent)
+    if not text:
+        return None, None
+    profile = new_agent.setdefault('profile', {})
+    profile['workAgreement'] = {
+        'text': text,
+        'draftedBy': onboard.get('agentId'),
+        'empoweredBy': admin_id,
+        'empoweredAt': now_ms,
+    }
+    _log_governance(state, onboard.get('agentId'), 'onboard',
+                    {'about': onboard['agentId'], 'action': 'agreement_drafted',
+                     'directorId': onboard['directorId']})
+    if admin_id:
+        _log_governance(state, admin_id, 'onboard',
+                        {'about': onboard['agentId'], 'action': 'agreement_empowered',
+                         'directorId': onboard['directorId']})
+    return text, admin_id
+
+
 def _resolve_onboard_meeting(state, onboard, now_ms):
     """After the Town-Hall duration elapses, the director stages the new agent's
     AGENT.md progressively. Everyone returns to duty; the new agent's profile is
@@ -4798,8 +5492,12 @@ def _resolve_onboard_meeting(state, onboard, now_ms):
             f"{((' (' + help_for.get('role', '') + ')') if help_for and help_for.get('role') else '')}: "
             "that is your concrete assignment from the meeting.")
     elif stage == 2:
-        # Stage 2 is fully drafted; move into the readiness hold. Stamp when the
-        # hold began so the timeout is measured from here, not from hire time.
+        # Stage 2 is fully drafted; the NEW HIRE drafts their own work agreement
+        # (their words from their own profile -- not the director's), and the
+        # ADMIN empowers it, before moving into the readiness hold. Stamp when
+        # the hold began so the timeout is measured from here, not from hire
+        # time.
+        _empower_work_agreement(state, onboard, now_ms)
         onboarding['stage'] = 3
         onboarding['holdSince'] = now_ms
         _log_governance(state, onboard['directorId'], 'onboard',
@@ -5049,6 +5747,18 @@ def _resolve_social(state, pending, now_ms, decider=None):
         _log_governance(state, aid, 'social_carryaway',
                         {'choice': choice, 'confidence': confidence,
                          'attendees': sorted(people), 'weekApprovals': a.get('weekApprovals') or 0})
+        # W2: an 'adopt' carry-away with real confidence must LAND -- it changes
+        # the worker's NEXT execution, not just a digest line. Route a coaching
+        # note through the existing growth-plan loop (repeat=True: each fresh
+        # weekly adopt is a new commitment, so it lands even if a prior one of
+        # the same kind is still queued/applied).
+        if choice == 'adopt' and isinstance(confidence, (int, float)) \
+                and confidence >= SOCIAL_ADOPT_CONFIDENCE:
+            _write_growth_plan(
+                state, aid, 'hangout', 'social_adopt', now_ms,
+                f"Knowledge Social adopt (confidence {confidence:.2f}): you committed to "
+                f"actually trying/applying what you saw cross-team. Do that on this "
+                f"task, not just note it.", repeat=True)
     duration = SOCIAL_MEET_MS
     for aid, snapshot in people.items():
         _restore_social_agent(state, aid, snapshot, now_ms, duration)
@@ -5132,6 +5842,28 @@ def file_work_request(state, agent_id, title, room, reason=None):
         'filedBy': agent_id, 'title': title, 'room': room,
         'reason': (reason or 'Pending follow-up in a thinning room').strip(),
         'filedAt': int(time.time() * 1000), 'status': 'pending',
+    }
+    state.setdefault('backlogRequests', []).append(req)
+    return req
+
+
+def file_large_request(state, authority_id, goal, team_id, now_ms=None):
+    """File a staffable large ask as a pending BREAKDOWN request for a team's
+    breakdown ceremony to card into stories/spikes. The ask is attributed to
+    the free authority who chose the team and tagged with the receiving team
+    so the breakdown ceremony convenes the RIGHT team's scrum master + workers.
+    Never predicts subtasks up front -- the ceremony does that. Returns the new
+    request dict, or None if malformed."""
+    goal = (goal or '').strip()
+    if not goal or not team_id:
+        return None
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    req = {
+        'id': f"wrq-{len(state.get('backlogRequests') or []) + 1}",
+        'filedBy': authority_id, 'title': goal[:120], 'room': 'pressoffice',
+        'reason': f"Large request: {goal[:200]}", 'goal': goal,
+        'filedAt': now_ms, 'status': 'pending', 'teamId': team_id,
+        'origin': 'large_request', 'breakdown': True,
     }
     state.setdefault('backlogRequests', []).append(req)
     return req
@@ -5909,9 +6641,12 @@ def _block_step(state, now, now_ms):
         t = _team_row(state, team_id)
         if not t:
             continue
-        scrum_master_id = t.get('scrumMasterId') or None
+        # The commit is MECHANICAL (judgment is always upstream), so ANY effective
+        # scrum master may sign it -- for a small team that is the director
+        # standing in, the same fallback refinement uses. Without even that, defer.
+        scrum_master_id = _refinement_scrum_master_for_team(state, team_id)
         if not scrum_master_id:
-            continue  # no SM designated yet -- defer
+            continue  # no effective scrum master yet -- defer
         a = (state.get('agents') or {}).get(scrum_master_id)
         if not a or a.get('busy') or a.get('offDuty'):
             continue  # SM busy/off-duty -- defer to a later pass
@@ -6400,6 +7135,57 @@ def _restore_refinement_agent(state, aid, snap, now_ms, duration_ms):
     a['visible'] = snap.get('visible'); a['offDuty'] = snap.get('offDuty')
 
 
+def _reassign_rolled_over_cards(state, team_id):
+    """Refinement re-plan (sprint rollover): a card that rolled over from one of
+    THIS team's closed sprints (still queued, tagged with a closed sprint whose
+    teamIds include this team) is re-assigned to the team's least-loaded free
+    member -- the carried-over work gets a fresh, explicit owner for the next
+    sprint instead of silently resuming with whoever the global round-robin last
+    pointed it at. The pin is soft (see _assign_due_item): honored while the
+    target is free, else the generic pool picks up. Deterministic, no model
+    call. Returns the count of cards re-planned."""
+    team_director = None
+    for t in (state.get('teams') or []):
+        if t.get('id') == team_id or t.get('directorId') == team_id:
+            team_director = t.get('directorId')
+            break
+    members = _sim_direct_reports(state, team_director) if team_director else []
+    agents = state.get('agents') or {}
+    members = [m for m in members if agents.get(m)]
+    if not members:
+        return 0
+    closed_ids = {s.get('id') for s in (state.get('sprints') or {}).values()
+                  if s.get('status') == 'closed' and team_id in (s.get('teamIds') or [])}
+    if not closed_ids:
+        return 0
+    tasks = state.get('tasks') or {}
+    picked = []
+    for it in (state.get('workQueue') or []):
+        if it.get('sprintId') not in closed_ids:
+            continue
+        if any(t.get('status') == 'done' and t.get('title') == it.get('title')
+               and t.get('room') == it.get('room')
+               for t in tasks.values()):
+            continue
+        picked.append(it)
+    if not picked:
+        return 0
+    free = [m for m in members
+            if not (agents[m].get('busy') or agents[m].get('offDuty'))]
+    if not free:
+        return 0
+    # Least-loaded first: fewest open tasks, tie-break by roster order.
+    def _load(m):
+        return sum(1 for t in tasks.values()
+                   if t.get('assignedTo') == m
+                   and t.get('status') in ('walking', 'working'))
+    free.sort(key=lambda m: (_load(m), members.index(m)))
+    target = free[0]
+    for it in picked:
+        it['_reassignedTo'] = target
+    return len(picked)
+
+
 def _resolve_refinement(state, pending, now_ms, decider=None):
     """When the ceremony window elapses, the scrum master grooms every pending
     request: the injectable refinement decider picks accept/reject per request,
@@ -6463,12 +7249,21 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
                 instructions += f"\n\nUser story: {story}"
             if criteria:
                 instructions += f"\n\nAcceptance criteria:\n{criteria}"
+            # Dependency cascade provenance: a card whose ISSUE was filed blocked
+            # on another task (issue['dependsOnTask']) carries that dependency
+            # onto its real task, so re-opening the dependency ripples a
+            # re-review to this story once it has shipped (see _cascade_rereview).
+            depends_on = None
+            linked_issue = (state.get('issues') or {}).get(req.get('issueKey'))
+            if linked_issue and linked_issue.get('dependsOnTask'):
+                depends_on = linked_issue['dependsOnTask']
             queue_work(state, [{
                 'title': req['title'], 'room': req['room'], 'goal': req.get('title'),
                 'instructions': instructions,
                 'teamId': req.get('teamId'),
                 'userStory': story,
                 'acceptanceCriteria': criteria,
+                'dependsOn': depends_on,
             }])
             accepted.append(req)
         else:
@@ -6482,12 +7277,21 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
             # proposals are trending trivial/ill-scoped.
             details['selfProposedRejected'] = True
         _log_governance(state, scrum_master_id, 'refinement_carryaway', details)
+    # Sprint rollover re-plan: cards that rolled over from this team's closed
+    # sprint are re-assigned to a fresh, least-loaded free member so the carried
+    # work has an explicit owner for the next sprint.
+    team_id = pending.get('teamId')
+    if team_id:
+        replanned = _reassign_rolled_over_cards(state, team_id)
+        if replanned:
+            _log_governance(state, scrum_master_id, 'refinement_carryaway',
+                            {'action': 'rollover_reassign', 'team': team_id,
+                             'reassigned': replanned})
     # Restore attendees; reset the cadence stamp event-to-event. Like the Social,
     # the work budget given back is the full ceremony length, so the meeting
     # burned none of a mid-task attendee's work time.
     for aid, snap in (pending.get('people') or {}).items():
         _restore_refinement_agent(state, aid, snap, now_ms, REFINEMENT_MEET_MS)
-    team_id = pending.get('teamId')
     if team_id:
         state.setdefault('teamRefinementAt', {})[team_id] = now_ms
     else:
@@ -6579,6 +7383,11 @@ def _refinement_step(state, now, now_ms, decider=None):
         # isolation: dev's scrum master refines only dev's cards).
         req_ids = []
         for r in _pending_work_requests(state):
+            if r.get('breakdown'):
+                # Large-request breakdowns are groomed by the BREAKDOWN ceremony
+                # (the receiving team's scrum master + workers plan the stories),
+                # never by this refinement groom -- two ceremonies, two kinds.
+                continue
             t = _refinement_team(state, r)
             if t and (t.get('id') == team_id or t.get('directorId') == team_id):
                 req_ids.append(r['id'])
@@ -6595,6 +7404,239 @@ def _refinement_step(state, now, now_ms, decider=None):
 
 
 # ---------------------------------------------------------------------------
+# Sprint staffing: the breakdown ceremony. A staffable large ask is filed as a
+# pending breakdown request (origin:'large_request', breakdown:True) by the free
+# authority, tagged with the receiving team. That team's OWN breakdown ceremony
+# -- scrum master + the team's workers -- meets at the Command Center and cards
+# the ask into concrete stories/spikes, which are queued as REAL work tagged
+# with the team + the goal. No sprint record is created up front and no subtasks
+# are predicted synchronously: the team plans its own work, like a real org.
+# Same convene-then-resolve ceremony shape as refinement; the decider is
+# injectable like every other Jev decision, and the ask is never dropped -- an
+# outage degrades to a single card titled the goal.
+# ---------------------------------------------------------------------------
+
+
+def _pending_breakdown_requests(state, team_id):
+    """Pending large-request breakdowns targeted at `team_id` (breakdown:True
+    records only) -- the breakdown ceremony's intake. Distinct from the
+    refinement ceremony's `_pending_work_requests`, which must never groom
+    these: the two ceremonies own different request kinds."""
+    return [r for r in (state.get('backlogRequests') or [])
+            if r.get('status') == 'pending' and r.get('breakdown')
+            and r.get('teamId') == team_id]
+
+
+def _breakdown_attendees(state, req_ids, scrum_master_id, team_id):
+    """The breakdown ceremony's attendees: the team's scrum master + its
+    non-director workers (the people who will WORK the stories -- a breakdown is
+    a team planning session). The director attends only when she IS the
+    effective scrum master (small teams where the director stands in). A busy
+    attendee defers the whole ceremony (never pull an agent out of a live
+    collaboration); an off-duty one is parked and free, and _start_breakdown
+    wakes her (snapshot + restore, exactly like refinement). Returns the
+    attendee ids, or None if any attendee is busy."""
+    agents = state.get('agents') or {}
+    ids = [scrum_master_id]
+    t = _team_row(state, team_id) or {}
+    director_id = t.get('directorId')
+    for aid in _sim_direct_reports(state, director_id):
+        if aid not in ids and aid != director_id:
+            ids.append(aid)
+    for aid in ids:
+        a = agents.get(aid)
+        if not a or a.get('busy'):
+            return None
+    return ids
+
+
+def _start_breakdown(state, team_id, req_ids, scrum_master_id, now_ms, pos_offset=0):
+    """Convene the breakdown ceremony at the Command Center: snapshot each
+    attendee's prior state into `pending['people']`, mark them busy at a spread,
+    and schedule the resolve BREAKDOWN_MEET_MS later. Returns True if convened
+    (attendees healthy), False to defer and retry next pass."""
+    ids = _breakdown_attendees(state, req_ids, scrum_master_id, team_id)
+    if not ids:
+        return False
+    agents = state.get('agents') or {}
+    snap = {}
+    base_x = 315 + (pos_offset * 460)
+    for i, aid in enumerate(ids):
+        a = agents.get(aid)
+        snap[aid] = {k: a.get(k) for k in ('offDuty', 'visible', 'x', 'y', 'dir',
+                                           'task', 'busy', 'inRoom', 'pairWith', 'handoff', 'workUntil')}
+        a['busy'] = True
+        a['visible'] = True
+        a['offDuty'] = False
+        a['task'] = None
+        a['inRoom'] = 'commandcenter'
+        a['dir'] = 'south'
+        a['roomX'] = base_x + (i * 85)
+        a['roomY'] = 155
+    state.setdefault('pendingBreakdowns', {})[team_id] = {
+        'at': now_ms + BREAKDOWN_MEET_MS, 'embarked': True,
+        'scrumMasterId': scrum_master_id, 'reqIds': req_ids,
+        'teamId': team_id, 'people': snap,
+    }
+    _log_governance(state, scrum_master_id, 'breakdown',
+                    {'action': 'meeting_start', 'requests': req_ids})
+    return True
+
+
+def _breakdown_decider_default(state, instructions, goal):
+    """Default resolver for the breakdown ceremony: a high-tier (JEV-gated)
+    chat call returns a JSON list of stories/spikes for the ask, accrued to its
+    own spend bucket. Returns the parsed dict, or None on a model outage (the
+    resolve then queues a single card titled the goal -- the ask is never
+    dropped)."""
+    try:
+        import serve
+    except Exception:
+        return None
+    try:
+        model = serve._resolve_model_tier(
+            f'Breaking a large request into worker-sized stories: {goal[:200]}',
+            allow_high=True)
+        if not model:
+            return None
+        data = serve._call_openrouter_sync(
+            model,
+            [{'role': 'system', 'content': instructions},
+             {'role': 'user', 'content': f"Break down this large request: {goal}"}],
+            max_tokens=serve._big_task_max_tokens)
+        cost = (data.get('usage') or {}).get('cost', 0.0)
+        if isinstance(cost, (int, float)) and cost:
+            serve._accrue_spend('__breakdowns__', cost)
+        reply = ((data.get('choices') or [{}])[0].get('message') or {}).get('content') or ''
+        start = reply.find('{')
+        end = reply.rfind('}')
+        if start != -1 and end > start:
+            reply = reply[start:end + 1]
+        parsed = json.loads(reply)
+        if isinstance(parsed, dict) and (parsed.get('items') or []):
+            return parsed
+    except Exception:
+        pass
+    return None
+
+
+# Injectable for tests (mirrors _refinement_decider / _retro_decider); the live
+# loop uses the high-tier default. The breakdown NEVER blocks the staffing reply
+# -- the ask is filed pending and carded on a later pass, so an outage costs
+# nothing but a single card titled the goal.
+_breakdown_decider = _breakdown_decider_default
+
+
+def _resolve_breakdown(state, pending, now_ms, decider=None):
+    """When the breakdown window elapses, the scrum master cards each pending
+    large-request into concrete stories/spikes via the injectable decider; the
+    pieces are queued as REAL work tagged with the receiving team + the goal
+    (room-less -- the agent who picks the work up resolves the room at
+    assignment, exactly like a shared-backlog card). On an outage a single
+    pressoffice card titled the goal is queued so the ask is never silently
+    dropped. Restores attendees, records the carryaway, pops the pending
+    record. Idempotent if a request vanished."""
+    decider = decider or _breakdown_decider
+    agents = state.get('agents') or {}
+    scrum_master_id = pending.get('scrumMasterId')
+    sm_def = next((d for d in (state.get('agentRoster') or []) if d.get('id') == scrum_master_id), {})
+    sm_name = sm_def.get('name') or (agents.get(scrum_master_id) or {}).get('name') or scrum_master_id
+    team_id = pending.get('teamId')
+    for req in (state.get('backlogRequests') or []):
+        if req.get('id') not in pending.get('reqIds', []):
+            continue
+        if req.get('status') != 'pending':
+            continue
+        goal = req.get('goal') or req.get('title') or 'untitled large request'
+        author = agents.get(req.get('filedBy')) or {}
+        instructions = (
+            f"{sm_name} is the scrum master of the receiving team breaking down a large request "
+            f"filed by {author.get('name') or req.get('filedBy')}: '{goal[:200]}'. "
+            "Break it into as many concrete stories (or spikes for investigation-first work) as the work actually "
+            "requires -- at least one, never a fixed count: a small ask may be a single card, a sprawling one may need many. "
+            "Do NOT assign a room to a card -- the buildings are shared and the agent who picks the work up figures out "
+            "where it needs to happen. Keep every title to ONE short sentence. For each card set \"type\" to "
+            "\"story\" (deliverable work) or \"spike\" (an investigation with no committed deliverable), "
+            "a one-line \"acceptanceCriteria\" when the story has a clear test of done, and a \"sizeEstimate\" of S/M/L. "
+            "Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: "
+            '{"items":[{"title":"short title","type":"story|spike","acceptanceCriteria":"one line or omitted","sizeEstimate":"S|M|L"}]}'
+        )
+        data = decider(state, instructions, goal)
+        items = []
+        if isinstance(data, dict):
+            items = [s for s in (data.get('items') or [])
+                     if isinstance(s, dict) and (s.get('title') or '').strip()]
+        if not items:
+            # Outage / unusable plan: never drop the ask -- queue a single card
+            # titled the goal so it stays in the pipeline for a worker to pick up.
+            items = [{'title': goal[:120], 'type': 'story'}]
+        for s in items:
+            title = (s.get('title') or '').strip()[:120]
+            task_type = 'spike' if (s.get('type') or 'story').strip().lower() == 'spike' else 'code'
+            ac = (s.get('acceptanceCriteria') or '').strip()
+            instructions_text = (f"Filed by {req.get('filedBy')} during a large-request breakdown by "
+                                 f"{sm_name}. Requested goal: {goal[:200]}")
+            if ac:
+                instructions_text += f"\n\nAcceptance criteria:\n{ac}"
+            queue_work(state, [{
+                'title': title, 'goal': goal[:200], 'instructions': instructions_text,
+                'teamId': req.get('teamId'), 'taskType': task_type,
+                # The decider was told to size each story S/M/L (see the
+                # breakdown prompt); carry it so the queued item + task keep the
+                # estimate and same-priority work is ordered largest-first.
+                'sizeEstimate': s.get('sizeEstimate'),
+            }])
+        req['status'] = 'accepted'
+        req['brokenDown'] = True
+        req['stories'] = items
+        _log_governance(state, scrum_master_id, 'breakdown_carryaway',
+                        {'request': req['id'], 'goal': goal[:120], 'stories': len(items)})
+    # Restore attendees; like refinement, the meeting burned none of a mid-task
+    # attendee's work time (the full ceremony length is given back).
+    for aid, snap in (pending.get('people') or {}).items():
+        _restore_refinement_agent(state, aid, snap, now_ms, BREAKDOWN_MEET_MS)
+    state.setdefault('pendingBreakdowns', {}).pop(team_id, None) if team_id else state.pop('_pendingBreakdown', None)
+
+
+def _breakdown_step(state, now, now_ms, decider=None):
+    """One large-request breakdown pass, called from _task_cycle ungated (a
+    staffed large ask is the point even on a quiet think tank). A pass
+    (a) advances every in-flight breakdown ceremony (embark on one pass,
+    RELEASE on the next -- no required fixed hold), and (b) convenes a breakdown
+    for every team that has pending large-request breakdowns AND a free scrum
+    master + healthy attendees. Never convenes an empty meeting; a team in an
+    active sprint is deferred (the sprint is the committed work, and the pending
+    breakdown request is carded once the team is free)."""
+    pending_map = state.setdefault('pendingBreakdowns', {})
+    for team_id in list(pending_map.keys()):
+        pending = pending_map[team_id]
+        if not pending.get('embarked'):
+            _start_breakdown(state, team_id, pending.get('reqIds', []),
+                             pending.get('scrumMasterId'), now_ms)
+        else:
+            _resolve_breakdown(state, pending, now_ms, decider=decider)
+    slot = 0
+    for team in (state.get('teams') or []):
+        team_id = team.get('id') or team.get('directorId')
+        if team_id in pending_map:
+            continue  # this team already has an in-flight breakdown ceremony
+        req_ids = [r['id'] for r in _pending_breakdown_requests(state, team_id)]
+        if not req_ids:
+            continue  # nothing to plan -- don't convene an empty meeting
+        if _team_in_active_sprint(state, team_id):
+            # The team is committed to a sprint; the pending breakdown request
+            # stays queued and is carded once the team is free (same rule as a
+            # team in an active sprint not refining mid-sprint).
+            continue
+        scrum_master_id = _refinement_scrum_master_for_team(state, team_id)
+        if not scrum_master_id:
+            continue  # this team has no (effective) scrum master designated yet
+        req_ids = req_ids[:BREAKDOWN_MAX_REQUESTS]
+        if _start_breakdown(state, team_id, req_ids, scrum_master_id, now_ms, pos_offset=slot):
+            slot += 1  # only to spread simultaneous ceremonies apart in the room
+
+
+# ---------------------------------------------------------------------------
 # WS-14: sprint retrospective (START / STOP / CONTINUE). When a sprint closes,
 # its team meets at the Command Center -- the scrum master + the team's
 # non-director members, with the DIRECTOR explicitly excluded (a retrospective
@@ -6606,15 +7648,42 @@ def _refinement_step(state, now, now_ms, decider=None):
 
 def _retro_scrum_master(state, team_ids):
     """The agent who facilitates a sprint's retrospective: the first team in the
-    sprint's team list with a NON-DIRECTOR effective scrum master. Returns None
-    for a small team whose only effective scrum master is its director (a retro
-    must exclude the director, so it waits until the team has a real scrum
-    master)."""
+    sprint's team list with a NON-DIRECTOR effective scrum master; else -- for a
+    team whose only scrum master is its own director (small teams below
+    SCRUM_MASTER_MIN_TEAM_SIZE, per the player's design the director already
+    serves as the scrum master) -- that team's OWN director stands in as
+    facilitator. The OWN director is preferred over any borrowed one: a retro is
+    the team's own reflection and should be run by someone the team actually
+    works with, not an outsider. Only when the own director is unavailable
+    (busy/off-duty) is a non-busy director from ANOTHER team borrowed in.
+    Returns None only when no facilitator can be found at all (the retro then
+    waits for a later pass)."""
     teams = {t.get('id'): t for t in (state.get('teams') or [])}
     for tid in team_ids or []:
         sm = _refinement_scrum_master_for_team(state, tid)
         if sm and sm != (teams.get(tid) or {}).get('directorId'):
             return sm
+    # No non-director scrum master among the sprint teams: the team's OWN
+    # director stands in (a small team's director already serves as its scrum
+    # master). Must be free + on-duty to convene; else defer to a later pass.
+    for tid in team_ids or []:
+        did = (teams.get(tid) or {}).get('directorId')
+        if not did:
+            continue
+        a = (state.get('agents') or {}).get(did)
+        if a and not a.get('busy') and not a.get('offDuty'):
+            return did
+    # Own director busy/off-duty: fall back to borrowing a non-busy director
+    # from another team rather than leaving the team without a retro.
+    sprint_directors = {(teams.get(tid) or {}).get('directorId') for tid in (team_ids or [])}
+    agents = state.get('agents') or {}
+    for t in (state.get('teams') or []):
+        did = t.get('directorId')
+        if not did or did in sprint_directors:
+            continue
+        a = agents.get(did)
+        if a and not a.get('busy') and not a.get('offDuty'):
+            return did
     return None
 
 
@@ -6791,7 +7860,7 @@ def _retro_step(state, now, now_ms, decider=None):
         record = (state.get('sprints') or {}).get(sid) or {}
         scrum_master_id = _retro_scrum_master(state, record.get('teamIds') or [])
         if not scrum_master_id:
-            continue  # small team whose only SM is the director -- retro waits
+            continue  # no facilitator available (own director busy, no other free director) -- retro waits
         team_ids = [t for t in (record.get('teamIds') or []) if _team_row(state, t)]
         if _start_retrospective(state, sid, team_ids, scrum_master_id, now_ms, pos_offset=slot):
             queued.remove(sid)
@@ -6927,6 +7996,60 @@ def _roadmap_release_demand(state, room):
                if d.get('room') == room)
 
 
+def _agent_trailing_grade(state, agent_id):
+    """Trailing-window mean grade for ONE agent's real completed deliverables
+    (the per-agent health signal the director's team-health review keys on).
+    Only real Jev grades count -- fabricated fallbacks (gradeIsReal=False) would
+    otherwise pull a weak agent's mean toward 5.0 and hide the signal. Returns a
+    float or None when the agent has no real graded deliverable yet."""
+    grades = [d.get('grade') for d in (state.get('completedDeliverables') or [])
+              if d.get('agentId') == agent_id and isinstance(d.get('grade'), (int, float))
+              and d.get('gradeIsReal', True)]
+    if not grades:
+        return None
+    return round(sum(grades) / len(grades), 1)
+
+
+def _team_health_review(state, team_ids, now_ms):
+    """Director gap 1: team-health review at sprint close. Each director reviews
+    the health of the WORKERS under them (never directors -- see the worker-only
+    judgment directive): an agent whose real trailing grade sits below the
+    delivery floor gets a coaching growth-plan note routed to their NEXT task
+    (via the existing _write_growth_plan/_coaching_note_for loop), so a weak
+    close turns into changed next execution rather than silent drift. Workers
+    with no real graded work yet are not judged. Pure state mutation, no Jev
+    spend -- the trailing mean IS the ground truth signal. Idempotent per agent:
+    _write_growth_plan dedups by kind, so a repeated low close re-coaches (the
+    coaching loop, W5) without spamming identical notes."""
+    if not team_ids:
+        return 0
+    reviewed = 0
+    for tid in team_ids:
+        team = _team_row(state, tid)
+        if not team:
+            continue
+        director_id = team.get('directorId') or team.get('id')
+        # Worker-only judgment: a director's own team-health review must never
+        # grade another director (or the admin), matching who_needs_review.
+        for worker_id in _sim_direct_reports(state, director_id):
+            wdef = next((d for d in (state.get('agentRoster') or [])
+                         if d.get('id') == worker_id), None)
+            if not wdef or wdef.get('isDirector') or wdef.get('isAdmin'):
+                continue
+            grade = _agent_trailing_grade(state, worker_id)
+            if grade is None or grade >= DELIVERABLE_GRADE_FLOOR:
+                continue
+            _write_growth_plan(
+                state, worker_id, team.get('room') or 'pressoffice',
+                'team_health', now_ms,
+                f"Sprint close team-health review: trailing grade {grade}/10 is "
+                f"below the {DELIVERABLE_GRADE_FLOOR:.0f} delivery floor. Focus this "
+                f"sprint's work on meeting the spec and room standards end-to-end.",
+                repeat=True)
+            reviewed += 1
+    return reviewed
+
+
 def _grade_completed_task(state, agent_id, task, now_ms):
     """Fire-and-forget grader for a landed deliverable. Never blocks completion;
     on outage records a deterministic default (room's trailing mean, else mid-
@@ -6965,8 +8088,65 @@ def _grade_completed_task(state, agent_id, task, now_ms):
         'source': 'refinement' if (task.get('instructions') or '').find('backlog refinement') >= 0 else 'other',
     })
     if grade < DELIVERABLE_GRADE_FLOOR:
-        _write_growth_plan(state, agent_id, room, 'low_grade', now_ms,
-                           f"Deliverable '{title}' in {room} graded {grade}/10 (below the {DELIVERABLE_GRADE_FLOOR:.0f} floor).")
+        _coach_low_grade(state, agent_id, room, grade, now_ms, title)
+
+
+def _coach_low_grade(state, agent_id, room, grade, now_ms, title):
+    """W5: round-aware low-grade coaching. A single _write_growth_plan deduped by
+    kind coached a weak worker ONCE; a worker who keeps closing below the floor
+    then absorbed the identical note forever. Each low close re-lands a fresh,
+    escalating coaching note (repeat=True) up to COACHING_MAX_ROUNDS, then the
+    problem escalates to the owning director (a work-request + governance entry)
+    -- either the coaching works, or it surfaces. Bounded: escalation fires once
+    per round-cap, and the work-request dedups."""
+    plans = state.setdefault('growthPlans', {}).setdefault(agent_id, [])
+    rounds = sum(1 for p in plans if p.get('kind') == 'low_grade')
+    if rounds >= COACHING_MAX_ROUNDS:
+        _escalate_coaching_loop(state, agent_id, room, grade, now_ms, title)
+        return
+    _write_growth_plan(
+        state, agent_id, room, 'low_grade', now_ms,
+        f"Deliverable '{title}' in {room} graded {grade}/10 (below the "
+        f"{DELIVERABLE_GRADE_FLOOR:.0f} floor). Coaching round {rounds + 1} of "
+        f"{COACHING_MAX_ROUNDS}: you've been coached on this before and the grade "
+        f"hasn't recovered -- meet the spec and room standards end-to-end this time.",
+        repeat=True)
+
+
+def _escalate_coaching_loop(state, agent_id, room, grade, now_ms, title):
+    """Terminal coaching-loop escalation: a worker who has closed below the
+    floor COACHING_MAX_ROUNDS times without improvement is surfaced to the
+    owning team's scrum master as a work-request (the same SM-routing as the
+    stale-work/help sweeps), so the SM can help, re-plan, or reassign -- a
+    bounded end to the loop, never an infinite re-coach. Logs governance."""
+    def _director_for(aid):
+        for d in (state.get('agentRoster') or []):
+            if d.get('id') == aid:
+                return d.get('director')
+        return None
+    director_id = _director_for(agent_id) or room  # fall back to room-keyed team
+    team = None
+    for t in (state.get('teams') or []):
+        if t.get('directorId') == director_id or t.get('room') == room:
+            team = t
+            break
+    filer = None
+    if team:
+        filer = _escalation_scrum_master_for(state, team.get('directorId') or team.get('id'))
+        if not filer:
+            filer = team.get('directorId') or team.get('id')
+    routed = False
+    if filer:
+        routed = bool(file_work_request(
+            state, filer,
+            (f'Help: {agent_id} keeps closing below the delivery floor')[:120],
+            room,
+            reason=(f'{agent_id} has closed below the {DELIVERABLE_GRADE_FLOOR:.0f} floor '
+                    f'{COACHING_MAX_ROUNDS}+ times (latest: {title}, {grade}/10). Coaching is '
+                    f'not working; the scrum master decides whether to help, re-plan, or reassign.')))
+    _log_governance(state, 'admin', 'coaching_loop_escalated',
+                    {'agent': agent_id, 'title': (title or '')[:120], 'room': room,
+                     'grade': grade, 'routed': routed})
 
 
 def _runbook_task(state, task, now_ms):
@@ -6994,14 +8174,17 @@ def _runbook_task(state, task, now_ms):
         del rb[:-RUNBOOK_MAX_ENTRIES_PER_PRODUCT]
 
 
-def _write_growth_plan(state, agent_id, room, kind, now_ms, note):
+def _write_growth_plan(state, agent_id, room, kind, now_ms, note, repeat=False):
     """Record a coaching note against an agent (dedup by kind so repeated low
     grades don't spam identical plans). The note is APPENDED once to that
-    agent's next assigned task by _coaching_note_for."""
+    agent's next assigned task by _coaching_note_for. `repeat=True` bypasses the
+    dedup (a NEW commitment each event -- e.g. a fresh Knowledge Social adopt --
+    must land even when an older one of the same kind already queued/applied)."""
     plans = state.setdefault('growthPlans', {}).setdefault(agent_id, [])
-    for p in plans:
-        if p.get('kind') == kind:
-            return  # already coaching on this axis
+    if not repeat:
+        for p in plans:
+            if p.get('kind') == kind:
+                return  # already coaching on this axis
     plans.append({'kind': kind, 'ts': now_ms, 'room': room, 'note': note, 'applied': False})
 
 
@@ -7600,6 +8783,232 @@ def _on_work_item_abandoned(state, pick, now_ms):
                              'assignment_abandoned', now_ms)
 
 
+def _stale_work_step(state, now, now_ms):
+    """SM gap 1: stale in-flight work oversight. Bugs already have a restore
+    alarm (RESTORE_TIMEOUT_MS via _escalation_step); a NON-bug task wedged in
+    'walking'/'working' had NO age alarm -- if the completion loop and the
+    orphan/stall repairs all miss it, it holds its worker forever.
+
+    A coarse-cadence sweep finds tasks whose in-flight age is definitively past
+    any legitimate budget:
+      - 'working': still 'working' long after workUntil elapsed (the completion
+        loop finishes every held working task within a pass, so still-working at
+        workUntil + grace means the wedge won self-resolve);
+      - 'walking': walking for longer than a generous ceiling (never arrived).
+    A first staleness re-queues the card fresh (fast re-issue, priority bump,
+    holder released). A repeat offender -- re-planned STALE_WORK_MAX_REPLANS
+    times for the same (title, room) -- is routed to the owning team's scrum
+    master as a work-request (the "SM re-plan"): refinement's accept/reject
+    decides whether the work survives, so the loop is bounded and never spins.
+    Never touches bugs (own alarm), shadow dry-runs, or review/fix subtasks
+    (their deadlock lives in the stuck-gate watchdog). Pure state mutation;
+    runs before the idle gate so a quiet tank still re-plans a wedged card.
+    Returns the number of cards re-planned (requeued + SM-routed)."""
+    if now_ms - (state.get('lastStaleWorkSweep') or 0) < STALE_WORK_CADENCE_MS:
+        return 0
+    state['lastStaleWorkSweep'] = now_ms
+    tasks = state.get('tasks')
+    if not isinstance(tasks, dict) or not tasks:
+        return 0
+    agents = state.get('agents') or {}
+    replan_map = state.setdefault('_staleWorkReplans', {})
+    replanned = 0
+    for tid, task in list(tasks.items()):
+        if not isinstance(task, dict):
+            continue
+        if task.get('status') not in ('walking', 'working'):
+            continue
+        if task.get('taskType') == 'bug' or task.get('incident') or task.get('shadow'):
+            continue  # bugs own an alarm; shadows never ship; reviews -> stuck-gate
+        if task.get('reviewOf'):
+            continue  # review/fix subtasks are the stuck-gate watchdog's domain
+        opened = task.get('openedAt') or task.get('assignedAt') or task.get('createdAt')
+        if opened is None:
+            continue
+        if task.get('status') == 'walking':
+            if now_ms - opened < STALE_WORK_TIMEOUT_MS:
+                continue
+        else:  # 'working'
+            work_until = task.get('workUntil') or 0
+            if now <= work_until + STALE_WORK_BUDGET_GRACE_S:
+                continue
+        # Genuinely wedged non-bug in-flight card. Release any holder so the
+        # worker is never pinned by a task that will no longer resolve.
+        for aid, a in list(agents.items()):
+            if isinstance(a, dict) and a.get('task') == tid:
+                a['task'] = None
+                a['busy'] = False
+                a['inRoom'] = None
+                break
+        key = _sprint_item_id(task)
+        replans = replan_map.get(key, 0)
+        if replans < STALE_WORK_MAX_REPLANS:
+            replan_map[key] = replans + 1
+            _requeue_stale_work(state, task)
+            reason = ('stale in-flight work swept after its budget elapsed; '
+                      're-issued so the work is not lost')
+            _log_governance(state, 'admin', 'stale_work_requeued',
+                            {'task': tid, 'title': task.get('title')[:120],
+                             'room': task.get('room'), 'replans': replans + 1})
+        else:
+            # Terminal re-plan: hand to the owning team's scrum master.
+            if _sm_replan_stale_work(state, task, now_ms):
+                _log_governance(state, 'admin', 'stale_work_sm_replan',
+                                {'task': tid, 'title': task.get('title')[:120],
+                                 'room': task.get('room'), 'replans': replans + 1})
+            else:
+                _log_governance(state, 'admin', 'stale_work_dropped',
+                                {'task': tid, 'title': task.get('title')[:120],
+                                 'room': task.get('room')})
+        del tasks[tid]
+        replanned += 1
+    return replanned
+
+
+def _requeue_stale_work(state, task):
+    """Fast-path re-plan: put the swept card back on the work queue so a fresh
+    assignment re-issues it, bumped to at least 'high' priority (it already
+    waited long enough once) and marked so a future sweep can find it fast."""
+    room = task.get('room') or _resolve_assignment_room(task)
+    queue_work(state, [{
+        'title': task.get('title'),
+        'room': room,
+        'instructions': (task.get('instructions') or '') + (
+            '\n\n[re-planned] This card was swept as stale in-flight work and re-issued '
+            'so it is not lost.') if task.get('instructions') else
+            f"Re-issued stale work: {task.get('title')}",
+        'goal': task.get('goal'),
+        'taskType': task.get('taskType') or 'code',
+        'sizeEstimate': task.get('sizeEstimate'),
+        'teamId': task.get('teamId'),
+        'productId': task.get('productId'),
+        'featureId': task.get('featureId'),
+        'backlogItemId': task.get('backlogItemId'),
+        'sprintId': task.get('sprintId'),
+        'priority': WORK_PRIORITY['high'],
+    }])
+
+
+def _sm_replan_stale_work(state, task, now_ms):
+    """Terminal re-plan: route a repeatedly-stale card to the owning team's
+    scrum master as a work-request, and make refinement due on the next pass so
+    the SM re-plans it promptly (accept -> new story, reject -> dropped, both
+    bounded). Returns True when the request was filed for a real team."""
+    room = task.get('room') or _resolve_assignment_room(task)
+    if room not in VALUED_QUEUE_ROOMS:
+        return False
+    team_id = task.get('teamId')
+    if not team_id and task.get('productId'):
+        team_id = _product_director(state, task.get('productId'))
+    team = _team_row(state, team_id) if team_id else None
+    if not team:
+        return False
+    # Attribute the re-plan request to the owning team's SM (or its director),
+    # so _refinement_team resolves it back to this team for grooming.
+    filer = _escalation_scrum_master_for(state, team.get('directorId') or team.get('id'))
+    if not filer:
+        filer = team.get('directorId') or team.get('id')
+    reason = ('Swept as stale in-flight work after repeated re-issues; the scrum '
+              'master decides whether this still needs doing. '
+              'ABS_REPLAN: this card no longer resolves on its own.')
+    if not file_work_request(state, filer, (task.get('title') or 'stale work')[:120],
+                             room, reason=reason):
+        return False
+    kick_refinement_now(state, team.get('directorId') or team.get('id'), now_ms)
+    return True
+
+
+def _sm_help_stuck_worker(state, task, now_ms):
+    """W4: route a worker-stuck help signal to the owning team's scrum master.
+    A worker whose content execution keeps FAILING is genuinely stuck; the SM
+    gets a work-request so they can help/re-plan (accept -> new story, reject ->
+    dropped, both bounded). Mirrors _sm_replan_stale_work's routing; returns
+    True when the request was filed for a real team."""
+    room = task.get('room') or _resolve_assignment_room(task)
+    if room not in VALUED_QUEUE_ROOMS:
+        return False
+    team_id = task.get('teamId')
+    if not team_id and task.get('productId'):
+        team_id = _product_director(state, task.get('productId'))
+    team = _team_row(state, team_id) if team_id else None
+    if not team:
+        return False
+    filer = _escalation_scrum_master_for(state, team.get('directorId') or team.get('id'))
+    if not filer:
+        filer = team.get('directorId') or team.get('id')
+    reason = ('A worker is stuck: repeated content-execution failures on this card. '
+              'The scrum master decides whether this still needs doing, or whether '
+              'the worker needs help / a different assignment.')
+    if not file_work_request(state, filer, (task.get('title') or 'stuck work')[:120],
+                             room, reason=reason):
+        return False
+    kick_refinement_now(state, team.get('directorId') or team.get('id'), now_ms)
+    return True
+
+
+def _worker_stuck_help_signal(state, agent_id, task, result_ok, now_ms):
+    """W4: worker stuck/help signal. Tracks CONSECUTIVE content-execution
+    failures per worker (a content result with ok=False -- a crash, or a red
+    pipeline). A clean result resets the streak. Once the streak crosses
+    WORKER_HELP_AFTER_FAILS, route a help signal to the owning team's scrum
+    master (_sm_help_stuck_worker) and log governance, then reset the streak so
+    the signal fires once per consecutive-failure run (the SM request dedups
+    anyway, so no spam). Pure state mutation; called from the content-result
+    branch of _task_cycle."""
+    if result_ok:
+        a = (state.get('agents') or {}).get(agent_id)
+        if a:
+            a['_contentFailStreak'] = 0
+        return
+    a = (state.get('agents') or {}).get(agent_id)
+    if not a:
+        return
+    streak = a.get('_contentFailStreak', 0) + 1
+    a['_contentFailStreak'] = streak
+    if streak < WORKER_HELP_AFTER_FAILS:
+        return
+    a['_contentFailStreak'] = 0  # re-arm only after a fresh clean result
+    routed = _sm_help_stuck_worker(state, task, now_ms)
+    _log_governance(state, 'admin', 'worker_stuck_help',
+                    {'agent': agent_id, 'task': task.get('id'),
+                     'title': (task.get('title') or '')[:120],
+                     'failures': streak, 'routed': routed})
+
+
+def _coaching_loop_step(state, now_ms):
+    """W5: daily coaching catch-up sweep. _coach_low_grade only fires when a
+    low-graded deliverable actually lands; a worker who then goes quiet could
+    absorb one coaching note and never improve, with the loop never checking
+    back. On a coarse cadence, this sweep re-checks every agent who HAS a
+    coaching plan (low_grade or team_health) applied: if their real trailing
+    grade is STILL below the floor, the coaching hasn't landed. Re-coaches
+    (round-aware, same cap as _coach_low_grade) or escalates through the same
+    bounded path -- a worker can't silently absorb an ignored plan forever.
+    Bounded: the cap limits rounds, and escalation dedups via the SM work-
+    request, so the sweep can't spin. Pure state mutation; runs before the
+    idle gate on the cadence, no-op otherwise."""
+    if now_ms - (state.get('lastCoachingLoop') or 0) < COACHING_LOOP_CADENCE_MS:
+        return 0
+    state['lastCoachingLoop'] = now_ms
+    plans = state.get('growthPlans') or {}
+    checked = 0
+    for agent_id, agent_plans in list(plans.items()):
+        if not isinstance(agent_plans, list):
+            continue
+        if not any(p.get('kind') in ('low_grade', 'team_health') for p in agent_plans):
+            continue
+        grade = _agent_trailing_grade(state, agent_id)
+        if grade is None or grade >= DELIVERABLE_GRADE_FLOOR:
+            continue
+        a = (state.get('agents') or {}).get(agent_id) or {}
+        room = (a.get('room') or 'pressoffice') if isinstance(a.get('room'), str) else 'pressoffice'
+        if room not in VALUED_QUEUE_ROOMS:
+            room = 'pressoffice'
+        _coach_low_grade(state, agent_id, room, grade, now_ms, 'follow-up review')
+        checked += 1
+    return checked
+
+
 def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     """The server-side heart of Phase 3 slice 1: one consumption pass over the
     persistent workQueue, mirroring the browser's runTaskCycleBody (tasks.js:350),
@@ -7646,6 +9055,20 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # treating the think tank as done. Cheap: no-op unless such a task exists.
     _reclaim_orphaned_walking_tasks(state)
 
+    # SM gap 1: age-based stale in-flight work sweep. A held non-bug card
+    # wedged past any legitimate budget (walking forever, or still working long
+    # after workUntil) is re-queued once, then routed to the owning scrum master
+    # to re-plan. Runs before the idle gate on a coarse cadence (no-op unless a
+    # card is genuinely wedged).
+    _stale_work_step(state, now, now_ms)
+
+    # W5: daily coaching catch-up sweep. Re-checks agents with an applied
+    # coaching plan whose real trailing grade is still below the floor, and
+    # re-coaches/escalates (bounded) -- coaching can't be absorbed once and
+    # ignored forever. Runs before the idle gate on a coarse cadence (no-op
+    # unless someone is still under the floor).
+    _coaching_loop_step(state, now_ms)
+
     # Weekly cross-team Knowledge Social: convene/resolve the 30-minute Hangout
     # conversation for eligible (week's-work) agents. Runs ungated -- the
     # conversation is the point even on an otherwise-idle think tank, and must not
@@ -7657,6 +9080,14 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # the Social (the ceremony is the point even on a quiet think tank) but no-ops
     # when there are no pending requests or no scrum master to run it.
     _refinement_step(state, now, now_ms)
+
+    # Sprint staffing: the breakdown ceremony -- a staffable large ask filed by
+    # the free authority is carded into stories/spikes by the receiving team's
+    # scrum master + workers. Runs ungated like its ceremony siblings (a staffed
+    # large ask is the point even on a quiet think tank); no-ops with nothing
+    # pending or no scrum master to run it, and defers a team in an active
+    # sprint until it's free.
+    _breakdown_step(state, now, now_ms)
 
     # WS-14: sprint retrospectives -- a just-closed sprint's team meets to capture
     # START / STOP / CONTINUE (director excluded) on a later pass. Runs ungated
@@ -7703,6 +9134,15 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
             continue
         tid = a.get('task')
         tasks = state.get('tasks') or {}
+        # W1: a PAIR NAVIGATOR is busy with no task of her own -- she rides
+        # along on the driver's (pairTaskId). Clearing her busy as a stale
+        # token would yank her out of a live pair session mid-work. Only a
+        # true stale hold (busy referencing a gone/non-working task, or busy
+        # with no task AND no pair session) is a legitimate repair target.
+        nav_tid = a.get('pairTaskId')
+        if (nav_tid and not a.get('task')
+                and (tasks.get(nav_tid) or {}).get('status') == 'working'):
+            continue  # a paired navigator mid-session -- leave the hold alone
         if tid and (tasks.get(tid) or {}).get('status') in ('working',):
             continue  # legitimately mid-task -- leave the hold alone
         a['busy'] = False
@@ -7751,7 +9191,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 # Content landed -- mirror the JS Promise.race: finalize as soon
                 # as the real work resolves (the min-visual floor is satisfied by
                 # the network round-trips), not when the timeout ceiling hits.
-                _apply_content_result(state, task, result)
+                _apply_content_result(state, task, result, now_ms)
                 # Bot Ops / shadow mode: a dry-run task ships nothing. Capture the
                 # outcome to the shadow ledger and release the agent, skipping the
                 # peer gate / quality gate / credits entirely.
@@ -7766,6 +9206,30 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 # ok=True (its verdict rides in peerVerdict), so this check never
                 # disturbs a normal gate vote.
                 result_ok = bool(result.get('ok', True))
+                # W4: worker stuck/help signal. A content result with ok=False
+                # (a content-executor crash, or a red pipeline) is a FAILURE --
+                # track consecutive failures per worker and route a help signal
+                # to the owning team's scrum master once the streak crosses the
+                # threshold, so a wedged worker is surfaced, not silently
+                # churning. Runs for every landed content result (reviews always
+                # report ok=True, so they never trip it).
+                _worker_stuck_help_signal(state, aid, task, result_ok, now_ms)
+                # Completion evidence is mandatory for ALL content work: a result
+                # that reports success but carries NO completion note (no evidence
+                # of what was actually done, or where it lives) is not completed.
+                # The card goes back to its author as a gap (see
+                # _send_back_after_failure) -- never a silent empty 'done'. Review
+                # subtasks are exempt (their verdict folds in during
+                # _apply_content_result and an empty note there is not a missing
+                # deliverable).
+                if result_ok and not (task.get('note') or '').strip() \
+                        and task.get('_contentInFlight') and not task.get('reviewOf'):
+                    _release_agent_after_failure(state, aid, task)
+                    _send_back_after_failure(
+                        state, task,
+                        fail_note='missing completion evidence: the work reported success but produced no note of what was done or where it lives')
+                    send_agent_off_duty(state, aid, doors, grid)
+                    continue
                 # Phase E addendum: completion is gated for deliverable rooms.
                 # A review/fix subtask (has reviewOf) folds its vote already in
                 # _apply_content_result; a primary deliverable task that has NEVER
@@ -7938,6 +9402,143 @@ def _park_idle_wanderers(state):
     return parked
 
 
+def _feature_affinity(state, agent_id, pick):
+    """Feature affinity score: how many PRIOR tasks `agent_id` completed that
+    match the picked work's feature signature -- same room, same feature (the
+    task's projectLabel, which assignment also folds the goal into), or same
+    product. A cheap counter over the durable tasks map, no model call. The
+    assignment loop uses it as a SOFT pull toward the person who already knows
+    the corner of the think tank this item belongs to."""
+    tasks = state.get('tasks') or {}
+    room = pick.get('room')
+    feature = pick.get('projectLabel') or pick.get('goal')
+    product_id = pick.get('productId')
+    score = 0
+    for t in tasks.values():
+        if t.get('status') != 'done' or t.get('assignedTo') != agent_id:
+            continue
+        if room and t.get('room') == room:
+            score += 1
+        if feature and (t.get('projectLabel') == feature or t.get('goal') == feature):
+            score += 1
+        if product_id and t.get('productId') == product_id:
+            score += 1
+    return score
+
+
+# A tiny stopword list for onboarding description-affinity: enough to strip
+# connective noise so the overlap counter keys on real content words. A fuller
+# NLP approach is overkill -- this is a SOFT pull, never a lock.
+_DESCRIPTION_STOPWORDS = frozenset({
+    'the', 'a', 'an', 'and', 'or', 'to', 'of', 'for', 'with', 'on', 'in',
+    'at', 'by', 'your', 'their', 'our', 'you', 'them', 'from', 'into', 'via',
+    'this', 'that', 'they', 'work', 'who', 'what', 'pick', 'up', 'picking',
+})
+
+
+def _description_affinity(state, agent_id, pick):
+    """Onboarding affinity: how well `agent_id`'s DESCRIPTION matches the picked
+    work. A brand-new hire has no completed-work history, so feature affinity
+    (_feature_affinity) can never route them -- they fall to pure round-robin.
+    This scores the agent's role / mission / profile instructions / access grant
+    against the task's own text (title + instructions + goal + projectLabel +
+    room) by meaningful-token overlap, so a new team member is handed the work
+    that fits their description instead of being chosen last. Cheap + deterministic
+    (no model call); the assignment loop uses it as a soft pull exactly like
+    feature affinity."""
+    roster_def = next((d for d in (state.get('agentRoster') or [])
+                       if d.get('id') == agent_id), None)
+    if not roster_def:
+        return 0
+    desc_parts = [
+        roster_def.get('role') or '',
+        roster_def.get('description') or '',
+        roster_def.get('specialty') or '',
+    ]
+    profile = roster_def.get('profile') or {}
+    if isinstance(profile, dict):
+        desc_parts.append(profile.get('mission') or '')
+        instr = profile.get('instructions')
+        if isinstance(instr, list):
+            desc_parts.extend(str(i) for i in instr)
+        elif instr:
+            desc_parts.append(str(instr))
+    desc_tokens = set()
+    for part in desc_parts:
+        desc_tokens.update(_description_tokens(part))
+    if not desc_tokens:
+        return 0
+    task_tokens = set()
+    for field in ('title', 'instructions', 'goal', 'projectLabel'):
+        task_tokens.update(_description_tokens(pick.get(field)))
+    task_tokens.update(_description_tokens(pick.get('room')))
+    if not task_tokens:
+        return 0
+    return len(task_tokens & desc_tokens)
+
+
+def _description_tokens(text):
+    if not text:
+        return []
+    out = []
+    for tok in str(text).lower().split():
+        clean = ''.join(ch for ch in tok if ch.isalnum())
+        if clean and clean not in _DESCRIPTION_STOPWORDS and len(clean) > 2:
+            out.append(clean)
+    return out
+
+
+def _recruit_pair_navigator(state, driver_id, task, can_wake_off_duty, grid, doors, now_ms):
+    """W1: server-owned pair recruitment. The client's assignPairTask recruits a
+    navigator and walks her over; the server previously assigned a `pair` card
+    SOLO (no navigator ever joined). Recruits the next most-idle eligible
+    candidate deterministically (round-robin, zero JEV spend, mirrors
+    _assign_due_item), walks her to a free spot beside the driver's door, and
+    marks her as the task's navigator (pairWith/pairTaskId/path). The driver's
+    own walk was already issued by the caller. Returns the navigator id, or
+    None when no second eligible hand exists (the driver proceeds solo, the
+    same graceful degradation the client's assignPairTask has when the pool is
+    too thin)."""
+    agents = state.get('agents') or {}
+    candidates = _eligible_candidates(state, can_wake_off_duty)
+    ordered = [cid for cid in candidates if cid != driver_id]
+    if not ordered:
+        return None
+    # Round-robin over eligible ids (deterministic, stable roster order).
+    rr = state.setdefault('sim', {}).setdefault('rr', {})
+    pointer = rr.get('pair', 0)
+    idx = pointer % len(ordered)
+    nav_id = ordered[idx]
+    rr['pair'] = (pointer + 1) % max(1, len(ordered))
+    nav = agents.get(nav_id)
+    if not nav:
+        return None
+    if nav.get('offDuty'):
+        appear_from_outskirts(state, nav_id, doors)
+    room = task.get('room')
+    door = (doors or {}).get(room)
+    if not door:
+        return None
+    base_x = door['x'] + door['w'] / 2
+    base_y = door['y'] + door['h'] + 4
+    # Try several offsets beside the door (mirrors assignPairTask's own
+    # "try offsets that clear the walkable strip" loop).
+    for dx in PAIR_WALK_OFFSETS:
+        path = find_path(nav['x'], nav['y'], base_x + dx, base_y, nav_id, agents, grid)
+        if path and len(path) > 0:
+            nav['pairWith'] = driver_id
+            nav['pairTaskId'] = task['id']
+            nav['path'] = path
+            nav['pathIndex'] = 0
+            nav['pathTarget'] = {'x': base_x + dx, 'y': base_y}
+            nav['stuckTimer'] = 0
+            nav['replanCount'] = 0
+            nav['respawnedForTask'] = False
+            task['pairWith'] = nav_id
+            return nav_id
+    return None
+
+
 def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_id_holder=None):
     """Deterministic assignment of one due queue item: pick the most-idle
     eligible candidate (round-robin, zero JEV spend), wake her if off-duty,
@@ -7961,13 +9562,22 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     # on-call -- same wake semantics as a reviewer pin, even with no reviewOf.
     # Theo routing: directRoute is the same pin/wake treatment for
     # a spike the classifier attributed to a specific team's worker.
-    pinned = pick.get('assignedTo') if (pick.get('reviewOf') or pick.get('incident')
-                                         or pick.get('_mailResume') or pick.get('directRoute')) else None
+    # Sprint rollover: a card re-planned by refinement carries `_reassignedTo`,
+    # a fresh explicit owner for the next sprint -- honored as a (soft) pin.
+    pin_kind = (pick.get('reviewOf') or pick.get('incident')
+                or pick.get('_mailResume') or pick.get('directRoute')
+                or pick.get('_reassignedTo'))
+    pinned = (pick.get('assignedTo') or pick.get('_reassignedTo')) if pin_kind else None
     if pinned and agents.get(pinned):
         pinned_agent = agents.get(pinned)
         if not pinned_agent.get('busy') and not pinned_agent.get('task') and not pinned_agent.get('pairWith'):
             chosen_id = pinned
-            if pinned_agent.get('offDuty'):
+            # A reviewer/incident pin wakes AT THE TARGET ROOM'S DOOR (short,
+            # reliable walk to judge the work); a refinement re-plan pin is not
+            # tied to a specific desk, so it wakes via the generic outskirts
+            # placement (see appear_from_outskirts below) -- same reachability
+            # guarantee, no door-geometry coupling.
+            if pinned_agent.get('offDuty') and not pick.get('_reassignedTo'):
                 # Wake a reviewer at the REVIEW TARGET'S OWN door approach: the reviewer
                 # is judging the author's work at that desk, so placing her at
                 # the room's own door gives a short, reliable path.
@@ -8012,6 +9622,12 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         team_id = pick.get('teamId')
         if team_id:
             team_members = set(_sim_direct_reports(state, team_id))
+            # Cross-team borrowing: an agent loaned to this team (roster `loan`
+            # tag) is part of the assignment pool for the loan's duration, so
+            # the borrower team's sprint items are soft-preferred to them too.
+            for d in (state.get('agentRoster') or []):
+                if d.get('loan') and d['loan'].get('teamId') == team_id:
+                    team_members.add(d['id'])
             team_ordered = [cid for cid in ordered if cid in team_members]
             if team_ordered:
                 ordered = team_ordered
@@ -8026,6 +9642,27 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         cool = [cid for cid in ordered if _agent_failure_score(state, cid, now_ms) < FAILURE_COOLDOWN_THRESHOLD]
         if cool:
             ordered = cool
+        # Feature affinity: SOFT pull toward an agent who has completed similar
+        # work before (same room / feature / product), so a team's backlog items
+        # gravitate to the person who already knows that corner of the tank.
+        # Same "soft preference, never a hard lock" shape: only narrow when
+        # someone has a nonzero history, ties preserve roster order, and a
+        # candidate with no matching history is never forced off the queue.
+        scored = [(cid, _feature_affinity(state, cid, pick)) for cid in ordered]
+        best_affinity = max((s for _, s in scored), default=0)
+        if best_affinity > 0:
+            ordered = [cid for cid, s in scored if s == best_affinity]
+        else:
+            # Onboarding: with nobody having prior work that matches this item
+            # (a brand-new team member has NO history, so feature affinity can
+            # never route to them -- they'd fall to pure round-robin), soft-pull
+            # toward the candidate whose DESCRIPTION fits the work. Same soft,
+            # never-a-lock shape: only narrow when someone's description actually
+            # matches, and ties keep roster order.
+            desc = [(cid, _description_affinity(state, cid, pick)) for cid in ordered]
+            best_desc = max((s for _, s in desc), default=0)
+            if best_desc > 0:
+                ordered = [cid for cid, s in desc if s == best_desc]
         idx = pointer % len(ordered)
         chosen_id = ordered[idx]
         rr['task'] = (pointer + 1) % max(1, len(ordered))
@@ -8049,9 +9686,14 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # silently never applied. See assign_task's own 'distill' field below,
         # which was equally missing.
         'distill': pick.get('distill'),
+        'kbClass': pick.get('kbClass'),
+        'dependsOn': pick.get('dependsOn'),
         # Phase E2b: a SPIKE's advisory time-budget (the executor keeps its
         # single model call short to honor it).
         'budgetMs': pick.get('budgetMs'),
+        # A breakdown story's size estimate rides onto the task so executors and
+        # dashboards can see effort (see queue_work / assign_task).
+        'sizeEstimate': pick.get('sizeEstimate'),
         'reviewOf': pick.get('reviewOf'),
         'reviewAuthorId': pick.get('reviewAuthorId'),
         # Phase E2d: an INCIDENT routes to the owning team's on-call (taskType
@@ -8077,6 +9719,13 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     instructions = _augment_task_instructions(
         state, chosen_id, pick.get('productId'), pick.get('instructions'),
         refocus=bool(pick.get('reviewOf') or pick.get('incident')))
-    return assign_task(state, chosen_id, pick.get('title'), pick.get('room'),
+    task = assign_task(state, chosen_id, pick.get('title'), pick.get('room'),
                        instructions, pick.get('projectLabel') or pick.get('goal'), extra,
                        grid, doors, now_ms, task_id_holder or _TASK_ID_HOLDER)
+    # W1: a `pair` card recruits a navigator server-side (deterministic
+    # round-robin, zero JEV). The driver keeps the solo walk when no second
+    # eligible hand exists -- graceful degradation, never a stuck card.
+    if task and pick.get('pair') and not pick.get('reviewOf') and not pick.get('incident'):
+        _recruit_pair_navigator(state, chosen_id, task, can_wake_off_duty,
+                                grid, doors, now_ms)
+    return task

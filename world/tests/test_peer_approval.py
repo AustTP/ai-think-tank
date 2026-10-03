@@ -532,5 +532,81 @@ class BoundedReviewEscalation(unittest.TestCase):
         esc.assert_not_called()
 
 
+class ReviewDenialCoaching(unittest.TestCase):
+    """W6: a peer-review DENIAL must land its rationale on the AUTHOR's growth
+    plan (kind 'review_denial', repeat=True) so the rejection changes the
+    author's NEXT execution -- a coaching note routed to their next task, not
+    just a one-time mailbox message. Covers both the plain 'actionable' fold and
+    the Cut-4 downgrade (a 'clean' verdict with a red pipeline)."""
+
+    def _gated_state(self):
+        state = _state()
+        task = _task()
+        state['tasks'][task['id']] = task
+        sim._enter_peer_review(state, task, now_ms=1000)
+        return state, task
+
+    def _reject(self, state, verdict='actionable', rationale='bad code', pipeline_ok=True):
+        parent_id = next(iter(state['tasks']))
+        review_task = {'id': f'rev-{verdict}-{rationale}', 'reviewOf': parent_id,
+                       'assignedTo': 'ada', 'taskType': 'review', 'status': 'working'}
+        result = {'note': rationale, 'peerVerdict': verdict}
+        if verdict == 'clean':
+            result['pipelineOk'] = pipeline_ok
+        sim._apply_content_result(state, review_task, result)
+        return state['tasks'][parent_id]
+
+    def _denial_notes(self, state):
+        return [p for p in state.get('growthPlans', {}).get('ben', [])
+                if p.get('kind') == 'review_denial']
+
+    def test_actionable_denial_writes_a_growth_plan_note_for_the_author(self):
+        state, task = self._gated_state()
+        self._reject(state, verdict='actionable', rationale='the total is computed wrong')
+        notes = self._denial_notes(state)
+        self.assertEqual(len(notes), 1, 'a denial writes exactly one coaching note')
+        self.assertIn('computed wrong', notes[0]['note'],
+                      'the reviewer\'s rationale is carried into the note')
+        self.assertIn('Build the checkout flow', notes[0]['note'],
+                      'the note names the rejected story')
+        self.assertFalse(notes[0]['applied'], 'queued for the author\'s NEXT task')
+
+    def test_clean_with_red_pipeline_is_downgraded_to_a_denial_note(self):
+        # Cut 4: a 'clean' vote on a red pipeline reads as a denial -- it must
+        # also coach the author.
+        state, task = self._gated_state()
+        self._reject(state, verdict='clean', rationale='pipeline red', pipeline_ok=False)
+        notes = self._denial_notes(state)
+        self.assertEqual(len(notes), 1)
+        self.assertIn('pipeline red', notes[0]['note'])
+
+    def test_repeated_denials_re_coach_each_time(self):
+        # repeat=True: each new denial is a fresh coaching note, so a worker
+        # who keeps getting sent back keeps getting re-coached (W5 coaching loop).
+        state, task = self._gated_state()
+        for i in range(3):
+            self._reject(state, verdict='actionable', rationale=f'problem {i}')
+        notes = self._denial_notes(state)
+        self.assertEqual(len(notes), 3, 'each denial lands a fresh note')
+        for i in range(3):
+            self.assertIn(f'problem {i}', notes[i]['note'])
+
+    def test_denial_note_flows_to_the_authors_next_task(self):
+        state, task = self._gated_state()
+        self._reject(state, verdict='actionable', rationale='missing error handling')
+        coaching = sim._coaching_note_for(state, 'ben')
+        self.assertIsNotNone(coaching, 'the denial note is served to the next task')
+        self.assertIn('missing error handling', coaching)
+        self.assertIsNone(sim._coaching_note_for(state, 'ben'),
+                          'each note is applied exactly once')
+
+    def test_clean_approval_never_writes_a_denial_note(self):
+        state, task = self._gated_state()
+        parent = self._reject(state, verdict='clean', rationale='looks solid', pipeline_ok=True)
+        self.assertEqual(parent['_peerGate']['approvals'], 1, 'a clean vote counts')
+        self.assertEqual(self._denial_notes(state), [],
+                          'a genuine approval must never coach as a denial')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

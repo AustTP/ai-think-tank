@@ -28,6 +28,7 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import serve
+import sim
 
 # Module-wide safety net: most classes below already redirect
 # DB_PATH themselves in their own setUp (their own temp dir layers on top of
@@ -907,6 +908,11 @@ class HealthChecks(unittest.TestCase):
             'ceremony_signal': 0.0,
             'progress_signal': 0.0,
             'ceremony_imbalance_score': 0.0,
+            'aging_in_flight_work': 0,
+            'open_escalations': 0,
+            'bank_over_cap': [],
+            'bank_used': 0.0,
+            'bank_cap': 0.0,
         }
         base.update(overrides)
         return base
@@ -1152,6 +1158,140 @@ class HealthChecks(unittest.TestCase):
             ceremony_signal=12.0, progress_signal=10.0,
         ))
         self.assertEqual(alerts, [])
+
+    def test_aging_in_flight_work_raises_a_warning(self):
+        # Admin gap 1: wedged in-flight work the stale-work sweep hasn't
+        # re-planned yet is a digest-worthy warning, not a silent wait.
+        alerts = serve._health_alerts_for_signals(self._signals(aging_in_flight_work=2))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['category'], 'work_queue')
+        self.assertEqual(alerts[0]['severity'], 'warning')
+        self.assertIn('wedged', alerts[0]['message'])
+
+    def test_no_aging_work_raises_nothing(self):
+        self.assertEqual(serve._health_alerts_for_signals(self._signals(aging_in_flight_work=0)), [])
+
+    def test_a_single_open_escalation_raises_nothing(self):
+        # One pending escalation is normal incident response -- only a stack
+        # of unresolved products is a backing-up signal.
+        alerts = serve._health_alerts_for_signals(self._signals(open_escalations=1))
+        self.assertEqual(alerts, [])
+
+    def test_two_open_escalations_raise_a_warning(self):
+        alerts = serve._health_alerts_for_signals(self._signals(open_escalations=2))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['category'], 'escalations')
+        self.assertEqual(alerts[0]['severity'], 'warning')
+
+    def test_bank_over_cap_raises_a_warning_naming_the_services(self):
+        # Spend is real money -- the director teller's warning surfaced to the
+        # admin digest, not just a bank-room readout a director opens on purpose.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            bank_over_cap=['openrouter'], bank_used=12.0, bank_cap=10.0,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['category'], 'bank')
+        self.assertEqual(alerts[0]['severity'], 'warning')
+        self.assertIn('openrouter', alerts[0]['message'])
+        self.assertIn('12.00', alerts[0]['message'])
+
+    def test_bank_within_cap_raises_nothing(self):
+        self.assertEqual(serve._health_alerts_for_signals(self._signals(
+            bank_over_cap=[], bank_used=4.0, bank_cap=100.0,
+        )), [])
+
+
+class AgingInFlightWork(unittest.TestCase):
+    """Admin gap 1: the health snapshot's mirror of sim's stale-work sweep --
+    counts non-bug tasks wedged past their budget (walking forever, or still
+    working long after workUntil). Pure read over a state blob."""
+
+    def _task(self, status, opened=None, work_until=None, **over):
+        base = {'id': 'task-1', 'status': status, 'taskType': 'code',
+                'title': 'Fix the weather', 'room': 'pressoffice',
+                'createdAt': opened or 0, 'openedAt': opened or 0}
+        if work_until is not None:
+            base['workUntil'] = work_until
+        base.update(over)
+        return base
+
+    def test_working_task_long_past_work_until_is_aging(self):
+        now_ms = 1_725_000_000_000
+        task = self._task('working', opened=now_ms - 1000,
+                          work_until=now_ms / 1000 - sim.STALE_WORK_BUDGET_GRACE_S - 60)
+        self.assertEqual(serve._aging_in_flight_work({'tasks': {'t1': task}}, now_ms), 1)
+
+    def test_working_task_within_budget_is_not_aging(self):
+        now_ms = 1_725_000_000_000
+        task = self._task('working', opened=now_ms - 1000,
+                          work_until=now_ms / 1000 + 5)
+        self.assertEqual(serve._aging_in_flight_work({'tasks': {'t1': task}}, now_ms), 0)
+
+    def test_walking_task_older_than_ceiling_is_aging(self):
+        now_ms = 1_725_000_000_000
+        task = self._task('walking', opened=now_ms - sim.STALE_WORK_TIMEOUT_MS - 1)
+        self.assertEqual(serve._aging_in_flight_work({'tasks': {'t1': task}}, now_ms), 1)
+
+    def test_fresh_walking_task_is_not_aging(self):
+        now_ms = 1_725_000_000_000
+        task = self._task('walking', opened=now_ms - 1000)
+        self.assertEqual(serve._aging_in_flight_work({'tasks': {'t1': task}}, now_ms), 0)
+
+    def test_bugs_shadows_and_reviews_never_count_as_aging(self):
+        now_ms = 1_725_000_000_000
+        stale = now_ms - sim.STALE_WORK_TIMEOUT_MS - 1
+        bugs = self._task('walking', opened=stale, taskType='bug')
+        shadow = self._task('working', opened=stale,
+                            work_until=now_ms / 1000 - sim.STALE_WORK_BUDGET_GRACE_S - 60,
+                            shadow=True)
+        review = self._task('working', opened=stale, reviewOf='task-0',
+                            work_until=now_ms / 1000 - sim.STALE_WORK_BUDGET_GRACE_S - 60)
+        self.assertEqual(serve._aging_in_flight_work(
+            {'tasks': {'b': bugs, 's': shadow, 'r': review}}, now_ms), 0)
+
+    def test_missing_or_empty_tasks_dict_counts_zero(self):
+        self.assertEqual(serve._aging_in_flight_work({}, 1_725_000_000_000), 0)
+        self.assertEqual(serve._aging_in_flight_work({'tasks': {}}, 1_725_000_000_000), 0)
+
+
+class HealthDigestMarkdown(unittest.TestCase):
+    """Admin gap 1: the periodic health digest is a readable markdown combining
+    alerts + Bank + aging work + escalations. Pure text assembly -- testable
+    with a synthetic snapshot, no DB or files."""
+
+    def _snapshot(self, **over):
+        base = {
+            'checked_at': 1_725_000_000,
+            'alerts': [{'category': 'bank', 'severity': 'warning',
+                        'message': 'over-cap spend on: openrouter'}],
+            'bank_used': 12.0, 'bank_cap': 10.0, 'bank_over_cap': ['openrouter'],
+            'aging_in_flight_work': 1, 'open_escalations': 0,
+        }
+        base.update(over)
+        return base
+
+    def test_digest_mentions_alerts_bank_aging_and_escalations(self):
+        md = serve._health_digest_markdown(self._snapshot())
+        self.assertIn('# Think Tank Health Digest', md)
+        self.assertIn('1 active alert(s)', md)
+        self.assertIn('over-cap', md)
+        self.assertIn('Bank:', md)
+        self.assertIn('12.00', md)
+        self.assertIn('Aging in-flight work:', md)
+        self.assertIn('Open escalations:', md)
+
+    def test_digest_no_alerts_and_clean_bank_reads_quiet(self):
+        md = serve._health_digest_markdown(self._snapshot(
+            alerts=[], bank_used=4.0, bank_cap=100.0, bank_over_cap=[],
+            aging_in_flight_work=0, open_escalations=0,
+        ))
+        self.assertIn('No active alerts.', md)
+        self.assertNotIn('OVER CAP', md)
+        self.assertIn('0 non-bug task(s)', md)
+
+    def test_digest_names_over_cap_services(self):
+        md = serve._health_digest_markdown(self._snapshot())
+        self.assertIn('OVER CAP on openrouter', md)
 
 
 class CoordinationImbalanceScalar(unittest.TestCase):
@@ -2134,6 +2274,80 @@ class PassportDecisionChain(unittest.TestCase):
             asyncio.run(serve.write_library_file(req))
         writes = [b for b in serve._load_passport()['blocks'] if b.get('kind') == 'library_write']
         self.assertEqual(len(writes), 2, 'each write/modify must be its own chained block')
+
+
+class WikiDeleteGuard(unittest.TestCase):
+    """The live wiki tree (library/wiki/) is the curated, director-gated
+    knowledge layer. The generic library write/promote endpoints must not become
+    a back door for an agent to overwrite or blank a live wiki page -- those only
+    change through write_wiki_page (version-bumped + passport-chained)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='wiki-delete-guard-test-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            THINK_TANK_DIR=self.tmp,
+            AGENTS_DIR=os.path.join(self.tmp, 'agents'),
+            LIBRARY_DIR=os.path.join(self.tmp, 'library'),
+            PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
+        )
+        self._cm.start()
+        serve.init_db()
+        os.makedirs(os.path.join(self.tmp, 'library'), exist_ok=True)
+
+    def tearDown(self):
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_generic_library_write_cannot_touch_live_wiki(self):
+        import asyncio
+        from unittest.mock import MagicMock, AsyncMock
+        dev_key = serve.get_or_create_agent_key('dev')
+        req = MagicMock(headers={'X-Agent-Key': dev_key})
+        req.json = AsyncMock(return_value={
+            'agentId': 'dev', 'path': 'wiki/observations/foo.md',
+            'content': 'sneaky', 'source': 'firsthand',
+        })
+        resp = asyncio.run(serve.write_library_file(req))
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(os.path.exists(os.path.join(serve.LIBRARY_DIR, 'wiki', 'observations', 'foo.md')))
+
+    def test_generic_library_write_cannot_drop_files_into_propose_quarantine(self):
+        # pending_review/wiki/ is the propose lane's own namespace; the generic
+        # endpoint must not bypass propose's id/path validation.
+        import asyncio
+        from unittest.mock import MagicMock, AsyncMock
+        dev_key = serve.get_or_create_agent_key('dev')
+        req = MagicMock(headers={'X-Agent-Key': dev_key})
+        req.json = AsyncMock(return_value={
+            'agentId': 'dev', 'path': 'pending_review/wiki/general/evil.md',
+            'content': 'sneaky', 'source': 'external',
+        })
+        resp = asyncio.run(serve.write_library_file(req))
+        self.assertEqual(resp.status_code, 403)
+
+    def test_promote_cannot_clobber_a_live_wiki_page(self):
+        import asyncio
+        from unittest.mock import MagicMock, AsyncMock
+        dev_key = serve.get_or_create_agent_key('dev')
+        wiki_page = os.path.join(serve.LIBRARY_DIR, 'wiki', 'observations', 'foo.md')
+        os.makedirs(os.path.dirname(wiki_page), exist_ok=True)
+        with open(wiki_page, 'w') as f:
+            f.write('ORIGINAL TRUSTED BODY')
+        pending = os.path.join(serve.LIBRARY_DIR, 'pending_review', 'wiki', 'observations', 'foo.md')
+        os.makedirs(os.path.dirname(pending), exist_ok=True)
+        with open(pending, 'w') as f:
+            f.write('untrusted attacker content')
+        req = MagicMock(headers={'X-Agent-Key': dev_key})
+        req.json = AsyncMock(return_value={
+            'agentId': 'dev', 'path': 'pending_review/wiki/observations/foo.md',
+        })
+        resp = asyncio.run(serve.library_promote(req))
+        self.assertEqual(resp.status_code, 403)
+        with open(wiki_page, 'r') as f:
+            self.assertEqual(f.read(), 'ORIGINAL TRUSTED BODY',
+                             'the live wiki page must survive the promote attempt')
 
 
 class JevChoiceExtraction(unittest.TestCase):
@@ -3185,26 +3399,27 @@ class RemainingExecutors(unittest.TestCase):
     def test_weather_notes_and_recorded(self):
         self._patch_store()
         try:
-            with unittest.mock.patch.object(serve, '_http_json',
-                                            self._fake_http(browse=[{'allowed': True, 'text': 'Weather is unpredictable today.'}]),
-                                            create=False):
+            with unittest.mock.patch.object(serve, '_weather_fetch',
+                                            return_value='28.4C, moderate rain'), \
+                 unittest.mock.patch.object(serve, 'WEATHER_LOCATION', 'Charlotte, NC'):
                 serve._run_weather_content({}, 'ada', {'id': 'w1', 'room': 'weatherstation'}, {})
         finally:
             self._restore()
         self.assertIn('w1', self.stored)
         self.assertIn('weather', self.stored['w1']['note'].lower())
+        self.assertIn('Charlotte, NC', self.stored['w1']['note'])
+        self.assertIn('28.4C', self.stored['w1']['note'])
 
-    def test_weather_denied(self):
-        # An unapproved browse -> a soft "wasn't approved" note (no crash).
+    def test_weather_fetch_failure_is_soft(self):
+        # A failed live fetch -> a soft "could not log" note (no crash).
         self._patch_store()
         try:
-            with unittest.mock.patch.object(serve, '_http_json',
-                                            self._fake_http(browse=[{'allowed': False, 'text': ''}]),
-                                            create=False):
+            with unittest.mock.patch.object(serve, '_weather_fetch',
+                                            return_value='__TOOL_ERROR__: weather fetch failed: boom'):
                 serve._run_weather_content({}, 'ada', {'id': 'w2', 'room': 'weatherstation'}, {})
         finally:
             self._restore()
-        self.assertIn('wasn\'t approved', self.stored['w2']['note'])
+        self.assertIn('Could not log live weather', self.stored['w2']['note'])
 
     def test_media_digest_no_feeds(self):
         self._patch_store()
@@ -3730,6 +3945,9 @@ class PlayerIntentEndpoints(unittest.TestCase):
         return {
             'agentRoster': roster,
             'agents': {d['id']: {'name': d['id'], 'busy': False, 'offDuty': False, 'role': 'x'} for d in roster},
+            'teams': [
+                {'id': 'nora', 'name': "Nora's Crew", 'directorId': 'nora', 'scrumMasterId': 'zara'},
+            ],
             'workQueue': [],
             'researchTopics': [],
             'roomDefinitions': room_defs,
@@ -3756,55 +3974,57 @@ class PlayerIntentEndpoints(unittest.TestCase):
             c.get('/api/rooms')
             save.assert_not_called()
 
-    def test_assign_big_task_queues_subtasks_from_model_reply(self):
-        # The free admin (Faye) decomposes a goal; the server queues the
-        # whitelisted subtasks into state and returns the UI-ready shape.
-        fake_reply = {
-            'reply': json.dumps({'subtasks': [
-                {'title': 'build an index', 'room': 'pressoffice', 'instructions': 'one sentence', 'taskType': 'code'},
-                {'title': 'research weather', 'room': 'observatory', 'instructions': 'one sentence',
-                 'priority': 'high', 'notBefore': 'not-a-time'},
-            ]})
-        }
+    def test_assign_big_task_staffs_ask_to_free_team_and_files_breakdown(self):
+        # The free admin (Faye) has no team of her own, so the ask is staffed
+        # to the first free team (Nora's crew) and FILED as a pending large-
+        # request breakdown. No subtasks are predicted or queued up front -- the
+        # receiving team's breakdown ceremony (scrum master + workers) cards
+        # them into stories/spikes on a later pass.
         saved = {}
         with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self._state()), \
              unittest.mock.patch.object(serve, 'save_state_to_db',
                                         side_effect=lambda s: saved.update(s)), \
-             unittest.mock.patch.object(serve, '_http_json', return_value=fake_reply), \
-             unittest.mock.patch.object(serve, 'get_or_create_agent_key', return_value='key'), \
+             unittest.mock.patch.object(serve, '_http_json') as http, \
              unittest.mock.patch.object(serve, 'log_action') as log, \
              unittest.mock.patch.object(serve, 'verify_session', return_value=True):
             c = TestClient(serve.app)
             r = c.post('/api/intent/assign-big-task', json={'goal': 'make the think tank better'})
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
+        self.assertTrue(body['ok'])
+        self.assertTrue(body['staffed'])
         self.assertEqual(body['admin'], 'faye')
-        self.assertEqual(len(body['subtasks']), 2)
-        # Whitelisted rooms survive; the malformed notBefore fails open to None.
-        self.assertEqual([s['room'] for s in body['subtasks']], ['pressoffice', 'observatory'])
-        self.assertEqual(body['subtasks'][1]['notBefore'], None)
-        self.assertEqual(body['subtasks'][1]['priority'], 'high')
-        # The subtasks were queued server-side (durable workQueue).
-        self.assertEqual(len(saved.get('workQueue', [])), 2)
+        self.assertEqual(body['team'], 'nora')
+        self.assertEqual(body['request'], 'wrq-1')
+        self.assertNotIn('subtasks', body)
+        # The ask was filed as a pending breakdown request for Nora's team --
+        # nothing queued, no model call (nothing is predicted up front).
+        req = saved['backlogRequests'][0]
+        self.assertEqual(req['id'], 'wrq-1')
+        self.assertEqual(req['status'], 'pending')
+        self.assertEqual(req['breakdown'], True)
+        self.assertEqual(req['origin'], 'large_request')
+        self.assertEqual(req['teamId'], 'nora')
+        self.assertEqual(saved.get('workQueue', []), [])
+        http.assert_not_called()
         log.assert_called_once()
 
-    def test_assign_big_task_rejects_non_whitelisted_rooms(self):
-        fake_reply = {'reply': json.dumps({'subtasks': [
-            {'title': 'bad', 'room': 'notroom', 'instructions': 'x'},
-            {'title': 'good', 'room': 'bank', 'instructions': 'x'},
-        ]})}
+    def test_assign_big_task_prefers_authority_own_free_team(self):
+        # The free authority is director Nora (the admin is busy); her OWN team
+        # is free, so the ask is staffed to HER team rather than bounced around.
+        state = self._state()
+        state['agents']['faye']['busy'] = True
         saved = {}
-        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self._state()), \
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
              unittest.mock.patch.object(serve, 'save_state_to_db',
                                         side_effect=lambda s: saved.update(s)), \
-             unittest.mock.patch.object(serve, '_http_json', return_value=fake_reply), \
-             unittest.mock.patch.object(serve, 'get_or_create_agent_key', return_value='key'), \
-             unittest.mock.patch.object(serve, 'log_action'), \
              unittest.mock.patch.object(serve, 'verify_session', return_value=True):
             c = TestClient(serve.app)
             r = c.post('/api/intent/assign-big-task', json={'goal': 'task'})
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual([s['room'] for s in r.json()['subtasks']], ['bank'])
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['admin'], 'nora')
+        self.assertEqual(r.json()['team'], 'nora')
+        self.assertEqual(r.json()['request'], 'wrq-1')
 
     def test_assign_big_task_no_free_authority_errors(self):
         state = self._state()
@@ -3828,25 +4048,24 @@ class PlayerIntentEndpoints(unittest.TestCase):
         state = self._state()
         for d in state['agentRoster']:
             state['agents'][d['id']]['offDuty'] = True
-        fake_reply = {'reply': json.dumps({'subtasks': [
-            {'title': 'build an index', 'room': 'pressoffice', 'instructions': 'one sentence', 'taskType': 'code'},
-        ]})}
         saved = {}
         with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
              unittest.mock.patch.object(serve, 'save_state_to_db',
                                         side_effect=lambda s: saved.update(s)), \
-             unittest.mock.patch.object(serve, '_http_json', return_value=fake_reply), \
-             unittest.mock.patch.object(serve, 'get_or_create_agent_key', return_value='key'), \
+             unittest.mock.patch.object(serve, '_http_json') as http, \
              unittest.mock.patch.object(serve, 'log_action'), \
              unittest.mock.patch.object(serve, 'verify_session', return_value=True):
             c = TestClient(serve.app)
             r = c.post('/api/intent/assign-big-task', json={'goal': 'make the think tank better'})
         self.assertEqual(r.status_code, 200, r.text)
-        # Faye (the admin) was woken on-duty and carried out the breakdown.
+        # Faye (the admin) was woken on-duty and staffed the ask to Nora's team.
         self.assertEqual(r.json()['admin'], 'faye')
+        self.assertEqual(r.json()['staffed'], True)
+        self.assertEqual(r.json()['team'], 'nora')
         self.assertEqual(state['agents']['faye']['offDuty'], False)
         self.assertEqual(state['agents']['faye']['visible'], True)
-        self.assertEqual(len(saved.get('workQueue', [])), 1)
+        self.assertEqual(len(saved.get('workQueue', [])), 0)
+        http.assert_not_called()
 
     def test_room_purpose_update_gated_to_director_and_persisted(self):
         state = self._state()
@@ -3972,6 +4191,119 @@ class PlayerIntentEndpoints(unittest.TestCase):
         # The author was told the PLAYER sent their work back.
         author_mail = saved['agents']['ben']['mailbox']
         self.assertTrue(any(m.get('kind') == 'player_veto' for m in author_mail))
+
+    def test_reject_carries_reason_to_author_mailbox(self):
+        # Todo-1 gap: a veto with no reason must still tell the author their
+        # work was sent back (and not claim a reason exists), while a veto WITH
+        # a reason must carry that reason VERBATIM to the author's mailbox so
+        # they can actually rework toward it -- the whole point of the re-entry
+        # loop is that the author learns what the player flagged.
+        state = self._veto_state()
+        state['tasks']['story-1']['_peerGate'] = {
+            'reviewerIds': ['ada', 'cora'], 'approvals': 2, 'approvers': ['ada', 'cora'],
+            'closed': True, 'enteredMs': 1000,
+        }
+        saved = {}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db',
+                                        side_effect=lambda s: saved.update(s)), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            c = TestClient(serve.app)
+            r = c.post('/api/intent/story/story-1/reject',
+                       json={'reason': 'needs an edge case for empty carts'})
+        self.assertEqual(r.status_code, 200, r.text)
+        note = saved['agents']['ben']['mailbox'][0]
+        self.assertEqual(note['kind'], 'player_veto')
+        self.assertIn('needs an edge case for empty carts', note['text'],
+                      'the player\'s veto reason must reach the author verbatim')
+
+    def test_reject_without_reason_still_notes_the_veto_not_a_reason(self):
+        state = self._veto_state()
+        state['tasks']['story-1']['_peerGate'] = {
+            'reviewerIds': ['ada', 'cora'], 'approvals': 2, 'approvers': ['ada', 'cora'],
+            'closed': True, 'enteredMs': 1000,
+        }
+        saved = {}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db',
+                                        side_effect=lambda s: saved.update(s)), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            c = TestClient(serve.app)
+            r = c.post('/api/intent/story/story-1/reject', json={})
+        self.assertEqual(r.status_code, 200, r.text)
+        note = saved['agents']['ben']['mailbox'][0]
+        self.assertEqual(note['kind'], 'player_veto')
+        self.assertNotIn('They said:', note['text'],
+                         'no reason given -> must not fabricate a quoted reason')
+
+    def test_reject_cascades_rereview_to_dependent_story(self):
+        # Ripple re-review: the dependent story was built on story-1's output
+        # (task['dependsOn']). A player veto of story-1 must re-open the shipped
+        # dependent through its OWN peer gate too -- same prior reviewers.
+        state = self._veto_state()
+        state['tasks']['story-1']['_peerGate'] = {
+            'reviewerIds': ['ada', 'cora'], 'approvals': 2, 'approvers': ['ada', 'cora'],
+            'closed': True, 'enteredMs': 1000,
+        }
+        state['tasks']['story-dep'] = {
+            'id': 'story-dep', 'title': 'Build on the checkout flow',
+            'room': 'pressoffice', 'instructions': 'extend it',
+            'projectLabel': 'storefront', 'taskType': 'code',
+            'assignedTo': 'ada', 'status': 'done', 'createdAt': 3000,
+            'goal': 'storefront', 'dependsOn': 'story-1',
+            '_peerGate': {'reviewerIds': ['ben', 'cora'], 'approvals': 2,
+                          'approvers': ['ben', 'cora'], 'closed': True, 'enteredMs': 2000},
+        }
+        saved = {}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db',
+                                        side_effect=lambda s: saved.update(s)), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            c = TestClient(serve.app)
+            r = c.post('/api/intent/story/story-1/reject', json={'reason': 'wrong currency'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['cascaded'], 1, 'the dependent must be re-opened')
+        dep = saved['tasks']['story-dep']
+        self.assertEqual(dep['status'], 'needs_review',
+                         'a shipped dependent must re-enter review when its dependency is re-opened')
+        self.assertEqual(sorted(dep['_peerGate']['reviewerIds']), ['ben', 'cora'],
+                         'the dependent re-verifies with its own prior reviewers')
+        self.assertEqual(dep['_peerGate']['approvals'], 0)
+
+    def test_reject_cascade_skips_non_gated_and_undone_dependents(self):
+        # Fail-closed ripple: an unshipped dependent stays put (its gate was
+        # never passed -- nothing built on the questioned output yet), and a
+        # non-gated lane (spike) is never forced into a gate.
+        state = self._veto_state()
+        state['tasks']['story-1']['_peerGate'] = {
+            'reviewerIds': ['ada', 'cora'], 'approvals': 2, 'approvers': ['ada', 'cora'],
+            'closed': True, 'enteredMs': 1000,
+        }
+        state['tasks']['story-wip'] = {
+            'id': 'story-wip', 'title': 'WIP dependent', 'room': 'pressoffice',
+            'instructions': 'x', 'projectLabel': 'storefront', 'taskType': 'code',
+            'assignedTo': 'cora', 'status': 'working', 'dependsOn': 'story-1', 'createdAt': 3000,
+        }
+        state['tasks']['story-spike'] = {
+            'id': 'story-spike', 'title': 'Spike dependent', 'room': 'pressoffice',
+            'instructions': 'x', 'projectLabel': 'storefront', 'taskType': 'spike',
+            'assignedTo': 'ben', 'status': 'done', 'dependsOn': 'story-1', 'createdAt': 3000,
+        }
+        saved = {}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db',
+                                        side_effect=lambda s: saved.update(s)), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            c = TestClient(serve.app)
+            r = c.post('/api/intent/story/story-1/reject', json={'reason': 'x'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['cascaded'], 0)
+        self.assertEqual(saved['tasks']['story-wip']['status'], 'working')
+        self.assertEqual(saved['tasks']['story-spike']['status'], 'done')
 
     def test_reject_live_story_is_conflict_not_mutated(self):
         state = self._veto_state()

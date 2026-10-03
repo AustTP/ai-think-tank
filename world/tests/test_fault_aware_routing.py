@@ -151,6 +151,178 @@ class RoundRobinFaultAvoidance(unittest.TestCase):
         self.assertIn(task.get('assignedTo'), {'ben', 'cora', 'dax', 'zia'})
 
 
+class RolloverReassignPin(unittest.TestCase):
+    """Refinement's sprint-rollover re-plan pins a carried-over card to a fresh
+    explicit owner via `_reassignedTo`; _assign_due_item honors it like any other
+    pin, and falls back to the generic pool when that member is unavailable."""
+
+    def test_reassigned_pin_is_honored_when_target_free(self):
+        state = _state()
+        state['workQueue'] = [{'title': 'Rolled over card', 'room': 'pressoffice',
+                               'taskType': 'code', 'priority': sim.WORK_PRIORITY['normal'],
+                               '_reassignedTo': 'cora'}]
+        task = _assign(state, now_ms=10_000)
+        self.assertIsNotNone(task)
+        self.assertEqual(task.get('assignedTo'), 'cora')
+
+    def test_reassigned_pin_falls_back_when_target_busy(self):
+        state = _state()
+        state['agents']['cora']['busy'] = True
+        state['agents']['cora']['task'] = 't-x'
+        state['tasks'] = {'t-x': {'id': 't-x', 'status': 'working',
+                                  'assignedTo': 'cora'}}
+        state['workQueue'] = [{'title': 'Rolled over card', 'room': 'pressoffice',
+                               'taskType': 'code', 'priority': sim.WORK_PRIORITY['normal'],
+                               '_reassignedTo': 'cora'}]
+        task = _assign(state, now_ms=10_000)
+        # A soft pin, never a hard lock: the card still gets assigned.
+        self.assertIsNotNone(task)
+        self.assertNotEqual(task.get('assignedTo'), 'cora')
+
+
+class FeatureAffinity(unittest.TestCase):
+    """Feature affinity: a soft pull toward the agent who has completed similar
+    work before (same room / feature / product), layered on top of the team +
+    fault-aware round-robin -- never a hard lock, ties preserve roster order."""
+
+    def _done(self, agent_id, room='pressoffice', **over):
+        task = {'id': f'd-{agent_id}-{room}', 'title': 'Prior', 'room': room,
+                'status': 'done', 'assignedTo': agent_id, 'projectLabel': None,
+                'goal': None, 'productId': None}
+        task.update(over)
+        return task
+
+    def _pick(self, **over):
+        item = {'title': 'Backlog card', 'room': 'pressoffice', 'taskType': 'code',
+                'priority': sim.WORK_PRIORITY['normal']}
+        item.update(over)
+        return item
+
+    def test_pulls_toward_agent_with_prior_similar_work(self):
+        state = _state()
+        state['tasks'] = {'d-1': self._done('cora')}
+        state['workQueue'] = [self._pick()]
+        task = _assign(state, now_ms=10_000)
+        self.assertEqual(task.get('assignedTo'), 'cora',
+                         'affinity beats the round-robin pointer at ben')
+
+    def test_affinity_is_soft_no_lock(self):
+        state = _state()
+        state['tasks'] = {'d-1': self._done('cora')}
+        state['agents']['cora']['busy'] = True
+        state['agents']['cora']['task'] = 't-x'
+        state['tasks']['t-x'] = {'id': 't-x', 'status': 'working',
+                                 'assignedTo': 'cora'}
+        state['workQueue'] = [self._pick()]
+        task = _assign(state, now_ms=10_000)
+        # cora is ineligible; the card still gets assigned elsewhere.
+        self.assertIsNotNone(task)
+        self.assertNotEqual(task.get('assignedTo'), 'cora')
+
+    def test_feature_match_preferred_over_plain_room_match(self):
+        state = _state()
+        state['tasks'] = {
+            'd-1': self._done('cora', room='observatory'),
+            'd-2': self._done('dax', room='pressoffice', projectLabel='bigfeature'),
+        }
+        state['workQueue'] = [self._pick(projectLabel='bigfeature')]
+        task = _assign(state, now_ms=10_000)
+        # dax matches room AND feature (2); cora matches neither (0).
+        self.assertEqual(task.get('assignedTo'), 'dax')
+
+    def test_ties_preserve_roster_order(self):
+        state = _state()
+        state['tasks'] = {
+            'd-1': self._done('cora'),
+            'd-2': self._done('dax'),
+        }
+        state['workQueue'] = [self._pick()]
+        task = _assign(state, now_ms=10_000)
+        self.assertEqual(task.get('assignedTo'), 'cora',
+                         'equal affinity falls back to roster order')
+
+    def test_no_history_means_plain_round_robin(self):
+        state = _state()
+        state['workQueue'] = [self._pick()]
+        task = _assign(state, now_ms=10_000)
+        self.assertEqual(task.get('assignedTo'), 'ben',
+                         'no affinity signal -> unchanged round-robin')
+
+
+class OnboardingAffinity(unittest.TestCase):
+    """A brand-new team member has NO completed-work history, so feature affinity
+    can never route work to them (they'd fall to pure round-robin). Description
+    affinity fills that gap: when nobody has matching prior work, the candidate
+    whose role/mission DESCRIPTION fits the task is soft-pulled toward it."""
+
+    def _hire(self, rid, role='engineer', mission='', **over):
+        d = _director(rid, director='maya')
+        d['role'] = role
+        d['profile'] = {'mission': mission, 'instructions': []}
+        d.update(over)
+        return d
+
+    def _weather_item(self):
+        return {'title': 'Crawl weather data and file a digest', 'room': 'observatory',
+                'taskType': 'code', 'priority': sim.WORK_PRIORITY['normal'],
+                'instructions': 'Crawl the weather data source and write up findings.'}
+
+    def test_fresh_hire_gets_work_matching_its_description(self):
+        state = _state()
+        # Everyone is a fresh hire (no done tasks); zia's description names the
+        # exact work domain. Feature affinity is 0 for all, so description
+        # affinity must route the weather work to zia over the round-robin head.
+        state['agentRoster'] = [
+            _director('maya', is_admin=True),
+            self._hire('ben', mission='Support the team with general backlog work.'),
+            self._hire('cora', mission='Support the team with general backlog work.'),
+            self._hire('dax', mission='Support the team with general backlog work.'),
+            self._hire('zia', role='Assistant weather researcher',
+                       mission='Support the research team by picking up weather data research overflow.'),
+        ]
+        state['agents']['zia'] = {**state['agents']['zia'], 'offDuty': True, 'x': 0, 'y': 0}
+        state['workQueue'] = [self._weather_item()]
+        task = _assign(state, now_ms=10_000)
+        self.assertIsNotNone(task)
+        self.assertEqual(task.get('assignedTo'), 'zia',
+                         'the fresh hire whose description fits the work must be chosen')
+
+    def test_description_affinity_is_soft_not_a_lock(self):
+        state = _state()
+        # Nobody's description matches the work domain at all -> unchanged
+        # round-robin (ben at the pointer), no fabricated match.
+        state['agentRoster'] = [
+            _director('maya', is_admin=True),
+            self._hire('ben', mission='Support the team with general backlog work.'),
+            self._hire('cora', mission='Support the team with general backlog work.'),
+            self._hire('dax', mission='Support the team with general backlog work.'),
+            self._hire('zia', mission='Support the team with general backlog work.'),
+        ]
+        state['workQueue'] = [self._weather_item()]
+        task = _assign(state, now_ms=10_000)
+        self.assertEqual(task.get('assignedTo'), 'ben')
+
+    def test_feature_affinity_wins_over_description(self):
+        # Once an agent HAS matching history, feature affinity outranks a fresh
+        # hire's description -- prior proof beats a written promise.
+        state = _state()
+        state['agentRoster'] = [
+            _director('maya', is_admin=True),
+            self._hire('ben', mission='Support the team with general backlog work.'),
+            self._hire('cora', mission='Support the team with general backlog work.'),
+            self._hire('dax', mission='Support the team with general backlog work.'),
+            self._hire('zia', role='Assistant weather researcher',
+                       mission='Support the research team by picking up weather data research overflow.'),
+        ]
+        state['tasks'] = {'d-1': {'id': 'd-1', 'title': 'Prior', 'room': 'observatory',
+                                  'status': 'done', 'assignedTo': 'ben',
+                                  'projectLabel': None, 'goal': None, 'productId': None}}
+        state['workQueue'] = [self._weather_item()]
+        task = _assign(state, now_ms=10_000)
+        self.assertEqual(task.get('assignedTo'), 'ben',
+                         'prior matching work must beat a description-only match')
+
+
 class OrphanReclaimRecordsFailure(unittest.TestCase):
     def test_reclaiming_an_orphaned_task_records_its_assignee_as_a_failure(self):
         state = {

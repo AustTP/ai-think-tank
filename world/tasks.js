@@ -934,7 +934,7 @@ async function assignBigTask(goal) {
   // kind of guess this whole project has been trying to eliminate.
   const systemPrompt = `You are ${admin.name}, now coordinating a small think tank of workers on behalf of the admin. `
     + `The real current date/time is ${new Date().toISOString()}. `
-    + `Break the following large task into 2 to 5 concrete subtasks, each assignable to one worker in a specific room. `
+    + `Break the following large task into as many concrete subtasks as the work actually requires (never a fixed count -- a small task may be a single subtask, a sprawling one may need many), each assignable to one worker in a specific room. `
     + `Valid rooms, and what each one ACTUALLY does right now, are:\n${DELEGATABLE_ROOMS.map(r => `- ${r}: ${ROOM_PURPOSES[r]}`).join('\n')}\n`
     + `Pick the room whose real capability actually matches each subtask -- most subtasks that need a real file written should go to pressoffice specifically, not wherever the room's name merely sounds plausible. `
     + `Keep every title and instructions field to ONE short sentence -- brevity matters more than detail here. `
@@ -2482,36 +2482,25 @@ async function runResearchTask(agentId, task) {
 }
 
 // A fixed, stable reference page rather than letting an agent (or its
-// model output) pick a URL -- there's no search step yet, and a fixed
-// known-good target means this can't itself become the thing that picks
-// something questionable. Still goes through the full /api/browse gate
-// (Jev classification, SSRF check, audit log) like any other request;
-// nothing here bypasses it.
-const WEATHER_REFERENCE_URL = 'https://en.wikipedia.org/wiki/Weather_forecasting';
-
+// Live weather for the think tank's configured location, served by the
+// server's /api/weather/now (real Open-Meteo data for WEATHER_LOCATION) --
+// no hard-coded forecast or fixed reference page.
 async function checkWeatherReference(agentId) {
   const a = AGENTS[agentId];
   if (!a) return;
   let note;
   try {
-    const res = await agentFetch('/api/browse', agentId, {
-      method: 'POST',
-      body: JSON.stringify({
-        url: WEATHER_REFERENCE_URL,
-        agentId,
-        purpose: 'Checking outside weather reference material for the think tank weather station.',
-      }),
-    });
+    const res = await agentFetch('/api/weather/now', agentId, { method: 'GET' });
     const data = await res.json();
-    if (data.allowed && data.text) {
-      note = `Checked outside weather reference -- noted: "${data.text.slice(0, 140).trim()}..."`;
-    } else if (data.allowed) {
-      note = 'Checked outside weather reference, but the page came back empty.';
+    if (data.reading) {
+      note = `Logged live weather for ${data.location}: "${data.reading.slice(0, 140).trim()}..."`;
+    } else if (data.error) {
+      note = `Tried to log live weather, but the server said: ${data.error}`;
     } else {
-      note = `Tried to check an outside reference, but it wasn't approved: ${data.reason || 'no reason given'}`;
+      note = 'Tried to log live weather, but the reading came back empty.';
     }
   } catch (e) {
-    note = 'Tried to check an outside reference, but the request failed.';
+    note = 'Tried to log live weather, but the request failed.';
   }
   // a may no longer be busy/on this task by the time this resolves (fired
   // outside the setTimeout that gates finishTask) -- still worth logging

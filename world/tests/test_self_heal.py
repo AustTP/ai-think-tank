@@ -253,5 +253,349 @@ class SkillReviewContentGate(unittest.TestCase):
         self.assertEqual([q for q in state['workQueue'] if q.get('skillReview')], [])
 
 
+class StaleWorkSweep(unittest.TestCase):
+    """SM gap 1: a non-bug card wedged in 'walking'/'working' has no age alarm
+    (bugs have RESTORE_TIMEOUT_MS). _stale_work_step re-queues a first-time
+    offender fresh (holder released), then routes a repeat offender to the owning
+    team's scrum master as a work-request -- bounded, never a spin loop."""
+
+    def _run(self, state, now_ms, task_id, status, work_until_s=None, opened_at=None,
+             **task_over):
+        state['agents']['ada']['task'] = task_id
+        state['agents']['ada']['busy'] = status == 'working'
+        state['agents']['ada']['inRoom'] = 'pressoffice'
+        opened_at = opened_at or (now_ms - sim.STALE_WORK_TIMEOUT_MS - 1)
+        task = _orphan_task(task_id=task_id, assigned_to='ada', status=status,
+                            createdAt=opened_at, openedAt=opened_at, **task_over)
+        if status == 'working':
+            task['workUntil'] = work_until_s
+        state['tasks'][task_id] = task
+        return sim._stale_work_step(state, now_ms / 1000, now_ms)
+
+    def test_walking_task_older_than_ceiling_is_requeued_and_holder_released(self):
+        state = _state()
+        n = self._run(state, _NOW_MS, 'task-1', 'walking')
+        self.assertEqual(n, 1)
+        self.assertNotIn('task-1', state['tasks'])
+        self.assertEqual(len(state['workQueue']), 1)
+        item = state['workQueue'][0]
+        self.assertEqual(item['title'], 'Fix the weather report')
+        self.assertEqual(item['priority'], sim.WORK_PRIORITY['high'],
+                         're-issued work is bumped to high so it is picked next')
+        self.assertFalse(state['agents']['ada']['busy'])
+        self.assertIsNone(state['agents']['ada']['task'],
+                          'the stuck worker is released, never pinned by the wedge')
+
+    def test_working_task_still_working_past_budget_grace_is_requeued(self):
+        # workUntil elapsed long ago yet the task is STILL 'working' -- the
+        # completion loop resolves every held working task within a pass, so this
+        # is a genuine wedge, not a busy agent mid-budget.
+        state = _state()
+        n = self._run(state, _NOW_MS, 'task-1', 'working',
+                      work_until_s=(_NOW_MS / 1000) - sim.STALE_WORK_BUDGET_GRACE_S - 60)
+        self.assertEqual(n, 1)
+        self.assertNotIn('task-1', state['tasks'])
+        self.assertEqual(len(state['workQueue']), 1)
+
+    def test_working_task_within_budget_is_left_alone(self):
+        # Still inside workUntil (plus grace) -> legitimately in flight.
+        state = _state()
+        n = self._run(state, _NOW_MS, 'task-1', 'working',
+                      work_until_s=(_NOW_MS / 1000) + 5)
+        self.assertEqual(n, 0)
+        self.assertIn('task-1', state['tasks'])
+        self.assertEqual(state['workQueue'], [])
+
+    def test_bugs_shadows_and_reviews_are_never_replanned(self):
+        now_ms = _NOW_MS
+        state = _state()
+        self._run(state, now_ms, 'task-1', 'walking')  # sets ada holding task-1
+        # A bug task older than the ceiling is the escalation step's domain.
+        bug = _orphan_task(task_id='task-2', status='walking', taskType='bug',
+                           createdAt=now_ms - sim.STALE_WORK_TIMEOUT_MS - 1,
+                           openedAt=now_ms - sim.STALE_WORK_TIMEOUT_MS - 1)
+        state['tasks']['task-2'] = bug
+        # A shadow dry-run must never ship.
+        shadow = _orphan_task(task_id='task-3', status='working', shadow=True,
+                              workUntil=(now_ms / 1000) - sim.STALE_WORK_BUDGET_GRACE_S - 60,
+                              createdAt=now_ms - sim.STALE_WORK_TIMEOUT_MS - 1,
+                              openedAt=now_ms - sim.STALE_WORK_TIMEOUT_MS - 1)
+        state['tasks']['task-3'] = shadow
+        # A review/fix subtask is the stuck-gate watchdog's domain.
+        review = _orphan_task(task_id='task-4', status='working', reviewOf='task-0',
+                              workUntil=(now_ms / 1000) - sim.STALE_WORK_BUDGET_GRACE_S - 60,
+                              createdAt=now_ms - sim.STALE_WORK_TIMEOUT_MS - 1,
+                              openedAt=now_ms - sim.STALE_WORK_TIMEOUT_MS - 1)
+        state['tasks']['task-4'] = review
+        state['agents']['ben']['task'] = None
+        sim._stale_work_step(state, now_ms / 1000, now_ms)
+        self.assertIn('task-2', state['tasks'], 'bugs are the escalation step\'s job')
+        self.assertIn('task-3', state['tasks'], 'shadows never re-plan')
+        self.assertIn('task-4', state['tasks'], 'review subtasks are the stuck-gate\'s job')
+
+    def test_repeat_offender_routes_to_the_owning_scrum_master(self):
+        state = _state()
+        state['teams'] = [
+            {'id': 'dev', 'directorId': 'dev', 'scrumMasterId': 'ada'},
+        ]
+        state['agentRoster'] = [{'id': 'ada'}, {'id': 'ben'}, {'id': 'dev'}]
+        state['backlogRequests'] = []
+        state['teamRefinementAt'] = {'dev': _NOW_MS}  # just refined -> kick should arm
+        state['_staleWorkReplans'] = {('Fix the weather report', 'pressoffice'): 2}
+        n = self._run(state, _NOW_MS, 'task-1', 'walking', teamId='dev')
+        self.assertEqual(n, 1)
+        self.assertNotIn('task-1', state['tasks'])
+        self.assertEqual(state['workQueue'], [], 'terminal re-plan does NOT re-queue')
+        self.assertEqual(len(state['backlogRequests']), 1,
+                          'the SM gets a work-request to re-plan the card')
+        req = state['backlogRequests'][0]
+        self.assertEqual(req['filedBy'], 'ada', 'attributed to the owning SM')
+        self.assertEqual(req['room'], 'pressoffice')
+        self.assertIn('stale in-flight work', req['reason'])
+        # Refinement is kicked so the SM re-plans on the next pass, not next week.
+        self.assertEqual(state['teamRefinementAt'].get('dev'), 0)
+
+    def test_repeat_offender_with_no_team_is_dropped_not_looped(self):
+        state = _state()
+        state['backlogRequests'] = []
+        state['_staleWorkReplans'] = {('Fix the weather report', 'pressoffice'): 2}
+        n = self._run(state, _NOW_MS, 'task-1', 'walking')
+        self.assertEqual(n, 1)
+        self.assertNotIn('task-1', state['tasks'], 'stale card is removed either way')
+        self.assertEqual(state['workQueue'], [])
+        self.assertEqual(state['backlogRequests'], [],
+                          'no team to route to -> dropped, never a spin loop')
+
+
+class WorkerStuckHelp(unittest.TestCase):
+    """W4: worker stuck/help signal. A worker whose content execution keeps
+    FAILING (a content-executor crash now stored ok=False, or a red pipeline) has
+    no server-side signal today. _worker_stuck_help_signal tracks CONSECUTIVE
+    content failures per worker and, once the streak crosses WORKER_HELP_AFTER_FAILS,
+    routes a help work-request to the owning team's scrum master (file_work_request
+    + kick_refinement_now, the same SM-routing as stale work) so the SM re-plans
+    or helps instead of the worker silently churning. Dovetails with SM gap 1:
+    stale work is a wedged CARD; W4 is a wedged WORKER."""
+
+    def _signal(self, state, agent_id, task, result_ok, now_ms):
+        return sim._worker_stuck_help_signal(state, agent_id, task, result_ok, now_ms)
+
+    def test_clean_result_resets_the_streak(self):
+        # A landed (ok) content result must reset any prior failure streak --
+        # a worker who recovers is not stuck.
+        state = _state()
+        task = _orphan_task(task_id='task-1', status='working')
+        self._signal(state, 'ada', task, False, _NOW_MS)
+        self.assertEqual(state['agents']['ada']['_contentFailStreak'], 1)
+        self._signal(state, 'ada', task, True, _NOW_MS)
+        self.assertEqual(state['agents']['ada']['_contentFailStreak'], 0,
+                         'a clean result resets the streak')
+
+    def test_repeated_crashes_route_help_to_the_owning_scrum_master(self):
+        # WORKER_HELP_AFTER_FAILS consecutive ok=False results -> the owning
+        # team's scrum master gets a help work-request + refinement is kicked.
+        state = _state()
+        state['teams'] = [
+            {'id': 'dev', 'directorId': 'dev', 'scrumMasterId': 'ada'},
+        ]
+        state['agentRoster'] = [{'id': 'ada'}, {'id': 'ben'}, {'id': 'dev'}]
+        state['backlogRequests'] = []
+        state['teamRefinementAt'] = {'dev': _NOW_MS}  # just refined -> kick should arm
+        task = _orphan_task(task_id='task-1', status='working', teamId='dev')
+        for _ in range(sim.WORKER_HELP_AFTER_FAILS):
+            self._signal(state, 'ada', task, False, _NOW_MS)
+        self.assertEqual(len(state['backlogRequests']), 1,
+                          'the SM gets a help work-request after repeated failures')
+        req = state['backlogRequests'][0]
+        self.assertEqual(req['filedBy'], 'ada', 'attributed to the owning SM')
+        self.assertEqual(req['room'], 'pressoffice')
+        self.assertIn('stuck', req['reason'])
+        self.assertEqual(state['teamRefinementAt'].get('dev'), 0,
+                          'refinement is kicked so the SM handles it on the next pass')
+        self.assertEqual(state['agents']['ada']['_contentFailStreak'], 0,
+                          'the streak re-arms only after a fresh clean result')
+
+    def test_fewer_than_threshold_failures_do_not_signal_yet(self):
+        # Below the threshold the worker's streak just accumulates.
+        state = _state()
+        state['backlogRequests'] = []
+        task = _orphan_task(task_id='task-1', status='working')
+        self._signal(state, 'ada', task, False, _NOW_MS)
+        self.assertEqual(state['backlogRequests'], [],
+                          'no help signal below the threshold')
+        self.assertEqual(state['agents']['ada']['_contentFailStreak'], 1)
+
+    def test_failure_with_no_team_is_dropped_not_looped(self):
+        # No owning team to route to -> no request filed, streak re-arms (the
+        # worker is not left in a perpetual help-signal state).
+        state = _state()
+        state['backlogRequests'] = []
+        task = _orphan_task(task_id='task-1', status='working')
+        for _ in range(sim.WORKER_HELP_AFTER_FAILS + 1):
+            self._signal(state, 'ada', task, False, _NOW_MS)
+        self.assertEqual(state['backlogRequests'], [],
+                          'no team to route to -> dropped, never a spin loop')
+        self.assertEqual(state['agents']['ada']['_contentFailStreak'], 1,
+                          'streak re-arms: the signal fired once, and the next '
+                          'call starts a fresh run')
+
+    def test_content_crash_is_stored_as_a_failure_not_silent_success(self):
+        # A content-executor CRASH must be stored ok=False so the fail-closed
+        # quality gate treats it like a red pipeline -- never a silent 'done'.
+        # (Before W4 the crash handler stored only a note, which read as a
+        # successful completion in _task_cycle.)
+        seen = {}
+        def boom(snapshot, agent_id, task, base_ctx):  # noqa: ARG001
+            raise RuntimeError('executor blew up')
+
+        real_thread = sim.threading.Thread
+
+        class _InlineThread(real_thread):
+            def start(self):
+                self._target(*self._args, **self._kwargs)
+
+        with mock.patch.object(sim, '_store_content_result',
+                               lambda tid, r: seen.__setitem__(tid, r)), \
+             mock.patch('sim.threading.Thread', _InlineThread):
+            sim._dispatch_content_work(boom, _state(), 'ada',
+                                       {'id': 'task-1', 'room': 'observatory',
+                                        'research': {'topicId': 't1'}}, 1000.0)
+        self.assertIn('task-1', seen, 'a crashed run still lands a result')
+        self.assertIs(seen['task-1'].get('ok'), False,
+                      'a crash must be marked ok=False, not a silent success')
+        self.assertIn('Content execution failed', seen['task-1'].get('note', ''))
+
+
+class CoachingLoopEscalation(unittest.TestCase):
+    """W5: the growth-plan coaching loop. A single low grade coaches once; a
+    worker who keeps closing below the floor must be RE-coached (each low close
+    re-lands an escalating note, not a deduped silent no-op) up to
+    COACHING_MAX_ROUNDS, then the problem escalates to the owning team's scrum
+    master as a work-request -- bounded, never an infinite re-coach.
+    _coaching_loop_step is the daily catch-up sweep: an agent who already has a
+    coaching plan and a real trailing grade STILL below the floor gets
+    re-coached (or escalated at the cap) even if no new deliverable landed to
+    trigger the event path."""
+
+    def _low_grade(self, state, agent_id, grade, title='Buggy headline', team_id=None):
+        with mock.patch.object(sim, '_grading_decider', lambda *a, **k: float(grade)):
+            sim._grade_completed_task(
+                state, agent_id,
+                {'id': f'd-{len(state.get("completedDeliverables") or [])}',
+                 'room': 'pressoffice', 'title': title, 'taskType': 'code',
+                 'reviewOf': None, 'teamId': team_id},
+                _NOW_MS)
+
+    def test_a_low_grade_coaches_once_and_lands_on_the_next_task(self):
+        state = _state()
+        self._low_grade(state, 'ada', 4.0)
+        plans = state['growthPlans']['ada']
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]['kind'], 'low_grade')
+        self.assertIn('round 1', plans[0]['note'])
+        note = sim._coaching_note_for(state, 'ada')
+        self.assertIn('Buggy headline', note)
+        self.assertIsNone(sim._coaching_note_for(state, 'ada'),
+                          'the note lands exactly once')
+
+    def test_repeated_low_closes_re_coach_up_to_the_cap(self):
+        # Each fresh low close re-lands an escalating note (repeat=True bypasses
+        # the kind dedup) -- the worker is re-coached, not absorbed into one.
+        state = _state()
+        for i in range(sim.COACHING_MAX_ROUNDS):
+            self._low_grade(state, 'ada', 4.0, title=f'Buggy headline {i}')
+        plans = state['growthPlans']['ada']
+        self.assertEqual(len(plans), sim.COACHING_MAX_ROUNDS)
+        rounds = [p['note'] for p in plans]
+        for r in range(1, sim.COACHING_MAX_ROUNDS + 1):
+            self.assertTrue(any(f'round {r} ' in n for n in rounds),
+                            f'coaching round {r} landed')
+
+    def test_at_the_cap_a_low_close_escalates_not_re_coaches(self):
+        # Past COACHING_MAX_ROUNDS, the loop is bounded: the owning SM gets a
+        # work-request + governance entry, and NO further coaching note is
+        # written (the worker is surfaced, not quietly re-coached forever).
+        state = _state()
+        state['teams'] = [
+            {'id': 'dev', 'directorId': 'dev', 'scrumMasterId': 'ada', 'room': 'pressoffice'},
+        ]
+        state['agentRoster'] = [
+            {'id': 'ada', 'director': 'dev'}, {'id': 'ben'}, {'id': 'dev'},
+        ]
+        state['backlogRequests'] = []
+        for i in range(sim.COACHING_MAX_ROUNDS):
+            self._low_grade(state, 'ada', 4.0, title=f'Buggy headline {i}', team_id='dev')
+        with mock.patch('serve.log_action') as log_action:
+            self._low_grade(state, 'ada', 4.0, title='Buggy headline cap', team_id='dev')
+        plans = state['growthPlans']['ada']
+        self.assertEqual(len(plans), sim.COACHING_MAX_ROUNDS,
+                          'no coaching note beyond the cap')
+        self.assertEqual(len(state['backlogRequests']), 1,
+                          'the owning SM gets a work-request at the cap')
+        req = state['backlogRequests'][0]
+        self.assertEqual(req['filedBy'], 'ada', 'attributed to the owning SM')
+        self.assertIn('below the', req['reason'])
+        esc = [c for c in log_action.call_args_list if c.args[1] == 'coaching_loop_escalated']
+        self.assertEqual(len(esc), 1, 'governance logs the escalation')
+        self.assertEqual(esc[0].args[2]['agent'], 'ada')
+
+    def test_a_grade_at_or_above_the_floor_never_coaches(self):
+        state = _state()
+        self._low_grade(state, 'ada', 6.0)
+        self._low_grade(state, 'ada', sim.DELIVERABLE_GRADE_FLOOR)
+        self.assertNotIn('ada', state.get('growthPlans', {}),
+                          'only sub-floor grades coach')
+
+    def test_daily_sweep_re_coaches_an_agent_still_below_the_floor(self):
+        # The catch-up sweep: an agent with an applied plan and a trailing grade
+        # STILL below the floor is re-coached even though no NEW deliverable
+        # landed (the event path can't fire if the agent went quiet).
+        state = _state()
+        state['growthPlans'] = {'ada': [{'kind': 'low_grade', 'applied': True}]}
+        state['completedDeliverables'] = [
+            {'room': 'pressoffice', 'agentId': 'ada', 'grade': 4.0, 'gradeIsReal': True},
+        ]
+        n = sim._coaching_loop_step(state, _NOW_MS)
+        self.assertEqual(n, 1)
+        self.assertEqual(len(state['growthPlans']['ada']), 2,
+                          'the sweep re-coached (round 2 note)')
+        self.assertIn('round 2', state['growthPlans']['ada'][-1]['note'])
+
+    def test_daily_sweep_escalates_once_at_the_cap(self):
+        state = _state()
+        state['teams'] = [
+            {'id': 'dev', 'directorId': 'dev', 'scrumMasterId': 'ada', 'room': 'pressoffice'},
+        ]
+        state['agentRoster'] = [
+            {'id': 'ada', 'director': 'dev'}, {'id': 'ben'}, {'id': 'dev'},
+        ]
+        state['backlogRequests'] = []
+        state['governance'] = []
+        plans = [{'kind': 'low_grade', 'applied': True}
+                 for _ in range(sim.COACHING_MAX_ROUNDS)]
+        state['growthPlans'] = {'ada': plans}
+        state['completedDeliverables'] = [
+            {'room': 'pressoffice', 'agentId': 'ada', 'grade': 3.0, 'gradeIsReal': True},
+        ]
+        n = sim._coaching_loop_step(state, _NOW_MS)
+        self.assertEqual(n, 1)
+        self.assertEqual(len(state['growthPlans']['ada']), sim.COACHING_MAX_ROUNDS,
+                          'no note beyond the cap -- escalated instead')
+        self.assertEqual(len(state['backlogRequests']), 1)
+
+    def test_daily_sweep_skips_agents_who_recovered_or_were_never_coached(self):
+        state = _state()
+        state['growthPlans'] = {'ada': [{'kind': 'low_grade', 'applied': True}]}
+        state['completedDeliverables'] = [
+            {'room': 'pressoffice', 'agentId': 'ada', 'grade': 8.0, 'gradeIsReal': True},
+        ]
+        self.assertEqual(sim._coaching_loop_step(state, _NOW_MS), 0,
+                          'recovered agent (grade above floor) is skipped')
+        state2 = _state()
+        state2['growthPlans'] = {}
+        self.assertEqual(sim._coaching_loop_step(state2, _NOW_MS), 0,
+                          'no plans -> nothing to catch up')
+
+
 if __name__ == '__main__':
     unittest.main()

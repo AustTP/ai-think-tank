@@ -389,5 +389,153 @@ class WriteWikiServerAutoSeed(unittest.TestCase):
                          {'label': 'Custom Think Tank Label', 'order': 7})
 
 
+class WikiProposeLane(unittest.TestCase):
+    """Todo: wiki agent-propose lane. Any agent can PROPOSE a wiki page; the
+    proposal sits in the pending_review/wiki/ quarantine and the LIVE wiki is
+    untouched until a director/admin approves it (or rejects it to
+    rejected/wiki/). Promotion is never automatic -- the same discipline as
+    library_promote/library_reject."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='think tank-wiki-propose-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            THINK_TANK_DIR=self.tmp,
+            AGENTS_DIR=os.path.join(self.tmp, 'agents'),
+            LIBRARY_DIR=os.path.join(self.tmp, 'library'),
+            SANDBOXES_DIR=os.path.join(self.tmp, 'sandboxes'),
+            PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
+            _FERNET_EDEK_DIR=os.path.join(self.tmp, '.secret_keys'),
+            _FERNET_EDEK_PATH=os.path.join(self.tmp, '.secret_keys', 'edek.key'),
+        )
+        self._cm.start()
+        serve.init_db()
+        serve.save_state_to_db(_make_product_state())
+
+    def tearDown(self):
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        c = TestClient(serve.app)
+        sid = serve.create_session()
+        c.cookies.set(serve.SESSION_COOKIE_NAME, sid)
+        return c
+
+    def _auth(self, c, agent_id):
+        key = serve.get_or_create_agent_key(agent_id)
+        return {'params': {'requesterId': agent_id}, 'headers': {'X-Agent-Key': key}}
+
+    def _pending_path(self, category, page_id):
+        return os.path.join(self.tmp, 'library', 'pending_review', 'wiki',
+                            category, f'{page_id}.json')
+
+    def test_propose_requires_agent_key(self):
+        c = self._client()
+        r = c.post('/api/intent/wiki/propose', json={
+            'id': 'x', 'title': 'X', 'category': 'workroom', 'body': 'body',
+        })
+        self.assertEqual(r.status_code, 403)
+
+    def test_propose_quarantines_and_leaves_live_wiki_untouched(self):
+        c = self._client()
+        r = c.post('/api/intent/wiki/propose', json={
+            'id': 'research-note', 'title': 'Note', 'category': 'research',
+            'body': 'Findings.', 'summary': 'a finding',
+        }, **self._auth(c, 'ada'))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(os.path.isfile(self._pending_path('research', 'research-note')),
+                        'the proposal must land in the quarantine')
+        # The LIVE wiki is untouched: no page metadata, no page on disk, and a
+        # read 404s -- the body is not trusted knowledge until approval.
+        got = c.get('/api/intent/wiki/page/research-note')
+        self.assertEqual(got.status_code, 404)
+        self.assertFalse(os.path.isfile(os.path.join(
+            self.tmp, 'library', 'wiki', 'research', 'research-note.md')))
+        persisted = serve.get_state_from_db()
+        self.assertNotIn('research-note', (persisted.get('wiki') or {}).get('pages') or {})
+
+    def test_proposals_listing_is_metadata_only(self):
+        c = self._client()
+        c.post('/api/intent/wiki/propose', json={
+            'id': 'research-note', 'title': 'Note', 'category': 'research',
+            'body': 'Findings.', 'summary': 'a finding',
+        }, **self._auth(c, 'ada'))
+        r = c.get('/api/intent/wiki/proposals')
+        self.assertEqual(r.status_code, 200, r.text)
+        items = r.json()['proposals']
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]['id'], 'research-note')
+        self.assertEqual(items[0]['proposedBy'], 'ada')
+        self.assertNotIn('body', items[0], 'the listing must not inline proposal bodies')
+
+    def test_propose_rejects_unknown_category(self):
+        c = self._client()
+        r = c.post('/api/intent/wiki/propose', json={
+            'id': 'x', 'title': 'X', 'category': 'nope', 'body': 'body',
+        }, **self._auth(c, 'ada'))
+        self.assertEqual(r.status_code, 400)
+
+    def test_approve_promotes_to_live_wiki(self):
+        c = self._client()
+        c.post('/api/intent/wiki/propose', json={
+            'id': 'research-note', 'title': 'Note', 'category': 'research',
+            'body': 'Findings.', 'summary': 'a finding',
+        }, **self._auth(c, 'ada'))
+        r = c.post('/api/intent/wiki/proposal/research-note/approve',
+                   json={'category': 'research'}, **self._auth(c, 'maya'))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['page']['version'], 1)
+        self.assertEqual(r.json()['proposedBy'], 'ada')
+        # Live now: metadata + body on disk + readable.
+        got = c.get('/api/intent/wiki/page/research-note')
+        self.assertEqual(got.status_code, 200)
+        self.assertEqual(got.json()['page']['body'], 'Findings.')
+        persisted = serve.get_state_from_db()
+        self.assertIn('research-note', (persisted.get('wiki') or {}).get('pages') or {})
+        # Proposal left the quarantine (archived for provenance, not live).
+        self.assertFalse(os.path.isfile(self._pending_path('research', 'research-note')))
+        archived = os.path.join(self.tmp, 'library', 'archive', 'wiki-proposals',
+                                'research', 'research-note.json')
+        self.assertTrue(os.path.isfile(archived))
+
+    def test_approve_blocked_for_non_director(self):
+        c = self._client()
+        c.post('/api/intent/wiki/propose', json={
+            'id': 'research-note', 'title': 'Note', 'category': 'research',
+            'body': 'Findings.',
+        }, **self._auth(c, 'ada'))
+        r = c.post('/api/intent/wiki/proposal/research-note/approve',
+                   json={'category': 'research'}, **self._auth(c, 'ada'))
+        self.assertEqual(r.status_code, 403)
+        self.assertTrue(os.path.isfile(self._pending_path('research', 'research-note')),
+                        'a rejected approval must leave the proposal pending')
+
+    def test_approve_unknown_proposal_404(self):
+        c = self._client()
+        r = c.post('/api/intent/wiki/proposal/nope/approve',
+                   json={'category': 'research'}, **self._auth(c, 'maya'))
+        self.assertEqual(r.status_code, 404)
+
+    def test_reject_moves_to_rejected_archive(self):
+        c = self._client()
+        c.post('/api/intent/wiki/propose', json={
+            'id': 'research-note', 'title': 'Note', 'category': 'research',
+            'body': 'Findings.',
+        }, **self._auth(c, 'ada'))
+        r = c.post('/api/intent/wiki/proposal/research-note/reject',
+                   json={'category': 'research'}, **self._auth(c, 'maya'))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertFalse(os.path.isfile(self._pending_path('research', 'research-note')))
+        rejected = os.path.join(self.tmp, 'library', 'rejected', 'wiki',
+                                'research', 'research-note.json')
+        self.assertTrue(os.path.isfile(rejected))
+        # The live wiki still has nothing -- rejection never writes the page.
+        got = c.get('/api/intent/wiki/page/research-note')
+        self.assertEqual(got.status_code, 404)
+
+
 if __name__ == '__main__':
     unittest.main()

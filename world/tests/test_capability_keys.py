@@ -9,6 +9,7 @@ Fernet key dir so nothing touches the live vault or makes network calls.
 import os
 import shutil
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -471,6 +472,73 @@ class HandlesEndpointAuth(unittest.TestCase):
         self.assertEqual(r.status_code, 403, r.text)
         with serve._db() as conn:
             self.assertIsNotNone(conn.execute('SELECT 1 FROM capability_handles WHERE handle = ?', (h,)).fetchone())
+
+
+class PerStoryCapabilityGrant(unittest.TestCase):
+    """Todo 14: a temporary capability grant is tied to the SPECIFIC story it
+    was granted for (task_id) and dies with it -- revoke_task_access fires when
+    the story ships, so capability access never outlives the work that
+    justified it (and the access-request endpoint only accepts the agent's own
+    live task)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='think tank-storygrant-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            THINK_TANK_DIR=self.tmp,
+            AGENTS_DIR=os.path.join(self.tmp, 'agents'),
+            LIBRARY_DIR=os.path.join(self.tmp, 'library'),
+            PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
+            _FERNET_EDEK_DIR=os.path.join(self.tmp, '.secret_keys'),
+            _FERNET_EDEK_PATH=os.path.join(self.tmp, '.secret_keys', 'edek.key'),
+        )
+        self._cm.start()
+        serve.init_db()
+
+    def tearDown(self):
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _grant(self, task_id='task-9'):
+        return serve._grant_temp_access('agent-a', 'curl', 'faye', 'need it for the weather crawl', task_id=task_id)
+
+    def test_grant_records_its_task_id(self):
+        self._grant()
+        with serve._db() as conn:
+            row = conn.execute('SELECT task_id FROM temp_access_grants WHERE agent_id = ?', ('agent-a',)).fetchone()
+        self.assertEqual(row[0], 'task-9')
+
+    def test_revoking_a_task_clears_only_that_storys_grants(self):
+        self._grant(task_id='task-9')
+        serve._grant_temp_access('agent-b', 'curl', 'faye', 'other story', task_id='task-10')
+        serve.revoke_task_access('task-9')
+        with serve._db() as conn:
+            self.assertIsNone(conn.execute('SELECT 1 FROM temp_access_grants WHERE agent_id = ?', ('agent-a',)).fetchone())
+            self.assertIsNotNone(conn.execute('SELECT 1 FROM temp_access_grants WHERE agent_id = ?', ('agent-b',)).fetchone(),
+                                 'an unrelated story\'s grant survives')
+
+    def test_revoke_task_access_is_a_noop_without_a_task(self):
+        self._grant()
+        serve.revoke_task_access(None)
+        serve.revoke_task_access('')
+        with serve._db() as conn:
+            self.assertIsNotNone(conn.execute('SELECT 1 FROM temp_access_grants WHERE agent_id = ?', ('agent-a',)).fetchone())
+
+    def test_story_scoped_grant_rides_no_timer(self):
+        expires_at = self._grant(task_id='task-9')
+        self.assertIsNone(expires_at, 'a story-scoped grant has no clock -- it dies with the story')
+        self.assertTrue(serve._has_active_temp_access('agent-a', 'curl'),
+                        'no-timer grant is active while its story is live')
+        with serve._db() as conn:
+            row = conn.execute('SELECT expires_at FROM temp_access_grants WHERE agent_id = ?', ('agent-a',)).fetchone()
+        self.assertIsNone(row[0])
+
+    def test_grant_without_a_story_keeps_a_finite_window(self):
+        expires_at = serve._grant_temp_access('agent-a', 'curl', 'faye', 'standing helper access')
+        self.assertIsNotNone(expires_at, 'a grant with no story still rides the finite timer')
+        self.assertGreater(expires_at, time.time())
+        self.assertTrue(serve._has_active_temp_access('agent-a', 'curl'))
 
 
 if __name__ == '__main__':

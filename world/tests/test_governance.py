@@ -516,6 +516,57 @@ class WhoNeedsReview(unittest.TestCase):
         self.assertEqual(pick.get('id'), 'ada',
                          'most-overloaded wins among equally-reported candidates')
 
+    def test_directors_and_admin_are_never_firing_candidates(self):
+        # Personnel-governance guardrail: the admin and every director --
+        # including the admin's PROMOTED-director direct reports -- sit outside
+        # the worker judgment lane. Even the strongest firing evidence (severe
+        # reports + overload) must never surface them; the worker-style
+        # firing/review path is worker-only by design. See §3.14.
+        state = _seed()
+        self._idle(state)
+        # nora is a director, faye the admin: both get the worst firing signal
+        # the worker path can produce -- more severe reports than any worker
+        # test, plus a crippling overload.
+        state['reports'] = [
+            {'aboutId': 'nora', 'fromId': 'ada', 'quote': 'a', 'severity': 'severe', 'note': 'x'},
+            {'aboutId': 'nora', 'fromId': 'ben', 'quote': 'b', 'severity': 'severe', 'note': 'x'},
+            {'aboutId': 'nora', 'fromId': 'faye', 'quote': 'c', 'severity': 'severe', 'note': 'x'},
+            {'aboutId': 'faye', 'fromId': 'ada', 'quote': 'd', 'severity': 'severe', 'note': 'x'},
+            {'aboutId': 'faye', 'fromId': 'nora', 'quote': 'e', 'severity': 'severe', 'note': 'x'},
+        ]
+        state['agents']['nora'].update({'droppedCount': 200, 'approvedCount': 0})
+        state['agents']['faye'].update({'droppedCount': 200, 'approvedCount': 0})
+        # The workers are clean so the ONLY signals are on admin/director.
+        pick = sim.who_needs_review(state, now_ms=10 ** 12)
+        self.assertIsNone(pick, 'admin/director signals must never yield a firing candidate')
+
+    def test_promoted_director_is_not_judged_by_worker_metrics(self):
+        # A worker promoted to director (_promote_to_director) reports to the
+        # admin and is that admin's direct report -- but a promotion moves them
+        # OUT of the worker judgment lane entirely. Same evidence that would
+        # fire a worker (a drop-off) must not touch the promoted director.
+        state = _seed()
+        self._idle(state)
+        # Lea starts as a plain worker under faye's team.
+        state['agentRoster'].append({'id': 'lea', 'name': 'Lea', 'role': 'Ops',
+                                     'director': 'faye'})
+        state['agents']['lea'] = {'id': 'lea', 'x': 400, 'y': 400, 'busy': False,
+                                  'task': None, 'inRoom': None, 'offDuty': False,
+                                  'dir': 'south', 'path': [],
+                                  'approvedCount': 0, 'droppedCount': 0,
+                                  'hiredAt': 10 ** 12, 'visible': True}
+        # Promote: the promoter (faye, the admin) stays lea's director, exactly
+        # how serve._promote_to_director wires it.
+        serve._promote_to_director(state, 'lea', 'faye')
+        lea_roster = next(d for d in state['agentRoster'] if d['id'] == 'lea')
+        self.assertTrue(lea_roster.get('isDirector'), 'promotion flags the director')
+        self.assertEqual(lea_roster.get('director'), 'faye',
+                         'the promoter stays the new director\'s director')
+        # Lea now holds the exact drop-off that fires a worker.
+        state['agents']['lea'].update({'droppedCount': 10, 'approvedCount': 0})
+        pick = sim.who_needs_review(state, now_ms=10 ** 12)
+        self.assertIsNone(pick, 'a promoted director is never a worker firing candidate')
+
 
 class FiringFallback(unittest.TestCase):
     """Jev-outage fallback in _fire_decision requires BOTH a negative report
@@ -553,6 +604,86 @@ class FiringFallback(unittest.TestCase):
                       'severity': 'severe', 'note': 'n'}],
             dropped=10, approved=0)
         self.assertEqual(self._outage_decision(state, reviewers), 'fire')
+
+
+class TeamHealthReview(unittest.TestCase):
+    """Director gap 1: at sprint close each director grades the trailing health
+    of the WORKERS under them and coaches anyone below the delivery floor -- a
+    growth-plan note routed to their next task. Worker-only: directors and the
+    admin are never judged (matches who_needs_review)."""
+
+    def _state(self):
+        state = _seed()
+        state['teams'] = [
+            {'id': 'team1', 'directorId': 'nora', 'scrumMasterId': 'ada',
+             'room': 'pressoffice'},
+        ]
+        for d in state['agentRoster']:
+            if d['id'] in ('ada', 'ben'):
+                d['director'] = 'nora'
+        state['completedDeliverables'] = []
+        return state
+
+    def _deliverable(self, agent_id, grade, real=True):
+        return {'agentId': agent_id, 'room': 'pressoffice', 'grade': grade,
+                'gradeIsReal': real, 'gradedAt': 10 ** 12, 'id': 'd1'}
+
+    def test_worker_below_floor_gets_a_coaching_note(self):
+        state = self._state()
+        state['completedDeliverables'] = [self._deliverable('ada', 3.0)]
+        n = sim._team_health_review(state, ['team1'], 10 ** 12)
+        self.assertEqual(n, 1)
+        plans = (state.get('growthPlans') or {}).get('ada') or []
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]['kind'], 'team_health')
+        self.assertIn('trailing grade 3.0/10', plans[0]['note'])
+
+    def test_worker_at_or_above_floor_is_not_coached(self):
+        state = self._state()
+        state['completedDeliverables'] = [self._deliverable('ada', 7.5),
+                                          self._deliverable('ben', sim.DELIVERABLE_GRADE_FLOOR)]
+        n = sim._team_health_review(state, ['team1'], 10 ** 12)
+        self.assertEqual(n, 0)
+        self.assertEqual((state.get('growthPlans') or {}), {})
+
+    def test_director_and_admin_are_never_judged(self):
+        # nora is a director with no reports, so a direct review of her as the
+        # 'team director' must be impossible; more to the point, a DIRECTOR who
+        # sits under another director (the chain) is never a review target.
+        state = self._state()
+        state['agentRoster'].append({'id': 'zoe', 'role': 'Ops', 'isDirector': True,
+                                     'director': 'nora'})
+        state['agents']['zoe'] = {'id': 'zoe', 'x': 0, 'y': 0, 'busy': False,
+                                  'task': None, 'inRoom': None, 'offDuty': False,
+                                  'dir': 'south', 'path': [], 'approvedCount': 0,
+                                  'droppedCount': 0, 'hiredAt': 10 ** 12,
+                                  'visible': True}
+        state['completedDeliverables'] = [self._deliverable('zoe', 2.0)]
+        n = sim._team_health_review(state, ['team1'], 10 ** 12)
+        self.assertEqual(n, 0, 'directors are never judged by worker metrics')
+
+    def test_worker_with_no_real_graded_work_is_not_judged(self):
+        state = self._state()
+        state['completedDeliverables'] = [self._deliverable('ada', 2.0, real=False)]
+        n = sim._team_health_review(state, ['team1'], 10 ** 12)
+        self.assertEqual(n, 0, 'fabricated fallback grades must not hide real health')
+
+    def test_unknown_team_is_skipped(self):
+        state = self._state()
+        n = sim._team_health_review(state, ['ghost'], 10 ** 12)
+        self.assertEqual(n, 0)
+
+    def test_sprint_close_hook_runs_the_review_for_touched_teams(self):
+        # The ceremony hook in _on_sprint_closed must actually coach a weak
+        # worker -- not just exist as a standalone function.
+        state = self._state()
+        state['completedDeliverables'] = [self._deliverable('ada', 2.5)]
+        record = {'id': 'spr-1', 'teamIds': ['team1']}
+        sim._on_sprint_closed(state, record, 10 ** 12)
+        plans = (state.get('growthPlans') or {}).get('ada') or []
+        self.assertEqual(len(plans), 1,
+                          'sprint close must route the weak close into coaching')
+        self.assertEqual(plans[0]['kind'], 'team_health')
 
 
 if __name__ == '__main__':
