@@ -679,6 +679,124 @@ class SprintRollover(unittest.TestCase):
                          'no closed sprint yet -> nothing to re-plan')
 
 
+class SprintVelocity(unittest.TestCase):
+    """Sprint close records a VELOCITY snapshot (landed/total/pct/rolledOver/
+    points/elapsed) and folds it into the per-team trailing history
+    state['teamVelocity'], capped at TEAM_VELOCITY_MAX. Points are the size
+    estimate weights (S=1/M=2/L=3), None when the sprint carried no estimates.
+    Idempotent: re-closing an already-closed sprint never re-folds."""
+
+    ROOMS = ['pressoffice', 'observatory']
+
+    def _state(self, **over):
+        state = _make_team_state()
+        state.update(over)
+        return state
+
+    def _sprint(self, state, items=None, team_ids=None, now_ms=1000):
+        sid = sim.next_sprint_id(state)
+        return sim.queue_sprint(
+            state, sid, 'S1', 'Ship it', 'faye',
+            items or [{'title': 'Build A', 'room': 'pressoffice'}],
+            self.ROOMS, team_ids=team_ids or ['dev'], now_ms=now_ms)
+
+    def _landed_state(self):
+        # One done (L=3), one working (M=2), one still queued (no estimate).
+        state = self._state()
+        self._sprint(state, items=[
+            {'title': 'fin', 'room': 'pressoffice', 'sizeEstimate': 'L'},
+            {'title': 'active', 'room': 'observatory', 'sizeEstimate': 'M'},
+            {'title': 'queued', 'room': 'pressoffice'}])
+        state['workQueue'] = [{'title': 'queued', 'room': 'pressoffice', 'sprintId': 'spr-1'}]
+        state['tasks'] = {
+            't1': {'title': 'fin', 'room': 'pressoffice', 'status': 'done',
+                   'sizeEstimate': 'L', 'assignedTo': 'ada'},
+            't2': {'title': 'active', 'room': 'observatory', 'status': 'working',
+                   'sizeEstimate': 'M', 'assignedTo': 'ben'},
+        }
+        return state
+
+    def test_close_records_velocity_snapshot(self):
+        state = self._landed_state()
+        rec = sim.close_sprint(state, 'spr-1', now_ms=5000)
+        v = rec['velocity']
+        self.assertEqual(v['landed'], 1)
+        self.assertEqual(v['total'], 3)
+        self.assertEqual(v['pct'], 33)
+        self.assertEqual(v['rolledOver'], 1)   # only the queued card carries over
+        self.assertEqual(v['pointsLanded'], 3) # the L that landed
+        self.assertEqual(v['pointsTotal'], 5)  # L(3) + M(2); unestimated queued excluded
+        self.assertEqual(v['elapsedMs'], 4000)
+        self.assertEqual(rec['closedAt'], 5000)
+
+    def test_velocity_folds_into_team_history(self):
+        state = self._landed_state()
+        sim.close_sprint(state, 'spr-1', now_ms=5000)
+        self.assertEqual(len(state['teamVelocity']['dev']), 1)
+        self.assertEqual(state['teamVelocity']['dev'][0]['landed'], 1)
+        self.assertIsNone(state['teamVelocity'].get('faye'))
+
+    def test_velocity_points_none_when_entirely_unestimated(self):
+        state = self._state()
+        self._sprint(state, items=[
+            {'title': 'a', 'room': 'pressoffice'},
+            {'title': 'b', 'room': 'observatory'}])
+        rec = sim.close_sprint(state, 'spr-1', now_ms=2000)
+        self.assertIsNone(rec['velocity']['pointsLanded'])
+        self.assertIsNone(rec['velocity']['pointsTotal'])
+        self.assertEqual(rec['velocity']['landed'], 0)
+        self.assertEqual(rec['velocity']['total'], 2)
+
+    def test_close_is_idempotent_for_velocity(self):
+        state = self._landed_state()
+        sim.close_sprint(state, 'spr-1', now_ms=5000)
+        first = state['sprints']['spr-1']['velocity']['elapsedMs']
+        sim.close_sprint(state, 'spr-1', now_ms=9999)
+        rec = state['sprints']['spr-1']
+        self.assertEqual(len(state['teamVelocity']['dev']), 1,
+                         'a re-close must not fold a second history entry')
+        self.assertEqual(rec['velocity']['elapsedMs'], first,
+                         'a re-close must not recompute the snapshot')
+        self.assertEqual(rec['closedAt'], 5000, 'a re-close must not move closedAt')
+
+    def test_velocity_history_capped_per_team(self):
+        state = self._state()
+        for i in range(sim.TEAM_VELOCITY_MAX + 5):
+            self._sprint(state, items=[{'title': f'item {i}', 'room': 'pressoffice'}],
+                         now_ms=1000 + i)
+            sim.close_sprint(state, f'spr-{i + 1}', now_ms=5000 + (i * 2))
+        self.assertEqual(len(state['teamVelocity']['dev']), sim.TEAM_VELOCITY_MAX,
+                         'the trailing history is a rolling window, not a ledger')
+        # Oldest dropped, newest kept (distinct elapsedMs proves ordering kept).
+        self.assertNotEqual(state['teamVelocity']['dev'][0]['elapsedMs'],
+                            state['teamVelocity']['dev'][-1]['elapsedMs'])
+
+    def test_close_sets_closed_at_for_player_close(self):
+        state = self._landed_state()
+        rec = sim.close_sprint(state, 'spr-1', now_ms=7777)
+        self.assertEqual(rec['closedAt'], 7777)
+
+    def test_shadow_and_absent_cards_estimate_zero(self):
+        # A card whose only matching task is SHADOW (dry-run) is skipped, and a
+        # card with no queue entry and no task at all falls through to 0 --
+        # 'not estimated' is honest, never guessed as a small size.
+        state = self._state()
+        self._sprint(state, items=[
+            {'title': 'ghost', 'room': 'pressoffice', 'sizeEstimate': 'L'},
+            {'title': 'absent', 'room': 'observatory'}])
+        state['workQueue'] = []
+        state['tasks'] = {
+            't1': {'title': 'ghost', 'room': 'pressoffice', 'status': 'done',
+                   'sizeEstimate': 'L', 'assignedTo': 'ada', 'shadow': True},
+        }
+        rec = sim.close_sprint(state, 'spr-1', now_ms=2000)
+        v = rec['velocity']
+        self.assertEqual(v['landed'], 0, 'shadow work ships nothing')
+        self.assertIsNone(v['pointsLanded'])
+        self.assertIsNone(v['pointsTotal'])
+        self.assertEqual(v['total'], 2)
+
+
 class SprintWorkerPool(unittest.TestCase):
     """The STRICT assignment pool for a sprint's cards: the non-admin members of
     the sprint's teams, capped at the director's `workerCount` (1-6). Lean

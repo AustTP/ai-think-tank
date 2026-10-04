@@ -1613,6 +1613,40 @@ def _grade_review_checklist(checklist, review, qp, agent_id):
     return {'grades': grades, 'escalate': escalate}
 
 
+def _record_classified_failures(agent_id, kind, checklist_grades, escalate, review_text):
+    """The 'sort' step's durable write: every verified-failed checklist
+    requirement and every escalated review requirement is classified into the
+    four-bucket taxonomy (factual error / client preference / missing
+    information / style) and appended to the failure ledger in serve.py, where
+    the weekly rule-mining pass turns recurring patterns into operator rule
+    proposals. Best-effort: recording must never break the review itself, so a
+    ledger failure is swallowed (the review result is unchanged)."""
+    recorded = 0
+    for g in (checklist_grades or []):
+        if g.get('verdict') != GRADE_FAILS:
+            continue
+        question = g.get('question') or g.get('id') or 'requirement'
+        section = g.get('section') or ''
+        try:
+            ftype = _serve._classify_failure(f'{question} {section}')
+            _serve._record_failure(ftype, question, rule_hint=question, section=section,
+                                   input_text=review_text[:800], agent_id=agent_id)
+            recorded += 1
+        except Exception:
+            pass
+    for req, _reason in (escalate or [])[:MAX_CHECKLIST_ESCALATIONS]:
+        question = req.get('question') or 'requirement'
+        section = req.get('section') or ''
+        try:
+            ftype = _serve._classify_failure(f'{question} {section}')
+            _serve._record_failure(ftype, question, rule_hint=question, section=section,
+                                   input_text=review_text[:800], agent_id=agent_id)
+            recorded += 1
+        except Exception:
+            pass
+    return recorded
+
+
 def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     """Port of tasks.js runReviewTask: a real review/QA pass -- gatherUnifiedContext,
     a skeptical critique call (probe-driven), a real screenshot visual pass, a Jev
@@ -1755,13 +1789,21 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
         checklist_grades = graded['grades']
         if any(g['verdict'] == GRADE_FAILS for g in checklist_grades):
             verdict = 'actionable'
+        what_checked = f'Reviewed {len(checklist)} checklist requirements during this {kind} pass'
         for req, reason in graded['escalate'][:MAX_CHECKLIST_ESCALATIONS]:
             try:
                 _serve.create_escalation(reason,
-                                         f'{req.get("question", "")} ({req.get("section", "") or "deliverable"})')
+                                         f'{req.get("question", "")} ({req.get("section", "") or "deliverable"})',
+                                         what_checked=what_checked,
+                                         look_first=req.get('question', '') or reason)
                 escalated_reqs.append(req.get('id') or 'req')
             except Exception:
                 pass
+        # The sort step: verified failures + escalated requirements land in the
+        # failure ledger (classified into the four buckets) for the weekly
+        # rule-mining pass. Best-effort -- never changes the review outcome.
+        _record_classified_failures(agent_id, kind, checklist_grades,
+                                    graded.get('escalate', []), full_review)
 
     queue_fix = None
     suffix = 'nothing actionable found'
@@ -2264,7 +2306,10 @@ _COLAB_RUN_TOOL = {
             "which is the FREE tier: usage is UNLIMITED (no monthly meter/wallet -- the only hard "
             "cap is the operator-set COLAB_MONTHLY_UNITS convention), but a runtime is NOT "
             "guaranteed -- provisioning can be refused (availability/cooldown), so keep runs small "
-            "and retry later if a slot is refused. Sessions get torn down after idle, GPU slots are "
+            "and retry later if a slot is refused. Provisioning is auto-retried server-side a few "
+            "times with backoff before a refusal is reported, so do not re-call immediately on a "
+            "refusal. "
+            "Sessions get torn down after idle, GPU slots are "
             "not guaranteed. To shard ONE computation across MULTIPLE runtimes (chain runtimes for a "
             "single task), pass runtimes>1: the same code then runs on each granted runtime with "
             "COLAB_SHARD_INDEX (0-based) and COLAB_SHARD_COUNT env vars so it can split work and "
@@ -2272,6 +2317,10 @@ _COLAB_RUN_TOOL = {
             "reported honestly back), extra runtimes are torn down after. SHARDING POLICY: if "
             "Jev's decisions model is degraded (fallback active), sharding is refused -- the "
             "server will tell you and you should re-run with runtimes=1 or wait for recovery. "
+            "The server independently caps your count with its own Jev gate: a sharded request is "
+            "approved only up to the band the computation's stated purpose earns (single=1, "
+            "double=2, shard=up to 5), so request runtimes>1 ONLY when the work genuinely "
+            "parallelizes and accept a reduced count if the gate judges it smaller. "
             "HARD LIMIT: the code runs "
             "as the player's identity, so it may ONLY touch compute -- never Google Drive, GCS/cloud "
             "APIs, credentials, mining/bulk-media/torrents, offensive-security tooling, or any exfil "

@@ -270,6 +270,7 @@ class RefinementForwardsContract(unittest.TestCase):
             'lastStuckGateSweep': far_future,
             'lastSocialAt': far_future,
             'lastDistillAt': far_future,
+            'lastRuleMineAt': far_future,
             'workQueue': [{'title': 'One-click checkout', 'room': 'pressoffice',
                            'instructions': 'go', 'goal': 'storefront',
                            'projectLabel': 'storefront', 'taskType': 'code',
@@ -410,6 +411,7 @@ class FailClosedTaskCycle(unittest.TestCase):
             'lastStuckGateSweep': now_ms,
             'lastSocialAt': now_ms,
             'lastDistillAt': now_ms,
+            'lastRuleMineAt': now_ms,
             'workQueue': [],
             'tasks': {task['id']: task},
         }

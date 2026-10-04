@@ -202,6 +202,45 @@ class Roadmap(unittest.TestCase):
         self.assertEqual(state['roadmap'], {})
 
 
+class RuleMineStep(unittest.TestCase):
+    # The weekly rule-mining pass: recurring classified failures become
+    # operator rule proposals, surfaced through the governance log. Pure
+    # derivation -- no ceremony, no Jev spend -- and best-effort: a ledger
+    # failure never blocks the task cycle.
+
+    def test_mines_on_cadence_and_logs_governance(self):
+        state = _seed()
+        proposals = [
+            {'id': 'rule-1', 'type': 'factual_error',
+             'rule': 'Never ship work where a number or claim is wrong or has no source: "quote the price".',
+             'count': 2, 'dedupeKey': 'factual_error:quote the price'},
+        ]
+        with unittest.mock.patch.object(serve, '_mine_rule_proposals',
+                                        return_value=proposals) as mine:
+            sim._rule_mine_step(state, sim.RULE_MINE_CADENCE_MS + 1)
+        mine.assert_called_once()
+        self.assertEqual(state['lastRuleMineAt'], sim.RULE_MINE_CADENCE_MS + 1)
+        with serve._db() as conn:
+            rows = conn.execute(
+                "SELECT details FROM action_log WHERE action = 'rule_proposal'").fetchall()
+        self.assertTrue(rows)
+        self.assertIn('"proposalId": "rule-1"', rows[-1][0])
+
+    def test_cadence_gated(self):
+        state = _seed()
+        with unittest.mock.patch.object(serve, '_mine_rule_proposals',
+                                        side_effect=AssertionError('must not mine early')):
+            sim._rule_mine_step(state, 1)
+        self.assertNotIn('lastRuleMineAt', state)
+
+    def test_ledger_failure_swallowed(self):
+        state = _seed()
+        with unittest.mock.patch.object(serve, '_mine_rule_proposals',
+                                        side_effect=RuntimeError('file lock')):
+            sim._rule_mine_step(state, sim.RULE_MINE_CADENCE_MS + 1)  # no raise
+        self.assertEqual(state['lastRuleMineAt'], sim.RULE_MINE_CADENCE_MS + 1)
+
+
 class Coaching(unittest.TestCase):
     def test_note_appended_once(self):
         state = _seed()

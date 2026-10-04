@@ -120,7 +120,8 @@ class PruneAndBackupLoops(unittest.TestCase):
                          ('old-agent', 'browse', None, None, time.time() - 20 * 86400, None))
             conn.execute('INSERT INTO action_log (agent_id, action, details, authorized, ts, trace_id) VALUES (?,?,?,?,?,?)',
                          ('new-agent', 'browse', None, None, time.time(), None))
-        deleted = serve._prune_logs()
+        with unittest.mock.patch.object(serve, '_load_env', return_value={}):
+            deleted = serve._prune_logs()
         self.assertGreaterEqual(deleted, 1)
         with serve._db() as conn:
             self.assertEqual(conn.execute("SELECT agent_id FROM action_log WHERE agent_id = 'old-agent'").fetchall(), [])
@@ -133,6 +134,25 @@ class PruneAndBackupLoops(unittest.TestCase):
     def test_prune_logs_is_best_effort_on_db_failure(self):
         with unittest.mock.patch.object(serve, '_db', side_effect=RuntimeError('db down')):
             self.assertEqual(serve._prune_logs(), 0)
+
+    def test_prune_logs_drops_resolved_escalations_past_retention(self):
+        old_resolved = {'esc-old': {'status': 'approved', 'ts': time.time() - 30 * 86400,
+                                    'resolvedAt': time.time() - 30 * 86400}}
+        fresh_resolved = {'esc-fresh': {'status': 'denied', 'ts': time.time(),
+                                        'resolvedAt': time.time()}}
+        pending = {'esc-pending': {'status': 'pending', 'ts': time.time() - 30 * 86400}}
+        with unittest.mock.patch.object(serve, '_load_escalations',
+                                        return_value=dict(old_resolved, **fresh_resolved, **pending)), \
+             unittest.mock.patch.object(serve, '_save_escalations') as save:
+            serve._prune_logs()
+        saved = save.call_args.args[0]
+        self.assertNotIn('esc-old', saved)
+        self.assertIn('esc-fresh', saved)
+        self.assertIn('esc-pending', saved)
+
+    def test_prune_logs_tolerates_escalation_prune_failure(self):
+        with unittest.mock.patch.object(serve, '_load_escalations', side_effect=OSError('locked')):
+            self.assertIsInstance(serve._prune_logs(), int)
 
     def test_log_prune_loop_runs(self):
         with unittest.mock.patch.object(serve, '_prune_logs') as prune, \

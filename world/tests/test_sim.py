@@ -445,6 +445,9 @@ class SimTaskLifecycle(unittest.TestCase):
             # it isn't re-examined too often. Pre-seed it like skill review so
             # an idle gate genuinely has nothing to write.
             'lastStuckGateSweep': far_future,
+            # Weekly rule mining is a standing sweep too -- pre-seed so it can't
+            # fire on a fresh state (and read the real failure ledger) mid-test.
+            'lastRuleMineAt': far_future,
             # Weekly Knowledge Social is its own cadence too (stamped in
             # _task_cycle, ungated by the work gate). Pre-seed so a short idle
             # window doesn't spuriously convene the Hangout.
