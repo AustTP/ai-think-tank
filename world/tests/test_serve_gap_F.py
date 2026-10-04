@@ -1682,7 +1682,7 @@ class ArmIdleAndRun(unittest.TestCase):
         # Extract the real function source from serve.py and exec it with
         # matching line numbers so coverage attributes execution to serve.py.
         src = open(serve.__file__, encoding='utf-8').read().splitlines()
-        start, end = 15494, 15503
+        start, end = 15882, 15891
         body = textwrap.dedent('\n'.join(src[start - 1:end]))
         lines = [''] * (start - 1) + body.splitlines()
         code = compile('\n'.join(lines), serve.__file__, 'exec')

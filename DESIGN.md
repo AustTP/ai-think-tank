@@ -114,6 +114,21 @@ teams run with the director standing in as facilitator.
 6. **Sprint progress**: Derivation-based — matches completed tasks' (title,room)
    pairs against sprint item records. Sprints auto-close when all items done.
 
+### One-off scheduled tasks
+
+A player can ask for a single task to run at a specific future day+time
+(`queue_once` in sim.py; exposed via the `schedule_once` routing lane and
+`POST /api/intent/schedule-once`). The item lands in the work queue with a
+`notBefore` (epoch-ms) gate instead of a cadence: `is_work_item_due` keeps it
+untouched until `at_ms`, so the idle gate treats a far-future item as "no work"
+and the think tank spends nothing waiting. When the clock passes `at_ms` the
+item enters the normal assign → work → complete lifecycle exactly once (never
+recurring). The gate accepts ISO 8601 day+time (trailing `Z` or explicit
+offset; naive times are treated as UTC so scheduling is unambiguous) or an
+epoch timestamp, fails closed on anything unparseable, rejects past times, and
+caps the horizon at 366 days so a misparsed date can't sit in the queue for
+years.
+
 ### Idle gate
 
 `think_tank_has_work()` gates spend: if no due queue items AND no agent is
@@ -174,7 +189,7 @@ OpenRouter catalog once a day. Selection within each band:
 
 The high tier additionally enforces `HIGH_TIER_MAX_PRICE_USD` (default $5/M) —
 no model over the ceiling is even offered to the pool, regardless of its score.
-And `HIGH_TIER_MONTHLY_BUDGET_USD` (default $2/mo) — once the month's high-tier
+And `HIGH_TIER_MONTHLY_BUDGET_USD` (default $5/mo) — once the month's high-tier
 spend hits the cap, the JEV gate fails closed to mid.
 
 ### JEV-gated tier escalation
@@ -243,12 +258,50 @@ it's set. Once hit every real model call (JEV, chat, decide) fails closed.
 Baseline is stored in the spend ledger itself so pre-existing spend never
 counts.
 
-### High-tier monthly budget ($2/month)
+### High-tier monthly budget ($5/month)
 
 `HIGH_TIER_MONTHLY_BUDGET_USD` caps total high-tier model spend per calendar
 month. The JEV gate checks this before returning the high slug — once spent,
 high requests are routed to mid. Accrual happens at the `/api/chat` choke
 point.
+
+### Test-time compute (deliberation on low/mid tiers)
+
+The low and mid tiers are the cheap, quality-limited models the sim leans on
+most (chat, daily logs, gathering), and they can't "think harder" the way the
+expensive tier can. So `/api/chat` runs a lightweight deliberation loop for
+them: sample the prompt `TTC_BEST_OF` (default 2, capped at `TTC_MAX_BEST_OF`
+= 3) times and fold the drafts into one answer — exact-match JSON majority
+vote for structured responses, a same-model self-verification judge pass
+(pick the best draft verbatim) for open-ended prose. The reported reply is
+therefore far more consistent than any single cheap draft, at the cost of
+best_of (prose: best_of + 1) cheap calls. Controls:
+
+- `TTC_ENABLED` (default on) kills the whole mechanism in one env var.
+- `deliberate: false` in a `/api/chat` body opts a single request out; `best_of`
+  overrides the sample count per request.
+- Expensive/reasoning/coding tiers never deliberate — they're already the
+  spend-heavy path. High-tier escalation already covers the rare deep-think
+  case.
+- Every sample and the judge call are real billed calls accrued to the spend
+  ledger, so the caps above bound them exactly like any other model call.
+
+### Plain-writing directive (token saver)
+
+The village's prose replies (chat, ask lane, clarify lane) carry an
+anti-AI-slop directive: "write plainly, short sentences, no filler, avoid
+these words" with a word-ban list mirrored from the coupon scanner
+(`leverage`, `utilize`, `seamless`, `moreover`, `it is worth noting`, ...).
+`_apply_plain_writing` folds the directive into the first system message at
+the model-call boundary, so every prose-producing path inherits it by default.
+It is a TOKEN saver, not a style law: cutting filler and recap shrinks both
+input and output tokens, and the directive is intentionally worded not to
+demand clipped speech. Controls:
+
+- On by default in `/api/chat`; `{"plain": false}` opts a single request out.
+- JSON-structured prompts (those containing `JSON`) are exempt so a schema is
+  never truncated mid-object.
+- The ask lane and clarify lane inherit it automatically.
 
 ### The Bank
 
@@ -320,7 +373,7 @@ session OR a valid agent key (so server-to-server loopback works).
 7. **Idle is free** — `think_tank_has_work()` gates spend before any ceremony
    fires. An idle think tank spends nothing.
 8. **High tier is bounded twice** — per-model price ceiling ($5/M) keeps the
-   daily refresh from picking a $200/M monster; monthly spend cap ($2/mo)
+   daily refresh from picking a $200/M monster; monthly spend cap ($5/mo)
    keeps the gate from escalating into the expensive tier more than a few
    times per month.
 9. **Teams are derived, not stored** — membership comes from walking the

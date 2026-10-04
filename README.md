@@ -63,7 +63,11 @@ cd world && python3 -m pytest tests/
   refresh re-picks each band's best-value model from the live OpenRouter
   catalog.
 - Budget controls: 1,000 page requests/month, a $5 hard spend cap, and a
-  $2/month high-tier budget that the JEV gate respects.
+  $5/month high-tier budget that the JEV gate respects.
+- A plain-writing directive at the model-call boundary: prose replies carry an
+  anti-AI-slop "write plainly, no filler" instruction with a word-ban list, so
+  the village spends fewer tokens on the same information. On by default,
+  opt-out per request, JSON prompts exempt.
 
 ## Key architecture
 
@@ -96,6 +100,6 @@ cd world && python3 -m pytest tests/
   agent names; the roster is seeded from `.env` on a cold DB.
 - Governance is idle-quiet: an idle think tank spends no model budget.
 - The high tier (the expensive one) is bounded twice: a per-model price
-  ceiling ($5/M) and a monthly spend cap ($2/mo).
+  ceiling ($5/M) and a monthly spend cap ($5/mo).
 - Room descriptions are director-editable; room geometry is not (it is a
   code-graph invariant).
