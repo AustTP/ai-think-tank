@@ -293,10 +293,39 @@ class ColabComputeProvision(unittest.TestCase):
         with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
              unittest.mock.patch.object(serve, '_colab_session_exists',
                                         return_value=False), \
-             unittest.mock.patch.object(serve, '_colab_cli', return_value=(1, 'out of quota')):
+             unittest.mock.patch.object(serve.time, 'sleep'), \
+             unittest.mock.patch.object(serve, '_colab_cli', return_value=(1, 'out of quota')) as cli:
             ok, msg = serve._colab_compute_provision('sess', kind='cpu')
         self.assertFalse(ok)
         self.assertTrue(msg.startswith('provision failed:'))
+        self.assertEqual(cli.call_count, 1 + len(serve.COLAB_PROVISION_RETRY_DELAYS_S))
+
+    def test_provision_retries_then_succeeds(self):
+        # A transient first refusal recovers: the second attempt provisions.
+        with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+             unittest.mock.patch.object(serve, '_colab_session_exists',
+                                        return_value=False), \
+             unittest.mock.patch.object(serve.time, 'sleep') as sleep, \
+             unittest.mock.patch.object(serve, '_colab_cli',
+                                        side_effect=[(1, 'capacity'), (0, '')]):
+            ok, msg = serve._colab_compute_provision('sess')
+        self.assertTrue(ok)
+        sleep.assert_called_once_with(serve.COLAB_PROVISION_RETRY_DELAYS_S[0])
+
+    def test_provision_gives_up_after_bounded_retries(self):
+        # A genuinely unavailable slot retries the bounded number of times,
+        # backs off between attempts, then gives up with the honest error.
+        with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+             unittest.mock.patch.object(serve, '_colab_session_exists',
+                                        return_value=False), \
+             unittest.mock.patch.object(serve.time, 'sleep') as sleep, \
+             unittest.mock.patch.object(serve, '_colab_cli',
+                                        return_value=(1, 'no gpu quota')):
+            ok, msg = serve._colab_compute_provision('sess')
+        self.assertFalse(ok)
+        self.assertIn('provision failed', msg)
+        delays = [c.args[0] for c in sleep.call_args_list]
+        self.assertEqual(delays, list(serve.COLAB_PROVISION_RETRY_DELAYS_S))
 
 
 class ColabDenied(unittest.TestCase):
@@ -328,6 +357,7 @@ class ColabComputeRun(unittest.TestCase):
             '_colab_denied': unittest.mock.Mock(return_value=None),
             '_colab_gate_urls': unittest.mock.Mock(return_value=None),
             '_colab_budget_exceeded': unittest.mock.Mock(return_value=False),
+            '_colab_shard_band': unittest.mock.Mock(return_value=('shard', 0.9)),
         }
         defaults.update(overrides)
         return unittest.mock.patch.multiple(serve, **defaults)
@@ -411,7 +441,108 @@ class ColabComputeRun(unittest.TestCase):
         self.assertEqual(result['shards'][1]['rc'], 1)
         self.assertIn('RUN FAILED (exit 1)', result['stdout'])
         self.assertIn('shard0 stdout', result['stdout'])
-        log.assert_called_once()
+        # The shard gate logged its band decision, then the run logged once.
+        self.assertEqual(log.call_count, 2)
+        log.assert_any_call('agent', 'colab_compute_run', unittest.mock.ANY, authorized=True)
+
+    def test_shard_gate_caps_count_to_approved_band(self):
+        # Jev approved only the 'double' band (2 runtimes) for a 5-runtime ask:
+        # the gate caps the run to 2, and the band decision is logged.
+        with self._base_patches(
+                _colab_shard_band=unittest.mock.Mock(return_value=('double', 0.9))), \
+             unittest.mock.patch.object(serve, '_colab_compute_provision',
+                                        return_value=(True, 'ok')), \
+             unittest.mock.patch.object(
+                 serve, '_colab_cli', return_value=(0, 'ok\n__COLAB_DONE__\n')), \
+             unittest.mock.patch.object(serve, 'log_action') as log:
+            result = serve._colab_compute_run(
+                'agent', 'print(1)', 'testing', [], 300, runtimes=5)
+        self.assertEqual(result['runtimes'], 2)
+        log.assert_any_call('agent', 'colab_shard_gate',
+                            {'requested': 5, 'band': 'double',
+                             'confidence': 0.9, 'approved': 2},
+                            authorized=False)
+
+    def test_shard_gate_band_single_runs_one_runtime(self):
+        # Jev says the computation earns only a single runtime: the sharded
+        # ask collapses to the single-runtime result shape (no shards/runtimes).
+        with self._base_patches(
+                _colab_shard_band=unittest.mock.Mock(return_value=('single', 0.95))), \
+             unittest.mock.patch.object(serve, '_colab_compute_provision',
+                                        return_value=(True, 'ok')), \
+             unittest.mock.patch.object(
+                 serve, '_colab_cli', return_value=(0, 'ok\n__COLAB_DONE__\n')), \
+             unittest.mock.patch.object(serve, 'log_action') as log:
+            result = serve._colab_compute_run(
+                'agent', 'print(1)', 'testing', [], 300, runtimes=3)
+        self.assertNotIn('shards', result)
+        self.assertNotIn('runtimes', result)
+        self.assertEqual(result['stdout'], 'ok')
+        log.assert_any_call('agent', 'colab_shard_gate',
+                            {'requested': 3, 'band': 'single',
+                             'confidence': 0.95, 'approved': 1},
+                            authorized=False)
+
+    def test_shard_gate_fails_closed_on_low_confidence(self):
+        # A shard band at weak confidence must not spend up: degrade to single,
+        # the same fail-to-cheap move as the model-tier gate.
+        with self._base_patches(
+                _colab_shard_band=unittest.mock.Mock(return_value=('shard', 0.4))), \
+             unittest.mock.patch.object(serve, '_colab_compute_provision',
+                                        return_value=(True, 'ok')), \
+             unittest.mock.patch.object(
+                 serve, '_colab_cli', return_value=(0, 'ok\n__COLAB_DONE__\n')), \
+             unittest.mock.patch.object(serve, 'log_action') as log:
+            result = serve._colab_compute_run(
+                'agent', 'print(1)', 'testing', [], 300, runtimes=4)
+        self.assertNotIn('shards', result)
+        log.assert_any_call('agent', 'colab_shard_gate',
+                            {'requested': 4, 'band': 'shard',
+                             'confidence': 0.4, 'approved': 1},
+                            authorized=False)
+
+    def test_shard_gate_fails_closed_on_classifier_outage(self):
+        # An unreachable/non-binary classifier (None) keeps one runtime.
+        with self._base_patches(
+                _colab_shard_band=unittest.mock.Mock(return_value=(None, 0.0))), \
+             unittest.mock.patch.object(serve, '_colab_compute_provision',
+                                        return_value=(True, 'ok')), \
+             unittest.mock.patch.object(
+                 serve, '_colab_cli', return_value=(0, 'ok\n__COLAB_DONE__\n')), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            result = serve._colab_compute_run(
+                'agent', 'print(1)', 'testing', [], 300, runtimes=2)
+        self.assertNotIn('shards', result)
+
+    def test_shard_gate_skipped_for_single_runtime(self):
+        # runtimes==1 is the cheap default -- no band decision is ever made.
+        gate = unittest.mock.Mock(return_value=('shard', 0.9))
+        with self._base_patches(_colab_shard_band=gate), \
+             unittest.mock.patch.object(serve, '_colab_compute_provision',
+                                        return_value=(True, 'ok')), \
+             unittest.mock.patch.object(
+                 serve, '_colab_cli', return_value=(0, 'ok\n__COLAB_DONE__\n')), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            result = serve._colab_compute_run(
+                'agent', 'print(1)', 'testing', [], 300, runtimes=1)
+        self.assertNotIn('shards', result)
+        gate.assert_not_called()
+
+
+class ColabShardBand(unittest.TestCase):
+    def test_returns_band_and_confidence(self):
+        with unittest.mock.patch.object(
+                serve, '_jev_quorum_choice_sync',
+                return_value=('double', 0.8, 0.01)):
+            self.assertEqual(serve._colab_shard_band('x = 1', 'split it', 4),
+                             ('double', 0.8))
+
+    def test_fails_closed_on_classifier_exception(self):
+        with unittest.mock.patch.object(
+                serve, '_jev_quorum_choice_sync',
+                side_effect=RuntimeError('boom')):
+            self.assertEqual(serve._colab_shard_band('x = 1', 'split it', 4),
+                             (None, 0.0))
 
 
 class EscalationJudgeDrift(unittest.TestCase):

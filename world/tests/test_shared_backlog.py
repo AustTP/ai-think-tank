@@ -349,6 +349,32 @@ class Retrospective(unittest.TestCase):
         self.assertNotIn('spr-1', state2.get('pendingRetrospectives', {}))
         self.assertIn('spr-1', state2['pendingSprintRetros'])  # still queued
 
+    def test_retro_resolve_carries_velocity_points_line(self):
+        # A sprint closed WITH size estimates records velocity (pointsTotal), and
+        # the resolved retrospective keeps it -- the retro's velocity line reads
+        # "X of Y points shipped" instead of the plain item counts.
+        state = _seed()
+        state['sprints']['spr-1'] = {
+            'id': 'spr-1', 'name': 'Launch', 'goal': 'Ship April', 'ownerId': 'faye',
+            'createdAt': 900_000, 'targetDate': None, 'teamIds': ['dev'],
+            'status': 'active', 'items': [('Land a launch page', 'pressoffice'),
+                                          ('Still open', 'observatory')],
+        }
+        state['workQueue'] = [{'title': 'Still open', 'room': 'observatory',
+                               'sprintId': 'spr-1'}]
+        state['tasks']['t1'] = {'title': 'Land a launch page', 'room': 'pressoffice',
+                                'status': 'done', 'sizeEstimate': 'L'}
+        rec = sim.close_sprint(state, 'spr-1', now_ms=1_000_000)
+        self.assertEqual(rec['velocity']['pointsTotal'], 3)  # L lands
+        sim._on_sprint_closed(state, rec, 1_000_000)
+        sim._retro_step(state, 1000.0, 1_000_001, decider=_stub_retro())
+        sim._retro_step(state, 1000.0, 1_000_001 + sim.RETRO_MEET_MS + 1,
+                        decider=_stub_retro())
+        retro = state['retrospectives']['spr-1']
+        self.assertEqual(retro['velocity']['landed'], 1)
+        self.assertEqual(retro['velocity']['pointsLanded'], 3)
+        self.assertEqual(retro['velocity']['pointsTotal'], 3)
+
 
 class RefinementGate(unittest.TestCase):
     def test_team_in_active_sprint_skips_refinement_then_refines_at_close(self):

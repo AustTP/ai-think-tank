@@ -660,6 +660,32 @@ class ColabComputeTests(unittest.TestCase):
         self.assertIn('exec', exec_call)
         self.assertIn('__COLAB_DONE__', cli.call_args.kwargs.get('input', ''))
 
+    def test_host_side_timeout_exceeds_cli_timeout_on_exec(self):
+        # The Colab CLI carries its own --timeout for the remote exec, but the
+        # host-side _colab_cli subprocess defaults to a 120s timeout -- a 120s
+        # default would kill a long transcription (CLI --timeout up to 630s)
+        # before the CLI finished or reported. The host timeout must always
+        # exceed the CLI's own --timeout, so the CLI (not the host) decides
+        # when a remote exec is done.
+        calls = []
+        def fake_cli(*a, **k):
+            calls.append((a, k))
+            return (0, 'ok\n__COLAB_DONE__\n')
+        with unittest.mock.patch.object(serve, '_colab_budget_exceeded', return_value=False), \
+             unittest.mock.patch.object(serve, '_colab_compute_provision', return_value=(True, 'ok')), \
+             unittest.mock.patch.object(serve, '_colab_cli', side_effect=fake_cli), \
+             unittest.mock.patch.object(serve, '_accrue_colab_units'), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            result = serve._colab_compute_run('agent-0', 'print(1)', 'transcribe', [], 600)
+        self.assertEqual(result['stdout'], 'ok')
+        exec_calls = [c for c in calls if c[0][0] == 'exec']
+        self.assertTrue(exec_calls, 'a successful run must exec the code')
+        for args, kwargs in exec_calls:
+            self.assertIn('--timeout', args)
+            cli_timeout = int(args[args.index('--timeout') + 1])
+            self.assertGreater(kwargs.get('timeout', 0), cli_timeout,
+                               'host subprocess timeout must exceed the CLI --timeout or the host kills long execs')
+
     def test_failed_cli_run_returns_honest_error(self):
         with unittest.mock.patch.object(serve, '_colab_budget_exceeded', return_value=False), \
              unittest.mock.patch.object(serve, '_colab_compute_provision', return_value=(True, 'ok')), \
