@@ -1995,6 +1995,32 @@ def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructi
         'taskType': 'spike',
         'budgetMs': budget_ms or 60_000,
     }])
+def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None,
+               goal=None, priority=None, project_label=None):
+    """Queue a single work item to fire ONCE at an absolute wall-clock time
+    (`at_ms`, epoch milliseconds). The item rides the same `notBefore` gate
+    the rest of the queue already honors (see is_work_item_due): it sits in
+    the work queue untouched until `at_ms`, then runs through the normal
+    assign -> work -> complete lifecycle exactly once. Returns the queued
+    work item dict, or None if rejected (no title, or `at_ms` is not a
+    positive future epoch-ms)."""
+    at_ms = int(at_ms or 0)
+    if not title or at_ms <= 0:
+        return None
+    item = {
+        'title': title,
+        'room': room or None,
+        'instructions': instructions or f'Handle this one-off request once: {title}',
+        'notBefore': at_ms,
+        'taskType': task_type or None,
+        'goal': goal or None,
+        'priority': normalize_priority(priority),
+        'projectLabel': project_label or None,
+    }
+    queue_work(state, [item])
+    return item
+
+
 def think_tank_has_work(state, now_ms):
     """Port of tasks.js thinkTankHasWork: a due queue item, or any agent currently
     task/handoff/pair/busy."""
