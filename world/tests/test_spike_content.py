@@ -318,6 +318,20 @@ class SpikeContent(unittest.TestCase):
         ]
         self.assertEqual(content._extract_execute_script_outputs(transcript), ['final line, no stderr block'])
 
+    def test_extract_execute_script_outputs_ignores_tool_results_without_stdout_marker(self):
+        transcript = [
+            {'role': 'assistant', 'tool_calls': [{'id': 'c1', 'function': {'name': 'execute_script', 'arguments': '{}'}}]},
+            {'role': 'tool', 'tool_call_id': 'c1', 'content': 'exit code: 0'},
+        ]
+        self.assertEqual(content._extract_execute_script_outputs(transcript), [])
+
+    def test_extract_execute_script_outputs_ignores_whitespace_only_stdout(self):
+        transcript = [
+            {'role': 'assistant', 'tool_calls': [{'id': 'c1', 'function': {'name': 'execute_script', 'arguments': '{}'}}]},
+            {'role': 'tool', 'tool_call_id': 'c1', 'content': 'exit code: 0\n\nstdout:\n   \n\nstderr:\n'},
+        ]
+        self.assertEqual(content._extract_execute_script_outputs(transcript), [])
+
     def test_missing_raw_output_gets_appended_automatically(self):
         """Second deterministic safety net, caught in the SAME
         real investigation as the basis-column one: a real file got cat'd
@@ -407,6 +421,38 @@ class SpikeContent(unittest.TestCase):
             content._run_spike_content(_snapshot(), 'cora', task)
         self.assertTrue(seen['spike-4']['ok'])
         self.assertIn('execute step fallback text', seen['spike-4']['notifyPlayer']['body'])
+
+    def test_both_synthesis_and_execute_empty_stores_nothing_usable(self):
+        # Even with a real investigation (transcript has a tool result), when
+        # BOTH the synthesis call AND the execute step's own closing text come
+        # back empty, the spike must fail honestly instead of filing an empty
+        # finding -- the exact same nothing-usable path as a non-investigation.
+        self._common_mocks()
+        seen = self._store()
+        task = {'id': 'spike-30', 'title': 'Review DreyX.com sources', 'budgetMs': 60000}
+        with self._mock_loop(''), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                         side_effect=[_completion('plan'), _completion('')]):
+            content._run_spike_content(_snapshot(), 'cora', task)
+        self.assertFalse(seen['spike-30']['ok'])
+        self.assertIn('came up empty', seen['spike-30']['notifyPlayer']['subject'])
+        self.assertIn('nothing usable', seen['spike-30']['notifyPlayer']['body'])
+
+    def test_run_on_colab_tool_absent_when_colab_cli_unavailable(self):
+        # Same conditional-availability rule as search_web/GitHub/Apify: no
+        # colab CLI on this machine -> run_on_colab is simply not offered, so
+        # the surface never advertises a tool that would fail.
+        self._common_mocks()
+        self._store()
+        task = {'id': 'spike-colab-1', 'title': 'Run a GPU job', 'budgetMs': 60000}
+        with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', False), \
+             unittest.mock.patch.object(serve, '_call_agent_tool_loop') as loop, \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                        side_effect=[_completion('plan'), _completion('report')]):
+            loop.return_value = ('done', [{'role': 'system', 'content': 's'}])
+            content._run_spike_content(_snapshot(), 'cora', task)
+        tool_names = {t['function']['name'] for t in loop.call_args.args[2]}
+        self.assertNotIn('run_on_colab', tool_names)
 
     def test_no_tools_used_notifies_player_and_skips_synthesis(self):
         # force_first_tool=True should make this unreachable in practice, but
@@ -808,6 +854,9 @@ class ReflectionAndReplan(unittest.TestCase):
         self.assertEqual(content._parse_reflection('not json at all'), (1.0, ''))
         self.assertEqual(content._parse_reflection(''), (1.0, ''))
         self.assertEqual(content._parse_reflection('{"confidence": 5.0, "note": "x"}'), (1.0, 'x'))  # out of range -> default
+        # A JSON object that fails mid-parse (unclosed brace) hits the
+        # except branch and falls back to the safe default.
+        self.assertEqual(content._parse_reflection('{oops'), (1.0, ''))
 
 
 class LibraryReviewTools(unittest.TestCase):
@@ -874,6 +923,21 @@ class LibraryReviewTools(unittest.TestCase):
             out = executor('read_library_file', {'path': '../escape'})
         self.assertIn('Not found', out)
         self.log_action.assert_called_once_with('cora', 'read_library_file', {'path': '../escape', 'found': False}, authorized=True)
+
+    def test_read_library_file_read_oserror_is_surfaced_not_raised(self):
+        # A real file that exists but cannot actually be read (I/O error) must
+        # be surfaced as a message, never crash the investigation.
+        tmp = tempfile.mkdtemp(prefix='think tank-lib-tool-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, 'finding.md')
+        with open(path, 'w') as f:
+            f.write('Real findings.')
+        executor = content._make_library_tools_executor('cora')
+        with unittest.mock.patch.object(serve, '_safe_library_path', return_value=path), \
+             unittest.mock.patch('builtins.open', side_effect=OSError('disk error')):
+            out = executor('read_library_file', {'path': 'finding.md'})
+        self.assertEqual(out, 'Could not read finding.md')
+        self.log_action.assert_not_called()  # the OSError branch returns before the found=True log
 
     def test_unknown_tool_name_raises(self):
         executor = content._make_library_tools_executor('cora')
@@ -1140,10 +1204,28 @@ class PixellabCharacterTool(unittest.TestCase):
         executor = content._make_pixellab_tools_executor()
         with unittest.mock.patch.object(serve, '_pixellab_account_balance', side_effect=[7.41, 7.41]), \
              unittest.mock.patch.object(serve, '_pixellab_call',
-                                        return_value=({'character_id': 'c', 'background_job_id': 'j'}, None)), \
+                                         return_value=({'character_id': 'c', 'background_job_id': 'j'}, None)), \
              unittest.mock.patch.object(serve, '_pixellab_poll_job', return_value=({'status': 'completed'}, None)), \
              unittest.mock.patch.object(serve, '_accrue_spend') as accrue:
             executor('generate_pixel_character', {'description': 'a knight'})
+        accrue.assert_not_called()
+
+    def test_unknown_balance_reads_skip_accrual(self):
+        # If PixelLab's balance can't be read (force call fails), there is no
+        # verified number to base cost on -- the generation still succeeds, it
+        # just accrues nothing rather than guessing a cost.
+        executor = content._make_pixellab_tools_executor()
+        with unittest.mock.patch.object(serve, '_pixellab_account_balance', return_value=None), \
+             unittest.mock.patch.object(serve, '_pixellab_call') as call, \
+             unittest.mock.patch.object(serve, '_pixellab_poll_job', return_value=({'status': 'completed'}, None)), \
+             unittest.mock.patch.object(serve, '_accrue_spend') as accrue:
+            call.side_effect = [
+                ({'character_id': 'char-1', 'background_job_id': 'job-1'}, None),
+                ({'rotation_urls': {'north': 'https://x/n.png'}}, None),
+            ]
+            out = executor('generate_pixel_character', {'description': 'a knight'})
+        result = json.loads(out)
+        self.assertEqual(result['character_id'], 'char-1')
         accrue.assert_not_called()
 
     def test_unknown_tool_name_raises(self):
@@ -1346,6 +1428,18 @@ class GitHubToolsExecutor(unittest.TestCase):
         self.assertEqual(call.call_count, 2)
         self.assertIn('comments?per_page=20', call.call_args_list[1].args[1])
 
+    def test_get_issue_comments_error_yields_empty_top_comments(self):
+        # A comments fetch failure must not fail the whole issue read -- the
+        # issue body/title are still real and useful; comments just degrade to
+        # an empty list rather than a fabricated one.
+        executor = content._make_github_tools_executor()
+        issue = {'number': 1, 'title': 't', 'state': 'open', 'labels': [], 'body': 'body', 'html_url': 'u'}
+        with unittest.mock.patch.object(serve, '_github_call',
+                                        side_effect=[(issue, None), (None, 'GitHub call failed (500): boom')]):
+            out = executor('github_get_issue', {'owner': 'o', 'repo': 'r', 'issue_number': 1})
+        self.assertIn('"top_comments": []', out)
+        self.assertIn('"title": "t"', out)
+
     def test_get_issue_requires_number(self):
         executor = content._make_github_tools_executor()
         with unittest.mock.patch.object(serve, '_github_call') as call:
@@ -1480,6 +1574,63 @@ class ApifyToolsExecutor(unittest.TestCase):
             out = executor('apify_run_actor', {'actorId': 'x', 'input': {}})
         accrue.assert_not_called()
         self.assertIn('Could not start Apify actor', out)
+
+    def test_run_actor_poll_error_breaks_without_accruing_or_fetching_items(self):
+        # A poll call failing mid-wait must stop polling (not keep hammering),
+        # report the last known status, and skip both cost accrual (no settled
+        # usage yet) and the items fetch (run never SUCCEEDED).
+        executor = content._make_apify_tools_executor()
+        calls = {'n': 0}
+        call_log = []
+
+        def fake_apify_call(path, **kw):
+            calls['n'] += 1
+            call_log.append(path)
+            if calls['n'] == 1:
+                return ({'data': {'id': 'run-1', 'status': 'RUNNING',
+                                  'defaultDatasetId': 'ds-1'}}, None)
+            return (None, 'Apify call failed (500): poll boom')
+
+        with unittest.mock.patch.object(serve, '_apify_budget_exceeded', return_value=False), \
+             unittest.mock.patch.object(serve, '_apify_call', side_effect=fake_apify_call), \
+             unittest.mock.patch.object(serve, '_accrue_apify_spend') as accrue, \
+             unittest.mock.patch('time.sleep'):
+            out = executor('apify_run_actor',
+                           {'actorId': 'apify/website-content-crawler',
+                            'input': {'startUrls': [{'url': 'https://example.com'}]},
+                            'waitSeconds': 5})
+        self.assertEqual(calls['n'], 2)  # start + one (errored) poll, then break
+        self.assertEqual(call_log, ['/actors/apify/website-content-crawler/runs', '/actor-runs/run-1'])
+        accrue.assert_not_called()
+        self.assertIn('RUNNING', out)  # never overwritten after the failed poll
+        self.assertIn('run-1', out)
+
+    def test_run_actor_reports_items_error_when_dataset_fetch_fails(self):
+        # A run that settles SUCCEEDED but whose dataset items fetch fails must
+        # still report the run honestly, with the items error surfaced.
+        executor = content._make_apify_tools_executor()
+
+        def fake_apify_call(path, **kw):
+            if path.startswith('/actors/') and path.endswith('/runs'):
+                return ({'data': {'id': 'run-1', 'status': 'SUCCEEDED',
+                                  'defaultDatasetId': 'ds-1', 'usageTotalUsd': 0.01}}, None)
+            if path == '/datasets/ds-1/items':
+                return (None, 'Apify call failed (500): items boom')
+            return ({}, None)
+
+        with unittest.mock.patch.object(serve, '_apify_budget_exceeded', return_value=False), \
+             unittest.mock.patch.object(serve, '_apify_call', side_effect=fake_apify_call) as call, \
+             unittest.mock.patch.object(serve, '_accrue_apify_spend') as accrue, \
+             unittest.mock.patch('time.sleep'):
+            out = executor('apify_run_actor',
+                           {'actorId': 'apify/website-content-crawler',
+                            'input': {'startUrls': []}, 'waitSeconds': 5})
+        self.assertIn('SUCCEEDED', out)
+        self.assertIn('itemsError', out)
+        self.assertIn('items boom', out)
+        accrue.assert_called_once_with(0.01)
+        # SUCCEEDED at start -> no poll loop; exactly start + items fetch.
+        self.assertEqual(call.call_count, 2)
 
     def test_get_dataset_items_fetches_clean_json(self):
         executor = content._make_apify_tools_executor()
