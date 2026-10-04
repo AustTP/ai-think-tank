@@ -33,8 +33,8 @@ print('=== health alert rows ===')
 with serve._db() as conn:
     try:
         cols = [c[1] for c in conn.execute("PRAGMA table_info(health_alerts)").fetchall()]
-        for r in conn.execute("SELECT * FROM health_alerts ORDER BY rowid DESC LIMIT 5"):
-            d = dict(zip(cols, r))
+        for row in conn.execute("SELECT * FROM health_alerts ORDER BY rowid DESC LIMIT 5"):
+            d = dict(zip(cols, row))
             print(json.dumps(d, default=str)[:200])
     except Exception as e:
         print('err', e)

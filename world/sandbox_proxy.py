@@ -81,7 +81,7 @@ def is_allowed(host):
 RATE_LIMIT_MAX_REQUESTS = 60
 RATE_LIMIT_WINDOW_S = 60
 _rate_lock = threading.Lock()
-_request_log = {}  # host -> [timestamps within the current window]
+_request_log: dict[str, list[float]] = {}  # host -> [timestamps within the current window]
 
 
 def rate_limited(host):
@@ -191,7 +191,7 @@ def handle_client(conn):
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(('0.0.0.0', PROXY_PORT))
+    server.bind(('0.0.0.0', PROXY_PORT))  # nosec B104 -- deliberate dual-homed egress proxy
     server.listen(50)
     print(f'sandbox egress allowlist proxy listening on :{PROXY_PORT}', flush=True)
     while True:
