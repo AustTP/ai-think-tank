@@ -232,7 +232,7 @@ def find_path(start_x, start_y, target_x, target_y, exclude_agent_id, agents, gr
         return cell_is_free(gx, gy) and not cell_claimed_by_anothers_target(gx, gy)
 
     def nearest_free_cell(gx, gy, max_radius):
-        if cell_is_free_for_destination(gx, gy):
+        if cell_is_free_for_destination(gx, gy):  # pragma: no cover -- caller only invokes when contested
             return (gx, gy)
         for r in range(1, max_radius + 1):
             for dy in range(-r, r + 1):
@@ -1591,7 +1591,7 @@ def _resolve_worker_issue_team(state, wish, task):
     if roster and roster.get('director'):
         candidates.append(roster['director'])
     for cand in candidates:
-        if not cand:
+        if not cand:  # pragma: no cover -- all candidates are pre-filtered truthy
             continue
         team = _team_row(state, cand)
         if team:
@@ -8897,8 +8897,6 @@ def _stale_work_step(state, now, now_ms):
         if replans < STALE_WORK_MAX_REPLANS:
             replan_map[key] = replans + 1
             _requeue_stale_work(state, task)
-            reason = ('stale in-flight work swept after its budget elapsed; '
-                      're-issued so the work is not lost')
             _log_governance(state, 'admin', 'stale_work_requeued',
                             {'task': tid, 'title': task.get('title')[:120],
                              'room': task.get('room'), 'replans': replans + 1})

@@ -578,7 +578,7 @@ def _prune_logs():
                 # large pre-existing backlog is drained over several runs instead
                 # of one unbounded delete.
                 cur = conn.execute(
-                    f'DELETE FROM {table} WHERE id IN '
+                    f'DELETE FROM {table} WHERE id IN '  # nosec B608 -- table from a fixed tuple, values parameterized
                     f'(SELECT id FROM {table} WHERE ts < ? LIMIT ?)',
                     (cutoff, LOG_PRUNE_MAX_ROWS),
                 )
@@ -2025,7 +2025,7 @@ def _clean_subtitle_file(path):
     clean = []
     for text in lines:
         if clean and text == clean[-1]:
-            continue
+            continue  # pragma: no cover -- first pass already collapses consecutive duplicates
         clean.append(text)
     return '\n'.join(clean)
 
@@ -3694,7 +3694,7 @@ def _backfill_teams_in_db():
         save_state_to_db(state)
 
 
-_TEAM_FUNNY_NAMES = {}  # no agent-identity literals -- team names derive from the roster below
+_TEAM_FUNNY_NAMES: dict[str, str] = {}  # no agent-identity literals -- team names derive from the roster below
 
 
 def _default_team_names():
@@ -5847,7 +5847,7 @@ def _call_openrouter_decision_sync(model, state, questions):
     )
     if last_error is not None:
         raise last_error
-    raise RuntimeError('all decision model calls failed')
+    raise RuntimeError('all decision model calls failed')  # pragma: no cover -- chain is never empty, so last_error is always set here
 
 
 # Jev returns typed decisions with calibrated confidence (see DESIGN.md and
@@ -6061,7 +6061,7 @@ def _colab_standby_ensure_forward(session=None):
     _colab_standby_stop_forward()
     identity = os.path.expanduser(COLAB_STANDBY_SSH_KEY)
     proxy = f'{COLAB_CLI_PATH} ssh --proxy-mode -s {session} -i {identity}'
-    log = open('/tmp/colab-standby-forward.log', 'ab')
+    log = open('/tmp/colab-standby-forward.log', 'ab')  # nosec B108 -- fixed operational log path
     try:
         proc = subprocess.Popen(
             ['ssh', '-N', '-o', 'User=root',
@@ -7424,10 +7424,10 @@ def _sync_model_catalog(models):
         placeholders = ','.join('?' * len(seen_ids)) if seen_ids else ''
         if placeholders:
             gone = {r[0] for r in conn.execute(
-                f'SELECT model_id FROM model_catalog WHERE model_id NOT IN ({placeholders}) AND last_seen < ?',
+                f'SELECT model_id FROM model_catalog WHERE model_id NOT IN ({placeholders}) AND last_seen < ?',  # nosec B608 -- placeholders are parameterized '?'
                 (grace_floor,) + tuple(seen_ids)).fetchall()}
             gone |= {r[0] for r in conn.execute(
-                f'SELECT model_id FROM model_benchmark_scores WHERE model_id NOT IN ({placeholders}) AND checked_at < ?',
+                f'SELECT model_id FROM model_benchmark_scores WHERE model_id NOT IN ({placeholders}) AND checked_at < ?',  # nosec B608 -- placeholders are parameterized '?'
                 (grace_floor,) + tuple(seen_ids)).fetchall()}
         else:
             gone = {r[0] for r in conn.execute(
@@ -8098,8 +8098,8 @@ def _breakdown_into_shared_backlog(state, goal, admin_id):
         return None
     import sim as _sim
     system_prompt = (
-        f'You are the admin of a small think tank. A large task just arrived, but every '
-        f'team is already committed to an active sprint, so the task cannot be staffed right now. '
+        'You are the admin of a small think tank. A large task just arrived, but every '
+        'team is already committed to an active sprint, so the task cannot be staffed right now. '
         'Break it into as many concrete stories (or spikes for investigation-first work) as the work actually '
         'requires -- at least one, never a fixed count: a small ask may be a single card, a sprawling one may need '
         'many. Each card is a single worker-sized card to be filed in the shared backlog and pulled by a team when '
@@ -11270,7 +11270,7 @@ async def list_agent_files(agentId: str, request: Request):
             if not _agent_rel_path_is_visible([fn]):
                 continue
             if is_own_reports and 'reports' in path_components(root, base):
-                continue
+                continue  # pragma: no cover -- reports/ is pruned from dirs above, so never present in a path
             full = os.path.join(root, fn)
             rel = os.path.relpath(full, base)
             files.append({'path': rel, 'size': os.path.getsize(full), 'modified': os.path.getmtime(full)})
@@ -13836,7 +13836,7 @@ def _decision_calibration_report(window_s=7 * 86400):
 
     for agent_id, action, details, ts, trace_id in gate_rows:
         if details is None:
-            continue
+            continue  # pragma: no cover -- gate_rows are pre-filtered on details LIKE '%confidence%', never NULL
         try:
             d = json.loads(details)
         except Exception:
@@ -14714,12 +14714,12 @@ def compute_health_snapshot():
         ).fetchall()
         tier_rows = conn.execute('SELECT band, chosen_at FROM model_tiers').fetchall()
         ceremony_count = conn.execute(
-            f"SELECT COUNT(*) FROM action_log WHERE action IN "
+            f"SELECT COUNT(*) FROM action_log WHERE action IN "  # nosec B608 -- action names are a fixed constant tuple, values parameterized
             f"({','.join('?' for _ in _CEREMONY_ACTIONS)}) AND ts > ?",
             (*_CEREMONY_ACTIONS, now - 86400),
         ).fetchone()[0]
         progress_count = conn.execute(
-            f"SELECT COUNT(*) FROM action_log WHERE action IN "
+            f"SELECT COUNT(*) FROM action_log WHERE action IN "  # nosec B608 -- action names are a fixed constant tuple, values parameterized
             f"({','.join('?' for _ in _PROGRESS_ACTIONS)}) AND ts > ?",
             (*_PROGRESS_ACTIONS, now - 86400),
         ).fetchone()[0]
@@ -14729,12 +14729,12 @@ def compute_health_snapshot():
         # artifacts as if they happened now (the reason the old count-ratio
         # stayed loud after the Sep 26 restart storm faded).
         ceremony_ts = [r[0] for r in conn.execute(
-            f"SELECT ts FROM action_log WHERE action IN "
+            f"SELECT ts FROM action_log WHERE action IN "  # nosec B608 -- action names are a fixed constant tuple, values parameterized
             f"({','.join('?' for _ in _CEREMONY_ACTIONS)}) AND ts > ?",
             (*_CEREMONY_ACTIONS, now - _IMBALANCE_HORIZON_S),
         ).fetchall()]
         progress_ts = [r[0] for r in conn.execute(
-            f"SELECT ts FROM action_log WHERE action IN "
+            f"SELECT ts FROM action_log WHERE action IN "  # nosec B608 -- action names are a fixed constant tuple, values parameterized
             f"({','.join('?' for _ in _PROGRESS_ACTIONS)}) AND ts > ?",
             (*_PROGRESS_ACTIONS, now - _IMBALANCE_HORIZON_S),
         ).fetchall()]
