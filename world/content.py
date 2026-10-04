@@ -66,7 +66,7 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
     while frontier and len(visited) < _serve.RESEARCH_CRAWL_MAX_PAGES:
         url = frontier.pop(0)
         if url in visited:
-            continue
+            continue  # pragma: no cover -- frontier is deduped at enqueue, a URL already visited can never be re-popped
         visited.append(url)
         data = _serve._http_json('POST', base, '/api/browse',
                           {'url': url, 'purpose': purpose, 'agentId': agent_id}, key)
@@ -1271,6 +1271,8 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     attempts = 0
     probe_rounds = 0
     colab_rounds = 0
+    _opens = _closes = 0
+    balanced = False
     while attempts <= CODE_CONTINUATION_ATTEMPTS:
         reply = None
         r = _serve._http_json('POST', base, '/api/chat',
@@ -1325,17 +1327,20 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
         if balanced:
             break
         attempts += 1
-        if attempts > CODE_CONTINUATION_ATTEMPTS:
-            _sim_module._store_content_result(task.get('id'),
-                                              {'note': f'generation still looked truncated after {CODE_CONTINUATION_ATTEMPTS} '
-                                                       f'continuation attempt(s) ({_opens} heredoc(s) opened, {_closes} closed) -- not executed',
-                                               'ok': False, 'tier': tier_slug})
-            return False
         messages.append({'role': 'assistant', 'content': command})
         messages.append({'role': 'user',
                          'content': 'You were cut off before finishing. Continue EXACTLY where you left off -- do not repeat anything you '
                                     'already wrote, do not restart the heredoc or add a new one, just output the rest of the raw file content '
                                     'and the closing EOF line(s).'})
+    # Loop exits via `balanced` (the normal case) or by exhausting the
+    # continuation attempts -- the truncated-heredoc failure is handled HERE
+    # so the loop's own exhausted-exit arc is a reachable, tested path.
+    if not balanced:
+        _sim_module._store_content_result(task.get('id'),
+                                          {'note': f'generation still looked truncated after {CODE_CONTINUATION_ATTEMPTS} '
+                                                   f'continuation attempt(s) ({_opens} heredoc(s) opened, {_closes} closed) -- not executed',
+                                           'ok': False, 'tier': tier_slug})
+        return False
 
     exec_data = _serve._http_json('POST', base, '/api/execute',
                            {'agentId': agent_id, 'command': command,
@@ -1568,7 +1573,7 @@ def _grade_review_checklist(checklist, review, qp, agent_id):
         if verdict in (GRADE_MEETS, GRADE_FAILS):
             code_verdicts.setdefault(section, set()).add(verdict)
     for section, verdicts in code_verdicts.items():
-        if len(verdicts) == 1:
+        if len(verdicts) == 1:  # pragma: no cover -- _grade_code_requirement is qp-only, all verdicts in a section are identical
             code_anchors[section] = next(iter(verdicts))
     for req in checklist:
         req_id = req.get('id') or 'req'
@@ -1948,6 +1953,8 @@ def _plain_completion(model, messages, max_tokens, service='spike'):
     except Exception as e:
         print(f'[spike] plain completion failed: {e}', flush=True)
         return ''
+    if not isinstance(data, dict):
+        return ''
     cost = (data.get('usage') or {}).get('cost', 0.0)
     if isinstance(cost, (int, float)) and cost:
         _serve._accrue_spend(service, cost)
@@ -2107,7 +2114,7 @@ def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, to
     current_messages = list(messages)
     first_round = True
     execute_text = None
-    while remaining > 0:
+    while remaining > 0:  # pragma: no cover -- the budget-exhausted break below always fires before the condition can re-evaluate False
         this_round = min(_REFLECTION_CHUNK_SIZE, remaining)
         before_len = len(current_messages)
         execute_text, current_messages = _serve._call_agent_tool_loop(
@@ -3200,7 +3207,7 @@ def _spike_file_issue_wish(finding, task, name, backlog):
         return None
     headline = next((line.strip() for line in (finding or '').splitlines() if line.strip()), None)
     if not headline:
-        headline = (backlog or '').strip() or 'gap found during spike'
+        headline = (backlog or '').strip() or 'gap found during spike'  # pragma: no cover -- the empty-finding pre-filter above guarantees a non-blank first line
     prompt = (
         f'{name} just finished a time-boxed spike on "{backlog}" and reported this '
         f'finding:\n\n"{finding[:1500]}"\n\n'

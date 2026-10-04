@@ -292,6 +292,111 @@ class DistillExecutor(unittest.TestCase):
                       'current wiki is fed to the synthesis model for an incremental merge')
 
 
+class DistillExecutorEdgeBranches(unittest.TestCase):
+    """Hermetic edge branches of _run_distill_content the main harness does
+    not reach: an OSError while listing/reading the archive dir, a non-file
+    entry in the archive dir, a missing model tier, a chat call that raises,
+    and a wiki write that returns None. Every case must terminate in a stored
+    noop result -- never a raised exception out of the executor."""
+
+    _WIKI_OK = {'id': 'x', 'title': 't', 'category': 'think_tank', 'version': 1}
+
+    def _exec(self, archive_names=('finding.md',), mid_tier='mid-tier',
+              http_json=None, write_wiki=_WIKI_OK, extra_patchers=None, extra_dirs=()):
+        import serve as serve_mod
+        tmp = tempfile.mkdtemp()
+        archive_dir = os.path.join(tmp, 'archive')
+        os.makedirs(archive_dir, exist_ok=True)
+        mtime = int(_NOW_MS / 1000) - 100
+        for n in archive_names:
+            p = os.path.join(archive_dir, n)
+            with open(p, 'w') as f:
+                f.write(f'{n} finding')
+            os.utime(p, (mtime, mtime))
+        for d in extra_dirs:
+            os.makedirs(os.path.join(archive_dir, d), exist_ok=True)
+        captured = {}
+        patchers = [
+            mock.patch.object(serve_mod, 'LIBRARY_ARCHIVE_DIR', archive_dir),
+            mock.patch.object(serve_mod, '_resolve_model_tier', return_value=mid_tier),
+            mock.patch.object(serve_mod, 'get_or_create_agent_key', return_value='k'),
+            mock.patch.object(sim, '_store_content_result',
+                              side_effect=lambda _tid, res: captured.update(res)),
+        ]
+        patchers.append(
+            mock.patch.object(serve_mod, '_http_json', return_value={'reply': 'merged'})
+            if http_json is None else
+            mock.patch.object(serve_mod, '_http_json', side_effect=http_json))
+        patchers.append(
+            mock.patch.object(serve_mod, '_write_wiki_server', return_value=write_wiki))
+        for p in (extra_patchers or []):
+            patchers.append(p)
+        for p in patchers:
+            p.start()
+        self.addCleanup(mock.patch.stopall)
+        from content import _run_distill_content
+        _run_distill_content({'agents': {}}, 'ada', _distill_task(distillSince=0))
+        return captured
+
+    def test_listdir_oserror_bails_to_noop(self):
+        captured = self._exec(
+            extra_patchers=[mock.patch('os.listdir', side_effect=OSError('boom'))])
+        self.assertTrue(captured.get('noop'))
+        self.assertIn('no new archive findings', captured.get('note', ''))
+
+    def test_missing_archive_dir_is_noop(self):
+        import serve as serve_mod
+        captured = self._exec(
+            extra_patchers=[mock.patch.object(serve_mod, 'LIBRARY_ARCHIVE_DIR',
+                                              '/nonexistent/archive/dir')])
+        self.assertTrue(captured.get('noop'))
+        self.assertIn('no new archive findings', captured.get('note', ''))
+
+    def test_non_file_entry_in_archive_dir_is_skipped(self):
+        captured = self._exec(
+            extra_dirs=('not-a-file',),
+            http_json=lambda *a, **k: {'reply': 'merged'},
+            write_wiki={'id': 'x', 'title': 't', 'category': 'think_tank', 'version': 1})
+        self.assertEqual(captured.get('distilled'), 1,
+                         'a directory entry in the archive dir must be skipped, not crash')
+
+    def test_unreadable_archive_is_skipped(self):
+        import builtins
+        real_open = builtins.open
+
+        def _raising_open(path, *args, **kwargs):
+            if str(path).endswith('broken.md'):
+                raise OSError('cannot read')
+            return real_open(path, *args, **kwargs)
+
+        captured = self._exec(
+            archive_names=('good.md', 'broken.md'),
+            http_json=lambda *a, **k: {'reply': 'merged'},
+            write_wiki={'id': 'x', 'title': 't', 'category': 'think_tank', 'version': 1},
+            extra_patchers=[mock.patch('builtins.open', side_effect=_raising_open)])
+        self.assertEqual(captured.get('distilled'), 1,
+                         'the readable archive is still folded in despite the broken one')
+
+    def test_no_model_tier_is_noop(self):
+        captured = self._exec(mid_tier=None)
+        self.assertTrue(captured.get('noop'))
+        self.assertIn('no model tier', captured.get('note', ''))
+
+    def test_chat_call_raises_bails_to_noop(self):
+        def http_json(method, base, path, body=None, header=None, timeout=30):
+            if path == '/api/chat':
+                raise RuntimeError('down')
+            return {'reply': 'merged'}
+        captured = self._exec(http_json=http_json)
+        self.assertTrue(captured.get('noop'))
+        self.assertIn('nothing usable', captured.get('note', ''))
+
+    def test_failed_wiki_write_is_noop(self):
+        captured = self._exec(write_wiki=None)
+        self.assertTrue(captured.get('noop'))
+        self.assertIn('write failed', captured.get('note', ''))
+
+
 class CsvLikeBlockExtraction(unittest.TestCase):
     """content._extract_csv_like_blocks: the pure detector behind the
     distill CSV-preservation safety net. Lazily imports content
@@ -314,6 +419,13 @@ class CsvLikeBlockExtraction(unittest.TestCase):
         blocks = self.content._extract_csv_like_blocks(text)
         self.assertEqual(len(blocks), 1)
         self.assertIn('name,url', blocks[0])
+
+    def test_fenced_block_below_min_lines_is_not_detected(self):
+        # A fenced block with fewer than _DISTILL_CSV_MIN_LINES data rows is
+        # not real tabular data worth preserving verbatim -- even though it is
+        # explicitly fenced.
+        text = '```csv\na,b\n```'
+        self.assertEqual(self.content._extract_csv_like_blocks(text), [])
 
     def test_unfenced_csv_like_lines_are_detected(self):
         text = 'Findings:\nname,url\nAda,https://a.com\nBen,https://b.com\n\nDone.'

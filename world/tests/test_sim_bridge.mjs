@@ -36,16 +36,9 @@ const refreshSimStatus = () => vm.runInContext('refreshSimStatus', context)();
 const startSimPoll = (...a) => vm.runInContext('startSimPoll', context)(...a);
 
 let passed = 0, failed = 0;
+const queued = [];
 function test(name, fn) {
-  try {
-    fn();
-    console.log(`  ok - ${name}`);
-    passed++;
-  } catch (e) {
-    console.log(`  FAIL - ${name}`);
-    console.log(`         ${e.message}`);
-    failed++;
-  }
+  queued.push({ name, fn });
 }
 
 // Switchable apiFetch so we can exercise the failure path.
@@ -79,16 +72,19 @@ test('a thrown poll is swallowed, not raised', async () => {
 test('startSimPoll does an immediate refresh then schedules', async () => {
   const scheduled = [];
   context.setInterval = (fn, ms) => { scheduled.push(ms); };
+  context.apiFetch = async () => nextResponse;
   nextResponse = { ok: true, json: async () => ({ running: true, tick: 12 }) };
   await startSimPoll();
   assert.equal(vm.runInContext('SIM_STATUS', context).tick, 12);
-  // status poll (2s) + position poll (1s) -- see sim_bridge.js startSimPoll.
+  // status poll (1s, sim_bridge.js SIM_POLL_MS) + position poll (250ms) --
+  // see sim_bridge.js startSimPoll.
   assert.equal(scheduled.length, 2);
-  assert.ok(scheduled.includes(2000), 'status poll cadence unchanged');
-  assert.ok(scheduled.includes(1000), 'position poll schedules at 1s');
+  assert.ok(scheduled.includes(1000), 'status poll cadence unchanged');
+  assert.ok(scheduled.includes(250), 'position poll schedules at 250ms');
 });
 
 test('refreshServerPositions stores the authoritative snapshot', async () => {
+  context.apiFetch = async () => nextResponse;
   nextResponse = { ok: true, json: async () => ({
     owner: 'server', tick: 41,
     agents: { ada: { x: 130, y: 90, dir: 'east', busy: true, inRoom: 'weatherstation', offDuty: false, pathActive: true, task: 'check weather' } },
@@ -144,4 +140,18 @@ test('applyServerPositions tolerates missing agents and partial snapshots', () =
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
-process.exit(failed ? 1 : 0);
+(async () => {
+  for (const { name, fn } of queued) {
+    try {
+      await fn();
+      console.log(`  ok - ${name}`);
+      passed++;
+    } catch (e) {
+      console.log(`  FAIL - ${name}`);
+      console.log(`         ${e.message}`);
+      failed++;
+    }
+  }
+  console.log(`\n${passed} passed, ${failed} failed`);
+  process.exit(failed ? 1 : 0);
+})();

@@ -184,6 +184,17 @@ class GradeReviewChecklist(unittest.TestCase):
         self.assertEqual(len(skipped), 2)
         self.assertEqual(len(out['escalate']), 2)
 
+    def test_non_pipeline_code_requirement_is_unsure_grade(self):
+        # A 'code' requirement whose question is NOT about code health has no
+        # predicate the executor can apply -- it grades insufficient_evidence
+        # (surfaced to the player), exactly like grading.js's absent-predicate
+        # fallback. It also never contributes to a section's mechanical anchor.
+        checklist = [{'id': 'c1', 'question': 'Is the design clean?', 'section': 'repo',
+                      'type': 'code'}]
+        out = content._grade_review_checklist(checklist, 'review', {'ok': True}, 'ada')
+        self.assertEqual(out['grades'][0]['verdict'], content.GRADE_UNSURE)
+        self.assertEqual(out['escalate'], [])
+
 
 class RecordReviewProcessTrace(unittest.TestCase):
     def _run_writer(self, grades, calls=None, get_result=None):
@@ -313,6 +324,252 @@ class RunReviewContentEnsemble(unittest.TestCase):
         )
         self.assertNotIn('queueFix', result)
         self.assertEqual(result['checklistEscalated'], ['j1'])
+
+    def test_no_model_tier_short_circuits_without_any_network_call(self):
+        snapshot = {}
+        task = {'id': 'task-r-n0', 'title': 'Review landing', 'room': 'pressoffice',
+                'taskType': 'review', 'projectLabel': 'landing'}
+        with mock.patch.object(content, '_gather_unified_context', return_value='context'), \
+             mock.patch.object(content, '_run_quality_pipeline',
+                               return_value={'ok': True, 'failedStep': None, 'results': [],
+                                             'note': 'quality pipeline all green'}), \
+             mock.patch.object(content._serve, 'SELF_BASE_URL', 'http://x'), \
+             mock.patch.object(content._serve, '_coding_tier_slug', return_value=None), \
+             mock.patch.object(content._serve, '_mid_tier_slug', return_value=None), \
+             mock.patch.object(content._serve, '_low_tier_slug', return_value=None), \
+             mock.patch.object(content._serve, '_http_json') as http_mock, \
+             mock.patch.object(sim, '_store_content_result', return_value=None) as store:
+            content._run_review_content(snapshot, 'ada', task)
+        result = store.call_args[0][1]
+        self.assertFalse(result['ok'])
+        self.assertIn('no model tier is configured', result['note'])
+        http_mock.assert_not_called()  # never got to the critique/visual/library calls
+
+    def test_qa_variant_uses_the_qa_lead_and_reports_QA(self):
+        snapshot = {}
+        task = {'id': 'task-qa1', 'title': 'QA landing', 'room': 'pressoffice',
+                'taskType': 'qa', 'projectLabel': 'landing'}
+        with mock.patch.object(content, '_agent_name', return_value='Ada'), \
+             mock.patch.object(content, '_gather_unified_context', return_value='context'), \
+             mock.patch.object(content, '_run_quality_pipeline',
+                               return_value={'ok': True, 'failedStep': None, 'results': [],
+                                             'note': 'quality pipeline all green'}), \
+             mock.patch.object(content, '_review_screenshot',
+                               return_value={'ok': True, 'review': 'visual pass'}), \
+             mock.patch.object(content._serve, 'SELF_BASE_URL', 'http://x'), \
+             mock.patch.object(content._serve, '_coding_tier_slug', return_value='gpt-4o-mini'), \
+             mock.patch.object(content._serve, '_http_json',
+                               side_effect=lambda method, base, path, body, key: {'reply': 'the review text'}), \
+             mock.patch.object(content._serve, '_call_openrouter_decision_sync',
+                               return_value=_answer('clean', 0.95)), \
+             mock.patch.object(content._serve, '_jev_choice', return_value=_HOLISTIC_CLEAN), \
+             mock.patch.object(content._serve, 'create_escalation', return_value='esc-1'), \
+             mock.patch.object(sim, '_store_content_result', return_value=None) as store:
+            content._run_review_content(snapshot, 'ada', task)
+        result = store.call_args[0][1]
+        self.assertEqual(result['note'], 'Filed a QA on "QA landing" (text + visual), nothing actionable found')
+
+    def test_probe_round_feeds_real_probe_feedback_back_into_the_chat(self):
+        snapshot = {}
+        task = {'id': 'task-probe', 'title': 'Review landing', 'room': 'pressoffice',
+                'taskType': 'review', 'projectLabel': 'landing'}
+        calls = {'chat': 0, 'probe': 0}
+        def http_side_effect(method, base, path, body=None, key=None):
+            if path == '/api/chat':
+                calls['chat'] += 1
+                if calls['chat'] == 1:
+                    return {'reply': '{"probeRequest": {"path": "index.html", "actions": [], '
+                                    '"probes": ["document.body.className"]}}'}
+                return {'reply': 'final assessment'}
+            if path == '/api/page-probe':
+                calls['probe'] += 1
+                return {'actionLog': ['clicked'], 'customGlobals': [],
+                        'results': {'document.body.className': 'dark'}}
+            return {'reply': 'x'}
+        with mock.patch.object(content, '_agent_name', return_value='Ada'), \
+             mock.patch.object(content, '_gather_unified_context', return_value='context'), \
+             mock.patch.object(content, '_run_quality_pipeline',
+                               return_value={'ok': True, 'failedStep': None, 'results': [],
+                                             'note': 'quality pipeline all green'}), \
+             mock.patch.object(content, '_review_screenshot',
+                               return_value={'ok': True, 'review': 'visual pass'}), \
+             mock.patch.object(content._serve, 'SELF_BASE_URL', 'http://x'), \
+             mock.patch.object(content._serve, '_coding_tier_slug', return_value='gpt-4o-mini'), \
+             mock.patch.object(content._serve, '_http_json', side_effect=http_side_effect), \
+             mock.patch.object(content._serve, '_call_openrouter_decision_sync',
+                               return_value=_answer('clean', 0.95)), \
+             mock.patch.object(content._serve, '_jev_choice', return_value=_HOLISTIC_CLEAN), \
+             mock.patch.object(content._serve, 'create_escalation', return_value='esc-1'), \
+             mock.patch.object(sim, '_store_content_result', return_value=None) as store:
+            content._run_review_content(snapshot, 'ada', task)
+        self.assertEqual(calls['chat'], 2)  # first reply was a probe, second was the real assessment
+        self.assertEqual(calls['probe'], 1)
+        result = store.call_args[0][1]
+        self.assertIn('Filed a review', result['note'])
+
+    def test_probe_rounds_exhausted_then_final_assessment(self):
+        # Both allowed probe rounds are used; on the LAST one the prompt
+        # tells the reviewer to write the final assessment as plain text.
+        snapshot = {}
+        task = {'id': 'task-probe2', 'title': 'Review landing', 'room': 'pressoffice',
+                'taskType': 'review', 'projectLabel': 'landing'}
+        calls = {'chat': 0, 'probe': 0}
+        def http_side_effect(method, base, path, body=None, key=None):
+            if path == '/api/chat':
+                calls['chat'] += 1
+                if calls['chat'] <= 2:
+                    return {'reply': '{"probeRequest": {"path": "index.html", "actions": [], '
+                                    '"probes": ["document.title"]}}'}
+                return {'reply': 'final assessment'}
+            if path == '/api/page-probe':
+                calls['probe'] += 1
+                return {'actionLog': [], 'customGlobals': [],
+                        'results': {'document.title': 'landing'}}
+            return {'reply': 'x'}
+        with mock.patch.object(content, '_agent_name', return_value='Ada'), \
+             mock.patch.object(content, '_gather_unified_context', return_value='context'), \
+             mock.patch.object(content, '_run_quality_pipeline',
+                               return_value={'ok': True, 'failedStep': None, 'results': [],
+                                             'note': 'quality pipeline all green'}), \
+             mock.patch.object(content, '_review_screenshot',
+                               return_value={'ok': True, 'review': 'visual pass'}), \
+             mock.patch.object(content._serve, 'SELF_BASE_URL', 'http://x'), \
+             mock.patch.object(content._serve, '_coding_tier_slug', return_value='gpt-4o-mini'), \
+             mock.patch.object(content._serve, '_http_json', side_effect=http_side_effect), \
+             mock.patch.object(content._serve, '_call_openrouter_decision_sync',
+                               return_value=_answer('clean', 0.95)), \
+             mock.patch.object(content._serve, '_jev_choice', return_value=_HOLISTIC_CLEAN), \
+             mock.patch.object(content._serve, 'create_escalation', return_value='esc-1'), \
+             mock.patch.object(sim, '_store_content_result', return_value=None) as store:
+            content._run_review_content(snapshot, 'ada', task)
+        self.assertEqual(calls['probe'], 2)  # both rounds used
+        self.assertEqual(calls['chat'], 3)
+        result = store.call_args[0][1]
+        self.assertIn('Filed a review', result['note'])
+
+    def test_jev_verdict_raise_falls_back_to_clean(self):
+        # The deterministic safe fallback: a Jev decision failure must NOT queue
+        # a fix the review can't justify -- reads as clean.
+        snapshot = {}
+        task = {'id': 'task-jev-raise', 'title': 'Review landing', 'room': 'pressoffice',
+                'taskType': 'review', 'projectLabel': 'landing'}
+        with mock.patch.object(content, '_agent_name', return_value='Ada'), \
+             mock.patch.object(content, '_gather_unified_context', return_value='context'), \
+             mock.patch.object(content, '_run_quality_pipeline',
+                               return_value={'ok': True, 'failedStep': None, 'results': [],
+                                             'note': 'quality pipeline all green'}), \
+             mock.patch.object(content, '_review_screenshot',
+                               return_value={'ok': True, 'review': 'visual pass'}), \
+             mock.patch.object(content._serve, 'SELF_BASE_URL', 'http://x'), \
+             mock.patch.object(content._serve, '_coding_tier_slug', return_value='gpt-4o-mini'), \
+             mock.patch.object(content._serve, '_http_json',
+                               side_effect=lambda method, base, path, body, key: {'reply': 'the review text'}), \
+             mock.patch.object(content._serve, '_call_openrouter_decision_sync',
+                               side_effect=RuntimeError('judge down')), \
+             mock.patch.object(content._serve, 'create_escalation', return_value='esc-1'), \
+             mock.patch.object(sim, '_store_content_result', return_value=None) as store:
+            content._run_review_content(snapshot, 'ada', task)
+        result = store.call_args[0][1]
+        self.assertNotIn('queueFix', result)  # safe clean fallback
+        self.assertTrue(result['ok'])
+
+    def test_red_quality_pipeline_forces_actionable_even_when_holistic_says_clean(self):
+        snapshot = {}
+        task = {'id': 'task-red', 'title': 'Review landing', 'room': 'pressoffice',
+                'taskType': 'review', 'projectLabel': 'landing'}
+        with mock.patch.object(content, '_agent_name', return_value='Ada'), \
+             mock.patch.object(content, '_gather_unified_context', return_value='context'), \
+             mock.patch.object(content, '_run_quality_pipeline',
+                               return_value={'ok': False, 'failedStep': 'flake8',
+                                             'results': [], 'note': 'quality pipeline FAILED at flake8'}), \
+             mock.patch.object(content, '_review_screenshot',
+                               return_value={'ok': True, 'review': 'visual pass'}), \
+             mock.patch.object(content._serve, 'SELF_BASE_URL', 'http://x'), \
+             mock.patch.object(content._serve, '_coding_tier_slug', return_value='gpt-4o-mini'), \
+             mock.patch.object(content._serve, '_http_json',
+                               side_effect=lambda method, base, path, body, key: {'reply': 'the review text'}), \
+             mock.patch.object(content._serve, '_call_openrouter_decision_sync',
+                               return_value=_answer('clean', 0.95)), \
+             mock.patch.object(content._serve, '_jev_choice', return_value=_HOLISTIC_CLEAN), \
+             mock.patch.object(content._serve, 'create_escalation', return_value='esc-1'), \
+             mock.patch.object(sim, '_store_content_result', return_value=None) as store:
+            content._run_review_content(snapshot, 'ada', task)
+        result = store.call_args[0][1]
+        self.assertFalse(result['pipelineOk'])
+        self.assertIsNotNone(result['queueFix'])  # red pipeline can never read as approval
+        self.assertIn('Quality pipeline is red', result['queueFix']['instructions'])
+        self.assertEqual(result['queueFix']['productId'], task.get('productId'))
+
+    def test_escalation_failure_is_swallowed(self):
+        # A create_escalation raise must not break the review result -- the
+        # grade/verdict still lands, just without the escalation side channel.
+        checklist = [{'id': 'h1', 'question': 'Is the tone right?', 'section': 'tone', 'type': 'human'}]
+        snapshot = {}
+        task = {'id': 'task-esc-raise', 'title': 'Review landing', 'room': 'pressoffice',
+                'taskType': 'review', 'projectLabel': 'landing', 'checklist': checklist}
+        with mock.patch.object(content, '_agent_name', return_value='Ada'), \
+             mock.patch.object(content, '_gather_unified_context', return_value='context'), \
+             mock.patch.object(content, '_run_quality_pipeline',
+                               return_value={'ok': True, 'failedStep': None, 'results': [],
+                                             'note': 'quality pipeline all green'}), \
+             mock.patch.object(content, '_review_screenshot',
+                               return_value={'ok': True, 'review': 'visual pass'}), \
+             mock.patch.object(content._serve, 'SELF_BASE_URL', 'http://x'), \
+             mock.patch.object(content._serve, '_coding_tier_slug', return_value='gpt-4o-mini'), \
+             mock.patch.object(content._serve, '_http_json',
+                               side_effect=lambda method, base, path, body, key: {'reply': 'the review text'}), \
+             mock.patch.object(content._serve, '_call_openrouter_decision_sync',
+                               return_value=_answer('clean', 0.95)), \
+             mock.patch.object(content._serve, '_jev_choice', return_value=_HOLISTIC_CLEAN), \
+             mock.patch.object(content._serve, 'create_escalation',
+                               side_effect=RuntimeError('escalation down')), \
+             mock.patch.object(sim, '_store_content_result', return_value=None) as store:
+            content._run_review_content(snapshot, 'ada', task)  # no raise
+        result = store.call_args[0][1]
+        self.assertNotIn('checklistEscalated', result)
+
+    def test_process_trace_failure_is_swallowed(self):
+        checklist = [{'id': 'j1', 'question': 'Is the opening specific?', 'section': 'opening', 'type': 'jev'}]
+        snapshot = {}
+        task = {'id': 'task-trace-raise', 'title': 'Review landing', 'room': 'pressoffice',
+                'taskType': 'review', 'projectLabel': 'landing', 'checklist': checklist}
+        with mock.patch.object(content, '_agent_name', return_value='Ada'), \
+             mock.patch.object(content, '_gather_unified_context', return_value='context'), \
+             mock.patch.object(content, '_run_quality_pipeline',
+                               return_value={'ok': True, 'failedStep': None, 'results': [],
+                                             'note': 'quality pipeline all green'}), \
+             mock.patch.object(content, '_review_screenshot',
+                               return_value={'ok': True, 'review': 'visual pass'}), \
+             mock.patch.object(content, '_record_review_process_trace',
+                               side_effect=RuntimeError('library down')), \
+             mock.patch.object(content._serve, 'SELF_BASE_URL', 'http://x'), \
+             mock.patch.object(content._serve, '_coding_tier_slug', return_value='gpt-4o-mini'), \
+             mock.patch.object(content._serve, '_http_json',
+                               side_effect=lambda method, base, path, body, key: {'reply': 'the review text'}), \
+             mock.patch.object(content._serve, '_call_openrouter_decision_sync',
+                               side_effect=[_answer('clean', 0.95), _answer(content.GRADE_FAILS, 0.9)]), \
+             mock.patch.object(content._serve, '_jev_choice',
+                               side_effect=[_HOLISTIC_CLEAN, (content.GRADE_FAILS, 0.9, 0.01)]), \
+             mock.patch.object(content._serve, 'create_escalation', return_value='esc-1'), \
+             mock.patch.object(sim, '_store_content_result', return_value=None) as store:
+            content._run_review_content(snapshot, 'ada', task)  # no raise
+        result = store.call_args[0][1]
+        self.assertNotIn('processTraceCount', result)  # swallowed -> 0, not surfaced
+
+
+class WikiContextForTask(unittest.TestCase):
+    def test_wiki_context_returns_the_injected_markdown(self):
+        state = {'agents': {}}
+        with mock.patch.object(sim, 'inject_wiki_context', return_value='# Room knowledge') as inject:
+            out = content._wiki_context_for_task(state, {'room': 'pressoffice'})
+        self.assertEqual(out, '# Room knowledge')
+        inject.assert_called_once_with(state, {'room': 'pressoffice'})
+
+    def test_wiki_context_exception_returns_empty_string(self):
+        # The executor must still run with a blank knowledge context if the
+        # injection path blows up -- never wedge the task on a wiki failure.
+        with mock.patch.object(sim, 'inject_wiki_context', side_effect=RuntimeError('db down')):
+            self.assertEqual(content._wiki_context_for_task({'agents': {}}, {'room': 'pressoffice'}), '')
 
 
 if __name__ == '__main__':
