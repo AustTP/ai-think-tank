@@ -29,6 +29,7 @@ function setGlobal(name, value) {
   vm.runInContext(`${name} = __inject_${name};`, context);
 }
 const moraleFor = (...args) => vm.runInContext('moraleFor', context)(...args);
+const thinkTankMorale = (...args) => vm.runInContext('thinkTankMorale', context)(...args);
 const DAY_MS = 86400000;
 
 let passed = 0, failed = 0;
@@ -100,6 +101,25 @@ test('reports/notes do NOT move the morale meter (they feed firing review instea
   // identical -- the reference video's meter reacts to approved/dropped/
   // neglected signals only, never to notes.
   assert.equal(moraleFor('dev'), base);
+});
+
+test('thinkTankMorale averages every agent and returns null with none', () => {
+  setGlobal('AGENTS', {});
+  assert.equal(thinkTankMorale(), null);
+
+  setGlobal('AGENTS', {
+    a: agent({ id: 'a', approvedCount: 0, droppedCount: 0, lastContactedAt: Date.now() }),
+    b: agent({ id: 'b', approvedCount: 0, droppedCount: 0, lastContactedAt: Date.now() }),
+  });
+  assert.equal(thinkTankMorale(), 100);
+
+  // One burned-out agent (6 drops + never contacted = 34) drags the
+  // tank-wide average down from 100 to 67.
+  setGlobal('AGENTS', {
+    a: agent({ id: 'a', approvedCount: 0, droppedCount: 0, lastContactedAt: Date.now() }),
+    b: agent({ id: 'b', approvedCount: 0, droppedCount: 6, lastContactedAt: null, hiredAt: Date.now() }),
+  });
+  assert.equal(thinkTankMorale(), 67);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
