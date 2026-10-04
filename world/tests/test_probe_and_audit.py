@@ -5,6 +5,7 @@ health.py health-check script. All hermetic: serve's network paths are faked,
 the reachability audit runs against the real collision/door JSON (pure
 geometry), and health.py reads a fabricated in-memory kv_state blob.
 """
+import ast
 import io
 import json
 import os
@@ -383,6 +384,55 @@ class VillageCheck(unittest.TestCase):
             else:
                 sys.modules.pop('serve', None)
         self.assertIn('err', text)
+
+
+# ---------------------------------------------------------------------------
+# _gapmap.py -- coverage-gap-by-function mapping tool
+# ---------------------------------------------------------------------------
+
+class GapMap(unittest.TestCase):
+    def _run(self, cov_files, sim_src):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, 'coverage.json'), 'w') as f:
+                json.dump({'files': cov_files}, f)
+            with open(os.path.join(td, 'sim.py'), 'w') as f:
+                f.write(sim_src)
+            src = open(os.path.join(WORLD_DIR, '_gapmap.py')).read()
+            old = os.getcwd()
+            os.chdir(td)
+            try:
+                with unittest.mock.patch('sys.stdout', io.StringIO()) as out:
+                    exec(compile(src, os.path.join(WORLD_DIR, '_gapmap.py'), 'exec'),
+                         {'__name__': '__main__', 'ast': ast, 'json': json})
+                return out.getvalue()
+            finally:
+                os.chdir(old)
+
+    def test_maps_missing_lines_to_functions(self):
+        sim_src = 'def foo():\n    pass\n\n\ndef bar():\n    return 1\n'
+        # Absolute sim.py key path -> the `.get` branch is taken directly.
+        cov = {'/Users/poole86/ai-village-template/world/sim.py': {'missing_lines': [2]}}
+        text = self._run(cov, sim_src)
+        self.assertIn('total missing: 1', text)
+        self.assertIn('foo (1-2): 1 -> [2]', text)
+        self.assertNotIn('bar', text)
+
+    def test_falls_back_to_suffix_match_when_key_absent(self):
+        sim_src = 'def foo():\n    pass\n\n\ndef bar():\n    return 1\n'
+        # Keyed by a different path: `.get` returns {} (falsy), so the
+        # endswith('sim.py') fallback loop finds and breaks on it.
+        cov = {'/elsewhere/mirror/sim.py': {'missing_lines': [5]}}
+        text = self._run(cov, sim_src)
+        self.assertIn('total missing: 1', text)
+        self.assertIn('bar (5-6): 1 -> [5]', text)
+
+    def test_no_matching_sim_key_raises(self):
+        sim_src = 'def foo():\n    pass\n\n\ndef bar():\n    return 1\n'
+        # No key ends with sim.py: the fallback loop exhausts without a break
+        # and the tool fails hard on the missing key (its real behavior).
+        cov = {'/elsewhere/other.py': {'missing_lines': [2]}}
+        with self.assertRaises(KeyError):
+            self._run(cov, sim_src)
 
 
 if __name__ == '__main__':
