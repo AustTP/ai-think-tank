@@ -98,6 +98,28 @@ THINK_TANK_DIR = os.path.dirname(ROOT)
 # exactly the kind of thing that must never be publicly fetchable.
 SANDBOXES_DIR = os.path.join(THINK_TANK_DIR, 'sandboxes')
 ESCALATIONS_PATH = os.path.join(THINK_TANK_DIR, 'escalations.json')
+# Draft-failure ledger + rule proposals: the human-in-the-loop rule book (see
+# DESIGN.md "Failure taxonomy and rule mining"). `failures.json` is the sorted
+# raw material -- one classified failure per review/QA send-back. The weekly
+# rule-mining pass aggregates it and writes `rule_proposals.json`: recurring
+# patterns (>= RULE_MIN_RECURRENCE) become PROPOSED rules (rule text + test
+# fixture), never auto-applied -- the operator turns a proposal into a real
+# rule by editing the ban list / Jev criteria, exactly like the other
+# operator-applied governance changes. Bounded so an aging think tank cannot
+# grow the files without bound.
+FAILURES_PATH = os.path.join(THINK_TANK_DIR, 'failures.json')
+RULE_PROPOSALS_PATH = os.path.join(THINK_TANK_DIR, 'rule_proposals.json')
+FAILURE_MAX_RECORDS = 200
+RULE_PROPOSALS_MAX = 50
+RULE_MIN_RECURRENCE = 2  # "happened more than once" -> rule-worthy
+# The four-bucket sort every draft failure goes into.
+FAILURE_TYPES = ('factual_error', 'client_preference', 'missing_information', 'style')
+FAILURE_TYPE_LABELS = {
+    'factual_error': 'a number or claim is wrong or has no source',
+    'client_preference': 'it contradicts the stated client/operator preference',
+    'missing_information': 'a required fact or field is missing',
+    'style': 'style, tone, or wording',
+}
 DB_PATH = os.path.join(THINK_TANK_DIR, 'think_tank.db')
 # The Library's real capability -- a shared file directory
 # any agent can read from or write to (code, notes, completed-task
@@ -563,8 +585,11 @@ def _prune_logs():
     (decision_tape, action_log). Deletes rows older than the
     retention window (default 7 days; override LOG_RETENTION_DAYS in .env),
     capped per run so a large pre-existing backlog is drained over a few runs
-    instead of one giant delete. Best-effort: a prune failure must never take
-    down the server. Runs on its own cadence via _log_prune_loop."""
+    instead of one giant delete. Also prunes RESOLVED escalations from
+    escalations.json once they pass the same window -- their approve/deny
+    decision is already recorded in action_log, so the file only needs to keep
+    them while they're still fresh. Best-effort: a prune failure must never
+    take down the server. Runs on its own cadence via _log_prune_loop."""
     try:
         days = float(_load_env().get('LOG_RETENTION_DAYS', LOG_RETENTION_DAYS_DEFAULT) or LOG_RETENTION_DAYS_DEFAULT)
     except Exception:
@@ -586,8 +611,22 @@ def _prune_logs():
     except Exception as e:
         print(f'[prune] failed: {e}', flush=True)
         return 0
-    if deleted:
-        print(f'[prune] removed {deleted} rows older than {days}d from decision_tape/action_log', flush=True)
+    pruned_escalations = 0
+    try:
+        escalations = _load_escalations()
+        stale = [esc_id for esc_id, esc in escalations.items()
+                 if esc.get('status') != 'pending'
+                 and (esc.get('resolvedAt') or esc.get('ts') or 0) < cutoff]
+        if stale:
+            for esc_id in stale:
+                del escalations[esc_id]
+            _save_escalations(escalations)
+            pruned_escalations = len(stale)
+    except Exception as e:
+        print(f'[prune] escalation prune failed: {e}', flush=True)
+    if deleted or pruned_escalations:
+        print(f'[prune] removed {deleted} rows older than {days}d from decision_tape/action_log '
+              f'and {pruned_escalations} resolved escalations', flush=True)
     return deleted
 
 
@@ -5039,21 +5078,190 @@ def provision_player_email(app_password):
     return {'ok': True, 'test_ok': bool(test_ok)}
 
 
-def create_escalation(kind, question, on_approve_note=''):
+def create_escalation(kind, question, on_approve_note='', what_checked='', look_first=''):
     # A random unguessable token per escalation, not just the record id --
     # the resolve link needs to not be trivially enumerable (id alone
     # would be sequential and guessable).
     escalations = _load_escalations()
     esc_id = 'esc-' + secrets.token_hex(4)
     token = secrets.token_urlsafe(24)
-    escalations[esc_id] = {'kind': kind, 'question': question, 'status': 'pending', 'token': token, 'ts': time.time(), 'note': on_approve_note}
+    escalations[esc_id] = {'kind': kind, 'question': question, 'status': 'pending', 'token': token, 'ts': time.time(), 'note': on_approve_note, 'whatChecked': what_checked, 'lookFirst': look_first}
     _save_escalations(escalations)
 
     approve_url = f'{ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=approve'
     deny_url = f'{ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=deny'
-    body = f'{question}\n\nApprove: {approve_url}\n\nDeny: {deny_url}'
+    body = (f'{question}\n\n'
+            f'What I checked: {what_checked or "(see question)"}\n'
+            f'Look here first: {look_first or "the question above"}\n\n'
+            f'Approve: {approve_url}\n\n'
+            f'Deny: {deny_url}')
     _send_escalation_email_sync(f'[AI Think Tank] Needs your call: {kind}', body)
     return esc_id
+
+
+def _load_failures():
+    if os.path.exists(FAILURES_PATH):
+        with open(FAILURES_PATH) as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    return []
+
+
+def _save_failures(data):
+    with open(FAILURES_PATH, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def _load_rule_proposals():
+    if os.path.exists(RULE_PROPOSALS_PATH):
+        with open(RULE_PROPOSALS_PATH) as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    return []
+
+
+def _save_rule_proposals(data):
+    with open(RULE_PROPOSALS_PATH, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+# Deterministic pre-classifier signals: money and any number-without-source is
+# ALWAYS a factual_error (never auto-OK'd, the "unsure about anything involving
+# money" rule); style-keyworded text maps to style. Everything else needs the
+# Jev classifier. Kept separate so the obvious buckets never spend a Jev call.
+_FAILURE_MONEY_HINTS = ('$', 'dollar', 'cost', 'price', 'budget')
+_FAILURE_STYLE_HINTS = ('rephrase', 'wording', 'tone', 'style', 'awkward', 'fluff', 'jargon', 'verbose')
+
+
+def _classify_failure_rule(text):
+    """Deterministic first cut of the sort step. Returns a FAILURE_TYPES value,
+    or None when the text needs the Jev classifier."""
+    low = (text or '').lower()
+    if any(w in text for w in _FAILURE_MONEY_HINTS) or any(w in low for w in ('cost', 'price', 'budget', 'dollar')):
+        return 'factual_error'
+    if any(w in low for w in _FAILURE_STYLE_HINTS):
+        return 'style'
+    return None
+
+
+def _failure_taxonomy_decider_default(text):
+    """The Jev half of the sort step: classify WHY a deliverable was sent back.
+    Returns (failure_type, confidence). Fails closed to ('style', 0.0) on a
+    failed call or a low-confidence answer -- a mislabeled fact landing in
+    'style' only produces a softer proposed rule, never a wrong safety gate
+    (the deterministic money rule above already pins the safety-critical
+    bucket without any model call)."""
+    try:
+        decision = _call_openrouter_decision_sync(
+            _jev_model(), {'messages': [], 'signals': {}},
+            {'choice': {'type': 'choice',
+                        'instructions': f'Classify why this draft was sent back for revision: "{text}".',
+                        'criteria': {'factual_error': FAILURE_TYPE_LABELS['factual_error'],
+                                     'client_preference': FAILURE_TYPE_LABELS['client_preference'],
+                                     'missing_information': FAILURE_TYPE_LABELS['missing_information'],
+                                     'style': FAILURE_TYPE_LABELS['style']}}})
+        choice, confidence, _cost = _jev_choice(decision)
+    except Exception:
+        return 'style', 0.0
+    if choice not in FAILURE_TYPES:
+        return 'style', 0.0
+    if confidence < _effective_review_grade_confidence():
+        return 'style', confidence
+    return choice, confidence
+
+
+_failure_taxonomy_decider = _failure_taxonomy_decider_default
+
+
+def _classify_failure(text):
+    """The sort step: a draft failure -> one of the four buckets. Deterministic
+    rules first (zero spend for the obvious cases), Jev classifier as the
+    fallback."""
+    rule = _classify_failure_rule(text)
+    if rule:
+        return rule
+    return _failure_taxonomy_decider(text)[0]
+
+
+def _record_failure(failure_type, summary, rule_hint='', section='', input_text='', accepted_text='', agent_id=''):
+    """Append one classified failure to the ledger -- the durable output of the
+    sort step, and the raw material the weekly rule-mining pass aggregates.
+    Bounded to the tail (FAILURE_MAX_RECORDS) so an aging think tank cannot
+    grow the file without bound. Returns the new record's id."""
+    failures = _load_failures()
+    record = {
+        'id': 'fail-' + secrets.token_hex(4),
+        'ts': time.time(),
+        'type': failure_type if failure_type in FAILURE_TYPES else 'style',
+        'summary': (summary or '')[:500],
+        'ruleHint': (rule_hint or '')[:200],
+        'section': (section or '')[:120],
+        'input': (input_text or '')[:2000],
+        'accepted': (accepted_text or '')[:2000],
+        'agentId': agent_id,
+    }
+    failures.append(record)
+    del failures[:-FAILURE_MAX_RECORDS]
+    _save_failures(failures)
+    return record['id']
+
+
+def _rule_text_for(failure_type, hint):
+    """A proposed rule statement for a recurring failure pattern, phrased as
+    an instruction the operator could encode in the ban list or Jev criteria."""
+    label = FAILURE_TYPE_LABELS.get(failure_type, 'a recurring issue')
+    return f'Never ship work where {label}: "{hint}".'
+
+
+def _mine_rule_proposals(now_ts=None, recurrence=RULE_MIN_RECURRENCE):
+    """The 'write a rule' + 'add a test' steps, as PROPOSALS: group the failure
+    ledger by (type, ruleHint) and any pattern that recurred at least
+    `recurrence` times becomes a pending proposal carrying the rule text and a
+    test fixture (the offending input + the requirement it missed). Nothing is
+    auto-applied -- the operator approves by encoding the rule (ban list, Jev
+    criteria) and pasting the fixture into a conformance test. Returns the
+    proposals created this pass."""
+    now_ts = time.time() if now_ts is None else now_ts
+    failures = _load_failures()
+    groups = {}
+    for f in failures:
+        ftype = f.get('type') or 'style'
+        hint = (f.get('ruleHint') or '').strip()
+        if not hint:
+            continue
+        groups.setdefault((ftype, hint), []).append(f)
+    proposals = _load_rule_proposals()
+    seen = {p.get('dedupeKey') for p in proposals}
+    created = []
+    for (ftype, hint), rows in sorted(groups.items()):
+        if len(rows) < recurrence:
+            continue
+        dedupe = f'{ftype}:{hint}'
+        if dedupe in seen:
+            continue
+        proposals.append({
+            'id': 'rule-' + secrets.token_hex(4),
+            'ts': now_ts,
+            'type': ftype,
+            'ruleHint': hint,
+            'count': len(rows),
+            'rule': _rule_text_for(ftype, hint),
+            'examples': [{'input': r.get('input') or '', 'issue': r.get('summary') or ''}
+                         for r in rows[:3]],
+            'fixture': {'input': rows[0].get('input') or '', 'issue': rows[0].get('summary') or ''},
+            'status': 'pending',
+            'dedupeKey': dedupe,
+        })
+        created.append(proposals[-1])
+    del proposals[:-RULE_PROPOSALS_MAX]
+    if created:
+        _save_rule_proposals(proposals)
+    return created
+
+
+def _rule_proposals():
+    """Read-only surface for the operator (the admin endpoint backs onto it)."""
+    return _load_rule_proposals()
 
 
 SANDBOX_NETWORK = 'ai-think-tank-sandbox-net'  # internal -- no route to the internet at all
@@ -6396,6 +6604,24 @@ COLAB_IDLE_GRACE_S = 15 * 60        # a parked GPU tears down after this idle
 # handled honestly (degrade to what provisioned, say so in the result), never
 # by lying about an account wallet being empty.
 COLAB_RUNTIMES_MAX = 5
+# Sharding is Jev-gated like the model-tier gate (TIER_GATE_MIN_CONFIDENCE):
+# the agent proposes a runtime count, but Jev picks the highest band the task's
+# stated purpose earns, and an uncertain or unreachable classifier degrades to
+# a SINGLE runtime -- one agent call must not 5x the spend on a computation
+# that doesn't need it. Bands cap approved counts; 'shard' tops out at
+# COLAB_RUNTIMES_MAX.
+_COLAB_SHARD_BANDS = {
+    'single': {'max': 1, 'description': "One runtime -- the whole computation on a single session. The cheap default; right for anything that does not genuinely need to split work."},
+    'double': {'max': 2, 'description': "Two runtimes -- the computation is split across two sessions to roughly halve wall time."},
+    'shard': {'max': COLAB_RUNTIMES_MAX, 'description': "Three to five runtimes -- a large, genuinely map-reduce-style computation split across many sessions."},
+}
+# A failed 'colab new' is not always permanent: free-tier availability, GPU
+# cooldowns, and transient CLI/API errors recover quickly. Retry provisioning a
+# BOUNDED number of times (these are the waits, in seconds, between each
+# attempt -- 3 attempts total) so a transient refusal doesn't punt the agent
+# into a whole expensive re-investigation. A genuine quota/capacity refusal
+# still fails, honestly, after the retries are spent.
+COLAB_PROVISION_RETRY_DELAYS_S = (5, 15)
 _COLAB_COMPUTE_LAST_USED = 0.0
 _COLAB_COMPUTE_LOCK = threading.Lock()
 
@@ -6540,21 +6766,27 @@ def _colab_compute_provision(session=None, kind='gpu'):
     (defaults to the dedicated think-tank-gpu session; kind 'gpu' rents a T4,
     'cpu' rents a CPU runtime -- CPU slots are more likely granted on the free
     tier than a GPU, so CPU-bound work should not need to rent a T4). Returns
-    (ok, msg). No GPU-capacity check -- a 'colab new' that fails
-    (quota/capacity) just returns an honest per-run error the agent can retry
-    later."""
+    (ok, msg). A failed 'colab new' (quota/capacity/cooldown) is retried a
+    bounded number of times with backoff (COLAB_PROVISION_RETRY_DELAYS_S)
+    before the honest per-run error is returned -- a transient refusal should
+    not send the agent off on a whole re-investigation, and the retry count is
+    bounded so a genuinely unavailable slot still gives up and says so."""
     session = session or COLAB_GPU_SESSION
     if not COLAB_CLI_AVAILABLE:
         return False, 'the colab CLI is not installed on this machine'
     if _colab_session_exists(session):
         return True, 'ok'
-    cmd = ['new', '-s', session]
-    if kind == 'gpu':
-        cmd += ['--gpu', COLAB_GPU_ACCEL]
-    rc, out = _colab_cli(*cmd, timeout=300)
-    if rc != 0:
-        return False, f'provision failed: {out[-500:]}'
-    return True, 'ok'
+    out = ''
+    for attempt, delay in enumerate((0,) + COLAB_PROVISION_RETRY_DELAYS_S):
+        if attempt:
+            time.sleep(delay)
+        cmd = ['new', '-s', session]
+        if kind == 'gpu':
+            cmd += ['--gpu', COLAB_GPU_ACCEL]
+        rc, out = _colab_cli(*cmd, timeout=300)
+        if rc == 0:
+            return True, 'ok'
+    return False, f'provision failed: {out[-500:]}'
 
 
 _COLAB_DENIED_EXPRESSIONS = {
@@ -6684,6 +6916,31 @@ def _colab_gate_urls(agent_id, code, purpose, authorized=None):
     return None
 
 
+def _colab_shard_band(code, purpose, requested):
+    """Jev decides the highest runtime-count band a sharded Colab computation
+    earns -- mirrors _tier_gate_decider_default (same quorum choice, same
+    fail-closed shape). Returns (band_id, confidence); (None, 0.0) on an
+    unreachable or non-binary classifier so the caller fails closed to a
+    single runtime. `requested` only grounds the prompt; the caller applies
+    the band to the final count."""
+    try:
+        decision, confidence, _cost = _jev_quorum_choice_sync(
+            'One computation wants to run on the player\'s FREE-tier Google Colab account. '
+            f'The agent requested {requested} runtime(s) (max {COLAB_RUNTIMES_MAX}). '
+            'Every granted runtime runs the SAME code and splits work via '
+            'COLAB_SHARD_INDEX/COLAB_SHARD_COUNT; each one is a metered extra cost '
+            '(compute units) and an extra fan-out of the think tank\'s decision gates.\n'
+            f'Stated purpose: {purpose or "not given"}\n'
+            f'Compute summary (first 500 chars): {(code or "")[:500]}\n'
+            'Pick the SMALLEST band the computation genuinely earns -- single unless the '
+            'work really needs parallel runtimes at that size.',
+            {bid: b['description'] for bid, b in _COLAB_SHARD_BANDS.items()},
+        )
+        return decision, confidence
+    except Exception:
+        return None, 0.0
+
+
 def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runtimes=1, kind='gpu', skip_deny_labels=(), env=None):
     """Run `code` (Python) on Colab runtime(s) and capture the output.
     Blocking -- the spike tool executor calls this on a worker thread like
@@ -6725,6 +6982,7 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runti
         runtimes = max(1, min(int(runtimes or 1), COLAB_RUNTIMES_MAX))
     except (TypeError, ValueError):
         runtimes = 1
+    requested_runtimes = runtimes
     # Sharding is deliberately gated on the decisions model being healthy.
     # Each shard's job still gets URL-gated through the Jev decision chain
     # (_colab_gate_urls -> _jev_quorum_choice_sync), so a sharded run fans
@@ -6737,6 +6995,21 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runti
                          'sharding is disabled while it is down, because every shard\'s URL gate '
                          'depends on the same decision path that is already failing. '
                          'Re-run with runtimes=1, or retry sharding once Jev recovers.'}
+    # Jev gates how many runtimes a shard request may actually use (band
+    # decision, fail closed to 1). The agent still proposes the count; the
+    # gate caps what it earns, so one agent call can't 5x the spend on a
+    # computation that doesn't need it -- the same fail-to-cheap shape as
+    # _resolve_model_tier. runtimes==1 skips the gate entirely.
+    if runtimes > 1:
+        band, confidence = _colab_shard_band(code, purpose, runtimes)
+        band_max = _COLAB_SHARD_BANDS.get(band, {}).get('max', 1)
+        if band_max > 1 and confidence < TIER_GATE_MIN_CONFIDENCE:
+            band_max = 1  # don't spend up on weak signal -- fail closed to single
+        runtimes = min(runtimes, band_max)
+        log_action(agent_id, 'colab_shard_gate',
+                   {'requested': requested_runtimes, 'band': band,
+                    'confidence': round(confidence, 3), 'approved': runtimes},
+                   authorized=False)
     blocked = _colab_denied(code, skip_deny_labels) or _colab_denied(purpose or '', skip_deny_labels)
     if blocked is None:
         for pkg in (packages or []):
@@ -6802,6 +7075,7 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runti
                     rc, out = _colab_cli(
                         'exec', '-s', session, '--timeout', '600',
                         '--env', f'COLAB_PKGS={pkg_line}',
+                        timeout=660,
                         input=('import os, subprocess\n'
                                'subprocess.run("pip install -q " + os.environ["COLAB_PKGS"], '
                                'shell=True, timeout=540)\nprint("__COLAB_PKGS_INSTALLED__")\n'))
@@ -6824,6 +7098,10 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runti
                 '--env', f'COLAB_SHARD_INDEX={shard_index}',
                 '--env', f'COLAB_SHARD_COUNT={runtimes}',
                 *env_flags,
+                # Host-side subprocess timeout must exceed the CLI's own
+                # --timeout, or the host kills the exec (and the transcript
+                # transcription with it) before the CLI can finish or report.
+                timeout=timeout + 90,
                 input=code + '\nprint("__COLAB_DONE__")\n')
             elapsed = max(1, int(time.time() - shard_start))
             _COLAB_COMPUTE_LAST_USED = time.time()
@@ -6837,7 +7115,8 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runti
         log_action('agent', 'colab_compute_run', {
             'purpose': (purpose or '')[:120],
             'sessions': sessions,
-            'requested_runtimes': runtimes,
+            'requested_runtimes': requested_runtimes,
+            'approved_runtimes': runtimes,
             'granted_runtimes': len(sessions),
             'kind': kind,
             'timeout': timeout,
@@ -10160,9 +10439,10 @@ def _extract_schedule_fields_sync(admin_id, key, text):
     system_prompt = (
         'Extract a recurring web-monitoring request from the player\'s message. '
         'Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: '
-        '{"topic": "short label for what to watch", "startUrl": "a real absolute URL to start from, or empty string if none was given", "cadenceMs": integer milliseconds between checks}. '
+        '{"topic": "short label for what to watch", "startUrl": "a real absolute URL to start from, or empty string if none was given", "cadenceMs": integer milliseconds between checks, "dependsOnTask": "a task id this should wait to finish before starting, or empty string if none was given"}. '
         'If the message gives a cadence in words (daily, hourly, every 6 hours, weekly), convert it to milliseconds. '
-        'If no real URL is identifiable, set startUrl to an empty string -- do not invent one.'
+        'If no real URL is identifiable, set startUrl to an empty string -- do not invent one. '
+        'If the message asks for this to run only AFTER some other task/story lands, put that task id in dependsOnTask; otherwise leave it empty.'
     )
     try:
         r = _http_json('POST', SELF_BASE_URL, '/api/chat',
@@ -10182,9 +10462,11 @@ def _extract_schedule_fields_sync(admin_id, key, text):
     topic = (parsed.get('topic') or '').strip()
     start_url = (parsed.get('startUrl') or '').strip()
     cadence_ms = parsed.get('cadenceMs')
+    depends_on_task = (parsed.get('dependsOnTask') or '').strip()
     if not topic or not start_url or not isinstance(cadence_ms, (int, float)):
         return None
-    return {'topic': topic, 'startUrl': start_url, 'cadenceMs': int(cadence_ms)}
+    return {'topic': topic, 'startUrl': start_url, 'cadenceMs': int(cadence_ms),
+            'dependsOnTask': depends_on_task or None}
 
 
 # A one-off scheduled task can be requested as far ahead as this (366 days)
@@ -10238,9 +10520,10 @@ def _extract_schedule_once_fields_sync(admin_id, key, text):
     system_prompt = (
         'Extract a one-time scheduled task from the player\'s message. '
         'Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: '
-        '{"title": "short label for the single task to do", "at": "ISO 8601 day and time, e.g. 2026-10-20T14:00:00-04:00, or an explicit Z suffix for UTC", "instructions": "short instruction for the task, or empty string if the title already says it"}. '
+        '{"title": "short label for the single task to do", "at": "ISO 8601 day and time, e.g. 2026-10-20T14:00:00-04:00, or an explicit Z suffix for UTC", "instructions": "short instruction for the task, or empty string if the title already says it", "dependsOnTask": "a task id this should wait to finish before running, or empty string if none was given"}. '
         'The player wants this done ONCE, at that specific time, not on a repeating cadence. '
-        'If no clear day+time is identifiable, set "at" to an empty string -- do not invent one.'
+        'If no clear day+time is identifiable, set "at" to an empty string -- do not invent one. '
+        'If the message asks for this to run only AFTER some other task/story lands, put that task id in dependsOnTask; otherwise leave it empty.'
     )
     try:
         r = _http_json('POST', SELF_BASE_URL, '/api/chat',
@@ -10260,12 +10543,14 @@ def _extract_schedule_once_fields_sync(admin_id, key, text):
     title = (parsed.get('title') or '').strip()
     at = (parsed.get('at') or '').strip()
     instructions = (parsed.get('instructions') or '').strip()
+    depends_on_task = (parsed.get('dependsOnTask') or '').strip()
     if not title or not at:
         return None
     at_ms = _parse_schedule_once_at(at)
     if not at_ms:
         return None
-    return {'title': title, 'at': at, 'atMs': at_ms, 'instructions': instructions or None}
+    return {'title': title, 'at': at, 'atMs': at_ms, 'instructions': instructions or None,
+            'dependsOnTask': depends_on_task or None}
 
 
 def _pick_team_worker(state, director_id):
@@ -10333,16 +10618,23 @@ async def _route_lane_schedule(state, text, admin_id):
                           "can you give me a URL and a cadence, e.g. \"check https://example.com "
                           "daily\" or \"every 6 hours\"?"}
     import sim as _sim
-    record = _sim.add_research_topic(state, fields['topic'], fields['startUrl'], fields['cadenceMs'])
+    record = _sim.add_research_topic(state, fields['topic'], fields['startUrl'],
+                                     fields['cadenceMs'],
+                                     depends_on_task=fields.get('dependsOnTask'))
     if not record:
         return {'reply': "That didn't look like a real link I could start from -- can you double-check the URL?"}
     save_state_to_db(state)
     log_action('player', 'schedule_created', {'topicId': record['id'], 'topic': record['topic'],
-                                              'startUrl': record['startUrl'], 'cadenceMs': record['cadenceMs']},
+                                              'startUrl': record['startUrl'],
+                                              'cadenceMs': record['cadenceMs'],
+                                              'dependsOnTask': record.get('dependsOnTask')},
               authorized=True)
     _append_passport_decision('schedule_created', admin_id, {'topicId': record['id'], 'topic': record['topic']})
     hours = record['cadenceMs'] / 3600000
     cadence_desc = f"every {hours:.1f}h" if hours < 48 else f"every {hours / 24:.1f}d"
+    if record.get('dependsOnTask'):
+        return {'reply': f"Got it -- I'll check \"{record['topic']}\" ({cadence_desc}) once "
+                         f"{record['dependsOnTask']} finishes."}
     return {'reply': f"Got it -- I'll keep checking \"{record['topic']}\" ({cadence_desc}), starting shortly."}
 
 
@@ -10361,16 +10653,20 @@ async def _route_lane_schedule_once(state, text, admin_id):
     if at_ms - now_ms > SCHEDULE_ONCE_MAX_AHEAD_MS:
         return {'reply': "That's more than a year out -- I'll schedule things up to a year ahead."}
     item = _sim.queue_once(state, fields['title'], at_ms,
-                           instructions=fields.get('instructions'))
+                           instructions=fields.get('instructions'),
+                           depends_on_task=fields.get('dependsOnTask'))
     if not item:
         return {'reply': "I couldn't schedule that -- try giving it a clear task name and a future time."}
     save_state_to_db(state)
     log_action('player', 'schedule_once_created', {'title': fields['title'],
                                                    'at': fields['at'], 'atMs': at_ms,
-                                                   'instructions': fields.get('instructions')},
+                                                   'instructions': fields.get('instructions'),
+                                                   'dependsOnTask': item.get('dependsOn')},
               authorized=True)
     _append_passport_decision('schedule_once_created', admin_id, {'title': fields['title'], 'at': fields['at']})
     when = datetime.datetime.fromtimestamp(at_ms / 1000, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    if item.get('dependsOn'):
+        return {'reply': f"Scheduled \"{fields['title']}\" to run once at {when}, after {item['dependsOn']} finishes."}
     return {'reply': f"Scheduled \"{fields['title']}\" to run once at {when}."}
 
 
@@ -10481,10 +10777,11 @@ async def _route_player_request(state, text):
 @app.post('/api/intent/schedule')
 async def intent_schedule(request: Request):
     """Structured parity endpoint for the schedule lane: POST
-    {topic, startUrl, cadenceMs}. The free-text extraction step
-    (_extract_schedule_fields_sync) is exclusive to the Telegram routing
-    layer; this takes already-structured fields -- the same relationship
-    /api/intent/ask already has to _ask_core."""
+    {topic, startUrl, cadenceMs, dependsOnTask?}. `dependsOnTask` optionally
+    gates the recurring topic until that task id is done. The free-text
+    extraction step (_extract_schedule_fields_sync) is exclusive to the
+    Telegram routing layer; this takes already-structured fields -- the same
+    relationship /api/intent/ask already has to _ask_core."""
     if not _require_player_session(request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     state = get_state_from_db()
@@ -10495,11 +10792,14 @@ async def intent_schedule(request: Request):
     except Exception:
         return JSONResponse({'error': 'malformed body'}, status_code=400)
     import sim as _sim
-    record = _sim.add_research_topic(state, body.get('topic'), body.get('startUrl'), body.get('cadenceMs'))
+    record = _sim.add_research_topic(state, body.get('topic'), body.get('startUrl'),
+                                     body.get('cadenceMs'),
+                                     depends_on_task=(body.get('dependsOnTask') or '').strip() or None)
     if not record:
         return JSONResponse({'error': 'topic, a real absolute startUrl, and cadenceMs are required'}, status_code=400)
     save_state_to_db(state)
-    log_action('player', 'schedule_created', {'topicId': record['id'], 'topic': record['topic']}, authorized=True)
+    log_action('player', 'schedule_created', {'topicId': record['id'], 'topic': record['topic'],
+                                              'dependsOnTask': record.get('dependsOnTask')}, authorized=True)
     _append_passport_decision('schedule_created', 'player', {'topicId': record['id']})
     return JSONResponse({'ok': True, 'topic': record})
 
@@ -10507,13 +10807,14 @@ async def intent_schedule(request: Request):
 @app.post('/api/intent/schedule-once')
 async def intent_schedule_once(request: Request):
     """Structured parity endpoint for the one-off scheduling lane: POST
-    {title, at, room?, instructions?, taskType?, goal?}. `at` is an ISO 8601
-    day+time (a trailing 'Z' or explicit offset; naive times are treated as
-    UTC) or an epoch timestamp. The task sits in the work queue untouched
-    (its notBefore gate) until `at`, then runs the normal lifecycle exactly
-    once. The free-text extraction step
-    (_extract_schedule_once_fields_sync) is exclusive to the Telegram
-    routing layer; this takes already-structured fields."""
+    {title, at, room?, instructions?, taskType?, goal?, dependsOnTask?}.
+    `at` is an ISO 8601 day+time (a trailing 'Z' or explicit offset; naive
+    times are treated as UTC) or an epoch timestamp. `dependsOnTask`
+    optionally holds the one-off in the queue until that task id is done.
+    The task sits in the work queue untouched (its notBefore gate) until
+    `at`, then runs the normal lifecycle exactly once. The free-text
+    extraction step (_extract_schedule_once_fields_sync) is exclusive to the
+    Telegram routing layer; this takes already-structured fields."""
     if not _require_player_session(request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     state = get_state_from_db()
@@ -10536,14 +10837,16 @@ async def intent_schedule_once(request: Request):
     instructions = (body.get('instructions') or '').strip() or None
     task_type = (body.get('taskType') or '').strip() or None
     goal = (body.get('goal') or '').strip() or None
+    depends_on_task = (body.get('dependsOnTask') or '').strip() or None
     import sim as _sim
     item = _sim.queue_once(state, title, at_ms, room=room, instructions=instructions,
-                           task_type=task_type, goal=goal)
+                           task_type=task_type, goal=goal, depends_on_task=depends_on_task)
     if not item:
         return JSONResponse({'error': 'could not queue that one-off task'}, status_code=400)
     save_state_to_db(state)
     log_action('player', 'schedule_once_created', {'title': title, 'atMs': at_ms,
-                                                   'room': room, 'taskType': task_type},
+                                                   'room': room, 'taskType': task_type,
+                                                   'dependsOnTask': depends_on_task},
                authorized=True)
     _append_passport_decision('schedule_once_created', 'player', {'title': title, 'atMs': at_ms})
     return JSONResponse({'ok': True, 'task': {'title': title, 'atMs': at_ms, 'notBefore': item.get('notBefore')}})
@@ -10551,13 +10854,14 @@ async def intent_schedule_once(request: Request):
 
 @app.post('/api/pipelines')
 async def pipelines_create(request: Request):
-    """The player-facing ORDERED-pipeline lane: POST {name, cadenceMs, steps}.
-    Each step is {title, room, offsetMs, instructions, tool, args}. Steps fire
-    in strict sequence -- step N+1 waits for step N's task to complete -- on a
-    cadence floored to MIN_PIPELINE_CADENCE_MS (1h). Same structured-parity
-    relationship to _check_pipelines that /api/intent/schedule has to
-    add_research_topic: this takes already-structured fields, no free-text
-    extraction."""
+    """The player-facing ORDERED-pipeline lane: POST {name, cadenceMs, steps,
+    dependsOnTask?}. Each step is {title, room, offsetMs, instructions, tool,
+    args}. Steps fire in strict sequence -- step N+1 waits for step N's task
+    to complete -- on a cadence floored to MIN_PIPELINE_CADENCE_MS (1h).
+    `dependsOnTask` optionally holds the whole pipeline at its first run
+    boundary until that task id is done. Same structured-parity relationship
+    to _check_pipelines that /api/intent/schedule has to add_research_topic:
+    this takes already-structured fields, no free-text extraction."""
     state = get_state_from_db()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -10566,11 +10870,14 @@ async def pipelines_create(request: Request):
     except Exception:
         return JSONResponse({'error': 'malformed body'}, status_code=400)
     import sim as _sim
-    record = _sim.add_pipeline(state, body.get('name'), body.get('cadenceMs'), body.get('steps'))
+    record = _sim.add_pipeline(state, body.get('name'), body.get('cadenceMs'), body.get('steps'),
+                               depends_on_task=(body.get('dependsOnTask') or '').strip() or None)
     if not record:
         return JSONResponse({'error': 'name, a non-empty steps list (each with title and room), and cadenceMs are required'}, status_code=400)
     save_state_to_db(state)
-    log_action('player', 'pipeline_created', {'pipelineId': record['id'], 'name': record['name'], 'steps': len(record['steps'])}, authorized=True)
+    log_action('player', 'pipeline_created', {'pipelineId': record['id'], 'name': record['name'],
+                                              'steps': len(record['steps']),
+                                              'dependsOnTask': record.get('dependsOnTask')}, authorized=True)
     _append_passport_decision('pipeline_created', 'player', {'pipelineId': record['id']})
     return JSONResponse({'ok': True, 'pipeline': record})
 
@@ -15659,9 +15966,24 @@ async def review_escalate(request: Request):
     allowed, _reason = _decide_allowed(agent_id)
     if not allowed:
         return JSONResponse({'error': 'rate limited'}, status_code=429)
-    esc_id = create_escalation(kind, f'Agent {agent_id} could not resolve a review requirement:\n\n{question}')
+    esc_id = create_escalation(kind,
+                               f'Agent {agent_id} could not resolve a review requirement:\n\n{question}',
+                               what_checked=f"Agent {agent_id}'s {kind} pass",
+                               look_first=question)
     log_action(agent_id, 'review_escalate', {'kind': kind, 'escalationId': esc_id})
     return JSONResponse({'queued': True, 'escalationId': esc_id})
+
+
+@app.get('/api/rule-proposals')
+async def rule_proposals_get(request: Request):
+    # Operator surface for the weekly rule-mining pass: the recurring-failure
+    # patterns that became PROPOSED rules (rule text + test fixture). Player-only
+    # like the other operator surfaces; read-only -- a proposal becomes a real
+    # rule when the operator encodes it (ban list, Jev criteria) and pastes the
+    # fixture into a conformance test.
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'rule proposals are player-only'}, status_code=403)
+    return JSONResponse({'proposals': _rule_proposals()})
 
 
 _LOGIN_PAGE = """<!DOCTYPE html>

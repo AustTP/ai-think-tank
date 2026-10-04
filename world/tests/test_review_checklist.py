@@ -274,6 +274,8 @@ class RunReviewContentEnsemble(unittest.TestCase):
                                side_effect=call_side_effects), \
              mock.patch.object(content._serve, '_jev_choice', side_effect=choice_side_effects), \
              mock.patch.object(content._serve, 'create_escalation', return_value='esc-1'), \
+             mock.patch.object(content._serve, '_classify_failure', return_value='style'), \
+             mock.patch.object(content._serve, '_record_failure', return_value='fail-1'), \
              mock.patch.object(sim, '_store_content_result', return_value=None) as store:
             content._run_review_content(snapshot, 'ada', task)
         return store.call_args[0][1]
@@ -523,6 +525,8 @@ class RunReviewContentEnsemble(unittest.TestCase):
              mock.patch.object(content._serve, '_jev_choice', return_value=_HOLISTIC_CLEAN), \
              mock.patch.object(content._serve, 'create_escalation',
                                side_effect=RuntimeError('escalation down')), \
+             mock.patch.object(content._serve, '_classify_failure', return_value='style'), \
+             mock.patch.object(content._serve, '_record_failure', return_value='fail-1'), \
              mock.patch.object(sim, '_store_content_result', return_value=None) as store:
             content._run_review_content(snapshot, 'ada', task)  # no raise
         result = store.call_args[0][1]
@@ -551,6 +555,8 @@ class RunReviewContentEnsemble(unittest.TestCase):
              mock.patch.object(content._serve, '_jev_choice',
                                side_effect=[_HOLISTIC_CLEAN, (content.GRADE_FAILS, 0.9, 0.01)]), \
              mock.patch.object(content._serve, 'create_escalation', return_value='esc-1'), \
+             mock.patch.object(content._serve, '_classify_failure', return_value='style'), \
+             mock.patch.object(content._serve, '_record_failure', return_value='fail-1'), \
              mock.patch.object(sim, '_store_content_result', return_value=None) as store:
             content._run_review_content(snapshot, 'ada', task)  # no raise
         result = store.call_args[0][1]
@@ -570,6 +576,102 @@ class WikiContextForTask(unittest.TestCase):
         # injection path blows up -- never wedge the task on a wiki failure.
         with mock.patch.object(sim, 'inject_wiki_context', side_effect=RuntimeError('db down')):
             self.assertEqual(content._wiki_context_for_task({'agents': {}}, {'room': 'pressoffice'}), '')
+
+
+class RecordClassifiedFailures(unittest.TestCase):
+    # The 'sort' step: verified-failed and escalated requirements are
+    # classified into the four buckets and written to the failure ledger, so
+    # the weekly rule-mining pass can turn recurring patterns into operator
+    # rule proposals. Best-effort -- a ledger failure never breaks the review.
+
+    def test_verified_fails_are_classified_and_recorded(self):
+        grades = [{'id': 'j1', 'question': 'quote the price', 'section': 'pricing',
+                   'type': 'jev', 'verdict': content.GRADE_FAILS, 'confidence': 0.9},
+                  {'id': 'j2', 'question': 'Is it specific?', 'section': 'opening',
+                   'type': 'jev', 'verdict': content.GRADE_MEETS, 'confidence': 0.9},
+                  {'id': 'j3', 'question': 'Any missing fields?', 'section': 'meta',
+                   'type': 'jev', 'verdict': content.GRADE_FAILS, 'confidence': 0.4}]
+        calls = []
+        with mock.patch.object(content._serve, '_classify_failure',
+                               side_effect=['factual_error', 'missing_information']), \
+             mock.patch.object(content._serve, '_record_failure',
+                               side_effect=lambda *a, **k: calls.append((a, k)) or 'fail-1'):
+            count = content._record_classified_failures('ada', 'review', grades, [], 'the review text')
+        self.assertEqual(count, 2)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1]['agent_id'], 'ada')
+        self.assertEqual(calls[0][1]['section'], 'pricing')
+        self.assertEqual(calls[0][0][0], 'factual_error')
+        self.assertEqual(calls[0][1]['input_text'], 'the review text')
+        self.assertEqual(calls[0][1]['rule_hint'], 'quote the price')
+        self.assertEqual(calls[1][0][0], 'missing_information')  # meets grades never recorded
+
+    def test_escalated_requirements_are_recorded(self):
+        escalate = [({'id': 'h1', 'question': 'Is the tone right?', 'section': 'tone'}, 'review decision for you'),
+                    ({'id': 'h2', 'question': 'Is the budget correct?', 'section': 'pricing'}, 'review decision for you')]
+        calls = []
+        with mock.patch.object(content._serve, '_classify_failure',
+                               side_effect=['style', 'factual_error']), \
+             mock.patch.object(content._serve, '_record_failure',
+                               side_effect=lambda *a, **k: calls.append((a, k)) or 'fail-1'):
+            content._record_classified_failures('ada', 'review', [], escalate, 'text')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][0][0], 'factual_error')  # money signal sorts deterministically
+
+    def test_ledger_failure_never_breaks_the_review(self):
+        grades = [{'id': 'j1', 'question': 'Q?', 'section': 's', 'type': 'jev',
+                   'verdict': content.GRADE_FAILS, 'confidence': 0.9}]
+        with mock.patch.object(content._serve, '_classify_failure',
+                               side_effect=RuntimeError('db down')), \
+             mock.patch.object(content._serve, '_record_failure'):
+            self.assertEqual(content._record_classified_failures('ada', 'review', grades, [], 'text'), 0)
+
+    def test_escalate_branch_ledger_failure_is_swallowed(self):
+        # The same best-effort guarantee applies to the escalate loop: a ledger
+        # failure while recording an escalated requirement never breaks review.
+        escalate = [({'id': 'h1', 'question': 'Q?', 'section': 's'}, 'review decision for you')]
+        with mock.patch.object(content._serve, '_classify_failure',
+                               side_effect=RuntimeError('db down')), \
+             mock.patch.object(content._serve, '_record_failure'):
+            self.assertEqual(content._record_classified_failures('ada', 'review', [], escalate, 'text'), 0)
+
+
+class ReviewTwoLineHandoff(unittest.TestCase):
+    # The "write two lines for the person" rule: a checklist escalation carries
+    # what the reviewer checked and what to look at first into create_escalation.
+
+    def test_checklist_escalation_carries_two_line_handoff(self):
+        checklist = [{'id': 'h1', 'question': 'Is the tone right?', 'section': 'tone', 'type': 'human'}]
+        snapshot = {}
+        task = {'id': 'task-2l', 'title': 'Review landing', 'room': 'pressoffice',
+                'taskType': 'review', 'projectLabel': 'landing', 'checklist': checklist}
+        calls = []
+        with mock.patch.object(content, '_agent_name', return_value='Ada'), \
+             mock.patch.object(content, '_gather_unified_context', return_value='context'), \
+             mock.patch.object(content, '_run_quality_pipeline',
+                               return_value={'ok': True, 'failedStep': None, 'results': [],
+                                             'note': 'quality pipeline all green'}), \
+             mock.patch.object(content, '_review_screenshot',
+                               return_value={'ok': True, 'review': 'visual pass'}), \
+             mock.patch.object(content._serve, 'SELF_BASE_URL', 'http://x'), \
+             mock.patch.object(content._serve, '_coding_tier_slug', return_value='gpt-4o-mini'), \
+             mock.patch.object(content._serve, '_mid_tier_slug', return_value='gpt-4o-mini'), \
+             mock.patch.object(content._serve, '_low_tier_slug', return_value='gpt-4o-mini'), \
+             mock.patch.object(content._serve, '_http_json',
+                               side_effect=lambda method, base, path, body, key: {'reply': 'the review text'}), \
+             mock.patch.object(content._serve, '_call_openrouter_decision_sync',
+                               side_effect=[_answer('clean', 0.95)]), \
+             mock.patch.object(content._serve, '_jev_choice', side_effect=[_HOLISTIC_CLEAN]), \
+             mock.patch.object(content._serve, '_classify_failure', return_value='style'), \
+             mock.patch.object(content._serve, '_record_failure', return_value='fail-1'), \
+             mock.patch.object(content._serve, 'create_escalation',
+                               side_effect=lambda *a, **k: calls.append((a, k)) or 'esc-1'), \
+             mock.patch.object(sim, '_store_content_result', return_value=None):
+            content._run_review_content(snapshot, 'ada', task)
+        self.assertEqual(len(calls), 1)
+        _args, kwargs = calls[0]
+        self.assertEqual(kwargs['look_first'], 'Is the tone right?')
+        self.assertIn('Reviewed 1 checklist requirements', kwargs['what_checked'])
 
 
 if __name__ == '__main__':

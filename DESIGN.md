@@ -129,6 +129,18 @@ epoch timestamp, fails closed on anything unparseable, rejects past times, and
 caps the horizon at 366 days so a misparsed date can't sit in the queue for
 years.
 
+### Dependency-gated scheduling
+
+A queued item (or a scheduled research topic / one-off) can carry a
+`dependsOn` / `depends_on_task` task id: even once its `notBefore` time
+passes, the item is NOT assigned until the referenced task reaches `done`
+in the durable task mirror (`_work_item_dependency_met`). The dependency
+not landing is "not work yet" — the idle gate treats a gated item as not
+due, so the think tank spends nothing waiting, and the assignment loop never
+hands a gated card to an agent. Landing a task auto-clears any
+dependency-blocks keyed on it, so a composed "run X once the dependency
+ships" pipeline resolves itself without a manual kick.
+
 ### Idle gate
 
 `think_tank_has_work()` gates spend: if no due queue items AND no agent is
@@ -155,6 +167,30 @@ majority vote). Used for every decision that has consequences:
 | Social carryaway | What an agent takes from the weekly knowledge social | n/a | Note skip |
 | Governance decider | Who needs help most (hiring) or needs review (firing) | n/a | Fallback pick |
 | Model tier gate | Whether a call deserves mid or high tier over cheap default | 0.55 | Fail closed to low |
+| Colab shard band | Highest runtime count one `run_on_colab` computation may shard across (single/double/shard) | 0.55 | Fail closed to a single runtime |
+
+### Colab shard gate
+
+A spike agent proposes a runtime count (up to 5) when it shards one computation
+across Google Colab runtimes. The count is a consequence-bearing spend choice —
+each runtime is a metered compute-unit cost and an extra fan-out of the think
+tank's decision gates — so JEV independently caps it: the agent's proposal is
+matched to the smallest band its stated purpose earns (`single`=1, `double`=2,
+`shard`=3-5), the run uses `min(requested, band max)` runtimes, and a
+low-confidence or unreachable classifier degrades to a single runtime (the same
+fail-to-cheap move as the tier gate). `runtimes=1` skips the gate entirely, and
+the degraded-Jev refusal still stands (a sharded run must not multiply work
+that depends on a decision path already failing). The band decision is logged
+as `colab_shard_gate`; the run itself logs requested vs approved vs granted
+counts.
+
+Provisioning failures are retried a bounded number of times with backoff
+(`COLAB_PROVISION_RETRY_DELAYS_S`, 3 attempts total) before the honest
+"provision failed" error is returned: free-tier availability, GPU cooldowns,
+and transient CLI/API errors recover quickly, and a code-level retry is far
+cheaper than punting the agent into a whole re-investigation. A genuine
+quota/capacity refusal still gives up and says so after the bounded retries
+are spent — there is no unbounded retry and no unbounded agent-side loop.
 
 ### Escalation processing
 
@@ -224,6 +260,15 @@ cadence — also triggered immediately on large-request arrival via
 - **Progress** derives from matching (title,room) pairs against done tasks.
 - **Auto-close** — when every sprint item is done and (for gated stories)
   peer-approved, the sprint closes automatically.
+- **Velocity** — `close_sprint` records a velocity snapshot on the
+  active→closed transition: landed / total / pct / rolledOver /
+  `pointsLanded` / `pointsTotal` / `elapsedMs`. Points are the item size
+  estimates (S=1 / M=2 / L=3), folded in as `state['teamVelocity'][teamId]`
+  as a rolling window capped at `TEAM_VELOCITY_MAX` (20). A sprint with no
+  numeric estimates records `None` points rather than a fake 0 — the honest
+  "not estimated" signal. Re-closing an already-closed sprint recomputes
+  nothing (idempotent). The retrospective prompt surfaces the snapshot, so
+  the retro is grounded in measured delivery, not recollection.
 
 ### Peer review gate
 
@@ -344,8 +389,8 @@ session OR a valid agent key (so server-to-server loopback works).
 | `kv_spend` | Single-row spend ledger (per-service used/cap, byDay series) | Forever |
 | `model_tiers` | Per-band model slug, name, price, chosen_at | Active bands only |
 | `model_benchmark_scores` | Cited benchmark scores (model_id, benchmark, score, source_url) | Preserved |
-| `action_log` | Per-agent activity feed (agent_id, action, details JSON, ts) | 7-day rolling prune |
-| `decision_tape` | Raw JEV/LLM decisions (prompt, criteria, choice, confidence, cost, raw) | 7-day rolling prune |
+| `action_log` | Per-agent activity feed (agent_id, action, details JSON, ts) | Rolling prune at `LOG_RETENTION_DAYS` (default 7, override in .env) |
+| `decision_tape` | Raw JEV/LLM decisions (prompt, criteria, choice, confidence, cost, raw) | Rolling prune at `LOG_RETENTION_DAYS` (default 7, override in .env) |
 | `agent_keys` | Agent attribution secrets (agent_id, secret_key) | Forever |
 | `sessions` | Player login sessions | 7-day expiry |
 
@@ -381,3 +426,64 @@ session OR a valid agent key (so server-to-server loopback works).
    membership list to drift.
 10. **Ceremonies run concurrently** — refinement has per-team slots. One
     team's scrum master never blocks another's from grooming their backlog.
+
+---
+
+## 12. Failure Taxonomy and Rule Mining
+
+The draft-review loop is more than "send it back" — it sorts WHY a deliverable
+failed and turns recurring reasons into operator-visible rule proposals.
+
+### The failure ledger
+
+Every review/QA send-back records one classified failure
+(`_record_failure` → `failures.json`, kept outside `world/` so it is never
+statically served). Classification (`_classify_failure`) runs cheap
+deterministic rules first, then a Jev classifier as fallback, into four
+buckets:
+
+| Type | Meaning |
+|------|---------|
+| `factual_error` | A number or claim is wrong or has no source |
+| `client_preference` | Contradicts a stated client/operator preference |
+| `missing_information` | A required fact or field is missing |
+| `style` | Style, tone, or wording |
+
+The classifier fails closed to `style` on a failed call or low confidence — a
+mislabeled fact landing in `style` only yields a softer proposed rule, never a
+wrong safety gate (and the deterministic money rule already pins the
+safety-critical bucket without any model call). The ledger is bounded to the
+tail (`FAILURE_MAX_RECORDS`).
+
+### Weekly rule mining
+
+On the same silent weekly cadence as the roadmap recompute, `_rule_mine_step`
+(sim.py) calls serve's `_mine_rule_proposals`: group the ledger by
+(type, ruleHint) and any pattern recurring at least `RULE_MIN_RECURRENCE` (2)
+times becomes a PROPOSED rule carrying the rule text plus a test fixture (the
+offending input and the requirement it missed). Nothing is auto-applied — a
+proposal surfaces to the operator and becomes a real rule only when the
+operator encodes it (ban list, Jev criteria) and pastes the fixture into a
+conformance test, exactly like every other operator-applied governance change.
+Proposals are capped (`RULE_PROPOSALS_MAX`), so an aging think tank cannot
+grow the file without bound.
+
+---
+
+## 13. Video-Takeaway Mapping
+
+Three videos were reviewed and their transcripts kept under
+`world/library/media/transcripts/` (`fde-masterclass`, `ai-roll-ups`,
+`fde-explained`). Their lessons were checked against the codebase and are
+already operationalized:
+
+| Video lesson | Where it lives |
+|--------------|----------------|
+| Run agents in the background before they touch anything real | Bot Ops shadow/dry-run mode — `shadow` queue items capture to `shadowLedger` and never ship, plus the weekly diff-against-expectation review |
+| A shared layer of rules that gets better every week | §12 failure taxonomy + weekly rule mining |
+| People shift from doing the work to checking it | Review checklists, verifier-ensemble grading, the peer review gate |
+| Measure constantly, prove the before/after delta | Weekly review (ground-truth week-over-week deltas) + sprint velocity (§7) |
+| Baseline before you build | Delivery-grade floor + trailing-grade coaching in the sim |
+
+No further code was added for the videos — the transcripts were ingested and
+the mapping recorded here so the review is auditable, not re-done.

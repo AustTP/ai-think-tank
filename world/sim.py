@@ -1387,6 +1387,10 @@ REFINEMENT_MEET_MS = 10_000                     # brief decision horizon (never 
 # instructions at ASSIGNMENT, never at grooming.
 DELIVERABLE_GRADE_FLOOR = 5.0      # graded below this -> coaching-worthy
 ROADMAP_CADENCE_MS = 7 * 24 * 3600 * 1000   # weekly silent priority recompute
+# Rule mining: weekly silent pass that turns recurring classified draft
+# failures (the review ledger) into operator rule PROPOSALS. Same shape as the
+# roadmap recompute -- pure derivation, no ceremony, no Jev spend.
+RULE_MINE_CADENCE_MS = 7 * 24 * 3600 * 1000   # weekly
 # A runbook's most recent entry, once written for a product/room, gets pulled
 # into every FUTURE incident task on that product as a "prior incident said:"
 # note, so handlers learn instead of re-discovering.
@@ -1996,14 +2000,17 @@ def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructi
         'budgetMs': budget_ms or 60_000,
     }])
 def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None,
-               goal=None, priority=None, project_label=None):
+               goal=None, priority=None, project_label=None, depends_on_task=None):
     """Queue a single work item to fire ONCE at an absolute wall-clock time
     (`at_ms`, epoch milliseconds). The item rides the same `notBefore` gate
     the rest of the queue already honors (see is_work_item_due): it sits in
     the work queue untouched until `at_ms`, then runs through the normal
-    assign -> work -> complete lifecycle exactly once. Returns the queued
-    work item dict, or None if rejected (no title, or `at_ms` is not a
-    positive future epoch-ms)."""
+    assign -> work -> complete lifecycle exactly once. `depends_on_task` (a
+    task id) adds the dependency gate: even once `at_ms` passes, the item is
+    NOT assigned until that task reaches 'done' (see _work_item_dependency_met)
+    -- the composed "run X once the dependency lands" scheduling lane. Returns
+    the queued work item dict, or None if rejected (no title, or `at_ms` is
+    not a positive future epoch-ms)."""
     at_ms = int(at_ms or 0)
     if not title or at_ms <= 0:
         return None
@@ -2016,6 +2023,7 @@ def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None
         'goal': goal or None,
         'priority': normalize_priority(priority),
         'projectLabel': project_label or None,
+        'dependsOn': depends_on_task or None,
     }
     queue_work(state, [item])
     return item
@@ -2023,9 +2031,12 @@ def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None
 
 def think_tank_has_work(state, now_ms):
     """Port of tasks.js thinkTankHasWork: a due queue item, or any agent currently
-    task/handoff/pair/busy."""
+    task/handoff/pair/busy. A due item whose `dependsOn` dependency hasn't
+    landed is NOT work yet -- it waits (no agent spend) until the dependency
+    ships, same gate pick_next_due_index applies at assignment."""
     work_queue = state.get('workQueue') or []
-    if any(is_work_item_due(item, now_ms) for item in work_queue):
+    if any(is_work_item_due(item, now_ms) and _work_item_dependency_met(state, item)
+           for item in work_queue):
         return True
     for a in (state.get('agents') or {}).values():
         if a and (a.get('task') or a.get('handoff') or a.get('pairWith') or a.get('busy')):
@@ -2217,13 +2228,37 @@ def queue_bug(state, product_id, title, now_ms=None, room=None, reported_by=None
     }])
 
 
-def pick_next_due_index(work_queue, now_ms, exclude_items):
+def _dependency_landed(state, task_id):
+    """True when the dependency task `task_id` has reached 'done' in the durable
+    task mirror. A dependency only 'lands' when a real done task exists under
+    that id (old done tasks persist in state, so this stays true after
+    completion). Absent / walking / working / needs_review -> not landed."""
+    t = (state.get('tasks') or {}).get(task_id)
+    return isinstance(t, dict) and t.get('status') == 'done'
+
+
+def _work_item_dependency_met(state, item):
+    """True when a queue item's dependency (item['dependsOn']) has landed --
+    i.e. the referenced task reached 'done' in the durable mirror. An item
+    with no dependency is always met. pick_next_due_index / think_tank_has_work
+    use this to keep a gated card IN the queue (never assigned, never abandoned
+    on the attempts cap) until its dependency actually ships."""
+    dep = item.get('dependsOn')
+    if not dep:
+        return True
+    return _dependency_landed(state, dep)
+
+
+def pick_next_due_index(work_queue, now_ms, exclude_items, state=None):
     """Port of tasks.js _pickNextDueIndex: highest due priority wins; at EQUAL
     priority, the larger size estimate (L > M > S) starts first -- an L story
     needs more wall-time than an S story, so it is pulled ahead of same-priority
     siblings (effort is a tiebreak, never an urgency override). strict >
     preserves arrival order at equal priority + equal size; skip items in
-    exclude_items (this call's attemptedThisCycle). Returns index or -1."""
+    exclude_items (this call's attemptedThisCycle). When `state` is supplied
+    (the live assignment loop), an item whose `dependsOn` dependency hasn't
+    landed is skipped too -- a gated card waits for its dependency, never
+    leaks into assignment. Returns index or -1."""
     best_index, best_score = -1, None
     for i, item in enumerate(work_queue):
         if not is_work_item_due(item, now_ms):
@@ -2231,6 +2266,8 @@ def pick_next_due_index(work_queue, now_ms, exclude_items):
         # exclude_items is a Set of QUEUE-ITEM IDENTITIES (id(item)), not the
         # dicts themselves -- queue items are mutable dicts and unhashable.
         if exclude_items and id(item) in exclude_items:
+            continue
+        if state is not None and not _work_item_dependency_met(state, item):
             continue
         priority = item.get('priority', WORK_PRIORITY['normal'])
         score = (priority, size_estimate_weight(item.get('sizeEstimate')))
@@ -2462,14 +2499,27 @@ def sprint_progress(state, sprint_id):
             'done': done, 'pct': pct, 'landed': landed}
 
 
-def close_sprint(state, sprint_id):
+# The sprint-close velocity signal is a trailing per-team history: how much of
+# a just-closed sprint actually landed (count + size points, when estimated).
+# Capped so the digest stays a rolling window, not a whole-of-history ledger.
+TEAM_VELOCITY_MAX = 20
+
+
+def close_sprint(state, sprint_id, now_ms=None):
     """Mark a sprint closed (a container action -- already-queued items finish
     or age out normally; closing doesn't cancel work). Sprint ROLLOVER: any card
     still waiting in the queue (tagged with this sprint, not yet done) is
     recorded on the record as `rolledOver` (id + title), so a follow-up sprint
     created for the same team carries it over explicitly instead of silently
-    losing the un-landed scope. Returns the updated record, or None if the
-    sprint doesn't exist."""
+    losing the un-landed scope. Sprint VELOCITY: on the active->closed
+    transition the record gains `velocity` (landed/total/pct/rolledOver/points/
+    elapsedMs) and is folded into the per-team trailing history
+    state['teamVelocity'] -- the signal a director reads to size the next
+    sprint. Idempotent: re-closing an already-closed sprint recomputes nothing
+    (no double velocity, no closedAt overwrite). Returns the updated record,
+    or None if the sprint doesn't exist."""
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
     sprints = state.get('sprints') or {}
     record = sprints.get(sprint_id)
     if not record:
@@ -2478,8 +2528,81 @@ def close_sprint(state, sprint_id):
         record['rolledOver'] = [
             {'id': _sprint_item_id(it), 'title': it.get('title')}
             for it in _unfinished_sprint_items(state, sprint_id)]
+        record['closedAt'] = now_ms
+        _record_sprint_velocity(state, record, now_ms)
     record['status'] = 'closed'
     return record
+
+
+def _sprint_item_estimate(state, sprint_id, title, room):
+    """The size-estimate WEIGHT of one sprint item, looked up from the live
+    state (an unassigned card still in the queue carries it; an assigned one
+    rides on its durable task). 0 when the card has no numeric estimate --
+    'not estimated' is honest, never guessed as a small size."""
+    for it in (state.get('workQueue') or []):
+        if it.get('sprintId') == sprint_id and it.get('title') == title \
+                and (it.get('room') or None) == room:
+            return size_estimate_weight(it.get('sizeEstimate'))
+    for t in (state.get('tasks') or {}).values():
+        if t.get('shadow'):
+            continue
+        if t.get('title') == title and (t.get('room') or None) == room:
+            return size_estimate_weight(t.get('sizeEstimate'))
+    return 0
+
+
+def _sprint_item_done(state, title, room):
+    """True when a sprint item has a matching DONE, non-shadow task -- the same
+    'landed' test sprint_progress derives (a peer-gated story counts only once
+    its gate closed)."""
+    return any(t.get('status') == 'done' and t.get('title') == title
+               and (t.get('room') or None) == room and not t.get('shadow')
+               for t in (state.get('tasks') or {}).values())
+
+
+def _record_sprint_velocity(state, record, now_ms):
+    """Compute the velocity snapshot of a sprint at close and fold it into the
+    per-team trailing history (state['teamVelocity'], capped at
+    TEAM_VELOCITY_MAX per team). `landed`/`total`/`pct` mirror sprint_progress;
+    `rolledOver` mirrors the close record; `pointsLanded`/`pointsTotal` sum the
+    size-estimate weights (S=1 / M=2 / L=3) and are None when the sprint carried
+    no numeric estimates at all. `elapsedMs` is wall-time since creation. Pure
+    state mutation; called once from close_sprint on the active->closed
+    transition (idempotent -- a re-close never re-folds)."""
+    items = record.get('items') or []
+    points_total = 0
+    points_estimated = False
+    landed_points = 0
+    landed = 0
+    for pair in items:
+        title, room = tuple(pair)
+        w = _sprint_item_estimate(state, record.get('id'), title, room)
+        if w:
+            points_estimated = True
+            points_total += w
+        if _sprint_item_done(state, title, room):
+            landed += 1
+            if w:
+                landed_points += w
+    total = len(items)
+    pct = round((landed / total) * 100) if total else 0
+    velocity = {
+        'landed': landed,
+        'total': total,
+        'pct': pct,
+        'rolledOver': len(record.get('rolledOver') or []),
+        'pointsLanded': landed_points if points_estimated else None,
+        'pointsTotal': points_total if points_estimated else None,
+        'elapsedMs': max(0, int(now_ms) - int(record.get('createdAt') or 0)),
+    }
+    record['velocity'] = velocity
+    history = state.setdefault('teamVelocity', {})
+    for tid in (record.get('teamIds') or []):
+        bucket = history.setdefault(tid, [])
+        bucket.append(velocity)
+        if len(bucket) > TEAM_VELOCITY_MAX:
+            del bucket[:len(bucket) - TEAM_VELOCITY_MAX]
+    return velocity
 
 
 def _unfinished_sprint_items(state, sprint_id):
@@ -2557,7 +2680,7 @@ def _auto_close_completed_sprints(state, now_ms=None):
             continue
         progress = sprint_progress(state, sid)
         if progress and progress.get('total') and progress['done'] >= progress['total']:
-            close_sprint(state, sid)
+            close_sprint(state, sid, now_ms)
             record['closedAt'] = now_ms
             record['autoClosed'] = True
             closed.append(sid)
@@ -3504,7 +3627,7 @@ def next_topic_id(state):
 
 
 def add_research_topic(state, topic, start_url, cadence_ms, now_ms=None,
-                       link_keyword=None, page_keyword=None):
+                       link_keyword=None, page_keyword=None, depends_on_task=None):
     """The creator side of the standing research-topic cadence: _check_schedules
     (below) has always been able to FIRE a due topic, but nothing ever appended
     one to state['researchTopics'] -- it was seeded empty at boot and never
@@ -3513,9 +3636,13 @@ def add_research_topic(state, topic, start_url, cadence_ms, now_ms=None,
     Fails closed rather than guessing: rejects an empty topic, a start_url that
     doesn't parse as a real absolute URL (scheme + host), and clamps cadence_ms
     to MIN_RESEARCH_CADENCE_MS so a bad interval can't turn into a queue-flood.
-    Returns the new record, or None if rejected. `lastRunAt` starts at 0 so the
-    first crawl fires on the very next _check_schedules pass, matching the
-    intuitive "start checking X" request rather than waiting a full cadence."""
+    `depends_on_task` (a task id) adds the dependency gate: the topic does not
+    fire until that task reaches 'done' -- and its cadence marker is NOT
+    advanced while it waits, so the crawl fires on the first pass after the
+    dependency lands. Returns the new record, or None if rejected. `lastRunAt`
+    starts at 0 so the first crawl fires on the very next _check_schedules pass,
+    matching the intuitive "start checking X" request rather than waiting a
+    full cadence."""
     topic = (topic or '').strip()
     start_url = (start_url or '').strip()
     if not topic or not start_url:
@@ -3533,6 +3660,7 @@ def add_research_topic(state, topic, start_url, cadence_ms, now_ms=None,
         'seenUrls': [],
         'linkKeyword': link_keyword or None,
         'pageKeyword': page_keyword or None,
+        'dependsOnTask': depends_on_task or None,
     }
     state.setdefault('researchTopics', []).append(record)
     return record
@@ -3547,7 +3675,7 @@ def next_pipeline_id(state):
     return f'pl-{n}'
 
 
-def add_pipeline(state, name, cadence_ms, steps, now_ms=None):
+def add_pipeline(state, name, cadence_ms, steps, now_ms=None, depends_on_task=None):
     """The creator side of an ORDERED pipeline: a named sequence of steps that
     fires in strict order, each step gated on its predecessor's completion (the
     player-facing scheduling lane -- see _check_pipelines below). This is the
@@ -3559,9 +3687,11 @@ def add_pipeline(state, name, cadence_ms, steps, now_ms=None):
     MIN_PIPELINE_CADENCE_MS so a bad interval can't turn into a queue-flood.
     Each step may carry {title, room, offsetMs, instructions, tool, args};
     offsetMs is a minimum delay AFTER the previous step's completion (not from
-    the run's start -- strict ordering dominates timing). Returns the new
-    record, or None if rejected. `lastRunAt` starts at 0 so the first step
-    fires on the very next _check_schedules pass."""
+    the run's start -- strict ordering dominates timing). `depends_on_task` (a
+    task id) adds the dependency gate: the run does not START until that task
+    reaches 'done' (a mid-run sequence keeps firing its remaining steps once it
+    has started). Returns the new record, or None if rejected. `lastRunAt`
+    starts at 0 so the first step fires on the very next _check_schedules pass."""
     name = (name or '').strip()
     if not name or not isinstance(steps, list) or not steps:
         return None
@@ -3599,6 +3729,7 @@ def add_pipeline(state, name, cadence_ms, steps, now_ms=None):
                              # same stepIndex across runs (old done tasks persist)
         'runStepIndex': 0,   # next step index to fire in the current run
         'lastStepCompletedAt': None,
+        'dependsOnTask': depends_on_task or None,
     }
     state.setdefault('pipelines', []).append(record)
     return record
@@ -3703,6 +3834,13 @@ def _check_schedules(state, now, now_ms):
     # Research topics.
     for topic in (state.get('researchTopics') or []):
         if now_ms - (topic.get('lastRunAt') or 0) < topic.get('cadenceMs', 0):
+            continue
+        # Composed schedule+dependency: a topic with a `dependsOnTask` waits for
+        # that task to reach 'done'. The marker is deliberately NOT advanced
+        # while it waits, so the crawl fires on the first pass AFTER the
+        # dependency lands (same marker-held-while-gated rule as the content
+        # gates below) instead of silently burning a cadence cycle.
+        if topic.get('dependsOnTask') and not _dependency_landed(state, topic['dependsOnTask']):
             continue
         previous_run_at = topic.get('lastRunAt') or 0
         topic['lastRunAt'] = now_ms
@@ -3812,6 +3950,15 @@ def _check_pipelines(state, now_ms):
         cadence_ms = max(p.get('cadenceMs') or 0, MIN_PIPELINE_CADENCE_MS)
         step_index = p.get('runStepIndex') or 0
         run_id = p.get('runId') or 0
+        # Composed schedule+dependency: a pipeline with a `dependsOnTask` gates
+        # at the RUN BOUNDARY only -- a never-started pipeline (no lastRunAt)
+        # and a completed run waiting to re-arm both hold until the dependency
+        # lands (no marker advance, so the run fires on the first pass after it
+        # does). A MID-RUN pipeline keeps firing its remaining steps: the
+        # dependency gates the run's start, not its tail.
+        if p.get('dependsOnTask') and not _dependency_landed(state, p['dependsOnTask']) \
+                and (not p.get('lastRunAt') or step_index >= len(steps)):
+            continue
         # Pipeline run complete (all steps fired) and waiting out the cadence
         # window before the next run -- idle, no work.
         if step_index >= len(steps):
@@ -7837,10 +7984,20 @@ def _resolve_retrospective(state, pending, now_ms, decider=None):
     progress = sprint_progress(state, sprint_id) or {}
     landed = progress.get('landed') or []
     landed_text = ', '.join(landed) if landed else '(nothing landed)'
+    velocity = record.get('velocity') or {}
+    velocity_line = ''
+    if velocity:
+        pts = ''
+        if velocity.get('pointsTotal') is not None:
+            pts = (f", {velocity.get('pointsLanded')} of "
+                   f"{velocity.get('pointsTotal')} points shipped")
+        velocity_line = (f" Sprint velocity: {velocity.get('landed')} of "
+                         f"{velocity.get('total')} items landed ({velocity.get('pct')}%), "
+                         f"{velocity.get('rolledOver')} carried over{pts}.")
     instructions = (
         f"{sm_name} is the scrum master facilitating the retrospective for the just-closed sprint "
         f"'{record.get('name') or sprint_id}' (goal: {record.get('goal') or 'none'}). "
-        f"What landed this sprint: {landed_text}. "
+        f"What landed this sprint: {landed_text}.{velocity_line} "
         "Name concrete, honest START / STOP / CONTINUE items for the team. START = something the team "
         "should begin doing (a new habit). STOP = something that wasted effort or didn't work. "
         "CONTINUE = something that worked and should be kept. 2-4 terse items per bucket; every item must be "
@@ -7862,6 +8019,7 @@ def _resolve_retrospective(state, pending, now_ms, decider=None):
         'sprintId': sprint_id,
         'sprintName': record.get('name') or sprint_id,
         'landed': landed,
+        'velocity': record.get('velocity') or None,
         'teamIds': pending.get('teamIds') or [],
         'attendees': list((pending.get('people') or {}).keys()),
         'completedAt': now_ms,
@@ -8371,6 +8529,34 @@ def _roadmap_step(state, now_ms):
             priority += 1
         roadmap[room] = {'priority': priority, 'ownerId': prev.get('ownerId'),
                          'lastGrade': gm, 'demand': demand}
+
+
+def _rule_mine_step(state, now_ms):
+    """Weekly silent pass: mine recurring classified failures (the review
+    ledger in serve.py) into operator rule proposals -- the 'write a rule' +
+    'add a test' steps of the draft-review loop. Mirrors _roadmap_step: pure
+    derivation, no ceremony, no Jev spend. Cadence-gated on the state stamp;
+    the mining itself lives in serve.py (file-backed ledger + proposals).
+    Nothing is auto-applied -- a proposal surfaces to the operator (governance
+    log + the /api/rule-proposals surface) and becomes a real rule only when
+    the operator encodes it. Best-effort: a ledger failure just skips this
+    week's mine, never blocks the task cycle."""
+    if now_ms - (state.get('lastRuleMineAt') or 0) < RULE_MINE_CADENCE_MS:
+        return
+    state['lastRuleMineAt'] = now_ms
+    try:
+        import serve as _serve_mod
+        created = _serve_mod._mine_rule_proposals()
+    except Exception:
+        return
+    for p in created:
+        _log_governance(state, None, 'rule_proposal', {
+            'proposalId': p.get('id'),
+            'type': p.get('type'),
+            'rule': p.get('rule'),
+            'count': p.get('count'),
+            'dedupeKey': p.get('dedupeKey'),
+        })
 
 
 def _refinement_context_for_room(state, room):
@@ -9172,6 +9358,11 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # roadmap current for the next grooming.
     _roadmap_step(state, now_ms)
 
+    # Weekly rule mining: recurring classified failures become operator rule
+    # proposals. Same shape as the roadmap step -- state stamp + file-backed
+    # derivation, no ceremony, no Jev spend.
+    _rule_mine_step(state, now_ms)
+
     # Cut 3 on-call escalation: advance an in-flight escalation ceremony, or
     # sweep open incident tasks past the restore window and hand the ones no
     # one could restore to the product team's scrum master. Ungated like its
@@ -9400,7 +9591,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     roster_size = sum(1 for d in roster if not d.get('isAdmin'))
     attempted = set()
     for _ in range(max(1, roster_size)):
-        due_index = pick_next_due_index(work_queue, now_ms, attempted)
+        due_index = pick_next_due_index(work_queue, now_ms, attempted, state)
         if due_index == -1:
             break
         pick = work_queue[due_index]

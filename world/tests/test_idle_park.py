@@ -56,6 +56,7 @@ def _quiet(state):
     state['workQueue'] = []
     state['lastSkillReviewAt'] = _IDLE_AT_MS
     state['lastDistillAt'] = _IDLE_AT_MS  # same: sweep must not enqueue work
+    state['lastRuleMineAt'] = _IDLE_AT_MS  # same: rule mining must not fire
     state['lastHireAt'] = _IDLE_AT_MS - 1  # recent hire keeps auto-hire quiet
     return state
 
