@@ -4246,6 +4246,126 @@ HIGH_TIER_MAX_PRICE_USD = float(_load_env().get('HIGH_TIER_MAX_PRICE_USD', '0') 
 # tier" at a glance, and so the cap reads it cleanly).
 HIGH_TIER_LEDGER_KEY = '__high_tier__'
 
+# --- Test-time compute (deliberation) on the low and mid tiers ----------------
+# The low and mid tiers are the cheap, quality-limited models the sim leans on
+# most (chat, daily logs, gathering). Because they can't just "think harder"
+# on their own like the expensive tier, /api/chat runs a lightweight
+# deliberation loop for them: sample the prompt `TTC_BEST_OF` times and fold
+# the drafts into one answer by JSON-majority vote (structured responses) or a
+# same-model self-verification pass (open-ended prose), so the *reported*
+# output is far more consistent than any single cheap draft. Each sample is a
+# real billed call, so the whole thing is gated on a flag and capped at
+# TTC_MAX_BEST_OF -- high-tier and reasoning-tier calls never deliberate
+# (they're already expensive), and a caller can opt out per-request with
+# {"deliberate": false}.
+TTC_ENABLED = os.environ.get('TTC_ENABLED', '1').lower() not in ('0', 'false', 'no', 'off')
+TTC_BEST_OF = max(2, min(int(_load_env().get('TTC_BEST_OF', '2') or 2), int(_load_env().get('TTC_MAX_BEST_OF', '3') or 3)))
+TTC_MAX_BEST_OF = max(TTC_BEST_OF, int(_load_env().get('TTC_MAX_BEST_OF', '3') or 3))
+
+
+def _ttc_should_deliberate(model, deliberate=None, best_of=None):
+    """Whether a /api/chat request should get test-time compute at all: the
+    feature is enabled, the resolved model is a low/mid (cheap) tier (the
+    expensive/reasoning/coding tiers already think hard enough per call), and
+    the caller hasn't explicitly opted out. An explicit request for
+    best_of>1 is honored even when the caller omitted `deliberate`."""
+    if not TTC_ENABLED:
+        return False
+    if deliberate is not None and not deliberate:
+        return False
+    if best_of is not None and int(best_of) > 1:
+        return True
+    if model is None:
+        return False
+    if model in (_high_tier_slug(), _coding_tier_slug(), _reasoning_tier_slug()):
+        return False
+    # Low and mid tiers (None is the fail-closed slug from _resolve_model_tier
+    # when the model_tiers table is empty -- no configured tiers, no guessing).
+    return model in (_low_tier_slug(), _mid_tier_slug())
+
+
+def _ttc_best_of(best_of=None):
+    """Clamp a caller's best_of (or fall back to the configured default) into
+    the [2, TTC_MAX_BEST_OF] range. Returns 1 (no sampling) when deliberation
+    is disabled entirely."""
+    if not TTC_ENABLED:
+        return 1
+    if best_of is not None:
+        try:
+            return max(2, min(int(best_of), TTC_MAX_BEST_OF))
+        except (TypeError, ValueError):
+            return TTC_BEST_OF
+    return TTC_BEST_OF
+
+
+def _ttc_majority_json(samples):
+    """Fold best-of-N drafts of a JSON-structured request into ONE answer by
+    exact-match majority vote. Each sample is the OpenRouter result dict; the
+    candidate is its reply content (normalized: fences and surrounding text
+    stripped). The most common candidate wins, ties broken by first-appearance
+    order. Returns the winning candidate string, or None when no candidate is
+    parseable."""
+    from collections import Counter
+    counts = Counter()
+    order = []
+    seen = set()
+    for s in samples:
+        content = (s.get('choices') or [{}])[0].get('message', {}).get('content') or ''
+        cleaned = re.sub(r'^```json\s*|^```\s*|```\s*$', '', content.strip()).strip()
+        if not cleaned:
+            continue
+        if cleaned not in seen:
+            seen.add(cleaned)
+            order.append(cleaned)
+        counts[cleaned] += 1
+    if not order:
+        return None
+    best = max(order, key=lambda c: counts[c])
+    return best if counts[best] >= 2 else None
+
+
+def _ttc_self_verify(model, messages, best_of, max_tokens, drafts=None, service=None):
+    """Self-verification pass for open-ended (non-JSON) prompts: take best-of-N
+    drafts of the SAME request and ask the SAME cheap model to pick the best
+    one and return it VERBATIM (best-of-N with a judge -- often measurably
+    better than voting for prose). Returns the chosen content string, or the
+    first draft when verification fails.
+
+    Cost accounting stays accurate: when `drafts` is None the helper samples
+    them itself and accrues each sample's cost to `service`; otherwise the
+    caller already accrued the drafts and the helper only pays for the single
+    judge call."""
+    if drafts is None:
+        drafts = []
+        for _ in range(int(best_of)):
+            r = _call_openrouter_sync(model, messages=messages, max_tokens=max_tokens)
+            drafts.append((r.get('choices') or [{}])[0].get('message', {}).get('content') or '')
+            if service:
+                cost = (r.get('usage') or {}).get('cost', 0.0)
+                if isinstance(cost, (int, float)) and cost:
+                    _accrue_spend(service, cost)
+    drafts = [d for d in drafts if d]
+    if not drafts:
+        return ''
+    if len(drafts) < 2:
+        return drafts[0]
+    judge = (
+        'Here are several candidate answers to the same request. Choose the single BEST one -- '
+        'the most complete, accurate, and clearly written -- and return it VERBATIM, byte for byte, '
+        'with no commentary, no quotes, no prefixes, no markdown.'
+    )
+    judge_messages = [{'role': 'system', 'content': judge}]
+    for i, d in enumerate(drafts):
+        judge_messages.append({'role': 'user', 'content': f'Candidate {i + 1}:\n{d}'})
+    judge_messages.append({'role': 'user', 'content': 'Return the best candidate verbatim.'})
+    r = _call_openrouter_sync(model, messages=judge_messages, max_tokens=max_tokens)
+    if service:
+        cost = (r.get('usage') or {}).get('cost', 0.0)
+        if isinstance(cost, (int, float)) and cost:
+            _accrue_spend(service, cost)
+    chosen = (r.get('choices') or [{}])[0].get('message', {}).get('content') or ''
+    return chosen if chosen else drafts[0]
+
 
 def _high_tier_budget_month():
     """The current UTC calendar month (2026-09) -- the rollover key: a fresh
@@ -5233,7 +5353,50 @@ def record_model_result(model_slug, success):
             log_action(None, 'model_circuit_broken', {'model': model_slug, 'cooldown_s': CIRCUIT_BREAKER_COOLDOWN_S})
 
 
-def _call_openrouter_sync(model, messages, max_tokens):
+PLAIN_WRITING_BAN_LIST = (
+    'leverage', 'utilize', 'seamless', 'robust', 'crucial', 'ensure',
+    'delve', 'dive into', 'unpack', 'harness', 'foster', 'elevate',
+    'underscore', 'illuminate', 'showcase', 'empower', 'innovative',
+    'transformative', 'cutting-edge', 'state-of-the-art', 'significant',
+    'notably', 'moreover', 'furthermore', 'additionally', 'overall',
+    'essentially', 'fundamentally', 'ultimately', 'comprehensive',
+    'it is worth noting', 'needless to say', 'in conclusion', 'in summary',
+    'that being said', 'having said that', 'when it comes to', 'at its core',
+    'play a role', 'serve as', 'act as', 'allow for', 'facilitate',
+    'potentially', 'effectively', 'efficiently', 'appropriately',
+)
+# Directs the village's models to write plain, short, no-AI-flavored prose --
+# the SAME anti-slop signal the coupon scanner uses (word ban list), applied at
+# the model-call boundary so every prose-producing path inherits it. This is a
+# TOKEN-saving directive, not a style law: it cuts filler that costs input and
+# output tokens, without demanding clipped caveman-speak.
+PLAIN_WRITING_DIRECTIVE = (
+    "Write plainly, the way a competent person talks to a colleague. "
+    "Make every sentence do work. Cut filler, hedging, preamble, and any "
+    "closing summary or recap. Prefer short sentences. Do not use the words "
+    "or phrases: {banned}. Keep the reply exactly as long as it needs to be "
+    "and not a word longer."
+)
+
+
+def _apply_plain_writing(messages):
+    """Return `messages` with the plain-writing directive folded into the first
+    system message (appended, so the caller's persona/instructions keep
+    precedence). Returns the same list when there is no system message to
+    attach to. Callers that need strictly structured output (JSON extraction)
+    should skip this -- the directive's "not a word longer" nudge can truncate
+    a schema mid-object."""
+    messages = list(messages or [])
+    directive = PLAIN_WRITING_DIRECTIVE.format(banned=', '.join(PLAIN_WRITING_BAN_LIST))
+    for i, msg in enumerate(messages):
+        if isinstance(msg, dict) and msg.get('role') == 'system':
+            messages[i] = dict(msg)
+            messages[i]['content'] = f"{messages[i].get('content') or ''}\n\n{directive}".strip()
+            return messages
+    return messages
+
+
+def _call_openrouter_once_sync(model, messages, max_tokens):
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if is_model_circuit_broken(model):
@@ -5266,6 +5429,24 @@ def _call_openrouter_sync(model, messages, max_tokens):
         raise
     record_model_result(model, success=True)
     return result
+
+
+def _call_openrouter_sync(model, messages, max_tokens, best_of=1):
+    """The plain OpenRouter chat-completions call. With `best_of=1` (the
+    default) it returns a single parsed result dict exactly as before.
+
+    `best_of>1` is the test-time-compute sampling primitive: it returns a
+    LIST of `best_of` independent completions (self-consistency samples) that
+    the caller -- /api/chat's deliberation path -- folds into a final answer
+    via JSON majority-voting or a self-verification pass. Each sample runs
+    through the same circuit breaker, retry, and model-result bookkeeping as
+    a lone call."""
+    if best_of is None or best_of <= 1:
+        return _call_openrouter_once_sync(model, messages, max_tokens)
+    samples = []
+    for _ in range(int(best_of)):
+        samples.append(_call_openrouter_once_sync(model, messages, max_tokens))
+    return samples
 
 
 def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choice=None):
@@ -9188,7 +9369,9 @@ def _clarify_in_character_messages(agent, kb_matches, product_name, question):
         f"## Library knowledge (searched for this product + your question)\n{kb_block}\n\n"
         f"## Player's question about '{product_name}'\n{question}"
     )
-    return [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}]
+    # Prose answer to the player -- inherit the plain-writing directive so the
+    # reply stays short and filler-free (fewer tokens, same information).
+    return _apply_plain_writing([{'role': 'system', 'content': system}, {'role': 'user', 'content': user}])
 
 
 @app.post('/api/intent/clarify')
@@ -9500,6 +9683,9 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     )
     user = f"## Player's fresh question\n{question}"
     messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}]
+    # The ask lane answers in prose, so it inherits the plain-writing
+    # directive by default -- shorter, filler-free replies at no extra cost.
+    messages = _apply_plain_writing(messages)
 
     # Ask lane: a fresh player question. Not code, so JEV-gated (default low,
     # light mid for a question that needs real reasoning).
@@ -9885,6 +10071,7 @@ async def intent_ask(request: Request):
 _ROUTING_LANES = [
     {'id': 'ask', 'description': "A direct question expecting an immediate, conversational answer right now (trivia, opinion, a quick lookup, small talk) -- not a request to change, build, or investigate anything in the think tank or its products."},
     {'id': 'schedule', 'description': "Asks for something to happen automatically on a recurring or periodic basis going forward (e.g. 'check X every hour/day', 'keep watching Y and update it') -- a standing job, not a one-time favor."},
+    {'id': 'schedule_once', 'description': "Asks for a single, one-time task to be done AT a specific day and time the player names (e.g. 'remind me to deploy the release Tuesday at 9am', 'run the monthly report on the 1st at 3pm once') -- a one-shot event on a calendar time, not a recurring cadence and not something to do right now."},
     {'id': 'spike', 'description': "Asks the think tank to look into or figure something out ONE TIME, with no need for an immediate reply and no clearly defined deliverable yet -- exploratory, time-boxed digging, not a committed piece of work."},
     {'id': 'story', 'description': "Asks for something substantial to be BUILT, CHANGED, or DELIVERED -- a real feature, fix, or piece of work with a concrete outcome, sized for a team's real backlog and sprint process."},
     {'id': 'incident', 'description': "Reports something already broken, down, or failing RIGHT NOW in a live product, wanting it fixed urgently."},
@@ -10000,6 +10187,87 @@ def _extract_schedule_fields_sync(admin_id, key, text):
     return {'topic': topic, 'startUrl': start_url, 'cadenceMs': int(cadence_ms)}
 
 
+# A one-off scheduled task can be requested as far ahead as this (366 days)
+# -- far enough for a real annual event, tight enough that a misparsed date
+# can't sit silently in the queue for years.
+SCHEDULE_ONCE_MAX_AHEAD_MS = 366 * 24 * 3600 * 1000
+
+
+def _parse_schedule_once_at(value, now_ms=None):
+    """Parse a player-supplied "at" into epoch milliseconds, or None if it
+    can't be read. Accepts an ISO 8601 string (a trailing 'Z' or an explicit
+    offset; a naive time is treated as UTC so scheduling is unambiguous
+    regardless of where the server sits) or a bare number (treated as epoch
+    milliseconds above 1e12, epoch seconds otherwise). Fails closed -- a
+    time that doesn't parse is None, never guessed."""
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        n = float(value)
+        if n <= 0:
+            return None
+        return int(n) if n >= 1e12 else int(n * 1000)
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        # A bare numeric string is epoch seconds/ms, same as the numeric path.
+        try:
+            n = float(s)
+            return int(n) if n >= 1e12 else int(n * 1000)
+        except ValueError:
+            pass
+        normalized = s.replace('Z', '+00:00')
+        try:
+            dt = datetime.datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return int(dt.timestamp() * 1000)
+    return None
+
+
+def _extract_schedule_once_fields_sync(admin_id, key, text):
+    """Small /api/chat JSON-extraction call (same shape as
+    _extract_schedule_fields_sync above) that pulls {title, at, instructions}
+    out of a free-text one-off scheduling request. `at` must be an ISO 8601
+    day+time. Returns None on anything that doesn't parse -- fails closed,
+    never invents a time."""
+    system_prompt = (
+        'Extract a one-time scheduled task from the player\'s message. '
+        'Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: '
+        '{"title": "short label for the single task to do", "at": "ISO 8601 day and time, e.g. 2026-10-20T14:00:00-04:00, or an explicit Z suffix for UTC", "instructions": "short instruction for the task, or empty string if the title already says it"}. '
+        'The player wants this done ONCE, at that specific time, not on a repeating cadence. '
+        'If no clear day+time is identifiable, set "at" to an empty string -- do not invent one.'
+    )
+    try:
+        r = _http_json('POST', SELF_BASE_URL, '/api/chat',
+                       {'model': _resolve_model_tier('Extract a one-off scheduled task (title, absolute ISO day+time) from a free-text message'),
+                        'messages': [{'role': 'system', 'content': system_prompt},
+                                     {'role': 'user', 'content': text}],
+                        'max_tokens': 200, 'agentId': admin_id}, key)
+    except Exception:
+        return None
+    if not isinstance(r, dict) or r.get('error') or not r.get('reply'):
+        return None
+    cleaned = re.sub(r'^```json\s*|^```\s*|```\s*$', '', r['reply'].strip())
+    try:
+        parsed = json.loads(cleaned)
+    except Exception:
+        return None
+    title = (parsed.get('title') or '').strip()
+    at = (parsed.get('at') or '').strip()
+    instructions = (parsed.get('instructions') or '').strip()
+    if not title or not at:
+        return None
+    at_ms = _parse_schedule_once_at(at)
+    if not at_ms:
+        return None
+    return {'title': title, 'at': at, 'atMs': at_ms, 'instructions': instructions or None}
+
+
 def _pick_team_worker(state, director_id):
     """A real worker to pin a directly-routed spike to -- reuses
     sim.on_call_agent's existing deterministic-rotation-preferring-active
@@ -10078,6 +10346,34 @@ async def _route_lane_schedule(state, text, admin_id):
     return {'reply': f"Got it -- I'll keep checking \"{record['topic']}\" ({cadence_desc}), starting shortly."}
 
 
+async def _route_lane_schedule_once(state, text, admin_id):
+    key = get_or_create_agent_key(admin_id)
+    fields = await asyncio.to_thread(_extract_schedule_once_fields_sync, admin_id, key, text)
+    if not fields:
+        return {'reply': "I couldn't pin down a one-time task and a specific day+time -- "
+                          "can you give me what to do and when, e.g. \"run the release checklist "
+                          "Friday at 3pm\"?"}
+    import sim as _sim
+    now_ms = int(time.time() * 1000)
+    at_ms = int(fields['atMs'])
+    if at_ms <= now_ms:
+        return {'reply': "That time is already in the past -- give me a day and time in the future."}
+    if at_ms - now_ms > SCHEDULE_ONCE_MAX_AHEAD_MS:
+        return {'reply': "That's more than a year out -- I'll schedule things up to a year ahead."}
+    item = _sim.queue_once(state, fields['title'], at_ms,
+                           instructions=fields.get('instructions'))
+    if not item:
+        return {'reply': "I couldn't schedule that -- try giving it a clear task name and a future time."}
+    save_state_to_db(state)
+    log_action('player', 'schedule_once_created', {'title': fields['title'],
+                                                   'at': fields['at'], 'atMs': at_ms,
+                                                   'instructions': fields.get('instructions')},
+              authorized=True)
+    _append_passport_decision('schedule_once_created', admin_id, {'title': fields['title'], 'at': fields['at']})
+    when = datetime.datetime.fromtimestamp(at_ms / 1000, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    return {'reply': f"Scheduled \"{fields['title']}\" to run once at {when}."}
+
+
 async def _route_lane_spike(state, text, admin_id):
     import sim as _sim
     team_id = await asyncio.to_thread(_team_decider, state, text)
@@ -10153,6 +10449,7 @@ async def _route_lane_incident(state, text, admin_id):
 _ROUTING_HANDLERS = {
     'ask': _route_lane_ask,
     'schedule': _route_lane_schedule,
+    'schedule_once': _route_lane_schedule_once,
     'spike': _route_lane_spike,
     'story': _route_lane_story,
     'incident': _route_lane_incident,
@@ -10205,6 +10502,51 @@ async def intent_schedule(request: Request):
     log_action('player', 'schedule_created', {'topicId': record['id'], 'topic': record['topic']}, authorized=True)
     _append_passport_decision('schedule_created', 'player', {'topicId': record['id']})
     return JSONResponse({'ok': True, 'topic': record})
+
+
+@app.post('/api/intent/schedule-once')
+async def intent_schedule_once(request: Request):
+    """Structured parity endpoint for the one-off scheduling lane: POST
+    {title, at, room?, instructions?, taskType?, goal?}. `at` is an ISO 8601
+    day+time (a trailing 'Z' or explicit offset; naive times are treated as
+    UTC) or an epoch timestamp. The task sits in the work queue untouched
+    (its notBefore gate) until `at`, then runs the normal lifecycle exactly
+    once. The free-text extraction step
+    (_extract_schedule_once_fields_sync) is exclusive to the Telegram
+    routing layer; this takes already-structured fields."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    title = (body.get('title') or '').strip()
+    at_ms = _parse_schedule_once_at(body.get('at'))
+    if not title or not at_ms:
+        return JSONResponse({'error': 'title and a parseable future `at` (ISO 8601 or epoch) are required'}, status_code=400)
+    now_ms = int(time.time() * 1000)
+    if at_ms <= now_ms:
+        return JSONResponse({'error': '`at` must be in the future'}, status_code=400)
+    if at_ms - now_ms > SCHEDULE_ONCE_MAX_AHEAD_MS:
+        return JSONResponse({'error': '`at` must be within a year of now'}, status_code=400)
+    room = (body.get('room') or '').strip() or None
+    instructions = (body.get('instructions') or '').strip() or None
+    task_type = (body.get('taskType') or '').strip() or None
+    goal = (body.get('goal') or '').strip() or None
+    import sim as _sim
+    item = _sim.queue_once(state, title, at_ms, room=room, instructions=instructions,
+                           task_type=task_type, goal=goal)
+    if not item:
+        return JSONResponse({'error': 'could not queue that one-off task'}, status_code=400)
+    save_state_to_db(state)
+    log_action('player', 'schedule_once_created', {'title': title, 'atMs': at_ms,
+                                                   'room': room, 'taskType': task_type},
+               authorized=True)
+    _append_passport_decision('schedule_once_created', 'player', {'title': title, 'atMs': at_ms})
+    return JSONResponse({'ok': True, 'task': {'title': title, 'atMs': at_ms, 'notBefore': item.get('notBefore')}})
 
 
 @app.post('/api/pipelines')
@@ -12174,14 +12516,60 @@ async def chat(request: Request):
     # per-product grouping (the useful strategic view) comes only from an
     # explicit service label, never from the agent's own id.
     service = body.get('service') or '__general__'
+    # Plain-writing directive (token saver): by default fold the anti-AI-slop
+    # ban list into the first system message so prose replies come back
+    # shorter -- less filler is fewer billed input AND output tokens, without
+    # demanding clipped speech. Skipped for structured/JSON requests (the
+    # "not a word longer" nudge can truncate a schema mid-object) and for any
+    # caller that opts out with {"plain": false}.
+    if body.get('plain', True):
+        prompt_text = ' '.join((m.get('content') or '') if isinstance(m, dict) else '' for m in (messages or []))
+        if 'JSON' not in prompt_text:
+            messages = _apply_plain_writing(messages)
+    # Test-time compute: for the low/mid (cheap) tiers, sample the prompt
+    # `best_of` times and fold the drafts into one answer -- JSON-majority
+    # vote when the request is structured, a same-model self-verification
+    # judge pass for open-ended prose -- so the reported reply is far more
+    # consistent than any single cheap draft. Deliberation is ON by default
+    # for those tiers and can be disabled/overridden per request
+    # ({"deliberate": false, "best_of": 3}); expensive/reasoning/coding tiers
+    # never deliberate. Each sample is a separate billed call and is accrued
+    # against the spend ledger like any other.
+    deliberate = _ttc_should_deliberate(model, body.get('deliberate'), body.get('best_of'))
+    best_n = _ttc_best_of(body.get('best_of')) if deliberate else 1
     try:
         # urllib is blocking -- run it off the event loop rather than
         # stalling every other request for the duration of the API call.
-        data = await asyncio.to_thread(_call_openrouter_sync, model, messages, max_tokens)
-        reply = data['choices'][0]['message']['content']
-        if not reply:
-            print(f'[chat-debug] empty reply for model={model} raw={json.dumps(data)[:2000]}', flush=True)
-        usage_cost = (data.get('usage') or {}).get('cost', 0.0)
+        data = await asyncio.to_thread(_call_openrouter_sync, model, messages, max_tokens, best_of=best_n)
+        if best_n > 1:
+            # Sampling path: every sample is a real completion. Fold the set
+            # into ONE answer, summing each sample's cost for the single
+            # accrual below. Prose that can't be majority-voted reuses these
+            # drafts in the judge pass rather than re-sampling.
+            total_cost = 0.0
+            drafts = []
+            for s in data:
+                sample_cost = (s.get('usage') or {}).get('cost', 0.0)
+                if isinstance(sample_cost, (int, float)) and sample_cost:
+                    total_cost += float(sample_cost)
+                drafts.append((s.get('choices') or [{}])[0].get('message', {}).get('content') or '')
+            winner = _ttc_majority_json(data)
+            if winner is not None:
+                try:
+                    json.loads(winner)
+                except Exception:
+                    winner = None
+            if winner is not None:
+                reply = winner
+            else:
+                reply = _ttc_self_verify(model, messages, best_n, max_tokens,
+                                         drafts=drafts, service=service)
+            usage_cost = total_cost
+        else:
+            reply = data['choices'][0]['message']['content']
+            if not reply:
+                print(f'[chat-debug] empty reply for model={model} raw={json.dumps(data)[:2000]}', flush=True)
+            usage_cost = (data.get('usage') or {}).get('cost', 0.0)
         if isinstance(usage_cost, (int, float)) and usage_cost:
             _accrue_spend(service, usage_cost)
             # High-tier calls accrue against the dedicated high-tier monthly
@@ -12191,7 +12579,7 @@ async def chat(request: Request):
             # by a duplicate block halving the effective budget).
             if model == _high_tier_slug():
                 _accrue_high_tier_spend(usage_cost)
-        log_action(agent_id, 'chat', {'model': model, 'service': service, 'cost': float(usage_cost) if isinstance(usage_cost, (int, float)) else 0.0}, authorized=authorized)
+        log_action(agent_id, 'chat', {'model': model, 'service': service, 'cost': float(usage_cost) if isinstance(usage_cost, (int, float)) else 0.0, 'best_of': best_n}, authorized=authorized)
         return JSONResponse({'reply': reply})
     except urllib.error.HTTPError as e:
         return JSONResponse({'error': e.read().decode()}, status_code=e.code)
