@@ -3160,6 +3160,9 @@ _GOOGLE_QUOTA_AWARENESS_BLOCK = (
     '~600/min/user; Docs reads ~300/min/user and writes ~60/min/user; Gmail is metered in units '
     '(a message read is 20, a search 5, a draft 10). Treat a Google call that returns a quota/429 '
     'error as a stop signal for that tool this investigation, not a reason to retry it in a loop. '
+    'The think tank also enforces a HARD shared rate cap per API (Sheets ~40 calls/min, Gmail ~80, '
+    'Docs ~80, Calendar ~400, spaced across all agents); if a Google tool returns the rate-budget '
+    'message, that budget is genuinely spent -- stop using that API this investigation. '
     'Gmail is READ + DRAFT ONLY: you may search, read, and create drafts for the player to send, '
     'but you have NO ability to send email and must never attempt to.'
 )
