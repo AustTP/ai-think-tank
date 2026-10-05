@@ -1,11 +1,13 @@
-import sys, time, json
+import sys
+import time
+import json
 sys.path.insert(0, 'world')
-import serve
+import serve  # noqa: E402
 
 now = time.time()
 
 print('=== server process ===')
-import subprocess
+import subprocess  # noqa: E402
 r = subprocess.run(['pgrep', '-f', 'python3 serve.py 8936'], capture_output=True, text=True)
 print('alive:', r.returncode == 0, r.stdout.strip())
 
