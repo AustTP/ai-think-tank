@@ -348,6 +348,31 @@ class SendBackAfterFailure(unittest.TestCase):
         gate2 = sim._enter_peer_review(state, task, now_ms=6000)
         self.assertTrue(gate2['escalated'])
 
+    def test_send_back_writes_pipeline_feedback_growth_plan(self):
+        state = _state()
+        task = _task(assignedTo="ben", userStory=STORY, acceptanceCriteria=CRITERIA)
+        state["tasks"][task["id"]] = task
+        sim._send_back_after_failure(state, task, fail_note='flake8 failed')
+        plans = state['growthPlans']['ben']
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0]['kind'], 'pipeline_feedback')
+        self.assertIn('flake8 failed', plans[0]['note'])
+        self.assertIn('Your deliverable', plans[0]['note'])
+        aug = sim._augment_task_instructions(state,'ben',None,'Next deliverable')
+        self.assertIn('flake8 failed', aug)
+        self.assertNotIn('flake8 failed', sim._augment_task_instructions(state,'ben',None,'Another task'))
+        self.assertTrue(state['growthPlans']['ben'][0]['applied'])
+
+    def test_send_back_without_author_skips_feedback_plan(self):
+        state = _state()
+        task = _task(assignedTo=None)
+        state["tasks"][task["id"]] = task
+        with unittest.mock.patch.object(sim, 'queue_work'), \
+             unittest.mock.patch.object(sim, '_write_growth_plan') as wgp:
+            sim._send_back_after_failure(state, task, fail_note='flake8 failed')
+        wgp.assert_not_called()
+        self.assertEqual(task['status'], 'failed')
+
     def test_release_after_failure_clears_agent_without_bumps(self):
         # A red deliverable is NOT shipped work: releasing its author must not
         # bump approvedCount, record a completed room, grade, or file a

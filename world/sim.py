@@ -1386,6 +1386,10 @@ REFINEMENT_MEET_MS = 10_000                     # brief decision horizon (never 
 # block the completion path. Coaching/runbook notes are appended to a task's
 # instructions at ASSIGNMENT, never at grooming.
 DELIVERABLE_GRADE_FLOOR = 5.0      # graded below this -> coaching-worthy
+# A deliverable graded at/above this is a SUCCESS worth mining (the positive
+# half of the rule-mining ledger -- "agents get smarter" by propagating what
+# worked, not just by avoiding what failed). Mirrors serve.SUCCESS_GRADE_FLOOR.
+SUCCESS_GRADE_FLOOR = 8.0
 ROADMAP_CADENCE_MS = 7 * 24 * 3600 * 1000   # weekly silent priority recompute
 # Rule mining: weekly silent pass that turns recurring classified draft
 # failures (the review ledger) into operator rule PROPOSALS. Same shape as the
@@ -1409,7 +1413,7 @@ ESCALATION_MAX_OPEN = 3                 # cap concurrent escalations per owning 
 # re-queue once for a fast re-issue, then route the repeat offender to the owning
 # team's scrum master (SM gap 1's "SM re-plan") instead of letting it wedge forever.
 STALE_WORK_CADENCE_MS = 20_000          # coarse sweep cadence (like STUCK_GATE)
-STALE_WORK_TIMEOUT_MS = 3 * 3600 * 1000 # 'walking' older than this -> never arrived
+STALE_WORK_TIMEOUT_MS = 3 * 3600 * 1000  # 'walking' older than this -> never arrived
 STALE_WORK_BUDGET_GRACE_S = 900         # 'working' still working this far past workUntil -> wedged
 STALE_WORK_MAX_REPLANS = 2              # re-queues per (title,room) before the SM re-plan
 # Worker stuck/help signal (W4): a worker whose content execution keeps FAILING
@@ -2783,7 +2787,7 @@ def add_backlog_item(state, title, feature_id, created_by, now_ms,
         'createdBy': created_by or None,
         'createdAt': now_ms,
         'teamId': None,   # assigned at pickup
-        'storyKey': None, # assigned at pickup (DEV-1, ...)
+        'storyKey': None,  # assigned at pickup (DEV-1, ...)
     }
     backlog.append(item)
     if item['featureId']:
@@ -4578,6 +4582,18 @@ def _send_back_after_failure(state, task, fail_note=None):
     author = task.get('assignedTo')
     note = (fail_note or task.get('note') or 'the pipeline did not pass').strip()
     _sim_notify_author_failed(state, task)
+    # Feedback injection (brunnfeld): a concrete failure reason must change the
+    # author's NEXT execution, not just land as a mailbox message. Same W6
+    # pattern as peer-review denial (_sim_notify_author): the pipeline failure
+    # reason is routed through the growth-plan loop so it is injected once into
+    # the author's next task via _coaching_note_for/_augment_task_instructions.
+    if author:
+        _write_growth_plan(
+            state, author, task.get('room') or 'pressoffice',
+            'pipeline_feedback', int(time.time() * 1000),
+            f"Your deliverable '{task.get('title')}' failed the quality pipeline. "
+            f"What failed: {(note or '')[:400]}. Address this on your next pass.",
+            repeat=True)
     if not task.get('_peerGate'):
         # Seed a real (empty) gate: _resolve_review_parent requires a truthy
         # _peerGate to resolve a later fix's completion, and the cycle cap needs
@@ -8325,6 +8341,17 @@ def _grade_completed_task(state, agent_id, task, now_ms):
     })
     if grade < DELIVERABLE_GRADE_FLOOR:
         _coach_low_grade(state, agent_id, room, grade, now_ms, title)
+    elif grade >= SUCCESS_GRADE_FLOOR:
+        # Positive learning loop (ChatDev ECL): a deliverable graded at/above
+        # the success floor is the raw material for the weekly success-mining
+        # pass -- "what made this good" should propagate, not just "what went
+        # wrong". Best-effort: a ledger failure is swallowed so grading never
+        # blocks completion (same contract as _rule_mine_step's failure path).
+        try:
+            import serve as _serve_mod
+            _serve_mod._record_success(room, title, grade, agent_id=agent_id)
+        except Exception:
+            pass
 
 
 def _coach_low_grade(state, agent_id, room, grade, now_ms, title):
@@ -8482,8 +8509,13 @@ def _augment_task_instructions(state, agent_id, product_id, instructions, refocu
     A pending growth plan is injected once (marking it applied); a product's
     runbook history is pulled into a new incident on that product; a refocus
     reminder (see _refocus_note_for) is added only when the caller says this
-    task is revisiting existing work, not starting fresh."""
+    task is revisiting existing work, not starting fresh. The hive-mind
+    consensus relay (see _consensus_relay_step) is READ FIRST -- a one-line
+    'current direction' the next cycle acts on."""
     pieces = [instructions] if instructions else []
+    relay = _consensus_relay_note(state)
+    if relay:
+        pieces.insert(0, relay)
     note = _coaching_note_for(state, agent_id)
     if note:
         pieces.append(note)
@@ -8531,6 +8563,45 @@ def _roadmap_step(state, now_ms):
                          'lastGrade': gm, 'demand': demand}
 
 
+def _consensus_relay_step(state, now_ms):
+    """Weekly silent recompute of the hive-mind consensus relay (auto-co-meta's
+    'read consensus -> act -> update -> repeat'). One small shared state note
+    the next cycle reads FIRST (_augment_task_instructions prepends it) and
+    that this step updates LAST, so a think tank's direction survives between
+    cycles and across restarts (state is persisted). Derives the current
+    consensus from the roadmap the director just recomputed: the highest-
+    priority room and why it is weak/starved. Pure derivation -- no ceremony,
+    no Jev spend. A no-op until a roadmap exists, so a fresh think tank never
+    fabricates a consensus that isn't grounded."""
+    roadmap = state.get('roadmap') or {}
+    ranked = sorted(((roadmap[r].get('priority') or 0, r) for r in roadmap),
+                    reverse=True)
+    if not ranked:
+        return
+    priority, room = ranked[0]
+    gm = _room_trailing_grade(state, room)
+    reasons = []
+    if gm is not None and gm < DELIVERABLE_GRADE_FLOOR:
+        reasons.append(f'weak trailing grade ({gm}/10)')
+    if _roadmap_release_demand(state, room) == 0:
+        reasons.append('no recent delivery')
+    why = ', '.join(reasons) if reasons else 'prioritized by the director'
+    state['consensusRelay'] = {
+        'room': room,
+        'consensus': f'Current direction: focus next work on {room} ({why}).',
+        'updatedAt': now_ms,
+    }
+
+
+def _consensus_relay_note(state):
+    """Read the consensus relay FIRST -- the one-line 'current direction' the
+    next cycle acts on. Returns None when no consensus has been derived yet."""
+    relay = state.get('consensusRelay')
+    if not relay:
+        return None
+    return relay.get('consensus')
+
+
 def _rule_mine_step(state, now_ms):
     """Weekly silent pass: mine recurring classified failures (the review
     ledger in serve.py) into operator rule proposals -- the 'write a rule' +
@@ -8554,6 +8625,35 @@ def _rule_mine_step(state, now_ms):
             'proposalId': p.get('id'),
             'type': p.get('type'),
             'rule': p.get('rule'),
+            'count': p.get('count'),
+            'dedupeKey': p.get('dedupeKey'),
+        })
+
+
+def _success_mine_step(state, now_ms):
+    """Weekly silent pass: mine recurring high-graded deliverables (the success
+    ledger in serve.py) into operator success-lesson proposals -- the positive
+    half of the rule-mining loop, so 'agents get smarter' by propagating what
+    WORKED, not just by avoiding what failed (ChatDev ECL: acquisition,
+    utilization, propagation, elimination). Same shape as _rule_mine_step:
+    pure derivation, no ceremony, no Jev spend, cadence-gated on the state
+    stamp. Nothing is auto-applied -- a proposal surfaces to the operator
+    (governance log + the /api/success-proposals surface) and becomes a real
+    standard only when the operator encodes it. Best-effort: a ledger failure
+    just skips this week's mine, never blocks the task cycle."""
+    if now_ms - (state.get('lastSuccessMineAt') or 0) < RULE_MINE_CADENCE_MS:
+        return
+    state['lastSuccessMineAt'] = now_ms
+    try:
+        import serve as _serve_mod
+        created = _serve_mod._mine_success_proposals()
+    except Exception:
+        return
+    for p in created:
+        _log_governance(state, None, 'success_proposal', {
+            'proposalId': p.get('id'),
+            'room': p.get('room'),
+            'lesson': p.get('lesson'),
             'count': p.get('count'),
             'dedupeKey': p.get('dedupeKey'),
         })
@@ -9135,10 +9235,13 @@ def _requeue_stale_work(state, task):
     queue_work(state, [{
         'title': task.get('title'),
         'room': room,
-        'instructions': (task.get('instructions') or '') + (
+        'instructions': (
+            (task.get('instructions') or '') +
             '\n\n[re-planned] This card was swept as stale in-flight work and re-issued '
-            'so it is not lost.') if task.get('instructions') else
-            f"Re-issued stale work: {task.get('title')}",
+            'so it is not lost.'
+            if task.get('instructions') else
+            f"Re-issued stale work: {task.get('title')}"
+        ),
         'goal': task.get('goal'),
         'taskType': task.get('taskType') or 'code',
         'sizeEstimate': task.get('sizeEstimate'),
@@ -9358,10 +9461,21 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # roadmap current for the next grooming.
     _roadmap_step(state, now_ms)
 
+    # Consensus relay: weekly silent update of the one-line 'current direction'
+    # the next cycle reads first (auto-co-meta's read -> act -> update -> repeat).
+    # Derives from the roadmap just recomputed; runs after it so the relay is
+    # always the LATEST consensus, not a stale one.
+    _consensus_relay_step(state, now_ms)
+
     # Weekly rule mining: recurring classified failures become operator rule
     # proposals. Same shape as the roadmap step -- state stamp + file-backed
     # derivation, no ceremony, no Jev spend.
     _rule_mine_step(state, now_ms)
+
+    # Weekly success mining: recurring high-graded deliverables become operator
+    # success-lesson proposals (the positive mirror of rule mining -- propagate
+    # what worked, not just what failed). Same cadence/shape as _rule_mine_step.
+    _success_mine_step(state, now_ms)
 
     # Cut 3 on-call escalation: advance an in-flight escalation ceremony, or
     # sweep open incident tasks past the restore window and hand the ones no

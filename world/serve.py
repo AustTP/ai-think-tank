@@ -112,6 +112,21 @@ RULE_PROPOSALS_PATH = os.path.join(THINK_TANK_DIR, 'rule_proposals.json')
 FAILURE_MAX_RECORDS = 200
 RULE_PROPOSALS_MAX = 50
 RULE_MIN_RECURRENCE = 2  # "happened more than once" -> rule-worthy
+# Success ledger + success proposals: the POSITIVE half of the rule book (the
+# ChatDev ECL lesson -- "agents get smarter" is not only about not repeating
+# failures, it's about propagating what WORKED). `successes.json` is the raw
+# material -- one high-graded deliverable per row. The weekly success-mining
+# pass aggregates it and writes `success_proposals.json`: a room that keeps
+# shipping high-graded work (>= SUCCESS_MIN_RECURRENCE rows) becomes a PROPOSED
+# "keep doing what works here" lesson, never auto-applied -- the operator turns
+# it into a real standard like the failure rules. Same bounded shape as the
+# failure ledger so an aging think tank cannot grow the files without bound.
+SUCCESSES_PATH = os.path.join(THINK_TANK_DIR, 'successes.json')
+SUCCESS_PROPOSALS_PATH = os.path.join(THINK_TANK_DIR, 'success_proposals.json')
+SUCCESS_MAX_RECORDS = 200
+SUCCESS_PROPOSALS_MAX = 50
+SUCCESS_MIN_RECURRENCE = 2    # same rule as failures: "happened more than once"
+SUCCESS_GRADE_FLOOR = 8.0     # a deliverable graded at/above this is a "success"
 # The four-bucket sort every draft failure goes into.
 FAILURE_TYPES = ('factual_error', 'client_preference', 'missing_information', 'style')
 FAILURE_TYPE_LABELS = {
@@ -5107,6 +5122,19 @@ def _load_failures():
     return []
 
 
+def _load_successes():
+    if os.path.exists(SUCCESSES_PATH):
+        with open(SUCCESSES_PATH) as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    return []
+
+
+def _save_successes(data):
+    with open(SUCCESSES_PATH, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
 def _save_failures(data):
     with open(FAILURES_PATH, 'w') as f:
         json.dump(data, f, indent=2)
@@ -5120,9 +5148,102 @@ def _load_rule_proposals():
     return []
 
 
+def _load_success_proposals():
+    if os.path.exists(SUCCESS_PROPOSALS_PATH):
+        with open(SUCCESS_PROPOSALS_PATH) as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    return []
+
+
+def _save_success_proposals(data):
+    with open(SUCCESS_PROPOSALS_PATH, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
 def _save_rule_proposals(data):
     with open(RULE_PROPOSALS_PATH, 'w') as f:
         json.dump(data, f, indent=2)
+
+
+def _record_success(room, title, grade, agent_id='', section=''):
+    """Append one high-graded deliverable to the success ledger -- the durable
+    output of the 'what worked' step, and the raw material the weekly
+    success-mining pass aggregates. Bounded to the tail (SUCCESS_MAX_RECORDS)
+    so an aging think tank cannot grow the file without bound. Returns the new
+    record's id. Best-effort by design: callers swallow a ledger failure."""
+    successes = _load_successes()
+    record = {
+        'id': 'succ-' + secrets.token_hex(4),
+        'ts': time.time(),
+        'room': (room or '')[:80],
+        'title': (title or '')[:200],
+        'grade': grade,
+        'section': (section or '')[:120],
+        'agentId': agent_id,
+    }
+    successes.append(record)
+    del successes[:-SUCCESS_MAX_RECORDS]
+    _save_successes(successes)
+    return record['id']
+
+
+def _success_text_for(room, count, avg_grade):
+    """A proposed success-lesson statement for a room that keeps shipping
+    high-graded work, phrased as an instruction the operator could encode as a
+    standard (the positive mirror of _rule_text_for)."""
+    return (f'Keep doing what makes the {room} room ship well: {count} recent '
+            f'deliverables graded {avg_grade:.1f}/10 or better. Apply that standard '
+            f'and its practices to future work here.')
+
+
+def _mine_success_proposals(now_ts=None, recurrence=SUCCESS_MIN_RECURRENCE):
+    """The positive half of rule mining: group the success ledger by room and
+    any room that shipped at least `recurrence` high-graded deliverables becomes
+    a PROPOSED success lesson (lesson text + examples + a fixture). Nothing is
+    auto-applied -- the operator approves by encoding the standard, exactly like
+    the failure rules. Returns the proposals created this pass."""
+    now_ts = time.time() if now_ts is None else now_ts
+    successes = _load_successes()
+    groups = {}
+    for s in successes:
+        room = (s.get('room') or '').strip()
+        if not room:
+            continue
+        groups.setdefault(room, []).append(s)
+    proposals = _load_success_proposals()
+    seen = {p.get('dedupeKey') for p in proposals}
+    created = []
+    for room, rows in sorted(groups.items()):
+        if len(rows) < recurrence:
+            continue
+        dedupe = f'success:{room}'
+        if dedupe in seen:
+            continue
+        avg = sum(float(r.get('grade') or 0.0) for r in rows) / len(rows)
+        proposals.append({
+            'id': 'succ-rule-' + secrets.token_hex(4),
+            'ts': now_ts,
+            'room': room,
+            'count': len(rows),
+            'avgGrade': round(avg, 1),
+            'lesson': _success_text_for(room, len(rows), avg),
+            'examples': [{'title': r.get('title') or '', 'section': r.get('section') or ''}
+                         for r in rows[:3]],
+            'fixture': {'title': rows[0].get('title') or '', 'room': rows[0].get('room') or ''},
+            'status': 'pending',
+            'dedupeKey': dedupe,
+        })
+        created.append(proposals[-1])
+    del proposals[:-SUCCESS_PROPOSALS_MAX]
+    if created:
+        _save_success_proposals(proposals)
+    return created
+
+
+def _success_proposals():
+    """Read-only surface for the operator (the admin endpoint backs onto it)."""
+    return _load_success_proposals()
 
 
 # Deterministic pre-classifier signals: money and any number-without-source is
@@ -15984,6 +16105,17 @@ async def rule_proposals_get(request: Request):
     if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
         return JSONResponse({'error': 'rule proposals are player-only'}, status_code=403)
     return JSONResponse({'proposals': _rule_proposals()})
+
+
+@app.get('/api/success-proposals')
+async def success_proposals_get(request: Request):
+    # Operator surface for the weekly success-mining pass: the rooms that keep
+    # shipping high-graded work as PROPOSED success lessons (the positive mirror
+    # of the rule-proposals surface). Player-only, read-only -- a lesson becomes
+    # a real standard when the operator encodes it.
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'success proposals are player-only'}, status_code=403)
+    return JSONResponse({'proposals': _success_proposals()})
 
 
 _LOGIN_PAGE = """<!DOCTYPE html>

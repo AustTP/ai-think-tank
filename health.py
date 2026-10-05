@@ -1,5 +1,8 @@
 # read-only. python3 health.py
-import sqlite3, json, time, collections
+import sqlite3
+import json
+import time
+import collections
 s = json.loads(sqlite3.connect('think_tank.db').execute(
     'select blob from kv_state where id=1').fetchone()[0])
 t = s.get('tasks') or {}
