@@ -2037,31 +2037,50 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     _sim_module._store_content_result(task.get('id'), result)
 
 
-def _wiki_context_for_task(state, task):
+def _wiki_context_for_task(state, task, agent_id=None):
     """Read-before-act: fold the wiki pages relevant to a task into a context
-    block (markdown) the executor prepends to its model prompt. Empty string
-    when the wiki has nothing for this task's room -- the executor still runs,
-    just with a blank knowledge context (the pre-existing behavior)."""
+    block (markdown) the executor prepends to its model prompt, scoped to the
+    task's agent's VILLAGE so a worker only ever sees their own village's wiki.
+    Empty string when the wiki has nothing for this task's room -- the executor
+    still runs, just with a blank knowledge context (the pre-existing
+    behavior)."""
     try:
         import sim as _sim
+        if agent_id:
+            village_id = _sim.village_of_agent(state, agent_id)
+            return _sim.inject_wiki_context(state, task, village_id=village_id)
         return _sim.inject_wiki_context(state, task)
     except Exception:
         return ''
 
 
-def _design_context_for_task(state, task):
+def _design_context_for_task(state, task, agent_id=None):
     """Read-before-act: the folded design taste doc (+ raw inspiration brief
-    pointers) for the project this task targets. Required context for design
-    work -- a product build or a labeled workroom task whose project has a
-    taste.md must reason over it. Empty string when the project has no design
-    vocabulary (the executor still runs, just without a design reference)."""
+    pointers) for the project this task targets, scoped to the task's agent's
+    VILLAGE. Required context for design work -- a product build or a labeled
+    workroom task whose project has a taste.md must reason over it. Empty
+    string when the project has no design vocabulary (the executor still runs,
+    just without a design reference)."""
     try:
         project = task.get('productId') or task.get('projectLabel')
         if not project:
             return ''
+        if agent_id:
+            village = _sim_village_of_agent(state, agent_id)
+            return _serve._design_context_for_project(project, village=village)
         return _serve._design_context_for_project(project)
     except Exception:
         return ''
+
+
+def _sim_village_of_agent(state, agent_id):
+    """Resolve an agent's village, defaulting to the main village when the sim
+    helper or the agent is unavailable."""
+    try:
+        import sim as _sim
+        return _sim.village_of_agent(state, agent_id) if agent_id else _sim.DEFAULT_VILLAGE
+    except Exception:
+        return 'main'
 
 
 def _run_product_build_content(snapshot, agent_id, task, base_ctx=None):
@@ -2100,14 +2119,16 @@ def _run_product_build_content(snapshot, agent_id, task, base_ctx=None):
                         key)
         if isinstance(ls, dict) and ls.get('allowed') and ls.get('stdout'):
             context_summary = f'Current files in the {project_label} sandbox:\n{ls["stdout"]}'
-    # Read-before-act: think tank knowledge for this task's room.
-    wiki_ctx = _wiki_context_for_task(snapshot, task)
+    # Read-before-act: think tank knowledge for this task's room, scoped to the
+    # agent's village.
+    wiki_ctx = _wiki_context_for_task(snapshot, task, agent_id)
     if wiki_ctx:
         context_summary = f'{wiki_ctx}\n\n{context_summary}'
     # Read-before-act: the folded design taste doc for this product's project
     # (required context for design work -- build against the player's taste,
-    # never against a guessed "modern/clean" default).
-    design_ctx = _design_context_for_task(snapshot, task)
+    # never against a guessed "modern/clean" default), scoped to the agent's
+    # village.
+    design_ctx = _design_context_for_task(snapshot, task, agent_id)
     if design_ctx:
         context_summary = f'{design_ctx}\n\n{context_summary}'
     ok = _run_coding_content(snapshot, agent_id,
@@ -4296,8 +4317,9 @@ def _run_workroom_content(snapshot, agent_id, task, base_ctx=None):
         if base_ctx:
             context_summary = '\n\n'.join(p for p in (base_ctx, context_summary) if p)
         # Read-before-act: the folded design taste doc for this project's
-        # design work, so a labeled build reasons over the player's taste.
-        design_ctx = _design_context_for_task(snapshot, task)
+        # design work, so a labeled build reasons over the player's taste,
+        # scoped to the agent's village.
+        design_ctx = _design_context_for_task(snapshot, task, agent_id)
         if design_ctx:
             context_summary = f'{design_ctx}\n\n{context_summary}'
         _run_coding_content(snapshot, agent_id,

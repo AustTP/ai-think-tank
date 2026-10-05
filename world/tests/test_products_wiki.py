@@ -134,6 +134,45 @@ class WikiHelpers(unittest.TestCase):
         self.assertIn('Beta', ctx)
         self.assertNotIn('Alpha', ctx)
 
+    def test_villages_keep_wiki_memory_separate(self):
+        # THE boundary: a page written into one village is invisible to a
+        # reader in another village, at both the page-list and the injected
+        # context level. This is the memory-scoping half of the village wall.
+        state = _make_product_state()
+        sim.create_village(state, 'North')
+        sim.create_village(state, 'South')
+        sim.wiki_write_page(state, 'north-secret', 'North Secret', 'workroom', 'north only', 'bri', village_id='north')
+        sim.wiki_write_page(state, 'south-secret', 'South Secret', 'workroom', 'south only', 'zed', village_id='south')
+        # North reader sees only the north page.
+        north_pages = sim.wiki_read_pages(state, 'pressoffice', village_id='north')
+        self.assertTrue(any(p['id'] == 'north-secret' for p in north_pages))
+        self.assertFalse(any(p['id'] == 'south-secret' for p in north_pages))
+        # South reader sees only the south page.
+        south_pages = sim.wiki_read_pages(state, 'pressoffice', village_id='south')
+        self.assertTrue(any(p['id'] == 'south-secret' for p in south_pages))
+        self.assertFalse(any(p['id'] == 'north-secret' for p in south_pages))
+        # Injected context scoped by the reader's village.
+        north_ctx = sim.inject_wiki_context(state, {'room': 'pressoffice'}, village_id='north')
+        self.assertIn('North Secret', north_ctx)
+        self.assertNotIn('South Secret', north_ctx)
+
+    def test_default_village_is_main(self):
+        state = _make_product_state()
+        rec, _ = sim.wiki_write_page(state, 'p', 'P', 'workroom', 'x', 'maya')
+        self.assertEqual(rec['villageId'], 'main')
+
+    def test_village_helpers_register_and_assign(self):
+        state = _make_product_state()
+        sim.ensure_villages(state)
+        self.assertEqual([v['id'] for v in state['villages']], ['main'])
+        rec = sim.create_village(state, 'North')
+        self.assertEqual(rec['id'], 'north' if 'north' in rec['id'] else 'vlg-1')
+        self.assertTrue(sim.set_agent_village(state, 'ada', rec['id']))
+        self.assertEqual(sim.village_of_agent(state, 'ada'), rec['id'])
+        self.assertEqual(sim.village_of_agent(state, 'nobody'), 'main')
+        self.assertFalse(sim.set_agent_village(state, 'ada', 'missing'))
+        self.assertFalse(sim.create_village(state, 'North'))  # duplicate name
+
 
 class ProductEndpoints(unittest.TestCase):
     def setUp(self):
