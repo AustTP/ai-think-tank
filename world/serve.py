@@ -10005,7 +10005,7 @@ async def _route_lane_ask(state, text, admin_id):
 
 
 async def _route_lane_unclear(state, text, admin_id):
-    # Routing reconciliation (REQUEST_PROCESSES.md appendix): the 'unclear'
+    # Routing reconciliation: the 'unclear'
     # lane -- a multi-intent bundle or an ask no classifier can pin -- is a
     # director's judgment call. The SENIOR-MOST director answers directly,
     # with the admin as fallback (the admin is herself a director, but she

@@ -4,13 +4,11 @@ import json
 with open('coverage.json') as f:
     cov = json.load(f)
 
-sim_data = cov['files'].get('/Users/poole86/ai-village-template/world/sim.py', {})
-# Also try relative key
-if not sim_data:
-    for k, v in cov['files'].items():
-        if k.endswith('sim.py'):
-            sim_data = v
-            break
+# Prefer the exact local sim.py key; otherwise fall back to any key whose
+# basename matches (preserves the tool across machines without embedding a
+# machine-specific absolute path).
+sim_key = next((k for k in cov['files'] if k.endswith('sim.py')), None)
+sim_data = cov['files'].get(sim_key, {})
 missing = set(sim_data['missing_lines'])
 
 src = open('sim.py').read()
