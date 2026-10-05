@@ -452,6 +452,14 @@ class SimTaskLifecycle(unittest.TestCase):
             # _task_cycle, ungated by the work gate). Pre-seed so a short idle
             # window doesn't spuriously convene the Hangout.
             'lastSocialAt': far_future,
+            # The roadmap + consensus relay are standing sweeps too (same
+            # cadence-stamp pattern): _roadmap_step creates the roadmap on the
+            # first pass, then _consensus_relay_step rewrites
+            # consensusRelay.updatedAt = now_ms on EVERY pass. Pre-seeding the
+            # roadmap cadence stamp keeps them no-ops, so two back-to-back idle
+            # passes are byte-identical even across a wall-clock ms boundary
+            # (the idempotency assertion below).
+            'lastRoadmapReviewAt': far_future,
             # Hive-mind distillation is a standing sweep too (fires immediately
             # on fresh state with no stamp). Pre-seed so it can't inject an extra
             # roll-up queue item and muddy the assignment-count expectations.
@@ -744,6 +752,201 @@ class SimTaskLifecycle(unittest.TestCase):
                       'new seenUrl from the content result must be merged back')
         self.assertGreater(state['agents']['ada'].get('approvedCount', 0), 0,
                            'content-completed task still bumps approvedCount')
+
+    def test_content_dispatch_passes_perception_as_base_ctx(self):
+        # Item 1: a dispatched content executor gets the agent's situational
+        # awareness as base_ctx (who they are, where they are, what they are
+        # working on) -- not a bare {} -- so a worker reasons like a teammate,
+        # not a stateless API call. The perception is a markdown string, which
+        # is exactly the type every real executor's `base_ctx or ''` expects.
+        names = {d['id']: d['name'] for d in self._roster()}
+        seen = {}
+
+        def fake_executor(snapshot, agent_id, task, base_ctx):
+            seen['agent'] = agent_id
+            seen['ctx'] = base_ctx
+            sim._store_content_result(task['id'], {'ok': True, 'note': 'did the thing'})
+
+        sim._content_executor = fake_executor
+        grid, doors = sim._load_outdoor_geometry()
+        state = self._base_state(work_queue=[self._item(
+            title='Build the login flow',
+            acceptanceCriteria='Logging in returns you to the dashboard.')])
+        engine = sim.SimEngine()
+        engine._grid, engine._doors = grid, doors
+        now = 1000.0
+        for _ in range(200):
+            now += sim.SIM_TICK_S
+            state = engine.tick(state, now=now)
+            if (state.get('tasks') or {}).get('task-1', {}).get('status') == 'done':
+                break
+        sim._content_executor = None
+        self.assertIn('agent', seen, 'the executor must be dispatched')
+        ctx = seen.get('ctx')
+        self.assertIsInstance(ctx, str, 'base_ctx must be a markdown string, not {}')
+        self.assertIn('You are ' + names[seen['agent']], ctx)
+        self.assertIn('pressoffice', ctx)
+        self.assertIn('Build the login flow', ctx)
+
+
+class SimAgentPerception(unittest.TestCase):
+    """Item 1: situational awareness for content executors. _build_agent_
+    perception is a pure read of a frozen snapshot -- who am I, where am I,
+    who's around (acquaintance-aware), what am I working on, what feedback came
+    back at me -- and the acquaintance helpers that gate how a stranger is
+    named."""
+
+    def _state(self):
+        return {
+            'agentRoster': [
+                {'id': 'ada', 'name': 'Ada', 'role': 'Research', 'isAdmin': False},
+                {'id': 'ben', 'name': 'Ben', 'role': 'Banking', 'isAdmin': False},
+                {'id': 'faye', 'name': 'Faye', 'role': 'Admin', 'isAdmin': True},
+            ],
+            'agents': {
+                'ada': {'id': 'ada', 'inRoom': 'pressoffice', 'offDuty': False},
+                'ben': {'id': 'ben', 'inRoom': 'pressoffice', 'offDuty': False},
+                'faye': {'id': 'faye', 'inRoom': 'observatory', 'offDuty': False},
+            },
+        }
+
+    def test_perception_carries_identity_room_present_task(self):
+        state = self._state()
+        task = {'title': 'Build the login flow',
+                'instructions': 'wire the form',
+                'acceptanceCriteria': 'Logging in returns you to the dashboard.',
+                'room': 'pressoffice'}
+        out = sim._build_agent_perception(state, 'ada', task)
+        self.assertIn('You are Ada.', out)
+        self.assertIn('Your role on the team: Research.', out)
+        self.assertIn('You are currently in the pressoffice.', out)
+        # Ben shares the room but ada has not met him -> role only, never a name.
+        self.assertIn('the Banking', out)
+        self.assertIn('Build the login flow -- wire the form.', out)
+        self.assertIn('Logging in returns you to the dashboard.', out)
+        self.assertNotIn('Ben', out,
+                         "a stranger's name is not a name the viewer can use")
+
+    def test_acquaintance_gates_naming(self):
+        state = self._state()
+        self.assertFalse(sim._are_acquainted(state, 'ada', 'ben'))
+        self.assertEqual(sim._describe_agent(state, 'ben', 'ada'), 'the Banking')
+        sim._mark_acquaintance(state, 'ada', 'ben')
+        self.assertTrue(sim._are_acquainted(state, 'ada', 'ben'))
+        self.assertTrue(sim._are_acquainted(state, 'ben', 'ada'))
+        self.assertEqual(sim._describe_agent(state, 'ben', 'ada'),
+                         'Ben (the Banking)')
+        self.assertIn('Ben (the Banking)',
+                      sim._build_agent_perception(state, 'ada'))
+
+    def test_acquaintance_mark_is_json_safe_and_idempotent(self):
+        state = self._state()
+        sim._mark_acquaintance(state, 'ada', 'ben')
+        sim._mark_acquaintance(state, 'ada', 'ben')  # idempotent
+        sim._mark_acquaintance(state, 'ada', 'ada')  # self-intro is a no-op
+        round_tripped = json.loads(json.dumps(state))
+        self.assertEqual(round_tripped['_acquaintances']['ada'], ['ben'])
+        self.assertEqual(round_tripped['_acquaintances']['ben'], ['ada'])
+
+    def test_perception_includes_pending_feedback(self):
+        state = self._state()
+        state['_feedback'] = {'ada': [
+            {'text': 'Your last fix shipped but the modal is still 2px off.'},
+            'Keep the heredoc under 200 lines.',
+        ]}
+        out = sim._build_agent_perception(state, 'ada', {'title': 'Fix the modal'})
+        self.assertIn('Feedback on your recent work:', out)
+        self.assertIn('modal is still 2px off', out)
+        self.assertIn('Keep the heredoc under 200 lines.', out)
+
+    def test_perception_unknown_agent_falls_back_gracefully(self):
+        out = sim._build_agent_perception(self._state(), 'ghost',
+                                          {'title': 'T'})
+        self.assertIn('You are ghost.', out)
+
+    def test_append_feedback_writes_and_caps(self):
+        # Item 2: _append_feedback is a JSON-safe buffer per agent, capped to a
+        # recent-memory window (not a ledger). Empty text / unknown agent no-op.
+        state = self._state()
+        sim._append_feedback(state, 'ada', 'fix the modal offset')
+        sim._append_feedback(state, 'ada', 'keep heredocs under 200 lines',
+                             source='peer_review')
+        sim._append_feedback(state, 'ada', '   ')  # blank -> no-op
+        sim._append_feedback(state, None, 'orphan')  # unknown -> no-op
+        bucket = state['_feedback']['ada']
+        self.assertEqual(len(bucket), 2)
+        self.assertEqual(bucket[0], {'text': 'fix the modal offset'})
+        self.assertEqual(bucket[1]['text'], 'keep heredocs under 200 lines')
+        self.assertEqual(bucket[1]['source'], 'peer_review')
+        self.assertNotIn('ghost', state['_feedback'])
+        round_tripped = json.loads(json.dumps(state))
+        self.assertEqual(round_tripped['_feedback']['ada'], bucket,
+                         'feedback must survive the kv_state round trip')
+        for i in range(sim._FEEDBACK_MAX + 5):
+            sim._append_feedback(state, 'ada', f'note {i}')
+        self.assertLessEqual(len(state['_feedback']['ada']), sim._FEEDBACK_MAX,
+                             'buffer is capped, not a ledger')
+        self.assertIn('note {}'.format(sim._FEEDBACK_MAX + 4),
+                      state['_feedback']['ada'][-1]['text'],
+                      'cap trims the OLDEST entries, newest survives')
+
+    def test_apply_content_result_consumes_executor_feedback(self):
+        # Item 2: an executor-reported block/failure rides the content result
+        # channel into the tick's single read-modify-write, where it lands in the
+        # author's feedback buffer (rendered on the next dispatch's perception).
+        state = self._state()
+        task = {'id': 'task-1', 'title': 'Build the login flow',
+                'assignedTo': 'ada', 'room': 'pressoffice'}
+        sim._apply_content_result(state, task, {
+            'note': 'blocked: security gate',
+            'ok': False,
+            'feedback': 'Your command was blocked before running: security gate.',
+        }, now_ms=1000)
+        bucket = state['_feedback']['ada']
+        self.assertEqual(len(bucket), 1)
+        self.assertIn('security gate', bucket[0]['text'])
+        self.assertEqual(bucket[0]['source'], 'executor')
+
+    def test_apply_content_result_consumes_feedback_dict_source(self):
+        # Item 2: the feedback entry may be a dict carrying its own source.
+        state = self._state()
+        task = {'id': 'task-1', 'title': 'T', 'assignedTo': 'ben', 'room': 'media'}
+        sim._apply_content_result(state, task, {
+            'ok': False,
+            'feedback': {'text': 'sandbox missing', 'source': 'executor'},
+        }, now_ms=1000)
+        self.assertEqual(state['_feedback']['ben'][0]['source'], 'executor')
+
+    def test_sim_notify_author_records_feedback_for_author(self):
+        # Item 2: a peer rejection writes the author's feedback buffer, so the
+        # next dispatch's perception block shows what came back at them -- the
+        # W6 coaching intent, visible in situational awareness.
+        state = self._state()
+        state['agents']['ada']['profile'] = {'notes': []}
+        parent = {'id': 'task-1', 'title': 'Build the login flow',
+                  'assignedTo': 'ada', 'room': 'pressoffice', '_peerGate': {}}
+        sim._sim_notify_author(state, parent, 'ben',
+                               rationale='the modal is 2px off')
+        bucket = state['_feedback']['ada']
+        self.assertEqual(len(bucket), 1)
+        self.assertIn('Build the login flow', bucket[0]['text'])
+        self.assertIn('2px off', bucket[0]['text'])
+        self.assertEqual(bucket[0]['source'], 'peer_review')
+        self.assertIn('peer_review_rejected',
+                      [m.get('kind') for m in state['agents']['ada']['mailbox']],
+                      'the mailbox note is still filed alongside the buffer')
+
+    def test_sim_notify_author_failed_records_feedback(self):
+        # Item 2: a red-pipeline send-back lands in the author's feedback buffer.
+        state = self._state()
+        state['agents']['ada']['profile'] = {'notes': []}
+        task = {'id': 'task-1', 'title': 'Build the login flow',
+                'assignedTo': 'ada', 'room': 'pressoffice'}
+        sim._sim_notify_author_failed(state, task)
+        bucket = state['_feedback']['ada']
+        self.assertEqual(len(bucket), 1)
+        self.assertIn('Build the login flow', bucket[0]['text'])
+        self.assertEqual(bucket[0]['source'], 'pipeline')
 
 
 class SimOffDutyWake(unittest.TestCase):

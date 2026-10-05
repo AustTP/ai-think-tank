@@ -206,6 +206,44 @@ class SandboxContextHelpers(unittest.TestCase):
             self.assertIn('vision call failed', res['note'])
 
 
+class ReviewVerdictParsing(unittest.TestCase):
+    def test_parse_review_verdict_accepts_bare_json(self):
+        v, summary, checks, risks = content._parse_review_verdict(
+            '{"verdict": "send_back", "summary": "reset is broken", '
+            '"checks": ["clicked reset"], "risks": ["no error handling"]}')
+        self.assertEqual(v, 'send_back')
+        self.assertEqual(summary, 'reset is broken')
+        self.assertEqual(checks, ['clicked reset'])
+        self.assertEqual(risks, ['no error handling'])
+
+    def test_parse_review_verdict_tolerates_embedded_prose_and_fences(self):
+        v, summary, checks, risks = content._parse_review_verdict(
+            'The code looks mostly fine but the reset path crashes.\n'
+            '```json\n{"verdict": "approve", "summary": "solid enough", '
+            '"checks": ["pipeline green"], "risks": []}\n```')
+        self.assertEqual(v, 'approve')
+        self.assertEqual(summary, 'solid enough')
+        self.assertEqual(checks, ['pipeline green'])
+
+    def test_parse_review_verdict_rejects_unknown_verdict(self):
+        v, *_ = content._parse_review_verdict('{"verdict": "maybe", "summary": "x"}')
+        self.assertIsNone(v)
+
+    def test_parse_review_verdict_falls_back_on_non_json(self):
+        v, summary, checks, risks = content._parse_review_verdict(
+            'This genuinely looks solid -- nothing actionable.')
+        self.assertIsNone(v)
+        self.assertEqual(summary, '')
+        self.assertEqual(checks, [])
+        self.assertEqual(risks, [])
+
+    def test_parse_review_verdict_filters_non_string_entries(self):
+        v, _, checks, risks = content._parse_review_verdict(
+            '{"verdict": "approve", "checks": ["ok", 42], "risks": ["r", null]}')
+        self.assertEqual(checks, ['ok'])
+        self.assertEqual(risks, ['r'])
+
+
 class JsFileIntegrity(unittest.TestCase):
     def test_extract_written_js_files(self):
         cmd = 'cat > app.js << EOF\nx\nEOF\ncat >> util.js << EOF\ny\nEOF\ncat > not.py << EOF\nEOF'
