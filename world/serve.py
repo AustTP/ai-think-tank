@@ -2191,6 +2191,22 @@ _GOOGLE_ACCESS_TOKEN_CACHE = {'at': 0.0, 'token': None}
 GOOGLE_ACCESS_TOKEN_TTL_S = 3000  # real tokens last 3599s; refresh a bit early
 
 
+def _google_is_configured():
+    """True when a usable Google OAuth credential is in the vault (a JSON blob
+    with client_id/client_secret/refresh_token). Cheap + non-network: just
+    checks the vault entry parses and carries a refresh_token, so callers can
+    gate tool availability / prompt text on real configuration without doing a
+    token refresh."""
+    raw = _open_secret(_credential_token('google') or '')
+    if not raw:
+        return False
+    try:
+        creds = json.loads(raw)
+    except ValueError:
+        return False
+    return bool(creds.get('refresh_token'))
+
+
 def _google_access_token(force=False):
     """Real OAuth access-token refresh (POST https://oauth2.googleapis.com/
     token, grant_type=refresh_token) -- Sheets/Calendar calls need this
