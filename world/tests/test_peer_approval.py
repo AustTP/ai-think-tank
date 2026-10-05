@@ -202,11 +202,13 @@ class VerdictFolding(unittest.TestCase):
         parent_id = next(iter(state['tasks']))
         review_task = {'id': f'rev-{reviewer}', 'reviewOf': parent_id,
                        'assignedTo': reviewer, 'taskType': 'review', 'status': 'working'}
-        # Cut 4: a clean vote only counts when the quality pipeline objectively
-        # passed -- so a clean verdict here carries pipelineOk=True.
+        # Cut 4 + Item 7: a clean vote only counts when the quality pipeline
+        # objectively passed AND the executor filed the pipeline's real output
+        # (result['evidence']) -- so a clean verdict here carries both.
         result = {'note': 'ok', 'peerVerdict': verdict}
         if verdict == 'clean':
             result['pipelineOk'] = True
+            result['evidence'] = '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'
         sim._apply_content_result(state, review_task, result)
         return state['tasks'][parent_id]
 
@@ -216,12 +218,44 @@ class VerdictFolding(unittest.TestCase):
         self.assertEqual(parent['_peerGate']['approvals'], 1)
         self.assertEqual(parent['_peerGate']['approvers'], ['ada'])
 
+    def test_structured_review_folds_onto_parent(self):
+        # Item 6: the reviewer's structured verdict block (summary / checks /
+        # risks) rides the result channel onto the parent's peerReviews ledger so
+        # the author and player can see WHY the vote went the way it did.
+        state, task = self._gated_state()
+        review_task = {'id': 'rev-ada', 'reviewOf': task['id'],
+                       'assignedTo': 'ada', 'taskType': 'review', 'status': 'working'}
+        sim._apply_content_result(state, review_task, {
+            'note': 'ok', 'peerVerdict': 'actionable', 'pipelineOk': True,
+            'peerSummary': 'the reset button calls an undefined function',
+            'peerChecks': ['clicked reset', 'followed the code path'],
+            'peerRisks': ['no error handling on the fetch'],
+        })
+        parent = state['tasks'][task['id']]
+        reviews = parent.get('peerReviews') or []
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0]['reviewer'], 'ada')
+        self.assertEqual(reviews[0]['verdict'], 'actionable')
+        self.assertEqual(reviews[0]['summary'], 'the reset button calls an undefined function')
+        self.assertEqual(reviews[0]['checks'], ['clicked reset', 'followed the code path'])
+        self.assertEqual(reviews[0]['risks'], ['no error handling on the fetch'])
+        # The gate was still reset by the actionable vote -- the structured
+        # fields add the WHY, they never change the binary outcome.
+        self.assertEqual(parent['_peerGate']['approvals'], 0)
+
+    def test_review_without_structured_block_changes_nothing(self):
+        state, task = self._gated_state()
+        parent = self._vote(state, 'cora', 'clean')
+        self.assertNotIn('peerReviews', parent)
+        self.assertEqual(parent['_peerGate']['approvals'], 1)
+
     def test_two_distinct_clean_close(self):
         state, task = self._gated_state()
         sim._apply_content_result(state, {'id': 'r0', 'reviewOf': task['id'],
                                           'assignedTo': 'ada', 'taskType': 'review',
                                           'status': 'working'},
-                                  {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True})
+                                  {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True,
+                                   'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         parent = state['tasks'][task['id']]
         self.assertEqual(parent['_peerGate']['approvals'], 1)
         # Parent closes only via _parent_close_from_vote (needs `now`), not the fold.
@@ -232,7 +266,8 @@ class VerdictFolding(unittest.TestCase):
         sim._apply_content_result(state, {'id': 'r1', 'reviewOf': task['id'],
                                           'assignedTo': 'cora', 'taskType': 'review',
                                           'status': 'working'},
-                                  {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True})
+                                  {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True,
+                                   'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         parent = state['tasks'][task['id']]
         self.assertEqual(parent['_peerGate']['approvals'], 2)
         self.assertTrue(sim._parent_close_from_vote(state, parent, now_ms=3000),
@@ -245,7 +280,8 @@ class VerdictFolding(unittest.TestCase):
             sim._apply_content_result(state, {'id': 'r0', 'reviewOf': task['id'],
                                               'assignedTo': 'ada', 'taskType': 'review',
                                               'status': 'working'},
-                                      {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True})
+                                      {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True,
+                                       'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         parent = state['tasks'][task['id']]
         self.assertEqual(parent['_peerGate']['approvals'], 1,
                          'a second vote from the same reviewer is ignored')
@@ -302,7 +338,8 @@ class VerdictFolding(unittest.TestCase):
         sim._apply_content_result(state, {'id': 'r0', 'reviewOf': task['id'],
                                           'assignedTo': 'ada', 'taskType': 'review',
                                           'status': 'working'},
-                                  {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True})
+                                  {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True,
+                                   'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         parent = state['tasks'][task['id']]
         now = parent['_peerGate']['enteredMs'] + sim.PEER_REVIEW_TIMEOUT_MS + 1
         self.assertTrue(sim._parent_close_from_vote(state, parent, now_ms=now),
@@ -432,13 +469,15 @@ class Integration(unittest.TestCase):
         sim._apply_content_result(state,
                                   {'id': 'rev-1', 'reviewOf': story['id'], 'assignedTo': reviewers[0],
                                    'taskType': 'review', 'status': 'working'},
-                                  {'note': 'looks good', 'peerVerdict': 'clean', 'pipelineOk': True})
+                                  {'note': 'looks good', 'peerVerdict': 'clean', 'pipelineOk': True,
+                                   'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         self.assertFalse(sim._parent_close_from_vote(state, story, now_ms=int(now * 1000)),
                          'one clean vote must not close within the timeout')
         sim._apply_content_result(state,
                                   {'id': 'rev-2', 'reviewOf': story['id'], 'assignedTo': reviewers[1],
                                    'taskType': 'review', 'status': 'working'},
-                                  {'note': 'solid', 'peerVerdict': 'clean', 'pipelineOk': True})
+                                  {'note': 'solid', 'peerVerdict': 'clean', 'pipelineOk': True,
+                                   'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         self.assertTrue(sim._parent_close_from_vote(state, story, now_ms=int(now * 1000)),
                         'two distinct clean votes close the story')
         self.assertEqual(story['status'], 'done', 'story must be done after close')
@@ -553,6 +592,8 @@ class ReviewDenialCoaching(unittest.TestCase):
         result = {'note': rationale, 'peerVerdict': verdict}
         if verdict == 'clean':
             result['pipelineOk'] = pipeline_ok
+            if pipeline_ok:
+                result['evidence'] = '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'
         sim._apply_content_result(state, review_task, result)
         return state['tasks'][parent_id]
 

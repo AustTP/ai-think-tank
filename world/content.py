@@ -31,6 +31,21 @@ import urllib.parse
 import serve as _serve
 
 
+def _chat_error_result(r, fallback_note):
+    """Item 4: when /api/chat refuses a call carrying a taskId because that
+    task's model-spend budget is exhausted (429 {'budgetExhausted': True}),
+    return a fail-closed result the executor can store directly. Returns None
+    for every OTHER failure shape so existing failure handling is untouched."""
+    if isinstance(r, dict) and r.get('budgetExhausted'):
+        return {'ok': False,
+                'budgetExhausted': True,
+                'taskSpendUsd': r.get('taskSpendUsd'),
+                'taskSpendAttempts': r.get('taskSpendAttempts'),
+                'note': (fallback_note or
+                         'This task used its full model-spend budget and was paused before any further model call.')}
+    return None
+
+
 def _run_research_content(snapshot, agent_id, task, base_ctx=None):
     """Port of runResearchTask's scheduled-topic branch (tasks.js:2201-2259) +
     crawlAndCollect (world.js:529+). Runs the real crawl > save > synthesize >
@@ -120,13 +135,15 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
                        + (f'Here is the EXISTING skill file -- preserve what still holds, update what changed, add what is genuinely new:\n\n{existing_content[:6000]}'
                           if existing_content else 'No existing skill file yet -- write one from scratch.'))
             reply = None
+            r = None
             try:
                 r = _serve._http_json('POST', base, '/api/chat',
                                {'model': tier_slug,
                                 'messages': [{'role': 'system', 'content': sys_msg},
                                              {'role': 'user', 'content': f'Freshly collected sources:\n\n{sources_text}'}],
                                 'max_tokens': _serve.RESEARCH_SKILL_SYNTHESIS_TOKENS,
-                                'agentId': agent_id}, key)
+                                'agentId': agent_id,
+                                'taskId': task.get('id')}, key)
                 if isinstance(r, dict) and not r.get('error') and r.get('reply'):
                     reply = r['reply'].strip()
             except Exception:
@@ -139,6 +156,10 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
                 note = (f'Ran scheduled research for "{topic.get("topic")}" -- collected '
                         f'{len(kept)} new page(s) and wrote an updated skill file (pending review).')
             else:
+                budget_hit = _chat_error_result(r, f'Collected {len(kept)} new page(s) for "{topic.get("topic")}", but the skill-file synthesis call was paused because this task used its full model-spend budget.')
+                if budget_hit:
+                    _sim_module._store_content_result(task.get('id'), budget_hit)
+                    return
                 note = (f'Collected {len(kept)} new page(s) for "{topic.get("topic")}", '
                         'but the skill-file synthesis call didn\'t produce anything usable.')
     else:
@@ -299,10 +320,16 @@ def _run_media_content(snapshot, agent_id, task, base_ctx=None):
                         'messages': [
                             {'role': 'system', 'content': 'Summarize the following page in 2-3 short, honest sentences for someone who has not read it. Only report what is actually in the text -- do not invent detail.'},
                             {'role': 'user', 'content': text[:6000]}],
-                        'max_tokens': _MEDIA_DIGEST_TOKENS, 'agentId': agent_id}, key)
+                        'max_tokens': _MEDIA_DIGEST_TOKENS, 'agentId': agent_id,
+                        'taskId': task.get('id')}, key)
         if isinstance(r, dict) and not r.get('error') and r.get('reply'):
             summary = r['reply'].strip()
     if not summary:
+        budget_hit = _chat_error_result(r,
+                                        f'Fetched {url}, but this task has used its full model-spend budget and the digest call was paused.')
+        if budget_hit:
+            _sim_module._store_content_result(task.get('id'), budget_hit)
+            return
         note = f"Fetched {url}, but couldn't summarize it this time."
         _sim_module._store_content_result(task.get('id'), {'note': note})
         return
@@ -440,18 +467,24 @@ def _run_distill_content(snapshot, agent_id, task, base_ctx=None):
         (f'\n\nCURRENT THINK TANK KNOWLEDGE (keep/merge):\n\n{current_wiki[:_DISTILL_WIKI_EXCERPT_CHARS]}'
          if current_wiki else '\n\nNo current think tank page yet -- write one from scratch.'))
     reply = None
+    r = None
     try:
         r = _serve._http_json('POST', base, '/api/chat',
                               {'model': tier_slug,
                                'messages': [{'role': 'system', 'content': sys_msg},
                                             {'role': 'user', 'content': f'Recent think tank findings:\n\n{sources_text}'}],
                                'max_tokens': _serve.RESEARCH_SKILL_SYNTHESIS_TOKENS,
-                               'agentId': agent_id}, key)
+                               'agentId': agent_id,
+                               'taskId': task.get('id')}, key)
         if isinstance(r, dict) and not r.get('error') and r.get('reply'):
             reply = r['reply'].strip()
     except Exception:
         reply = None
     if not reply:
+        budget_hit = _chat_error_result(r, f'Distilled {len(archives)} finding(s), but this task has used its full model-spend budget and the synthesis call was paused.')
+        if budget_hit:
+            _sim_module._store_content_result(task.get('id'), budget_hit)
+            return
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f'Distilled {len(archives)} finding(s), but the synthesis call returned nothing usable.', 'noop': True})
         return
@@ -687,6 +720,7 @@ def _run_research_project_content(snapshot, agent_id, task, base_ctx=None):
     backlog = f"{task.get('title')} -- {task.get('instructions')}" if task.get('instructions') else (task.get('title') or '')
     tier_slug = _serve._resolve_model_tier(f'Write research findings for a project: {project or backlog[:120]}')
     finding = None
+    r = None
     if tier_slug:
         r = _serve._http_json('POST', base, '/api/chat',
                        {'model': tier_slug,
@@ -694,7 +728,8 @@ def _run_research_project_content(snapshot, agent_id, task, base_ctx=None):
                             {'role': 'system', 'content': f'You are researching for a real project: {project}. Your specific task right now: {backlog}. Write 2-4 honest, concrete sentences of real findings or analysis -- no filler, an actual answer or set of concrete points.'},
                             {'role': 'user', 'content': 'Go ahead.'}],
                         'max_tokens': 400, 'agentId': agent_id,
-                        'service': project or task.get('productId') or '__general__'}, key)
+                        'service': project or task.get('productId') or '__general__',
+                        'taskId': task.get('id')}, key)
         if isinstance(r, dict) and not r.get('error') and r.get('reply'):
             finding = r['reply'].strip()
     if finding:
@@ -708,6 +743,10 @@ def _run_research_project_content(snapshot, agent_id, task, base_ctx=None):
                     'source': 'firsthand'}, key)
         note = f'Researched "{task.get("title")}" for real and logged the finding.'
     else:
+        budget_hit = _chat_error_result(r, f'Tried to research "{task.get("title")}", but this task has used its full model-spend budget and the research call was paused.')
+        if budget_hit:
+            _sim_module._store_content_result(task.get('id'), budget_hit)
+            return
         note = f'Tried to research "{task.get("title")}", but the model call didn\'t produce anything usable.'
     _sim_module._store_content_result(task.get('id'), {'note': note})
 
@@ -939,7 +978,7 @@ def _gather_unified_context(snapshot, base, key, agent_id, sandbox_id, topic):
             f'## Your mailbox (most recent)\n{mail_block}')
 
 
-def _review_screenshot(base, key, agent_id, sandbox_id, path, question):
+def _review_screenshot(base, key, agent_id, sandbox_id, path, question, task_id=None):
     """Port of world.js reviewScreenshot: real headless screenshot of a
     sandboxed file handed to the MMMU-scored vision tier. Returns {ok, review}
     or {ok: False, note: ...} -- degrades to a note, never a crash, if the
@@ -957,9 +996,14 @@ def _review_screenshot(base, key, agent_id, sandbox_id, path, question):
                                   'content': [{'type': 'text', 'text': question},
                                               {'type': 'image_url',
                                                'image_url': {'url': 'data:image/png;base64,' + (shot.get('imageBase64') or '')}}]}],
-                    'max_tokens': _VISION_MAX_TOKENS, 'agentId': agent_id}, key)
+                    'max_tokens': _VISION_MAX_TOKENS, 'agentId': agent_id,
+                    'taskId': task_id}, key)
     if isinstance(r, dict) and not r.get('error') and r.get('reply'):
         return {'ok': True, 'review': r['reply'].strip()}
+    budget_hit = _chat_error_result(r, 'the vision call was paused because this task used its full model-spend budget')
+    if budget_hit:
+        return {'ok': False, 'budgetExhausted': True, 'taskSpendUsd': budget_hit.get('taskSpendUsd'),
+                'taskSpendAttempts': budget_hit.get('taskSpendAttempts'), 'note': budget_hit['note']}
     return {'ok': False, 'note': 'vision call failed or returned nothing'}
 
 
@@ -1007,7 +1051,7 @@ def _guess_link_target_html(base, key, agent_id, sandbox_id, js_file):
     return 'index.html'
 
 
-def _auto_link_js_files(base, key, agent_id, sandbox_id, unlinked_files, messages, tier_slug):
+def _auto_link_js_files(base, key, agent_id, sandbox_id, unlinked_files, messages, tier_slug, task_id=None):
     """Port of tasks.js _autoLinkJsFiles: ask the SAME model in the SAME
     conversation for just the missing <script src> line(s), then execute it,
     grouped by which HTML page each unlinked file belongs on."""
@@ -1025,8 +1069,15 @@ def _auto_link_js_files(base, key, agent_id, sandbox_id, unlinked_files, message
                   f'the missing <script src> tag(s) to {html} -- e.g.:\ncat >> {html} << \'EOF\'\n<script src="{files[0]}"></script>\nEOF')
         r = _serve._http_json('POST', base, '/api/chat',
                        {'model': tier_slug, 'messages': messages + [{'role': 'user', 'content': prompt}],
-                        'max_tokens': 400, 'agentId': agent_id}, key)
+                        'max_tokens': 400, 'agentId': agent_id,
+                        'taskId': task_id}, key)
         if not isinstance(r, dict) or r.get('error') or not r.get('reply'):
+            budget_hit = _chat_error_result(r, f'{html}: the follow-up model call was paused because this task used its full model-spend budget')
+            if budget_hit:
+                return {'ok': False, 'budgetExhausted': True,
+                        'taskSpendUsd': budget_hit.get('taskSpendUsd'),
+                        'taskSpendAttempts': budget_hit.get('taskSpendAttempts'),
+                        'note': budget_hit['note']}
             all_ok = False
             notes.append(f'{html}: follow-up model call failed or returned nothing')
             continue
@@ -1211,6 +1262,27 @@ def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose):
     return {'ok': True, 'failedStep': None, 'results': results, 'note': 'quality pipeline all green'}
 
 
+def _quality_pipeline_evidence(qp):
+    """Item 7: extract OBJECTIVE evidence from a quality-pipeline run -- the
+    actual per-step output (coverage line, flake8/mypy/bandit tails) that proves
+    the code was really exercised by the standard gate, not just declared ok by a
+    reviewer. Empty when the pipeline didn't run or produced no output. The sim's
+    evidence-based done gate refuses to count a clean vote for a CODING-CLASS
+    parent unless this is non-empty."""
+    results = qp.get('results') or []
+    lines = []
+    for s in results:
+        name = (s.get('name') or 'step')
+        out = (s.get('stdout') or '').strip()
+        err = (s.get('stderr') or '').strip()
+        text = out + ('\n' + err if err else '')
+        if not text.strip():
+            continue
+        tail = text.splitlines()[-2:]
+        lines.append(f'[{name}]\n' + '\n'.join(tail))
+    return '\n'.join(lines)[:2000]
+
+
 def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     """Port of tasks.js runCodingTask (the real Work Room coding pipeline):
     a real model call with probe-before-writing + heredoc-continuation handling,
@@ -1278,10 +1350,16 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
         r = _serve._http_json('POST', base, '/api/chat',
                        {'model': tier_slug, 'messages': messages,
                         'max_tokens': _CODE_MAX_TOKENS, 'agentId': agent_id,
-                        'service': project_label or task.get('productId') or '__general__'}, key)
+                        'service': project_label or task.get('productId') or '__general__',
+                        'taskId': task.get('id')}, key)
         if not isinstance(r, dict) or r.get('error') or not r.get('reply'):
-            _sim_module._store_content_result(task.get('id'),
-                                              {'note': 'the model call failed or returned nothing', 'ok': False, 'tier': tier_slug})
+            budget_hit = _chat_error_result(r, 'this task used its full model-spend budget and the coding call was paused')
+            if budget_hit:
+                budget_hit['tier'] = tier_slug
+                _sim_module._store_content_result(task.get('id'), budget_hit)
+            else:
+                _sim_module._store_content_result(task.get('id'),
+                                                  {'note': 'the model call failed or returned nothing', 'ok': False, 'tier': tier_slug})
             return False
         reply = r['reply']
 
@@ -1348,7 +1426,13 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     if not isinstance(exec_data, dict) or not exec_data.get('allowed'):
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f"blocked: {exec_data.get('reason') if isinstance(exec_data, dict) else 'no response'}",
-                                           'command': command, 'ok': False, 'tier': tier_slug})
+                                           'command': command, 'ok': False, 'tier': tier_slug,
+                                           # Item 2: the block reason rides the result channel
+                                           # into sim._apply_content_result, where it lands in the
+                                           # author's feedback buffer and shows up on the next
+                                           # dispatch's perception block.
+                                           'feedback': (f'Your command was blocked before running: '
+                                                        f'{exec_data.get("reason") if isinstance(exec_data, dict) else "no response"}.')})
         return False
     ok = bool(exec_data.get('exitCode') == 0 and not exec_data.get('timedOut'))
     result = {'ok': ok, 'exitCode': exec_data.get('exitCode'), 'command': command, 'tier': tier_slug}
@@ -1364,10 +1448,18 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     if written:
         unlinked = _find_unlinked_js_files(base, key, agent_id, WORKROOM_SANDBOX_ID, written)
         if unlinked:
-            linked = _auto_link_js_files(base, key, agent_id, WORKROOM_SANDBOX_ID, unlinked, messages, tier_slug)
+            linked = _auto_link_js_files(base, key, agent_id, WORKROOM_SANDBOX_ID, unlinked, messages, tier_slug,
+                                         task_id=task.get('id'))
             if linked['ok']:
                 result['note'] = f'auto-linked previously-orphaned file(s) into index.html: {", ".join(unlinked)}'
             else:
+                if linked.get('budgetExhausted'):
+                    _sim_module._store_content_result(task.get('id'), {
+                        'ok': False, 'budgetExhausted': True, 'tier': tier_slug,
+                        'taskSpendUsd': linked.get('taskSpendUsd'),
+                        'taskSpendAttempts': linked.get('taskSpendAttempts'),
+                        'note': f'wrote {", ".join(unlinked)}, but the auto-link follow-up was paused because this task used its full model-spend budget.'})
+                    return False
                 plural = len(unlinked) > 1
                 result['note'] = (f'WARNING: created {", ".join(unlinked)} but {"they are" if plural else "it is"} not referenced '
                                   f'by a <script src> tag in index.html, and the automatic follow-up to link {"them" if plural else "it"} '
@@ -1647,6 +1739,14 @@ def _record_classified_failures(agent_id, kind, checklist_grades, escalate, revi
     return recorded
 
 
+def _perception_block(base_ctx):
+    """The situational-awareness block (sim's base_ctx, see sim._build_agent_
+    perception) folded into an executor's prompt. '' when the sim supplied
+    nothing -- keeps prompts byte-identical for the unit tests that call
+    executors bare (base_ctx=None)."""
+    return f'\n\nContext from the sim:\n{base_ctx}' if base_ctx else ''
+
+
 def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     """Port of tasks.js runReviewTask: a real review/QA pass -- gatherUnifiedContext,
     a skeptical critique call (probe-driven), a real screenshot visual pass, a Jev
@@ -1695,6 +1795,7 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                        else f'Quality pipeline status (run live in the sandbox just now): {qp["note"]}. '
                             'This is the bar the code must clear -- taking the pipeline result as given.')
     system_prompt = (lead +
+                     _perception_block(base_ctx) +
                      f'\n\n{pipeline_clause}' +
                      ' Before answering, you may check real facts about how the ACTUAL running page behaves right now -- what a button '
                      'click or keypress actually does -- instead of guessing from the source alone. To do this, respond with ONLY a JSON '
@@ -1703,16 +1804,31 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                      '{"type":"keydown","key":"a"}], "probes": ["document.body.className", "typeof window.SomeGlobal"]}}\n'
                      'Action types are click ({selector}), keydown ({key}), wait ({ms}), eval ({code}). '
                      f'You can do this up to {MAX_REVIEW_PROBE_ROUNDS} times if you genuinely need to. '
-                     'When ready, respond with your final assessment as plain text, not JSON.')
+                     # Item 6: the reviewer's final answer carries a structured
+                     # verdict -- approve/send_back + the WHY (summary/checks/risks)
+                     # -- so the gate decision is the reviewer's own explicit call,
+                     # not a Jev guess at what the prose implies. The verdict JSON
+                     # is the base; a red pipeline and verified checklist failures
+                     # still override it (see below). On a probe round the verdict
+                     # is requested again with the same wording.
+                     'When ready, respond with your final assessment as plain text, then END with a single JSON object '
+                     '(no markdown fence) in exactly this shape: '
+                     '{"verdict": "approve" or "send_back", "summary": "<one short sentence>", '
+                     '"checks": ["<what you actually verified>"], "risks": ["<what remains a risk>"]}. '
+                     '"approve" only if the work genuinely looks solid and the quality pipeline passed; '
+                     '"send_back" if you found any real, specific problem that should be fixed.')
     messages = [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': 'Give your assessment.'}]
     review = None
     probe_rounds = 0
+    budget_hit = None
     while True:
         r = _serve._http_json('POST', base, '/api/chat',
                        {'model': tier_slug, 'messages': messages,
                         'max_tokens': _REVIEW_MAX_TOKENS, 'agentId': agent_id,
-                        'service': project_label or task.get('productId') or '__general__'}, key)
+                        'service': project_label or task.get('productId') or '__general__',
+                        'taskId': task.get('id')}, key)
         if not isinstance(r, dict) or r.get('error') or not r.get('reply'):
+            budget_hit = _chat_error_result(r, f'Tried to {("QA-test" if is_qa else "review")} "{backlog}", but this task used its full model-spend budget and the review call was paused.')
             break
         reply = r['reply'].strip()
         probe_req = _parse_probe_request(reply) if probe_rounds < MAX_REVIEW_PROBE_ROUNDS else None
@@ -1725,12 +1841,15 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                                      'probes': probe_req['probes']}, key)
             feedback = _format_page_probe_result(probe_data)
             if probe_rounds >= MAX_REVIEW_PROBE_ROUNDS:
-                feedback += f'\n\nYou have used all {MAX_REVIEW_PROBE_ROUNDS} probe rounds. Respond now with your final assessment as plain text.'
+                feedback += f'\n\nYou have used all {MAX_REVIEW_PROBE_ROUNDS} probe rounds. Respond now with your final assessment as plain text, then the JSON verdict object as instructed.'
             messages.append({'role': 'user', 'content': feedback})
             continue
         review = reply
         break
     if not review:
+        if budget_hit:
+            _sim_module._store_content_result(task.get('id'), budget_hit)
+            return
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f'Tried to {("QA-test" if is_qa else "review")} "{backlog}", but the model call didn\'t produce anything usable.',
                                            'ok': False})
@@ -1739,7 +1858,9 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     visual = _review_screenshot(base, key, agent_id, WORKROOM_SANDBOX_ID, 'index.html',
                                 f'You\'re reviewing a real screenshot of this project\'s main page. Task: {backlog_item}. '
                                 'Describe what you actually see, and call out anything that looks visually broken -- elements in the '
-                                'wrong place, overlapping, cut off, or missing.')
+                                'wrong place, overlapping, cut off, or missing.',
+                                task_id=task.get('id'))
+    visual_budget_hit = bool(visual.get('budgetExhausted'))
     full_review = (f'{review}\n\n## Visual check (real screenshot)\n\n{visual["review"]}' if visual['ok']
                    else f'{review}\n\n## Visual check\n\n(could not complete: {visual["note"]})')
 
@@ -1749,6 +1870,15 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                 'path': f"archive/{int(time.time() * 1000)}-{task.get('taskType') or 'review'}-{task.get('id') or 'adhoc'}.md",
                 'content': f'# {backlog}\n\nProject: {project_label}\nBy: {name} ({kind})\n\n{full_review}\n',
                 'source': 'firsthand'}, key)
+
+    # Item 6: the reviewer's own structured verdict is the base vote. The review
+    # ends with {"verdict":"approve"|"send_back", ...}; a clean parse gives the
+    # reviewer's EXPLICIT call (send_back -> actionable, approve -> clean) as the
+    # primary signal. Jev still runs as the prose cross-check + the hard
+    # overrides below (red pipeline, verified checklist failures) still outvote
+    # it -- fail-closed stays fail-closed.
+    structured_verdict, peer_summary, peer_checks, peer_risks = _parse_review_verdict(review)
+    structured_actionable = structured_verdict == 'send_back'
 
     # Jev verdict: actionable -> queue a follow-up fix; clean -> nothing to do.
     verdict = 'clean'
@@ -1768,6 +1898,10 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
         verdict, _, _ = _serve._jev_choice(decision)
     except Exception:
         verdict = 'clean'  # deterministic safe fallback: don't queue a fix we can't justify
+    # The reviewer's own explicit send_back outvotes a Jev read of the prose; an
+    # approve (or a failed JSON parse) leaves Jev's decision as the base.
+    if structured_actionable:
+        verdict = 'actionable'
 
     # Cut 4 hard gate: a red quality pipeline can NEVER read as approval. Force
     # the vote to actionable so the story goes back for a fix even if the review
@@ -1863,7 +1997,12 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     result = {'note': f'Filed a {kind} on "{backlog}" (text + visual), {suffix}',
               'ok': True,
               'pipelineOk': qp['ok'],
-              'pipelineSummary': qp['note']}
+              'pipelineSummary': qp['note'],
+              # Item 7: the objective quality-pipeline output rides the result so
+              # the evidence-based done gate can verify the code was ACTUALLY
+              # exercised by the standard gate -- never just "a reviewer said it
+              # looked ok". Empty when the pipeline couldn't run.
+              'evidence': _quality_pipeline_evidence(qp)}
     if checklist_grades:
         result['checklistGrades'] = checklist_grades
     if escalated_reqs:
@@ -1871,6 +2010,26 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     if is_gate_review:
         # Relay the vote so _apply_content_result can count it on the parent.
         result['peerVerdict'] = verdict
+    # Item 6: carry the reviewer's structured verdict (its own explicit call +
+    # the WHY -- summary / verified checks / remaining risks) through the result
+    # channel so _apply_content_result can fold them onto the parent task and
+    # the author/player can see the basis of the vote, not just the binary.
+    if peer_summary or peer_checks or peer_risks:
+        result['peerSummary'] = peer_summary
+        result['peerChecks'] = peer_checks
+        result['peerRisks'] = peer_risks
+    if visual_budget_hit:
+        # The vision pass was refused because the task's model-spend budget is
+        # exhausted -- this is NOT a review that found work needing a fix, and
+        # queueing a stray fix task here would start ANOTHER unpaid lane. Drop
+        # it and fail the card closed so the sim's budget branch (notify +
+        # fail-closed) owns the shutdown.
+        queue_fix = None
+        result['budgetExhausted'] = True
+        result['taskSpendUsd'] = visual.get('taskSpendUsd')
+        result['taskSpendAttempts'] = visual.get('taskSpendAttempts')
+        result['note'] = (f'Review text was filed, but the visual screenshot check was paused because this task used its '
+                          f'full model-spend budget ({result.get("note", "")}).')
     if process_trace_count:
         result['processTraceCount'] = process_trace_count
     if queue_fix:
@@ -1983,13 +2142,17 @@ def _release_product_from_build(product_id, releasing_agent, base, key):
         return
 
 
-def _plain_completion(model, messages, max_tokens, service='spike'):
+def _plain_completion(model, messages, max_tokens, service='spike', task_id=None):
     """One non-tool completion call, with the same spend accrual _http_json
     self-loopback calls get from serve.py's own endpoints -- used for the
     plan/synthesize bookends of a spike, which need real (possibly extended-
     reasoning) deliberation but no tool access of their own. Returns stripped
     text, or '' on any failure (never raises -- a spike must always still
     complete via SOME path, per the notifyPlayer-on-every-outcome rule)."""
+    # Item 4 gate: the spike lane accrues per-task like every other lane, so a
+    # spike over its task budget must not keep paying for plan/synthesize.
+    if task_id and _serve._task_budget_exhausted(task_id):
+        return ''
     try:
         data = _serve._call_openrouter_sync(model, messages, max_tokens)
     except Exception as e:
@@ -2000,6 +2163,8 @@ def _plain_completion(model, messages, max_tokens, service='spike'):
     cost = (data.get('usage') or {}).get('cost', 0.0)
     if isinstance(cost, (int, float)) and cost:
         _serve._accrue_spend(service, cost)
+        if task_id:
+            _serve._accrue_task_spend(task_id, cost)
     try:
         return (data['choices'][0]['message']['content'] or '').strip()
     except (KeyError, IndexError, TypeError):
@@ -2032,6 +2197,38 @@ def _parse_reflection(text):
     confidence = float(confidence) if isinstance(confidence, (int, float)) and 0.0 <= confidence <= 1.0 else 1.0
     note = data.get('note') if isinstance(data.get('note'), str) else ''
     return confidence, note
+
+
+def _parse_review_verdict(text):
+    """Item 6: parse the structured verdict block a review ends with --
+    {"verdict": "approve"|"send_back", "summary": "...", "checks": [...],
+    "risks": [...]}. Returns (verdict_or_None, summary, checks, risks); the
+    verdict is the ONLY signal that decides (approve->clean, send_back->
+    actionable), the rest is diagnostic carried to the author/player. Tolerates
+    the JSON embedded in surrounding prose or wrapped in a code fence; on any
+    parse failure returns (None, '', [], []) so the caller falls back to the
+    Jev decision exactly as before."""
+    text = (text or '').strip()
+    data = None
+    try:
+        if text.startswith('{'):
+            data = json.loads(text)
+        else:
+            m = re.search(r'\{.*\}', text, re.DOTALL)
+            if m:
+                data = json.loads(m.group())
+    except (json.JSONDecodeError, TypeError):
+        data = None
+    if not isinstance(data, dict):
+        return None, '', [], []
+    verdict = data.get('verdict')
+    verdict = verdict if verdict in ('approve', 'send_back') else None
+    summary = data.get('summary') if isinstance(data.get('summary'), str) else ''
+    checks = data.get('checks') if isinstance(data.get('checks'), list) else []
+    checks = [c for c in checks if isinstance(c, str)][:12]
+    risks = data.get('risks') if isinstance(data.get('risks'), list) else []
+    risks = [r for r in risks if isinstance(r, str)][:12]
+    return verdict, summary, checks, risks
 
 
 def _plan_requires_verification_basis(plan_text):
@@ -2151,7 +2348,7 @@ _REFLECTION_CONFIDENCE_FLOOR = 0.5
 
 
 def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, tools, execute_tool,
-                                         total_iterations, max_tokens, force_first_tool):
+                                         total_iterations, max_tokens, force_first_tool, task_id=None):
     remaining = total_iterations
     current_messages = list(messages)
     first_round = True
@@ -2162,7 +2359,8 @@ def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, to
         execute_text, current_messages = _serve._call_agent_tool_loop(
             tier_slug, current_messages, tools, execute_tool,
             max_iterations=this_round, max_tokens=max_tokens, service='spike',
-            force_first_tool=(force_first_tool if first_round else False), return_transcript=True)
+            force_first_tool=(force_first_tool if first_round else False), return_transcript=True,
+            task_id=task_id)
         remaining -= this_round
         if len(current_messages) == before_len:
             # No progress at all this round (no tool call, no settling text
@@ -2182,8 +2380,8 @@ def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, to
                 'of your final report): given everything above, respond with ONLY a JSON object: '
                 '{"confidence": <0.0-1.0, how likely you are to produce a real, complete answer with '
                 'what has actually been gathered so far>, "note": "<one short sentence: what to do '
-                'differently, or \'on track\' if the current approach is working>"}.')},
-        ], max_tokens=150)
+                'differently, or \'on track\' if the current approach is working>"}')},
+        ], max_tokens=150, task_id=task_id)
         confidence, note = _parse_reflection(reflection)
         if confidence < _REFLECTION_CONFIDENCE_FLOOR and note and note.strip().lower() != 'on track':
             current_messages.append({'role': 'user', 'content': f'Self-check before continuing: {note}'})
@@ -3317,6 +3515,25 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     backlog = task.get('title') or ''
     instructions = task.get('instructions')
     budget = task.get('budgetMs')
+    # Item 4 gate up front: a spike that has already used its full model-spend
+    # budget is failed closed BEFORE it resolves tiers or makes any call --
+    # no further money is spent, and the sim sees budgetExhausted and runs its
+    # notify + fail-closed branch. (The serve-side gate inside every /api/chat
+    # and _plain_completion call backs this up; this check just fails fast and
+    # stores the canonical result.)
+    if _serve._task_budget_exhausted(task.get('id')):
+        spent, attempts = _serve._task_budget_spent(task.get('id'))
+        _sim_module._store_content_result(task.get('id'), {
+            'ok': False,
+            'budgetExhausted': True,
+            'taskSpendUsd': spent,
+            'taskSpendAttempts': attempts,
+            'note': f'Spike "{backlog}" was paused before it started: this task already used its full model-spend budget (${spent:.4f} spent).',
+            'notifyPlayer': {'kind': 'spike_done',
+                             'subject': f'[AI Think Tank] Spike paused on budget: {backlog[:80]}',
+                             'body': f'{name} tried to spike "{backlog}" but the task already used its full model-spend budget (${spent:.4f} spent, {attempts} model call(s)) -- no further calls were made.'},
+        })
+        return
     # A spike finishing used to generate no notice on either channel; the
     # think tank was reactive-only. notifyPlayer is the (safe, indirect --
     # _apply_content_result actually queues it) way any executor asks to be
@@ -3354,8 +3571,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             'write a short numbered checklist (3-7 items) of concrete sub-goals needed to answer it '
             'thoroughly and honestly -- e.g. which pages/categories to visit, what to extract from '
             'each, and what a real answer must cover. The FIRST item must always be a search_web '
-            'query for what OTHER sites say about the subject -- a subject\'s own pages never '
-            'disclose everything about it (methodology, reputation, who else covers it), and a '
+            'query for what OTHER sites say about the subject -- a subject\'s own pages never '            'disclose everything about it (methodology, reputation, who else covers it), and a '
             'JS-heavy site may not even be readable by a plain fetch. If the subject has a large '
             'list of items (a directory, a catalog), include a step to sample a few individual item '
             'pages, not just the top-level listing.\n\n'
@@ -3396,7 +3612,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             '-- do not answer the question yourself, do not invent facts, just plan the investigation.')},
         {'role': 'user', 'content': f'Question: {backlog}'
                                      f'{(" Method/constraints: " + instructions) if instructions else ""}'},
-    ], max_tokens=500)
+    ], max_tokens=500, task_id=task.get('id'))
 
     # EXECUTE -- the existing many-iteration real tool loop (mid tier: cheap
     # enough to spend on up to 18 round trips), now following the plan above
@@ -3569,7 +3785,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     try:
         execute_text, transcript = _run_spike_tool_loop_with_reflection(
             tier_slug, reasoning_slug, messages, spike_tools, execute_tool,
-            total_iterations=50, max_tokens=900, force_first_tool=first_tool)
+            total_iterations=50, max_tokens=900, force_first_tool=first_tool,
+            task_id=task.get('id'))
     except Exception as e:
         # A model-call failure (circuit-breaker RuntimeError, a 4xx, a network
         # blip) must never crash the spike executor or leave a half-baked
@@ -3620,7 +3837,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         'fine). No filler, no release notes.'
     )
     finding = _plain_completion(
-        reasoning_slug, transcript + [{'role': 'user', 'content': synth_prompt}], max_tokens=1800)
+        reasoning_slug, transcript + [{'role': 'user', 'content': synth_prompt}], max_tokens=1800,
+        task_id=task.get('id'))
     if not finding:
         finding = (execute_text or '').strip()
     if not finding:
@@ -3730,6 +3948,10 @@ def _run_workroom_content(snapshot, agent_id, task, base_ctx=None):
                         _serve.get_or_create_agent_key(agent_id))
         if isinstance(ls, dict) and ls.get('allowed') and ls.get('stdout'):
             context_summary = f'Current files in the shared Work Room sandbox:\n{ls["stdout"]}'
+        # Item 1: the sim's perception (base_ctx) must survive this path -- the
+        # file listing is extra context, not a replacement for who/where/why.
+        if base_ctx:
+            context_summary = '\n\n'.join(p for p in (base_ctx, context_summary) if p)
         _run_coding_content(snapshot, agent_id,
                             {**task, 'projectLabel': project_label,
                              'title': backlog or task.get('title', ''),

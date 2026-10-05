@@ -97,6 +97,19 @@ class SocialCeremony(SimIsolation):
         self.assertFalse(ben['offDuty'])
         self.assertEqual(pending['people']['ben']['offDuty'], True)
 
+    def test_convene_social_records_co_location_acquaintances(self):
+        # Item 8: co-location at the social ceremony is the marker that two agents
+        # met -- every pair pulled into the Hangout becomes acquainted, so the
+        # perception present-list can name them afterwards.
+        state = self._social_state()
+        pending = {'embarked': False, 'at': 0, 'people': {}}
+        with unittest.mock.patch('serve.log_action'):
+            sim._convene_social(state, pending, 1234)
+        self.assertTrue(sim._are_acquainted(state, 'ada', 'ben'))
+        self.assertTrue(sim._are_acquainted(state, 'ben', 'ada'))
+        self.assertEqual(sim._describe_agent(state, 'ben', 'ada'), 'Ben')
+        self.assertIn('Ben', sim._build_agent_perception(state, 'ada'))
+
     def test_restore_worker_extends_workuntil(self):
         state = self._social_state()
         snapshot = {'offDuty': False, 'visible': True, 'x': 10, 'y': 20,
