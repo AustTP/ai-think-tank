@@ -481,10 +481,9 @@ grow the file without bound.
 
 ## 13. Video-Takeaway Mapping
 
-Three videos were reviewed and their transcripts kept under
-`world/library/media/transcripts/` (`fde-masterclass`, `ai-roll-ups`,
-`fde-explained`). Their lessons were checked against the codebase and are
-already operationalized:
+Three videos were reviewed and their takeaway lessons checked against the
+codebase. The mapping is already operationalized (the transcripts themselves
+are private and not published):
 
 | Video lesson | Where it lives |
 |--------------|----------------|

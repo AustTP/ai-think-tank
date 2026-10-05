@@ -82,6 +82,7 @@ library/refinement/
 # tree at runtime (readable by any agent via /api/library/file) -- generated
 # content, like the other runtime dirs above, never tracked.
 library/media/transcripts/
+world/library/media/transcripts/
 sandboxes/spike-task-*/
 sandboxes/sb-*/
 # Manual pre-cleanup DB backup -- a big one-off snapshot, not source
