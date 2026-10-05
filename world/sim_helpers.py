@@ -120,3 +120,76 @@ def _is_fully_idle(a, in_room):
     assignment/active paths treat as 'working'."""
     return not (a.get('busy') or a.get('task') or a.get('path') or a.get('pathActive')
                 or a.get('pairWith') or a.get('handoff') or a.get('inRoom') or in_room)
+
+
+# --- Villages -----------------------------------------------------------------
+# A VILLAGE is the top-level identity + memory boundary. Each agent belongs to
+# exactly one village (default 'main'); wiki pages and design taste docs are
+# scoped to the writer/reader's village so one village's knowledge never leaks
+# into another. Mobility (workers walking between villages) and opposition come
+# later -- THIS layer only proves the boundary: a village's agents only ever
+# read their own wiki and their own design taste.
+
+DEFAULT_VILLAGE = 'main'
+
+
+def ensure_villages(state):
+    """State's village registry (list of {id, name}), seeding the default
+    'main' village on first access. Every existing agent is backfilled to
+    'main' here so a pre-village database keeps working."""
+    villages = state.setdefault('villages', [])
+    if not any(v.get('id') == DEFAULT_VILLAGE for v in villages):
+        villages.insert(0, {'id': DEFAULT_VILLAGE, 'name': 'Main Village'})
+    agents = state.setdefault('agents', {})
+    for a in agents.values():
+        a.setdefault('villageId', DEFAULT_VILLAGE)
+    return villages
+
+
+def next_village_id(state):
+    """Server-side monotonic village id (vlg-1, vlg-2, ...), cold-start-at-1 /
+    hot-never-collides like next_sprint_id."""
+    n = 0
+    for v in (state.get('villages') or []):
+        vid = v.get('id') or ''
+        if isinstance(vid, str) and vid.startswith('vlg-'):
+            try:
+                n = max(n, int(vid[4:]))
+            except ValueError:
+                pass
+    return f'vlg-{n + 1}'
+
+
+def create_village(state, name):
+    """Pure: add a village to the registry. Returns the record, or None on a
+    name clash / blank name / duplicate id. Agents are NOT moved here -- the
+    caller reassigns members explicitly."""
+    name = (name or '').strip()
+    if not name:
+        return None
+    ensure_villages(state)
+    villages = state['villages']
+    if any(v.get('name', '').strip().lower() == name.lower() for v in villages):
+        return None
+    vid = next_village_id(state)
+    record = {'id': vid, 'name': name}
+    villages.append(record)
+    return record
+
+
+def village_of_agent(state, agent_id):
+    """The villageId an agent belongs to, defaulting to 'main' for unknown or
+    pre-village agents."""
+    return ((state.get('agents') or {}).get(agent_id) or {}).get('villageId') or DEFAULT_VILLAGE
+
+
+def set_agent_village(state, agent_id, village_id):
+    """Pure: move an agent into a village. No-op (False) for unknown agents or
+    an unknown village id; True when the assignment happened."""
+    agent = (state.get('agents') or {}).get(agent_id)
+    if not agent:
+        return False
+    if not any(v.get('id') == village_id for v in (state.get('villages') or [])):
+        return False
+    agent['villageId'] = village_id
+    return True
