@@ -87,6 +87,7 @@ from bank import (  # noqa: E402,F401
     _accrue_high_tier_spend,
     _accrue_page_request,
     _accrue_spend,
+    _accrue_task_spend,
     _apify_budget_exceeded,
     _apify_budget_month,
     _apify_spend_this_month,
@@ -108,6 +109,8 @@ from bank import (  # noqa: E402,F401
     _spend_cap_period,
     _spend_ledger_read,
     _spend_ledger_write,
+    _task_budget_exhausted,
+    _task_budget_spent,
     _think_tank_spend_cap_exceeded,
 )
 from notify import (  # noqa: E402,F401
@@ -5186,7 +5189,8 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
 
 
 def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3, max_tokens=None,
-                          service='__player_ask__', force_first_tool=False, return_transcript=False):
+                          service='__player_ask__', force_first_tool=False, return_transcript=False,
+                          task_id=None):
     """Agentic tool-calling loop for /api/intent/ask. Sends `messages` with
     `tools`; while the model replies with tool_calls, executes each via
     `execute_tool(name, args)`, appends the results back as `role:tool`
@@ -5231,6 +5235,10 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
     """
     current_messages = list(messages)
     for i in range(max_iterations):
+        # Item 4 per-task gate inside the loop too: a spike that is already
+        # over its task budget must not keep paying for further tool rounds.
+        if task_id and _task_budget_exhausted(task_id):
+            return (None, current_messages) if return_transcript else None
         tool_choice = None
         if force_first_tool and i == 0:
             tool_choice = ({'type': 'function', 'function': {'name': force_first_tool}}
@@ -5238,6 +5246,10 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
         data = _post_openrouter_raw(model, current_messages, tools=tools, max_tokens=max_tokens,
                                     tool_choice=tool_choice)
         _accrue_spend(service, ((data or {}).get('usage') or {}).get('cost', 0.0))
+        if task_id and isinstance(((data or {}).get('usage') or {}).get('cost'), (int, float)):
+            task_cost = ((data or {}).get('usage') or {}).get('cost', 0.0)
+            if task_cost:
+                _accrue_task_spend(task_id, task_cost)
         choice = ((data or {}).get('choices') or [{}])[0]
         message = choice.get('message') or {}
         tool_calls = message.get('tool_calls') or []
@@ -11213,6 +11225,44 @@ async def delete_template(role: str, request: Request):
     return JSONResponse({'ok': True, 'role': role})
 
 
+@app.post('/api/task-budget')
+async def grant_task_budget(request: Request):
+    """Item 4 runtime override: a director/admin grants a budget-exhausted card
+    (status 'failed' + budgetExhausted) more model-spend money and re-opens it.
+    The sim's _director_grant_budget_reopen refuses unless the new ceiling is a
+    real raise past what was already spent (else the /api/chat gate would refuse
+    the very next call), and re-queues the card under the new budget."""
+    requester = _resolve_requester(request)
+    if not requester:
+        return JSONResponse({'error': 'unauthenticated'}, status_code=401)
+    authorized = verify_agent_key(requester, request.headers.get('X-Agent-Key'))
+    if authorized is not True:
+        return JSONResponse({'error': 'attribution key mismatch'}, status_code=403)
+    body = await request.json()
+    task_id = (body.get('taskId') or '').strip()
+    new_budget = body.get('budgetUsd')
+    if not task_id:
+        return JSONResponse({'error': 'taskId is required'}, status_code=400)
+    if not isinstance(new_budget, (int, float)) or new_budget <= 0:
+        return JSONResponse({'error': 'budgetUsd must be a positive number'}, status_code=400)
+    import sim as _sim
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    if not _is_director_or_admin(state, requester):
+        return JSONResponse({'error': 'only directors and the admin may grant task budget'}, status_code=403)
+    result = _sim._director_grant_budget_reopen(
+        state, task_id, new_budget, director_id=requester)
+    if not result.get('ok'):
+        return JSONResponse({'error': result.get('error', 'could not re-open the task')}, status_code=400)
+    save_state_to_db(state)
+    log_action(requester, 'task_budget_granted',
+               {'taskId': task_id, 'budgetUsd': result.get('budgetUsd'),
+                'spentUsd': result.get('spentUsd'), 'attempts': result.get('attempts')},
+               authorized=True)
+    return JSONResponse({'ok': True, **result})
+
+
 def _safe_library_path(rel_path):
     # Path-traversal guard -- must resolve to strictly inside LIBRARY_DIR.
     # A shared, agent-writable directory is exactly the kind of thing a
@@ -12251,6 +12301,29 @@ async def chat(request: Request):
     # per-product grouping (the useful strategic view) comes only from an
     # explicit service label, never from the agent's own id.
     service = body.get('service') or '__general__'
+    # Item 4 per-task spend gate: a call carrying a taskId is refused once that
+    # task's own model-spend budget is exhausted (see _task_budget_exhausted --
+    # the ceiling reads the DURABLE task's budgetUsd, the spent total reads the
+    # task's own ledger bucket, so the gate and the sim can never disagree).
+    # The sim fail-closes the card on 'budgetExhausted' in the content result;
+    # this refusal is a hard 429 so NO further money is spent for the task.
+    # Calls without a taskId (the ask lane, the player, serve's own loopback
+    # planning calls) are never gated, and a state/ledger read failure never
+    # blocks a call.
+    task_id = (body.get('taskId') or '').strip()
+    if task_id and _task_budget_exhausted(task_id):
+        spent, attempts = _task_budget_spent(task_id)
+        log_action(agent_id, 'task_budget_blocked',
+                   {'taskId': task_id, 'model': model, 'service': service,
+                    'taskSpendUsd': round(spent, 6), 'taskSpendAttempts': attempts},
+                   authorized=authorized)
+        return JSONResponse({
+            'error': (f'This task has used its full model-spend budget '
+                      f'(${spent:.4f} spent) and further model calls are paused until a director raises it.'),
+            'budgetExhausted': True,
+            'taskSpendUsd': round(spent, 6),
+            'taskSpendAttempts': attempts,
+        }, status_code=429)
     # Plain-writing directive (token saver): by default fold the anti-AI-slop
     # ban list into the first system message so prose replies come back
     # shorter -- less filler is fewer billed input AND output tokens, without
@@ -12307,6 +12380,11 @@ async def chat(request: Request):
             usage_cost = (data.get('usage') or {}).get('cost', 0.0)
         if isinstance(usage_cost, (int, float)) and usage_cost:
             _accrue_spend(service, usage_cost)
+            # Item 4 per-task accrual: count this call against the task's own
+            # ledger bucket so _task_budget_exhausted sees live spend. Only
+            # calls that passed the gate (or carry no taskId) reach here.
+            if task_id:
+                _accrue_task_spend(task_id, usage_cost)
             # High-tier calls accrue against the dedicated high-tier monthly
             # budget too so the JEV gate can fail closed when the
             # month's high-tier allowance is spent. Single accrual point -- this

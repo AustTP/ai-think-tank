@@ -89,7 +89,8 @@ class ApprovalGate(unittest.TestCase):
 
     def test_clean_with_green_pipeline_counts(self):
         state, _ = self._gated()
-        parent = self._vote(state, 'ada', {'peerVerdict': 'clean', 'pipelineOk': True})
+        parent = self._vote(state, 'ada', {'peerVerdict': 'clean', 'pipelineOk': True,
+                                           'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         self.assertEqual(parent['_peerGate']['approvals'], 1)
         self.assertEqual(parent['_peerGate']['approvers'], ['ada'])
 
@@ -108,6 +109,39 @@ class ApprovalGate(unittest.TestCase):
         parent = self._vote(state, 'ada', {'peerVerdict': 'clean'})  # no pipelineOk key
         self.assertEqual(parent['_peerGate']['approvals'], 0)
         self.assertEqual(parent['_peerGate']['approvers'], [])
+
+    def test_item7_clean_with_green_pipeline_but_no_evidence_is_not_approval(self):
+        # Item 7 evidence-based done gate: for a CODING-CLASS parent (pressoffice
+        # story) a clean vote needs the executor's objective pipeline output
+        # (result['evidence']) on top of pipelineOk. A green-pipeline clean vote
+        # with no evidence is still "looks solid, unverified" -- downgraded.
+        state, _ = self._gated()
+        parent = self._vote(state, 'ada', {'peerVerdict': 'clean', 'pipelineOk': True})
+        self.assertEqual(parent['_peerGate']['approvals'], 0,
+                         'a clean vote without pipeline evidence must not count for a coding-class parent')
+        self.assertEqual(parent['_peerGate']['approvers'], [])
+
+    def test_item7_clean_with_evidence_resets_nothing_and_counts(self):
+        # The positive side of Item 7: once the executor files the real pipeline
+        # output, the clean vote is a genuine approval (no denial coaching).
+        state, story = self._gated()
+        parent = self._vote(state, 'ada', {'peerVerdict': 'clean', 'pipelineOk': True,
+                                           'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 92%'})
+        self.assertEqual(parent['_peerGate']['approvals'], 1)
+        self.assertEqual(parent['_peerGate']['approvers'], ['ada'])
+        self.assertEqual(state['agents'][story['assignedTo']].get('mailbox', []), [],
+                         'a real approval must not coach the author as a denial')
+
+    def test_item7_non_coding_parent_needs_no_evidence(self):
+        # Item 7 scopes the evidence requirement to coding-class parents only: a
+        # pure-research lane (observatory) closes on pipelineOk alone.
+        state = _state()
+        story = _story(room='observatory', projectLabel=None)
+        state['tasks'][story['id']] = story
+        sim._enter_peer_review(state, story, now_ms=1000)
+        parent = self._vote(state, 'ada', {'peerVerdict': 'clean', 'pipelineOk': True})
+        self.assertEqual(parent['_peerGate']['approvals'], 1,
+                         'a non-coding parent approves on a clean green pipeline without evidence')
 
     def test_red_pipeline_clean_verdict_resets_gate_and_notifies_author(self):
         # Downgraded red -> actionable path: gate reset + author rejection notice.

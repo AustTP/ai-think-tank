@@ -119,6 +119,89 @@ def _spend_ledger_write(ledger):
         )
 
 
+# ---------------------------------------------------------------------------
+# Per-task spend budget (Item 4). Every real model call a task makes accrues
+# against a per-task ledger bucket (a reserved `__task__/<task_id>` key in the
+# SAME kv_spend row), and the /api/chat handler (plus the spike lane's direct-
+# completion helpers) refuses further calls for that task once the durable
+# task's budgetUsd ceiling is crossed. The ceiling lives on the durable task
+# record (state['tasks'][task_id]['budgetUsd'], stamped by sim.assign_task
+# from the groomer's refinement band), so the gate and the sim never disagree
+# about how much a task was worth. A task with no/zero budget or an unknown id
+# is NEVER gated -- budget 0 is the explicit 'unbudgeted' opt-out. Per-task
+# buckets are excluded from every service view and from the monthly spend
+# cap's own total (they are an attribution aid, not a service).
+# ---------------------------------------------------------------------------
+_TASK_SPEND_PREFIX = '__task__'
+
+
+def _task_spend_key(task_id):
+    return f'{_TASK_SPEND_PREFIX}/{task_id}'
+
+
+def _is_task_spend_key(key):
+    return isinstance(key, str) and key.startswith(_TASK_SPEND_PREFIX + '/')
+
+
+def _task_budget_spent(task_id):
+    """(used, calls) accrued against a task's own ledger bucket, or (0.0, 0)
+    when it has never spent anything. Best-effort read: a ledger failure is
+    (0.0, 0), i.e. never refuses on its own."""
+    import serve as _serve
+    if not task_id:
+        return 0.0, 0
+    try:
+        bucket = (_serve._spend_ledger_read() or {}).get(_task_spend_key(task_id)) or {}
+        used = float(bucket.get('used', 0) or 0)
+        calls = int(bucket.get('calls', 0) or 0)
+        return used, calls
+    except Exception:
+        return 0.0, 0
+
+
+def _accrue_task_spend(task_id, cost):
+    """Accrue one real model call's cost against a task's own ledger bucket.
+    Best-effort exactly like _accrue_spend: an accounting failure must never
+    break the call itself."""
+    import serve as _serve
+    if not task_id or not isinstance(cost, (int, float)) or not cost:
+        return
+    cost = float(cost)
+    try:
+        ledger = _serve._spend_ledger_read()
+        bucket = ledger.setdefault(_task_spend_key(task_id), {'used': 0.0, 'calls': 0})
+        bucket['used'] = float(bucket.get('used', 0) or 0) + cost
+        bucket['calls'] = int(bucket.get('calls', 0) or 0) + 1
+        bucket['lastAt'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _serve._spend_ledger_write(ledger)
+    except Exception:
+        pass
+
+
+def _task_budget_exhausted(task_id):
+    """True when `task_id` has consumed its whole per-task spend budget -- the
+    predicate the /api/chat handler (and the spike lane's direct-completion
+    helpers) consult BEFORE a model call goes out. Reads the ceiling from the
+    DURABLE task record (state['tasks'][task_id]['budgetUsd'], the authoritative
+    value sim.assign_task stamped) and the spent total from this task's ledger
+    bucket, so the two can never disagree about where the money is. A task with
+    no budget (absent / <= 0) or an unknown task id is NEVER gated. Best-effort:
+    a state or ledger read failure returns False (never refuse on an accounting
+    hiccup)."""
+    import serve as _serve
+    if not task_id:
+        return False
+    try:
+        state = _serve.get_state_from_db()
+        budget = (state or {}).get('tasks', {}).get(task_id, {}).get('budgetUsd') or 0
+        if not isinstance(budget, (int, float)) or budget <= 0:
+            return False
+        spent, _calls = _task_budget_spent(task_id)
+        return spent >= float(budget)
+    except Exception:
+        return False
+
+
 def _spend_cap_period():
     """The current UTC month window for the spend cap, e.g. '2026-10'. The
     cap is a MONTHLY budget: at each month boundary the baseline rolls
@@ -155,7 +238,7 @@ def _think_tank_spend_cap_exceeded():
     # classifier call closed).
     excluded = {_serve._SPEND_CAP_BASELINE_KEY, _serve.COLAB_LEDGER_KEY}
     total = sum(float(v.get('used') or 0) for k, v in ledger.items()
-               if k not in excluded and isinstance(v, dict))
+               if k not in excluded and not _is_task_spend_key(k) and isinstance(v, dict))
     period = _serve._spend_cap_period()
     rec = ledger.get(_serve._SPEND_CAP_BASELINE_KEY)
     # Legacy migration: the old format stored a bare float (the baseline at
@@ -195,8 +278,8 @@ def _bank_budget_view(snapshot):
     products = list(products)
     services = {}
     for svc, bucket in (_serve._spend_ledger_read() or {}).items():
-        if svc == _serve._SPEND_CAP_BASELINE_KEY or not isinstance(bucket, dict):
-            continue  # the spend-cap baseline is a reserved float, not a service bucket
+        if svc == _serve._SPEND_CAP_BASELINE_KEY or _is_task_spend_key(svc) or not isinstance(bucket, dict):
+            continue  # the spend-cap baseline and per-task buckets are reserved keys, not service buckets
         used = float(bucket.get('used', 0) or 0)
         cap = _serve._budget_cap_usd(svc, products)
         service_row = {

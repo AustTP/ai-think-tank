@@ -173,7 +173,8 @@ class FullLifecycle(unittest.TestCase):
             sim._apply_content_result(
                 state, {'id': f'rev-{rid}', 'reviewOf': story['id'], 'assignedTo': rid,
                         'taskType': 'review', 'status': 'working'},
-                {'note': 'looks correct', 'peerVerdict': 'clean', 'pipelineOk': True})
+                {'note': 'looks correct', 'peerVerdict': 'clean', 'pipelineOk': True,
+                 'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         self.assertEqual(state['tasks'][story['id']]['_peerGate']['approvals'], len(gate['reviewerIds']))
         self.assertTrue(sim._parent_close_from_vote(state, state['tasks'][story['id']], now_ms=2**62),
                         'two distinct clean votes must close the story')

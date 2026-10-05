@@ -1513,6 +1513,54 @@ TASK_CYCLE_S = 6.0
 # state blob can't grow without bound.
 MAILBOX_KEEP_COUNT = 200
 
+# ---------------------------------------------------------------------------
+# Item 4: per-task model-spend ceiling. A card gets a hard budgetUsd at
+# ASSIGNMENT (stamped onto the durable task). The /api/chat gate (serve.py)
+# REFUSES further model calls for the task once its ledger spend crosses the
+# budget; the sim loop sees the refusal (result['budgetExhausted']) and fails
+# the card closed + notifies the owning director, who can re-open with more
+# budget. The budget is set per story/spike during backlog refinement (the
+# grooming choice also picks a band) or defaults by task type.
+# ---------------------------------------------------------------------------
+
+# USD ceiling per task TYPE (a card of a type with no entry uses the default).
+# Coding-class work is the expensive lane; research/observation and media are
+# cheap crawls; distill/skillReview are single-call ceremonies. Kept small
+# because this is a per-card ceiling, not a daily budget.
+_TASK_BUDGET_USD = {
+    'code': 0.50,
+    'bug': 0.50,
+    'review': 0.40,
+    'qa': 0.40,
+    'spike': 0.30,
+    'research': 0.15,
+    'media': 0.15,
+    'distill': 0.10,
+    'skillReview': 0.10,
+}
+_TASK_BUDGET_USD_DEFAULT = 0.25
+
+# Refinement bands: the groomer's choice scales the type-default budget (a
+# HIGH-VALUE story accepted as 'accept_generous' gets twice the standard
+# ceiling; 'standard' is 1x). An explicit per-card `budgetUsd` always wins.
+_REFINEMENT_BAND_MULTIPLIER = {'standard': 1.0, 'generous': 2.0}
+
+
+def budget_usd_for_task(task_type, budget_usd=None, budget_band=None):
+    """The model-spend ceiling for a task, in USD. Explicit positive
+    `budget_usd` wins outright (a player/director can always name a number);
+    otherwise the type tier applies, and the refinement `budget_band` scales
+    ONLY that tier (a generous-band story gets 2x the type default -- the band
+    is a judgment about worth, never a reason to shrink an explicit budget).
+    Returns a non-negative float; a card with no ceiling at all is 0.0 (gate
+    off)."""
+    if isinstance(budget_usd, (int, float)) and budget_usd > 0:
+        return float(budget_usd)
+    tier = _TASK_BUDGET_USD.get((task_type or '').strip().lower())
+    base = _TASK_BUDGET_USD_DEFAULT if tier is None else tier
+    mult = _REFINEMENT_BAND_MULTIPLIER.get((budget_band or 'standard').strip().lower(), 1.0)
+    return max(0.0, base * mult)
+
 # Server in-memory task-id counter (mirrors tasks.js nextTaskId). Not persisted
 # -- on restart it resets; a fresh 'task-N' id is unique for a given server run,
 # and the durable state['tasks'] mirror keyed by it is authoritative.
@@ -1652,6 +1700,18 @@ def _file_spike_issue(state, wish, task, now_ms):
     return True
 
 
+def _peer_coding_class(parent):
+    """Item 7: is this card a CODING-CLASS parent -- the lane whose done gate
+    needs objective evidence that the quality pipeline really ran on the code?
+    A pressoffice story (the workroom delivers code there) or any product-backed
+    card (has a productId) counts. Pure-research lanes (observatory, etc.) are
+    NOT coding-class: their clean vote rests on pipelineOk alone (they don't run
+    the flake8/mypy/bandit/pytest-cov stack the way a code review does)."""
+    if not isinstance(parent, dict):
+        return False
+    return parent.get('room') == 'pressoffice' or bool(parent.get('productId'))
+
+
 def _apply_content_result(state, task, result, now_ms=None):
     """Merge a completed content-executor result into the durable state, inside
     the task_cycle's single read-modify-write. Writes the research topic's
@@ -1697,6 +1757,19 @@ def _apply_content_result(state, task, result, now_ms=None):
             notes.append(note)
             if len(notes) > 5:
                 del notes[:-5]
+    # Item 2: feedback injection. A content executor reports `feedback` when its
+    # run hit a block or failure (a blocked command, a red pipeline -- see
+    # content.py's coding executor); it rides the result channel into the tick's
+    # single read-modify-write here, where `state` is live, so it lands in the
+    # author's feedback buffer (_build_agent_perception renders it on the next
+    # dispatch). Never written from the executor thread itself, which only has a
+    # snapshot.
+    fb = result.get('feedback')
+    if fb and aid:
+        if isinstance(fb, str):
+            _append_feedback(state, aid, fb, source='executor')
+        elif isinstance(fb, dict):
+            _append_feedback(state, aid, fb.get('text') or '', source=fb.get('source') or 'executor')
     # Phase 3 pressoffice: a review/QA pass that found real problems enqueues a
     # follow-up fix task (mirrors runReviewTask's queueWork on an 'actionable'
     # Jev verdict). Must go through the tick's single read-modify-write, not a
@@ -1736,6 +1809,20 @@ def _apply_content_result(state, task, result, now_ms=None):
             verdict = result.get('peerVerdict')
             reviewer = task.get('assignedTo')
             gate = parent['_peerGate']
+            # Item 6: fold the reviewer's structured verdict onto the parent so
+            # the author and player see WHY the vote went the way it did, not
+            # just the binary -- the summary, the checks actually verified, and
+            # the remaining risks. Best-effort; a missing structured block
+            # changes nothing.
+            if result.get('peerSummary') or result.get('peerChecks') or result.get('peerRisks'):
+                parent.setdefault('peerReviews', []).append({
+                    'reviewer': reviewer,
+                    'verdict': verdict,
+                    'summary': result.get('peerSummary') or '',
+                    'checks': list(result.get('peerChecks') or []),
+                    'risks': list(result.get('peerRisks') or []),
+                    'atMs': now_ms,
+                })
             if verdict == 'actionable':
                 if not _maybe_escalate_stuck_gate(parent, gate, 'repeated rejections'):
                     gate['approvals'] = 0
@@ -1751,6 +1838,18 @@ def _apply_content_result(state, task, result, now_ms=None):
                 # author) exactly as if the reviewer had rejected it.
                 if not result.get('pipelineOk'):
                     verdict = 'actionable'
+                # Item 7 evidence-based done gate: for a CODING-CLASS parent (a
+                # pressoffice story or any product-backed card), a clean vote also
+                # needs OBJECTIVE evidence that the quality pipeline actually ran
+                # and exercised the code -- the executor files the real per-step
+                # output (coverage line, flake8/mypy/bandit tails) in
+                # result['evidence']. A 'looks solid' with no evidence cannot
+                # approve code any more than a red pipeline can; without this a
+                # hollow clean vote would close a card that was never really
+                # tested. Non-coding lanes (observatory etc.) stay on the
+                # pipelineOk check alone.
+                elif _peer_coding_class(parent) and not (result.get('evidence') or '').strip():
+                    verdict = 'actionable'
                 if verdict == 'actionable':
                     if not _maybe_escalate_stuck_gate(parent, gate, 'repeated red-pipeline rejections'):
                         gate['approvals'] = 0
@@ -1764,6 +1863,134 @@ def _apply_content_result(state, task, result, now_ms=None):
 def _take_content_result(task_id):
     with _content_results_lock:
         return _content_results.pop(task_id, None)
+
+
+# Item 2: per-agent feedback buffer -- the durable 'what came back at me'
+# channel _build_agent_perception renders into the next dispatch's context.
+# Capped so it stays a recent-memory window, not a ledger.
+_FEEDBACK_MAX = 10
+
+
+def _append_feedback(state, agent_id, text, source=None):
+    """Record one feedback entry for `agent_id` (a rejection rationale, a
+    pipeline failure, or an executor-reported block). Pure state mutation;
+    JSON-safe (a list of small dicts). Written ONLY inside the tick's single
+    read-modify-write (or a pure helper it calls) -- never from an executor
+    thread, which has only a snapshot."""
+    text = (text or '').strip()
+    if not agent_id or not text:
+        return
+    bucket = state.setdefault('_feedback', {}).setdefault(agent_id, [])
+    entry = {'text': text[:500]}
+    if source:
+        entry['source'] = source
+    bucket.append(entry)
+    if len(bucket) > _FEEDBACK_MAX:
+        del bucket[:len(bucket) - _FEEDBACK_MAX]
+
+
+def _acquaintance_set(state, agent_id):
+    """The ids `agent_id` is acquainted with. Stored as JSON-safe lists (never
+    sets), so `_acquaintances` survives the kv_state blob round trip."""
+    return (state.get('_acquaintances') or {}).get(agent_id) or []
+
+
+def _mark_acquaintance(state, a, b):
+    """Record that `a` and `b` met, symmetrically (co-location at a social
+    ceremony is the marker -- see the social sweep). A self-introduction or a
+    missing id is a no-op. Pure state mutation; item 8's gate."""
+    if not a or not b or a == b:
+        return
+    acq = state.setdefault('_acquaintances', {})
+    for x, y in ((a, b), (b, a)):
+        lst = acq.setdefault(x, [])
+        if y not in lst:
+            lst.append(y)
+
+
+def _are_acquainted(state, a, b):
+    """True when `a` and `b` have been co-located at a social ceremony. Nobody
+    is a stranger to themselves."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return b in _acquaintance_set(state, a)
+
+
+def _describe_agent(state, agent_id, viewer_id, fallback_name=None):
+    """How `viewer_id` should refer to `agent_id`: by name once they are
+    acquainted, otherwise by role ('the Research analyst') -- a stranger's name
+    is not a name the viewer can honestly use. Falls back to the raw id."""
+    roster = {d.get('id'): d for d in (state.get('agentRoster') or [])
+              if isinstance(d, dict)}
+    rec = roster.get(agent_id) or {}
+    name = rec.get('name') or fallback_name or agent_id
+    role = rec.get('role') or ''
+    if _are_acquainted(state, viewer_id, agent_id):
+        return name + (f' (the {role})' if role else '')
+    if role:
+        return f'the {role}'
+    return 'a colleague you have not met'
+
+
+def _build_agent_perception(state, agent_id, task=None):
+    """Compose the agent's situational awareness into a compact markdown block
+    (base_ctx) folded into the content executor's system prompt: who am I, where
+    am I, who's around me, what am I working on, and what feedback came back at
+    me -- so a worker reasons like a teammate walking into the room, not a
+    stateless API call. Pure read of `state` (a frozen snapshot in production,
+    so no race with the sync pass); returns '' when nothing coherent can be
+    said, and executors treat a falsy base_ctx as 'no perception' so their
+    existing unit-test prompts stay byte-identical."""
+    agents = state.get('agents') or {}
+    roster = {d.get('id'): d for d in (state.get('agentRoster') or [])
+              if isinstance(d, dict)}
+    me = agents.get(agent_id) or {}
+    rec = roster.get(agent_id) or {}
+    parts = []
+    identity = f'You are {rec.get("name") or me.get("name") or agent_id}.'
+    role = rec.get('role') or ''
+    if role:
+        identity += f' Your role on the team: {role}.'
+    parts.append(identity)
+    room = me.get('inRoom') or (task or {}).get('room') or ''
+    if room:
+        parts.append(f'You are currently in the {room}.')
+    present = [a for a in agents.values()
+               if a and a.get('id') != agent_id and a.get('inRoom') == room
+               and not a.get('offDuty')]
+    if present:
+        who = ', '.join(_describe_agent(state, a['id'], agent_id)
+                        for a in present[:8])
+        parts.append(f'People in the room with you: {who}.')
+    if task:
+        title = (task.get('title') or '').strip()
+        if title:
+            line = f'Your current task: {title}'
+            instructions = task.get('instructions')
+            if instructions:
+                line += f' -- {instructions}'
+            parts.append(line + '.')
+        ac = task.get('acceptanceCriteria')
+        if ac:
+            parts.append(f'Acceptance criteria: {ac}')
+        if task.get('reviewOf'):
+            parts.append(f'This is a peer-review of task {task["reviewOf"]} '
+                         f'-- your verdict counts on the parent story.')
+    feedback = (state.get('_feedback') or {}).get(agent_id) or []
+    if feedback:
+        lines = []
+        for f in feedback[-5:]:
+            if isinstance(f, dict):
+                text = f.get('text') or f.get('guidance') or ''
+            else:
+                text = str(f)
+            if text:
+                lines.append(f'- {text}')
+        if lines:
+            parts.append('Feedback on your recent work:\n' + '\n'.join(lines))
+    return '\n\n'.join(p for p in parts if p)
 
 
 # The content executor for the CURRENT task, set by serve.py so sim.py stays
@@ -1796,10 +2023,16 @@ def _dispatch_content_work(executor, state, agent_id, task, now):
     task['workUntil'] = now + TASK_CONTENT_TIMEOUT_S
     task['_contentInFlight'] = True
     snapshot = json.loads(json.dumps(state))
+    # Item 1: situational awareness. Build the perception block here, on the
+    # main thread, from the FROZEN snapshot + the live task dict -- never inside
+    # the worker thread, where a read of the still-mutating live `state` would
+    # race the sync pass. Falsy (an empty perception) keeps the executor's
+    # pre-existing prompt exactly.
+    perception = _build_agent_perception(snapshot, agent_id, task)
 
     def _run():
         try:
-            executor(snapshot, agent_id, task, base_ctx={})
+            executor(snapshot, agent_id, task, base_ctx=perception)
         except Exception as e:  # never let a content failure strand the agent
             # W4: a crashed content run is a FAILURE, not a silent success.
             # Mark ok=False so the fail-closed quality gate treats it like a red
@@ -1978,6 +2211,13 @@ def queue_work(state, items):
             # trip so the real task knows it's a dry run (same whitelist contract
             # as 'distill'/'checklist').
             'shadow': bool(item.get('shadow')),
+            # Item 4: the per-task spend ceiling (USD) + the refinement band
+            # ('standard'/'generous') set during grooming survive the queue round
+            # trip so the ASSIGNED task carries them (see assign_task). Same
+            # whitelist contract as 'distill'/'checklist': silently dropping them
+            # would leave the task without the budget the groomer judged it worth.
+            'budgetUsd': item.get('budgetUsd') or None,
+            'budgetBand': item.get('budgetBand') or None,
         })
     return len(work_queue)
 
@@ -3288,6 +3528,17 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         # completion path (_task_cycle) captures to the shadow ledger instead of
         # shipping.
         'shadow': bool((extra or {}).get('shadow')),
+        # Item 4: the per-task model-spend ceiling, resolved AT ASSIGNMENT and
+        # stamped onto the durable task. Explicit budgetUsd wins; else the task
+        # type's tier; else the type default, scaled by the refinement band. The
+        # /api/chat gate (serve.py) reads THIS number as the ceiling; the sim
+        # loop's budgetExhausted branch is the enforcement that fails the card
+        # closed + notifies the owning director. budgetUsd 0.0 = no ceiling.
+        'budgetBand': (extra or {}).get('budgetBand') or 'standard',
+        'budgetUsd': budget_usd_for_task(
+            (extra or {}).get('taskType', 'code'),
+            (extra or {}).get('budgetUsd'),
+            (extra or {}).get('budgetBand')),
         'assignedTo': agent_id,
         'status': 'walking',
         'createdAt': now_ms,
@@ -4532,6 +4783,14 @@ def _sim_notify_author(state, parent, reviewer_id, rationale=None):
             f"Peer review of '{parent.get('title')}' was sent back for a fix. "
             f"What the reviewer said: {(rationale or '')[:400]}. Address this on "
             f"your next pass.", repeat=True)
+    # Item 2: the rejection itself lands in the author's feedback buffer, so the
+    # NEXT dispatch's perception block shows what came back at them (same W6
+    # intent -- coaching that changes the next execution -- but visible in the
+    # worker's situational awareness, not just the growth-plan loop).
+    _append_feedback(state, author,
+                     f"Peer review of '{parent.get('title')}' was sent back for "
+                     f"a fix. What the reviewer said: {(rationale or 'no reason given')[:400]}",
+                     source='peer_review')
 
 
 def _sim_notify_author_failed(state, task):
@@ -4547,6 +4806,13 @@ def _sim_notify_author_failed(state, task):
         'about': task.get('id'),
         'title': task.get('title'),
         'text': f'Your work on "{task.get("title")}" failed the quality pipeline and was sent back -- it needs a fix before it can be reviewed. Fix it and it will be reviewed again.'})
+    # Item 2: the pipeline failure also lands in the author's feedback buffer, so
+    # the next dispatch's perception block names the failing task.
+    _append_feedback(state, author,
+                     f"Your deliverable '{task.get('title')}' failed the quality "
+                     f"pipeline and was sent back. It will be reviewed again after "
+                     f"you fix it.",
+                     source='pipeline')
 
 
 def _log_quality_gate_reject(state, task, note, escalated):
@@ -5836,6 +6102,15 @@ def _convene_social(state, pending, now_ms):
         spread += 1
     pending['people'] = people
     pending['embarked'] = True
+    # Item 8: co-location at the social ceremony is the marker that two agents
+    # actually met -- every pair brought into the Hangout becomes acquainted
+    # (symmetric, idempotent, JSON-safe). This is what lets the perception
+    # present-list name them: a stranger stays "the Banking", an attendee you
+    # shared a ceremony with becomes "Ben (the Banking)".
+    met = [aid for aid in attendees if aid in people]
+    for i, a in enumerate(met):
+        for b in met[i + 1:]:
+            _mark_acquaintance(state, a, b)
     # The conversation runs 30 minutes from convene (convene is the true start; a
     # schedule-time preliminary `at` is superseded rather than compounded).
     pending['at'] = now_ms + SOCIAL_MEET_MS
@@ -7451,6 +7726,7 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
                          + ABSOLUTE_ZERO_SCOPING_GUIDANCE)
         criteria = [
             {'id': 'accept', 'description': f"Create '{req.get('title')}' as a real story in {req.get('room')} -- it's a genuine, well-scoped, MEDIUM-difficulty gap worth a card."},
+            {'id': 'accept_generous', 'description': f"Create '{req.get('title')}' as a real story in {req.get('room')} -- it's a genuine, well-scoped, HIGH-VALUE gap worth a card AND a generous spend budget (a bigger investigation or deliverable than the standard card)."},
             {'id': 'reject', 'description': "Groom this request out -- it's a duplicate, low-value, trivial/filler, over-ambitious/un-scoped, out-of-scope, or the roadmap already covers it."},
         ]
         choice = decider(instructions, criteria)
@@ -7459,7 +7735,18 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
             # delegatable-room gap (same determinism as the governance fallback --
             # better to ship one well-scoped card than to silently drop a filed gap).
             choice = 'accept' if req.get('room') in VALUED_QUEUE_ROOMS else 'reject'
-        if choice == 'accept':
+        # Item 4: the grooming choice also picks the spend band. 'accept_generous'
+        # (a HIGH-VALUE story) doubles the type-default ceiling; 'accept' is the
+        # standard band; the rejected branch never touches it. An explicit
+        # req['budgetUsd'] (player-named, from file_issue) always wins over the
+        # band -- the band only scales the TYPE default, never an explicit number.
+        band = 'generous' if choice == 'accept_generous' else 'standard'
+        req['budgetBand'] = band
+        req['budgetUsd'] = budget_usd_for_task(
+            req.get('taskType') or 'code',
+            req.get('budgetUsd'),
+            band)
+        if choice in ('accept', 'accept_generous'):
             req['status'] = 'accepted'
             # queue_work whitelists fields, so the provenance (filer/groomer/
             # room/title) lives on the durable `backlogRequests` record + the
@@ -7496,6 +7783,10 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
                 'userStory': story,
                 'acceptanceCriteria': criteria,
                 'dependsOn': depends_on,
+                # Item 4: the groomer-judged spend ceiling + band ride the queue
+                # item (whitelisted) so the ASSIGNED task carries them.
+                'budgetUsd': req.get('budgetUsd'),
+                'budgetBand': req.get('budgetBand'),
             }])
             accepted.append(req)
         else:
@@ -9115,6 +9406,117 @@ def _log_governance(state, agent_id, action, details):
         pass
 
 
+def _task_owner_director(state, task):
+    """The director who owns the team working `task`, for budget-exhausted
+    escalation. Candidate chain: the task's teamId -> its productId (via
+    _product_director) -> the assigned agent's roster `director` pointer.
+    Returns a director id (as state['agents'] keys it) or None."""
+    if task.get('teamId'):
+        team = _team_row(state, task['teamId'])
+        if team:
+            return team.get('directorId') or team.get('id')
+    if task.get('productId'):
+        director = _product_director(state, task.get('productId'))
+        if director:
+            return director
+    roster = next((d for d in (state.get('agentRoster') or [])
+                   if d.get('id') == task.get('assignedTo')), None)
+    if roster and roster.get('director'):
+        return roster['director']
+    return None
+
+
+def _notify_task_budget_exhausted(state, task, spent=None, attempts=None):
+    """One-time director notification when a task's model-spend ceiling is hit
+    (see the budgetExhausted content result). Fires once per task (stamped
+    `_budgetExhaustedNotified`); the owning director gets a NON-DISRUPTIVE
+    mailbox note (kind task_budget_exhausted, no wake -- the card is already
+    closed, waking her to act would be churn) + a governance log row carrying
+    the diagnostic (budget / actual spend / attempt count / author) so she can
+    investigate and re-open the card with more budget. Pure state mutation."""
+    if task.get('_budgetExhaustedNotified'):
+        return
+    task['_budgetExhaustedNotified'] = True
+    director_id = _task_owner_director(state, task)
+    title = task.get('title') or 'a task'
+    budget = task.get('budgetUsd')
+    budget_line = f" of ${budget:.2f}" if isinstance(budget, (int, float)) else ''
+    spent_line = f" after spending ${spent:.4f}" if isinstance(spent, (int, float)) else ''
+    attempts_line = f" across {int(attempts)} attempt(s)" if isinstance(attempts, (int, float)) else ''
+    text = (f'The task "{title}" exhausted its model-spend budget{budget_line}'
+            f"{spent_line}{attempts_line} and was closed as failed. Investigate the "
+            f"task and either grant it more budget and re-open it, or close the work.")
+    director = (state.get('agents') or {}).get(director_id) if director_id else None
+    if director:
+        _append_mailbox(director, {
+            'kind': 'task_budget_exhausted',
+            'taskId': task.get('id'),
+            'title': title,
+            'text': text,
+        })
+    _log_governance(state, director_id or task.get('assignedTo'),
+                    'task_budget_exhausted',
+                    {'taskId': task.get('id'), 'title': title[:120],
+                     'budgetUsd': budget, 'spentUsd': spent,
+                     'attempts': attempts, 'assignedTo': task.get('assignedTo')})
+
+
+def _director_grant_budget_reopen(state, task_id, new_budget_usd, director_id=None, now_ms=None):
+    """Item 4 runtime override: a director grants a budget-exhausted card more
+    model-spend money and re-opens the work. Refuses unless the card is actually
+    budget-failed (status 'failed' + budgetExhausted) and the new ceiling is a
+    real raise past what was already spent -- otherwise the /api/chat gate would
+    still refuse the very next call. Re-queues the card (same title/goal/room/
+    product/instructions, pinned to its original author) carrying the raised
+    budgetUsd, so the assignment loop works it again under the new ceiling. The
+    failed record is kept and stamped with the raised budget (the audit trail);
+    the re-opened card is a fresh task under the new budget. Pure state
+    mutation; returns {'ok': ...}."""
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    tasks = state.get('tasks') or {}
+    task = tasks.get(task_id) if task_id else None
+    if not isinstance(task, dict):
+        return {'ok': False, 'error': 'unknown task'}
+    if task.get('status') != 'failed' or not task.get('budgetExhausted'):
+        return {'ok': False, 'error': 'only a budget-exhausted (failed) card can be re-opened with more budget'}
+    if not isinstance(new_budget_usd, (int, float)) or new_budget_usd <= 0:
+        return {'ok': False, 'error': 'new budget must be a positive USD amount'}
+    import serve as _serve_mod
+    spent, attempts = _serve_mod._task_budget_spent(task_id)
+    if float(new_budget_usd) <= spent:
+        return {'ok': False,
+                'error': f'new budget ${float(new_budget_usd):.4f} does not exceed the ${spent:.4f} already spent on this task -- the gate would refuse the next call anyway'}
+    budget = float(new_budget_usd)
+    # Audit trail on the failed record + the authoritative ceiling for the
+    # re-opened card (queue_work whitelists budgetUsd onto the assigned task).
+    task['budgetUsd'] = budget
+    task['budgetGrantedAt'] = now_ms
+    task['budgetGrantedBy'] = director_id
+    fail_note = (task.get('failNote') or '').strip()
+    queue_work(state, [{
+        'title': task.get('title') or 'Re-opened task',
+        'room': task.get('room'),
+        'instructions': (f'This card was re-opened by {director_id or "the director"} with more model-spend budget '
+                         f'(${budget:.2f} total) after exhausting its previous ceiling.'
+                         + (f' Previous failure: {fail_note}' if fail_note else '')
+                         + (f'\n\n{task.get("instructions")}' if task.get('instructions') else '')),
+        'goal': task.get('projectLabel') or task.get('goal'),
+        'projectLabel': task.get('projectLabel') or task.get('title'),
+        'productId': task.get('productId'),
+        'taskType': task.get('taskType') or 'code',
+        'assignedTo': task.get('assignedTo'),  # pin back to the original author
+        'budgetUsd': budget,
+        'budgetBand': task.get('budgetBand') or 'standard',
+        'userStory': task.get('userStory'),
+        'acceptanceCriteria': task.get('acceptanceCriteria'),
+    }])
+    _log_governance(state, director_id or task.get('assignedTo'), 'task_budget_granted',
+                    {'taskId': task_id, 'title': (task.get('title') or '')[:120],
+                     'newBudgetUsd': budget, 'spentUsd': spent, 'attempts': attempts})
+    return {'ok': True, 'taskId': task_id, 'budgetUsd': budget,
+            'spentUsd': spent, 'attempts': attempts}
+
+
 def _revoke_agent_credentials(agent_id):
     """Best-effort revocation of EVERY standing credential a fired agent held:
     the external-capability handles (Phase D), the per-agent attribution secret
@@ -9574,6 +9976,33 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 # peer gate / quality gate / credits entirely.
                 if task.get('shadow'):
                     _complete_shadow_task(state, aid, task, now_ms, grid)
+                    send_agent_off_duty(state, aid, doors, grid)
+                    continue
+                # Item 4: FAIL-CLOSED budget-exhausted branch. The /api/chat gate
+                # (serve.py) refuses the task's model calls once its ledger spend
+                # crosses the ceiling and folds that refusal into its content
+                # result (budgetExhausted + taskSpendUsd/taskSpendAttempts). Here
+                # the card is closed as 'failed' -- NOT sent back / re-fixed: a fix
+                # would re-hit the same empty budget and loop forever. The agent is
+                # released INLINE (a budget-exhausted card must not bump approvals
+                # or ship anything), the owning director is notified once with the
+                # diagnostic, and the card waits for her to re-open it with more
+                # budget or close the work. Never touches a review/fix subtask's
+                # parent -- the gate refuses the task whose budget ran out.
+                if result.get('budgetExhausted'):
+                    task['budgetExhausted'] = True
+                    task['status'] = 'failed'
+                    task['failedAt'] = now_ms
+                    task['failNote'] = (result.get('note') or task.get('note')
+                                        or 'task model-spend budget exhausted').strip()[:300]
+                    a['task'] = None
+                    a['busy'] = False
+                    a['inRoom'] = None
+                    a['visible'] = True
+                    _notify_task_budget_exhausted(
+                        state, task,
+                        spent=result.get('taskSpendUsd'),
+                        attempts=result.get('taskSpendAttempts'))
                     send_agent_off_duty(state, aid, doors, grid)
                     continue
                 # Fail-closed quality gate: a content result that FAILED the
@@ -10227,6 +10656,11 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # Bot Ops / shadow mode: thread the dry-run flag onto the assigned task
         # (see assign_task) -- same class of whitelist as 'distill'/'checklist'.
         'shadow': pick.get('shadow'),
+        # Item 4: the groomer-judged spend ceiling + band survive onto the task
+        # (see assign_task, which resolves the budget). Same whitelist class as
+        # 'distill'/'checklist': dropping them would leave the task unbudgeted.
+        'budgetUsd': pick.get('budgetUsd'),
+        'budgetBand': pick.get('budgetBand'),
     }
     # Cut 2 coaching + runbook injection: append the chosen agent's pending
     # growth-plan note (applied once) and any product runbook knowledge to the
