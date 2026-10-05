@@ -577,6 +577,15 @@ class WikiContextForTask(unittest.TestCase):
         with mock.patch.object(sim, 'inject_wiki_context', side_effect=RuntimeError('db down')):
             self.assertEqual(content._wiki_context_for_task({'agents': {}}, {'room': 'pressoffice'}), '')
 
+    def test_wiki_context_scopes_to_task_agents_village(self):
+        # A worker's read-before-act wiki context must come only from their own
+        # village -- the boundary is enforced at read time via village_of_agent.
+        state = {'agents': {'bri': {'villageId': 'north'}}}
+        with mock.patch.object(sim, 'inject_wiki_context', return_value='# North knowledge') as inject:
+            out = content._wiki_context_for_task(state, {'room': 'pressoffice', 'agentId': 'bri'}, agent_id='bri')
+        self.assertEqual(out, '# North knowledge')
+        inject.assert_called_once_with(state, {'room': 'pressoffice', 'agentId': 'bri'}, village_id='north')
+
 
 class RecordClassifiedFailures(unittest.TestCase):
     # The 'sort' step: verified-failed and escalated requirements are

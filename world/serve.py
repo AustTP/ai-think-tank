@@ -1084,6 +1084,7 @@ def _seed_default_roster():
         profile = _profile_for_role(state_for_templates, d['role'])
         agents[aid] = {
             'id': aid, 'name': d['name'], 'color': d['color'], 'role': d['role'],
+            'villageId': 'main',
             'profile': {'mission': profile['mission'], 'instructions': list(profile['instructions']), 'notes': list(profile['notes'])}, 'model': d['model'],
             'approvedCount': 0, 'droppedCount': 0, 'weekApprovals': 0, 'mailbox': [], 'conversationLog': [],
             'lastContactedAt': None, 'hiredAt': now_ms,
@@ -1094,7 +1095,7 @@ def _seed_default_roster():
         }
     seed_room_defs = {r: {'label': d['label'], 'purpose': d['purpose']}
                       for r, d in _DEFAULT_ROOM_DEFINITIONS.items()}
-    save_state_to_db({'agentRoster': roster, 'agents': agents, 'reports': [], 'nextReportId': 1, 'workQueue': [], 'researchTopics': [], 'templates': state_for_templates.get('templates') or {}, 'roomDefinitions': seed_room_defs})
+    save_state_to_db({'agentRoster': roster, 'agents': agents, 'reports': [], 'nextReportId': 1, 'workQueue': [], 'researchTopics': [], 'templates': state_for_templates.get('templates') or {}, 'roomDefinitions': seed_room_defs, 'villages': [{'id': 'main', 'name': 'Main Village'}]})
     # Stamp admin/director tier (idempotent) so the DB owns the authority
     # graph from the very first read.
     _backfill_directors_in_db()
@@ -2769,24 +2770,34 @@ def _safe_design_reference_name(name):
     return cleaned or None
 
 
-def _design_project_rel(project):
-    """Library-relative directory for a design project's inspiration briefs.
-    Returns None when the project slug is unusable. 'general' (or the empty
-    string) resolves to the design-references/ root -- the shared, unprojected
-    area -- so existing flat briefs keep working."""
+def _design_project_rel(project, village='main'):
+    """Library-relative directory for a design project's inspiration briefs,
+    scoped to a VILLAGE so each village keeps its own design vocabulary. The
+    default 'main' village maps to the flat design-references/ root (backward
+    compatible with all pre-village briefs); a non-default village gets its own
+    design-references/<village>/ subtree so one village's taste never leaks
+    into another. Returns None when the project slug is unusable. 'general' (or
+    the empty string) resolves to the village's design-references root -- the
+    shared, unprojected area."""
+    vslug = _safe_design_reference_name(village) or 'main'
     slug = _safe_design_reference_name(project)
     if slug is None:
         slug = _safe_design_reference_name('general')
+    if vslug in ('main', 'general', 'root', ''):
+        base = 'design-references'
+    else:
+        base = os.path.join('design-references', vslug)
     if slug in ('general', 'root', ''):
-        return 'design-references'
-    return os.path.join('design-references', slug)
+        return base
+    return os.path.join(base, slug)
 
 
-def _list_design_briefs(project):
+def _list_design_briefs(project, village='main'):
     """Library-relative paths of every plain-text design brief in a project's
-    inspiration directory (taste.md excluded -- it is the folded summary, not
-    raw inspiration). Empty list when the directory is missing or empty."""
-    rel_dir = _design_project_rel(project)
+    inspiration directory, scoped to a VILLAGE (taste.md excluded -- it is the
+    folded summary, not raw inspiration). Empty list when the directory is
+    missing or empty."""
+    rel_dir = _design_project_rel(project, village=village)
     target = _safe_library_path(rel_dir)
     if not target or not os.path.isdir(target):
         return []
@@ -7682,7 +7693,7 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/villages', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews')
 # Gap: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
@@ -10790,7 +10801,8 @@ async def write_wiki_page(request: Request):
     if not actor or not _is_director_or_admin(state, actor):
         return JSONResponse({'error': 'only a director or the admin may write the wiki'}, status_code=403)
     import sim as _sim
-    record, is_new = _sim.wiki_write_page(state, page_id, title, category, content, actor)
+    record, is_new = _sim.wiki_write_page(state, page_id, title, category, content, actor,
+                                          village_id=_sim.village_of_agent(state, actor))
     if record is None:
         return JSONResponse({'error': 'could not write wiki page'}, status_code=400)
     # Persist the body to disk under library/wiki/<category>/ (inside LIBRARY_DIR).
@@ -10930,7 +10942,8 @@ async def approve_wiki_proposal(page_id: str, request: Request):
         return JSONResponse({'error': f'no pending proposal for {page_id} in {category}'}, status_code=404)
     import sim as _sim
     record, is_new = _sim.wiki_write_page(state, page_id, proposal.get('title') or page_id,
-                                          category, proposal.get('body') or '', actor)
+                                          category, proposal.get('body') or '', actor,
+                                          village_id=_sim.village_of_agent(state, actor))
     if record is None:
         return JSONResponse({'error': 'could not write wiki page'}, status_code=400)
     cat_dir = os.path.join(LIBRARY_DIR, 'wiki', category)
@@ -12404,6 +12417,79 @@ async def ingest_library(request: Request):
     return JSONResponse({'ok': True, 'results': results, 'okCount': ok_count, 'totalCount': len(results)})
 
 
+@app.get('/api/villages')
+async def list_villages(request: Request):
+    """Read-only village listing. Shows the registry + which agents belong to
+    each village (for the boundary UI). Any authenticated client can read it;
+    only the player may mutate it."""
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    import sim as _sim
+    villages = _sim.ensure_villages(state)
+    agents = state.get('agents') or {}
+    roster = {d.get('id'): d.get('name', '') for d in (state.get('agentRoster') or [])}
+    out = []
+    for v in villages:
+        out.append({
+            'id': v.get('id'),
+            'name': v.get('name'),
+            'members': sorted(aid for aid, a in agents.items()
+                              if (a.get('villageId') or _sim.DEFAULT_VILLAGE) == v.get('id')),
+            'memberNames': {aid: roster.get(aid, aid) for aid in agents
+                            if (agents[aid].get('villageId') or _sim.DEFAULT_VILLAGE) == v.get('id')},
+        })
+    return JSONResponse({'villages': out})
+
+
+@app.post('/api/villages')
+async def create_village_endpoint(request: Request):
+    """Create a new village (player-only). A village is the top-level identity
+    + memory boundary: its agents only ever read their own wiki and their own
+    design taste. {name} required; optionally {agentIds} to seed membership."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    body = await request.json()
+    import sim as _sim
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    name = (body.get('name') or '').strip()
+    if not name:
+        return JSONResponse({'error': 'a village name is required'}, status_code=400)
+    record = _sim.create_village(state, name)
+    if record is None:
+        return JSONResponse({'error': 'could not create the village (blank or duplicate name)'}, status_code=409)
+    agents = state.get('agents') or {}
+    for aid in (body.get('agentIds') or []):
+        if aid in agents:
+            _sim.set_agent_village(state, aid, record['id'])
+    save_state_to_db(state)
+    log_action('player', 'village_created', {'id': record['id'], 'name': name}, authorized=True)
+    return JSONResponse({'ok': True, 'village': record})
+
+
+@app.post('/api/villages/assign')
+async def assign_agent_to_village(request: Request):
+    """Move an agent into a village (player-only). The boundary is enforced at
+    read time: after this, the agent's wiki + design-taste context come only
+    from the target village."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    body = await request.json()
+    agent_id = (body.get('agentId') or '').strip()
+    village_id = (body.get('villageId') or '').strip()
+    import sim as _sim
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    if not _sim.set_agent_village(state, agent_id, village_id):
+        return JSONResponse({'error': 'unknown agent or village'}, status_code=400)
+    save_state_to_db(state)
+    log_action('player', 'village_assign', {'agentId': agent_id, 'villageId': village_id}, authorized=True)
+    return JSONResponse({'ok': True, 'agentId': agent_id, 'villageId': village_id})
+
+
 @app.post('/api/design-reference')
 async def design_reference(request: Request):
     """Designmind-style design brief from an uploaded image. Player-only (same
@@ -12419,7 +12505,7 @@ async def design_reference(request: Request):
         return JSONResponse({'error': 'design references are player-only'}, status_code=403)
     name = _safe_design_reference_name(body.get('name'))
     image_b64 = (body.get('imageBase64') or '').strip()
-    project = _design_project_rel(body.get('project'))
+    project = _design_project_rel(body.get('project'), village=body.get('village') or 'main')
     if not name:
         return JSONResponse({'error': 'a safe name is required (letters, digits, dashes, underscores)'}, status_code=400)
     if not image_b64:
@@ -12498,7 +12584,7 @@ async def design_reference_url(request: Request):
     brief = _design_brief_from_image(screenshot_b64, f'URL {url}', context=f'Design review of the live page at {url}')
     if not brief.get('ok'):
         return JSONResponse({'error': brief.get('note', 'could not generate the design brief')}, status_code=502)
-    project = _design_project_rel(body.get('project'))
+    project = _design_project_rel(body.get('project'), village=body.get('village') or 'main')
     try:
         design_dir = _safe_library_path(project)
         if not design_dir:
@@ -12578,11 +12664,11 @@ async def design_reference_taste(request: Request):
     agent_id = body.get('agentId', 'player')
     if agent_id != 'player':
         return JSONResponse({'error': 'design references are player-only'}, status_code=403)
-    project = _design_project_rel(body.get('project'))
-    briefs = _list_design_briefs(project)
+    project = _design_project_rel(body.get('project'), village=body.get('village') or 'main')
+    briefs = _list_design_briefs(body.get('project'), village=body.get('village') or 'main')
     if not briefs:
         return JSONResponse({'error': 'no design briefs in this project yet -- upload inspiration first'}, status_code=400)
-    taste, error = _fold_design_taste(briefs, project)
+    taste, error = _fold_design_taste(briefs, body.get('project'))
     if error:
         return JSONResponse({'error': error}, status_code=502)
     taste_rel = os.path.join(project, 'taste.md')
@@ -12600,12 +12686,13 @@ async def design_reference_taste(request: Request):
                          'text': taste})
 
 
-def _design_context_for_project(project):
+def _design_context_for_project(project, village='main'):
     """Read-before-act context block for design work on a project: the folded
-    taste doc plus a pointer to the raw inspiration briefs. Empty string when
-    the project has no taste doc (the executor still runs, just without a
-    design vocabulary -- the pre-existing behavior)."""
-    rel_dir = _design_project_rel(project)
+    taste doc plus a pointer to the raw inspiration briefs, scoped to the
+    reader's VILLAGE so one village's design vocabulary never leaks into
+    another. Empty string when the project has no taste doc (the executor still
+    runs, just without a design vocabulary -- the pre-existing behavior)."""
+    rel_dir = _design_project_rel(project, village=village)
     taste_rel = os.path.join(rel_dir, 'taste.md')
     taste_path = _safe_library_path(taste_rel)
     lines = []
@@ -12617,7 +12704,7 @@ def _design_context_for_project(project):
             taste = ''
         if taste.strip():
             lines.append(f'The design taste for this project (READ THIS FIRST):\n{taste.strip()}')
-    briefs = _list_design_briefs(project)
+    briefs = _list_design_briefs(project, village=village)
     if briefs:
         lines.append('Raw inspiration briefs in the project library (read the relevant ones): '
                      + ', '.join(f'{b}' for b in briefs))

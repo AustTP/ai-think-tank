@@ -51,6 +51,13 @@ from sim_helpers import (  # noqa: E402, F401
     normalize_priority,
     normalize_size_estimate,
     size_estimate_weight,
+    # Villages: the top-level identity + memory boundary.
+    DEFAULT_VILLAGE,
+    create_village,
+    ensure_villages,
+    next_village_id,
+    set_agent_village,
+    village_of_agent,
 )
 
 # 1.0s (was 2.0s). The server only PUBLISHES new positions ~once
@@ -3251,7 +3258,7 @@ WIKI_CATEGORY_ROOMS = {  # default category -> room affinity for read-before-act
 
 
 def wiki_write_page(state, page_id, title, category, body, edited_by,
-                    edited_at_ms=None):
+                    edited_at_ms=None, village_id=None):
     """Pure: create or update a wiki page's METADATA + return the lined-up
     record for serve.py to persist (serve writes page['body'] to disk only for
     pre-existing/new pages; the metadata carries version + history). Rejects
@@ -3275,6 +3282,7 @@ def wiki_write_page(state, page_id, title, category, body, edited_by,
         'id': page_id,
         'title': title or page_id,
         'category': category,
+        'villageId': village_id or DEFAULT_VILLAGE,
         'version': version,
         'editedBy': edited_by or None,
         'editedAt': edited_at_ms,
@@ -3292,17 +3300,21 @@ def _page_room_affinity(state, page):
     return mapping.get(cat)
 
 
-def wiki_read_pages(state, room, max_pages=3):
+def wiki_read_pages(state, room, max_pages=3, village_id=DEFAULT_VILLAGE):
     """Pure: the subset of wiki pages relevant to a task in `room`, chosen by
-    category-room affinity. Only pages affined to THIS room or to the think tank as
-    a whole (a None affinity) are injected -- a page affined to a DIFFERENT room
-    is never pulled in; "read before acting" means reading the pages about the
-    work you're about to do, not a random archive. Returns metadata-only records
-    (id/title/category/version) so serve.py can fetch the bodies. Stable order
-    (recency, then version) for deterministic injection."""
+    category-room affinity AND the reader's village. Only pages affined to THIS
+    room (or to the think tank as a whole -- a None affinity) AND written by
+    THIS village are injected; a page affined to a different room, or from a
+    different village, is never pulled in. "Read before acting" means reading
+    the pages about the work you're about to do in your own village, not a
+    random archive or a neighbor's memory. Returns metadata-only records
+    (id/title/category/version/villageId) so serve.py can fetch the bodies.
+    Stable order (recency, then version) for deterministic injection."""
     pages = ensure_wiki(state)
     scored = []
     for page_id, rec in pages.items():
+        if (rec.get('villageId') or DEFAULT_VILLAGE) != village_id:
+            continue  # a different village's memory is not this reader's
         affinity = _page_room_affinity(state, rec)
         if affinity != room and affinity is not None:
             continue  # affined to another room -> irrelevant here
@@ -3312,7 +3324,7 @@ def wiki_read_pages(state, room, max_pages=3):
     return [r for _s, _a, _pid, r in scored[:max_pages]]
 
 
-def inject_wiki_context(state, task):
+def inject_wiki_context(state, task, village_id=None):
     """Pure: build the 'before you act, here's what the think tank knows' context
     block for a task, from the wiki pages for its room. Returns a non-empty
     string only when there ARE relevant pages; empty when the wiki has none
@@ -3320,11 +3332,17 @@ def inject_wiki_context(state, task):
     room = (task or {}).get('room')
     if not room:
         return ''
+    if village_id is None:
+        # Resolve the reader's village from the task's agent so a worker only
+        # ever sees their own village's memory.
+        village_id = village_of_agent(state, (task or {}).get('agentId'))
     page_ids = (task or {}).get('wikiPageIds')
     if page_ids:
-        pages = [(ensure_wiki(state)).get(pid) for pid in page_ids if (ensure_wiki(state)).get(pid)]
+        pages = [(ensure_wiki(state)).get(pid) for pid in page_ids
+                 if (ensure_wiki(state)).get(pid)
+                 and ((ensure_wiki(state)).get(pid).get('villageId') or DEFAULT_VILLAGE) == village_id]
     else:
-        pages = wiki_read_pages(state, room)
+        pages = wiki_read_pages(state, room, village_id=village_id)
     if not pages:
         return ''
     lines = ['The think tank knowledge base has these entries relevant to this work:' , '']
@@ -5427,6 +5445,7 @@ def _complete_auto_hire(state, pending, grid, now_ms):
     roster.append({
         'id': new_id, 'name': name, 'color': color, 'role': role, 'model': 'small',
         'director': director_id,   # -> resolves into the team for _derive_team_members
+        'villageId': village_of_agent(state, director_id),
         'approvedCount': 0, 'droppedCount': 0, 'weekApprovals': 0,
         'mailbox': [f"Welcome aboard -- you're here to help {pending['helpForName']} with {help_for.get('role', '').lower()} work."],
         'elevatedAccess': True, 'accessGrant': access_grant, 'profile': profile,
@@ -5604,6 +5623,7 @@ def _spawn_team_agent(state, name, role, director_id, now_ms, grid, is_director=
     roster_entry = {
         'id': new_id, 'name': name, 'color': color, 'role': role, 'model': 'small',
         'director': None if is_director else director_id,
+        'villageId': village_of_agent(state, director_id),
         'approvedCount': 0, 'droppedCount': 0, 'weekApprovals': 0,
         'mailbox': [f"Welcome aboard -- you're on the new {director_id} team."],
         'elevatedAccess': elevated, 'accessGrant': None, 'profile': profile,
@@ -5618,6 +5638,7 @@ def _spawn_team_agent(state, name, role, director_id, now_ms, grid, is_director=
     agents[new_id] = {
         'id': new_id, 'name': name, 'color': color, 'role': role, 'profile': profile,
         'model': 'small', 'approvedCount': 0, 'droppedCount': 0, 'weekApprovals': 0,
+        'villageId': village_of_agent(state, director_id),
         'mailbox': [{'text': f"Welcome aboard -- you're on the new {director_id} team.", 'read': False, 'ts': now_ms}],
         'conversationLog': [], 'lastContactedAt': None, 'hiredAt': now_ms,
         'elevatedAccess': elevated, 'accessGrant': None,

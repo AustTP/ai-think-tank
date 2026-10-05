@@ -1316,6 +1316,30 @@ class DesignContextForTask(unittest.TestCase):
             ctx = content._design_context_for_task({'a': 1}, {'productId': 'product-1'})
         self.assertEqual(ctx, '')
 
+    def test_resolves_village_from_task_agent(self):
+        # A task for an agent in 'north' must pull the NORTH village's design
+        # taste, not the main village's -- the boundary is enforced at read time.
+        state = {'agents': {'bri': {'villageId': 'north'}}}
+        with mock.patch.object(serve, '_design_context_for_project', return_value='STYLE: brutalist') as dc:
+            ctx = content._design_context_for_task(state, {'productId': 'product-1', 'agentId': 'bri'}, agent_id='bri')
+        self.assertEqual(ctx, 'STYLE: brutalist')
+        dc.assert_called_once_with('product-1', village='north')
+
+    def test_defaults_to_main_when_agent_has_no_village(self):
+        state = {'agents': {'bri': {}}}
+        with mock.patch.object(serve, '_design_context_for_project', return_value='STYLE: minimal') as dc:
+            ctx = content._design_context_for_task(state, {'productId': 'product-1', 'agentId': 'bri'}, agent_id='bri')
+        self.assertEqual(ctx, 'STYLE: minimal')
+        dc.assert_called_once_with('product-1', village='main')
+
+    def test_defaults_to_main_when_no_agent_id(self):
+        # No agent_id (pre-village callers / unit tests) keeps the original
+        # single-argument call shape.
+        with mock.patch.object(serve, '_design_context_for_project', return_value='PALETTE: #111') as dc:
+            ctx = content._design_context_for_task({'a': 1}, {'productId': 'product-1'})
+        self.assertEqual(ctx, 'PALETTE: #111')
+        dc.assert_called_once_with('product-1')
+
 
 if __name__ == '__main__':
     unittest.main()

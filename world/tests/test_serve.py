@@ -1757,6 +1757,73 @@ class DesignReferenceEndpoints(unittest.TestCase):
         # preserved as filename characters, never as a traversal).
         self.assertEqual(serve._design_project_rel('../evil'), 'design-references/evil')
 
+    def test_design_project_rel_scopes_non_main_villages(self):
+        # THE boundary: a non-default village gets its own design-references/
+        # <village>/ subtree so its taste never collides with the main village's
+        # or another village's. 'main' keeps the flat root (backward compatible).
+        self.assertEqual(serve._design_project_rel('product-1', village='north'),
+                         'design-references/north/product-1')
+        self.assertEqual(serve._design_project_rel(None, village='north'),
+                         'design-references/north')
+        self.assertEqual(serve._design_project_rel('product-1', village='main'),
+                         'design-references/product-1')
+        # '../evil' sanitizes to a single safe village segment.
+        self.assertEqual(serve._design_project_rel('product-1', village='../evil'),
+                         'design-references/evil/product-1')
+
+    def test_design_reference_upload_scopes_to_village_dir(self):
+        # A design brief for the 'north' village lands under
+        # design-references/north/, never the main village's tree.
+        brief_out = {'ok': True, 'brief': 'STYLE: brutalist'}
+        written = []
+        with unittest.mock.patch.object(serve, '_design_brief_from_image', return_value=brief_out), \
+             unittest.mock.patch.object(serve, '_write_file',
+                                        side_effect=lambda path, content: written.append((path, content))):
+            r = self._post('/api/design-reference',
+                           {'agentId': 'player', 'name': 'hero', 'imageBase64': 'aGVsbG8=', 'village': 'north'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['briefPath'], 'design-references/north/hero.txt')
+        self.assertEqual(r.json()['image'], 'design-references/north/hero.png')
+
+    def test_design_context_for_project_is_village_scoped(self):
+        # _design_context_for_project must resolve a taste doc inside the
+        # reader's village dir -- main and north read different files.
+        taste_main = []
+        with unittest.mock.patch.object(serve, '_safe_library_path',
+                                        side_effect=lambda p: os.path.join('/tmp/lib', p)), \
+             unittest.mock.patch.object(serve, '_list_design_briefs', return_value=[]):
+            with unittest.mock.patch('os.path.isfile',
+                                     side_effect=lambda p: p == '/tmp/lib/design-references/product-1/taste.md'), \
+                 unittest.mock.patch('builtins.open', unittest.mock.mock_open(read_data='MAIN TASTE')):
+                ctx_main = serve._design_context_for_project('product-1', village='main')
+            with unittest.mock.patch('os.path.isfile',
+                                     side_effect=lambda p: p == '/tmp/lib/design-references/north/product-1/taste.md'), \
+                 unittest.mock.patch('builtins.open', unittest.mock.mock_open(read_data='NORTH TASTE')):
+                ctx_north = serve._design_context_for_project('product-1', village='north')
+        self.assertIn('MAIN TASTE', ctx_main)
+        self.assertIn('NORTH TASTE', ctx_north)
+
+    def test_design_reference_taste_folds_into_village_dir(self):
+        # The taste fold for a village writes to that village's subtree.
+        taste_out = 'STYLE: brutalist'
+        brief_files = ['design-references/north/hero.txt', 'design-references/north/nav.txt']
+        written = []
+        with unittest.mock.patch.object(serve, '_list_design_briefs', return_value=brief_files), \
+             unittest.mock.patch.object(serve, '_safe_library_path',
+                                        side_effect=lambda p: p if p.startswith('design-references') else None), \
+             unittest.mock.patch('os.path.isfile', return_value=True), \
+             unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-x'), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                        return_value={'choices': [{'message': {'content': taste_out}}]}), \
+             unittest.mock.patch.object(serve, '_write_file',
+                                        side_effect=lambda path, content: written.append((path, content))), \
+             unittest.mock.patch('builtins.open', unittest.mock.mock_open(read_data='STYLE: brutalist')):
+            r = self._post('/api/design-reference/taste',
+                           {'agentId': 'player', 'project': 'product-1', 'village': 'north'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['tastePath'], 'design-references/north/product-1/taste.md')
+        self.assertTrue(any('north' in str(p) and 'taste.md' in str(p) for p, _ in written))
+
     def test_list_design_briefs_excludes_taste_and_missing_dirs(self):
         self.assertEqual(serve._list_design_briefs('no-such-project'), [])
 
@@ -1802,6 +1869,97 @@ class DesignReferenceEndpoints(unittest.TestCase):
         with unittest.mock.patch.object(serve, '_safe_library_path', return_value=None), \
              unittest.mock.patch.object(serve, '_list_design_briefs', return_value=[]):
             self.assertEqual(serve._design_context_for_project('no-taste-project'), '')
+
+
+class VillageEndpoints(unittest.TestCase):
+    """The village boundary API: create a village, list it (with members), and
+    move agents into it (all player-only). Combined with the read-time scoping
+    in wiki + design taste, these make the boundary real end to end."""
+
+    def _state(self):
+        return {
+            'villages': [{'id': 'main', 'name': 'Main Village'}],
+            'agents': {
+                'ada': {'id': 'ada', 'name': 'Ada'},
+                'ben': {'id': 'ben', 'name': 'Ben'},
+            },
+            'agentRoster': [
+                {'id': 'ada', 'name': 'Ada'},
+                {'id': 'ben', 'name': 'Ben'},
+            ],
+            'wiki': {'pages': {}, 'categories': {}},
+        }
+
+    def _client(self):
+        return TestClient(serve.app)
+
+    def test_create_village(self):
+        state = self._state()
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db'), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'log_action', return_value=None):
+            r = self._client().post('/api/villages', json={'name': 'North'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['village']['name'], 'North')
+        self.assertTrue(any(v['name'] == 'North' for v in state['villages']))
+
+    def test_create_village_rejects_duplicate_and_blank(self):
+        state = self._state()
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db'), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'log_action', return_value=None):
+            r = self._client().post('/api/villages', json={'name': 'Main Village'})
+            self.assertEqual(r.status_code, 409)
+            r = self._client().post('/api/villages', json={'name': '   '})
+            self.assertEqual(r.status_code, 400)
+
+    def test_create_village_rejects_non_player(self):
+        state = self._state()
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
+             unittest.mock.patch.object(serve, 'log_action', return_value=None):
+            r = self._client().post('/api/villages', json={'name': 'North'})
+        self.assertEqual(r.status_code, 401)
+
+    def test_assign_agent_to_village(self):
+        state = self._state()
+        import sim as _sim
+        _sim.create_village(state, 'North')
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db'), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'log_action', return_value=None):
+            r = self._client().post('/api/villages/assign', json={'agentId': 'ada', 'villageId': 'vlg-1'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(state['agents']['ada']['villageId'], 'vlg-1')
+
+    def test_assign_rejects_unknown_agent_or_village(self):
+        state = self._state()
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db'), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'log_action', return_value=None):
+            r = self._client().post('/api/villages/assign', json={'agentId': 'nobody', 'villageId': 'main'})
+            self.assertEqual(r.status_code, 400)
+            r = self._client().post('/api/villages/assign', json={'agentId': 'ada', 'villageId': 'nope'})
+            self.assertEqual(r.status_code, 400)
+
+    def test_list_villages_groups_members(self):
+        state = self._state()
+        import sim as _sim
+        _sim.create_village(state, 'North')
+        _sim.set_agent_village(state, 'ada', 'vlg-1')
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'log_action', return_value=None):
+            r = self._client().get('/api/villages')
+        self.assertEqual(r.status_code, 200, r.text)
+        villages = {v['id']: v for v in r.json()['villages']}
+        self.assertEqual(villages['vlg-1']['name'], 'North')
+        self.assertIn('ada', villages['vlg-1']['members'])
+        self.assertIn('ben', villages['main']['members'])
 
 
 class ServerOwnedSeed(unittest.TestCase):
