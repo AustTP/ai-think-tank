@@ -1626,6 +1626,102 @@ class LibraryIngest(unittest.TestCase):
         self.assertFalse(any('node_modules' in p for p in paths))
 
 
+class DesignReferenceEndpoints(unittest.TestCase):
+    """Player-only designmind-style brief generation: /api/design-reference
+    (image upload) and /api/design-reference-url (live URL). Both write a
+    design-references/<name>.txt brief any agent can read, and both fail
+    closed for non-player callers and on bad input. Vision + screenshot seams
+    are patched so no real model call or network fetch happens."""
+
+    def _post(self, path, body, as_agent=False):
+        with unittest.mock.patch.object(serve, 'log_action', return_value=None), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True):
+            c = TestClient(serve.app)
+            headers = {}
+            if as_agent:
+                headers['X-Agent-Key'] = 'agent-secret-key'
+            return c.post(path, json=body, headers=headers)
+
+    def test_design_reference_image_upload_writes_image_and_brief(self):
+        brief_out = {'ok': True, 'brief': 'PALETTE: #111\nTYPOGRAPHY: sans\nLAYOUT: grid\nSTYLE: minimal'}
+        written = []
+        with unittest.mock.patch.object(serve, '_design_brief_from_image', return_value=brief_out), \
+             unittest.mock.patch.object(serve, '_write_file',
+                                        side_effect=lambda path, content: written.append((path, content))):
+            r = self._post('/api/design-reference',
+                           {'agentId': 'player', 'name': 'landing page', 'imageBase64': 'aGVsbG8='})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body['ok'])
+        self.assertIn('PALETTE: #111', body['text'])
+        self.assertEqual(body['briefPath'], 'design-references/landing_page.txt')
+        self.assertEqual(body['image'], 'design-references/landing_page.png')
+        # The brief text goes through _write_file; the image bytes are written
+        # directly via open() in the endpoint (binary).
+        self.assertEqual(len(written), 1)
+        self.assertIn('PALETTE: #111', written[0][1])
+
+    def test_design_reference_rejects_non_player(self):
+        with unittest.mock.patch.object(serve, '_design_brief_from_image') as brief:
+            r = self._post('/api/design-reference', {'agentId': 'cora', 'name': 'x', 'imageBase64': 'QUJD'})
+        self.assertEqual(r.status_code, 403)
+        brief.assert_not_called()
+
+    def test_design_reference_validates_input(self):
+        # '../evil' sanitizes to 'evil' (path separators stripped), so this is
+        # a valid, safe name -- the request proceeds to the vision seam.
+        with unittest.mock.patch.object(serve, '_design_brief_from_image',
+                                        return_value={'ok': True, 'brief': 'PALETTE: #000'}):
+            r = self._post('/api/design-reference', {'agentId': 'player', 'name': '../evil', 'imageBase64': 'QUJD'})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()['briefPath'], 'design-references/evil.txt')
+        r = self._post('/api/design-reference', {'agentId': 'player', 'name': '', 'imageBase64': 'QUJD'})
+        self.assertEqual(r.status_code, 400)
+        r = self._post('/api/design-reference', {'agentId': 'player', 'name': 'ok', 'imageBase64': ''})
+        self.assertEqual(r.status_code, 400)
+        r = self._post('/api/design-reference', {'agentId': 'player', 'name': 'ok', 'imageBase64': '!!!not-base64!!!'})
+        self.assertEqual(r.status_code, 400)
+
+    def test_design_reference_degrades_when_vision_fails(self):
+        with unittest.mock.patch.object(serve, '_design_brief_from_image',
+                                        return_value={'ok': False, 'note': 'vision tier missing'}):
+            r = self._post('/api/design-reference', {'agentId': 'player', 'name': 'x', 'imageBase64': 'QUJD'})
+        self.assertEqual(r.status_code, 502)
+        self.assertIn('vision tier missing', r.json()['error'])
+
+    def test_design_reference_url_writes_brief_from_live_screenshot(self):
+        brief_out = {'ok': True, 'brief': 'STYLE: bold editorial'}
+        written = []
+        with unittest.mock.patch.object(serve, '_screenshot_url_sync', return_value='U0hPVA=='), \
+             unittest.mock.patch.object(serve, '_design_brief_from_image', return_value=brief_out), \
+             unittest.mock.patch.object(serve, '_write_file',
+                                        side_effect=lambda path, content: written.append((path, content))), \
+             unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True):
+            r = self._post('/api/design-reference-url',
+                           {'agentId': 'player', 'url': 'https://example.com/page'})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body['ok'])
+        self.assertIn('STYLE: bold editorial', body['text'])
+        self.assertEqual(body['briefPath'], 'design-references/example.com.txt')
+        self.assertEqual(len(written), 1)
+
+    def test_design_reference_url_blocks_private_hosts(self):
+        with unittest.mock.patch.object(serve, '_screenshot_url_sync') as shot:
+            r = self._post('/api/design-reference-url',
+                           {'agentId': 'player', 'url': 'http://127.0.0.1:8000/admin'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('private or internal', r.json()['error'])
+        shot.assert_not_called()
+
+    def test_design_reference_url_degrades_when_screenshot_fails(self):
+        with unittest.mock.patch.object(serve, '_screenshot_url_sync', return_value=None), \
+             unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True):
+            r = self._post('/api/design-reference-url', {'agentId': 'player', 'url': 'https://example.com'})
+        self.assertEqual(r.status_code, 502)
+        self.assertIn('could not screenshot', r.json()['error'])
+
+
 class ServerOwnedSeed(unittest.TestCase):
     # Server-owned roster: no static agent names live in any JS
     # file; serve.py seeds the default roster into an empty database on first
@@ -2530,6 +2626,63 @@ class GoogleOAuth(unittest.TestCase):
         serve._GOOGLE_ACCESS_TOKEN_CACHE['at'] = 0.0
         serve._GOOGLE_ACCESS_TOKEN_CACHE['token'] = None
         self.addCleanup(lambda: serve._GOOGLE_ACCESS_TOKEN_CACHE.update({'at': 0.0, 'token': None}))
+        serve._GOOGLE_RATE_WINDOW.clear()
+        self.addCleanup(serve._GOOGLE_RATE_WINDOW.clear)
+        self._rate_limits_backup = dict(serve._GOOGLE_RATE_LIMITS)
+        self.addCleanup(lambda: serve._GOOGLE_RATE_LIMITS.update(self._rate_limits_backup))
+
+    def test_rate_guard_fails_closed_when_per_minute_budget_spent(self):
+        serve._GOOGLE_RATE_LIMITS['sheets'] = (3, 0.0)
+        now = [1000.0]
+        orig = time.monotonic
+        time.monotonic = lambda: now[0]
+        try:
+            self.assertIsNone(serve._google_rate_guard('sheets'))
+            self.assertIsNone(serve._google_rate_guard('sheets'))
+            self.assertIsNone(serve._google_rate_guard('sheets'))
+            # 4th call within the same 60s window is refused.
+            err = serve._google_rate_guard('sheets')
+            self.assertIsNotNone(err)
+            self.assertIn('rate budget spent', err)
+            self.assertIn('do not retry', err)
+            # A new minute (window slides) frees capacity.
+            now[0] += 61.0
+            self.assertIsNone(serve._google_rate_guard('sheets'))
+        finally:
+            time.monotonic = orig
+
+    def test_rate_guard_paces_min_interval(self):
+        serve._GOOGLE_RATE_LIMITS['sheets'] = (1000, 0.5)
+        t0 = time.monotonic()
+        self.assertIsNone(serve._google_rate_guard('sheets'))
+        self.assertIsNone(serve._google_rate_guard('sheets'))  # second call paced to >=0.5s
+        self.assertGreaterEqual(time.monotonic() - t0, 0.5)
+
+    def test_rate_guard_tracks_apis_separately(self):
+        serve._GOOGLE_RATE_LIMITS['calendar'] = (1, 0.0)
+        serve._GOOGLE_RATE_LIMITS['sheets'] = (1, 0.0)
+        self.assertIsNone(serve._google_rate_guard('calendar'))
+        self.assertIsNone(serve._google_rate_guard('sheets'))  # separate bucket
+        self.assertIsNotNone(serve._google_rate_guard('calendar'))
+        self.assertIsNotNone(serve._google_rate_guard('sheets'))
+
+    def test_google_api_name_maps_urls_to_rate_keys(self):
+        self.assertEqual(serve._google_api_name('https://sheets.googleapis.com/v4/spreadsheets/x/values/A1'), 'sheets')
+        self.assertEqual(serve._google_api_name('https://gmail.googleapis.com/gmail/v1/users/me/messages'), 'gmail')
+        self.assertEqual(serve._google_api_name('https://docs.googleapis.com/v1/documents/d1'), 'docs')
+        self.assertEqual(serve._google_api_name('https://www.googleapis.com/calendar/v3/calendars/primary/events'), 'calendar')
+        self.assertIsNone(serve._google_api_name('https://oauth2.googleapis.com/token'))
+
+    def test_google_call_refused_before_network_when_rate_budget_spent(self):
+        serve._GOOGLE_RATE_LIMITS['gmail'] = (1, 0.0)
+        # First call passes the guard; it fails later on the missing credential.
+        data, error = serve._google_call('GET', 'https://gmail.googleapis.com/gmail/v1/users/me/messages')
+        self.assertIsNone(data)
+        self.assertIn('not configured', error)
+        # Second call is refused by the rate guard before any token/network work.
+        data, error = serve._google_call('GET', 'https://gmail.googleapis.com/gmail/v1/users/me/messages')
+        self.assertIsNone(data)
+        self.assertIn('rate budget spent', error)
 
     def test_no_credential_fails_closed(self):
         with unittest.mock.patch.object(serve, '_open_secret', return_value=None):
@@ -2555,6 +2708,35 @@ class GoogleOAuth(unittest.TestCase):
         with unittest.mock.patch.object(serve, '_open_secret',
                                        return_value=json.dumps({'client_id': 'c', 'refresh_token': 'rt'})):
             self.assertTrue(serve._google_is_configured())
+
+    def test_safe_design_reference_name_sanitizes(self):
+        self.assertEqual(serve._safe_design_reference_name('landing page v2'), 'landing_page_v2')
+        self.assertEqual(serve._safe_design_reference_name('a/b\\c'), 'abc')
+        self.assertEqual(serve._safe_design_reference_name('  my.design  '), 'my.design')
+        self.assertIsNone(serve._safe_design_reference_name(''))
+        self.assertIsNone(serve._safe_design_reference_name('../..'))
+
+    def test_design_brief_from_image_parses_vision_reply(self):
+        with unittest.mock.patch.object(serve, '_vision_tier_slug', return_value='vision-x'), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                        return_value={'choices': [{'message': {'content': 'PALETTE: #fff'}}]}):
+            out = serve._design_brief_from_image('QUJD', 'image x')
+        self.assertTrue(out['ok'])
+        self.assertIn('PALETTE: #fff', out['brief'])
+
+    def test_design_brief_from_image_fails_gracefully_without_vision_tier(self):
+        with unittest.mock.patch.object(serve, '_vision_tier_slug', return_value=None):
+            out = serve._design_brief_from_image('QUJD', 'image x')
+        self.assertFalse(out['ok'])
+        self.assertIn('vision model tier not available', out['note'])
+
+    def test_design_brief_from_image_degrades_on_call_failure(self):
+        with unittest.mock.patch.object(serve, '_vision_tier_slug', return_value='vision-x'), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                        side_effect=RuntimeError('boom')):
+            out = serve._design_brief_from_image('QUJD', 'image x')
+        self.assertFalse(out['ok'])
+        self.assertIn('boom', out['note'])
 
     def test_real_refresh_request_shape(self):
         creds = json.dumps({'client_id': 'cid', 'client_secret': 'sec', 'refresh_token': 'rt-1'})
