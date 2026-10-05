@@ -18,8 +18,6 @@ import asyncio
 import base64
 import contextlib
 import datetime
-import email.mime.text
-import email.utils
 import hashlib
 import hmac
 import html
@@ -30,7 +28,6 @@ import re
 import random
 import secrets
 import shutil
-import smtplib
 import sqlite3
 import threading
 import subprocess
@@ -44,7 +41,7 @@ import zipfile
 
 # Pure web/text/path/security helpers extracted to their own module
 # to shrink the serve.py monolith. See web_helpers.py.
-from web_helpers import (  # noqa: E402
+from web_helpers import (  # noqa: E402,F401
     _block_link_value,
     _download_dest_rel_path,
     _extract_links,
@@ -54,6 +51,79 @@ from web_helpers import (  # noqa: E402
     _sanitize_download_filename,
     _sha256_file,
     _strip_html_to_text,
+)
+
+# ---------------------------------------------------------------------------
+# Extracted modules (see DESIGN.md). The Bank (spend ledger + budget gates),
+# player auth/sessions, and escalation/email/telegram notifications live in
+# bank.py / auth.py / notify.py and are re-exported here so
+# `serve._accrue_spend`, `serve.create_session`, `serve.create_escalation`,
+# etc. stay the stable public surface the call sites and tests use. The
+# modules reach serve.py's own state through `_serve.X` at call time (the
+# same lazy pattern sim.py and content.py use), so there is no import-time
+# cycle: by the time these functions RUN, this module is fully populated.
+from auth import (  # noqa: E402,F401
+    _LOGIN_ATTEMPT_LIMIT,
+    _check_login_rate_limit,
+    _get_or_create_admin_credentials,
+    _get_or_create_device_key,
+    _get_or_create_server_secret,
+    _hash_password,
+    _require_player_session,
+    PBKDF2_ITERATIONS,
+    SESSION_COOKIE_NAME,
+    SESSION_LIFETIME_S,
+    create_session,
+    destroy_session,
+    verify_session,
+)
+from bank import (  # noqa: E402,F401
+    DEFAULT_BUDGET_CAP_USD,
+    OPENROUTER_CREDITS_CACHE_TTL_S,
+    _OPENROUTER_CREDITS_CACHE,
+    _SPEND_CAP_BASELINE_KEY,
+    _accrue_apify_spend,
+    _accrue_colab_units,
+    _accrue_high_tier_spend,
+    _accrue_page_request,
+    _accrue_spend,
+    _apify_budget_exceeded,
+    _apify_budget_month,
+    _apify_spend_this_month,
+    _bank_budget_view,
+    _budget_cap_usd,
+    _colab_budget_exceeded,
+    _colab_budget_month,
+    _colab_spend_this_month,
+    _forecast,
+    _high_tier_budget_exceeded,
+    _high_tier_budget_month,
+    _high_tier_spend_this_month,
+    _openrouter_account_credits,
+    _page_budget_exhausted,
+    _page_budget_ledger_read,
+    _page_budget_ledger_write,
+    _page_budget_month,
+    _page_budget_used,
+    _spend_cap_period,
+    _spend_ledger_read,
+    _spend_ledger_write,
+    _think_tank_spend_cap_exceeded,
+)
+from notify import (  # noqa: E402,F401
+    GMAIL_SMTP,
+    GMAIL_SMTP_HOST,
+    GMAIL_SMTP_PORT,
+    _GMAIL_CRED_NAME,
+    _credential_token,
+    _load_escalations,
+    _save_escalations,
+    _send_escalation_email_sync,
+    _send_player_email_sync,
+    create_escalation,
+    provision_player_email,
+    send_player_email_sync,
+    send_player_telegram_sync,
 )
 
 # Optional, real dependencies for document ingestion (/api/library/ingest,
@@ -767,303 +837,12 @@ def save_state_to_db(data):
 # per-service fixed-$ figures; the ledger is just state accrued over time.
 # Budget is deliberately recorded, not enforced: enforcement is the directors'
 # job, not the ledger's.
+#
+# Implemented in bank.py (extracted 2026-10-05) and re-exported at the top of
+# this file; the constants BELOW are the env-derived caps this file still owns,
+# while the ledger/budget/forecast functions live in world/bank.py and read
+# them through `serve.` at call time.
 # ---------------------------------------------------------------------------
-DEFAULT_BUDGET_CAP_USD = 50.0
-
-
-def _budget_cap_usd(service, products=None):
-    """A service's fixed $ cap. A per-product cap (budgetCapUsd) on the product
-    record wins when the service names a product; productIds and names both
-    match. Everything else -- the __general__ / __player_ask__ / __jev__ lanes
-    and any product without an explicit cap -- falls back to the default. The
-    cumulative cap is the sum of each service's cap (its product cap if pinned
-    else the default), which is the cleanest stand-in for "how much is the
-    whole think tank allowed to spend before directors must re-budget."""
-    if not isinstance(service, str):
-        return DEFAULT_BUDGET_CAP_USD
-    if service == COLAB_LEDGER_KEY:
-        # Compute-UNIT budget (not USD) -- the generic ledger row would
-        # otherwise show the $ default cap against a units number. Constants
-        # are defined later in this module; resolved at call time.
-        return float(COLAB_MONTHLY_UNITS)
-    products = products or []
-    for p in products:
-        if p.get('id') == service or p.get('name') == service:
-            cap = p.get('budgetCapUsd')
-            if isinstance(cap, (int, float)) and cap > 0:
-                return float(cap)
-            break
-    return DEFAULT_BUDGET_CAP_USD
-
-
-def _accrue_spend(service, cost):
-    """Accrue a single model call's cost to a service's ledger bucket. The whole
-    point is that accrual happens exactly once per model call, at the choke
-    point, so whatever the ledger shows is exactly what the think tank has spent."""
-    if not isinstance(cost, (int, float)) or not cost:
-        return  # no usage.cost reported -- nothing to record
-    cost = float(cost)
-    try:
-        ledger = _spend_ledger_read()
-        bucket = ledger.setdefault(service, {'used': 0.0, 'calls': 0})
-        bucket['used'] = float(bucket.get('used', 0) or 0) + cost
-        bucket['calls'] = int(bucket.get('calls', 0) or 0) + 1
-        now = datetime.datetime.now(datetime.timezone.utc)
-        bucket['lastAt'] = now.isoformat()
-        # Daily series for the burn-rate forecast. Keyed by UTC date so the
-        # trailing-7-day rate stays cheap and monotonic across process restarts.
-        series = bucket.setdefault('byDay', {})
-        day = now.strftime('%Y-%m-%d')
-        series[day] = float(series.get(day, 0) or 0) + cost
-        _spend_ledger_write(ledger)
-    except Exception:
-        # Spend accounting must never take the think tank down: a failed read or
-        # write just means this call's cost isn't reflected in the ledger.
-        pass
-
-
-def _spend_ledger_read():
-    """Read the spend ledger from its own kv_spend row. Never the whole-think tank
-    blob -- see the kv_spend DDL comment for why accounting is independent."""
-    try:
-        with _db() as conn:
-            conn.execute('''CREATE TABLE IF NOT EXISTS kv_spend (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                blob TEXT NOT NULL,
-                updated_at REAL NOT NULL
-            )''')
-            row = conn.execute('SELECT blob FROM kv_spend WHERE id = 1').fetchone()
-            return json.loads(row[0]) if row else {}
-    except Exception:
-        return {}
-
-
-def _spend_ledger_write(ledger):
-    with _db() as conn:
-        conn.execute(
-            'INSERT INTO kv_spend (id, blob, updated_at) VALUES (1, ?, ?) '
-            'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
-            (json.dumps(ledger), time.time()),
-        )
-
-
-_SPEND_CAP_BASELINE_KEY = '__spend_cap_baseline__'
-
-
-def _spend_cap_period():
-    """The current UTC month window for the spend cap, e.g. '2026-10'. The
-    cap is a MONTHLY budget: at each month boundary the baseline rolls
-    forward to the current ledger total, so only spend accrued WITHIN the
-    current month counts against SPEND_CAP_USD. Rollover happens lazily on
-    the first check of a new month, so there is no timer to drift or die
-    with a restart."""
-    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
-
-
-def _think_tank_spend_cap_exceeded():
-    """Hard, absolute MONTHLY spend-cap check -- called at the top of EVERY
-    real money-spending chokepoint (_call_openrouter_sync, _post_openrouter_raw,
-    _call_openrouter_decision_sync), before any network call. Disabled
-    (returns False) when SPEND_CAP_USD is explicitly 0. The baseline (a
-    reserved key in the same ledger row) is per-month: on the first real check
-    in a month the CURRENT total ledger spend is stored as that month's
-    baseline, so spend from previous months is never counted -- only what
-    accrues within the current month counts against the monthly budget. The
-    rollover is lazy (first check of the new month) and the period rides the
-    real ledger, so it survives restarts. Deliberately a plain function with
-    no bypass/override path from inside the think tank -- see SPEND_CAP_USD's
-    own comment for why."""
-    if not SPEND_CAP_USD:
-        return False
-    ledger = _spend_ledger_read()
-    # The spend cap is a USD ceiling on real money, so only dollar-
-    # denominated service buckets count. COLAB_LEDGER_KEY carries Colab
-    # COMPUTE UNITS, not dollars -- it has its own budget gate
-    # (COLAB_MONTHLY_UNITS) and its own Bank row, so counting it here
-    # would trip the USD cap on a currency that isn't money (a single T4
-    # run accruing ~4 units looked like $4 of spend and failed every
-    # classifier call closed).
-    excluded = {_SPEND_CAP_BASELINE_KEY, COLAB_LEDGER_KEY}
-    total = sum(float(v.get('used') or 0) for k, v in ledger.items()
-               if k not in excluded and isinstance(v, dict))
-    period = _spend_cap_period()
-    rec = ledger.get(_SPEND_CAP_BASELINE_KEY)
-    # Legacy migration: the old format stored a bare float (the baseline at
-    # install time). Adopt it as this month's baseline so pre-existing
-    # historical spend still never counts -- same guarantee, same month.
-    if not isinstance(rec, dict):
-        baseline = rec if isinstance(rec, (int, float)) else total
-        ledger[_SPEND_CAP_BASELINE_KEY] = {'period': period, 'baseline': baseline}
-        _spend_ledger_write(ledger)
-        return False
-    if rec.get('period') != period:
-        # New month: roll the baseline forward to the current total so only
-        # this month's accrual counts against the monthly budget.
-        ledger[_SPEND_CAP_BASELINE_KEY] = {'period': period, 'baseline': total}
-        _spend_ledger_write(ledger)
-        return False
-    baseline = rec.get('baseline')
-    if not isinstance(baseline, (int, float)):
-        ledger[_SPEND_CAP_BASELINE_KEY] = {'period': period, 'baseline': total}
-        _spend_ledger_write(ledger)
-        return False
-    return (total - baseline) >= SPEND_CAP_USD
-
-
-def _bank_budget_view(snapshot):
-    """Snap the spend ledger + per-service caps into a director-facing view:
-       used / cap / left / a forecast (trailing-7-day burn rate projected to
-       when the cap is hit) for every service that has spent anything, plus a
-       cumulative row across all services so directors can see the whole
-       think tank and not exceed cumulatively. Pure read -- never mutates state.
-       Forecast uses real wall-clock spend (real money, real calls). The ledger
-       comes from its own kv_spend row; `snapshot` (the whole-think tank state)
-       contributes only the product records the caps are read from."""
-    products = (snapshot.get('products') or {}).values() if isinstance(snapshot.get('products'), dict) \
-        else (snapshot.get('products') or [])
-    products = list(products)
-    services = {}
-    for svc, bucket in (_spend_ledger_read() or {}).items():
-        if svc == _SPEND_CAP_BASELINE_KEY or not isinstance(bucket, dict):
-            continue  # the spend-cap baseline is a reserved float, not a service bucket
-        used = float(bucket.get('used', 0) or 0)
-        cap = _budget_cap_usd(svc, products)
-        service_row = {
-            'service': svc,
-            'used': round(used, 6),
-            'cap': cap,
-            'left': round(max(0.0, cap - used), 6),
-            'over': used > cap,
-            'calls': int(bucket.get('calls', 0) or 0),
-            'lastAt': bucket.get('lastAt'),
-            'burnPerDay': 0.0,
-            'daysLeft': None,
-        }
-        service_row['burnPerDay'], service_row['daysLeft'] = _forecast(bucket, cap)
-        services[svc] = service_row
-    # A director-set budget (e.g. DigitalOcean's
-    # $25/mo cap) should be visible to a teller from the moment it's set, not
-    # only after the service's first real charge lands in the ledger -- a cap
-    # nobody can see until it's already being spent against isn't much of a
-    # budget. Seed a zero-usage row for any product that names an explicit cap
-    # and hasn't accrued anything yet.
-    for p in products:
-        svc = p.get('id') or p.get('name')
-        cap = p.get('budgetCapUsd')
-        if not svc or svc in services or not isinstance(cap, (int, float)) or cap <= 0:
-            continue
-        services[svc] = {
-            'service': svc, 'used': 0.0, 'cap': float(cap), 'left': float(cap),
-            'over': False, 'calls': 0, 'lastAt': None,
-            'burnPerDay': 0.0, 'daysLeft': None,
-        }
-    # Apify FREE-plan monthly budget: same "visible from day
-    # one" rule -- the $5/month cap is real (enforced by the plan, not just a
-    # think tank convention), so it belongs in the Bank even before the first
-    # actor run accrues anything. Only when the account is actually configured
-    # (APIFY_API_KEY) AND the budget is enabled (APIFY_MONTHLY_BUDGET_USD > 0)
-    # -- a clone without an Apify account sees no phantom row, mirroring how
-    # the OpenRouter reconcile line is omitted without a key.
-    if APIFY_API_KEY and APIFY_MONTHLY_BUDGET_USD > 0 \
-            and APIFY_LEDGER_KEY not in services:
-        services[APIFY_LEDGER_KEY] = {
-            'service': APIFY_LEDGER_KEY,
-            'used': 0.0, 'cap': float(APIFY_MONTHLY_BUDGET_USD),
-            'left': float(APIFY_MONTHLY_BUDGET_USD), 'over': False,
-            'calls': 0, 'lastAt': None, 'burnPerDay': 0.0, 'daysLeft': None,
-        }
-    # Colab agent compute: same "visible from day one" rule -- a
-    # GPU session burns the account's compute units fast, so the cap belongs
-    # in the Bank before the first run_on_colab run. Shown only when the
-    # colab CLI actually exists on this machine (the think tank's lever) and the
-    # budget is enabled (>0); a clone without the CLI sees no phantom row.
-    if COLAB_CLI_AVAILABLE and COLAB_MONTHLY_UNITS > 0 \
-            and COLAB_LEDGER_KEY not in services:
-        _used = _colab_spend_this_month()
-        _usage = _colab_account_usage()
-        services[COLAB_LEDGER_KEY] = {
-            'service': COLAB_LEDGER_KEY,
-            'used': round(_used, 3), 'cap': float(COLAB_MONTHLY_UNITS),
-            'left': round(max(0.0, COLAB_MONTHLY_UNITS - _used), 3),
-            'over': _used > COLAB_MONTHLY_UNITS,
-            'calls': 0, 'lastAt': None, 'burnPerDay': 0.0, 'daysLeft': None,
-            'balance_units': None if _usage is None else round(_usage['balance'], 3),
-        }
-    return services
-
-
-def _forecast(bucket, cap):
-    """Return (daily_burn, days_until_cap_at_that_rate). daily burn is the last
-    7 UTC days' spend / the number of days actually present in that window (not
-    a hard 7 -- a fresh ledger with two days of spend is burning fast, and
-    dividing by 7 would hide it); daysLeft is None when there's no signal (no
-    series, zero burn, or already over -- you're not forecasting your way out
-    of an overrun, you're re-budgeting). Cheap integer-date bucketing, no
-    timezone wrangling: days older than 7 fall out of a rolling window
-    naturally."""
-    used = float(bucket.get('used', 0) or 0)
-    by_day = bucket.get('byDay') or {}
-    if not by_day or used <= 0:
-        return 0.0, None
-    today = datetime.date.today()
-    window = 0.0
-    days_present = 0
-    for day_str, amt in by_day.items():
-        try:
-            day = datetime.date.fromisoformat(day_str)
-        except (ValueError, TypeError):
-            continue
-        if (today - day).days <= 7:
-            window += float(amt or 0)
-            days_present += 1
-    if not days_present:
-        return 0.0, None
-    burn = window / days_present
-    if burn <= 0 or used >= cap:
-        return round(burn, 6), None
-    left = cap - used
-    return round(burn, 6), max(0.0, left / burn)
-
-
-# The Bank's per-service ledger tracks the
-# think tank's OWN attributed spend, but that's a different number from what
-# OpenRouter itself says the account has left -- the real account can also
-# carry usage from outside the think tank (or a manually top-up), so the two
-# numbers can legitimately diverge. Directors should see BOTH, not just the
-# think tank's internal accounting, which is exactly the reconciliation
-# BURN-IN.md's Phase 4 flags as unverified. Cached briefly so a director
-# stepping up to a teller doesn't trigger a live network call every time.
-_OPENROUTER_CREDITS_CACHE = {'at': 0.0, 'data': None}
-OPENROUTER_CREDITS_CACHE_TTL_S = 300
-
-
-def _openrouter_account_credits():
-    """Live GET https://openrouter.ai/api/v1/credits -- real total_credits
-    (purchased) and total_usage (spent), account-wide (not the think tank's own
-    per-service ledger). Returns None on any failure (no key, network, bad
-    response) so the Bank teller can fail closed and just omit this line
-    rather than ever showing stale or fabricated numbers."""
-    if not OPENROUTER_API_KEY:
-        return None
-    now = time.time()
-    cached = _OPENROUTER_CREDITS_CACHE
-    if cached['data'] is not None and (now - cached['at']) < OPENROUTER_CREDITS_CACHE_TTL_S:
-        return cached['data']
-    try:
-        req = urllib.request.Request(
-            'https://openrouter.ai/api/v1/credits',
-            headers={'Authorization': f'Bearer {OPENROUTER_API_KEY}'})
-        with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 -- fixed OpenRouter API host
-            data = json.loads(resp.read().decode('utf-8', errors='replace')).get('data') or {}
-        total_credits = float(data.get('total_credits') or 0)
-        total_usage = float(data.get('total_usage') or 0)
-        result = {'totalCredits': total_credits, 'totalUsage': total_usage,
-                  'remaining': max(0.0, total_credits - total_usage)}
-        cached['at'] = now
-        cached['data'] = result
-        return result
-    except Exception:
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -4028,20 +3807,6 @@ def _higgsfield_configured():
     return bool(HIGGSFIELD_API_KEY_ID and HIGGSFIELD_API_KEY_SECRET)
 
 
-def _get_or_create_server_secret():
-    # NOT the access gate anymore (see the real login/session system
-    # below) -- this is now purely an internal cryptographic secret
-    # (HMAC key for the boundary markers, _BOUNDARY_SECRET). Kept under
-    # its own name so it's not confused with something a browser or an
-    # API caller should ever hold.
-    env_path = os.path.join(THINK_TANK_DIR, '.env')
-    env = _load_env()
-    if env.get('SERVER_SECRET'):
-        return env['SERVER_SECRET']
-    key = secrets.token_hex(32)
-    with open(env_path, 'a') as f:
-        f.write(f'\nSERVER_SECRET={key}\n')
-    return key
 
 
 SERVER_ACCESS_KEY = _get_or_create_server_secret()
@@ -4057,109 +3822,27 @@ SERVER_ACCESS_KEY = _get_or_create_server_secret()
 # session whose id is the only thing the browser ever holds, as an
 # HttpOnly cookie -- unlike the old key, page JS (and so an XSS bug)
 # can't read it at all.
-SESSION_COOKIE_NAME = 'ai_think_tank_session'
-SESSION_LIFETIME_S = 7 * 24 * 3600
-PBKDF2_ITERATIONS = 200_000
+#
+# Credential creation, hashing, the session cookie constants, and login
+# rate limiting live in auth.py (extracted 2026-10-05) and are reached
+# through `serve.` at call time. The three assignments below are the only
+# auth code that stays here: they RUN at import time, storing each secret
+# in ~/ai-think-tank/.env on first boot and exposing the loaded values.
+ADMIN_USERNAME, ADMIN_PASSWORD_SALT, ADMIN_PASSWORD_HASH, _GENERATED_PASSWORD = _get_or_create_admin_credentials()
 
 
-def _hash_password(password, salt=None):
-    salt = salt or secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), PBKDF2_ITERATIONS).hex()
-    return salt, digest
 
 
-def _get_or_create_admin_credentials():
-    # First run: generate a real random password (not a placeholder you'd
-    # forget to change), store only its salted hash, and print the
-    # PLAINTEXT once -- the only time it's ever available in the clear.
-    # Same "auto-generate, persist, surface once" shape as every other
-    # secret the server creates, applied to something that now actually
-    # gates a real login instead of being embedded in every page load.
-    env_path = os.path.join(THINK_TANK_DIR, '.env')
-    env = _load_env()
-    username = env.get('ADMIN_USERNAME', 'admin')
-    if env.get('ADMIN_PASSWORD_SALT') and env.get('ADMIN_PASSWORD_HASH'):
-        return username, env['ADMIN_PASSWORD_SALT'], env['ADMIN_PASSWORD_HASH'], None
-    password = secrets.token_urlsafe(12)
-    salt, digest = _hash_password(password)
-    with open(env_path, 'a') as f:
-        f.write(f'\nADMIN_USERNAME={username}\nADMIN_PASSWORD_SALT={salt}\nADMIN_PASSWORD_HASH={digest}\n')
-    return username, salt, digest, password
 
 
 ADMIN_USERNAME, ADMIN_PASSWORD_SALT, ADMIN_PASSWORD_HASH, _GENERATED_PASSWORD = _get_or_create_admin_credentials()
 
 
-def _get_or_create_device_key():
-    # A device (an iOS Shortcut, to start) that
-    # isn't a player browser session (no cookie support) and isn't an AI
-    # agent (agent_keys are per-agent, not per-device) needs its own bearer
-    # credential. One player, one phone today -- a single token, not a
-    # per-device table; that's real complexity for a need that doesn't exist
-    # yet. Same "auto-generate, persist, surface once" shape as the admin
-    # password above, but compared directly (secrets.compare_digest) like
-    # agent_keys/TELEGRAM_BOT_TOKEN, not hashed -- this is a bearer token
-    # presented on every request, not a human-typed password.
-    env = _load_env()
-    key = env.get('DEVICE_API_KEY')
-    if key:
-        return key, None
-    key = secrets.token_urlsafe(24)
-    with open(os.path.join(THINK_TANK_DIR, '.env'), 'a') as f:
-        f.write(f'\nDEVICE_API_KEY={key}\n')
-    return key, key  # second value set only when freshly generated -- print it once
 
 
 DEVICE_API_KEY, _GENERATED_DEVICE_KEY = _get_or_create_device_key()
 
 
-def create_session():
-    session_id = secrets.token_urlsafe(32)
-    now = time.time()
-    with _db() as conn:
-        conn.execute('INSERT INTO sessions (session_id, created_at, expires_at) VALUES (?, ?, ?)',
-                     (session_id, now, now + SESSION_LIFETIME_S))
-    return session_id
-
-
-def verify_session(session_id):
-    if not session_id:
-        return False
-    with _db() as conn:
-        row = conn.execute('SELECT expires_at FROM sessions WHERE session_id = ?', (session_id,)).fetchone()
-    return bool(row and row[0] > time.time())
-
-
-def _require_player_session(request):
-    """Player-only gate for the /api/intent/* write surface (and the team
-    prefix endpoint). The AUTH_PROTECTED_PREFIXES middleware accepts EITHER a
-    real session OR a valid agent key (server content executors loopback with
-    only a key), but these handlers are the PLAYER's controls -- they hardcode
-    actor 'player', and a valid agent key must not let an agent create or close
-    a sprint, trigger a publish push, release a product, veto a story, promote
-    a spike, or file new work as the player. A session is the only credential
-    that satisfies them. Fail closed (False) on anything else."""
-    return verify_session(request.cookies.get(SESSION_COOKIE_NAME))
-
-
-def destroy_session(session_id):
-    with _db() as conn:
-        conn.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
-
-
-_LOGIN_ATTEMPT_LIMIT_WINDOW_S = 300
-_LOGIN_ATTEMPT_LIMIT = 10
-_login_attempts: dict[str, list[float]] = {}  # ip -> [timestamps within the current window]
-
-
-def _check_login_rate_limit(ip):
-    now = time.time()
-    attempts = _login_attempts.setdefault(ip, [])
-    attempts[:] = [t for t in attempts if now - t < _LOGIN_ATTEMPT_LIMIT_WINDOW_S]
-    if len(attempts) >= _LOGIN_ATTEMPT_LIMIT:
-        return False
-    attempts.append(now)
-    return True
 
 # Kill switch for agent internet access -- this needs to be
 # something you can flip off in one place without touching code, same
@@ -4206,75 +3889,6 @@ PAGE_REQUEST_LEDGER_KEY = '__page_budget__'
 PAGE_REQUEST_BUDGET_START_KEY = '__page_budget_start__'
 
 
-def _page_budget_ledger_read():
-    """Read the page-request ledger from its own kv_pagebudget row (independent
-    of the whole-think tank blob -- same accounting-isolation reason as kv_spend)."""
-    try:
-        with _db() as conn:
-            conn.execute('''CREATE TABLE IF NOT EXISTS kv_pagebudget (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                blob TEXT NOT NULL,
-                updated_at REAL NOT NULL
-            )''')
-            row = conn.execute('SELECT blob FROM kv_pagebudget WHERE id = 1').fetchone()
-            return json.loads(row[0]) if row else {}
-    except Exception:
-        return {}
-
-
-def _page_budget_ledger_write(ledger):
-    try:
-        with _db() as conn:
-            conn.execute(
-                'INSERT INTO kv_pagebudget (id, blob, updated_at) VALUES (1, ?, ?) '
-                'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
-                (json.dumps(ledger), time.time()),
-            )
-    except Exception:
-        pass
-
-
-def _page_budget_month():
-    """The current UTC calendar month as a sortable string (2026-09) -- the
-    rollover key: a fresh month starts a new 1000-request allowance."""
-    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
-
-
-def _page_budget_used(now=None):
-    """How many page requests have been consumed this calendar month."""
-    ledger = _page_budget_ledger_read()
-    month = _page_budget_month()
-    bucket = ledger.get(month) or {}
-    return int(bucket.get('used', 0) or 0)
-
-
-def _page_budget_exhausted():
-    """True when the monthly page-request allowance is spent (no more external
-    fetches may be made). Never true when the budget is disabled (0/unset)."""
-    if not PAGE_REQUEST_MONTHLY_BUDGET:
-        return False
-    return _page_budget_used() >= PAGE_REQUEST_MONTHLY_BUDGET
-
-
-def _accrue_page_request():
-    """Record ONE external page request (browse fetch or search_web call) against
-    this month's budget. Best-effort like _accrue_spend: a ledger failure must
-    never break the actual fetch. Returns True if the request was within budget
-    (recorded), False if the month's allowance is exhausted."""
-    if _page_budget_exhausted():
-        return False
-    try:
-        ledger = _page_budget_ledger_read()
-        month = _page_budget_month()
-        bucket = ledger.setdefault(month, {'used': 0})
-        bucket['used'] = int(bucket.get('used', 0) or 0) + 1
-        ledger[PAGE_REQUEST_LEDGER_KEY] = month
-        if PAGE_REQUEST_BUDGET_START_KEY not in ledger:
-            ledger[PAGE_REQUEST_BUDGET_START_KEY] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        _page_budget_ledger_write(ledger)
-    except Exception:
-        pass  # accounting never breaks a real fetch
-    return True
 
 # HIGH-tier spend cap: the high tier is the expensive one (a
 # stronger model for high-stakes planning), and the player wants its USE kept
@@ -4421,50 +4035,6 @@ def _ttc_self_verify(model, messages, best_of, max_tokens, drafts=None, service=
     return chosen if chosen else drafts[0]
 
 
-def _high_tier_budget_month():
-    """The current UTC calendar month (2026-09) -- the rollover key: a fresh
-    month resets the high-tier allowance."""
-    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
-
-
-def _high_tier_spend_this_month():
-    """Total high-tier model spend this calendar month (USD)."""
-    try:
-        ledger = _spend_ledger_read()
-        bucket = ledger.get(HIGH_TIER_LEDGER_KEY) or {}
-        series = bucket.get('byMonth') or {}
-        return float(series.get(_high_tier_budget_month(), 0) or 0)
-    except Exception:
-        return 0.0
-
-
-def _high_tier_budget_exceeded():
-    """True when the high tier has consumed its monthly budget (no more
-    high-tier calls allowed unless the cap is raised / the month rolls over).
-    Never true when the cap is disabled (0/unset)."""
-    if not HIGH_TIER_MONTHLY_BUDGET_USD:
-        return False
-    return _high_tier_spend_this_month() >= HIGH_TIER_MONTHLY_BUDGET_USD
-
-
-def _accrue_high_tier_spend(cost):
-    """Accrue a high-tier model call's cost against the monthly high-tier
-    budget. Best-effort like _accrue_spend: an accounting failure must never
-    break the actual call. Uses the SAME kv_spend ledger as _accrue_spend (so
-    the bank sees it) but a reserved bucket + monthly series keyed by month."""
-    if not isinstance(cost, (int, float)) or not cost:
-        return
-    try:
-        ledger = _spend_ledger_read()
-        bucket = ledger.setdefault(HIGH_TIER_LEDGER_KEY, {'used': 0.0, 'calls': 0, 'byMonth': {}})
-        cost = float(cost)
-        bucket['used'] = float(bucket.get('used', 0) or 0) + cost
-        bucket['calls'] = int(bucket.get('calls', 0) or 0) + 1
-        month = _high_tier_budget_month()
-        bucket['byMonth'][month] = float((bucket['byMonth'] or {}).get(month, 0) or 0) + cost
-        _spend_ledger_write(ledger)
-    except Exception:
-        pass  # accounting never blocks a real call
 
 
 # Apify FREE-plan monthly budget: the player's Apify account is on
@@ -4487,51 +4057,6 @@ _APIFY_USAGE_CACHE = {'at': 0.0, 'data': None}
 _APIFY_USAGE_CACHE_TTL_S = 60
 
 
-def _apify_budget_month():
-    """The current UTC calendar month (2026-09) -- the rollover key: a fresh
-    month resets the Apify allowance."""
-    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
-
-
-def _apify_spend_this_month():
-    """Total Apify spend accrued this calendar month (USD)."""
-    try:
-        ledger = _spend_ledger_read()
-        bucket = ledger.get(APIFY_LEDGER_KEY) or {}
-        series = bucket.get('byMonth') or {}
-        return float(series.get(_apify_budget_month(), 0) or 0)
-    except Exception:
-        return 0.0
-
-
-def _apify_budget_exceeded():
-    """True when the Apify account's monthly allowance is spent. Never true
-    when the budget is disabled (0/unset)."""
-    if not APIFY_MONTHLY_BUDGET_USD:
-        return False
-    return _apify_spend_this_month() >= APIFY_MONTHLY_BUDGET_USD
-
-
-def _accrue_apify_spend(cost):
-    """Accrue an Apify actor run's real cost against the monthly budget.
-    Best-effort like _accrue_spend: an accounting failure must never break the
-    actual run. Uses the same kv_spend ledger so the Bank sees it, under the
-    reserved __apify__ bucket with a monthly series keyed by month."""
-    if not isinstance(cost, (int, float)) or not cost:
-        return
-    try:
-        ledger = _spend_ledger_read()
-        bucket = ledger.setdefault(
-            APIFY_LEDGER_KEY, {'used': 0.0, 'calls': 0, 'byMonth': {}})
-        cost = float(cost)
-        bucket['used'] = float(bucket.get('used', 0) or 0) + cost
-        bucket['calls'] = int(bucket.get('calls', 0) or 0) + 1
-        month = _apify_budget_month()
-        bucket['byMonth'][month] = \
-            float((bucket['byMonth'] or {}).get(month, 0) or 0) + cost
-        _spend_ledger_write(ledger)
-    except Exception:
-        pass  # accounting never blocks a real run
 
 
 def _apify_account_usage():
@@ -4955,163 +4480,6 @@ ESCALATION_BASE_URL = _load_env().get('ESCALATION_BASE_URL', 'http://localhost:8
 TELEGRAM_BOT_TOKEN = _load_env().get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_ALLOWED_CHAT_IDS = {c.strip() for c in (_load_env().get('TELEGRAM_ALLOWED_CHAT_IDS') or '').split(',') if c.strip()}
 TELEGRAM_POLL_TIMEOUT_S = 25
-
-
-def _load_escalations():
-    if os.path.exists(ESCALATIONS_PATH):
-        with open(ESCALATIONS_PATH) as f:
-            return json.load(f)
-    return {}
-
-
-def _save_escalations(data):
-    with open(ESCALATIONS_PATH, 'w') as f:
-        json.dump(data, f, indent=2)
-
-
-def _send_escalation_email_sync(subject, body_text):
-    # Best-effort -- an admin decision this needs shouldn't hang forever
-    # because email isn't configured yet. Logged either way so a missing
-    # SMTP setup is visible in the server's own stdout, not silently
-    # swallowed.
-    if not (ESCALATION_EMAIL_TO and SMTP_HOST and SMTP_USER and SMTP_PASSWORD):
-        print(f'[escalation] SMTP not configured -- would have sent: {subject}')
-        return False
-    msg = email.mime.text.MIMEText(body_text)
-    msg['Subject'] = subject
-    msg['From'] = SMTP_USER
-    msg['To'] = ESCALATION_EMAIL_TO
-    try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.send_message(msg)
-        return True
-    except Exception as e:
-        print(f'[escalation] send failed: {e}')
-        return False
-
-
-# ---------------------------------------------------------------------------
-# Player notification email. One-way SMTP to the player's real
-# address via a Gmail app-password held in the encrypted vault (credential name
-# `gmail_smtp`), NOT a capability handle -- this is the think tank's own outbound
-# channel, not an agent-delegated grant. The FROM/TO are the same player
-# address; only the app-password is secret. Mirrors the escalation sender's
-# fail-closed shape (never raise into the sim loop).
-# ---------------------------------------------------------------------------
-GMAIL_SMTP = os.environ.get('AI_THINK_TANK_GMAIL_SMTP_EMAIL') or 'austtp25@gmail.com'
-GMAIL_SMTP_HOST = os.environ.get('AI_THINK_TANK_GMAIL_SMTP_HOST') or 'smtp.gmail.com'
-GMAIL_SMTP_PORT = int(os.environ.get('AI_THINK_TANK_GMAIL_SMTP_PORT', '587'))
-_GMAIL_CRED_NAME = 'gmail_smtp'
-
-
-def _credential_token(name):
-    with _db() as conn:
-        row = conn.execute('SELECT encrypted_value FROM external_credentials WHERE name = ?',
-                           (name,)).fetchone()
-        return row[0] if row else None
-
-
-def _send_player_email_sync(subject, body_text):
-    """Send one notification email to the player. Fail-closed and best-effort:
-    returns True on success, False (after logging) when no credential is
-    provisioned or SMTP fails. Must NEVER raise -- it's called from the sim loop
-    drain and a raised exception would propagate into the think tank tick."""
-    if not PLAYER_EMAIL_ENABLED:
-        return False
-    token = None
-    try:
-        token = _credential_token(_GMAIL_CRED_NAME)
-    except Exception as e:
-        print(f'[email] credential lookup failed: {e}')
-        return False
-    if not token:
-        print(f'[email] no {_GMAIL_CRED_NAME} credential provisioned -- not sending: {subject}')
-        return False
-    app_password = _open_secret(token)
-    if not app_password:
-        print(f'[email] {_GMAIL_CRED_NAME} credential present but undecryptable -- not sending: {subject}')
-        return False
-    msg = email.mime.text.MIMEText((body_text or '').strip() or '(no body)')
-    msg['Subject'] = subject
-    msg['From'] = GMAIL_SMTP
-    msg['To'] = GMAIL_SMTP
-    try:
-        with smtplib.SMTP(GMAIL_SMTP_HOST, GMAIL_SMTP_PORT, timeout=15) as server:
-            server.starttls()
-            server.login(GMAIL_SMTP, app_password)
-            server.send_message(msg)
-        return True
-    except Exception as e:
-        print(f'[email] send failed: {e}')
-        return False
-
-
-def send_player_email_sync(subject, body_text):
-    """Public alias the pure sim loop drain calls. Sim.py late-imports this so
-    the sim stays pure; serve owns all networking + credentials."""
-    return _send_player_email_sync(subject, body_text)
-
-
-def send_player_telegram_sync(subject, body_text):
-    """The think tank was reactive-only on Telegram --
-    it could reply to an incoming message but never push anything on its own,
-    so a spike/story finishing generated no notice on either channel unless
-    it happened to be one of the two existing email triggers (agent_ask,
-    card_blocked). This is the proactive half: same outbox entry, same
-    dedup/drain mechanism as send_player_email_sync (sim.py's
-    _drain_email_outbox_sync calls both for every entry), just a second
-    best-effort delivery channel. No-op (returns False, never raises) if the
-    bridge isn't configured -- mirrors every other optional-integration gate
-    in this file (AGENT_BROWSING_ENABLED, TAVILY_API_KEY). Telegram has no
-    separate subject line, so it's folded into the message text."""
-    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS):
-        return False
-    text = f"{subject}\n\n{body_text}" if subject else body_text
-    ok = False
-    for chat_id in TELEGRAM_ALLOWED_CHAT_IDS:
-        try:
-            result = _telegram_api_sync('sendMessage', {'chat_id': chat_id, 'text': text})
-        except Exception as e:
-            print(f'[telegram] player push failed for {chat_id}: {e}', flush=True)
-            result = None
-        ok = ok or (result is not None)
-    return ok
-
-
-def provision_player_email(app_password):
-    """Admin endpoint body: validate + store the Gmail app-password in the vault,
-    then fire a self-test so provisioning is verified, not assumed. Returns a
-    dict {ok, test_ok, error?} -- never returns or logs the password."""
-    pw = (app_password or '').strip()
-    if not _looks_like_gmail_app_password(pw):
-        return {'ok': False, 'error': 'not a valid Gmail app-password (16 chars, 4 groups of 4, no spaces)'}
-    _store_credential(_GMAIL_CRED_NAME, 'Gmail SMTP (player notifications)', pw)
-    test_ok = _send_player_email_sync('[AI Think Tank] Email configured',
-                                      'Your AI Think Tank is now emailing you on action-needed events.')
-    return {'ok': True, 'test_ok': bool(test_ok)}
-
-
-def create_escalation(kind, question, on_approve_note='', what_checked='', look_first=''):
-    # A random unguessable token per escalation, not just the record id --
-    # the resolve link needs to not be trivially enumerable (id alone
-    # would be sequential and guessable).
-    escalations = _load_escalations()
-    esc_id = 'esc-' + secrets.token_hex(4)
-    token = secrets.token_urlsafe(24)
-    escalations[esc_id] = {'kind': kind, 'question': question, 'status': 'pending', 'token': token, 'ts': time.time(), 'note': on_approve_note, 'whatChecked': what_checked, 'lookFirst': look_first}
-    _save_escalations(escalations)
-
-    approve_url = f'{ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=approve'
-    deny_url = f'{ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=deny'
-    body = (f'{question}\n\n'
-            f'What I checked: {what_checked or "(see question)"}\n'
-            f'Look here first: {look_first or "the question above"}\n\n'
-            f'Approve: {approve_url}\n\n'
-            f'Deny: {deny_url}')
-    _send_escalation_email_sync(f'[AI Think Tank] Needs your call: {kind}', body)
-    return esc_id
 
 
 def _load_failures():
@@ -6747,67 +6115,6 @@ _COLAB_COMPUTE_LAST_USED = 0.0
 _COLAB_COMPUTE_LOCK = threading.Lock()
 
 
-def _colab_budget_month():
-    """The current UTC calendar month (2026-09) -- the rollover key: a fresh
-    month resets the Colab compute-unit allowance."""
-    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
-
-
-def _colab_spend_this_month():
-    """Compute units accrued this calendar month (NOT USD -- the Bank row for
-    this service reads units against the COLAB_MONTHLY_UNITS cap)."""
-    try:
-        ledger = _spend_ledger_read()
-        bucket = ledger.get(COLAB_LEDGER_KEY) or {}
-        series = bucket.get('byMonth') or {}
-        return float(series.get(_colab_budget_month(), 0) or 0)
-    except Exception:
-        return 0.0
-
-
-def _colab_budget_exceeded():
-    """True when Colab compute should refuse a new run:
-      * the operator's think tank cap is spent (COLAB_MONTHLY_UNITS > 0 -- Google
-        publishes no fixed quota, so this is a self-imposed convention, not a
-        real contract);
-      * OR, on a NON-free account only, `colab usage` reports the real prepaid
-        balance is exhausted (0 or negative).
-    On the free tier (COLAB_FREE_TIER=1) the real balance is NOT a gate: free
-    tier has no prepaid wallet, `colab usage` will typically report 0.00, and
-    Google enforces free-tier limits dynamically (session length, idle auto-
-    disconnect, GPU availability, cooldowns) -- the refusal would just block
-    every run for nothing. A None balance (CLI missing/unparseable) likewise is
-    never treated as spent on its own."""
-    if COLAB_MONTHLY_UNITS and _colab_spend_this_month() >= COLAB_MONTHLY_UNITS:
-        return True
-    if COLAB_FREE_TIER:
-        return False
-    usage = _colab_account_usage()
-    if usage is not None and float(usage.get('balance') or 0) <= 0:
-        return True
-    return False
-
-
-def _accrue_colab_units(units):
-    """Accrue a run's compute units against the monthly budget. Best-effort
-    like _accrue_spend: an accounting failure must never break the real run.
-    Uses the same kv_spend ledger so the Bank sees it, under the reserved
-    __colab_compute__ bucket with a monthly series keyed by month."""
-    if not isinstance(units, (int, float)) or not units:
-        return
-    try:
-        ledger = _spend_ledger_read()
-        bucket = ledger.setdefault(
-            COLAB_LEDGER_KEY, {'used': 0.0, 'calls': 0, 'byMonth': {}})
-        units = float(units)
-        bucket['used'] = float(bucket.get('used', 0) or 0) + units
-        bucket['calls'] = int(bucket.get('calls', 0) or 0) + 1
-        month = _colab_budget_month()
-        bucket['byMonth'][month] = \
-            float((bucket['byMonth'] or {}).get(month, 0) or 0) + units
-        _spend_ledger_write(ledger)
-    except Exception:
-        pass  # accounting never blocks a real run
 
 
 def _colab_cli(*args, timeout=120, input=None):
@@ -12405,7 +11712,7 @@ async def library_download(request: Request):
     if not BROWSING_ENABLED:
         return JSONResponse({'error': 'Agent browsing is disabled (AGENT_BROWSING_ENABLED=false in .env)'}, status_code=403)
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
 
     body = await request.json()
     url = (body.get('url') or '').strip()
@@ -12884,7 +12191,7 @@ async def chat(request: Request):
     # (it owns persona/prompt construction, this is just a secure proxy)
     # and gets back the reply text, nothing else.
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
     # /api/chat is NOT in AUTH_PROTECTED_PREFIXES (it governs OpenRouter spend,
     # so it guards itself by EITHER a player session OR a valid agent key --
     # the same agent-key attribution model every other /api endpoint uses). The
@@ -13027,7 +12334,7 @@ async def browse(request: Request):
     if not BROWSING_ENABLED:
         return JSONResponse({'error': 'Agent browsing is disabled (AGENT_BROWSING_ENABLED=false in .env)'}, status_code=403)
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
     # Monthly page-request budget: a count-based quota on external
     # fetches, NOT a dollar cap. When the month's allowance is spent, browsing
     # refuses rather than silently running over the 1000 free requests.
@@ -13415,7 +12722,7 @@ async def curl(request: Request):
     if not BROWSING_ENABLED:
         return JSONResponse({'error': 'Agent browsing is disabled (AGENT_BROWSING_ENABLED=false in .env)'}, status_code=403)
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
 
     body_json = await request.json()
     agent_id = body_json.get('agentId', 'unknown')
@@ -13546,7 +12853,7 @@ async def sandbox_download(request: Request):
     if not BROWSING_ENABLED:
         return JSONResponse({'error': 'Agent browsing is disabled (AGENT_BROWSING_ENABLED=false in .env)'}, status_code=403)
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
 
     body = await request.json()
     url = (body.get('url') or '').strip()
@@ -13642,7 +12949,7 @@ async def sandbox_save_page(request: Request):
     if not BROWSING_ENABLED:
         return JSONResponse({'error': 'Agent browsing is disabled (AGENT_BROWSING_ENABLED=false in .env)'}, status_code=403)
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
 
     body = await request.json()
     url = (body.get('url') or '').strip()
@@ -13750,7 +13057,7 @@ async def access_request(request: Request):
         if live_task != task_id:
             return JSONResponse({'error': 'taskId must be the story the agent is currently working on'}, status_code=400)
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
 
     criteria = {
         'approve': f'The stated reason is a specific, legitimate, task-related need for this capability ({TEMP_ACCESS_CAPABILITIES[capability]}) -- not vague, not "just in case."',
@@ -15978,7 +15285,7 @@ async def decide(request: Request):
     # secure-proxy shape as /api/chat: the client builds state/questions,
     # this just forwards it with the key attached and returns the answer.
     if not OPENROUTER_API_KEY:
-        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in ~/ai-think-tank/.env'}, status_code=500)
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
     body = await request.json()
     # The resolved JEV model is authoritative -- a client-provided model is
     # ignored so an operator switch (env or the /api/jev/model DB setting)

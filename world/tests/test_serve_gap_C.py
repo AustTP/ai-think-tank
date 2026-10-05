@@ -844,6 +844,10 @@ class RefreshModelTiers(unittest.TestCase):
 
 
 class GetCachedModelTiers(unittest.TestCase):
+    def setUp(self):
+        with serve._db() as conn:
+            conn.execute('DELETE FROM model_tiers')
+
     def test_reads_rows_from_db(self):
         with serve._db() as conn:
             conn.execute(

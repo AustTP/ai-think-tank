@@ -1,0 +1,20 @@
+# AI Think Tank runtime + quality-gate dependencies (2026-10-05).
+# Install:  python3 -m pip install -r requirements.txt
+#
+# Runtime (world/serve.py). Version floors, widened:
+fastapi>=0.115
+uvicorn>=0.34
+pydantic>=2.0
+# Document ingestion (/api/library/ingest) -- optional, degrade with a clear
+# per-file error when absent (serve.py guards both imports).
+openpyxl>=3.0
+pypdf>=6.0
+
+# Quality gates. Pinned to the exact versions baked into the Work Room
+# sandbox (world/sandbox/Dockerfile) and expected by the CI workflow
+# (.github/workflows/ci.yml), so local and CI agree.
+flake8==6.0.0
+mypy==1.8.0
+bandit==1.9.4
+pytest==7.4.0
+pytest-cov==7.1.0
