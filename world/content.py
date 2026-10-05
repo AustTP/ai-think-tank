@@ -2330,6 +2330,10 @@ def _extract_execute_script_outputs(transcript):
             match = re.search(r'stdout:\n(.*?)(?:\n\nstderr:|\Z)', m.get('content') or '', re.DOTALL)
             if match:
                 stdout = match.group(1).strip()
+                # Strip the external-data injection wrapper (the END marker the
+                # executor appends) so the deterministic raw-output safety net
+                # still recovers the real stdout, not the boundary decoration.
+                stdout = re.sub(r'\n<<<END_EXTERNAL_DATA.*?\Z', '', stdout, flags=re.DOTALL).strip()
                 if stdout:
                     outputs.append(stdout)
     return outputs
@@ -2472,7 +2476,14 @@ def _make_spike_sandbox_executor(agent_id, agent_key, sandbox_id, struck_tools=N
             parts.append(f'stderr:\n{stderr}')
         if result.get('timedOut'):
             parts.append('(command timed out -- this may be transient, may retry once with a shorter/simpler command)')
-        return '\n\n'.join(parts)
+        # Injection boundary: sandbox command output is UNTRUSTED code output
+        # (the agent writes it, but the code it runs may download/print arbitrary
+        # content). Wrap it exactly like fetched web pages so any instructions
+        # embedded in the output are read as data, never obeyed as directives.
+        raw = '\n\n'.join(parts)
+        wrapped, _nonce, _tag, instruction = _serve.wrap_external_content(
+            raw, 'the output of a command run in the sandbox')
+        return f'{instruction}\n\n{wrapped}'
     return execute_tool
 
 
@@ -2594,7 +2605,13 @@ def _make_colab_compute_executor(agent_id, struck_tools=None):
             parts.append(f'output:\n{stdout}')
         if not stdout:
             parts.append('(no output -- your code printed nothing)')
-        return '\n\n'.join(parts)
+        # Injection boundary: Colab output is UNTRUSTED code output (remote GPU
+        # code the agent wrote may print arbitrary content). Wrap it like any
+        # other external data so embedded instructions are data, not directives.
+        raw = '\n\n'.join(parts)
+        wrapped, _nonce, _tag, instruction = _serve.wrap_external_content(
+            raw, 'the output of a Colab GPU run')
+        return f'{instruction}\n\n{wrapped}'
     return execute_tool
 
 
@@ -2832,7 +2849,12 @@ def _make_treg_tools_executor():
             if error:
                 return f'Could not get trending topics: {error}'
             _serve._accrue_spend('treg', _serve.TREG_ENDPOINT_COSTS['x.x.get-trends-by-woeid'])
-            return json.dumps(data)[:4000]
+            # Injection boundary: X posts are untrusted third-party text that can
+            # embed instructions. Wrap like any fetched web page.
+            raw = json.dumps(data)[:4000]
+            wrapped, _nonce, _tag, instruction = _serve.wrap_external_content(
+                raw, 'X trending topics')
+            return f'{instruction}\n\n{wrapped}'
         if name == 'search_linkedin_posts':
             query = (args.get('query') or '').strip()
             if not query:
@@ -2842,7 +2864,12 @@ def _make_treg_tools_executor():
             if error:
                 return f'Could not search LinkedIn posts: {error}'
             _serve._accrue_spend('treg', _serve.TREG_ENDPOINT_COSTS['scrapecreators.x.v1-linkedin-search-posts'])
-            return json.dumps(data)[:4000]
+            # Injection boundary: LinkedIn post text is untrusted third-party
+            # content that can embed instructions. Wrap like any fetched page.
+            raw = json.dumps(data)[:4000]
+            wrapped, _nonce, _tag, instruction = _serve.wrap_external_content(
+                raw, 'LinkedIn posts')
+            return f'{instruction}\n\n{wrapped}'
         raise ValueError(f'unknown tool: {name}')
     return execute_tool
 
@@ -2879,7 +2906,11 @@ def _make_youtube_transcript_executor(agent_id, agent_key):
         filed = result.get('filed')
         where = (f'\n\nFiled to Library: media/transcripts/ (read it with '
                  f'read_library_file path={filed})' if filed else '')
-        return f"Transcript of {result.get('url')} ({result.get('chars')} chars):\n\n{text}{where}"
+        # Injection boundary: a transcript is untrusted third-party text that
+        # can embed instructions. Wrap like any fetched page.
+        wrapped, _nonce, _tag, instruction = _serve.wrap_external_content(
+            text, 'a YouTube transcript')
+        return f"Transcript of {result.get('url')} ({result.get('chars')} chars):\n\n{instruction}\n\n{wrapped}{where}"
     return execute_tool
 
 
@@ -3001,7 +3032,12 @@ def _make_apify_tools_executor():
                     result['itemsError'] = error
                 else:
                     result['items'] = items
-            return json.dumps(result)[:6000]
+            # Injection boundary: scraped web items are untrusted third-party
+            # content. Wrap before returning to the model.
+            raw = json.dumps(result)[:6000]
+            wrapped, _nonce, _tag, instruction = _serve.wrap_external_content(
+                raw, 'scraped Apify actor results')
+            return f'{instruction}\n\n{wrapped}'
         if name == 'apify_get_dataset_items':
             dataset_id = (args.get('datasetId') or '').strip()
             if not dataset_id:
@@ -3012,7 +3048,11 @@ def _make_apify_tools_executor():
                 query={'format': 'json', 'clean': '1', 'limit': str(limit)}, timeout=30)
             if error:
                 return f'Could not fetch Apify dataset items: {error}'
-            return json.dumps(data)[:6000]
+            # Injection boundary: dataset items are untrusted third-party content.
+            raw = json.dumps(data)[:6000]
+            wrapped, _nonce, _tag, instruction = _serve.wrap_external_content(
+                raw, 'Apify dataset items')
+            return f'{instruction}\n\n{wrapped}'
         raise ValueError(f'unknown tool: {name}')
     return execute_tool
 
@@ -3098,6 +3138,31 @@ def _make_pixellab_tools_executor():
 # "prefer read-only / low-frequency use... over any write-heavy or high-
 # frequency automation" -- these tools stay simple, single-call operations,
 # never a batch/high-frequency loop.
+# Google API quota awareness: folded into every spike's system prompt so the
+# agent paces its Google calls and never trips the shared per-project limits
+# (the same account is used for Sheets/Calendar/Gmail/Docs, so one agent's loop
+# hurts every other agent's real Google work). Numbers are the current public
+# Google Workspace API defaults:
+#   Calendar: 10,000 req/min/project, 600 req/min/user, 1,000,000 req/day/project.
+#   Sheets:   300 reads/min/project + 60 reads/min/user, 300 writes/min/project
+#             + 60 writes/min/user; 2MB max payload; 180s max processing time.
+#   Gmail:    1,200,000 units/min/project, 6,000 units/min/user, 80M units/day.
+#             Per-method: messages.get=20, messages.list=5, drafts.create=10.
+#   Docs:     3,000 reads/min/project + 300 reads/min/user, 600 writes/min/project
+#             + 60 writes/min/user.
+# Gmail is READ + DRAFT ONLY -- the account has no send capability and the agent
+# must never try to send email.
+_GOOGLE_QUOTA_AWARENESS_BLOCK = (
+    '\n\nGoogle APIs (Sheets/Calendar/Gmail/Docs) share ONE Google account and one set of per-project '
+    'quota limits, so every call an agent makes competes with every other agent\'s real Google work. '
+    'Pace yourself: batch reads, never loop a Google tool, and prefer the cheapest tool that answers '
+    'the question. Sheet reads cost ~300/min/project and writes ~60/min/user; Calendar runs '
+    '~600/min/user; Docs reads ~300/min/user and writes ~60/min/user; Gmail is metered in units '
+    '(a message read is 20, a search 5, a draft 10). Treat a Google call that returns a quota/429 '
+    'error as a stop signal for that tool this investigation, not a reason to retry it in a loop. '
+    'Gmail is READ + DRAFT ONLY: you may search, read, and create drafts for the player to send, '
+    'but you have NO ability to send email and must never attempt to.'
+)
 _GOOGLE_SHEETS_READ_TOOL = {
     'type': 'function',
     'function': {
@@ -3105,7 +3170,9 @@ _GOOGLE_SHEETS_READ_TOOL = {
         'description': (
             "Read a real range of cells from a real Google Sheet, via the think tank's own Google "
             "account. Use this to check real, current spreadsheet data -- never invent plausible-"
-            "looking cell values."
+            "looking cell values. Respect Google's Sheets API quota: 300 reads/min/project, 60/"
+            "min/user (shared across all the think tank's Google calls) -- read a bounded range, "
+            "do not page through whole spreadsheets in a loop."
         ),
         'parameters': {
             'type': 'object',
@@ -3125,7 +3192,9 @@ _GOOGLE_SHEETS_APPEND_TOOL = {
         'description': (
             "Append one real row to a real Google Sheet, via the think tank's own Google account. "
             "Use this sparingly (occasional syncs, not a high-frequency loop) -- e.g. adding a "
-            "finding to a shared roadmap sheet."
+            "finding to a shared roadmap sheet. Respect Google's Sheets API write quota: 300 writes/"
+            "min/project, 60/min/user (shared across all the think tank's Google calls) -- never "
+            "loop appends in a tight loop."
         ),
         'parameters': {
             'type': 'object',
@@ -3145,7 +3214,9 @@ _GOOGLE_CALENDAR_LIST_TOOL = {
         'name': 'list_calendar_events',
         'description': (
             "List real, real upcoming events on the think tank's own Google Calendar. Use this to "
-            "check what's actually scheduled -- never invent a plausible-sounding event."
+            "check what's actually scheduled -- never invent a plausible-sounding event. Respect "
+            "Google's Calendar API quota: 10,000 requests/min/project, 600/min/user (shared across "
+            "all the think tank's Google calls) -- a single bounded list is fine, do not loop it."
         ),
         'parameters': {
             'type': 'object',
@@ -3163,7 +3234,10 @@ _GOOGLE_CALENDAR_CREATE_TOOL = {
         'name': 'create_calendar_event',
         'description': (
             "Create one real event on the think tank's own Google Calendar -- e.g. for a real "
-            "ceremony. Use this sparingly (a handful of real events, not a high-frequency loop)."
+            "ceremony. Use this sparingly (a handful of real events, not a high-frequency loop). "
+            "Respect Google's Calendar API quota: 10,000 requests/min/project, 600/min/user (shared "
+            "across all the think tank's Google calls) -- creating a few real events is fine, never "
+            "loop event creation."
         ),
         'parameters': {
             'type': 'object',
@@ -3174,6 +3248,123 @@ _GOOGLE_CALENDAR_CREATE_TOOL = {
                 'description': {'type': 'string', 'description': 'Optional event description.'},
             },
             'required': ['summary', 'start_datetime', 'end_datetime'],
+        },
+    },
+}
+
+# Gmail read tools + draft creation (READ + DRAFT ONLY -- NEVER SEND).
+# The think tank's Google account is read/write for Sheets/Calendar/Docs, but
+# email is deliberately NOT send-capable: an agent may search/read messages and
+# create DRAFTS for the player to review, but there is NO send tool and no
+# path to messages.send / drafts.send. A persuasive agent (or a prompt-injected
+# email) must not be able to mail on the player's behalf. Quota (Gmail's
+# per-method unit model): 1,200,000 units/min/project, 6,000/min/user, 80M/day.
+_GMAIL_SEARCH_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'search_gmail_messages',
+        'description': (
+            "Search the think tank's own Gmail inbox for messages matching a query (sender, subject, "
+            "text), using Gmail's search syntax e.g. \"from:someone subject:invoice\". Read-only. "
+            "Returns a bounded list of message metadata (id, sender, subject, snippet) -- use "
+            "read_gmail_message on a specific id to read the full text. NEVER send email: there is "
+            "no send capability on this account. Respect Gmail API quota (messages.list costs 5 "
+            "units; 6,000 units/min/user shared across all Google calls) -- a handful of searches "
+            "is fine, never loop."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'query': {'type': 'string', 'description': "Gmail search query, e.g. 'from:someone subject:invoice'."},
+                'max_results': {'type': 'integer', 'description': 'Maximum messages to return (default 10, max 25).'},
+            },
+            'required': ['query'],
+        },
+    },
+}
+
+_GMAIL_READ_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'read_gmail_message',
+        'description': (
+            "Read the full text of one real Gmail message by id (returned by search_gmail_messages). "
+            "Read-only. NEVER send email: there is no send capability on this account. Respect Gmail "
+            "API quota (messages.get costs 20 units; 6,000 units/min/user shared across all Google "
+            "calls) -- read a few specific messages, never page through a whole inbox."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'message_id': {'type': 'string', 'description': 'The Gmail message id to read.'},
+            },
+            'required': ['message_id'],
+        },
+    },
+}
+
+_GMAIL_CREATE_DRAFT_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'create_gmail_draft',
+        'description': (
+            "Create a DRAFT email in the think tank's own Gmail for the player to review and send -- "
+            "drafts are never auto-sent, and there is NO send capability on this account, so the "
+            "player must press send themselves. Use this to prepare a real reply or outreach an "
+            "agent was asked to draft. Respect Gmail API quota (drafts.create costs 10 units; 6,000 "
+            "units/min/user shared across all Google calls) -- draft a handful, never loop."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'to': {'type': 'string', 'description': 'Recipient email address(es), comma-separated.'},
+                'subject': {'type': 'string', 'description': 'The draft subject line.'},
+                'body': {'type': 'string', 'description': 'The draft plain-text body.'},
+            },
+            'required': ['to', 'subject', 'body'],
+        },
+    },
+}
+
+# Google Docs tools: read + create. Read quota 3,000/min/project, 300/min/user;
+# write quota 600/min/project, 60/min/user (shared across all Google calls).
+_GOOGLE_DOCS_READ_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'read_google_doc',
+        'description': (
+            "Read the full text of one real Google Doc by id. Use this to check real, current "
+            "document content -- never invent what a doc says. Respect Google Docs API quota: 3,000 "
+            "reads/min/project, 300/min/user (shared across all the think tank's Google calls) -- "
+            "read a bounded set of docs, never loop."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'document_id': {'type': 'string', 'description': 'The Google Doc id from its URL.'},
+            },
+            'required': ['document_id'],
+        },
+    },
+}
+
+_GOOGLE_DOCS_CREATE_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'create_google_doc',
+        'description': (
+            "Create a new real Google Doc with a title and optional body text. Use this sparingly "
+            "(a real deliverable that belongs in Docs, not a high-frequency loop). Respect Google "
+            "Docs API write quota: 600 writes/min/project, 60/min/user (shared across all the think "
+            "tank's Google calls) -- creating a handful of real docs is fine, never loop."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'title': {'type': 'string', 'description': 'The new document title.'},
+                'body': {'type': 'string', 'description': 'Optional initial plain-text body content.'},
+            },
+            'required': ['title'],
         },
     },
 }
@@ -3192,7 +3383,10 @@ def _make_google_tools_executor():
             data, error = _serve._google_call('GET', url)
             if error:
                 return f'Could not read the sheet: {error}'
-            return json.dumps(data)[:4000]
+            raw = json.dumps(data)[:4000]
+            wrapped, _nonce, _tag, instruction = _serve.wrap_external_content(
+                raw, 'a Google Sheet range')
+            return f"{instruction}\n\n{wrapped}"
         if name == 'append_google_sheet_row':
             spreadsheet_id = (args.get('spreadsheet_id') or '').strip()
             rng = (args.get('range') or '').strip()
@@ -3213,7 +3407,10 @@ def _make_google_tools_executor():
             data, error = _serve._google_call('GET', url)
             if error:
                 return f'Could not list calendar events: {error}'
-            return json.dumps(data.get('items', []))[:4000]
+            raw = json.dumps(data.get('items', []))[:4000]
+            wrapped, _nonce, _tag, instruction = _serve.wrap_external_content(
+                raw, 'a Google Calendar event list')
+            return f"{instruction}\n\n{wrapped}"
         if name == 'create_calendar_event':
             summary = (args.get('summary') or '').strip()
             start = (args.get('start_datetime') or '').strip()
@@ -3228,8 +3425,124 @@ def _make_google_tools_executor():
             if error:
                 return f'Could not create the event: {error}'
             return json.dumps({'id': data.get('id'), 'htmlLink': data.get('htmlLink')})
+        if name == 'search_gmail_messages':
+            query = (args.get('query') or '').strip()
+            if not query:
+                return 'query is required'
+            max_results = args.get('max_results') or 10
+            url = ('https://gmail.googleapis.com/gmail/v1/users/me/messages?'
+                   f'q={_serve.urllib.parse.quote(query)}&maxResults={int(max_results)}')
+            data, error = _serve._google_call('GET', url)
+            if error:
+                return f'Could not search Gmail: {error}'
+            items = data.get('messages') or []
+            if not items:
+                return 'No messages matched that Gmail query.'
+            # messages.list returns only id+threadId; resolve each to a
+            # readable snippet via a bounded read of a few messages.
+            lines = []
+            for m in items[:10]:
+                mid = m.get('id')
+                meta, merr = _serve._google_call(
+                    'GET', f'https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}?format=metadata')
+                if merr:
+                    lines.append(f'- {mid}: (could not read: {merr})')
+                    continue
+                headers = {h.get('name'): h.get('value')
+                           for h in ((meta.get('payload') or {}).get('headers') or [])}
+                snippet = (meta.get('snippet') or '')[:160]
+                lines.append(f"- {mid} | From: {headers.get('From', '?')} | Subject: "
+                             f"{headers.get('Subject', '?')} | {snippet}")
+            out = '\n'.join(lines)
+            wrapped, _nonce, _tag, instruction = _serve.wrap_external_content(
+                out, 'a Gmail search result')
+            return f"{instruction}\n\n{wrapped}"
+        if name == 'read_gmail_message':
+            mid = (args.get('message_id') or '').strip()
+            if not mid:
+                return 'message_id is required'
+            data, error = _serve._google_call(
+                'GET', f'https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}?format=full')
+            if error:
+                return f'Could not read the message: {error}'
+            headers = {h.get('name'): h.get('value')
+                       for h in ((data.get('payload') or {}).get('headers') or [])}
+            body_parts = []
+            payload = data.get('payload') or {}
+            for part in payload.get('parts') or []:
+                body = part.get('body') or {}
+                if part.get('mimeType') == 'text/plain' and body.get('data'):
+                    body_parts.append(_gmail_base64url_decode(body['data']))
+            if not body_parts and (payload.get('body') or {}).get('data'):
+                body_parts.append(_gmail_base64url_decode(payload['body']['data']))
+            out = (f"From: {headers.get('From', '?')}\nTo: {headers.get('To', '?')}\n"
+                   f"Date: {headers.get('Date', '?')}\nSubject: {headers.get('Subject', '?')}\n\n"
+                   + ('\n\n'.join(body_parts) or (data.get('snippet') or '')))
+            out = out[:12000]
+            wrapped, _nonce, _tag, instruction = _serve.wrap_external_content(
+                out, 'a Gmail message')
+            return f"{instruction}\n\n{wrapped}"
+        if name == 'create_gmail_draft':
+            to = (args.get('to') or '').strip()
+            subject = (args.get('subject') or '').strip()
+            body = (args.get('body') or '').strip()
+            if not to or not subject:
+                return 'to, subject, and body are required'
+            import base64
+            raw_msg = f"To: {to}\r\nSubject: {subject}\r\n\r\n{body}"
+            data, error = _serve._google_call(
+                'POST', 'https://gmail.googleapis.com/gmail/v1/users/me/drafts',
+                {'message': {'raw': base64.urlsafe_b64encode(raw_msg.encode('utf-8')).decode()}})
+            if error:
+                return f'Could not create the draft: {error}'
+            return (f"Draft created (id {data.get('id')}) -- a draft is NEVER auto-sent. "
+                    "The player must open Gmail and press send.")
+        if name == 'read_google_doc':
+            doc_id = (args.get('document_id') or '').strip()
+            if not doc_id:
+                return 'document_id is required'
+            data, error = _serve._google_call(
+                'GET', f'https://docs.googleapis.com/v1/documents/{doc_id}')
+            if error:
+                return f'Could not read the doc: {error}'
+            # Flatten the doc's structured body into plain text.
+            texts = []
+            for el in (data.get('body') or {}).get('content') or []:
+                para = el.get('paragraph') or {}
+                for run in para.get('elements') or []:
+                    tr = run.get('textRun') or {}
+                    if tr.get('content'):
+                        texts.append(tr['content'])
+            out = ''.join(texts)[:12000]
+            wrapped, _nonce, _tag, instruction = _serve.wrap_external_content(
+                out, 'a Google Doc')
+            return f"{instruction}\n\n{wrapped}"
+        if name == 'create_google_doc':
+            title = (args.get('title') or '').strip()
+            if not title:
+                return 'title is required'
+            body_text = (args.get('body') or '').strip()
+            data, error = _serve._google_call(
+                'POST', 'https://docs.googleapis.com/v1/documents', {'title': title})
+            if error:
+                return f'Could not create the doc: {error}'
+            doc_id = data.get('documentId')
+            if body_text and doc_id:
+                _serve._google_call(
+                    'POST', f'https://docs.googleapis.com/v1/documents/{doc_id}:batchUpdate',
+                    {'requests': [{'insertText': {'location': {'index': 1}, 'text': body_text}}]})
+            return json.dumps({'documentId': doc_id,
+                               'url': f'https://docs.google.com/document/d/{doc_id}/edit'})
         raise ValueError(f'unknown tool: {name}')
     return execute_tool
+
+
+def _gmail_base64url_decode(encoded):
+    import base64
+    try:
+        return base64.urlsafe_b64decode(encoded).decode('utf-8', errors='replace')
+    except Exception:
+        return ''
 
 
 # GitHub read tools: the think tank is an
@@ -3668,6 +3981,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         'polish. If you produced a file, cat its full contents out before you finish so the final '
         'report can include it verbatim.'
     )
+    if _serve._google_is_configured():
+        system += _GOOGLE_QUOTA_AWARENESS_BLOCK
     messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': 'Go ahead.'}]
     # One-strike-per-tool (ported from the user's own MAGI framework's
     # ReflectionEngine): a shared set across BOTH sub-executors, so a policy
@@ -3694,7 +4009,9 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                                             _TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL,
                                             _PIXELLAB_CHARACTER_TOOL,
                                             _GOOGLE_SHEETS_READ_TOOL, _GOOGLE_SHEETS_APPEND_TOOL,
-                                            _GOOGLE_CALENDAR_LIST_TOOL, _GOOGLE_CALENDAR_CREATE_TOOL]
+                                            _GOOGLE_CALENDAR_LIST_TOOL, _GOOGLE_CALENDAR_CREATE_TOOL,
+                                            _GMAIL_SEARCH_TOOL, _GMAIL_READ_TOOL, _GMAIL_CREATE_DRAFT_TOOL,
+                                            _GOOGLE_DOCS_READ_TOOL, _GOOGLE_DOCS_CREATE_TOOL]
     # YouTube transcripts: offered only when APIFY_API_KEY is set -- the route
     # ALWAYS downloads the audio via the Apify actor on the Colab runtime (no
     # captions fast-path), so unset = tool simply absent, same
@@ -3715,7 +4032,9 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     if _serve.COLAB_CLI_AVAILABLE:
         spike_tools += [_COLAB_RUN_TOOL]
     _GOOGLE_TOOL_NAMES = ('read_google_sheet', 'append_google_sheet_row',
-                          'list_calendar_events', 'create_calendar_event')
+                          'list_calendar_events', 'create_calendar_event',
+                          'search_gmail_messages', 'read_gmail_message', 'create_gmail_draft',
+                          'read_google_doc', 'create_google_doc')
 
     def execute_tool(tool_name, args):
         if tool_name in struck_tools:
