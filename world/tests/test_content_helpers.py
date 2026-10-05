@@ -1288,5 +1288,34 @@ class SpikeExecutorBranches(unittest.TestCase):
         self.assertIsNone(seen['spike-f']['fileIssue'])
 
 
+class DesignContextForTask(unittest.TestCase):
+    """Read-before-act design-taste injection: _design_context_for_task must
+    resolve the task's project (productId or projectLabel) to its folded
+    design taste doc, and return '' when the task has no project or the server
+    has nothing for it (the executor still runs, just without design context)."""
+
+    def test_injects_taste_for_product_task(self):
+        with mock.patch.object(serve, '_design_context_for_project', return_value='PALETTE: #111') as dc:
+            ctx = content._design_context_for_task({'a': 1}, {'productId': 'product-1', 'title': 'x'})
+        self.assertEqual(ctx, 'PALETTE: #111')
+        dc.assert_called_once_with('product-1')
+
+    def test_injects_taste_for_project_label_task(self):
+        with mock.patch.object(serve, '_design_context_for_project', return_value='STYLE: minimal'):
+            ctx = content._design_context_for_task({'a': 1}, {'projectLabel': 'website-v2', 'title': 'x'})
+        self.assertEqual(ctx, 'STYLE: minimal')
+
+    def test_empty_when_task_has_no_project(self):
+        with mock.patch.object(serve, '_design_context_for_project') as dc:
+            ctx = content._design_context_for_task({'a': 1}, {'title': 'x'})
+        self.assertEqual(ctx, '')
+        dc.assert_not_called()
+
+    def test_empty_when_server_raises(self):
+        with mock.patch.object(serve, '_design_context_for_project', side_effect=RuntimeError('boom')):
+            ctx = content._design_context_for_task({'a': 1}, {'productId': 'product-1'})
+        self.assertEqual(ctx, '')
+
+
 if __name__ == '__main__':
     unittest.main()

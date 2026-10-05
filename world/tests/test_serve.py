@@ -1721,6 +1721,88 @@ class DesignReferenceEndpoints(unittest.TestCase):
         self.assertEqual(r.status_code, 502)
         self.assertIn('could not screenshot', r.json()['error'])
 
+    def test_design_reference_upload_scopes_to_project_dir(self):
+        brief_out = {'ok': True, 'brief': 'PALETTE: #abc'}
+        written = []
+        with unittest.mock.patch.object(serve, '_design_brief_from_image', return_value=brief_out), \
+             unittest.mock.patch.object(serve, '_write_file',
+                                        side_effect=lambda path, content: written.append((path, content))):
+            r = self._post('/api/design-reference',
+                           {'agentId': 'player', 'name': 'hero', 'imageBase64': 'aGVsbG8=', 'project': 'product-1'})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body['briefPath'], 'design-references/product-1/hero.txt')
+        self.assertEqual(body['image'], 'design-references/product-1/hero.png')
+
+    def test_design_reference_url_scopes_to_project_dir(self):
+        brief_out = {'ok': True, 'brief': 'STYLE: minimal'}
+        with unittest.mock.patch.object(serve, '_screenshot_url_sync', return_value='U0hPVA=='), \
+             unittest.mock.patch.object(serve, '_design_brief_from_image', return_value=brief_out), \
+             unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True), \
+             unittest.mock.patch.object(serve, '_write_file') as write:
+            r = self._post('/api/design-reference-url',
+                           {'agentId': 'player', 'url': 'https://example.com', 'project': 'product-1'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['briefPath'], 'design-references/product-1/example.com.txt')
+        write.assert_called_once()
+        rel = write.call_args[0][0]
+        self.assertIn('product-1', rel)
+
+    def test_design_project_rel_maps_projects_to_subdirs(self):
+        self.assertEqual(serve._design_project_rel('product-1'), 'design-references/product-1')
+        self.assertEqual(serve._design_project_rel(None), 'design-references')
+        self.assertEqual(serve._design_project_rel(''), 'design-references')
+        self.assertEqual(serve._design_project_rel('general'), 'design-references')
+        # '../evil' sanitizes to a single safe segment 'evil' (dots are
+        # preserved as filename characters, never as a traversal).
+        self.assertEqual(serve._design_project_rel('../evil'), 'design-references/evil')
+
+    def test_list_design_briefs_excludes_taste_and_missing_dirs(self):
+        self.assertEqual(serve._list_design_briefs('no-such-project'), [])
+
+    def test_design_reference_taste_folds_briefs(self):
+        taste_out = 'PALETTE: #111\nTYPOGRAPHY: sans\nLAYOUT: grid\nSTYLE: minimal'
+        brief_files = ['design-references/product-1/hero.txt', 'design-references/product-1/nav.txt']
+        written = []
+        with unittest.mock.patch.object(serve, '_list_design_briefs', return_value=brief_files), \
+             unittest.mock.patch.object(serve, '_safe_library_path',
+                                        side_effect=lambda p: p if p.startswith('design-references') else None), \
+             unittest.mock.patch('os.path.isfile', return_value=True), \
+             unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-x'), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                        return_value={'choices': [{'message': {'content': taste_out}}]}), \
+             unittest.mock.patch.object(serve, '_write_file',
+                                        side_effect=lambda path, content: written.append((path, content))), \
+             unittest.mock.patch('builtins.open', unittest.mock.mock_open(read_data='PALETTE: #111')):
+            r = self._post('/api/design-reference/taste', {'agentId': 'player', 'project': 'product-1'})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body['tastePath'], 'design-references/product-1/taste.md')
+        self.assertEqual(body['briefCount'], 2)
+        self.assertIn('PALETTE: #111', body['text'])
+        self.assertTrue(any('taste.md' in str(p) for p, _ in written))
+
+    def test_design_reference_taste_rejects_empty_project(self):
+        with unittest.mock.patch.object(serve, '_list_design_briefs', return_value=[]):
+            r = self._post('/api/design-reference/taste', {'agentId': 'player', 'project': 'product-1'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('no design briefs', r.json()['error'])
+
+    def test_design_context_for_project_reads_taste_doc(self):
+        with unittest.mock.patch.object(serve, '_safe_library_path',
+                                        side_effect=lambda p: p if p.startswith('design-references') else None), \
+             unittest.mock.patch('os.path.isfile', return_value=True), \
+             unittest.mock.patch.object(serve, '_list_design_briefs', return_value=[]), \
+             unittest.mock.patch('builtins.open', unittest.mock.mock_open(read_data='PALETTE: #222')):
+            ctx = serve._design_context_for_project('product-1')
+        self.assertIn('PALETTE: #222', ctx)
+        self.assertIn('READ THIS FIRST', ctx)
+
+    def test_design_context_for_project_empty_without_taste(self):
+        with unittest.mock.patch.object(serve, '_safe_library_path', return_value=None), \
+             unittest.mock.patch.object(serve, '_list_design_briefs', return_value=[]):
+            self.assertEqual(serve._design_context_for_project('no-taste-project'), '')
+
 
 class ServerOwnedSeed(unittest.TestCase):
     # Server-owned roster: no static agent names live in any JS
