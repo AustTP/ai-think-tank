@@ -74,12 +74,15 @@ cd world && python3 -m pytest tests/
 | Component | What it owns |
 |-----------|-------------|
 | `world/serve.py` | FastAPI app: state DB, model calls, tools, auth, spend ledger, simulation driver, team/director hierarchy, model-tier refresh |
+| `world/bank.py` | The Bank: spend ledger + per-service budget gates, spend cap, forecasts (re-exported from serve.py) |
+| `world/auth.py` | Player auth: credential creation, password hashing, login sessions, rate limiting (re-exported from serve.py) |
+| `world/notify.py` | Escalation + player-notification email/telegram senders (re-exported from serve.py) |
 | `world/sim.py` | Server simulation engine: movement, task lifecycle, ceremonies, peer gates, sprint lifecycle, governance |
 | `world/content.py` | Per-room content executors: research, code writing/review, weather, media, distill, spikes, bank teller |
 | `world/web_helpers.py` | Pure HTML stripping, link extraction, HTTP-date parsing, SSRF host check |
 | `world/sim_helpers.py` | Pure priority normalization, room/team derivation, sprint/product id generation |
 | `world/index.html` + `world/*.js` | Browser renderer; the client is a viewport, never the state machine |
-| `world/tests/` | Python test suite (869 tests) covering every path |
+| `world/tests/` | Python test suite (3,424 tests) covering every path |
 
 ## Repo layout
 

@@ -5,9 +5,10 @@
 # (line-grep, NOT `. .env` -- SEED_ROSTER contains pipes that bash would
 # misparse as a pipeline) and pushes with the token in the URL:
 #
-#   git -c credential.helper= push "https://x-access-token:${GITHUB_TOKEN}@github.com/AustTP/ai-think-tank.git" main
+#   git -c credential.helper= push "https://x-access-token:${GITHUB_TOKEN}@github.com/${REMOTE}.git" main
 #
 # Usage: ./scripts/push.sh [branch]   (defaults to main)
+# Remote overridable with REMOTE=owner/repo.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 GITHUB_TOKEN="$(grep -E '^GITHUB_TOKEN=' .env | head -1 | cut -d= -f2-)"
@@ -15,5 +16,6 @@ if [ -z "$GITHUB_TOKEN" ]; then
     echo "GITHUB_TOKEN is empty in .env -- nothing to push with." >&2
     exit 1
 fi
+REMOTE="${REMOTE:-AustTP/ai-think-tank}"
 BRANCH="${1:-main}"
-git -c credential.helper= push "https://x-access-token:${GITHUB_TOKEN}@github.com/AustTP/ai-think-tank.git" "$BRANCH"
+git -c credential.helper= push "https://x-access-token:${GITHUB_TOKEN}@github.com/${REMOTE}.git" "$BRANCH"
