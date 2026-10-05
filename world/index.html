@@ -636,6 +636,18 @@
           <button id="libraryIngestBtn">Ingest</button>
           <span id="libraryIngestStatus"></span>
         </div>
+        <div class="library-section-label">Design references (image upload → brief)</div>
+        <div class="terminal-inputline">
+          <input type="text" id="designRefNameInput" placeholder="name, e.g. landing-page-v2">
+          <input type="file" id="designRefImageInput" accept="image/png,image/jpeg,image/webp">
+          <button id="designRefUploadBtn">Brief this image</button>
+          <span id="designRefUploadStatus"></span>
+        </div>
+        <div class="terminal-inputline" title="Give a live URL and get a designmind-style review of that page, written to library/design-references/.">
+          <input type="text" id="designRefUrlInput" placeholder="live URL, e.g. https://example.com">
+          <button id="designRefUrlBtn">Review this URL</button>
+          <span id="designRefUrlStatus"></span>
+        </div>
       </div>
     </div>
   </div>
@@ -1415,6 +1427,85 @@ async function handleLibraryIngest() {
     }
   } catch (e) {
     statusEl.textContent = 'Ingest failed.';
+  }
+  btn.disabled = false;
+}
+
+// Designmind-style design references: player uploads an image (or gives a
+// live URL), the server runs a vision pass and writes a design brief into
+// library/design-references/ that any agent can read. Player-only on the
+// server too, not just the UI.
+async function handleDesignRefUpload() {
+  const fileInput = document.getElementById('designRefImageInput');
+  const nameInput = document.getElementById('designRefNameInput');
+  const statusEl = document.getElementById('designRefUploadStatus');
+  const btn = document.getElementById('designRefUploadBtn');
+  const file = fileInput.files && fileInput.files[0];
+  const name = nameInput.value.trim();
+  if (!file) { statusEl.textContent = 'Choose an image first.'; return; }
+  if (!name) { statusEl.textContent = 'Give it a name first.'; return; }
+  btn.disabled = true;
+  statusEl.textContent = 'Analyzing image...';
+  try {
+    const imageBase64 = await readFileAsBase64(file);
+    const res = await apiFetch('/api/design-reference', {
+      method: 'POST',
+      body: JSON.stringify({ agentId: 'player', name, imageBase64 }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      statusEl.textContent = `Failed: ${data.error}`;
+    } else {
+      statusEl.textContent = `Brief written to ${data.briefPath}.`;
+      document.getElementById('libraryFileHeader').textContent = data.briefPath;
+      document.getElementById('libraryFileContent').textContent = data.text;
+      logThinkTankAction('player', 'design_reference', { name, briefPath: data.briefPath });
+      renderLibraryFileList();
+    }
+  } catch (e) {
+    statusEl.textContent = 'Upload failed.';
+  }
+  btn.disabled = false;
+}
+
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || '');
+      const idx = result.indexOf(',');
+      resolve(idx >= 0 ? result.slice(idx + 1) : result);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function handleDesignRefUrl() {
+  const urlInput = document.getElementById('designRefUrlInput');
+  const statusEl = document.getElementById('designRefUrlStatus');
+  const btn = document.getElementById('designRefUrlBtn');
+  const url = urlInput.value.trim();
+  if (!url) { statusEl.textContent = 'Give a URL first.'; return; }
+  btn.disabled = true;
+  statusEl.textContent = 'Screenshotting and analyzing...';
+  try {
+    const res = await apiFetch('/api/design-reference-url', {
+      method: 'POST',
+      body: JSON.stringify({ agentId: 'player', url }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      statusEl.textContent = `Failed: ${data.error}`;
+    } else {
+      statusEl.textContent = `Review written to ${data.briefPath}.`;
+      document.getElementById('libraryFileHeader').textContent = data.briefPath;
+      document.getElementById('libraryFileContent').textContent = data.text;
+      logThinkTankAction('player', 'design_reference_url', { url, briefPath: data.briefPath });
+      renderLibraryFileList();
+    }
+  } catch (e) {
+    statusEl.textContent = 'Review failed.';
   }
   btn.disabled = false;
 }
@@ -3287,6 +3378,8 @@ async function main() {
   document.getElementById('libraryCloseBtn').addEventListener('click', closeLibrary);
   document.getElementById('libraryWriteBtn').addEventListener('click', handleLibraryWrite);
   document.getElementById('libraryIngestBtn').addEventListener('click', handleLibraryIngest);
+  document.getElementById('designRefUploadBtn').addEventListener('click', handleDesignRefUpload);
+  document.getElementById('designRefUrlBtn').addEventListener('click', handleDesignRefUrl);
   document.getElementById('librarySearchBtn').addEventListener('click', handleLibrarySearch);
   document.getElementById('librarySearchInput').addEventListener('keydown', e => { if (e.key === 'Enter') handleLibrarySearch(); });
   document.getElementById('agentFilePicker').addEventListener('change', e => {

@@ -1769,6 +1769,15 @@ YOUTUBE_TRANSCRIPT_MAX_SEGMENTS = 800
 # /api/library/file. Written by the endpoint after a successful extraction.
 YOUTUBE_TRANSCRIPTS_DIR = os.path.join(LIBRARY_DIR, 'media', 'transcripts')
 
+# Designmind-style design references: a project-based directory the player
+# seeds with real design briefs (an uploaded image, or a live-URL screenshot
+# that gets a vision pass). Every file here is plain text in the same shape
+# designmind.studioerlach.com produces -- palette, typography, layout, style --
+# so ANY agent can read one via /api/library/file and find it via
+# /api/library/search, and build against a concrete, shared visual vocabulary
+# instead of guessing what "clean" or "modern" means.
+DESIGN_REFERENCES_DIR = os.path.join(LIBRARY_DIR, 'design-references')
+
 
 def _is_youtube_url(url):
     """True only for a real youtube.com / youtu.be URL (the fixed host set
@@ -2190,6 +2199,71 @@ def _pixellab_poll_job(job_id, timeout=90, interval=3):
 _GOOGLE_ACCESS_TOKEN_CACHE = {'at': 0.0, 'token': None}
 GOOGLE_ACCESS_TOKEN_TTL_S = 3000  # real tokens last 3599s; refresh a bit early
 
+# Hard per-API rate caps, shared across ALL agents. The whole think tank is ONE
+# Google user (one OAuth credential), so Google's per-user quotas apply to the
+# entire tank -- this guard keeps every agent together safely UNDER them by
+# refusing (fail-closed) when the shared per-minute budget is spent, instead of
+# letting the tank drift into a real Google 429. Numbers are deliberately well
+# below Google's published per-user limits (Calendar 600 req/min/user, Sheets
+# 60 read + 60 write /min/user, Gmail 6,000 quota units/min/user where a
+# messages.get already costs 20 units, Docs 300 reads + 60 writes /min/user).
+# Each entry: (max_calls_per_minute, min_interval_seconds).
+_GOOGLE_RATE_LIMITS = {
+    'calendar': (400, 0.15),
+    'sheets':   (40, 0.4),
+    'gmail':    (80, 0.3),
+    'docs':     (80, 0.3),
+}
+_GOOGLE_RATE_WINDOW_S = 60.0
+_GOOGLE_RATE_LOCK = threading.Lock()
+_GOOGLE_RATE_WINDOW: dict[str, list[float]] = {}  # api -> [monotonic call timestamps in the current window]
+
+
+def _google_api_name(url):
+    """Map a Google API URL to its rate-limiter key ('calendar', 'sheets',
+    'gmail', 'docs'), or None for hosts the tank does not meter (the OAuth
+    token endpoint)."""
+    if 'sheets.googleapis.com' in url:
+        return 'sheets'
+    if 'gmail.googleapis.com' in url:
+        return 'gmail'
+    if 'docs.googleapis.com' in url:
+        return 'docs'
+    if 'googleapis.com' in url and '/calendar/' in url:
+        return 'calendar'
+    return None
+
+
+def _google_rate_guard(api):
+    """Pace + hard-cap Google calls for one API, shared across all agents.
+    Returns an error string when the per-minute budget is spent (fail-closed:
+    refuse the call rather than risk a real Google 429 -- the caller should
+    stop using this API, matching the quota block in the spike prompt). Sleeps
+    only the min-interval remainder to smooth bursts, never across the lock.
+    Thread-safe via _GOOGLE_RATE_LOCK."""
+    max_per_min, min_interval = _GOOGLE_RATE_LIMITS[api]
+    now = time.monotonic()
+    with _GOOGLE_RATE_LOCK:
+        window = [t for t in _GOOGLE_RATE_WINDOW.get(api, [])
+                  if now - t < _GOOGLE_RATE_WINDOW_S]
+        if len(window) >= max_per_min:
+            return (f'Google {api} API rate budget spent this minute '
+                    f'({max_per_min} calls/min shared across all agents) -- stop calling this '
+                    f'API now; do not retry this investigation.')
+        _GOOGLE_RATE_WINDOW[api] = window
+        wait = 0.0
+        if window:
+            wait = min_interval - (now - window[-1])
+    if wait > 0:
+        time.sleep(wait)
+    with _GOOGLE_RATE_LOCK:
+        now = time.monotonic()
+        window = [t for t in _GOOGLE_RATE_WINDOW.get(api, [])
+                  if now - t < _GOOGLE_RATE_WINDOW_S]
+        window.append(now)
+        _GOOGLE_RATE_WINDOW[api] = window
+    return None
+
 
 def _google_is_configured():
     """True when a usable Google OAuth credential is in the vault (a JSON blob
@@ -2260,6 +2334,11 @@ def _google_call(method, url, body=None, timeout=30):
     not a real failure, just an expected refresh point). Returns
     (data, error), same 2-tuple shape as every other real integration
     """
+    api = _google_api_name(url)
+    if api:
+        rate_error = _google_rate_guard(api)
+        if rate_error:
+            return None, rate_error
     token, error = _google_access_token()
     if error:
         return None, error
@@ -2679,6 +2758,53 @@ def _vision_tier_slug():
     # mid tier so reviewScreenshot still degrades (to a plain text review,
     # not a failure) on a machine that refreshed tiers before vision existed.
     return _model_tier_slug('vision') or _mid_tier_slug()
+
+
+def _safe_design_reference_name(name):
+    """Sanitize a player-supplied design-reference name to a safe filename
+    (letters, digits, dashes, underscores, dots -- never a path separator).
+    Returns None if nothing usable remains."""
+    cleaned = re.sub(r'[^A-Za-z0-9._\- ]', '', (name or '').strip())
+    cleaned = re.sub(r'\s+', '_', cleaned).strip('._')
+    return cleaned or None
+
+
+def _design_brief_from_image(image_b64, source_label, context=''):
+    """Designmind-style design brief (palette, typography, layout, style) for
+    one real image (a player upload or a live-URL screenshot), via the vision
+    tier. Returns {ok: True, brief} or {ok: False, note} -- degrades to a note,
+    never a crash, if the vision tier is missing or the call fails (same
+    degrade-not-crash shape as reviewScreenshot)."""
+    vision_slug = _vision_tier_slug()
+    if not vision_slug:
+        return {'ok': False, 'note': 'vision model tier not available'}
+    context_block = f'\nContext: {context}' if context else ''
+    prompt = (
+        'You are analyzing one screenshot/image for a design system the think tank will build '
+        'from. Produce a concise design brief in the style of designmind.studioerlach.com with '
+        'these exact sections:\n'
+        'PALETTE: the concrete hex colors you can actually see (backgrounds, text, accents, borders).\n'
+        'TYPOGRAPHY: the font families/styles that appear, their sizes and weights, heading-vs-body contrast.\n'
+        'LAYOUT: grid/columns, spacing rhythm, alignment, section structure, whitespace.\n'
+        'STYLE: a one-line overall aesthetic judgment (minimal, bold, playful, corporate, etc.).\n'
+        'Only report what is actually visible in the image -- never invent colors, fonts, or sections.'
+        f'{context_block}'
+    )
+    messages = [{'role': 'user', 'content': [
+        {'type': 'text', 'text': prompt},
+        {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + image_b64}},
+    ]}]
+    try:
+        result = _call_openrouter_sync(vision_slug, messages, 700)
+    except Exception as e:
+        return {'ok': False, 'note': f'design brief vision call failed: {e}'}
+    try:
+        reply = (result.get('choices') or [{}])[0].get('message', {}).get('content') or ''
+    except Exception:
+        reply = ''
+    if not reply.strip():
+        return {'ok': False, 'note': 'design brief vision call returned no reply'}
+    return {'ok': True, 'brief': reply.strip()[:6000]}
 
 
 def _reasoning_tier_slug():
@@ -7528,7 +7654,7 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews')
 # Gap: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
@@ -12248,6 +12374,119 @@ async def ingest_library(request: Request):
     ok_count = sum(1 for r in results if r.get('ok'))
     log_action(agent_id, 'library_ingest', {'sourcePath': source_path, 'fileCount': len(results), 'okCount': ok_count})
     return JSONResponse({'ok': True, 'results': results, 'okCount': ok_count, 'totalCount': len(results)})
+
+
+@app.post('/api/design-reference')
+async def design_reference(request: Request):
+    """Designmind-style design brief from an uploaded image. Player-only (same
+    reasoning as /api/library/ingest -- a human handing the tank a file is a
+    different, narrower risk than letting an agent choose files). Saves the
+    image into library/design-references/, runs the vision tier over it, and
+    writes a <name>.txt brief next to it that any agent can read via
+    /api/library/file and find via /api/library/search. Returns the brief and
+    the library-relative paths."""
+    body = await request.json()
+    agent_id = body.get('agentId', 'player')
+    if agent_id != 'player':
+        return JSONResponse({'error': 'design references are player-only'}, status_code=403)
+    name = _safe_design_reference_name(body.get('name'))
+    image_b64 = (body.get('imageBase64') or '').strip()
+    if not name:
+        return JSONResponse({'error': 'a safe name is required (letters, digits, dashes, underscores)'}, status_code=400)
+    if not image_b64:
+        return JSONResponse({'error': 'imageBase64 is required'}, status_code=400)
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception:
+        return JSONResponse({'error': 'imageBase64 is not valid base64'}, status_code=400)
+    if len(image_bytes) > 12 * 1024 * 1024:
+        return JSONResponse({'error': 'image is too large (max 12 MB)'}, status_code=400)
+    try:
+        design_dir = _safe_library_path('design-references')
+        if not design_dir:
+            return JSONResponse({'error': 'invalid design-references path'}, status_code=400)
+        os.makedirs(design_dir, exist_ok=True)
+    except Exception:
+        return JSONResponse({'error': 'could not create the design-references directory'}, status_code=500)
+    ext = '.png'
+    for magic, candidate in ((b'\x89PNG\r\n\x1a\n', '.png'),
+                             (b'\xff\xd8\xff', '.jpg'),
+                             (b'RIFF', '.webp')):
+        if image_bytes[:len(magic)] == magic:
+            ext = candidate
+            break
+    image_rel = os.path.join('design-references', f'{name}{ext}')
+    image_path = _safe_library_path(image_rel)
+    if not image_path:
+        return JSONResponse({'error': 'invalid name'}, status_code=400)
+    brief = _design_brief_from_image(image_b64, f'uploaded image {name}', context=body.get('context'))
+    if not brief.get('ok'):
+        return JSONResponse({'error': brief.get('note', 'could not generate the design brief')}, status_code=502)
+    header = (f'# Design reference: {name}\n\n'
+              f'- Source: uploaded image ({ext.lstrip(".")})\n'
+              f'- Generated: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n'
+              f'- Image file: {image_rel}\n\n')
+    try:
+        with open(image_path, 'wb') as f:
+            f.write(image_bytes)
+        brief_rel = os.path.join('design-references', f'{name}.txt')
+        brief_path = _safe_library_path(brief_rel)
+        if brief_path:
+            _write_file(brief_path, header + brief['brief'] + '\n')
+    except Exception as e:
+        return JSONResponse({'error': f'could not write the design reference: {e}'}, status_code=500)
+    log_action(agent_id, 'design_reference', {'name': name, 'image': image_rel, 'brief': brief_rel})
+    return JSONResponse({'ok': True, 'name': name, 'image': image_rel, 'briefPath': brief_rel,
+                         'text': header + brief['brief']})
+
+
+@app.post('/api/design-reference-url')
+async def design_reference_url(request: Request):
+    """Designmind-style design brief from a live URL: fetch the page, take a
+    real screenshot, run the vision tier, and write a design-references/<host>.txt
+    brief any agent can read. Player-only, and the URL goes through the same
+    SSRF/public-host guard as /api/browse (never a private/internal address)."""
+    body = await request.json()
+    agent_id = body.get('agentId', 'player')
+    if agent_id != 'player':
+        return JSONResponse({'error': 'design references are player-only'}, status_code=403)
+    url = (body.get('url') or '').strip()
+    if not url:
+        return JSONResponse({'error': 'url is required'}, status_code=400)
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        parsed = None
+    if not parsed or parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        return JSONResponse({'error': 'a valid http(s) URL is required'}, status_code=400)
+    if not _is_safe_public_host(parsed.hostname):
+        return JSONResponse({'error': 'that address resolves to a private or internal network location'}, status_code=400)
+    screenshot_b64 = await asyncio.to_thread(_screenshot_url_sync, url)
+    if not screenshot_b64:
+        return JSONResponse({'error': 'could not screenshot that page (no headless browser, or the page did not render)'}, status_code=502)
+    host = re.sub(r'[^A-Za-z0-9._\-]', '_', (parsed.hostname or 'page'))
+    brief = _design_brief_from_image(screenshot_b64, f'URL {url}', context=f'Design review of the live page at {url}')
+    if not brief.get('ok'):
+        return JSONResponse({'error': brief.get('note', 'could not generate the design brief')}, status_code=502)
+    try:
+        design_dir = _safe_library_path('design-references')
+        if not design_dir:
+            return JSONResponse({'error': 'invalid design-references path'}, status_code=400)
+        os.makedirs(design_dir, exist_ok=True)
+    except Exception:
+        return JSONResponse({'error': 'could not create the design-references directory'}, status_code=500)
+    header = (f'# Design review: {url}\n\n'
+              f'- Source: live page screenshot\n'
+              f'- Generated: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n\n')
+    try:
+        brief_rel = os.path.join('design-references', f'{host}.txt')
+        brief_path = _safe_library_path(brief_rel)
+        if brief_path:
+            _write_file(brief_path, header + brief['brief'] + '\n')
+    except Exception as e:
+        return JSONResponse({'error': f'could not write the design review: {e}'}, status_code=500)
+    log_action(agent_id, 'design_reference_url', {'url': url, 'brief': brief_rel})
+    return JSONResponse({'ok': True, 'url': url, 'briefPath': brief_rel, 'text': header + brief['brief']})
 
 
 @app.post('/api/chat')
