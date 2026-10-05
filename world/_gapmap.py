@@ -1,4 +1,5 @@
-import ast, json
+import ast
+import json
 
 with open('coverage.json') as f:
     cov = json.load(f)
