@@ -1,8 +1,8 @@
 """Tests for the small/standalone world modules that had zero coverage:
 probe_model (weekly model probe), audit_reachability (find_path reachability
-audit), tinyprobe/probe_bare/probe_world (tiny dev probes), and the root-level
-health.py health-check script. All hermetic: serve's network paths are faked,
-the reachability audit runs against the real collision/door JSON (pure
+audit), the root-level health.py health-check script, and the operational
+_village_check.py server/DB check. All hermetic: serve's network paths are
+faked, the reachability audit runs against the real collision/door JSON (pure
 geometry), and health.py reads a fabricated in-memory kv_state blob.
 """
 import ast
@@ -19,7 +19,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import audit_reachability  # noqa: E402
 import probe_model  # noqa: E402
-import tinyprobe  # noqa: E402
 
 WORLD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_ROOT = os.path.dirname(WORLD_DIR)
@@ -116,7 +115,7 @@ class ProbeMain(unittest.TestCase):
                  unittest.mock.patch.object(probe_model._serve, '_post_openrouter_raw',
                                             return_value={'choices': [{'message': {'content': 'probe reply'}}],
                                                           'usage': {'cost': 0.01}}), \
-                 unittest.mock.patch('sys.stdout', io.StringIO()) as out:
+                 unittest.mock.patch('sys.stdout', io.StringIO()):
                 code = probe_model.main()
             scores = os.path.join(td, 'probe', 'scores.md')
             self.assertEqual(code, 0)
@@ -206,26 +205,6 @@ class ModuleMain(unittest.TestCase):
                 self.assertEqual(cm.exception.code, 0)
         finally:
             os.unlink(path)
-
-
-# ---------------------------------------------------------------------------
-# tinyprobe / probe_bare / probe_world -- tiny dev probes
-# ---------------------------------------------------------------------------
-
-class TinyProbe(unittest.TestCase):
-    def test_z_returns_eleven(self):
-        self.assertEqual(tinyprobe.z(), 11)
-
-    def test_probe_bare_imports_cleanly(self):
-        import importlib
-        mod = importlib.import_module('probe_bare')
-        self.assertEqual(mod.x, 1)
-
-    def test_probe_world_imports_cleanly(self):
-        import importlib
-        with unittest.mock.patch('sys.stdout', io.StringIO()):
-            mod = importlib.import_module('probe_world')
-        self.assertIsNotNone(mod)
 
 
 # ---------------------------------------------------------------------------
