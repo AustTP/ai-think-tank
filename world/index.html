@@ -638,15 +638,22 @@
         </div>
         <div class="library-section-label">Design references (image upload → brief)</div>
         <div class="terminal-inputline">
+          <input type="text" id="designRefProjectInput" placeholder="project (optional), e.g. product-1">
           <input type="text" id="designRefNameInput" placeholder="name, e.g. landing-page-v2">
           <input type="file" id="designRefImageInput" accept="image/png,image/jpeg,image/webp">
           <button id="designRefUploadBtn">Brief this image</button>
           <span id="designRefUploadStatus"></span>
         </div>
         <div class="terminal-inputline" title="Give a live URL and get a designmind-style review of that page, written to library/design-references/.">
+          <input type="text" id="designRefUrlProjectInput" placeholder="project (optional)">
           <input type="text" id="designRefUrlInput" placeholder="live URL, e.g. https://example.com">
           <button id="designRefUrlBtn">Review this URL</button>
           <span id="designRefUrlStatus"></span>
+        </div>
+        <div class="terminal-inputline" title="Fold all briefs in a project into one distilled taste.md agents are required to load before design work.">
+          <input type="text" id="designRefTasteProjectInput" placeholder="project to fold, e.g. product-1">
+          <button id="designRefTasteBtn">Fold taste doc</button>
+          <span id="designRefTasteStatus"></span>
         </div>
       </div>
     </div>
@@ -1450,7 +1457,12 @@ async function handleDesignRefUpload() {
     const imageBase64 = await readFileAsBase64(file);
     const res = await apiFetch('/api/design-reference', {
       method: 'POST',
-      body: JSON.stringify({ agentId: 'player', name, imageBase64 }),
+      body: JSON.stringify({
+        agentId: 'player',
+        name,
+        imageBase64,
+        project: document.getElementById('designRefProjectInput').value.trim(),
+      }),
     });
     const data = await res.json();
     if (data.error) {
@@ -1492,7 +1504,11 @@ async function handleDesignRefUrl() {
   try {
     const res = await apiFetch('/api/design-reference-url', {
       method: 'POST',
-      body: JSON.stringify({ agentId: 'player', url }),
+      body: JSON.stringify({
+        agentId: 'player',
+        url,
+        project: document.getElementById('designRefUrlProjectInput').value.trim(),
+      }),
     });
     const data = await res.json();
     if (data.error) {
@@ -1506,6 +1522,35 @@ async function handleDesignRefUrl() {
     }
   } catch (e) {
     statusEl.textContent = 'Review failed.';
+  }
+  btn.disabled = false;
+}
+
+async function handleDesignRefTaste() {
+  const projectInput = document.getElementById('designRefTasteProjectInput');
+  const statusEl = document.getElementById('designRefTasteStatus');
+  const btn = document.getElementById('designRefTasteBtn');
+  const project = projectInput.value.trim();
+  if (!project) { statusEl.textContent = 'Give a project first.'; return; }
+  btn.disabled = true;
+  statusEl.textContent = 'Folding taste doc...';
+  try {
+    const res = await apiFetch('/api/design-reference/taste', {
+      method: 'POST',
+      body: JSON.stringify({ agentId: 'player', project }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      statusEl.textContent = `Failed: ${data.error}`;
+    } else {
+      statusEl.textContent = `Taste doc written to ${data.tastePath} from ${data.briefCount} brief(s).`;
+      document.getElementById('libraryFileHeader').textContent = data.tastePath;
+      document.getElementById('libraryFileContent').textContent = data.text;
+      logThinkTankAction('player', 'design_reference_taste', { project, tastePath: data.tastePath });
+      renderLibraryFileList();
+    }
+  } catch (e) {
+    statusEl.textContent = 'Fold failed.';
   }
   btn.disabled = false;
 }
@@ -3380,6 +3425,7 @@ async function main() {
   document.getElementById('libraryIngestBtn').addEventListener('click', handleLibraryIngest);
   document.getElementById('designRefUploadBtn').addEventListener('click', handleDesignRefUpload);
   document.getElementById('designRefUrlBtn').addEventListener('click', handleDesignRefUrl);
+  document.getElementById('designRefTasteBtn').addEventListener('click', handleDesignRefTaste);
   document.getElementById('librarySearchBtn').addEventListener('click', handleLibrarySearch);
   document.getElementById('librarySearchInput').addEventListener('keydown', e => { if (e.key === 'Enter') handleLibrarySearch(); });
   document.getElementById('agentFilePicker').addEventListener('change', e => {

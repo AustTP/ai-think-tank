@@ -2049,6 +2049,21 @@ def _wiki_context_for_task(state, task):
         return ''
 
 
+def _design_context_for_task(state, task):
+    """Read-before-act: the folded design taste doc (+ raw inspiration brief
+    pointers) for the project this task targets. Required context for design
+    work -- a product build or a labeled workroom task whose project has a
+    taste.md must reason over it. Empty string when the project has no design
+    vocabulary (the executor still runs, just without a design reference)."""
+    try:
+        project = task.get('productId') or task.get('projectLabel')
+        if not project:
+            return ''
+        return _serve._design_context_for_project(project)
+    except Exception:
+        return ''
+
+
 def _run_product_build_content(snapshot, agent_id, task, base_ctx=None):
     """Phase E: a pressoffice task targeting a PRODUCT (task['productId']).
     Reads the product's catalog record + sandbox, injects the wiki context so
@@ -2089,6 +2104,12 @@ def _run_product_build_content(snapshot, agent_id, task, base_ctx=None):
     wiki_ctx = _wiki_context_for_task(snapshot, task)
     if wiki_ctx:
         context_summary = f'{wiki_ctx}\n\n{context_summary}'
+    # Read-before-act: the folded design taste doc for this product's project
+    # (required context for design work -- build against the player's taste,
+    # never against a guessed "modern/clean" default).
+    design_ctx = _design_context_for_task(snapshot, task)
+    if design_ctx:
+        context_summary = f'{design_ctx}\n\n{context_summary}'
     ok = _run_coding_content(snapshot, agent_id,
                              {**task, 'projectLabel': project_label,
                               'title': backlog_item, 'instructions': None,
@@ -4274,6 +4295,11 @@ def _run_workroom_content(snapshot, agent_id, task, base_ctx=None):
         # file listing is extra context, not a replacement for who/where/why.
         if base_ctx:
             context_summary = '\n\n'.join(p for p in (base_ctx, context_summary) if p)
+        # Read-before-act: the folded design taste doc for this project's
+        # design work, so a labeled build reasons over the player's taste.
+        design_ctx = _design_context_for_task(snapshot, task)
+        if design_ctx:
+            context_summary = f'{design_ctx}\n\n{context_summary}'
         _run_coding_content(snapshot, agent_id,
                             {**task, 'projectLabel': project_label,
                              'title': backlog or task.get('title', ''),
