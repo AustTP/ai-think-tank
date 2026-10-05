@@ -84,6 +84,47 @@ class SpikeContent(unittest.TestCase):
         return unittest.mock.patch.object(
             serve, '_call_agent_tool_loop', return_value=(execute_text, transcript))
 
+    def test_google_quota_awareness_block_folded_when_google_configured(self):
+        """The quota wiring: when a Google credential is in the vault, the
+        spike system prompt carries the Google-API quota-awareness block so the
+        agent paces its Sheets/Calendar/Gmail/Docs calls and knows Gmail is
+        read+draft-only. Absent when no Google credential exists (no tokens
+        wasted advertising a tool that can't work)."""
+        self._common_mocks(tavily=True)
+        self._store()
+        task = {'id': 'spike-quota', 'title': 'Check a shared sheet', 'budgetMs': 60000}
+        with unittest.mock.patch.object(serve, '_google_is_configured', return_value=True), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                        side_effect=[_completion('plan'), _completion('report')]), \
+             self._mock_loop('summary') as loop:
+            content._run_spike_content(_snapshot(), 'cora', task)
+        args, kwargs = loop.call_args
+        model, messages, tools, execute_tool = args[:4]
+        system = next(m['content'] for m in messages if m.get('role') == 'system')
+        self.assertIn('READ + DRAFT ONLY', system)
+        self.assertIn('~300/min/project', system)
+        self.assertIn('a draft 10', system)
+        tool_names = {t['function']['name'] for t in tools}
+        for name in ('search_gmail_messages', 'read_gmail_message', 'create_gmail_draft',
+                     'read_google_doc', 'create_google_doc'):
+            self.assertIn(name, tool_names)
+        # No send tool is ever offered.
+        self.assertNotIn('send_gmail_message', tool_names)
+
+    def test_google_quota_awareness_block_absent_when_not_configured(self):
+        self._common_mocks(tavily=True)
+        self._store()
+        task = {'id': 'spike-quota-2', 'title': 'Check a shared sheet', 'budgetMs': 60000}
+        with unittest.mock.patch.object(serve, '_google_is_configured', return_value=False), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                        side_effect=[_completion('plan'), _completion('report')]), \
+             self._mock_loop('summary') as loop:
+            content._run_spike_content(_snapshot(), 'cora', task)
+        args, kwargs = loop.call_args
+        model, messages, tools, execute_tool = args[:4]
+        system = next(m['content'] for m in messages if m.get('role') == 'system')
+        self.assertNotIn('Google APIs', system)
+
     def test_uses_real_tool_loop_with_transcript_and_forces_search_web_first(self):
         """The tool-access fix: the executor must call _call_agent_tool_loop
         with AGENT_ASK_TOOLS (browse_page/search_web), return_transcript=True

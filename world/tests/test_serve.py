@@ -2544,6 +2544,18 @@ class GoogleOAuth(unittest.TestCase):
         self.assertIsNone(token)
         self.assertIn('OAuth consent step was never completed', error)
 
+    def test_google_is_configured_checks_vault_without_network(self):
+        with unittest.mock.patch.object(serve, '_open_secret', return_value=None):
+            self.assertFalse(serve._google_is_configured())
+        with unittest.mock.patch.object(serve, '_open_secret', return_value='not-json'):
+            self.assertFalse(serve._google_is_configured())
+        with unittest.mock.patch.object(serve, '_open_secret',
+                                       return_value=json.dumps({'client_id': 'c', 'refresh_token': None})):
+            self.assertFalse(serve._google_is_configured())
+        with unittest.mock.patch.object(serve, '_open_secret',
+                                       return_value=json.dumps({'client_id': 'c', 'refresh_token': 'rt'})):
+            self.assertTrue(serve._google_is_configured())
+
     def test_real_refresh_request_shape(self):
         creds = json.dumps({'client_id': 'cid', 'client_secret': 'sec', 'refresh_token': 'rt-1'})
         captured = {}
