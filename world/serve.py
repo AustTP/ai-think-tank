@@ -2769,6 +2769,34 @@ def _safe_design_reference_name(name):
     return cleaned or None
 
 
+def _design_project_rel(project):
+    """Library-relative directory for a design project's inspiration briefs.
+    Returns None when the project slug is unusable. 'general' (or the empty
+    string) resolves to the design-references/ root -- the shared, unprojected
+    area -- so existing flat briefs keep working."""
+    slug = _safe_design_reference_name(project)
+    if slug is None:
+        slug = _safe_design_reference_name('general')
+    if slug in ('general', 'root', ''):
+        return 'design-references'
+    return os.path.join('design-references', slug)
+
+
+def _list_design_briefs(project):
+    """Library-relative paths of every plain-text design brief in a project's
+    inspiration directory (taste.md excluded -- it is the folded summary, not
+    raw inspiration). Empty list when the directory is missing or empty."""
+    rel_dir = _design_project_rel(project)
+    target = _safe_library_path(rel_dir)
+    if not target or not os.path.isdir(target):
+        return []
+    names = []
+    for fn in sorted(os.listdir(target)):
+        if fn.endswith('.txt') and fn.lower() != 'taste.md':
+            names.append(os.path.join(rel_dir, fn))
+    return names
+
+
 def _design_brief_from_image(image_b64, source_label, context=''):
     """Designmind-style design brief (palette, typography, layout, style) for
     one real image (a player upload or a live-URL screenshot), via the vision
@@ -12391,6 +12419,7 @@ async def design_reference(request: Request):
         return JSONResponse({'error': 'design references are player-only'}, status_code=403)
     name = _safe_design_reference_name(body.get('name'))
     image_b64 = (body.get('imageBase64') or '').strip()
+    project = _design_project_rel(body.get('project'))
     if not name:
         return JSONResponse({'error': 'a safe name is required (letters, digits, dashes, underscores)'}, status_code=400)
     if not image_b64:
@@ -12402,7 +12431,7 @@ async def design_reference(request: Request):
     if len(image_bytes) > 12 * 1024 * 1024:
         return JSONResponse({'error': 'image is too large (max 12 MB)'}, status_code=400)
     try:
-        design_dir = _safe_library_path('design-references')
+        design_dir = _safe_library_path(project)
         if not design_dir:
             return JSONResponse({'error': 'invalid design-references path'}, status_code=400)
         os.makedirs(design_dir, exist_ok=True)
@@ -12415,7 +12444,7 @@ async def design_reference(request: Request):
         if image_bytes[:len(magic)] == magic:
             ext = candidate
             break
-    image_rel = os.path.join('design-references', f'{name}{ext}')
+    image_rel = os.path.join(project, f'{name}{ext}')
     image_path = _safe_library_path(image_rel)
     if not image_path:
         return JSONResponse({'error': 'invalid name'}, status_code=400)
@@ -12424,18 +12453,19 @@ async def design_reference(request: Request):
         return JSONResponse({'error': brief.get('note', 'could not generate the design brief')}, status_code=502)
     header = (f'# Design reference: {name}\n\n'
               f'- Source: uploaded image ({ext.lstrip(".")})\n'
+              f'- Project: {project}\n'
               f'- Generated: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n'
               f'- Image file: {image_rel}\n\n')
     try:
         with open(image_path, 'wb') as f:
             f.write(image_bytes)
-        brief_rel = os.path.join('design-references', f'{name}.txt')
+        brief_rel = os.path.join(project, f'{name}.txt')
         brief_path = _safe_library_path(brief_rel)
         if brief_path:
             _write_file(brief_path, header + brief['brief'] + '\n')
     except Exception as e:
         return JSONResponse({'error': f'could not write the design reference: {e}'}, status_code=500)
-    log_action(agent_id, 'design_reference', {'name': name, 'image': image_rel, 'brief': brief_rel})
+    log_action(agent_id, 'design_reference', {'name': name, 'image': image_rel, 'brief': brief_rel, 'project': project})
     return JSONResponse({'ok': True, 'name': name, 'image': image_rel, 'briefPath': brief_rel,
                          'text': header + brief['brief']})
 
@@ -12468,8 +12498,9 @@ async def design_reference_url(request: Request):
     brief = _design_brief_from_image(screenshot_b64, f'URL {url}', context=f'Design review of the live page at {url}')
     if not brief.get('ok'):
         return JSONResponse({'error': brief.get('note', 'could not generate the design brief')}, status_code=502)
+    project = _design_project_rel(body.get('project'))
     try:
-        design_dir = _safe_library_path('design-references')
+        design_dir = _safe_library_path(project)
         if not design_dir:
             return JSONResponse({'error': 'invalid design-references path'}, status_code=400)
         os.makedirs(design_dir, exist_ok=True)
@@ -12477,16 +12508,120 @@ async def design_reference_url(request: Request):
         return JSONResponse({'error': 'could not create the design-references directory'}, status_code=500)
     header = (f'# Design review: {url}\n\n'
               f'- Source: live page screenshot\n'
+              f'- Project: {project}\n'
               f'- Generated: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n\n')
     try:
-        brief_rel = os.path.join('design-references', f'{host}.txt')
+        brief_rel = os.path.join(project, f'{host}.txt')
         brief_path = _safe_library_path(brief_rel)
         if brief_path:
             _write_file(brief_path, header + brief['brief'] + '\n')
     except Exception as e:
         return JSONResponse({'error': f'could not write the design review: {e}'}, status_code=500)
-    log_action(agent_id, 'design_reference_url', {'url': url, 'brief': brief_rel})
+    log_action(agent_id, 'design_reference_url', {'url': url, 'brief': brief_rel, 'project': project})
     return JSONResponse({'ok': True, 'url': url, 'briefPath': brief_rel, 'text': header + brief['brief']})
+
+
+def _fold_design_taste(briefs, project):
+    """Fold a project's raw design briefs into ONE distilled taste doc, the
+    single source of truth agents load before design work. Uses the mid tier
+    (a text-synthesis fold, not a vision read -- each brief is already a
+    structured text report). Returns (taste_text, error)."""
+    if not briefs:
+        return None, 'no design briefs in this project yet'
+    items = []
+    for i, rel in enumerate(briefs, 1):
+        target = _safe_library_path(rel)
+        if not target or not os.path.isfile(target):
+            continue
+        try:
+            with open(target, 'r', errors='replace') as f:
+                items.append(f'--- Brief {i}: {rel} ---\n' + f.read()[:8000])
+        except Exception:
+            continue
+    if not items:
+        return None, 'no design briefs could be read'
+    try:
+        tier = _mid_tier_slug()
+        if not tier:
+            return None, 'no mid-tier model is configured to fold the taste doc'
+        prompt = (
+            'You are distilling a design TASTE DOC for a small team. Below are design briefs '
+            'the player collected as inspiration for a project. Fold them into ONE concise '
+            'taste reference with these exact sections:\n'
+            'PALETTE: the hex colors to use (backgrounds, text, accents) -- merge the briefs, '
+            'keep every distinct color that appears in more than one brief.\n'
+            'TYPOGRAPHY: font families/styles, sizes, weights, heading-vs-body contrast.\n'
+            'LAYOUT: grid, spacing rhythm, alignment, section structure, whitespace.\n'
+            'STYLE: a one-line overall aesthetic.\n'
+            'AVOID: colors/fonts/patterns only one brief mentions, and anything not grounded '
+            'in at least two of the briefs. Be concrete -- real hex codes.\n\n' + '\n\n'.join(items)
+        )
+        result = _call_openrouter_sync(tier, [{'role': 'user', 'content': prompt}], 1200)
+        reply = (result.get('choices') or [{}])[0].get('message', {}).get('content') or ''
+    except Exception as e:
+        return None, f'design taste fold failed: {e}'
+    if not reply.strip():
+        return None, 'design taste fold returned no reply'
+    header = (f'# Design taste: {project}\n\n'
+              f'- Folded from {len(items)} design briefs\n'
+              f'- Generated: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n\n')
+    return header + reply.strip()[:12000], None
+
+
+@app.post('/api/design-reference/taste')
+async def design_reference_taste(request: Request):
+    """Fold a project's collected design briefs into one distilled taste doc
+    (design-references/<project>/taste.md), the single source of truth agents
+    are required to load before design work on that project. Player-only.
+    Overwrites taste.md in place -- re-run after adding briefs."""
+    body = await request.json()
+    agent_id = body.get('agentId', 'player')
+    if agent_id != 'player':
+        return JSONResponse({'error': 'design references are player-only'}, status_code=403)
+    project = _design_project_rel(body.get('project'))
+    briefs = _list_design_briefs(project)
+    if not briefs:
+        return JSONResponse({'error': 'no design briefs in this project yet -- upload inspiration first'}, status_code=400)
+    taste, error = _fold_design_taste(briefs, project)
+    if error:
+        return JSONResponse({'error': error}, status_code=502)
+    taste_rel = os.path.join(project, 'taste.md')
+    taste_path = _safe_library_path(taste_rel)
+    if not taste_path:
+        return JSONResponse({'error': 'invalid project path'}, status_code=400)
+    try:
+        design_dir = _safe_library_path(project)
+        os.makedirs(design_dir, exist_ok=True)
+        _write_file(taste_path, taste + '\n')
+    except Exception as e:
+        return JSONResponse({'error': f'could not write the taste doc: {e}'}, status_code=500)
+    log_action(agent_id, 'design_reference_taste', {'project': project, 'taste': taste_rel, 'briefs': len(briefs)})
+    return JSONResponse({'ok': True, 'project': project, 'tastePath': taste_rel, 'briefCount': len(briefs),
+                         'text': taste})
+
+
+def _design_context_for_project(project):
+    """Read-before-act context block for design work on a project: the folded
+    taste doc plus a pointer to the raw inspiration briefs. Empty string when
+    the project has no taste doc (the executor still runs, just without a
+    design vocabulary -- the pre-existing behavior)."""
+    rel_dir = _design_project_rel(project)
+    taste_rel = os.path.join(rel_dir, 'taste.md')
+    taste_path = _safe_library_path(taste_rel)
+    lines = []
+    if taste_path and os.path.isfile(taste_path):
+        try:
+            with open(taste_path, 'r', errors='replace') as f:
+                taste = f.read(20000)
+        except Exception:
+            taste = ''
+        if taste.strip():
+            lines.append(f'The design taste for this project (READ THIS FIRST):\n{taste.strip()}')
+    briefs = _list_design_briefs(project)
+    if briefs:
+        lines.append('Raw inspiration briefs in the project library (read the relevant ones): '
+                     + ', '.join(f'{b}' for b in briefs))
+    return '\n\n'.join(lines)
 
 
 @app.post('/api/chat')
