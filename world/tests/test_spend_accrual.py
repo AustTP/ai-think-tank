@@ -160,7 +160,7 @@ class ClarifyLaneAccrual(unittest.TestCase):
                                         return_value=[{'path': 'projects/p1/README.md', 'snippet': 'input'}]), \
              unittest.mock.patch.object(serve, '_call_openrouter_sync', return_value=fake), \
              unittest.mock.patch.object(serve, '_accrue_spend',
-                                        side_effect=lambda s2, c2: calls.append((s2, c2))):
+                                        side_effect=lambda s2, c2, village_id=None: calls.append((s2, c2))):
             resp = c.post('/api/intent/clarify',
                           json={'productId': 'p1', 'question': 'how was it parsed?'})
         self.assertEqual(resp.status_code, 200, resp.text)
@@ -192,7 +192,7 @@ class ClarifyLaneAccrual(unittest.TestCase):
              unittest.mock.patch.object(serve, '_call_openrouter_sync',
                                         side_effect=[first, second]), \
              unittest.mock.patch.object(serve, '_accrue_spend',
-                                        side_effect=lambda s2, c2: calls.append((s2, c2))):
+                                        side_effect=lambda s2, c2, village_id=None: calls.append((s2, c2))):
             resp = c.post('/api/intent/clarify',
                           json={'productId': 'p1', 'question': 'q'})
         self.assertEqual(resp.status_code, 200, resp.text)
@@ -218,7 +218,7 @@ class ClarifyLaneAccrual(unittest.TestCase):
              unittest.mock.patch.object(serve, '_library_search_matches', return_value=[]), \
              unittest.mock.patch.object(serve, '_call_openrouter_sync', return_value=fake) as mc, \
              unittest.mock.patch.object(serve, '_accrue_spend',
-                                        side_effect=lambda s2, c2: calls.append((s2, c2))):
+                                        side_effect=lambda s2, c2, village_id=None: calls.append((s2, c2))):
             resp = c.post('/api/intent/clarify',
                           json={'productId': 'p1', 'question': 'q'})
         self.assertEqual(resp.status_code, 200, resp.text)
