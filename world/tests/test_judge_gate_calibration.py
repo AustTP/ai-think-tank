@@ -336,9 +336,45 @@ class ReviewGradeCalibrationTests(unittest.TestCase):
         self.assertEqual(report['samples'], 3)
         self.assertEqual(report['agreed'], 2)
         self.assertAlmostEqual(report['agreement_rate'], 0.6667, places=3)
+        # Contingency: meets/meets=1, meets/fails=1, fails/fails=1.
+        # p_o = 2/3, p_e = 4/9, kappa = (2/3 - 4/9) / (1 - 4/9) = 0.4.
+        self.assertAlmostEqual(report['kappa'], 0.4, places=3)
         by = {s['section']: s for s in report['sections']}
         self.assertEqual((by['repo']['samples'], by['repo']['agreed']), (2, 1))
         self.assertEqual((by['opening']['samples'], by['opening']['agreed']), (1, 1))
+
+    def test_kappa_perfect_agreement_is_one(self):
+        serve._insert_review_calibration_sample('repo', 'meets', 0.9, 'meets')
+        serve._insert_review_calibration_sample('repo', 'fails', 0.9, 'fails')
+        report = serve._review_grade_calibration_report()
+        self.assertAlmostEqual(report['kappa'], 1.0, places=3)
+        self.assertAlmostEqual(report['agreement_rate'], 1.0, places=3)
+
+    def test_kappa_chance_agreement_is_zero(self):
+        # Judge and anchor agree 2/4 times (0.5 raw), exactly chance:
+        # meets/meets + meets/fails + fails/meets + fails/fails.
+        serve._insert_review_calibration_sample('repo', 'meets', 0.9, 'meets')
+        serve._insert_review_calibration_sample('repo', 'meets', 0.9, 'fails')
+        serve._insert_review_calibration_sample('repo', 'fails', 0.9, 'meets')
+        serve._insert_review_calibration_sample('repo', 'fails', 0.9, 'fails')
+        report = serve._review_grade_calibration_report()
+        self.assertAlmostEqual(report['kappa'], 0.0, places=3)
+
+    def test_kappa_none_when_a_rater_never_varies(self):
+        # All-meets on both sides: 100% raw agreement but no second cell for
+        # either rater -- kappa is undefined, so it reports None (raw
+        # agreement is the only honest number).
+        serve._insert_review_calibration_sample('repo', 'meets', 0.9, 'meets')
+        serve._insert_review_calibration_sample('repo', 'meets', 0.9, 'meets')
+        report = serve._review_grade_calibration_report()
+        self.assertEqual(report['agreement_rate'], 1.0)
+        self.assertIsNone(report['kappa'])
+
+    def test_report_empty_yields_none_rate_and_kappa(self):
+        report = serve._review_grade_calibration_report()
+        self.assertEqual(report['samples'], 0)
+        self.assertIsNone(report['agreement_rate'])
+        self.assertIsNone(report['kappa'])
 
     def test_effective_confidence_default_and_clamp(self):
         self.assertEqual(serve._effective_review_grade_confidence(), serve.JEV_SAFETY_CONFIDENCE)

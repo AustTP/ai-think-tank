@@ -62,6 +62,14 @@ class WeeklyReview(unittest.TestCase):
                 (ts, kind, 'test-model', 'p', 'c', 'x', confidence, cost, '{}', int(ok)),
             )
 
+    def _seed_library_write(self, agent_id, path, source, ts):
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO action_log (agent_id, action, details, authorized, ts) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (agent_id, 'library_write', json.dumps({'path': path, 'source': source}), 1, ts),
+            )
+
     def test_period_start_is_the_utc_week_boundary(self):
         now = 2000000.0  # a fixed epoch (well past the 1970 epoch)
         start = serve._weekly_period_start(now)
@@ -107,6 +115,55 @@ class WeeklyReview(unittest.TestCase):
 
     def test_build_weekly_review_returns_none_when_nothing_to_review(self):
         self.assertIsNone(serve._build_weekly_review(now=2000000.0))
+
+    def test_build_weekly_review_reports_library_write_provenance(self):
+        # Firsthand work goes to the trusted tree; external (web-browsed)
+        # content is gated into pending_review/. A write marked external that
+        # landed in the trusted tree is the memory-poisoning signal.
+        now = 2000000.0
+        self._seed_library_write('ada', 'shared/notes.md', 'firsthand', now - 100)
+        self._seed_library_write('ben', 'pending_review/x.md', 'external', now - 100)
+        self._seed_library_write('ben', 'wiki/cat/p.md', 'external', now - 100)
+        review = serve._build_weekly_review(now=now)
+        self.assertIsNotNone(review)
+        prov = review['digest']['provenance']
+        self.assertEqual(prov['library_writes'], 3)
+        self.assertEqual(prov['by_source'], {'external': 2, 'firsthand': 1})
+        self.assertEqual(prov['external_in_trusted'], ['wiki/cat/p.md'])
+        self.assertEqual(prov['unvetted_pending_n'], 0)
+        self.assertIn('## Knowledge provenance audit', review['markdown'])
+        self.assertIn('Memory-poisoning signal', review['markdown'])
+
+    def test_build_weekly_review_lists_unvetted_pending_content_alone(self):
+        # The audit's real job: a quiet week with only external content parked
+        # in pending_review/ must still produce a review (the early-return
+        # "nothing to review" check includes the provenance findings).
+        now = 2000000.0
+        pending = os.path.join(self.tmp, 'library', 'pending_review', 'shared')
+        os.makedirs(pending)
+        with open(os.path.join(pending, 'scraped.md'), 'w') as f:
+            f.write('# scraped from the web\n')
+        review = serve._build_weekly_review(now=now)
+        self.assertIsNotNone(review)
+        prov = review['digest']['provenance']
+        self.assertEqual(prov['unvetted_pending'], ['pending_review/shared/scraped.md'])
+        self.assertEqual(prov['library_writes'], 0)
+        self.assertIn('Unvetted external content', review['markdown'])
+        self.assertIn('`pending_review/shared/scraped.md`', review['markdown'])
+
+    def test_provenance_audit_is_best_effort(self):
+        # The memory audit must never raise: a broken DB read or an
+        # unreadable pending_review tree both return the default dict.
+        now = 2000000.0
+        with unittest.mock.patch.object(os.path, 'isdir', return_value=True), \
+             unittest.mock.patch.object(os, 'walk', side_effect=OSError('fs unreachable')):
+            prov = serve._library_provenance_audit(now, WEEK)
+        self.assertEqual(prov['unvetted_pending'], [])
+        self.assertEqual(prov['writes'], 0)
+        with unittest.mock.patch.object(serve, '_db', side_effect=RuntimeError('db unreachable')):
+            prov = serve._library_provenance_audit(now, WEEK)
+        self.assertEqual(prov['writes'], 0)
+        self.assertEqual(prov['external_in_trusted'], [])
 
     def test_generate_weekly_review_is_idempotent_per_week(self):
         now = 2000000.0

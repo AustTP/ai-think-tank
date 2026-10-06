@@ -1859,7 +1859,9 @@ def _apply_content_result(state, task, result, now_ms=None):
                 # approve code any more than a red pipeline can; without this a
                 # hollow clean vote would close a card that was never really
                 # tested. Non-coding lanes (observatory etc.) stay on the
-                # pipelineOk check alone.
+                # pipelineOk check alone -- deliberately: they can
+                # legitimately conclude with no deliverable (see
+                # library/design-references/stop-condition.md).
                 elif _peer_coding_class(parent) and not (result.get('evidence') or '').strip():
                     verdict = 'actionable'
                 if verdict == 'actionable':
