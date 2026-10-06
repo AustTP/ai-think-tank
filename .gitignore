@@ -1,6 +1,7 @@
 # Secrets — never commit
 .env
 .env.*
+!.env.template
 *.bak
 *.bak.*
 # An exported YouTube cookies.txt for the sandbox's yt-dlp -- a full session
