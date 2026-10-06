@@ -1011,6 +1011,7 @@ class HealthSnapshot(unittest.TestCase):
             conn.execute('DELETE FROM action_log')
             conn.execute('DELETE FROM decision_tape')
             conn.execute('DELETE FROM model_tiers')
+            conn.execute('DELETE FROM review_judge_calibration')
 
     def test_db_failure_returns_critical_alert(self):
         with unittest.mock.patch.object(serve, '_db', side_effect=RuntimeError('db unreachable')):
@@ -1065,6 +1066,16 @@ class HealthSnapshot(unittest.TestCase):
             conn.execute('INSERT INTO action_log (agent_id, action, details, ts) VALUES (?, ?, ?, ?)',
                          ('eli', 'quality_gate_reject', json.dumps({'redPipelineEscaped': True}),
                           now - 100))
+            # Grader calibration: Jev verdict vs mechanical pipeline anchor.
+            # meets/meets + meets/fails + fails/fails -> agreement 2/3,
+            # kappa 0.4 (see test_judge_gate_calibration for the math).
+            for row in [('repo', 'meets', 0.9, 'meets', 1),
+                        ('repo', 'meets', 0.8, 'fails', 0),
+                        ('opening', 'fails', 0.9, 'fails', 1)]:
+                conn.execute(
+                    'INSERT INTO review_judge_calibration (ts, section, judge_verdict, judge_confidence, anchor_verdict, agree) '
+                    'VALUES (?, ?, ?, ?, ?, ?)',
+                    (now - 100, row[0], row[1], row[2], row[3], row[4]))
             for ok in (1, 0, 0):
                 conn.execute(
                     'INSERT INTO decision_tape (ts, kind, model, prompt, criteria, choice, confidence, cost, raw, ok) '
@@ -1105,11 +1116,65 @@ class HealthSnapshot(unittest.TestCase):
         self.assertEqual(snap['red_pipeline_escapes_last_24h'], 1)
         self.assertEqual(snap['ceremony_actions_last_24h'], 3)
         self.assertEqual(snap['progress_actions_last_24h'], 3)
+        # The 3 review_escalate rows are rework loops; with 3 progress actions
+        # the straight-through rate is 50%. No taskId/title in their details,
+        # so no ledger spend attaches to them.
+        self.assertEqual(snap['rework_loops_last_24h'], 3)
+        self.assertEqual(snap['looped_tasks_last_24h'], 0)
+        self.assertAlmostEqual(snap['loop_cost_usd_last_24h'], 0.0)
+        self.assertAlmostEqual(snap['straight_through_rate'], 0.5)
+        self.assertEqual(snap['review_grader_samples'], 3)
+        self.assertAlmostEqual(snap['review_grader_agreement_rate'], 0.6667, places=3)
+        self.assertAlmostEqual(snap['review_grader_kappa'], 0.4, places=3)
         self.assertEqual(snap['task_assigned_last_24h'], 1)
         self.assertEqual(snap['task_completed_last_24h'], 1)
         self.assertIn('low', snap['model_tier_bands'])
         self.assertIn('mid', snap['missing_model_tier_bands'])
         self.assertTrue(any(a['category'] == 'behavior' for a in snap['alerts']))
+
+    def test_rework_metrics_prices_distinct_looped_tasks_from_ledger(self):
+        # 4 requeue rows for the same task = 4 loops, 1 distinct task, and the
+        # task's per-task ledger bucket counts once toward the loop cost.
+        now = time.time()
+        with serve._db() as conn:
+            for _ in range(4):
+                conn.execute(
+                    'INSERT INTO action_log (agent_id, action, details, ts) VALUES (?, ?, ?, ?)',
+                    ('a', 'task_review_requeued',
+                     json.dumps({'taskId': 't9', 'title': 'Loop me'}), now - 100))
+        ledger = {'__task__/t9': {'used': 2.5, 'calls': 3}}
+        with unittest.mock.patch.object(serve, '_spend_ledger_read', return_value=ledger):
+            m = serve._rework_metrics(now)
+        self.assertEqual(m['loops'], 4)
+        self.assertEqual(m['looped_tasks'], 1)
+        self.assertAlmostEqual(m['loop_cost_usd'], 2.5)
+
+    def test_rework_metrics_falls_back_to_title_key(self):
+        # Some rework rows carry only the title; the ledger's title-keyed
+        # bucket (the old per-task keying) still prices the loop.
+        now = time.time()
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO action_log (agent_id, action, details, ts) VALUES (?, ?, ?, ?)',
+                ('a', 'story_vetoed', json.dumps({'title': '[STORY] Some story'}), now - 100))
+        ledger = {'[STORY] Some story': {'used': 1.25, 'calls': 5}}
+        with unittest.mock.patch.object(serve, '_spend_ledger_read', return_value=ledger):
+            m = serve._rework_metrics(now)
+        self.assertEqual(m['loops'], 1)
+        self.assertEqual(m['looped_tasks'], 1)
+        self.assertAlmostEqual(m['loop_cost_usd'], 1.25)
+
+    def test_rework_metrics_outside_window_is_ignored(self):
+        now = time.time()
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO action_log (agent_id, action, details, ts) VALUES (?, ?, ?, ?)',
+                ('a', 'review_escalate', json.dumps({'taskId': 'old'}), now - serve._REWORK_WINDOW_S - 10))
+        with unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={'__task__/old': {'used': 9.0}}):
+            m = serve._rework_metrics(now)
+        self.assertEqual(m['loops'], 0)
+        self.assertEqual(m['looped_tasks'], 0)
+        self.assertEqual(m['loop_cost_usd'], 0.0)
 
 
 class HealthAlertsPersist(unittest.TestCase):
@@ -1148,7 +1213,9 @@ class HealthDigest(unittest.TestCase):
         return {'checked_at': time.time(), 'alerts': [{'category': 'jev', 'severity': 'warning',
                                                        'message': 'x'}],
                 'bank_used': 1.0, 'bank_cap': 5.0, 'bank_over_cap': [],
-                'aging_in_flight_work': 0, 'open_escalations': 1}
+                'aging_in_flight_work': 0, 'open_escalations': 1,
+                'review_grader_samples': 3, 'review_grader_agreement_rate': 0.6667,
+                'review_grader_kappa': 0.4}
 
     def test_skips_when_digest_recently_written(self):
         with serve._db() as conn:
@@ -1165,6 +1232,8 @@ class HealthDigest(unittest.TestCase):
             content = f.read()
         self.assertIn('Think Tank Health Digest', content)
         self.assertIn('Open escalations:** 1', content)
+        self.assertIn('**Rework:**', content)
+        self.assertIn('**Grader:** 3 anchored review grade(s), agreement 67%, kappa 0.40', content)
         with serve._db() as conn:
             row = conn.execute('SELECT value FROM settings WHERE key = ?',
                                (serve._DIGEST_STAMP_KEY,)).fetchone()

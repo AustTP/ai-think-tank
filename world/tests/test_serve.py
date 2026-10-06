@@ -908,6 +908,10 @@ class HealthChecks(unittest.TestCase):
             'ceremony_signal': 0.0,
             'progress_signal': 0.0,
             'ceremony_imbalance_score': 0.0,
+            'rework_loops_last_24h': 0,
+            'looped_tasks_last_24h': 0,
+            'loop_cost_usd_last_24h': 0.0,
+            'straight_through_rate': None,
             'aging_in_flight_work': 0,
             'open_escalations': 0,
             'bank_over_cap': [],
@@ -1054,6 +1058,35 @@ class HealthChecks(unittest.TestCase):
             self_proposed_rejected_last_24h=serve.SELF_PROPOSED_REJECT_THRESHOLD - 1,
         ))
         self.assertEqual(alerts, [])
+
+    def test_rework_loops_below_volume_threshold_raise_nothing(self):
+        # A couple of requeues is normal review churn, not a loop signal.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            rework_loops_last_24h=serve._REWORK_MIN_LOOPS_FOR_ALERT - 1,
+            straight_through_rate=0.2,
+        ))
+        self.assertEqual(alerts, [])
+
+    def test_rework_loops_with_good_straight_through_raise_nothing(self):
+        # Loops with plenty of completed work to show for them aren't debt.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            rework_loops_last_24h=8, straight_through_rate=0.8,
+        ))
+        self.assertEqual(alerts, [])
+
+    def test_low_straight_through_rate_raises_rework_warning(self):
+        # The review pipeline redoing work instead of finishing it: enough
+        # loops AND a straight-through rate below the floor.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            rework_loops_last_24h=6, looped_tasks_last_24h=2,
+            loop_cost_usd_last_24h=3.5, straight_through_rate=0.4,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['category'], 'rework')
+        self.assertEqual(alerts[0]['severity'], 'warning')
+        self.assertIn('6 rework loop', alerts[0]['message'])
+        self.assertIn('$3.50', alerts[0]['message'])
+        self.assertIn('40%', alerts[0]['message'])
 
     def test_self_proposed_rejection_pattern_raises_coordination_info(self):
         alerts = serve._health_alerts_for_signals(self._signals(
