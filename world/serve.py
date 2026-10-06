@@ -92,6 +92,9 @@ from bank import (  # noqa: E402,F401
     _apify_budget_month,
     _apify_spend_this_month,
     _bank_budget_view,
+    _bank_profit_loss_view,
+    _bank_profit_loss_note,
+    _record_closed_position,
     _budget_cap_usd,
     _colab_budget_exceeded,
     _colab_budget_month,
@@ -8937,6 +8940,35 @@ async def promote_shadow_entry(idx: str, request: Request):
 # product-passport. The read endpoint (get_sprints) powers the board modal.
 # /api/intent prefix is already session-auth'd via AUTH_PROTECTED_PREFIXES.
 # ---------------------------------------------------------------------------
+@app.get('/api/bank/profit-loss')
+async def bank_profit_loss(request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    return _bank_profit_loss_view()
+
+
+@app.post('/api/bank/closed-positions')
+async def bank_record_closed_position(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({'error': 'body must be an object'}, status_code=400)
+    agent_id = body.get('agentId')
+    if not isinstance(agent_id, str) or not agent_id:
+        return JSONResponse({'error': 'agentId is required'}, status_code=400)
+    if not _require_player_session(request) and verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    state = get_state_from_db() or {}
+    if agent_id not in {a.get('id') for a in state.get('agentRoster', [])}:
+        return JSONResponse({'error': 'unknown agentId'}, status_code=400)
+    try:
+        return _record_closed_position(body)
+    except ValueError as exc:
+        return JSONResponse({'error': str(exc)}, status_code=400)
+
+
 @app.post('/api/intent/sprint')
 async def intent_sprint(request: Request):
     """Seed a new sprint: {name?, goal, items:[...], targetDate?}. Returns the

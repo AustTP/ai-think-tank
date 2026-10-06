@@ -24,6 +24,118 @@ import datetime
 import json
 import time
 import urllib.request
+from decimal import Decimal, InvalidOperation
+
+
+def _trade_table(conn):
+    conn.execute('''CREATE TABLE IF NOT EXISTS bank_closed_positions (
+        broker TEXT NOT NULL, position_id TEXT NOT NULL, blob TEXT NOT NULL,
+        PRIMARY KEY (broker, position_id)
+    )''')
+
+
+def _record_closed_position(body):
+    """Record a confirmed FULL closure, atomically and idempotently.
+
+    Prices must be actual weighted-average fills, quantity the fully closed
+    quantity, and fees all entry/exit commissions and financing in quoteCurrency.
+    This ledger does not place trades or infer closure from a task completing.
+    """
+    import serve as _serve
+    if not isinstance(body, dict):
+        raise ValueError('body must be an object')
+    record = {}
+    for key in ('broker', 'positionId', 'agentId', 'symbol', 'quoteCurrency'):
+        value = body.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f'{key} is required')
+        record[key] = value.strip()
+    if body.get('side') not in ('long', 'short'):
+        raise ValueError('side must be long or short')
+    if body.get('status') != 'closed':
+        raise ValueError('only confirmed fully closed positions are accepted')
+    record.update(side=body['side'], status='closed')
+    dates = []
+    for key in ('openedAt', 'closedAt'):
+        try:
+            dt = datetime.datetime.fromisoformat(body[key].replace('Z', '+00:00'))
+            if dt.utcoffset() is None:
+                raise ValueError('timezone required')
+        except (KeyError, AttributeError, TypeError, ValueError):
+            raise ValueError(f'{key} must be an ISO timestamp with timezone') from None
+        dates.append(dt)
+        record[key] = dt.astimezone(datetime.timezone.utc).isoformat()
+    if dates[1] < dates[0]:
+        raise ValueError('closedAt must not precede openedAt')
+    numbers = {}
+    for key in ('quantity', 'entryPrice', 'exitPrice', 'fees'):
+        try:
+            value = Decimal(str(body[key]))
+        except (KeyError, InvalidOperation):
+            raise ValueError(f'{key} must be a finite number') from None
+        if not value.is_finite() or value < 0 or (key != 'fees' and value == 0):
+            raise ValueError(f'{key} must be positive (fees may be zero)')
+        numbers[key] = value
+        record[key] = str(value.normalize())
+    gross = (numbers['exitPrice'] - numbers['entryPrice']) * numbers['quantity']
+    if record['side'] == 'short':
+        gross = -gross
+    record['grossPnl'] = str(gross)
+    record['netPnl'] = str(gross - numbers['fees'])
+    with _serve._db() as conn:
+        _trade_table(conn)
+        conn.execute('INSERT OR IGNORE INTO bank_closed_positions VALUES (?, ?, ?)',
+                     (record['broker'], record['positionId'], json.dumps(record)))
+        stored = json.loads(conn.execute(
+            'SELECT blob FROM bank_closed_positions WHERE broker = ? AND position_id = ?',
+            (record['broker'], record['positionId'])).fetchone()[0])
+        if stored != record:
+            raise ValueError('position already recorded with different closure details')
+    return stored
+
+
+def _bank_profit_loss_view():
+    """Realized trading results by agent AND currency; never sum currencies.
+
+    Operating model/API spend remains in the separate budget ledger. Historical
+    spend has no reliable agent attribution and is not subtracted here.
+    """
+    import serve as _serve
+    with _serve._db() as conn:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bank_closed_positions'").fetchone():
+            return {'basis': 'realized_closed_positions', 'agents': [], 'positions': []}
+        records = [json.loads(row[0]) for row in conn.execute(
+            'SELECT blob FROM bank_closed_positions ORDER BY broker, position_id')]
+    groups = {}
+    for record in records:
+        key = (record['agentId'], record['quoteCurrency'])
+        row = groups.setdefault(key, {
+            'agentId': key[0], 'quoteCurrency': key[1], 'closedPositions': 0,
+            'wins': 0, 'losses': 0, 'breakeven': 0,
+            'grossPnl': Decimal(0), 'fees': Decimal(0), 'netPnl': Decimal(0),
+        })
+        row['closedPositions'] += 1
+        net = Decimal(record['netPnl'])
+        row['wins' if net > 0 else 'losses' if net < 0 else 'breakeven'] += 1
+        for field in ('grossPnl', 'fees', 'netPnl'):
+            row[field] += Decimal(record[field])
+    rows = []
+    for _, row in sorted(groups.items()):
+        row['winRate'] = row['wins'] / row['closedPositions']
+        for field in ('grossPnl', 'fees', 'netPnl'):
+            row[field] = str(row[field])
+        rows.append(row)
+    return {'basis': 'realized_closed_positions', 'agents': rows, 'positions': records}
+
+
+def _bank_profit_loss_note():
+    view = _bank_profit_loss_view()
+    if not view['agents']:
+        return ' Trading P&L: no confirmed closed positions recorded yet.'
+    lines = [f"{r['agentId']} ({r['quoteCurrency']}): net {r['netPnl']}, gross {r['grossPnl']}, "
+             f"fees {r['fees']}; {r['closedPositions']} closed, {r['wins']} wins, {r['losses']} losses"
+             for r in view['agents']]
+    return ' Realized trading P&L (before operating costs): ' + '; '.join(lines) + '.'
 
 # The default per-service budget when no product record pins a cap.
 DEFAULT_BUDGET_CAP_USD = 50.0

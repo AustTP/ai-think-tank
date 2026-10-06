@@ -682,12 +682,12 @@ def _run_bank_content(snapshot, agent_id, task, base_ctx=None):
                      f"services. " + ("At least one service is OVER its cap -- work in that "
                      "area should slow down; only a director can reallocate or raise it."
                      if over_any else "Everything is within cap right now."))
-        _sim_module._store_content_result(task.get('id'), {'note': note})
+        _sim_module._store_content_result(task.get('id'), {'note': note + _serve._bank_profit_loss_note()})
         return
     if not view:
         note = (f"{name} (director) checked the bank: nothing has been spent yet, so "
                 f"every service is at $0.00 of its cap. No forecast until there's a burn signal.")
-        _sim_module._store_content_result(task.get('id'), {'note': note})
+        _sim_module._store_content_result(task.get('id'), {'note': note + _serve._bank_profit_loss_note()})
         return
     lines = []
     total_used = total_cap = 0.0
@@ -720,7 +720,7 @@ def _run_bank_content(snapshot, agent_id, task, base_ctx=None):
         note += (f" Apify account (real): ${apify_usage['usedUsd']:.4f} of "
                  f"${apify_usage['capUsd']:.2f} monthly cap spent "
                  f"(${apify_usage['remainingUsd']:.4f} remaining).")
-    _sim_module._store_content_result(task.get('id'), {'note': note})
+    _sim_module._store_content_result(task.get('id'), {'note': note + _serve._bank_profit_loss_note()})
 
 
 def _run_research_project_content(snapshot, agent_id, task, base_ctx=None):

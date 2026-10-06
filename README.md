@@ -128,3 +128,46 @@ cd world && python3 -m pytest tests/
   by default (disabled).
 - Room descriptions are director-editable; room geometry is not (it is a
   code-graph invariant).
+### Closed trading positions and the Bank
+
+The Bank reports realized trading P&L per agent and quote currency alongside
+its existing operating-spend review. Trading results use actual fill prices:
+long gross P&L = (exitPrice - entryPrice) * quantity; short reverses the sign.
+Net P&L subtracts fees. Model/API costs remain separate because historical
+spend is attributed to services/tasks, not reliably to trading agents.
+
+A future broker adapter should POST `/api/bank/closed-positions` only after
+confirming a **fully closed** position. Authenticate with the player session
+or the owning agent's `X-Agent-Key`. Example payload:
+
+```json
+{
+  "broker": "paper-account-1",
+  "positionId": "position-123",
+  "agentId": "ben",
+  "symbol": "ABC",
+  "quoteCurrency": "USD",
+  "status": "closed",
+  "side": "long",
+  "quantity": "2",
+  "entryPrice": "100.10",
+  "exitPrice": "110.20",
+  "fees": "0.20",
+  "openedAt": "2026-10-01T12:00:00Z",
+  "closedAt": "2026-10-02T12:00:00Z"
+}
+```
+
+Use weighted-average executed entry/exit prices, total closed quantity, and
+all entry/exit commissions and financing costs in the quote currency. Use a
+broker/account namespace and a unique position ID per completed lifecycle.
+Records are immutable: identical retries return the stored record; conflicting
+retries are rejected. SQLite stores closures independently of world autosaves.
+Decimal strings preserve monetary precision. The example nets 20.00 USD.
+
+GET `/api/bank/profit-loss` with a player session returns closure records and
+per-agent/currency gross P&L, fees, net P&L, wins, losses, breakeven counts, and
+win rate. The Bank teller also includes these results even before any API spend.
+No currencies are combined or converted. This foundation supports linear
+instruments; derivatives with contract multipliers, partial-close fill matching,
+open-position valuations, and live broker execution need adapter work before use.
