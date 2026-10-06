@@ -252,6 +252,46 @@ class CreateEscalationTwoLineHandoff(unittest.TestCase):
         self.assertIn('Look here first: the question above', sent['body'])
 
 
+class CreateEscalationDedup(unittest.TestCase):
+    """The escalation-storm guard: a pending escalation with the SAME kind and
+    question is reused instead of spawning a new record, so a retrying agent
+    (same blocked command, same stuck story) cannot balloon the file into the
+    thousands. A resolved record does NOT block a fresh one."""
+
+    def _patched(self):
+        store = {}
+        return unittest.mock.patch.object(serve, '_load_escalations', side_effect=lambda: store), \
+            unittest.mock.patch.object(serve, '_save_escalations', lambda d: None), \
+            unittest.mock.patch.object(serve, '_send_escalation_email_sync', lambda s, b: None), \
+            store
+
+    def test_pending_duplicate_is_reused_not_recreated(self):
+        load, save, email, store = self._patched()
+        with load, save, email:
+            first = serve.create_escalation('blocked command', 'Agent ada wants to run: cat > x.py')
+            second = serve.create_escalation('blocked command', 'Agent ada wants to run: cat > x.py')
+        self.assertEqual(first, second, 'same pending kind+question reuses the existing escalation')
+        self.assertEqual(len(store), 1, 'no duplicate record is created')
+
+    def test_different_question_creates_new(self):
+        load, save, email, store = self._patched()
+        with load, save, email:
+            a = serve.create_escalation('blocked command', 'cmd one')
+            b = serve.create_escalation('blocked command', 'cmd two')
+        self.assertNotEqual(a, b)
+        self.assertEqual(len(store), 2)
+
+    def test_resolved_duplicate_allows_fresh(self):
+        load, save, email, store = self._patched()
+        with load, save, email:
+            a = serve.create_escalation('kind', 'Q')
+            for v in store.values():
+                v['status'] = 'approved'
+            b = serve.create_escalation('kind', 'Q')
+        self.assertNotEqual(a, b, 'a resolved escalation does not block a fresh one')
+        self.assertEqual(len(store), 2)
+
+
 class RuleProposalsEndpoint(_LedgerTestCase):
     def _request(self):
         return unittest.mock.MagicMock(cookies={})
