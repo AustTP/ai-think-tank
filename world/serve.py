@@ -9522,6 +9522,30 @@ async def respond_player_inbox(message_id: str, request: Request):
     return JSONResponse({'ok': True, 'message': m})
 
 
+@app.post('/api/intent/player-task/{task_id}/complete')
+async def complete_player_task_endpoint(task_id: str, request: Request):
+    """Human-in-the-loop: the player marks an assigned-to-them task done. The
+    task was handed to the player by the think tank (assignedTo 'player', a
+    'needs_player' card -- see _assign_player_task); marking it done flips it
+    to 'done', which releases anything queued depends_on_task on it: agent
+    cards become assignable on the next task cycle, and any issue committed
+    blocked on it is auto-unblocked with its waiting agent woken. PLAYER-only
+    -- an agent key is NOT a credential here (an agent answering for you would
+    defeat the gate)."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    import sim as _sim
+    task = _sim.complete_player_task(state, task_id)
+    save_state_to_db(state)
+    if not task:
+        return JSONResponse({'error': 'unknown, not player-owned, or already-completed task'}, status_code=404)
+    return JSONResponse({'ok': True, 'task': {'id': task['id'], 'title': task['title'],
+                                              'status': task['status']}})
+
+
 @app.post('/api/player-email/credential')
 async def provision_player_email_endpoint(request: Request):
     """Provision the Gmail app-password used for action-needed notification
@@ -10849,10 +10873,16 @@ async def intent_schedule(request: Request):
 @app.post('/api/intent/schedule-once')
 async def intent_schedule_once(request: Request):
     """Structured parity endpoint for the one-off scheduling lane: POST
-    {title, at, room?, instructions?, taskType?, goal?, dependsOnTask?}.
+    {title, at, room?, instructions?, taskType?, goal?, dependsOnTask?,
+    assignedTo?}.
     `at` is an ISO 8601 day+time (a trailing 'Z' or explicit offset; naive
     times are treated as UTC) or an epoch timestamp. `dependsOnTask`
     optionally holds the one-off in the queue until that task id is done.
+    `assignedTo` optionally hands the one-off to the PLAYER instead of an
+    agent ('player' -- the only accepted value): the card is delivered into
+    your player-inbox and anything queued dependsOnTask on it resumes when
+    you mark it done. Combined with dependsOnTask this is the "give me X once
+    story T lands" scheduling lane.
     The task sits in the work queue untouched (its notBefore gate) until
     `at`, then runs the normal lifecycle exactly once. The free-text
     extraction step (_extract_schedule_once_fields_sync) is exclusive to the
@@ -10880,15 +10910,20 @@ async def intent_schedule_once(request: Request):
     task_type = (body.get('taskType') or '').strip() or None
     goal = (body.get('goal') or '').strip() or None
     depends_on_task = (body.get('dependsOnTask') or '').strip() or None
+    assigned_to = (body.get('assignedTo') or '').strip() or None
+    if assigned_to and assigned_to != 'player':
+        return JSONResponse({'error': '`assignedTo` only accepts "player" (hand this one-off to you)'}, status_code=400)
     import sim as _sim
     item = _sim.queue_once(state, title, at_ms, room=room, instructions=instructions,
-                           task_type=task_type, goal=goal, depends_on_task=depends_on_task)
+                           task_type=task_type, goal=goal, depends_on_task=depends_on_task,
+                           assigned_to=assigned_to)
     if not item:
         return JSONResponse({'error': 'could not queue that one-off task'}, status_code=400)
     save_state_to_db(state)
     log_action('player', 'schedule_once_created', {'title': title, 'atMs': at_ms,
                                                    'room': room, 'taskType': task_type,
-                                                   'dependsOnTask': depends_on_task},
+                                                   'dependsOnTask': depends_on_task,
+                                                   'assignedTo': assigned_to},
                authorized=True)
     _append_passport_decision('schedule_once_created', 'player', {'title': title, 'atMs': at_ms})
     return JSONResponse({'ok': True, 'task': {'title': title, 'atMs': at_ms, 'notBefore': item.get('notBefore')}})

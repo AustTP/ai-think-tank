@@ -2123,20 +2123,24 @@ async function renderPlayerInbox() {
   await refreshPlayerInbox();
   const log = document.getElementById('playerInboxLog');
   log.innerHTML = '';
-  const awaiting = playerInboxCache.filter(m => m.status === 'awaiting_input');
-  const answered = playerInboxCache.filter(m => m.status !== 'awaiting_input');
+  const awaiting = playerInboxCache.filter(m => m.status === 'awaiting_input' || m.status === 'needs_player');
+  const answered = playerInboxCache.filter(m => m.status !== 'awaiting_input' && m.status !== 'needs_player');
   if (playerInboxCache.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'empty';
-    empty.textContent = 'Nothing waiting. Agents only block on you when a director-approved question can\u2019t be answered internally.';
+    empty.textContent = 'Nothing waiting. Agents only block on you when a director-approved question can\u2019t be answered internally, or when a task is handed to you.';
     log.appendChild(empty);
     return;
   }
   const header = document.createElement('div');
   header.className = 'thread-header';
-  header.textContent = awaiting.length > 0
-    ? `${awaiting.length} agent${awaiting.length === 1 ? '' : 's'} waiting on your answer`
-    : 'No questions waiting';
+  if (awaiting.length === 0) {
+    header.textContent = 'Nothing waiting on you right now';
+  } else {
+    const asks = awaiting.filter(m => m.status === 'awaiting_input').length;
+    const tasks = awaiting.filter(m => m.status === 'needs_player').length;
+    header.textContent = `${asks} question${asks === 1 ? '' : 's'} and ${tasks} task${tasks === 1 ? '' : 's'} waiting on you`;
+  }
   log.appendChild(header);
   for (const m of awaiting) appendInboxMessage(log, m, true);
   for (const m of answered) appendInboxMessage(log, m, false);
@@ -2147,9 +2151,50 @@ function appendInboxMessage(log, m, waiting) {
   box.className = 'msg' + (waiting ? ' unread' : '');
   box.style.borderLeft = waiting ? '3px solid #c34f1f' : '3px solid #7fd0ff';
   box.style.paddingLeft = '6px';
-  const agentName = (AGENT_ROSTER.find(d => d.id === m.agentId) || {}).name || m.agentId;
   const who = document.createElement('div');
   who.className = 'from';
+  if (m.kind === 'player_task') {
+    who.textContent = `Assigned to you — ${m.title || 'a task'}`;
+    box.appendChild(who);
+    const q = document.createElement('div');
+    q.style.whiteSpace = 'pre-wrap';
+    q.textContent = m.instructions || '';
+    box.appendChild(q);
+    if (waiting) {
+      const row = document.createElement('div');
+      row.className = 'thread-input';
+      row.style.display = 'flex';
+      row.style.gap = '6px';
+      const btn = document.createElement('button');
+      btn.textContent = 'Mark done \u2014 resume the work behind it';
+      const send = async () => {
+        btn.disabled = true;
+        try {
+          const res = await apiFetch(`/api/intent/player-task/${encodeURIComponent(m.taskId)}/complete`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+          });
+          if (res.ok) await renderPlayerInbox();
+          else {
+            btn.disabled = false;
+            btn.textContent = 'Failed \u2014 try again';
+          }
+        } catch (e) { btn.disabled = false; }
+      };
+      btn.addEventListener('click', send);
+      row.appendChild(btn);
+      box.appendChild(row);
+    } else {
+      const a = document.createElement('div');
+      a.style.opacity = '0.85';
+      a.textContent = '\u2713 Done \u2014 anything queued behind this task has resumed.';
+      box.appendChild(a);
+    }
+    log.appendChild(box);
+    return;
+  }
+  const agentName = (AGENT_ROSTER.find(d => d.id === m.agentId) || {}).name || m.agentId;
   who.textContent = `${agentName} — ${m.issueKey || 'ask'}`;
   box.appendChild(who);
   const q = document.createElement('div');
@@ -2208,7 +2253,7 @@ async function refreshInboxCount() {
   await refreshPlayerInbox();
   const el = document.getElementById('hudInboxCount');
   if (!el) return;
-  const n = playerInboxCache.filter(m => m.status === 'awaiting_input').length;
+  const n = playerInboxCache.filter(m => m.status === 'awaiting_input' || m.status === 'needs_player').length;
   el.textContent = n > 0 ? String(n) : '';
   el.style.background = n > 0 ? '#c34f1f' : 'transparent';
 }
