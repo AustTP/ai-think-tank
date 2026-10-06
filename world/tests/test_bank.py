@@ -361,6 +361,22 @@ class BudgetView(unittest.TestCase):
             view = serve._bank_budget_view(_snapshot())
         self.assertEqual(set(view), {'a', 'b'})
 
+    def test_zero_cap_is_no_cap_never_over(self):
+        # __colab_compute__ with COLAB_MONTHLY_UNITS unset (0) has no cap:
+        # the row is never 'over' (the health alert's trigger) and shows no
+        # left/forecast -- mirroring _colab_budget_exceeded, which fails open.
+        ledger = {serve.COLAB_LEDGER_KEY: {'used': 25.0, 'calls': 10, 'lastAt': 'x',
+                                           'byDay': {d: 5.0 for d in _last_n_days(7)}}}
+        with unittest.mock.patch.object(serve, 'COLAB_MONTHLY_UNITS', 0.0), \
+             unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 0), \
+             unittest.mock.patch.object(serve, '_spend_ledger_read', return_value=ledger):
+            view = serve._bank_budget_view(_snapshot())
+        row = view[serve.COLAB_LEDGER_KEY]
+        self.assertFalse(row['over'])
+        self.assertIsNone(row['left'])
+        self.assertIsNone(row['daysLeft'])
+        self.assertAlmostEqual(row['cap'], 0.0)
+
     def test_no_data_yields_empty_view(self):
         with unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 0), \
              unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}):
