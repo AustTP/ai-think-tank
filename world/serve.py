@@ -8862,6 +8862,51 @@ async def intent_promote_spike(task_id: str, request: Request):
         body = await request.json()
     except Exception:
         body = {}
+    if body.get('groom') is True:
+        import sim as _sim
+        if task.get('promotedRequestId'):
+            return JSONResponse({'ok': True, 'requestId': task['promotedRequestId'],
+                                 'groomerId': task.get('promotedTo'),
+                                 'promotedAt': task.get('promotedAt'), 'alreadyPromoted': True})
+        groomer = next((d for d in state.get('agentRoster', [])
+                        if d.get('id') == 'theo' and d.get('isAdmin')), None)
+        if not groomer or 'theo' not in (state.get('agents') or {}):
+            return JSONResponse({'error': 'Theo is unavailable in the roster.'}, status_code=409)
+        team = next((t for t in state.get('teams', []) if t.get('directorId') == 'theo'), None)
+        if not team:
+            return JSONResponse({'error': "Theo's grooming team is unavailable."}, status_code=409)
+        finding = (task.get('note') or '').strip()
+        library_path = task.get('libraryPath')
+        target = _safe_library_path(library_path) if library_path else None
+        if target and os.path.isfile(target):
+            try:
+                with open(target, encoding='utf-8', errors='replace') as f:
+                    finding = f.read(20_000).strip() or finding
+            except OSError:
+                pass
+        title = task.get('title') or 'spike'
+        req = _sim.file_work_request(
+            state, 'theo', f'Groom findings: {title}', 'observatory',
+            reason=(f'The player promoted spike {task_id} for Theo to groom. '
+                    'Assess the findings, identify a concrete research follow-up, and reject '
+                    'duplicate or unsupported work. This promotion does not authorize trades. '
+                    f'Library document: {library_path or "none"}. Findings: {finding}'))
+        if not req:
+            return JSONResponse({'error': 'An identical grooming request is already pending.'}, status_code=409)
+        now_ms = int(time.time() * 1000)
+        req.update(teamId=team.get('id') or 'theo', groomerId='theo',
+                   taskType='spike', budgetMs=task.get('budgetMs') or 60_000,
+                   origin='spike_promotion', sourceSpikeId=task_id,
+                   goal=task.get('goal') or title)
+        task.update(promotedRequestId=req['id'], promotedTo='theo', promotedAt=now_ms)
+        _sim.kick_refinement_now(state, req['teamId'], now_ms)
+        save_state_to_db(state)
+        details = {'spikeId': task_id, 'requestId': req['id'], 'groomerId': 'theo'}
+        log_action('player', 'spike_promoted', details, authorized=True)
+        _append_passport_decision('spike_promoted', 'player', details)
+        return JSONResponse({'ok': True, 'requestId': req['id'],
+                             'groomerId': 'theo', 'promotedAt': now_ms})
+
     room = (body.get('room') or 'pressoffice').strip()
     if room not in _DELEGATABLE_ROOMS:
         room = 'pressoffice'

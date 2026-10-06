@@ -7960,6 +7960,12 @@ def _ceremony_facilitator(state, team_id):
         a = agents.get(aid)
         return bool(a) and not a.get('busy') and not a.get('offDuty')
 
+    # Player-promoted findings are explicitly assigned to a groomer. Wait
+    # for that agent rather than borrowing a different director silently.
+    for req in _pending_work_requests(state):
+        if req.get('teamId') == team_id and req.get('groomerId'):
+            groomer = req['groomerId']
+            return groomer if _free(groomer) else None
     sm = _refinement_scrum_master_for_team(state, team_id)
     if sm and _free(sm):
         return sm
@@ -8212,6 +8218,8 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
                 # item (whitelisted) so the ASSIGNED task carries them.
                 'budgetUsd': req.get('budgetUsd'),
                 'budgetBand': req.get('budgetBand'),
+                'taskType': req.get('taskType') or 'code',
+                'budgetMs': req.get('budgetMs'),
             }])
             accepted.append(req)
         else:

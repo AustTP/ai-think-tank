@@ -1747,11 +1747,12 @@ function openBoard() {
 // straight off TASKS/AGENTS, the same live objects everything else reads,
 // not a separate summary someone has to remember to update.
 let boardClearMessage = '';
-async function clearFailedBoardTasks() {
-  const btn = document.getElementById('clearFailedBoardBtn');
+async function clearFailedBoardTasks(group = 'failed') {
+  const statuses = group === 'stopped' ? ['cancelled', 'abandoned'] : ['failed'];
+  const btn = document.getElementById(group === 'stopped' ? 'clearStoppedBoardBtn' : 'clearFailedBoardBtn');
   if (btn) btn.disabled = true;
   const taskIds = Object.values(TASKS).filter(t =>
-    ['failed', 'cancelled', 'abandoned'].includes(t.status) &&
+    statuses.includes(t.status) &&
     (!t.boardClearedAt || (t.failedAt || 0) > t.boardClearedAt)
   ).map(t => t.id);
   try {
@@ -1795,9 +1796,10 @@ function renderBoard() {
   const boardTasks = Object.values(TASKS).filter(t => !t.boardClearedAt ||
     (t.failedAt || 0) > t.boardClearedAt ||
     !['failed', 'cancelled', 'abandoned'].includes(t.status));
-  const failed = boardTasks.filter(t => ['failed', 'cancelled', 'abandoned'].includes(t.status));
-  const open = boardTasks.filter(t => t.status !== 'done' && !failed.includes(t));
-  const done = Object.values(TASKS).filter(t => t.status === 'done').sort((a, b) => b.createdAt - a.createdAt).slice(0, 5);
+  const failed = boardTasks.filter(t => t.status === 'failed');
+  const stopped = boardTasks.filter(t => ['cancelled', 'abandoned'].includes(t.status));
+  const open = boardTasks.filter(t => !['done', 'failed', 'cancelled', 'abandoned'].includes(t.status));
+  const done = Object.values(TASKS).filter(t => t.status === 'done' && !t.promotedRequestId).sort((a, b) => b.createdAt - a.createdAt).slice(0, 5);
   // Peer-approval gate: a deliverable story awaiting two reviewer approvals is
   // neither "in progress" (its author finished) nor done. Show it separately.
   const needsReview = open.filter(t => t.status === 'needs_review');
@@ -1870,19 +1872,22 @@ function renderBoard() {
   window.promoteSpike = async function (encId, encTitle) {
     const taskId = decodeURIComponent(encId);
     const title = decodeURIComponent(encTitle);
-    const confirmed = window.confirm(`Promote "${title}" into a real work item?\n\nThe spike's findings will become a queued deliverable, which then needs peer review like any committed story.`);
+    const confirmed = window.confirm(`Promote "${title}" into a real work item?\n\nTheo will groom the findings before any follow-up is assigned. This spike will leave the triage board.`);
     if (!confirmed) return;
     const res = await apiFetch(`/api/intent/spike/${encodeURIComponent(taskId)}/promote`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({}),
+      body: JSON.stringify({groom: true}),
     });
     const data = await res.json();
     if (!res.ok || !data.ok) {
       alert(data.error || 'Could not promote that spike.');
       return;
     }
-    alert(`Queued "${data.queued.title}" (${data.queued.room}) from the spike's findings. The spike remains on record.`);
+    if (TASKS[taskId]) Object.assign(TASKS[taskId], {
+      promotedRequestId: data.requestId, promotedTo: data.groomerId, promotedAt: data.promotedAt
+    });
+    boardClearMessage = `Sent to Theo for grooming (${data.requestId}). Findings remain in the Library.`;
     renderBoard();
   };
 
@@ -1891,7 +1896,7 @@ function renderBoard() {
   // the rest of the board -- no extra endpoint. Only *done* spikes are triage-
   // able; a working one isn't finished (the endpoint 409s on it).
   const spikeTasks = Object.values(TASKS).filter(t => t.taskType === 'spike');
-  const doneSpikes = spikeTasks.filter(t => t.status === 'done');
+  const doneSpikes = spikeTasks.filter(t => t.status === 'done' && !t.promotedRequestId);
   const spikeLines = doneSpikes.length
     ? doneSpikes.map(t => {
         const finding = (t.note || '').split('. ')[0]; // first sentence, enough to triage by
@@ -1906,9 +1911,12 @@ function renderBoard() {
     <div style="margin-bottom:4px;"><strong>In progress (${inProgress.length})</strong></div>
     ${openLines}
     ${reviewLines ? `<div style="margin:8px 0 4px;"><strong>Awaiting peer review (${needsReview.length})</strong></div>${reviewLines}` : ''}
-    ${failed.length ? `<div style="margin:8px 0 4px;"><strong>Failed or stopped (${failed.length})</strong> <button id="clearFailedBoardBtn" class="hud-btn" onclick="clearFailedBoardTasks()">Clear failed/stopped</button></div>` + failed.map(t => `<div>${t.title} (${t.status})</div>${taskNote(t)}`).join('') : ''}
+    <div style="margin:8px 0 4px;"><strong>Failed (${failed.length})</strong> ${failed.length ? '<button id="clearFailedBoardBtn" class="hud-btn" onclick="clearFailedBoardTasks(\'failed\')">Clear failed</button>' : ''}</div>
+    ${failed.length ? failed.map(t => `<div>${t.title} (${t.status})</div>${taskNote(t)}`).join('') : '<div style="opacity:0.6;">No failed tasks.</div>'}
+    <div style="margin:8px 0 4px;"><strong>Stopped (${stopped.length})</strong> ${stopped.length ? '<button id="clearStoppedBoardBtn" class="hud-btn" onclick="clearFailedBoardTasks(\'stopped\')">Clear stopped</button>' : ''}</div>
+    ${stopped.length ? stopped.map(t => `<div>${t.title} (${t.status})</div>${taskNote(t)}`).join('') : '<div style="opacity:0.6;">No stopped tasks.</div>'}
     <div id="boardClearStatus" role="status"></div>
-    <div style="margin:8px 0 4px;"><strong>Recently completed</strong></div>
+    <div style="margin:8px 0 4px;"><strong>Recently completed (${done.length})</strong></div>
     ${doneLines}
     <div style="margin:8px 0 4px;"><strong>Spikes to triage (${doneSpikes.length})</strong></div>
     ${spikeLines}
