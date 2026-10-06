@@ -11,6 +11,16 @@ See `DESIGN.md` for the full architecture documentation.
 
 ## Running it
 
+Build the agent execution sandbox once (with Docker running):
+
+```powershell
+docker build -t ai-think-tank-work-sandbox world/sandbox
+```
+
+This image contains the offline quality tools. Without it, execution and
+review tasks fail before their commands run. The server starts the sandbox
+egress proxy automatically.
+
 ```bash
 cd world
 python3 serve.py 8936

@@ -908,6 +908,46 @@ def save_state_to_db(data):
         print(f'[agent-dirs] sync failed: {e}')  # best-effort -- a filesystem hiccup shouldn't break autosave
 
 
+def _backfill_task_counter_in_db():
+    """Recover the ID high-water mark, including assignments lost to old overwrites."""
+    state = get_state_from_db()
+    if not state:
+        return
+    high = state.get('taskCounter', 0)
+    ids = list((state.get('tasks') or {}).keys())
+    with _db() as conn:
+        for row in conn.execute("SELECT details FROM action_log WHERE action = 'task_assigned'"):
+            try:
+                ids.append(json.loads(row[0]).get('taskId'))
+            except (ValueError, TypeError, AttributeError):
+                continue
+    for tid in ids:
+        if isinstance(tid, str) and tid.startswith('task-') and tid[5:].isdigit():
+            high = max(high, int(tid[5:]))
+    if state.get('taskCounter') != high:
+        state['taskCounter'] = high
+        save_state_to_db(state)
+
+
+def _backfill_failed_repairs_in_db():
+    """Correct legacy repair records whose executor failure was labeled done."""
+    state = get_state_from_db()
+    if not state:
+        return
+    changed = False
+    failure_prefixes = ('the model call failed', 'execution exited non-zero',
+                        'blocked:', 'Content execution failed:')
+    for task in (state.get('tasks') or {}).values():
+        note = task.get('note') or ''
+        if task.get('status') == 'done' and task.get('reviewOf') \
+                and task.get('taskType') != 'review' and note.startswith(failure_prefixes):
+            task.update(status='failed', failNote=note, previousStatus='done',
+                        statusCorrectedAt=int(time.time() * 1000))
+            changed = True
+    if changed:
+        save_state_to_db(state)
+
+
 # ---------------------------------------------------------------------------
 # The Bank: a spend ledger for the model/API budget. Every model call in the
 # think tank flows through /api/chat (or /api/decide for Jev); OpenRouter returns
@@ -3444,6 +3484,8 @@ async def _peer_review_loop():
 
 @asynccontextmanager
 async def _lifespan(app):
+    _backfill_task_counter_in_db()
+    _backfill_failed_repairs_in_db()
     # The admin/manager/director information should
     # live in the DATABASE, not be baked into a JS file. It does -- the
     # kv_state blob is authoritative and agents/*.json are only materialized
@@ -7957,7 +7999,7 @@ def _merge_server_owned(existing, incoming):
         # The client still sends `workQueue`, but a stale copy must not clobber
         # the server's mid-cycle edits -- the server's queue + task map win
         # when they exist.
-        for k in ('workQueue', 'tasks', 'researchTopics', 'reports', 'nextReportId'):
+        for k in ('workQueue', 'tasks', 'taskCounter', 'researchTopics', 'reports', 'nextReportId'):
             if k in existing:
                 merged[k] = existing[k]
         # Phase 4: governance (auto-hire / auto-firing review) is a server

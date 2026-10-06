@@ -1453,7 +1453,8 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     if not ok:
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f'execution exited non-zero (code {exec_data.get("exitCode")}), '
-                                                   f'timed out: {bool(exec_data.get("timedOut"))}',
+                                                   f'timed out: {bool(exec_data.get("timedOut"))}. '
+                                                   f'{(exec_data.get("stderr") or "").strip()[-1000:]}',
                                            'command': command, 'ok': False, 'tier': tier_slug})
         return False
 

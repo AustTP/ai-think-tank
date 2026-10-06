@@ -1600,9 +1600,7 @@ def budget_usd_for_task(task_type, budget_usd=None, budget_band=None):
     mult = _REFINEMENT_BAND_MULTIPLIER.get((budget_band or 'standard').strip().lower(), 1.0)
     return max(0.0, base * mult)
 
-# Server in-memory task-id counter (mirrors tasks.js nextTaskId). Not persisted
-# -- on restart it resets; a fresh 'task-N' id is unique for a given server run,
-# and the durable state['tasks'] mirror keyed by it is authoritative.
+# The holder is a cache; state.taskCounter is the durable high-water mark.
 _TASK_ID_HOLDER = [0]
 
 # Phase 3 slice 2: completed content-executor results, keyed by task id. A real
@@ -3643,7 +3641,11 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
     if not path or len(path) == 0:
         return None
 
-    task_id_holder[0] += 1
+    existing_ids = [int(k[5:]) for k in (state.get('tasks') or {})
+                    if isinstance(k, str) and k.startswith('task-') and k[5:].isdigit()]
+    task_id_holder[0] = max(task_id_holder[0], state.get('taskCounter', 0),
+                            max(existing_ids, default=0)) + 1
+    state['taskCounter'] = task_id_holder[0]
     task_id = 'task-' + str(task_id_holder[0])
     rest_x = path[-1]['x']
     rest_y = path[-1]['y']
@@ -5259,14 +5261,16 @@ def _release_agent_after_failure(state, agent_id, task):
     file a follow-up -- a red-pipeline result is not shipped work and must not
     count as one (a fabricated 0.0 trailing grade would otherwise pollute the
     roadmap signal and a follow-up would propose more work off a failure). The
-    completed task is marked 'done' so _reclaim_orphaned_walking_tasks never
-    re-issues it. Pure state mutation."""
+    failed task is terminal and remains visible as 'failed', without implying
+    successful delivery. Pure state mutation."""
     agents = state.get('agents') or {}
     a = agents.get(agent_id)
     if not a:
         return
     if task:
-        task['status'] = 'done'
+        task['status'] = 'failed'
+        task['failNote'] = task.get('note') or 'content execution failed'
+        task['failedAt'] = int(time.time() * 1000)
     a['task'] = None
     a['busy'] = False
     a['inRoom'] = None
@@ -10487,6 +10491,13 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 # churning. Runs for every landed content result (reviews always
                 # report ok=True, so they never trip it).
                 _worker_stuck_help_signal(state, aid, task, result_ok, now_ms)
+                if not result_ok:
+                    _release_agent_after_failure(state, aid, task)
+                    parent = _resolve_review_parent(state, task) if task.get('reviewOf') else task
+                    if parent is not None and _peer_gated_lane(parent):
+                        _send_back_after_failure(state, parent, fail_note=task.get('note'))
+                    send_agent_off_duty(state, aid, doors, grid)
+                    continue
                 # Completion evidence is mandatory for ALL content work: a result
                 # that reports success but carries NO completion note (no evidence
                 # of what was actually done, or where it lives) is not completed.
@@ -10521,15 +10532,6 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                         # manual attention, not silently re-entered.
                         if not (parent.get('_peerGate') or {}).get('escalated'):
                             _enter_peer_review(state, parent, now_ms)
-                    elif parent is not None and _peer_gated_lane(parent):
-                        # Fail-closed: the FIX itself failed the pipeline. Do NOT
-                        # re-arm the gate; the story stays 'failed' and another
-                        # fix is queued back to the author (or it escalates once
-                        # the shared cycle cap is hit).
-                        _release_agent_after_failure(state, aid, task)
-                        _send_back_after_failure(state, parent, fail_note=task.get('note'))
-                        send_agent_off_duty(state, aid, doors, grid)
-                        continue
                     elif parent is not None:
                         # Parent isn't supposed to be gated (skillReview/distill)
                         # but somehow already has a stale _peerGate -- clear it
@@ -10550,15 +10552,6 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                     else:
                         finish_task(state, aid, grid)
                         send_agent_off_duty(state, aid, doors, grid)
-                elif _peer_gated_lane(task) and not task.get('_peerGate'):
-                    # Fail-closed: a red-pipeline primary deliverable must NOT
-                    # enter the peer gate. Release the agent (no approval/grade)
-                    # and send the story back -- or escalate once the shared
-                    # cycle cap is hit. (_send_back_after_failure notifies the
-                    # author.)
-                    _release_agent_after_failure(state, aid, task)
-                    _send_back_after_failure(state, task, fail_note=task.get('note'))
-                    send_agent_off_duty(state, aid, doors, grid)
                 else:
                     finish_task(state, aid, grid)
                     send_agent_off_duty(state, aid, doors, grid)

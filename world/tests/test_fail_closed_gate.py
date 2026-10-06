@@ -376,7 +376,7 @@ class SendBackAfterFailure(unittest.TestCase):
     def test_release_after_failure_clears_agent_without_bumps(self):
         # A red deliverable is NOT shipped work: releasing its author must not
         # bump approvedCount, record a completed room, grade, or file a
-        # follow-up -- and the task itself is marked 'done' so the orphan-reclaim
+        # follow-up -- and the task itself is terminal 'failed' so the orphan-reclaim
         # never re-issues it (it was already sent back via _send_back).
         state = _state()
         state['agents']['ben']['task'] = 'task-1'
@@ -396,7 +396,7 @@ class SendBackAfterFailure(unittest.TestCase):
         self.assertEqual(a.get('weekApprovals'), 2)
         self.assertEqual(a.get('completedRooms'), ['pressoffice'],
                          'no completed-room recorded for a failed deliverable')
-        self.assertEqual(task['status'], 'done')
+        self.assertEqual(task['status'], 'failed')
 
 
 class FailClosedTaskCycle(unittest.TestCase):
@@ -526,9 +526,10 @@ class FailClosedTaskCycle(unittest.TestCase):
         self.assertFalse(parent.get('_peerGate', {}).get('escalated'))
         self.assertEqual(parent['_peerGate']['cycleCount'], 2,
                          'the shared cap keeps counting across mechanisms')
-        # The fix itself is terminal (released as done) and the author is freed
+        # The fix itself is terminal (failed) and the author is freed
         # from it, with no approval/grade bump.
-        self.assertEqual(fix['status'], 'done')
+        self.assertEqual(fix['status'], 'failed')
+        self.assertEqual(fix['failNote'], 'still red')
         self.assertNotEqual(state['agents']['ben'].get('task'), 'task-2')
         self.assertEqual(state['agents']['ben'].get('approvedCount', 0), 0)
         # Another fix is queued (or already re-pinned to the author).
