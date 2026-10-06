@@ -323,18 +323,25 @@ def _bank_budget_view(snapshot):
             continue  # the spend-cap baseline and per-task buckets are reserved keys, not service buckets
         used = float(bucket.get('used', 0) or 0)
         cap = _serve._budget_cap_usd(svc, products)
+        # A zero/unset cap means NO cap (e.g. __colab_compute__ with
+        # COLAB_MONTHLY_UNITS unset on the free tier): the service is never
+        # "over", has no left/no forecast, and contributes nothing to the
+        # cumulative cap. This mirrors _colab_budget_exceeded, which also
+        # fails open when no operator cap is set.
+        uncapped = cap <= 0
         service_row = {
             'service': svc,
             'used': round(used, 6),
             'cap': cap,
-            'left': round(max(0.0, cap - used), 6),
-            'over': used > cap,
+            'left': None if uncapped else round(max(0.0, cap - used), 6),
+            'over': False if uncapped else used > cap,
             'calls': int(bucket.get('calls', 0) or 0),
             'lastAt': bucket.get('lastAt'),
             'burnPerDay': 0.0,
             'daysLeft': None,
         }
-        service_row['burnPerDay'], service_row['daysLeft'] = _serve._forecast(bucket, cap)
+        if not uncapped:
+            service_row['burnPerDay'], service_row['daysLeft'] = _serve._forecast(bucket, cap)
         services[svc] = service_row
     # A director-set budget (e.g. DigitalOcean's
     # $25/mo cap) should be visible to a teller from the moment it's set, not
