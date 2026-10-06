@@ -682,8 +682,9 @@ def _run_bank_content(snapshot, agent_id, task, base_ctx=None):
         total_used += row['used']
         total_cap += row['cap']
         status = 'OVER' if row['over'] else 'ok'
+        left_s = 'no cap' if row['left'] is None else f"{row['left']:.2f} left"
         forecast = f", {row['daysLeft']:.1f} days until cap at current burn" if row['daysLeft'] is not None else ""
-        lines.append(f"- {svc}: ${row['used']:.2f} / ${row['cap']:.2f} cap ({row['left']:.2f} left, {status}, {row['calls']} calls, {row['burnPerDay']:.2f}/day{forecast})")
+        lines.append(f"- {svc}: ${row['used']:.2f} / ${row['cap']:.2f} cap ({left_s}, {status}, {row['calls']} calls, {row['burnPerDay']:.2f}/day{forecast})")
     body = '; '.join(lines)
     over_any = any(v['over'] for v in view.values())
     note = (f"{name} (director) reviewed the bank. Cumulative: ${total_used:.2f} used of ${total_cap:.2f} "
