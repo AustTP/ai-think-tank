@@ -487,10 +487,12 @@ class AskEndpoint(unittest.TestCase):
         # AGENT_ASK_TOOLS-adjacent capabilities, not security-role-gated --
         # only attempt_curl/request_capability_handle (SECURITY_TEST_TOOLS)
         # are restricted to the Red Team Auditor role.
-        # search_web only appears when TAVILY_API_KEY is actually configured.
+        # search_web only appears when TAVILY_API_KEY is actually configured;
+        # generate_image/generate_video only when the Higgsfield key pair is.
         expected = ({'weather_now', 'browse_page', 'request_allowlist', 'read_peer_reviews',
                      'team_digest', 'x_trending_topics', 'search_linkedin_posts'}
-                    | ({'search_web'} if serve.TAVILY_API_KEY else set()))
+                    | ({'search_web'} if serve.TAVILY_API_KEY else set())
+                    | ({'generate_image', 'generate_video'} if serve._higgsfield_configured() else set()))
         self.assertEqual(tool_names, expected)
 
     def test_trending_question_forces_x_trending_topics_first(self):

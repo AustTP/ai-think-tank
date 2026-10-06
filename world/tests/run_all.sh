@@ -148,6 +148,9 @@ echo
 echo "== Python: ask lane -- genuinely new one-off question -> agent tool loop =="
 python3 tests/test_ask.py
 echo
+echo "== Python: Higgsfield image/video generation tools (estimate -> submit -> poll -> accrue) =="
+python3 tests/test_higgsfield.py
+echo
 echo "== Python: phone check-in -- POST /api/device/checkin (location/battery/Focus/Wi-Fi) =="
 python3 tests/test_device_checkin.py
 echo

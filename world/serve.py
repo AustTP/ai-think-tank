@@ -4093,15 +4093,186 @@ APIFY_API_KEY = _load_env().get('APIFY_API_KEY')
 # Higgsfield AI API key: a two-part credential (key ID + shared
 # secret) for image/video generation + editing, stored in .env like the other
 # service keys. Loaded as module constants; _higgsfield_configured() is the
-# single availability gate (both halves present) a future feature checks --
-# the same "absent means the surface never advertises it" pattern as
-# TAVILY_API_KEY/GITHUB_TOKEN.
+# single availability gate (both halves present) that gates the
+# generate_image / generate_video agent tools and the Higgsfield helpers below
+# -- the same "absent means the surface never advertises it" pattern as
+# TAVILY_API_KEY/GITHUB_TOKEN. The tools simply don't exist in the tool list
+# until both halves are configured.
 HIGGSFIELD_API_KEY_ID = _load_env().get('HIGGSFIELD_API_KEY_ID')
 HIGGSFIELD_API_KEY_SECRET = _load_env().get('HIGGSFIELD_API_KEY_SECRET')
 
 
 def _higgsfield_configured():
     return bool(HIGGSFIELD_API_KEY_ID and HIGGSFIELD_API_KEY_SECRET)
+
+
+# ---- Higgsfield image/video generation (wired 2026-10-06) ------------------
+# Real generative media through the think tank's Higgsfield account. One
+# authenticated, asynchronous request lifecycle for every model: POST to the
+# model endpoint with the two-part `Key ID:SECRET` credential, get a
+# request_id, poll the status endpoint to a terminal state. Call shape
+# verified against the live docs (docs.higgsfield.ai) -- SOUL V2
+# (higgsfield-ai/soul/v2/standard) for images, Kling 3.0 Standard
+# (kling-video/v3.0/std/text-to-video) for video -- NOT guessed from the
+# OpenAPI spec, per the "verify, don't assume" discipline applied to every
+# other real integration. Cost is the REAL up-front /estimate number for the
+# exact body being submitted, accrued on SUCCESS only (failed/nsfw/canceled
+# requests are not charged by Higgsfield). The caller never holds the raw
+# credential halves; the vault pattern is the same as every other service.
+_HIGGSFIELD_BASE_URL = 'https://api.higgsfield.ai'
+_HIGGSFIELD_IMAGE_ENDPOINT = 'higgsfield-ai/soul/v2/standard'
+_HIGGSFIELD_VIDEO_ENDPOINT = 'kling-video/v3.0/std/text-to-video'
+_HIGGSFIELD_POLL_IMAGE_TIMEOUT_S = 90
+_HIGGSFIELD_POLL_VIDEO_TIMEOUT_S = 300
+
+
+def _higgsfield_call(method, path, body=None, timeout=120):
+    """Real call to the Higgsfield API (https://api.higgsfield.ai{path}) with
+    the two-part Key credential, mirroring _pixellab_call's shape. `path`
+    includes the leading slash and any endpoint id, e.g.
+    '/higgsfield-ai/soul/v2/standard' or '/requests/<id>/status'. Returns
+    (data, error) like every other external integration."""
+    if not (HIGGSFIELD_API_KEY_ID and HIGGSFIELD_API_KEY_SECRET):
+        return None, 'Higgsfield is not configured (no API key pair in the vault)'
+    try:
+        data_bytes = json.dumps(body).encode('utf-8') if body is not None else None
+        req = urllib.request.Request(
+            f'{_HIGGSFIELD_BASE_URL}{path}', data=data_bytes, method=method,
+            headers={
+                'Authorization': f'Key {HIGGSFIELD_API_KEY_ID}:{HIGGSFIELD_API_KEY_SECRET}',
+                'Content-Type': 'application/json',
+            })
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- fixed Higgsfield API host
+            return json.loads(resp.read().decode('utf-8', errors='replace')), None
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode('utf-8', errors='replace')[:500]
+        return None, f'Higgsfield call failed ({e.code}): {detail}'
+    except Exception as e:
+        return None, f'Higgsfield call failed: {e}'
+
+
+def _higgsfield_estimate_usd(endpoint_id, body):
+    """Real up-front cost estimate from Higgsfield's /estimate endpoint for the
+    EXACT body being submitted -- a verified number, never a guess (the
+    "don't fabricate a number" rule applied to every other real integration).
+    Returns float USD or None (estimate unavailable)."""
+    data, error = _higgsfield_call('POST', f'/estimate/{endpoint_id}', body, timeout=30)
+    if error or not isinstance(data, dict):
+        return None
+    try:
+        usd = float(data.get('usd') or 0)
+        return usd if usd > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _higgsfield_poll(request_id, timeout=300, interval=3):
+    """Poll a Higgsfield request until a terminal status (completed/failed/
+    nsfw/canceled), the timeout, or an error -- same shape as
+    _pixellab_poll_job. Returns the final (data, error) tuple."""
+    start = time.time()
+    while time.time() - start < timeout:
+        data, error = _higgsfield_call('GET', f'/requests/{request_id}/status', timeout=30)
+        if error:
+            return None, error
+        status = (data or {}).get('status')
+        if status in ('completed', 'failed', 'nsfw', 'canceled'):
+            return data, None
+        time.sleep(interval)
+    return None, 'Higgsfield request did not finish in time (timed out while polling)'
+
+
+def _higgsfield_log_manifest(media_kind, prompt, endpoint_id, urls, agent_id, agent_key):
+    """Write a durable manifest of a completed generation into the Library
+    (media/generated/), so the player has a record and the links while
+    Higgsfield retains the output. Best-effort: a manifest failure must never
+    fail the generation that already succeeded."""
+    try:
+        slug = ''.join(c if c.isalnum() else '-' for c in prompt.lower())[:40].strip('-') or 'media'
+        path = f'media/generated/{int(time.time() * 1000)}-{media_kind}-{slug}.md'
+        content = (
+            f"# Generated {media_kind} -- {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n\n"
+            f"Model: {endpoint_id}\nPrompt: {prompt}\n\nOutput URL(s):\n"
+            + '\n'.join(f'- {u}' for u in urls)
+            + '\n\nHiggsfield retains generated output for at least 7 days. Download it to your '
+              'own storage for long-term retention.\n'
+        )
+        _http_json('POST', SELF_BASE_URL, '/api/library/file',
+                   {'agentId': agent_id, 'path': path, 'content': content, 'source': 'firsthand'},
+                   agent_key)
+    except Exception:
+        pass
+
+
+def _higgsfield_generate(media_kind, args, agent_id=None, agent_key=None):
+    """Run one real Higgsfield generation: estimate the cost up-front, submit,
+    poll to completion, accrue the real estimated cost on SUCCESS only, write a
+    durable manifest into the Library, and return a model-facing result string.
+    The single choke point for every Higgsfield generation, so spend is accrued
+    exactly once per real, billed generation. `media_kind` is 'image' or
+    'video'."""
+    args = args or {}
+    prompt = (args.get('prompt') or '').strip()
+    if not prompt:
+        return 'prompt is required'
+    if media_kind == 'image':
+        endpoint_id = _HIGGSFIELD_IMAGE_ENDPOINT
+        body = {'prompt': prompt}
+    else:
+        endpoint_id = _HIGGSFIELD_VIDEO_ENDPOINT
+        body = {'prompt': prompt}
+        duration = args.get('duration')
+        if duration is not None:
+            try:
+                body['duration'] = max(3, min(15, int(duration)))
+            except (TypeError, ValueError):
+                pass
+        ar = (args.get('aspect_ratio') or '').strip()
+        if ar in ('16:9', '9:16', '1:1'):
+            body['aspect_ratio'] = ar
+        sound = (args.get('sound') or '').strip().lower()
+        if sound in ('on', 'off'):
+            body['sound'] = sound
+    usd_estimate = _higgsfield_estimate_usd(endpoint_id, body)
+    data, error = _higgsfield_call('POST', f'/{endpoint_id}', body, timeout=120)
+    if error:
+        return f'Could not generate: {error}'
+    request_id = (data or {}).get('request_id')
+    status = (data or {}).get('status')
+    if not request_id:
+        return f'Unexpected response from Higgsfield: {json.dumps(data)[:500]}'
+    if status == 'completed':
+        result = data
+    else:
+        result, error = _higgsfield_poll(
+            request_id, timeout=(_HIGGSFIELD_POLL_VIDEO_TIMEOUT_S if media_kind == 'video'
+                                 else _HIGGSFIELD_POLL_IMAGE_TIMEOUT_S))
+        if error:
+            return f'Could not generate: {error}'
+    result = result or {}
+    terminal = result.get('status') or 'unknown'
+    if terminal != 'completed':
+        return (f'Generation did not complete (status: {terminal}). It was not charged.')
+    urls = []
+    for item in (result.get('images') or []):
+        if isinstance(item, dict) and item.get('url'):
+            urls.append(item['url'])
+    v = result.get('video')
+    if isinstance(v, dict) and v.get('url'):
+        urls.append(v['url'])
+    for item in (result.get('videos') or []):
+        if isinstance(item, dict) and item.get('url'):
+            urls.append(item['url'])
+    if not urls:
+        return f'Generation completed but no output URL was returned: {json.dumps(result)[:500]}'
+    charged = isinstance(usd_estimate, (int, float)) and usd_estimate > 0
+    if charged:
+        _accrue_spend('higgsfield', float(usd_estimate))
+    _higgsfield_log_manifest(media_kind, prompt, endpoint_id, urls, agent_id, agent_key)
+    kind_word = 'image' if media_kind == 'image' else 'video'
+    cost_line = f' (~${usd_estimate:.3f} billed to the think tank)' if charged else ''
+    return (f'Generated a real {kind_word}. Output URL(s): ' + ', '.join(urls) + cost_line
+            + '. A manifest with these links is under media/generated/ in the Library.')
 
 
 
@@ -5566,6 +5737,65 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
     return (None, current_messages) if return_transcript else None
 
 
+# Higgsfield AI image/video generation tools (2026-10-06). Real, metered
+# generation through the think tank's Higgsfield account: the cost is
+# estimated up-front via the real /estimate endpoint (a verified number, never
+# a guess) and accrued to the spend cap on SUCCESS only -- failed/nsfw/canceled
+# requests are not charged by Higgsfield, so they never hit the ledger.
+# Conditional-availability rule (same as search_web): absent unless both key
+# halves are configured, so the surface never advertises a tool that would
+# fail at call time.
+_HIGGSFIELD_IMAGE_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'generate_image',
+        'description': (
+            "Generate a real image from a text prompt via the think tank's real Higgsfield "
+            "account (SOUL V2). This is a real, metered generation billed against the account's "
+            "credits -- only call this when the investigation genuinely needs a real generated "
+            "image, not a description of what one might look like. It takes up to ~90 real "
+            "seconds. The output link is saved to the Library under media/generated/ for the "
+            "player; Higgsfield keeps generated output for at least 7 days, so the player should "
+            "download it for long-term retention."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'prompt': {'type': 'string',
+                           'description': 'A detailed text description of the image to generate, e.g. "a quiet alpine lake at sunrise, editorial photography".'},
+            },
+            'required': ['prompt'],
+        },
+    },
+}
+
+_HIGGSFIELD_VIDEO_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'generate_video',
+        'description': (
+            "Generate a real short video from a text prompt via the think tank's real Higgsfield "
+            "account (Kling 3.0 Standard). This is a real, metered generation billed against the "
+            "account's credits and can take several minutes -- only call this when the "
+            "investigation genuinely needs a real generated video, never as a cheap look. The "
+            "output link is saved to the Library under media/generated/ for the player; Higgsfield "
+            "keeps generated output for at least 7 days, so the player should download it for "
+            "long-term retention."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'prompt': {'type': 'string',
+                           'description': 'A detailed text description of the video to generate, e.g. "a slow cinematic tracking shot along a sunlit coastal road".'},
+                'duration': {'type': 'integer', 'description': 'Output length in seconds, 3 to 15 (default 5).'},
+                'aspect_ratio': {'type': 'string', 'description': 'One of "16:9", "9:16", "1:1" (default "16:9").'},
+                'sound': {'type': 'string', 'description': '"on" or "off" (default "on").'},
+            },
+            'required': ['prompt'],
+        },
+    },
+}
+
 # The tools /api/intent/ask exposes to its dispatched agent. Kept as data next
 # to the loop so the schema (what the model is allowed to call) stays a single,
 # reviewable structure, and so tests build the exact shape they mock against.
@@ -5700,7 +5930,10 @@ AGENT_ASK_TOOLS = [
             'required': ['query'],
         },
     },
-}] if TAVILY_API_KEY else [])
+}] if TAVILY_API_KEY else []) + ([
+    _HIGGSFIELD_IMAGE_TOOL,
+    _HIGGSFIELD_VIDEO_TOOL,
+] if (HIGGSFIELD_API_KEY_ID and HIGGSFIELD_API_KEY_SECRET) else [])
 
 # Additional tools offered to /api/intent/ask ONLY when the dispatched agent's
 # role is Red Team Auditor -- real calls through the SAME gated
@@ -9604,6 +9837,11 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                         f'pending until the player decides]' if result.get('requested')
                         else f'{msg} [no further request needed]')
             return f'Could not file the allowlist request: {result}'
+        if name in ('generate_image', 'generate_video'):
+            # Real, metered Higgsfield generation -- estimated, submitted,
+            # polled, and accrued inside the single choke point.
+            return _higgsfield_generate('image' if name == 'generate_image' else 'video',
+                                        args, agent_id, agent_key)
         if name == 'weather_now':
             loc = (args or {}).get('location') or default_location or ''
             result = _weather_fetch(loc)
