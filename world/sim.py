@@ -29,6 +29,8 @@ import json
 import math
 import os
 import random
+import re
+import hashlib
 import threading
 import time
 import urllib.parse
@@ -1645,7 +1647,7 @@ def _store_content_result(task_id, result):
 MAX_REVIEW_CYCLES = 8
 
 
-def _maybe_escalate_stuck_gate(parent, gate, reason):
+def _maybe_escalate_stuck_gate(parent, gate, reason, failure_text=None):
     """Bump the gate's cycle counter; once it crosses MAX_REVIEW_CYCLES,
     freeze the gate (mark it escalated) and notify the player instead of
     continuing to loop. Returns True if the gate is (now, or already)
@@ -1655,9 +1657,25 @@ def _maybe_escalate_stuck_gate(parent, gate, reason):
     if gate.get('escalated'):
         return True
     gate['cycleCount'] = gate.get('cycleCount', 0) + 1
-    if gate['cycleCount'] < MAX_REVIEW_CYCLES:
+    if failure_text:
+        normalized = re.sub(r':\d+:\d+:', ':LINE:', failure_text.strip())
+        fingerprint = hashlib.sha256(normalized.encode()).hexdigest()
+        repeated = gate.get('lastFailureFingerprint') == fingerprint
+        gate['noProgressCount'] = gate.get('noProgressCount', 1) + 1 if repeated else 1
+        gate['lastFailureFingerprint'] = fingerprint
+        codes = re.findall(r'\b([EF]\d{3})\b', failure_text)
+        category = 'formatting' if codes and all(c.startswith('E') and c != 'E999' for c in codes) else 'code_defect'
+        if any(w in failure_text.lower() for w in ('missing data', 'market inputs', 'credentials', 'not configured')):
+            category = 'missing_inputs'
+        parent['reviewDiagnosis'] = {'category': category, 'repeatedAttempts': gate['noProgressCount'],
+                                    'failure': failure_text[:4000], 'fingerprint': fingerprint,
+                                    'errorCount': len(codes)}
+        gate.setdefault('failureHistory', []).append({'cycle': gate['cycleCount'], 'category': category,
+                                                     'errorCount': len(codes), 'fingerprint': fingerprint})
+    if gate['cycleCount'] < MAX_REVIEW_CYCLES and gate.get('noProgressCount', 0) < 2:
         return False
     gate['escalated'] = True
+    parent['manualAttention'] = True
     title = parent.get('title') or 'a story'
     try:
         from serve import create_escalation
@@ -1665,7 +1683,10 @@ def _maybe_escalate_stuck_gate(parent, gate, reason):
             'stuck review loop',
             f'"{title}" has gone through {gate["cycleCount"]} review cycles without closing ({reason}). '
             'Automatic review/fix cycling has been paused for this story -- it needs manual attention '
-            '(reject it outright, edit its scope, or otherwise intervene) rather than continuing to loop.',
+            'Use the guidance form to pause, retry with instructions, supply inputs, change scope, '
+            'reassign, split the story, request research, or reject it.',
+            on_approve_note=json.dumps({'taskId': parent.get('id')}),
+            what_checked=json.dumps(parent.get('reviewDiagnosis') or {'reason': reason}),
         )
     except Exception:
         pass
@@ -1855,6 +1876,9 @@ def _apply_content_result(state, task, result, now_ms=None):
     if task.get('reviewOf'):
         parent = _resolve_review_parent(state, task)
         if parent is not None:
+            if result.get('libraryPath') and task.get('taskType') not in ('review', 'qa') and result.get('ok', True):
+                parent['libraryPath'] = result['libraryPath']
+                parent['note'] = result.get('note') or parent.get('note')
             verdict = result.get('peerVerdict')
             reviewer = task.get('assignedTo')
             gate = parent['_peerGate']
@@ -1873,7 +1897,7 @@ def _apply_content_result(state, task, result, now_ms=None):
                     'atMs': now_ms,
                 })
             if verdict == 'actionable':
-                if not _maybe_escalate_stuck_gate(parent, gate, 'repeated rejections'):
+                if not _maybe_escalate_stuck_gate(parent, gate, 'repeated rejections', failure_text=task.get('note')):
                     gate['approvals'] = 0
                     gate['approvers'] = []
                     _sim_notify_author(state, parent, reviewer, rationale=task.get('note'))
@@ -1902,7 +1926,7 @@ def _apply_content_result(state, task, result, now_ms=None):
                 elif _peer_coding_class(parent) and not (result.get('evidence') or '').strip():
                     verdict = 'actionable'
                 if verdict == 'actionable':
-                    if not _maybe_escalate_stuck_gate(parent, gate, 'repeated red-pipeline rejections'):
+                    if not _maybe_escalate_stuck_gate(parent, gate, 'repeated red-pipeline rejections', failure_text=task.get('note')):
                         gate['approvals'] = 0
                         gate['approvers'] = []
                         _sim_notify_author(state, parent, reviewer, rationale=task.get('note'))
@@ -5084,6 +5108,9 @@ def _enter_peer_review(state, task, now_ms, preferred=None):
         'escalated': bool(prior.get('escalated')),
     }
     task['status'] = 'needs_review'
+    for field in ('lastFailureFingerprint', 'noProgressCount', 'failureHistory'):
+        if field in prior:
+            gate[field] = list(prior[field]) if field == 'failureHistory' else prior[field]
     task['_peerGate'] = gate
     # Peer review is agent-to-agent -- the two
     # reviewers picked below (mailbox 'peer_review_request') handle it, so the
@@ -5285,7 +5312,7 @@ def _send_back_after_failure(state, task, fail_note=None):
     task['status'] = 'failed'
     task['failedAt'] = int(time.time() * 1000)
     task['failNote'] = note[:300]
-    escalated = _maybe_escalate_stuck_gate(task, gate, 'quality pipeline keeps failing')
+    escalated = _maybe_escalate_stuck_gate(task, gate, 'quality pipeline keeps failing', failure_text=note)
     _log_quality_gate_reject(state, task, note, escalated=escalated)
     if escalated:
         return  # frozen -- escalated + player notified; no further fix cycling
@@ -10522,6 +10549,10 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # being parked-idle in this same tick before she can process it).
     _mail_action_step(state, now, now_ms)
 
+    # Frozen gates must not leave automatic repairs queued indefinitely.
+    state['workQueue'] = [it for it in (state.get('workQueue') or [])
+                          if not (((state.get('tasks') or {}).get(it.get('reviewOf')) or {})
+                                  .get('_peerGate') or {}).get('escalated')]
     work_queue = state.get('workQueue')
     if not isinstance(work_queue, list):
         work_queue = state['workQueue'] = []
@@ -10650,7 +10681,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 if not result_ok:
                     _release_agent_after_failure(state, aid, task)
                     parent = _resolve_review_parent(state, task) if task.get('reviewOf') else task
-                    if parent is not None and _peer_gated_lane(parent):
+                    if parent is not None and _peer_gated_lane(parent) and not result.get('dataUnavailable'):
                         _send_back_after_failure(state, parent, fail_note=task.get('note'))
                     send_agent_off_duty(state, aid, doors, grid)
                     continue
@@ -11085,6 +11116,17 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     assign. Returns the task dict or None. Mirrors assignTaskViaJev's
     fallback-to-first-eligible but replaces JEV with a deterministic pick."""
     agents = state.get('agents') or {}
+    if (pick.get('room') or _resolve_assignment_room(pick)) == 'pressoffice':
+        tasks = state.get('tasks') or {}
+        # One writer or reviewer at a time; hold unrelated writes while a
+        # version is awaiting its peer votes so both reviewers see that version.
+        if any(t.get('room') == 'pressoffice' and t.get('status') in ('walking', 'working')
+               for t in tasks.values()):
+            return None
+        awaiting = {t['id'] for t in tasks.values() if t.get('room') == 'pressoffice'
+                    and t.get('status') == 'needs_review' and not (t.get('_peerGate') or {}).get('escalated')}
+        if awaiting and pick.get('reviewOf') not in awaiting:
+            return None
     # A shared-backlog card is queued ROOM-LESS on purpose: the ASSIGNED agent
     # figures out where the work needs to happen. Resolve the room here, at the
     # moment of assignment, and persist it onto the pick so the walk/gate/grade

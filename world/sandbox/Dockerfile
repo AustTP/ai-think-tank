@@ -10,6 +10,7 @@ FROM python:3.12-slim
 # serve.py SANDBOX_IMAGE points at it.
 RUN python -m pip install --no-cache-dir \
     flake8==6.0.0 \
+    black==24.10.0 \
     mypy==1.8.0 \
     bandit==1.9.4 \
     pytest==7.4.0 \

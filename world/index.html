@@ -1788,10 +1788,13 @@ function setBoardSectionHtml(body, html) {
 function renderBoard() {
   const body = document.getElementById('boardBody');
   const taskNote = t => {
-    if (!t.note) return '';
+    const guide = (t.manualAttention || (t._peerGate || {}).escalated || t.status === 'blocked')
+      && !['done', 'cancelled', 'abandoned'].includes(t.status)
+      ? `<a class="hud-btn" href="/api/intent/task/${encodeURIComponent(t.id)}/guidance" target="_blank" rel="noopener">Guide review</a>` : '';
+    if (!t.note) return guide;
     const el = document.createElement('div');
     el.textContent = t.note;
-    return `<div style="opacity:0.8; margin:3px 0 8px;">${el.innerHTML}</div>`;
+    return `<div style="opacity:0.8; margin:3px 0 8px;">${el.innerHTML}</div>${guide}`;
   };
   const boardTasks = Object.values(TASKS).filter(t => !t.boardClearedAt ||
     (t.failedAt || 0) > t.boardClearedAt ||

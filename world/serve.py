@@ -5824,7 +5824,7 @@ _OPENMETEO_FORECAST = 'https://api.open-meteo.com/v1/forecast'
 # The think tank's live-weather location for the Weather Station's autonomous
 # readings: real Open-Meteo data via _weather_fetch, never a hard-coded
 # forecast. Defaults to Charlotte, NC; override with WEATHER_LOCATION.
-WEATHER_LOCATION = os.environ.get('WEATHER_LOCATION', '').strip() or 'Charlotte, NC'
+WEATHER_LOCATION = _load_env().get('WEATHER_LOCATION', '').strip() or 'Charlotte, NC'
 
 
 def _weather_geocode(location):
@@ -5852,8 +5852,10 @@ def _weather_fetch(location):
     before it ever reaches a model."""
     geo = _weather_geocode(location)
     if geo is None:
-        return f'Could not resolve a forecast location for "{location}".'
+        return f'__TOOL_ERROR__: Could not resolve a forecast location for "{location}".'
     lat, lon, _name = geo
+    if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+        return '__TOOL_ERROR__: Weather provider returned invalid coordinates.'
     params = urllib.parse.urlencode({
         'latitude': lat, 'longitude': lon,
         'current': 'temperature_2m,apparent_temperature,weather_code',
@@ -5865,11 +5867,14 @@ def _weather_fetch(location):
     except Exception as e:
         return f'__TOOL_ERROR__: weather fetch failed: {e}'
     current = ((data or {}).get('current')) or {}
+    if any(current.get(k) is None for k in ('temperature_2m', 'apparent_temperature', 'weather_code')):
+        return '__TOOL_ERROR__: Weather provider returned incomplete current readings.'
     cond = _weather_code_human(current.get('weather_code'))
     temp = current.get('temperature_2m')
     feels = current.get('apparent_temperature')
     return (f'Weather for {location}: temperature {temp}°C, feels like {feels}°C, '
-            f'{cond}. (Data is external and may be stale from the previous hour.)')
+            f'{cond}. Observation time: {current.get("time") or "not supplied"}; '
+            f'timezone: {data.get("timezone") or "provider default"}. Source: external Open-Meteo data.')
 
 
 _TAVILY_SEARCH_URL = 'https://api.tavily.com/search'
@@ -7125,6 +7130,7 @@ def _jev_quorum_choice_sync(instructions, criteria):
 # a classifier failure (exception / non-approve-deny) still leaves the escalation
 # pending and bumps the error counter -- never auto-decides.
 ESCALATION_KIND_RISK = {
+    'stuck review loop':      {'floor': 1.0},
     # kind -> {'floor': min composite confidence to auto-approve, 1.0 = never}
     # "unsure safety decision" is a genuinely uncertain one by construction (the
     # classifier already said "not clearly blocked"); raise its floor above a
@@ -14784,6 +14790,8 @@ async def resolve_escalation(id: str, token: str, decision: str):
         return HTMLResponse('<p>Invalid or expired link.</p>', status_code=404)
     if esc['status'] != 'pending':
         return HTMLResponse(f"<p>Already resolved: {esc['status']}.</p>")
+    if esc.get('kind') == 'stuck review loop':
+        return RedirectResponse(f'/api/escalation/{urllib.parse.quote(id)}/guide?token={urllib.parse.quote(token)}')
     if decision not in ('approve', 'deny'):
         return HTMLResponse('<p>Invalid decision.</p>', status_code=400)
 
@@ -14822,6 +14830,62 @@ async def get_escalation(esc_id: str):
     if not esc:
         return JSONResponse({'error': 'not found'}, status_code=404)
     return JSONResponse({'status': esc['status'], 'kind': esc['kind']})
+
+
+@app.api_route('/api/escalation/{esc_id}/guide', methods=['GET', 'POST'])
+async def guide_escalated_review(esc_id: str, request: Request):
+    import review_guidance as guidance
+    esc = _load_escalations().get(esc_id)
+    token = request.query_params.get('token')
+    if not esc or not token or not secrets.compare_digest(str(esc.get('token') or ''), token):
+        return HTMLResponse('Invalid or expired guidance link.', status_code=404)
+    if esc.get('kind') != 'stuck review loop' or esc.get('status') != 'pending':
+        return HTMLResponse('This decision is no longer pending.', status_code=409)
+    state = get_state_from_db() or {}
+    task_id = guidance.escalation_task_id(esc, state)
+    if not task_id:
+        return HTMLResponse('Could not identify the original story. Open its guidance button on the Board.', status_code=409)
+    return await _review_guidance_response(request, state, task_id, esc_id=esc_id)
+
+
+@app.api_route('/api/intent/task/{task_id}/guidance', methods=['GET', 'POST'])
+async def guide_review_task(task_id: str, request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    return await _review_guidance_response(request, get_state_from_db() or {}, task_id)
+
+
+async def _review_guidance_response(request, state, task_id, esc_id=None):
+    import review_guidance as guidance
+    task = (state.get('tasks') or {}).get(task_id)
+    if not task:
+        return HTMLResponse('Unknown task.', status_code=404)
+    if request.method == 'GET':
+        masters = {t.get('scrumMasterId') for t in state.get('teams', [])}
+        agents = {d['id']: d for d in state.get('agentRoster', [])
+                  if not d.get('isAdmin') and d['id'] not in masters}
+        return HTMLResponse(guidance.render_form(task, str(request.url), agents))
+    escalations = _load_escalations()
+    matching_ids = {eid for eid, e in escalations.items()
+                    if e.get('kind') == 'stuck review loop' and e.get('status') == 'pending'
+                    and guidance.escalation_task_id(e, state) == task_id}
+    try:
+        data = await guidance.form_data(request)
+        state = get_state_from_db() or state
+        result = guidance.apply_guidance(state, task_id, data)
+    except (ValueError, TypeError) as e:
+        return HTMLResponse(f'<p>{html.escape(str(e))}</p><p>Go back to edit your guidance.</p>', status_code=400)
+    save_state_to_db(state)
+    escalations = _load_escalations()
+    for eid, escalation in escalations.items():
+        if escalation.get('kind') == 'stuck review loop' and escalation.get('status') == 'pending' \
+                and (eid == esc_id or eid in matching_ids):
+            escalation.update(status='guided', resolvedBy='player', resolvedAt=time.time(),
+                              guidanceAction=result['action'])
+    _save_escalations(escalations)
+    log_action('player', 'review_guidance', result, authorized=True)
+    return HTMLResponse(f'<p>Recorded: {html.escape(result["action"])}. The story still requires normal checks.</p>'
+                        '<p><a href="/">Return to the app</a></p>')
 
 
 @app.get('/api/activity')

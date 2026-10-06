@@ -320,8 +320,8 @@ class SendBackAfterFailure(unittest.TestCase):
         task = _task(assignedTo='ben')
         state['tasks'][task['id']] = task
         with unittest.mock.patch.object(serve, 'create_escalation') as esc:
-            for _ in range(sim.MAX_REVIEW_CYCLES - 1):
-                sim._send_back_after_failure(state, task)
+            for attempt in range(sim.MAX_REVIEW_CYCLES - 1):
+                sim._send_back_after_failure(state, task, fail_note=f'Different issue {attempt}')
             self.assertFalse(task['_peerGate'].get('escalated'))
             sim._send_back_after_failure(state, task)  # the cap-crossing call
         self.assertTrue(task['_peerGate']['escalated'], 'cap crossed -> frozen')

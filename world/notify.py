@@ -197,6 +197,11 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
             f'Look here first: {look_first or "the question above"}\n\n'
             f'Approve: {approve_url}\n\n'
             f'Deny: {deny_url}')
+    if kind == 'stuck review loop':
+        guide_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/{esc_id}/guide?token={token}'
+        body = (f'{question}\n\nWhat I checked: {what_checked}\n\n'
+                'Guide this review (pause, retry with instructions, supply inputs, change scope, '
+                f'reassign, split, investigate, or reject):\n{guide_url}')
     sent = bool(_serve._send_escalation_email_sync(f'[AI Think Tank] Needs your call: {kind}', body))
     latest = _serve._load_escalations()
     if esc_id in latest:
