@@ -430,6 +430,25 @@ def init_db():
             conn.execute('ALTER TABLE decision_tape ADD COLUMN trace_id TEXT')
         except Exception:
             pass
+        # The permanent decision ARCHIVE. _prune_logs distills old decision_tape
+        # rows (prompt/raw are the expensive part) into this append-only table
+        # before deleting them, so the think tank's institutional memory --
+        # what was decided, by which model, how confident, at what cost -- is
+        # NEVER lost to retention pruning. The noisy full prompt/response stays
+        # on the 7-day tape; the distilled decision survives forever and is
+        # folded into the weekly decision-archive wiki page (_archive_distill_step).
+        conn.execute('''CREATE TABLE IF NOT EXISTS decision_archive (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            kind TEXT NOT NULL,
+            model TEXT NOT NULL,
+            choice TEXT,
+            confidence REAL,
+            cost REAL,
+            ok INTEGER NOT NULL,
+            trace_id TEXT
+        )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_decision_archive_ts ON decision_archive(ts)')
         conn.execute('''CREATE TABLE IF NOT EXISTS model_tiers (
             band TEXT PRIMARY KEY,
             slug TEXT NOT NULL,
@@ -688,16 +707,31 @@ def _prune_logs():
     deleted = 0
     try:
         with _db() as conn:
-            for table in ('decision_tape', 'action_log'):
-                # SQLite has no DELETE ... LIMIT; cap the run via a subquery so a
-                # large pre-existing backlog is drained over several runs instead
-                # of one unbounded delete.
-                cur = conn.execute(
-                    f'DELETE FROM {table} WHERE id IN '  # nosec B608 -- table from a fixed tuple, values parameterized
-                    f'(SELECT id FROM {table} WHERE ts < ? LIMIT ?)',
-                    (cutoff, LOG_PRUNE_MAX_ROWS),
-                )
-                deleted += cur.rowcount
+            # action_log keeps the noisy per-agent feed; pruned as before.
+            cur = conn.execute(
+                'DELETE FROM action_log WHERE id IN '
+                '(SELECT id FROM action_log WHERE ts < ? LIMIT ?)',
+                (cutoff, LOG_PRUNE_MAX_ROWS),
+            )
+            deleted += cur.rowcount
+            # decision_tape is ARCHIVED, never just deleted: distil each old row
+            # into decision_archive (the expensive prompt/raw columns are
+            # dropped; the distilled decision is the institutional memory that
+            # must survive) and then remove it from the tape. Same LIMIT
+            # subquery cap as action_log so a large backlog is drained over
+            # several runs, and the archive copy is bounded to the same batch.
+            cur = conn.execute(
+                'INSERT INTO decision_archive (ts, kind, model, choice, confidence, cost, ok, trace_id) '
+                'SELECT ts, kind, model, choice, confidence, cost, ok, trace_id '
+                'FROM decision_tape WHERE ts < ? LIMIT ?',
+                (cutoff, LOG_PRUNE_MAX_ROWS),
+            )
+            conn.execute(
+                'DELETE FROM decision_tape WHERE id IN '
+                '(SELECT id FROM decision_tape WHERE ts < ? LIMIT ?)',
+                (cutoff, LOG_PRUNE_MAX_ROWS),
+            )
+            deleted += cur.rowcount
     except Exception as e:
         print(f'[prune] failed: {e}', flush=True)
         return 0
@@ -726,6 +760,45 @@ async def _log_prune_loop():
         await asyncio.sleep(LOG_PRUNE_INTERVAL_S)
         await asyncio.to_thread(_prune_logs)
         _LAST_LOG_PRUNE = time.time()
+
+
+def _wiki_page_body(page_id, category):
+    """Read a wiki page's current BODY straight off disk (the server-authority
+    write path persists `library/wiki/{category}/{page_id}.md`), or '' when it
+    does not exist yet. Used by the archive-distill step to merge a new weekly
+    section into the existing decision-archive page without a DB round trip.
+    Best-effort: any read failure returns '' so a caller always has a string."""
+    try:
+        path = os.path.join(LIBRARY_DIR, 'wiki', category or '', f'{page_id}.md')
+        with open(path, encoding='utf-8') as f:
+            return f.read()
+    except Exception:
+        return ''
+
+
+def _decision_archive_summary(since_ts):
+    """Aggregate the decision_archive table since `since_ts` into a short digest:
+    per-kind decision counts with ok-count + total spend, plus the overall
+    totals. The raw material for the weekly decision-archive wiki page. Returns
+    a dict, or None on any DB failure (callers treat that as 'skip this week')."""
+    try:
+        with _db() as conn:
+            kinds = conn.execute(
+                'SELECT kind, COUNT(*), COALESCE(SUM(ok),0), COALESCE(SUM(cost),0) '
+                'FROM decision_archive WHERE ts >= ? GROUP BY kind ORDER BY kind',
+                (since_ts,)).fetchall()
+            total = conn.execute(
+                'SELECT COUNT(*), COALESCE(SUM(ok=0),0), COALESCE(SUM(cost),0) '
+                'FROM decision_archive WHERE ts >= ?',
+                (since_ts,)).fetchone()
+        return {
+            'kinds': [{'kind': r[0], 'count': r[1], 'ok': r[2], 'cost': r[3]} for r in kinds],
+            'total': total[0] if total else 0,
+            'failed': total[1] if total else 0,
+            'cost': total[2] if total else 0.0,
+        }
+    except Exception:
+        return None
 
 
 async def _model_tier_refresh_loop():
@@ -7982,6 +8055,38 @@ async def api_log(request: Request):
     return PlainTextResponse('logged')
 
 
+def _classify_report_severity(quote, note):
+    """Deterministic severity classification for a filed report (2026-10-06):
+    'small things of no harm' can't be marked as firing-grade negatives. Scans
+    quote+note for the most serious keyword signal -- severe (real
+    misconduct/sabotage) > serious (real harm, dropped/missed work) > major
+    (friction, miscommunication) > minor (default, no harm). Rule-based on
+    purpose: severity decides who may be fired, so it must be derivable and
+    testable, not a coin flip. Only serious/severe count as firing strikes
+    (see sim._is_strike_severity)."""
+    text = f'{quote} {note}'.lower()
+    severe = ['sabotage', 'fabricat', 'forge', 'harass', 'threaten', 'threat',
+              'coerc', 'extort', 'bribe', 'stole', 'steal', 'theft', 'credential',
+              'password', 'backdoor', 'exploit', 'malware', 'assault', 'blackmail',
+              'lied', 'vandal']
+    serious = ['dropped', 'missed', 'unresponsive', 'unreachable', 'ghosted',
+               'ignored', 'deadline', 'overdue', 'unreliable', 'incompet',
+               'not responding', 'failed to', 'negligent', 'broke the build']
+    major = ['miscommunicat', 'confusion', 'confused', 'unclear', 'friction',
+             'argument', 'rude', 'dismissive', 'unhelpful', 'overwhelmed',
+             'sloppy', 'careless']
+    for word in severe:
+        if word in text:
+            return 'severe'
+    for word in serious:
+        if word in text:
+            return 'serious'
+    for word in major:
+        if word in text:
+            return 'major'
+    return 'minor'
+
+
 @app.post('/api/reports')
 async def post_report(request: Request):
     # Agent-filed report into ANOTHER agent's reports/ directory (your
@@ -8021,13 +8126,38 @@ async def post_report(request: Request):
         'id': f'report-{int(time.time() * 1000)}-{about_id}',
         'aboutId': about_id, 'fromId': from_id, 'quote': quote, 'note': note,
         'ts': int(time.time() * 1000),
-        'severity': 'minor',  # filled finer by the client/peer classifier when relevant
+        # Classified at filing, not left to the client: only a genuine
+        # serious/severe report can ever become a firing strike.
+        'severity': _classify_report_severity(quote, note),
     }
     reports.append(report)
     state['reports'] = reports
     save_state_to_db(state)  # materializes into agents/<about_id>/reports/
     log_action(from_id, 'report_filed', {'about': about_id}, authorized=True)
     _append_passport_decision('report_filed', from_id, {'about': about_id})
+    # Player notification only when the evidence crosses a real bar: a severe
+    # review, or the second strike landing inside the grace window. Minor/major
+    # noise never pings the player's inbox, so a single honest complaint can't
+    # drum up a notification.
+    try:
+        import sim as _sim
+        strikes = _sim._report_strikes(state, about_id, int(time.time() * 1000))
+        if strikes['severe'] >= 1 or strikes['count'] >= 2:
+            window_days = _sim.REPORT_STRIKE_WINDOW_MS // (24 * 3600 * 1000)
+            create_escalation(
+                'personnel_strike',
+                f'{from_id} filed a serious negative review of {about_id}; '
+                f'{strikes["count"]} firing strike(s) on record inside the {window_days}-day grace window.',
+                what_checked=f'reports about {about_id} inside the window: {strikes["count"]}',
+                look_first=f'{about_id}\'s reports directory')
+            log_action('player', 'personnel_strike',
+                       {'about': about_id, 'from': from_id,
+                        'strikes': strikes['count'], 'severe': strikes['severe']},
+                       authorized=True)
+    except Exception:
+        # Notification is best-effort -- a filing must never fail because the
+        # alert couldn't be raised.
+        pass
     return JSONResponse({'ok': True, 'id': report['id']})
 
 
@@ -11597,6 +11727,20 @@ def _owns_reports_dir(agent_id, requester_id):
     return requester_id == agent_id
 
 
+def _agent_reports_off_limits(requester_id):
+    # Reviewer independence (2026-10-06): NO agent may read the reports/
+    # directory of ANY employee through the file API -- reviews are write-only
+    # from an agent's perspective. An employee who wants to write a review must
+    # not first read what has already been filed about that same employee: that
+    # keeps every verdict independent (no herding off prior reviews) and stops
+    # an adversarial actor from reading what is said about them to tailor a
+    # denial. The player/ops (requester None / 'player') keeps full visibility;
+    # the firing reviewers already receive the reports through the state
+    # (_firing_consultation), never through the file API, so nothing they need
+    # is taken away.
+    return bool(requester_id) and requester_id not in ('player', 'unknown')
+
+
 def _resolve_requester(request):
     # Resolve who a request is being made AS, if anyone: validates a real
     # agent key against the claimed id. The player UI sends no agent key, so
@@ -11621,17 +11765,21 @@ async def list_agent_files(agentId: str, request: Request):
     if not os.path.isdir(base):
         return JSONResponse({'files': []})
     is_own_reports = _owns_reports_dir(agentId, requester)
+    # An agent can't see ANY employee's reports/ -- neither its own (self-
+    # sanitization) nor a coworker's (reviewer independence). The player keeps
+    # full visibility.
+    hide_reports = is_own_reports or _agent_reports_off_limits(requester)
     files = []
     for root, dirs, filenames in os.walk(base):
         dirs[:] = [d for d in dirs if _agent_rel_path_is_visible([d])]
-        # An agent browsing its own directory never sees its own reports/ --
-        # peer reports about it stay hidden from the subject itself.
-        if is_own_reports:
+        # An agent browsing never sees reports/ -- peer reports stay hidden from
+        # every agent, not just the subject.
+        if hide_reports:
             dirs[:] = [d for d in dirs if d != 'reports']
         for fn in filenames:
             if not _agent_rel_path_is_visible([fn]):
                 continue
-            if is_own_reports and 'reports' in path_components(root, base):
+            if hide_reports and 'reports' in path_components(root, base):
                 continue  # pragma: no cover -- reports/ is pruned from dirs above, so never present in a path
             full = os.path.join(root, fn)
             rel = os.path.relpath(full, base)
@@ -11653,6 +11801,10 @@ async def read_agent_file(agentId: str, path: str, request: Request):
     # An agent cannot read ITS OWN reports/ -- denied here (not just hidden)
     # so a direct read still can't pull a peer report about itself.
     if _owns_reports_dir(agentId, requester) and is_under_reports(path):
+        return JSONResponse({'error': 'not readable'}, status_code=403)
+    # Reviewer independence: no agent may read ANY employee's reports/ through
+    # the file API -- reviews are write-only from an agent's perspective.
+    if _agent_reports_off_limits(requester) and is_under_reports(path):
         return JSONResponse({'error': 'not readable'}, status_code=403)
     if not os.path.isfile(target):
         return JSONResponse({'error': 'not found'}, status_code=404)

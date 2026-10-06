@@ -1350,6 +1350,13 @@ HIRE_DURATION_MS = 8000       # hiring.js:25 (review completion now deferral)
 HIRE_COLOR_POOL = ['#f6b26b', '#76a5af', '#a4c2f4', '#d5a6bd', '#b6d7a8', '#ffe599']
 FIRING_COOLDOWN_MS = 60000    # firing.js:21
 FIRING_REVIEW_DURATION_MS = 10000  # deferral between start + resolution
+# Personnel-strike grace window (2026-10-06): a serious/severe negative review
+# counts toward the two-strike firing bar only when it lands INSIDE this window
+# of the moment the evidence is weighed. A single negative review no longer
+# hangs over an employee forever -- two honest mistakes spaced months apart
+# never accumulate into a firing. 'minor'/'major' reports (friction, no harm,
+# underperformance) never count as strikes at all.
+REPORT_STRIKE_WINDOW_MS = 14 * 24 * 3600 * 1000  # 14 days
 # Phase B: the staging gap between the ceremony embarking the director + the
 # employees who'll work with a new hire at Command Center and the first staged
 # AGENT.md draft. Long enough to read as a real Town-Hall pre-meeting, short
@@ -1459,6 +1466,26 @@ COACHING_LOOP_CADENCE_MS = 24 * 3600 * 1000  # daily catch-up sweep (like stale 
 # this many items left -- "we finished X, and the room is thinning out". Zero
 # turns the signal off entirely (opt-in per deployment).
 WORK_REQUEST_ROOM_THIN = 1
+# Bell-style spare-time lane (2026-10-06): a bounded allowance of FREE SPIKES an
+# agent earns per week by finishing real deliverable work. A free spike is
+# self-filed, never groomed by refinement, and LOWEST priority (fills gaps,
+# never blocks committed work) -- the 'spare time' Bell Labs researchers
+# bootlegged. The caps are what keep it from opening the spend flood gates:
+# the FIRST real deliverable completion of a week earns one free spike, capped
+# per agent AND tank-wide, deterministic (no Jev), and time-boxed.
+FREE_SPIKE_ALLOWANCE_PER_WEEK = 1      # free spikes one agent may earn per week
+FREE_SPIKE_GLOBAL_CAP_PER_WEEK = 3     # free spikes the whole tank earns per week
+FREE_SPIKE_BUDGET_MS = 2 * 60 * 1000   # time-box per free spike (2 minutes)
+# Spare time is OPPORTUNISTIC, not a follow-up chore: a free spike becomes
+# assignable only after a short deferral, so it fills genuine idle gaps instead
+# of instantly re-arming the author the same tick a story reaches review.
+FREE_SPIKE_DEFER_MS = 60 * 1000        # 1 sim-minute before a free spike is due
+FREE_SPIKE_PREMISE_GUIDANCE = (
+    'This is free exploration: your only deliverable is what you actually learn. '
+    'QUESTION THE PREMISE first -- state the assumption buried in the question and '
+    'ask whether the question is even the right one. The most valuable finding is '
+    'often that the frame was wrong.'
+)
 # Hard cap of filed-but-not-yet-groomed requests in a single ceremony, so a
 # churny think tank can't convene a backlog-refinement meeting over a runaway list.
 REFINEMENT_MAX_REQUESTS = 20
@@ -2232,19 +2259,27 @@ def queue_work(state, items):
             # would leave the task without the budget the groomer judged it worth.
             'budgetUsd': item.get('budgetUsd') or None,
             'budgetBand': item.get('budgetBand') or None,
+            # Bell-style spare-time lane: a MOONSHOT item is a protected
+            # exploration lane -- never enters the peer gate (spikes are already
+            # non-gated) and its failures are NOT mined into operator rules
+            # (see _record_classified_failures). Explicit flag so the protection
+            # is auditable, not implicit.
+            'moonshot': bool(item.get('moonshot')),
         })
     return len(work_queue)
 
 
 def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructions=None,
-                project_label=None):
+                project_label=None, moonshot=False, notBefore=None):
     """Phase E2b: enqueue a time-boxed SPIKE (taskType='spike'). A spike is an
     investigation with no committed deliverable: it's LOWEST priority (fills
     gaps, never blocks committed work), carries a hard `budgetMs` for the work
     cycle, and -- because nothing ships -- its completion does NOT open a peer
     gate (see _peer_gated_lane). Produces a findings artifact, not a release.
-    Returns the new queue length, or None if the item was rejected (no room or
-    title)."""
+    `moonshot` marks a protected spare-time spike (see FREE_SPIKE_*): its
+    failures are never mined into operator rules. `notBefore` (epoch ms) gates
+    when the spike becomes assignable (spare-time work is deferred). Returns
+    the new queue length, or None if the item was rejected (no room or title)."""
     return queue_work(state, [{
         'title': title,
         'room': room,
@@ -2256,6 +2291,8 @@ def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructi
         'priority': WORK_PRIORITY['low'],
         'taskType': 'spike',
         'budgetMs': budget_ms or 60_000,
+        'moonshot': bool(moonshot),
+        'notBefore': notBefore,
     }])
 def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None,
                goal=None, priority=None, project_label=None, depends_on_task=None):
@@ -3654,6 +3691,9 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
             (extra or {}).get('taskType', 'code'),
             (extra or {}).get('budgetUsd'),
             (extra or {}).get('budgetBand')),
+        # Bell-style spare-time lane: the protected-exploration flag (a free
+        # spike's failures are never mined into operator rules).
+        'moonshot': bool((extra or {}).get('moonshot')),
         'assignedTo': agent_id,
         'status': 'walking',
         'createdAt': now_ms,
@@ -3986,6 +4026,16 @@ def _complete_shadow_task(state, agent_id, task, now_ms, grid=None):
 MIN_RESEARCH_CADENCE_MS = 5 * 60 * 1000  # floor: a misparsed "every second" can't spam the queue
 MIN_PIPELINE_CADENCE_MS = 60 * 60 * 1000  # floor for an ordered pipeline: a misparsed "every second" can't spam the queue
 
+# Bell-style long-horizon problem (2026-10-06): one standing research topic per
+# village whose crawl cadence is far in the future -- the think tank always has
+# something on the table that is NOT due this sprint, so the org keeps a horizon
+# beyond the 6s tick and the weekly ceremonies. Configurable via .env
+# (LONG_HORIZON_TOPIC / LONG_HORIZON_TOPIC_URL / LONG_HORIZON_CADENCE_DAYS);
+# the defaults are a safe self-questioning frame.
+LONG_HORIZON_TOPIC_DEFAULT = 'Re-examine our own assumptions: what does the think tank believe, and what would falsify it'
+LONG_HORIZON_TOPIC_URL_DEFAULT = 'https://en.wikipedia.org/wiki/Falsifiability'
+LONG_HORIZON_CADENCE_DAYS_DEFAULT = 30.0
+
 
 def next_topic_id(state):
     """Server-side monotonic counter for researchTopics ids (topic-1, topic-2,
@@ -4192,6 +4242,53 @@ def _distill_has_new_archives(since_ms):
     return False
 
 
+def _ensure_long_horizon_topic(state, now_ms):
+    """Bell-style long-horizon problem: seed ONE standing research topic per
+    village whose crawl cadence is far in the future (LONG_HORIZON_CADENCE_DAYS),
+    so the think tank always has something on the table that is NOT due this
+    sprint -- a horizon beyond the 6s tick and the weekly ceremonies. Idempotent
+    and self-cleaning: `state['longHorizonSeeded']` records which villages were
+    seeded, so a topic deleted by the player is never silently re-created, while
+    a partially-failed seed (bad .env URL) falls back to the safe defaults and is
+    retried next pass. `lastRunAt` is seeded to now so the first crawl fires one
+    full cadence out, not on the next pass. Pure state mutation, no Jev spend."""
+    villages = state.get('villages') or []
+    if not villages:
+        return
+    try:
+        import serve as _serve_mod
+        env = _serve_mod._load_env()
+        topic = (env.get('LONG_HORIZON_TOPIC') or '').strip() or LONG_HORIZON_TOPIC_DEFAULT
+        url = (env.get('LONG_HORIZON_TOPIC_URL') or '').strip() or LONG_HORIZON_TOPIC_URL_DEFAULT
+        cadence_days = float(env.get('LONG_HORIZON_CADENCE_DAYS') or 0) or LONG_HORIZON_CADENCE_DAYS_DEFAULT
+    except Exception:
+        topic, url, cadence_days = (LONG_HORIZON_TOPIC_DEFAULT,
+                                    LONG_HORIZON_TOPIC_URL_DEFAULT,
+                                    LONG_HORIZON_CADENCE_DAYS_DEFAULT)
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        url = LONG_HORIZON_TOPIC_URL_DEFAULT
+    cadence_ms = max(int(cadence_days * 24 * 3600 * 1000), MIN_RESEARCH_CADENCE_MS)
+    seeded = state.setdefault('longHorizonSeeded', {})
+    for v in villages:
+        vid = v.get('id') or DEFAULT_VILLAGE
+        if seeded.get(vid):
+            continue
+        state.setdefault('researchTopics', []).append({
+            'id': next_topic_id(state),
+            'topic': topic,
+            'startUrl': url,
+            'cadenceMs': cadence_ms,
+            'lastRunAt': now_ms,
+            'seenUrls': [],
+            'villageId': vid,
+            'longHorizon': True,
+        })
+        seeded[vid] = True
+        _log_governance(state, None, 'long_horizon_topic_seeded',
+                        {'villageId': vid, 'topic': topic, 'cadenceDays': cadence_days})
+
+
 def _check_schedules(state, now, now_ms):
     """Port of tasks.js checkResearchSchedule + checkSkillReviewSchedule: queue
     due standing work, stamping lastRunAt/lastSkillReviewAt BEFORE assignment so
@@ -4202,6 +4299,10 @@ def _check_schedules(state, now, now_ms):
     review/merge. With no content the marker is deliberately NOT advanced, so
     the sweep fires on the first later pass where content appears."""
     # Research topics.
+    # Long-horizon seeding first: a village's standing far-future topic is
+    # created before due topics fire, so a fresh village always has its horizon
+    # problem on the table from its first pass.
+    _ensure_long_horizon_topic(state, now_ms)
     for topic in (state.get('researchTopics') or []):
         if now_ms - (topic.get('lastRunAt') or 0) < topic.get('cadenceMs', 0):
             continue
@@ -4476,40 +4577,41 @@ def _review_is_stale(state, agent_id, now_ms):
     return same_morale and same_reports
 
 
-def _has_firing_signal(state, agent_id):
+def _has_firing_signal(state, agent_id, now_ms=None):
     """Firing keys off a real, corroborated personnel
     problem, NOT the composite morale score. Morale folds in neglect (never
     contacted = low score) and approved-work noise that say 'send this agent
     help / they might be underutilized' -- the hiring/load-spreading concern --
     but are NOT grounds to fire someone. The legitimate firing signals are
-    (a) a negative report filed against the agent (their peers flagged a real
-    problem), and (b) a true drop-off -- they were handed work and dropped more
-    of it than a third of what they approved (falling behind, not loafing)."""
+    (a) two serious/severe negative reviews that landed INSIDE the strike
+    grace window (REPORT_STRIKE_WINDOW_MS), or a single severe one -- their
+    peers flagged a real problem, and it's recent enough to matter -- and (b) a
+    true drop-off -- they were handed work and dropped more of it than a third
+    of what they approved (falling behind, not loafing). A lone negative review
+    is not a signal: it may expire out of the window, and it is never grounds
+    to convene a firing review by itself."""
     a = (state.get('agents') or {}).get(agent_id)
     if not a:
         return False
-    info = _firing_consultation(state, agent_id)
-    negative_reports = [r for r in info['reporters'] if _is_negative_severity(r['severity'])]
-    if negative_reports:
+    strikes = _report_strikes(state, agent_id, now_ms)
+    if strikes['count'] >= 2 or strikes['severe'] >= 1:
         return True
     dropped = a.get('droppedCount') or 0
     approved = a.get('approvedCount') or 0
     return dropped > approved * 0.3
 
 
-def _firing_signal_strength(state, agent_id):
+def _firing_signal_strength(state, agent_id, now_ms=None):
     """Comparable strength of an agent's firing signal for who_needs_review:
-    (severity-weighted negative report count, overload). Severe>serious>major
-    (3/2/1); overload = dropped / (approved + 1), the same ratio _has_firing_signal
-    thresholds at 0.3. Primary sort = the report evidence, secondary = how far
-    behind they've fallen -- so a reported+overloaded agent beats a report-only
-    one, and an unreported overload alone ranks below any real report."""
-    info = _firing_consultation(state, agent_id)
-    weights = {'severe': 3, 'serious': 2, 'major': 1}
-    score = 0
-    for r in info['reporters']:
-        for sev in (r.get('severity') or '').split(','):
-            score += weights.get(sev.strip().lower(), 0)
+    (severity-weighted strike count within the grace window, overload).
+    Severe=3, serious=2 per strike; overload = dropped / (approved + 1), the
+    same ratio _has_firing_signal thresholds at 0.3. Primary sort = the report
+    evidence, secondary = how far behind they've fallen -- so a
+    reported+overloaded agent beats a report-only one, and an unreported
+    overload alone ranks below any real report. 'minor'/'major' reports carry
+    no firing weight (see _report_strikes)."""
+    strikes = _report_strikes(state, agent_id, now_ms)
+    score = strikes['severe'] * 3 + (strikes['count'] - strikes['severe']) * 2
     a = (state.get('agents') or {}).get(agent_id) or {}
     dropped = a.get('droppedCount') or 0
     approved = a.get('approvedCount') or 0
@@ -4535,9 +4637,9 @@ def who_needs_review(state, now_ms):
         a = (state.get('agents') or {}).get(d.get('id'))
         if not a or a.get('busy') or a.get('task') or a.get('pairWith') or a.get('handoff'):
             continue
-        if not _has_firing_signal(state, d.get('id')):
+        if not _has_firing_signal(state, d.get('id'), now_ms):
             continue
-        strength = _firing_signal_strength(state, d.get('id'))
+        strength = _firing_signal_strength(state, d.get('id'), now_ms)
         if best is None or strength > best_strength:
             best = d
             best_strength = strength
@@ -4579,21 +4681,60 @@ def _is_negative_severity(severity):
     return 'severe' in s or 'serious' in s or 'major' in s
 
 
+def _is_strike_severity(severity):
+    """A report severity that COUNTS toward the two-strike firing bar. Only
+    serious/severe -- real harm or real misconduct. 'minor' (no harm) and
+    'major' (friction, underperformance) never count as a strike, so small
+    things can't snowball into a firing; underperformance is a drop-off signal
+    and a help target, not a strike."""
+    s = (severity or '').lower()
+    return 'severe' in s or 'serious' in s
+
+
+def _report_strikes(state, agent_id, now_ms=None):
+    """The firing-relevant review evidence for an agent, windowed: serious and
+    severe negative reports that landed INSIDE REPORT_STRIKE_WINDOW_MS of the
+    moment the evidence is weighed. A report without a `ts` is treated as fresh
+    (state-seeded reports and pre-window records both count), so a hard fire
+    never slips through a missing timestamp. Returns {'count', 'severe',
+    'freshest'} where 'count' is the total strikes in the window and 'severe'
+    the subset that were severe. `now_ms` injectable for deterministic tests."""
+    now = int(time.time() * 1000) if now_ms is None else now_ms
+    strikes = []
+    severe = 0
+    freshest = 0
+    for r in reports_about(state, agent_id):
+        if not _is_strike_severity(r.get('severity')):
+            continue
+        ts = r.get('ts')
+        if ts is not None and now - ts > REPORT_STRIKE_WINDOW_MS:
+            continue
+        strikes.append(r)
+        if _is_severe(r.get('severity')):
+            severe += 1
+        freshest = max(freshest, ts or 0)
+    return {'count': len(strikes), 'severe': severe, 'freshest': freshest}
+
+
+def _is_severe(severity):
+    s = (severity or '').lower()
+    return 'severe' in s
+
+
 def _consultation_blocks_firing(state, candidate_id, now_ms):
     """firing.js consultationBlocksFiring: two independent guardrails against
-    premature firing -- an active collaborator, or no corroborated negative
-    report (severe alone justifies; a single serious/major defers)."""
+    premature firing -- an active collaborator, or no corroborated strike
+    evidence inside the grace window (a severe strike alone justifies; two
+    serious/serious+ strikes are required otherwise)."""
     info = _firing_consultation(state, candidate_id)
     if info['coworkers']:
         return True, info
-    negatives = [r for r in info['reporters'] if _is_negative_severity(r['severity'])]
-    if not negatives:
+    strikes = _report_strikes(state, candidate_id, now_ms)
+    if not strikes['count']:
         return True, info
-    severe = any(r['severity'] and any(s.strip().lower() == 'severe' for s in r['severity'].split(','))
-                 for r in negatives)
-    if severe:
+    if strikes['severe']:
         return False, info
-    return len(negatives) < 2, info
+    return strikes['count'] < 2, info
 
 
 def _fire_decision(state, reviewers, candidate_def, now_ms, decider=None):
@@ -4612,12 +4753,17 @@ def _fire_decision(state, reviewers, candidate_def, now_ms, decider=None):
                     *(f'{c.get("name")} (currently working directly with {candidate.get("name")})'
                       for c in info['coworkers'])]) or 'no one reported them and no one is currently working directly with them')
     reviewer1, reviewer2 = reviewers
+    strikes = _report_strikes(state, candidate_def.get('id'), now_ms)
+    window_days = REPORT_STRIKE_WINDOW_MS // (24 * 3600 * 1000)
     instructions = (f'{reviewer1.get("name")} and {reviewer2.get("name")} are jointly reviewing '
                     f'{candidate.get("name")}\'s ({candidate.get("role")}) performance. '
                     f'{reviewer1.get("name")} is the admin; {reviewer2.get("name")} is the senior-most '
                     f'director standing in for the admin. Morale score: {morale}/100. Approved work: '
                     f'{candidate.get("approvedCount")}. Dropped work: {candidate.get("droppedCount")}. '
-                    f'Reports filed against them: {report_quotes}. {candidate.get("name")}\'s own manager has '
+                    f'Reports filed against them: {report_quotes}. '
+                    f'Firing-signal strikes inside the {window_days}-day grace window: {strikes["count"]} '
+                    f'({strikes["severe"]} severe). '
+                    f'{candidate.get("name")}\'s own manager has '
                     f'already been notified of these reports. People consulted who have worked with or reported '
                     f'{candidate.get("name")}: {consultant_line}. Decide whether to fire them or keep them on.')
     candidates = [
@@ -4633,8 +4779,8 @@ def _fire_decision(state, reviewers, candidate_def, now_ms, decider=None):
         # than a third of what they approved). Either alone stays 'keep' --
         # a report-only or drop-off-only agent is a help/hiring target, not a
         # firing one (see _has_firing_signal).
-        info = _firing_consultation(state, candidate_def.get('id'))
-        has_report = any(_is_negative_severity(r['severity']) for r in info['reporters'])
+        strikes = _report_strikes(state, candidate_def.get('id'), now_ms)
+        has_report = strikes['count'] >= 2 or strikes['severe'] >= 1
         dropped = candidate.get('droppedCount') or 0
         approved = candidate.get('approvedCount') or 0
         decision = ('fire' if has_report and dropped > approved * 0.3
@@ -4740,13 +4886,37 @@ def _pick_reviewer_ids(state, author_id, task_room=None, preferred=None):
     def _idle_key(cid):
         a = agents.get(cid) or {}
         cid_room_contrib = bool(task_room) and task_room in (a.get('completedRooms') or [])
-        return (1 if cid not in team_set and not cid_room_contrib else 0,  # stranger loses
+        return (0 if preferred and cid in preferred else 1,  # prior reviewers stay at the head
+                1 if cid not in team_set and not cid_room_contrib else 0,  # stranger loses
                 0 if cid in team_set else 1,                               # same-team first
                 0 if cid_room_contrib else 1,                              # known-craft next
                 0 if a.get('offDuty') else 1,
                 a.get('busy') is True,
                 roster_order(cid, roster))
     ordered_ids.sort(key=_idle_key)
+    if not preferred:
+        # Bell-style cross-pollination (2026-10-06): when the tank can supply
+        # both an on-team AND an off-team reviewer, force the pair to span
+        # teams -- a reviewer who doesn't share the author's team's normalized
+        # assumptions catches what the team itself has learned to ignore.
+        # Off-team means a worker reporting to a DIFFERENT team director than
+        # the author's (the author's own director standing in is not
+        # cross-pollination, and a bare director with no team of their own is
+        # not either). Falls back to the pure quality ordering when the pool
+        # can't span (a tiny think tank) or when re-using a prior pair (a
+        # rejection must be re-verified by the same reviewer who flagged it).
+        team_directors = {t.get('directorId') for t in (state.get('teams') or []) if t.get('directorId')}
+        author_director = (author_roster or {}).get('director')
+        off_team = []
+        for c in ordered_ids:
+            if c in team_set:
+                continue
+            cd = next((d.get('director') for d in roster if d.get('id') == c), None)
+            if cd and cd != author_director and cd in team_directors:
+                off_team.append(c)
+        same_team = [c for c in ordered_ids if c in team_set]
+        if same_team and off_team:
+            return [same_team[0], off_team[0]]
     return ordered_ids[:2]
 
 
@@ -4759,10 +4929,17 @@ def roster_order(cid, roster):
 
 def _enter_peer_review(state, task, now_ms, preferred=None):
     """Move a deliverable task whose primary content work just finished into the
-    peer-approval gate: status -> 'needs_review', pick two same-team reviewers,
+    peer-approval gate: status -> 'needs_review', pick two reviewers (see
+    _pick_reviewer_ids -- one is forced cross-team when the tank can supply it),
     record the gate (approval counter + reviewer pair), and notify each reviewer
     (the 'tell your teammates' step, server-side at the trigger instant). Returns
     the _peerGate dict (or None if the task is misconfigured).
+
+    Adversarial split (2026-10-06): the FIRST reviewer is designated the CRITIC
+    -- instructed to prove the work wrong, not rubber-stamp it -- so a gate
+    approval means the work survived hostile scrutiny, and a rubber-stamp pair
+    can no longer pass a weak deliverable on 2 clean votes. The other reviewer
+    keeps the standard skeptical-review framing. Same spend, stronger signal.
 
     `preferred` (prior reviewer pair): a re-open (reviewer rejection of the fix,
     or a player veto re-opening a closed story) should be re-verified by the
@@ -4802,16 +4979,27 @@ def _enter_peer_review(state, task, now_ms, preferred=None):
     # only for things that actually need player input (agent_ask, card_blocked
     # below). This used to also email the player here; removed on request.
     review_items = []
-    for rid in reviewers:
+    for i, rid in enumerate(reviewers):
+        # Adversarial split: reviewer[0] is the CRITIC, briefed to find the
+        # flaw; reviewer[1] keeps the standard skeptical frame.
+        critic = (i == 0)
         _append_mailbox((state.get('agents') or {}).get(rid, {}), {
             'kind': 'peer_review_request',
             'about': task.get('id'),
             'title': task.get('title'),
-            'text': f'Work on "{task.get("title")}" is ready for your review. Please review it and approve or send it back.'})
+            'text': (f'Work on "{task.get("title")}" is ready for your review. '
+                     + ('As the CRITIC, your job is to find what is wrong with it -- assume it has a hidden flaw until you prove it does not, and send it back if you find a concrete, fixable problem.'
+                        if critic else
+                        'Please review it and approve or send it back.'))})
         review_items.append({
             'title': f'Review: {task.get("title")}',
             'room': task.get('room'),
-            'instructions': (f'Review the work for "{task.get("title")}" and approve it only if it is genuinely solid '
+            'instructions': (f'You are the CRITIC on this review. Review the work for "{task.get("title")}" '
+                             'as an adversary: assume it has a hidden flaw until you have proven it does not. '
+                             'Check the claims, the numbers, and the reasoning. Approve ONLY if the work survives '
+                             'your scrutiny; if you find a concrete, fixable problem, send it back.'
+                             if critic else
+                             f'Review the work for "{task.get("title")}" and approve it only if it is genuinely solid '
                              'with no concrete, fixable problems. Be a skeptical reviewer, not a rubber stamp.'),
             'goal': task.get('projectLabel') or task.get('goal'),
             'taskType': 'review',
@@ -5533,6 +5721,12 @@ def _complete_auto_hire(state, pending, grid, now_ms):
     }
     new_id = name.lower()
     roster = state.setdefault('agentRoster', [])
+    # Reentry guard: a fired employee can never come back. Refuse the hire and
+    # drop the pending record so the next pass stages a fresh (different) hire
+    # instead of retrying the same forbidden one forever.
+    if _is_fired(state, new_id, name):
+        state.pop('_pendingHire', None)
+        return None
     # Defensive re-check: a director's team may have grown to cap between the
     # hire's approval and this completion pass; never blow past the cap. The
     # hire itself adds one member, so the check accounts for that extra.
@@ -5652,6 +5846,23 @@ def _remember_name(state, name):
         state['_usedNames'].append(low)
 
 
+def _is_fired(state, agent_id, name=None):
+    """True when `agent_id` (or its name, when given) is on the durable
+    fired-employee blocklist. The reentry guard checked at every agent-creation
+    gate: a fired employee can never reenter the think tank, no matter which
+    hire path (auto-hire, large-request team spawn) or generative name chooser
+    is involved. The blocklist itself is written at the moment of firing (see
+    _resolve_firing_review) and survives the fired agent leaving the roster."""
+    fired = state.get('firedAgents') or {}
+    if agent_id in fired:
+        return True
+    if name:
+        low = name.strip().lower()
+        return any(str(v.get('name') or '').strip().lower() == low
+                   for v in fired.values())
+    return False
+
+
 def _name_chooser_default(state, chooser_name, used_names, for_role):
     """Default generative name chooser for a hire, late-importing serve.py so
     sim.py stays unit-testable offline. The hiring DIRECTOR (`chooser_name`,
@@ -5709,6 +5920,9 @@ def _spawn_team_agent(state, name, role, director_id, now_ms, grid, is_director=
     new_id = name.lower()
     color_pool = HIRE_COLOR_POOL
     color = color_pool[random.randrange(len(color_pool))]
+    # Reentry guard: a fired employee can never reenter under any hire path.
+    if _is_fired(state, new_id, name):
+        return None
     profile = {
         'mission': f"Part of the {director_id} team, taking on the think tank's newest large request.",
         'instructions': [
@@ -7555,6 +7769,79 @@ ABSOLUTE_ZERO_SCOPING_GUIDANCE = (
 )
 
 
+def _free_spike_week(now_ms):
+    """The weekly bucket a free-spike allowance is counted against -- an integer
+    ISO-ish week number derived from the wall clock, so the allowance rolls by
+    itself (no ceremony dependency, unlike weekApprovals which the Social
+    resets)."""
+    return int((now_ms or int(time.time() * 1000)) // (7 * 24 * 3600 * 1000))
+
+
+def _file_free_spike(state, agent_id, completed_task, now_ms=None):
+    """The spare-time lane: an agent that just finished REAL deliverable work may
+    earn one FREE SPIKE this week -- a self-filed, never-groomed, lowest-priority
+    investigation of its own choosing. Deterministic intake (no Jev), bounded by
+    the per-agent weekly allowance AND the tank-wide weekly cap, and time-boxed.
+    A free spike is tagged `moonshot`: protected from rule mining (its failures
+    never become operator rules) and already non-gated (spikes don't ship a
+    peer-reviewed deliverable). Returns 1 when a free spike was queued, else 0.
+    Dedups against an identical pending free spike in the same room."""
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    room = (completed_task or {}).get('room')
+    if not room or room not in VALUED_QUEUE_ROOMS:
+        return 0
+    a = (state.get('agents') or {}).get(agent_id)
+    if not a or a.get('offDuty') or a.get('busy') or a.get('task'):
+        return 0
+    week = _free_spike_week(now_ms)
+    used_map = state.setdefault('freeSpikeUsed', {})
+    if not isinstance(used_map, dict):
+        used_map = state['freeSpikeUsed'] = {}
+    used_week, used = used_map.get(agent_id, (week, 0))
+    if used_week != week:
+        used = 0
+    if used >= FREE_SPIKE_ALLOWANCE_PER_WEEK:
+        return 0
+    global_map = state.setdefault('freeSpikeGlobal', {})
+    if not isinstance(global_map, dict):
+        global_map = state['freeSpikeGlobal'] = {}
+    # Roll the tank-wide week bucket + prune stale buckets (bounded growth).
+    for stale in [k for k in global_map if k < week - 1]:
+        del global_map[stale]
+    tank_used = global_map.get(week, 0)
+    if tank_used >= FREE_SPIKE_GLOBAL_CAP_PER_WEEK:
+        return 0
+    # One free exploration per room per week: a pending moonshot spike already
+    # filed in this room THIS week is the same question -- don't double-file.
+    rooms_map = state.setdefault('freeSpikeRooms', {})
+    if not isinstance(rooms_map, dict):
+        rooms_map = state['freeSpikeRooms'] = {}
+    for stale in [k for k in rooms_map if k < week - 1]:
+        del rooms_map[stale]
+    if room in (rooms_map.get(week) or []):
+        return 0
+    global_map[week] = tank_used + 1
+    used_map[agent_id] = (week, used + 1)
+    rooms_map.setdefault(week, []).append(room)
+    title = f"Free exploration: question an assumption about {room}"
+    instructions = (
+        f"{FREE_SPIKE_PREMISE_GUIDANCE} You just completed real work in {room} "
+        f"('{completed_task.get('title') or 'previous task'}'). This is your spare "
+        f"time: pick ONE question about {room} that the committed work does not cover "
+        f"-- a technique, a method, or an assumption your team holds that you want to "
+        f"challenge or understand better. Investigate honestly and write up what you "
+        f"found."
+    )
+    queue_spike(state, title, room, FREE_SPIKE_BUDGET_MS, now_ms=now_ms,
+                instructions=instructions, goal=f"Free exploration in {room}",
+                moonshot=True, notBefore=now_ms + FREE_SPIKE_DEFER_MS)
+    _log_governance(state, agent_id, 'free_spike_filed', {
+        'room': room, 'week': week, 'agentUsed': used + 1,
+        'tankUsed': tank_used + 1, 'after': (completed_task or {}).get('id'),
+    })
+    return 1
+
+
 def _maybe_file_followup(state, agent_id, completed_task, now_ms):
     """Deterministic signal generator: an on-duty agent that just COMPLETED a
     task in a delegatable room files a follow-up work-request if that room's
@@ -7569,13 +7856,21 @@ def _maybe_file_followup(state, agent_id, completed_task, now_ms):
         return
     if (completed_task.get('taskType') or 'code') in ('spike', 'bug'):
         return
-    if _room_backlog_count(state, completed_task['room']) > WORK_REQUEST_ROOM_THIN:
-        return
     room_label = completed_task['room']
+    # Measure the room's backlog BEFORE the spare-time lane files anything -- a
+    # just-filed free spike must not count against the room's "thin" check (it
+    # is spare time, not committed work).
+    backlog = _room_backlog_count(state, room_label)
+    # Spare-time lane: a finished REAL deliverable earns the agent's weekly free
+    # spike (independent of room backlog -- exploration isn't gated on the room
+    # thinning). Bounded by _file_free_spike's own allowance/cap.
+    _file_free_spike(state, agent_id, completed_task, now_ms)
+    if backlog > WORK_REQUEST_ROOM_THIN:
+        return
     title = f"Follow-up: further {room_label} work after completing '{completed_task.get('title') or 'previous task'}'"
     file_work_request(
         state, agent_id, title, room_label,
-        reason=f"Completed '{completed_task.get('title') or 'previous task'}' in {room_label} and the remaining backlog there has thinned to {_room_backlog_count(state, room_label)} item(s); this room can absorb another story. {ABSOLUTE_ZERO_SCOPING_GUIDANCE}")
+        reason=f"Completed '{completed_task.get('title') or 'previous task'}' in {room_label} and the remaining backlog there has thinned to {backlog} item(s); this room can absorb another story. {ABSOLUTE_ZERO_SCOPING_GUIDANCE}")
 
 
 def _refinement_decider_default(instructions, criteria):
@@ -9039,6 +9334,42 @@ def _rule_mine_step(state, now_ms):
         })
 
 
+def _archive_distill_step(state, now_ms):
+    """Weekly silent pass: fold the ARCHIVED decision tape (kept permanently --
+    see serve._prune_logs's decision_archive table) into a short 'decision
+    archive' wiki page, so the think tank can reason over what it has decided as
+    a body instead of pruning the memory away. Pure derivation + one wiki write
+    (server-authority path, actor 'distill'), no ceremony, no Jev spend.
+    Cadence-gated like rule mining; best-effort -- a DB or write failure just
+    skips the week."""
+    if now_ms - (state.get('lastArchiveDistillAt') or 0) < RULE_MINE_CADENCE_MS:
+        return
+    state['lastArchiveDistillAt'] = now_ms
+    try:
+        import serve as _serve_mod
+        since_ms = state.get('lastArchiveDistillWindowAt') or (now_ms - RULE_MINE_CADENCE_MS)
+        summary = _serve_mod._decision_archive_summary(since_ms / 1000.0)
+        if not summary or not summary.get('total'):
+            return
+        state['lastArchiveDistillWindowAt'] = now_ms
+        week_label = datetime.datetime.utcfromtimestamp(now_ms / 1000.0).strftime('%Y-%m-%d')
+        section = [f'## {week_label}', '']
+        for k in summary.get('kinds') or []:
+            section.append(f"- {k['kind']}: {k['count']} decision(s), {k['ok']} ok, ${k['cost']:.4f}")
+        section.append(f"- total: {summary.get('total')} decision(s), {summary.get('failed') or 0} failed, ${summary.get('cost') or 0.0:.4f}")
+        # Read the existing page (if any) and keep only the last 8 weekly
+        # sections so the archive page stays bounded as the years accumulate.
+        existing = _serve_mod._wiki_page_body('decision-archive', 'think_tank') or ''
+        body = '\n'.join(section) + '\n'
+        if existing.strip():
+            kept = existing.split('\n## ')[:8]
+            body = '\n## '.join(kept).strip('\n') + '\n\n' + body
+        _serve_mod._write_wiki_server('decision-archive', 'Decision Archive',
+                                      'think_tank', body)
+    except Exception:
+        return
+
+
 def _success_mine_step(state, now_ms):
     """Weekly silent pass: mine recurring high-graded deliverables (the success
     ledger in serve.py) into operator success-lesson proposals -- the positive
@@ -9490,6 +9821,17 @@ def _resolve_firing_review(state, pending, now_ms, decider=None):
         agents.pop(pending['candidateId'], None)
         roster = state.get('agentRoster') or []
         state['agentRoster'] = [d for d in roster if d.get('id') != pending['candidateId']]
+        # Durable blocklist: a fired employee can never reenter the think tank.
+        # The id (and the name, via _usedNames) is reserved forever and the hire
+        # gate refuses it, so no ceremony, generative name chooser, or re-seed
+        # can bring the same person back under a new cover.
+        state.setdefault('firedAgents', {})[pending['candidateId']] = {
+            'name': candidate_def.get('name'),
+            'role': candidate_def.get('role'),
+            'at': now_ms,
+            'firedBy': pending['reviewer1Id'],
+            'reviewers': [pending['reviewer1Id'], pending['reviewer2Id']],
+        }
         # Revoke every standing credential the fired agent held (capability
         # handles + attribution key + temp grants) -- a fired agent must lose
         # all of it, not just its roster entry.
@@ -9991,6 +10333,10 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # proposals. Same shape as the roadmap step -- state stamp + file-backed
     # derivation, no ceremony, no Jev spend.
     _rule_mine_step(state, now_ms)
+
+    # Weekly archive distill: fold the archived decision tape into the wiki so
+    # the think tank's institutional memory compounds instead of being pruned.
+    _archive_distill_step(state, now_ms)
 
     # Weekly success mining: recurring high-graded deliverables become operator
     # success-lesson proposals (the positive mirror of rule mining -- propagate
@@ -10779,6 +11125,10 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # 'distill'/'checklist': dropping them would leave the task unbudgeted.
         'budgetUsd': pick.get('budgetUsd'),
         'budgetBand': pick.get('budgetBand'),
+        # Bell-style spare-time lane: the protected-exploration flag rides onto
+        # the assigned task (see assign_task) so review/failure paths can honor
+        # it -- same whitelist contract as 'distill'/'checklist'.
+        'moonshot': bool(pick.get('moonshot')),
     }
     # Cut 2 coaching + runbook injection: append the chosen agent's pending
     # growth-plan note (applied once) and any product runbook knowledge to the

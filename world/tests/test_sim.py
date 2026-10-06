@@ -628,7 +628,17 @@ class SimTaskLifecycle(unittest.TestCase):
         tasks = state.get('tasks') or {}
         self.assertTrue(any(t.get('status') == 'done' for t in tasks.values()),
                         'the task must complete')
-        self.assertEqual(state['workQueue'], [], 'queue drained after completion')
+        # Spare-time lane (2026-10-06): completing a real deliverable earns one
+        # deferred free exploration spike, so the queue is never literally
+        # empty after work -- but NO committed work may remain, and the spike
+        # must be spare time (moonshot, not yet due), not a new obligation.
+        q = state.get('workQueue') or []
+        committed = [x for x in q if not (x.get('moonshot') and x.get('taskType') == 'spike')]
+        self.assertEqual(committed, [], 'no committed work left queued after completion')
+        spikes = [x for x in q if x.get('moonshot') and x.get('taskType') == 'spike']
+        self.assertEqual(len(spikes), 1, 'the completed deliverable earns one free spike')
+        self.assertFalse(sim.is_work_item_due(spikes[0], int(now * 1000)),
+                         'a free spike is spare time -- deferred, not immediately due')
 
     def test_research_arrival_without_executor_uses_workuntil_fallback(self):
         # No content executor registered (the default) -> an arriving research
