@@ -32,7 +32,7 @@ import time
 # -- this is the think tank's own outbound channel, not an agent-delegated
 # grant. The FROM/TO are the same player address; only the app-password is
 # secret.
-GMAIL_SMTP = os.environ.get('AI_THINK_TANK_GMAIL_SMTP_EMAIL') or 'austtp25@gmail.com'
+GMAIL_SMTP = os.environ.get('AI_THINK_TANK_GMAIL_SMTP_EMAIL') or ''
 GMAIL_SMTP_HOST = os.environ.get('AI_THINK_TANK_GMAIL_SMTP_HOST') or 'smtp.gmail.com'
 GMAIL_SMTP_PORT = int(os.environ.get('AI_THINK_TANK_GMAIL_SMTP_PORT', '587'))
 _GMAIL_CRED_NAME = 'gmail_smtp'
@@ -59,8 +59,7 @@ def _send_escalation_email_sync(subject, body_text):
     # SMTP setup is visible in the server's own stdout, not silently
     # swallowed.
     if not (_serve.ESCALATION_EMAIL_TO and _serve.SMTP_HOST and _serve.SMTP_USER and _serve.SMTP_PASSWORD):
-        print(f'[escalation] SMTP not configured -- would have sent: {subject}')
-        return False
+        return _serve._send_player_email_sync(subject, body_text)
     msg = email.mime.text.MIMEText(body_text)
     msg['Subject'] = subject
     msg['From'] = _serve.SMTP_USER
@@ -99,6 +98,8 @@ def _send_player_email_sync(subject, body_text):
         print(f'[email] credential lookup failed: {e}')
         return False
     if not token:
+        if _serve.ESCALATION_EMAIL_TO and _serve.SMTP_HOST and _serve.SMTP_USER and _serve.SMTP_PASSWORD:
+            return _serve._send_escalation_email_sync(subject, body_text)
         print(f'[email] no {_serve._GMAIL_CRED_NAME} credential provisioned -- not sending: {subject}')
         return False
     app_password = _serve._open_secret(token)
@@ -159,7 +160,7 @@ def provision_player_email(app_password):
     then fire a self-test so provisioning is verified, not assumed. Returns a
     dict {ok, test_ok, error?} -- never returns or logs the password."""
     import serve as _serve
-    pw = (app_password or '').strip()
+    pw = ''.join((app_password or '').split())
     if not _serve._looks_like_gmail_app_password(pw):
         return {'ok': False, 'error': 'not a valid Gmail app-password (16 chars, 4 groups of 4, no spaces)'}
     _serve._store_credential(_serve._GMAIL_CRED_NAME, 'Gmail SMTP (player notifications)', pw)
@@ -196,5 +197,10 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
             f'Look here first: {look_first or "the question above"}\n\n'
             f'Approve: {approve_url}\n\n'
             f'Deny: {deny_url}')
-    _serve._send_escalation_email_sync(f'[AI Think Tank] Needs your call: {kind}', body)
+    sent = bool(_serve._send_escalation_email_sync(f'[AI Think Tank] Needs your call: {kind}', body))
+    latest = _serve._load_escalations()
+    if esc_id in latest:
+        latest[esc_id]['emailSent'] = sent
+        latest[esc_id]['emailAttemptedAt'] = time.time()
+        _serve._save_escalations(latest)
     return esc_id

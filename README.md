@@ -21,6 +21,12 @@ This image contains the offline quality tools. Without it, execution and
 review tasks fail before their commands run. The server starts the sandbox
 egress proxy automatically.
 
+Install the browser used by `browse_page(render=true)` and page probes:
+
+```powershell
+python -m playwright install chromium
+```
+
 ```bash
 cd world
 python3 serve.py 8936

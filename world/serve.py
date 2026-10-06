@@ -1383,10 +1383,17 @@ def sync_prototypes(agent_id, sandbox_dir):
     if agent_id in (None, 'unknown', 'player') or not os.path.isdir(sandbox_dir):
         return
     dest = os.path.join(AGENTS_DIR, agent_id, 'prototypes')
+    dest = os.path.abspath(dest)
+    if os.path.commonpath([dest, os.path.abspath(AGENTS_DIR)]) != os.path.abspath(AGENTS_DIR):
+        return
+    def remove_readonly(function, path, _exc):
+        os.chmod(path, 0o700)
+        function(path)
     try:
         if os.path.exists(dest):
-            shutil.rmtree(dest)
-        shutil.copytree(sandbox_dir, dest)
+            shutil.rmtree(dest, onerror=remove_readonly)
+        shutil.copytree(sandbox_dir, dest, ignore=shutil.ignore_patterns(
+            '.git', '__pycache__', '.pytest_cache', '.mypy_cache'))
     except OSError as e:
         print(f'[agent-dirs] prototypes sync failed for {agent_id}: {e}')
 
@@ -4779,7 +4786,8 @@ SMTP_HOST = _load_env().get('SMTP_HOST')
 SMTP_PORT = int(_load_env().get('SMTP_PORT', '587'))
 SMTP_USER = _load_env().get('SMTP_USER')
 SMTP_PASSWORD = _load_env().get('SMTP_PASSWORD')
-ESCALATION_BASE_URL = _load_env().get('ESCALATION_BASE_URL', 'http://localhost:8010')
+GMAIL_SMTP = _load_env().get('AI_THINK_TANK_GMAIL_SMTP_EMAIL') or SMTP_USER or GMAIL_SMTP
+ESCALATION_BASE_URL = _load_env().get('ESCALATION_BASE_URL', 'http://127.0.0.1:8936')
 
 # Telegram bridge: lets the player talk to the think tank's admin
 # from a phone, like texting, without exposing anything to the public
@@ -5221,7 +5229,9 @@ def _fetch_rendered_page_sync(url):
         browser = p.chromium.launch(headless=True)
         try:
             page = browser.new_page()
-            page.goto(url, timeout=RENDER_TIMEOUT_S * 1000, wait_until='domcontentloaded')
+            response = page.goto(url, timeout=RENDER_TIMEOUT_S * 1000, wait_until='domcontentloaded')
+            if response is not None and isinstance(response.status, int) and response.status >= 400:
+                raise ValueError(f'Source returned HTTP {response.status}; no readable page was retrieved')
             page.wait_for_timeout(RENDER_SETTLE_MS)
             final_url = page.url
             # Re-check the FINAL host, same reasoning as _fetch_page_sync's
@@ -5406,6 +5416,38 @@ def _apply_plain_writing(messages):
     return messages
 
 
+def _read_openrouter_response(req):
+    """A provider error inside HTTP 200 is a failure, not a valid completion.
+
+    Retry once, excluding the failed provider while preserving the model,
+    messages, tool definitions, and token ceiling.
+    """
+    result = json.loads(_urlopen_with_resilience(req, timeout=30))
+    def failed(data):
+        return bool(data.get('error') or not data.get('choices') or
+                    any(c.get('finish_reason') == 'error' for c in data.get('choices', [])))
+    if not failed(result):
+        return result
+    if _think_tank_spend_cap_exceeded():
+        raise RuntimeError('Provider returned an error and the spend cap prevents a retry')
+    body = json.loads(req.data)
+    provider = result.get('provider')
+    if isinstance(provider, str) and provider:
+        routing = dict(body.get('provider') or {})
+        routing['ignore'] = list(routing.get('ignore') or []) + [re.sub(r'[^a-z0-9]+', '-', provider.lower())]
+        body['provider'] = routing
+    retry = urllib.request.Request(req.full_url, data=json.dumps(body).encode(),
+                                   headers=dict(req.header_items()), method='POST')
+    recovered = json.loads(_urlopen_with_resilience(retry, timeout=30))
+    if failed(recovered):
+        raise RuntimeError('Model provider failed to produce a completion after one retry')
+    first_cost = (result.get('usage') or {}).get('cost', 0)
+    if isinstance(first_cost, (int, float)) and first_cost:
+        usage = recovered.setdefault('usage', {})
+        usage['cost'] = float(usage.get('cost') or 0) + first_cost
+    return recovered
+
+
 def _call_openrouter_once_sync(model, messages, max_tokens):
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
@@ -5433,7 +5475,7 @@ def _call_openrouter_once_sync(model, messages, max_tokens):
         method='POST',
     )
     try:
-        result = json.loads(_urlopen_with_resilience(req, timeout=30))
+        result = _read_openrouter_response(req)
     except Exception:
         record_model_result(model, success=False)
         raise
@@ -5490,7 +5532,7 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
         method='POST',
     )
     try:
-        result = json.loads(_urlopen_with_resilience(req, timeout=30))
+        result = _read_openrouter_response(req)
     except Exception:
         record_model_result(model, success=False)
         raise
@@ -8531,6 +8573,34 @@ async def intent_assign_big_task(request: Request):
                          'teamName': team_name,
                          'request': req['id'],
                          'note': f'{authority.get("name")} filed this with the {team_name} team. Its scrum master and workers will break it into concrete stories at their next planning session.'})
+
+
+@app.post('/api/intent/board/clear-failed')
+async def intent_clear_failed_board(request: Request):
+    """Dismiss failed/stopped Board entries without deleting task history."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    ids = body.get('taskIds') if isinstance(body, dict) else None
+    if not isinstance(ids, list) or not all(isinstance(tid, str) for tid in ids):
+        return JSONResponse({'error': 'taskIds must be a list of task IDs'}, status_code=400)
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    cleared = []
+    at = int(time.time() * 1000)
+    for tid in dict.fromkeys(ids):
+        task = (state.get('tasks') or {}).get(tid)
+        if task and task.get('status') in ('failed', 'cancelled', 'abandoned'):
+            task['boardClearedAt'] = at
+            cleared.append(tid)
+    if cleared:
+        save_state_to_db(state)
+        log_action('player', 'board_failed_tasks_cleared', {'taskIds': cleared}, authorized=True)
+    return JSONResponse({'ok': True, 'taskIds': cleared, 'clearedAt': at})
 
 
 @app.post('/api/intent/story/{task_id}/reject')
@@ -12034,6 +12104,20 @@ async def read_library_file(path: str):
     return JSONResponse({'path': path, 'content': content})
 
 
+@app.get('/api/library/document')
+async def read_library_document(request: Request, path: str):
+    """Full player document view; agent context reads retain their size limit."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    target = _safe_library_path(path)
+    if not target or not os.path.isfile(target):
+        return JSONResponse({'error': 'not found'}, status_code=404)
+    with open(target, 'r', errors='replace') as f:
+        content = f.read()
+    record_library_read(path)
+    return JSONResponse({'path': path, 'content': content})
+
+
 # A cheap, real idea worth taking regardless of the memory/cost question:
 # this is a SHARED, agent-writable space now, so a credential accidentally
 # pasted into a note shouldn't just sit there in plain text forever.
@@ -13425,7 +13509,10 @@ async def allowlist_request(request: Request):
         if esc.get('kind') == 'allowlist request' and esc.get('status') == 'pending' \
                 and esc.get('note', '').strip().lower() == host:
             return JSONResponse({'requested': True, 'host': host, 'escalationId': esc_id,
-                                 'message': 'an allowlist request for this host is already pending review'})
+                                 'emailSent': bool(esc.get('emailSent')),
+                                 'message': 'an allowlist request for this host is already pending review. '
+                                            + ('An approval email was sent.' if esc.get('emailSent')
+                                               else 'No successful approval email delivery is recorded; configure or check email delivery.')})
     esc_id = create_escalation(
         'allowlist request',
         f'Agent {agent_id} requests {host} be added to the player-vetted allowlist.\n'
@@ -13438,8 +13525,11 @@ async def allowlist_request(request: Request):
     log_action(agent_id, 'allowlist_request', {'host': host, 'purpose': purpose[:200],
                                                'escalationId': esc_id}, authorized=authorized)
     return JSONResponse({'requested': True, 'host': host, 'escalationId': esc_id,
-                         'message': f'Allowlist request for {host} filed -- the player decides by email; '
-                                    f'until then {host} still goes through the normal Jev gate.'})
+                         'emailSent': bool((_load_escalations().get(esc_id) or {}).get('emailSent')),
+                         'message': f'Allowlist request for {host} filed. '
+                                    + ('The approval email was sent to the player. ' if (_load_escalations().get(esc_id) or {}).get('emailSent')
+                                       else 'The approval email was NOT sent; email delivery needs to be configured or checked. ')
+                                    + f'Until approved, {host} still goes through the normal Jev gate.'})
 
 
 CURL_METHODS = {'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'}
@@ -16717,6 +16807,8 @@ if __name__ == '__main__':
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8936
     if not _load_env().get('SELF_BASE_URL'):
         SELF_BASE_URL = f'http://127.0.0.1:{port}'
+    if not _load_env().get('ESCALATION_BASE_URL'):
+        ESCALATION_BASE_URL = f'http://127.0.0.1:{port}'
     # --max-idle-minutes N: exit the server after N minutes with no HTTP
     # request at all (any request, authed or not -- touched in middleware).
     # The enforced form of "kill the server when idle"; 0 = disabled.

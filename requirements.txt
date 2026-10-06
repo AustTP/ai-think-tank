@@ -5,6 +5,9 @@
 fastapi>=0.115
 uvicorn>=0.34
 pydantic>=2.0
+cryptography>=41
+playwright>=1.40
+# After installing: python -m playwright install chromium
 # Document ingestion (/api/library/ingest) -- optional, degrade with a clear
 # per-file error when absent (serve.py guards both imports).
 openpyxl>=3.0

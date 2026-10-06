@@ -391,6 +391,17 @@
     .hud-btn { padding: 9px 9px; font-size: 8px; }
   }
 </style>
+<style>
+  .library-document-heading { display: flex; align-items: center; gap: 8px; }
+  .library-document-heading .thread-header { flex: 1; overflow-wrap: anywhere; }
+  #libraryFileContent { white-space: pre-wrap; overflow-wrap: anywhere; }
+  #libraryModal.library-expanded .modal-box { width: 94vw; max-width: 1200px; height: 92vh; display: flex; flex-direction: column; }
+  #libraryModal.library-expanded .chat-body { flex: 1; min-height: 0; height: auto; }
+  #libraryModal.library-expanded .chat-roster { display: none; }
+  #libraryModal.library-expanded .chat-thread { min-height: 0; }
+  #libraryModal.library-expanded .chat-thread > :not(.library-document-heading):not(#libraryFileContent) { display: none; }
+  #libraryModal.library-expanded #libraryFileContent { flex: 1; min-height: 0; overflow: auto; font: 15px/1.65 var(--font-mono); }
+</style>
 </head>
 <body>
 <div id="wrap">
@@ -621,7 +632,10 @@
         <div id="agentFileList"></div>
       </div>
       <div class="chat-thread">
-        <div class="thread-header" id="libraryFileHeader">Select a file</div>
+        <div class="library-document-heading">
+          <div class="thread-header" id="libraryFileHeader">Select a file</div>
+          <button id="libraryExpandBtn" aria-expanded="false" aria-controls="libraryFileContent">Expand document</button>
+        </div>
         <div class="thread-log" id="libraryFileContent"></div>
         <div class="terminal-inputline">
           <input type="text" id="libraryPathInput" placeholder="path, e.g. notes/idea.md">
@@ -1240,6 +1254,20 @@ async function handleResearchRun() {
 // problem flagged earlier.
 let libraryActiveFile = null;
 
+function toggleLibraryDocument() {
+  const expanded = document.getElementById('libraryModal').classList.toggle('library-expanded');
+  const btn = document.getElementById('libraryExpandBtn');
+  btn.textContent = expanded ? 'Collapse document' : 'Expand document';
+  btn.setAttribute('aria-expanded', String(expanded));
+}
+
+async function openTaskDocument(path) {
+  closeBoard();
+  openLibrary({zone: null});
+  await openLibraryFile(path);
+  if (!document.getElementById('libraryModal').classList.contains('library-expanded')) toggleLibraryDocument();
+}
+
 function openLibrary(item) {
   activeInteractZone = item.zone;
   state.ui = 'library';
@@ -1316,6 +1344,9 @@ async function openAgentFile(agentId, path) {
 function closeLibrary() {
   state.ui = null;
   document.getElementById('libraryModal').classList.add('hidden');
+  document.getElementById('libraryModal').classList.remove('library-expanded');
+  document.getElementById('libraryExpandBtn').textContent = 'Expand document';
+  document.getElementById('libraryExpandBtn').setAttribute('aria-expanded', 'false');
   clearInteractZone();
 }
 
@@ -1377,8 +1408,9 @@ async function openLibraryFile(path) {
   const content = document.getElementById('libraryFileContent');
   content.textContent = 'Loading...';
   try {
-    const res = await apiFetch('/api/library/file?path=' + encodeURIComponent(path));
+    const res = await apiFetch('/api/library/document?path=' + encodeURIComponent(path));
     const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Could not load this file.');
     content.textContent = data.content || '(empty)';
     document.getElementById('libraryContentInput').value = data.content || '';
   } catch (e) {
@@ -1393,6 +1425,10 @@ async function handleLibraryWrite() {
   if (!path) return;
   const statusEl = document.getElementById('libraryStatus');
   const btn = document.getElementById('libraryWriteBtn');
+  if (content.length > 200000) {
+    statusEl.textContent = 'This document exceeds the editor save limit. Edit the local file to preserve the full document.';
+    return;
+  }
   btn.disabled = true;
   statusEl.textContent = 'Saving...';
   try {
@@ -1710,6 +1746,31 @@ function openBoard() {
 // Real think tank status, not the static placeholder text this used to be --
 // straight off TASKS/AGENTS, the same live objects everything else reads,
 // not a separate summary someone has to remember to update.
+let boardClearMessage = '';
+async function clearFailedBoardTasks() {
+  const btn = document.getElementById('clearFailedBoardBtn');
+  if (btn) btn.disabled = true;
+  const taskIds = Object.values(TASKS).filter(t =>
+    ['failed', 'cancelled', 'abandoned'].includes(t.status) &&
+    (!t.boardClearedAt || (t.failedAt || 0) > t.boardClearedAt)
+  ).map(t => t.id);
+  try {
+    const res = await apiFetch('/api/intent/board/clear-failed', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({taskIds})
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || 'Could not clear tasks.');
+    for (const id of data.taskIds) {
+      if (TASKS[id]) TASKS[id].boardClearedAt = data.clearedAt;
+    }
+    boardClearMessage = `Cleared ${data.taskIds.length} task(s). History is preserved.`;
+  } catch (e) {
+    boardClearMessage = e.message || 'Could not clear tasks.';
+  }
+  renderBoard();
+}
+
 function renderBoard() {
   const body = document.getElementById('boardBody');
   const taskNote = t => {
@@ -1718,8 +1779,11 @@ function renderBoard() {
     el.textContent = t.note;
     return `<div style="opacity:0.8; margin:3px 0 8px;">${el.innerHTML}</div>`;
   };
-  const failed = Object.values(TASKS).filter(t => ['failed', 'cancelled', 'abandoned'].includes(t.status));
-  const open = Object.values(TASKS).filter(t => t.status !== 'done' && !failed.includes(t));
+  const boardTasks = Object.values(TASKS).filter(t => !t.boardClearedAt ||
+    (t.failedAt || 0) > t.boardClearedAt ||
+    !['failed', 'cancelled', 'abandoned'].includes(t.status));
+  const failed = boardTasks.filter(t => ['failed', 'cancelled', 'abandoned'].includes(t.status));
+  const open = boardTasks.filter(t => t.status !== 'done' && !failed.includes(t));
   const done = Object.values(TASKS).filter(t => t.status === 'done').sort((a, b) => b.createdAt - a.createdAt).slice(0, 5);
   // Peer-approval gate: a deliverable story awaiting two reviewer approvals is
   // neither "in progress" (its author finished) nor done. Show it separately.
@@ -1762,7 +1826,8 @@ function renderBoard() {
         // encodeURIComponent so quotes/odd chars in ids or titles can't break
         // the onclick attribute; vetoStory decodes before use.
         const btn = ` <button class="hud-btn" style="font-size:11px;padding:1px 6px;" onclick="vetoStory('${encodeURIComponent(t.id)}','${encodeURIComponent(t.title)}')">reject</button>`;
-        return `<div>&bull; ${t.title} -- ${who}${btn}</div>${taskNote(t)}`;
+        const read = t.libraryPath ? ` <button onclick="openTaskDocument(decodeURIComponent('${encodeURIComponent(t.libraryPath).replace(/'/g, '%27')}'))">Read document</button>` : '';
+        return `<div>&bull; ${t.title} -- ${who}${btn}${read}</div>${taskNote(t)}`;
       }).join('')
     : '<div style="opacity:0.6;">Nothing completed yet.</div>';
 
@@ -1819,7 +1884,8 @@ function renderBoard() {
         const finding = (t.note || '').split('. ')[0]; // first sentence, enough to triage by
         const who = AGENTS[t.assignedTo] ? AGENTS[t.assignedTo].name : t.assignedTo;
         const btn = ` <button class="hud-btn" style="font-size:11px;padding:1px 6px;" onclick="promoteSpike('${encodeURIComponent(t.id)}','${encodeURIComponent(t.title)}')">promote</button>`;
-        return `<div>&bull; ${t.title} -- ${who} <span style="opacity:0.7;font-size:11px;">("${finding}")</span>${btn}</div>`;
+        const read = t.libraryPath ? ` <button onclick="openTaskDocument(decodeURIComponent('${encodeURIComponent(t.libraryPath).replace(/'/g, '%27')}'))">Read document</button>` : '';
+        return `<div>&bull; ${t.title} -- ${who} <span style="opacity:0.7;font-size:11px;">("${finding}")</span>${btn}${read}</div>`;
       }).join('')
     : '<div style="opacity:0.6;">No finished spikes to triage.</div>';
 
@@ -1827,12 +1893,14 @@ function renderBoard() {
     <div style="margin-bottom:4px;"><strong>In progress (${inProgress.length})</strong></div>
     ${openLines}
     ${reviewLines ? `<div style="margin:8px 0 4px;"><strong>Awaiting peer review (${needsReview.length})</strong></div>${reviewLines}` : ''}
-    ${failed.length ? `<div style="margin:8px 0 4px;"><strong>Failed or stopped (${failed.length})</strong></div>` + failed.map(t => `<div>${t.title} (${t.status})</div>${taskNote(t)}`).join('') : ''}
+    ${failed.length ? `<div style="margin:8px 0 4px;"><strong>Failed or stopped (${failed.length})</strong> <button id="clearFailedBoardBtn" class="hud-btn" onclick="clearFailedBoardTasks()">Clear failed/stopped</button></div>` + failed.map(t => `<div>${t.title} (${t.status})</div>${taskNote(t)}`).join('') : ''}
+    <div id="boardClearStatus" role="status"></div>
     <div style="margin:8px 0 4px;"><strong>Recently completed</strong></div>
     ${doneLines}
     <div style="margin:8px 0 4px;"><strong>Spikes to triage (${doneSpikes.length})</strong></div>
     ${spikeLines}
   `;
+  document.getElementById('boardClearStatus').textContent = boardClearMessage;
   // The House is the directors'/admin's workspace -- the role-template library
   // lives here, gated to the acting authority (which availableAuthority()
   // resolves to: admin, else senior-most director). Refresh with the board so
@@ -3429,6 +3497,7 @@ async function main() {
   document.getElementById('researchCloseBtn').addEventListener('click', closeResearch);
   document.getElementById('researchRunBtn').addEventListener('click', handleResearchRun);
   document.getElementById('libraryCloseBtn').addEventListener('click', closeLibrary);
+  document.getElementById('libraryExpandBtn').addEventListener('click', toggleLibraryDocument);
   document.getElementById('libraryWriteBtn').addEventListener('click', handleLibraryWrite);
   document.getElementById('libraryIngestBtn').addEventListener('click', handleLibraryIngest);
   document.getElementById('designRefUploadBtn').addEventListener('click', handleDesignRefUpload);

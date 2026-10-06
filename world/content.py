@@ -27,9 +27,24 @@ import random
 import re
 import time
 import urllib.parse
-
 import serve as _serve
 
+
+def _extract_shell_command(reply):
+    """Keep one shell code block intact; never execute surrounding prose."""
+    if re.fullmatch(r'```(?:bash|sh|shell)?\s*```', reply.strip()):
+        return ''
+    openings = re.findall(r'^```(?:bash|sh|shell)[ \t]*$', reply, re.MULTILINE)
+    blocks = re.findall(r'^```(?:bash|sh|shell)?[ \t]*\n(.*)^```[ \t]*$',
+                        reply.strip(), re.MULTILINE | re.DOTALL)
+    if blocks:
+        if len(openings) > 1:
+            raise ValueError('Return one complete shell command block, not multiple blocks.')
+        return blocks[0].strip()
+    command = reply.strip()
+    if re.match(r'^(?:It\b|Here\b|This\b|The\b|To\b|I\b|We\b|You\b|First\b|Sure\b)', command):
+        raise ValueError('The response contains explanatory prose instead of a shell command.')
+    return command
 
 def _chat_error_result(r, fallback_note):
     """Item 4: when /api/chat refuses a call carrying a taskId because that
@@ -1324,6 +1339,9 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     system_prompt = (f'You are {name}, a developer on a small team building {project_label or "a real, working small web application for the team"}. '
                      f'Current project state:\n{context_summary or "(nothing written yet -- you may be starting the first file.)"}\n\n'
                      f'Your task right now: {backlog_item}\n\n'
+                     'The sandbox has Python, pandas, NumPy, scikit-learn, yfinance, and the quality tools. '
+                     'Browser probes run on the server through /api/page-probe; do not install Playwright in the sandbox. '
+                     'Research briefs should be Markdown or CSV unless the task explicitly requires a web page. '
                      'Before writing your final answer, you may check real facts about how the ACTUAL running page behaves right now -- '
                      'what globals it defines and their real shape, what a button click or keypress actually does -- instead of guessing a '
                      'plausible-sounding name. To do this, respond with ONLY a JSON object, no shell command, no markdown fences, no explanation, '
@@ -1357,6 +1375,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     attempts = 0
     probe_rounds = 0
     colab_rounds = 0
+    format_attempts = 0
     _opens = _closes = 0
     balanced = False
     while attempts <= CODE_CONTINUATION_ATTEMPTS:
@@ -1407,7 +1426,17 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
         # Only the FIRST real command reply may have a fenced-code wrapper worth
         # stripping; a continuation is raw mid-file text by definition.
         if attempts == 0:
-            command = reply.strip().replace('```bash', '').replace('```sh', '').replace('```', '').strip()
+            try:
+                command = _extract_shell_command(reply)
+            except ValueError as exc:
+                if format_attempts >= 2:
+                    _sim_module._store_content_result(task.get('id'),
+                                                     {'note': str(exc), 'ok': False, 'tier': tier_slug})
+                    return False
+                format_attempts += 1
+                messages.append({'role': 'assistant', 'content': reply})
+                messages.append({'role': 'user', 'content': str(exc) + ' Output ONLY one bash code block with the command, without explanation.'})
+                continue
         else:
             command += reply
         if not command:
