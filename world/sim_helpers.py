@@ -132,6 +132,20 @@ def _is_fully_idle(a, in_room):
 
 DEFAULT_VILLAGE = 'main'
 
+# Memory clocks (the two-clock rule): SLOW clock (definitions, stable process,
+# voice) can be remembered and trusted; FAST clock (status, balance, price,
+# assignee, permission, metric) must be re-fetched live, never trusted from a
+# stale copy. A wiki page carries a clock; a fast-clock page is still injected
+# (so the agent knows it exists) but flagged to re-check the source.
+SLOW_CLOCK = 'slow'
+FAST_CLOCK = 'fast'
+MEMORY_CLOCKS = (SLOW_CLOCK, FAST_CLOCK)
+
+# Default lifetime of a shared-memory write before it must be re-verified.
+# reviewAfterMs is the expiry; a page whose reviewAfterMs has passed is no
+# longer injected as trusted context (the "review_after" on the memory card).
+DEFAULT_REVIEW_DAYS = 30
+
 
 def ensure_villages(state):
     """State's village registry (list of {id, name}), seeding the default

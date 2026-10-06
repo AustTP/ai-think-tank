@@ -58,6 +58,11 @@ from sim_helpers import (  # noqa: E402, F401
     next_village_id,
     set_agent_village,
     village_of_agent,
+    # Memory engineering: two-clock rule + expiry.
+    DEFAULT_REVIEW_DAYS,
+    FAST_CLOCK,
+    MEMORY_CLOCKS,
+    SLOW_CLOCK,
 )
 
 # 1.0s (was 2.0s). The server only PUBLISHES new positions ~once
@@ -3258,16 +3263,27 @@ WIKI_CATEGORY_ROOMS = {  # default category -> room affinity for read-before-act
 
 
 def wiki_write_page(state, page_id, title, category, body, edited_by,
-                    edited_at_ms=None, village_id=None):
+                    edited_at_ms=None, village_id=None, owner=None,
+                    clock=SLOW_CLOCK, review_after_ms=None,
+                    source=None, scope='team'):
     """Pure: create or update a wiki page's METADATA + return the lined-up
     record for serve.py to persist (serve writes page['body'] to disk only for
     pre-existing/new pages; the metadata carries version + history). Rejects
-    too-long bodies and unknown categories. Returns (record, is_new)."""
+    too-long bodies and unknown categories. Returns (record, is_new).
+
+    Memory-engineering fields: owner (who is accountable for the claim),
+    clock (SLOW/FAST -- fast-clock pages must be re-fetched, not trusted),
+    review_after_ms (expiry -- an expired page is no longer injected), source
+    (where the claim can be verified), scope (who may reuse it). These are the
+    review-card fields that make a stale or wrong memory findable and
+    correctable."""
     import time as _time
     edited_at_ms = edited_at_ms if edited_at_ms is not None else int(_time.time() * 1000)
     categories = (state.get('wiki') or {}).get('categories') or {}
     if category not in categories:
         return None, False
+    if clock not in MEMORY_CLOCKS:
+        clock = SLOW_CLOCK
     body = body or ''
     if len(body) > 200_000:
         return None, False
@@ -3283,6 +3299,11 @@ def wiki_write_page(state, page_id, title, category, body, edited_by,
         'title': title or page_id,
         'category': category,
         'villageId': village_id or DEFAULT_VILLAGE,
+        'clock': clock,
+        'owner': owner or edited_by or None,
+        'scope': scope,
+        'source': source or None,
+        'reviewAfterMs': int(review_after_ms) if review_after_ms else None,
         'version': version,
         'editedBy': edited_by or None,
         'editedAt': edited_at_ms,
@@ -3300,7 +3321,7 @@ def _page_room_affinity(state, page):
     return mapping.get(cat)
 
 
-def wiki_read_pages(state, room, max_pages=3, village_id=DEFAULT_VILLAGE):
+def wiki_read_pages(state, room, max_pages=3, village_id=DEFAULT_VILLAGE, now_ms=None):
     """Pure: the subset of wiki pages relevant to a task in `room`, chosen by
     category-room affinity AND the reader's village. Only pages affined to THIS
     room (or to the think tank as a whole -- a None affinity) AND written by
@@ -3308,13 +3329,19 @@ def wiki_read_pages(state, room, max_pages=3, village_id=DEFAULT_VILLAGE):
     different village, is never pulled in. "Read before acting" means reading
     the pages about the work you're about to do in your own village, not a
     random archive or a neighbor's memory. Returns metadata-only records
-    (id/title/category/version/villageId) so serve.py can fetch the bodies.
-    Stable order (recency, then version) for deterministic injection."""
+    (id/title/category/version/villageId/clock) so serve.py can fetch the
+    bodies. Stable order (recency, then version) for deterministic injection.
+    A page whose reviewAfterMs has passed is treated as expired: it is NOT
+    injected as trusted context (the "recheck before acting" gate)."""
     pages = ensure_wiki(state)
+    now_ms = now_ms if now_ms is not None else _time_ms()
     scored = []
     for page_id, rec in pages.items():
         if (rec.get('villageId') or DEFAULT_VILLAGE) != village_id:
             continue  # a different village's memory is not this reader's
+        review_after = rec.get('reviewAfterMs')
+        if review_after and int(review_after) < now_ms:
+            continue  # expired -- do not inject as trusted knowledge
         affinity = _page_room_affinity(state, rec)
         if affinity != room and affinity is not None:
             continue  # affined to another room -> irrelevant here
@@ -3324,14 +3351,78 @@ def wiki_read_pages(state, room, max_pages=3, village_id=DEFAULT_VILLAGE):
     return [r for _s, _a, _pid, r in scored[:max_pages]]
 
 
-def inject_wiki_context(state, task, village_id=None):
+def _time_ms():
+    import time as _t
+    return int(_t.time() * 1000)
+
+
+def _page_is_expired(rec, now_ms):
+    review_after = rec.get('reviewAfterMs')
+    return bool(review_after and int(review_after) < now_ms)
+
+
+def record_memory_provenance(state, actor, page_id, title, claim, source,
+                             scope, clock, review_after_ms, village_id):
+    """Pure: append a memory-write provenance entry to state['memoryLedger'].
+    This is the audit trail (rari's external ledger) that answers "what did the
+    team learn, where, who owns it, and when to recheck" -- independent of the
+    wiki body so a stale or wrong memory can be found and corrected later.
+    Best-effort; a ledger append never blocks the write."""
+    entry = {
+        'ts': _time_ms(),
+        'actor': actor,
+        'pageId': page_id,
+        'title': title,
+        'claim': (claim or '')[:2000],
+        'source': source or None,
+        'owner': None,
+        'scope': scope or 'team',
+        'clock': clock,
+        'villageId': village_id,
+        'reviewAfterMs': int(review_after_ms) if review_after_ms else None,
+    }
+    state.setdefault('memoryLedger', []).append(entry)
+    return entry
+
+
+def resolve_memory_fields(state, body, actor):
+    """Resolve the memory-engineering fields (clock, owner, scope, source,
+    review_after) for a wiki/taste write from a request body + the acting
+    agent. Defaults: slow clock, actor as owner, team scope, default review
+    window. Returns a dict of kwargs for the write."""
+    import time as _t
+    clock = (body.get('clock') or '').strip().lower()
+    if clock not in MEMORY_CLOCKS:
+        clock = SLOW_CLOCK
+    owner = (body.get('owner') or '').strip() or actor
+    scope = (body.get('scope') or '').strip() or 'team'
+    source = (body.get('source') or '').strip() or None
+    review_days = body.get('reviewAfterDays')
+    if review_days is None:
+        review_days = DEFAULT_REVIEW_DAYS
+    try:
+        review_days = max(0, int(review_days))
+    except (TypeError, ValueError):
+        review_days = DEFAULT_REVIEW_DAYS
+    review_after_ms = int(_t.time() * 1000) + int(review_days * 24 * 3600 * 1000)
+    return {'clock': clock, 'owner': owner, 'scope': scope,
+            'source': source, 'review_after_ms': review_after_ms}
+
+
+def inject_wiki_context(state, task, village_id=None, now_ms=None):
     """Pure: build the 'before you act, here's what the think tank knows' context
     block for a task, from the wiki pages for its room. Returns a non-empty
     string only when there ARE relevant pages; empty when the wiki has none
-    (caller still runs the executor with a blank context)."""
+    (caller still runs the executor with a blank context).
+
+    Expiry: a page whose reviewAfterMs has passed is skipped (recheck before
+    acting). Two-clock: a FAST-clock page is still injected (so the agent knows
+    the knowledge exists) but explicitly flagged to re-fetch the live source
+    rather than trust the copy -- the "fast clock should be fetched" rule."""
     room = (task or {}).get('room')
     if not room:
         return ''
+    now_ms = now_ms if now_ms is not None else _time_ms()
     if village_id is None:
         # Resolve the reader's village from the task's agent so a worker only
         # ever sees their own village's memory.
@@ -3340,14 +3431,18 @@ def inject_wiki_context(state, task, village_id=None):
     if page_ids:
         pages = [(ensure_wiki(state)).get(pid) for pid in page_ids
                  if (ensure_wiki(state)).get(pid)
-                 and ((ensure_wiki(state)).get(pid).get('villageId') or DEFAULT_VILLAGE) == village_id]
+                 and ((ensure_wiki(state)).get(pid).get('villageId') or DEFAULT_VILLAGE) == village_id
+                 and not _page_is_expired((ensure_wiki(state)).get(pid), now_ms)]
     else:
-        pages = wiki_read_pages(state, room, village_id=village_id)
+        pages = wiki_read_pages(state, room, village_id=village_id, now_ms=now_ms)
     if not pages:
         return ''
-    lines = ['The think tank knowledge base has these entries relevant to this work:' , '']
+    lines = ['The think tank knowledge base has these entries relevant to this work:', '']
     for rec in pages:
-        lines.append(f"- {rec.get('title')} (category: {rec.get('category')}, v{rec.get('version')})")
+        line = f"- {rec.get('title')} (category: {rec.get('category')}, v{rec.get('version')})"
+        if (rec.get('clock') or SLOW_CLOCK) == FAST_CLOCK:
+            line += ' [LIVE DATA: re-check the current source before acting on this]'
+        lines.append(line)
     return '\n'.join(lines) + '\n'
 
 

@@ -173,6 +173,81 @@ class WikiHelpers(unittest.TestCase):
         self.assertFalse(sim.set_agent_village(state, 'ada', 'missing'))
         self.assertFalse(sim.create_village(state, 'North'))  # duplicate name
 
+    def test_memory_write_carries_owner_clock_scope_source_review(self):
+        state = _make_product_state()
+        rec, _ = sim.wiki_write_page(state, 'p', 'P', 'workroom', 'x', 'maya',
+                                     owner='maya', clock=sim.FAST_CLOCK, scope='team',
+                                     source='https://source', review_after_ms=9999999999999)
+        self.assertEqual(rec['clock'], 'fast')
+        self.assertEqual(rec['owner'], 'maya')
+        self.assertEqual(rec['source'], 'https://source')
+        self.assertEqual(rec['reviewAfterMs'], 9999999999999)
+        # Defaults: slow clock, edited_by as owner, team scope.
+        rec2, _ = sim.wiki_write_page(state, 'q', 'Q', 'workroom', 'y', 'ben')
+        self.assertEqual(rec2['clock'], 'slow')
+        self.assertEqual(rec2['owner'], 'ben')
+        # Invalid clock falls back to slow.
+        rec3, _ = sim.wiki_write_page(state, 'r', 'R', 'workroom', 'z', 'ada', clock='bogus')
+        self.assertEqual(rec3['clock'], 'slow')
+
+    def test_expired_page_is_not_injected(self):
+        state = _make_product_state()
+        # Slow-clock workroom page expiring soon.
+        sim.wiki_write_page(state, 'fresh', 'Fresh', 'workroom', 'b1', 'maya',
+                            review_after_ms=5000)
+        # Fast-clock page that already expired.
+        sim.wiki_write_page(state, 'stale', 'Stale', 'workroom', 'b2', 'maya',
+                            clock=sim.FAST_CLOCK, review_after_ms=1000)
+        # now_ms = 2000: fresh (expires 5000) is injectable; stale (expires 1000) is not.
+        pages = sim.wiki_read_pages(state, 'pressoffice', max_pages=3, now_ms=2000)
+        self.assertTrue(any(p['id'] == 'fresh' for p in pages))
+        self.assertFalse(any(p['id'] == 'stale' for p in pages))
+        ctx = sim.inject_wiki_context(state, {'room': 'pressoffice'}, now_ms=2000)
+        self.assertIn('Fresh', ctx)
+        self.assertNotIn('Stale', ctx)
+
+    def test_fast_clock_page_flagged_to_recheck_live_source(self):
+        state = _make_product_state()
+        sim.wiki_write_page(state, 'balance', 'Account Balance', 'workroom', '1000', 'maya',
+                            clock=sim.FAST_CLOCK)
+        sim.wiki_write_page(state, 'policy', 'Policy', 'workroom', 'do the thing', 'maya',
+                            clock=sim.SLOW_CLOCK)
+        ctx = sim.inject_wiki_context(state, {'room': 'pressoffice'}, now_ms=9999999999999)
+        self.assertIn('LIVE DATA: re-check the current source before acting', ctx)
+        # The slow-clock page is trusted without the flag.
+
+    def test_memory_provenance_ledger_records_write(self):
+        state = _make_product_state()
+        entry = sim.record_memory_provenance(state, 'maya', 'p', 'P', 'claim text',
+                                             source='https://source', scope='team',
+                                             clock=sim.FAST_CLOCK, review_after_ms=123,
+                                             village_id='main')
+        self.assertEqual(entry['claim'], 'claim text')
+        self.assertEqual(entry['source'], 'https://source')
+        self.assertEqual(entry['clock'], 'fast')
+        self.assertEqual(entry['reviewAfterMs'], 123)
+        self.assertEqual(len(state['memoryLedger']), 1)
+
+    def test_resolve_memory_fields_defaults_and_overrides(self):
+        state = _make_product_state()
+        import time as _t
+        before = int(_t.time() * 1000)
+        m = sim.resolve_memory_fields(state, {}, 'maya')
+        self.assertEqual(m['clock'], 'slow')
+        self.assertEqual(m['owner'], 'maya')
+        self.assertEqual(m['scope'], 'team')
+        self.assertIsNotNone(m['review_after_ms'])
+        self.assertGreaterEqual(m['review_after_ms'], before)
+        m2 = sim.resolve_memory_fields(state, {'clock': 'fast', 'owner': 'zed',
+                                               'scope': 'village', 'source': 's',
+                                               'reviewAfterDays': 1}, 'maya')
+        self.assertEqual(m2['clock'], 'fast')
+        self.assertEqual(m2['owner'], 'zed')
+        self.assertEqual(m2['scope'], 'village')
+        self.assertEqual(m2['source'], 's')
+        # A 1-day window expires well before the default 30-day window.
+        self.assertLess(m2['review_after_ms'], m['review_after_ms'])
+
 
 class ProductEndpoints(unittest.TestCase):
     def setUp(self):
