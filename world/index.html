@@ -1712,7 +1712,14 @@ function openBoard() {
 // not a separate summary someone has to remember to update.
 function renderBoard() {
   const body = document.getElementById('boardBody');
-  const open = Object.values(TASKS).filter(t => t.status !== 'done');
+  const taskNote = t => {
+    if (!t.note) return '';
+    const el = document.createElement('div');
+    el.textContent = t.note;
+    return `<div style="opacity:0.8; margin:3px 0 8px;">${el.innerHTML}</div>`;
+  };
+  const failed = Object.values(TASKS).filter(t => ['failed', 'cancelled', 'abandoned'].includes(t.status));
+  const open = Object.values(TASKS).filter(t => t.status !== 'done' && !failed.includes(t));
   const done = Object.values(TASKS).filter(t => t.status === 'done').sort((a, b) => b.createdAt - a.createdAt).slice(0, 5);
   // Peer-approval gate: a deliverable story awaiting two reviewer approvals is
   // neither "in progress" (its author finished) nor done. Show it separately.
@@ -1723,7 +1730,7 @@ function renderBoard() {
     ? inProgress.map(t => {
         const who = AGENTS[t.assignedTo] ? AGENTS[t.assignedTo].name : t.assignedTo;
         const room = ROOMS[t.room] ? ROOMS[t.room].label : t.room;
-        return `<div>&bull; ${t.title} -- ${who} (${room}, ${t.status})</div>`;
+        return `<div>&bull; ${t.title} -- ${who} (${room}, ${t.status})</div>${taskNote(t)}`;
       }).join('')
     : '<div style="opacity:0.6;">Nothing in progress right now.</div>';
 
@@ -1755,7 +1762,7 @@ function renderBoard() {
         // encodeURIComponent so quotes/odd chars in ids or titles can't break
         // the onclick attribute; vetoStory decodes before use.
         const btn = ` <button class="hud-btn" style="font-size:11px;padding:1px 6px;" onclick="vetoStory('${encodeURIComponent(t.id)}','${encodeURIComponent(t.title)}')">reject</button>`;
-        return `<div>&bull; ${t.title} -- ${who}${btn}</div>`;
+        return `<div>&bull; ${t.title} -- ${who}${btn}</div>${taskNote(t)}`;
       }).join('')
     : '<div style="opacity:0.6;">Nothing completed yet.</div>';
 
@@ -1820,6 +1827,7 @@ function renderBoard() {
     <div style="margin-bottom:4px;"><strong>In progress (${inProgress.length})</strong></div>
     ${openLines}
     ${reviewLines ? `<div style="margin:8px 0 4px;"><strong>Awaiting peer review (${needsReview.length})</strong></div>${reviewLines}` : ''}
+    ${failed.length ? `<div style="margin:8px 0 4px;"><strong>Failed or stopped (${failed.length})</strong></div>` + failed.map(t => `<div>${t.title} (${t.status})</div>${taskNote(t)}`).join('') : ''}
     <div style="margin:8px 0 4px;"><strong>Recently completed</strong></div>
     ${doneLines}
     <div style="margin:8px 0 4px;"><strong>Spikes to triage (${doneSpikes.length})</strong></div>

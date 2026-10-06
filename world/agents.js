@@ -275,6 +275,11 @@ async function initAgents() {
       for (const def of saved.agentRoster) AGENT_ROSTER.push(def);
     }
     AGENTS = saved.agents;
+    const serverOwns = saved.sim && saved.sim.owner === 'server';
+    if (serverOwns && typeof TASKS !== 'undefined') {
+      for (const id of Object.keys(TASKS)) delete TASKS[id];
+      Object.assign(TASKS, saved.tasks || {});
+    }
     // Recovery: a call, task, or hire in progress when the page last
     // closed has no corresponding MEETINGS/TASKS entry now (neither is
     // persisted -- there's no meaningful way to resume a chat UI or a
@@ -283,6 +288,10 @@ async function initAgents() {
     // finish something that no longer exists. Treat a refresh as
     // "anything in progress is abandoned."
     for (const id in AGENTS) {
+      if (serverOwns) {
+        AGENTS[id].mailbox = (AGENTS[id].mailbox || []).map(normalizeMailEntry);
+        continue;
+      }
       AGENTS[id].busy = false;
       // A reload should restore whatever was
       // actually saved, not force everyone back on duty -- offDuty is a
@@ -343,7 +352,7 @@ async function initAgents() {
     // placed in the DB from real priors) has distinct positions and is
     // left alone.
     const distinctCoords = new Set(Object.values(AGENTS).map(a => `${a.x},${a.y}`));
-    if (distinctCoords.size === 1 && AGENT_ROSTER.length > 1) {
+    if (!serverOwns && distinctCoords.size === 1 && AGENT_ROSTER.length > 1) {
       const occupied = [{ x: state.player.x, y: state.player.y }];
       for (const def of AGENT_ROSTER) {
         const spot = pickFreeSpot(occupied);

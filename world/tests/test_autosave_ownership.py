@@ -22,3 +22,20 @@ class AutosaveOwnership(unittest.TestCase):
         self.assertEqual(second['teams'], existing['teams'])
         self.assertIn('admin', second['agents'])
         self.assertEqual(incoming['sim']['owner'], 'client')
+
+    def test_reload_cannot_clear_active_work_or_resurrect_fired_agent(self):
+        existing = {'sim': {'owner': 'server'}, 'agents': {
+            'ada': {'busy': True, 'task': 't1', 'inRoom': 'observatory',
+                    'approvedCount': 4, 'profile': {'notes': ['real result']}}},
+                    'researchTopics': [{'id': 'topic', 'lastRunAt': 123}],
+                    'reports': [{'id': 1}], 'nextReportId': 2}
+        incoming = {'agents': {'ada': {'busy': False, 'task': None, 'inRoom': None,
+                                      'approvedCount': 0, 'profile': {'notes': []}},
+                               'fired': {'id': 'fired'}},
+                    'researchTopics': [], 'reports': [], 'nextReportId': 1}
+        merged = serve._merge_server_owned(existing, incoming)
+        self.assertEqual(merged['agents']['ada'], existing['agents']['ada'])
+        self.assertNotIn('fired', merged['agents'])
+        self.assertEqual(merged['researchTopics'], existing['researchTopics'])
+        self.assertEqual(merged['reports'], existing['reports'])
+        self.assertEqual(merged['nextReportId'], 2)

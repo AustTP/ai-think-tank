@@ -7897,6 +7897,9 @@ async def post_state(request: Request):
 
 
 _SERVER_OWNED_AGENT_FIELDS = (
+    'busy', 'task', 'inRoom', 'roomX', 'roomY', 'meetingId', 'handoff',
+    'pairWith', 'pairTaskId', 'approvedCount', 'droppedCount', 'weekApprovals',
+    'completedRooms', 'profile', 'role', 'model', 'director',
     'x', 'y', 'dir', 'path', 'path_index', 'pathIndex', 'path_target',
     'pathTarget', 'stuckTimer', 'stuck_timer', 'replanCount', 'replan_count',
     'respawnedForTask', 'respawned_for_task',
@@ -7945,7 +7948,7 @@ def _merge_server_owned(existing, incoming):
             # copy -- nested agent dicts are shared references otherwise).
             merged['agents'] = {
                 aid: _merge_server_owned_agent(ex_agents.get(aid), inc_agents.get(aid))
-                for aid in set(list(ex_agents.keys()) + list(inc_agents.keys()))
+                for aid in ex_agents
             }
         # Phase 3: under server ownership the server is ALSO the authoritative
         # writer of the task lifecycle -- the workQueue (assign/requeue/abandon)
@@ -7954,7 +7957,7 @@ def _merge_server_owned(existing, incoming):
         # The client still sends `workQueue`, but a stale copy must not clobber
         # the server's mid-cycle edits -- the server's queue + task map win
         # when they exist.
-        for k in ('workQueue', 'tasks'):
+        for k in ('workQueue', 'tasks', 'researchTopics', 'reports', 'nextReportId'):
             if k in existing:
                 merged[k] = existing[k]
         # Phase 4: governance (auto-hire / auto-firing review) is a server

@@ -57,6 +57,7 @@ node tests/test_tasks_routing.mjs
 echo
 echo "== JS: server-side sim bridge =="
 node tests/test_sim_bridge.mjs
+node tests/test_live_state.mjs
 echo
 echo "== JS: grading module (checklist meets/fails/insufficient) =="
 node tests/test_grading.mjs

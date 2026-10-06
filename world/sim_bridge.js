@@ -20,6 +20,48 @@ let SIM_STATUS = null;
 // inRoom,offDuty,pathActive,task} } }. Under client ownership this stays
 // empty -- the browser is the mover and renders its own live truth.
 let SERVER_POSITIONS = null;
+let serverStateRefreshing = false;
+
+// Positions alone cannot refresh hires, task results, or the Board. Adopt the
+// canonical state in place so open views observe the same live objects.
+async function refreshServerState() {
+  if (serverStateRefreshing || !SIM_STATUS || SIM_STATUS.owner !== 'server') return;
+  serverStateRefreshing = true;
+  try {
+    const res = await apiFetch('/api/state');
+    if (!res.ok) return;
+    const saved = await res.json();
+    if (!saved || !saved.sim || saved.sim.owner !== 'server') return;
+    if (typeof AGENT_ROSTER !== 'undefined' && Array.isArray(saved.agentRoster)) {
+      AGENT_ROSTER.splice(0, AGENT_ROSTER.length, ...saved.agentRoster);
+    }
+    if (typeof AGENTS !== 'undefined' && saved.agents) {
+      for (const id of Object.keys(AGENTS)) {
+        if (!saved.agents[id]) delete AGENTS[id];
+      }
+      for (const [id, agent] of Object.entries(saved.agents)) {
+        const current = AGENTS[id];
+        if (current) {
+          const { x, y } = current;
+          Object.assign(current, agent);
+          current.x = x;
+          current.y = y;
+        } else AGENTS[id] = agent;
+      }
+    }
+    if (typeof TASKS !== 'undefined') {
+      for (const id of Object.keys(TASKS)) delete TASKS[id];
+      Object.assign(TASKS, saved.tasks || {});
+    }
+    if (typeof WORK_QUEUE !== 'undefined') WORK_QUEUE.splice(0, WORK_QUEUE.length, ...(saved.workQueue || []));
+    if (typeof RESEARCH_TOPICS !== 'undefined') RESEARCH_TOPICS.splice(0, RESEARCH_TOPICS.length, ...(saved.researchTopics || []));
+    if (typeof REPORTS !== 'undefined') REPORTS.splice(0, REPORTS.length, ...(saved.reports || []));
+    if (typeof nextReportId !== 'undefined' && saved.nextReportId) nextReportId = saved.nextReportId;
+    if (typeof AGENT_KEYS !== 'undefined' && saved.agentKeys) AGENT_KEYS = saved.agentKeys;
+  } finally {
+    serverStateRefreshing = false;
+  }
+}
 
 async function refreshSimStatus() {
   try {
@@ -27,6 +69,7 @@ async function refreshSimStatus() {
     if (!res.ok) return;
     SIM_STATUS = await res.json();
     window.dispatchEvent && window.dispatchEvent(new CustomEvent('sim-status', { detail: SIM_STATUS }));
+    await refreshServerState();
   } catch (e) {
     // backend unreachable -- leave last known status in place
   }
@@ -81,6 +124,7 @@ function applyServerPositions(state) {
     // every already-open tab. agentIsDrawn() (agents.js) reads exactly
     // this field, so syncing it here is what actually makes her disappear.
     if (typeof sp.visible === 'boolean') a.visible = sp.visible;
+    if (typeof sp.task !== 'undefined') a.task = sp.task;
   }
 }
 

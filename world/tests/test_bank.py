@@ -388,6 +388,13 @@ class ApifyBudget(unittest.TestCase):
     plan enforces, surfaced in the Bank as its own __apify__ row from day one
     (before any accrual) and reconciled live against the real account."""
 
+    def setUp(self):
+        # Budget visibility requires a configured account. Never rely on the
+        # developer's private .env to satisfy this test precondition.
+        patcher = unittest.mock.patch.object(serve, 'APIFY_API_KEY', 'test-placeholder')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_bank_view_seeds_apify_row_even_with_zero_spend(self):
         # The cap is real (enforced by the plan), so it belongs in the Bank
         # before the first actor run accrues anything -- same "visible from
