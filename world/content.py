@@ -762,7 +762,7 @@ def _run_research_project_content(snapshot, agent_id, task, base_ctx=None):
             _sim_module._store_content_result(task.get('id'), budget_hit)
             return
         note = f'Tried to research "{task.get("title")}", but the model call didn\'t produce anything usable.'
-    _sim_module._store_content_result(task.get('id'), {'note': note})
+    _sim_module._store_content_result(task.get('id'), {'note': note, 'ok': bool(finding)})
 
 
 def _run_research_bare_content(snapshot, agent_id, task, base_ctx=None):

@@ -7806,9 +7806,11 @@ def _file_free_spike(state, agent_id, completed_task, now_ms=None):
     if not isinstance(global_map, dict):
         global_map = state['freeSpikeGlobal'] = {}
     # Roll the tank-wide week bucket + prune stale buckets (bounded growth).
-    for stale in [k for k in global_map if k < week - 1]:
+    global_map = state['freeSpikeGlobal'] = {str(k): v for k, v in global_map.items()}
+    for stale in [k for k in global_map if not k.isdigit() or int(k) < week - 1]:
         del global_map[stale]
-    tank_used = global_map.get(week, 0)
+    week_key = str(week)
+    tank_used = global_map.get(week_key, 0)
     if tank_used >= FREE_SPIKE_GLOBAL_CAP_PER_WEEK:
         return 0
     # One free exploration per room per week: a pending moonshot spike already
@@ -7816,13 +7818,14 @@ def _file_free_spike(state, agent_id, completed_task, now_ms=None):
     rooms_map = state.setdefault('freeSpikeRooms', {})
     if not isinstance(rooms_map, dict):
         rooms_map = state['freeSpikeRooms'] = {}
-    for stale in [k for k in rooms_map if k < week - 1]:
+    rooms_map = state['freeSpikeRooms'] = {str(k): v for k, v in rooms_map.items()}
+    for stale in [k for k in rooms_map if not k.isdigit() or int(k) < week - 1]:
         del rooms_map[stale]
-    if room in (rooms_map.get(week) or []):
+    if room in (rooms_map.get(week_key) or []):
         return 0
-    global_map[week] = tank_used + 1
+    global_map[week_key] = tank_used + 1
     used_map[agent_id] = (week, used + 1)
-    rooms_map.setdefault(week, []).append(room)
+    rooms_map.setdefault(week_key, []).append(room)
     title = f"Free exploration: question an assumption about {room}"
     instructions = (
         f"{FREE_SPIKE_PREMISE_GUIDANCE} You just completed real work in {room} "

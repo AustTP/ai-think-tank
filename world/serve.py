@@ -16195,7 +16195,7 @@ def _health_digest_markdown(snapshot):
 # agent's real key: auth, rate-limit, Jev, redaction, and the passport all run
 # exactly as they do for browser-driven work. This is the lowest-drift port --
 # not a re-implementation of browse/save/chat internals.
-SELF_BASE_URL = _load_env().get('SELF_BASE_URL', 'http://localhost:8010')
+SELF_BASE_URL = _load_env().get('SELF_BASE_URL', 'http://127.0.0.1:8936')
 _SANDBOX_RESEARCH_ID = 'research-shared'  # index.html: RESEARCH_SANDBOX_ID
 RESEARCH_CRAWL_MAX_PAGES = 50             # tasks.js crawlAndCollect -- raised 6->30->50 for deeper research
 RESEARCH_SKILL_SYNTHESIS_TOKENS = 900     # runResearchTask /api/chat max_tokens
@@ -16673,6 +16673,8 @@ app.mount('/', StaticFiles(directory=ROOT, html=True), name='static')
 if __name__ == '__main__':
     from uvicorn import Server, Config
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8936
+    if not _load_env().get('SELF_BASE_URL'):
+        SELF_BASE_URL = f'http://127.0.0.1:{port}'
     # --max-idle-minutes N: exit the server after N minutes with no HTTP
     # request at all (any request, authed or not -- touched in middleware).
     # The enforced form of "kill the server when idle"; 0 = disabled.

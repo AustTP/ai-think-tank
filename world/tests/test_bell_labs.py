@@ -71,6 +71,15 @@ def _tank_state(**over):
 
 
 class SpareTimeLane(unittest.TestCase):
+    def test_weekly_allowances_survive_json_reload(self):
+        state = _tank_state()
+        done = {'id': 'task-1', 'room': 'pressoffice', 'title': 'Build ledger tool', 'taskType': 'code'}
+        self.assertEqual(sim._file_free_spike(state, 'ben', done, now_ms=1_000_000), 1)
+        state = json.loads(json.dumps(state))
+        self.assertEqual(sim._file_free_spike(state, 'ada', done, now_ms=1_000_001), 0)
+        self.assertEqual(sim._file_free_spike(state, 'ben', done, now_ms=1_000_000 + _WEEK_MS), 1)
+        self.assertEqual(state['freeSpikeGlobal'], {'0': 1, '1': 1})
+
     def test_finished_deliverable_earns_one_moonshot_free_spike(self):
         state = _tank_state()
         done = {'id': 'task-1', 'room': 'pressoffice', 'title': 'Build ledger tool', 'taskType': 'code'}
