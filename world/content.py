@@ -46,6 +46,18 @@ def _chat_error_result(r, fallback_note):
     return None
 
 
+# Bell-style first-principles pass (2026-10-06): folded into research synthesis
+# and spike planning so the model questions the FRAME of a question before
+# answering it -- Bell Labs did fundamental science because people asked why
+# before how. Pure prompt guidance (token cost near zero at the cheap tier).
+PREMISE_QUESTIONING_GUIDANCE = (
+    'QUESTION THE PREMISE before you answer: state the assumption buried in the '
+    'question itself and ask whether it is even the right question to be asking. '
+    'Challenge the frame -- the most valuable finding is often that the frame was '
+    'wrong. Distinguish what you actually verified from what you are assuming.'
+)
+
+
 def _run_research_content(snapshot, agent_id, task, base_ctx=None):
     """Port of runResearchTask's scheduled-topic branch (tasks.js:2201-2259) +
     crawlAndCollect (world.js:529+). Runs the real crawl > save > synthesize >
@@ -132,6 +144,7 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
                 f'### {p["url"]}\n{(p.get("text") or "")[:3000]}' for p in kept)
             sys_msg = (f'You are updating a real skill-reference file for "{topic.get("topic")}". '
                        f'{_skill_file_format_guide()} '
+                       + PREMISE_QUESTIONING_GUIDANCE + ' '
                        + (f'Here is the EXISTING skill file -- preserve what still holds, update what changed, add what is genuinely new:\n\n{existing_content[:6000]}'
                           if existing_content else 'No existing skill file yet -- write one from scratch.'))
             reply = None
@@ -1706,15 +1719,23 @@ def _grade_review_checklist(checklist, review, qp, agent_id):
     return {'grades': grades, 'escalate': escalate}
 
 
-def _record_classified_failures(agent_id, kind, checklist_grades, escalate, review_text):
+def _record_classified_failures(agent_id, kind, checklist_grades, escalate, review_text,
+                                moonshot=False):
     """The 'sort' step's durable write: every verified-failed checklist
     requirement and every escalated review requirement is classified into the
     four-bucket taxonomy (factual error / client preference / missing
     information / style) and appended to the failure ledger in serve.py, where
     the weekly rule-mining pass turns recurring patterns into operator rule
     proposals. Best-effort: recording must never break the review itself, so a
-    ledger failure is swallowed (the review result is unchanged)."""
+    ledger failure is swallowed (the review result is unchanged).
+
+    `moonshot`: a protected spare-time lane (a free spike) -- its failures are
+    NEVER mined into operator rules. Bell's lesson: you can't have a moonshot
+    lane if every failed experiment tightens the rules. The review outcome is
+    unchanged; only the rule-mining input is skipped."""
     recorded = 0
+    if moonshot:
+        return recorded
     for g in (checklist_grades or []):
         if g.get('verdict') != GRADE_FAILS:
             continue
@@ -1938,7 +1959,8 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
         # failure ledger (classified into the four buckets) for the weekly
         # rule-mining pass. Best-effort -- never changes the review outcome.
         _record_classified_failures(agent_id, kind, checklist_grades,
-                                    graded.get('escalate', []), full_review)
+                                    graded.get('escalate', []), full_review,
+                                    moonshot=bool(task.get('moonshot')))
 
     queue_fix = None
     suffix = 'nothing actionable found'
@@ -3929,6 +3951,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     plan_text = _plain_completion(reasoning_slug, [
         {'role': 'system', 'content': (
             'You are planning a real, tool-driven web investigation. Given the question below, '
+            + PREMISE_QUESTIONING_GUIDANCE + ' '
             'write a short numbered checklist (3-7 items) of concrete sub-goals needed to answer it '
             'thoroughly and honestly -- e.g. which pages/categories to visit, what to extract from '
             'each, and what a real answer must cover. The FIRST item must always be a search_web '
