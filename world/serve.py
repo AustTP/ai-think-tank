@@ -111,6 +111,7 @@ from bank import (  # noqa: E402,F401
     _spend_ledger_write,
     _task_budget_exhausted,
     _task_budget_spent,
+    _task_spend_key,
     _think_tank_spend_cap_exceeded,
     _village_spend_view,
 )
@@ -2607,6 +2608,13 @@ _CEREMONY_ACTIONS = ('task_peer_widened', 'task_review_requeued', 'review_escala
                      'escalation_deny', 'access_request')
 _PROGRESS_ACTIONS = ('task_completed', 'product_released', 'sprint_closed',
                      'artifact_published', 'spike_promoted', 'library_promote')
+
+# Rework actions: finished work that went BACK instead of straight through --
+# the "61% of requests looped back" shape. A strict subset of ceremony: requeue,
+# veto, escalate, widen. NOT the escalation resolutions or access requests,
+# which close loops rather than open them.
+_REWORK_ACTIONS = ('task_review_requeued', 'story_vetoed', 'review_escalate',
+                   'task_peer_widened')
 
 
 async def _health_check_loop():
@@ -14761,6 +14769,43 @@ REVIEW_GRADE_CALIBRATION_MIN_SAMPLES = 10   # need >= this many anchored grades 
 REVIEW_GRADE_CALIBRATION_STEP = 0.05        # the bar moves in one fixed step per pass
 
 
+def _cohens_kappa_binary(judge_labels, anchor_labels):
+    """Cohen's kappa for the two binary raters in review_judge_calibration
+    (Jev verdict vs the mechanical pipeline anchor). Raw agreement is
+    misleading when most outputs pass -- 60% raw agreement can be chance
+    (the evals lesson) -- so kappa corrects for the base rate. The labels are
+    the stored 'meets'/'fails' verdict strings; the result is label-swap
+    symmetric. None when there is nothing to compare (no samples, or either
+    rater never varied -- kappa is undefined and raw agreement is the only
+    honest number); 0.0 when chance agreement is total (a degenerate all-one-
+    cell table), so the report never divides by zero."""
+    n = len(judge_labels)
+    if n == 0:
+        return None
+    j_vals = sorted(set(judge_labels))
+    a_vals = sorted(set(anchor_labels))
+    if len(j_vals) < 2 or len(a_vals) < 2:
+        return None
+    pos = j_vals[0]  # arbitrary; binary kappa is label-swap symmetric
+    a = b = c = d = 0
+    for jv, av in zip(judge_labels, anchor_labels):
+        j_pos = jv == pos
+        a_pos = av == pos
+        if j_pos and a_pos:
+            a += 1
+        elif j_pos:
+            b += 1
+        elif a_pos:
+            c += 1
+        else:
+            d += 1
+    p_o = (a + d) / n
+    p_e = ((a + b) * (a + c) + (b + d) * (c + d)) / (n * n)
+    if p_e >= 1.0:
+        return 0.0
+    return (p_o - p_e) / (1.0 - p_e)
+
+
 def _insert_review_calibration_sample(section, judge_verdict, judge_confidence, anchor_verdict):
     """Best-effort recorder for one anchored review grade -- a write failure must
     never break the grading path it is called from, so any DB error is swallowed."""
@@ -14779,18 +14824,22 @@ def _insert_review_calibration_sample(section, judge_verdict, judge_confidence, 
 
 def _review_grade_calibration_report(window_s=7 * 86400):
     """Aggregate anchored review grades over the window: total samples, total
-    agreement, agreement rate, and the per-section breakdown -- the sensor the
-    _review_grade_calibration_pass actuator reads. DB-only, no network."""
+    agreement, agreement rate, Cohen's kappa (base-rate-corrected agreement --
+    raw agreement flatters when most outputs pass), and the per-section
+    breakdown -- the sensor the _review_grade_calibration_pass actuator reads.
+    DB-only, no network."""
     now = time.time()
     with _db() as conn:
         rows = conn.execute(
-            'SELECT section, agree FROM review_judge_calibration WHERE ts > ?',
+            'SELECT section, agree, judge_verdict, anchor_verdict '
+            'FROM review_judge_calibration WHERE ts > ?',
             (now - window_s,),
         ).fetchall()
     total = len(rows)
     agreed = sum(r[1] for r in rows)
+    kappa = _cohens_kappa_binary([r[2] for r in rows], [r[3] for r in rows])
     by_section = {}
-    for section, agree in rows:
+    for section, agree, _jv, _av in rows:
         s = by_section.setdefault(section, {'samples': 0, 'agreed': 0})
         s['samples'] += 1
         s['agreed'] += int(agree)
@@ -14800,6 +14849,7 @@ def _review_grade_calibration_report(window_s=7 * 86400):
         'samples': total,
         'agreed': agreed,
         'agreement_rate': round(agreed / total, 4) if total else None,
+        'kappa': round(kappa, 4) if kappa is not None else None,
         'sections': [{'section': k, 'samples': v['samples'], 'agreed': v['agreed'],
                       'agreement_rate': round(v['agreed'] / v['samples'], 4) if v['samples'] else None}
                      for k, v in sorted(by_section.items())],
@@ -14876,6 +14926,58 @@ def _weekly_period_start(now=None):
     return int(start * 1000)
 
 
+def _library_provenance_audit(now, window_s):
+    """The weekly memory audit: what persistent knowledge the colony absorbed
+    this window and where it came from (the article's "mark anything that came
+    from web content rather than directly from you"). Reads ground truth only:
+    the library_write action log (path + source) and the pending_review tree
+    on disk. The write gate forces source='external' content into
+    pending_review/, so any external write that landed in the TRUSTED tree is
+    the memory-poisoning failure class the gate exists to prevent -- report
+    it, don't bury it. Best-effort: a DB or filesystem error never breaks the
+    weekly review."""
+    rows = []
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                'SELECT details FROM action_log WHERE action = ? AND ts > ? AND ts <= ?',
+                ('library_write', now - window_s, now),
+            ).fetchall()
+    except Exception:
+        rows = []
+    by_source: dict = {}
+    external_in_trusted = []
+    for (details,) in rows:
+        d = {}
+        if details:
+            try:
+                d = json.loads(details)
+            except Exception:
+                d = {}
+        source = d.get('source', 'firsthand')
+        by_source[source] = by_source.get(source, 0) + 1
+        path = d.get('path') or ''
+        if source == 'external' and path and not path.startswith('pending_review/'):
+            external_in_trusted.append(path)
+    unvetted = []
+    try:
+        pending_root = os.path.join(LIBRARY_DIR, 'pending_review')
+        if os.path.isdir(pending_root):
+            for root, _dirs, files in os.walk(pending_root):
+                for name in files:
+                    full = os.path.join(root, name)
+                    unvetted.append(os.path.relpath(full, LIBRARY_DIR))
+    except Exception:
+        pass
+    unvetted.sort()
+    return {
+        'writes': len(rows),
+        'by_source': {k: by_source[k] for k in sorted(by_source)},
+        'external_in_trusted': sorted(set(external_in_trusted)),
+        'unvetted_pending': unvetted,
+    }
+
+
 def _build_weekly_review(now=None):
     """Assemble one weekly review from GROUND-TRUTH tables (action_log +
     decision_tape), not agent self-reports. `now` is injected for pure
@@ -14936,6 +15038,12 @@ def _build_weekly_review(now=None):
     prior_decisions_n = len(prior_decisions)
     prior_cost = sum(float(d[1] or 0) for d in prior_decisions)
 
+    # Knowledge provenance audit (the memory audit): what the colony wrote
+    # this window and where it came from, plus what external content is still
+    # sitting unvetted in pending_review/. Computed up front so a quiet week
+    # with only injected/external content still produces a review.
+    provenance = _library_provenance_audit(now, week)
+
     def _delta(cur, prior):
         return round(cur - prior, 1)
 
@@ -14958,9 +15066,17 @@ def _build_weekly_review(now=None):
             'decisions': _delta(n_decisions, prior_decisions_n),
             'decision_cost_usd': round(jep_cost - prior_cost, 4),
         },
+        'provenance': {
+            'library_writes': provenance['writes'],
+            'by_source': provenance['by_source'],
+            'external_in_trusted': provenance['external_in_trusted'],
+            'unvetted_pending_n': len(provenance['unvetted_pending']),
+            'unvetted_pending': provenance['unvetted_pending'][:20],
+        },
     }
 
-    if not actions and not decisions:
+    if not actions and not decisions and provenance['writes'] == 0 \
+            and not provenance['external_in_trusted'] and not provenance['unvetted_pending']:
         return None
 
     stamp = time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(now))
@@ -14988,6 +15104,27 @@ def _build_weekly_review(now=None):
         lines += ['', '## Decisions by kind', '']
         for kind, v in sorted(per_kind.items()):
             lines.append(f'- {kind}: {v["n"]} ({v["ok"]} ok)')
+    # Knowledge provenance audit: what the colony absorbed and where it came
+    # from. External (web-browsed) content is the memory-poisoning risk; it is
+    # gated into pending_review/, so a write that landed in the trusted tree
+    # is a real signal, and unvetted pending content is the article's "mark
+    # what came from the web" list.
+    if provenance['writes'] or provenance['external_in_trusted'] or provenance['unvetted_pending']:
+        lines += ['', '## Knowledge provenance audit', '']
+        lines.append(f'- Library writes this window: **{provenance["writes"]}**')
+        if provenance['by_source']:
+            by_src = ', '.join(f'{k}: {v}' for k, v in provenance['by_source'].items())
+            lines.append(f'- By source: {by_src}')
+        if provenance['external_in_trusted']:
+            lines.append('- **Memory-poisoning signal**: external content landed in the '
+                         'trusted tree (the gate should have sent it to pending_review/):')
+            for p in provenance['external_in_trusted'][:20]:
+                lines.append(f'  - `{p}`')
+        if provenance['unvetted_pending']:
+            lines.append(f'- Unvetted external content still in pending_review/ '
+                         f'({len(provenance["unvetted_pending"])} file(s)):')
+            for p in provenance['unvetted_pending'][:20]:
+                lines.append(f'  - `{p}`')
     return {'digest': digest, 'markdown': '\n'.join(lines) + '\n'}
 
 
@@ -15125,6 +15262,12 @@ _IMBALANCE_HALF_LIFE_S = 12 * 3600        # Reddit uses ~45,000s; a day of age ~
 _COORDINATION_INFO_SCORE = 0.5
 _COORDINATION_WARNING_SCORE = 1.0
 _COORDINATION_MIN_CEREMONY_SIGNAL = 3.0  # find the imbalance within a real ceremony signal
+# Rework/loop telemetry: finished work that had to go back is process debt.
+# The alert needs BOTH a minimum loop volume (a couple of requeues is noise)
+# and a low straight-through rate (progress / (progress + rework)) to trip.
+_REWORK_WINDOW_S = 86400
+_REWORK_MIN_LOOPS_FOR_ALERT = 5
+_REWORK_LOW_STRAIGHT_THROUGH = 0.5
 
 
 def _decayed_signal(timestamps, now, half_life_s=None, horizon_s=None):
@@ -15233,6 +15376,22 @@ def _health_alerts_for_signals(signals):
               f'vs {progress_signal:.1f} shipped action weight (decayed over a week) -- '
               f'{ceremony} ceremony / {progress} shipped in the last 24h; process may be '
               f'outrunning actual work')
+
+    # Loop/rework rate: finished work that had to go back is process debt --
+    # the "61% of requests looped back" shape. A low straight-through rate
+    # with real loop volume means the review pipeline is redoing work instead
+    # of finishing it. Requires BOTH a minimum loop count (a couple of
+    # requeues is noise) and a straight-through rate below the floor.
+    loops = signals.get('rework_loops_last_24h', 0)
+    straight_through = signals.get('straight_through_rate')
+    if (loops >= _REWORK_MIN_LOOPS_FOR_ALERT and straight_through is not None
+            and straight_through < _REWORK_LOW_STRAIGHT_THROUGH):
+        alert('rework', 'warning',
+              f'{loops} rework loop(s) in the last 24h across '
+              f'{signals.get("looped_tasks_last_24h", 0)} task(s) '
+              f'(${signals.get("loop_cost_usd_last_24h", 0.0):.2f} accrued on looped work) '
+              f'-- straight-through rate {straight_through:.0%}; the review pipeline is '
+              f'redoing work instead of finishing it')
 
     # Absolute Zero rejection signal: a rising count of self-proposed
     # work-requests groomed OUT at refinement means the think tank's own proposals are
@@ -15354,6 +15513,47 @@ def _aging_in_flight_work(data, now_ms):
                 continue
         n += 1
     return n
+
+
+def _rework_metrics(now):
+    """Loop/rework telemetry: how much finished work had to go back, and what
+    that rework cost in real spend. Straight-through rate (progress /
+    (progress + rework)) is computed by the caller from the 24h counts. Loop
+    cost is the per-task ledger spend (by taskId bucket, falling back to the
+    title key) of the DISTINCT tasks that looped in the window -- the money
+    already spent on work that had to be redone, never double-counted when a
+    task loops twice. Pure DB reads, no network, no LLM spend."""
+    with _db() as conn:
+        rows = conn.execute(
+            f"SELECT details FROM action_log WHERE action IN "  # nosec B608 -- fixed constant tuple, values parameterized
+            f"({','.join('?' for _ in _REWORK_ACTIONS)}) AND ts > ?",
+            (*_REWORK_ACTIONS, now - _REWORK_WINDOW_S),
+        ).fetchall()
+    loops = len(rows)
+    looped = {}
+    for (details,) in rows:
+        if not details:
+            continue
+        try:
+            d = json.loads(details)
+        except Exception:
+            continue
+        key = d.get('taskId') or d.get('title')
+        if key and key not in looped:
+            looped[key] = d
+    loop_cost = 0.0
+    if looped:
+        ledger = _spend_ledger_read() or {}
+        for d in looped.values():
+            used = 0.0
+            tid = d.get('taskId')
+            if tid:
+                used = float((ledger.get(_task_spend_key(tid)) or {}).get('used', 0) or 0)
+            if not used and d.get('title'):
+                used = float((ledger.get(d['title']) or {}).get('used', 0) or 0)
+            loop_cost += used
+    return {'loops': loops, 'looped_tasks': len(looped),
+            'loop_cost_usd': round(loop_cost, 4)}
 
 
 def _task_horizon_metrics(now):
@@ -15563,6 +15763,15 @@ def compute_health_snapshot():
         # whether the colony finishes the work it starts, measured as a rate
         # at 1h/24h, not a raw completion count.
         metr = _task_horizon_metrics(now)
+        # Rework/loop telemetry: how much finished work had to go back and
+        # what that rework cost (see _rework_metrics).
+        rework = _rework_metrics(now)
+        # Grader agreement: the evals two-numbers principle -- every product
+        # number needs the grader's own number next to it. The review-grade
+        # judge (Jev) is calibrated against the mechanical pipeline anchor;
+        # kappa is the base-rate-corrected agreement (raw agreement flatters
+        # when most grades agree by chance).
+        grader = _review_grade_calibration_report()
 
     chosen_bands = {row[0] for row in tier_rows}
     signals = {
@@ -15600,6 +15809,23 @@ def compute_health_snapshot():
         'task_median_completion_hours': metr['median_completion_hours'],
         'task_fast_completion_rate': metr['fast_completion_rate'],
         'task_horizon_completion_rate': metr['horizon_completion_rate'],
+        # Rework/loop telemetry: finished work that looped back, the distinct
+        # tasks involved, and the real $ accrued on that looped work -- the
+        # article's "price every loop in money and time".
+        'rework_loops_last_24h': rework['loops'],
+        'looped_tasks_last_24h': rework['looped_tasks'],
+        'loop_cost_usd_last_24h': rework['loop_cost_usd'],
+        # Straight-through rate: the fraction of finished work that did NOT
+        # loop back (progress / (progress + rework)). None when there is
+        # nothing to measure. The inverse of "61% of requests looped back".
+        'straight_through_rate': (progress_count / (progress_count + rework['loops'])
+                                  if (progress_count + rework['loops']) else None),
+        # Grader agreement: samples, raw agreement, and kappa against the
+        # mechanical pipeline anchor -- surfaced so the review-grade judge is
+        # audited next to the grades it produces (the evals two-numbers rule).
+        'review_grader_samples': grader['samples'],
+        'review_grader_agreement_rate': grader['agreement_rate'],
+        'review_grader_kappa': grader['kappa'],
         'model_tier_bands': {row[0]: {'chosen_at': row[1], 'age_hours': (now - row[1]) / 3600} for row in tier_rows},
         'missing_model_tier_bands': [b for b in EXPECTED_MODEL_BANDS if b not in chosen_bands],
         'ceremony_actions_last_24h': ceremony_count,
@@ -15740,6 +15966,22 @@ def _health_digest_markdown(snapshot):
     # Aging work
     aging = snapshot.get('aging_in_flight_work', 0)
     lines.append(f'**Aging in-flight work:** {aging} non-bug task(s) wedged past their budget')
+    # Rework / straight-through: the loop picture in one line.
+    loops = snapshot.get('rework_loops_last_24h', 0)
+    straight = snapshot.get('straight_through_rate')
+    straight_s = f'{straight:.0%}' if straight is not None else 'n/a'
+    loop_cost = snapshot.get('loop_cost_usd_last_24h', 0.0)
+    lines.append(f'**Rework:** {loops} loop(s) over {snapshot.get("looped_tasks_last_24h", 0)} '
+                 f'task(s), straight-through {straight_s}, ${loop_cost:.2f} accrued on looped work')
+    # Grader agreement: the review-grade judge's own number next to the grades
+    # it produces -- kappa corrects raw agreement for the base rate.
+    gs = snapshot.get('review_grader_samples', 0)
+    if gs:
+        agr = snapshot.get('review_grader_agreement_rate')
+        kap = snapshot.get('review_grader_kappa')
+        agr_s = f'{agr:.0%}' if agr is not None else 'n/a'
+        kap_s = f'{kap:.2f}' if kap is not None else 'n/a'
+        lines.append(f'**Grader:** {gs} anchored review grade(s), agreement {agr_s}, kappa {kap_s}')
     # Escalations
     esc = snapshot.get('open_escalations', 0)
     lines.append(f'**Open escalations:** {esc}')
