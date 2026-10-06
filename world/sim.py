@@ -1794,6 +1794,9 @@ def _apply_content_result(state, task, result, now_ms=None):
     note = result.get('note')
     if note:
         task['note'] = note
+    if result.get('dataUnavailable'):
+        task['manualAttention'] = True
+        task['reviewDiagnosis'] = {'category': 'missing_inputs', 'failure': note or 'Live data unavailable'}
     # Gap: a spike's FULL findings only ever
     # lived in the Library file -- task.note is deliberately kept lean (a
     # short pointer, "see the Library entry just filed"), by design (see the
