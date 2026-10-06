@@ -2180,6 +2180,10 @@ def queue_work(state, items):
             'budgetMs': item.get('budgetMs') or None,
             # Phase E addendum: a peer-rejected fix returns to the original author.
             'assignedTo': item.get('assignedTo') or None,
+            # Human-in-the-loop: a JIRA issue filed FOR the player (assignedTo
+            # 'player') travels with its issueKey so the player task records its
+            # provenance -- same class of whitelist as 'distill'/'checklist'.
+            'issueKey': item.get('issueKey') or None,
             # Phase E2d: an INCIDENT (bug) is pinned to the owning team's on-call
             # and pin-woken even though it carries no reviewOf.
             'incident': bool(item.get('incident')),
@@ -2270,7 +2274,7 @@ def queue_work(state, items):
 
 
 def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructions=None,
-                project_label=None, moonshot=False, notBefore=None):
+                project_label=None, moonshot=False, notBefore=None, assigned_to=None):
     """Phase E2b: enqueue a time-boxed SPIKE (taskType='spike'). A spike is an
     investigation with no committed deliverable: it's LOWEST priority (fills
     gaps, never blocks committed work), carries a hard `budgetMs` for the work
@@ -2279,7 +2283,11 @@ def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructi
     `moonshot` marks a protected spare-time spike (see FREE_SPIKE_*): its
     failures are never mined into operator rules. `notBefore` (epoch ms) gates
     when the spike becomes assignable (spare-time work is deferred). Returns
-    the new queue length, or None if the item was rejected (no room or title)."""
+    the new queue length, or None if the item was rejected (no room or title).
+    Human-in-the-loop: `assigned_to='player'` hands the spike to the PLAYER
+    instead of an agent -- the player completes it via the player task
+    complete endpoint, and anything queued `depends_on_task` on it resumes the
+    moment it ships (see _assign_player_task)."""
     return queue_work(state, [{
         'title': title,
         'room': room,
@@ -2293,9 +2301,11 @@ def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructi
         'budgetMs': budget_ms or 60_000,
         'moonshot': bool(moonshot),
         'notBefore': notBefore,
+        'assignedTo': assigned_to or None,
     }])
 def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None,
-               goal=None, priority=None, project_label=None, depends_on_task=None):
+               goal=None, priority=None, project_label=None, depends_on_task=None,
+               assigned_to=None):
     """Queue a single work item to fire ONCE at an absolute wall-clock time
     (`at_ms`, epoch milliseconds). The item rides the same `notBefore` gate
     the rest of the queue already honors (see is_work_item_due): it sits in
@@ -2305,7 +2315,10 @@ def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None
     NOT assigned until that task reaches 'done' (see _work_item_dependency_met)
     -- the composed "run X once the dependency lands" scheduling lane. Returns
     the queued work item dict, or None if rejected (no title, or `at_ms` is
-    not a positive future epoch-ms)."""
+    not a positive future epoch-ms).
+    Human-in-the-loop: `assigned_to='player'` hands the item to the PLAYER
+    instead of an agent -- combined with `depends_on_task` this is the
+    "give the player X once story T lands" lane (see _assign_player_task)."""
     at_ms = int(at_ms or 0)
     if not title or at_ms <= 0:
         return None
@@ -2319,6 +2332,7 @@ def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None
         'priority': normalize_priority(priority),
         'projectLabel': project_label or None,
         'dependsOn': depends_on_task or None,
+        'assignedTo': assigned_to or None,
     }
     queue_work(state, [item])
     return item
@@ -2328,7 +2342,10 @@ def think_tank_has_work(state, now_ms):
     """Port of tasks.js thinkTankHasWork: a due queue item, or any agent currently
     task/handoff/pair/busy. A due item whose `dependsOn` dependency hasn't
     landed is NOT work yet -- it waits (no agent spend) until the dependency
-    ships, same gate pick_next_due_index applies at assignment."""
+    ships, same gate pick_next_due_index applies at assignment.
+    Human-in-the-loop: a due PLAYER card (assignedTo 'player') counts as work
+    too -- the idle gate must not short-circuit a pass that is supposed to
+    deliver a card into the player's hands (see _assign_player_task)."""
     work_queue = state.get('workQueue') or []
     if any(is_work_item_due(item, now_ms) and _work_item_dependency_met(state, item)
            for item in work_queue):
@@ -6827,7 +6844,8 @@ def _groups_look_like_gwt(text):
 
 
 def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
-               description='', story_points=None, title=None, now_ms=None):
+               description='', story_points=None, title=None, now_ms=None,
+               assigned_to=None):
     """File a JIRA-style issue for team_id. Returns the issue record dict, or
     None if a required field is missing (team_id / issue_type / summary /
     feature / reporter_id), the issue type is unknown, or the team is unknown.
@@ -6839,6 +6857,11 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
     `title` is an OPTIONAL one-line headline kept DISTINCT from `summary` so an
     agent scanning a long list can grasp the card without reading the whole
     description/criteria; defaults to `summary` when omitted.
+    Human-in-the-loop: `assigned_to='player'` marks the issue as the PLAYER's
+    to do -- the ownership survives file_issue -> refinement -> queue, and the
+    card is handed to the player (not an agent) at assignment. An agent (the
+    scrum master filing the issue) uses this to hand a story/spike to the
+    player when the next step genuinely needs human hands.
     Pure: mutates state['issues'], state['issueCounters'], and appends a
     backlogRequests record (tagged issueKey + teamId) so the owning scrum
     master can groom the card into a sprint -- the think tank does the work."""
@@ -6874,6 +6897,7 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         'blocked': False,  # SM-committed boolean field -- see _file_block_change
         'blockedAt': None,
         'blockedBy': None,
+        'assignedTo': assigned_to or None,  # 'player' = the human does this one
     }
     state.setdefault('issues', {})[key] = issue
     # Feed the backlog pipe: a backlogRequests record the refinement ceremony
@@ -6891,6 +6915,10 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         'issueKey': key,
         'teamId': team_id,
         'issueType': issue_type,
+        # Human-in-the-loop: a card filed for the PLAYER stays the player's
+        # through refinement (assignedTo survives onto the queued item, and
+        # _assign_due_item hands it to the player -- see _resolve_refinement).
+        'assignedTo': assigned_to or None,
         # The player-facing contract: the normalized user story + acceptance
         # criteria travel with the backlog request so the refinement ceremony can
         # hand the WORKER the full spec, not just the one-line summary (see
@@ -7243,6 +7271,54 @@ def _pending_player_ask_sweep(state, now_ms, decider=None):
     if not _director_gate_due_for(state, issue_key, now_ms):
         return None
     return request_player_input_verdict(state, issue_key, decider=decider)
+
+
+def complete_player_task(state, task_id, now_ms=None):
+    """Human-in-the-loop: the player marks an assigned-to-them task done. The
+    task (a 'needs_player' card minted by _assign_player_task) flips to 'done',
+    which makes the existing dependency machinery release anything queued
+    behind it:
+      - agent cards queued depends_on_task=<this id> become assignable
+        (_dependency_landed is now true) on the next task cycle;
+      - any ISSUE committed blocked on this task is auto-unblocked and the
+        waiting agent is woken (_auto_clear_dependency_blocks).
+    The player-inbox card is marked done, a confirmation email is queued, and
+    the action is logged. Returns the completed task dict, or None if the task
+    id is unknown / not a player-owned card / already done."""
+    now_ms = time.time() * 1000 if now_ms is None else now_ms
+    tasks = state.get('tasks') or {}
+    task = tasks.get(task_id)
+    if not isinstance(task, dict):
+        return None
+    if task.get('assignedTo') != 'player':
+        return None
+    if task.get('status') != 'needs_player':
+        return None
+    task['status'] = 'done'
+    task['completedAt'] = now_ms
+    # Any issue committed blocked on this task frees up, and its waiting agent
+    # is woken -- the exact same release finish_task triggers when an agent's
+    # story ships.
+    _auto_clear_dependency_blocks(state, task_id, now_ms=now_ms)
+    # Mark the player-inbox card done so the UI stops listing it as waiting.
+    mid = task.get('playerInboxId')
+    if mid:
+        for m in (state.get('playerInbox') or []):
+            if m.get('id') == mid:
+                m['status'] = 'done'
+                m['answeredAt'] = now_ms
+                break
+    title = task.get('title') or task_id
+    _queue_player_email(
+        state, 'player_task_done',
+        f"[AI Think Tank] Your task is complete: {title}",
+        (f"You marked '{title}' done. The think tank has picked the work back up: "
+         f"anything that was queued behind your task resumes now."),
+        now_ms=now_ms)
+    from serve import log_action
+    log_action('player', 'task_completed',
+               {'taskId': task_id, 'title': title}, authorized=False)
+    return task
 
 
 # ---------------------------------------------------------------------------
@@ -8196,6 +8272,12 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
                 'userStory': story,
                 'acceptanceCriteria': criteria,
                 'dependsOn': depends_on,
+                'issueKey': req.get('issueKey') or None,
+                # Human-in-the-loop: a card the filer marked for the PLAYER
+                # (assignedTo 'player') stays the player's -- _assign_due_item
+                # hands it to the player instead of an agent. Any other value is
+                # dropped (agents are picked, not named, on the refinement path).
+                'assignedTo': req.get('assignedTo') if req.get('assignedTo') == 'player' else None,
                 # Item 4: the groomer-judged spend ceiling + band ride the queue
                 # item (whitelisted) so the ASSIGNED task carries them.
                 'budgetUsd': req.get('budgetUsd'),
@@ -10615,7 +10697,12 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         _pinned_review = bool(pick.get('reviewOf') or pick.get('sprintId'))
         can_wake_off_duty = (_pinned_review or bool(pick.get('notBefore')) or _awake_idle_count(state) == 0) \
             and can_activate_another(state)
-        if _awake_idle_count(state) == 0 and not (can_wake_off_duty and _any_available_including_off_duty(state)):
+        # A PLAYER card needs no awake agent at all -- the assign step delivers
+        # it into the player's inbox. Only the agent-work guard below can stop
+        # it, so the wake-guard break must never fire for one.
+        if not (pick.get('assignedTo') or '') == 'player' \
+                and _awake_idle_count(state) == 0 \
+                and not (can_wake_off_duty and _any_available_including_off_duty(state)):
             break  # nobody who could take this right now, of any kind
         work_queue.pop(due_index)
         assigned = _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_id_holder)
@@ -10628,7 +10715,11 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
             # Sprint staffing: a sprint card is STRICTLY staffed -- it waits
             # (forever, if need be) for a member of its chosen pool to free up
             # and is never shed to the think-tank-wide fallback or abandoned.
+            # Human-in-the-loop: a PLAYER card is likewise never abandoned --
+            # it waits for the player, not for an agent, and the delivery path
+            # has no agent-availability failure to shed it for.
             if pick.get('reviewOf') or pick.get('sprintId') \
+                    or (pick.get('assignedTo') or '') == 'player' \
                     or pick['attempts'] < WORK_ITEM_MAX_ATTEMPTS:
                 work_queue.append(pick)
             else:
@@ -10925,12 +11016,86 @@ def _sprint_staffing_step(state, now_ms=None):
     return expanded
 
 
+def _assign_player_task(state, pick, now_ms, task_id_holder=None):
+    """Assign one due queue item to the PLAYER (a human-in-the-loop card): mint
+    the durable state['tasks'] record with status 'needs_player' and delivered
+    to the player's inbox + email, instead of walking any agent. Returns the
+    task dict, or None on failure (-> caller requeues/attempt++).
+
+    The player card is a REAL task in the durable mirror, so the existing
+    dependency machinery works unchanged in BOTH directions:
+      - an agent card queued `depends_on_task=<this id>` stays unassigned until
+        the player marks it done (see _work_item_dependency_met / _dependency_landed);
+      - this card's own `dependsOn` (an agent story the player's work waits on)
+        is honored by pick_next_due_index, so it is not even delivered until
+        that story lands.
+    `task_id_holder` is the mutable init([count]) nextTaskId counter, shared
+    with assign_task so ids never collide."""
+    title = (pick.get('title') or '').strip()
+    if not title:
+        return None
+    task_id_holder[0] += 1
+    task_id = 'task-' + str(task_id_holder[0])
+    task = {
+        'id': task_id,
+        'title': title,
+        'room': pick.get('room') or None,
+        'instructions': pick.get('instructions') or '',
+        'projectLabel': pick.get('projectLabel') or pick.get('goal') or None,
+        'taskType': pick.get('taskType') or 'code',
+        'assignedTo': 'player',
+        'status': 'needs_player',  # the player's to do; -> 'done' via complete_player_task
+        'createdAt': now_ms,
+        'dependsOn': pick.get('dependsOn') or None,
+        'userStory': pick.get('userStory') or None,
+        'acceptanceCriteria': pick.get('acceptanceCriteria') or None,
+        'issueKey': pick.get('issueKey') or None,
+        'budgetMs': pick.get('budgetMs') or None,
+    }
+    state.setdefault('tasks', {})[task_id] = task
+    # Deliver to the player: an inbox card (rendered by the UI with a Mark-done
+    # button) + a real email so the wait is visible even when the player isn't
+    # looking at the sim.
+    mid = f'ptask-{int(now_ms)}'
+    task['playerInboxId'] = mid
+    inbox = state.setdefault('playerInbox', [])
+    inbox.append({
+        'id': mid, 'kind': 'player_task', 'taskId': task_id,
+        'title': title, 'instructions': task['instructions'],
+        'status': 'needs_player', 'createdAt': now_ms,
+        'dependsOn': task['dependsOn'], 'issueKey': task['issueKey'],
+    })
+    depends_line = ''
+    if task['dependsOn']:
+        depends_line = f"\n\nNote: this task waits on '{task['dependsOn']}' being done before it starts."
+    _queue_player_email(
+        state, 'player_task',
+        f"[AI Think Tank] A task is waiting on YOU: {title}",
+        (f"The think tank has handed you this task and is waiting on your hands before "
+         f"it resumes the work queued behind it:\n\n"
+         f"{title}\n\n{task['instructions'] or '(no further instructions)'}\n\n"
+         f"Mark it done in the player-inbox when you've completed it."
+         f"{depends_line}"),
+        now_ms=now_ms)
+    from serve import log_action
+    log_action('player', 'task_assigned',
+               {'taskId': task_id, 'title': title, 'room': task['room']}, authorized=False)
+    return task
+
+
 def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_id_holder=None):
     """Deterministic assignment of one due queue item: pick the most-idle
     eligible candidate (round-robin, zero JEV spend), wake her if off-duty,
     assign. Returns the task dict or None. Mirrors assignTaskViaJev's
     fallback-to-first-eligible but replaces JEV with a deterministic pick."""
     agents = state.get('agents') or {}
+    # Human-in-the-loop: a card pinned to the PLAYER (assignedTo 'player') is
+    # never an agent's job. Assign it to the player (durable 'needs_player'
+    # task + inbox/email delivery) and return -- no door path, no roster pick,
+    # no spend. Anything queued depends_on_task on it resumes when the player
+    # marks it done.
+    if (pick.get('assignedTo') or '') == 'player':
+        return _assign_player_task(state, pick, now_ms, task_id_holder or _TASK_ID_HOLDER)
     # A shared-backlog card is queued ROOM-LESS on purpose: the ASSIGNED agent
     # figures out where the work needs to happen. Resolve the room here, at the
     # moment of assignment, and persist it onto the pick so the walk/gate/grade

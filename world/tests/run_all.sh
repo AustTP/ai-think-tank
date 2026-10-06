@@ -151,6 +151,9 @@ echo
 echo "== Python: Higgsfield image/video generation tools (estimate -> submit -> poll -> accrue) =="
 python3 tests/test_higgsfield.py
 echo
+echo "== Python: human-in-the-loop -- player tasks (agents wait, player completes, deps release) =="
+python3 tests/test_player_tasks.py
+echo
 echo "== Python: phone check-in -- POST /api/device/checkin (location/battery/Focus/Wi-Fi) =="
 python3 tests/test_device_checkin.py
 echo
