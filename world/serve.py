@@ -16176,7 +16176,7 @@ async def serve_index(request: Request):
     # call authenticates via the session cookie the browser already holds.
     if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
         return HTMLResponse(_LOGIN_PAGE.replace('__ERROR_HTML__', ''))
-    with open(os.path.join(ROOT, 'index.html')) as f:
+    with open(os.path.join(ROOT, 'index.html'), encoding='utf-8') as f:
         page = f.read()
     return HTMLResponse(page)
 
