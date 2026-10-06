@@ -2184,7 +2184,8 @@ def _release_product_from_build(product_id, releasing_agent, base, key):
         return
 
 
-def _plain_completion(model, messages, max_tokens, service='spike', task_id=None):
+def _plain_completion(model, messages, max_tokens, service='spike', task_id=None,
+                      village_id=None):
     """One non-tool completion call, with the same spend accrual _http_json
     self-loopback calls get from serve.py's own endpoints -- used for the
     plan/synthesize bookends of a spike, which need real (possibly extended-
@@ -2204,7 +2205,7 @@ def _plain_completion(model, messages, max_tokens, service='spike', task_id=None
         return ''
     cost = (data.get('usage') or {}).get('cost', 0.0)
     if isinstance(cost, (int, float)) and cost:
-        _serve._accrue_spend(service, cost)
+        _serve._accrue_spend(service, cost, village_id=village_id)
         if task_id:
             _serve._accrue_task_spend(task_id, cost)
     try:
@@ -2394,7 +2395,8 @@ _REFLECTION_CONFIDENCE_FLOOR = 0.5
 
 
 def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, tools, execute_tool,
-                                         total_iterations, max_tokens, force_first_tool, task_id=None):
+                                         total_iterations, max_tokens, force_first_tool, task_id=None,
+                                         village_id=None):
     remaining = total_iterations
     current_messages = list(messages)
     first_round = True
@@ -2406,7 +2408,7 @@ def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, to
             tier_slug, current_messages, tools, execute_tool,
             max_iterations=this_round, max_tokens=max_tokens, service='spike',
             force_first_tool=(force_first_tool if first_round else False), return_transcript=True,
-            task_id=task_id)
+            task_id=task_id, village_id=village_id)
         remaining -= this_round
         if len(current_messages) == before_len:
             # No progress at all this round (no tool call, no settling text
@@ -2427,7 +2429,7 @@ def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, to
                 '{"confidence": <0.0-1.0, how likely you are to produce a real, complete answer with '
                 'what has actually been gathered so far>, "note": "<one short sentence: what to do '
                 'differently, or \'on track\' if the current approach is working>"}')},
-        ], max_tokens=150, task_id=task_id)
+        ], max_tokens=150, task_id=task_id, village_id=village_id)
         confidence, note = _parse_reflection(reflection)
         if confidence < _REFLECTION_CONFIDENCE_FLOOR and note and note.strip().lower() != 'on track':
             current_messages.append({'role': 'user', 'content': f'Self-check before continuing: {note}'})
@@ -4150,7 +4152,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         execute_text, transcript = _run_spike_tool_loop_with_reflection(
             tier_slug, reasoning_slug, messages, spike_tools, execute_tool,
             total_iterations=50, max_tokens=900, force_first_tool=first_tool,
-            task_id=task.get('id'))
+            task_id=task.get('id'),
+            village_id=_sim_village_of_agent(snapshot, agent_id))
     except Exception as e:
         # A model-call failure (circuit-breaker RuntimeError, a 4xx, a network
         # blip) must never crash the spike executor or leave a half-baked

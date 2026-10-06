@@ -709,7 +709,7 @@ class PlainCompletionAndReflection(unittest.TestCase):
                                              'usage': {'cost': 0.5}}), \
              mock.patch.object(serve, '_accrue_spend') as accrue:
             self.assertEqual(content._plain_completion('m', [], 100), 'answer')
-            accrue.assert_called_once_with('spike', 0.5)
+            accrue.assert_called_once_with('spike', 0.5, village_id=None)
 
     def test_plain_completion_no_cost(self):
         with mock.patch.object(serve, '_call_openrouter_sync',

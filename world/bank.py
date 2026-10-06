@@ -65,10 +65,18 @@ def _budget_cap_usd(service, products=None):
     return DEFAULT_BUDGET_CAP_USD
 
 
-def _accrue_spend(service, cost):
+def _accrue_spend(service, cost, village_id=None):
     """Accrue a single model call's cost to a service's ledger bucket. The whole
     point is that accrual happens exactly once per model call, at the choke
-    point, so whatever the ledger shows is exactly what the think tank has spent."""
+    point, so whatever the ledger shows is exactly what the think tank has spent.
+
+    A VILLAGE dimension is accrued alongside: when `village_id` is given, the
+    cost also lands in a `__village__/<village_id>` bucket so per-village spend
+    is visible. That bucket is EXCLUDED from the shared monthly cap total (like
+    per-task buckets) -- the cap still sums the flat service buckets, so adding
+    a village rollup never double-counts or changes the shared-budget behavior.
+    A call with no village_id (player, serve's own loopback, unknown agent)
+    is accrued to the service bucket only."""
     import serve as _serve
     if not isinstance(cost, (int, float)) or not cost:
         return  # no usage.cost reported -- nothing to record
@@ -85,11 +93,43 @@ def _accrue_spend(service, cost):
         series = bucket.setdefault('byDay', {})
         day = now.strftime('%Y-%m-%d')
         series[day] = float(series.get(day, 0) or 0) + cost
+        if village_id:
+            vkey = _village_spend_key(village_id)
+            vbucket = ledger.setdefault(vkey, {'used': 0.0, 'calls': 0})
+            vbucket['used'] = float(vbucket.get('used', 0) or 0) + cost
+            vbucket['calls'] = int(vbucket.get('calls', 0) or 0) + 1
+            vbucket['lastAt'] = now.isoformat()
         _serve._spend_ledger_write(ledger)
     except Exception:
         # Spend accounting must never take the think tank down: a failed read or
         # write just means this call's cost isn't reflected in the ledger.
         pass
+
+
+def _village_spend_key(village_id):
+    """The ledger bucket key for a village's rollup spend. Namespaced with a
+    leading double-underscore so the shared cap (which excludes `__village__/*`
+    like it excludes per-task keys) never double-counts it."""
+    return f'__village__/{village_id}'
+
+
+def _village_spend_view():
+    """Per-village spend rollup from the ledger: {village_id: {'used': float,
+    'calls': int}}. Reads only the `__village__/*` buckets -- the attribution
+    dimension -- leaving the shared service buckets untouched."""
+    import serve as _serve
+    try:
+        ledger = _serve._spend_ledger_read()
+    except Exception:
+        return {}
+    out = {}
+    prefix = '__village__/'
+    for k, v in (ledger or {}).items():
+        if k.startswith(prefix) and isinstance(v, dict):
+            vid = k[len(prefix):]
+            out[vid] = {'used': float(v.get('used', 0) or 0),
+                        'calls': int(v.get('calls', 0) or 0)}
+    return out
 
 
 def _spend_ledger_read():
@@ -238,7 +278,8 @@ def _think_tank_spend_cap_exceeded():
     # classifier call closed).
     excluded = {_serve._SPEND_CAP_BASELINE_KEY, _serve.COLAB_LEDGER_KEY}
     total = sum(float(v.get('used') or 0) for k, v in ledger.items()
-               if k not in excluded and not _is_task_spend_key(k) and isinstance(v, dict))
+                if k not in excluded and not _is_task_spend_key(k)
+                and not k.startswith('__village__/') and isinstance(v, dict))
     period = _serve._spend_cap_period()
     rec = ledger.get(_serve._SPEND_CAP_BASELINE_KEY)
     # Legacy migration: the old format stored a bare float (the baseline at

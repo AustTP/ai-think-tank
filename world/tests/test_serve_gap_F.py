@@ -1412,7 +1412,7 @@ class JevEndpoints(unittest.TestCase):
                        json={'state': {'x': 1}, 'questions': ['q'], 'agentId': 'eli'})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()['choice'], 'allow')
-        accrue.assert_called_once_with('__jev__', 0.001)
+        accrue.assert_called_once_with('__jev__', 0.001, village_id='main')
         self.assertEqual(log.call_args[0][1], 'decide')
 
     def test_decide_http_error(self):
@@ -1955,7 +1955,7 @@ class DecideEndpoint(unittest.TestCase):
         r, log, accrue = self._post(self._body())
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json(), self.DATA)
-        accrue.assert_called_once_with('__jev__', 0.001)
+        accrue.assert_called_once_with('__jev__', 0.001, village_id='main')
         self.assertEqual(log.call_args[0][1], 'decide')
         self.assertEqual(log.call_args[0][2]['choice'], 'allow')
 
