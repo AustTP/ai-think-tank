@@ -1870,6 +1870,57 @@ class DesignReferenceEndpoints(unittest.TestCase):
              unittest.mock.patch.object(serve, '_list_design_briefs', return_value=[]):
             self.assertEqual(serve._design_context_for_project('no-taste-project'), '')
 
+    def test_design_context_skips_expired_taste(self):
+        # A taste doc whose Review-after header has passed is NOT injected as
+        # trusted design context (recheck before acting). A future one is.
+        import datetime as _dt
+        expired = _dt.date.today() - _dt.timedelta(days=1)
+        future = _dt.date.today() + _dt.timedelta(days=10)
+        for label, review, expected in (
+                ('expired', expired.strftime('%Y-%m-%d'), False),
+                ('future', future.strftime('%Y-%m-%d'), True)):
+            taste = f'# Design taste\n- Owner: player\n- Review after: {review}\n\nPALETTE: #111'
+            with self.subTest(label=label):
+                with unittest.mock.patch.object(serve, '_safe_library_path',
+                                                side_effect=lambda p: p if p.startswith('design-references') else None), \
+                     unittest.mock.patch('os.path.isfile', return_value=True), \
+                     unittest.mock.patch.object(serve, '_list_design_briefs', return_value=[]), \
+                     unittest.mock.patch('builtins.open', unittest.mock.mock_open(read_data=taste)):
+                    ctx = serve._design_context_for_project('product-1')
+                if expected:
+                    self.assertIn('PALETTE: #111', ctx)
+                else:
+                    self.assertEqual(ctx, '')
+
+    def test_taste_is_expired_parses_review_date(self):
+        import datetime as _dt
+        past = _dt.date.today() - _dt.timedelta(days=3)
+        future = _dt.date.today() + _dt.timedelta(days=3)
+        self.assertTrue(serve._taste_is_expired(f'- Review after: {past.strftime("%Y-%m-%d")}'))
+        self.assertFalse(serve._taste_is_expired(f'- Review after: {future.strftime("%Y-%m-%d")}'))
+        self.assertFalse(serve._taste_is_expired('no review header'))
+        self.assertFalse(serve._taste_is_expired('- Review after: not-a-date'))
+
+    def test_design_taste_fold_writes_owner_and_review_after(self):
+        taste_out = 'STYLE: minimal'
+        brief_files = ['design-references/product-1/hero.txt']
+        written = []
+        with unittest.mock.patch.object(serve, '_list_design_briefs', return_value=brief_files), \
+             unittest.mock.patch.object(serve, '_safe_library_path',
+                                        side_effect=lambda p: p if p.startswith('design-references') else None), \
+             unittest.mock.patch('os.path.isfile', return_value=True), \
+             unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-x'), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                        return_value={'choices': [{'message': {'content': taste_out}}]}), \
+             unittest.mock.patch.object(serve, '_write_file',
+                                        side_effect=lambda path, content: written.append((path, content))), \
+             unittest.mock.patch('builtins.open', unittest.mock.mock_open(read_data='STYLE: minimal')):
+            r = self._post('/api/design-reference/taste',
+                           {'agentId': 'player', 'project': 'product-1',
+                            'owner': 'maya', 'reviewAfterDays': 1})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(written[-1][1].splitlines()[3], '- Owner: maya')
+
 
 class VillageEndpoints(unittest.TestCase):
     """The village boundary API: create a village, list it (with members), and
