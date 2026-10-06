@@ -1870,9 +1870,9 @@ function renderBoard() {
   window.promoteSpike = async function (encId, encTitle) {
     const taskId = decodeURIComponent(encId);
     const title = decodeURIComponent(encTitle);
-    const confirm = confirm(`Promote "${title}" into a real work item?\n\nThe spike's findings will become a queued deliverable, which then needs peer review like any committed story.`);
-    if (!confirm) return;
-    const res = await fetch(`/api/intent/spike/${encodeURIComponent(taskId)}/promote`, {
+    const confirmed = window.confirm(`Promote "${title}" into a real work item?\n\nThe spike's findings will become a queued deliverable, which then needs peer review like any committed story.`);
+    if (!confirmed) return;
+    const res = await apiFetch(`/api/intent/spike/${encodeURIComponent(taskId)}/promote`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({}),

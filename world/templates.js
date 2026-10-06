@@ -67,7 +67,7 @@ async function deleteTemplate(role) {
 }
 
 // Render the templates editor into #boardTemplatesBody. Called by renderBoard.
-async function renderTemplatesEditor() {
+async function renderTemplatesEditor(force = false) {
   const container = document.getElementById('boardTemplatesBody');
   if (!container) return;
   if (!state.ui || state.ui !== 'board') return; // only refresh inside The House dialog
@@ -93,7 +93,7 @@ async function renderTemplatesEditor() {
   const signature = JSON.stringify([templates, AGENT_ROSTER]);
   if (container._templatesSignature === signature) return;
   // Defer external changes while the player is editing the form.
-  if (container.contains && container.contains(document.activeElement)) return;
+  if (!force && container.contains && container.contains(document.activeElement)) return;
   const modal = document.querySelector ? document.querySelector('#boardModal .modal-box') : null;
   const scrollTop = modal ? modal.scrollTop : 0;
   const roles = Object.keys(templates).sort();
@@ -153,7 +153,7 @@ async function handleTemplateCreate(existing) {
   if (!role) { alert('Give the new role a name.'); return; }
   if (existing[role]) { alert(`A template for "${role}" already exists -- open it and Edit instead.`); return; }
   const result = await saveTemplate(role, mission, instructions, []);
-  if (result.ok) { renderTemplatesEditor(); renderBoard(); }
+  if (result.ok) { await renderTemplatesEditor(true); renderBoard(); }
   else alert(result.error || 'Could not create template.');
 }
 

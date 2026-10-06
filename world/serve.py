@@ -11688,6 +11688,10 @@ async def upsert_template(request: Request):
     templates[role] = template
     state['templates'] = templates
     applied = _apply_template_to_role(state, role, template, requester)
+    if not applied:
+        # New roles have no holders yet, so the application helper has nothing
+        # to persist. Save the library itself before acknowledging creation.
+        save_state_to_db(state)
     log_action(requester, 'template_create' if is_new else 'template_update', {'role': role, 'appliedTo': len(applied)}, authorized=True)
     _append_passport_decision('template_' + ('create' if is_new else 'update'), requester, {'role': role})
     return JSONResponse({'ok': True, 'role': role, 'created': is_new, 'appliedTo': applied})

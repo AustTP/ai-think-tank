@@ -119,6 +119,21 @@ def _seed_with_request(**over):
 
 
 class RefinementEntry(unittest.TestCase):
+    def test_director_filed_request_convenes_own_team(self):
+        state, req = _seed_with_request()
+        req['filedBy'] = 'dev'
+        _step(state, None, 1_000_000)
+        pending = state['pendingRefinements']['dev']
+        self.assertIn(req['id'], pending['reqIds'])
+
+    def test_director_own_team_wins_over_parent_reporting_tree(self):
+        state = _seed()
+        state['teams'].insert(0, {'id': 'faye', 'directorId': 'faye'})
+        next(d for d in state['agentRoster'] if d['id'] == 'dev')['director'] = 'faye'
+        self.assertEqual(sim._refinement_team(state, {'filedBy': 'dev'})['id'], 'dev')
+        self.assertEqual(sim._refinement_team(state, {
+            'filedBy': 'dev', 'teamId': 'faye'})['id'], 'faye')
+
     def test_no_request_no_ceremony(self):
         state = _seed()
         # No pending requests, even though cadence is due -> no ceremony.

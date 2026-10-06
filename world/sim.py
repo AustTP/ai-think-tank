@@ -7914,6 +7914,11 @@ def _refinement_team(state, req):
         if t:
             return t
     filed_by = req.get('filedBy')
+    # Directors file work for their own team too. Resolve that before the
+    # reporting tree: a director who reports to an admin still owns this work.
+    for t in (state.get('teams') or []):
+        if filed_by and filed_by == t.get('directorId'):
+            return t
     for t in (state.get('teams') or []):
         if filed_by in _sim_direct_reports(state, t.get('directorId')):
             return t
