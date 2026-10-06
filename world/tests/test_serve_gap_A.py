@@ -1111,27 +1111,34 @@ class PeerReviewPass(unittest.TestCase):
         for _ in range(n):
             serve.log_action(agent_id, 'task_completed', {'title': 'x'}, authorized=False)
 
-    def test_files_a_peer_note(self):
+    def test_raises_a_help_signal_not_a_report(self):
         now = time.time()
         state = {
             'agentRoster': [
                 {'id': None, 'name': 'Nameless'},
                 {'id': 'ghost', 'name': 'Ghost', 'role': 'Worker'},
-                {'id': 'busy', 'name': 'Busy', 'role': 'Worker'},
-                {'id': 'idle', 'name': 'Idle', 'role': 'Worker'},
+                {'id': 'maya', 'name': 'Maya', 'role': 'Director', 'isDirector': True},
+                {'id': 'busy', 'name': 'Busy', 'role': 'Worker', 'director': 'maya'},
+                {'id': 'idle', 'name': 'Idle', 'role': 'Worker', 'director': 'maya'},
             ],
-            'agents': {'busy': {'name': 'Busy'}, 'idle': {'name': 'Idle'}},
+            'agents': {'maya': {'id': 'maya'}, 'busy': {'name': 'Busy'}, 'idle': {'name': 'Idle'}},
             'reports': 'not-a-list',
         }
         self._log_work('busy', 3)
         with unittest.mock.patch.object(serve.random, 'random', return_value=0.0):
             n = serve._peer_review_pass(state, now)
         self.assertEqual(n, 1)
-        self.assertEqual(len(state['reports']), 1)
-        self.assertEqual(state['reports'][0]['aboutId'], 'idle')
-        self.assertEqual(state['reports'][0]['fromId'], 'busy')
+        self.assertEqual(state['reports'], [], 'the machine never writes reports')
+        signals = state.get('helpSignals') or []
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]['aboutId'], 'idle')
+        self.assertEqual(signals[0]['directorId'], 'maya')
+        self.assertEqual(signals[0]['direction'], 'quiet')
+        mailbox = (state.get('agents') or {}).get('maya', {}).get('mailbox') or []
+        self.assertTrue(any(m.get('kind') == 'help_signal' for m in mailbox),
+                        'the director is told in-world')
 
-    def test_returns_zero_without_observers(self):
+    def test_returns_zero_when_target_has_no_director(self):
         now = time.time()
         state = {
             'agentRoster': [{'id': 'target', 'name': 'T', 'role': 'Worker'}],
@@ -1141,6 +1148,7 @@ class PeerReviewPass(unittest.TestCase):
         self._log_work('target', 5)
         with unittest.mock.patch.object(serve.random, 'random', return_value=0.0):
             self.assertEqual(serve._peer_review_pass(state, now), 0)
+        self.assertIsNone(state.get('helpSignals'))
         self.assertEqual(state['reports'], [])
 
     def test_returns_zero_when_village_idle(self):

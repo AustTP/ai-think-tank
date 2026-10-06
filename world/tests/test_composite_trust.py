@@ -882,30 +882,33 @@ class FreshnessProvenanceTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Peer-note writer -- redesigned to be village-natural (2026-09-30)
+# Peer help-signal writer -- redesigned 2026-10-06
 # ---------------------------------------------------------------------------
 
 class PeerReviewWorkerPickerTests(unittest.TestCase):
-    """serve._peer_review_pass was rewritten to be Jev-free and non-deterministic:
-    a RANDOM PEER observer watches the real action_log, and when the evidence
-    shows a worker genuinely out of line (an underperformer or a standout) a
-    weighted-probability pick decides whether THAT watch files a note. No senior
-    director always authors every note, no fixed 90s metronome. These tests pin
-    the new contract: evidence gates (quiet/nominal village files nothing),
-    dedup/staleness coverage, the probability gate, and a random PEER (never
-    the target, never the admin/director) authoring the note."""
+    """serve._peer_review_pass raises HELP SIGNALS, never reports (2026-10-06):
+    a watch over the real action_log, and when the evidence shows a worker
+    genuinely out of line (an underperformer or a standout) a weighted-
+    probability pick decides whether THAT watch raises a help signal to the
+    worker's DIRECTOR. The pass NEVER files a report: a worker's productivity
+    is tracked structurally (approvedCount, droppedCount, morale, the firing
+    drop-off signal), so a bug-hunter deep in an investigation is never dinged
+    and the reports ledger holds only genuine agent/player-written reviews.
+    These tests pin the new contract: evidence gates (quiet/nominal village
+    raises nothing), dedup/staleness coverage, the probability gate, the
+    director destination, and that no report is ever written."""
 
     def setUp(self):
         # These tests share one global DB, so isolate each one: clear the
-        # action_log rows (the evidence the picker reads) and the reports list
-        # (the dedup window) so a prior test can't leak its ada/ben activity or
-        # its filed reports into the next assertion. Each test then seeds its
-        # own exact activity baseline.
+        # action_log rows (the evidence the picker reads) and the reports +
+        # helpSignals lists so a prior test can't leak its ada/ben activity or
+        # its raised signals into the next assertion.
         with serve._db() as conn:
             conn.execute('DELETE FROM action_log')
         state = serve.get_state_from_db()
         if state is not None:
             state['reports'] = []
+            state.pop('helpSignals', None)
             serve.save_state_to_db(state)
 
     def _seed_roster_and_activity(self, now):
@@ -920,117 +923,131 @@ class PeerReviewWorkerPickerTests(unittest.TestCase):
         }
         serve.save_state_to_db(state)
         # Real action_log rows: ada does plenty of real work, ben does none --
-        # a clear, real divergence for a peer to notice. ada = standout
-        # (real 5 >= 5 and >= group max), ben = underperformer (real 0 < 2).
+        # a clear, real divergence for a watch to notice. ada = standout
+        # (real 5 >= 5 and >= group max), ben = quiet (real 0 < 2).
         for _ in range(5):
             serve.log_action('ada', 'task_completed', {}, authorized=True)
         return state
 
     def _force_probability_gate(self):
-        """The probability gate files only when random.random() <
-        PEER_REVIEW_FILE_PROBABILITY; force the 'file this watch' branch."""
+        """The probability gate raises only when random.random() <
+        PEER_REVIEW_FILE_PROBABILITY; force the 'raise this watch' branch."""
         return unittest.mock.patch.object(serve.random, 'random', return_value=0.0)
 
-    def test_a_random_peer_files_the_note_not_the_director(self):
-        state = self._seed_roster_and_activity(time.time())
+    def test_a_help_signal_goes_to_the_director_not_a_report(self):
+        self._seed_roster_and_activity(time.time())
         with self._force_probability_gate(), \
              unittest.mock.patch.object(serve.random, 'choices',
                                         return_value=[{'id': 'ben', 'name': 'Ben', 'role': '',
                                                        'actions': 0, 'real': 0, 'last': None,
-                                                       'already': False}]):
+                                                       'already': False, 'director': 'maya'}]):
             serve._peer_review_loop_pass()
         saved = serve.get_state_from_db()
-        reports = saved.get('reports') or []
-        self.assertEqual(len(reports), 1)
-        self.assertEqual(reports[0]['aboutId'], 'ben')
-        # The note is authored by a PEER (a worker), never the senior director
-        # (maya), never the admin, and never the target themselves.
-        self.assertEqual(reports[0]['fromId'], 'ada')
-        self.assertNotEqual(reports[0]['fromId'], 'maya')
-        self.assertNotEqual(reports[0]['fromId'], 'ben')
+        self.assertEqual(saved.get('reports') or [], [],
+                         'the machine never writes a report about productivity')
+        signals = saved.get('helpSignals') or []
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]['aboutId'], 'ben')
+        self.assertEqual(signals[0]['directorId'], 'maya',
+                         'the signal goes to the worker\'s director, not a random peer')
+        self.assertEqual(signals[0]['direction'], 'quiet')
+        mailbox = (saved.get('agents') or {}).get('maya', {}).get('mailbox') or []
+        self.assertTrue(any(m.get('kind') == 'help_signal' for m in mailbox),
+                        'the director is told in-world')
 
-    def test_the_note_is_probabilistic_not_a_fixed_metronome(self):
+    def test_a_standout_raises_an_overloaded_signal(self):
+        # "Get someone help if they're carrying the load": a standout is a
+        # HELP signal (offer help / reallocation), never a praise report.
+        self._seed_roster_and_activity(time.time())
+        with self._force_probability_gate(), \
+             unittest.mock.patch.object(serve.random, 'choices',
+                                        return_value=[{'id': 'ada', 'name': 'Ada', 'role': '',
+                                                       'actions': 5, 'real': 5, 'last': None,
+                                                       'already': False, 'director': 'maya'}]):
+            serve._peer_review_loop_pass()
+        saved = serve.get_state_from_db()
+        signals = saved.get('helpSignals') or []
+        self.assertEqual(len(signals), 1)
+        self.assertEqual(signals[0]['aboutId'], 'ada')
+        self.assertEqual(signals[0]['direction'], 'overloaded')
+
+    def test_the_signal_is_probabilistic_not_a_fixed_metronome(self):
         # The old design filed a report EVERY cadence (fixed clock). Now the
-        # probability gate means a given watch may file nothing even when the
+        # probability gate means a given watch may raise nothing even when the
         # evidence is genuine. Patch random.random above the threshold.
         self._seed_roster_and_activity(time.time())
         with unittest.mock.patch.object(serve.random, 'random', return_value=0.99):
             n = serve._peer_review_loop_pass()
-        self.assertEqual(n, 0, 'the probability gate must let a genuine watch pass without filing')
+        self.assertEqual(n, 0, 'the probability gate must let a genuine watch pass without signaling')
         saved = serve.get_state_from_db()
-        self.assertEqual(len(saved.get('reports') or []), 0)
+        self.assertEqual(saved.get('helpSignals') or [], [])
 
-    def test_the_probability_gate_still_files_when_it_passes(self):
-        # Same evidence, but the watch "happens" -- the note must file.
+    def test_the_probability_gate_still_signals_when_it_passes(self):
+        # Same evidence, but the watch "happens" -- the signal must raise.
         self._seed_roster_and_activity(time.time())
         with self._force_probability_gate():
             n = serve._peer_review_loop_pass()
-        self.assertEqual(n, 1, 'an evidence-backed watch that passes the gate must file a note')
+        self.assertEqual(n, 1, 'an evidence-backed watch that passes the gate must raise a signal')
         saved = serve.get_state_from_db()
-        self.assertEqual(len(saved.get('reports') or []), 1)
+        self.assertEqual(len(saved.get('helpSignals') or []), 1)
 
-    def _seed_recent_report(self, about_id, ts_ms=None, severity='major'):
-        """Append a report about `about_id` to the stored state. ts_ms defaults
-        to 'now' (fresh inside the staleness window)."""
+    def _seed_recent_signal(self, about_id, ts_ms=None, direction='quiet'):
+        """Append a help signal about `about_id` to the stored state. ts_ms
+        defaults to 'now' (fresh inside the staleness window)."""
         state = serve.get_state_from_db()
-        reports = state.get('reports') or []
-        reports.append({
-            'id': f'report-seed-{about_id}',
-            'aboutId': about_id,
-            'fromId': 'maya',
-            'quote': 'seeded for the dedup test',
-            'note': 'seeded',
+        signals = state.setdefault('helpSignals', [])
+        signals.append({
+            'id': f'help-seed-{about_id}',
+            'aboutId': about_id, 'directorId': 'maya', 'direction': direction,
+            'real': 0, 'actions': 0,
             'ts': int(time.time() * 1000) if ts_ms is None else ts_ms,
-            'severity': severity,
+            'text': 'seeded for the dedup test',
         })
-        state['reports'] = reports
+        state['helpSignals'] = signals
         serve.save_state_to_db(state)
 
-    def test_does_not_re_report_a_worker_within_the_stale_window(self):
-        # Both workers covered by a FRESH report -> the loop files nothing.
-        # The old behavior fell back to the whole roster and re-flagged the
-        # same worker every cycle forever.
+    def test_does_not_re_signal_a_worker_within_the_stale_window(self):
+        # Both workers covered by a FRESH signal -> the loop raises nothing.
         self._seed_roster_and_activity(time.time())
-        self._seed_recent_report('ada')
-        self._seed_recent_report('ben')
+        self._seed_recent_signal('ada')
+        self._seed_recent_signal('ben')
         with self._force_probability_gate():
             n = serve._peer_review_loop_pass()
-        self.assertEqual(n, 0, 'an all-covered roster must not file another report')
+        self.assertEqual(n, 0, 'an all-covered roster must not raise another signal')
         saved = serve.get_state_from_db()
-        self.assertEqual(len(saved.get('reports') or []), 2)
+        self.assertEqual(len(saved.get('helpSignals') or []), 2)
 
-    def test_a_covered_worker_is_skipped_while_a_fresh_peer_is_flagged(self):
-        # ada already fresh-covered; ben is not -> the pool is ben ONLY
-        # (freshness-filtered, no `or candidates` fallback) and he gets flagged.
+    def test_a_covered_worker_is_skipped_while_a_fresh_peer_is_signaled(self):
+        # ada already fresh-covered; ben is not -> the pool is ben ONLY and he
+        # gets the signal.
         self._seed_roster_and_activity(time.time())
-        self._seed_recent_report('ada')
+        self._seed_recent_signal('ada')
         with self._force_probability_gate():
             serve._peer_review_loop_pass()
         saved = serve.get_state_from_db()
-        reports = saved.get('reports') or []
-        self.assertEqual(len(reports), 2)
-        self.assertEqual(reports[-1]['aboutId'], 'ben',
-                         'the fresh candidate, not the already-covered worker, gets the note')
+        signals = saved.get('helpSignals') or []
+        self.assertEqual(len(signals), 2)
+        self.assertEqual(signals[-1]['aboutId'], 'ben',
+                         'the fresh candidate, not the already-covered worker, gets the signal')
 
-    def test_a_stale_report_allows_a_worker_back_into_the_pool(self):
-        # Both workers' only reports are OLDER than the staleness window, so
-        # both are fresh again and a new note may be filed.
+    def test_a_stale_signal_allows_a_worker_back_into_the_pool(self):
+        # Both workers' only signals are OLDER than the staleness window, so
+        # both are fresh again and a new signal may be raised.
         self._seed_roster_and_activity(time.time())
-        stale_ms = int((time.time() - serve.PEER_REVIEW_REPORT_STALE_S - 60) * 1000)
-        self._seed_recent_report('ada', ts_ms=stale_ms)
-        self._seed_recent_report('ben', ts_ms=stale_ms)
+        stale_ms = int((time.time() - serve.PEER_REVIEW_SIGNAL_STALE_S - 60) * 1000)
+        self._seed_recent_signal('ada', ts_ms=stale_ms)
+        self._seed_recent_signal('ben', ts_ms=stale_ms)
         with self._force_probability_gate():
             serve._peer_review_loop_pass()
         saved = serve.get_state_from_db()
-        self.assertEqual(len(saved.get('reports') or []), 3,
-                         'staleness must let a worker back into the pool for a fresh note')
+        self.assertEqual(len(saved.get('helpSignals') or []), 3,
+                         'staleness must let a worker back into the pool for a fresh signal')
 
-    def test_a_quiet_village_files_no_note_on_a_baseline(self):
+    def test_a_quiet_village_raises_no_signal_on_a_baseline(self):
         # EVIDENCE GATE: a village where NO ONE has done any real work is just
         # idle -- nobody is underperforming (all equally quiet) and nobody is a
-        # standout, so there is nothing legitimate to note. The old behavior
-        # auto-filed "Underperforming" every cadence against this baseline,
-        # which fabricated evidence. No note must be filed.
+        # standout, so there is nothing legitimate to signal. No signal must be
+        # raised.
         state = {
             'agentRoster': [
                 {'id': 'maya', 'name': 'Maya', 'isDirector': True, 'isAdmin': False},
@@ -1044,16 +1061,15 @@ class PeerReviewWorkerPickerTests(unittest.TestCase):
         # NOTE: deliberately NO real action_log rows -- a fully quiet village.
         with self._force_probability_gate():
             n = serve._peer_review_loop_pass()
-        self.assertEqual(n, 0, 'a fully idle village must not auto-file a peer note')
+        self.assertEqual(n, 0, 'a fully idle village must not raise a help signal')
         saved = serve.get_state_from_db()
-        self.assertEqual(len(saved.get('reports') or []), 0)
+        self.assertEqual(saved.get('helpSignals') or [], [])
 
-    def test_a_nominal_village_without_divergence_files_no_note(self):
+    def test_a_nominal_village_without_divergence_raises_no_signal(self):
         # EVIDENCE GATE (target): even when the village is active, a worker at
         # only nominal output (real in [2,4], comparable to peers) is NOT a
-        # note -- "for the record" filing was exactly what the user rejected.
-        # Only a genuine underperformer (<2 while peers demonstrably worked) or
-        # a standout (>=5, the group max) qualifies.
+        # signal. Only a genuine underperformer (<2 while peers demonstrably
+        # worked) or a standout (>=5, the group max) qualifies.
         state = {
             'agentRoster': [
                 {'id': 'maya', 'name': 'Maya', 'isDirector': True, 'isAdmin': False},
@@ -1065,16 +1081,16 @@ class PeerReviewWorkerPickerTests(unittest.TestCase):
         }
         serve.save_state_to_db(state)
         # Both workers at nominal, comparable real work (2 and 3) -- active but
-        # with NO genuine divergence to note.
+        # with NO genuine divergence to signal.
         for _ in range(2):
             serve.log_action('ada', 'task_completed', {}, authorized=True)
         for _ in range(3):
             serve.log_action('ben', 'task_completed', {}, authorized=True)
         with self._force_probability_gate():
             n = serve._peer_review_loop_pass()
-        self.assertEqual(n, 0, 'comparable nominal output is not evidence for a peer note')
+        self.assertEqual(n, 0, 'comparable nominal output is not evidence for a help signal')
         saved = serve.get_state_from_db()
-        self.assertEqual(len(saved.get('reports') or []), 0)
+        self.assertEqual(saved.get('helpSignals') or [], [])
 
 
 if __name__ == '__main__':
