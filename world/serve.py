@@ -7933,6 +7933,9 @@ def _merge_server_owned(existing, incoming):
     # forward verbatim from the server's view.
     owner = (existing.get('sim') or {}).get('owner')
     if owner == 'server':
+        # Ownership cannot be reverted by a browser with a stale sim snapshot.
+        # Otherwise its next autosave can erase the server's roster and teams.
+        merged['sim'] = dict(existing['sim'])
         inc_agents = incoming.get('agents')
         ex_agents = existing.get('agents')
         if isinstance(inc_agents, dict) and isinstance(ex_agents, dict) \
