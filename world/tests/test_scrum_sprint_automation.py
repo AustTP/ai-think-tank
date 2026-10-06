@@ -21,6 +21,19 @@ def state():
 
 
 class ScrumSprintAutomation(unittest.TestCase):
+    def test_assignment_keeps_sprint_and_team_attribution(self):
+        s = state()
+        s['agents']['worker'] = {'id': 'worker', 'x': 1, 'y': 1, 'busy': False}
+        sid = sim._plan_scrum_sprints(s, 1_000_000)[0]
+        pick = s['workQueue'][0]
+        with patch.object(sim, 'find_path', return_value=[{'x': 2, 'y': 2}]), \
+                patch.object(serve, 'log_action'):
+            task = sim._assign_due_item(s, pick, True, {}, {
+                'observatory': {'x': 0, 'y': 0, 'w': 1, 'h': 1}}, 1_000_001, [0])
+        self.assertEqual(task['sprintId'], sid)
+        self.assertEqual(task['teamId'], 'team')
+        self.assertEqual(s['tasks'][task['id']]['sprintId'], sid)
+
     def test_groomed_work_gets_one_staffed_sprint(self):
         s = state()
         created = sim._plan_scrum_sprints(s, 1_000_000)

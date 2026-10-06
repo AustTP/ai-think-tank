@@ -2874,14 +2874,17 @@ def _queue_sprint_results(state, record, now_ms):
     lines = [f"Sprint: {record.get('name')}", f"Goal: {record.get('goal')}",
              'Scrum masters: ' + ', '.join(names.get(a, a) for a in masters), '',
              'Results (closing a sprint does not mean every item succeeded):']
+    if record.get('resultsCorrectedAt'):
+        lines.insert(0, 'Corrected report: the initial email lacked task attribution; actual results follow.')
     for item in items:
         lines.append(f"- {item['title']}: {item['status']} ({item['taskId'] or 'not assigned'})")
         if item['libraryPath']:
             lines.append(f"  Library document: {item['libraryPath']}")
         if item['note']:
             lines.append(f"  {item['note']}")
+    prefix = 'Corrected sprint results' if record.get('resultsCorrectedAt') else 'Sprint results'
     entry = _queue_player_email(state, f"sprint_results:{record['id']}",
-                                f"Sprint results: {record.get('name')}", '\n'.join(lines), now_ms)
+                                f"{prefix}: {record.get('name')}", '\n'.join(lines), now_ms)
     if entry:
         entry.update(sprintId=record['id'], emailOnly=True)
         record['resultsEmail'] = {'status': 'queued', 'queuedAt': now_ms}
@@ -8654,7 +8657,8 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             "analysis or trading plans, and spike for exploratory investigation. "
             "a one-line \"acceptanceCriteria\" when the story has a clear test of done, and a \"sizeEstimate\" of S/M/L. "
             "Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: "
-            '{"items":[{"title":"short title","type":"story|spike","acceptanceCriteria":"one line or omitted","sizeEstimate":"S|M|L"}]}'
+            '{"items":[{"title":"short title","type":"story|spike","taskType":"code|research|spike",'
+            '"acceptanceCriteria":"one line or omitted","sizeEstimate":"S|M|L"}]}'
         )
         data = decider(state, instructions, goal)
         items = []
