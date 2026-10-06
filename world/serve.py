@@ -2770,6 +2770,12 @@ def _safe_design_reference_name(name):
     return cleaned or None
 
 
+# Default lifetime (days) of a folded design taste doc before it must be
+# re-verified. A taste doc is a SLOW-clock shared memory; an expired one is no
+# longer injected as trusted design context (the "recheck before acting" gate).
+_DESIGN_REVIEW_DAYS = 30
+
+
 def _design_project_rel(project, village='main'):
     """Library-relative directory for a design project's inspiration briefs,
     scoped to a VILLAGE so each village keeps its own design vocabulary. The
@@ -7693,7 +7699,7 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/villages', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/villages', '/api/memory-ledger', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews')
 # Gap: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
@@ -10801,10 +10807,20 @@ async def write_wiki_page(request: Request):
     if not actor or not _is_director_or_admin(state, actor):
         return JSONResponse({'error': 'only a director or the admin may write the wiki'}, status_code=403)
     import sim as _sim
+    mfields = _sim.resolve_memory_fields(state, body, actor)
+    village_id = _sim.village_of_agent(state, actor)
     record, is_new = _sim.wiki_write_page(state, page_id, title, category, content, actor,
-                                          village_id=_sim.village_of_agent(state, actor))
+                                          village_id=village_id, owner=mfields['owner'],
+                                          clock=mfields['clock'], scope=mfields['scope'],
+                                          source=mfields['source'],
+                                          review_after_ms=mfields['review_after_ms'])
     if record is None:
         return JSONResponse({'error': 'could not write wiki page'}, status_code=400)
+    _sim.record_memory_provenance(state, actor, page_id, title, content[:2000],
+                                  source=mfields['source'], scope=mfields['scope'],
+                                  clock=mfields['clock'],
+                                  review_after_ms=mfields['review_after_ms'],
+                                  village_id=village_id)
     # Persist the body to disk under library/wiki/<category>/ (inside LIBRARY_DIR).
     cat_dir = os.path.join(LIBRARY_DIR, 'wiki', category)
     os.makedirs(cat_dir, exist_ok=True)
@@ -10941,11 +10957,22 @@ async def approve_wiki_proposal(page_id: str, request: Request):
     if proposal is None:
         return JSONResponse({'error': f'no pending proposal for {page_id} in {category}'}, status_code=404)
     import sim as _sim
+    mfields = _sim.resolve_memory_fields(state, proposal or {}, actor)
+    village_id = _sim.village_of_agent(state, actor)
     record, is_new = _sim.wiki_write_page(state, page_id, proposal.get('title') or page_id,
                                           category, proposal.get('body') or '', actor,
-                                          village_id=_sim.village_of_agent(state, actor))
+                                          village_id=village_id, owner=mfields['owner'],
+                                          clock=mfields['clock'], scope=mfields['scope'],
+                                          source=mfields['source'],
+                                          review_after_ms=mfields['review_after_ms'])
     if record is None:
         return JSONResponse({'error': 'could not write wiki page'}, status_code=400)
+    _sim.record_memory_provenance(state, actor, page_id, proposal.get('title') or page_id,
+                                  (proposal.get('body') or '')[:2000],
+                                  source=mfields['source'], scope=mfields['scope'],
+                                  clock=mfields['clock'],
+                                  review_after_ms=mfields['review_after_ms'],
+                                  village_id=village_id)
     cat_dir = os.path.join(LIBRARY_DIR, 'wiki', category)
     os.makedirs(cat_dir, exist_ok=True)
     _write_file(os.path.join(cat_dir, f'{page_id}.md'), proposal.get('body') or '')
@@ -11040,6 +11067,9 @@ def _write_wiki_server(page_id, title, category, content):
         categories['think_tank'] = {'label': 'Think Tank', 'order': 0}
     record, _is_new = _sim.wiki_write_page(state, page_id, title, category,
                                            content, 'distill')
+    _sim.record_memory_provenance(state, 'distill', page_id, title, content[:2000],
+                                  source=None, scope='team', clock=_sim.SLOW_CLOCK,
+                                  review_after_ms=None, village_id=_sim.DEFAULT_VILLAGE)
     if record is None:
         return None
     cat_dir = os.path.join(LIBRARY_DIR, 'wiki', category)
@@ -12417,6 +12447,19 @@ async def ingest_library(request: Request):
     return JSONResponse({'ok': True, 'results': results, 'okCount': ok_count, 'totalCount': len(results)})
 
 
+@app.get('/api/memory-ledger')
+async def memory_ledger(request: Request):
+    """Read-only audit trail of shared-memory writes (wiki pages + taste folds):
+    what the team learned, where, who owns it, its clock, and when to recheck.
+    This is the provenance ledger that makes a stale or wrong memory findable
+    and correctable (claim / source / owner / scope / review date)."""
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    entries = list(reversed(state.get('memoryLedger') or []))
+    return JSONResponse({'ledger': entries})
+
+
 @app.get('/api/villages')
 async def list_villages(request: Request):
     """Read-only village listing. Shows the registry + which agents belong to
@@ -12607,11 +12650,16 @@ async def design_reference_url(request: Request):
     return JSONResponse({'ok': True, 'url': url, 'briefPath': brief_rel, 'text': header + brief['brief']})
 
 
-def _fold_design_taste(briefs, project):
+def _fold_design_taste(briefs, project, owner='player', review_after_days=None,
+                       village='main'):
     """Fold a project's raw design briefs into ONE distilled taste doc, the
     single source of truth agents load before design work. Uses the mid tier
     (a text-synthesis fold, not a vision read -- each brief is already a
-    structured text report). Returns (taste_text, error)."""
+    structured text report). Returns (taste_text, error).
+
+    Memory-engineering: the taste doc is a SLOW-clock shared memory. Its header
+    records owner + reviewAfterDays (the player who owns the taste, and when it
+    must be re-verified) so the read path can skip an expired taste doc."""
     if not briefs:
         return None, 'no design briefs in this project yet'
     items = []
@@ -12648,8 +12696,17 @@ def _fold_design_taste(briefs, project):
         return None, f'design taste fold failed: {e}'
     if not reply.strip():
         return None, 'design taste fold returned no reply'
+    try:
+        days = max(0, int(review_after_days)) if review_after_days is not None else _DESIGN_REVIEW_DAYS
+    except (TypeError, ValueError):
+        days = _DESIGN_REVIEW_DAYS
+    review_after = (datetime.datetime.now(datetime.timezone.utc)
+                    + datetime.timedelta(days=days)).strftime('%Y-%m-%d')
     header = (f'# Design taste: {project}\n\n'
               f'- Folded from {len(items)} design briefs\n'
+              f'- Owner: {owner}\n'
+              f'- Village: {village}\n'
+              f'- Review after: {review_after}\n'
               f'- Generated: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n\n')
     return header + reply.strip()[:12000], None
 
@@ -12668,7 +12725,10 @@ async def design_reference_taste(request: Request):
     briefs = _list_design_briefs(body.get('project'), village=body.get('village') or 'main')
     if not briefs:
         return JSONResponse({'error': 'no design briefs in this project yet -- upload inspiration first'}, status_code=400)
-    taste, error = _fold_design_taste(briefs, body.get('project'))
+    taste, error = _fold_design_taste(briefs, body.get('project'),
+                                      owner=body.get('owner') or 'player',
+                                      review_after_days=body.get('reviewAfterDays'),
+                                      village=body.get('village') or 'main')
     if error:
         return JSONResponse({'error': error}, status_code=502)
     taste_rel = os.path.join(project, 'taste.md')
@@ -12702,13 +12762,28 @@ def _design_context_for_project(project, village='main'):
                 taste = f.read(20000)
         except Exception:
             taste = ''
-        if taste.strip():
+        if taste.strip() and not _taste_is_expired(taste):
             lines.append(f'The design taste for this project (READ THIS FIRST):\n{taste.strip()}')
     briefs = _list_design_briefs(project, village=village)
     if briefs:
         lines.append('Raw inspiration briefs in the project library (read the relevant ones): '
                      + ', '.join(f'{b}' for b in briefs))
     return '\n\n'.join(lines)
+
+
+def _taste_is_expired(taste):
+    """True when a taste doc's 'Review after: YYYY-MM-DD' header has passed --
+    the taste is a SLOW-clock memory that must be re-verified, not trusted
+    forever. Missing/unparseable review date is treated as not expired (never
+    silently drop a valid doc on a format change)."""
+    m = re.search(r'Review after:\s*(\d{4})-(\d{2})-(\d{2})', taste)
+    if not m:
+        return False
+    try:
+        review = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return False
+    return review < datetime.date.today()
 
 
 @app.post('/api/chat')
