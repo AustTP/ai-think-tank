@@ -55,7 +55,7 @@ def _get_or_create_server_secret():
     if env.get('SERVER_SECRET'):
         return env['SERVER_SECRET']
     key = secrets.token_hex(32)
-    with open(os.path.join(_serve.THINK_TANK_DIR, '.env'), 'a') as f:
+    with open(os.path.join(_serve.THINK_TANK_DIR, '.env'), 'a', encoding='utf-8') as f:
         f.write(f'\nSERVER_SECRET={key}\n')
     return key
 
@@ -74,7 +74,7 @@ def _get_or_create_admin_credentials():
         return username, env['ADMIN_PASSWORD_SALT'], env['ADMIN_PASSWORD_HASH'], None
     password = secrets.token_urlsafe(12)
     salt, digest = _hash_password(password)
-    with open(os.path.join(_serve.THINK_TANK_DIR, '.env'), 'a') as f:
+    with open(os.path.join(_serve.THINK_TANK_DIR, '.env'), 'a', encoding='utf-8') as f:
         f.write(f'\nADMIN_USERNAME={username}\nADMIN_PASSWORD_SALT={salt}\nADMIN_PASSWORD_HASH={digest}\n')
     return username, salt, digest, password
 
@@ -95,7 +95,7 @@ def _get_or_create_device_key():
     if key:
         return key, None
     key = secrets.token_urlsafe(24)
-    with open(os.path.join(_serve.THINK_TANK_DIR, '.env'), 'a') as f:
+    with open(os.path.join(_serve.THINK_TANK_DIR, '.env'), 'a', encoding='utf-8') as f:
         f.write(f'\nDEVICE_API_KEY={key}\n')
     return key, key  # second value set only when freshly generated -- print it once
 
