@@ -112,6 +112,7 @@ from bank import (  # noqa: E402,F401
     _task_budget_exhausted,
     _task_budget_spent,
     _think_tank_spend_cap_exceeded,
+    _village_spend_view,
 )
 from notify import (  # noqa: E402,F401
     GMAIL_SMTP,
@@ -4182,7 +4183,8 @@ def _ttc_majority_json(samples):
     return best if counts[best] >= 2 else None
 
 
-def _ttc_self_verify(model, messages, best_of, max_tokens, drafts=None, service=None):
+def _ttc_self_verify(model, messages, best_of, max_tokens, drafts=None, service=None,
+                     village_id=None):
     """Self-verification pass for open-ended (non-JSON) prompts: take best-of-N
     drafts of the SAME request and ask the SAME cheap model to pick the best
     one and return it VERBATIM (best-of-N with a judge -- often measurably
@@ -4201,7 +4203,7 @@ def _ttc_self_verify(model, messages, best_of, max_tokens, drafts=None, service=
             if service:
                 cost = (r.get('usage') or {}).get('cost', 0.0)
                 if isinstance(cost, (int, float)) and cost:
-                    _accrue_spend(service, cost)
+                    _accrue_spend(service, cost, village_id=village_id)
     drafts = [d for d in drafts if d]
     if not drafts:
         return ''
@@ -4220,7 +4222,7 @@ def _ttc_self_verify(model, messages, best_of, max_tokens, drafts=None, service=
     if service:
         cost = (r.get('usage') or {}).get('cost', 0.0)
         if isinstance(cost, (int, float)) and cost:
-            _accrue_spend(service, cost)
+            _accrue_spend(service, cost, village_id=village_id)
     chosen = (r.get('choices') or [{}])[0].get('message', {}).get('content') or ''
     return chosen if chosen else drafts[0]
 
@@ -5377,7 +5379,7 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
 
 def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3, max_tokens=None,
                           service='__player_ask__', force_first_tool=False, return_transcript=False,
-                          task_id=None):
+                          task_id=None, village_id=None):
     """Agentic tool-calling loop for /api/intent/ask. Sends `messages` with
     `tools`; while the model replies with tool_calls, executes each via
     `execute_tool(name, args)`, appends the results back as `role:tool`
@@ -5432,7 +5434,7 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
                            if isinstance(force_first_tool, str) else 'required')
         data = _post_openrouter_raw(model, current_messages, tools=tools, max_tokens=max_tokens,
                                     tool_choice=tool_choice)
-        _accrue_spend(service, ((data or {}).get('usage') or {}).get('cost', 0.0))
+        _accrue_spend(service, ((data or {}).get('usage') or {}).get('cost', 0.0), village_id=village_id)
         if task_id and isinstance(((data or {}).get('usage') or {}).get('cost'), (int, float)):
             task_cost = ((data or {}).get('usage') or {}).get('cost', 0.0)
             if task_cost:
@@ -5808,7 +5810,7 @@ def _decision_request(model, state, questions):
     )
 
 
-def _finalize_decision(data, prompt, criteria, trace_id, model):
+def _finalize_decision(data, prompt, criteria, trace_id, model, village_id=None):
     choice, confidence, cost = _jev_choice(data)
     # Gap: every OTHER real model call accrues
     # into the spend ledger at its own chokepoint, but Jev's cost was only
@@ -5816,7 +5818,7 @@ def _finalize_decision(data, prompt, criteria, trace_id, model):
     # spend cap reading the ledger alone would undercount real spend by every
     # Jev decision ever made. One dedicated bucket for the whole decisions
     # model class, whichever slug in the failover chain answered.
-    _accrue_spend('__jev__', cost)
+    _accrue_spend('__jev__', cost, village_id=village_id)
     _append_decision_tape(
         _decision_kind(prompt), model, prompt, criteria,
         choice, confidence, cost, data, True,
@@ -5826,7 +5828,7 @@ def _finalize_decision(data, prompt, criteria, trace_id, model):
     return data
 
 
-def _call_openrouter_decision_sync(model, state, questions):
+def _call_openrouter_decision_sync(model, state, questions, village_id=None):
     # Jev (TypeSafe's System One decision model) via OpenRouter -- a
     # genuinely different endpoint from chat completions, confirmed only
     # after two wrong assumptions first (see memory/DESIGN.md): the
@@ -5902,7 +5904,7 @@ def _call_openrouter_decision_sync(model, state, questions):
             continue
         if armed:
             record_model_result(slug, True)
-        return _finalize_decision(data, prompt, criteria, trace_id, slug)
+        return _finalize_decision(data, prompt, criteria, trace_id, slug, village_id=village_id)
     # All candidates failed (or were already open). Tape the failure -- an ok=0
     # row marks the decision as having been attempted and lost, so a gap in the
     # tape is distinguishable from a decision that never happened. Then re-raise;
@@ -9249,6 +9251,21 @@ def _agent_record_for(state, agent_id):
     return (state.get('agents') or {}).get(agent_id) or {}
 
 
+def _sim_village_for_agent(agent_id):
+    """Resolve an agent's village from the live DB state, for spend
+    attribution. Best-effort: an unknown agent or a state read failure falls
+    back to the default village so a ledger hiccup never throws in the money
+    path."""
+    import sim as _sim
+    try:
+        state = get_state_from_db()
+        if state:
+            return _sim.village_of_agent(state, agent_id)
+    except Exception:
+        return _sim.DEFAULT_VILLAGE
+    return _sim.DEFAULT_VILLAGE
+
+
 def _clarify_in_character_messages(agent, kb_matches, product_name, question):
     """The in-character prompt for the on-call answering a player's clarify, in
     the same voice as index.html's requestAgentReply. KB matches are injected as
@@ -9344,7 +9361,8 @@ async def intent_clarify(request: Request):
         # per question) but was never accrued -- the cap and the Bank were
         # undercounting every clarify answer. Dedicated bucket so its cost is
         # visible separately from the ask lane.
-        _accrue_spend('__clarify__', ((data or {}).get('usage') or {}).get('cost', 0.0))
+        _accrue_spend('__clarify__', ((data or {}).get('usage') or {}).get('cost', 0.0),
+                      village_id=_sim_village_for_agent(on_call))
         reply = (data['choices'][0]['message']['content'] or '').strip()
     except Exception as e:
         if escalated_to:
@@ -9721,7 +9739,8 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
             reply = await asyncio.to_thread(
                 _call_agent_tool_loop, model, messages, tools,
                 execute_tool, 50, int(max_tokens),
-                force_first_tool=ask_force_first_tool)
+                force_first_tool=ask_force_first_tool,
+                village_id=_sim_village_for_agent(pick))
         else:
             reply = None
     except Exception as e:
@@ -12472,15 +12491,18 @@ async def list_villages(request: Request):
     villages = _sim.ensure_villages(state)
     agents = state.get('agents') or {}
     roster = {d.get('id'): d.get('name', '') for d in (state.get('agentRoster') or [])}
+    village_spend = _village_spend_view()
     out = []
     for v in villages:
+        vid = v.get('id')
         out.append({
-            'id': v.get('id'),
+            'id': vid,
             'name': v.get('name'),
             'members': sorted(aid for aid, a in agents.items()
-                              if (a.get('villageId') or _sim.DEFAULT_VILLAGE) == v.get('id')),
+                              if (a.get('villageId') or _sim.DEFAULT_VILLAGE) == vid),
             'memberNames': {aid: roster.get(aid, aid) for aid in agents
-                            if (agents[aid].get('villageId') or _sim.DEFAULT_VILLAGE) == v.get('id')},
+                            if (agents[aid].get('villageId') or _sim.DEFAULT_VILLAGE) == vid},
+            'spend': village_spend.get(vid, {'used': 0.0, 'calls': 0}),
         })
     return JSONResponse({'villages': out})
 
@@ -12923,7 +12945,8 @@ async def chat(request: Request):
                 reply = winner
             else:
                 reply = _ttc_self_verify(model, messages, best_n, max_tokens,
-                                         drafts=drafts, service=service)
+                                         drafts=drafts, service=service,
+                                         village_id=_sim_village_for_agent(agent_id))
             usage_cost = total_cost
         else:
             reply = data['choices'][0]['message']['content']
@@ -12931,7 +12954,8 @@ async def chat(request: Request):
                 print(f'[chat-debug] empty reply for model={model} raw={json.dumps(data)[:2000]}', flush=True)
             usage_cost = (data.get('usage') or {}).get('cost', 0.0)
         if isinstance(usage_cost, (int, float)) and usage_cost:
-            _accrue_spend(service, usage_cost)
+            village_id = _sim_village_for_agent(agent_id)
+            _accrue_spend(service, usage_cost, village_id=village_id)
             # Item 4 per-task accrual: count this call against the task's own
             # ledger bucket so _task_budget_exhausted sees live spend. Only
             # calls that passed the gate (or carry no taskId) reach here.
@@ -15938,7 +15962,7 @@ async def decide(request: Request):
     try:
         data = await asyncio.to_thread(_call_openrouter_decision_sync, model, state, questions)
         _choice, confidence, cost = _jev_choice(data)
-        _accrue_spend('__jev__', cost)
+        _accrue_spend('__jev__', cost, village_id=_sim_village_for_agent(agent_id))
         log_action(agent_id, 'decide', {'model': model, 'confidence': confidence, 'cost': cost, 'choice': _choice})
         return JSONResponse(data)
     except urllib.error.HTTPError as e:

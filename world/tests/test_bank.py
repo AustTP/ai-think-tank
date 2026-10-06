@@ -124,6 +124,33 @@ class Ledger(unittest.TestCase):
         serve._accrue_spend('gamma', 0.0)
         self.assertEqual(serve._spend_ledger_read(), {})
 
+    def test_village_dimension_rolls_up_per_village(self):
+        self._leak()
+        serve._accrue_spend('alpha', 1.25, village_id='main')
+        serve._accrue_spend('alpha', 0.75, village_id='main')
+        serve._accrue_spend('beta', 5.0, village_id='colony-b')
+        view = serve._village_spend_view()
+        self.assertAlmostEqual(view['main']['used'], 2.0)
+        self.assertEqual(view['main']['calls'], 2)
+        self.assertAlmostEqual(view['colony-b']['used'], 5.0)
+
+    def test_village_dimension_does_not_double_count_service_used(self):
+        self._leak()
+        serve._accrue_spend('alpha', 1.0, village_id='main')
+        ledger = serve._spend_ledger_read()
+        # The service bucket (what the shared cap sums) is untouched by the
+        # rollup; the village rollup is a separate, parallel key.
+        self.assertAlmostEqual(ledger['alpha']['used'], 1.0)
+        self.assertAlmostEqual(ledger['__village__/main']['used'], 1.0)
+        self.assertAlmostEqual(serve._village_spend_view()['main']['used'], 1.0)
+
+    def test_village_dimension_excluded_from_shared_cap_total(self):
+        self._leak()
+        serve._accrue_spend('__village__/main', 999.0)
+        with unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 100.0):
+            self.assertFalse(serve._think_tank_spend_cap_exceeded())
+        self.assertAlmostEqual(serve._village_spend_view()['main']['used'], 999.0)
+
     def test_byday_series_drives_forecast(self):
         self._leak()
         serve._accrue_spend('alpha', 3.5)  # single today call
