@@ -2032,7 +2032,8 @@ async function renderSprints() {
     const p = (s && s.progress) || { total: 0, done: 0, queued: 0, inProgress: 0, pct: 0 };
     const badge = rec.status === 'closed' ? ' <span style="opacity:0.5;">(closed)</span>'
       : ` <span style="color:${p.pct === 100 ? '#6f6' : '#ffb84d'};">${p.done}/${p.total}</span>`;
-    const prog = p.total ? `${p.done} done, ${p.inProgress} in progress, ${p.queued} queued (${p.pct}%)` : 'no items';
+    const issues = `${p.failed ? `, ${p.failed} failed` : ''}${p.stopped ? `, ${p.stopped} stopped` : ''}${p.blocked ? `, ${p.blocked} blocked` : ''}`;
+    const prog = p.total ? `${p.done} done, ${p.inProgress} in progress, ${p.queued} queued${issues} (${p.pct}%)` : 'no items';
     const scrum = rec.teamIds && rec.teamIds.length
       ? ` &middot; teams: ${rec.teamIds.join(', ')}` : '';
     // Phase E3.5: the "what landed" digest -- done items, in sprint order.
@@ -2041,7 +2042,8 @@ async function renderSprints() {
     const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const landed = Array.isArray(p.landed) && p.landed.length
       ? `<div style="margin:1px 0 0;opacity:0.75;"><span style="font-size:11px;">Landed:</span> ${p.landed.map(t => `<span style="font-size:11px;">&bull; ${esc(t)}</span>`).join(' ')}</div>` : '';
-    return `<div style="margin:2px 0;"><strong>${rec.name || sid}</strong>${badge} &mdash; <span style="opacity:0.8;">${prog}${scrum}</span><br><span style="opacity:0.6; font-size:11px;">${rec.goal || ''}</span>${landed}</div>`;
+    const email = rec.resultsEmail ? `<div style="font-size:11px;opacity:0.75;">Results email: ${esc(rec.resultsEmail.status)}</div>` : '';
+    return `<div style="margin:2px 0;"><strong>${rec.name || sid}</strong>${badge} &mdash; <span style="opacity:0.8;">${prog}${scrum}</span><br><span style="opacity:0.6; font-size:11px;">${rec.goal || ''}</span>${landed}${email}</div>`;
   }).join('<hr style="opacity:0.2; margin:4px 0;">'));
 }
 

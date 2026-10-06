@@ -99,7 +99,8 @@ class SprintHelpers(unittest.TestCase):
         }
         p = sim.sprint_progress(state, 'spr-1')
         self.assertEqual(p, {'total': 3, 'queued': 1, 'inProgress': 1,
-                             'done': 1, 'pct': 33, 'landed': ['fin']})
+                             'done': 1, 'pct': 33, 'landed': ['fin'],
+                             'failed': 0, 'stopped': 0, 'blocked': 0})
 
     def test_sprint_progress_landed_in_item_order(self):
         # The "what landed" digest: done titles, in sprint-item order (not task

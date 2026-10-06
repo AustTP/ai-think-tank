@@ -1223,6 +1223,7 @@ def _drain_emails_from_db():
     state = serve.get_state_from_db()
     if not state:
         return []
+    original_outbox = list(state.get('emailOutbox') or [])
     results = []
     try:
         results = _drain_email_outbox_sync(state)
@@ -1231,7 +1232,18 @@ def _drain_emails_from_db():
         return []
     if results:
         try:
-            serve.save_state_to_db(state)
+            # SMTP runs on a separate thread. Merge its delivery receipts into
+            # the latest state so a slow send cannot undo intervening task ticks.
+            fresh = serve.get_state_from_db()
+            if fresh:
+                drained = {(e.get('kind'), e.get('queuedAt')) for e in original_outbox}
+                fresh['emailOutbox'] = [e for e in fresh.get('emailOutbox', [])
+                                        if (e.get('kind'), e.get('queuedAt')) not in drained]
+                fresh['emailOutbox'].extend(state.get('emailOutbox') or [])
+                for sid, record in (state.get('sprints') or {}).items():
+                    if sid in (fresh.get('sprints') or {}) and record.get('resultsEmail'):
+                        fresh['sprints'][sid]['resultsEmail'] = record['resultsEmail']
+                serve.save_state_to_db(fresh)
         except Exception as e:  # pragma: no cover
             print(f'[sim] email drain save failed: {e}')
     return results
@@ -2737,12 +2749,14 @@ def sprint_progress(state, sprint_id):
     if not record:
         return None
     items = record.get('items') or []  # list of (title, room) tuples
-    open_tasks = state.get('tasks') or {}
+    open_tasks = {tid: t for tid, t in (state.get('tasks') or {}).items()
+                  if not t.get('sprintId') or t.get('sprintId') == sprint_id}
     # Bot Ops / shadow mode: shadow (dry-run) work must not count toward a
     # sprint -- it ships nothing. Exclude shadow queue items from the still-queued
     # set and shadow tasks from the done/in-progress match.
     still_queued = set(_sprint_item_id(it) for it in (state.get('workQueue') or [])
-                       if not it.get('shadow'))
+                       if not it.get('shadow') and
+                       (not it.get('sprintId') or it.get('sprintId') == sprint_id))
     # Bot Ops / shadow mode: a purely-shadow (dry-run) item must not count toward
     # the sprint at all -- not queued, not in-progress, not done. Track which item
     # ids have ONLY a shadow representation so the fallback below can skip them.
@@ -2751,7 +2765,7 @@ def sprint_progress(state, sprint_id):
     for t in (state.get('tasks') or {}).values():
         if t.get('shadow'):
             shadow_ids.add((t.get('title') or '', t.get('room') or ''))
-    done = in_progress = queued = 0
+    done = in_progress = queued = failed = stopped = blocked = 0
     landed = []
     for pair in items:
         # After a save/load round-trip tuples arrive as JSON lists -- normalize
@@ -2766,6 +2780,7 @@ def sprint_progress(state, sprint_id):
             queued += 1
             continue
         matched_done = matched_active = False
+        terminal_status = None
         for t in open_tasks.values():
             if t.get('title') != title or t.get('room') != room:
                 continue
@@ -2773,13 +2788,21 @@ def sprint_progress(state, sprint_id):
                 continue
             if t.get('status') == 'done':
                 matched_done = True
-            elif t.get('status') in ('walking', 'working'):
+            elif t.get('status') in ('walking', 'working', 'needs_review'):
                 matched_active = True
+            elif t.get('status') in ('failed', 'cancelled', 'abandoned', 'blocked'):
+                terminal_status = t.get('status')
         if matched_done:
             done += 1
             landed.append(title)
         elif matched_active:
             in_progress += 1
+        elif terminal_status == 'failed':
+            failed += 1
+        elif terminal_status in ('cancelled', 'abandoned'):
+            stopped += 1
+        elif terminal_status == 'blocked':
+            blocked += 1
         elif ident in shadow_ids:
             # The only representation of this item is shadow (dry-run) work --
             # it ships nothing, so it is invisible to the sprint.
@@ -2789,7 +2812,8 @@ def sprint_progress(state, sprint_id):
     total = len(items)
     pct = round((done / total) * 100) if total else 0
     return {'total': total, 'queued': queued, 'inProgress': in_progress,
-            'done': done, 'pct': pct, 'landed': landed}
+            'done': done, 'pct': pct, 'landed': landed,
+            'failed': failed, 'stopped': stopped, 'blocked': blocked}
 
 
 # The sprint-close velocity signal is a trailing per-team history: how much of
@@ -2824,7 +2848,83 @@ def close_sprint(state, sprint_id, now_ms=None):
         record['closedAt'] = now_ms
         _record_sprint_velocity(state, record, now_ms)
     record['status'] = 'closed'
+    _queue_sprint_results(state, record, now_ms)
     return record
+
+
+def _queue_sprint_results(state, record, now_ms):
+    """Snapshot actual outcomes and queue one email from the sprint facilitator."""
+    if record.get('resultsEmail'):
+        return
+    teams = [_team_row(state, tid) for tid in record.get('teamIds', [])]
+    masters = [t.get('scrumMasterId') for t in teams if t and t.get('scrumMasterId')]
+    if not masters:
+        return
+    items = []
+    tasks = state.get('tasks') or {}
+    for title, room in record.get('items', []):
+        matches = [t for t in tasks.values() if t.get('sprintId') == record['id']
+                   and t.get('title') == title]
+        latest = max(matches, key=lambda t: t.get('createdAt') or 0) if matches else {}
+        items.append({'title': title, 'status': latest.get('status') or 'queued',
+                      'taskId': latest.get('id'), 'libraryPath': latest.get('libraryPath'),
+                      'note': (latest.get('note') or '')[:1500]})
+    record['results'] = {'reportedBy': masters, 'items': items, 'createdAt': now_ms}
+    names = {d['id']: d.get('name') or d['id'] for d in state.get('agentRoster', [])}
+    lines = [f"Sprint: {record.get('name')}", f"Goal: {record.get('goal')}",
+             'Scrum masters: ' + ', '.join(names.get(a, a) for a in masters), '',
+             'Results (closing a sprint does not mean every item succeeded):']
+    for item in items:
+        lines.append(f"- {item['title']}: {item['status']} ({item['taskId'] or 'not assigned'})")
+        if item['libraryPath']:
+            lines.append(f"  Library document: {item['libraryPath']}")
+        if item['note']:
+            lines.append(f"  {item['note']}")
+    entry = _queue_player_email(state, f"sprint_results:{record['id']}",
+                                f"Sprint results: {record.get('name')}", '\n'.join(lines), now_ms)
+    if entry:
+        entry.update(sprintId=record['id'], emailOnly=True)
+        record['resultsEmail'] = {'status': 'queued', 'queuedAt': now_ms}
+
+
+def _plan_scrum_sprints(state, now_ms):
+    """Group groomed, team-owned queued work into staffed sprint records."""
+    created = []
+    for team in state.get('teams') or []:
+        tid = team.get('id') or team.get('directorId')
+        if not team.get('autoSprints') or not team.get('scrumMasterId'):
+            continue
+        delivery = _team_row(state, team.get('sprintDeliveryTeamId') or tid)
+        if not delivery or not delivery.get('scrumMasterId'):
+            continue
+        team_ids = list(dict.fromkeys([tid, delivery.get('id') or tid]))
+        if any(_team_in_active_sprint(state, t) for t in team_ids):
+            continue
+        master_ids = {t.get('scrumMasterId') for t in (state.get('teams') or [])}
+        workers = [d for d in state.get('agentRoster', [])
+                   if d.get('director') == delivery.get('directorId')
+                   and d.get('id') not in master_ids and not d.get('isAdmin')]
+        if not workers:
+            continue
+        pending = [it for it in state.get('workQueue') or []
+                   if it.get('teamId') == tid and not it.get('sprintId') and not it.get('shadow')
+                   and not it.get('reviewOf')]
+        if not pending:
+            continue
+        items = [dict(it, room=it.get('room') or _resolve_assignment_room(it)) for it in pending]
+        state['workQueue'] = [it for it in state.get('workQueue') or [] if it not in pending]
+        sid = next_sprint_id(state)
+        goal = items[0].get('goal') or items[0]['title']
+        record = queue_sprint(state, sid, f"{team.get('name') or tid}: {goal[:80]}", goal,
+                              team.get('directorId'), items, VALUED_QUEUE_ROOMS,
+                              now_ms=now_ms, team_ids=team_ids, worker_count=min(2, len(workers)))
+        if record:
+            record['plannedBy'] = team['scrumMasterId']
+            record['source'] = 'scrum_planning'
+            created.append(sid)
+        else:
+            state['workQueue'].extend(pending)
+    return created
 
 
 def _sprint_item_estimate(state, sprint_id, title, room):
@@ -2972,10 +3072,13 @@ def _auto_close_completed_sprints(state, now_ms=None):
         if record.get('status') != 'active':
             continue
         progress = sprint_progress(state, sid)
-        if progress and progress.get('total') and progress['done'] >= progress['total']:
+        terminal_count = sum((progress or {}).get(k, 0) for k in ('done', 'failed', 'stopped'))
+        if progress and progress.get('total') and terminal_count >= progress['total']:
             close_sprint(state, sid, now_ms)
             record['closedAt'] = now_ms
             record['autoClosed'] = True
+            record['outcome'] = ('completed' if progress['done'] == progress['total']
+                                 else 'finished_with_failures')
             closed.append(sid)
             # WS-14 sprint-close ceremony: retrospective + shared-backlog pull +
             # refinement kick happen the moment the sprint fully lands.
@@ -3549,8 +3652,10 @@ def _eligible_candidates(state, include_off_duty):
     roster = state.get('agentRoster') or []
     agents = state.get('agents') or {}
     out = []
+    facilitators = {t.get('scrumMasterId') for t in (state.get('teams') or [])
+                    if t.get('autoSprints')}
     for d in roster:
-        if d.get('isAdmin'):
+        if d.get('isAdmin') or d.get('id') in facilitators:
             continue
         a = agents.get(d.get('id'))
         if not a or a.get('busy') or a.get('task') or a.get('pairWith'):
@@ -3656,6 +3761,8 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'instructions': instructions,
         'projectLabel': project_label,
         'research': (extra or {}).get('research'),
+        'sprintId': (extra or {}).get('sprintId'),
+        'teamId': (extra or {}).get('teamId'),
         'taskType': (extra or {}).get('taskType', 'code'),
         'skillReview': bool((extra or {}).get('skillReview')),
         'distill': bool((extra or {}).get('distill')),
@@ -7132,6 +7239,7 @@ def _drain_email_outbox_sync(state):
     if not outbox:
         return []
     results = []
+    retained = []
     try:
         from serve import send_player_email_sync, send_player_telegram_sync
     except Exception as e:  # pragma: no cover - import failure only
@@ -7139,18 +7247,35 @@ def _drain_email_outbox_sync(state):
         state['emailOutbox'] = []
         return [('import', False, False)]
     for entry in list(outbox):
+        if entry.get('nextAttemptAt', 0) > int(time.time() * 1000):
+            retained.append(entry)
+            continue
         try:
             email_ok = send_player_email_sync(entry.get('subject'), entry.get('body'))
         except Exception as e:  # pragma: no cover
             email_ok = False
             print(f'[email] send raised: {e}')
         try:
-            telegram_ok = send_player_telegram_sync(entry.get('subject'), entry.get('body'))
+            telegram_ok = (False if entry.get('emailOnly') else
+                           send_player_telegram_sync(entry.get('subject'), entry.get('body')))
         except Exception as e:  # pragma: no cover
             telegram_ok = False
             print(f'[telegram] player push raised: {e}')
         results.append((entry.get('kind'), bool(email_ok), bool(telegram_ok)))
-    state['emailOutbox'] = []
+        sid = entry.get('sprintId')
+        record = (state.get('sprints') or {}).get(sid)
+        if record:
+            attempts = int(entry.get('attempts') or 0) + 1
+            now_ms = int(time.time() * 1000)
+            record['resultsEmail'] = {'status': 'sent' if email_ok else 'failed',
+                                      'attempts': attempts, 'attemptedAt': now_ms}
+            if email_ok:
+                record['resultsEmail']['sentAt'] = now_ms
+            elif attempts < 3:
+                entry.update(attempts=attempts, nextAttemptAt=now_ms + 60_000)
+                retained.append(entry)
+                record['resultsEmail']['status'] = 'retrying'
+    state['emailOutbox'] = retained
     return results
 
 
@@ -7967,6 +8092,14 @@ def _ceremony_facilitator(state, team_id):
             groomer = req['groomerId']
             return groomer if _free(groomer) else None
     sm = _refinement_scrum_master_for_team(state, team_id)
+    team = teams.get(team_id) or {}
+    if sm and team.get('autoSprints'):
+        a = agents.get(sm) or {}
+        needs_grooming = any((_refinement_team(state, r) or {}).get('id') == team_id
+                             for r in _pending_work_requests(state))
+        if needs_grooming and not a.get('busy') and not a.get('task') and a.get('offDuty'):
+            a['offDuty'] = False
+            a['visible'] = True
     if sm and _free(sm):
         return sm
     did = (teams.get(team_id) or {}).get('directorId')
@@ -8517,6 +8650,8 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             "Do NOT assign a room to a card -- the buildings are shared and the agent who picks the work up figures out "
             "where it needs to happen. Keep every title to ONE short sentence. For each card set \"type\" to "
             "\"story\" (deliverable work) or \"spike\" (an investigation with no committed deliverable), "
+            "and set taskType to code ONLY for software implementation; use research for documents, "
+            "analysis or trading plans, and spike for exploratory investigation. "
             "a one-line \"acceptanceCriteria\" when the story has a clear test of done, and a \"sizeEstimate\" of S/M/L. "
             "Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: "
             '{"items":[{"title":"short title","type":"story|spike","acceptanceCriteria":"one line or omitted","sizeEstimate":"S|M|L"}]}'
@@ -8533,6 +8668,8 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
         for s in items:
             title = (s.get('title') or '').strip()[:120]
             task_type = 'spike' if (s.get('type') or 'story').strip().lower() == 'spike' else 'code'
+            if task_type != 'spike' and s.get('taskType') == 'research':
+                task_type = 'research'
             ac = (s.get('acceptanceCriteria') or '').strip()
             instructions_text = (f"Filed by {req.get('filedBy')} during a large-request breakdown by "
                                  f"{sm_name}. Requested goal: {goal[:200]}")
@@ -8541,6 +8678,7 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             queue_work(state, [{
                 'title': title, 'goal': goal[:200], 'instructions': instructions_text,
                 'teamId': req.get('teamId'), 'taskType': task_type,
+                'room': 'observatory' if task_type == 'research' else None,
                 # The decider was told to size each story S/M/L (see the
                 # breakdown prompt); carry it so the queued item + task keep the
                 # estimate and same-priority work is ordered largest-first.
@@ -10331,6 +10469,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # pending or no scrum master to run it, and defers a team in an active
     # sprint until it's free.
     _breakdown_step(state, now, now_ms)
+    _plan_scrum_sprints(state, now_ms)
 
     # WS-14: sprint retrospectives -- a just-closed sprint's team meets to capture
     # START / STOP / CONTINUE (director excluded) on a later pass. Runs ungated
@@ -10868,6 +11007,8 @@ def _sprint_worker_pool(state, sprint_id, worker_count=None):
     # never the dedicated facilitator -- she runs ceremonies, not cards. A
     # sprint at/above the floor counts the scrum master as a working member.
     excluded = set()
+    excluded.update(t.get('scrumMasterId') for t in (state.get('teams') or [])
+                    if t.get('autoSprints') and t.get('scrumMasterId'))
     if worker_count < SCRUM_MASTER_MIN_TEAM_SIZE:
         for d in directors:
             t = next((x for x in (state.get('teams') or []) if x.get('directorId') == d), None)
@@ -11089,6 +11230,8 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         appear_from_outskirts(state, chosen_id, doors)
     extra = {
         'research': pick.get('research'),
+        'sprintId': pick.get('sprintId'),
+        'teamId': pick.get('teamId'),
         'taskType': pick.get('taskType'),
         'skillReview': pick.get('skillReview'),
         # CS329A takeaway #2: thread the review checklist through
