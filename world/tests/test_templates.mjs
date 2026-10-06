@@ -302,12 +302,31 @@ await test('renderTemplatesEditor shows the empty state when no templates exist'
   assert.ok(body.innerHTML.includes('No templates yet'), body.innerHTML);
 });
 
-await test('renderTemplatesEditor shows an error on a failed fetch', async () => {
+await test('renderTemplatesEditor preserves existing content on a failed refresh', async () => {
   setRoster(FULL_ROSTER);
   context.apiFetch = async () => { throw new Error('network'); };
   const body = context.document.getElementById('boardTemplatesBody');
   await renderTemplatesEditor();
-  assert.ok(body.innerHTML.includes('Could not load templates'), body.innerHTML);
+  assert.ok(body.innerHTML.includes('No templates yet'), body.innerHTML);
+});
+
+await test('template refresh keeps the editor visible and preserves unchanged DOM', async () => {
+  setRoster(FULL_ROSTER);
+  context.state.ui = 'board';
+  const body = context.document.getElementById('boardTemplatesBody');
+  const templates = { Researcher: { mission: 'Research', instructions: ['Verify sources'] } };
+  context.apiFetch = async () => ({ json: async () => ({ templates }) });
+  await renderTemplatesEditor();
+  const existing = body.innerHTML;
+  let complete;
+  context.apiFetch = () => new Promise(resolve => { complete = resolve; });
+  const refresh = renderTemplatesEditor();
+  assert.equal(body.innerHTML, existing, 'fetch must not collapse the editor');
+  // A user edit remains intact when the fetched template data is unchanged.
+  body.innerHTML += '<span>unsaved editor state</span>';
+  complete({ json: async () => ({ templates }) });
+  await refresh;
+  assert.ok(body.innerHTML.includes('unsaved editor state'));
 });
 
 await test('buildNewTemplateForm wires the create button to handleTemplateCreate', async () => {

@@ -1771,6 +1771,19 @@ async function clearFailedBoardTasks() {
   renderBoard();
 }
 
+// Keep live updates from replacing unchanged DOM or moving the reader.
+const boardSectionHtml = new WeakMap();
+function setBoardSectionHtml(body, html) {
+  if (boardSectionHtml.get(body) === html) return;
+  const modal = document.querySelector('#boardModal .modal-box');
+  const scrollTop = modal ? modal.scrollTop : 0;
+  const sectionScrollTop = body.scrollTop;
+  body.innerHTML = html;
+  boardSectionHtml.set(body, html);
+  body.scrollTop = sectionScrollTop;
+  if (modal) modal.scrollTop = scrollTop;
+}
+
 function renderBoard() {
   const body = document.getElementById('boardBody');
   const taskNote = t => {
@@ -1889,7 +1902,7 @@ function renderBoard() {
       }).join('')
     : '<div style="opacity:0.6;">No finished spikes to triage.</div>';
 
-  body.innerHTML = `
+  setBoardSectionHtml(body, `
     <div style="margin-bottom:4px;"><strong>In progress (${inProgress.length})</strong></div>
     ${openLines}
     ${reviewLines ? `<div style="margin:8px 0 4px;"><strong>Awaiting peer review (${needsReview.length})</strong></div>${reviewLines}` : ''}
@@ -1899,7 +1912,7 @@ function renderBoard() {
     ${doneLines}
     <div style="margin:8px 0 4px;"><strong>Spikes to triage (${doneSpikes.length})</strong></div>
     ${spikeLines}
-  `;
+  `);
   document.getElementById('boardClearStatus').textContent = boardClearMessage;
   // The House is the directors'/admin's workspace -- the role-template library
   // lives here, gated to the acting authority (which availableAuthority()
@@ -1923,7 +1936,7 @@ async function renderProducts() {
   if (!body) return;
   try {
     const res = await fetch('/api/intent/products');
-    if (!res.ok) { body.innerHTML = '<div style="opacity:0.6;">Products unavailable.</div>'; return; }
+    if (!res.ok) { setBoardSectionHtml(body, '<div style="opacity:0.6;">Products unavailable.</div>'); return; }
     const data = await res.json();
     _productsCache = data.products || {};
   } catch (e) {
@@ -1932,10 +1945,10 @@ async function renderProducts() {
   const products = _productsCache || {};
   const ids = Object.keys(products);
   if (!ids.length) {
-    body.innerHTML = '<div style="opacity:0.6;">No products yet. A director can create one via /api/intent/product.</div>';
+    setBoardSectionHtml(body, '<div style="opacity:0.6;">No products yet. A director can create one via /api/intent/product.</div>');
     return;
   }
-  body.innerHTML = ids.map(pid => {
+  setBoardSectionHtml(body, ids.map(pid => {
     const p = products[pid] || {};
     const revisions = (p.revisions || []).length;
     const badge = p.status === 'released'
@@ -1944,7 +1957,7 @@ async function renderProducts() {
     const revTxt = revisions ? ` &middot; ${revisions} release${revisions === 1 ? '' : 's'}` : ' &middot; no releases yet';
     const sand = p.sandboxId ? ` &middot; <span style="opacity:0.8;">${p.sandboxId}</span>` : '';
     return `<div style="margin:2px 0;"><strong>${p.name || pid}</strong>${badge}${sand}${revTxt}<br><span style="opacity:0.6; font-size:11px;">${p.summary || ''}</span></div>`;
-  }).join('<hr style="opacity:0.2; margin:4px 0;">');
+  }).join('<hr style="opacity:0.2; margin:4px 0;">'));
 }
 
 let _wikiCache = null;
@@ -1953,7 +1966,7 @@ async function renderWiki() {
   if (!body) return;
   try {
     const res = await fetch('/api/intent/wiki');
-    if (!res.ok) { body.innerHTML = '<div style="opacity:0.6;">Wiki unavailable.</div>'; return; }
+    if (!res.ok) { setBoardSectionHtml(body, '<div style="opacity:0.6;">Wiki unavailable.</div>'); return; }
     const data = await res.json();
     _wikiCache = data;
   } catch (e) {
@@ -1964,7 +1977,7 @@ async function renderWiki() {
   const cats = data.categories || {};
   const ids = Object.keys(pages);
   if (!ids.length) {
-    body.innerHTML = '<div style="opacity:0.6;">No wiki pages yet. Directors can write one via /api/intent/wiki/page.</div>';
+    setBoardSectionHtml(body, '<div style="opacity:0.6;">No wiki pages yet. Directors can write one via /api/intent/wiki/page.</div>');
     return;
   }
   // Group the page list by category, ordered by each category's `order`.
@@ -1979,12 +1992,12 @@ async function renderWiki() {
     const ob = (cats[b[0]] || {}).order || 0;
     return oa - ob;
   });
-  body.innerHTML = ordered.map(([cat, list]) => {
+  setBoardSectionHtml(body, ordered.map(([cat, list]) => {
     const label = (cats[cat] || {}).label || cat;
     const entries = list.map(({ pid, rec }) =>
       `<div style="margin:1px 0;">&bull; ${rec.title || pid} <span style="opacity:0.6; font-size:11px;">(v${rec.version}, by ${rec.editedBy || '?'})</span></div>`).join('');
     return `<div style="margin:2px 0;"><strong>${label}</strong></div>${entries}`;
-  }).join('<hr style="opacity:0.2; margin:4px 0;">');
+  }).join('<hr style="opacity:0.2; margin:4px 0;">'));
 }
 
 let _sprintsCache = null;
@@ -1993,7 +2006,7 @@ async function renderSprints() {
   if (!body) return;
   try {
     const res = await fetch('/api/intent/sprints');
-    if (!res.ok) { body.innerHTML = '<div style="opacity:0.6;">Sprints unavailable.</div>'; return; }
+    if (!res.ok) { setBoardSectionHtml(body, '<div style="opacity:0.6;">Sprints unavailable.</div>'); return; }
     const data = await res.json();
     _sprintsCache = data.sprints || {};
   } catch (e) {
@@ -2002,10 +2015,10 @@ async function renderSprints() {
   const sprints = _sprintsCache || {};
   const ids = Object.keys(sprints);
   if (!ids.length) {
-    body.innerHTML = '<div style="opacity:0.6;">No sprints yet. A director can seed one via /api/intent/sprint.</div>';
+    setBoardSectionHtml(body, '<div style="opacity:0.6;">No sprints yet. A director can seed one via /api/intent/sprint.</div>');
     return;
   }
-  body.innerHTML = ids.map(sid => {
+  setBoardSectionHtml(body, ids.map(sid => {
     const s = sprints[sid];
     const rec = (s && s.record) || {};
     const p = (s && s.progress) || { total: 0, done: 0, queued: 0, inProgress: 0, pct: 0 };
@@ -2021,8 +2034,9 @@ async function renderSprints() {
     const landed = Array.isArray(p.landed) && p.landed.length
       ? `<div style="margin:1px 0 0;opacity:0.75;"><span style="font-size:11px;">Landed:</span> ${p.landed.map(t => `<span style="font-size:11px;">&bull; ${esc(t)}</span>`).join(' ')}</div>` : '';
     return `<div style="margin:2px 0;"><strong>${rec.name || sid}</strong>${badge} &mdash; <span style="opacity:0.8;">${prog}${scrum}</span><br><span style="opacity:0.6; font-size:11px;">${rec.goal || ''}</span>${landed}</div>`;
-  }).join('<hr style="opacity:0.2; margin:4px 0;">');
+  }).join('<hr style="opacity:0.2; margin:4px 0;">'));
 }
+
 
 function closeBoard() {
   state.ui = null;

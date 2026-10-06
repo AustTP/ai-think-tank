@@ -72,17 +72,30 @@ async function renderTemplatesEditor() {
   if (!container) return;
   if (!state.ui || state.ui !== 'board') return; // only refresh inside The House dialog
   if (!isTemplateAuthor()) {
+    container._templatesSignature = null;
     container.innerHTML = '<div class="empty">Only directors and the admin may author templates. No director or admin is available right now.</div>';
     return;
   }
-  container.innerHTML = '<div class="empty">Loading templates...</div>';
+  // Leave the previous editor in place while fetching: collapsing it clamps
+  // the Board's scroll position and destroys any unsaved form inputs.
+  if (container._templatesLoading) return;
+  container._templatesLoading = true;
   let templates;
   try {
     templates = await fetchTemplates();
   } catch (e) {
-    container.innerHTML = '<div class="empty">Could not load templates.</div>';
+    if (!container._templatesSignature) container.innerHTML = '<div class="empty">Could not load templates.</div>';
     return;
+  } finally {
+    container._templatesLoading = false;
   }
+  if (state.ui !== 'board' || !isTemplateAuthor()) return;
+  const signature = JSON.stringify([templates, AGENT_ROSTER]);
+  if (container._templatesSignature === signature) return;
+  // Defer external changes while the player is editing the form.
+  if (container.contains && container.contains(document.activeElement)) return;
+  const modal = document.querySelector ? document.querySelector('#boardModal .modal-box') : null;
+  const scrollTop = modal ? modal.scrollTop : 0;
   const roles = Object.keys(templates).sort();
   const rows = roles.map(role => {
     const t = templates[role];
@@ -99,6 +112,8 @@ async function renderTemplatesEditor() {
   container.innerHTML = rows || '<div class="empty">No templates yet.</div>';
   bindTemplateListButtons(container);
   container.appendChild(buildNewTemplateForm(templates));
+  container._templatesSignature = signature;
+  if (modal) modal.scrollTop = scrollTop;
 }
 
 function buildNewTemplateForm(existing) {
