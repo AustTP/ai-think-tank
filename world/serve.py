@@ -3214,52 +3214,56 @@ async def _director_approval_loop():
             print(f'[director] loop error: {e}', flush=True)
 
 
-# --- autonomous peer notes (issue #5, redesigned 2026-09-30) -----------------
-# "Are agents writing notes about other agents when some of them aren't doing
-# work, or when some are doing the most?" They now do, on a real cadence,
-# server-side -- but like a real village, NOT on a rigid metronome and NOT all
-# from one authority. A RANDOM PEER (another worker, never the senior director
-# standing in for the admin, and never the target themselves) observes the
-# ACTUAL action_log (real work vs. silence), and when the evidence supports it
-# a note is filed into state['reports'] exactly like a client-filed report
-# (same shape, same materialization into agents/<id>/reports, same consumption
-# by firing reviews). The quote/note are real signals pulled from the log, not
-# invented praise or blame. Nothing is deterministic: which peer happens to be
-# watching, who they notice, and whether a given watch leads to a note are all
-# weighted probabilities, so the village reads naturally instead of firing the
-# same fixed report on a fixed clock. Idempotent: a worker already noted in
-# this window isn't re-noted until the next review.
+# --- autonomous peer help signals (issue #5, redesigned 2026-10-06) ---------
+# Peers DO notice when a worker is out of line -- but the machine never writes
+# a NEGATIVE review about a worker's productivity. The old design ranked
+# workers by real-work counts and probabilistically filed "Underperforming"
+# reports against whoever did the least, which would ding a legitimate
+# bug-hunter who spent the window deep in one investigation. That conflated
+# two different signals that never share a ledger:
+#   underload/overload = a HELP signal ("get this person help or more work")
+#   misconduct          = a REPORT (firing evidence)
+# This pass watches the REAL action_log (real work vs. silence) on a cadence,
+# and when the evidence supports it raises a HELP SIGNAL to the worker's
+# DIRECTOR: a mailbox note + action_log entry + state['helpSignals'] record
+# telling them to check in (quiet worker) or offer help/reallocation (standout
+# carrying the load). No report is ever filed, no firing evidence is
+# fabricated, and the reports ledger holds only genuine agent/player-written
+# reviews. Nothing is deterministic: which worker is noticed, and whether a
+# given watch raises a signal, are weighted probabilities, so the village reads
+# naturally instead of firing the same fixed note on a fixed clock. Idempotent:
+# a worker already signaled in this window isn't re-signaled until the next
+# review.
 PEER_REVIEW_INTERVAL_S = 90
 PEER_REVIEW_MIN_LOOKBACK_S = 3600  # judge an hour of real activity, not 90 stray seconds
-# Chance a peer watch that finds genuine divergence actually results in a note.
-# Evidence gates (below) decide WHO is report-worthy; this decides whether a
-# given cadence files anything at all, so reports arrive organically rather
+# Chance a peer watch that finds genuine divergence actually raises a signal.
+# Evidence gates (below) decide WHO is worth signaling; this decides whether a
+# given cadence raises anything at all, so signals arrive organically rather
 # than every PEER_REVIEW_INTERVAL_S like clockwork.
 PEER_REVIEW_FILE_PROBABILITY = 0.4
-# A worker already reported on WITHIN this window is not re-reported: the peer
-# note's job is to spread coverage across the roster, not hammer one worker.
-# Reports are never consumed (they feed firing review), so a worker only
-# re-enters the pool after this window elapses (gap:
-# once every worker had a report, the old pool fell back to ALL candidates and
-# re-flagged the same lowest-real-work worker every PEER_REVIEW_INTERVAL_S --
-# ~560 reports about one idle worker in a night).
-PEER_REVIEW_REPORT_STALE_S = 6 * 3600
+# A worker already signaled WITHIN this window is not re-signaled: the pass's
+# job is to spread coverage across the roster, not hammer one worker.
+# Signals are not reports (they don't feed firing review); a worker only
+# re-enters the pool after this window elapses.
+PEER_REVIEW_SIGNAL_STALE_S = 6 * 3600
 
 
 def _peer_review_pass(state, now):
-    """Peer-note writer, run on the caller's in-hand `state` object
+    """Peer help-signal writer, run on the caller's in-hand `state` object
     (mutated in place, no separate get/save of the whole blob). Returns the
-    number of notes filed. This is the CORE of the loop -- see
+    number of signals raised. This is the CORE of the loop -- see
     _peer_review_loop_pass (DB wrapper) and _peer_review_tick (cadence +
-    single-writer driver). Keeps the pass's own report list contract intact
-    (reports are never removed here -- staleness is a dedup window, see the
-    peer-review tests); the LIVE driver prunes old reports instead.
+    single-writer driver).
 
-    Redesigned to be village-natural rather than deterministic: a random peer
-    observer watches the real action_log, and when the evidence shows a worker
-    genuinely out of line (an underperformer or a standout) a weighted-probability
-    pick decides whether THAT watch results in a note. No Jev, no senior
-    director always authoring every note."""
+    Redesigned 2026-10-06: the pass NEVER writes a report. A worker's
+    productivity is already tracked structurally (approvedCount, droppedCount,
+    morale, the firing drop-off signal) and needs no report to act on. All the
+    pass does is watch the real action_log and, when the evidence shows a
+    worker genuinely out of line (an underperformer or a standout), raise a
+    HELP SIGNAL to that worker's DIRECTOR so help or reallocation can follow.
+    A quiet worker under a real investigation (a bug-hunt, a long synthesis)
+    is exactly the case the director should be told to CHECK IN on -- never to
+    ding. No Jev, no senior director always authoring every signal."""
     roster = state.get('agentRoster', [])
     live = state.get('agents', {})
     reports = state.get('reports', [])
@@ -3267,17 +3271,18 @@ def _peer_review_pass(state, now):
         reports = state['reports'] = []
     # Gather real activity from the action_log for every NON-director worker.
     cutoff = now - PEER_REVIEW_MIN_LOOKBACK_S  # action_log.ts is seconds (time.time())
-    # A worker counts as "already covered" only if a report about them was
-    # filed within the staleness window -- a stale report (long consumed by
-    # firing review or simply old) stops blocking a fresh note.
-    fresh_cutoff_ms = (now - PEER_REVIEW_REPORT_STALE_S) * 1000
-    existing_about = {r.get('aboutId') for r in reports if r.get('ts', 0) >= fresh_cutoff_ms}
+    # A worker counts as "already covered" only if a help signal was raised for
+    # them within the staleness window -- an old signal (or none) stops
+    # blocking a fresh one.
+    fresh_cutoff_ms = (now - PEER_REVIEW_SIGNAL_STALE_S) * 1000
+    existing_signals = {s.get('aboutId') for s in state.get('helpSignals', [])
+                        if s.get('ts', 0) >= fresh_cutoff_ms}
     candidates = []
     for d in roster:
         aid = d.get('id')
         if not aid:
             continue
-        # Only workers -- skip admin and directors (peers review workers,
+        # Only workers -- skip admin and directors (peers watch workers,
         # exactly like the firing review does).
         if d.get('isAdmin') or d.get('isDirector') or _direct_reports(state, aid):
             continue
@@ -3296,23 +3301,23 @@ def _peer_review_pass(state, now):
         candidates.append({
             'id': aid, 'name': d.get('name', aid), 'role': d.get('role', ''),
             'actions': total, 'real': real, 'last': rows[0][2] if rows else None,
-            'already': aid in existing_about,
+            'already': aid in existing_signals, 'director': d.get('director'),
         })
     if not candidates:
         return 0
-    # EVIDENCE GATE (village): a peer note is a consequential claim about
-    # another worker's performance, so it must rest on solid evidence -- not a
-    # quiet baseline. If NO ONE in the think tank has done any real work in the
+    # EVIDENCE GATE (village): a help signal is a consequential claim about
+    # another worker's load, so it must rest on solid evidence -- not a quiet
+    # baseline. If NO ONE in the think tank has done any real work in the
     # lookback window, the whole village is simply idle: nobody is
     # underperforming (everyone is equally quiet) and nobody is a standout, so
-    # there is nothing legitimate to note. Filing "Underperforming" against a
+    # there is nothing legitimate to signal. Raising a help signal against a
     # village where every worker is at zero fabricates evidence. So: no real
-    # work anywhere => file nothing.
+    # work anywhere => raise nothing.
     group_activity = max((c['real'] for c in candidates), default=0)
     if group_activity < 2:
         return 0
     # Dedup, not fallback: candidates already covered within the staleness
-    # window are excluded, and an ALL-covered pool files nothing.
+    # window are excluded, and an ALL-covered pool raises nothing.
     cand_pool = [c for c in candidates if not c['already']]
     if not cand_pool:
         return 0
@@ -3320,8 +3325,8 @@ def _peer_review_pass(state, now):
     # divergence qualifies -- either a clear underperformer (well behind while
     # the rest of the village demonstrably worked) or a clear standout (doing
     # far more real work than peers). A nominal "everyone performed about the
-    # same" worker is NOT a note: group_activity >= 2 is already guaranteed by
-    # the village gate above, so this reduces to: the target is genuinely
+    # same" worker is NOT a signal: group_activity >= 2 is already guaranteed
+    # by the village gate above, so this reduces to: the target is genuinely
     # behind (real < 2) or genuinely ahead (real >= 5, the group max).
     report_worthy = [
         c for c in cand_pool
@@ -3329,9 +3334,9 @@ def _peer_review_pass(state, now):
     ]
     if not report_worthy:
         return 0
-    # PROBABILITY GATE: evidence says someone IS worth noting, but a real
-    # village doesn't file on a fixed clock -- a peer happens to notice, or
-    # doesn't. This roll is what makes notes arrive organically instead of
+    # PROBABILITY GATE: evidence says someone IS worth a signal, but a real
+    # village doesn't raise one on a fixed clock -- a peer happens to notice,
+    # or doesn't. This roll is what makes signals arrive organically instead of
     # every cadence like clockwork.
     if random.random() > PEER_REVIEW_FILE_PROBABILITY:
         return 0
@@ -3347,33 +3352,40 @@ def _peer_review_pass(state, now):
         else:
             weights.append(max(1, c['real'] - median_real))
     target = random.choices(report_worthy, weights=weights, k=1)[0]
-    # RANDOM PEER OBSERVER: who notices is a peer worker, chosen at random from
-    # the non-director roster -- never the target themselves, never the senior
-    # director always filing the same notes (the old single-author churn).
-    observers = [
-        d.get('id') for d in roster
-        if d.get('id') and d.get('id') != target['id']
-        and not d.get('isAdmin') and not d.get('isDirector')
-        and d.get('id') in live
-    ]
-    if not observers:
+    # A help signal needs a DIRECTOR to act on it. A worker with no director on
+    # record can't be helped by this pass -- skip (no admin stand-in: a senior
+    # director flagging everyone is exactly the old single-author churn).
+    director_id = target.get('director')
+    if not director_id or director_id not in live:
         return 0
-    observer_id = random.choice(observers)
-    quote = f'Peer note on {target["name"]} ({target["role"]}): {target["actions"]} actions, {target["real"]} real work in the last {PEER_REVIEW_MIN_LOOKBACK_S // 60} minutes.'
-    note = ('Underperforming -- well below expected output this period.' if target['real'] < 2 else
-            'Standout performer -- doing the most real work this period.' if target['real'] >= 5 else
-            'Nominal output this period; no action needed, filed for the record.')
-    report = {
-        'id': f'report-{int(now * 1000)}-{target["id"]}',
-        'aboutId': target['id'], 'fromId': observer_id, 'quote': quote, 'note': note,
-        'ts': int(now * 1000), 'severity': 'minor' if target['real'] >= 2 else 'major',
+    direction = 'overloaded' if target['real'] >= 5 else 'quiet'
+    if direction == 'overloaded':
+        text = (f'Help signal: {target["name"]} ({target["role"]}) is carrying the load this '
+                f'period -- {target["real"]} real actions. Check whether they need help or work '
+                f'reallocation before they burn out.')
+    else:
+        text = (f'Help signal: {target["name"]} ({target["role"]}) has done little real work this '
+                f'period ({target["real"]} real actions). Could be idle, or deep in a long '
+                f'investigation -- check in before assuming anything.')
+    signal = {
+        'id': f'help-{int(now * 1000)}-{target["id"]}',
+        'aboutId': target['id'], 'directorId': director_id,
+        'direction': direction, 'real': target['real'], 'actions': target['actions'],
+        'ts': int(now * 1000), 'text': text,
     }
-    reports.append(report)
-    state['reports'] = reports
-    log_action(observer_id, 'report_filed', {'about': target['id'], 'real': target['real'], 'actions': target['actions']}, authorized=False)
-    # An autonomous peer note is the same consequential class as a
-    # client-filed one -- chain it into the passport too.
-    _append_passport_decision('report_filed', observer_id, {'about': target['id'], 'real': target['real']})
+    state.setdefault('helpSignals', []).append(signal)
+    # In-world: the director is told, not a random peer. Best-effort -- a
+    # mailbox failure must never block the signal itself.
+    try:
+        import sim as _sim
+        _sim._deliver_mail(state, director_id, 'help_signal',
+                           {'text': text, 'about': target['id']})
+    except Exception:
+        pass
+    log_action(director_id, 'help_signal', {
+        'about': target['id'], 'direction': direction,
+        'real': target['real'], 'actions': target['actions'],
+    }, authorized=False)
     return 1
 
 
@@ -3399,7 +3411,7 @@ def _peer_review_loop_pass(state=None, now=None):
 def _peer_review_tick(state):
     """Cadence + single-writer driver for the LIVE path. Called from inside the
     sim loop's one read-modify-write (see _sim_loop_pass in sim.py) on the same
-    `state` object that is about to be saved, so the report it files can never
+    `state` object that is about to be saved, so the signal it raises can never
     be clobbered by a concurrent whole-blob save -- the exact race that made
     reports vanish and the loop re-file forever. Gated to the same cadence the
     old standalone thread used, so it fires ~once per PEER_REVIEW_INTERVAL_S,
@@ -3409,16 +3421,29 @@ def _peer_review_tick(state):
         return 0
     state['lastPeerReviewAt'] = now
     # Prune stale reports on the LIVE path so the report list can't accumulate
-    # unbounded and permanently drag every worker's firing signal down
-    # (stale reports never decay out of the review pile otherwise). Reports older
-    # than the staleness window are already treated as "not fresh" by the dedup,
-    # so pruning them is safe for coverage; it only caps the pile. The pass's own
-    # report-list contract (see the peer-review tests) is untouched -- this runs
-    # in the single-writer driver, not in _peer_review_pass.
-    stale_cutoff_ms = (now - PEER_REVIEW_REPORT_STALE_S) * 1000
+    # unbounded and drag every worker's firing signal down (stale reports never
+    # decay out of the review pile otherwise). The 14-day strike window
+    # (2026-10-06) means serious/severe EVIDENCE must survive long enough to
+    # count as a strike -- pruning a serious report at 6h could silently erase
+    # the first of two strikes spaced days apart. So: serious/severe reports
+    # are retained for the full strike window; minor/major reports (which never
+    # count as strikes) decay at the old staleness window. The pass's own
+    # list contract (see the peer-review tests) is untouched -- this runs in
+    # the single-writer driver, not in _peer_review_pass.
+    stale_cutoff_ms = (now - PEER_REVIEW_SIGNAL_STALE_S) * 1000
     reports = state.get('reports')
     if isinstance(reports, list):
-        pruned = [r for r in reports if (r.get('ts') or 0) >= stale_cutoff_ms]
+        import sim as _sim
+        strike_cutoff_ms = (now * 1000) - _sim.REPORT_STRIKE_WINDOW_MS
+        pruned = []
+        for r in reports:
+            ts = r.get('ts') or 0
+            if r.get('severity') in ('serious', 'severe'):
+                keep = ts >= strike_cutoff_ms
+            else:
+                keep = ts >= stale_cutoff_ms
+            if keep:
+                pruned.append(r)
         if len(pruned) != len(reports):
             state['reports'] = pruned
     return _peer_review_pass(state, now)
