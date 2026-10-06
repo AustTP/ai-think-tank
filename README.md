@@ -33,6 +33,12 @@ Secrets live in `.env` at the repo root (git-ignored). Copy `.env.template`
 to `.env` and set at least `OPENROUTER_API_KEY`. Admin credentials and
 `SERVER_SECRET` are auto-generated on first boot if absent.
 
+Only `OPENROUTER_API_KEY` is required to run. Every other key in
+`.env.template` is optional: leave a key blank (or omit it) and the matching
+feature simply stays off — the server reads each key independently and treats
+blank the same as unset. So a partial `.env` works fine; you only fill in the
+integrations you actually use.
+
 Tests:
 
 ```bash
@@ -62,12 +68,25 @@ cd world && python3 -m pytest tests/
   Coding tasks automatically use the coding tier (qwen3-coder). The daily
   refresh re-picks each band's best-value model from the live OpenRouter
   catalog.
-- Budget controls: 1,000 page requests/month, a $5 hard spend cap, and a
-  $5/month high-tier budget that the JEV gate respects.
+- Budget controls: 1,000 page requests/month, a configurable hard spend cap
+  (default $50/month, set via `SPEND_CAP_USD`), and a high-tier budget that the
+  JEV gate respects.
 - A plain-writing directive at the model-call boundary: prose replies carry an
   anti-AI-slop "write plainly, no filler" instruction with a word-ban list, so
   the village spends fewer tokens on the same information. On by default,
   opt-out per request, JSON prompts exempt.
+- Villages: the top-level identity + memory boundary. Every agent belongs to a
+  village (default `main`); wiki pages and design taste docs are scoped to the
+  writer/reader's village, so one village's memory never leaks into another.
+  Villages are created and agents assigned via the player-only
+  `/api/villages` / `/api/villages/assign` endpoints.
+- Memory engineering (shared-memory hygiene): every wiki page carries an
+  owner, a clock (slow/fast), a source, and a `reviewAfterMs` expiry. Expired
+  pages are no longer injected as trusted context, and fast-clock pages are
+  flagged to re-fetch the live source instead of trusting the copy. Design
+  taste docs carry an owner + review-after date and are skipped when expired.
+  Every shared-memory write is recorded in a provenance ledger
+  (`GET /api/memory-ledger`) with claim/source/owner/scope/review date.
 
 ## Key architecture
 
@@ -80,9 +99,9 @@ cd world && python3 -m pytest tests/
 | `world/sim.py` | Server simulation engine: movement, task lifecycle, ceremonies, peer gates, sprint lifecycle, governance |
 | `world/content.py` | Per-room content executors: research, code writing/review, weather, media, distill, spikes, bank teller |
 | `world/web_helpers.py` | Pure HTML stripping, link extraction, HTTP-date parsing, SSRF host check |
-| `world/sim_helpers.py` | Pure priority normalization, room/team derivation, sprint/product id generation |
+| `world/sim_helpers.py` | Pure priority normalization, room/team derivation, sprint/product id generation, village + memory-clock helpers |
 | `world/index.html` + `world/*.js` | Browser renderer; the client is a viewport, never the state machine |
-| `world/tests/` | Python test suite (3,424 tests) covering every path |
+| `world/tests/` | Python test suite (3,520 tests) covering every path |
 
 ## Repo layout
 
@@ -95,7 +114,9 @@ cd world && python3 -m pytest tests/
   regenerated.
 - `sandboxes/`: per-agent isolated development directories.
 - `.env` (git-ignored): per-install secrets and configuration. Copy
-  `.env.template` for the documented format.
+  `.env.template` for the documented format. Only `OPENROUTER_API_KEY` is
+  required; every other key is optional and simply disables its feature when
+  blank or absent.
 
 ## Notes
 
@@ -103,6 +124,7 @@ cd world && python3 -m pytest tests/
   agent names; the roster is seeded from `.env` on a cold DB.
 - Governance is idle-quiet: an idle think tank spends no model budget.
 - The high tier (the expensive one) is bounded twice: a per-model price
-  ceiling ($5/M) and a monthly spend cap ($5/mo).
+  ceiling and a monthly spend cap, both configurable via `.env` and 0/unset
+  by default (disabled).
 - Room descriptions are director-editable; room geometry is not (it is a
   code-graph invariant).
