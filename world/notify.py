@@ -170,10 +170,20 @@ def provision_player_email(app_password):
 
 def create_escalation(kind, question, on_approve_note='', what_checked='', look_first=''):
     import serve as _serve
+    # Escalation-storm guard: a pending escalation with the SAME kind and
+    # question is reused instead of spawning a new record. Without this, a
+    # retrying agent (the same blocked command, the same stuck story) creates
+    # a new escalation per attempt -- the 3.8k-record pileup this guard
+    # exists to prevent. Only PENDING records dedup; a resolved one lets a
+    # fresh escalation be created if the same thing genuinely recurs later.
+    escalations = _serve._load_escalations()
+    for esc_id, existing in escalations.items():
+        if existing.get('status') == 'pending' and existing.get('kind') == kind \
+                and existing.get('question') == question:
+            return esc_id
     # A random unguessable token per escalation, not just the record id --
     # the resolve link needs to not be trivially enumerable (id alone
     # would be sequential and guessable).
-    escalations = _serve._load_escalations()
     esc_id = 'esc-' + secrets.token_hex(4)
     token = secrets.token_urlsafe(24)
     escalations[esc_id] = {'kind': kind, 'question': question, 'status': 'pending', 'token': token, 'ts': time.time(), 'note': on_approve_note, 'whatChecked': what_checked, 'lookFirst': look_first}
