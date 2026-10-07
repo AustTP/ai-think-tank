@@ -3731,7 +3731,7 @@ def _any_available_including_off_duty(state):
     return False
 
 
-def _eligible_candidates(state, include_off_duty, include_reviewers=False):
+def _eligible_candidates(state, include_off_duty, include_reviewers=False, include_code_director=False):
     """Port of tasks.js assignTaskViaJev's candidate filter: non-admin, not
     busy/task/pairWith, and (unless include_off_duty) not off-duty.
     Returns list of agent ids in roster order (deterministic base for RR)."""
@@ -3744,6 +3744,8 @@ def _eligible_candidates(state, include_off_duty, include_reviewers=False):
         if d.get('isAdmin') or d.get('id') in facilitators:
             continue
         if d.get('dedicatedReviewer') and not include_reviewers:
+            continue
+        if d.get('codeDirector') and not include_code_director:
             continue
         a = agents.get(d.get('id'))
         if not a or a.get('busy') or a.get('task') or a.get('pairWith'):
@@ -5069,6 +5071,8 @@ def _pick_reviewer_ids(state, author_id, task_room=None, preferred=None):
     # Candidates = preferred pair first, then team (excl author), then widen to
     # all non-author.
     order = list(preferred or []) + team + [d.get('id') for d in roster if not d.get('isAdmin') and d.get('id') != author_id]
+    director_ids = {d['id'] for d in roster if d.get('codeDirector')}
+    order = [cid for cid in order if cid not in director_ids]
     seen = set()
     ordered_ids = []
     for cid in order:
@@ -5155,6 +5159,11 @@ def _enter_peer_review(state, task, now_ms, preferred=None):
     reviewer(s) who already have the context -- the person who flagged a problem
     is the one who can confirm it was fixed. Fall back to a fresh pick if the
     prior pair is unavailable."""
+    if _peer_coding_class(task) and not task.get('_codeDirectorPassed'):
+        import code_director
+        pending = code_director.queue_check(state, task)
+        if pending is not None:
+            return pending
     author = task.get('assignedTo')
     prior = task.get('_peerGate') or {}
     if preferred is None:
@@ -5316,6 +5325,7 @@ def _queue_peer_repair(state, parent, rationale=None):
     """One author-owned repair per rejected artifact, across both reviewer votes."""
     if (parent.get('_peerGate') or {}).get('escalated'):
         return
+    parent.pop('_codeDirectorPassed', None)
     author = parent.get('assignedTo')
     if not author or author not in (state.get('agents') or {}):
         return
@@ -5437,6 +5447,9 @@ def _send_back_after_failure(state, task, fail_note=None):
     _log_quality_gate_reject(state, task, note, escalated=escalated)
     if escalated:
         return  # frozen -- escalated + player notified; no further fix cycling
+    import code_director
+    if code_director.queue_check(state, task, note) is not None:
+        return
     instructions = (f"Your work on '{task.get('title')}' failed the quality pipeline: "
                     f"{note}. Fix it so the pipeline passes clean, then it will be re-reviewed.")
     if task.get('userStory'):
@@ -5629,7 +5642,7 @@ def _sweep_stuck_gates(state, now_ms):
         for d in (state.get('agentRoster') or []):
             if len(fresh) >= 2:
                 break
-            if d.get('isAdmin') or d.get('id') == author or d.get('id') in locked:
+            if d.get('isAdmin') or d.get('codeDirector') or d.get('id') == author or d.get('id') in locked:
                 continue
             if d.get('id') in fresh:
                 continue
@@ -10791,6 +10804,8 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 # ok=True (its verdict rides in peerVerdict), so this check never
                 # disturbs a normal gate vote.
                 result_ok = bool(result.get('ok', True))
+                if task.get('taskType') == 'code_preflight':
+                    result_ok = bool(result_ok and result.get('pipelineOk') and result.get('evidence'))
                 # W4: worker stuck/help signal. A content result with ok=False
                 # (a content-executor crash, or a red pipeline) is a FAILURE --
                 # track consecutive failures per worker and route a help signal
@@ -10828,7 +10843,10 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 # been gated enters the peer gate instead of completing.
                 if task.get('reviewOf'):
                     parent = _resolve_review_parent(state, task)
-                    if parent is not None and task.get('taskType') == 'review':
+                    if parent is not None and task.get('taskType') == 'code_preflight':
+                        import code_director
+                        code_director.complete_check(state, task, result, now_ms)
+                    elif parent is not None and task.get('taskType') == 'review':
                         # Vote worker finished; close the parent if 2 clean votes
                         # (or 1 + timeout) are in.
                         _parent_close_from_vote(state, parent, now_ms)
@@ -10839,6 +10857,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                         # escalated) gate -- an escalated story stays paused for
                         # manual attention, not silently re-entered.
                         if not (parent.get('_peerGate') or {}).get('escalated'):
+                            parent.pop('_codeDirectorPassed', None)
                             _enter_peer_review(state, parent, now_ms)
                     elif parent is not None:
                         # Parent isn't supposed to be gated (skillReview/distill)
@@ -10864,6 +10883,13 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                     finish_task(state, aid, grid)
                     send_agent_off_duty(state, aid, doors, grid)
             elif now >= task['workUntil']:
+                if task.get('taskType') == 'code_preflight':
+                    _release_agent_after_failure(state, aid, task)
+                    parent = _resolve_review_parent(state, task)
+                    if parent is not None:
+                        _send_back_after_failure(state, parent, 'Code director validation timed out without a passing pipeline.')
+                    send_agent_off_duty(state, aid, doors, grid)
+                    continue
                 # No content result within the budget (timeout OR the slice-1
                 # placeholder) -- fallback completion. Same gate branching.
                 # Bot Ops / shadow mode: capture the dry-run outcome to the shadow
@@ -11172,7 +11198,7 @@ def _sprint_worker_pool(state, sprint_id, worker_count=None):
                 excluded.add(t['scrumMasterId'])
     pool = []
     for d in (state.get('agentRoster') or []):
-        if d.get('isAdmin') or d.get('dedicatedReviewer'):
+        if d.get('isAdmin') or d.get('dedicatedReviewer') or d.get('codeDirector'):
             continue
         if d.get('director') not in directors:
             continue
@@ -11254,7 +11280,9 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     # lifecycle (which routes by task['room']) sees a concrete room.
     if not pick.get('room'):
         pick['room'] = _resolve_assignment_room(pick)
-    candidates = _eligible_candidates(state, can_wake_off_duty, include_reviewers=pick.get('taskType') == 'review')
+    candidates = _eligible_candidates(state, can_wake_off_duty,
+                                     include_reviewers=pick.get('taskType') == 'review',
+                                     include_code_director=pick.get('taskType') == 'code_preflight')
     # Sprint staffing: a sprint card is assigned ONLY to the sprint's chosen
     # worker pool (the director's 1-6). This is a HARD restriction, not the
     # soft team preference below -- a lean sprint's cards wait (empty pool ->
@@ -11288,6 +11316,9 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     if pinned and sprint_pool is not None and pinned not in sprint_pool:
         pinned = None
     if pinned and agents.get(pinned):
+        if pick.get('taskType') != 'code_preflight' and any(
+                d.get('id') == pinned and d.get('codeDirector') for d in state.get('agentRoster') or []):
+            return None
         if pick.get('taskType') != 'review' and any(
                 d.get('id') == pinned and d.get('dedicatedReviewer')
                 for d in state.get('agentRoster') or []):

@@ -3648,7 +3648,7 @@ def _backfill_directors_in_db():
     backfill_map = _director_backfill_map()
     changed = False
     for d in roster:
-        if d.get('dedicatedReviewer'):
+        if d.get('dedicatedReviewer') or d.get('codeDirector'):
             continue
         aid = d.get('id')
         is_admin = aid in admin_ids

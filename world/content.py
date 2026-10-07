@@ -603,6 +603,7 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
         # story open in 'needs_review' forever (the infinite fork).
         'review': _run_review_content,
         'qa': _run_review_content,
+        'code_preflight': _run_code_director_content,
     }
     room_executors = {
         'observatory': _run_observatory_content,
@@ -1327,6 +1328,27 @@ def _quality_pipeline_evidence(qp):
     return '\n'.join(lines)[:2000]
 
 
+def _run_code_director_content(snapshot, agent_id, task, base_ctx=None):
+    """Check first; repair only when the existing code fails its real pipeline."""
+    import sim
+    product = (snapshot.get('products') or {}).get(task.get('productId')) or {}
+    sandbox_id = product.get('sandboxId') or WORKROOM_SANDBOX_ID
+    try:
+        qp = _run_quality_pipeline(_serve.SELF_BASE_URL, _serve.get_or_create_agent_key(agent_id),
+                                   agent_id, sandbox_id, 'coding task: code director pre-review validation')
+        if qp.get('ok'):
+            sim._store_content_result(task['id'], {'ok': True, 'pipelineOk': True,
+                'evidence': _quality_pipeline_evidence(qp),
+                'note': 'Code director ran the quality checks; all passed. Ready for independent peer review.'})
+            return
+        context = (f"{base_ctx or ''}\n\nActual failing quality checks:\n"
+                   + json.dumps(qp.get('results') or [], ensure_ascii=True)[:10000])
+        _run_coding_content(snapshot, agent_id, {**task, '_sandboxId': sandbox_id}, base_ctx=context)
+    except Exception as error:
+        sim._store_content_result(task['id'], {'ok': False, 'pipelineOk': False,
+            'note': f'Code director could not validate the implementation: {error}'})
+
+
 def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     """Port of tasks.js runCodingTask (the real Work Room coding pipeline):
     a real model call with probe-before-writing + heredoc-continuation handling,
@@ -1339,6 +1361,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     key = _serve.get_or_create_agent_key(agent_id)
     project_label = task.get('projectLabel') or ''
     backlog = task.get('title') or ''
+    sandbox_id = task.get('_sandboxId') or WORKROOM_SANDBOX_ID
     instructions = task.get('instructions')
     backlog_item = f'{backlog} -- {instructions}' if instructions else backlog
     context_summary = base_ctx or ''
@@ -1416,7 +1439,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
             probe_rounds += 1
             messages.append({'role': 'assistant', 'content': reply})
             probe_data = _serve._http_json('POST', base, '/api/page-probe',
-                                    {'agentId': agent_id, 'sandboxId': WORKROOM_SANDBOX_ID,
+                                    {'agentId': agent_id, 'sandboxId': sandbox_id,
                                      'path': probe_req['path'], 'actions': probe_req['actions'],
                                      'probes': probe_req['probes']}, key)
             feedback = _format_page_probe_result(probe_data)
@@ -1480,7 +1503,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
 
     exec_data = _serve._http_json('POST', base, '/api/execute',
                            {'agentId': agent_id, 'command': command,
-                            'purpose': f'Coding task: {backlog_item}', 'sandboxId': WORKROOM_SANDBOX_ID}, key)
+                            'purpose': f'Coding task: {backlog_item}', 'sandboxId': sandbox_id}, key)
     if not isinstance(exec_data, dict) or not exec_data.get('allowed'):
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f"blocked: {exec_data.get('reason') if isinstance(exec_data, dict) else 'no response'}",
@@ -1505,9 +1528,9 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     # ---- The four mechanical integrity checks (mirror runCodingTask) ----
     written = _extract_written_js_files(command)
     if written:
-        unlinked = _find_unlinked_js_files(base, key, agent_id, WORKROOM_SANDBOX_ID, written)
+        unlinked = _find_unlinked_js_files(base, key, agent_id, sandbox_id, written)
         if unlinked:
-            linked = _auto_link_js_files(base, key, agent_id, WORKROOM_SANDBOX_ID, unlinked, messages, tier_slug,
+            linked = _auto_link_js_files(base, key, agent_id, sandbox_id, unlinked, messages, tier_slug,
                                          task_id=task.get('id'))
             if linked['ok']:
                 result['note'] = f'auto-linked previously-orphaned file(s) into index.html: {", ".join(unlinked)}'
@@ -1523,16 +1546,16 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
                 result['note'] = (f'WARNING: created {", ".join(unlinked)} but {"they are" if plural else "it is"} not referenced '
                                   f'by a <script src> tag in index.html, and the automatic follow-up to link {"them" if plural else "it"} '
                                   f'failed -- {linked["note"]}')
-    phantom_refs = _find_phantom_script_refs(base, key, agent_id, WORKROOM_SANDBOX_ID)
+    phantom_refs = _find_phantom_script_refs(base, key, agent_id, sandbox_id)
     if phantom_refs:
-        cleaned = _remove_phantom_script_refs(base, key, agent_id, WORKROOM_SANDBOX_ID, phantom_refs)
+        cleaned = _remove_phantom_script_refs(base, key, agent_id, sandbox_id, phantom_refs)
         ref_list = ', '.join(f'{p["file"]} (in {p["html"]})' for p in phantom_refs)
         phantom_note = (f'removed <script src> reference(s) to file(s) that don\'t actually exist: {ref_list}' if cleaned['ok']
                         else f'WARNING: HTML file(s) reference file(s) that were never written and don\'t exist: {ref_list} '
                              f'-- automatic cleanup failed ({cleaned["note"]})')
         result['note'] = f"{result.get('note')} | {phantom_note}" if result.get('note') else phantom_note
 
-    dangling = _find_dangling_selector_refs(base, key, agent_id, WORKROOM_SANDBOX_ID)
+    dangling = _find_dangling_selector_refs(base, key, agent_id, sandbox_id)
     if dangling:
         pieces = []
         for d in dangling:
@@ -1546,7 +1569,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     # the standard (PEP 8, types, no bandit High/Medium, >=90% coverage). A red
     # pipeline fails the author's task here, before anything reaches review, so
     # there is nothing left for a reviewer to approve.
-    qp = _run_quality_pipeline(base, key, agent_id, WORKROOM_SANDBOX_ID,
+    qp = _run_quality_pipeline(base, key, agent_id, sandbox_id,
                                f'Quality gate for coding task: {backlog_item}')
     if not qp['ok']:
         _sim_module._store_content_result(task.get('id'),
@@ -1557,7 +1580,8 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     _sim_module._store_content_result(task.get('id'),
                                       {'note': ((result.get('note') or ('Wrote and ran the code in the shared Work Room sandbox.'))
                                                 + ' | quality pipeline all green'),
-                                       'command': command, 'ok': True, 'tier': tier_slug})
+                                       'command': command, 'ok': True, 'tier': tier_slug,
+                                       'pipelineOk': True, 'evidence': _quality_pipeline_evidence(qp)})
     return True
 
 
