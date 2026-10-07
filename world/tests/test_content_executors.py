@@ -517,6 +517,7 @@ class ObservatoriesAndDispatcher(_ExecutorTestCase):
                  mock.patch.object(content, '_run_skill_review_content') as s, \
                  mock.patch.object(content, '_run_research_content') as r, \
                  mock.patch.object(content, '_run_research_project_content') as rp, \
+                 mock.patch.object(content, '_run_spike_content') as spike, \
                  mock.patch.object(content, '_run_research_bare_content') as rb:
                 content._run_observatory_content(_snapshot(), 'cora', task)
             if flag == 'distill':
@@ -526,7 +527,9 @@ class ObservatoriesAndDispatcher(_ExecutorTestCase):
             elif flag == 'research':
                 r.assert_called_once()
             elif flag == 'projectLabel':
-                rp.assert_called_once()
+                spike.assert_called_once()
+                self.assertEqual(spike.call_args.args[2]['taskType'], 'spike')
+                rp.assert_not_called()
             else:
                 rb.assert_called_once()
 

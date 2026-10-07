@@ -300,6 +300,46 @@ class VerdictFolding(unittest.TestCase):
         kinds = [m.get('kind') for m in state['agents']['ben'].setdefault('mailbox', [])]
         self.assertIn('peer_review_rejected', kinds)
 
+    def test_two_document_rejections_queue_one_author_repair_with_both_findings(self):
+        state, parent = self._gated_state()
+        parent.update(room='observatory', taskType='research', libraryPath='archive/report.md',
+                      instructions='Document dataset limitations', acceptanceCriteria='Cite sources and refresh cadence')
+        state['workQueue'] = []
+        for rid, note in [('ada', 'Missing citations'), ('cora', 'Missing refresh cadence')]:
+            sim._apply_content_result(state, {'id': f'rev-{rid}', 'reviewOf': parent['id'],
+                'assignedTo': rid, 'taskType': 'review'}, {'note': note, 'peerVerdict': 'actionable',
+                'peerChecks': [note], 'queueFix': {'title': 'Duplicate executor repair', 'room': 'observatory'}})
+        self.assertEqual(parent['status'], 'failed')
+        self.assertTrue(parent['_peerRepairPending'])
+        self.assertEqual(parent['_peerGate']['cycleCount'], 1)
+        self.assertEqual(len(state['workQueue']), 1)
+        repair = state['workQueue'][0]
+        self.assertEqual(repair['assignedTo'], 'ben')
+        self.assertEqual(repair['reviewOf'], parent['id'])
+        self.assertEqual(repair['taskType'], 'research')
+        for text in ['Missing citations', 'Missing refresh cadence', 'archive/report.md']:
+            self.assertIn(text, repair['instructions'])
+        with unittest.mock.patch.object(sim, '_reenter_gate_review') as reenter:
+            sim._sweep_stuck_gates(state, now_ms=10_000_000)
+        reenter.assert_not_called()
+
+    def test_late_clean_vote_cannot_close_rejected_artifact(self):
+        state, parent = self._gated_state()
+        self._vote(state, 'ada', 'actionable')
+        self._vote(state, 'cora', 'clean')
+        self.assertEqual(parent['_peerGate']['approvals'], 0)
+        self.assertTrue(parent['_peerRepairPending'])
+
+    def test_repaired_artifact_reopens_gate_with_original_reviewers(self):
+        state, parent = self._gated_state()
+        original_pair = parent['_peerGate']['reviewerIds'][:]
+        self._vote(state, 'ada', 'actionable')
+        gate = sim._enter_peer_review(state, parent, now_ms=3000)
+        self.assertNotIn('_peerRepairPending', parent)
+        self.assertEqual(parent['status'], 'needs_review')
+        self.assertEqual(set(gate['reviewerIds']), set(original_pair))
+        self.assertEqual(gate['cycleCount'], 1)
+
     def test_reopen_reprefers_the_prior_reviewer_pair(self):
         # Phase E3.4: a rejection (reviewer verdict OR player veto) is a request
         # to verify the flagged problem was actually fixed -- only the reviewer

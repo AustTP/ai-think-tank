@@ -3648,6 +3648,8 @@ def _backfill_directors_in_db():
     backfill_map = _director_backfill_map()
     changed = False
     for d in roster:
+        if d.get('dedicatedReviewer'):
+            continue
         aid = d.get('id')
         is_admin = aid in admin_ids
         is_senior_dir = (aid == senior_dir)
@@ -5196,15 +5198,24 @@ def _run_in_sandbox_sync(sandbox_dir, command):
         'sh', '-c', command,
     ]
     try:
-        result = subprocess.run(docker_cmd, capture_output=True, text=True, timeout=SANDBOX_TIMEOUT_S)
+        result = subprocess.run(docker_cmd, capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=SANDBOX_TIMEOUT_S)
         return {
             'exitCode': result.returncode,
-            'stdout': result.stdout[:SANDBOX_MAX_OUTPUT],
-            'stderr': result.stderr[:SANDBOX_MAX_OUTPUT],
+            'stdout': _sandbox_output_text(result.stdout),
+            'stderr': _sandbox_output_text(result.stderr),
             'timedOut': False,
         }
     except subprocess.TimeoutExpired as e:
-        return {'exitCode': None, 'stdout': (e.stdout or '')[:SANDBOX_MAX_OUTPUT], 'stderr': (e.stderr or '')[:SANDBOX_MAX_OUTPUT], 'timedOut': True}
+        return {'exitCode': None, 'stdout': _sandbox_output_text(e.stdout),
+                'stderr': _sandbox_output_text(e.stderr), 'timedOut': True}
+
+
+def _sandbox_output_text(output):
+    # TimeoutExpired can carry bytes even when the subprocess used text mode.
+    if isinstance(output, bytes):
+        output = output.decode('utf-8', errors='replace')
+    return (output or '')[:SANDBOX_MAX_OUTPUT]
 
 
 # How long real JS/AJAX content gets to finish loading before the text is
@@ -14912,7 +14923,7 @@ async def _review_guidance_response(request, state, task_id, esc_id=None):
     if request.method == 'GET':
         masters = {t.get('scrumMasterId') for t in state.get('teams', [])}
         agents = {d['id']: d for d in state.get('agentRoster', [])
-                  if not d.get('isAdmin') and d['id'] not in masters}
+                  if not d.get('isAdmin') and not d.get('dedicatedReviewer') and d['id'] not in masters}
         return HTMLResponse(guidance.render_form(task, str(request.url), agents))
     escalations = _load_escalations()
     matching_ids = {eid for eid, e in escalations.items()
@@ -14940,6 +14951,11 @@ def _save_review_guidance(task_id, data):
     with _STATE_UPDATE_LOCK:
         state = get_state_from_db() or {}
         result = guidance.apply_guidance(state, task_id, data)
+        for message in state.get('playerInbox') or []:
+            if message.get('kind') == 'review_blocked' and message.get('taskId') == task_id \
+                    and message.get('status') == 'awaiting_guidance':
+                message.update(status='resolved', answer=f'Guidance applied: {result["action"]}',
+                               resolvedAt=int(time.time() * 1000))
         save_state_to_db(state)
         return result
 

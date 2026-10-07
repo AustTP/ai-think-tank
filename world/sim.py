@@ -1653,7 +1653,7 @@ def _store_content_result(task_id, result):
 MAX_REVIEW_CYCLES = 8
 
 
-def _maybe_escalate_stuck_gate(parent, gate, reason, failure_text=None):
+def _maybe_escalate_stuck_gate(parent, gate, reason, failure_text=None, state=None):
     """Bump the gate's cycle counter; once it crosses MAX_REVIEW_CYCLES,
     freeze the gate (mark it escalated) and notify the player instead of
     continuing to loop. Returns True if the gate is (now, or already)
@@ -1683,11 +1683,15 @@ def _maybe_escalate_stuck_gate(parent, gate, reason, failure_text=None):
     gate['escalated'] = True
     parent['manualAttention'] = True
     title = parent.get('title') or 'a story'
+    communication = _review_blocker_message(parent, reason)
+    parent['reviewBlocker'] = communication
+    if state is not None:
+        _communicate_stuck_review(state, parent, communication)
     try:
         from serve import create_escalation
         create_escalation(
             'stuck review loop',
-            f'"{title}" has gone through {gate["cycleCount"]} review cycles without closing ({reason}). '
+            communication + '\n\n' +
             'Automatic review/fix cycling has been paused for this story -- it needs manual attention '
             'Use the guidance form to pause, retry with instructions, supply inputs, change scope, '
             'reassign, split the story, request research, or reject it.',
@@ -1697,6 +1701,43 @@ def _maybe_escalate_stuck_gate(parent, gate, reason, failure_text=None):
     except Exception:
         pass
     return True
+
+
+def _review_blocker_message(task, reason):
+    gate = task.get('_peerGate') or {}
+    diagnosis = task.get('reviewDiagnosis') or {}
+    details = diagnosis.get('failure') or task.get('failNote') or ''
+    findings = []
+    for review in (task.get('peerReviews') or [])[-2:]:
+        if review.get('verdict') == 'actionable':
+            text = '; '.join(str(c) for c in review.get('checks') or [])
+            findings.append(f"{review.get('reviewer') or 'Reviewer'}: {review.get('summary') or text or 'No detailed findings recorded.'}")
+    message = (f"Review paused: {task.get('title') or task.get('id')}.\n"
+               f"Reason: {reason}. {gate.get('cycleCount', 0)} review/fix attempts; "
+               f"{gate.get('approvals', 0)} approvals.\n")
+    if details:
+        message += f'Latest failure: {details[:4000]}\n'
+    if findings:
+        message += 'Reviewer findings:\n' + '\n'.join(findings) + '\n'
+    if not details and not findings:
+        message += 'No completed review verdict or detailed failure was recorded. Review assignment or execution needs investigation.\n'
+    message += ('Next step: open Guide review to supply missing inputs, request a repair with instructions, '
+                'or investigate an execution failure. Quality checks and peer approval still apply.')
+    return message
+
+
+def _communicate_stuck_review(state, task, message):
+    messages = state.setdefault('playerInbox', [])
+    existing = next((m for m in messages if m.get('kind') == 'review_blocked'
+                     and m.get('taskId') == task['id'] and m.get('status') == 'awaiting_guidance'), None)
+    if existing:
+        existing['question'] = message
+        return
+    messages.append({'id': f"review-{task['id']}-{int(time.time()*1000)}",
+                     'kind': 'review_blocked', 'taskId': task['id'], 'issueKey': task['id'],
+                     'agentId': task.get('assignedTo') or 'player', 'question': message,
+                     'context': 'Automatic retries paused; the original task requires intervention.',
+                     'status': 'awaiting_guidance', 'createdAt': int(time.time()*1000)})
 
 
 def _resolve_worker_issue_team(state, wish, task):
@@ -1854,7 +1895,8 @@ def _apply_content_result(state, task, result, now_ms=None):
     # Jev verdict). Must go through the tick's single read-modify-write, not a
     # direct DB write, so queue it here from the executor's result.
     qf = result.get('queueFix')
-    if qf:
+    if qf and not (task.get('reviewOf') and task.get('taskType') in ('review', 'qa')
+                   and result.get('peerVerdict')):
         # A gate review that must go BACK to the same author + the same gate
         # carries the parent id; a free-form pressoffice fix does not.
         queue_work(state, [qf])
@@ -1891,6 +1933,9 @@ def _apply_content_result(state, task, result, now_ms=None):
             verdict = result.get('peerVerdict')
             reviewer = task.get('assignedTo')
             gate = parent['_peerGate']
+            if (task.get('taskType') in ('review', 'qa') and task.get('createdAt')
+                    and task['createdAt'] < (gate.get('enteredMs') or 0)):
+                return  # vote belongs to the previous artifact, before its repair
             # Item 6: fold the reviewer's structured verdict onto the parent so
             # the author and player see WHY the vote went the way it did, not
             # just the binary -- the summary, the checks actually verified, and
@@ -1906,11 +1951,16 @@ def _apply_content_result(state, task, result, now_ms=None):
                     'atMs': now_ms,
                 })
             if verdict == 'actionable':
-                if not _maybe_escalate_stuck_gate(parent, gate, 'repeated rejections', failure_text=task.get('note')):
+                same_round = (parent.get('_peerRepairPending')
+                              and reviewer not in parent.get('_peerRejectedBy', []))
+                if not gate.get('escalated') and (same_round or not _maybe_escalate_stuck_gate(parent, gate, 'repeated rejections', failure_text=task.get('note'), state=state)):
                     gate['approvals'] = 0
                     gate['approvers'] = []
+                    parent.setdefault('_peerRejectedBy', []).append(reviewer)
                     _sim_notify_author(state, parent, reviewer, rationale=task.get('note'))
             elif verdict == 'clean':
+                if parent.get('_peerRepairPending') or gate.get('escalated'):
+                    return  # a rejected artifact cannot close while its repair is pending
                 # Cut 4 hard gate: a review that finds the work clean can only
                 # count as an APPROVAL if its quality pipeline objectively
                 # passed (flake8/mypy/bandit/pytest-cov all green). A reviewer's
@@ -1935,7 +1985,7 @@ def _apply_content_result(state, task, result, now_ms=None):
                 elif _peer_coding_class(parent) and not (result.get('evidence') or '').strip():
                     verdict = 'actionable'
                 if verdict == 'actionable':
-                    if not _maybe_escalate_stuck_gate(parent, gate, 'repeated red-pipeline rejections', failure_text=task.get('note')):
+                    if not _maybe_escalate_stuck_gate(parent, gate, 'repeated red-pipeline rejections', failure_text=task.get('note'), state=state):
                         gate['approvals'] = 0
                         gate['approvers'] = []
                         _sim_notify_author(state, parent, reviewer, rationale=task.get('note'))
@@ -3681,7 +3731,7 @@ def _any_available_including_off_duty(state):
     return False
 
 
-def _eligible_candidates(state, include_off_duty):
+def _eligible_candidates(state, include_off_duty, include_reviewers=False):
     """Port of tasks.js assignTaskViaJev's candidate filter: non-admin, not
     busy/task/pairWith, and (unless include_off_duty) not off-duty.
     Returns list of agent ids in roster order (deterministic base for RR)."""
@@ -3692,6 +3742,8 @@ def _eligible_candidates(state, include_off_duty):
                     if t.get('autoSprints')}
     for d in roster:
         if d.get('isAdmin') or d.get('id') in facilitators:
+            continue
+        if d.get('dedicatedReviewer') and not include_reviewers:
             continue
         a = agents.get(d.get('id'))
         if not a or a.get('busy') or a.get('task') or a.get('pairWith'):
@@ -5028,10 +5080,20 @@ def _pick_reviewer_ids(state, author_id, task_room=None, preferred=None):
             ordered_ids.append(cid)
     team_set = set(team)
 
+    dedicated = {d['id'] for d in roster if d.get('dedicatedReviewer')}
+    pending_reviews = {}
+    for item in state.get('workQueue') or []:
+        if item.get('taskType') == 'review':
+            cid = item.get('assignedTo')
+            pending_reviews[cid] = pending_reviews.get(cid, 0) + 1
+
     def _idle_key(cid):
         a = agents.get(cid) or {}
         cid_room_contrib = bool(task_room) and task_room in (a.get('completedRooms') or [])
         return (0 if preferred and cid in preferred else 1,  # prior reviewers stay at the head
+                0 if cid in dedicated else 1,
+                bool(a.get('busy') or a.get('task') or a.get('pairWith')) if cid in dedicated else False,
+                pending_reviews.get(cid, 0) if cid in dedicated else 0,
                 1 if cid not in team_set and not cid_room_contrib else 0,  # stranger loses
                 0 if cid in team_set else 1,                               # same-team first
                 0 if cid_room_contrib else 1,                              # known-craft next
@@ -5039,6 +5101,8 @@ def _pick_reviewer_ids(state, author_id, task_room=None, preferred=None):
                 a.get('busy') is True,
                 roster_order(cid, roster))
     ordered_ids.sort(key=_idle_key)
+    if any(cid in dedicated for cid in ordered_ids[:2]):
+        return ordered_ids[:2]
     if not preferred:
         # Bell-style cross-pollination (2026-10-06): when the tank can supply
         # both an on-team AND an off-team reviewer, force the pair to span
@@ -5117,6 +5181,8 @@ def _enter_peer_review(state, task, now_ms, preferred=None):
         'escalated': bool(prior.get('escalated')),
     }
     task['status'] = 'needs_review'
+    task.pop('_peerRepairPending', None)
+    task.pop('_peerRejectedBy', None)
     for field in ('lastFailureFingerprint', 'noProgressCount', 'failureHistory'):
         if field in prior:
             gate[field] = list(prior[field]) if field == 'failureHistory' else prior[field]
@@ -5151,6 +5217,7 @@ def _enter_peer_review(state, task, now_ms, preferred=None):
                              'with no concrete, fixable problems. Be a skeptical reviewer, not a rubber stamp.'),
             'goal': task.get('projectLabel') or task.get('goal'),
             'taskType': 'review',
+            'priority': 'high',
             # projectLabel + taskType=review is what routes pressoffice work to the
             # review executor; reviewOf links this vote back to the story.
             'projectLabel': task.get('projectLabel') or task.get('title'),
@@ -5242,6 +5309,51 @@ def _sim_notify_author(state, parent, reviewer_id, rationale=None):
                      f"Peer review of '{parent.get('title')}' was sent back for "
                      f"a fix. What the reviewer said: {(rationale or 'no reason given')[:400]}",
                      source='peer_review')
+    _queue_peer_repair(state, parent, rationale)
+
+
+def _queue_peer_repair(state, parent, rationale=None):
+    """One author-owned repair per rejected artifact, across both reviewer votes."""
+    if (parent.get('_peerGate') or {}).get('escalated'):
+        return
+    author = parent.get('assignedTo')
+    if not author or author not in (state.get('agents') or {}):
+        return
+    tid = parent['id']
+    findings = '\n'.join(
+        f"{r.get('reviewer')}: {r.get('summary') or ''} "
+        + '; '.join(str(check) for check in r.get('checks') or [])
+        for r in (parent.get('peerReviews') or [])[-2:] if r.get('verdict') == 'actionable')
+    feedback = rationale or 'Address the rejected peer-review findings.'
+    instructions = (f"{parent.get('instructions') or ''}\n\nRepair the original deliverable: {parent.get('title')}."
+                    f"\nPeer-review findings: {feedback}\n{findings}"
+                    f"\nExisting Library document: {parent.get('libraryPath') or 'not yet saved'}."
+                    '\nSave the corrected deliverable and meet the original acceptance criteria before requesting review.')
+    existing = next((q for q in state.get('workQueue') or []
+                     if q.get('reviewOf') == tid and q.get('taskType') not in ('review', 'qa')), None)
+    active = next((t for t in (state.get('tasks') or {}).values()
+                   if t.get('reviewOf') == tid and t.get('taskType') not in ('review', 'qa')
+                   and t.get('status') in ('walking', 'working')), None)
+    parent['status'] = 'failed'
+    parent['_peerRepairPending'] = True
+    parent['failNote'] = feedback
+    parent['failedAt'] = int(time.time() * 1000)
+    if existing:
+        existing['instructions'] = instructions
+        return
+    if active:
+        active['instructions'] = instructions
+        return
+    queue_work(state, [{
+        'title': f'Fix: {parent.get("title")}', 'room': parent.get('room'),
+        'taskType': parent.get('taskType') or ('code' if parent.get('room') == 'pressoffice' else 'research'),
+        'instructions': instructions, 'assignedTo': author, 'reviewAuthorId': author, 'reviewOf': tid,
+        'goal': parent.get('goal') or parent.get('projectLabel'),
+        'projectLabel': parent.get('projectLabel') or parent.get('title'),
+        'productId': parent.get('productId'), 'userStory': parent.get('userStory'),
+        'acceptanceCriteria': parent.get('acceptanceCriteria'), 'teamId': parent.get('teamId'),
+        'budgetUsd': parent.get('budgetUsd'), 'priority': 'high',
+    }])
 
 
 def _sim_notify_author_failed(state, task):
@@ -5321,7 +5433,7 @@ def _send_back_after_failure(state, task, fail_note=None):
     task['status'] = 'failed'
     task['failedAt'] = int(time.time() * 1000)
     task['failNote'] = note[:300]
-    escalated = _maybe_escalate_stuck_gate(task, gate, 'quality pipeline keeps failing', failure_text=note)
+    escalated = _maybe_escalate_stuck_gate(task, gate, 'quality pipeline keeps failing', failure_text=note, state=state)
     _log_quality_gate_reject(state, task, note, escalated=escalated)
     if escalated:
         return  # frozen -- escalated + player notified; no further fix cycling
@@ -5489,7 +5601,7 @@ def _sweep_stuck_gates(state, now_ms):
                 # by the shared cycle cap -- this rescue path used to be able
                 # to re-enter indefinitely (once per cooldown window, forever)
                 # with no overall bound at all.
-                if _maybe_escalate_stuck_gate(task, gate, 'repeated failed review attempts'):
+                if _maybe_escalate_stuck_gate(task, gate, 'repeated failed review attempts', state=state):
                     continue
                 repl = _reenter_gate_review(state, task, locked)
                 if repl:
@@ -11060,7 +11172,7 @@ def _sprint_worker_pool(state, sprint_id, worker_count=None):
                 excluded.add(t['scrumMasterId'])
     pool = []
     for d in (state.get('agentRoster') or []):
-        if d.get('isAdmin'):
+        if d.get('isAdmin') or d.get('dedicatedReviewer'):
             continue
         if d.get('director') not in directors:
             continue
@@ -11142,7 +11254,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     # lifecycle (which routes by task['room']) sees a concrete room.
     if not pick.get('room'):
         pick['room'] = _resolve_assignment_room(pick)
-    candidates = _eligible_candidates(state, can_wake_off_duty)
+    candidates = _eligible_candidates(state, can_wake_off_duty, include_reviewers=pick.get('taskType') == 'review')
     # Sprint staffing: a sprint card is assigned ONLY to the sprint's chosen
     # worker pool (the director's 1-6). This is a HARD restriction, not the
     # soft team preference below -- a lean sprint's cards wait (empty pool ->
@@ -11176,6 +11288,10 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     if pinned and sprint_pool is not None and pinned not in sprint_pool:
         pinned = None
     if pinned and agents.get(pinned):
+        if pick.get('taskType') != 'review' and any(
+                d.get('id') == pinned and d.get('dedicatedReviewer')
+                for d in state.get('agentRoster') or []):
+            return None
         pinned_agent = agents.get(pinned)
         if not pinned_agent.get('busy') and not pinned_agent.get('task') and not pinned_agent.get('pairWith'):
             chosen_id = pinned

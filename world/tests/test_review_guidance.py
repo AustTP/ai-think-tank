@@ -25,6 +25,40 @@ def state():
 
 
 class Guidance(unittest.TestCase):
+    def test_stuck_review_communication_includes_cause_evidence_and_next_step(self):
+        s = state()
+        task = s['tasks']['t']
+        task['_peerGate'] = {'cycleCount': sim.MAX_REVIEW_CYCLES - 1, 'approvals': 0}
+        task['peerReviews'] = [{'reviewer': 'ada', 'verdict': 'actionable',
+                                'checks': ['Missing source citations']}]
+        with patch.object(serve, 'create_escalation') as escalate:
+            self.assertTrue(sim._maybe_escalate_stuck_gate(task, task['_peerGate'],
+                'quality pipeline keeps failing', failure_text='Docker daemon unavailable', state=s))
+            sim._maybe_escalate_stuck_gate(task, task['_peerGate'], 'repeated', state=s)
+        self.assertEqual(len(s['playerInbox']), 1)
+        notice = s['playerInbox'][0]
+        for text in ['Docker daemon unavailable', 'Missing source citations', 'Next step:', 'Guide review']:
+            self.assertIn(text, notice['question'])
+            self.assertIn(text, escalate.call_args.args[1])
+        self.assertEqual(notice['status'], 'awaiting_guidance')
+        self.assertEqual(notice['taskId'], 't')
+        escalate.assert_called_once()
+
+    def test_missing_review_verdict_reports_unknown_cause_without_inventing_one(self):
+        task = state()['tasks']['t']
+        message = sim._review_blocker_message(task, 'repeated failed review attempts')
+        self.assertIn('No completed review verdict', message)
+        self.assertIn('execution needs investigation', message)
+
+    def test_applying_guidance_resolves_communication(self):
+        s = state()
+        sim._communicate_stuck_review(s, s['tasks']['t'], 'Review blocked')
+        with patch.object(serve, 'get_state_from_db', return_value=s), \
+                patch.object(serve, 'save_state_to_db'):
+            serve._save_review_guidance('t', {'action': 'retry', 'guidance': 'Fix citations'})
+        self.assertEqual(s['playerInbox'][0]['status'], 'resolved')
+        self.assertIn('retry', s['playerInbox'][0]['answer'])
+
     def test_form_selects_recommended_action_instead_of_pause(self):
         for category, action in [('formatting', 'retry'), ('missing_inputs', 'provide_inputs'),
                                  ('code_defect', 'research')]:

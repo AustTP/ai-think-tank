@@ -2284,8 +2284,8 @@ async function renderPlayerInbox() {
   await refreshPlayerInbox();
   const log = document.getElementById('playerInboxLog');
   log.innerHTML = '';
-  const awaiting = playerInboxCache.filter(m => m.status === 'awaiting_input');
-  const answered = playerInboxCache.filter(m => m.status !== 'awaiting_input');
+  const awaiting = playerInboxCache.filter(m => ['awaiting_input', 'awaiting_guidance'].includes(m.status));
+  const answered = playerInboxCache.filter(m => !['awaiting_input', 'awaiting_guidance'].includes(m.status));
   if (playerInboxCache.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'empty';
@@ -2296,7 +2296,7 @@ async function renderPlayerInbox() {
   const header = document.createElement('div');
   header.className = 'thread-header';
   header.textContent = awaiting.length > 0
-    ? `${awaiting.length} agent${awaiting.length === 1 ? '' : 's'} waiting on your answer`
+    ? `${awaiting.length} message${awaiting.length === 1 ? '' : 's'} needing your attention`
     : 'No questions waiting';
   log.appendChild(header);
   for (const m of awaiting) appendInboxMessage(log, m, true);
@@ -2315,6 +2315,7 @@ function appendInboxMessage(log, m, waiting) {
   box.appendChild(who);
   const q = document.createElement('div');
   q.textContent = m.question || '';
+  q.style.whiteSpace = 'pre-wrap';
   box.appendChild(q);
   if (m.context) {
     const ctx = document.createElement('div');
@@ -2323,7 +2324,13 @@ function appendInboxMessage(log, m, waiting) {
     ctx.textContent = m.context;
     box.appendChild(ctx);
   }
-  if (waiting) {
+  if (m.kind === 'review_blocked' && waiting) {
+    const guide = document.createElement('a');
+    guide.className = 'hud-btn';
+    guide.href = `/api/intent/task/${encodeURIComponent(m.taskId)}/guidance`;
+    guide.textContent = 'Guide review';
+    box.appendChild(guide);
+  } else if (waiting) {
     const row = document.createElement('div');
     row.className = 'thread-input';
     row.style.display = 'flex';
@@ -2369,7 +2376,7 @@ async function refreshInboxCount() {
   await refreshPlayerInbox();
   const el = document.getElementById('hudInboxCount');
   if (!el) return;
-  const n = playerInboxCache.filter(m => m.status === 'awaiting_input').length;
+  const n = playerInboxCache.filter(m => ['awaiting_input', 'awaiting_guidance'].includes(m.status)).length;
   el.textContent = n > 0 ? String(n) : '';
   el.style.background = n > 0 ? '#c34f1f' : 'transparent';
 }

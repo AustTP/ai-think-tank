@@ -566,6 +566,26 @@ class EnsureSandboxNetworkingGap(unittest.TestCase):
 
 
 class RunInSandboxSync(unittest.TestCase):
+    def test_docker_output_uses_utf8_and_tolerates_missing_streams(self):
+        with unittest.mock.patch.object(serve, 'SANDBOX_EXECUTION', 'local'), \
+             unittest.mock.patch.object(serve.subprocess, 'run',
+                 return_value=_fake_run_result(returncode=0, stdout='checks passed →', stderr=None)) as run:
+            out = serve._run_in_sandbox_sync('/tmp/sb', 'echo hi')
+        self.assertEqual(run.call_args.kwargs['encoding'], 'utf-8')
+        self.assertEqual(run.call_args.kwargs['errors'], 'replace')
+        self.assertEqual(out['stdout'], 'checks passed →')
+        self.assertEqual(out['stderr'], '')
+
+    def test_timeout_byte_output_is_json_serializable(self):
+        exc = subprocess.TimeoutExpired(['docker'], 30, output='partial →'.encode('utf-8'), stderr=b'bad\xff')
+        with unittest.mock.patch.object(serve, 'SANDBOX_EXECUTION', 'local'), \
+             unittest.mock.patch.object(serve.subprocess, 'run', side_effect=exc):
+            out = serve._run_in_sandbox_sync('/tmp/sb', 'sleep 100')
+        self.assertEqual(out['stdout'], 'partial →')
+        self.assertEqual(out['stderr'], 'bad\ufffd')
+        self.assertTrue(out['timedOut'])
+        json.dumps(out)
+
     def test_local_backend_runs_command(self):
         with unittest.mock.patch.object(serve, 'SANDBOX_EXECUTION', 'local'), \
              unittest.mock.patch.object(serve.subprocess, 'run',
