@@ -1771,6 +1771,14 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     backlog_item = f'{backlog} -- {instructions}' if instructions else backlog
     name = _agent_name(snapshot, agent_id)
     context = _gather_unified_context(snapshot, base, key, agent_id, WORKROOM_SANDBOX_ID, backlog)
+    # Real review work (quality pipeline + up to 2 probe-round model calls + a
+    # screenshot pass + the Jev verdict) can genuinely take longer than the
+    # generic 120s content ceiling _dispatch_content_work installs -- widen it
+    # here so a slow-but-real verdict is not dropped by that timeout before this
+    # thread finishes (a dropped review leaves the parent gate stuck at 0
+    # approvals and the stuck-gate watchdog re-queues it forever). Same widening
+    # the spike executor applies.
+    task['workUntil'] = time.time() + 300
 
     # Cut 4 -- objective pipeline evidence, run by the sandbox, NOT by reviewer
     # opinion. The approval gate in sim.py refuses to count a clean vote unless
