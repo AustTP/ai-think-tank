@@ -48,7 +48,12 @@ const ROOM_COLLISIONS = {
     { x: 490, y: 95, w: 80, h: 65 },
   ],
   postoffice: [
-    { x: 5, y: 50, w: 620, h: 125 },
+    // Full-width wall that MATCHES the mailbox art: the visual mailbox bank
+    // ends at ~y=238 in room_postoffice.png, so the collision bottom must sit
+    // there too -- otherwise the player walks up into the lower mailboxes and
+    // the mailbox interaction zone (derived just below this wall) lands on
+    // top of the art instead of in front of it.
+    { x: 5, y: 50, w: 620, h: 188 },
   ],
   // Hangout: an empty gathering room, same open layout as the old Outskirts
   // rooms -- just a top wall band, everything below is open walkable space
