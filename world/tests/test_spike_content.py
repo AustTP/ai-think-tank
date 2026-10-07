@@ -1174,103 +1174,44 @@ class SpikeTregWiring(unittest.TestCase):
 
 
 class PixellabCharacterTool(unittest.TestCase):
-    """generate_pixel_character: the SAME real call shape as the think tank's
-    own already-tested spike script (scripts/pixellab_spike.py), not a
-    fresh guess -- create -> poll -> fetch -> real before/after balance
-    delta as cost (PixelLab has no per-call price list the way Treg's
-    catalog does)."""
+    """generate_pixel_character now runs through the generic workflow
+    chokepoint (_api_execute with the registry's pixellab workflow spec):
+    submit /create-character-with-4-directions, poll the background job, fetch
+    the final character, and accrue the real before/after balance delta as
+    cost (PixelLab has no per-call price list). The balance-delta accrual
+    rules (no accrual on zero/negative delta, skip on unreadable balance) are
+    tested against _api_execute_workflow in test_api_call.py; here we cover
+    the executor's thin contract."""
+
+    def _wf(self, data=None, ids=None):
+        return {'ok': True, 'data': data or {'rotation_urls': {'north': 'https://x/n.png'}},
+                'ids': ids or {'character_id': 'char-1'}, 'usd': None,
+                'textForModel': '', 'modelInstruction': ''}
 
     def test_full_flow_returns_character_id_and_rotation_urls(self):
-        executor = content._make_pixellab_tools_executor()
-        with unittest.mock.patch.object(serve, '_pixellab_account_balance', side_effect=[7.41, 7.35]), \
-             unittest.mock.patch.object(serve, '_pixellab_call') as call, \
-             unittest.mock.patch.object(serve, '_pixellab_poll_job', return_value=({'status': 'completed'}, None)), \
-             unittest.mock.patch.object(serve, '_accrue_spend') as accrue:
-            call.side_effect = [
-                ({'character_id': 'char-1', 'background_job_id': 'job-1'}, None),
-                ({'rotation_urls': {'north': 'https://x/n.png'}}, None),
-            ]
+        executor = content._make_pixellab_tools_executor('ben', 'k')
+        with unittest.mock.patch.object(serve, '_api_execute', return_value=self._wf()):
             out = executor('generate_pixel_character', {'description': 'a knight'})
         result = json.loads(out)
         self.assertEqual(result['character_id'], 'char-1')
         self.assertEqual(result['rotation_urls'], {'north': 'https://x/n.png'})
-        # Real cost = the observed balance delta, not a fabricated number.
-        accrue.assert_called_once_with('pixellab', unittest.mock.ANY)
-        self.assertAlmostEqual(accrue.call_args.args[1], 0.06, places=6)
-
-    def test_uses_forced_uncached_balance_reads_on_both_sides(self):
-        executor = content._make_pixellab_tools_executor()
-        with unittest.mock.patch.object(serve, '_pixellab_account_balance', return_value=1.0) as bal, \
-             unittest.mock.patch.object(serve, '_pixellab_call',
-                                        return_value=({'character_id': 'c', 'background_job_id': 'j'}, None)), \
-             unittest.mock.patch.object(serve, '_pixellab_poll_job', return_value=({'status': 'completed'}, None)), \
-             unittest.mock.patch.object(serve, '_accrue_spend'):
-            executor('generate_pixel_character', {'description': 'a knight'})
-        for call in bal.call_args_list:
-            self.assertEqual(call.kwargs.get('force'), True)
 
     def test_empty_description_is_rejected_without_a_call(self):
-        executor = content._make_pixellab_tools_executor()
-        with unittest.mock.patch.object(serve, '_pixellab_call') as call:
+        executor = content._make_pixellab_tools_executor('ben', 'k')
+        with unittest.mock.patch.object(serve, '_api_execute') as ae:
             out = executor('generate_pixel_character', {'description': '  '})
-        call.assert_not_called()
+        ae.assert_not_called()
         self.assertIn('required', out)
 
-    def test_create_error_does_not_poll_or_accrue(self):
-        executor = content._make_pixellab_tools_executor()
-        with unittest.mock.patch.object(serve, '_pixellab_account_balance', return_value=1.0), \
-             unittest.mock.patch.object(serve, '_pixellab_call', return_value=(None, 'PixelLab call failed (500): boom')), \
-             unittest.mock.patch.object(serve, '_pixellab_poll_job') as poll, \
-             unittest.mock.patch.object(serve, '_accrue_spend') as accrue:
+    def test_create_error_is_surfaced_not_raised(self):
+        executor = content._make_pixellab_tools_executor('ben', 'k')
+        with unittest.mock.patch.object(serve, '_api_execute',
+                                        return_value={'ok': False, 'error': 'PixelLab call failed (500): boom'}):
             out = executor('generate_pixel_character', {'description': 'a knight'})
-        poll.assert_not_called()
-        accrue.assert_not_called()
         self.assertIn('Could not generate character', out)
-
-    def test_job_failure_does_not_accrue(self):
-        executor = content._make_pixellab_tools_executor()
-        with unittest.mock.patch.object(serve, '_pixellab_account_balance', return_value=1.0), \
-             unittest.mock.patch.object(serve, '_pixellab_call',
-                                        return_value=({'character_id': 'c', 'background_job_id': 'j'}, None)), \
-             unittest.mock.patch.object(serve, '_pixellab_poll_job', return_value=(None, 'PixelLab job timed out')), \
-             unittest.mock.patch.object(serve, '_accrue_spend') as accrue:
-            out = executor('generate_pixel_character', {'description': 'a knight'})
-        accrue.assert_not_called()
-        self.assertIn('Could not generate character', out)
-
-    def test_zero_or_negative_balance_delta_does_not_accrue(self):
-        # A subscription-covered generation (within the free monthly
-        # allotment) shows no real balance movement -- must not fabricate a
-        # nonzero cost just because a generation happened.
-        executor = content._make_pixellab_tools_executor()
-        with unittest.mock.patch.object(serve, '_pixellab_account_balance', side_effect=[7.41, 7.41]), \
-             unittest.mock.patch.object(serve, '_pixellab_call',
-                                         return_value=({'character_id': 'c', 'background_job_id': 'j'}, None)), \
-             unittest.mock.patch.object(serve, '_pixellab_poll_job', return_value=({'status': 'completed'}, None)), \
-             unittest.mock.patch.object(serve, '_accrue_spend') as accrue:
-            executor('generate_pixel_character', {'description': 'a knight'})
-        accrue.assert_not_called()
-
-    def test_unknown_balance_reads_skip_accrual(self):
-        # If PixelLab's balance can't be read (force call fails), there is no
-        # verified number to base cost on -- the generation still succeeds, it
-        # just accrues nothing rather than guessing a cost.
-        executor = content._make_pixellab_tools_executor()
-        with unittest.mock.patch.object(serve, '_pixellab_account_balance', return_value=None), \
-             unittest.mock.patch.object(serve, '_pixellab_call') as call, \
-             unittest.mock.patch.object(serve, '_pixellab_poll_job', return_value=({'status': 'completed'}, None)), \
-             unittest.mock.patch.object(serve, '_accrue_spend') as accrue:
-            call.side_effect = [
-                ({'character_id': 'char-1', 'background_job_id': 'job-1'}, None),
-                ({'rotation_urls': {'north': 'https://x/n.png'}}, None),
-            ]
-            out = executor('generate_pixel_character', {'description': 'a knight'})
-        result = json.loads(out)
-        self.assertEqual(result['character_id'], 'char-1')
-        accrue.assert_not_called()
 
     def test_unknown_tool_name_raises(self):
-        executor = content._make_pixellab_tools_executor()
+        executor = content._make_pixellab_tools_executor('ben', 'k')
         with self.assertRaises(ValueError):
             executor('some_other_tool', {})
 
@@ -1405,113 +1346,121 @@ class GitHubToolsExecutor(unittest.TestCase):
     hallucinating plausible-looking repos/issues."""
 
     def test_get_repo_builds_the_real_url_and_returns_metadata(self):
-        executor = content._make_github_tools_executor()
-        with unittest.mock.patch.object(serve, '_github_call',
-                                        return_value=({'full_name': 'python/cpython', 'stargazers_count': 70000}, None)) as call:
+        executor = content._make_github_tools_executor('ben', 'k')
+        with unittest.mock.patch.object(serve, '_api_execute',
+                                        return_value={'ok': True, 'data': {'full_name': 'python/cpython', 'stargazers_count': 70000},
+                                                      'textForModel': '', 'modelInstruction': ''}) as ae:
             out = executor('github_get_repo', {'owner': 'python', 'repo': 'cpython'})
-        call.assert_called_once_with(
-            'GET', 'https://api.github.com/repos/python/cpython')
+        self.assertEqual(ae.call_args.args[2], 'https://api.github.com/repos/python/cpython')
         self.assertIn('python/cpython', out)
         self.assertIn('stars', out)
 
     def test_get_repo_url_escapes_owner_and_repo(self):
-        executor = content._make_github_tools_executor()
-        with unittest.mock.patch.object(serve, '_github_call', return_value=({}, None)) as call:
+        executor = content._make_github_tools_executor('ben', 'k')
+        with unittest.mock.patch.object(serve, '_api_execute',
+                                        return_value={'ok': True, 'data': {}, 'textForModel': '', 'modelInstruction': ''}) as ae:
             executor('github_get_repo', {'owner': 'my org', 'repo': 'my/repo'})
-        self.assertIn('my%20org', call.call_args.args[1])
-        self.assertIn('my%2Frepo', call.call_args.args[1])
+        self.assertIn('my%20org', ae.call_args.args[2])
+        self.assertIn('my%2Frepo', ae.call_args.args[2])
 
     def test_get_repo_requires_owner_and_repo(self):
-        executor = content._make_github_tools_executor()
-        with unittest.mock.patch.object(serve, '_github_call') as call:
+        executor = content._make_github_tools_executor('ben', 'k')
+        with unittest.mock.patch.object(serve, '_api_execute') as ae:
             out = executor('github_get_repo', {'owner': '', 'repo': ''})
-        call.assert_not_called()
+        ae.assert_not_called()
         self.assertIn('required', out)
 
     def test_list_issues_filters_out_pull_requests(self):
-        executor = content._make_github_tools_executor()
+        executor = content._make_github_tools_executor('ben', 'k')
         fake = [
             {'number': 1, 'title': 'an issue', 'state': 'open', 'labels': [], 'comments': 2, 'html_url': 'u1'},
             {'number': 2, 'title': 'a PR', 'state': 'open', 'labels': [], 'comments': 0, 'html_url': 'u2', 'pull_request': {}},
         ]
-        with unittest.mock.patch.object(serve, '_github_call', return_value=(fake, None)) as call:
+        with unittest.mock.patch.object(serve, '_api_execute',
+                                        return_value={'ok': True, 'data': fake, 'textForModel': '', 'modelInstruction': ''}) as ae:
             out = executor('github_list_issues', {'owner': 'python', 'repo': 'cpython'})
         self.assertIn('an issue', out)
-        self.assertIn('state=open', call.call_args.args[1])
-        self.assertIn('per_page=10', call.call_args.args[1])
+        self.assertIn('state=open', ae.call_args.args[2])
+        self.assertIn('per_page=10', ae.call_args.args[2])
         self.assertNotIn('a PR', out)
 
     def test_list_issues_respects_state_and_limit(self):
-        executor = content._make_github_tools_executor()
-        with unittest.mock.patch.object(serve, '_github_call', return_value=([], None)) as call:
+        executor = content._make_github_tools_executor('ben', 'k')
+        with unittest.mock.patch.object(serve, '_api_execute',
+                                        return_value={'ok': True, 'data': [], 'textForModel': '', 'modelInstruction': ''}) as ae:
             executor('github_list_issues', {'owner': 'o', 'repo': 'r', 'state': 'closed', 'limit': 30})
-        self.assertIn('state=closed', call.call_args.args[1])
-        self.assertIn('per_page=30', call.call_args.args[1])
+        self.assertIn('state=closed', ae.call_args.args[2])
+        self.assertIn('per_page=30', ae.call_args.args[2])
 
     def test_get_issue_guards_against_pull_requests(self):
-        executor = content._make_github_tools_executor()
-        with unittest.mock.patch.object(serve, '_github_call',
-                                        return_value=({'number': 7, 'pull_request': {'url': 'x'}}, None)) as call:
+        executor = content._make_github_tools_executor('ben', 'k')
+        with unittest.mock.patch.object(serve, '_api_execute',
+                                        return_value={'ok': True, 'data': {'number': 7, 'pull_request': {'url': 'x'}},
+                                                      'textForModel': '', 'modelInstruction': ''}) as ae:
             out = executor('github_get_issue', {'owner': 'o', 'repo': 'r', 'issue_number': 7})
         self.assertIn('is a pull request', out)
         # The comments fetch must not have happened for a PR.
-        call.assert_called_once()
+        ae.assert_called_once()
 
     def test_get_issue_fetches_top_comments(self):
-        executor = content._make_github_tools_executor()
+        executor = content._make_github_tools_executor('ben', 'k')
         issue = {'number': 1, 'title': 't', 'state': 'open', 'labels': [], 'body': 'body', 'html_url': 'u'}
         comments = [{'user': {'login': 'alice'}, 'body': 'agree'}]
-        with unittest.mock.patch.object(serve, '_github_call',
-                                        side_effect=[(issue, None), (comments, None)]) as call:
+        with unittest.mock.patch.object(serve, '_api_execute',
+                                        side_effect=[{'ok': True, 'data': issue, 'textForModel': '', 'modelInstruction': ''},
+                                                     {'ok': True, 'data': comments, 'textForModel': '', 'modelInstruction': ''}]) as ae:
             out = executor('github_get_issue', {'owner': 'o', 'repo': 'r', 'issue_number': 1})
         self.assertIn('top_comments', out)
         self.assertIn('alice', out)
-        self.assertEqual(call.call_count, 2)
-        self.assertIn('comments?per_page=20', call.call_args_list[1].args[1])
+        self.assertEqual(ae.call_count, 2)
+        self.assertIn('comments?per_page=20', ae.call_args_list[1].args[2])
 
     def test_get_issue_comments_error_yields_empty_top_comments(self):
         # A comments fetch failure must not fail the whole issue read -- the
         # issue body/title are still real and useful; comments just degrade to
         # an empty list rather than a fabricated one.
-        executor = content._make_github_tools_executor()
+        executor = content._make_github_tools_executor('ben', 'k')
         issue = {'number': 1, 'title': 't', 'state': 'open', 'labels': [], 'body': 'body', 'html_url': 'u'}
-        with unittest.mock.patch.object(serve, '_github_call',
-                                        side_effect=[(issue, None), (None, 'GitHub call failed (500): boom')]):
+        with unittest.mock.patch.object(serve, '_api_execute',
+                                        side_effect=[{'ok': True, 'data': issue, 'textForModel': '', 'modelInstruction': ''},
+                                                     {'ok': False, 'error': 'GitHub call failed (500): boom'}]):
             out = executor('github_get_issue', {'owner': 'o', 'repo': 'r', 'issue_number': 1})
         self.assertIn('"top_comments": []', out)
         self.assertIn('"title": "t"', out)
 
     def test_get_issue_requires_number(self):
-        executor = content._make_github_tools_executor()
-        with unittest.mock.patch.object(serve, '_github_call') as call:
+        executor = content._make_github_tools_executor('ben', 'k')
+        with unittest.mock.patch.object(serve, '_api_execute') as ae:
             out = executor('github_get_issue', {'owner': 'o', 'repo': 'r'})
-        call.assert_not_called()
+        ae.assert_not_called()
         self.assertIn('required', out)
 
     def test_search_code_builds_the_real_query_url(self):
-        executor = content._make_github_tools_executor()
+        executor = content._make_github_tools_executor('ben', 'k')
         fake = {'total_count': 1, 'items': [{'repository': {'full_name': 'o/r'}, 'path': 'p.py', 'html_url': 'u'}]}
-        with unittest.mock.patch.object(serve, '_github_call', return_value=(fake, None)) as call:
+        with unittest.mock.patch.object(serve, '_api_execute',
+                                        return_value={'ok': True, 'data': fake, 'textForModel': '', 'modelInstruction': ''}) as ae:
             out = executor('github_search_code', {'query': 'openrouter language:python'})
         self.assertIn('total_count', out)
-        self.assertIn('openrouter%20language%3Apython', call.call_args.args[1])
-        self.assertIn('per_page=5', call.call_args.args[1])
+        self.assertIn('openrouter%20language%3Apython', ae.call_args.args[2])
+        self.assertIn('per_page=5', ae.call_args.args[2])
 
     def test_search_code_requires_a_query(self):
-        executor = content._make_github_tools_executor()
-        with unittest.mock.patch.object(serve, '_github_call') as call:
+        executor = content._make_github_tools_executor('ben', 'k')
+        with unittest.mock.patch.object(serve, '_api_execute') as ae:
             out = executor('github_search_code', {'query': ''})
-        call.assert_not_called()
+        ae.assert_not_called()
         self.assertIn('required', out)
 
     def test_error_from_github_call_is_surfaced_not_raised(self):
-        executor = content._make_github_tools_executor()
-        with unittest.mock.patch.object(serve, '_github_call', return_value=(None, 'GitHub call failed (404): not found')):
+        executor = content._make_github_tools_executor('ben', 'k')
+        with unittest.mock.patch.object(serve, '_api_execute',
+                                        return_value={'ok': False, 'error': 'GitHub call failed (404): not found'}):
             out = executor('github_get_repo', {'owner': 'o', 'repo': 'nope'})
         self.assertIn('Could not read the repo', out)
 
     def test_unknown_tool_name_raises(self):
-        executor = content._make_github_tools_executor()
+        executor = content._make_github_tools_executor('ben', 'k')
         with self.assertRaises(ValueError):
             executor('some_other_tool', {})
 
@@ -1559,109 +1508,98 @@ class ApifyToolsExecutor(unittest.TestCase):
     a fabricated number."""
 
     def test_run_actor_success_accrues_reported_cost_and_fetches_items(self):
-        executor = content._make_apify_tools_executor()
+        executor = content._make_apify_tools_executor('ben', 'k')
         started = {'data': {'id': 'run-1', 'status': 'RUNNING',
                             'defaultDatasetId': 'ds-1', 'usageTotalUsd': 0.0}}
         settled = {'data': {'id': 'run-1', 'status': 'SUCCEEDED',
                             'defaultDatasetId': 'ds-1', 'usageTotalUsd': 0.0042}}
         items = [{'url': 'https://example.com', 'title': 'Example'}]
-        calls = {'n': 0}
 
-        def fake_apify_call(path, **kw):
-            if path.startswith('/actors/') and path.endswith('/runs'):
-                return started, None
-            if path == '/actor-runs/run-1':
-                return settled, None
-            if path == '/datasets/ds-1/items':
-                return items, None
-            return {}, None
+        def fake_execute(agent_id, key, url, method='GET', req_body=None, req_headers=None,
+                         purpose='', workflow=False, workflow_params=None, trace_id=None):
+            if '/actors/' in url and '/runs' in url:
+                return {'ok': True, 'data': started, 'textForModel': '', 'modelInstruction': ''}
+            if '/actor-runs/' in url:
+                return {'ok': True, 'data': settled, 'textForModel': '', 'modelInstruction': ''}
+            if '/datasets/' in url:
+                return {'ok': True, 'data': items, 'textForModel': '', 'modelInstruction': ''}
+            return {'ok': True, 'data': {}, 'textForModel': '', 'modelInstruction': ''}
 
         with unittest.mock.patch.object(serve, '_apify_budget_exceeded', return_value=False) as gate, \
-             unittest.mock.patch.object(serve, '_apify_call', side_effect=fake_apify_call) as call, \
-             unittest.mock.patch.object(serve, '_accrue_apify_spend') as accrue, \
+             unittest.mock.patch.object(serve, '_api_execute', side_effect=fake_execute) as ae, \
              unittest.mock.patch('time.sleep'):
             out = executor('apify_run_actor',
                            {'actorId': 'apify/website-content-crawler',
                             'input': {'startUrls': [{'url': 'https://example.com'}]},
                             'waitSeconds': 5})
         gate.assert_called_once()
-        call.assert_any_call('/actors/apify/website-content-crawler/runs', method='POST',
-                             body={'startUrls': [{'url': 'https://example.com'}]},
-                             query={'timeout': '60'}, timeout=60)
-        call.assert_any_call('/actor-runs/run-1', timeout=20)
-        call.assert_any_call('/datasets/ds-1/items', query={'format': 'json', 'clean': '1', 'limit': '10'},
-                             timeout=20)
-        accrue.assert_called_once_with(0.0042)
+        urls = [c.args[2] for c in ae.call_args_list]
+        self.assertIn('/actors/apify/website-content-crawler/runs', urls[0])
+        self.assertIn('/actor-runs/run-1', urls[1])
+        self.assertIn('/datasets/ds-1/items', urls[2])
         self.assertIn('SUCCEEDED', out)
         self.assertIn('run-1', out)
         self.assertIn('https://example.com', out)
 
     def test_run_actor_refuses_when_budget_exceeded_without_any_network_call(self):
-        executor = content._make_apify_tools_executor()
+        executor = content._make_apify_tools_executor('ben', 'k')
         with unittest.mock.patch.object(serve, '_apify_budget_exceeded', return_value=True), \
-             unittest.mock.patch.object(serve, '_apify_call') as call, \
-             unittest.mock.patch.object(serve, '_accrue_apify_spend') as accrue:
+             unittest.mock.patch.object(serve, '_api_execute') as ae:
             out = executor('apify_run_actor', {'actorId': 'apify/website-content-crawler',
                                                'input': {'startUrls': []}})
-        call.assert_not_called()
-        accrue.assert_not_called()
+        ae.assert_not_called()
         self.assertIn('budget is exhausted', out)
 
     def test_run_actor_error_is_returned_without_accruing(self):
-        executor = content._make_apify_tools_executor()
+        executor = content._make_apify_tools_executor('ben', 'k')
         with unittest.mock.patch.object(serve, '_apify_budget_exceeded', return_value=False), \
-             unittest.mock.patch.object(serve, '_apify_call', return_value=(None, 'Apify call failed (403): denied')), \
-             unittest.mock.patch.object(serve, '_accrue_apify_spend') as accrue:
+             unittest.mock.patch.object(serve, '_api_execute',
+                                        return_value={'ok': False, 'error': 'Apify call failed (403): denied'}):
             out = executor('apify_run_actor', {'actorId': 'x', 'input': {}})
-        accrue.assert_not_called()
         self.assertIn('Could not start Apify actor', out)
 
     def test_run_actor_poll_error_breaks_without_accruing_or_fetching_items(self):
         # A poll call failing mid-wait must stop polling (not keep hammering),
-        # report the last known status, and skip both cost accrual (no settled
-        # usage yet) and the items fetch (run never SUCCEEDED).
-        executor = content._make_apify_tools_executor()
+        # report the last known status, and skip the items fetch (run never
+        # SUCCEEDED). Spend accrual lives in _api_execute (tested separately).
+        executor = content._make_apify_tools_executor('ben', 'k')
         calls = {'n': 0}
-        call_log = []
 
-        def fake_apify_call(path, **kw):
+        def fake_execute(agent_id, key, url, method='GET', req_body=None, req_headers=None,
+                         purpose='', workflow=False, workflow_params=None, trace_id=None):
             calls['n'] += 1
-            call_log.append(path)
             if calls['n'] == 1:
-                return ({'data': {'id': 'run-1', 'status': 'RUNNING',
-                                  'defaultDatasetId': 'ds-1'}}, None)
-            return (None, 'Apify call failed (500): poll boom')
+                return {'ok': True, 'data': {'data': {'id': 'run-1', 'status': 'RUNNING',
+                                                      'defaultDatasetId': 'ds-1'}},
+                        'textForModel': '', 'modelInstruction': ''}
+            return {'ok': False, 'error': 'Apify call failed (500): poll boom'}
 
         with unittest.mock.patch.object(serve, '_apify_budget_exceeded', return_value=False), \
-             unittest.mock.patch.object(serve, '_apify_call', side_effect=fake_apify_call), \
-             unittest.mock.patch.object(serve, '_accrue_apify_spend') as accrue, \
+             unittest.mock.patch.object(serve, '_api_execute', side_effect=fake_execute), \
              unittest.mock.patch('time.sleep'):
             out = executor('apify_run_actor',
                            {'actorId': 'apify/website-content-crawler',
                             'input': {'startUrls': [{'url': 'https://example.com'}]},
                             'waitSeconds': 5})
         self.assertEqual(calls['n'], 2)  # start + one (errored) poll, then break
-        self.assertEqual(call_log, ['/actors/apify/website-content-crawler/runs', '/actor-runs/run-1'])
-        accrue.assert_not_called()
         self.assertIn('RUNNING', out)  # never overwritten after the failed poll
         self.assertIn('run-1', out)
 
     def test_run_actor_reports_items_error_when_dataset_fetch_fails(self):
         # A run that settles SUCCEEDED but whose dataset items fetch fails must
         # still report the run honestly, with the items error surfaced.
-        executor = content._make_apify_tools_executor()
+        executor = content._make_apify_tools_executor('ben', 'k')
 
-        def fake_apify_call(path, **kw):
-            if path.startswith('/actors/') and path.endswith('/runs'):
-                return ({'data': {'id': 'run-1', 'status': 'SUCCEEDED',
-                                  'defaultDatasetId': 'ds-1', 'usageTotalUsd': 0.01}}, None)
-            if path == '/datasets/ds-1/items':
-                return (None, 'Apify call failed (500): items boom')
-            return ({}, None)
+        def fake_execute(agent_id, key, url, method='GET', req_body=None, req_headers=None,
+                         purpose='', workflow=False, workflow_params=None, trace_id=None):
+            if '/actors/' in url:
+                return {'ok': True, 'data': {'data': {'id': 'run-1', 'status': 'SUCCEEDED',
+                                                      'defaultDatasetId': 'ds-1', 'usageTotalUsd': 0.01}},
+                        'textForModel': '', 'modelInstruction': ''}
+            return {'ok': False, 'error': 'Apify call failed (500): items boom'}
 
         with unittest.mock.patch.object(serve, '_apify_budget_exceeded', return_value=False), \
-             unittest.mock.patch.object(serve, '_apify_call', side_effect=fake_apify_call) as call, \
-             unittest.mock.patch.object(serve, '_accrue_apify_spend') as accrue, \
+             unittest.mock.patch.object(serve, '_api_execute', side_effect=fake_execute) as ae, \
              unittest.mock.patch('time.sleep'):
             out = executor('apify_run_actor',
                            {'actorId': 'apify/website-content-crawler',
@@ -1669,21 +1607,20 @@ class ApifyToolsExecutor(unittest.TestCase):
         self.assertIn('SUCCEEDED', out)
         self.assertIn('itemsError', out)
         self.assertIn('items boom', out)
-        accrue.assert_called_once_with(0.01)
         # SUCCEEDED at start -> no poll loop; exactly start + items fetch.
-        self.assertEqual(call.call_count, 2)
+        self.assertEqual(ae.call_count, 2)
 
     def test_get_dataset_items_fetches_clean_json(self):
-        executor = content._make_apify_tools_executor()
-        with unittest.mock.patch.object(serve, '_apify_call',
-                                        return_value=([{'a': 1}], None)) as call:
+        executor = content._make_apify_tools_executor('ben', 'k')
+        with unittest.mock.patch.object(serve, '_api_execute',
+                                        return_value={'ok': True, 'data': [{'a': 1}],
+                                                      'textForModel': '', 'modelInstruction': ''}) as ae:
             out = executor('apify_get_dataset_items', {'datasetId': 'ds-9'})
-        call.assert_called_once_with('/datasets/ds-9/items',
-                                     query={'format': 'json', 'clean': '1', 'limit': '10'}, timeout=30)
+        self.assertIn('/datasets/ds-9/items', ae.call_args.args[2])
         self.assertIn('"a"', out)
 
     def test_unknown_tool_name_raises(self):
-        executor = content._make_apify_tools_executor()
+        executor = content._make_apify_tools_executor('ben', 'k')
         with self.assertRaises(ValueError):
             executor('some_other_tool', {})
 

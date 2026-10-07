@@ -127,83 +127,66 @@ class HiggsfieldGenerate(unittest.TestCase):
         self.assertEqual(serve._higgsfield_generate('image', {}), 'prompt is required')
         self.assertEqual(serve._higgsfield_generate('video', {'prompt': '  '}), 'prompt is required')
 
-    def test_image_success_accrues_the_real_estimate_once(self):
-        submit = self._submit()
-        completed = ({'status': 'completed', 'request_id': 'req-1',
-                      'images': [{'url': 'https://cdn.example.com/i.jpg'}]}, None)
-        with mock.patch.object(serve, '_higgsfield_estimate_usd', return_value=0.094), \
-             mock.patch.object(serve, '_higgsfield_call', side_effect=[submit, completed]), \
-             mock.patch.object(serve, '_higgsfield_log_manifest') as mani, \
-             mock.patch.object(serve, '_accrue_spend') as acc:
+    def _wf(self, data, usd=0.094):
+        return {'ok': True, 'data': data, 'usd': usd, 'ids': {},
+                'textForModel': '<<<EXTERNAL_DATA', 'modelInstruction': ''}
+
+    def test_image_success_uses_the_workflow_and_manifests(self):
+        completed = {'status': 'completed', 'request_id': 'req-1',
+                     'images': [{'url': 'https://cdn.example.com/i.jpg'}]}
+        with mock.patch.object(serve, '_api_execute', return_value=self._wf(completed, 0.094)), \
+             mock.patch.object(serve, '_higgsfield_log_manifest') as mani:
             out = serve._higgsfield_generate('image', {'prompt': 'an alpine lake'}, 'ada', 'key')
         self.assertIn('https://cdn.example.com/i.jpg', out)
         self.assertIn('$0.094', out)
-        acc.assert_called_once_with('higgsfield', 0.094)
         mani.assert_called_once()
 
-    def test_video_success_uses_the_completed_submit_directly(self):
-        # A submit that already returns completed must not poll again.
-        done = ({'status': 'completed', 'request_id': 'req-2',
-                 'video': {'url': 'https://cdn.example.com/v.mp4'}}, None)
-        with mock.patch.object(serve, '_higgsfield_estimate_usd', return_value=0.300), \
-             mock.patch.object(serve, '_higgsfield_call', return_value=done), \
-             mock.patch.object(serve, '_higgsfield_log_manifest'), \
-             mock.patch.object(serve, '_accrue_spend') as acc:
+    def test_video_success_surfaces_the_url(self):
+        done = {'status': 'completed', 'request_id': 'req-2',
+                'video': {'url': 'https://cdn.example.com/v.mp4'}}
+        with mock.patch.object(serve, '_api_execute', return_value=self._wf(done, 0.300)), \
+             mock.patch.object(serve, '_higgsfield_log_manifest'):
             out = serve._higgsfield_generate('video', {'prompt': 'sunset drive'}, 'ada', 'key')
         self.assertIn('https://cdn.example.com/v.mp4', out)
-        acc.assert_called_once_with('higgsfield', 0.300)
 
     def test_failed_request_is_never_charged(self):
-        submit = self._submit()
-        failed = ({'status': 'failed', 'request_id': 'req-1'}, None)
-        with mock.patch.object(serve, '_higgsfield_estimate_usd', return_value=0.094), \
-             mock.patch.object(serve, '_higgsfield_call', side_effect=[submit, failed]), \
-             mock.patch.object(serve, '_higgsfield_log_manifest'), \
-             mock.patch.object(serve, '_accrue_spend') as acc:
+        failed = {'status': 'failed', 'request_id': 'req-1'}
+        with mock.patch.object(serve, '_api_execute', return_value=self._wf(failed, 0.094)), \
+             mock.patch.object(serve, '_higgsfield_log_manifest') as mani:
             out = serve._higgsfield_generate('image', {'prompt': 'x'}, 'ada', 'key')
         self.assertIn('did not complete', out)
         self.assertIn('not charged', out)
-        acc.assert_not_called()
+        mani.assert_not_called()
 
     def test_nsfw_request_is_never_charged(self):
-        submit = self._submit()
-        nsfw = ({'status': 'nsfw', 'request_id': 'req-1'}, None)
-        with mock.patch.object(serve, '_higgsfield_estimate_usd', return_value=0.094), \
-             mock.patch.object(serve, '_higgsfield_call', side_effect=[submit, nsfw]), \
-             mock.patch.object(serve, '_higgsfield_log_manifest'), \
-             mock.patch.object(serve, '_accrue_spend') as acc:
+        nsfw = {'status': 'nsfw', 'request_id': 'req-1'}
+        with mock.patch.object(serve, '_api_execute', return_value=self._wf(nsfw, 0.094)), \
+             mock.patch.object(serve, '_higgsfield_log_manifest') as mani:
             out = serve._higgsfield_generate('video', {'prompt': 'x'}, 'ada', 'key')
         self.assertIn('nsfw', out)
-        acc.assert_not_called()
+        mani.assert_not_called()
 
     def test_missing_estimate_still_generates_but_charges_nothing(self):
-        submit = self._submit()
-        completed = ({'status': 'completed', 'request_id': 'req-1',
-                      'images': [{'url': 'https://cdn.example.com/i.jpg'}]}, None)
-        with mock.patch.object(serve, '_higgsfield_estimate_usd', return_value=None), \
-             mock.patch.object(serve, '_higgsfield_call', side_effect=[submit, completed]), \
-             mock.patch.object(serve, '_higgsfield_log_manifest'), \
-             mock.patch.object(serve, '_accrue_spend') as acc:
+        completed = {'status': 'completed', 'request_id': 'req-1',
+                     'images': [{'url': 'https://cdn.example.com/i.jpg'}]}
+        with mock.patch.object(serve, '_api_execute', return_value=self._wf(completed, None)), \
+             mock.patch.object(serve, '_higgsfield_log_manifest'):
             out = serve._higgsfield_generate('image', {'prompt': 'x'}, 'ada', 'key')
         self.assertIn('https://cdn.example.com/i.jpg', out)
-        acc.assert_not_called()
+        self.assertNotIn('billed to the think tank', out)
 
     def test_video_body_clamps_and_validates_params(self):
         captured = {}
-
-        def fake_call(method, path, body=None, timeout=120):
-            captured['path'] = path
-            captured['body'] = body
-            return ({'status': 'completed', 'request_id': 'r',
-                     'video': {'url': 'https://cdn.example.com/v.mp4'}}, None)
-
-        with mock.patch.object(serve, '_higgsfield_estimate_usd', return_value=0.2), \
-             mock.patch.object(serve, '_higgsfield_call', side_effect=fake_call), \
+        with mock.patch.object(serve, '_api_execute', return_value=self._wf(
+                {'status': 'completed', 'request_id': 'r',
+                 'video': {'url': 'https://cdn.example.com/v.mp4'}}, 0.2)) as ae, \
              mock.patch.object(serve, '_higgsfield_log_manifest'):
             serve._higgsfield_generate('video',
                                        {'prompt': 'sunset', 'duration': 20,
                                         'aspect_ratio': '1:1', 'sound': 'off'}, 'ada', 'key')
-        self.assertEqual(captured['path'], '/kling-video/v3.0/std/text-to-video')
+        captured['path'] = ae.call_args.kwargs['workflow_params']['endpoint']
+        captured['body'] = ae.call_args.args[4]
+        self.assertEqual(captured['path'], serve._HIGGSFIELD_VIDEO_ENDPOINT)
         self.assertEqual(captured['body']['prompt'], 'sunset')
         self.assertEqual(captured['body']['duration'], 15, 'duration clamps to the documented max')
         self.assertEqual(captured['body']['aspect_ratio'], '1:1')
@@ -211,18 +194,14 @@ class HiggsfieldGenerate(unittest.TestCase):
 
     def test_image_body_is_just_the_prompt(self):
         captured = {}
-
-        def fake_call(method, path, body=None, timeout=120):
-            captured['path'] = path
-            captured['body'] = body
-            return ({'status': 'completed', 'request_id': 'r',
-                     'images': [{'url': 'https://cdn.example.com/i.jpg'}]}, None)
-
-        with mock.patch.object(serve, '_higgsfield_estimate_usd', return_value=0.1), \
-             mock.patch.object(serve, '_higgsfield_call', side_effect=fake_call), \
+        with mock.patch.object(serve, '_api_execute', return_value=self._wf(
+                {'status': 'completed', 'request_id': 'r',
+                 'images': [{'url': 'https://cdn.example.com/i.jpg'}]}, 0.1)) as ae, \
              mock.patch.object(serve, '_higgsfield_log_manifest'):
             serve._higgsfield_generate('image', {'prompt': 'lake'}, 'ada', 'key')
-        self.assertEqual(captured['path'], '/higgsfield-ai/soul/v2/standard')
+        captured['path'] = ae.call_args.kwargs['workflow_params']['endpoint']
+        captured['body'] = ae.call_args.args[4]
+        self.assertEqual(captured['path'], serve._HIGGSFIELD_IMAGE_ENDPOINT)
         self.assertEqual(captured['body'], {'prompt': 'lake'})
 
 

@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "comment": "Registry of external services reachable through the generic api_call tool. Adding a service here (base_url, credential source, auth, allowed paths/methods, spend rule) is the config-not-code path: no Python adapter needed. The security gates around these entries (SSRF, Jev classification, rate limit, one-strike, page/spend accrual) live in serve.py and are never delegated to this file. path_rules prefixes are matched against the URL path under base_url.",
+  "services": {
+    "github": {
+      "name": "GitHub",
+      "base_url": "https://api.github.com",
+      "credential": {"type": "env", "key": "GITHUB_TOKEN"},
+      "auth": {"type": "header_bearer"},
+      "default_headers": {"Accept": "application/vnd.github+json"},
+      "methods": ["GET", "HEAD"],
+      "path_rules": [
+        {"prefix": "/", "methods": ["GET", "HEAD"]}
+      ],
+      "spend": {"kind": "none", "note": "free public API, rate-limited by GitHub"}
+    },
+    "tavily": {
+      "name": "Tavily",
+      "base_url": "https://api.tavily.com",
+      "credential": {"type": "env", "key": "TAVILY_API_KEY"},
+      "auth": {"type": "body_field", "field": "api_key"},
+      "methods": ["POST"],
+      "path_rules": [
+        {"prefix": "/search", "methods": ["POST"]}
+      ],
+      "spend": {"kind": "page_request", "note": "counts one page request against the monthly budget"}
+    },
+    "apify": {
+      "name": "Apify",
+      "base_url": "https://api.apify.com/v2",
+      "credential": {"type": "env", "key": "APIFY_API_KEY"},
+      "auth": {"type": "header_bearer"},
+      "methods": ["GET", "POST", "DELETE"],
+      "path_rules": [
+        {"prefix": "/users/me", "methods": ["GET"]},
+        {"prefix": "/actors/", "methods": ["POST"]},
+        {"prefix": "/actor-tasks/", "methods": ["POST"]},
+        {"prefix": "/actor-runs/", "methods": ["GET"]},
+        {"prefix": "/datasets/", "methods": ["GET", "DELETE"]}
+      ],
+      "spend": {"kind": "apify", "note": "budget gate before actor runs; usageTotalUsd accrued from the run object after"}
+    },
+    "pixellab": {
+      "name": "PixelLab",
+      "base_url": "https://api.pixellab.ai/v2",
+      "credential": {"type": "vault", "name": "pixellab"},
+      "auth": {"type": "header_bearer"},
+      "methods": ["GET", "POST"],
+      "path_rules": [
+        {"prefix": "/", "methods": ["GET", "POST"]}
+      ],
+      "spend": {"kind": "none", "note": "generation is async (background-job poll); balance-delta accrual wired in phase 2"},
+      "workflow": {
+        "kind": "submit_poll_finalize",
+        "submit": {"path_template": "/create-character-with-4-directions", "method": "POST",
+                   "id_field": "background_job_id", "extra_ids": ["character_id"]},
+        "poll": {"path_template": "/background-jobs/{background_job_id}", "method": "GET",
+                 "id_field": "background_job_id", "interval_s": 5, "timeout_s": 95,
+                 "terminal": ["completed", "failed"], "success": ["completed"]},
+        "finalize": {"path_template": "/characters/{character_id}", "method": "GET"},
+        "spend": {"kind": "balance_delta", "service": "pixellab", "balance_path": "/v2/balance"}
+      }
+    },
+    "higgsfield": {
+      "name": "Higgsfield",
+      "base_url": "https://api.higgsfield.ai",
+      "credential": {"type": "env", "key": "HIGGSFIELD_API_KEY_ID", "key2": "HIGGSFIELD_API_KEY_SECRET"},
+      "auth": {"type": "header_key", "value_format": "Key {key}:{key2}"},
+      "methods": ["GET", "POST"],
+      "path_rules": [
+        {"prefix": "/estimate/", "methods": ["POST"]},
+        {"prefix": "/requests/", "methods": ["GET"]},
+        {"prefix": "/higgsfield-ai/", "methods": ["POST"]},
+        {"prefix": "/kling-video/", "methods": ["POST"]}
+      ],
+      "spend": {"kind": "none", "note": "submit/poll/accrue workflow wired in phase 2"},
+      "workflow": {
+        "kind": "submit_poll",
+        "submit": {"path_template": "/{endpoint}", "method": "POST", "id_field": "request_id"},
+        "estimate": {"path_template": "/estimate/{endpoint}", "method": "POST", "usd_field": "usd"},
+        "poll": {"path_template": "/requests/{request_id}/status", "method": "GET",
+                 "id_field": "request_id", "interval_s": 6, "timeout_s": 150,
+                 "terminal": ["completed", "failed", "canceled", "nsfw", "age_restricted", "invalid"],
+                 "success": ["completed"]},
+        "spend": {"kind": "estimate_first", "service": "higgsfield"}
+      }
+    }
+  }
+}

@@ -1458,11 +1458,12 @@ class MakeWebToolsExecutor(unittest.TestCase):
         self.assertIn("wrapped", out)
 
     def test_search_web(self):
-        with unittest.mock.patch.object(serve, "_tavily_search_sync", return_value="results"), \
-             unittest.mock.patch.object(serve, "wrap_external_content",
-                                        return_value=("wrapped", "n", "t", "inst")):
+        with unittest.mock.patch.object(serve, "_api_execute",
+                                        return_value={"ok": True, "textForModel": "wrapped",
+                                                      "modelInstruction": "inst"}):
             out = self._exec()("search_web", {"query": "news"})
         self.assertIn("wrapped", out)
+        self.assertIn("inst", out)
 
     def test_browse_allowed_with_links(self):
         result = {"allowed": True, "textForModel": "page text", "modelInstruction": "mi",
