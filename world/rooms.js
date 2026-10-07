@@ -88,14 +88,19 @@ const ROOMS = {
 // then scaled up to world-space (*SCALE, same convention as world.js's
 // own collision math) here at load time.
 let ROOM_DOOR_TRIGGERS = null;
+let MAIN_DOOR_TRIGGERS = null;
+let WINTER_DOOR_TRIGGERS = null;
 
 async function loadDoorTriggers() {
-  const res = await fetch('door_triggers.json?v=' + Date.now());
-  const native = await res.json();
-  ROOM_DOOR_TRIGGERS = {};
+  const [mainRes, winterRes] = await Promise.all([
+    fetch('door_triggers.json?v=' + Date.now()),
+    fetch('door_triggers_winter.json?v=' + Date.now()),
+  ]);
+  const native = await mainRes.json();
+  MAIN_DOOR_TRIGGERS = {};
   for (const building in native) {
     const d = native[building];
-    ROOM_DOOR_TRIGGERS[building] = { x: d.x * SCALE, y: d.y * SCALE, w: d.w * SCALE, h: d.h * SCALE };
+    MAIN_DOOR_TRIGGERS[building] = { x: d.x * SCALE, y: d.y * SCALE, w: d.w * SCALE, h: d.h * SCALE };
   }
   // The Hangout shares the Town Hall's front door (multi-option entry) -- the
   // outskirt rooms each had their own door, but the hangout is behind the
@@ -103,6 +108,30 @@ async function loadDoorTriggers() {
   // the townhall door tile. Alias it so exitRoom()/movement resolve cleanly.
   if (native.townhall) {
     const d = native.townhall;
-    ROOM_DOOR_TRIGGERS.hangout = { x: d.x * SCALE, y: d.y * SCALE, w: d.w * SCALE, h: d.h * SCALE };
+    MAIN_DOOR_TRIGGERS.hangout = { x: d.x * SCALE, y: d.y * SCALE, w: d.w * SCALE, h: d.h * SCALE };
   }
+  WINTER_DOOR_TRIGGERS = {};
+  try {
+    const winterNative = await winterRes.json();
+    for (const building in winterNative) {
+      const d = winterNative[building];
+      WINTER_DOOR_TRIGGERS[building] = { x: d.x * SCALE, y: d.y * SCALE, w: d.w * SCALE, h: d.h * SCALE };
+    }
+    if (winterNative.townhall) {
+      const d = winterNative.townhall;
+      WINTER_DOOR_TRIGGERS.hangout = { x: d.x * SCALE, y: d.y * SCALE, w: d.w * SCALE, h: d.h * SCALE };
+    }
+  } catch (e) {
+    // If the winter door file is missing, the winter map simply has no
+    // enterable buildings (still walkable).
+  }
+  ROOM_DOOR_TRIGGERS = MAIN_DOOR_TRIGGERS;
+}
+
+// Swap the active door-trigger set when the player crosses between the main
+// village and the winter (adversarial) village. Called by world.js's
+// applyScene().
+function setSceneDoors(name) {
+  ROOM_DOOR_TRIGGERS = (name === 'winter' && WINTER_DOOR_TRIGGERS)
+    ? WINTER_DOOR_TRIGGERS : MAIN_DOOR_TRIGGERS;
 }

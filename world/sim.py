@@ -1193,6 +1193,14 @@ def _sim_loop_pass():
         serve._peer_review_tick(state)
     except Exception as e:
         print(f'[sim] peer review tick error: {e}', flush=True)
+    # Adversarial (winter) village lifecycle: when both sides have delivered
+    # the shared adversarial task, complete + disable (drain the winter team
+    # back to the main village). Same in-place mutation inside the single
+    # read-modify-write; no-op when disabled.
+    try:
+        serve._adversarial_village_tick(state)
+    except Exception as e:
+        print(f'[sim] adversarial village tick error: {e}', flush=True)
     serve.save_state_to_db(state)
     return state
 
@@ -2238,6 +2246,12 @@ def queue_work(state, items):
             # starve one team's queue while another sits idle.
             'teamId': item.get('teamId') or None,
             'sprintId': item.get('sprintId') or None,
+            # Adversarial (winter) village: tags every card a side's director
+            # files for the shared adversarial task, so completion detection
+            # (serve._adversarial_village_tick) can tell when a side has
+            # delivered. Same whitelist contract as 'distill'/'checklist'.
+            'adversarialTaskId': item.get('adversarialTaskId') or None,
+            'villageId': item.get('villageId') or None,
             # WS-14: a story pulled from the shared backlog keeps its provenance
             # -- the FEATURE it belongs to and the SHARED-BACKLOG item id it was
             # claimed from -- so the sprint digest and backlog board can read
@@ -3773,6 +3787,10 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'checklist': list((extra or {}).get('checklist') or []),
         'incident': bool((extra or {}).get('incident')),
         'productId': (extra or {}).get('productId'),
+        # Adversarial (winter) village tags (see queue_work / _assign_due_item)
+        # -- stamped so serve._adversarial_village_tick can detect a side done.
+        'adversarialTaskId': (extra or {}).get('adversarialTaskId'),
+        'villageId': (extra or {}).get('villageId'),
         # A player-filed card's contract: the user story + acceptance criteria
         # ride onto the task so the coding executor's prompt includes the full
         # spec (content.py folds them into the backlog line it builds from
@@ -11459,6 +11477,10 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # the cap can be enforced against the open task set).
         'incident': bool(pick.get('incident')),
         'productId': pick.get('productId'),
+        # Adversarial (winter) village tags thread onto the task (see
+        # assign_task / queue_work) so completion can be read per side.
+        'adversarialTaskId': pick.get('adversarialTaskId'),
+        'villageId': pick.get('villageId'),
         # A player-filed card's contract survives onto the task (see assign_task).
         'userStory': pick.get('userStory'),
         'acceptanceCriteria': pick.get('acceptanceCriteria'),
