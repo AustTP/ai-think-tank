@@ -889,6 +889,9 @@ async def _idle_shutdown_loop(poll_s=30):
             print(f'[idle] no request for {int(idle_s)}s (>= {_MAX_IDLE_MINUTES}m) -- think tank dormant; waking on next request', flush=True)
 
 
+_STATE_UPDATE_LOCK = threading.RLock()
+
+
 def get_state_from_db():
     with _db() as conn:
         row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
@@ -9269,6 +9272,52 @@ async def close_sprint(sprint_id: str, request: Request):
 _ISSUE_REQUIRED = ('teamId', 'type', 'summary', 'feature')
 
 
+@app.get('/api/intent/work-orders')
+async def get_work_orders(request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    state = get_state_from_db() or {}
+    return JSONResponse({'orders': [r for r in state.get('backlogRequests', [])
+                                    if r.get('origin') == 'player_work_order'],
+                         'teams': [{'id': t['id'], 'name': t.get('name') or t['id']}
+                                   for t in state.get('teams', [])]})
+
+
+@app.post('/api/intent/work-orders')
+async def queue_work_order(request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError()
+        fields = {k: (body.get(k) or '').strip() for k in
+                  ('title', 'instructions', 'teamId', 'taskType', 'acceptanceCriteria')}
+    except (ValueError, AttributeError, TypeError):
+        return JSONResponse({'error': 'Invalid work order.'}, status_code=400)
+    if not fields['title'] or not fields['instructions'] or len(fields['title']) > 200 \
+            or len(fields['instructions']) > 12000 or len(fields['acceptanceCriteria']) > 6000:
+        return JSONResponse({'error': 'Provide a title (up to 200 characters) and work instructions (up to 12000).'}, status_code=400)
+    if fields['taskType'] not in ('research', 'code', 'spike'):
+        return JSONResponse({'error': 'Choose research, software implementation, or investigation.'}, status_code=400)
+    import sim
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'State unavailable.'}, status_code=503)
+    if not sim._team_row(state, fields['teamId']):
+        return JSONResponse({'error': 'Choose an existing team.'}, status_code=400)
+    room = 'pressoffice' if fields['taskType'] == 'code' else 'observatory'
+    order = sim.file_work_request(state, 'player', fields['title'], room, reason=fields['instructions'])
+    if not order:
+        return JSONResponse({'error': 'An order with this title is already awaiting grooming.'}, status_code=409)
+    order.update(teamId=fields['teamId'], taskType=fields['taskType'],
+                 acceptanceCriteria=fields['acceptanceCriteria'], origin='player_work_order')
+    sim.kick_refinement_now(state, fields['teamId'])
+    save_state_to_db(state)
+    log_action('player', 'work_order_queued', {'id': order['id'], 'teamId': fields['teamId']}, authorized=True)
+    return JSONResponse({'ok': True, 'order': order}, status_code=201)
+
+
 @app.get('/api/intent/issues')
 async def get_issues(request: Request):
     """List issues, optionally filtered by ?teamId=. Newest first."""
@@ -14871,11 +14920,9 @@ async def _review_guidance_response(request, state, task_id, esc_id=None):
                     and guidance.escalation_task_id(e, state) == task_id}
     try:
         data = await guidance.form_data(request)
-        state = get_state_from_db() or state
-        result = guidance.apply_guidance(state, task_id, data)
+        result = await asyncio.to_thread(_save_review_guidance, task_id, data)
     except (ValueError, TypeError) as e:
         return HTMLResponse(f'<p>{html.escape(str(e))}</p><p>Go back to edit your guidance.</p>', status_code=400)
-    save_state_to_db(state)
     escalations = _load_escalations()
     for eid, escalation in escalations.items():
         if escalation.get('kind') == 'stuck review loop' and escalation.get('status') == 'pending' \
@@ -14886,6 +14933,15 @@ async def _review_guidance_response(request, state, task_id, esc_id=None):
     log_action('player', 'review_guidance', result, authorized=True)
     return HTMLResponse(f'<p>Recorded: {html.escape(result["action"])}. The story still requires normal checks.</p>'
                         '<p><a href="/">Return to the app</a></p>')
+
+
+def _save_review_guidance(task_id, data):
+    import review_guidance as guidance
+    with _STATE_UPDATE_LOCK:
+        state = get_state_from_db() or {}
+        result = guidance.apply_guidance(state, task_id, data)
+        save_state_to_db(state)
+        return result
 
 
 @app.get('/api/activity')

@@ -725,6 +725,19 @@
 <div id="boardModal" class="modal hidden">
   <div class="modal-box">
     <h3>The Board</h3>
+    <details style="text-align:left;margin-bottom:12px;">
+      <summary>Queue a work order</summary>
+      <form id="workOrderForm" onsubmit="submitWorkOrder(event)" style="display:grid;gap:8px;margin-top:8px;">
+        <label>Title<input name="title" required maxlength="200" style="width:100%;box-sizing:border-box;"></label>
+        <label>Team<select name="teamId" id="workOrderTeam" required></select></label>
+        <label>Work type<select name="taskType"><option value="research">Research document / plan</option><option value="spike">Exploratory investigation</option><option value="code">Software implementation</option></select></label>
+        <label>Instructions<textarea name="instructions" required maxlength="12000" rows="4" style="width:100%;box-sizing:border-box;"></textarea></label>
+        <label>What counts as done<textarea name="acceptanceCriteria" maxlength="6000" rows="2" style="width:100%;box-sizing:border-box;"></textarea></label>
+        <button id="workOrderSubmit" type="submit">Queue work order</button>
+      </form>
+      <p id="workOrderStatus" role="status"></p>
+    </details>
+    <div id="workOrdersBody" style="text-align:left;font-size:12px;"></div>
     <div id="boardBody" style="font-size:13px; opacity:0.85; text-align:left;">Nothing scheduled yet.</div>
     <div class="terminal-inputline">
       <input type="text" id="bigTaskInput" placeholder="Give the admins a large task to break down and delegate...">
@@ -1933,6 +1946,51 @@ function renderBoard() {
   renderSprints();
   renderProducts();
   renderWiki();
+  renderWorkOrders();
+}
+
+async function submitWorkOrder(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const btn = document.getElementById('workOrderSubmit');
+  const status = document.getElementById('workOrderStatus');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  try {
+    const payload = Object.fromEntries(new FormData(form));
+    const res = await apiFetch('/api/intent/work-orders', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || 'Could not queue work.');
+    form.reset();
+    status.textContent = `${data.order.id} queued for team grooming. You can queue more work now.`;
+    await renderWorkOrders();
+  } catch (e) {
+    status.textContent = e.message;
+  } finally { btn.disabled = false; }
+}
+
+async function renderWorkOrders() {
+  try {
+    const res = await apiFetch('/api/intent/work-orders');
+    if (!res.ok) return;
+    const data = await res.json();
+    const select = document.getElementById('workOrderTeam');
+    const teams = data.teams || [];
+    const signature = JSON.stringify(teams);
+    if (select.dataset.teams !== signature) {
+      const selected = select.value || 'nora';
+      select.replaceChildren(...teams.map(t => new Option(t.name, t.id)));
+      if (teams.some(t => t.id === selected)) select.value = selected;
+      select.dataset.teams = signature;
+    }
+    const esc = s => { const el = document.createElement('div'); el.textContent = s; return el.innerHTML; };
+    const orders = (data.orders || []).slice(-10).reverse();
+    setBoardSectionHtml(document.getElementById('workOrdersBody'), orders.length
+      ? '<strong>Your work orders</strong>' + orders.map(o => `<div>${esc(o.title)} — ${esc(o.status)} (${esc(o.id)})</div>`).join('')
+      : 'No work orders submitted yet.');
+  } catch (e) { /* retain the last successful list */ }
 }
 
 // Phase C: a read-only sprint dashboard for the House board. Sprints are
@@ -2323,9 +2381,14 @@ async function refreshInboxCount() {
 async function handleBigTaskDelegate() {
   const input = document.getElementById('bigTaskInput');
   const goal = input.value.trim();
-  if (!goal) return;
   const statusEl = document.getElementById('bigTaskStatus');
   const btn = document.getElementById('bigTaskBtn');
+  if (btn.disabled) return;
+  if (!goal) {
+    statusEl.textContent = 'Enter a task to delegate.';
+    input.focus();
+    return;
+  }
   btn.disabled = true;
   statusEl.textContent = 'Breaking this down...';
   try {
@@ -2347,6 +2410,11 @@ async function handleBigTaskDelegate() {
     }
     if (result.error) {
       statusEl.textContent = result.error;
+    } else if (result.backlogged || result.newTeam) {
+      statusEl.textContent = result.note || (result.backlogged
+        ? 'Your request was filed in the shared backlog. A team will pick it up when available.'
+        : `A new ${result.teamName || result.team || ''} team was created to plan your request.`);
+      input.value = '';
     } else if (result.staffed) {
       // Server-owned sim, sprint staffing: the ask is filed with a free team,
       // whose scrum master + workers break it into concrete stories at their
@@ -2372,9 +2440,10 @@ async function handleBigTaskDelegate() {
       input.value = '';
     }
   } catch (e) {
-    statusEl.textContent = 'Something went wrong delegating that.';
+    statusEl.textContent = `Could not delegate the task: ${e.message || 'please try again.'}`;
+  } finally {
+    btn.disabled = false;
   }
-  btn.disabled = false;
 }
 
 // Player-triggered publish. Freezes the think tank's released work (projects,

@@ -31,12 +31,13 @@ def escalation_task_id(escalation, state):
 
 def render_form(task, action_url, agents):
     esc = html.escape
-    options = ''.join(f'<option value="{a}">{esc(label)}</option>' for a, label in ACTIONS.items())
     owners = '<option value="">Keep current owner</option>' + ''.join(
         f'<option value="{esc(a)}">{esc(d.get("name") or a)}</option>'
         for a, d in agents.items())
     diagnosis = task.get('reviewDiagnosis') or {}
     recommended = {'formatting': 'retry', 'missing_inputs': 'provide_inputs'}.get(diagnosis.get('category'), 'research')
+    options = ''.join(f'<option value="{a}"{" selected" if a == recommended else ""}>{esc(label)}</option>'
+                      for a, label in ACTIONS.items())
     return f'''<!doctype html><html><meta name="viewport" content="width=device-width">
     <title>Guide a stuck review</title><style>body{{max-width:800px;margin:30px auto;padding:15px;
     font:16px system-ui}}label{{display:block;margin:14px 0}}textarea,input,select{{box-sizing:border-box;
@@ -45,6 +46,8 @@ def render_form(task, action_url, agents):
     <p>Task {esc(task['id'])}. No choice bypasses quality checks or peer review.</p>
     <p>Diagnosis: {esc(diagnosis.get('category') or 'needs investigation')}. Suggested next step:
     {esc(ACTIONS[recommended])}.</p>
+    <p>Retry queues a repair using your instructions. Investigate keeps this story blocked while
+    a separate investigation is queued. Pause saves your instructions without resuming work.</p>
     <pre>{esc(diagnosis.get('failure') or task.get('failNote') or task.get('note') or '')}</pre>
     <form method="post" action="{esc(action_url)}">
     <label>Decision<select name="action">{options}</select></label>

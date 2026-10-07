@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -24,6 +25,45 @@ def state():
 
 
 class Guidance(unittest.TestCase):
+    def test_form_selects_recommended_action_instead_of_pause(self):
+        for category, action in [('formatting', 'retry'), ('missing_inputs', 'provide_inputs'),
+                                 ('code_defect', 'research')]:
+            task = state()['tasks']['t']
+            task['reviewDiagnosis'] = {'category': category}
+            form = guidance.render_form(task, '/guide', {})
+            self.assertIn(f'value="{action}" selected', form)
+            self.assertNotIn('value="pause" selected', form)
+
+    def test_guidance_waits_for_tick_and_reads_its_latest_state(self):
+        current = state()
+        started = threading.Event()
+        finished = threading.Event()
+        errors = []
+
+        def submit():
+            started.set()
+            try:
+                serve._save_review_guidance('t', {'action': 'retry', 'guidance': 'Fix the import'})
+            except Exception as error:
+                errors.append(error)
+            finally:
+                finished.set()
+
+        with patch.object(serve, 'get_state_from_db', side_effect=lambda: copy.deepcopy(current)), \
+                patch.object(serve, 'save_state_to_db', side_effect=lambda s: current.update(s)):
+            with serve._STATE_UPDATE_LOCK:
+                worker = threading.Thread(target=submit)
+                worker.start()
+                self.assertTrue(started.wait(2))
+                self.assertFalse(finished.wait(0.05))
+                current['tickMarker'] = 'latest tick'
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(current['tickMarker'], 'latest tick')
+        self.assertEqual(len(current['workQueue']), 1)
+        self.assertIn('Fix the import', current['tasks']['t']['instructions'])
+
     def test_all_guidance_actions_have_concrete_effects(self):
         for action in guidance.ACTIONS:
             with self.subTest(action=action):

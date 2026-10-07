@@ -1157,6 +1157,12 @@ _engine = SimEngine()
 
 
 def _sim_loop_pass():
+    import serve
+    with serve._STATE_UPDATE_LOCK:
+        return _sim_loop_pass_locked()
+
+
+def _sim_loop_pass_locked():
     # Returns the updated state after one tick, or None if nothing to do.
     # Runs on a worker thread (the loop calls us via asyncio.to_thread).
     import serve
