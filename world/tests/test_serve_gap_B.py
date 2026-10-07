@@ -817,45 +817,6 @@ class CallAgentToolLoop(unittest.TestCase):
         self.assertIsNone(result)
 
 
-class WeatherGeocode(unittest.TestCase):
-    def test_resolves_location(self):
-        body = b'{"results": [{"latitude": 35.22, "longitude": -80.84, "name": "Charlotte"}]}'
-        with unittest.mock.patch('urllib.request.urlopen', return_value=_fake_urlopen_resp(body)):
-            out = serve._weather_geocode('Charlotte, NC')
-        self.assertEqual(out, (35.22, -80.84, 'Charlotte'))
-
-    def test_fetch_failure_returns_none(self):
-        with unittest.mock.patch('urllib.request.urlopen', side_effect=OSError('net down')):
-            self.assertIsNone(serve._weather_geocode('Nowhere'))
-
-    def test_no_results_returns_none(self):
-        with unittest.mock.patch('urllib.request.urlopen',
-                                 return_value=_fake_urlopen_resp(b'{"results": []}')):
-            self.assertIsNone(serve._weather_geocode('Nowhere'))
-
-
-class WeatherFetch(unittest.TestCase):
-    def test_returns_conditions_summary(self):
-        body = b'{"current": {"temperature_2m": 20.5, "apparent_temperature": 19.0, "weather_code": 0}}'
-        with unittest.mock.patch.object(serve, '_weather_geocode',
-                                        return_value=(35.22, -80.84, 'Charlotte')), \
-             unittest.mock.patch('urllib.request.urlopen', return_value=_fake_urlopen_resp(body)):
-            out = serve._weather_fetch('Charlotte, NC')
-        self.assertIn('Weather for Charlotte, NC', out)
-        self.assertIn('20.5', out)
-
-    def test_fetch_failure_returns_tool_error(self):
-        with unittest.mock.patch.object(serve, '_weather_geocode', return_value=(1, 2, 'X')), \
-             unittest.mock.patch('urllib.request.urlopen', side_effect=OSError('boom')):
-            out = serve._weather_fetch('Somewhere')
-        self.assertIn('__TOOL_ERROR__: weather fetch failed', out)
-
-    def test_unresolved_location_returns_note(self):
-        with unittest.mock.patch.object(serve, '_weather_geocode', return_value=None):
-            out = serve._weather_fetch('Nowhere')
-        self.assertIn('Could not resolve', out)
-
-
 class TavilySearchSync(unittest.TestCase):
     def test_no_api_key_returns_tool_error(self):
         with unittest.mock.patch.object(serve, 'TAVILY_API_KEY', ''):

@@ -245,7 +245,7 @@ class ApiCallEndpoint(unittest.TestCase):
         # Unregistered host => Jev runs; a block is honored.
         self._start(self._gates(jev_allow=False))
         r = self._client().post('/api/api-call', json={
-            'agentId': 'ben', 'url': 'https://open-meteo.com/weather', 'method': 'GET', 'purpose': 'p'})
+            'agentId': 'ben', 'url': 'https://example.com/data', 'method': 'GET', 'purpose': 'p'})
         self.assertFalse(r.json()['allowed'])
 
     def test_registered_get_injects_credential_and_wraps(self):
@@ -267,11 +267,11 @@ class ApiCallEndpoint(unittest.TestCase):
 
     def test_unregistered_get_is_read_only_with_no_auth_headers(self):
         self._start(self._gates())
-        fake_result = {'status': 200, 'finalUrl': 'https://open-meteo.com/',
+        fake_result = {'status': 200, 'finalUrl': 'https://example.com/',
                        'contentType': 'text/plain', 'body': 'ok', 'truncated': False}
         with unittest.mock.patch.object(serve, '_api_request_sync', return_value=fake_result) as fetch:
             r = self._client().post('/api/api-call', json={
-                'agentId': 'ben', 'url': 'https://open-meteo.com/weather', 'method': 'GET', 'purpose': 'check weather',
+                'agentId': 'ben', 'url': 'https://example.com/data', 'method': 'GET', 'purpose': 'check status',
                 'headers': {'Authorization': 'Bearer steal', 'Accept': 'application/json'}})
         self.assertTrue(r.json()['allowed'])
         sent_headers = fetch.call_args.args[2]

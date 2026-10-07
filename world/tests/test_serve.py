@@ -3914,31 +3914,6 @@ class RemainingExecutors(unittest.TestCase):
         self._real_store = _sim._store_content_result
         _sim._store_content_result = self._record
 
-    def test_weather_notes_and_recorded(self):
-        self._patch_store()
-        try:
-            with unittest.mock.patch.object(serve, '_weather_fetch',
-                                            return_value='28.4C, moderate rain'), \
-                 unittest.mock.patch.object(serve, 'WEATHER_LOCATION', 'Charlotte, NC'):
-                serve._run_weather_content({}, 'ada', {'id': 'w1', 'room': 'weatherstation'}, {})
-        finally:
-            self._restore()
-        self.assertIn('w1', self.stored)
-        self.assertIn('weather', self.stored['w1']['note'].lower())
-        self.assertIn('Charlotte, NC', self.stored['w1']['note'])
-        self.assertIn('28.4C', self.stored['w1']['note'])
-
-    def test_weather_fetch_failure_is_soft(self):
-        # A failed live fetch -> a soft "could not log" note (no crash).
-        self._patch_store()
-        try:
-            with unittest.mock.patch.object(serve, '_weather_fetch',
-                                            return_value='__TOOL_ERROR__: weather fetch failed: boom'):
-                serve._run_weather_content({}, 'ada', {'id': 'w2', 'room': 'weatherstation'}, {})
-        finally:
-            self._restore()
-        self.assertIn('Could not log live weather', self.stored['w2']['note'])
-
     def test_media_digest_no_feeds(self):
         self._patch_store()
         try:

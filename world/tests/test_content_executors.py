@@ -225,21 +225,7 @@ class ResearchContent(_ExecutorTestCase):
         self.assertIn('didn\'t produce anything usable', result['note'])
 
 
-class WeatherAndMediaContent(_ExecutorTestCase):
-    def test_weather_error_notes_tool_failure(self):
-        seen = _store()
-        _base_mocks()
-        with mock.patch.object(serve, '_weather_fetch', return_value='__TOOL_ERROR__: no data'):
-            content._run_weather_content(_snapshot(), 'cora', {'id': 'w1'})
-        self.assertIn('Could not log live weather', seen['w1']['note'])
-
-    def test_weather_success_logs_reading(self):
-        seen = _store()
-        _base_mocks()
-        with mock.patch.object(serve, '_weather_fetch', return_value='72F sunny'):
-            content._run_weather_content(_snapshot(), 'cora', {'id': 'w2'})
-        self.assertIn('Logged live weather', seen['w2']['note'])
-
+class MediaContent(_ExecutorTestCase):
     def test_media_no_feeds(self):
         seen = _store()
         _base_mocks()
@@ -537,7 +523,7 @@ class ObservatoriesAndDispatcher(_ExecutorTestCase):
             ({'id': 'x1', 'taskType': 'spike'}, '_run_spike_content'),
             ({'id': 'x2', 'taskType': 'review'}, '_run_review_content'),
             ({'id': 'x3', 'taskType': 'qa'}, '_run_review_content'),
-            ({'id': 'x4', 'room': 'weatherstation'}, '_run_weather_content'),
+            ({'id': 'x4', 'room': 'weatherstation'}, '_run_observatory_content'),
             ({'id': 'x5', 'room': 'media'}, '_run_media_content'),
             ({'id': 'x6', 'room': 'bank'}, '_run_bank_content'),
             ({'id': 'x7', 'room': 'pressoffice'}, '_run_workroom_content'),
@@ -546,14 +532,13 @@ class ObservatoriesAndDispatcher(_ExecutorTestCase):
         ]:
             with mock.patch.object(content, '_run_spike_content') as spike, \
                  mock.patch.object(content, '_run_review_content') as review, \
-                 mock.patch.object(content, '_run_weather_content') as weather, \
                  mock.patch.object(content, '_run_media_content') as media, \
                  mock.patch.object(content, '_run_bank_content') as bank, \
                  mock.patch.object(content, '_run_workroom_content') as workroom, \
                  mock.patch.object(content, '_run_observatory_content') as observatory:
                 content._server_content_dispatcher(_snapshot(), 'cora', task)
             target = {'_run_spike_content': spike, '_run_review_content': review,
-                      '_run_weather_content': weather, '_run_media_content': media,
+                      '_run_media_content': media,
                       '_run_bank_content': bank, '_run_workroom_content': workroom,
                       '_run_observatory_content': observatory}
             if expected is None:

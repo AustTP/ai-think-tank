@@ -909,8 +909,8 @@ function openTerminal(item) {
 // classifies the URL + stated purpose BEFORE anything is fetched, every
 // request is logged server-side, and the whole thing fails closed if the
 // classifier is unreachable. This modal is the player-driven front end
-// for it; an agent's own Weather Station task work also uses it
-// autonomously now (tasks.js's checkWeatherReference()).
+// for it; an agent's own research task work also uses it autonomously
+// now (tasks.js's runResearchTask()).
 function openBrowser(item) {
   activeInteractZone = item.zone;
   state.ui = 'browser';
