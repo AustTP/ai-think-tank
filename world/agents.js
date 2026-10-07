@@ -544,9 +544,15 @@ function agentIsDrawn(a) {
 }
 
 function renderAgents(ctx, toScreen, zoom, playerSprites) {
+  // Each outdoor scene shows only its own village's agents: main-village
+  // agents live in the main map's coordinate space, winter-village agents in
+  // the winter (flipped) map's space. Default to 'main' for any agent that
+  // predates the villageId field.
+  const sceneVillage = (typeof state !== 'undefined' && state.scene === 'winter') ? 'winter' : 'main';
   for (const id in AGENTS) {
     const a = AGENTS[id];
     if (!agentIsDrawn(a)) continue;
+    if ((a.villageId || 'main') !== sceneVillage) continue;
     drawAgentAt(ctx, toScreen, zoom, playerSprites, a, a.x, a.y);
   }
 }

@@ -825,6 +825,7 @@ const state = {
   showFootprints: false,
   location: { kind: 'outside' },
   ui: null,
+  scene: 'main',
 };
 
 // Remembered so exitRoom() has somewhere sane to put the player back for a
@@ -3286,6 +3287,26 @@ function updateOutside(dt) {
     }
   }
 
+  // Scene transition at the shared connection path: walking off the main
+  // map's right edge enters the winter (adversarial) village, and walking
+  // off winter's left edge returns to the main village. Only while winter
+  // is ENABLED -- otherwise the boundary is simply a wall. If winter was
+  // disabled while the player was inside it, pull them back to the main
+  // village rather than leaving them in a now-unwalkable map.
+  if (state.scene === 'main') {
+    if (WINTER_ENABLED) {
+      const inBand = state.player.y >= CONNECTION_BAND.y0 && state.player.y <= CONNECTION_BAND.y1;
+      if (inBand && state.player.x + state.player.w >= GROUND_W - 2) { switchScene('winter'); return; }
+    }
+  } else if (state.scene === 'winter') {
+    if (WINTER_ENABLED) {
+      const inBand = state.player.y >= CONNECTION_BAND.y0 && state.player.y <= CONNECTION_BAND.y1;
+      if (inBand && state.player.x <= 2) { switchScene('main'); return; }
+    } else {
+      switchScene('main'); return;
+    }
+  }
+
   // Standing next to a (now-solid) agent shows a "press B to talk" prompt
   // rather than opening the conversation automatically --
   // you decide when the dialog pops up, walking up to someone shouldn't be
@@ -3371,8 +3392,7 @@ function wireZoom() {
 }
 
 async function main() {
-  const bg = await loadImage(BG_SPRITE);
-  await loadCollisionGrid();
+  await loadSceneAssets();
   await loadDoorTriggers();
   await loadMeetingPresets();
   // Real ordering fix: a genuinely fresh start now generates each seed
@@ -3386,6 +3406,10 @@ async function main() {
   // Server-side sim loop liveness -- starts the poll; the server engine ticks
   // regardless, this only lets the browser observe/verify it.
   if (typeof startSimPoll === 'function') startSimPoll();
+  if (typeof pollAdversarialVillage === 'function') {
+    pollAdversarialVillage();
+    setInterval(pollAdversarialVillage, 3000);
+  }
   const playerSprites = {
     south: await loadImage('assets/character_south.png'),
     north: await loadImage('assets/character_north.png'),
@@ -3623,7 +3647,7 @@ async function main() {
     const toScreen = cameraFor(zoom, GROUND_W, GROUND_H, cameraFocus.x, cameraFocus.y);
 
     const [bx, by] = toScreen(0, 0);
-    ctx.drawImage(bg, bx, by, GROUND_W * zoom, GROUND_H * zoom);
+    ctx.drawImage(SCENE.bg, bx, by, GROUND_W * zoom, GROUND_H * zoom);
     renderAgents(ctx, toScreen, zoom, playerSprites);
     // The player vanishes from the map for the duration of a call, same as
     // any other participant -- see meetings.js.

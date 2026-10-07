@@ -565,23 +565,116 @@ function formatPageProbeResult(data) {
   return lines.join('\n');
 }
 
-const BG_SPRITE = 'assets/think_tank_background.png';
 const NATIVE_W = 688;
 const NATIVE_H = 384;
 const GROUND_W = NATIVE_W * SCALE;
 const GROUND_H = NATIVE_H * SCALE;
-const SPAWN = { x: 300 * SCALE, y: 170 * SCALE };
-const GRID_SPRITE = 'collision_grid.json';
 
-// Populated by loadCollisionGrid() before the game loop starts (see
-// index.html's main()). { cols, rows, cell, grid: [[0|1,...], ...] } in
-// NATIVE pixel coordinates -- blockedAt() divides world-space queries by
-// SCALE before looking a cell up.
+// The adversarial (winter) village. Two scenes share one boundary map: the
+// winter map is the main map flipped horizontally (reusing the same
+// collision/door geometry, mirrored), and the two connect along the
+// walkable path band at rows 26-32 -- main's right edge <-> winter's left
+// edge (CONNECTION_BAND below, in world px). Scene-switching is only
+// possible while the winter village is ENABLED (state.adversarialVillage.
+// enabled), which Theo toggles; when disabled the winter map is not
+// walkable at all.
+const CONNECTION_BAND = { y0: 26 * 8 * SCALE, y1: 33 * 8 * SCALE };
+
+const SCENES = {
+  main: {
+    bgSprite: 'assets/think_tank_background.png',
+    gridSprite: 'collision_grid.json',
+    doorsSprite: 'door_triggers.json',
+    spawn: { x: 300 * SCALE, y: 170 * SCALE },
+  },
+  winter: {
+    bgSprite: 'assets/think_tank_winter.png',
+    gridSprite: 'collision_grid_winter.json',
+    doorsSprite: 'door_triggers_winter.json',
+    // Mirrored spawn: the connection path's band on the winter (flipped)
+    // map is its LEFT edge; drop the player just inside it.
+    spawn: { x: 12, y: 29 * 8 * SCALE },
+  },
+};
+
+// Runtime scene state. SCENE.bg/grid/doors are populated by
+// loadSceneAssets() (background + grid) and rooms.js's loadDoorTriggers()
+// (doors) before the game loop starts.
+let SCENE = { name: 'main', bg: null, grid: null, doors: null };
+let WINTER_ENABLED = false; // mirrors state.adversarialVillage.enabled
+
+// Compatibility shims: legacy callers reference BG_SPRITE / GRID_SPRITE /
+// SPAWN / COLLISION_GRID directly. Keep them pointed at the active scene.
+let BG_SPRITE = SCENES.main.bgSprite;
+let GRID_SPRITE = SCENES.main.gridSprite;
+let SPAWN = SCENES.main.spawn;
 let COLLISION_GRID = null;
 
+async function loadSceneAssets() {
+  for (const key in SCENES) {
+    const s = SCENES[key];
+    // Best-effort per scene: a missing winter background/grid must never break
+    // the main map's boot (winter is only reachable when enabled anyway).
+    try {
+      s.bg = await loadImage(s.bgSprite);
+      const res = await fetch(s.gridSprite + '?v=' + Date.now());
+      s.grid = await res.json();
+    } catch (e) {
+      console.error(`Failed to load scene "${key}":`, e);
+    }
+  }
+  applyScene('main');
+}
+
+// Apply the current scene's assets to the module-level shims. `name` is
+// 'main' or 'winter'. Rooms' door triggers are swapped via setSceneDoors
+// (rooms.js).
+function applyScene(name) {
+  const s = SCENES[name] || SCENES.main;
+  SCENE = { name: s.name || name, bg: s.bg, grid: s.grid, doors: null };
+  COLLISION_GRID = s.grid;
+  BG_SPRITE = s.bgSprite;
+  GRID_SPRITE = s.gridSprite;
+  SPAWN = s.spawn;
+  if (typeof setSceneDoors === 'function') setSceneDoors(name);
+}
+
+// Compatibility helper (tests reference it): fetch just the ACTIVE scene's
+// grid into COLLISION_GRID. The boot path uses loadSceneAssets(), which loads
+// both scenes.
 async function loadCollisionGrid() {
   const res = await fetch(GRID_SPRITE + '?v=' + Date.now());
   COLLISION_GRID = await res.json();
+}
+
+// Move the player between the two villages at the shared connection path.
+// Only reachable from the outside world and only when winter is enabled.
+function switchScene(to) {
+  const s = SCENES[to];
+  if (!s || state.scene === to) return;
+  // Refuse to enter a scene whose assets failed to load (e.g. winter files
+  // missing) -- never render a null background.
+  if (!s.bg || !s.grid) return;
+  applyScene(to);
+  state.scene = to;
+  state.player.x = s.spawn.x;
+  state.player.y = s.spawn.y;
+  state.zoom = ZOOM_SHOW_ALL;
+}
+
+// Poll the server for the adversarial (winter) village toggle state. The
+// winter map only becomes walkable when the admin (Theo) enables it. A
+// 404 / failure just leaves winter disabled (fail closed). Called on a
+// timer from main().
+async function pollAdversarialVillage() {
+  try {
+    const res = await fetch('/api/adversarial-village');
+    const data = await res.json();
+    WINTER_ENABLED = !!(data && data.enabled);
+    if (!WINTER_ENABLED && state && state.scene === 'winter') switchScene('main');
+  } catch (e) {
+    WINTER_ENABLED = false;
+  }
 }
 
 function blockedAt(p) {

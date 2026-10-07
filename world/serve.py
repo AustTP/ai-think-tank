@@ -6611,6 +6611,28 @@ SECURITY_TEST_TOOLS = [
             },
         },
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'adversarial_village',
+            'description': 'Admin-only (Theo). Toggle the adversarial (winter) village on or off. '
+                           'Enabling spawns a winter director and small team in a second, winter-'
+                           'themed map and files the SAME task to BOTH the main village director and '
+                           'the winter director so the two sides work the same goal adversarially. '
+                           'Action "enable" requires a "task" (the shared goal); action "disable" '
+                           'shuts it down: the winter team returns to the main village and the winter '
+                           'map becomes non-walkable. The winter map is only reachable by the player '
+                           'while enabled.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'action': {'type': 'string', 'enum': ['enable', 'disable'], 'description': '"enable" to launch the adversarial village (with a task), "disable" to shut it down.'},
+                    'task': {'type': 'string', 'description': 'Required when enabling: the shared goal both villages will work adversarially.'},
+                },
+                'required': ['action'],
+            },
+        },
+    },
 ]
 
 _TAVILY_SEARCH_URL = 'https://api.tavily.com/search'
@@ -10761,6 +10783,22 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         if name in ('x_trending_topics', 'search_linkedin_posts'):
             tools_used.append(name)
             return _treg_tool(name, args)
+        if name == 'adversarial_village':
+            tools_used.append(name)
+            if not _is_admin(state, pick):
+                return 'Only the admin (Theo) may toggle the adversarial village.'
+            action = ((args or {}).get('action') or '').strip()
+            if action == 'enable':
+                ok, msg = _launch_adversarial_village(state, pick, (args or {}).get('task') or '')
+            elif action == 'disable':
+                _disable_adversarial_village(state, reason='admin')
+                ok, msg = True, 'Adversarial village disabled; the winter team has returned to the main village and the winter map is no longer walkable.'
+            else:
+                return 'Usage: action must be "enable" (with a task) or "disable".'
+            if ok:
+                save_state_to_db(state)
+            log_action(pick, 'adversarial_village', {'action': action, 'ok': ok})
+            return msg
         raise ValueError(f'unknown tool: {name}')
 
     tools = (AGENT_ASK_TOOLS + [_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL]
@@ -13572,6 +13610,174 @@ async def memory_ledger(request: Request):
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     entries = list(reversed(state.get('memoryLedger') or []))
     return JSONResponse({'ledger': entries})
+
+
+# ---------------------------------------------------------------------------
+# Adversarial (winter) village.
+# ---------------------------------------------------------------------------
+# The winter map (think_tank_winter.png) is the main boundary map flipped
+# horizontally, connected to the main village along the right-edge path band.
+# It is NOT always on: Theo (the admin) toggles it via the `adversarial_village`
+# tool. Enabling spawns a winter director + small team and files the same task
+# to BOTH the main and winter directors (tagged with a shared adversarialTaskId)
+# so the two sides work the same goal adversarially. When both sides have
+# delivered, the sim tick (_adversarial_village_tick) completes it and disables
+# the winter village (its team returns to the main village; the client pulls the
+# player back when `enabled` flips false). The whole record is a top-level
+# kv_state key so _merge_server_owned carries it across client autosaves.
+_ADV_VILLAGE_KEY = 'adversarialVillage'
+_ADV_VILLAGE_ID = 'winter'
+_ADV_VILLAGE_NAME = 'Winter Village'
+_ADV_TEAM_SIZE = 3
+_ADV_DELIVERED_STATUSES = ('done', 'closed', 'needs_review')
+
+
+def _adversarial_state(state):
+    st = state.setdefault(_ADV_VILLAGE_KEY, {
+        'enabled': False, 'status': 'disabled', 'villageId': _ADV_VILLAGE_ID,
+        'taskGoal': None, 'taskId': None, 'winterDirectorId': None,
+        'launchedAt': None, 'mainRequestId': None, 'winterRequestId': None,
+    })
+    st.setdefault('status', 'disabled')
+    return st
+
+
+def _spawn_winter_team(state, admin_id, goal, now_ms):
+    """Create the 'winter' village and spawn a fresh director + small team in
+    it, reassigning every new agent to villageId 'winter'. Returns the winter
+    director id, or None on failure (name pool / agent cap exhausted)."""
+    import sim as _sim
+    villages = state.setdefault('villages', [])
+    if not any(v.get('id') == _ADV_VILLAGE_ID for v in villages):
+        villages.append({'id': _ADV_VILLAGE_ID, 'name': _ADV_VILLAGE_NAME})
+    team = _sim.spawn_new_team_for_request(state, goal, now_ms=now_ms, admin_id=admin_id,
+                                           employees=_ADV_TEAM_SIZE)
+    if not team:
+        return None
+    director_id = team.get('directorId') or team.get('id')
+    for mid in [director_id] + list(team.get('members') or []):
+        if mid:
+            _sim.set_agent_village(state, mid, _ADV_VILLAGE_ID)
+    return director_id
+
+
+def _adv_side_delivered(state, task_id, village_id):
+    """A side of the adversarial task has delivered when every task tagged
+    (task_id, village_id) is in a terminal-delivered state, and at least one
+    real task exists for that side. No tasks yet = not delivered."""
+    tasks = state.get('tasks') or {}
+    side = [t for t in tasks.values()
+            if t.get('adversarialTaskId') == task_id
+            and (t.get('villageId') or 'main') == village_id]
+    if not side:
+        return False
+    return all(t.get('status') in _ADV_DELIVERED_STATUSES for t in side)
+
+
+def _disable_adversarial_village(state, reason='completed'):
+    """Drain + disable: reassign the winter team back to the main village,
+    drop the winter village from the registry, and flip enabled off. The client
+    pulls the player back to the main map when it sees enabled=false."""
+    import sim as _sim
+    st = _adversarial_state(state)
+    director_id = st.get('winterDirectorId')
+    teams = state.get('teams') or []
+    team = next((t for t in teams if t.get('id') == director_id), None)
+    for mid in [director_id] + list((team or {}).get('members') or []):
+        if mid:
+            _sim.set_agent_village(state, mid, 'main')
+    state['teams'] = [t for t in teams if t.get('id') != director_id]
+    # Failsafe: no agent may remain tagged winter once the village is gone.
+    for a in (state.get('agents') or {}).values():
+        if (a.get('villageId') or 'main') == _ADV_VILLAGE_ID:
+            a['villageId'] = 'main'
+    state['villages'] = [v for v in (state.get('villages') or [])
+                         if v.get('id') != _ADV_VILLAGE_ID]
+    st['enabled'] = False
+    st['status'] = 'disabled'
+    st['winterDirectorId'] = None
+    st['lastStatus'] = reason
+    log_action('system', 'adversarial_village_disabled', {'reason': reason})
+    return st
+
+
+def _launch_adversarial_village(state, admin_id, task, now_ms=None):
+    """Enable the adversarial village: spawn the winter team and file the same
+    goal to BOTH the main and winter directors, tagged with one shared
+    adversarialTaskId. Returns (ok, message)."""
+    import sim as _sim
+    st = _adversarial_state(state)
+    if st.get('enabled'):
+        return False, 'The adversarial village is already active.'
+    task = (task or '').strip()
+    if not task:
+        return False, 'A task/goal is required to launch the adversarial village.'
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    task_id = st.get('taskId') or ('adv-' + str(int(time.time() * 1000)))
+    st['taskId'] = task_id
+    st['taskGoal'] = task
+    winter_director = _spawn_winter_team(state, admin_id, task, now_ms)
+    if not winter_director:
+        return False, 'Could not spawn the winter team (name pool or agent cap exhausted).'
+    st['winterDirectorId'] = winter_director
+    st['launchedAt'] = now_ms
+    st['enabled'] = True
+    st['status'] = 'active'
+    # File the same goal to the MAIN village's free authority team.
+    authority = _free_authority(state) or admin_id
+    team = _staffing_team_for_authority(state, authority)
+    main_team_id = (team.get('id') or team.get('directorId')) if team else authority
+    main_req = _sim.file_large_request(state, authority, task, main_team_id, now_ms=now_ms)
+    if main_req:
+        main_req['adversarialTaskId'] = task_id
+        main_req['villageId'] = 'main'
+        st['mainRequestId'] = main_req['id']
+    # The winter side was already filed by spawn_new_team_for_request; tag it.
+    for req in state.get('backlogRequests') or []:
+        if req.get('teamId') == winter_director:
+            req['adversarialTaskId'] = task_id
+            req['villageId'] = _ADV_VILLAGE_ID
+            st['winterRequestId'] = req['id']
+            break
+    log_action(admin_id, 'adversarial_village_enabled',
+               {'task': task, 'taskId': task_id, 'winterDirector': winter_director})
+    return True, (f'Adversarial village launched. Winter director: {winter_director}. '
+                  f'The same goal is now in both the main village and the winter village.')
+
+
+def _adversarial_village_tick(state):
+    """Called from the sim loop each tick. Advances the adversarial village's
+    lifecycle: when BOTH sides have delivered the shared task, complete and
+    disable the winter village. No-op when disabled. Mutates `state` in place
+    (runs inside the sim's single read-modify-write, before the one save)."""
+    st = _adversarial_state(state)
+    if not st.get('enabled') or st.get('status') != 'active':
+        return
+    task_id = st.get('taskId')
+    if not task_id:
+        return
+    main_done = _adv_side_delivered(state, task_id, 'main')
+    winter_done = _adv_side_delivered(state, task_id, _ADV_VILLAGE_ID)
+    if main_done and winter_done:
+        log_action('system', 'adversarial_village_completed',
+                   {'taskId': task_id, 'taskGoal': st.get('taskGoal')})
+        _disable_adversarial_village(state, reason='completed')
+
+
+@app.get('/api/adversarial-village')
+async def adversarial_village_status(request: Request):
+    """Adversarial (winter) village status, polled by the client so it knows
+    whether the winter map is walkable. Read-only, any authenticated client."""
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    st = _adversarial_state(state)
+    return JSONResponse({
+        'enabled': bool(st.get('enabled')),
+        'status': st.get('status'),
+        'taskGoal': st.get('taskGoal'),
+        'winterDirector': st.get('winterDirectorId'),
+    })
 
 
 @app.get('/api/villages')
