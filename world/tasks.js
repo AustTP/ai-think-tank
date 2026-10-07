@@ -24,7 +24,7 @@ const TASK_WALK_SPEED = 60; // world-space px/sec -- a bit slower than the playe
 const TASK_ARRIVE_DIST = 12;
 // Fix: this used to be the WHOLE duration -- a fixed
 // setTimeout fired finishTask() regardless of whether the real dispatched
-// work (checkWeatherReference/runWorkroomTask/runResearchTask/
+// work (runWorkroomTask/runResearchTask/runMediaDigestTask/
 // runMediaDigestTask, all real async calls -- a model call, a crawl, a
 // multi-step coding pipeline) had actually finished yet. A fast check
 // looked artificially slow; a genuinely long one (a scheduled research
@@ -80,7 +80,7 @@ const TASK_POOL = [
   // runWorkroomTask() below.
   { title: 'Maintain the shared Work Room tooling', room: 'pressoffice', instructions: 'Pick whoever is best suited to maintain the shared coding tools in the Work Room.', pair: true },
   { title: 'Sort the incoming mail queue', room: 'postoffice', instructions: 'Pick whoever is best suited to sort the incoming mail at the Post Office.' },
-  { title: "Log today's weather readings", room: 'weatherstation', instructions: 'Pick whoever is best suited to log readings at the Weather Station.' },
+  { title: 'Research an open question', room: 'weatherstation', instructions: 'Pick whoever is best suited to research an open question at the Weather Station.' },
   { title: 'Catalog new library arrivals', room: 'library', instructions: 'Pick whoever is best suited to catalog new arrivals at the Library.' },
   // `dependsOn` (see handoffs.js): agents should talk to
   // each other for real reasons -- a real dependency between two rooms'
@@ -92,7 +92,7 @@ const TASK_POOL = [
   { title: "Prep tonight's broadcast segment", room: 'media', dependsOn: 'pressoffice', instructions: 'Pick whoever is best suited to prep tonight\'s broadcast segment at Media.' },
   { title: 'Reconcile the daily ledger', room: 'bank', dependsOn: 'postoffice', instructions: 'Pick whoever is best suited to reconcile the daily ledger at the Bank.' },
   // Gap: every task above maps to one named specialist
-  // (weather -> Eli, banking -> Ben, etc.), so Dev's four assistants --
+  // (internet-access room -> Eli, banking -> Ben, etc.), so Dev's four assistants --
   // whose whole job is "overflow support," nobody's specialty -- could
   // never win a best-fit call against the actual specialist. This is the
   // one task in the pool explicitly for them.
@@ -881,7 +881,7 @@ const DELEGATABLE_ROOMS = ['observatory', 'pressoffice', 'postoffice', 'bank', '
 const _ROOM_PURPOSE_FALLBACK = {
   pressoffice: 'Work Room -- real sandboxed software development; actually writes and runs code for the SPECIFIC task given (taskType "code"), or reviews/QA-tests an already-built deliverable for real, specific problems (taskType "review" or "qa"). Use this for anything meaning "write/build/fix code" OR "review/test what was built."',
   observatory: 'Research Center -- makes a real model call reasoning about the SPECIFIC subtask given and files a genuine, findable finding. Use for "research/investigate/write up findings on X."',
-  weatherstation: 'Weather Station -- currently only checks a fixed weather reference, not yet aware of a specific subtask\'s content.',
+  weatherstation: 'Weather Station -- an open-ended research room with internet access; may investigate or analyze any topic on request. The name is cosmetic and does not limit the topic. Use for "research/investigate/analyze X" on any subject.',
   media: 'Studio -- digests one of the subscribed feeds (media/feeds.md) into a summary. Use only for "summarize/digest an external source."',
   library: 'Library -- reference/reading room. No automated work happens here at all; never assign a subtask here that needs a real deliverable.',
   postoffice: 'Post Office -- no automated work happens here at all; never assign a subtask here that needs a real deliverable.',
@@ -924,8 +924,8 @@ async function assignBigTask(goal) {
   if (!authorityDef) return { error: 'No admin or director is free right now -- try again shortly.' };
   const admin = AGENTS[authorityDef.id];
 
-  // A subtask that can't start until a specific time (e.g. "log
-  // tonight's weather at 9pm"). WORK_QUEUE items already support this
+  // A subtask that can't start until a specific time (e.g. "run
+  // the report at 9pm"). WORK_QUEUE items already support this
   // (queueWork's notBefore, respected by runTaskCycleBody/thinkTankHasWork
   // -- a scheduled item makes zero real calls while it waits). The one
   // thing the model needs to actually use it correctly is the real
@@ -1245,7 +1245,7 @@ function arriveAtTask(id) {
   // unset room) has nothing to wait on, so it just resolves immediately
   // and falls through to the minimum visual floor below.
   let dispatchPromise;
-  if (task.room === 'weatherstation') dispatchPromise = checkWeatherReference(id);
+  if (task.room === 'weatherstation') dispatchPromise = runResearchTask(id, task);
   else if (task.room === 'pressoffice') dispatchPromise = runWorkroomTask(id, task);
   else if (task.room === 'observatory') dispatchPromise = runResearchTask(id, task);
   else if (task.room === 'media') dispatchPromise = runMediaDigestTask(id);
@@ -2330,11 +2330,9 @@ async function runSkillReviewTask(agentId) {
 // Fix (hiring-to-shutdown audit): this used to run the
 // exact SAME fixed log-and-tally action every time, regardless of what
 // the assigned task actually asked for -- same gap class as
-// runWorkroomTask's own fix. checkWeatherReference (weatherstation) is
-// deliberately left as-is: that room's whole identity is one specific
-// external reference, not a general-purpose room the way Research
-// Center is framed to be. Uses the SAME persistent sandbox every time
-// (RESEARCH_SANDBOX_ID) -- agents should reuse it, not
+// runWorkroomTask's own fix. The Weather Station room now routes
+// through this same open-ended research path. Uses the SAME persistent
+// sandbox every time (RESEARCH_SANDBOX_ID) -- agents should reuse it, not
 // each get a throwaway one. When the task has real project lineage
 // (projectLabel set), this now makes a real model call reasoning about
 // the SPECIFIC subtask and writes a genuine finding -- to findings.log
@@ -2475,36 +2473,6 @@ async function runResearchTask(agentId, task) {
       note = 'Tried to work in the Research Center sandbox, but the request failed.';
     }
   }
-  if (AGENTS[agentId]) {
-    AGENTS[agentId].profile.notes.push(note);
-    if (AGENTS[agentId].profile.notes.length > 5) AGENTS[agentId].profile.notes.shift();
-  }
-}
-
-// A fixed, stable reference page rather than letting an agent (or its
-// Live weather for the think tank's configured location, served by the
-// server's /api/weather/now (real Open-Meteo data for WEATHER_LOCATION) --
-// no hard-coded forecast or fixed reference page.
-async function checkWeatherReference(agentId) {
-  const a = AGENTS[agentId];
-  if (!a) return;
-  let note;
-  try {
-    const res = await agentFetch('/api/weather/now', agentId, { method: 'GET' });
-    const data = await res.json();
-    if (data.reading) {
-      note = `Logged live weather for ${data.location}: "${data.reading.slice(0, 140).trim()}..."`;
-    } else if (data.error) {
-      note = `Tried to log live weather, but the server said: ${data.error}`;
-    } else {
-      note = 'Tried to log live weather, but the reading came back empty.';
-    }
-  } catch (e) {
-    note = 'Tried to log live weather, but the request failed.';
-  }
-  // a may no longer be busy/on this task by the time this resolves (fired
-  // outside the setTimeout that gates finishTask) -- still worth logging
-  // even so, same as any other note.
   if (AGENTS[agentId]) {
     AGENTS[agentId].profile.notes.push(note);
     if (AGENTS[agentId].profile.notes.length > 5) AGENTS[agentId].profile.notes.shift();

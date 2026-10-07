@@ -1450,13 +1450,6 @@ class MakeWebToolsExecutor(unittest.TestCase):
             out = self._exec()("request_allowlist", {"host": "example.com"})
         self.assertIn("Could not file", out)
 
-    def test_weather_now(self):
-        with unittest.mock.patch.object(serve, "_weather_fetch", return_value="sunny"), \
-             unittest.mock.patch.object(serve, "wrap_external_content",
-                                        return_value=("wrapped", "n", "t", "inst")):
-            out = self._exec()("weather_now", {"location": "London"})
-        self.assertIn("wrapped", out)
-
     def test_search_web(self):
         with unittest.mock.patch.object(serve, "_api_execute",
                                         return_value={"ok": True, "textForModel": "wrapped",
@@ -1498,7 +1491,7 @@ class MakeWebToolsExecutor(unittest.TestCase):
         self.assertIn("unexpected response", out)
 
     def test_struck_tool_preblocked(self):
-        out = self._exec(struck_tools={"weather_now"})("weather_now", {})
+        out = self._exec(struck_tools={"search_web"})("search_web", {"query": "news"})
         self.assertIn("already blocked once", out)
 
     def test_unknown_tool(self):

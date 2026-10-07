@@ -1,7 +1,7 @@
 """Server-owned content executors: the per-room real-work runners.
 
 Extracted from serve.py (phase-consolidation): this module holds every `_run_*`
-content executor (research/weather/media/skill-review/research-project/research-
+content executor (research/media/skill-review/research-project/research-
 bare/bank/coding/review/product-build/spike/workroom), the dispatcher
 (_server_content_dispatcher), and the private helpers only those executors use
 (_gather_unified_context, _parse_probe_request, _format_page_probe_result,
@@ -272,20 +272,6 @@ def _extract_csv_like_blocks(text):
         else:
             i += 1
     return blocks
-
-
-def _run_weather_content(snapshot, agent_id, task, base_ctx=None):
-    """The Weather Station logs LIVE readings for the think tank's configured
-    location (serve.WEATHER_LOCATION, default Charlotte, NC -- overridable via
-    WEATHER_LOCATION env). Real Open-Meteo data through serve's own fetcher,
-    never a hard-coded forecast or a fixed reference page."""
-    import sim as _sim_module
-    reading = _serve._weather_fetch(_serve.WEATHER_LOCATION)
-    if reading.startswith('__TOOL_ERROR__'):
-        note = f'Could not log live weather readings: {reading}'
-    else:
-        note = f'Logged live weather for {_serve.WEATHER_LOCATION}: {reading}'
-    _sim_module._store_content_result(task.get('id'), {'note': note})
 
 
 def _parse_feed_urls_after(text):
@@ -579,7 +565,7 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
     }
     room_executors = {
         'observatory': _run_observatory_content,
-        'weatherstation': _run_weather_content,
+        'weatherstation': _run_observatory_content,
         'media': _run_media_content,
         'pressoffice': _run_workroom_content,
         'bank': _run_bank_content,
@@ -2814,9 +2800,8 @@ def _make_library_tools_executor(agent_id, struck_tools=None):
 # OpenRouter spend cap), and the discipline established this same evening
 # was "no more building beyond what's needed, watch spend closely." These
 # are FIXED-purpose, narrow calls (a location's trends, a keyword search),
-# not an open redirect to an arbitrary agent-chosen URL -- same reasoning
-# weather_now is not Jev-gated: there is no domain/URL for Jev to judge,
-# the target is fixed by the tool itself.
+# not an open redirect to an arbitrary agent-chosen URL -- there is no
+# domain/URL for Jev to judge, the target is fixed by the tool itself.
 _TREG_X_TRENDING_TOOL = {
     'type': 'function',
     'function': {

@@ -1048,11 +1048,12 @@ _SEED_PROFILES = {
         'notes': [],
     },
     'Weather Station': {
-        'mission': 'Gather environmental observations and turn them into forecasts and warnings the think tank can rely on.',
+        'mission': 'Research open-ended questions and topics on request, using the internet access this room provides to ground findings in real sources. The room\'s name is cosmetic and does not limit what may be researched.',
         'instructions': [
-            'Distinguish observed data from inference in every report; never present a guess as a reading.',
-            'Flag unusual conditions early rather than waiting for confirmation.',
-            'Route any request for gated or high-risk checks through the senior-most director.',
+            'Ground every finding in real, verifiable sources; never present a guess as a verified fact.',
+            'The room\'s name does not restrict the topic -- research whatever the task or player asks for.',
+            'Distinguish observed/verified data from inference in every report.',
+            'Flag uncertainty honestly rather than padding a conclusion.',
         ],
         'notes': [],
     },
@@ -1988,8 +1989,7 @@ def _clean_subtitle_file(path):
 def _youtube_transcript(url, lang='en', timeout=90):
     """Fetch the transcript of a YouTube video via local yt-dlp. Returns
     (text, None) on success or (None, error-string) on failure. Free -- no
-    metered API involved, so nothing is accrued against any balance (the
-    same reason weather_now needs no budget gate)."""
+    metered API involved, so nothing is accrued against any balance."""
     url = (url or '').strip()
     if not _is_youtube_url(url):
         return None, f'Not a YouTube URL (only youtube.com / youtu.be are allowed): {url}'
@@ -6235,24 +6235,6 @@ AGENT_ASK_TOOLS = [
     {
         'type': 'function',
         'function': {
-            'name': 'weather_now',
-            'description': 'Get the current weather and feels-like conditions for a place, '
-                           'e.g. "Charlotte, NC". Returns temperature, apparent temperature, '
-                           'and a short condition description. Use this to answer dressing or '
-                           'conditions questions that depend on live outside weather.',
-            'parameters': {
-                'type': 'object',
-                'properties': {
-                    'location': {'type': 'string',
-                                 'description': 'Free-form place name, e.g. "Charlotte, NC".'},
-                },
-                'required': ['location'],
-            },
-        },
-    },
-    {
-        'type': 'function',
-        'function': {
             'name': 'browse_page',
             'description': 'Fetch a real, specific web page for live/current information the '
                            'weather tool cannot cover (a stock quote, current news, a specific '
@@ -6419,62 +6401,6 @@ SECURITY_TEST_TOOLS = [
     },
 ]
 
-# Open-Meteo needs no API key and is a single reliable fetch for live weather.
-_OPENMETEO_GEOCODE = 'https://geocoding-api.open-meteo.com/v1/search'
-_OPENMETEO_FORECAST = 'https://api.open-meteo.com/v1/forecast'
-
-
-# The think tank's live-weather location for the Weather Station's autonomous
-# readings: real Open-Meteo data via _weather_fetch, never a hard-coded
-# forecast. Defaults to Charlotte, NC; override with WEATHER_LOCATION.
-WEATHER_LOCATION = os.environ.get('WEATHER_LOCATION', '').strip() or 'Charlotte, NC'
-
-
-def _weather_geocode(location):
-    """Resolve a free-form place name to lat/lon via Open-Meteo geocoding.
-    Returns (lat, lon, display_name) or None when unresolved. A dedicated fetch
-    (not _http_json) because the target is a third-party host, not our own API."""
-    params = urllib.parse.urlencode({'name': location, 'count': 1, 'language': 'en'})
-    req = urllib.request.Request(f'{_OPENMETEO_GEOCODE}?{params}', headers={'User-Agent': 'ai-think-tank/1.0'})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310 -- fixed allow-listed weather host
-            data = json.loads(resp.read().decode('utf-8', errors='replace'))
-    except Exception:
-        return None
-    results = (data or {}).get('results') or []
-    if not results:
-        return None
-    r = results[0]
-    return r.get('latitude'), r.get('longitude'), r.get('name')
-
-
-def _weather_fetch(location):
-    """Fetch current conditions for `location`. Returns a short plain-string
-    summary, or a __TOOL_ERROR__-style note on failure. No API key. The result
-    is EXTERNAL DATA and is wrapped with the injection boundary by the caller
-    before it ever reaches a model."""
-    geo = _weather_geocode(location)
-    if geo is None:
-        return f'Could not resolve a forecast location for "{location}".'
-    lat, lon, _name = geo
-    params = urllib.parse.urlencode({
-        'latitude': lat, 'longitude': lon,
-        'current': 'temperature_2m,apparent_temperature,weather_code',
-    })
-    req = urllib.request.Request(f'{_OPENMETEO_FORECAST}?{params}', headers={'User-Agent': 'ai-think-tank/1.0'})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310 -- fixed allow-listed weather host
-            data = json.loads(resp.read().decode('utf-8', errors='replace'))
-    except Exception as e:
-        return f'__TOOL_ERROR__: weather fetch failed: {e}'
-    current = ((data or {}).get('current')) or {}
-    cond = _weather_code_human(current.get('weather_code'))
-    temp = current.get('temperature_2m')
-    feels = current.get('apparent_temperature')
-    return (f'Weather for {location}: temperature {temp}°C, feels like {feels}°C, '
-            f'{cond}. (Data is external and may be stale from the previous hour.)')
-
-
 _TAVILY_SEARCH_URL = 'https://api.tavily.com/search'
 
 
@@ -6521,36 +6447,6 @@ def _tavily_search_sync(query, max_results=5):
     if not parts:
         return f'No search results found for "{query}".'
     return '\n'.join(parts)
-
-
-# Open-Meteo current.weather_code -> short human label (WMO 4677 subset). A
-# one-word-ish label is enough for a dressing decision; the full code is only
-# ever shown back to the model as DATA, never trusted as an instruction.
-_WMO_CODES = {
-    0: 'clear sky', 1: 'mainly clear', 2: 'partly cloudy', 3: 'overcast',
-    45: 'foggy', 48: 'depositing rime fog', 51: 'light drizzle', 53: 'drizzle',
-    55: 'dense drizzle', 61: 'slight rain', 63: 'moderate rain', 65: 'heavy rain',
-    66: 'freezing rain', 67: 'freezing rain', 71: 'slight snow', 73: 'snow',
-    75: 'heavy snow', 77: 'snow grains', 80: 'slight rain showers',
-    81: 'rain showers', 82: 'violent rain showers', 85: 'snow showers',
-    86: 'heavy snow showers', 95: 'thunderstorm', 96: 'thunderstorm with hail',
-    99: 'thunderstorm with heavy hail',
-}
-
-
-def _weather_code_human(code):
-    return _WMO_CODES.get(code, f'weather code {code}')
-
-
-@app.get('/api/weather/now')
-async def weather_now():
-    """Live weather for the think tank's configured location (WEATHER_LOCATION,
-    default Charlotte, NC). The Weather Station's autonomous readings use this
-    instead of any hard-coded forecast -- real Open-Meteo data, wrapped at the
-    same injection boundary every other external-data tool uses."""
-    result = _weather_fetch(WEATHER_LOCATION)
-    wrapped, _nonce, _tag, instruction = wrap_external_content(result, 'a live weather service')
-    return JSONResponse({'location': WEATHER_LOCATION, 'reading': result, 'forModel': f"{instruction}\n\n{wrapped}"})
 
 
 def _decision_request(model, state, questions):
@@ -8876,7 +8772,7 @@ _DELEGATABLE_ROOMS = ['observatory', 'pressoffice', 'postoffice', 'bank',
 _DEFAULT_ROOM_DEFINITIONS = {
     'pressoffice': {'label': 'Work Room', 'purpose': 'real sandboxed software development; actually writes and runs code for the SPECIFIC task given (taskType "code"), or reviews/QA-tests an already-built deliverable for real, specific problems (taskType "review" or "qa"). Use this for anything meaning "write/build/fix code" OR "review/test what was built." QUALITY BAR: written code must follow PEP 8 and pass the standard Python toolchain baked into this sandbox -- flake8, mypy, bandit, and pytest with >=90% coverage (the "quality pipeline") -- and work is NOT approved unless that pipeline is green.'},
     'observatory': {'label': 'Research Center', 'purpose': 'makes a real model call reasoning about the SPECIFIC subtask given and files a genuine, findable finding. Use for "research/investigate/write up findings on X."'},
-    'weatherstation': {'label': 'Weather Station', 'purpose': 'currently only checks a fixed weather reference, not yet aware of a specific subtask\'s content.'},
+    'weatherstation': {'label': 'Weather Station', 'purpose': 'an open-ended research room with internet access; may investigate or analyze any topic on request. The name is cosmetic and does not limit the topic. Use for "research/investigate/analyze X" on any subject.'},
     'media': {'label': 'Studio', 'purpose': 'digests one of the subscribed feeds (media/feeds.md) into a summary. Use only for "summarize/digest an external source."'},
     'library': {'label': 'Library', 'purpose': 'reference/reading room. No automated work happens here at all; never assign a subtask here that needs a real deliverable.'},
     'postoffice': {'label': 'Post Office', 'purpose': 'no automated work happens here at all; never assign a subtask here that needs a real deliverable.'},
@@ -10303,7 +10199,7 @@ async def intent_clarify(request: Request):
 
 
 def _make_web_tools_executor(agent_id, agent_key, default_location=None, default_query=None, struck_tools=None):
-    """Shared weather_now/search_web/browse_page tool executor for any
+    """Shared search_web/browse_page tool executor for any
     AGENT_ASK_TOOLS-driven tool-calling loop. Extracted so the
     spike content executor can reuse the exact same gated fetch/wrap logic
     _ask_core uses, instead of the single free-text completion with NO tool
@@ -10343,11 +10239,6 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             # polled, and accrued inside the single choke point.
             return _higgsfield_generate('image' if name == 'generate_image' else 'video',
                                         args, agent_id, agent_key)
-        if name == 'weather_now':
-            loc = (args or {}).get('location') or default_location or ''
-            result = _weather_fetch(loc)
-            wrapped, _nonce, _tag, instruction = wrap_external_content(result, 'a live weather service')
-            return f"{instruction}\n\n{wrapped}"
         if name == 'search_web':
             query = (args or {}).get('query') or default_query or ''
             # Runs through the generic chokepoint -- Tavily auth (body_field
@@ -10523,9 +10414,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         f"Your mission: {mission}{checklist} "
         f"The player asks you a fresh question that has nothing to do with the think tank's "
         f"own products or backlog. Answer it directly, in character, in 2-4 sentences. "
-        f"If answering depends on live outside conditions, use the weather_now tool with "
-        f"the location from the question (or the provided location). For any other live/current "
-        f"real-world fact (a stock price, current news, a specific fact you don't already know), "
+        f"For any live/current real-world fact (a stock price, current news, a specific fact you don't already know), "
         + ("use search_web first if you don't already know a specific URL that has the answer, "
            "then browse_page on the best result if the search snippet alone isn't enough. "
            if TAVILY_API_KEY else
@@ -10588,7 +10477,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
 
     def execute_tool(name, args):
         # Every tool result is external data -> wrap BEFORE it can reach a model.
-        if name in ('weather_now', 'search_web', 'browse_page'):
+        if name in ('search_web', 'browse_page'):
             tools_used.append(name)
             return _web_tool(name, args)
         if name == 'team_digest':
@@ -12795,7 +12684,7 @@ def _redact_secrets(content):
 # is untrusted by construction (Jev only judges the destination and
 # stated purpose before fetching -- it never inspects what's actually on
 # the page). Nothing currently feeds browsed text into an agent's own
-# model call, but checkWeatherReference() (tasks.js) is one step away
+# model call, but an agent-driven research task (tasks.js) is one step away
 # from doing exactly that, and there is real prior art for exactly this
 # failure: a page engineered to contain something like "SYSTEM: ignore
 # previous instructions" would otherwise be indistinguishable from a real
@@ -17972,7 +17861,6 @@ try:
     import content as _content
     _server_content_dispatcher = _content._server_content_dispatcher
     _run_research_content = _content._run_research_content
-    _run_weather_content = _content._run_weather_content
     _run_media_content = _content._run_media_content
     _run_skill_review_content = _content._run_skill_review_content
     _run_bank_content = _content._run_bank_content
