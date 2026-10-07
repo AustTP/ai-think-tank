@@ -36,6 +36,13 @@ const PLACEMENT_MIN_DIST = 60;
 
 let AGENTS = {}; // id -> { id, name, color, x, y, dir, visible, busy, meetingId }
 
+// Per-agent generated sprite sets (the "Per-agent sprites" product): id ->
+// { south, north, east, west }, each an Image loaded from
+// /api/avatar/<id>/<orientation>.png. Populated best-effort by index.html at
+// boot; any orientation missing (PixelLab unavailable / not yet generated)
+// falls back to the shared default player sprite via drawAgentAt.
+let agentSprites = {};
+
 // "Unblocked" alone isn't enough -- a cell can be walkable and still sit in
 // a pocket with no path out (a grass patch fully boxed in by a fence or
 // building edge, say), which would strand whoever spawns there. Flood-fill
@@ -507,7 +514,8 @@ function drawSpeechBubble(ctx, toScreen, zoom, a, x, y) {
 }
 
 function drawAgentAt(ctx, toScreen, zoom, playerSprites, a, x, y) {
-  const spr = playerSprites[a.dir];
+  const per = (agentSprites && agentSprites[a.id]) ? agentSprites[a.id][a.dir] : null;
+  const spr = per || playerSprites[a.dir];
   const [sx, sy] = toScreen(x - (spr.width - AGENT_W) / 2, y - (spr.height - AGENT_H));
   ctx.drawImage(spr, sx, sy, spr.width * zoom, spr.height * zoom);
 
