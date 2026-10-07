@@ -1200,6 +1200,9 @@ def _sim_loop_pass_locked():
         serve._peer_review_tick(state)
     except Exception as e:
         print(f'[sim] peer review tick error: {e}', flush=True)
+    import trading_workflow, blocker_control
+    trading_workflow.advance(state)
+    blocker_control.reconcile_notices(state)
     serve.save_state_to_db(state)
     return state
 
@@ -1839,6 +1842,11 @@ def _apply_content_result(state, task, result, now_ms=None):
     that omits it falls back to wall-clock so the function stays standalone."""
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     note = result.get('note')
+    if result.get('tradingAcceptance') is not None:
+        task['tradingAcceptance'] = result['tradingAcceptance']
+        if not result['tradingAcceptance'].get('accepted'):
+            task['manualAttention'] = True
+            task['blockedReason'] = 'acceptance_failed'
     if note:
         task['note'] = note
     if result.get('dataUnavailable'):
@@ -2262,6 +2270,7 @@ def queue_work(state, items):
             'projectLabel': item.get('projectLabel') or None,
             'research': item.get('research') or None,
             'taskType': item.get('taskType') or 'code',
+            'tradingStage': item.get('tradingStage'),
             'skillReview': bool(item.get('skillReview')),
             # Hive mind: a distillation content-task that merges recent archive
             # findings into the think tank wiki (see _check_schedules's distill sweep).
@@ -3854,6 +3863,7 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'sprintId': (extra or {}).get('sprintId'),
         'teamId': (extra or {}).get('teamId'),
         'taskType': (extra or {}).get('taskType', 'code'),
+        'tradingStage': (extra or {}).get('tradingStage'),
         'skillReview': bool((extra or {}).get('skillReview')),
         'distill': bool((extra or {}).get('distill')),
         'kbClass': (extra or {}).get('kbClass') or None,
@@ -4503,6 +4513,8 @@ def _check_schedules(state, now, now_ms):
     # problem on the table from its first pass.
     _ensure_long_horizon_topic(state, now_ms)
     for topic in (state.get('researchTopics') or []):
+        if topic.get('disabled'):
+            continue
         if now_ms - (topic.get('lastRunAt') or 0) < topic.get('cadenceMs', 0):
             continue
         # Composed schedule+dependency: a topic with a `dependsOnTask` waits for
@@ -9600,6 +9612,11 @@ def _consensus_relay_step(state, now_ms):
     priority room and why it is weak/starved. Pure derivation -- no ceremony,
     no Jev spend. A no-op until a roadmap exists, so a fresh think tank never
     fabricates a consensus that isn't grounded."""
+    if state.get('researchFocus') == 'coinbase_spot':
+        state['consensusRelay'] = {'room': 'observatory',
+            'consensus': 'Current direction: Coinbase spot research, evidence-based strategy, $50 risk limit, and paper trading. Weather research is outside this scope.',
+            'updatedAt': now_ms}
+        return
     roadmap = state.get('roadmap') or {}
     ranked = sorted(((roadmap[r].get('priority') or 0, r) for r in roadmap),
                     reverse=True)
@@ -11435,6 +11452,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         'sprintId': pick.get('sprintId'),
         'teamId': pick.get('teamId'),
         'taskType': pick.get('taskType'),
+        'tradingStage': pick.get('tradingStage'),
         'skillReview': pick.get('skillReview'),
         # CS329A takeaway #2: thread the review checklist through
         # to the assigned task so the Python review executor can grade each

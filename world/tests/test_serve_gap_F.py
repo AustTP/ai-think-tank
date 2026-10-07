@@ -2118,6 +2118,13 @@ class PipelineEndpoint(unittest.TestCase):
     RESULT = {'exitCode': 0, 'stdout': 'ok', 'stderr': '', 'timedOut': False}
     FAIL = {'exitCode': 2, 'stdout': '', 'stderr': 'boom', 'timedOut': False}
 
+    def test_invalid_payloads_return_400_without_running_commands(self):
+        for body in [[], None, {'steps': 'echo hi'}, {'steps': ['echo hi']},
+                     {'steps': [{'command': 123}]}, {'steps': [{'command': 'echo hi', 'name': []}]},
+                     {'steps': self._steps(), 'agentId': []}]:
+            with self.subTest(body=body):
+                self.assertEqual(self._post(body).status_code, 400)
+
     def setUp(self):
         self.sbx = tempfile.mkdtemp(prefix='gap-f-sandbox-')
         self.addCleanup(shutil.rmtree, self.sbx, ignore_errors=True)

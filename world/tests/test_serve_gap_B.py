@@ -566,6 +566,13 @@ class EnsureSandboxNetworkingGap(unittest.TestCase):
 
 
 class RunInSandboxSync(unittest.TestCase):
+    def test_docker_launch_failure_is_a_structured_failure(self):
+        with unittest.mock.patch.object(serve, 'SANDBOX_EXECUTION', 'local'), \
+             unittest.mock.patch.object(serve.subprocess, 'run', side_effect=FileNotFoundError('docker not found')):
+            result = serve._run_in_sandbox_sync('/tmp/sb', 'echo hi')
+        self.assertIsNone(result['exitCode'])
+        self.assertIn('docker not found', result['stderr'])
+        self.assertFalse(result['timedOut'])
     def test_docker_output_uses_utf8_and_tolerates_missing_streams(self):
         with unittest.mock.patch.object(serve, 'SANDBOX_EXECUTION', 'local'), \
              unittest.mock.patch.object(serve.subprocess, 'run',

@@ -1,0 +1,263 @@
+"""Coinbase public spot data and isolated paper execution. No live order API."""
+import asyncio
+import hashlib
+import json
+import re
+import time
+import urllib.parse
+import urllib.request
+from decimal import Decimal, InvalidOperation
+
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+
+BASE = 'https://api.coinbase.com/api/v3/brokerage/market'
+GRANULARITY = {'ONE_MINUTE': 60, 'FIVE_MINUTE': 300, 'FIFTEEN_MINUTE': 900,
+               'ONE_HOUR': 3600, 'FOUR_HOUR': 14400, 'ONE_DAY': 86400}
+
+RESEARCH_TOOLS = [
+    {'type': 'function', 'function': {'name': 'coinbase_paper_account',
+     'description': 'Read the isolated simulated account and order ledger. Does not submit orders.',
+     'parameters': {'type': 'object', 'properties': {}}}},
+    {'type': 'function', 'function': {'name': 'coinbase_spot_market',
+     'description': 'Read current Coinbase spot product metadata and bid/ask. No trading or account access.',
+     'parameters': {'type': 'object', 'properties': {'productId': {'type': 'string'}}, 'required': ['productId']}}},
+    {'type': 'function', 'function': {'name': 'coinbase_spot_candles',
+     'description': 'Read up to 350 Coinbase historical spot candles; includes timestamps and source.',
+     'parameters': {'type': 'object', 'properties': {'productId': {'type': 'string'},
+       'granularity': {'type': 'string', 'enum': list(GRANULARITY)}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 350}},
+       'required': ['productId']}}},
+]
+
+
+def research_tool(name, args):
+    if name == 'coinbase_paper_account':
+        import serve
+        with serve._db() as conn:
+            init_paper(conn)
+            account = json.loads(conn.execute('SELECT blob FROM coinbase_paper_account WHERE id=1').fetchone()[0])
+            account['orders'] = [json.loads(r[0]) for r in conn.execute('SELECT blob FROM coinbase_paper_orders ORDER BY rowid DESC LIMIT 100')]
+        return json.dumps(account)
+    if name == 'coinbase_spot_market':
+        return json.dumps(market(args.get('productId')))
+    if name == 'coinbase_spot_candles':
+        return json.dumps(candles(args.get('productId'), args.get('granularity', 'ONE_HOUR'), int(args.get('limit', 100))))
+    raise ValueError('Unknown Coinbase research tool.')
+
+
+def product_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[A-Z0-9]{2,15}-USD', value):
+        raise ValueError('Use a USD spot pair such as BTC-USD. Derivatives are unsupported.')
+    return value
+
+
+def positive(value):
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation:
+        raise ValueError('Expected a decimal amount.') from None
+    if not number.is_finite() or number <= 0:
+        raise ValueError('Amounts must be finite and positive.')
+    return number
+
+
+def public_get(path, params=None):
+    url = BASE + path
+    if params:
+        url += '?' + urllib.parse.urlencode(params)
+    request = urllib.request.Request(url, headers={'User-Agent': 'AI-Think-Tank/1.0',
+                                                  'Cache-Control': 'no-cache'})
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.load(response)
+
+
+def market(product):
+    product = product_id(product)
+    info = public_get('/products/' + product)
+    if info.get('product_type') != 'SPOT' or info.get('trading_disabled') or info.get('is_disabled'):
+        raise ValueError('Product is not an enabled spot market.')
+    ticker = public_get('/products/' + product + '/ticker', {'limit': 1})
+    return {'product': info, 'ticker': ticker, 'fetchedAt': time.time(),
+            'source': BASE + '/products/' + product}
+
+
+def candles(product, granularity='ONE_HOUR', limit=100):
+    product = product_id(product)
+    if granularity not in GRANULARITY or not 1 <= limit <= 350:
+        raise ValueError('Choose a supported granularity and 1–350 candles.')
+    end = int(time.time())
+    data = public_get('/products/' + product + '/candles', {
+        'start': end - GRANULARITY[granularity] * limit, 'end': end,
+        'granularity': granularity, 'limit': limit})
+    return {'productId': product, 'granularity': granularity, 'fetchedAt': time.time(),
+            'source': BASE + '/products/' + product + '/candles',
+            'candles': sorted(data.get('candles', []), key=lambda c: int(c['start']))}
+
+
+def init_paper(conn):
+    conn.execute('CREATE TABLE IF NOT EXISTS coinbase_paper_account (id INTEGER PRIMARY KEY, blob TEXT NOT NULL)')
+    conn.execute('CREATE TABLE IF NOT EXISTS coinbase_paper_orders (client_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, blob TEXT NOT NULL)')
+    initial = {'cashUsd': '10000', 'holdings': {}, 'mode': 'paper',
+               'costBasisUsd': {}, 'dailyLossLimitUsd': '50',
+               'feeBps': '60', 'slippageBps': '10', 'maxOrderUsd': '100'}
+    conn.execute('INSERT OR IGNORE INTO coinbase_paper_account VALUES (1, ?)', (json.dumps(initial),))
+
+
+def paper_order(connect, body, quote, policy=None):
+    if not isinstance(body, dict) or body.get('mode', 'paper') != 'paper':
+        raise ValueError('Only paper orders are implemented; live trading is unavailable.')
+    product = product_id(body.get('productId'))
+    side = body.get('side')
+    quantity = positive(body.get('baseSize'))
+    client_id = body.get('clientOrderId')
+    if side not in ('BUY', 'SELL') or not isinstance(client_id, str) or not 1 <= len(client_id) <= 100:
+        raise ValueError('Provide BUY/SELL, baseSize, and a unique clientOrderId.')
+    fingerprint = hashlib.sha256(json.dumps([product, side, str(quantity.normalize())]).encode()).hexdigest()
+    with connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        init_paper(conn)
+        prior = conn.execute('SELECT fingerprint, blob FROM coinbase_paper_orders WHERE client_id=?', (client_id,)).fetchone()
+        if prior:
+            if prior[0] != fingerprint:
+                raise ValueError('clientOrderId was already used for a different order.')
+            return json.loads(prior[1])
+        if quote.get('product', {}).get('product_id') != product or time.time() - quote.get('fetchedAt', 0) > 30:
+            raise ValueError('Matching recent market data is required.')
+        account = json.loads(conn.execute('SELECT blob FROM coinbase_paper_account WHERE id=1').fetchone()[0])
+        if policy:
+            if product not in policy['pairs']:
+                raise ValueError('This pair is outside the researched paper strategy.')
+            account['maxOrderUsd'] = str(positive(policy['maxOrderUsd']))
+            account['allocationUsd'] = str(positive(policy['allocationUsd']))
+        account.setdefault('costBasisUsd', {})
+        realized = sum((Decimal(json.loads(row[0]).get('realizedPnlUsd', '0'))
+                        for row in conn.execute('SELECT blob FROM coinbase_paper_orders')
+                        if json.loads(row[0]).get('createdAt', 0) >= time.time() - 86400), Decimal(0))
+        if side == 'BUY' and realized <= -Decimal('50'):
+            raise ValueError('The $50 rolling 24-hour realized paper loss limit was reached; only reducing positions is permitted.')
+        increment = positive(quote['product']['base_increment'])
+        if quantity % increment:
+            raise ValueError('baseSize does not match the product increment.')
+        price = positive(quote['ticker'].get('best_ask' if side == 'BUY' else 'best_bid'))
+        slip = Decimal(account['slippageBps']) / 10000
+        price *= 1 + slip if side == 'BUY' else 1 - slip
+        cost = quantity * price
+        if side == 'BUY' and account.get('allocationUsd'):
+            exposure = sum((Decimal(v) for v in account.get('costBasisUsd', {}).values()), Decimal(0))
+            if exposure + cost > Decimal(account['allocationUsd']):
+                raise ValueError('The researched paper allocation would be exceeded.')
+        if cost > Decimal(account['maxOrderUsd']):
+            raise ValueError('Paper order exceeds the $100 simulated order limit.')
+        fee = cost * Decimal(account['feeBps']) / 10000
+        cash = Decimal(account['cashUsd'])
+        holding = Decimal(account['holdings'].get(product, '0'))
+        basis = Decimal(account['costBasisUsd'].get(product, '0'))
+        equity = None
+        if policy:
+            marks = quote.get('portfolioMarks') or {}
+            for pair, size in account['holdings'].items():
+                if Decimal(size) > 0 and pair not in marks:
+                    raise ValueError('Current bid prices are required for every held spot asset.')
+            equity = cash + sum((Decimal(size) * positive(marks[pair])
+                                 for pair, size in account['holdings'].items() if Decimal(size) > 0), Decimal(0))
+            recent_equities = [positive(json.loads(row[0])['equityBeforeUsd'])
+                for row in conn.execute('SELECT blob FROM coinbase_paper_orders')
+                if json.loads(row[0]).get('createdAt', 0) >= time.time()-86400
+                and json.loads(row[0]).get('equityBeforeUsd')]
+            peak = max([equity] + recent_equities)
+            if side == 'BUY' and peak - equity >= Decimal('50'):
+                raise ValueError('The $50 observed total-equity paper drawdown limit was reached; only exits are permitted.')
+        if side == 'BUY':
+            if cash < cost + fee:
+                raise ValueError('Insufficient simulated USD balance.')
+            cash -= cost + fee
+            holding += quantity
+            basis += cost
+            pnl = -fee
+        else:
+            if holding < quantity:
+                raise ValueError('Spot paper trading cannot sell more than it holds.')
+            cash += cost - fee
+            released_basis = basis * quantity / holding
+            pnl = cost - released_basis - fee
+            basis -= released_basis
+            holding -= quantity
+        account['cashUsd'] = str(cash)
+        account['holdings'][product] = str(holding)
+        account['costBasisUsd'][product] = str(basis)
+        order = {'mode': 'paper', 'status': 'simulated_fill', 'clientOrderId': client_id,
+                 'productId': product, 'side': side, 'baseSize': str(quantity),
+                 'fillPrice': str(price), 'feesUsd': str(fee), 'createdAt': time.time(),
+                 'realizedPnlUsd': str(pnl),
+                 'note': 'Simulated fill; estimated fees and slippage, not a Coinbase transaction.'}
+        if equity is not None:
+            order['equityBeforeUsd'] = str(equity)
+        conn.execute('UPDATE coinbase_paper_account SET blob=? WHERE id=1', (json.dumps(account),))
+        conn.execute('INSERT INTO coinbase_paper_orders VALUES (?, ?, ?)', (client_id, fingerprint, json.dumps(order)))
+        return order
+
+
+def router_for(serve):
+    router = APIRouter(prefix='/api/trading/coinbase')
+
+    @router.get('/status')
+    async def status():
+        return {'exchange': 'coinbase', 'marketType': 'spot', 'mode': 'paper',
+                'liveTradingAvailable': False, 'credentialsRequiredForPublicData': False}
+
+    @router.get('/market/{product}')
+    async def get_market(product: str):
+        try:
+            return await asyncio.to_thread(market, product)
+        except ValueError as error:
+            return JSONResponse({'error': str(error)}, status_code=400)
+        except Exception:
+            return JSONResponse({'error': 'Coinbase market data unavailable.'}, status_code=502)
+
+    @router.get('/candles/{product}')
+    async def get_candles(product: str, granularity: str = 'ONE_HOUR', limit: int = 100):
+        try:
+            return await asyncio.to_thread(candles, product, granularity, limit)
+        except ValueError as error:
+            return JSONResponse({'error': str(error)}, status_code=400)
+        except Exception:
+            return JSONResponse({'error': 'Coinbase historical data unavailable.'}, status_code=502)
+
+    @router.get('/paper/account')
+    async def account():
+        with serve._db() as conn:
+            init_paper(conn)
+            data = json.loads(conn.execute('SELECT blob FROM coinbase_paper_account WHERE id=1').fetchone()[0])
+            data['orders'] = [json.loads(r[0]) for r in conn.execute('SELECT blob FROM coinbase_paper_orders ORDER BY rowid DESC LIMIT 100')]
+        return data
+
+    @router.post('/paper/orders')
+    async def submit(request: Request):
+        if not serve._require_player_session(request):
+            return JSONResponse({'error': 'Paper execution currently requires a player session.'}, status_code=401)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict) or body.get('mode', 'paper') != 'paper':
+                raise ValueError('Only paper orders are implemented.')
+            workflow = (serve.get_state_from_db() or {}).get('tradingWorkflow') or {}
+            evidence = workflow.get('evidence') or {}
+            if workflow and (not evidence.get('risk', {}).get('approved') or not evidence.get('strategy')):
+                return JSONResponse({'error': 'Research, strategy and independent risk review must pass before paper execution.'}, status_code=409)
+            quote = await asyncio.to_thread(market, product_id(body.get('productId')))
+            if evidence.get('strategy'):
+                with serve._db() as conn:
+                    init_paper(conn)
+                    holdings = json.loads(conn.execute('SELECT blob FROM coinbase_paper_account WHERE id=1').fetchone()[0])['holdings']
+                marks = {}
+                for pair, size in holdings.items():
+                    if Decimal(size) > 0:
+                        data = quote if pair == body['productId'] else await asyncio.to_thread(market, pair)
+                        marks[pair] = data['ticker']['best_bid']
+                quote['portfolioMarks'] = marks
+            return await asyncio.to_thread(paper_order, serve._db, body, quote, evidence.get('strategy'))
+        except (ValueError, InvalidOperation) as error:
+            return JSONResponse({'error': str(error)}, status_code=400)
+        except Exception:
+            return JSONResponse({'error': 'Paper order could not be processed; no live order was submitted.'}, status_code=502)
+
+    return router

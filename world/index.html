@@ -584,10 +584,11 @@
 <div id="playerInboxModal" class="modal hidden">
   <div class="modal-box chat-box">
     <div class="chat-header">
-      <h3>Player Inbox</h3>
+      <h3>Needs your decision</h3>
       <button id="playerInboxCloseBtn">Close</button>
     </div>
     <div class="chat-body">
+      <div id="blockerDecisionPanel"></div>
       <div class="thread-log" id="playerInboxLog"></div>
     </div>
   </div>
@@ -2281,6 +2282,7 @@ async function refreshPlayerInbox() {
 }
 
 async function renderPlayerInbox() {
+  await renderBlockerDecisions();
   await refreshPlayerInbox();
   const log = document.getElementById('playerInboxLog');
   log.innerHTML = '';
@@ -2301,6 +2303,76 @@ async function renderPlayerInbox() {
   log.appendChild(header);
   for (const m of awaiting) appendInboxMessage(log, m, true);
   for (const m of answered) appendInboxMessage(log, m, false);
+}
+
+async function renderBlockerDecisions() {
+  const panel = document.getElementById('blockerDecisionPanel');
+  if (!panel || panel.contains(document.activeElement)) return;
+  try {
+    const response = await apiFetch('/api/intent/blockers');
+    if (!response.ok) return;
+    const data = await response.json();
+    panel.replaceChildren();
+    if (data.workflow) {
+      const progress = document.createElement('p');
+      progress.textContent = `Coinbase spot: ${data.workflow.stage} — ${data.workflow.phase}. Live trading remains unavailable.`;
+      panel.appendChild(progress);
+    }
+    const labels = { provide_inputs: 'Supply missing inputs', clarify_scope: 'Clarify scope',
+      assign_repair: 'Assign repair', retry_infrastructure: 'Retry after infrastructure fix', cancel: 'Cancel task' };
+    for (const blocker of data.blockers || []) {
+      const card = document.createElement('section');
+      card.className = 'msg';
+      card.style.cssText = 'padding:12px;border:1px solid #555;margin-bottom:12px';
+      const heading = document.createElement('strong');
+      heading.textContent = `${blocker.title} (${blocker.taskId})`;
+      card.appendChild(heading);
+      const details = document.createElement('pre');
+      details.style.whiteSpace = 'pre-wrap';
+      details.textContent = `Reason: ${blocker.category}\nOwner: ${blocker.owner}\n${blocker.evidence}\n${(blocker.findings || []).join('\n')}`;
+      card.appendChild(details);
+      const action = document.createElement('select');
+      for (const key of blocker.actions) {
+        const option = document.createElement('option');
+        option.value = key;
+        option.textContent = labels[key] + (key === blocker.recommendedAction ? ' (recommended)' : '');
+        action.appendChild(option);
+      }
+      action.value = blocker.recommendedAction;
+      const guidance = document.createElement('textarea');
+      guidance.placeholder = 'Missing inputs, repair instructions, or replacement scope';
+      const criteria = document.createElement('textarea');
+      criteria.placeholder = 'Measurable acceptance criteria (required to clarify scope)';
+      criteria.value = blocker.acceptanceCriteria || '';
+      for (const input of [action, guidance, criteria]) {
+        input.style.cssText = 'display:block;width:100%;box-sizing:border-box;margin:6px 0';
+        card.appendChild(input);
+      }
+      const result = document.createElement('p');
+      const apply = document.createElement('button');
+      apply.textContent = 'Apply decision';
+      apply.addEventListener('click', async () => {
+        apply.disabled = true;
+        try {
+          const response = await apiFetch(`/api/intent/blockers/${encodeURIComponent(blocker.taskId)}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: action.value, guidance: guidance.value, acceptanceCriteria: criteria.value })
+          });
+          const reply = await response.json();
+          if (!response.ok) throw new Error(reply.error || 'Decision could not be saved.');
+          document.activeElement?.blur();
+          await renderPlayerInbox();
+        } catch (error) {
+          result.textContent = error.message;
+          apply.disabled = false;
+        }
+      });
+      card.append(apply, result);
+      panel.appendChild(card);
+    }
+  } catch (error) {
+    if (!panel.hasChildNodes()) panel.textContent = `Could not load decisions: ${error.message}`;
+  }
 }
 
 function appendInboxMessage(log, m, waiting) {
@@ -2324,7 +2396,7 @@ function appendInboxMessage(log, m, waiting) {
     ctx.textContent = m.context;
     box.appendChild(ctx);
   }
-  if (m.kind === 'review_blocked' && waiting) {
+  if (['review_blocked', 'work_blocked'].includes(m.kind) && waiting) {
     const guide = document.createElement('a');
     guide.className = 'hud-btn';
     guide.href = `/api/intent/task/${encodeURIComponent(m.taskId)}/guidance`;

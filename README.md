@@ -144,7 +144,57 @@ cd world && python3 -m pytest tests/
   by default (disabled).
 - Room descriptions are director-editable; room geometry is not (it is a
   code-graph invariant).
-### Closed trading positions and the Bank
+### Coinbase spot research and paper trading
+
+The player inbox includes a **Needs your decision** panel showing each current
+blocker's evidence, responsible agent and recommended action. Supply inputs,
+clarify scope with measurable acceptance criteria, assign a repair, retry after
+Docker is healthy, or cancel. Resumed/completed/dismissed work no longer leaves
+an unresolved inbox notice.
+
+The Coinbase workflow queues Aria's research, Dorian's strategy, Mira's risk
+review and Rowan's paper monitoring sequentially. Each stage requires a saved
+report and structured acceptance manifest; missing or explicitly incomplete
+requirements block progression. Research requires observed quotes and at least
+100 actual candles per proposed pair. Strategy metrics must match an executed
+backtest output and use non-overlapping training/test windows. Risk review must
+read the saved evidence and address the $50 total-equity loss constraint.
+These gates establish evidence and reproducibility requirements, not profitability.
+Weather scheduling and consensus can be disabled by the Coinbase focus migration.
+
+Once research/strategy/risk pass, player-authorized paper orders enforce the
+proposed pair list, order limit and allocation. Portfolio bids are required for
+held assets; new exposure is blocked at $50 of observed rolling 24-hour equity
+drawdown. This check runs on order requests and is not a continuous stop-loss
+or a live exchange order. Rowan's monitor observes the simulated ledger every
+15 seconds after the approved paper stage starts. Live execution remains unavailable.
+
+Coinbase public market data is available through authenticated
+`GET /api/trading/coinbase/market/BTC-USD` and
+`GET /api/trading/coinbase/candles/BTC-USD?granularity=ONE_HOUR&limit=100`.
+Research agents have `coinbase_spot_market` and `coinbase_spot_candles` tools.
+These public Coinbase endpoints require no exchange API credentials.
+
+`GET /api/trading/coinbase/status` reports the execution mode.
+`GET /api/trading/coinbase/paper/account` returns an isolated simulated ledger.
+Logged-in players can POST `/api/trading/coinbase/paper/orders` with
+`{"mode":"paper","productId":"BTC-USD","side":"BUY","baseSize":"0.0001","clientOrderId":"unique-id"}`.
+Reusing an ID for the same order returns its original simulated fill.
+Conflicting IDs, overselling, invalid increments, stale quotes and oversized
+orders are rejected. The paper account starts with $10,000 simulated USD,
+a $100 simulated order ceiling, estimated 60-basis-point fees and
+10-basis-point slippage. These are testing assumptions, not researched strategy
+parameters or actual Coinbase balances/fees. A $50 rolling 24-hour realized
+loss limit blocks new buys while permitting exits; unrealized losses are not
+yet part of that paper limit.
+
+Live trading and withdrawals are not implemented. The agreed research brief
+is Coinbase spot trading with a $50 loss limit; agents must propose allocation,
+order sizing and eligible pairs with evidence, held-out backtesting and paper
+results. The live executor still needs approved parameters, account credentials,
+total-equity risk enforcement, strategy approval and order/fill reconciliation.
+
+### Closed-position accounting
 
 The Bank reports realized trading P&L per agent and quote currency alongside
 its existing operating-spend review. Trading results use actual fill prices:

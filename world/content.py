@@ -4183,7 +4183,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     colab_compute_tool = None
     if _serve.COLAB_CLI_AVAILABLE:
         colab_compute_tool = _make_colab_compute_executor(agent_id, struck_tools=struck_tools)
-    spike_tools = _serve.AGENT_ASK_TOOLS + [_SPIKE_SANDBOX_TOOL, _LIBRARY_SEARCH_TOOL, _LIBRARY_READ_TOOL,
+    import coinbase_spot
+    spike_tools = _serve.AGENT_ASK_TOOLS + coinbase_spot.RESEARCH_TOOLS + [_SPIKE_SANDBOX_TOOL, _LIBRARY_SEARCH_TOOL, _LIBRARY_READ_TOOL,
                                             _TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL,
                                             _PIXELLAB_CHARACTER_TOOL,
                                             _GOOGLE_SHEETS_READ_TOOL, _GOOGLE_SHEETS_APPEND_TOOL,
@@ -4214,14 +4215,32 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                           'search_gmail_messages', 'read_gmail_message', 'create_gmail_draft',
                           'read_google_doc', 'create_google_doc')
 
+    trading_observations = []
     def execute_tool(tool_name, args):
+        if tool_name in ('coinbase_spot_market', 'coinbase_spot_candles', 'coinbase_paper_account'):
+            try:
+                result = coinbase_spot.research_tool(tool_name, args or {})
+                observed = json.loads(result)
+                trading_observations.append({'tool': tool_name, 'productId': (args or {}).get('productId'),
+                    'count': len(observed.get('candles', [])), 'fetchedAt': observed.get('fetchedAt')})
+                _serve.log_action(agent_id, tool_name, args or {}, authorized=True)
+                return result
+            except Exception as error:
+                return f'Coinbase spot research failed: {error}'
         if tool_name in struck_tools:
             return (f'{tool_name} was already blocked once this investigation (one-strike) -- do '
                      'not call it again, use a different tool or approach instead.')
         if tool_name == 'execute_script':
-            return sandbox_tool(tool_name, args)
+            result = sandbox_tool(tool_name, args)
+            if task.get('tradingStage'):
+                import trading_workflow
+                trading_observations.extend(trading_workflow.execution_observations(result))
+            return result
         if tool_name in ('search_library', 'read_library_file'):
-            return library_tool(tool_name, args)
+            result = library_tool(tool_name, args)
+            if tool_name == 'read_library_file' and result and 'not found' not in str(result).lower():
+                trading_observations.append({'tool': tool_name, 'path': (args or {}).get('path')})
+            return result
         if tool_name in ('x_trending_topics', 'search_linkedin_posts'):
             return treg_tool(tool_name, args)
         if tool_name == 'youtube_transcript':
@@ -4405,8 +4424,18 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # THIRD, deliberate exception to that same rule -- the player asking to
     # be told what was found is a genuinely different need than the durable
     # task record staying lean, not a regression of the same bug.
+    acceptance = None
+    if task.get('tradingStage'):
+        import trading_workflow
+        acceptance = trading_workflow.validate_report(task['tradingStage'], finding, trading_observations,
+                    {**((snapshot.get('tradingWorkflow') or {}).get('evidence') or {}),
+                     '_reports': (snapshot.get('tradingWorkflow') or {}).get('reports') or {}})
     _sim_module._store_content_result(task.get('id'), {
-        'note': f'{name} spiked "{backlog}" -- see the Library entry just filed.', 'ok': True,
+        'note': (f'{name} spiked "{backlog}" -- see the Library entry just filed.'
+                 if acceptance is None or acceptance['accepted'] else
+                 'Acceptance requirements not met: ' + '; '.join(acceptance['errors'])),
+        'ok': acceptance is None or acceptance['accepted'],
+        'tradingAcceptance': acceptance,
         # Gap: /api/intent/spike/{id}/promote
         # (turning a spike into a real followup story) only ever had the
         # short note above to work with -- recording the exact path lets it

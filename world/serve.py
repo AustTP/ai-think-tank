@@ -3648,7 +3648,7 @@ def _backfill_directors_in_db():
     backfill_map = _director_backfill_map()
     changed = False
     for d in roster:
-        if d.get('dedicatedReviewer') or d.get('codeDirector'):
+        if d.get('dedicatedReviewer') or d.get('codeDirector') or d.get('tradingSpecialist'):
             continue
         aid = d.get('id')
         is_admin = aid in admin_ids
@@ -4083,6 +4083,10 @@ def _teams_missing_scrum_master(state, team_ids):
 
 
 app = FastAPI(lifespan=_lifespan)
+import coinbase_spot
+app.include_router(coinbase_spot.router_for(sys.modules[__name__]))
+import blocker_control
+app.include_router(blocker_control.router_for(sys.modules[__name__]))
 
 
 def _load_env():
@@ -5209,6 +5213,9 @@ def _run_in_sandbox_sync(sandbox_dir, command):
     except subprocess.TimeoutExpired as e:
         return {'exitCode': None, 'stdout': _sandbox_output_text(e.stdout),
                 'stderr': _sandbox_output_text(e.stderr), 'timedOut': True}
+    except OSError as e:
+        return {'exitCode': None, 'stdout': '',
+                'stderr': f'Could not start the Docker sandbox: {e}', 'timedOut': False}
 
 
 def _sandbox_output_text(output):
@@ -7892,6 +7899,9 @@ AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/a
 # silently overwrote the player's real Gmail app-password. Same two-layer
 # shape /api/keys already uses: this middleware requires SOME valid auth
 # (session or agent key) before the handler's own player-only check ever runs.
+
+
+AUTH_PROTECTED_PREFIXES += ('/api/trading',)
 
 
 def _valid_agent_key_presented(presented_key):
@@ -14388,6 +14398,26 @@ async def delete_handle(handle: str, request: Request):
     return JSONResponse({'ok': True})
 
 
+def _validate_execution_body(body, pipeline=False):
+    if not isinstance(body, dict):
+        raise ValueError('Execution request must be a JSON object.')
+    for field in ('agentId', 'sandboxId', 'purpose', 'command'):
+        if field in body and not isinstance(body[field], str):
+            raise ValueError(f'{field} must be a string.')
+    if pipeline:
+        steps = body.get('steps')
+        if not steps:
+            raise ValueError('steps is required')
+        if not isinstance(steps, list) or not steps:
+            raise ValueError('steps must be a nonempty list.')
+        for step in steps:
+            if not isinstance(step, dict) or not isinstance(step.get('command'), str) or not step['command'].strip():
+                raise ValueError('Each pipeline step needs a nonempty command string.')
+            if 'name' in step and not isinstance(step['name'], str):
+                raise ValueError('Pipeline step names must be strings.')
+    return body
+
+
 @app.post('/api/execute')
 async def execute(request: Request):
     # Real sandboxed execution for the Work Room -- real
@@ -14400,7 +14430,10 @@ async def execute(request: Request):
     if not EXECUTION_ENABLED:
         return JSONResponse({'error': 'Agent execution is disabled (AGENT_EXECUTION_ENABLED=false in .env)'}, status_code=403)
 
-    body = await request.json()
+    try:
+        body = _validate_execution_body(await request.json())
+    except (ValueError, TypeError) as error:
+        return JSONResponse({'error': str(error)}, status_code=400)
     agent_id = body.get('agentId', 'unknown')
     command = (body.get('command') or '').strip()
     purpose = (body.get('purpose') or '').strip()
@@ -14447,7 +14480,10 @@ async def pipeline(request: Request):
     if not EXECUTION_ENABLED:
         return JSONResponse({'error': 'Agent execution is disabled (AGENT_EXECUTION_ENABLED=false in .env)'}, status_code=403)
 
-    body = await request.json()
+    try:
+        body = _validate_execution_body(await request.json(), pipeline=True)
+    except (ValueError, TypeError) as error:
+        return JSONResponse({'error': str(error)}, status_code=400)
     agent_id = body.get('agentId', 'unknown')
     steps = body.get('steps') or []
     sandbox_id = body.get('sandboxId') or ('sandbox-' + secrets.token_hex(4))
