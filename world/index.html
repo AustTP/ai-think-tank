@@ -3393,6 +3393,21 @@ async function main() {
     west: await loadImage('assets/character_west.png'),
   };
 
+  // Per-agent generated sprites: load each non-admin agent's 4-direction set
+  // from /api/avatar/<id>/<orientation>.png. Best-effort -- any orientation
+  // that 404s (PixelLab unavailable, no credits, or generation still pending)
+  // is null and drawAgentAt falls back to the shared default player sprite.
+  agentSprites = {};
+  const adminIds = new Set(AGENT_ROSTER.filter(d => d.isAdmin).map(d => d.id));
+  for (const id in AGENTS) {
+    if (adminIds.has(id)) continue;
+    const set = {};
+    for (const o of ['south', 'north', 'east', 'west']) {
+      set[o] = await loadImage(`/api/avatar/${id}/${o}.png`).catch(() => null);
+    }
+    if (['south', 'north', 'east', 'west'].some(o => set[o])) agentSprites[id] = set;
+  }
+
   // Several buildings share the same room image (see rooms.js) -- load
   // each distinct path once and key the cache by path, not by building.
   const roomImages = {};
