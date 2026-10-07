@@ -577,6 +577,7 @@
       <button id="playerInboxCloseBtn">Close</button>
     </div>
     <div class="chat-body">
+      <div class="thread-log" id="charterPanel" style="border:1px dashed #666;background:#1a1a1a;padding:8px 10px;margin-bottom:10px;"></div>
       <div class="thread-log" id="playerInboxLog"></div>
     </div>
   </div>
@@ -1723,7 +1724,8 @@ function renderBoard() {
     ? inProgress.map(t => {
         const who = AGENTS[t.assignedTo] ? AGENTS[t.assignedTo].name : t.assignedTo;
         const room = ROOMS[t.room] ? ROOMS[t.room].label : t.room;
-        return `<div>&bull; ${t.title} -- ${who} (${room}, ${t.status})</div>`;
+        const lane = t.lane ? ` <span style="opacity:0.6;font-size:11px;">[${t.lane}]</span>` : '';
+        return `<div>&bull; ${t.title} -- ${who} (${room}, ${t.status})${lane}</div>`;
       }).join('')
     : '<div style="opacity:0.6;">Nothing in progress right now.</div>';
 
@@ -2097,6 +2099,7 @@ let playerInboxRefreshTimer = null;
 function openPlayerInbox() {
   state.ui = 'player-inbox';
   document.getElementById('playerInboxModal').classList.remove('hidden');
+  renderCharterPanel();
   renderPlayerInbox();
   playerInboxRefreshTimer = setInterval(renderPlayerInbox, 3000);
 }
@@ -2117,6 +2120,61 @@ async function refreshPlayerInbox() {
     const data = await res.json();
     if (data.ok) playerInboxCache = data.messages || [];
   } catch (e) { /* poll errors are transient -- keep the last good cache */ }
+}
+
+async function renderCharterPanel() {
+  const panel = document.getElementById('charterPanel');
+  if (!panel) return;
+  let charter = {};
+  try {
+    const res = await apiFetch('/api/intent/charter');
+    if (res.ok) {
+      const data = await res.json();
+      if (data.ok && data.charter) charter = data.charter;
+    }
+  } catch (e) { /* poll errors are transient */ }
+  const goal = charter.goal || '';
+  const interests = (charter.interests || []).join(', ');
+  const notes = charter.notes || '';
+  panel.innerHTML = `
+    <div style="font-weight:bold;color:#7fd0ff;">Your charter — the spine every lane points at</div>
+    <div style="opacity:0.7;font-size:11px;margin-top:2px;">Set one direction; the tank plans against it (roadmap, refinement, and every task's instructions).</div>
+    <input id="charterGoal" type="text" value="${goal.replace(/"/g, '&quot;')}" placeholder="Goal — the north-star (e.g. ship a research-backed product)" style="width:100%;margin-top:6px;" />
+    <input id="charterInterests" type="text" value="${interests.replace(/"/g, '&quot;')}" placeholder="Interests — comma-separated (e.g. research, writing, media)" style="width:100%;" />
+    <input id="charterNotes" type="text" value="${notes.replace(/"/g, '&quot;')}" placeholder="Notes for the directors (optional)" style="width:100%;" />
+    <div style="display:flex;gap:6px;margin-top:4px;">
+      <button id="charterSaveBtn" class="hud-btn">Set charter</button>
+      <span id="charterStatus" style="opacity:0.7;font-size:11px;"></span>
+    </div>`;
+  const btn = document.getElementById('charterSaveBtn');
+  btn.addEventListener('click', async () => {
+    btn.disabled = true;
+    const status = document.getElementById('charterStatus');
+    status.textContent = 'saving...';
+    const body = {
+      goal: document.getElementById('charterGoal').value.trim(),
+      interests: document.getElementById('charterInterests').value.split(',').map(s => s.trim()).filter(Boolean),
+      notes: document.getElementById('charterNotes').value.trim(),
+    };
+    try {
+      const res = await apiFetch('/api/intent/charter', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        status.textContent = 'saved — the tank will plan against this.';
+        btn.disabled = false;
+      } else {
+        const data = await res.json();
+        status.textContent = (data && data.error) || 'failed — try again';
+        btn.disabled = false;
+      }
+    } catch (e) {
+      status.textContent = 'failed — try again';
+      btn.disabled = false;
+    }
+  });
 }
 
 async function renderPlayerInbox() {
@@ -2156,6 +2214,13 @@ function appendInboxMessage(log, m, waiting) {
   if (m.kind === 'player_task') {
     who.textContent = `Assigned to you — ${m.title || 'a task'}`;
     box.appendChild(who);
+    if (m.lane) {
+      const badge = document.createElement('div');
+      badge.style.fontSize = '11px';
+      badge.style.opacity = '0.7';
+      badge.textContent = `lane: ${m.lane}`;
+      box.appendChild(badge);
+    }
     const q = document.createElement('div');
     q.style.whiteSpace = 'pre-wrap';
     q.textContent = m.instructions || '';

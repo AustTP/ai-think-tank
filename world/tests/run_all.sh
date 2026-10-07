@@ -154,6 +154,9 @@ echo
 echo "== Python: human-in-the-loop -- player tasks (agents wait, player completes, deps release) =="
 python3 tests/test_player_tasks.py
 echo
+echo "== Python: the spine + attention lanes -- player charter and build/reading/open/parking-lot =="
+python3 tests/test_charter_lanes.py
+echo
 echo "== Python: phone check-in -- POST /api/device/checkin (location/battery/Focus/Wi-Fi) =="
 python3 tests/test_device_checkin.py
 echo
