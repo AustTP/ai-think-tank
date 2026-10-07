@@ -167,6 +167,24 @@ from typing import Optional
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 THINK_TANK_DIR = os.path.dirname(ROOT)
+
+
+def _load_env():
+    # Loads the same .env the CLI already uses for other service keys
+    # (~/ai-think-tank/.env, one directory above world/) -- manual parsing,
+    # matching the rest of the project's own convention, rather than
+    # adding a python-dotenv dependency for one file read.
+    env = {}
+    env_path = os.path.join(os.path.dirname(ROOT), '.env')
+    if os.path.exists(env_path):
+        with open(env_path, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    env[k] = v
+    return env
+
 # Deliberately OUTSIDE world/ -- same reasoning as the .env API key: this
 # directory is served to the browser as static files, so anything under it
 # is visible via view-source. A database of what agents actually did is
@@ -1705,7 +1723,7 @@ def _delete_credential(name):
 
 
 _DIGITALOCEAN_BALANCE_CACHE = {'at': 0.0, 'data': None}
-DIGITALOCEAN_BALANCE_CACHE_TTL_S = 300
+DIGITALOCEAN_BALANCE_CACHE_TTL_S = float(_load_env().get('BALANCE_CACHE_TTL_S', '300') or 300)
 
 
 def _digitalocean_account_balance():
@@ -1743,7 +1761,7 @@ def _digitalocean_account_balance():
 
 
 _TREG_BALANCE_CACHE = {'at': 0.0, 'data': None}
-TREG_BALANCE_CACHE_TTL_S = 300
+TREG_BALANCE_CACHE_TTL_S = float(_load_env().get('BALANCE_CACHE_TTL_S', '300') or 300)
 
 
 def _treg_account_balance():
@@ -2208,7 +2226,7 @@ def _youtube_transcript_colab(url, lang='en', model_size='small'):
 
 
 _PIXELLAB_BALANCE_CACHE = {'at': 0.0, 'data': None}
-PIXELLAB_BALANCE_CACHE_TTL_S = 300
+PIXELLAB_BALANCE_CACHE_TTL_S = float(_load_env().get('BALANCE_CACHE_TTL_S', '300') or 300)
 
 
 def _pixellab_account_balance(force=False):
@@ -2278,11 +2296,14 @@ def _pixellab_call(method, path, body=None, timeout=30):
         return None, f'PixelLab call failed: {e}'
 
 
-def _pixellab_poll_job(job_id, timeout=90, interval=3):
+def _pixellab_poll_job(job_id, timeout=None, interval=3):
     """Poll a PixelLab background job (every real generation call is async)
     until completed/failed/timeout -- same pattern as the think tank's own
-    already-tested spike script, just capped at 90s (not the script's 180s)
-    so one tool call can't eat a whole spike's time budget."""
+    already-tested spike script, just capped (default 90s, tunable via the
+    PIXELLAB_POLL_TIMEOUT_S env var) so one tool call can't eat a whole
+    spike's time budget."""
+    if timeout is None:
+        timeout = float(_load_env().get('PIXELLAB_POLL_TIMEOUT_S', '90') or 90)
     start = time.time()
     while time.time() - start < timeout:
         data, error = _pixellab_call('GET', f'/background-jobs/{job_id}')
@@ -2508,7 +2529,7 @@ async def _avatar_loop():
 # (Google OAuth needs all three; every other credential here is a single
 # token), and the caller never holds any of it directly.
 _GOOGLE_ACCESS_TOKEN_CACHE = {'at': 0.0, 'token': None}
-GOOGLE_ACCESS_TOKEN_TTL_S = 3000  # real tokens last 3599s; refresh a bit early
+GOOGLE_ACCESS_TOKEN_TTL_S = float(_load_env().get('GOOGLE_ACCESS_TOKEN_TTL_S', '3000') or 3000)  # real tokens last 3599s; refresh a bit early
 
 # Hard per-API rate caps, shared across ALL agents. The whole think tank is ONE
 # Google user (one OAuth credential), so Google's per-user quotas apply to the
@@ -2518,12 +2539,16 @@ GOOGLE_ACCESS_TOKEN_TTL_S = 3000  # real tokens last 3599s; refresh a bit early
 # below Google's published per-user limits (Calendar 600 req/min/user, Sheets
 # 60 read + 60 write /min/user, Gmail 6,000 quota units/min/user where a
 # messages.get already costs 20 units, Docs 300 reads + 60 writes /min/user).
-# Each entry: (max_calls_per_minute, min_interval_seconds).
+# Each entry: (max_calls_per_minute, min_interval_seconds). The per-minute
+# values are operator-tunable via .env (GOOGLE_*_RATE_PER_MIN) so a deployment
+# can pace under Google's real published per-user quotas without a code edit;
+# the enforcement mechanism below stays in code and the values still fail
+# closed (agents can never raise their own ceiling).
 _GOOGLE_RATE_LIMITS = {
-    'calendar': (400, 0.15),
-    'sheets':   (40, 0.4),
-    'gmail':    (80, 0.3),
-    'docs':     (80, 0.3),
+    'calendar': (float(_load_env().get('GOOGLE_CALENDAR_RATE_PER_MIN', '400') or 400), 0.15),
+    'sheets':   (float(_load_env().get('GOOGLE_SHEETS_RATE_PER_MIN', '40') or 40), 0.4),
+    'gmail':    (float(_load_env().get('GOOGLE_GMAIL_RATE_PER_MIN', '80') or 80), 0.3),
+    'docs':     (float(_load_env().get('GOOGLE_DOCS_RATE_PER_MIN', '80') or 80), 0.3),
 }
 _GOOGLE_RATE_WINDOW_S = 60.0
 _GOOGLE_RATE_LOCK = threading.Lock()
@@ -4291,23 +4316,6 @@ def _teams_missing_scrum_master(state, team_ids):
 app = FastAPI(lifespan=_lifespan)
 
 
-def _load_env():
-    # Loads the same .env the CLI already uses for other service keys
-    # (~/ai-think-tank/.env, one directory above world/) -- manual parsing,
-    # matching the rest of the project's own convention, rather than
-    # adding a python-dotenv dependency for one file read.
-    env = {}
-    env_path = os.path.join(os.path.dirname(ROOT), '.env')
-    if os.path.exists(env_path):
-        with open(env_path, encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    k, v = line.split('=', 1)
-                    env[k] = v
-    return env
-
-
 OPENROUTER_API_KEY = _load_env().get('OPENROUTER_API_KEY')
 # Tavily search: browse_page alone can only fetch a URL the model
 # already guessed -- real web/search-engine scraping hits a bot-detection
@@ -4360,8 +4368,8 @@ def _higgsfield_configured():
 _HIGGSFIELD_BASE_URL = 'https://api.higgsfield.ai'
 _HIGGSFIELD_IMAGE_ENDPOINT = 'higgsfield-ai/soul/v2/standard'
 _HIGGSFIELD_VIDEO_ENDPOINT = 'kling-video/v3.0/std/text-to-video'
-_HIGGSFIELD_POLL_IMAGE_TIMEOUT_S = 90
-_HIGGSFIELD_POLL_VIDEO_TIMEOUT_S = 300
+_HIGGSFIELD_POLL_IMAGE_TIMEOUT_S = float(_load_env().get('HIGGSFIELD_POLL_IMAGE_TIMEOUT_S', '90') or 90)
+_HIGGSFIELD_POLL_VIDEO_TIMEOUT_S = float(_load_env().get('HIGGSFIELD_POLL_VIDEO_TIMEOUT_S', '300') or 300)
 
 
 def _higgsfield_call(method, path, body=None, timeout=120):
