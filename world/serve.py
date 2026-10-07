@@ -1246,12 +1246,11 @@ def _render_agents_md(name, role, profile):
 
 
 # Solves the exact problem "which notes deserve to survive that cap" --
-# researched against MAGI's
-# own memory_trust.py decay formula rather than guessed at. Fully
-# portable to plain SQLite: no embeddings, no vector search, just
+# researched against a memory_trust.py decay formula rather than guessed at.
+# Fully portable to plain SQLite: no embeddings, no vector search, just
 # arithmetic over what action_log already has. Records past
 # MEMORY_MAX_AGE_DAYS are hard-excluded regardless of score, matching
-# MAGI's own hard cutoff; everything else is ranked by a blend of
+# a hard age cutoff; everything else is ranked by a blend of
 # recency and how consequential the action actually was, not recency
 # alone -- so an old firing review can outrank a recent routine browse.
 MEMORY_MAX_AGE_DAYS = 90
@@ -5845,7 +5844,7 @@ def _fetch_page_sync(url):
     return final_url, content_type, body, truncated, last_modified
 
 
-# Per the MAGI llm_resilience.py research: retries only genuinely
+# llm_resilience research: retries only genuinely
 # TRANSIENT failures (timeouts, rate limits, upstream 5xx) with backoff --
 # deliberately does NOT retry 4xx client errors (a bad model slug, a
 # malformed request), since retrying those just wastes calls on something
@@ -5873,7 +5872,7 @@ def _urlopen_with_resilience(req, timeout, max_attempts=3, base_delay=0.5):
     raise last_exc
 
 
-# Per the MAGI react_engine.py ReflectionEngine research: a "one-strike"
+# react_engine.py ReflectionEngine research: a "one-strike"
 # style breaker, but for repeated PERSISTENT failures (not transient ones
 # already handled by retry above) -- if a specific model slug fails
 # `CIRCUIT_BREAKER_THRESHOLD` times in a row, stop spending calls on it
@@ -10317,7 +10316,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
     is expected to check this set itself before calling in again; this
     function only records strikes, on the ask lane's request it never
     enforces them (None here -- the ask lane's plain Q&A doesn't need this;
-    spikes opt in by passing a real set). Ported from the user's own MAGI
+    spikes opt in by passing a real set). Ported from the user's own
     framework's ReflectionEngine ("one-strike-per-service": never retry a
     tool that just told you no, don't burn budget hoping for a different
     answer). Self-checks `struck_tools` too (not just records into it) --
@@ -12792,7 +12791,7 @@ def _redact_secrets(content):
     return content
 
 
-# From the MAGI research: content fetched via /api/browse
+# Content fetched via /api/browse
 # is untrusted by construction (Jev only judges the destination and
 # stated purpose before fetching -- it never inspects what's actually on
 # the page). Nothing currently feeds browsed text into an agent's own
@@ -12835,7 +12834,7 @@ def verify_boundary_intact(content, nonce, tag):
     return hmac.compare_digest(tag, expected)
 
 
-# Per the MAGI tool_governance.py research: /api/execute, /api/browse, and
+# Per the tool_governance.py research: /api/execute, /api/browse, and
 # /api/pipeline are logged and Jev-classified, but nothing previously
 # bounded how OFTEN a given identity could call them at all -- a genuine
 # gap, not a hypothetical one, given past work already found

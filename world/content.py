@@ -2239,7 +2239,7 @@ def _plain_completion(model, messages, max_tokens, service='spike', task_id=None
 
 def _parse_reflection(text):
     """Parse a reflection self-check's JSON reply, ported (structure, not
-    code) from the user's own MAGI framework's ReflectionEngine.parse_
+    code) from the user's own framework's ReflectionEngine.parse_
     reflection -- same shape: tolerate a bare JSON object or one embedded in
     surrounding prose, fall back to a safe default on anything else.
     Confidence defaults to 1.0 (not 0.0 or 0.5) on parse failure -- a
@@ -2406,7 +2406,7 @@ def _extract_execute_script_outputs(transcript):
 
 
 # Reflection/replan, ported (design, not code) from the user's
-# own MAGI framework's react_engine.py ReflectionEngine -- a real gap: the
+# own framework's react_engine.py ReflectionEngine -- a real gap: the
 # EXECUTE tool loop ran as ONE flat call for its whole iteration budget,
 # with no mid-run check on whether it was actually still on track. This
 # chunks the SAME total iteration budget into rounds, with a cheap
@@ -2506,7 +2506,7 @@ _SPIKE_SANDBOX_TOOL = {
 def _make_spike_sandbox_executor(agent_id, agent_key, sandbox_id, struck_tools=None):
     """`struck_tools`, if given a set, gets 'execute_script' added the moment
     a command is BLOCKED (a real policy denial) -- same one-strike shape
-    _make_web_tools_executor uses, ported from the user's own MAGI
+    _make_web_tools_executor uses, ported from the user's own
     framework. A timed-out or failed-but-approved command is transient, not
     a strike -- it may be worth one retry with a different approach.
     Self-checks `struck_tools` too (not just records into it) -- defense in
@@ -4067,7 +4067,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     if _serve._google_is_configured():
         system += _GOOGLE_QUOTA_AWARENESS_BLOCK
     messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': 'Go ahead.'}]
-    # One-strike-per-tool (ported from the user's own MAGI framework's
+    # One-strike-per-tool (ported from the user's own framework's
     # ReflectionEngine): a shared set across BOTH sub-executors, so a policy
     # denial on either browse_page or execute_script is remembered and the
     # SAME tool is refused (no network call at all) if the model tries it

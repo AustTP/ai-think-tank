@@ -152,7 +152,7 @@ class SpikeContent(unittest.TestCase):
         # it is a spike" (a CSV of sources, a processed dataset, etc.).
         self.assertIn('execute_script', tool_names)
         # Chunked into rounds now (reflection/replan, ported from the user's
-        # own MAGI framework) -- 18 total, spent _REFLECTION_CHUNK_SIZE at a
+        # own framework) -- 18 total, spent _REFLECTION_CHUNK_SIZE at a
         # time, not one flat 18-iteration call.
         self.assertEqual(kwargs.get('max_iterations'), content._REFLECTION_CHUNK_SIZE)
         self.assertEqual(kwargs.get('force_first_tool'), 'search_web')
@@ -737,7 +737,7 @@ class SpikeSandboxExecutor(unittest.TestCase):
 
 
 class OneStrikePerTool(unittest.TestCase):
-    """Ported (design) from the user's own MAGI framework's ReflectionEngine:
+    """Ported (design) from the user's own framework's ReflectionEngine:
     a real policy denial (Jev said no) must never be retried -- the SAME
     tool, called again, is refused locally with no second network call."""
 
@@ -774,7 +774,7 @@ class OneStrikePerTool(unittest.TestCase):
 
     def test_strikes_are_per_tool_not_global(self):
         # A browse_page strike must NOT block execute_script -- one-strike
-        # is per SERVICE/tool (matching MAGI's own naming), not a blanket
+        # is per SERVICE/tool (matching the framework's own naming), not a blanket
         # "something failed, stop everything." They share one struck set
         # (spent from the same iteration ceiling) but track independently.
         self._common_mocks = SpikeContent._common_mocks.__get__(self)
@@ -806,7 +806,7 @@ class OneStrikePerTool(unittest.TestCase):
 
 
 class ReflectionAndReplan(unittest.TestCase):
-    """Ported (design) from the user's own MAGI framework's ReflectionEngine:
+    """Ported (design) from the user's own framework's ReflectionEngine:
     the EXECUTE budget is chunked into rounds with a cheap confidence check
     between them, never exceeding the original total iteration ceiling."""
 
