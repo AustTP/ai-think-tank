@@ -457,24 +457,24 @@ class PipelineStepContent(_ExecutorTestCase):
         self.assertIn('trends', result['note'])
 
     def test_apify_tool_runs(self):
-        result = self._run({'id': 'p4', 'pipelineStep': {'pipelineId': 'pl', 'stepIndex': 0}},
-                           steps=[{'tool': 'apify_get_dataset_items', 'args': {'datasetId': 'd'}}],
-                           tools_side_effect=lambda *a, **k: ({'items': []}, None))
-        self.assertIn('items', result['note'])
+        snapshot = _snapshot(pipelines=[{'id': 'pl', 'steps': [
+            {'tool': 'apify_get_dataset_items', 'args': {'datasetId': 'd'}}]}])
+        seen = _store()
+        _base_mocks()
+        with mock.patch.object(serve, '_api_execute', return_value={
+                'ok': True, 'data': {'items': []}, 'textForModel': '<<<EXTERNAL_DATA', 'modelInstruction': ''}):
+            content._run_pipeline_step_content(snapshot, 'cora',
+                                               {'id': 'p4', 'pipelineStep': {'pipelineId': 'pl', 'stepIndex': 0}})
+        self.assertIn('items', seen['p4']['note'])
 
     def test_pixellab_tool_runs(self):
         snapshot = _snapshot(pipelines=[{'id': 'pl', 'steps': [
             {'tool': 'generate_pixel_character', 'args': {'description': 'a hero'}}]}])
         seen = _store()
         _base_mocks()
-        with mock.patch.object(serve, '_pixellab_account_balance',
-                               side_effect=[7.41, 7.35]), \
-             mock.patch.object(serve, '_pixellab_call',
-                               side_effect=lambda method, path, body=None, timeout=30: (
-                                   ({'character_id': 'c', 'background_job_id': 'j'}, None)
-                                   if path == '/create-character-with-4-directions'
-                                   else ({'rotation_urls': {'up': 'u'}}, None))), \
-             mock.patch.object(serve, '_pixellab_poll_job', return_value=({}, None)):
+        with mock.patch.object(serve, '_api_execute', return_value={
+                'ok': True, 'data': {'rotation_urls': {'up': 'u'}},
+                'ids': {'character_id': 'c'}, 'usd': None, 'textForModel': '', 'modelInstruction': ''}):
             content._run_pipeline_step_content(snapshot, 'cora',
                                                {'id': 'p5', 'pipelineStep': {'pipelineId': 'pl', 'stepIndex': 0}})
         self.assertIn('character_id', seen['p5']['note'])

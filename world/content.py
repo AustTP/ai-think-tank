@@ -628,9 +628,9 @@ def _run_pipeline_step_content(snapshot, agent_id, task, base_ctx=None):
             if tool in ('x_trending_topics', 'search_linkedin_posts'):
                 executor = _make_treg_tools_executor()
             elif tool in _APIFY_TOOL_NAMES:
-                executor = _make_apify_tools_executor()
+                executor = _make_apify_tools_executor(agent_id, None)
             elif tool == 'generate_pixel_character':
-                executor = _make_pixellab_tools_executor()
+                executor = _make_pixellab_tools_executor(agent_id, None)
             else:
                 executor = None
             if executor is None:
@@ -3045,16 +3045,29 @@ _APIFY_GET_DATASET_ITEMS_TOOL = {
 _APIFY_TOOL_NAMES = ('apify_run_actor', 'apify_get_dataset_items')
 
 
-def _make_apify_tools_executor():
-    """apify_run_actor / apify_get_dataset_items -- thin wrappers over
-    _serve._apify_call. No one-strike/struck_tools tracking here (same
+def _make_apify_tools_executor(agent_id, key):
+    """apify_run_actor / apify_get_dataset_items -- thin wrappers over the
+    shared _serve._api_execute chokepoint (registry base URL + credential
+    injection + budget gate + spend accrual from the run's usageTotalUsd).
+    No one-strike/struck_tools tracking here (same
     reasoning as the treg/pixellab executors): those track POLICY denials
     from a real gate, and there is no such gate here -- an error from Apify
     is a real API/network failure or the budget gate, never a per-call
     policy decision, so it's always worth a caller retrying once. Budget
     enforcement happens BEFORE any real run starts (_apify_budget_exceeded
-    fails closed), and real cost is accrued from the run's own usageTotalUsd
-    when it settles."""
+    fails closed inside _api_execute), and real cost is accrued from the
+    run's own usageTotalUsd when it settles -- the executor no longer accrues
+    itself, so spend is recorded exactly once."""
+
+    def _call(path, method='GET', body=None, query=None, purpose='apify'):
+        url = _serve._api_base_url('api.apify.com') + path
+        if query:
+            url += '?' + _serve.urllib.parse.urlencode(query)
+        out = _serve._api_execute(agent_id, key, url, method, body, {}, purpose)
+        if out.get('ok') is not True:
+            return None, out.get('reason') or out.get('error') or 'failed'
+        return out.get('data'), None
+
     def execute_tool(name, args):
         args = args or {}
         if name == 'apify_run_actor':
@@ -3067,9 +3080,8 @@ def _make_apify_tools_executor():
             inp = args.get('input') or {}
             wait = min(int(args.get('waitSeconds') or 30), 60)
             query = {'timeout': str(max(60, wait + 30))}
-            data, error = _serve._apify_call(
-                f'/actors/{actor_id}/runs', method='POST', body=inp,
-                query=query, timeout=max(60, wait + 30))
+            data, error = _call(f'/actors/{actor_id}/runs', method='POST', body=inp, query=query,
+                                purpose='run an Apify actor')
             if error:
                 return f'Could not start Apify actor: {error}'
             run = (data or {}).get('data') or {}
@@ -3080,21 +3092,19 @@ def _make_apify_tools_executor():
             while status in ('READY', 'RUNNING') and elapsed < wait:
                 time.sleep(3)
                 elapsed += 3
-                data, error = _serve._apify_call(f'/actor-runs/{run_id}', timeout=20)
+                data, error = _call(f'/actor-runs/{run_id}', purpose='poll an Apify actor run')
                 if error:
                     break
                 run = (data or {}).get('data') or {}
                 status = run.get('status') or 'RUNNING'
                 dataset_id = run.get('defaultDatasetId') or dataset_id
             cost = run.get('usageTotalUsd') or 0.0
-            if cost:
-                _serve._accrue_apify_spend(cost)
             result = {'runId': run_id, 'datasetId': dataset_id, 'status': status,
                       'usageTotalUsd': cost}
             if status == 'SUCCEEDED' and dataset_id:
-                items, error = _serve._apify_call(
-                    f'/datasets/{dataset_id}/items',
-                    query={'format': 'json', 'clean': '1', 'limit': '10'}, timeout=20)
+                items, error = _call(f'/datasets/{dataset_id}/items',
+                                     query={'format': 'json', 'clean': '1', 'limit': '10'},
+                                     purpose='fetch Apify dataset items')
                 if error:
                     result['itemsError'] = error
                 else:
@@ -3110,9 +3120,9 @@ def _make_apify_tools_executor():
             if not dataset_id:
                 return 'datasetId is required'
             limit = max(1, min(int(args.get('limit') or 10), 50))
-            data, error = _serve._apify_call(
-                f'/datasets/{dataset_id}/items',
-                query={'format': 'json', 'clean': '1', 'limit': str(limit)}, timeout=30)
+            data, error = _call(f'/datasets/{dataset_id}/items',
+                                query={'format': 'json', 'clean': '1', 'limit': str(limit)},
+                                purpose='fetch Apify dataset items')
             if error:
                 return f'Could not fetch Apify dataset items: {error}'
             # Injection boundary: dataset items are untrusted third-party content.
@@ -3158,7 +3168,7 @@ _PIXELLAB_CHARACTER_TOOL = {
 }
 
 
-def _make_pixellab_tools_executor():
+def _make_pixellab_tools_executor(agent_id, key):
     def execute_tool(name, args):
         args = args or {}
         if name != 'generate_pixel_character':
@@ -3166,34 +3176,26 @@ def _make_pixellab_tools_executor():
         description = (args.get('description') or '').strip()
         if not description:
             return 'description is required'
-        balance_before = _serve._pixellab_account_balance(force=True)
-        resp, error = _serve._pixellab_call('POST', '/create-character-with-4-directions', {
+        body = {
             'description': description,
             'image_size': {'width': 48, 'height': 48},
             'view': args.get('view') or 'high top-down',
             'template_id': 'mannequin',
-        })
-        if error:
-            return f'Could not generate character: {error}'
-        char_id = (resp or {}).get('character_id')
-        job_id = (resp or {}).get('background_job_id')
-        if not char_id or not job_id:
-            return f'Unexpected response from PixelLab: {json.dumps(resp)[:500]}'
-        _job, error = _serve._pixellab_poll_job(job_id)
-        if error:
-            return f'Could not generate character: {error}'
-        char, error = _serve._pixellab_call('GET', f'/characters/{char_id}')
-        if error:
-            return f'Could not fetch the generated character: {error}'
-        rotation_urls = (char or {}).get('rotation_urls') or {}
-        balance_after = _serve._pixellab_account_balance(force=True)
-        if isinstance(balance_before, (int, float)) and isinstance(balance_after, (int, float)):
-            # Spending REDUCES the balance -- cost is before minus after, not
-            # the other way around (real bug caught by this file's own test:
-            # a balance drop from 7.41 to 7.35 must accrue $0.06, not $0.00).
-            real_cost = max(0.0, balance_before - balance_after)
-            if real_cost > 0:
-                _serve._accrue_spend('pixellab', real_cost)
+        }
+        # Runs through the generic workflow chokepoint: submit
+        # /create-character-with-4-directions, poll the background job,
+        # fetch the final character, and accrue the real balance delta -- all
+        # driven by the registry's pixellab workflow spec (no bespoke
+        # orchestration here, and no hardcoded base URL).
+        base = _serve._api_base_url('api.pixellab.ai')
+        out = _serve._api_execute(agent_id, key, base, 'POST', body, {},
+                                  'generate a pixel character sprite', workflow=True)
+        if out.get('ok') is not True:
+            return f'Could not generate character: {out.get("reason") or out.get("error") or "failed"}'
+        char = out.get('data') or {}
+        char_id = out.get('ids') or {}
+        char_id = char_id.get('character_id')
+        rotation_urls = char.get('rotation_urls') or {}
         return json.dumps({'character_id': char_id, 'rotation_urls': rotation_urls})
     return execute_tool
 
@@ -3713,24 +3715,36 @@ _GITHUB_SEARCH_TOOL = {
 _GITHUB_TOOL_NAMES = ('github_get_repo', 'github_list_issues', 'github_get_issue', 'github_search_code')
 
 
-def _make_github_tools_executor():
+def _make_github_tools_executor(agent_id, key):
     """github_get_repo / github_list_issues / github_get_issue / github_search_code
-    -- thin wrappers over _serve._github_call. No struck_tools / no spend
-    accrual: read-only, rate-limited (not gated), and free like Google."""
+    -- thin wrappers over the shared _serve._api_execute chokepoint (registry-
+    driven base URL + server-side credential injection + response wrapping).
+    No struck_tools / no spend accrual: read-only, rate-limited (not gated),
+    and free like Google."""
 
     def _owner_repo(args):
         owner = (args.get('owner') or '').strip()
         repo = (args.get('repo') or '').strip()
         return owner, repo
 
+    def _get(url, purpose):
+        # The credential and auth come from the registry, injected by
+        # _api_execute; the executor only supplies the URL + purpose.
+        out = _serve._api_execute(agent_id, key, url, 'GET', None,
+                                  {'Accept': 'application/vnd.github+json'}, purpose)
+        if out.get('ok') is not True:
+            return None, out.get('reason') or out.get('error') or 'failed'
+        return out.get('data'), None
+
     def execute_tool(name, args):
         args = args or {}
+        base = _serve._api_base_url('api.github.com')
+        q = _serve.urllib.parse.quote
         if name == 'github_get_repo':
             owner, repo = _owner_repo(args)
             if not owner or not repo:
                 return 'owner and repo are required'
-            data, error = _serve._github_call(
-                'GET', f'https://api.github.com/repos/{_serve.urllib.parse.quote(owner, safe="")}/{_serve.urllib.parse.quote(repo, safe="")}')
+            data, error = _get(f'{base}/repos/{q(owner, safe="")}/{q(repo, safe="")}', 'read a GitHub repo')
             if error:
                 return f'Could not read the repo: {error}'
             return json.dumps({
@@ -3751,9 +3765,9 @@ def _make_github_tools_executor():
                 return 'owner and repo are required'
             state = (args.get('state') or 'open').strip()
             limit = min(int(args.get('limit') or 10), 30)
-            data, error = _serve._github_call(
-                'GET', f'https://api.github.com/repos/{_serve.urllib.parse.quote(owner, safe="")}/{_serve.urllib.parse.quote(repo, safe="")}/issues'
-                       f'?state={state}&per_page={limit}')
+            data, error = _get(
+                f'{base}/repos/{q(owner, safe="")}/{q(repo, safe="")}/issues?state={state}&per_page={limit}',
+                'list GitHub issues')
             if error:
                 return f'Could not list issues: {error}'
             items = data if isinstance(data, list) else []
@@ -3767,13 +3781,13 @@ def _make_github_tools_executor():
             number = args.get('issue_number')
             if not owner or not repo or number is None:
                 return 'owner, repo, and issue_number are required'
-            base = f'https://api.github.com/repos/{_serve.urllib.parse.quote(owner, safe="")}/{_serve.urllib.parse.quote(repo, safe="")}'
-            data, error = _serve._github_call('GET', f'{base}/issues/{int(number)}')
+            repo_base = f'{base}/repos/{q(owner, safe="")}/{q(repo, safe="")}'
+            data, error = _get(f'{repo_base}/issues/{int(number)}', 'read a GitHub issue')
             if error:
                 return f'Could not read the issue: {error}'
             if data.get('pull_request'):
                 return f'#{number} is a pull request, not an issue -- use the issues list.'
-            comments_data, comments_error = _serve._github_call('GET', f'{base}/issues/{int(number)}/comments?per_page=20')
+            comments_data, comments_error = _get(f'{repo_base}/issues/{int(number)}/comments?per_page=20', 'read issue comments')
             comments = []
             if not comments_error and isinstance(comments_data, list):
                 comments = [{'user': (c.get('user') or {}).get('login'), 'body': c.get('body')[:1000]}
@@ -3789,9 +3803,7 @@ def _make_github_tools_executor():
             if not query:
                 return 'query is required'
             limit = min(int(args.get('limit') or 5), 10)
-            data, error = _serve._github_call(
-                'GET', 'https://api.github.com/search/code'
-                       f'?q={_serve.urllib.parse.quote(query, safe="")}&per_page={limit}')
+            data, error = _get(f'{base}/search/code?q={q(query, safe="")}&per_page={limit}', 'search GitHub code')
             if error:
                 return f'Could not search code: {error}'
             items = (data or {}).get('items') or []
@@ -4066,10 +4078,10 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     sandbox_tool = _make_spike_sandbox_executor(agent_id, key, sandbox_id, struck_tools=struck_tools)
     library_tool = _make_library_tools_executor(agent_id, struck_tools=struck_tools)
     treg_tool = _make_treg_tools_executor()
-    pixellab_tool = _make_pixellab_tools_executor()
+    pixellab_tool = _make_pixellab_tools_executor(agent_id, key)
     google_tool = _make_google_tools_executor()
-    github_tool = _make_github_tools_executor()
-    apify_tool = _make_apify_tools_executor()
+    github_tool = _make_github_tools_executor(agent_id, key)
+    apify_tool = _make_apify_tools_executor(agent_id, key)
     youtube_tool = _make_youtube_transcript_executor(agent_id, key)
     # Colab agent compute (run_on_colab) -- offered only when the colab CLI
     # is actually on this machine; absent means the tool is simply absent.

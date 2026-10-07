@@ -893,48 +893,43 @@ class SpikeExecutorBranches(unittest.TestCase):
             self.assertIn('EXTERNAL_DATA', out)  # injection boundary on transcripts
 
     def test_make_apify_tools_executor(self):
-        ex = content._make_apify_tools_executor()
+        ex = content._make_apify_tools_executor('ben', 'k')
         with self.assertRaises(ValueError):
             ex('other', {})
         self.assertIn('actorId is required', ex('apify_run_actor', {}))
         with mock.patch.object(serve, '_apify_budget_exceeded', return_value=True):
             self.assertIn('budget is exhausted', ex('apify_run_actor', {'actorId': 'a'}))
         with mock.patch.object(serve, '_apify_budget_exceeded', return_value=False), \
-             mock.patch.object(serve, '_apify_call',
-                               side_effect=[(None, 'start error'), (None, 'poll error'),
-                                            (None, 'items error'), ({'items': 'x'}, None),
-                                            (None, 'items fail')]):
+             mock.patch.object(serve, '_api_execute', return_value={'ok': False, 'error': 'start error'}):
             self.assertIn('Could not start Apify actor',
                           ex('apify_run_actor', {'actorId': 'a', 'input': {}, 'waitSeconds': 1}))
         self.assertIn('datasetId is required', ex('apify_get_dataset_items', {}))
-        with mock.patch.object(serve, '_apify_call', return_value=(None, 'fetch error')):
+        with mock.patch.object(serve, '_api_execute', return_value={'ok': False, 'error': 'fetch error'}):
             self.assertIn('Could not fetch Apify dataset items',
                           ex('apify_get_dataset_items', {'datasetId': 'd'}))
-        with mock.patch.object(serve, '_apify_call', return_value=([{'a': 1}], None)):
+        with mock.patch.object(serve, '_api_execute', return_value={
+                'ok': True, 'data': [{'a': 1}], 'textForModel': '', 'modelInstruction': ''}):
             out = ex('apify_get_dataset_items', {'datasetId': 'd', 'limit': 100})
             self.assertIn('a', out)
             self.assertIn('EXTERNAL_DATA', out)  # injection boundary on scraped items
 
     def test_make_apify_tools_executor_run_succeeded(self):
-        ex = content._make_apify_tools_executor()
-        calls = []
-        def apify(path, method='GET', body=None, query=None, timeout=30):
-            calls.append(path)
-            if path.endswith('/runs'):
-                return ({'data': {'id': 'r1', 'defaultDatasetId': 'd1', 'status': 'SUCCEEDED',
-                                  'usageTotalUsd': 0.05}}, None)
-            if path == '/actor-runs/r1':
-                return ({'data': {'id': 'r1', 'defaultDatasetId': 'd1', 'status': 'SUCCEEDED',
-                                  'usageTotalUsd': 0.05}}, None)
-            return ([{'item': 1}], None)
+        ex = content._make_apify_tools_executor('ben', 'k')
+
+        def api_execute(agent_id, key, url, method='GET', req_body=None, req_headers=None,
+                        purpose='', workflow=False, workflow_params=None, trace_id=None):
+            if '/datasets/' in url:
+                return {'ok': True, 'data': [{'item': 1}], 'textForModel': '', 'modelInstruction': ''}
+            return {'ok': True, 'data': {'data': {'id': 'r1', 'defaultDatasetId': 'd1',
+                                                  'status': 'SUCCEEDED', 'usageTotalUsd': 0.05}},
+                    'textForModel': '', 'modelInstruction': ''}
+
         with mock.patch.object(serve, '_apify_budget_exceeded', return_value=False), \
-             mock.patch.object(serve, '_apify_call', side_effect=apify), \
-             mock.patch.object(serve, '_accrue_apify_spend') as accrue:
+             mock.patch.object(serve, '_api_execute', side_effect=api_execute):
             out = ex('apify_run_actor', {'actorId': 'a', 'input': {}, 'waitSeconds': 1})
         self.assertIn('"status": "SUCCEEDED"', out)
         self.assertIn('"items"', out)
         self.assertIn('EXTERNAL_DATA', out)  # injection boundary on scraped items
-        accrue.assert_called_once_with(0.05)
 
     def test_make_google_tools_executor(self):
         ex = content._make_google_tools_executor()
@@ -1031,97 +1026,73 @@ class SpikeExecutorBranches(unittest.TestCase):
             self.assertIn('n2', out)
 
     def test_make_github_tools_executor(self):
-        ex = content._make_github_tools_executor()
+        ex = content._make_github_tools_executor('ben', 'k')
         with self.assertRaises(ValueError):
             ex('other', {})
         self.assertIn('owner and repo are required', ex('github_get_repo', {}))
-        with mock.patch.object(serve, '_github_call', return_value=(None, 'err')):
+        with mock.patch.object(serve, '_api_execute', return_value={'ok': False, 'error': 'err'}):
             self.assertIn('Could not read the repo',
                           ex('github_get_repo', {'owner': 'o', 'repo': 'r'}))
-        with mock.patch.object(serve, '_github_call',
-                               return_value=({'full_name': 'o/r', 'description': 'd',
-                                              'stargazers_count': 1, 'forks_count': 2,
-                                              'language': 'py', 'topics': [], 'default_branch': 'm',
-                                              'open_issues_count': 3, 'pushed_at': 'p',
-                                              'html_url': 'u'}, None)):
+        with mock.patch.object(serve, '_api_execute', return_value={
+                'ok': True, 'data': {'full_name': 'o/r', 'description': 'd',
+                                     'stargazers_count': 1, 'forks_count': 2,
+                                     'language': 'py', 'topics': [], 'default_branch': 'm',
+                                     'open_issues_count': 3, 'pushed_at': 'p',
+                                     'html_url': 'u'}, 'textForModel': '', 'modelInstruction': ''}):
             self.assertIn('o/r', ex('github_get_repo', {'owner': 'o', 'repo': 'r'}))
         self.assertIn('owner and repo are required', ex('github_list_issues', {}))
-        with mock.patch.object(serve, '_github_call', return_value=(None, 'err')):
+        with mock.patch.object(serve, '_api_execute', return_value={'ok': False, 'error': 'err'}):
             self.assertIn('Could not list issues',
                           ex('github_list_issues', {'owner': 'o', 'repo': 'r'}))
-        with mock.patch.object(serve, '_github_call',
-                               return_value=([{'number': 1, 'title': 't', 'state': 'open',
-                                               'labels': [], 'comments': 0, 'html_url': 'u'},
-                                              {'number': 2, 'title': 'pr', 'state': 'open',
-                                               'labels': [], 'comments': 0, 'html_url': 'u',
-                                               'pull_request': {}}], None)):
+        with mock.patch.object(serve, '_api_execute', return_value={
+                'ok': True, 'data': [{'number': 1, 'title': 't', 'state': 'open',
+                                      'labels': [], 'comments': 0, 'html_url': 'u'},
+                                     {'number': 2, 'title': 'pr', 'state': 'open',
+                                      'labels': [], 'comments': 0, 'html_url': 'u',
+                                      'pull_request': {}}], 'textForModel': '', 'modelInstruction': ''}):
             out = ex('github_list_issues', {'owner': 'o', 'repo': 'r', 'state': 'all', 'limit': 100})
             self.assertIn('"number": 1', out)
             self.assertNotIn('"number": 2', out)
         self.assertIn('owner, repo, and issue_number are required', ex('github_get_issue', {}))
-        with mock.patch.object(serve, '_github_call', return_value=(None, 'err')):
+        with mock.patch.object(serve, '_api_execute', return_value={'ok': False, 'error': 'err'}):
             self.assertIn('Could not read the issue',
                           ex('github_get_issue', {'owner': 'o', 'repo': 'r', 'issue_number': 1}))
-        with mock.patch.object(serve, '_github_call',
-                               side_effect=[({'pull_request': {'url': 'x'}}, None)]):
+        with mock.patch.object(serve, '_api_execute', return_value={
+                'ok': True, 'data': {'pull_request': {'url': 'x'}}, 'textForModel': '', 'modelInstruction': ''}):
             self.assertIn('is a pull request',
                           ex('github_get_issue', {'owner': 'o', 'repo': 'r', 'issue_number': 1}))
-        with mock.patch.object(serve, '_github_call',
-                               side_effect=[({'number': 1, 'title': 't', 'state': 'open',
-                                              'labels': [], 'body': 'b', 'html_url': 'u'}, None),
-                                            ([{'user': {'login': 'u'}, 'body': 'comment'}], None)]):
+        with mock.patch.object(serve, '_api_execute',
+                               side_effect=[{'ok': True, 'data': {'number': 1, 'title': 't', 'state': 'open',
+                                                                  'labels': [], 'body': 'b', 'html_url': 'u'},
+                                             'textForModel': '', 'modelInstruction': ''},
+                                            {'ok': True, 'data': [{'user': {'login': 'u'}, 'body': 'comment'}],
+                                             'textForModel': '', 'modelInstruction': ''}]):
             out = ex('github_get_issue', {'owner': 'o', 'repo': 'r', 'issue_number': 1})
             self.assertIn('comment', out)
         self.assertIn('query is required', ex('github_search_code', {}))
-        with mock.patch.object(serve, '_github_call', return_value=(None, 'err')):
+        with mock.patch.object(serve, '_api_execute', return_value={'ok': False, 'error': 'err'}):
             self.assertIn('Could not search code', ex('github_search_code', {'query': 'q'}))
-        with mock.patch.object(serve, '_github_call',
-                               return_value=({'total_count': 1,
-                                              'items': [{'repository': {'full_name': 'o/r'},
-                                                         'path': 'f.py', 'html_url': 'u'}]}, None)):
+        with mock.patch.object(serve, '_api_execute', return_value={
+                'ok': True, 'data': {'total_count': 1,
+                                     'items': [{'repository': {'full_name': 'o/r'},
+                                                'path': 'f.py', 'html_url': 'u'}]},
+                'textForModel': '', 'modelInstruction': ''}):
             out = ex('github_search_code', {'query': 'q', 'limit': 100})
             self.assertIn('o/r', out)
 
     def test_make_pixellab_tools_executor(self):
-        ex = content._make_pixellab_tools_executor()
+        ex = content._make_pixellab_tools_executor('ben', 'k')
         with self.assertRaises(ValueError):
             ex('other', {})
         self.assertIn('description is required', ex('generate_pixel_character', {}))
-        with mock.patch.object(serve, '_pixellab_account_balance', return_value=7.41), \
-             mock.patch.object(serve, '_pixellab_call', return_value=(None, 'gen error')):
+        with mock.patch.object(serve, '_api_execute', return_value={'ok': False, 'error': 'gen error'}):
             self.assertIn('Could not generate character', ex('generate_pixel_character',
                                                              {'description': 'a hero'}))
-        with mock.patch.object(serve, '_pixellab_account_balance', return_value=7.41), \
-             mock.patch.object(serve, '_pixellab_call',
-                               return_value=({'character_id': None, 'background_job_id': None},
-                                             None)):
-            self.assertIn('Unexpected response from PixelLab', ex('generate_pixel_character',
-                                                                  {'description': 'a hero'}))
-        with mock.patch.object(serve, '_pixellab_account_balance', return_value=7.41), \
-             mock.patch.object(serve, '_pixellab_call',
-                               return_value=({'character_id': 'c', 'background_job_id': 'j'},
-                                             None)), \
-             mock.patch.object(serve, '_pixellab_poll_job', return_value=(None, 'poll error')):
-            self.assertIn('Could not generate character', ex('generate_pixel_character',
-                                                             {'description': 'a hero'}))
-        with mock.patch.object(serve, '_pixellab_account_balance', return_value=7.41), \
-             mock.patch.object(serve, '_pixellab_call',
-                               side_effect=[({'character_id': 'c', 'background_job_id': 'j'}, None),
-                                            (None, 'fetch error')]), \
-             mock.patch.object(serve, '_pixellab_poll_job', return_value=({}, None)):
-            self.assertIn('Could not fetch the generated character', ex('generate_pixel_character',
-                                                                        {'description': 'a hero'}))
-        with mock.patch.object(serve, '_pixellab_account_balance',
-                               side_effect=[7.41, 7.35]), \
-             mock.patch.object(serve, '_pixellab_call',
-                               side_effect=[({'character_id': 'c', 'background_job_id': 'j'}, None),
-                                            ({'rotation_urls': {'up': 'u'}}, None)]), \
-             mock.patch.object(serve, '_pixellab_poll_job', return_value=({}, None)), \
-             mock.patch.object(serve, '_accrue_spend') as accrue:
+        with mock.patch.object(serve, '_api_execute', return_value={
+                'ok': True, 'data': {'rotation_urls': {'up': 'u'}}, 'ids': {'character_id': 'c'},
+                'usd': None, 'textForModel': '', 'modelInstruction': ''}):
             out = ex('generate_pixel_character', {'description': 'a hero', 'view': 'top'})
             self.assertIn('"character_id": "c"', out)
-            accrue.assert_called_once_with('pixellab', mock.ANY)
-            self.assertAlmostEqual(accrue.call_args[0][1], 0.06, places=6)
 
     def test_spike_file_issue_wish(self):
         self.assertIsNone(content._spike_file_issue_wish('', {}, 'Ada', 'b'))
