@@ -86,6 +86,18 @@ Prereq: provision the credential once —
 
 ---
 
+## 6b. The spine + attention lanes (2026-10-06)
+- [ ] `POST /api/intent/charter` sets the player's charter (goal required); `GET` reads it back. PLAYER-only, agent key rejected.
+- [ ] Roadmap recompute (`_roadmap_step`) gives a charter-aligned room a priority boost; a FRESH aligned room defaults to priority 1, an off-spine one to 0.
+- [ ] The consensus relay names the charter goal; every task's instructions open with `Tank charter: <goal>`.
+- [ ] A `lane` on a queued card survives queue_work → refinement → assign onto the real task.
+- [ ] `parking-lot` cards are never auto-assigned and do NOT count as work for the idle gate (they wait with a bookmark, never dropped).
+- [ ] At equal priority, build > open > reading; urgency still beats a lane.
+- [ ] The reading lane is rate-limited to ONE active card per room (`pick_next_due_index` skips a second one until the first completes).
+- [ ] `POST /api/intent/schedule-once` accepts `lane` and rejects an unknown lane with a 400.
+
+---
+
 ## 7. Clarify / Ask (player → agent)
 - [ ] `POST /api/intent/clarify` → the on-call agent answers **knowledge-base-first** (library search), falling back to the completing agent.
 - [ ] Fail-closed on auth (no agent key / bad key → rejected).

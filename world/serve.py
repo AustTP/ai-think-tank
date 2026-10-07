@@ -9546,6 +9546,51 @@ async def complete_player_task_endpoint(task_id: str, request: Request):
                                               'status': task['status']}})
 
 
+@app.get('/api/intent/charter')
+async def get_charter_endpoint(request: Request):
+    """Read the player's charter -- the tank-level spine (goal + interests) the
+    roadmap recompute and refinement weigh, and every task's instructions open
+    with. PLAYER-only: the charter is player-owned by design (you decide, the
+    tank plans)."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    import sim as _sim
+    return JSONResponse({'ok': True, 'charter': _sim.get_charter(state)})
+
+
+@app.post('/api/intent/charter')
+async def set_charter_endpoint(request: Request):
+    """Set the player's charter (the spine). Body: {'goal': str (required),
+    'interests': [str], 'notes': str}. PLAYER-only. A missing/blank goal is a
+    400 -- the tank never invents a direction for you. Stamps the governance
+    log + passport so the setting is attributable."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    import sim as _sim
+    goal = (body.get('goal') or '').strip()
+    if not goal:
+        return JSONResponse({'error': '`goal` is required (a vague goal gets a vague plan)'}, status_code=400)
+    interests = body.get('interests') or []
+    if not isinstance(interests, list):
+        return JSONResponse({'error': '`interests` must be a list of strings'}, status_code=400)
+    notes = (body.get('notes') or '').strip()
+    charter = _sim.set_charter(state, goal, interests=interests, notes=notes)
+    save_state_to_db(state)
+    log_action('player', 'charter_set', {'goal': goal, 'interests': interests}, authorized=True)
+    _append_passport_decision('charter_set', 'player', {'goal': goal[:120]})
+    return JSONResponse({'ok': True, 'charter': charter})
+
+
 @app.post('/api/player-email/credential')
 async def provision_player_email_endpoint(request: Request):
     """Provision the Gmail app-password used for action-needed notification
@@ -10914,16 +10959,20 @@ async def intent_schedule_once(request: Request):
     if assigned_to and assigned_to != 'player':
         return JSONResponse({'error': '`assignedTo` only accepts "player" (hand this one-off to you)'}, status_code=400)
     import sim as _sim
+    lane = (body.get('lane') or '').strip() or None
+    if lane and lane not in _sim.LANES:
+        return JSONResponse({'error': f'`lane` must be one of: {", ".join(sorted(_sim.LANES))}'}, status_code=400)
     item = _sim.queue_once(state, title, at_ms, room=room, instructions=instructions,
                            task_type=task_type, goal=goal, depends_on_task=depends_on_task,
-                           assigned_to=assigned_to)
+                           assigned_to=assigned_to, lane=lane)
     if not item:
         return JSONResponse({'error': 'could not queue that one-off task'}, status_code=400)
     save_state_to_db(state)
     log_action('player', 'schedule_once_created', {'title': title, 'atMs': at_ms,
                                                    'room': room, 'taskType': task_type,
                                                    'dependsOnTask': depends_on_task,
-                                                   'assignedTo': assigned_to},
+                                                   'assignedTo': assigned_to,
+                                                   'lane': lane},
                authorized=True)
     _append_passport_decision('schedule_once_created', 'player', {'title': title, 'atMs': at_ms})
     return JSONResponse({'ok': True, 'task': {'title': title, 'atMs': at_ms, 'notBefore': item.get('notBefore')}})

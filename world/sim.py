@@ -953,6 +953,7 @@ def _reclaim_orphaned_walking_tasks(state):
             'reviewAuthorId': task.get('reviewAuthorId') or None,
             'checklist': task.get('checklist') or None,
             'pipelineStep': task.get('pipelineStep') or None,
+            'lane': task.get('lane') or None,
             'attempts': attempts,
         })
         # Fault-aware routing memory: this agent's work attempt just failed
@@ -1521,6 +1522,40 @@ BLOCK_CLAIM_GATE_MS = 5_000
 # _DELEGATABLE_ROOMS so sim.py stays decoupled; keep in sync if the set changes).
 VALUED_QUEUE_ROOMS = frozenset(
     {'observatory', 'pressoffice', 'postoffice', 'bank', 'weatherstation', 'library', 'media'})
+
+# Attention lanes (the spine's rule 1: lanes, not sequences). A queue item may
+# ride a lane so threads coexist instead of one queue pulling attention away
+# from everything else. `parking-lot` is special: the card waits with a
+# bookmark and is NEVER auto-assigned -- nothing gets dropped, it just holds
+# until someone promotes it. Build > open > reading at equal priority.
+LANES = frozenset({'build', 'reading', 'open', 'parking-lot'})
+LANE_WEIGHT = {'build': 3, 'open': 2, 'reading': 1}
+
+
+def normalize_lane(lane):
+    """Canonical lane or None (unknown lanes are not a scheduling signal)."""
+    if not lane:
+        return None
+    return lane if lane in LANES else None
+
+
+def _is_parked(item):
+    """A parking-lot card waits with a bookmark -- never auto-assigned."""
+    return (item.get('lane') or '') == 'parking-lot'
+
+
+# Room keywords the charter alignment keys on (the spine's rule 2: point every
+# lane at one direction). Each room's craft vocabulary -- if the charter names
+# a room's keywords, that room is aligned with the spine.
+_ROOM_KEYWORDS = {
+    'observatory': ['research', 'science', 'study', 'explore', 'observatory'],
+    'pressoffice': ['write', 'writing', 'publish', 'publishing', 'news', 'press', 'article', 'report'],
+    'postoffice': ['mail', 'email', 'comms', 'communication', 'outreach', 'post'],
+    'bank': ['finance', 'money', 'budget', 'bank', 'treasury', 'fund'],
+    'weatherstation': ['forecast', 'weather', 'warning', 'trend', 'signal', 'predict'],
+    'library': ['learn', 'learning', 'knowledge', 'book', 'library', 'note', 'teach'],
+    'media': ['media', 'video', 'image', 'design', 'creative', 'audio', 'art'],
+}
 MORALE_APPROVED_WEIGHT = 0.5  # morale.js:16
 MORALE_APPROVED_CAP = 15
 MORALE_DROPPED_WEIGHT = 6
@@ -2269,12 +2304,19 @@ def queue_work(state, items):
             # (see _record_classified_failures). Explicit flag so the protection
             # is auditable, not implicit.
             'moonshot': bool(item.get('moonshot')),
+            # Attention lane (build/reading/open/parking-lot): threads coexist
+            # instead of one queue pulling. parking-lot cards are never auto-
+            # assigned (see _is_parked / pick_next_due_index). Same whitelist
+            # contract as 'distill'/'checklist': a lane silently dropped here
+            # would let a parked card leak into assignment.
+            'lane': normalize_lane(item.get('lane')),
         })
     return len(work_queue)
 
 
 def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructions=None,
-                project_label=None, moonshot=False, notBefore=None, assigned_to=None):
+                project_label=None, moonshot=False, notBefore=None, assigned_to=None,
+                lane=None):
     """Phase E2b: enqueue a time-boxed SPIKE (taskType='spike'). A spike is an
     investigation with no committed deliverable: it's LOWEST priority (fills
     gaps, never blocks committed work), carries a hard `budgetMs` for the work
@@ -2287,7 +2329,10 @@ def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructi
     Human-in-the-loop: `assigned_to='player'` hands the spike to the PLAYER
     instead of an agent -- the player completes it via the player task
     complete endpoint, and anything queued `depends_on_task` on it resumes the
-    moment it ships (see _assign_player_task)."""
+    moment it ships (see _assign_player_task).
+    `lane` (build/reading/open/parking-lot) rides the card so it can coexist
+    with other threads instead of one queue pulling all the attention (see
+    LANES)."""
     return queue_work(state, [{
         'title': title,
         'room': room,
@@ -2302,10 +2347,11 @@ def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructi
         'moonshot': bool(moonshot),
         'notBefore': notBefore,
         'assignedTo': assigned_to or None,
+        'lane': lane,
     }])
 def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None,
                goal=None, priority=None, project_label=None, depends_on_task=None,
-               assigned_to=None):
+               assigned_to=None, lane=None):
     """Queue a single work item to fire ONCE at an absolute wall-clock time
     (`at_ms`, epoch milliseconds). The item rides the same `notBefore` gate
     the rest of the queue already honors (see is_work_item_due): it sits in
@@ -2318,7 +2364,9 @@ def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None
     not a positive future epoch-ms).
     Human-in-the-loop: `assigned_to='player'` hands the item to the PLAYER
     instead of an agent -- combined with `depends_on_task` this is the
-    "give the player X once story T lands" lane (see _assign_player_task)."""
+    "give the player X once story T lands" lane (see _assign_player_task).
+    `lane` (build/reading/open/parking-lot) rides the card so threads coexist
+    (see LANES); `parking-lot` defers it with a bookmark -- never auto-assigned."""
     at_ms = int(at_ms or 0)
     if not title or at_ms <= 0:
         return None
@@ -2333,6 +2381,7 @@ def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None
         'projectLabel': project_label or None,
         'dependsOn': depends_on_task or None,
         'assignedTo': assigned_to or None,
+        'lane': lane,
     }
     queue_work(state, [item])
     return item
@@ -2348,6 +2397,7 @@ def think_tank_has_work(state, now_ms):
     deliver a card into the player's hands (see _assign_player_task)."""
     work_queue = state.get('workQueue') or []
     if any(is_work_item_due(item, now_ms) and _work_item_dependency_met(state, item)
+           and not _is_parked(item)
            for item in work_queue):
         return True
     for a in (state.get('agents') or {}).values():
@@ -2570,7 +2620,14 @@ def pick_next_due_index(work_queue, now_ms, exclude_items, state=None):
     exclude_items (this call's attemptedThisCycle). When `state` is supplied
     (the live assignment loop), an item whose `dependsOn` dependency hasn't
     landed is skipped too -- a gated card waits for its dependency, never
-    leaks into assignment. Returns index or -1."""
+    leaks into assignment. Returns index or -1.
+
+    Attention lanes (see LANES): a `parking-lot` card is never auto-picked --
+    it waits with a bookmark, so no booking pulls it in. The lane weight
+    (build 3 / open 2 / reading 1 / none 0) breaks priority ties, never
+    overrides urgency: urgent always beats normal regardless of lane. With
+    `state`, a `reading` card is rate-limited to ONE active per room -- the
+    slow lane moves one thread at a time, not a flood."""
     best_index, best_score = -1, None
     for i, item in enumerate(work_queue):
         if not is_work_item_due(item, now_ms):
@@ -2579,13 +2636,43 @@ def pick_next_due_index(work_queue, now_ms, exclude_items, state=None):
         # dicts themselves -- queue items are mutable dicts and unhashable.
         if exclude_items and id(item) in exclude_items:
             continue
+        # Parking-lot: the bookmark lane. Skip on EVERY call (with or without
+        # state) -- an auto-pick must never leak a parked card into assignment.
+        if _is_parked(item):
+            continue
         if state is not None and not _work_item_dependency_met(state, item):
             continue
+        if state is not None and _reading_lane_busy(state, item):
+            continue
         priority = item.get('priority', WORK_PRIORITY['normal'])
-        score = (priority, size_estimate_weight(item.get('sizeEstimate')))
+        lane_weight = LANE_WEIGHT.get(item.get('lane') or '', 0)
+        score = (priority, lane_weight, size_estimate_weight(item.get('sizeEstimate')))
         if best_score is None or score > best_score:
             best_score, best_index = score, i
     return best_index
+
+
+def _reading_lane_busy(state, item):
+    """The reading lane is rate-limited to one ACTIVE card per room -- a slow
+    lane moves one chapter/paper thread at a time (see LANES). True when
+    another reading-lane task is currently walking/working in the item's room,
+    so a fresh reading card waits its turn instead of stacking on top."""
+    if (item.get('lane') or '') != 'reading':
+        return False
+    room = item.get('room')
+    for t in (state.get('tasks') or {}).values():
+        if not isinstance(t, dict):
+            continue
+        if t.get('lane') != 'reading':
+            continue
+        if t.get('status') not in ('walking', 'working'):
+            continue
+        if room and t.get('room') != room:
+            continue
+        if t.get('id') == item.get('id'):
+            continue
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -3711,6 +3798,10 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         # Bell-style spare-time lane: the protected-exploration flag (a free
         # spike's failures are never mined into operator rules).
         'moonshot': bool((extra or {}).get('moonshot')),
+        # Attention lane (build/reading/open/parking-lot) -- see LANES. Rides
+        # onto the durable task so the board can show it and the reading
+        # rate-limit can count it as the room's one active slow thread.
+        'lane': (extra or {}).get('lane'),
         'assignedTo': agent_id,
         'status': 'walking',
         'createdAt': now_ms,
@@ -6845,7 +6936,7 @@ def _groups_look_like_gwt(text):
 
 def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
                description='', story_points=None, title=None, now_ms=None,
-               assigned_to=None):
+               assigned_to=None, lane=None):
     """File a JIRA-style issue for team_id. Returns the issue record dict, or
     None if a required field is missing (team_id / issue_type / summary /
     feature / reporter_id), the issue type is unknown, or the team is unknown.
@@ -6898,6 +6989,7 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         'blockedAt': None,
         'blockedBy': None,
         'assignedTo': assigned_to or None,  # 'player' = the human does this one
+        'lane': normalize_lane(lane),       # attention lane (build/reading/open/parking-lot)
     }
     state.setdefault('issues', {})[key] = issue
     # Feed the backlog pipe: a backlogRequests record the refinement ceremony
@@ -6919,6 +7011,10 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         # through refinement (assignedTo survives onto the queued item, and
         # _assign_due_item hands it to the player -- see _resolve_refinement).
         'assignedTo': assigned_to or None,
+        # The attention lane the filed card rides -- survives file_issue ->
+        # refinement -> queue so a parked or build-lane card keeps its lane
+        # (see _resolve_refinement, which forwards req['lane'] onto the queue).
+        'lane': normalize_lane(lane),
         # The player-facing contract: the normalized user story + acceptance
         # criteria travel with the backlog request so the refinement ceremony can
         # hand the WORKER the full spec, not just the one-line summary (see
@@ -8278,6 +8374,10 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
                 # hands it to the player instead of an agent. Any other value is
                 # dropped (agents are picked, not named, on the refinement path).
                 'assignedTo': req.get('assignedTo') if req.get('assignedTo') == 'player' else None,
+                # The card's attention lane survives grooming onto the queue
+                # (queue_work normalizes), so a build/reading/parking-lot card
+                # keeps its lane through refinement.
+                'lane': req.get('lane'),
                 # Item 4: the groomer-judged spend ceiling + band ride the queue
                 # item (whitelisted) so the ASSIGNED task carries them.
                 'budgetUsd': req.get('budgetUsd'),
@@ -9299,6 +9399,11 @@ def _augment_task_instructions(state, agent_id, product_id, instructions, refocu
     consensus relay (see _consensus_relay_step) is READ FIRST -- a one-line
     'current direction' the next cycle acts on."""
     pieces = [instructions] if instructions else []
+    # The spine FIRST: the charter goal opens every task's instructions so the
+    # work a room does points at the player's direction (see _charter_note).
+    charter_line = _charter_note(state)
+    if charter_line:
+        pieces.insert(0, charter_line)
     relay = _consensus_relay_note(state)
     if relay:
         pieces.insert(0, relay)
@@ -9318,11 +9423,70 @@ def _augment_task_instructions(state, agent_id, product_id, instructions, refocu
     return '\n'.join(p for p in pieces if p)
 
 
+def set_charter(state, goal, interests=None, notes='', now_ms=None):
+    """The player's charter -- the tank-level SPINE (the article's rule 2: one
+    direction every lane points at). Player-owned: the player decides, the tank
+    plans against it. `goal` is the north-star statement; `interests` are the
+    free-form threads (crafts, topics, rooms) that goal is built from; `notes`
+    is anything else the directors should weigh. Stores on state['charter'] and
+    returns the record, or None when no goal is given (a vague goal gets a
+    vague plan -- the tank never invents a spine for you)."""
+    goal = (goal or '').strip()
+    if not goal:
+        return None
+    interests = [str(i).strip() for i in (interests or []) if str(i).strip()]
+    charter = {
+        'goal': goal,
+        'interests': interests,
+        'notes': (notes or '').strip(),
+        'updatedAt': int(time.time() * 1000) if now_ms is None else int(now_ms),
+    }
+    state['charter'] = charter
+    return charter
+
+
+def get_charter(state):
+    """The player's charter record, or None (a fresh tank has no spine until
+    the player sets one -- the tank never fabricates a direction)."""
+    ch = state.get('charter')
+    if not isinstance(ch, dict) or not (ch.get('goal') or '').strip():
+        return None
+    return ch
+
+
+def _charter_alignment(state, room):
+    """Is `room` aligned with the charter's spine? True when the charter's goal
+    or interests name any of the room's craft keywords (see _ROOM_KEYWORDS) --
+    the article's rule 2 made real: fragmented interests that share a spine
+    stop competing. Returns True/False, or None when no charter exists."""
+    ch = get_charter(state)
+    if not ch:
+        return None
+    text = ' '.join([ch.get('goal') or '', ' '.join(ch.get('interests') or [])]).lower()
+    if not text:
+        return False
+    return any(k in text for k in (_ROOM_KEYWORDS.get(room) or []))
+
+
+def _charter_note(state):
+    """One line the tank prepends to every task's instructions: the spine the
+    work points at. Returns None when no charter exists."""
+    ch = get_charter(state)
+    if not ch:
+        return None
+    return f"Tank charter: {ch['goal']}"
+
+
 def _roadmap_step(state, now_ms):
     """Weekly silent recompute: director-owned roadmap maps each room to a
     priority derived from trailing grades + recent delivery. A room that shipped
     poorly (low grade) or that agents keep flagging gets higher priority so fresh
-    work lands where it's weakest. Pure derivation -- no ceremony, no Jev spend."""
+    work lands where it's weakest. Pure derivation -- no ceremony, no Jev spend.
+
+    The spine: when the player has set a charter, a room aligned with it gets a
+    priority boost -- and a FRESH room (no grade, no delivery yet) defaults to
+    aligned>0 instead of 0, so the charter decides a new tank's direction
+    instead of every room starting flat. The charter aligns, the grades steer."""
     if now_ms - (state.get('lastRoadmapReviewAt') or 0) < ROADMAP_CADENCE_MS:
         return
     state['lastRoadmapReviewAt'] = now_ms
@@ -9330,12 +9494,17 @@ def _roadmap_step(state, now_ms):
     for room in VALUED_QUEUE_ROOMS:
         gm = _room_trailing_grade(state, room)
         demand = _roadmap_release_demand(state, room)
+        aligned = _charter_alignment(state, room)
         prev = roadmap.get(room) or {}
         if gm is None and demand == 0:
             # No history yet -- leave whatever the director set, else default.
+            # The charter decides a fresh room's starting priority: aligned
+            # rooms get a baseline so the spine (not the void) picks direction.
             if not prev:
-                roadmap[room] = {'priority': 0, 'ownerId': prev.get('ownerId'),
-                                 'lastGrade': None, 'demand': 0}
+                roadmap[room] = {'priority': 1 if aligned else 0,
+                                 'ownerId': prev.get('ownerId'),
+                                 'lastGrade': None, 'demand': 0,
+                                 'charterAligned': aligned}
             continue
         # Weak grade and/or low delivery -> higher priority to rebalance.
         priority = 0
@@ -9345,8 +9514,11 @@ def _roadmap_step(state, now_ms):
             priority += 1           # starved room -- feed it
         elif gm is not None and gm < 7:
             priority += 1
+        if aligned:
+            priority += 1           # on the spine -- keep its thread alive
         roadmap[room] = {'priority': priority, 'ownerId': prev.get('ownerId'),
-                         'lastGrade': gm, 'demand': demand}
+                         'lastGrade': gm, 'demand': demand,
+                         'charterAligned': aligned}
 
 
 def _consensus_relay_step(state, now_ms):
@@ -9372,9 +9544,14 @@ def _consensus_relay_step(state, now_ms):
     if _roadmap_release_demand(state, room) == 0:
         reasons.append('no recent delivery')
     why = ', '.join(reasons) if reasons else 'prioritized by the director'
+    # The spine (when the player set one): the charter goal leads the consensus
+    # so the direction every task acts on names the GOAL, not just the weakest
+    # room. "point them at one thing, and they all turn into one direction."
+    charter = get_charter(state)
+    lead = f"Current direction: {charter['goal']}. " if charter else ''
     state['consensusRelay'] = {
         'room': room,
-        'consensus': f'Current direction: focus next work on {room} ({why}).',
+        'consensus': f"{lead}Focus next work on {room} ({why}).",
         'updatedAt': now_ms,
     }
 
@@ -9484,7 +9661,9 @@ def _success_mine_step(state, now_ms):
 def _refinement_context_for_room(state, room):
     """The roadmap context the refinement groom should weigh: the room's current
     roadmap priority + trailing grade, so a scrum master grooms high-priority /
-    weak rooms preferentially. Returns a short string or None."""
+    weak rooms preferentially. A charter (the spine) is weighed too -- an
+    aligned room is worth grooming in, an off-spine one is easier to park.
+    Returns a short string or None."""
     roadmap = (state.get('roadmap') or {}).get(room) or {}
     gm = _room_trailing_grade(state, room)
     bits = []
@@ -9492,6 +9671,9 @@ def _refinement_context_for_room(state, room):
         bits.append(f"roadmap priority {roadmap['priority']}")
     if gm is not None:
         bits.append(f"trailing grade {gm}/10")
+    aligned = _charter_alignment(state, room)
+    if aligned is not None:
+        bits.append('charter aligned' if aligned else 'charter: off-spine')
     return ('; '.join(bits)) or None
 
 
@@ -11051,6 +11233,7 @@ def _assign_player_task(state, pick, now_ms, task_id_holder=None):
         'acceptanceCriteria': pick.get('acceptanceCriteria') or None,
         'issueKey': pick.get('issueKey') or None,
         'budgetMs': pick.get('budgetMs') or None,
+        'lane': pick.get('lane') or None,
     }
     state.setdefault('tasks', {})[task_id] = task
     # Deliver to the player: an inbox card (rendered by the UI with a Mark-done
@@ -11064,6 +11247,7 @@ def _assign_player_task(state, pick, now_ms, task_id_holder=None):
         'title': title, 'instructions': task['instructions'],
         'status': 'needs_player', 'createdAt': now_ms,
         'dependsOn': task['dependsOn'], 'issueKey': task['issueKey'],
+        'lane': task['lane'],
     })
     depends_line = ''
     if task['dependsOn']:
@@ -11294,6 +11478,9 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # the assigned task (see assign_task) so review/failure paths can honor
         # it -- same whitelist contract as 'distill'/'checklist'.
         'moonshot': bool(pick.get('moonshot')),
+        # Attention lane (build/reading/open/parking-lot) rides onto the task so
+        # the board and the reading rate-limit can see it (see assign_task).
+        'lane': pick.get('lane'),
     }
     # Cut 2 coaching + runbook injection: append the chosen agent's pending
     # growth-plan note (applied once) and any product runbook knowledge to the
