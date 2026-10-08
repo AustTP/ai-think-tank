@@ -134,7 +134,7 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
     note = None
     if kept:
         existing = _serve._http_json('GET', base, '/api/library/file?path=' +
-                              urllib.parse.quote(f"skills/{_skill_slug(topic.get('topic'))}.md") + '&requesterId=' + urllib.parse.quote(agent_id))
+                              urllib.parse.quote(f"skills/{_skill_slug(topic.get('topic'))}.md") + '&requesterId=' + urllib.parse.quote(agent_id), None, key)
         existing_content = existing.get('content') if isinstance(existing, dict) and 'content' in existing else None
         tier_slug = _serve._resolve_model_tier(f'Synthesize an updated skill-reference file for research topic: {topic.get("topic")}')
         if not tier_slug:
@@ -285,7 +285,7 @@ def _run_media_content(snapshot, agent_id, task, base_ctx=None):
     import sim as _sim_module
     base = _serve.SELF_BASE_URL
     key = _serve.get_or_create_agent_key(agent_id)
-    out = _serve._http_json('GET', base, '/api/library/file?path=' + urllib.parse.quote(_MEDIA_FEEDS_PATH) + '&requesterId=' + urllib.parse.quote(agent_id))
+    out = _serve._http_json('GET', base, '/api/library/file?path=' + urllib.parse.quote(_MEDIA_FEEDS_PATH) + '&requesterId=' + urllib.parse.quote(agent_id), None, key)
     feeds = _parse_feed_urls_after(out.get('content') if isinstance(out, dict) else None)
     if not feeds:
         note = 'No feeds configured yet -- waiting on media/feeds.md in the Library.'
@@ -349,7 +349,7 @@ def _run_skill_review_content(snapshot, agent_id, task, base_ctx=None):
     import sim as _sim_module
     base = _serve.SELF_BASE_URL
     key = _serve.get_or_create_agent_key(agent_id)
-    listing = _serve._http_json('GET', base, '/api/library?requesterId=' + urllib.parse.quote(agent_id))
+    listing = _serve._http_json('GET', base, '/api/library?requesterId=' + urllib.parse.quote(agent_id), None, key)
     files = listing.get('files') or []
     pending = [f for f in files if f.get('path', '').startswith('pending_review/skills/') or 'pending_review/skills/' in f.get('path', '')][:_SKILL_REVIEW_MAX_PER_SWEEP]
     if not pending:
@@ -359,7 +359,7 @@ def _run_skill_review_content(snapshot, agent_id, task, base_ctx=None):
     kept = rejected = 0
     for f in pending:
         path = f['path']
-        content = _serve._http_json('GET', base, '/api/library/file?path=' + urllib.parse.quote(path) + '&requesterId=' + urllib.parse.quote(agent_id))
+        content = _serve._http_json('GET', base, '/api/library/file?path=' + urllib.parse.quote(path) + '&requesterId=' + urllib.parse.quote(agent_id), None, key)
         if not isinstance(content, dict) or 'content' not in content:
             continue
         body = content['content']
@@ -937,10 +937,10 @@ def _get_sandbox_context(base, key, agent_id, sandbox_id):
 def _search_library_files(base, key, agent_id, query):
     """Port of world.js searchLibraryFiles: GET /api/library/search?q=. Returns
     [] on any failure -- a failed search shouldn't block the task it feeds.
-    No X-Agent-Key header (client searchLibraryFiles sends none, and GET reads
-    are not key-gated)."""
+    The agent key rides along so the server can attribute (and village-scope)
+    the search to this agent, exactly like the browse/execute loopbacks."""
     import urllib.parse as _up
-    data = _serve._http_json('GET', base, '/api/library/search?q=' + _up.quote(query or '') + '&requesterId=' + _up.quote(agent_id))
+    data = _serve._http_json('GET', base, '/api/library/search?q=' + _up.quote(query or '') + '&requesterId=' + _up.quote(agent_id), None, key)
     if isinstance(data, dict) and data.get('matches'):
         return data['matches']
     return []
@@ -1568,7 +1568,7 @@ def _record_review_process_trace(base, key, agent_id, project_label, backlog, ki
         path = f'pending_review/skills/review-trace/{_skill_slug(project_label or "project") or "project"}/{slug}.md'
         existing = None
         try:
-            r = _serve._http_json('GET', base, '/api/library/file?path=' + urllib.parse.quote(path))
+            r = _serve._http_json('GET', base, '/api/library/file?path=' + urllib.parse.quote(path), None, key)
             existing = r.get('content') if isinstance(r, dict) else None
         except Exception:
             existing = None

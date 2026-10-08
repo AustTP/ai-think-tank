@@ -4932,6 +4932,16 @@ PEER_REVIEW_TIMEOUT_MS = 15 * 60 * 1000  # sim-ms: waiting window after which on
 STUCK_GATE_CADENCE_MS               = 20_000
 STUCK_GATE_GRACE_MS                 = 5 * 60 * 1000   # no widening before this age
 STUCK_GATE_RESCUE_REVIEW_TIMEOUT_MS = 30 * 60 * 1000  # min gap between re-picks
+# State-blob pruning: the whole kv_state blob is autosaved every ~1s, so
+# unbounded append-only structures make that write slower and slower. The
+# prune pass bounds the historical TAIL of each (live/open/pending entries are
+# always kept); `tasks` is intentionally left alone (it backs per-agent history).
+_STATE_PRUNE_CADENCE_MS = 60 * 60 * 1000  # hourly
+_TAIL_COMPLETED_DELIVERABLES = 500
+_TAIL_BACKLOG_RESOLVED = 200
+_TAIL_PLAYER_INBOX_ANSWERED = 100
+_TAIL_ISSUES_CLOSED = 100
+_TAIL_GROWTH_PLANS_APPLIED = 50
 # Non-gated work lanes (Phase E2b/E2d): a SPIKE is a time-boxed investigation
 # with no committed deliverable; a BUG is incident response on a live product
 # (see the on-call phase). Neither ships a peer-reviewed story -- both land a
@@ -5420,6 +5430,48 @@ def _gate_reviewer_reachable(state, rid, gate, now_ms):
         if item.get('reviewOf') and item.get('assignedTo') == rid:
             return True
     return False
+
+
+def _prune_state_blob(state, now_ms):
+    """Bound the append-only tails inside the kv_state blob. The whole blob is
+    serialized + autosaved every ~1s, so anything that grows without bound keeps
+    growing that write forever (the 'save takes a second' slowdown). Every
+    structure here is a bounded TAIL: live/open/pending entries are ALWAYS kept,
+    only the historical tail is capped. `tasks` is deliberately untouched -- it
+    backs per-agent history and counters, and a hard cap there would silently
+    corrupt them. Pure; mutates `state` only. Called from _task_cycle on a coarse
+    cadence."""
+    cd = state.get('completedDeliverables')
+    if isinstance(cd, list) and len(cd) > _TAIL_COMPLETED_DELIVERABLES:
+        state['completedDeliverables'] = cd[-_TAIL_COMPLETED_DELIVERABLES:]
+    br = state.get('backlogRequests')
+    if isinstance(br, list):
+        keep = [r for r in br if (r or {}).get('status') == 'pending']
+        tail = [r for r in br if (r or {}).get('status') != 'pending']
+        if len(tail) > _TAIL_BACKLOG_RESOLVED:
+            tail = tail[-_TAIL_BACKLOG_RESOLVED:]
+        state['backlogRequests'] = keep + tail
+    pi = state.get('playerInbox')
+    if isinstance(pi, list):
+        keep = [m for m in pi if not (m or {}).get('answered')]
+        tail = [m for m in pi if (m or {}).get('answered')]
+        if len(tail) > _TAIL_PLAYER_INBOX_ANSWERED:
+            tail = tail[-_TAIL_PLAYER_INBOX_ANSWERED:]
+        state['playerInbox'] = keep + tail
+    issues = state.get('issues')
+    if isinstance(issues, dict):
+        open_entries = [e for e in issues.values() if (e or {}).get('status') not in ('resolved', 'closed')]
+        closed_entries = [e for e in issues.values() if (e or {}).get('status') in ('resolved', 'closed')]
+        if len(closed_entries) > _TAIL_ISSUES_CLOSED:
+            closed_entries = closed_entries[-_TAIL_ISSUES_CLOSED:]
+        state['issues'] = {e.get('key') or i: e for i, e in enumerate(open_entries + closed_entries)}
+    gp = state.get('growthPlans')
+    if isinstance(gp, list):
+        keep = [p for p in gp if (p or {}).get('status') != 'applied']
+        tail = [p for p in gp if (p or {}).get('status') == 'applied']
+        if len(tail) > _TAIL_GROWTH_PLANS_APPLIED:
+            tail = tail[-_TAIL_GROWTH_PLANS_APPLIED:]
+        state['growthPlans'] = keep + tail
 
 
 def _sweep_stuck_gates(state, now_ms):
@@ -10569,6 +10621,14 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     if now_ms - (state.get('lastStuckGateSweep') or 0) >= STUCK_GATE_CADENCE_MS:
         state['lastStuckGateSweep'] = now_ms
         _sweep_stuck_gates(state, now_ms)
+
+    # Bound the append-only tails of the kv_state blob (completedDeliverables,
+    # resolved backlogRequests, answered playerInbox, closed issues, applied
+    # growthPlans) on a coarse hourly cadence so the 1s autosave write doesn't
+    # grow without bound. Live/open/pending entries are always kept.
+    if now_ms - (state.get('lastStatePrune') or 0) >= _STATE_PRUNE_CADENCE_MS:
+        state['lastStatePrune'] = now_ms
+        _prune_state_blob(state, now_ms)
 
     # Reclaim a 'walking'/'working' task whose assignee no longer
     # holds it (the orphaned-fix wedge). Runs BEFORE the idle gate so a quiet

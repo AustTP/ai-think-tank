@@ -1658,19 +1658,33 @@ def verify_agent_key(agent_id, presented_key):
 # request. The secret therefore never leaves this process and can't be
 # exfiltrated by a persuaded agent.
 # --------------------------------------------------------------------------
-_FERNET_EDEK_DIR = os.path.join(ROOT, '.secret_keys')
+_FERNET_EDEK_DIR = os.path.join(THINK_TANK_DIR, '.secret_keys')
 _FERNET_EDEK_PATH = os.path.join(_FERNET_EDEK_DIR, 'edek.key')
+# The old location lived under ROOT (world/), which IS the static-served tree
+# (app.mount('/', StaticFiles(directory=ROOT))) -- a plain GET served the
+# master key unauthenticated. THINK_TANK_DIR (repo root) is NOT mounted, so
+# the key is no longer reachable over HTTP.
+_LEGACY_FERNET_EDEK_PATH = os.path.join(ROOT, '.secret_keys', 'edek.key')
 
 
 def _fernet():
     # Lazy so serve.py still boots (and tests that don't hit keys still run)
     # if the `cryptography` package is absent. The key file is written on
     # first use (0600, gitignored), which keeps the master key out of .env
-    # and off the filesystem tree than anything served.
+    # and off the served filesystem tree.
     try:
         from cryptography.fernet import Fernet
     except Exception:
         return None
+    # Migrate a pre-existing key out of the (served) old location so any
+    # vault entries already encrypted with it stay decryptable after the move.
+    if not os.path.exists(_FERNET_EDEK_PATH) and os.path.exists(_LEGACY_FERNET_EDEK_PATH):
+        try:
+            os.makedirs(_FERNET_EDEK_DIR, exist_ok=True)
+            shutil.copyfile(_LEGACY_FERNET_EDEK_PATH, _FERNET_EDEK_PATH)
+            os.chmod(_FERNET_EDEK_PATH, 0o600)
+        except OSError:
+            pass
     if not os.path.exists(_FERNET_EDEK_PATH):
         os.makedirs(_FERNET_EDEK_DIR, exist_ok=True)
         with open(_FERNET_EDEK_PATH, 'w') as f:
@@ -8602,7 +8616,7 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/api-call', '/api/api-service', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/villages', '/api/memory-ledger', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/api-call', '/api/api-service', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/villages', '/api/memory-ledger', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews', '/api/agent-files')
 # Gap: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
@@ -9362,9 +9376,10 @@ async def intent_reject_story(task_id: str, request: Request):
 
     # Veto is a first-class actor action: file a mailbox note to the author so
     # they know it's the PLAYER (not a peer) sending their work back, and chain
-    # the veto into the passport alongside sprint/product actions.
-    mailbox = (state.get('agents') or {}).get(author, {}).setdefault('mailbox', [])
-    mailbox.append({
+    # the veto into the passport alongside sprint/product actions. Routed through
+    # _append_mailbox so the player-veto write honors MAILBOX_KEEP_COUNT like every
+    # other mailbox append (a direct append here would grow the blob unboundedly).
+    _sim._append_mailbox((state.get('agents') or {}).get(author, {}), {
         'kind': 'player_veto',
         'about': task_id,
         'title': task.get('title'),
@@ -11914,6 +11929,8 @@ async def write_wiki_page(request: Request):
     content = body.get('body') or ''
     if not page_id or not category:
         return JSONResponse({'error': 'id and category are required'}, status_code=400)
+    if any(ch in page_id for ch in '/\\'):
+        return JSONResponse({'error': 'invalid page id'}, status_code=400)
     state = get_state_from_db()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -12064,6 +12081,8 @@ async def approve_wiki_proposal(page_id: str, request: Request):
     category = (body.get('category') or '').strip()
     if not category:
         return JSONResponse({'error': 'category is required'}, status_code=400)
+    if any(ch in page_id for ch in '/\\'):
+        return JSONResponse({'error': 'invalid page id'}, status_code=400)
     state = get_state_from_db()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -12809,21 +12828,48 @@ def _cross_village_agent_denied(state, requester, target_agent_id):
     return rv != tv
 
 
+def _agent_id_for_key(presented_key):
+    """Reverse lookup: the agent_id that owns a bearer key, or None. A key that
+    matches nothing (or no key) is not an agent identity -- the reverse of
+    `verify_agent_key`, used to derive WHO a request is from when only a key is
+    presented (the server's content executors loopback with a key, no session)."""
+    if not presented_key:
+        return None
+    with _db() as conn:
+        row = conn.execute('SELECT agent_id FROM agent_keys WHERE secret_key = ?',
+                           (presented_key,)).fetchone()
+    return row[0] if row else None
+
+
 def _resolve_requester(request):
-    # Resolve who a request is being made AS, if anyone: validates a real
-    # agent key against the claimed id. The player UI sends no agent key, so
-    # this returns None (player/ops). Misclaimed or absent keys fail closed to
-    # None as well -- an unauthenticated caller is never treated as an agent
-    # with narrower rights for the self-reports rule.
+    # Resolve who a request is being made AS. The authenticated PRINCIPAL is
+    # authoritative -- never the caller-supplied requesterId, which is a
+    # narrowing hint only:
+    #   - a valid PLAYER session -> the player (None = all-village / ops). The
+    #     UI may still narrow with a verified requesterId, but the session alone
+    #     is enough to be the player;
+    #   - otherwise the presented X-Agent-Key's OWNER is the requester (an agent
+    #     can only ever be itself -- a misclaimed requesterId is ignored, not
+    #     trusted);
+    #   - nothing valid -> None. Callers must treat that None as
+    #     UNAUTHENTICATED, not as the all-village player (the fail-open that let
+    #     an agent with a key but no requesterId read every village).
+    session_ok = verify_session(request.cookies.get(SESSION_COOKIE_NAME))
+    key_owner = _agent_id_for_key(request.headers.get('X-Agent-Key'))
     claimed = (request.query_params.get('requesterId') or '').strip() or None
-    if not claimed:
-        return None
     if claimed in ('player', 'unknown'):
+        claimed = None
+    if session_ok:
+        # A real player session. Honor an explicit, verified agent claim (the
+        # UI asks for a specific agent with the session present), else player.
+        if claimed and key_owner == claimed:
+            return claimed
         return None
-    ok = verify_agent_key(claimed, request.headers.get('X-Agent-Key'))
-    if ok is not True:
-        return None
-    return claimed
+    if key_owner:
+        # No session: the key's owner is the requester. An explicit claim that
+        # differs is ignored -- the key is what authenticates, not the body.
+        return claimed if claimed == key_owner else key_owner
+    return None
 
 
 @app.get('/api/avatar/{agent_id}/{filename}')
@@ -13711,6 +13757,11 @@ def _ingest_walk(root_dir, dest_root, results: list[dict[str, object]]):
 
 @app.post('/api/library/ingest')
 async def ingest_library(request: Request):
+    # Player-only -- see the module comment above. The gate is a REAL player
+    # session, not the body's self-declared agentId: an agent key bearer must
+    # not be able to point this at arbitrary host paths (~/.ssh/id_rsa, .env).
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     body = await request.json()
     agent_id = body.get('agentId', 'player')
     # Deliberately not agent-callable -- see the module comment above.
@@ -14020,6 +14071,8 @@ async def design_reference(request: Request):
     writes a <name>.txt brief next to it that any agent can read via
     /api/library/file and find via /api/library/search. Returns the brief and
     the library-relative paths."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     body = await request.json()
     agent_id = body.get('agentId', 'player')
     if agent_id != 'player':
@@ -14083,6 +14136,8 @@ async def design_reference_url(request: Request):
     real screenshot, run the vision tier, and write a design-references/<host>.txt
     brief any agent can read. Player-only, and the URL goes through the same
     SSRF/public-host guard as /api/browse (never a private/internal address)."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     body = await request.json()
     agent_id = body.get('agentId', 'player')
     if agent_id != 'player':
@@ -14195,6 +14250,8 @@ async def design_reference_taste(request: Request):
     (design-references/<project>/taste.md), the single source of truth agents
     are required to load before design work on that project. Player-only.
     Overwrites taste.md in place -- re-run after adding briefs."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     body = await request.json()
     agent_id = body.get('agentId', 'player')
     if agent_id != 'player':
@@ -15203,7 +15260,11 @@ async def api_service_list():
 @app.post('/api/api-service/revoke')
 async def api_service_revoke(request: Request):
     # Player-facing removal: sets the service row to 'denied' so it stops being
-    # served, and drops it from the in-memory registry.
+    # served, and drops it from the in-memory registry. De-registering a service
+    # kills its reachability for the WHOLE colony -- only the player may do it,
+    # proven by a real session (an agent key must not revoke GitHub/Apify/Tavily).
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     body = await request.json()
     sid = (body.get('serviceId') or '').strip().lower()
     if not sid:
@@ -15392,6 +15453,8 @@ async def sandbox_download(request: Request):
     agent_id = body.get('agentId', 'unknown')
     sandbox_id = (body.get('sandboxId') or '').strip()
     sandbox_id = _village_sandbox_id(agent_id, sandbox_id)  # per-village repo isolation
+    if not _SANDBOX_ID_RE.match(sandbox_id or ''):
+        return JSONResponse({'error': 'invalid sandboxId'}, status_code=400)
     purpose = (body.get('purpose') or '').strip()
     filename = (body.get('filename') or '').strip()
     # Live room override (see _agent_is_in_sandbox_room) -- an agent that
@@ -15489,6 +15552,8 @@ async def sandbox_save_page(request: Request):
     agent_id = body.get('agentId', 'unknown')
     sandbox_id = (body.get('sandboxId') or '').strip()
     sandbox_id = _village_sandbox_id(agent_id, sandbox_id)  # per-village repo isolation
+    if not _SANDBOX_ID_RE.match(sandbox_id or ''):
+        return JSONResponse({'error': 'invalid sandboxId'}, status_code=400)
     purpose = (body.get('purpose') or '').strip()
     filename = (body.get('filename') or '').strip()
     content = body.get('content') or ''
@@ -15645,7 +15710,17 @@ async def _classify_command(command, purpose, agent_id='unknown'):
     return True, 'allow'
 
 
+# A sandbox_id may only be a safe, flat slug -- never path separators, never
+# '..' (a traversal there would mount the repo root -- with .env -- into the
+# container via os.path.join). Letters/digits/._- only, one component, capped
+# length. Enforced at the one chokepoint every sandbox endpoint funnels
+# through, so an agent-supplied sandboxId cannot escape SANDBOXES_DIR.
+_SANDBOX_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+
+
 def _sandbox_dir_for(sandbox_id):
+    if not sandbox_id or not isinstance(sandbox_id, str) or not _SANDBOX_ID_RE.match(sandbox_id):
+        raise ValueError(f'invalid sandbox id: {sandbox_id!r}')
     path = os.path.join(SANDBOXES_DIR, sandbox_id)
     os.makedirs(path, exist_ok=True)
     return path
@@ -15760,14 +15835,14 @@ def _restore_sandbox_backup(sandbox_id, stamp):
 @app.get('/api/keys/credentials')
 async def list_credentials(request: Request):
     # Session-protected + player-only (agents never get to enumerate the vault).
-    if _resolve_requester(request):
+    if not _require_player_session(request):
         return JSONResponse({'error': 'credential vault is player-only'}, status_code=403)
     return JSONResponse({'credentials': _list_credentials()})
 
 
 @app.post('/api/keys/credentials')
 async def add_credential(request: Request):
-    if _resolve_requester(request):
+    if not _require_player_session(request):
         return JSONResponse({'error': 'credential vault is player-only'}, status_code=403)
     body = await request.json()
     name = (body.get('name') or '').strip()
@@ -15785,7 +15860,7 @@ async def add_credential(request: Request):
 
 @app.delete('/api/keys/credentials/{name}')
 async def delete_credential(name: str, request: Request):
-    if _resolve_requester(request):
+    if not _require_player_session(request):
         return JSONResponse({'error': 'credential vault is player-only'}, status_code=403)
     _delete_credential(name)
     log_action('player', 'credential_deleted', {'name': name}, authorized=True)
@@ -15869,6 +15944,8 @@ async def execute(request: Request):
     purpose = (body.get('purpose') or '').strip()
     sandbox_id = body.get('sandboxId') or ('sandbox-' + secrets.token_hex(4))
     sandbox_id = _village_sandbox_id(agent_id, sandbox_id)  # per-village repo isolation
+    if not _SANDBOX_ID_RE.match(sandbox_id or ''):
+        return JSONResponse({'error': 'invalid sandboxId'}, status_code=400)
     if not check_rate_limit(agent_id):
         log_action(agent_id, 'rate_limited', {'endpoint': 'execute'})
         return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
@@ -15915,6 +15992,8 @@ async def pipeline(request: Request):
     steps = body.get('steps') or []
     sandbox_id = body.get('sandboxId') or ('sandbox-' + secrets.token_hex(4))
     sandbox_id = _village_sandbox_id(agent_id, sandbox_id)  # per-village repo isolation
+    if not _SANDBOX_ID_RE.match(sandbox_id or ''):
+        return JSONResponse({'error': 'invalid sandboxId'}, status_code=400)
     # Counted as ONE call regardless of step count -- a pipeline is one
     # logical request from the caller's side even though it fans out into
     # several sandbox runs internally; each individual step already goes
@@ -15989,6 +16068,8 @@ async def youtube_transcript(request: Request):
 
 @app.get('/api/sandbox-backups')
 async def sandbox_backups(sandboxId: str):
+    if not _SANDBOX_ID_RE.match(sandboxId or ''):
+        return JSONResponse({'error': 'invalid sandboxId'}, status_code=400)
     return JSONResponse({'backups': _list_sandbox_backups(sandboxId)})
 
 
@@ -15999,6 +16080,8 @@ async def sandbox_backups_restore(request: Request):
     # even a bad restore is undoable), which is a meaningfully
     # consequential action, not something an agent should trigger on its
     # own judgment about another agent's work.
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     body = await request.json()
     agent_id = body.get('agentId')
     if agent_id != 'player':
@@ -16077,6 +16160,8 @@ async def screenshot(request: Request):
     agent_id = body.get('agentId', 'unknown')
     sandbox_id = body.get('sandboxId')
     sandbox_id = _village_sandbox_id(agent_id, sandbox_id)  # per-village repo isolation
+    if not _SANDBOX_ID_RE.match(sandbox_id or ''):
+        return JSONResponse({'error': 'invalid sandboxId'}, status_code=400)
     rel_path = body.get('path', 'index.html')
     width = min(max(int(body.get('width', 900)), 200), 1600)
     height = min(max(int(body.get('height', 700)), 200), 1600)
@@ -16260,6 +16345,8 @@ async def page_probe(request: Request):
     agent_id = body.get('agentId', 'unknown')
     sandbox_id = body.get('sandboxId')
     sandbox_id = _village_sandbox_id(agent_id, sandbox_id)  # per-village repo isolation
+    if not _SANDBOX_ID_RE.match(sandbox_id or ''):
+        return JSONResponse({'error': 'invalid sandboxId'}, status_code=400)
     rel_path = body.get('path', 'index.html')
     actions = body.get('actions') or []
     probes = body.get('probes') or []
