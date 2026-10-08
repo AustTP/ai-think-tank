@@ -106,9 +106,12 @@ class BrowseEndpointAllowlist(unittest.TestCase):
             unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'fake-key'),
             unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True),
             unittest.mock.patch.object(serve, 'check_rate_limit', return_value=True),
+            # Echo the requested URL back as the final URL (same host) -- the
+            # redirect re-gate must not fire for these allowlist/provenance
+            # tests, which are about the PRE-fetch decision, not redirects.
             unittest.mock.patch.object(
                 serve, '_fetch_page_sync',
-                return_value=('https://dreyx.com/', 'text/html', '<html><body>hi</body></html>', False, None)),
+                side_effect=lambda url: (url, 'text/html', '<html><body>hi</body></html>', False, None)),
         ]
         for p in patchers:
             p.start()
@@ -218,6 +221,122 @@ class BrowseEndpointAllowlist(unittest.TestCase):
             self._client().post('/api/browse', json={
                 'agentId': 'ben', 'url': 'https://dreyx.com/tools', 'purpose': 'look around'})
         record.assert_not_called()
+
+
+class BrowseEndpointRedirectReGate(unittest.TestCase):
+    """The short-link laundering vector: Jev approves the ORIGINAL url, then a
+    redirect lands the content on a DIFFERENT host Jev never classified. The
+    fetch re-checks the final host for NETWORK safety only -- this re-gate
+    re-judges it for CONTENT before any content is returned, and fails closed.
+    Same-host redirects (echo) and redirects to player-vetted destinations
+    (allowlist) skip the extra round trip."""
+
+    def _client(self):
+        from starlette.testclient import TestClient
+        c = TestClient(serve.app)
+        c.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
+        return c
+
+    def _common_mocks(self, final_url):
+        patchers = [
+            unittest.mock.patch.object(serve, 'BROWSING_ENABLED', True),
+            unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'fake-key'),
+            unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True),
+            unittest.mock.patch.object(serve, 'check_rate_limit', return_value=True),
+            unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()),
+            unittest.mock.patch.object(
+                serve, '_fetch_page_sync',
+                return_value=(final_url, 'text/html', '<html><body>hi</body></html>', False, None)),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_cross_host_redirect_to_a_blocked_category_destination_is_denied(self):
+        # The user's worst fear: an innocuous-looking short link Jev approves,
+        # whose redirect lands on a blocked-category host. The re-gate must
+        # classify the FINAL destination and deny it -- no content reaches the
+        # agent even though the ORIGINAL url was allowed.
+        self._common_mocks('https://definitely-not-blocked.example/landing')
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as jev, \
+             unittest.mock.patch.object(serve, '_jev_choice', side_effect=[
+                 ('allow', 0.95, 0.0),   # original short-link url: allowed
+                 ('block', 0.99, 0.0),   # redirect destination: blocked
+             ]):
+            r = self._client().post('/api/browse', json={
+                'agentId': 'ben', 'url': 'https://t.co/abc123', 'purpose': 'check this link'})
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()['allowed'])
+        self.assertIn('redirected', r.json()['reason'])
+        # The re-gate DID judge the final destination against Jev's criteria.
+        self.assertEqual(jev.call_count, 2)
+        redirect_instructions = jev.call_args_list[1][0][2]['choice']['instructions']
+        self.assertIn('definitely-not-blocked.example/landing', redirect_instructions)
+        self.assertIn('REDIRECTED', redirect_instructions)
+
+    def test_same_host_redirect_needs_no_second_classification(self):
+        # A redirect that stays on the SAME host (http->https, path moves,
+        # www. normalizing) is the host Jev already judged -- no extra call.
+        self._common_mocks('https://docs.python.org/3/library/urllib.html#http-redirections')
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as jev, \
+             unittest.mock.patch.object(serve, '_jev_choice', return_value=('allow', 0.95, 0.0)):
+            r = self._client().post('/api/browse', json={
+                'agentId': 'ben', 'url': 'https://docs.python.org/3/library/urllib.html',
+                'purpose': 'read the urllib docs'})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()['allowed'])
+        jev.assert_called_once()  # only the original pre-fetch classification
+
+    def test_cross_host_redirect_to_an_allowlisted_final_host_skips_the_extra_call(self):
+        # A redirect landing on a host the PLAYER vetted (allowlist) is a
+        # destination the player approved directly -- no re-classification.
+        # The ORIGINAL short link (t.co) is NOT allowlisted, so it still went
+        # through Jev once; only the final destination skips a second call.
+        self._common_mocks('https://www.dreyx.com/deep/landing')
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as jev, \
+             unittest.mock.patch.object(serve, '_jev_choice', return_value=('allow', 0.95, 0.0)), \
+             unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', {'dreyx.com'}):
+            r = self._client().post('/api/browse', json={
+                'agentId': 'ben', 'url': 'https://t.co/abc123', 'purpose': 'follow a link'})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()['allowed'])
+        jev.assert_called_once()  # original short link classified once; allowlisted final host skipped
+
+    def test_cross_host_redirect_that_jev_allows_is_returned(self):
+        # A legit host-changing redirect (e.g. a shortener for a real docs
+        # page) is re-classified and allowed -- one extra call, content flows.
+        self._common_mocks('https://docs.python.org/3/library/urllib.html')
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as jev, \
+             unittest.mock.patch.object(serve, '_jev_choice', side_effect=[
+                 ('allow', 0.95, 0.0),   # original short-link url: allowed
+                 ('allow', 0.96, 0.0),   # redirect destination: also allowed
+             ]):
+            r = self._client().post('/api/browse', json={
+                'agentId': 'ben', 'url': 'https://t.co/abc123', 'purpose': 'follow a link'})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()['allowed'])
+        self.assertEqual(jev.call_count, 2)  # original url + re-classified destination
+
+    def test_player_authored_work_context_final_host_still_skips_the_re_gate(self):
+        # Provenance semantics carry through to the re-gate: a redirect landing
+        # on a host the PLAYER explicitly named in a player-authored task is a
+        # destination the player vetted -- no re-classification, matching the
+        # original gate's bypass exactly. The ORIGINAL short link (t.co) is
+        # not a work-context host, so it still went through Jev once.
+        self._common_mocks('https://docs.python.org/3/library/urllib.html#redirections')
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as jev, \
+             unittest.mock.patch.object(serve, '_jev_choice', return_value=('allow', 0.95, 0.0)):
+            r = self._client().post('/api/browse', json={
+                'agentId': 'ben', 'url': 'https://t.co/abc123',
+                'purpose': 'read the urllib docs',
+                'workContext': 'Investigate urllib -- see https://docs.python.org/3/library/urllib.html',
+                'workContextTrusted': True})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()['allowed'])
+        # One call (the unvetted short link); the player-vetted final host
+        # (docs.python.org, named in the player-authored work) skipped the
+        # re-gate.
+        jev.assert_called_once()
 
 
 class BrowseTrailBuilding(unittest.TestCase):
@@ -384,7 +503,7 @@ class BrowseEndpointMullvadVpn(unittest.TestCase):
             unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', {'dreyx.com'}),
             unittest.mock.patch.object(
                 serve, '_fetch_page_sync',
-                return_value=('https://dreyx.com/', 'text/html', '<html><body>hi</body></html>', False, None)),
+                side_effect=lambda url: (url, 'text/html', '<html><body>hi</body></html>', False, None)),
         ]
         for p in patchers:
             p.start()
