@@ -1170,39 +1170,42 @@ def _sim_loop_pass():
     # untouched, so the checkpoint backup loop / _expire_handles still run.
     if serve._dormant():
         return None
-    state = serve.get_state_from_db()
-    if not state:
-        return None
-    state = _engine.tick(state)
-    # Deliver any finished drained player-ask answers INSIDE this single
-    # read-modify-write (same two-phase discipline as _content_results: the
-    # model call ran on its own thread and stashed an in-memory result; this
-    # pass delivers it durably). No-op when nothing finished.
     try:
-        serve._apply_pending_ask_results(state)
-    except Exception as e:
-        print(f'[sim] ask apply error: {e}', flush=True)
-    # Peer reviews run INSIDE the sim's single read-modify-write -- on this
-    # same `state` object, right before the one save -- so the report it files
-    # can never be clobbered by a concurrent whole-blob save (the race that
-    # made freshly-filed reports vanish and the old standalone peer thread
-    # re-flag the same worker every 90s forever). Cadence-gated; no-op when not
-    # due. serve._peer_review_tick reads only this in-hand state + the
-    # action_log (read-only), then mutates state in place.
-    try:
-        serve._peer_review_tick(state)
-    except Exception as e:
-        print(f'[sim] peer review tick error: {e}', flush=True)
-    # Adversarial (winter) village lifecycle: when both sides have delivered
-    # the shared adversarial task, complete + disable (drain the winter team
-    # back to the main village). Same in-place mutation inside the single
-    # read-modify-write; no-op when disabled.
-    try:
-        serve._adversarial_village_tick(state)
-    except Exception as e:
-        print(f'[sim] adversarial village tick error: {e}', flush=True)
-    serve.save_state_to_db(state)
-    return state
+        state = serve._state_begin()
+        if not state:
+            return None
+        state = _engine.tick(state)
+        # Deliver any finished drained player-ask answers INSIDE this single
+        # read-modify-write (same two-phase discipline as _content_results: the
+        # model call ran on its own thread and stashed an in-memory result; this
+        # pass delivers it durably). No-op when nothing finished.
+        try:
+            serve._apply_pending_ask_results(state)
+        except Exception as e:
+            print(f'[sim] ask apply error: {e}', flush=True)
+        # Peer reviews run INSIDE the sim's single read-modify-write -- on this
+        # same `state` object, right before the one save -- so the report it files
+        # can never be clobbered by a concurrent whole-blob save (the race that
+        # made freshly-filed reports vanish and the old standalone peer thread
+        # re-flag the same worker every 90s forever). Cadence-gated; no-op when not
+        # due. serve._peer_review_tick reads only this in-hand state + the
+        # action_log (read-only), then mutates state in place.
+        try:
+            serve._peer_review_tick(state)
+        except Exception as e:
+            print(f'[sim] peer review tick error: {e}', flush=True)
+        # Adversarial (winter) village lifecycle: when both sides have delivered
+        # the shared adversarial task, complete + disable (drain the winter team
+        # back to the main village). Same in-place mutation inside the single
+        # read-modify-write; no-op when disabled.
+        try:
+            serve._adversarial_village_tick(state)
+        except Exception as e:
+            print(f'[sim] adversarial village tick error: {e}', flush=True)
+        serve.save_state_to_db(state)
+        return state
+    finally:
+        serve._state_abort()
 
 
 async def _sim_loop():
@@ -1229,21 +1232,24 @@ def _drain_emails_from_db():
         import serve
     except Exception:
         return []
-    state = serve.get_state_from_db()
-    if not state:
-        return []
-    results = []
     try:
-        results = _drain_email_outbox_sync(state)
-    except Exception as e:  # pragma: no cover
-        print(f'[sim] email drain failed: {e}')
-        return []
-    if results:
+        state = serve._state_begin()
+        if not state:
+            return []
+        results = []
         try:
-            serve.save_state_to_db(state)
+            results = _drain_email_outbox_sync(state)
         except Exception as e:  # pragma: no cover
-            print(f'[sim] email drain save failed: {e}')
-    return results
+            print(f'[sim] email drain failed: {e}')
+            return []
+        if results:
+            try:
+                serve.save_state_to_db(state)
+            except Exception as e:  # pragma: no cover
+                print(f'[sim] email drain save failed: {e}')
+        return results
+    finally:
+        serve._state_abort()
 
 
 # ---------------------------------------------------------------------------
