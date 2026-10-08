@@ -8044,7 +8044,19 @@ def _maybe_file_followup(state, agent_id, completed_task, now_ms):
     a = (state.get('agents') or {}).get(agent_id)
     if not a or a.get('offDuty') or a.get('busy') or a.get('task'):
         return
-    if (completed_task.get('taskType') or 'code') in ('spike', 'bug'):
+    if (completed_task.get('taskType') or 'code') in ('spike', 'bug', 'review'):
+        # spike/bug already IS the incident response; a review is meta-process
+        # work, not a fresh deliverable -- none of them should propose the next
+        # story (that's the recursion: 'Follow-up ... after completing Review:
+        # Follow-up ...' cards grew indefinitely).
+        return
+    # A follow-up to a follow-up: a completed card that was ITSELF a follow-up
+    # (taskType 'code', title prefixed 'Follow-up:') must not propose yet another
+    # follow-up. Otherwise each completed follow-up nests its own title into the
+    # next one and the backlog churns self-referential cards that mostly get
+    # groomed out. Only a REAL deliverable completion proposes the next story.
+    prev_title = (completed_task.get('title') or '').strip()
+    if prev_title.lower().startswith('follow-up:'):
         return
     room_label = completed_task['room']
     # Measure the room's backlog BEFORE the spare-time lane files anything -- a

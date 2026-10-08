@@ -419,6 +419,34 @@ class RefinementSignalGenerator(unittest.TestCase):
         sim._maybe_file_followup(state, 'ben', {'room': 'pressoffice', 'taskType': 'bug'}, 1_000_000)
         self.assertEqual(state['backlogRequests'], [])
 
+    def test_review_completion_does_not_file(self):
+        # A completed 'Review: ...' task is meta-process, not a real deliverable --
+        # it must not propose the next story (that was the recursion source).
+        state = _seed()
+        sim._maybe_file_followup(state, 'ben',
+                                 {'room': 'pressoffice', 'title': 'Review: Build ledger tool',
+                                  'taskType': 'review'}, 1_000_000)
+        self.assertEqual(state['backlogRequests'], [])
+
+    def test_followup_completion_does_not_file(self):
+        # A completed card that was ITSELF a follow-up must not spawn another
+        # follow-up, or the backlog churns self-referential 'Follow-up ... after
+        # completing Follow-up ...' cards (the observed runaway).
+        state = _seed()
+        sim._maybe_file_followup(state, 'ben',
+                                 {'room': 'pressoffice',
+                                  'title': "Follow-up: further pressoffice work after completing 'X'",
+                                  'taskType': 'code'}, 1_000_000)
+        self.assertEqual(state['backlogRequests'], [])
+
+    def test_real_deliverable_still_files(self):
+        # The guard only stops meta-work; a genuine deliverable still files.
+        state = _seed()
+        sim._maybe_file_followup(state, 'ben',
+                                 {'room': 'pressoffice', 'title': 'Build ledger tool', 'taskType': 'code'},
+                                 1_000_000)
+        self.assertEqual(len(state['backlogRequests']), 1)
+
     def test_duplicate_pending_deduped(self):
         state = _seed()
         task = {'room': 'pressoffice', 'title': 'Build ledger tool', 'taskType': 'code'}
