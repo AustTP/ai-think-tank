@@ -726,18 +726,20 @@
 <div id="boardModal" class="modal hidden">
   <div class="modal-box">
     <h3>The Board</h3>
-    <details style="text-align:left;margin-bottom:12px;">
-      <summary>Queue a work order</summary>
+    <details open style="text-align:left;margin-bottom:12px;">
+      <summary>Scrum Master Requests</summary>
+      <p>Queue requests even while the team is busy. The scrum master will groom and schedule them.</p>
       <form id="workOrderForm" onsubmit="submitWorkOrder(event)" style="display:grid;gap:8px;margin-top:8px;">
         <label>Title<input name="title" required maxlength="200" style="width:100%;box-sizing:border-box;"></label>
-        <label>Team<select name="teamId" id="workOrderTeam" required></select></label>
+        <label>Scrum master / team<select name="teamId" id="workOrderTeam" required></select></label>
         <label>Work type<select name="taskType"><option value="research">Research document / plan</option><option value="spike">Exploratory investigation</option><option value="code">Software implementation</option></select></label>
         <label>Instructions<textarea name="instructions" required maxlength="12000" rows="4" style="width:100%;box-sizing:border-box;"></textarea></label>
         <label>What counts as done<textarea name="acceptanceCriteria" maxlength="6000" rows="2" style="width:100%;box-sizing:border-box;"></textarea></label>
-        <button id="workOrderSubmit" type="submit">Queue work order</button>
+        <button id="workOrderSubmit" type="submit">Queue request</button>
       </form>
       <p id="workOrderStatus" role="status"></p>
     </details>
+    <div id="specialistRolesBody" style="text-align:left;margin:12px 0;"></div>
     <div id="workOrdersBody" style="text-align:left;font-size:12px;"></div>
     <div id="boardBody" style="font-size:13px; opacity:0.85; text-align:left;">Nothing scheduled yet.</div>
     <div class="terminal-inputline">
@@ -1972,7 +1974,21 @@ async function submitWorkOrder(event) {
   } finally { btn.disabled = false; }
 }
 
+function renderSpecialistRoles() {
+  const body = document.getElementById('specialistRolesBody');
+  if (!body) return;
+  body.replaceChildren();
+  const title = document.createElement('strong'); title.textContent = 'Specialist roles'; body.appendChild(title);
+  for (const def of AGENT_ROSTER) {
+    const agent = AGENTS[def.id] || def;
+    if (!agent.tradingSpecialist && !agent.dedicatedReviewer && !agent.codeDirector && !def.tradingSpecialist && !def.dedicatedReviewer && !def.codeDirector) continue;
+    const button = document.createElement('button'); button.className = 'roster-item';
+    button.textContent = `${def.name} / ${def.role || agent.role} / ${agent.busy ? 'Working' : 'Available / waiting for assignment'}`;
+    button.addEventListener('click', () => openProfile(def.id)); body.appendChild(button);
+  }
+}
 async function renderWorkOrders() {
+  renderSpecialistRoles();
   try {
     const res = await apiFetch('/api/intent/work-orders');
     if (!res.ok) return;
@@ -1982,14 +1998,14 @@ async function renderWorkOrders() {
     const signature = JSON.stringify(teams);
     if (select.dataset.teams !== signature) {
       const selected = select.value || 'nora';
-      select.replaceChildren(...teams.map(t => new Option(t.name, t.id)));
+      select.replaceChildren(...teams.map(t => new Option(`${t.scrumMaster || 'Scrum master'} / ${t.name}`, t.id)));
       if (teams.some(t => t.id === selected)) select.value = selected;
       select.dataset.teams = signature;
     }
     const esc = s => { const el = document.createElement('div'); el.textContent = s; return el.innerHTML; };
     const orders = (data.orders || []).slice(-10).reverse();
     setBoardSectionHtml(document.getElementById('workOrdersBody'), orders.length
-      ? '<strong>Your work orders</strong>' + orders.map(o => `<div>${esc(o.title)} — ${esc(o.status)} (${esc(o.id)})</div>`).join('')
+      ? '<strong>Your work orders</strong>' + orders.map(o => `<div>${esc(o.title)} — ${esc(o.deliveryStatus || o.status)} (${esc(o.id)})${o.tasks?.length ? ' / ' + o.tasks.map(t => esc(t.assignedTo || 'Unassigned') + ': ' + esc(t.status)).join(', ') : ''}${o.waitingReason ? '<br>' + esc(o.waitingReason) : ''}</div>`).join('')
       : 'No work orders submitted yet.');
   } catch (e) { /* retain the last successful list */ }
 }

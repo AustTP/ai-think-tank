@@ -164,6 +164,27 @@ def advance(state):
                 workflow['phase'] = 'blocked'
                 return
         elif task.get('status') in ('failed', 'blocked', 'cancelled'):
+            errors = (task.get('tradingAcceptance') or {}).get('errors') or []
+            retries = workflow.setdefault('repairAttempts', {}).get(stage, 0)
+            if errors and task.get('status') != 'cancelled' and retries < 2:
+                if not any(q.get('tradingStage') == stage for q in state.get('workQueue') or []):
+                    sim.queue_work(state, [{'title': f'Coinbase spot workflow: {stage} repair {retries + 1}',
+                        'room': 'observatory', 'taskType': 'spike', 'tradingStage': stage,
+                        'assignedTo': OWNERS[stage], 'directRoute': True, 'priority': 'high', 'budgetUsd': 0.50,
+                        'projectLabel': 'Coinbase spot trading', 'acceptanceCriteria': CONTRACTS[stage],
+                        'instructions': stage_instructions(state, stage) + '\nRepair the actual failed checks: '
+                            + '; '.join(errors) + '\nPrevious report: ' + str(task.get('libraryPath') or 'none')}])
+                    workflow['repairAttempts'][stage] = retries + 1
+                    task.update(status='cancelled', manualAttention=False, blockedReason=None,
+                                supersededByAutomaticRepair=True)
+                    sim._queue_player_email(state, 'work_recovery', 'Automatic report repair queued',
+                        f"{task['id']} was blocked because: {'; '.join(errors)}. "
+                        f"{OWNERS[stage]} will repair it (attempt {retries + 1}/2). Acceptance checks remain required.")
+                workflow['phase'] = 'queued'
+                return
+            if task.get('supersededByAutomaticRepair') and any(q.get('tradingStage') == stage for q in state.get('workQueue') or []):
+                workflow['phase'] = 'queued'
+                return
             workflow['phase'] = 'blocked'
             task['manualAttention'] = True
             task['blockedReason'] = 'acceptance_failed'

@@ -50,6 +50,25 @@ class Workflow(unittest.TestCase):
         self.assertEqual(state['tasks']['t']['status'], 'blocked')
         self.assertEqual(state['workQueue'], [])
 
+    def test_failed_manifest_retries_twice_without_approving(self):
+        state = {'tasks': {}, 'workQueue': []}
+        flow.start(state)
+        for attempt in range(3):
+            state['workQueue'] = []
+            task = {'id': f't{attempt}', 'tradingStage': 'research', 'status': 'failed',
+                    'tradingAcceptance': {'accepted': False, 'errors': ['Missing candles.']}}
+            state['tasks'][task['id']] = task
+            flow.advance(state)
+            if attempt < 2:
+                self.assertEqual(len(state['workQueue']), 1)
+                self.assertIn('Missing candles.', state['workQueue'][0]['instructions'])
+                self.assertFalse(task['manualAttention'])
+            else:
+                self.assertEqual(state['workQueue'], [])
+                self.assertTrue(task['manualAttention'])
+        self.assertEqual(state['tradingWorkflow']['stage'], 'research')
+        self.assertEqual(state['tradingWorkflow']['repairAttempts']['research'], 2)
+
     def test_accepted_research_queues_strategy_once_and_supplies_report(self):
         state = {'tasks': {}, 'workQueue': []}
         flow.start(state)

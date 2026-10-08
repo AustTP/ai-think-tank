@@ -481,5 +481,67 @@ class RefinementEventDriven(unittest.TestCase):
         self.assertIn('dev', state.get('pendingRefinements') or {})
 
 
+class PlayerWorkOrderPickup(unittest.TestCase):
+    def _order(self, state):
+        req = sim.file_work_request(state, 'player', 'Research Coinbase liquidity', 'observatory', 'Use actual quotes.')
+        req.update(teamId='dev', origin='player_work_order', taskType='research', acceptanceCriteria='Save sourced findings.')
+        return req
+
+    def test_off_duty_scrum_master_wakes_and_preserves_order_contract(self):
+        state = _seed()
+        state['agents']['ada']['offDuty'] = True
+        req = self._order(state)
+        for now in (1000001, 1000002, 1000003):
+            _step(state, None, now)
+        self.assertEqual(req['status'], 'accepted')
+        self.assertEqual(len(state['workQueue']), 1)
+        queued = state['workQueue'][0]
+        self.assertEqual(queued['workOrderId'], req['id'])
+        self.assertEqual(queued['taskType'], 'research')
+        self.assertIn('Save sourced findings.', queued['instructions'])
+
+    def test_lost_accepted_order_restored_once_and_linked_at_assignment(self):
+        state = _seed()
+        req = self._order(state)
+        req['status'] = 'accepted'
+        sim._reconcile_player_work_orders(state)
+        sim._reconcile_player_work_orders(state)
+        self.assertEqual(len(state['workQueue']), 1)
+        queued = state['workQueue'][0]
+        def assigned(*args):
+            task = {'id': 'picked', 'workOrderId': args[6]['workOrderId'], 'assignedTo': args[1]}
+            state['tasks']['picked'] = task
+            return task
+        with unittest.mock.patch.object(sim, 'assign_task', side_effect=assigned):
+            task = sim._assign_due_item(state, queued, True, [], {}, 1000004)
+        self.assertIsNotNone(task)
+        self.assertEqual(task['workOrderId'], req['id'])
+        state['workQueue'] = []
+        sim._reconcile_player_work_orders(state)
+        self.assertEqual(state['workQueue'], [])
+
+    def test_player_order_groomed_during_active_sprint(self):
+        state = _seed()
+        req = self._order(state)
+        state['sprints'] = {'s': {'id': 's', 'status': 'active', 'teamIds': ['dev'], 'items': []}}
+        for now in (1000001, 1000002, 1000003):
+            _step(state, None, now)
+        self.assertEqual(req['status'], 'accepted')
+        self.assertEqual(state['workQueue'][0]['workOrderId'], req['id'])
+
+    def test_busy_facilitators_defer_without_dropping_order(self):
+        state = _seed()
+        req = self._order(state)
+        state['agents']['ada']['busy'] = True
+        state['agents']['dev']['busy'] = True
+        _step(state, None, 1000001)
+        self.assertEqual(req['status'], 'pending')
+        state['agents']['ada']['busy'] = False
+        for now in (1000002, 1000003, 1000004):
+            _step(state, None, now)
+        self.assertEqual(req['status'], 'accepted')
+        self.assertEqual(len(state['workQueue']), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

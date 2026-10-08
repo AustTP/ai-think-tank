@@ -58,6 +58,8 @@ async function refreshServerState() {
     if (typeof REPORTS !== 'undefined') REPORTS.splice(0, REPORTS.length, ...(saved.reports || []));
     if (typeof nextReportId !== 'undefined' && saved.nextReportId) nextReportId = saved.nextReportId;
     if (typeof AGENT_KEYS !== 'undefined' && saved.agentKeys) AGENT_KEYS = saved.agentKeys;
+    if (typeof renderSpecialistRoles === 'function') renderSpecialistRoles();
+    if (!document.getElementById('rosterListModal')?.classList.contains('hidden') && typeof renderRosterList === 'function') renderRosterList();
   } finally {
     serverStateRefreshing = false;
   }

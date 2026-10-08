@@ -9298,10 +9298,24 @@ async def get_work_orders(request: Request):
     if not _require_player_session(request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     state = get_state_from_db() or {}
-    return JSONResponse({'orders': [r for r in state.get('backlogRequests', [])
-                                    if r.get('origin') == 'player_work_order'],
-                         'teams': [{'id': t['id'], 'name': t.get('name') or t['id']}
-                                   for t in state.get('teams', [])]})
+    orders = []
+    for record in state.get('backlogRequests', []):
+        if record.get('origin') != 'player_work_order':
+            continue
+        order = dict(record)
+        tasks = [t for t in (state.get('tasks') or {}).values() if t.get('workOrderId') == record['id']]
+        queued = any(q.get('workOrderId') == record['id'] for q in state.get('workQueue', []))
+        order['tasks'] = [{'id': t['id'], 'status': t.get('status'), 'assignedTo': t.get('assignedTo')} for t in tasks]
+        order['deliveryStatus'] = tasks[-1].get('status') if tasks else 'queued' if queued else record.get('status')
+        if record.get('status') == 'pending':
+            team_id = record.get('teamId')
+            order['waitingReason'] = ('Scrum master is grooming this request.' if team_id in state.get('pendingRefinements', {})
+                                      else 'Waiting for an available scrum master or director to groom the request.')
+        orders.append(order)
+    return JSONResponse({'orders': orders,
+                         'teams': [{'id': t['id'], 'name': t.get('name') or t['id'],
+                                    'scrumMaster': (state.get('agents', {}).get(t.get('scrumMasterId')) or {}).get('name') or t.get('scrumMasterId')}
+                                   for t in state.get('teams', []) if t.get('scrumMasterId')]})
 
 
 @app.post('/api/intent/work-orders')
@@ -9322,21 +9336,22 @@ async def queue_work_order(request: Request):
     if fields['taskType'] not in ('research', 'code', 'spike'):
         return JSONResponse({'error': 'Choose research, software implementation, or investigation.'}, status_code=400)
     import sim
-    state = get_state_from_db()
-    if not state:
-        return JSONResponse({'error': 'State unavailable.'}, status_code=503)
-    if not sim._team_row(state, fields['teamId']):
-        return JSONResponse({'error': 'Choose an existing team.'}, status_code=400)
-    room = 'pressoffice' if fields['taskType'] == 'code' else 'observatory'
-    order = sim.file_work_request(state, 'player', fields['title'], room, reason=fields['instructions'])
-    if not order:
-        return JSONResponse({'error': 'An order with this title is already awaiting grooming.'}, status_code=409)
-    order.update(teamId=fields['teamId'], taskType=fields['taskType'],
-                 acceptanceCriteria=fields['acceptanceCriteria'], origin='player_work_order')
-    sim.kick_refinement_now(state, fields['teamId'])
-    save_state_to_db(state)
-    log_action('player', 'work_order_queued', {'id': order['id'], 'teamId': fields['teamId']}, authorized=True)
-    return JSONResponse({'ok': True, 'order': order}, status_code=201)
+    with _STATE_UPDATE_LOCK:
+        state = get_state_from_db()
+        if not state:
+            return JSONResponse({'error': 'State unavailable.'}, status_code=503)
+        if not sim._team_row(state, fields['teamId']):
+            return JSONResponse({'error': 'Choose an existing team.'}, status_code=400)
+        room = 'pressoffice' if fields['taskType'] == 'code' else 'observatory'
+        order = sim.file_work_request(state, 'player', fields['title'], room, reason=fields['instructions'])
+        if not order:
+            return JSONResponse({'error': 'An order with this title is already awaiting grooming.'}, status_code=409)
+        order.update(teamId=fields['teamId'], taskType=fields['taskType'],
+                     acceptanceCriteria=fields['acceptanceCriteria'], origin='player_work_order')
+        sim.kick_refinement_now(state, fields['teamId'])
+        save_state_to_db(state)
+        log_action('player', 'work_order_queued', {'id': order['id'], 'teamId': fields['teamId']}, authorized=True)
+        return JSONResponse({'ok': True, 'order': order}, status_code=201)
 
 
 @app.get('/api/intent/issues')

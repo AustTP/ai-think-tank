@@ -1941,6 +1941,16 @@ def _apply_content_result(state, task, result, now_ms=None):
             verdict = result.get('peerVerdict')
             reviewer = task.get('assignedTo')
             gate = parent['_peerGate']
+            if result.get('reviewFormatError'):
+                failures = gate['formatFailures'] = gate.get('formatFailures', 0) + 1
+                _queue_player_email(state, 'work_recovery', 'Review response could not be parsed',
+                    f"{task['id']} returned no valid verdict after a format retry. No rejection or approval was recorded. "
+                    + ('Another independent reviewer will be assigned.' if failures < 3 else 'Three review attempts failed; model configuration needs attention.'))
+                if failures >= 3:
+                    gate['escalated'] = True
+                    parent.update(manualAttention=True, blockedReason='review_model_response',
+                                  failNote='Three reviewers returned invalid verdicts after format retries; check the review model.')
+                return
             if (task.get('taskType') in ('review', 'qa') and task.get('createdAt')
                     and task['createdAt'] < (gate.get('enteredMs') or 0)):
                 return  # vote belongs to the previous artifact, before its repair
@@ -2257,6 +2267,7 @@ def queue_work(state, items):
             # a whitelist that silently drops a field its consumer needs.
             'userStory': item.get('userStory') or None,
             'acceptanceCriteria': item.get('acceptanceCriteria') or None,
+            'workOrderId': item.get('workOrderId'),
             'pair': bool(item.get('pair')),
             'notBefore': item.get('notBefore') or None,
             'priority': normalize_priority(item.get('priority')),
@@ -3884,6 +3895,7 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         # task.instructions).
         'userStory': (extra or {}).get('userStory'),
         'acceptanceCriteria': (extra or {}).get('acceptanceCriteria'),
+        'workOrderId': (extra or {}).get('workOrderId'),
         'pipelineStep': (extra or {}).get('pipelineStep'),
         # Bot Ops / shadow mode: a dry-run task (see queue_work). Stamped so the
         # completion path (_task_cycle) captures to the shadow ledger instead of
@@ -5598,6 +5610,15 @@ def _sweep_stuck_gates(state, now_ms):
         gate = task.get('_peerGate')
         if not gate or task.get('status') != 'needs_review':
             continue
+        if (gate.get('escalated') and not gate.get('legacyFormatRecovered')
+                and task.get('failNote') == 'The document review did not produce a valid verdict; no approval recorded.'):
+            gate.update(escalated=False, legacyFormatRecovered=True, cycleCount=0, noProgressCount=0,
+                        formatFailures=0, lastFailureFingerprint=None, enteredMs=now_ms)
+            task.update(manualAttention=False, blockedReason=None, failNote=None)
+            _reenter_gate_review(state, task, gate.get('reviewerIds') or [])
+            _queue_player_email(state, 'work_recovery', 'Retrying a review blocked by invalid output',
+                f"{task['id']} was frozen because the reviewer returned no valid verdict. "
+                'The review will run again with format correction; no approval has been granted.')
         if gate.get('escalated'):
             continue  # frozen -- _maybe_escalate_stuck_gate already notified the player
         entered = gate.get('enteredMs') or 0
@@ -6907,6 +6928,23 @@ def _social_step(state, now, now_ms, decider=None):
 # Desk-tested cadence stamps: a stale TEST sentinel far in the future (e.g.
 # 1e18) must not permanently silence the ceremony -- same rule as the skill-
 # review sweep and the Social (handled inside _refinement_cadence_due_for).
+
+def _reconcile_player_work_orders(state):
+    """Restore accepted player orders lost from the assignment queue, once."""
+    for req in state.get('backlogRequests') or []:
+        if req.get('origin') != 'player_work_order' or req.get('status') != 'accepted':
+            continue
+        order_id = req['id']
+        if any(t.get('workOrderId') == order_id for t in (state.get('tasks') or {}).values()):
+            continue
+        if any(q.get('workOrderId') == order_id for q in state.get('workQueue') or []):
+            continue
+        queue_work(state, [{'title': req['title'], 'room': req['room'], 'teamId': req.get('teamId'),
+            'workOrderId': order_id, 'taskType': req.get('taskType') or 'research',
+            'acceptanceCriteria': req.get('acceptanceCriteria'), 'budgetUsd': req.get('budgetUsd'),
+            'instructions': str(req.get('reason') or '') + '\nAcceptance criteria: '
+                + str(req.get('acceptanceCriteria') or 'As specified.')}])
+
 
 def _pending_work_requests(state):
     """Pending (not-yet-groomed) work-requests a refinement ceremony will read."""
@@ -8269,7 +8307,7 @@ def _ceremony_facilitator(state, team_id):
             return groomer if _free(groomer) else None
     sm = _refinement_scrum_master_for_team(state, team_id)
     team = teams.get(team_id) or {}
-    if sm and team.get('autoSprints'):
+    if sm:
         a = agents.get(sm) or {}
         needs_grooming = any((_refinement_team(state, r) or {}).get('id') == team_id
                              for r in _pending_work_requests(state))
@@ -8469,6 +8507,11 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
             {'id': 'accept_generous', 'description': f"Create '{req.get('title')}' as a real story in {req.get('room')} -- it's a genuine, well-scoped, HIGH-VALUE gap worth a card AND a generous spend budget (a bigger investigation or deliverable than the standard card)."},
             {'id': 'reject', 'description': "Groom this request out -- it's a duplicate, low-value, trivial/filler, over-ambitious/un-scoped, out-of-scope, or the roadmap already covers it."},
         ]
+        if req.get('origin') == 'player_work_order':
+            instructions += (' This is an explicit player request, not an agent suggestion. '
+                             'Groom it for execution against its instructions and acceptance criteria; '
+                             'do not reject it merely because it is outside the current research roadmap. '
+                             'Acceptance criteria: ' + str(req.get('acceptanceCriteria') or 'As specified.'))
         choice = decider(instructions, criteria)
         if choice is None:
             # Outage fallback: accept only a request that names a real
@@ -8518,6 +8561,7 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
                 depends_on = linked_issue['dependsOnTask']
             queue_work(state, [{
                 'title': req['title'], 'room': req['room'], 'goal': req.get('title'),
+                'workOrderId': req['id'] if req.get('origin') == 'player_work_order' else None,
                 'instructions': instructions,
                 'teamId': req.get('teamId'),
                 'userStory': story,
@@ -8643,7 +8687,9 @@ def _refinement_step(state, now, now_ms, decider=None):
         facilitator = _ceremony_facilitator(state, team_id)
         if not facilitator:
             continue  # this team has no free+on-duty facilitator right now
-        if _team_in_active_sprint(state, team_id):
+        player_intake = any(r.get('origin') == 'player_work_order' and r.get('teamId') == team_id
+                            for r in _pending_work_requests(state))
+        if _team_in_active_sprint(state, team_id) and not player_intake:
             # WS-14: a team in an active sprint refines at CLOSE, never
             # mid-sprint -- the sprint is the committed work.
             continue
@@ -10700,6 +10746,8 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # being parked-idle in this same tick before she can process it).
     _mail_action_step(state, now, now_ms)
 
+    _reconcile_player_work_orders(state)
+
     # Frozen gates must not leave automatic repairs queued indefinitely.
     state['workQueue'] = [it for it in (state.get('workQueue') or [])
                           if not (((state.get('tasks') or {}).get(it.get('reviewOf')) or {})
@@ -10960,7 +11008,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         # must be woken to staff the sprint even when the generic wake rule
         # would otherwise keep the think tank thin.
         _pinned_review = bool(pick.get('reviewOf') or pick.get('sprintId'))
-        can_wake_off_duty = (_pinned_review or bool(pick.get('notBefore')) or _awake_idle_count(state) == 0) \
+        can_wake_off_duty = (_pinned_review or bool(pick.get('workOrderId')) or bool(pick.get('notBefore')) or _awake_idle_count(state) == 0) \
             and can_activate_another(state)
         if _awake_idle_count(state) == 0 and not (can_wake_off_duty and _any_available_including_off_duty(state)):
             break  # nobody who could take this right now, of any kind
@@ -10975,7 +11023,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
             # Sprint staffing: a sprint card is STRICTLY staffed -- it waits
             # (forever, if need be) for a member of its chosen pool to free up
             # and is never shed to the think-tank-wide fallback or abandoned.
-            if pick.get('reviewOf') or pick.get('sprintId') \
+            if pick.get('reviewOf') or pick.get('sprintId') or pick.get('workOrderId') \
                     or pick['attempts'] < WORK_ITEM_MAX_ATTEMPTS:
                 work_queue.append(pick)
             else:
@@ -11449,6 +11497,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         appear_from_outskirts(state, chosen_id, doors)
     extra = {
         'research': pick.get('research'),
+        'workOrderId': pick.get('workOrderId'),
         'sprintId': pick.get('sprintId'),
         'teamId': pick.get('teamId'),
         'taskType': pick.get('taskType'),
