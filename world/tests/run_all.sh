@@ -201,6 +201,9 @@ python3 tests/test_full_lifecycle.py
 echo
 echo "== Python: adversarial (winter) village -- toggle, both-side delivery, drain/disable =="
 python3 tests/test_adversarial_village.py
+echo
+echo "== Python: village isolation -- library/sandbox/agent-file scoping =="
+python3 tests/test_village_isolation.py
 
 # NOTE: test_visual_regression.py is NOT run here. Every test above is a pure-
 # function test with no live server/DB/browser (hermetic, per test_bank.py's

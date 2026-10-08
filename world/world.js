@@ -185,9 +185,10 @@ function writeLibraryFile(agentId, path, content, source = 'firsthand') {
 // client function of its own. Needed so a real update (not just a fresh
 // write) can see what's already there first -- e.g. an existing skill
 // file, before deciding what's actually new.
-async function readLibraryFile(path) {
+async function readLibraryFile(path, agentId) {
   try {
-    const res = await apiFetch('/api/library/file?path=' + encodeURIComponent(path));
+    const q = '?path=' + encodeURIComponent(path) + (agentId ? '&requesterId=' + encodeURIComponent(agentId) : '');
+    const res = await apiFetch('/api/library/file' + q);
     if (!res.ok) return null;
     const data = await res.json();
     return data.content || null;
@@ -199,10 +200,12 @@ async function readLibraryFile(path) {
 // A plain listing (serve.py's GET /api/library, already backing the
 // Library browser UI in index.html) -- needed so a skill-review sweep can
 // see what's actually sitting in pending_review/skills/ without already
-// knowing every filename in advance.
-async function listLibraryFiles() {
+// knowing every filename in advance. Pass `agentId` to scope the listing
+// to that agent's own village (player/UI reads all).
+async function listLibraryFiles(agentId) {
   try {
-    const res = await apiFetch('/api/library');
+    const q = agentId ? '?requesterId=' + encodeURIComponent(agentId) : '';
+    const res = await apiFetch('/api/library' + q);
     if (!res.ok) return [];
     const data = await res.json();
     return data.files || [];
@@ -280,7 +283,7 @@ function writeSkillFile(agentId, name, content, source = 'firsthand') {
 // failure -- a failed search shouldn't block whatever task triggered it.
 async function searchLibraryFiles(agentId, query) {
   try {
-    const res = await agentFetch('/api/library/search?q=' + encodeURIComponent(query), agentId);
+    const res = await agentFetch('/api/library/search?q=' + encodeURIComponent(query) + '&requesterId=' + encodeURIComponent(agentId), agentId);
     const data = await res.json();
     return data.matches || [];
   } catch (e) {

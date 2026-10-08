@@ -202,7 +202,7 @@ class LibraryTrailReinforcement(unittest.TestCase):
     def test_read_library_file_endpoint_records_a_trail_read(self):
         self._write('found.md', 'a real finding')
         with unittest.mock.patch.object(serve, 'record_library_read') as record:
-            result = asyncio.run(serve.read_library_file('found.md'))
+            result = asyncio.run(serve.read_library_file('found.md', None))
         self.assertEqual(json.loads(result.body)['content'], 'a real finding')
         record.assert_called_once_with('found.md')
 
@@ -3898,7 +3898,7 @@ class RemainingExecutors(unittest.TestCase):
                 return '_raw = saved'
             if path == '/api/library/promote' or path == '/api/library/reject':
                 return {'ok': True, 'path': (body or {}).get('path')}
-            if path == '/api/library':
+            if path.split('?')[0] == '/api/library':
                 return {'files': kw.get('library_files', [])}
             if path == '/api/pipeline':
                 return {'ok': pipeline_ok, 'failedStep': kw.get('pipeline_failed_step')}

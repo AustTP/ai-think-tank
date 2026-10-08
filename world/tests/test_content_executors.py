@@ -352,7 +352,7 @@ class SkillReviewContent(_ExecutorTestCase):
         _base_mocks()
         calls = {'reject': 0, 'promote': 0, 'reject_call': 0}
         def side_effect(method, base, path, body=None, header=None, timeout=30):
-            if path == '/api/library':
+            if path.split('?')[0] == '/api/library':
                 return {'files': listing_files}
             if path.startswith('/api/library/file?'):
                 return file_content
@@ -403,7 +403,7 @@ class SkillReviewContent(_ExecutorTestCase):
         seen = _store()
         _base_mocks()
         def side_effect(method, base, path, body=None, header=None, timeout=30):
-            if path == '/api/library':
+            if path.split('?')[0] == '/api/library':
                 return {'files': [{'path': 'pending_review/skills/a.md'}]}
             if path.startswith('/api/library/file?'):
                 return {'content': 'skill'}

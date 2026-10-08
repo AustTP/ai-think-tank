@@ -2300,13 +2300,13 @@ async function runWorkroomTask(agentId, task) {
 const SKILL_REVIEW_MAX_PER_SWEEP = 5;
 
 async function runSkillReviewTask(agentId) {
-  const files = await listLibraryFiles();
-  const pending = files.filter(f => f.path.startsWith('pending_review/skills/')).slice(0, SKILL_REVIEW_MAX_PER_SWEEP);
+  const files = await listLibraryFiles(agentId);
+  const pending = files.filter(f => f.path.includes('pending_review/skills/')).slice(0, SKILL_REVIEW_MAX_PER_SWEEP);
   if (pending.length === 0) return 'Checked for pending skill files -- nothing waiting right now.';
 
   let kept = 0, rejected = 0;
   for (const f of pending) {
-    const content = await readLibraryFile(f.path);
+    const content = await readLibraryFile(f.path, agentId);
     if (!content) continue; // genuinely unreadable -- leave it for a later sweep rather than guessing
     const verdict = (await requestJevChoice(
       `A candidate skill-reference file is waiting for review. Its content: "${content.slice(0, 1500)}" Is this accurate and genuinely useful as real reference material for future work, or should it be discarded?`,
@@ -2373,7 +2373,7 @@ async function runResearchTask(agentId, task) {
         for (const p of crawl.pages) {
           if (!topic.seenUrls.includes(p.url)) topic.seenUrls.push(p.url);
         }
-        const existingContent = await readLibraryFile(`skills/${skillSlug(topic.topic)}.md`);
+        const existingContent = await readLibraryFile(`skills/${skillSlug(topic.topic)}.md`, agentId);
         const tier = await pickModelTierForAction(a, `update the "${topic.topic}" skill file from freshly collected research`);
         const sourcesText = crawl.pages.map(p => `### ${p.url}\n${(p.text || '').slice(0, 3000)}`).join('\n\n');
         let updated = null;

@@ -920,9 +920,10 @@ class LibraryReviewTools(unittest.TestCase):
         matches = [{'path': 'archive/1-spike-x.md', 'snippet': 'WebRTC works for 1:1...',
                    'modified': 1.0, 'size': 240}]
         executor = content._make_library_tools_executor('cora')
-        with unittest.mock.patch.object(serve, '_library_search_matches', return_value=matches) as search:
+        with unittest.mock.patch.object(serve, '_library_search_matches', return_value=matches) as search, \
+             unittest.mock.patch.object(serve, '_requester_villages', return_value={'main'}):
             out = executor('search_library', {'query': 'webrtc'})
-        search.assert_called_once_with('webrtc')
+        search.assert_called_once_with('webrtc', allowed={'main'})
         self.assertIn('archive/1-spike-x.md', out)
         self.assertIn('240 bytes', out)
         self.assertIn('WebRTC works for 1:1', out)
