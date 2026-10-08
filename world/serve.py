@@ -3648,7 +3648,7 @@ def _backfill_directors_in_db():
     backfill_map = _director_backfill_map()
     changed = False
     for d in roster:
-        if d.get('dedicatedReviewer') or d.get('codeDirector') or d.get('tradingSpecialist'):
+        if d.get('dedicatedReviewer') or d.get('codeDirector') or d.get('tradingSpecialist') or (d.get('taskMaster') or d.get('librarian')):
             continue
         aid = d.get('id')
         is_admin = aid in admin_ids
@@ -4087,6 +4087,8 @@ import coinbase_spot
 app.include_router(coinbase_spot.router_for(sys.modules[__name__]))
 import blocker_control
 app.include_router(blocker_control.router_for(sys.modules[__name__]))
+import company_planning
+app.include_router(company_planning.router_for(sys.modules[__name__]))
 
 
 def _load_env():
@@ -5443,7 +5445,16 @@ def _read_openrouter_response(req):
     Retry once, excluding the failed provider while preserving the model,
     messages, tool definitions, and token ceiling.
     """
-    result = json.loads(_urlopen_with_resilience(req, timeout=30))
+    def read_response(request):
+        try:
+            return json.loads(_urlopen_with_resilience(request, timeout=30))
+        except urllib.error.HTTPError as error:
+            if error.code != 429 and error.code < 500:
+                raise
+            return {'error':{'code':error.code,'message':'Provider HTTP request failed'}}
+        except (urllib.error.URLError, TimeoutError) as error:
+            return {'error':{'message':_redact_secrets(str(error))[:300]}}
+    result = read_response(req)
     def failed(data):
         return bool(data.get('error') or not data.get('choices') or
                     any(c.get('finish_reason') == 'error' for c in data.get('choices', [])))
@@ -5452,20 +5463,50 @@ def _read_openrouter_response(req):
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError('Provider returned an error and the spend cap prevents a retry')
     body = json.loads(req.data)
+    original_model = body.get('model')
+    fallback = None
+    if original_model == 'meta-llama/llama-3.1-70b-instruct':
+        fallback = _load_env().get('OPENROUTER_LLAMA_FALLBACK_MODEL','mistralai/mistral-nemo').strip()
+        if fallback == original_model or (fallback and is_model_circuit_broken(fallback)):
+            fallback = None
+    if fallback:
+        body['model'] = fallback
+        # Provider preferences for the failing model may not serve the fallback.
+        body.pop('provider',None)
+        body['reasoning'] = {'enabled':False}
     provider = result.get('provider')
-    if isinstance(provider, str) and provider:
+    if not fallback and isinstance(provider, str) and provider:
         routing = dict(body.get('provider') or {})
         routing['ignore'] = list(routing.get('ignore') or []) + [re.sub(r'[^a-z0-9]+', '-', provider.lower())]
         body['provider'] = routing
     retry = urllib.request.Request(req.full_url, data=json.dumps(body).encode(),
                                    headers=dict(req.header_items()), method='POST')
-    recovered = json.loads(_urlopen_with_resilience(retry, timeout=30))
+    recovered = read_response(retry)
     if failed(recovered):
-        raise RuntimeError('Model provider failed to produce a completion after one retry')
+        def explanation(data):
+            error = data.get('error') or {}
+            if isinstance(error, dict):
+                message = str(error.get('message') or 'No provider explanation returned')
+                code = error.get('code')
+                if code is not None:
+                    message = f'{code}: {message}'
+            else:
+                message = str(error)
+            if not data.get('error'):
+                message = ('No completion choices returned' if not data.get('choices')
+                           else 'Completion ended with finish_reason=error')
+            return _redact_secrets(message)[:600]
+        details = (f"model={body.get('model') or 'unspecified'}, "
+                   f"first provider={result.get('provider') or 'unspecified'}: {explanation(result)}; "
+                   f"retry provider={recovered.get('provider') or 'unspecified'}: {explanation(recovered)}")
+        raise RuntimeError('Model provider failed to produce a completion after one retry. ' + details)
     first_cost = (result.get('usage') or {}).get('cost', 0)
     if isinstance(first_cost, (int, float)) and first_cost:
         usage = recovered.setdefault('usage', {})
         usage['cost'] = float(usage.get('cost') or 0) + first_cost
+    if fallback:
+        recovered['fallbackFrom'] = original_model
+        recovered['fallbackModel'] = fallback
     return recovered
 
 
@@ -5473,7 +5514,12 @@ def _call_openrouter_once_sync(model, messages, max_tokens):
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if is_model_circuit_broken(model):
-        raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
+        fallback = (_load_env().get('OPENROUTER_LLAMA_FALLBACK_MODEL', 'mistralai/mistral-nemo').strip()
+                    if model == 'meta-llama/llama-3.1-70b-instruct' else None)
+        if fallback and fallback != model and not is_model_circuit_broken(fallback):
+            model = fallback
+        else:
+            raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
     # Keep reasoning for the tiers that benefit from it (coding, high, and mid --
     # the JEV gate now escalates mid for judgment calls, so it earns the same
     # reasoning), but CAP it to half the request budget so the visible answer
@@ -5500,7 +5546,11 @@ def _call_openrouter_once_sync(model, messages, max_tokens):
     except Exception:
         record_model_result(model, success=False)
         raise
-    record_model_result(model, success=True)
+    if result.get('fallbackModel'):
+        record_model_result(model, success=False)
+        record_model_result(result['fallbackModel'], success=True)
+    else:
+        record_model_result(model, success=True)
     return result
 
 
@@ -5535,7 +5585,12 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if is_model_circuit_broken(model):
-        raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
+        fallback = (_load_env().get('OPENROUTER_LLAMA_FALLBACK_MODEL', 'mistralai/mistral-nemo').strip()
+                    if model == 'meta-llama/llama-3.1-70b-instruct' else None)
+        if fallback and fallback != model and not is_model_circuit_broken(fallback):
+            model = fallback
+        else:
+            raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
     body = {'model': model, 'messages': messages}
     if tools is not None:
         body['tools'] = tools
@@ -5557,7 +5612,11 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     except Exception:
         record_model_result(model, success=False)
         raise
-    record_model_result(model, success=True)
+    if result.get('fallbackModel'):
+        record_model_result(model, success=False)
+        record_model_result(result['fallbackModel'], success=True)
+    else:
+        record_model_result(model, success=True)
     return result
 
 
@@ -7992,6 +8051,8 @@ async def get_state():
 @app.post('/api/state')
 async def post_state(request: Request):
     data = await request.json()
+    if not isinstance(data, dict):
+        return JSONResponse({'error':'State must be a JSON object.'},status_code=400)
     data.pop('agentKeys', None)  # never persist keys back into the state blob itself -- agent_keys table is the one source of truth
     # The client autosave (agents.js saveState) rebuilds the state blob from a
     # fixed client-owned field list every 5s, so server-owned keys it doesn't
@@ -8001,8 +8062,9 @@ async def post_state(request: Request):
     # client always sends the game fields (agents/roster/reports/...), so those
     # are replaced exactly as before; only truly server-owned keys survive, and
     # a brand-new server field never needs a client change to stop vanishing.
-    data = _merge_server_owned(get_state_from_db() or {}, data)
-    save_state_to_db(data)
+    with _STATE_UPDATE_LOCK:
+        data = _merge_server_owned(get_state_from_db() or {}, data)
+        save_state_to_db(data)
     # Not logged -- this fires every 5s from the client's own autosave
     # timer (agents.js), and a heartbeat isn't an "action" worth an
     # audit-log row. Real actions (chat, browse, execute, hire, fire,
@@ -8041,6 +8103,12 @@ def _merge_server_owned(existing, incoming):
     for key, value in existing.items():
         if key not in merged:
             merged[key] = value
+    # Company direction is authored through the player-only North Star route.
+    for key in ('northStar','northStarHistory'):
+        if key in existing:
+            merged[key] = existing[key]
+        else:
+            merged.pop(key,None)
     # Server-ownership defense: if the existing state already marked the server
     # as the movement owner, the incoming autosave's agent POSITIONS must not
     # overwrite the server's -- that's the whole point of the flip (the server
@@ -8071,7 +8139,7 @@ def _merge_server_owned(existing, incoming):
         # The client still sends `workQueue`, but a stale copy must not clobber
         # the server's mid-cycle edits -- the server's queue + task map win
         # when they exist.
-        for k in ('workQueue', 'tasks', 'taskCounter', 'researchTopics', 'reports', 'nextReportId'):
+        for k in ('workQueue', 'tasks', 'taskCounter', 'researchTopics', 'reports', 'nextReportId', 'backlogRequests', 'taskMasterControl'):
             if k in existing:
                 merged[k] = existing[k]
         # Phase 4: governance (auto-hire / auto-firing review) is a server
@@ -9305,8 +9373,22 @@ async def get_work_orders(request: Request):
         order = dict(record)
         tasks = [t for t in (state.get('tasks') or {}).values() if t.get('workOrderId') == record['id']]
         queued = any(q.get('workOrderId') == record['id'] for q in state.get('workQueue', []))
-        order['tasks'] = [{'id': t['id'], 'status': t.get('status'), 'assignedTo': t.get('assignedTo')} for t in tasks]
+        order['tasks'] = [{'id': t['id'], 'title':t.get('title'), 'status': t.get('status'), 'assignedTo': t.get('assignedTo'), 'storyId':t.get('workOrderStoryId')} for t in tasks]
         order['deliveryStatus'] = tasks[-1].get('status') if tasks else 'queued' if queued else record.get('status')
+        if record.get('plan'):
+            active_statuses = {t.get('status') for t in tasks}
+            if active_statuses.intersection({'working','walking'}): order['deliveryStatus'] = 'working'
+            elif active_statuses.intersection({'failed','blocked'}): order['deliveryStatus'] = 'blocked'
+            elif 'needs_review' in active_statuses: order['deliveryStatus'] = 'needs_review'
+            elif queued: order['deliveryStatus'] = 'queued'
+            else:
+                completed_ids = {t.get('workOrderStoryId') for t in tasks if t.get('status')=='done'}
+                expected_ids = {story['id'] for story in record['plan']['stories']}
+                order['deliveryStatus'] = 'done' if expected_ids and expected_ids <= completed_ids else record.get('status')
+        if record.get('status') in ('planning','needs_input','superseded'):
+            order['deliveryStatus'] = record['status']
+        elif not record.get('plan') and tasks and all(t.get('status') == 'done' for t in tasks) and not queued:
+            order['deliveryStatus'] = 'done'
         if record.get('status') == 'pending':
             team_id = record.get('teamId')
             order['waitingReason'] = ('Scrum master is grooming this request.' if team_id in state.get('pendingRefinements', {})
@@ -9536,18 +9618,24 @@ async def respond_player_inbox(message_id: str, request: Request):
     except Exception:
         return JSONResponse({'error': 'malformed body'}, status_code=400)
     import sim as _sim
-    state = get_state_from_db()
-    if not state:
-        return JSONResponse({'error': 'state unavailable'}, status_code=503)
-    answer = (body.get('answer') or '').strip()
-    if not answer:
-        return JSONResponse({'error': 'answer is required'}, status_code=400)
-    m = _sim.resolve_player_ask(state, message_id, answer)
-    save_state_to_db(state)
-    if not m:
-        return JSONResponse({'error': 'unknown or already-answered message'}, status_code=404)
-    log_action('player', 'player_inbox_respond', {'messageId': message_id}, authorized=True)
-    return JSONResponse({'ok': True, 'message': m})
+    with _STATE_UPDATE_LOCK:
+        state = get_state_from_db()
+        if not state:
+            return JSONResponse({'error': 'state unavailable'}, status_code=503)
+        answer = (body.get('answer') or '').strip()
+        if not answer:
+            return JSONResponse({'error': 'answer is required'}, status_code=400)
+        planned_message = next((m for m in state.get('playerInbox') or [] if m.get('id') == message_id and m.get('kind') == 'work_order_question'), None)
+        if planned_message:
+            company_planning.answer(state, planned_message['workOrderId'], planned_message['questionId'], answer)
+            m = planned_message
+        else:
+            m = _sim.resolve_player_ask(state, message_id, answer)
+        save_state_to_db(state)
+        if not m:
+            return JSONResponse({'error': 'unknown or already-answered message'}, status_code=404)
+        log_action('player', 'player_inbox_respond', {'messageId': message_id}, authorized=True)
+        return JSONResponse({'ok': True, 'message': m})
 
 
 @app.post('/api/player-email/credential')
@@ -14974,7 +15062,7 @@ async def _review_guidance_response(request, state, task_id, esc_id=None):
     if request.method == 'GET':
         masters = {t.get('scrumMasterId') for t in state.get('teams', [])}
         agents = {d['id']: d for d in state.get('agentRoster', [])
-                  if not d.get('isAdmin') and not d.get('dedicatedReviewer') and d['id'] not in masters}
+                  if not d.get('isAdmin') and not (d.get('taskMaster') or d.get('librarian')) and not d.get('dedicatedReviewer') and d['id'] not in masters}
         return HTMLResponse(guidance.render_form(task, str(request.url), agents))
     escalations = _load_escalations()
     matching_ids = {eid for eid, e in escalations.items()

@@ -20,11 +20,26 @@ def state():
                             'taskType': 'code', 'assignedTo': 'ben', 'teamId': 'team',
                             '_peerGate': {'escalated': True, 'cycleCount': 8}}},
             'agentRoster': [{'id': 'ben', 'director': 'team'}, {'id': 'ada', 'director': 'team'}],
-            'agents': {'ben': {}, 'ada': {}}, 'workQueue': [],
+            'agents': {'ben': {}, 'ada': {}, 'sm': {}}, 'workQueue': [],
             'teams': [{'id': 'team', 'directorId': 'team', 'scrumMasterId': 'sm'}]}
 
 
 class Guidance(unittest.TestCase):
+    def test_retry_queues_runnable_repair_and_clears_stale_blocker(self):
+        s=state();t=s['tasks']['t']
+        t.update(boardClearedAt=1,failNote='Old failure',blockedReason='code_director_check',
+                 _codeDirectorPending=True,projectLabel='project')
+        result=guidance.apply_guidance(s,'t',{'action':'retry','guidance':'Correct imports'})
+        self.assertEqual(result['status'],'repairing')
+        self.assertNotIn('failNote',t)
+        self.assertNotIn('boardClearedAt',t)
+        self.assertNotIn('_codeDirectorPending',t)
+        q=s['workQueue'][0]
+        self.assertTrue(q['directRoute'])
+        self.assertTrue(q['taskMasterWork'])
+        self.assertEqual(q['projectLabel'],'project')
+        self.assertIn('Correct imports',q['instructions'])
+
     def test_stuck_review_communication_includes_cause_evidence_and_next_step(self):
         s = state()
         task = s['tasks']['t']
@@ -118,13 +133,24 @@ class Guidance(unittest.TestCase):
                 if action == 'split':
                     self.assertEqual(len(s['backlogRequests']), 2)
                 if action == 'research':
-                    self.assertEqual(s['backlogRequests'][0]['taskType'], 'spike')
+                    self.assertEqual(s['workQueue'][0]['taskType'], 'spike')
+                    self.assertEqual(s['workQueue'][0]['assignedTo'], 'sm')
+                    self.assertEqual(s['tasks']['t']['status'], 'investigating')
+                    self.assertFalse(s['tasks']['t']['manualAttention'])
+
+    def test_research_without_guidance_routes_to_scrum_master(self):
+        s = state()
+        result = guidance.apply_guidance(s, 't', {'action':'research'})
+        self.assertEqual(result['status'], 'investigating')
+        self.assertEqual(s['tasks']['t']['assignedTo'], 'sm')
+        self.assertEqual(s['workQueue'][0]['investigationOf'], 't')
+        self.assertFalse(s['tasks']['t']['_peerGate']['escalated'])
 
     def test_invalid_retry_does_not_mutate_state(self):
         s = state()
         original = copy.deepcopy(s)
         with self.assertRaises(ValueError):
-            guidance.apply_guidance(s, 't', {'action': 'retry'})
+            guidance.apply_guidance(s, 't', {'action': 'edit_scope'})
         self.assertEqual(s, original)
 
     def test_repeated_error_stops_after_two_attempts(self):

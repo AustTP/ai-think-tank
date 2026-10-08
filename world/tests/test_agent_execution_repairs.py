@@ -12,6 +12,25 @@ import serve
 
 
 class ExecutionRepairs(unittest.TestCase):
+    def test_llama_failure_uses_fallback_and_preserves_tools_and_budget(self):
+        payload={'model':'meta-llama/llama-3.1-70b-instruct','max_tokens':500,
+                 'messages':[{'role':'user','content':'test'}],'tools':[{'type':'function'}]}
+        req=urllib.request.Request('https://openrouter.ai/api/v1/chat/completions',data=json.dumps(payload).encode())
+        failure={'error':{'message':'Unavailable'},'usage':{'cost':0.01}}
+        success={'choices':[{'finish_reason':'stop','message':{'content':'OK'}}],'usage':{'cost':0.02}}
+        with patch.object(serve,'_urlopen_with_resilience',side_effect=[json.dumps(failure),json.dumps(success)]) as post, \
+             patch.object(serve,'_think_tank_spend_cap_exceeded',return_value=False), \
+             patch.object(serve,'is_model_circuit_broken',return_value=False), \
+             patch.object(serve,'_load_env',return_value={}):
+            result=serve._read_openrouter_response(req)
+            retry=json.loads(post.call_args_list[1].args[0].data)
+        self.assertEqual(retry['model'],'mistralai/mistral-nemo')
+        self.assertEqual(retry['tools'],payload['tools'])
+        self.assertEqual(retry['messages'],payload['messages'])
+        self.assertEqual(retry['max_tokens'],500)
+        self.assertAlmostEqual(result['usage']['cost'],0.03)
+        self.assertEqual(result['fallbackFrom'],payload['model'])
+
     def test_shell_fence_excludes_prose_and_preserves_embedded_markdown(self):
         reply = "Here is the command:\n```bash\ncat > brief.md << 'EOF'\n```python\nprint(1)\n```\nEOF\n```\nThis writes the brief."
         command = content._extract_shell_command(reply)

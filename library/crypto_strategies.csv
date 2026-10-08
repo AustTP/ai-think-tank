@@ -1,0 +1,5 @@
+strategy_name,estimated_profit_loss_ratio,risk_level,leverage_required,api_request_efficiency,platform,basis
+Scalping,1-3% per trade,4,No,High,Coinbase,Verified
+Day Trading,5-10% per day,3-4,No,Medium to High,Coinbase,Estimated
+Dollar-Cost Averaging,1-5% per month,2-3,No,Low,Coinbase,Estimated
+Coinrule Advanced Bots,Varies by strategy,3-4,No,Medium to High,Coinbase,Estimated

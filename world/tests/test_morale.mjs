@@ -109,10 +109,10 @@ test('recent delivery has no score without outcomes', () => {
 });
 test('completed work improves score; failures and blockers lower it', () => {
   const now = Date.now();
-  setGlobal('DELIVERY_STATE', {tasks: {a: {id:'a', status:'done', createdAt:now, assignedTo:'dev'}}});
+  setGlobal('DELIVERY_STATE', {tasks: {a: {id:'a', status:'done', completedAt:now, assignedTo:'dev'}}});
   const good = thinkTankMorale();
   assert.equal(moraleFor('dev'), good);
-  setGlobal('DELIVERY_STATE', {tasks: {a: {id:'a', status:'done', createdAt:now}, b:{status:'failed',createdAt:now}, c:{status:'blocked'}}});
+  setGlobal('DELIVERY_STATE', {tasks: {a: {id:'a', status:'done', completedAt:now}, b:{status:'failed',failedAt:now}, c:{status:'blocked'}}});
   assert.ok(thinkTankMorale() < good);
 });
 test('review subtasks and stale outcomes do not inflate delivery', () => {
@@ -121,12 +121,16 @@ test('review subtasks and stale outcomes do not inflate delivery', () => {
 });
 test('sprint rollover lowers delivery and released projects improve it', () => {
   const now = Date.now();
-  const state = {tasks:{a:{status:'done',createdAt:now}},sprints:{s:{status:'closed',closedAt:now,items:[{},{}],rolledOver:[]}}};
+  const state = {tasks:{a:{status:'done',completedAt:now}},sprints:{s:{status:'closed',closedAt:now,items:[{},{}],rolledOver:[]}}};
   setGlobal('DELIVERY_STATE', state);const good=thinkTankMorale();
   state.sprints.s.rolledOver=[{},{}];setGlobal('DELIVERY_STATE', state);
   assert.ok(thinkTankMorale()<good);const before=thinkTankMorale();
   state.products={p:{revisions:[{at:now}]}};setGlobal('DELIVERY_STATE',state);
   assert.ok(thinkTankMorale()>before);
+});
+test('creation time does not count as a completion or failure time', () => {
+  setGlobal('DELIVERY_STATE',{tasks:{a:{status:'done',createdAt:Date.now()},b:{status:'failed',createdAt:Date.now()}}});
+  assert.equal(thinkTankMorale(),null);
 });
 test('working includes hidden agents; idle includes off-duty agents', () => {
   setGlobal('AGENTS',{a:{busy:true,visible:false},b:{offDuty:true},c:{task:'t'}});

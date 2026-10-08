@@ -1,0 +1,6 @@
+Strategy Name,Description,Evidence URL,Verification Status,Risk Limit,Paper Trading Feasibility
+Limit Order Strategy,"A basic strategy that involves placing orders at a specific price, allowing for precise entry and exit points.",https://help.coinbase.com/en/pro/trading-and-investing/trading-basics/limit-orders,Verified,Low,Yes
+Market Order Strategy,"A basic strategy that involves buying or selling at the current market price, ideal for immediate execution.",https://help.coinbase.com/en/pro/trading-and-investing/trading-basics/market-orders,Verified,Medium,Yes
+Bollinger Band Strategy,A momentum-based strategy that uses Bollinger Bands to identify overbought/oversold conditions and trend reversals.,https://www.investopedia.com/terms/b/bollingerbands.asp,Estimated,Medium,Yes
+MACD Strategy,A trend-following strategy that uses the Moving Average Convergence Divergence (MACD) indicator to identify changes in the direction of the asset's momentum.,https://www.investopedia.com/terms/m/macd.asp,Estimated,Medium,Yes
+RSI Strategy,A momentum-based strategy that uses the Relative Strength Index (RSI) to identify overbought/oversold conditions and trend reversals.,https://www.investopedia.com/terms/r/rsi.asp,Estimated,Medium,Yes

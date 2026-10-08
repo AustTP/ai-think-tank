@@ -178,6 +178,21 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
     # exists to prevent. Only PENDING records dedup; a resolved one lets a
     # fresh escalation be created if the same thing genuinely recurs later.
     escalations = _serve._load_escalations()
+    task_id = fingerprint = None
+    if kind == 'stuck review loop':
+        try:
+            task_id = json.loads(on_approve_note or '{}').get('taskId')
+            fingerprint = json.loads(what_checked or '{}').get('fingerprint')
+        except (ValueError, AttributeError):
+            pass
+        for esc_id, existing in escalations.items():
+            try:
+                same_task = task_id and json.loads(existing.get('note') or '{}').get('taskId') == task_id
+                same_failure = fingerprint and json.loads(existing.get('whatChecked') or '{}').get('fingerprint') == fingerprint
+            except (ValueError, AttributeError):
+                continue
+            if existing.get('kind') == kind and same_task and (existing.get('status') == 'pending' or same_failure):
+                return esc_id
     for esc_id, existing in escalations.items():
         if existing.get('status') == 'pending' and existing.get('kind') == kind \
                 and existing.get('question') == question:
@@ -189,6 +204,14 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
     token = secrets.token_urlsafe(24)
     escalations[esc_id] = {'kind': kind, 'question': question, 'status': 'pending', 'token': token, 'ts': time.time(), 'note': on_approve_note, 'whatChecked': what_checked, 'lookFirst': look_first}
     _serve._save_escalations(escalations)
+    if kind == 'stuck review loop':
+        # Technical delivery failures belong in the Board recovery queue.
+        # They are not automatically a human decision and must not email on
+        # every repair cycle. Explicit player questions use their own channel.
+        escalations[esc_id]['notificationChannel'] = 'board'
+        escalations[esc_id]['emailSent'] = False
+        _serve._save_escalations(escalations)
+        return esc_id
 
     approve_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=approve'
     deny_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=deny'
@@ -209,3 +232,24 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
         latest[esc_id]['emailAttemptedAt'] = time.time()
         _serve._save_escalations(latest)
     return esc_id
+
+
+def reconcile_review_escalations(state):
+    """Close obsolete review alerts without sending a message or approving work."""
+    import serve as _serve
+    escalations = _serve._load_escalations()
+    changed = False
+    for record in escalations.values():
+        if record.get('kind') != 'stuck review loop' or record.get('status') != 'pending':
+            continue
+        try:
+            task_id = json.loads(record.get('note') or '{}').get('taskId')
+        except (ValueError, AttributeError):
+            continue
+        task = (state.get('tasks') or {}).get(task_id)
+        if task and (task.get('status') in ('done','cancelled','abandoned','walking','working')
+                     or not (task.get('manualAttention') or (task.get('_peerGate') or {}).get('escalated'))):
+            record.update(status='resolved',resolvedAt=time.time(),resolution='Story resumed or completed; previous review alert is obsolete.')
+            changed = True
+    if changed:
+        _serve._save_escalations(escalations)

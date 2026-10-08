@@ -1,0 +1,3 @@
+cat > script.py <<EOF
+# Write the python script to compare and recommend the best data storage options here
+EOF; python3 script.py

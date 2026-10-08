@@ -390,6 +390,13 @@
     .hud-pill .value { font-size: 12px; }
     .hud-btn { padding: 9px 9px; font-size: 8px; }
   }
+
+#boardModal .modal-box { width:96vw; max-width:1500px; height:92vh; box-sizing:border-box; overflow:auto; text-align:left; padding:24px; }
+#boardModal .board-tabs { display:flex; flex-wrap:wrap; gap:8px; position:sticky; top:0; background:#161b26; padding:12px 0; z-index:2; }
+#boardModal .board-tabs button[aria-selected=true] { outline:2px solid #a78bfa; }
+#boardModal .board-pane { font-size:14px; line-height:1.6; }
+#boardModal .blocker-card { border:1px solid #e9a35b; border-radius:8px; padding:16px; margin:12px 0; background:#29232b; }
+#boardModal .blocker-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr)); gap:14px; }
 </style>
 <style>
   .library-document-heading { display: flex; align-items: center; gap: 8px; }
@@ -727,6 +734,23 @@
 <div id="boardModal" class="modal hidden">
   <div class="modal-box">
     <h3>The Board</h3>
+    <nav class="board-tabs" aria-label="Board sections">
+      <button type="button" onclick="showBoardPane('recovery',this)" aria-selected="true">Unblock work</button>
+      <button type="button" onclick="showBoardPane('requests',this)" aria-selected="false">North Star &amp; requests</button>
+      <button type="button" onclick="showBoardPane('roles',this)" aria-selected="false">Agent roles</button>
+      <button type="button" onclick="showBoardPane('projects',this)" aria-selected="false">Projects &amp; Library</button>
+    </nav>
+    <section id="board-recovery" class="board-pane"><h4>Needs attention</h4><p>Choose a blocked story to see its requirements and send recovery instructions.</p><div id="boardBlockers" class="blocker-grid"></div></section>
+    <section id="board-requests" class="board-pane" hidden>
+    <details open style="text-align:left;margin-bottom:12px;">
+      <summary>Company North Star</summary>
+      <form id="northStarForm" onsubmit="saveNorthStar(event)" style="display:grid;gap:8px;">
+        <label>Overarching objective<textarea name="objective" required maxlength="6000" rows="2" style="width:100%;box-sizing:border-box;" placeholder="What should the whole company work toward?"></textarea></label>
+        <label>Success measures<textarea name="successMeasures" maxlength="6000" rows="2" style="width:100%;box-sizing:border-box;" placeholder="How will we know we succeeded?"></textarea></label>
+        <label>Constraints<textarea name="constraints" maxlength="6000" rows="2" style="width:100%;box-sizing:border-box;" placeholder="Boundaries, priorities, and requirements"></textarea></label>
+        <button type="submit">Save North Star</button><span id="northStarStatus" role="status"></span>
+      </form>
+    </details>
     <details open style="text-align:left;margin-bottom:12px;">
       <summary>Scrum Master Requests</summary>
       <p>Queue requests even while the team is busy. The scrum master will groom and schedule them.</p>
@@ -740,9 +764,13 @@
       </form>
       <p id="workOrderStatus" role="status"></p>
     </details>
+    </section><section id="board-roles" class="board-pane" hidden>
     <div id="specialistRolesBody" style="text-align:left;margin:12px 0;"></div>
+    </section><section class="board-pane" id="board-orders-location" hidden>
     <div id="workOrdersBody" style="text-align:left;font-size:12px;"></div>
+    </section><section class="board-pane" id="board-activity"><details><summary>Active work, peer reviews, and completed investigations</summary>
     <div id="boardBody" style="font-size:13px; opacity:0.85; text-align:left;">Nothing scheduled yet.</div>
+    </details></section><section id="board-projects" class="board-pane" hidden>
     <div class="terminal-inputline">
       <input type="text" id="bigTaskInput" placeholder="Give the admins a large task to break down and delegate...">
       <button id="bigTaskBtn">Delegate</button>
@@ -770,7 +798,7 @@
     <div id="boardTemplateEditor" class="hidden" style="font-size:13px;">
       <div id="boardTemplateEditorBody" style="font-size:12px;">Loading...</div>
     </div>
-    <div class="modal-actions"><button id="boardCloseBtn">Close</button></div>
+    </section><div class="modal-actions"><button id="boardCloseBtn">Close</button></div>
   </div>
 </div>
 
@@ -780,7 +808,7 @@
 <script src="agents.js?v=28"></script>
 <script src="meetings.js?v=2"></script>
 <script src="reports.js?v=4"></script>
-<script src="morale.js?v=4"></script>
+<script src="morale.js?v=5"></script>
 <script src="hiring.js?v=22"></script>
 <script src="firing.js?v=9"></script>
 <script src="jev.js?v=4"></script>
@@ -788,7 +816,7 @@
 <script src="tasks.js?v=76"></script>
 <script src="handoffs.js?v=11"></script>
 <script src="templates.js?v=1"></script>
-<script src="sim_bridge.js?v=4"></script>
+<script src="sim_bridge.js?v=5"></script>
 <script>
 const VIEW_W = 1024, VIEW_H = Math.round(1024 * 384 / 688);
 const canvas = document.getElementById('game');
@@ -1802,16 +1830,32 @@ function setBoardSectionHtml(body, html) {
   if (modal) modal.scrollTop = scrollTop;
 }
 
+function showBoardPane(id, button) {
+  document.querySelectorAll('#boardModal .board-pane').forEach(el => el.hidden = el.id !== 'board-' + id);
+  document.getElementById('board-activity').hidden = id !== 'recovery';
+  document.querySelectorAll('#boardModal .board-tabs button').forEach(el => el.setAttribute('aria-selected', String(el === button)));
+}
+// Keep queued requests beside their form without changing polling targets.
+document.getElementById('board-requests').appendChild(document.getElementById('workOrdersBody'));
 function renderBoard() {
+  const blockers = Object.values(TASKS).filter(t => !t.boardClearedAt && !t.reviewOf && !['done','cancelled','abandoned'].includes(t.status) && (t.manualAttention || t.status === 'blocked' || t.status === 'failed' || t._peerGate?.escalated));
+  const escBoard = value => { const span = document.createElement('span'); span.textContent = value || ''; return span.innerHTML; };
+  setBoardSectionHtml(document.getElementById('boardBlockers'), blockers.length ? blockers.map(t => `<article class="blocker-card"><strong>${escBoard(t.title)}</strong><p>Owner: ${escBoard(AGENTS[t.assignedTo]?.name || t.assignedTo)} ? ${escBoard(t.status)}</p><p>Required: ${escBoard(t.acceptanceCriteria || 'Completion criteria need clarification')}</p><details><summary>Reason work stopped</summary><p>${escBoard((t.failNote || t.note || 'Investigate the recorded blocker.').slice(0,1800))}</p></details><p><a class="hud-btn" href="/api/intent/task/${encodeURIComponent(t.id)}/guidance" target="_blank" rel="noopener">Unblock this story</a></p></article>`).join('') : '<p>No blocked stories need attention.</p>');
   const body = document.getElementById('boardBody');
   const taskNote = t => {
     const guide = (t.manualAttention || (t._peerGate || {}).escalated || t.status === 'blocked')
       && !['done', 'cancelled', 'abandoned'].includes(t.status)
       ? `<a class="hud-btn" href="/api/intent/task/${encodeURIComponent(t.id)}/guidance" target="_blank" rel="noopener">Guide review</a>` : '';
-    if (!t.note) return guide;
+    const reviewTasks = Object.values(TASKS).filter(r => r.reviewOf === t.id && r.reviewDiagnostics);
+    const escapeDetails = value => { const el = document.createElement('span'); el.textContent = value; return el.innerHTML; };
+    const diagnostics = reviewTasks.length ? `<details><summary>Review diagnostics (${reviewTasks.length})</summary>${reviewTasks.map(r => `<details><summary>${escapeDetails(r.id)} / ${escapeDetails(r.assignedTo || '')}</summary><pre style="white-space:pre-wrap;max-height:240px;overflow:auto;">${escapeDetails(JSON.stringify(r.reviewDiagnostics, null, 2))}</pre></details>`).join('')}</details>` : '';
+    const repairs = Object.values(TASKS).filter(r => r.reviewOf === t.id && !['review','qa'].includes(r.taskType));
+    const recovery = (t._peerRepairPending || t.manualAttention || t.status === 'blocked')
+      ? `<div>Recovery owner: ${escapeDetails(t.assignedTo || 'Unassigned')}. ${repairs.length ? repairs.map(r => `${escapeDetails(r.id)}: ${escapeDetails(r.status)} / ${escapeDetails(r.assignedTo || '')}`).join('; ') : 'Next: inspect the blocker and choose its recovery action.'}</div>` : '';
+    if (!t.note && !t.failNote) return guide + recovery + diagnostics;
     const el = document.createElement('div');
-    el.textContent = t.note;
-    return `<div style="opacity:0.8; margin:3px 0 8px;">${el.innerHTML}</div>${guide}`;
+    el.textContent = t.failNote || t.note;
+    return `<div style="opacity:0.8; margin:3px 0 8px;">${el.innerHTML}</div>${guide}${recovery}${diagnostics}`;
   };
   const boardTasks = Object.values(TASKS).filter(t => !t.boardClearedAt ||
     (t.failedAt || 0) > t.boardClearedAt ||
@@ -1848,7 +1892,13 @@ function renderBoard() {
           return `${name}${known ? ' (✓'+t.room+')' : ''}`;
         }).join(', ');
         const mark = g.closed ? '&check;' : (done >= total ? '&check;' : `(${done}/${total})`);
-        return `<div>&bull; <strong>${t.title}</strong> -- awaiting ${total} reviews (${done}/${total}) by ${reviewers} ${mark}</div>`;
+        const escReview = value => { const el = document.createElement('span'); el.textContent = value || ''; return el.innerHTML; };
+        const status = g.escalated ? `Blocked: ${escReview(t.failNote || 'Review retry limit reached')}`
+          : t._peerRepairPending ? 'Repair in progress before another review' : `awaiting ${total} reviews (${done}/${total}) by ${reviewers} ${mark}`;
+        const repairTasks = Object.values(TASKS).filter(r => r.reviewOf === t.id && !['review','qa'].includes(r.taskType));
+        const repairStatus = repairTasks.length ? repairTasks[repairTasks.length - 1].status : 'queued';
+        const repairStories = (t.repairStories || []).map(r => `<div style="margin-left:12px;">Repair: ${escReview(r.title)} / ${escReview(r.owner || t.assignedTo)} / ${escReview(repairStatus)}<br>Done when: ${escReview(r.acceptanceCriteria)}</div>`).join('');
+        return `<div>&bull; <strong>${escReview(t.title)}</strong> -- ${status}${repairStories}${taskNote(t)}</div>`;
       }).join('')
     : '';
 
@@ -1980,16 +2030,51 @@ function renderSpecialistRoles() {
   if (!body) return;
   body.replaceChildren();
   const title = document.createElement('strong'); title.textContent = 'Specialist roles'; body.appendChild(title);
+  if (typeof DELIVERY_STATE !== 'undefined' && DELIVERY_STATE?.taskMasterControl) {
+    const info = DELIVERY_STATE.taskMasterControl; const status = document.createElement('p');
+    status.textContent = `Task Master: ${info.status} / ${info.idleWorkers}/${info.totalWorkers} workers idle. Trigger: 50% idle; up to 2 assignments per 5 minutes.`; body.appendChild(status);
+  }
   for (const def of AGENT_ROSTER) {
     const agent = AGENTS[def.id] || def;
-    if (!agent.tradingSpecialist && !agent.dedicatedReviewer && !agent.codeDirector && !def.tradingSpecialist && !def.dedicatedReviewer && !def.codeDirector) continue;
+    if (!agent.librarian && !def.librarian && !agent.taskMaster && !def.taskMaster && !agent.tradingSpecialist && !agent.dedicatedReviewer && !agent.codeDirector && !def.tradingSpecialist && !def.dedicatedReviewer && !def.codeDirector) continue;
     const button = document.createElement('button'); button.className = 'roster-item';
     button.textContent = `${def.name} / ${def.role || agent.role} / ${agent.busy ? 'Working' : 'Available / waiting for assignment'}`;
     button.addEventListener('click', () => openProfile(def.id)); body.appendChild(button);
   }
 }
+async function renderNorthStar() {
+  const form = document.getElementById('northStarForm');
+  if (form.contains(document.activeElement)) return;
+  const response = await apiFetch('/api/intent/north-star');
+  if (!response.ok) return;
+  const {northStar} = await response.json();
+  const signature = JSON.stringify(northStar);
+  if (form.dataset.version === signature || form.contains(document.activeElement)) return;
+  for (const key of ['objective','successMeasures','constraints']) form.elements[key].value = northStar[key] || '';
+  form.dataset.version = signature;
+}
+async function saveNorthStar(event) {
+  event.preventDefault();
+  const status = document.getElementById('northStarStatus');
+  try {
+    const response = await apiFetch('/api/intent/north-star', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(Object.fromEntries(new FormData(event.target)))});
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Could not save North Star.');
+    status.textContent = 'Saved. Scrum masters and agents will use this direction for new work.';
+    event.target.dataset.version = JSON.stringify(data.northStar);
+  } catch(error) {status.textContent = error.message;}
+}
+async function answerWorkOrder(event, orderId) {
+  event.preventDefault(); const form = event.target;
+  try {
+    const answers = Object.fromEntries(new FormData(form));
+    const response = await apiFetch(`/api/intent/work-orders/${encodeURIComponent(orderId)}/answers`, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({answers})});
+    const data = await response.json(); if (!response.ok) throw new Error(data.error || 'Could not save answers.');
+    document.activeElement?.blur(); await renderWorkOrders();
+  } catch(error) {form.querySelector('[role="status"]').textContent = error.message;}
+}
 async function renderWorkOrders() {
   renderSpecialistRoles();
+  renderNorthStar().catch(() => {});
   try {
     const res = await apiFetch('/api/intent/work-orders');
     if (!res.ok) return;
@@ -2005,8 +2090,16 @@ async function renderWorkOrders() {
     }
     const esc = s => { const el = document.createElement('div'); el.textContent = s; return el.innerHTML; };
     const orders = (data.orders || []).slice(-10).reverse();
+    if (document.getElementById('workOrdersBody').contains(document.activeElement)) return;
+    const planningDetails = order => {
+      const plan = order.plan || {};
+      const questions = (plan.questions || []).filter(q => q.status === 'awaiting_input');
+      const stories = (plan.stories || []).map(story => `<div style="margin-left:12px;">Story: ${esc(story.title)}<br>Done when: ${esc(story.acceptanceCriteria)}</div>`).join('');
+      const form = questions.length ? `<form onsubmit="answerWorkOrder(event, '${order.id}')" style="display:grid;gap:6px;">${questions.map(q => `<label>Scrum master asks: ${esc(q.question)}<textarea name="${esc(q.id)}" required maxlength="6000" rows="2" style="width:100%;box-sizing:border-box;"></textarea></label>`).join('')}<button type="submit">Send answers</button><span role="status"></span></form>` : '';
+      return `${order.groomingReason ? '<div>'+esc(order.groomingReason)+'</div>' : ''}${stories}${form}`;
+    };
     setBoardSectionHtml(document.getElementById('workOrdersBody'), orders.length
-      ? '<strong>Your work orders</strong>' + orders.map(o => `<div>${esc(o.title)} — ${esc(o.deliveryStatus || o.status)} (${esc(o.id)})${o.tasks?.length ? ' / ' + o.tasks.map(t => esc(t.assignedTo || 'Unassigned') + ': ' + esc(t.status)).join(', ') : ''}${o.waitingReason ? '<br>' + esc(o.waitingReason) : ''}</div>`).join('')
+      ? '<strong>Your work orders</strong>' + orders.map(o => `<div>${esc(o.title)} — ${esc(o.deliveryStatus || o.status)} (${esc(o.id)})${o.tasks?.length ? ' / ' + o.tasks.map(t => esc(t.title || t.id) + ' / ' + esc(t.assignedTo || 'Unassigned') + ': ' + esc(t.status)).join(', ') : ''}${o.waitingReason ? '<br>' + esc(o.waitingReason) : ''}${planningDetails(o)}</div>`).join('')
       : 'No work orders submitted yet.');
   } catch (e) { /* retain the last successful list */ }
 }
@@ -2335,7 +2428,7 @@ async function renderBlockerDecisions() {
       progress.textContent = `Coinbase spot: ${data.workflow.stage} — ${data.workflow.phase}. Live trading remains unavailable.`;
       panel.appendChild(progress);
     }
-    const labels = { provide_inputs: 'Supply missing inputs', clarify_scope: 'Clarify scope',
+    const labels = {retry_review: 'Retry review without rewriting deliverable', provide_inputs: 'Supply missing inputs', clarify_scope: 'Clarify scope',
       assign_repair: 'Assign repair', retry_infrastructure: 'Retry after infrastructure fix', cancel: 'Cancel task' };
     for (const blocker of data.blockers || []) {
       const card = document.createElement('section');
@@ -2346,7 +2439,7 @@ async function renderBlockerDecisions() {
       card.appendChild(heading);
       const details = document.createElement('pre');
       details.style.whiteSpace = 'pre-wrap';
-      details.textContent = `Reason: ${blocker.category}\nOwner: ${blocker.owner}\n${blocker.evidence}\n${(blocker.findings || []).join('\n')}`;
+      details.textContent = `Reason: ${blocker.category}\nOwner: ${blocker.owner}\nRecovery owner: ${blocker.recoveryOwner || blocker.owner}\nNext: ${blocker.nextAction || blocker.recommendedAction}\nHuman input: ${blocker.needsHumanInput ? "Required" : "Not required"}\n${blocker.evidence}\n${(blocker.findings || []).join('\n')}`;
       card.appendChild(details);
       const action = document.createElement('select');
       for (const key of blocker.actions) {

@@ -1180,6 +1180,12 @@ def _sim_loop_pass_locked():
     state = serve.get_state_from_db()
     if not state:
         return None
+    import company_planning, librarian
+    librarian.step(state)
+    __import__('recovery_staffing').step(state)
+    __import__('notify').reconcile_review_escalations(state)
+    company_planning.step(state)
+    _recover_content_after_restart(state)
     state = _engine.tick(state)
     # Deliver any finished drained player-ask answers INSIDE this single
     # read-modify-write (same two-phase discipline as _content_results: the
@@ -1200,7 +1206,9 @@ def _sim_loop_pass_locked():
         serve._peer_review_tick(state)
     except Exception as e:
         print(f'[sim] peer review tick error: {e}', flush=True)
-    import trading_workflow, blocker_control
+    import trading_workflow, blocker_control, task_master, company_planning
+    company_planning.step(state)
+    task_master.step(state)
     trading_workflow.advance(state)
     blocker_control.reconcile_notices(state)
     serve.save_state_to_db(state)
@@ -1674,6 +1682,8 @@ def _maybe_escalate_stuck_gate(parent, gate, reason, failure_text=None, state=No
         gate['lastFailureFingerprint'] = fingerprint
         codes = re.findall(r'\b([EF]\d{3})\b', failure_text)
         category = 'formatting' if codes and all(c.startswith('E') and c != 'E999' for c in codes) else 'code_defect'
+        if category == 'code_defect' and not _peer_coding_class(parent):
+            category = 'deliverable_defect'
         if any(w in failure_text.lower() for w in ('missing data', 'market inputs', 'credentials', 'not configured')):
             category = 'missing_inputs'
         parent['reviewDiagnosis'] = {'category': category, 'repeatedAttempts': gate['noProgressCount'],
@@ -1841,7 +1851,17 @@ def _apply_content_result(state, task, result, now_ms=None):
     `now_ms` is threaded from the caller (the tick already has it); a caller
     that omits it falls back to wall-clock so the function stays standalone."""
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    if result.get('ok') is False:
+        task['failedAt'] = now_ms
+    if result.get('reviewContract') and task.get('reviewOf'):
+        parent_contract_task = (state.get('tasks') or {}).get(task['reviewOf'])
+        if parent_contract_task is not None and not parent_contract_task.get('reviewContract'):
+            parent_contract_task['reviewContract'] = result['reviewContract']
     note = result.get('note')
+    for field in ('reviewDiagnostics', 'reviewFailureKind', 'reviewContract'):
+        if result.get(field) is not None:
+            task[field] = result[field]
+    task['contentFinishedAt'] = now_ms
     if result.get('tradingAcceptance') is not None:
         task['tradingAcceptance'] = result['tradingAcceptance']
         if not result['tradingAcceptance'].get('accepted'):
@@ -1942,15 +1962,37 @@ def _apply_content_result(state, task, result, now_ms=None):
             reviewer = task.get('assignedTo')
             gate = parent['_peerGate']
             if result.get('reviewFormatError'):
-                failures = gate['formatFailures'] = gate.get('formatFailures', 0) + 1
+                kind = result.get('reviewFailureKind') or 'invalid_response'
+                parent['reviewFailureKind'] = kind
+                parent['reviewDiagnosis'] = {'category':kind, 'failure':result.get('note')}
+                parent['lastReviewDiagnosticsTask'] = task['id']
+                counter = 'serviceFailures' if kind == 'service_unavailable' else 'inputFailures' if kind == 'missing_inputs' else 'formatFailures'
+                failures = gate[counter] = gate.get(counter, 0) + 1
                 _queue_player_email(state, 'work_recovery', 'Review response could not be parsed',
-                    f"{task['id']} returned no valid verdict after a format retry. No rejection or approval was recorded. "
-                    + ('Another independent reviewer will be assigned.' if failures < 3 else 'Three review attempts failed; model configuration needs attention.'))
-                if failures >= 3:
+                    f"{task['id']}: {result.get('note') or 'No usable review verdict.'} No rejection or approval was recorded. "
+                    + ('Another independent reviewer will be assigned.' if failures < 3 else 'Three review attempts failed; inspect the recorded request or validation error.'))
+                if failures < 3 and kind != 'missing_inputs' and reviewer:
+                    pending_retry = any(q.get('reviewOf') == parent['id'] and q.get('assignedTo') == reviewer
+                                        for q in state.get('workQueue') or [])
+                    if not pending_retry:
+                        queue_work(state, [{'title':f'Retry review: {parent.get("title")}',
+                            'room':parent.get('room'), 'taskType':'review', 'reviewOf':parent['id'],
+                            'reviewAuthorId':parent.get('assignedTo'), 'assignedTo':reviewer,
+                            'projectLabel':parent.get('projectLabel'), 'priority':'high',
+                            'notBefore':now_ms + (30_000 * failures if kind == 'service_unavailable' else 10_000),
+                            'instructions':'Review the saved artifact against the stable original contract. '
+                                'Previous review failed due to ' + kind + '; do not treat this as an artifact defect.'}])
+                    parent['nextReviewRetryAt'] = now_ms + (30_000 * failures if kind == 'service_unavailable' else 10_000)
+                if failures >= 3 or kind == 'missing_inputs':
                     gate['escalated'] = True
-                    parent.update(manualAttention=True, blockedReason='review_model_response',
-                                  failNote='Three reviewers returned invalid verdicts after format retries; check the review model.')
+                    parent.update(manualAttention=True, blockedReason=kind,
+                                  failNote='Review attempts stopped: ' + str(result.get('note') or 'No usable verdict.')[:500])
                 return
+            if result.get('reviewDiagnostics'):
+                parent['lastReviewDiagnosticsTask'] = task['id']
+            if verdict in ('clean', 'actionable'):
+                parent.pop('reviewFailureKind', None)
+                gate.update(formatFailures=0, serviceFailures=0, inputFailures=0)
             if (task.get('taskType') in ('review', 'qa') and task.get('createdAt')
                     and task['createdAt'] < (gate.get('enteredMs') or 0)):
                 return  # vote belongs to the previous artifact, before its repair
@@ -1966,6 +2008,7 @@ def _apply_content_result(state, task, result, now_ms=None):
                     'summary': result.get('peerSummary') or '',
                     'checks': list(result.get('peerChecks') or []),
                     'risks': list(result.get('peerRisks') or []),
+                    'repairStories': list(result.get('peerRepairStories') or []),
                     'atMs': now_ms,
                 })
             if verdict == 'actionable':
@@ -2101,6 +2144,10 @@ def _build_agent_perception(state, agent_id, task=None):
     me = agents.get(agent_id) or {}
     rec = roster.get(agent_id) or {}
     parts = []
+    import company_planning
+    direction = company_planning.north_star_context(state)
+    if direction:
+        parts.append(direction)
     identity = f'You are {rec.get("name") or me.get("name") or agent_id}.'
     role = rec.get('role') or ''
     if role:
@@ -2152,6 +2199,29 @@ def _build_agent_perception(state, agent_id, task=None):
 # _store_content_result(task_id, {'note': str, 'seenUrls': [...]}). None =
 # no real content executor ported for this room -> the workUntil fallback.
 _content_executor = None
+_restart_recovery_done = False
+
+
+def _recover_content_after_restart(state):
+    """Resume checkpointed executions once per process, preserving IDs and budgets."""
+    global _restart_recovery_done
+    if _restart_recovery_done or not _content_executor:
+        return []
+    _restart_recovery_done = True
+    resumed = []
+    for task in (state.get('tasks') or {}).values():
+        agent_id = task.get('assignedTo')
+        agent = (state.get('agents') or {}).get(agent_id) or {}
+        if task.get('status') != 'working' or not task.get('_contentInFlight'):
+            continue
+        if agent.get('task') != task.get('id') or not agent.get('busy'):
+            continue
+        task['resumedAt'] = int(time.time()*1000)
+        task['resumeCount'] = task.get('resumeCount',0) + 1
+        if _dispatch_content_work(_content_executor,state,agent_id,task,time.time()):
+            resumed.append(task['id'])
+    return resumed
+
 
 
 def _dispatch_content_work(executor, state, agent_id, task, now):
@@ -2268,6 +2338,9 @@ def queue_work(state, items):
             'userStory': item.get('userStory') or None,
             'acceptanceCriteria': item.get('acceptanceCriteria') or None,
             'workOrderId': item.get('workOrderId'),
+            'workOrderStoryId': item.get('workOrderStoryId'),
+            'investigationOf': item.get('investigationOf'),
+            'reviewContract': item.get('reviewContract'),
             'pair': bool(item.get('pair')),
             'notBefore': item.get('notBefore') or None,
             'priority': normalize_priority(item.get('priority')),
@@ -2300,6 +2373,7 @@ def queue_work(state, items):
             # to a specific team is pinned to that team's on-call worker, same
             # pin-and-wake treatment as an incident -- see _assign_due_item.
             'directRoute': bool(item.get('directRoute')),
+            'taskMasterWork': bool(item.get('taskMasterWork')),
             # Gap: filing a story against a specific
             # team never meant it would be WORKED by that team -- assignment
             # (_assign_due_item) is think tank-wide round robin with zero team
@@ -3761,7 +3835,7 @@ def _eligible_candidates(state, include_off_duty, include_reviewers=False, inclu
     facilitators = {t.get('scrumMasterId') for t in (state.get('teams') or [])
                     if t.get('autoSprints')}
     for d in roster:
-        if d.get('isAdmin') or d.get('id') in facilitators:
+        if d.get('isAdmin') or (d.get('taskMaster') or d.get('librarian')) or d.get('id') in facilitators:
             continue
         if d.get('dedicatedReviewer') and not include_reviewers:
             continue
@@ -3895,7 +3969,12 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         # task.instructions).
         'userStory': (extra or {}).get('userStory'),
         'acceptanceCriteria': (extra or {}).get('acceptanceCriteria'),
+        'reviewContract': (extra or {}).get('reviewContract') or __import__('review_quality').contract_for({'instructions': instructions or '', 'acceptanceCriteria': (extra or {}).get('acceptanceCriteria') or ''}),
         'workOrderId': (extra or {}).get('workOrderId'),
+        'workOrderStoryId': (extra or {}).get('workOrderStoryId'),
+        'investigationOf': (extra or {}).get('investigationOf'),
+        'codeWorkspaceVersion': 1,
+        'taskMasterWork': bool((extra or {}).get('taskMasterWork')),
         'pipelineStep': (extra or {}).get('pipelineStep'),
         # Bot Ops / shadow mode: a dry-run task (see queue_work). Stamped so the
         # completion path (_task_cycle) captures to the shadow ledger instead of
@@ -4139,6 +4218,7 @@ def finish_task(state, agent_id, grid=None):
     task = (state.get('tasks') or {}).get(a.get('task'))
     if task:
         task['status'] = 'done'
+        task['completedAt'] = int(time.time() * 1000)
         # A landed task satisfies any dependency-block keyed on it: queue the
         # SM's auto-unblock so the cards that were waiting on this work free up.
         _auto_clear_dependency_blocks(state, task.get('id'),
@@ -4215,6 +4295,7 @@ def _complete_shadow_task(state, agent_id, task, now_ms, grid=None):
     completedRooms/grade/runbook, no follow-up filing, no dependency unblock. The
     work happened; the world didn't move. Returns the ledger entry."""
     task['status'] = 'done'
+    task['completedAt'] = int(time.time() * 1000)
     task['shadowDoneAt'] = now_ms
     entry = {
         'title': task.get('title'),
@@ -5095,7 +5176,7 @@ def _pick_reviewer_ids(state, author_id, task_room=None, preferred=None):
     # Candidates = preferred pair first, then team (excl author), then widen to
     # all non-author.
     order = list(preferred or []) + team + [d.get('id') for d in roster if not d.get('isAdmin') and d.get('id') != author_id]
-    director_ids = {d['id'] for d in roster if d.get('codeDirector')}
+    director_ids = {d['id'] for d in roster if d.get('codeDirector') or (d.get('taskMaster') or d.get('librarian'))}
     order = [cid for cid in order if cid not in director_ids]
     seen = set()
     ordered_ids = []
@@ -5183,6 +5264,9 @@ def _enter_peer_review(state, task, now_ms, preferred=None):
     reviewer(s) who already have the context -- the person who flagged a problem
     is the one who can confirm it was fixed. Fall back to a fresh pick if the
     prior pair is unavailable."""
+    import librarian, serve
+    librarian.create_role(state)
+    librarian.inspect_report(task, serve)
     if _peer_coding_class(task) and not task.get('_codeDirectorPassed'):
         import code_director
         pending = code_director.queue_check(state, task)
@@ -5358,11 +5442,27 @@ def _queue_peer_repair(state, parent, rationale=None):
         f"{r.get('reviewer')}: {r.get('summary') or ''} "
         + '; '.join(str(check) for check in r.get('checks') or [])
         for r in (parent.get('peerReviews') or [])[-2:] if r.get('verdict') == 'actionable')
+    repairs = []
+    for review in (parent.get('peerReviews') or [])[-2:]:
+        if review.get('verdict') == 'actionable':
+            for story in review.get('repairStories') or []:
+                if story not in repairs:
+                    repairs.append(story)
+    parent['repairStories'] = [{**story, 'id':f'{tid}-repair-{index+1}', 'owner':author, 'status':'queued'}
+                              for index, story in enumerate(repairs)]
     feedback = rationale or 'Address the rejected peer-review findings.'
-    instructions = (f"{parent.get('instructions') or ''}\n\nRepair the original deliverable: {parent.get('title')}."
+    import review_quality
+    stable_contract = review_quality.contract_for(parent)
+    instructions = (f"{stable_contract['instructions']}\n\nRepair the original deliverable: {parent.get('title')}."
                     f"\nPeer-review findings: {feedback}\n{findings}"
                     f"\nExisting Library document: {parent.get('libraryPath') or 'not yet saved'}."
                     '\nSave the corrected deliverable and meet the original acceptance criteria before requesting review.')
+    if repairs:
+        instructions += '\nConcrete repair stories (complete each before submitting the artifact):'
+        for index, story in enumerate(repairs, 1):
+            instructions += (f"\n{index}. {story['title']}\nRequirement: {story['criterion']}"
+                             f"\nObserved evidence: {story['evidenceQuote']}\nDo: {story['instructions']}"
+                             f"\nDone when: {story['acceptanceCriteria']}")
     existing = next((q for q in state.get('workQueue') or []
                      if q.get('reviewOf') == tid and q.get('taskType') not in ('review', 'qa')), None)
     active = next((t for t in (state.get('tasks') or {}).values()
@@ -5675,7 +5775,7 @@ def _sweep_stuck_gates(state, now_ms):
         for d in (state.get('agentRoster') or []):
             if len(fresh) >= 2:
                 break
-            if d.get('isAdmin') or d.get('codeDirector') or d.get('id') == author or d.get('id') in locked:
+            if d.get('isAdmin') or (d.get('taskMaster') or d.get('librarian')) or d.get('codeDirector') or d.get('id') == author or d.get('id') in locked:
                 continue
             if d.get('id') in fresh:
                 continue
@@ -5746,6 +5846,7 @@ def _close_gated_story(state, parent):
     review_counts = parent.get('_peerGate') or {}
     review_counts['closed'] = True
     parent['status'] = 'done'
+    parent['completedAt'] = int(time.time() * 1000)
     # The gated story shipped: its per-story capability grant dies with it.
     _revoke_task_access(parent.get('id'))
     try:
@@ -6932,7 +7033,7 @@ def _social_step(state, now, now_ms, decider=None):
 def _reconcile_player_work_orders(state):
     """Restore accepted player orders lost from the assignment queue, once."""
     for req in state.get('backlogRequests') or []:
-        if req.get('origin') != 'player_work_order' or req.get('status') != 'accepted':
+        if req.get('origin') != 'player_work_order' or req.get('status') != 'accepted' or req.get('plan'):
             continue
         order_id = req['id']
         if any(t.get('workOrderId') == order_id for t in (state.get('tasks') or {}).values()):
@@ -8490,12 +8591,24 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
             continue
         if req.get('status') != 'pending':
             continue
+        if req.get('origin') == 'player_work_order':
+            import company_planning
+            request_team = _team_row(state, req.get('teamId')) or {}
+            assigned_master = request_team.get('scrumMasterId') or scrum_master_id
+            company_planning.begin(state, req, assigned_master)
+            _log_governance(state, scrum_master_id, 'player_work_order_planning',
+                            {'request':req['id'],'status':'planning','origin':'player_work_order'})
+            continue
         filed_by = req.get('filedBy')
         author = (agents.get(filed_by) or {})
         instructions = (f"{sm_name} is the scrum master running backlog refinement for {filed_by}'s "
                         f"({author.get('name') or filed_by} / {author.get('role') or 'worker'}) work request "
                         f"in the {req.get('room')} room. Requested story: '{req.get('title')}'. Reason: "
                         f"{req.get('reason')}.")
+        import company_planning
+        company_direction = company_planning.north_star_context(state)
+        if company_direction:
+            instructions += ' Company direction takes priority over old roadmap context: ' + company_direction
         ctx = _refinement_context_for_room(state, req.get('room'))
         if ctx:
             instructions += f" Roadmap context for this room: {ctx}."
@@ -8579,7 +8692,7 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
             req['status'] = 'rejected'
         details = {'request': req['id'], 'choice': choice, 'filedBy': filed_by,
                    'room': req['room'], 'title': req['title'][:120]}
-        if choice == 'reject':
+        if choice == 'reject' and filed_by != 'player':
             # Absolute Zero rejection signal: a self-proposed work-request was
             # groomed OUT. Durable, queryable (the health check counts these) --
             # a rising reject rate is the think tank's own early warning that its
@@ -9599,6 +9712,8 @@ def _augment_task_instructions(state, agent_id, product_id, instructions, refocu
     'current direction' the next cycle acts on."""
     pieces = [instructions] if instructions else []
     relay = _consensus_relay_note(state)
+    if (state.get('northStar') or {}).get('objective'):
+        relay = ''
     if relay:
         pieces.insert(0, relay)
     note = _coaching_note_for(state, agent_id)
@@ -10746,6 +10861,36 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # being parked-idle in this same tick before she can process it).
     _mail_action_step(state, now, now_ms)
 
+    for parent in list((state.get('tasks') or {}).values()):
+        if parent.get('status') != 'failed' or not parent.get('_peerRepairPending'):
+            continue
+        if (parent.get('_peerGate') or {}).get('escalated'):
+            continue
+        tid = parent['id']
+        pending = any(q.get('reviewOf') == tid and q.get('taskType') not in ('review', 'qa')
+                      for q in state.get('workQueue') or [])
+        active = any(t.get('reviewOf') == tid and t.get('taskType') not in ('review', 'qa')
+                     and t.get('status') in ('walking', 'working') for t in (state.get('tasks') or {}).values())
+        if not pending and not active:
+            _queue_peer_repair(state, parent, parent.get('failNote'))
+
+    for parent in (state.get('tasks') or {}).values():
+        if not parent.get('repairStories'):
+            continue
+        repairs = [r for r in (state.get('tasks') or {}).values() if r.get('reviewOf') == parent['id']
+                   and r.get('taskType') not in ('review','qa')]
+        latest = max(repairs, key=lambda r:r.get('createdAt') or 0) if repairs else None
+        for story in parent['repairStories']:
+            story['taskId'] = latest.get('id') if latest else None
+            story['status'] = ('done' if parent.get('status') == 'done' else
+                'awaiting_review' if latest and latest.get('status') == 'done' else
+                latest.get('status') if latest else 'queued')
+
+    for delivery in state.get('completedDeliverables') or []:
+        completed = (state.get('tasks') or {}).get(delivery.get('id'))
+        if completed and completed.get('status') == 'done' and not completed.get('completedAt'):
+            completed['completedAt'] = delivery.get('gradedAt')
+
     _reconcile_player_work_orders(state)
 
     # Frozen gates must not leave automatic repairs queued indefinitely.
@@ -11008,7 +11153,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         # must be woken to staff the sprint even when the generic wake rule
         # would otherwise keep the think tank thin.
         _pinned_review = bool(pick.get('reviewOf') or pick.get('sprintId'))
-        can_wake_off_duty = (_pinned_review or bool(pick.get('workOrderId')) or bool(pick.get('notBefore')) or _awake_idle_count(state) == 0) \
+        can_wake_off_duty = (_pinned_review or bool(pick.get('taskMasterWork')) or bool(pick.get('workOrderId')) or bool(pick.get('notBefore')) or _awake_idle_count(state) == 0) \
             and can_activate_another(state)
         if _awake_idle_count(state) == 0 and not (can_wake_off_duty and _any_available_including_off_duty(state)):
             break  # nobody who could take this right now, of any kind
@@ -11498,6 +11643,10 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     extra = {
         'research': pick.get('research'),
         'workOrderId': pick.get('workOrderId'),
+        'workOrderStoryId': pick.get('workOrderStoryId'),
+        'investigationOf': pick.get('investigationOf'),
+        'reviewContract': pick.get('reviewContract'),
+        'taskMasterWork': bool(pick.get('taskMasterWork')),
         'sprintId': pick.get('sprintId'),
         'teamId': pick.get('teamId'),
         'taskType': pick.get('taskType'),

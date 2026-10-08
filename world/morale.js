@@ -66,8 +66,8 @@ function recentDeliveryScore(agentId = null, now = Date.now()) {
   const completions = new Map((state.completedDeliverables || []).map(d => [d.id, d.gradedAt]));
   const work = tasks.filter(t => !t.reviewOf && !['review','qa','code_preflight'].includes(t.taskType)
     && (!agentId || t.assignedTo === agentId) && !t.supersededByAutomaticRepair);
-  const completed = work.filter(t => t.status === 'done' && recent(t.completedAt || completions.get(t.id) || t.createdAt)).length;
-  const failed = work.filter(t => ['failed','abandoned'].includes(t.status) && recent(t.completedAt || t.createdAt)).length;
+  const completed = work.filter(t => t.status === 'done' && recent(t.completedAt || completions.get(t.id))).length;
+  const failed = work.filter(t => ['failed','abandoned'].includes(t.status) && recent(t.failedAt)).length;
   const blocked = work.filter(t => !t.boardClearedAt && !['done','cancelled','abandoned'].includes(t.status)
     && (t.manualAttention || t.status === 'blocked' || t._peerGate?.escalated)).length;
   const working = work.filter(t => ['walking','working'].includes(t.status)).length;

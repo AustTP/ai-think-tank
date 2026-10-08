@@ -61,7 +61,14 @@ def _stub_decider(choice='accept'):
 def _step(state, _zero_unused, now, decider=None):
     """Drive one refinement pass with a deterministic decider threaded (a resolve
     would otherwise hit the network default)."""
-    return sim._refinement_step(state, 1000.0, now, decider=decider or _stub_decider())
+    import company_planning
+    def plan_player(state, req, master):
+        company_planning.apply_plan(state,req,{'questions':[], 'stories':[{
+            'id':'main','title':req['title'],'taskType':req.get('taskType') or 'research',
+            'instructions':req.get('reason') or 'Deliver request.',
+            'acceptanceCriteria':req.get('acceptanceCriteria') or 'Save evidence.'}]},master)
+    with unittest.mock.patch.object(company_planning,'begin',side_effect=plan_player):
+        return sim._refinement_step(state, 1000.0, now, decider=decider or _stub_decider())
 
 
 def _seed(**over):

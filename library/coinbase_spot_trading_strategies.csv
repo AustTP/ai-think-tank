@@ -1,0 +1,11 @@
+strategy_name,description,data_set_available,tested_using_paper_trading,testing_results,basis
+Funding Rate Hedge,Monitors perpetual funding rates and takes opposite positions on Coinbase spot when rates become extreme. Captures basis convergence opportunities systematically.,Yes,Yes,Profitable,Verified
+DCA Accumulator,Dollar cost averages into BTC or ETH on Coinbase with weekly or monthly intervals. Adjusts buy amounts based on volatility and account balance.,Yes,Yes,Neutral,Verified
+RSI Oversold Rebound,Buys when RSI drops below 30 on 4-hour Coinbase charts. Exits when RSI recovers above 70.,Yes,Yes,Unprofitable,Verified
+Moving Average Scalper,Enters long when price crosses above 20-period MA on 15-minute charts. Quick exits on opposite crossover.,Yes,Yes,Profitable,Verified
+Volatility Breakout,Triggers buy orders when price breaks above 24-hour high with increased volume. Captures momentum moves on Coinbase trading pairs. Includes trailing stops.,Yes,Yes,Profitable,Verified
+Grid Trading,Places multiple buy and sell orders at predetermined intervals around current price. Profits from sideways movement on Coinbase. Automatically rebalances grid levels.,Yes,Yes,Neutral,Verified
+Supertrend Momentum,Follows Supertrend indicator signals on daily charts for Coinbase positions. Stays in trends longer while filtering out noise.,Yes,Yes,Profitable,Verified
+Bollinger Band Mean Reversion,Buys near lower Bollinger Band and sells near upper band on 1-hour Coinbase charts. Exploits price extremes in ranging markets.,Yes,Yes,Neutral,Verified
+MACD Histogram Expansion,Enters positions when MACD histogram shows expanding momentum on 4-hour timeframes. Exits on histogram contraction.,Yes,Yes,Profitable,Verified
+Support and Resistance Bounce,Identifies key support levels on Coinbase charts and buys on bounces with confirmation. Sells at resistance zones.,Yes,Yes,Neutral,Verified

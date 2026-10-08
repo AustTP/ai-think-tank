@@ -16,6 +16,12 @@ GRANULARITY = {'ONE_MINUTE': 60, 'FIVE_MINUTE': 300, 'FIFTEEN_MINUTE': 900,
                'ONE_HOUR': 3600, 'FOUR_HOUR': 14400, 'ONE_DAY': 86400}
 
 RESEARCH_TOOLS = [
+    {'type': 'function', 'function': {'name': 'coinbase_collect_history',
+     'description': 'Fetch actual daily Coinbase spot candles and save dated CSV plus provenance metadata in Library. Use for historical training data; source lists are not datasets. No orders.',
+     'parameters': {'type': 'object', 'properties': {'productId': {'type': 'string'},
+       'start': {'type': 'string', 'description': 'YYYY-MM-DD'},
+       'end': {'type': 'string', 'description': 'Exclusive YYYY-MM-DD; defaults to today UTC.'}},
+       'required': ['productId', 'start']}}},
     {'type': 'function', 'function': {'name': 'coinbase_paper_account',
      'description': 'Read the isolated simulated account and order ledger. Does not submit orders.',
      'parameters': {'type': 'object', 'properties': {}}}},
@@ -31,6 +37,9 @@ RESEARCH_TOOLS = [
 
 
 def research_tool(name, args):
+    if name == 'coinbase_collect_history':
+        import historical_data
+        return json.dumps(historical_data.collect(args.get('productId'), args.get('start'), args.get('end')))
     if name == 'coinbase_paper_account':
         import serve
         with serve._db() as conn:

@@ -1,0 +1,5 @@
+Endpoint,Parameters,Description
+/candles,"start_time, end_time, granularity",Provides OHLCV data for a specific time period.
+/historical-rates,"start_time, end_time, currency",Provides historical price data for a specific time period.
+/order-book,None,Provides the current order book data.
+/trades,"start_time, end_time, currency",Provides historical trade data for a specific time period.
