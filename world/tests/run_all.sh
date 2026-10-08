@@ -169,6 +169,9 @@ echo
 echo "== Python: sandbox networking setup -- proxy create/recreate-on-drift =="
 python3 tests/test_sandbox_networking.py
 echo
+echo "== Python: browser_act -- Jev-gated real-browser form interactions (endpoint, gate, runner, tool) =="
+python3 tests/test_browser_act.py
+echo
 echo "== Python: the Bank -- model-spend ledger + director teller (used/left/forecast) =="
 python3 tests/test_bank.py
 echo

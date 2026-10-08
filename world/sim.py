@@ -954,6 +954,11 @@ def _reclaim_orphaned_walking_tasks(state):
             'checklist': task.get('checklist') or None,
             'pipelineStep': task.get('pipelineStep') or None,
             'lane': task.get('lane') or None,
+            # Player-authored provenance survives the orphan-reclaim round trip
+            # (see queue_work / _assign_due_item / assign_task) -- the JEV gate's
+            # work-context bypass depends on it, so dropping it here would
+            # silently downgrade a player-vetted task to agent-authored.
+            'playerAuthored': bool(task.get('playerAuthored')),
             'attempts': attempts,
         })
         # Fault-aware routing memory: this agent's work attempt just failed
@@ -2330,13 +2335,21 @@ def queue_work(state, items):
             # contract as 'distill'/'checklist': a lane silently dropped here
             # would let a parked card leak into assignment.
             'lane': normalize_lane(item.get('lane')),
+            # Player-authored provenance: True only when the PLAYER wrote the
+            # work text (player chat lane / player-filed JIRA issue), never an
+            # agent. Rides the queue -> assignment -> task round trip (see
+            # _assign_due_item / assign_task) so the JEV gate can tell a task
+            # the player vetted from one an agent wrote (an agent-authored
+            # story must not be able to manufacture its own work-context
+            # bypass by naming a URL in its own text).
+            'playerAuthored': bool(item.get('playerAuthored')),
         })
     return len(work_queue)
 
 
 def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructions=None,
                 project_label=None, moonshot=False, notBefore=None, assigned_to=None,
-                lane=None):
+                lane=None, player_authored=False):
     """Phase E2b: enqueue a time-boxed SPIKE (taskType='spike'). A spike is an
     investigation with no committed deliverable: it's LOWEST priority (fills
     gaps, never blocks committed work), carries a hard `budgetMs` for the work
@@ -2368,6 +2381,9 @@ def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructi
         'notBefore': notBefore,
         'assignedTo': assigned_to or None,
         'lane': lane,
+        # Player-authored provenance: True only when the PLAYER filed this spike
+        # (the player chat lane) -- see queue_work's whitelist comment.
+        'playerAuthored': bool(player_authored),
     }])
 def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None,
                goal=None, priority=None, project_label=None, depends_on_task=None,
@@ -3826,6 +3842,12 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         # onto the durable task so the board can show it and the reading
         # rate-limit can count it as the room's one active slow thread.
         'lane': (extra or {}).get('lane'),
+        # Player-authored provenance: True only when the PLAYER wrote this
+        # task's work text (see queue_work / _assign_due_item). The JEV gate's
+        # work-context bypass trusts only these tasks; an agent-authored task
+        # must never be able to manufacture a bypass by naming a URL in its
+        # own story text.
+        'playerAuthored': bool((extra or {}).get('playerAuthored')),
         'assignedTo': agent_id,
         'status': 'walking',
         'createdAt': now_ms,
@@ -8470,6 +8492,12 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
                 # item (whitelisted) so the ASSIGNED task carries them.
                 'budgetUsd': req.get('budgetUsd'),
                 'budgetBand': req.get('budgetBand'),
+                # Player-authored provenance: a backlog request the PLAYER filed
+                # (filedBy 'player' -- the player chat lane, or a player-filed
+                # JIRA issue) is player-vetted; every agent-filed request is
+                # not. Threaded so the JEV gate's work-context bypass trusts
+                # only these tasks.
+                'playerAuthored': bool(filed_by == 'player'),
             }])
             accepted.append(req)
         else:
@@ -11581,6 +11609,11 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # Attention lane (build/reading/open/parking-lot) rides onto the task so
         # the board and the reading rate-limit can see it (see assign_task).
         'lane': pick.get('lane'),
+        # Player-authored provenance rides onto the assigned task (see
+        # assign_task) -- the JEV gate's work-context bypass trusts only tasks
+        # the PLAYER wrote, so dropping this here would silently downgrade a
+        # player-vetted task to agent-authored.
+        'playerAuthored': pick.get('playerAuthored'),
     }
     # Cut 2 coaching + runbook injection: append the chosen agent's pending
     # growth-plan note (applied once) and any product runbook knowledge to the

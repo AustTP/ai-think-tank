@@ -51,8 +51,10 @@ class PlayerTaskBase(unittest.TestCase):
                  'director': 'faye'},
                 {'id': 'faye', 'name': 'Faye', 'role': 'Admin', 'isAdmin': True},
             ],
-            'agents': {'ada': {'id': 'ada', 'offDuty': False},
-                       'faye': {'id': 'faye', 'offDuty': False}},
+            'agents': {'ada': {'id': 'ada', 'offDuty': False, 'busy': False, 'task': None,
+                           'x': 600, 'y': 340},
+                   'faye': {'id': 'faye', 'offDuty': False, 'busy': False, 'task': None,
+                            'x': 680, 'y': 340}},
             'teams': [{'id': 'ada', 'directorId': 'ada', 'scrumMasterId': 'ada',
                        'prefix': 'DEV', 'name': 'Dev Team'}],
             'workQueue': [],
@@ -190,6 +192,49 @@ class PlayerTaskCreationChannels(PlayerTaskBase):
         # The generic due-item clause already counts it: the tank must not
         # treat a waiting player card as a reason to idle out.
         self.assertTrue(sim.think_tank_has_work(state, int(time.time() * 1000)))
+
+    def test_player_authored_provenance_survives_queue_to_assigned_task(self):
+        # The JEV gate's work-context host bypass trusts ONLY player-authored
+        # tasks. The flag must survive the whole queue -> assignment round trip
+        # (queue_work -> _assign_due_item -> assign_task) or a player-vetted
+        # task silently loses its provenance.
+        state = self._state()
+        sim.queue_spike(state, 'Investigate the urllib docs', 'observatory',
+                        60_000, player_authored=True)
+        self.assertTrue(state['workQueue'][0]['playerAuthored'])
+        pick = state['workQueue'].pop(0)
+        grid, doors = sim._load_outdoor_geometry()
+        task = sim._assign_due_item(state, pick, False, grid, doors,
+                                    int(time.time() * 1000), [0])
+        self.assertIsNotNone(task)
+        self.assertIs(task['playerAuthored'], True)
+
+    def test_agent_authored_task_defaults_to_not_player_authored(self):
+        # An agent-filed spike (free spike / follow-up / refinement) must NOT
+        # carry the player-authored flag -- its story text is agent-written and
+        # must never unlock the Jev-free work-context bypass.
+        state = self._state()
+        sim.queue_spike(state, 'Investigate the urllib docs', 'observatory', 60_000)
+        self.assertIs(state['workQueue'][0]['playerAuthored'], False)
+
+    def test_player_filed_issue_refinement_stamps_player_authored(self):
+        # A player-filed JIRA issue (filedBy 'player') grooms into a queue item
+        # that IS player-authored; an agent-filed one is not.
+        state = self._state()
+        sim.file_issue(state, 'ada', 'story', 'Research urllib', 'research', 'player')
+        req = state['backlogRequests'][0]
+        pending = {'scrumMasterId': 'ada', 'reqIds': [req['id']], 'teamId': 'ada'}
+        sim._resolve_refinement(state, pending, int(time.time() * 1000),
+                                decider=lambda i, c: 'accept')
+        self.assertIs(state['workQueue'][-1]['playerAuthored'], True)
+
+        state2 = self._state()
+        sim.file_issue(state2, 'ada', 'story', 'Research urllib', 'research', 'ben')
+        req2 = state2['backlogRequests'][0]
+        pending2 = {'scrumMasterId': 'ada', 'reqIds': [req2['id']], 'teamId': 'ada'}
+        sim._resolve_refinement(state2, pending2, int(time.time() * 1000),
+                                decider=lambda i, c: 'accept')
+        self.assertIs(state2['workQueue'][-1]['playerAuthored'], False)
 
 
 if __name__ == '__main__':

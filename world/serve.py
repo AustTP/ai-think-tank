@@ -5023,6 +5023,58 @@ def _is_allowlisted_host(hostname):
     return any(host == d or host.endswith('.' + d) for d in _effective_allowlist_domains())
 
 
+# Work-context-aware gating (2026-10-08): the browser-like gates
+# (/api/browse, /api/curl, /api/api-call, /api/browser-act) now judge a URL
+# against the agent's CURRENT WORK, not in isolation. The executors thread the
+# actual assigned task (`title -- instructions`, which the AGENT does not
+# author -- the player/backlog does) through to the endpoint, and the gate
+# uses it two ways:
+#   1. A host the player EXPLICITLY named in the work bypasses Jev exactly
+#      like an allowlisted domain -- the player vetted it by writing it into
+#      the assignment. (Same reachability semantics as a full allowlist grant:
+#      naming one URL on a host covers the whole host, exactly like granting
+#      the domain covers the whole domain.)
+#   2. Every non-explicit URL is judged with the work context IN the Jev
+#      prompt, so a site that is clearly relevant to the assigned work is
+#      allowed where the old gate (URL + one-line purpose, no work) blocked
+#      it. Jev still blocks unrelated or sketchy destinations exactly as
+#      before -- the work context widens the allow side, never narrows the
+#      block side.
+# The trust anchor is the assignment, not the agent: the work context comes
+# from the player-filed task the agent is executing, never from what the
+# agent claims in its own request, so an agent cannot manufacture its own
+# allowlist by lying about its work.
+
+_WORK_URL_RE = re.compile(r'https?://([A-Za-z0-9._\-]+)')
+
+
+def _work_context_hosts(work_context):
+    """Hosts the player explicitly named in the assigned work text."""
+    if not work_context:
+        return set()
+    return {m.group(1).lower() for m in _WORK_URL_RE.finditer(work_context)}
+
+
+def _is_work_context_host(work_context, hostname):
+    """True when `hostname` (or a subdomain of it) was explicitly named as a
+    URL in the player-filed work -- a real bypass, same shape as the
+    allowlist, because the player vetted it by writing it into the task."""
+    host = (hostname or '').lower()
+    return any(host == d or host.endswith('.' + d) for d in _work_context_hosts(work_context))
+
+
+def _work_context_clause(work_context):
+    """The sentence every browser-like Jev prompt gains when work context is
+    present. Kept tiny (the task text is already in the instructions).
+    Work relevance is SUBORDINATE to the blocked categories: it widens the
+    gray zone for legal, on-task sites only -- it can never let a destination
+    that falls into a blocked category through (an agent can file a story
+    with inappropriate text and cite it as "the work", so relevance must stay
+    subordinate, or the story becomes a laundering vector)."""
+    return ('A URL that is clearly part of, or relevant to, the agent\'s CURRENT assigned work is allowed, '
+            'provided it does not fall into any blocked category.' if work_context else '')
+
+
 # ---- Generic api_call service registry (config, not code) ------------------
 # A new external service is added via the proposal/approval flow
 # (/api/api-service/request -> player approval -> a row in the api_services
@@ -5958,6 +6010,12 @@ def _rule_proposals():
 SANDBOX_NETWORK = 'ai-think-tank-sandbox-net'  # internal -- no route to the internet at all
 EGRESS_NETWORK = 'ai-think-tank-egress-net'    # normal -- real internet access, only the proxy container touches it
 PROXY_CONTAINER = 'ai-think-tank-egress-proxy'
+# Shared JEV-approved-egress grants file (2026-10-08): a short-lived, scoped
+# {host: expiry} map written by serve.py when Jev approves a browser action
+# to a non-allowlisted host, and mounted into the egress proxy container so
+# the browser can actually reach it. Removed when the run finishes; the proxy
+# re-reads it on every connection and ignores expired grants.
+EGRESS_GRANTS_PATH = os.path.join(ROOT, 'sandbox_egress_grants.json')
 PROXY_PORT = 8899
 
 
@@ -6018,7 +6076,12 @@ def ensure_sandbox_networking():
     desired_extra_hosts = ','.join(sorted(_effective_allowlist_domains()))
     if _docker_container_running(PROXY_CONTAINER):
         current_extra_hosts = _docker_container_env_value(PROXY_CONTAINER, 'SANDBOX_EGRESS_EXTRA_HOSTS')
-        if current_extra_hosts != desired_extra_hosts:
+        current_grants_path = _docker_container_env_value(PROXY_CONTAINER, 'SANDBOX_EGRESS_GRANTS_PATH')
+        # Recreate when the allowlist env drifted OR the Jev-approved-egress
+        # grants file isn't mounted yet (a proxy created before 2026-10-08
+        # won't have it -- without it, Jev-approved browser hosts stay
+        # unreachable at the network layer).
+        if current_extra_hosts != desired_extra_hosts or current_grants_path != EGRESS_GRANTS_PATH:
             subprocess.run(['docker', 'rm', '-f', PROXY_CONTAINER], capture_output=True)
     if not _docker_container_running(PROXY_CONTAINER):
         subprocess.run(['docker', 'rm', '-f', PROXY_CONTAINER], capture_output=True)  # clear a stale/stopped one, if any
@@ -6026,10 +6089,57 @@ def ensure_sandbox_networking():
             'docker', 'run', '-d', '--name', PROXY_CONTAINER,
             '--network', SANDBOX_NETWORK,
             '-e', f'SANDBOX_EGRESS_EXTRA_HOSTS={desired_extra_hosts}',
+            '-e', f'SANDBOX_EGRESS_GRANTS_PATH={EGRESS_GRANTS_PATH}',
             '-v', f'{os.path.join(ROOT, "sandbox_proxy.py")}:/proxy.py:ro',
+            '-v', f'{EGRESS_GRANTS_PATH}:{EGRESS_GRANTS_PATH}',
             SANDBOX_IMAGE, 'python3', '/proxy.py',
         ], capture_output=True)
         subprocess.run(['docker', 'network', 'connect', EGRESS_NETWORK, PROXY_CONTAINER], capture_output=True)
+
+
+# JEV-approved egress grants (2026-10-08): a {host: expiry-epoch} map in the
+# shared file the egress proxy re-reads on every connection. Write a grant
+# right before a Jev-approved browser run to a non-allowlisted host, revoke it
+# when the run finishes. Atomic replace so the proxy never reads a
+# half-written file; short TTL so an orphaned grant expires on its own.
+_EGRESS_GRANT_TTL_S = 120
+_egress_grants_lock = threading.Lock()
+
+
+def _grant_egress_host(host):
+    if not host:
+        return
+    host = (host or '').lower().strip()
+    with _egress_grants_lock:
+        grants = {}
+        try:
+            with open(EGRESS_GRANTS_PATH, 'r') as f:
+                grants = json.load(f) or {}
+        except (OSError, ValueError):
+            grants = {}
+        grants[host] = time.time() + _EGRESS_GRANT_TTL_S
+        _write_egress_grants(grants)
+
+
+def _revoke_egress_host(host):
+    if not host:
+        return
+    host = (host or '').lower().strip()
+    with _egress_grants_lock:
+        try:
+            with open(EGRESS_GRANTS_PATH, 'r') as f:
+                grants = json.load(f) or {}
+        except (OSError, ValueError):
+            grants = {}
+        grants.pop(host, None)
+        _write_egress_grants(grants)
+
+
+def _write_egress_grants(grants):
+    tmp = EGRESS_GRANTS_PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(grants, f)
+    os.replace(tmp, EGRESS_GRANTS_PATH)
 
 
 def _run_in_sandbox_sync(sandbox_dir, command):
@@ -6083,6 +6193,96 @@ def _run_in_sandbox_sync(sandbox_dir, command):
         }
     except subprocess.TimeoutExpired as e:
         return {'exitCode': None, 'stdout': (e.stdout or '')[:SANDBOX_MAX_OUTPUT], 'stderr': (e.stderr or '')[:SANDBOX_MAX_OUTPUT], 'timedOut': True}
+
+
+# browser_act: run the fixed browser driver inside the SAME sandbox container
+# as every other agent command (see browser_driver.py / the sandbox Dockerfile
+# COPY). One op per invocation, driver is a fixed /opt/browser_driver.py, never
+# a free-form script. Network rides the same internal SANDBOX_NETWORK +
+# allowlist egress proxy, so a page an agent script couldn't reach via the
+# proxy is a page the browser can't load either. The action is written to the
+# sandbox's own scratch dir (mounted at /workspace) so the driver's persistent
+# profile + result/screenshot files survive for the caller to read back.
+BROWSER_ACT_TIMEOUT_S = 60
+BROWSER_ACT_MAX_OUTPUT = 60_000
+
+
+def _run_browser_act_sync(sandbox_dir, action):
+    """Run ONE already-classified browser_act op in the sandbox and return the
+    parsed result dict from the driver's result file (falling back to parsing
+    its stdout JSON). Returns None on harness-level failure (docker/IO), never
+    a browser-level 'error' -- those come back inside the parsed result."""
+    import secrets as _secrets
+    work_dir = os.path.join(sandbox_dir, '.browser-act')
+    os.makedirs(work_dir, exist_ok=True)
+    run_id = _secrets.token_hex(4)
+    action_path = os.path.join(work_dir, f'action-{run_id}.json')
+    result_path = os.path.join(work_dir, f'result-{run_id}.json')
+    shot_path = os.path.join(work_dir, f'shot-{run_id}.png')
+    action['workDir'] = '/workspace/.browser-act'
+    action['profileDir'] = '/workspace/.browser-act/profile'
+    action['resultPath'] = f'/workspace/.browser-act/result-{run_id}.json'
+    action['screenshotPath'] = f'/workspace/.browser-act/shot-{run_id}.png'
+    try:
+        with open(action_path, 'w') as f:
+            json.dump(action, f)
+    except OSError as e:
+        return None, f'could not write browser action to sandbox: {e}'
+    # JEV-approved egress: grant the target host in the shared grants file the
+    # proxy re-reads, so a Jev-approved non-allowlisted host is genuinely
+    # reachable by the browser. Revoked in a finally below -- the grant never
+    # outlives this one action run.
+    try:
+        grant_host = urllib.parse.urlparse(action.get('url') or '').hostname or ''
+    except Exception:
+        grant_host = ''
+    if grant_host and not _is_allowlisted_host(grant_host):
+        _grant_egress_host(grant_host)
+    proxy_url = f'http://{PROXY_CONTAINER}:{PROXY_PORT}'
+    docker_cmd = [
+        'docker', 'run', '--rm',
+        '--network', SANDBOX_NETWORK,
+        '-e', f'http_proxy={proxy_url}', '-e', f'https_proxy={proxy_url}',
+        '-e', f'HTTP_PROXY={proxy_url}', '-e', f'HTTPS_PROXY={proxy_url}',
+        '-e', f'BROWSER_PROXY_URL={proxy_url}',
+        '--memory', '512m',
+        '--cpus', '1',
+        '--pids-limit', '128',
+        '--shm-size', '256m',
+        '-v', f'{sandbox_dir}:/workspace',
+        '-w', '/workspace',
+        SANDBOX_IMAGE,
+        'python3', '/opt/browser_driver.py', f'/workspace/.browser-act/action-{run_id}.json',
+    ]
+    try:
+        try:
+            result = subprocess.run(docker_cmd, capture_output=True, text=True, timeout=BROWSER_ACT_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            return None, 'browser action timed out in sandbox'
+        # Prefer the driver's own result file (not truncated by capture caps).
+        if os.path.isfile(result_path):
+            try:
+                with open(result_path, 'r') as f:
+                    parsed = json.load(f)
+                if os.path.isfile(shot_path):
+                    with open(shot_path, 'rb') as f:
+                        parsed['_shotB64'] = base64.b64encode(f.read()).decode()
+                return parsed, None
+            except (OSError, ValueError):
+                pass
+        # Fallback: parse stdout JSON (may be truncated, hence the file-first).
+        out = (result.stdout or '')[:BROWSER_ACT_MAX_OUTPUT]
+        try:
+            parsed = json.loads(out)
+            if os.path.isfile(shot_path):
+                with open(shot_path, 'rb') as f:
+                    parsed['_shotB64'] = base64.b64encode(f.read()).decode()
+            return parsed, None
+        except ValueError:
+            return None, f'browser driver produced no parseable result (exit {result.returncode}): {out[-500:] or (result.stderr or "")[-500:]}'
+    finally:
+        if grant_host and not _is_allowlisted_host(grant_host):
+            _revoke_egress_host(grant_host)
 
 
 # How long real JS/AJAX content gets to finish loading before the text is
@@ -7963,6 +8163,10 @@ ESCALATION_KIND_RISK = {
     # always human.
     'blocked command':        {'floor': 1.0},
     'blocked pipeline step':  {'floor': 1.0},
+    # A blocked browser action is the same class of decision as a blocked
+    # command -- Jev said no, and the only acceptable override is the human
+    # who owns the keyboard. Same floor as blocked command.
+    'blocked browser action': {'floor': 1.0},
     # Agent-driven "could not resolve a review requirement": ordinary routine
     # approval/denial is fine at the default floor.
     'unresolved review requirement': {'floor': JEV_SAFETY_CONFIDENCE},
@@ -8691,7 +8895,7 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/api-call', '/api/api-service', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/villages', '/api/memory-ledger', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews', '/api/agent-files')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/browser-act', '/api/api-call', '/api/api-service', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/villages', '/api/memory-ledger', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews', '/api/agent-files')
 # Gap: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
@@ -9727,6 +9931,7 @@ async def intent_promote_spike(task_id: str, request: Request):
             'goal': task.get('goal') or spike_title,
             'taskType': task_type,
         }
+    new_item['playerAuthored'] = True
     _sim.queue_work(state, [new_item])
     save_state_to_db(state)
     player_id = 'player'
@@ -9830,6 +10035,7 @@ async def promote_shadow_entry(idx: str, request: Request):
             'goal': entry.get('projectLabel') or entry.get('title'),
             'taskType': task_type,
         }
+    new_item['playerAuthored'] = True
     _sim.queue_work(state, [new_item])
     entry['promoted'] = True
     entry['promotedAt'] = int(time.time() * 1000)
@@ -10543,13 +10749,19 @@ async def intent_clarify(request: Request):
         'onCallFallback': plan.get('onCallFallback', False)})
 
 
-def _make_web_tools_executor(agent_id, agent_key, default_location=None, default_query=None, struck_tools=None):
+def _make_web_tools_executor(agent_id, agent_key, default_location=None, default_query=None, struck_tools=None, work_context='', work_context_trusted=False):
     """Shared search_web/browse_page tool executor for any
     AGENT_ASK_TOOLS-driven tool-calling loop. Extracted so the
     spike content executor can reuse the exact same gated fetch/wrap logic
     _ask_core uses, instead of the single free-text completion with NO tool
     access it used before -- see the SECURITY_TEST_TOOLS comment above about
     that exact pattern already producing fabricated "test reports" once.
+
+    `work_context` is the player-filed task this agent is currently executing
+    (title -- instructions), threaded into every browser-like endpoint so its
+    Jev gate judges URLs against the work instead of in isolation. It comes
+    from the assignment, never from what the agent claims, so an agent cannot
+    manufacture its own bypass by lying about its work.
 
     `struck_tools`, if given a set, gets a tool name added to it the moment
     that tool is BLOCKED (a real policy denial -- Jev said no -- not a
@@ -10602,6 +10814,8 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 'purpose': (args or {}).get('purpose') or 'research',
                 'render': bool((args or {}).get('render')),
                 'viaVpnCountry': country,
+                'workContext': work_context,
+                'workContextTrusted': bool(work_context_trusted),
             }, agent_key, timeout=60 if not country else 60 + MULLVAD_CONNECT_TIMEOUT_S)
             if isinstance(result, dict) and result.get('allowed') and result.get('textForModel'):
                 # Gap: /api/browse already
@@ -10644,6 +10858,8 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 'body': (args or {}).get('body'),
                 'headers': (args or {}).get('headers') or {},
                 'purpose': (args or {}).get('purpose') or 'research',
+                'workContext': work_context,
+                'workContextTrusted': bool(work_context_trusted),
             }, agent_key, timeout=API_CALL_TIMEOUT_S + 5)
             if isinstance(result, dict) and result.get('allowed') and result.get('textForModel'):
                 return f"{result.get('modelInstruction', '')}\n\n{result['textForModel']}"
@@ -11511,7 +11727,7 @@ async def _route_lane_spike(state, text, admin_id):
     team_id = await asyncio.to_thread(_team_decider, state, text)
     room = await asyncio.to_thread(_classify_room_default, state, text)
     title = text[:120]
-    queued = _sim.queue_spike(state, title, room, budget_ms=None, goal=text)
+    queued = _sim.queue_spike(state, title, room, budget_ms=None, goal=text, player_authored=True)
     if not queued:
         return {'reply': "I couldn't queue that as an investigation -- try rephrasing it."}
     worker_id = None
@@ -14635,6 +14851,20 @@ async def browse(request: Request):
     url = (body.get('url') or '').strip()
     agent_id = body.get('agentId', 'unknown')
     purpose = (body.get('purpose') or '').strip()
+    # Work-context-aware gating: the player-filed task the agent is currently
+    # executing (threaded by the executors). A host the player EXPLICITLY
+    # named in that work bypasses Jev like the allowlist -- the player vetted
+    # it by writing it into the assignment. Every other URL is judged with the
+    # work context IN the Jev prompt, so on-task sites are allowed instead of
+    # blocked for being unfamiliar.
+    work_context = (body.get('workContext') or '').strip()
+    # Player-authored provenance (threaded by the executors from the task's
+    # playerAuthored flag): a host the player EXPLICITLY named in a task the
+    # PLAYER wrote bypasses Jev like the allowlist -- the player vetted it by
+    # writing it into the assignment. An agent-authored story's work text is
+    # NEVER trusted for this bypass (the agent wrote the text itself), so its
+    # named hosts always go through the story-aware Jev prompt.
+    work_context_trusted = bool(body.get('workContextTrusted'))
     if not check_rate_limit(agent_id):
         log_action(agent_id, 'rate_limited', {'endpoint': 'browse'})
         return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
@@ -14654,21 +14884,29 @@ async def browse(request: Request):
     # path has no decision to trace, so default to None before the branch
     # (the outcome rows after it are threaded with whichever value applied).
     trace_id = None
-    if _is_allowlisted_host(parsed.hostname):
-        # Player-vetted domain -- skip the Jev classify+escalate round trip
-        # entirely (gap: the SAME url got a low-confidence
-        # 'escalated_unsure' from Jev on one run and a clean allow on
-        # another, purely from classifier variance on a site the player had
-        # already decided was fine). SSRF/private-network protection above
-        # is NOT skipped -- this only replaces the content/purpose judgment
-        # call, never the network-safety one.
-        log_action(agent_id, 'browse', {'url': url, 'purpose': purpose, 'decision': 'allowed_by_allowlist'}, authorized=authorized)
+    if _is_allowlisted_host(parsed.hostname) or (work_context_trusted and _is_work_context_host(work_context, parsed.hostname)):
+        # Player-vetted domain (allowlist, or a host the player EXPLICITLY
+        # named in THIS task's work, and the task is player-authored) -- skip
+        # the Jev classify+escalate round trip entirely (gap: the SAME url got
+        # a low-confidence 'escalated_unsure' from Jev on one run and a clean
+        # allow on another, purely from classifier variance on a site the
+        # player had already decided was fine). SSRF/private-network protection
+        # above is NOT skipped -- this only replaces the content/purpose
+        # judgment call, never the network-safety one. An agent-authored
+        # story's own text is never trusted for this bypass: the agent wrote
+        # that text, so it must not be able to launder a site by naming it in
+        # its own story.
+        log_action(agent_id, 'browse', {'url': url, 'purpose': purpose, 'decision': 'allowed_by_allowlist', 'workContext': bool(work_context)}, authorized=authorized)
     else:
         criteria = {
-            'allow': 'The URL and stated purpose look like ordinary, legal browsing (reference material, news, weather, general research, public information).',
-            'block': 'The URL, domain, or stated purpose suggests: ' + '; '.join(BROWSE_BLOCK_CATEGORIES) + '.',
+            'allow': 'The URL and stated purpose look like ordinary, legal browsing (reference material, news, weather, general research, public information).'
+                     + (' A URL that is clearly part of, or relevant to, the agent\'s CURRENT assigned work is allowed, provided it does not fall into any blocked category.' if work_context else ''),
+            'block': 'The URL, domain, or stated purpose suggests: ' + '; '.join(BROWSE_BLOCK_CATEGORIES) + '. A blocked category ALWAYS blocks: relevance to the assigned work or a stated purpose never overrides it -- an agent can describe its work however it likes, and that must not launder an inappropriate site.',
         }
-        instructions = f'An in-game agent wants to visit this URL: {url}\nStated reason: {purpose or "not given"}\nDecide allow or block based on the URL/domain and stated purpose alone (the page has not been fetched yet).'
+        instructions = f'An in-game agent wants to visit this URL: {url}\nStated reason: {purpose or "not given"}\n'
+        if work_context:
+            instructions += f'The agent is currently working on this assigned task: {work_context[:600]}\n'
+        instructions += 'Decide allow or block based on the URL/domain, the stated purpose, and the work the URL serves (the page has not been fetched yet). If the URL falls into any blocked category, you MUST block it regardless of work relevance or stated purpose.'
         decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
 
         if not _jev_safety_gate(agent_id, 'browse', 'This page', url, purpose, decision, confidence, cost, authorized, trace_id):
@@ -15262,6 +15500,17 @@ async def api_call(request: Request):
     req_headers = dict(body_json.get('headers') or {})
     req_body = body_json.get('body')
     purpose = (body_json.get('purpose') or '').strip()
+    # Work-context-aware gating: same rule as /api/browse -- a host the player
+    # explicitly named in the current assigned work bypasses Jev like the
+    # allowlist; every other unregistered URL is judged with the work context
+    # in the Jev prompt, so on-task API calls are allowed instead of blocked
+    # for being unfamiliar.
+    work_context = (body_json.get('workContext') or '').strip()
+    # Player-authored provenance: the work-context host bypass below (a host
+    # named in the assigned work skipping Jev like the allowlist) fires ONLY
+    # for a task the PLAYER wrote. An agent-authored story can name any URL in
+    # its own text -- never trusted for the bypass.
+    work_context_trusted = bool(body_json.get('workContextTrusted'))
     workflow = bool(body_json.get('workflow'))
 
     if not check_rate_limit(agent_id):
@@ -15285,16 +15534,20 @@ async def api_call(request: Request):
     # paths/methods are already trusted.
     registered = _api_service_for_host(parsed.hostname) is not None
     trace_id = None
-    if not registered and not _is_allowlisted_host(parsed.hostname):
+    if not registered and not _is_allowlisted_host(parsed.hostname) and not (work_context_trusted and _is_work_context_host(work_context, parsed.hostname)):
         criteria = {
-            'allow': 'The URL, method, and stated purpose look like ordinary, legal API interaction -- reading a real response, checking raw JSON/HTML, or a registered service call.',
-            'block': 'The URL, domain, method, body, or stated purpose suggests: ' + '; '.join(BROWSE_BLOCK_CATEGORIES) + '; or an attempt to submit data, authenticate against, or modify state on a real service without a clear, legitimate, stated reason.',
+            'allow': 'The URL, method, and stated purpose look like ordinary, legal API interaction -- reading a real response, checking raw JSON/HTML, or a registered service call.'
+                     + (' A request that is clearly part of, or relevant to, the agent\'s CURRENT assigned work is allowed, provided it does not fall into any blocked category.' if work_context else ''),
+            'block': 'The URL, domain, method, body, or stated purpose suggests: ' + '; '.join(BROWSE_BLOCK_CATEGORIES) + '; or an attempt to submit data, authenticate against, or modify state on a real service without a clear, legitimate, stated reason. A blocked category ALWAYS blocks: relevance to the assigned work or a stated purpose never overrides it -- an agent can describe its work however it likes, and that must not launder an inappropriate site.',
         }
         instructions = (
             f'An in-game agent wants to make a real {method} HTTP request to: {url}\n'
             f'Body: {(json.dumps(req_body) if req_body is not None else "")[:500]}\n'
-            f'Stated reason: {purpose or "not given"}\nDecide allow or block based on the request and stated purpose alone (nothing has been sent yet).'
+            f'Stated reason: {purpose or "not given"}\n'
         )
+        if work_context:
+            instructions += f'The agent is currently working on this assigned task: {work_context[:600]}\n'
+        instructions += 'Decide allow or block based on the request, the stated purpose, and the work the request serves (nothing has been sent yet). If the request falls into any blocked category, you MUST block it regardless of work relevance or stated purpose.'
         decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
         if not _jev_safety_gate(agent_id, 'api-call', 'This API request', f'{method} {url}', purpose, decision, confidence, cost, authorized, trace_id):
             return _api_call_response(agent_id, authorized, {'ok': False, 'allowed': False, 'reason': 'This request was not approved for a think tank agent to make.'}, url=url, method=method, purpose=purpose, trace_id=trace_id)
@@ -15447,6 +15700,12 @@ async def curl(request: Request):
     req_headers = body_json.get('headers') or {}
     req_body = body_json.get('body')
     purpose = (body_json.get('purpose') or '').strip()
+    # Work-context-aware gating: same rule as /api/browse -- a host the player
+    # explicitly named in the current assigned work bypasses Jev like the
+    # allowlist; every other URL is judged with the work context in the Jev
+    # prompt, so on-task HTTP requests are allowed instead of blocked for
+    # being unfamiliar.
+    work_context = (body_json.get('workContext') or '').strip()
     # Live room override for the gate below -- the agent's real-time
     # in-room, so a freshly-arrived agent (whose `inRoom` hasn't been
     # autosaved yet) isn't wrongly blocked (see _agent_is_in_weatherstation).
@@ -15474,14 +15733,18 @@ async def curl(request: Request):
         return JSONResponse({'allowed': False, 'reason': 'That address resolves to a private or internal network location and cannot be reached.'})
 
     criteria = {
-        'allow': 'The URL, method, and stated purpose look like ordinary, legal HTTP/API interaction -- reading a real response, checking raw HTML/headers, inspecting response structure.',
-        'block': 'The URL, domain, method, body, or stated purpose suggests: ' + '; '.join(BROWSE_BLOCK_CATEGORIES) + '; or an attempt to submit data to, authenticate against, or modify state on a real service without a clear, legitimate, stated reason.',
+        'allow': 'The URL, method, and stated purpose look like ordinary, legal HTTP/API interaction -- reading a real response, checking raw HTML/headers, inspecting response structure.'
+                 + (' A request that is clearly part of, or relevant to, the agent\'s CURRENT assigned work is allowed, provided it does not fall into any blocked category.' if work_context else ''),
+        'block': 'The URL, domain, method, body, or stated purpose suggests: ' + '; '.join(BROWSE_BLOCK_CATEGORIES) + '; or an attempt to submit data to, authenticate against, or modify state on a real service without a clear, legitimate, stated reason. A blocked category ALWAYS blocks: relevance to the assigned work or a stated purpose never overrides it -- an agent can describe its work however it likes, and that must not launder an inappropriate site.',
     }
     instructions = (
         f'An in-game agent wants to make a real {method} HTTP request to: {url}\n'
         f'Headers: {json.dumps(req_headers)[:500]}\nBody: {(req_body or "")[:500]}\n'
-        f'Stated reason: {purpose or "not given"}\nDecide allow or block based on the request and stated purpose alone (nothing has been sent yet).'
+        f'Stated reason: {purpose or "not given"}\n'
     )
+    if work_context:
+        instructions += f'The agent is currently working on this assigned task: {work_context[:600]}\n'
+    instructions += 'Decide allow or block based on the request, the stated purpose, and the work the request serves (nothing has been sent yet). If the request falls into any blocked category, you MUST block it regardless of work relevance or stated purpose.'
     decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
     if not _jev_safety_gate(agent_id, 'curl', 'This HTTP request', f'{method} {url}', purpose, decision, confidence, cost, authorized, trace_id):
         return JSONResponse({'allowed': False, 'reason': 'This request was not approved for a think tank agent to make.'})
@@ -15833,6 +16096,48 @@ async def _classify_command(command, purpose, agent_id='unknown'):
     return True, 'allow'
 
 
+# browser_act is a REAL headed-browser form interaction running inside the
+# sandbox container -- more consequential than a plain browse_page GET because
+# it can submit forms, so it gets its own JEV gate rather than riding browse's.
+# Read ops (goto/read/screenshot) on a player-vetted allowlisted host skip Jev
+# exactly like browse_page does (the allowlist already stands in for a content
+# judgment call there); anything else -- a submit, a fill, or any op on a
+# non-allowlisted host -- is classified before it runs. Fail-closed like every
+# other gate: an unreachable classifier is not consent to drive a browser.
+BROWSER_ACT_READ_OPS = frozenset({'goto', 'read', 'screenshot'})
+
+
+async def _classify_browser_action(op, url, purpose, agent_id='unknown', work_context='', work_context_trusted=False):
+    try:
+        host = urllib.parse.urlparse(url).hostname or ''
+    except Exception:
+        host = ''
+    # The work-context bypass (a host named in the assigned work skipping Jev
+    # like the allowlist) fires ONLY for a task the PLAYER wrote. An
+    # agent-authored story can name any URL in its own text -- never trusted
+    # for the bypass.
+    if op in BROWSER_ACT_READ_OPS and (_is_allowlisted_host(host) or (work_context_trusted and _is_work_context_host(work_context, host))):
+        return True, 'allow (allowlisted or explicitly named in the assigned work)'
+    if not OPENROUTER_API_KEY:
+        return False, 'OPENROUTER_API_KEY not set'
+    criteria = {
+        'allow': 'An in-game agent filling or submitting a routine form or reading a page on the web for legitimate research or work -- standard web usage a human doing the same research would perform.'
+                 + (' A browser action that is clearly part of, or relevant to, the agent\'s CURRENT assigned work is allowed, provided it does not fall into any blocked category.' if work_context else ''),
+        'block': 'The browser action, or its stated purpose, suggests: submitting credentials, payment information, or sensitive personal data to an arbitrary third party; exfiltrating the think tank\'s data or an agent\'s findings to an external site; bypassing authentication, anti-bot, or CAPTCHA protections; ' + '; '.join(BROWSE_BLOCK_CATEGORIES) + '. A blocked category ALWAYS blocks: relevance to the assigned work or a stated purpose never overrides it -- an agent can describe its work however it likes, and that must not launder an inappropriate site.',
+    }
+    instructions = (f'An in-game agent wants to drive a real browser ({op}) to: {url or "(current page)"}\n'
+                    f'Stated reason: {purpose or "not given"}\n')
+    if work_context:
+        instructions += f'The agent is currently working on this assigned task: {work_context[:600]}\n'
+    instructions += 'Decide allow or block based on the action, the stated purpose, and the work the action serves. If the action falls into any blocked category, you MUST block it regardless of work relevance or stated purpose.'
+    decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
+    if not _jev_safety_gate(agent_id, 'browser_act_classify', 'This browser action', f'{op} {url or ""}', purpose, decision, confidence, cost, None, trace_id):
+        if decision not in ('allow', 'approve'):
+            return False, decision or 'classifier unavailable or gave no answer'
+        return False, f'unsure (Jev confidence {confidence:.2f}), escalated'
+    return True, 'allow'
+
+
 # A sandbox_id may only be a safe, flat slug -- never path separators, never
 # '..' (a traversal there would mount the repo root -- with .env -- into the
 # container via os.path.join). Letters/digits/._- only, one component, capped
@@ -16100,6 +16405,95 @@ async def execute(request: Request):
     log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'purpose': purpose, 'decision': 'allowed', 'exitCode': result['exitCode'], 'timedOut': result['timedOut']}, authorized=authorized)
     sync_prototypes(agent_id, sandbox_dir)
     return JSONResponse({'allowed': True, 'sandboxId': sandbox_id, **result})
+
+
+# browser_act -- the think tank's only real headed-browser primitive
+# (2026-10-08). /api/execute runs arbitrary scripts; /api/browse fetches a
+# single page; NEITHER can fill a form, click a button, submit, and keep the
+# session. This endpoint can: one fixed op (goto|read|fill|click|submit|
+# screenshot) at a time, executed by the fixed /opt/browser_driver.py inside
+# the SAME sandbox container (same network allowlist, same isolation), so the
+# Jev-classified action runs where every other agent action runs. A persistent
+# profile dir under the sandbox makes the session survive across calls, so an
+# agent can go -> fill -> submit -> read like a real user.
+BROWSER_ACT_OPS = ('goto', 'read', 'fill', 'click', 'submit', 'screenshot')
+
+
+@app.post('/api/browser-act')
+async def browser_act(request: Request):
+    if not EXECUTION_ENABLED:
+        return JSONResponse({'error': 'Agent execution is disabled (AGENT_EXECUTION_ENABLED=false in .env)'}, status_code=403)
+    if not BROWSING_ENABLED:
+        return JSONResponse({'error': 'Agent browsing is disabled (AGENT_BROWSING_ENABLED=false in .env)'}, status_code=403)
+
+    body = await request.json()
+    agent_id = body.get('agentId', 'unknown')
+    op = (body.get('op') or '').strip().lower()
+    url = (body.get('url') or '').strip()
+    selector = (body.get('selector') or '').strip()
+    value = body.get('value')
+    purpose = (body.get('purpose') or '').strip()
+    max_text = int(body.get('maxText') or 0) or 0
+    # Work-context-aware gating: the player-filed task this agent is executing.
+    # A host explicitly named in it bypasses Jev (same rule as /api/browse);
+    # every other action is judged with the work context in the Jev prompt.
+    work_context = (body.get('workContext') or '').strip()
+    # Player-authored provenance: the work-context bypass inside
+    # _classify_browser_action (a host named in the assigned work skipping Jev
+    # like the allowlist) fires ONLY for a task the PLAYER wrote. An
+    # agent-authored story can name any URL in its own text -- never trusted
+    # for the bypass.
+    work_context_trusted = bool(body.get('workContextTrusted'))
+    sandbox_id = body.get('sandboxId') or ('sandbox-' + secrets.token_hex(4))
+    sandbox_id = _village_sandbox_id(agent_id, sandbox_id)  # per-village repo isolation
+    if not _SANDBOX_ID_RE.match(sandbox_id or ''):
+        return JSONResponse({'error': 'invalid sandboxId'}, status_code=400)
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'browser-act'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    if op not in BROWSER_ACT_OPS:
+        return JSONResponse({'error': f'op must be one of {", ".join(BROWSER_ACT_OPS)}'}, status_code=400)
+    if op in ('goto',) and not url:
+        return JSONResponse({'error': 'url is required for op=goto'}, status_code=400)
+    if op == 'fill' and not selector:
+        return JSONResponse({'error': 'selector is required for op=fill'}, status_code=400)
+    if op == 'click' and not selector:
+        return JSONResponse({'error': 'selector is required for op=click'}, status_code=400)
+    if op in ('goto',):
+        # Same URL guardrails as /api/browse: http(s) only, and the final host
+        # must be a safe public host (SSRF/private-network protection). The
+        # sandbox egress proxy still applies underneath -- this is the intent
+        # gate; the proxy is the hard boundary for everything except hosts Jev
+        # explicitly approved (which get a short-lived, scoped egress grant
+        # for exactly this run -- see _run_browser_act_sync).
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+            return JSONResponse({'error': 'url must be http(s) with a real host'}, status_code=400)
+        if not _is_safe_public_host(parsed.hostname):
+            return JSONResponse({'error': 'url host is not an allowed public host'}, status_code=400)
+
+    allowed, reason = await _classify_browser_action(op, url, purpose, agent_id, work_context, work_context_trusted)
+    if not allowed:
+        esc_id = create_escalation(
+            'blocked browser action',
+            f'Agent {agent_id} wants to drive a real browser action ({op}) {("to " + url) if url else "on the current page"}, but it was blocked ({reason}).\n\nPurpose given: {purpose or "none given"}\n\nAssigned work: {work_context[:600] or "none"}',
+        )
+        log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'blocked', 'reason': reason, 'escalationId': esc_id}, authorized=authorized)
+        return JSONResponse({'allowed': False, 'reason': reason, 'escalationId': esc_id})
+
+    sandbox_dir = _sandbox_dir_for(sandbox_id)
+    action = {'op': op, 'url': url, 'selector': selector, 'value': value if value is not None else '',
+             'timeoutMs': 30000, 'maxText': max_text}
+    parsed_result, run_error = await asyncio.to_thread(_run_browser_act_sync, sandbox_dir, action)
+    if parsed_result is None:
+        log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'error', 'reason': run_error}, authorized=authorized)
+        return JSONResponse({'allowed': True, 'ok': False, 'error': run_error})
+    # The driver result carries page state (text/fields/links) plus an optional
+    # embedded screenshot (_shotB64) for the vision-tier readback loop.
+    shot = parsed_result.pop('_shotB64', None)
+    log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'allowed', 'ok': parsed_result.get('ok')}, authorized=authorized)
+    return JSONResponse({'allowed': True, **parsed_result, 'screenshotBase64': shot})
 
 
 @app.post('/api/pipeline')
