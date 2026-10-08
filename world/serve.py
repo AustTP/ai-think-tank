@@ -5139,11 +5139,11 @@ def _validate_api_service_spec(spec):
     if parsed.scheme != 'https' or not parsed.hostname or not _is_safe_public_host(parsed.hostname):
         return None, None, 'base_url must be a public https URL'
     cred = spec.get('credential') or {}
-    if cred.get('type') not in ('env', 'vault'):
-        return None, None, 'credential.type must be "env" or "vault"'
+    if cred.get('type') not in ('none', 'env', 'vault'):
+        return None, None, 'credential.type must be "none", "env", or "vault"'
     auth_type = (spec.get('auth') or {}).get('type')
-    if auth_type not in ('header_bearer', 'header_key', 'body_field'):
-        return None, None, 'auth.type must be header_bearer, header_key, or body_field'
+    if auth_type not in ('none', 'header_bearer', 'header_key', 'body_field'):
+        return None, None, 'auth.type must be none, header_bearer, header_key, or body_field'
     methods = spec.get('methods') or []
     if not methods or not all(m in CURL_METHODS for m in methods):
         return None, None, 'methods must be a non-empty subset of GET/POST/PUT/PATCH/DELETE/HEAD'
@@ -5228,6 +5228,11 @@ def _api_credential_value(spec):
     single chokepoint, same as _treg_call/_pixellab_call."""
     cred = (spec or {}).get('credential') or {}
     ctype = cred.get('type')
+    if ctype == 'none':
+        # A keyless/free public API (Open-Meteo, ...) -- no credential to
+        # resolve, no auth to inject, and never an "unconfigured credential"
+        # block. This is the config-not-code path for free integrations.
+        return None, None, None
     if ctype == 'env':
         key = cred.get('key') or ''
         token = globals().get(key)

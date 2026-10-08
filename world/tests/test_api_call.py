@@ -84,6 +84,8 @@ class RegistryLoader(unittest.TestCase):
         self.assertIn('tavily', serve._API_SERVICES)
         self.assertIn('pixellab', serve._API_SERVICES)
         self.assertIn('higgsfield', serve._API_SERVICES)
+        self.assertIn('open-meteo', serve._API_SERVICES)
+        self.assertIn('open-meteo-geocoding', serve._API_SERVICES)
 
     def test_host_lookup_exact_and_subdomain(self):
         self.assertIsNotNone(serve._api_service_for_host('api.github.com'))
@@ -92,6 +94,17 @@ class RegistryLoader(unittest.TestCase):
 
     def test_unknown_host_is_none(self):
         self.assertIsNone(serve._api_service_for_host('api.not-registered.com'))
+
+    def test_open_meteo_keyless_lookup_and_paths(self):
+        om = serve._api_service_for_host('api.open-meteo.com')
+        self.assertIsNotNone(om)
+        self.assertEqual(om.get('credential', {}).get('type'), 'none')
+        self.assertEqual(om.get('auth', {}).get('type'), 'none')
+        self.assertTrue(serve._api_service_path_allowed(om, 'GET', '/v1/forecast'))
+        self.assertFalse(serve._api_service_path_allowed(om, 'POST', '/v1/forecast'))
+        geo = serve._api_service_for_host('geocoding-api.open-meteo.com')
+        self.assertIsNotNone(geo)
+        self.assertTrue(serve._api_service_path_allowed(geo, 'GET', '/v1/search'))
 
     def test_path_rules_enforced(self):
         apify = serve._api_service_for_host('api.apify.com')
@@ -149,6 +162,15 @@ class CredentialResolution(unittest.TestCase):
         self.assertIsNone(token)
         self.assertIn('no credential', err)
 
+    def test_none_credential_is_keyless(self):
+        # A keyless/free public API (Open-Meteo): no token, no error, so the
+        # caller never blocks on a missing credential and never injects auth.
+        spec = {'credential': {'type': 'none'}}
+        token, token2, err = serve._api_credential_value(spec)
+        self.assertIsNone(token)
+        self.assertIsNone(token2)
+        self.assertIsNone(err)
+
 
 class AuthInjection(unittest.TestCase):
     def test_header_bearer(self):
@@ -164,6 +186,10 @@ class AuthInjection(unittest.TestCase):
         spec = {'auth': {'type': 'body_field', 'field': 'api_key'}}
         url, headers, body = serve._api_apply_auth(spec, 'K', None, 'POST', 'u', {}, {'query': 'x'})
         self.assertEqual(body, {'query': 'x', 'api_key': 'K'})
+
+    def test_none_auth_is_a_noop(self):
+        url, headers, body = serve._api_apply_auth({'auth': {'type': 'none'}}, None, None, 'GET', 'u', {}, None)
+        self.assertEqual((url, headers, body), ('u', {}, None))
 
 
 class ApiRequestSync(unittest.TestCase):
@@ -365,6 +391,16 @@ class ApiServiceRegistry(unittest.TestCase):
         self.assertIn('auth.type', error)
         _sid, _norm, error = serve._validate_api_service_spec(self._proposal_spec(methods=[]))
         self.assertIn('methods', error)
+
+    def test_validation_accepts_keyless_spec(self):
+        # A free public API needs no credential and no auth -- the config-not-
+        # code path that lets agents reach keyless services (Open-Meteo) with
+        # zero setup and no vault/env requirement.
+        sid, norm, error = serve._validate_api_service_spec(self._proposal_spec(
+            credential={'type': 'none'}, auth={'type': 'none'}))
+        self.assertIsNone(error)
+        self.assertEqual(sid, 'my_service')
+        self.assertEqual(norm['credential']['type'], 'none')
 
     def test_upsert_persists_and_loads_as_active(self):
         sid, norm, error = serve._validate_api_service_spec(self._proposal_spec())
