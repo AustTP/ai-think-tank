@@ -10353,7 +10353,7 @@ async def intent_clarify(request: Request):
     product_name = (plan.get('product') or {}).get('name') or product_id
     # KB-first: the same library search the agents use, on the product + question.
     kb_query = f'{product_name} {question}'[:200]
-    kb_matches = _library_search_matches(kb_query)
+    kb_matches = _library_search_matches(kb_query, allowed=_requester_villages(on_call))
 
     completing = plan.get('completing')
     escalated_to = None
@@ -12616,10 +12616,94 @@ def _owns_library_path(rel_path):
     return None
 
 
+def _library_path_village(rel_path, state=None):
+    """The village a Library-relative path belongs to. Non-main villages live
+    under library/villages/<vid>/...; design-references/<village>/ and the
+    per-agent downloads/<agent>/ / pending_review/downloads/<agent>/ trees
+    already encode a village (the owning agent's). Anything else (the flat,
+    legacy tree) belongs to 'main'. Falls back to 'main' for unknown agents."""
+    norm = rel_path.strip('/').split('/')
+    if norm and norm[0] == 'villages':
+        return norm[1] if len(norm) >= 2 else 'main'
+    if norm and norm[0] == 'design-references' and len(norm) >= 2:
+        v = norm[1]
+        if v not in ('main', 'general', 'root', ''):
+            return v
+    if state:
+        import sim_helpers as _sh
+        if norm[0] == 'downloads' and len(norm) >= 2:
+            return _sh.village_of_agent(state, norm[1]) or 'main'
+        if norm[0] == 'pending_review' and len(norm) >= 3 and norm[1] == 'downloads':
+            return _sh.village_of_agent(state, norm[2]) or 'main'
+    return 'main'
+
+
+def _requester_villages(requester):
+    """The set of village ids `requester` may access, or None for ALL.
+    Player (None/empty/'player') and the admin cross the village boundary; any
+    other agent gets only their own village. The returned None means "every
+    village" so _scope_allows stays a single two-way check."""
+    if not requester or requester == 'player':
+        return None
+    state = get_state_from_db()
+    if not state:
+        # No state means no agents and no village data to isolate against.
+        return None
+    if _is_admin(state, requester):
+        return None
+    import sim_helpers as _sh
+    return {_sh.village_of_agent(state, requester)}
+
+
+def _scope_allows(allowed, path_village):
+    # None == all villages (player/admin); a set == an explicit allowlist.
+    if allowed is None:
+        return True
+    return path_village in allowed
+
+
+def _library_namespace_write(agent_id, rel_path, state=None):
+    """Namespace a library WRITE so it lands in the writer's own village.
+
+    Main stays flat (legacy layout, all existing content + consumers expect
+    it). A non-main, non-admin, non-player agent writing COMMONS (skills/,
+    shared/, ...) gets it placed under villages/<vid>/ so it never leaks into
+    main's flat tree and a different village can't see it. Paths that already
+    encode a village (villages/<vid>/, design-references/<village>/,
+    downloads/<agent>/ -- scoped by the owning agent) are returned unchanged.
+    Admin (Theo) and the player are not namespaced: they cross the boundary."""
+    if not rel_path or agent_id in (None, 'player'):
+        return rel_path
+    state = state if state is not None else get_state_from_db()
+    if not state or _is_admin(state, agent_id):
+        return rel_path
+    import sim_helpers as _sh
+    vid = _sh.village_of_agent(state, agent_id)
+    if not vid or vid == 'main':
+        return rel_path
+    # Already village-scoped by path or owner.
+    if rel_path.startswith('villages/') or _library_path_village(rel_path, state) != 'main':
+        return rel_path
+    return 'villages/' + vid + '/' + rel_path.lstrip('/')
+
+
+def _split_village_prefix(rel_path):
+    """Split a library-relative path into (village_id_or_None, rest). Paths under
+    villages/<vid>/... yield the village + the remainder; flat/legacy paths
+    yield (None, the whole path)."""
+    norm = rel_path.strip('/').split('/')
+    if norm and norm[0] == 'villages' and len(norm) >= 3:
+        return norm[1], '/'.join(norm[2:])
+    return None, rel_path
+
+
 @app.get('/api/library')
-async def list_library():
+async def list_library(request: Request):
+    state = get_state_from_db()
+    requester = _resolve_requester(request)
+    allowed = _requester_villages(requester)
     os.makedirs(LIBRARY_ARCHIVE_DIR, exist_ok=True)
-    files = []
+    rows = []  # (modified_float, rel_path, size) -- typed tuple avoids dict-value widening
     for root, _dirs, filenames in os.walk(LIBRARY_DIR):
         # Gap (found while adding trail-based ranking
         # to search): nothing here skipped dotfiles, so .passport.json (the
@@ -12632,8 +12716,13 @@ async def list_library():
         for fn in filenames:
             full = os.path.join(root, fn)
             rel = os.path.relpath(full, LIBRARY_DIR)
-            files.append({'path': rel, 'size': os.path.getsize(full), 'modified': os.path.getmtime(full)})
-    files.sort(key=lambda f: -f['modified'])
+            # Village isolation: only surface files the requester's village may
+            # see (player/admin cross; an agent sees only its own village).
+            if not _scope_allows(allowed, _library_path_village(rel, state)):
+                continue
+            rows.append((os.path.getmtime(full), rel, os.path.getsize(full)))
+    rows.sort(key=lambda r: -r[0])
+    files = [{'path': p, 'size': s, 'modified': m} for m, p, s in rows]
     return JSONResponse({'files': files})
 
 
@@ -12701,6 +12790,20 @@ def _agent_reports_off_limits(requester_id):
     return bool(requester_id) and requester_id not in ('player', 'unknown')
 
 
+def _cross_village_agent_denied(state, requester, target_agent_id):
+    """True when `requester` is a real, non-admin agent from a DIFFERENT village
+    than the target agent -- i.e. the per-agent-file read must be refused under
+    village isolation. Player (None/'player') and the admin cross the boundary."""
+    if not requester or requester == 'player':
+        return False
+    if not state or _is_admin(state, requester):
+        return False
+    import sim_helpers as _sh
+    rv = _sh.village_of_agent(state, requester)
+    tv = _sh.village_of_agent(state, target_agent_id)
+    return rv != tv
+
+
 def _resolve_requester(request):
     # Resolve who a request is being made AS, if anyone: validates a real
     # agent key against the claimed id. The player UI sends no agent key, so
@@ -12739,6 +12842,10 @@ async def get_agent_avatar(agent_id: str, filename: str):
 @app.get('/api/agent-files')
 async def list_agent_files(agentId: str, request: Request):
     requester = _resolve_requester(request)
+    state = get_state_from_db()
+    # Village isolation: a worker cannot list another village's files.
+    if _cross_village_agent_denied(state, requester, agentId):
+        return JSONResponse({'files': []})
     base = os.path.join(AGENTS_DIR, agentId)
     if not os.path.isdir(base):
         return JSONResponse({'files': []})
@@ -12769,6 +12876,10 @@ async def list_agent_files(agentId: str, request: Request):
 @app.get('/api/agent-files/read')
 async def read_agent_file(agentId: str, path: str, request: Request):
     requester = _resolve_requester(request)
+    state = get_state_from_db()
+    # Village isolation: a worker cannot read another village's files.
+    if _cross_village_agent_denied(state, requester, agentId):
+        return JSONResponse({'error': 'not readable'}, status_code=403)
     base = os.path.abspath(os.path.join(AGENTS_DIR, agentId))
     target = os.path.normpath(os.path.join(base, path))
     # Strict containment -- no traversal out of the agent's own directory.
@@ -12795,7 +12906,7 @@ async def read_agent_file(agentId: str, path: str, request: Request):
 
 
 @app.get('/api/library/search')
-async def search_library(q: str):
+async def search_library(q: str, request: Request):
     # Real gap an agent's own retrospective named directly: the Library
     # was a flat, unsearchable file list -- finding relevant prior work
     # meant already knowing its exact path. A plain case-insensitive
@@ -12807,7 +12918,9 @@ async def search_library(q: str):
     query = (q or '').strip()
     if not query:
         return JSONResponse({'error': 'q is required'}, status_code=400)
-    matches = _library_search_matches(query)
+    requester = _resolve_requester(request)
+    allowed = _requester_villages(requester)
+    matches = _library_search_matches(query, allowed=allowed)
     return JSONResponse({'query': query, 'matches': matches[:50]})
 
 
@@ -12869,12 +12982,17 @@ def _library_trail_score(path, usage, now=None):
     return entry.get('count', 0) * decay
 
 
-def _library_search_matches(query):
+def _library_search_matches(query, allowed=None):
     """Pure KB search over real Library file contents: a case-insensitive
     substring match on content or path, with a context snippet either side of
     the first hit. Shares one implementation with /api/library/search so the
     clarify router's KNOWLEDGE-BASE-FIRST lookup is literally the same search
     the agents themselves use -- no second, divergent indexing to drift.
+
+    `allowed` is the caller's village scope (see _requester_villages): None =
+    every village (player/admin), a set = only that set. Filters each match by
+    its path's village so one village's knowledge never surfaces in another's
+    search.
 
     Ranked by trail score first (real, validated, revisited knowledge surfaces
     before merely-recent-but-never-touched files), modified time as the
@@ -12889,6 +13007,7 @@ def _library_search_matches(query):
     query_lower = (query or '').strip().lower()
     if not query_lower:
         return []
+    state = get_state_from_db()
     matches = []
     for root, _dirs, filenames in os.walk(LIBRARY_DIR):
         for fn in filenames:
@@ -12896,6 +13015,9 @@ def _library_search_matches(query):
                 continue  # see list_library's own dotfile-leak fix
             full = os.path.join(root, fn)
             rel = os.path.relpath(full, LIBRARY_DIR)
+            # Village isolation: skip paths outside the caller's scope.
+            if not _scope_allows(allowed, _library_path_village(rel, state)):
+                continue
             # Skip binary files (images) -- a substring search over raw
             # bytes decoded as text would either throw or return noise.
             if os.path.splitext(fn)[1].lower() in INGEST_IMAGE_EXTENSIONS:
@@ -12922,7 +13044,13 @@ def _library_search_matches(query):
 
 
 @app.get('/api/library/file')
-async def read_library_file(path: str):
+async def read_library_file(path: str, request: Request):
+    state = get_state_from_db()
+    requester = _resolve_requester(request) if request is not None else None
+    allowed = _requester_villages(requester)
+    # Village isolation: a cross-village read is refused (player/admin cross).
+    if not _scope_allows(allowed, _library_path_village(path, state)):
+        return JSONResponse({'error': 'not found'}, status_code=404)
     target = _safe_library_path(path)
     if not target or not os.path.isfile(target):
         return JSONResponse({'error': 'not found'}, status_code=404)
@@ -13083,15 +13211,21 @@ async def write_library_file(request: Request):
         if state and not _can_write_agent(state, agent_id, own):
             log_action(agent_id, 'library_write_denied', {'path': rel_path, 'owner': own}, authorized=authorized)
             return JSONResponse({'error': f'Only {own}, {own}\'s director, or the admin may write to that agent\'s files.'}, status_code=403)
+    # Village isolation: land the write in the writer's OWN village (main
+    # stays flat; a non-main agent's commons writes go under villages/<vid>/).
+    write_rel = _library_namespace_write(agent_id, rel_path, get_state_from_db())
+    target = _safe_library_path(write_rel)
+    if not target:
+        return JSONResponse({'error': 'invalid path'}, status_code=400)
     os.makedirs(os.path.dirname(target), exist_ok=True)
     with open(target, 'w') as f:
         f.write(content[:200_000])
-    log_action(agent_id, 'library_write', {'path': rel_path, 'bytes': len(content), 'source': source}, authorized=authorized)
+    log_action(agent_id, 'library_write', {'path': write_rel, 'bytes': len(content), 'source': source}, authorized=authorized)
     # Every time an agent writes or modifies a file, it's chained into the
     # passport -- so the immutable ledger records not
     # just promotes but the actual act of writing, and any later tampering
     # with a written file is detectable against it.
-    _append_passport_decision('library_write', agent_id, {'path': rel_path, 'source': source})
+    _append_passport_decision('library_write', agent_id, {'path': write_rel, 'source': source})
     return PlainTextResponse('saved')
 
 
@@ -13184,6 +13318,10 @@ async def library_download(request: Request):
         return JSONResponse({'allowed': True, 'ok': False, 'reason': str(e)})
 
     rel_path = _download_dest_rel_path(scope, agent_id, safe_name)
+    # Village isolation: a non-main agent's SHARED download lands in their own
+    # village's tree (personal downloads are already scoped by owning agent).
+    if scope == 'shared':
+        rel_path = _library_namespace_write(agent_id, rel_path, get_state_from_db())
     target = _safe_library_path(rel_path)
     if not target:
         return JSONResponse({'error': 'invalid destination'}, status_code=400)
@@ -13343,18 +13481,24 @@ async def library_promote(request: Request):
     body = await request.json()
     agent_id = body.get('agentId', 'unknown')
     pending_path = (body.get('path') or '').strip()
-    if not pending_path.startswith('pending_review/'):
+    vid, pending_rest = _split_village_prefix(pending_path)
+    if not pending_rest.startswith('pending_review/'):
         return JSONResponse({'error': 'path must be inside pending_review/'}, status_code=400)
     source_target = _safe_library_path(pending_path)
     if not source_target or not os.path.isfile(source_target):
         return JSONResponse({'error': 'file not found'}, status_code=404)
-    dest_rel = pending_path[len('pending_review/'):]
+    dest_rel = ('villages/' + vid + '/' if vid else '') + pending_rest[len('pending_review/'):]
     if not dest_rel:
         return JSONResponse({'error': 'invalid destination'}, status_code=400)
     dest_target = _safe_library_path(dest_rel)
     if not dest_target:
         return JSONResponse({'error': 'invalid destination'}, status_code=400)
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    # Village isolation: only promote within your own village (player/admin cross).
+    if not _scope_allows(_requester_villages(agent_id if authorized is True else None),
+                         _library_path_village(dest_rel, get_state_from_db())):
+        log_action(agent_id, 'library_promote_denied', {'to': dest_rel, 'reason': 'cross-village'}, authorized=authorized)
+        return JSONResponse({'error': 'You can only promote files in your own village.'}, status_code=403)
     # Same per-agent namespace ACL as write_library_file -- can't promote a
     # file into another agent's personal downloads/ space without being that
     # agent's director/above/admin.
@@ -13399,16 +13543,22 @@ async def library_reject(request: Request):
     body = await request.json()
     agent_id = body.get('agentId', 'unknown')
     pending_path = (body.get('path') or '').strip()
-    if not pending_path.startswith('pending_review/'):
+    vid, pending_rest = _split_village_prefix(pending_path)
+    if not pending_rest.startswith('pending_review/'):
         return JSONResponse({'error': 'path must be inside pending_review/'}, status_code=400)
     source_target = _safe_library_path(pending_path)
     if not source_target or not os.path.isfile(source_target):
         return JSONResponse({'error': 'file not found'}, status_code=404)
-    dest_rel = 'rejected/' + pending_path[len('pending_review/'):]
+    dest_rel = ('villages/' + vid + '/' if vid else '') + 'rejected/' + pending_rest[len('pending_review/'):]
     dest_target = _safe_library_path(dest_rel)
     if not dest_target:
         return JSONResponse({'error': 'invalid destination'}, status_code=400)
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    # Village isolation: only reject within your own village (player/admin cross).
+    if not _scope_allows(_requester_villages(agent_id if authorized is True else None),
+                         _library_path_village(dest_rel, get_state_from_db())):
+        log_action(agent_id, 'library_reject_denied', {'to': dest_rel, 'reason': 'cross-village'}, authorized=authorized)
+        return JSONResponse({'error': 'You can only reject files in your own village.'}, status_code=403)
     os.makedirs(os.path.dirname(dest_target), exist_ok=True)
     shutil.move(source_target, dest_target)
     log_action(agent_id, 'library_reject', {'from': pending_path, 'to': dest_rel}, authorized=authorized)
@@ -15236,6 +15386,7 @@ async def sandbox_download(request: Request):
     url = (body.get('url') or '').strip()
     agent_id = body.get('agentId', 'unknown')
     sandbox_id = (body.get('sandboxId') or '').strip()
+    sandbox_id = _village_sandbox_id(agent_id, sandbox_id)  # per-village repo isolation
     purpose = (body.get('purpose') or '').strip()
     filename = (body.get('filename') or '').strip()
     # Live room override (see _agent_is_in_sandbox_room) -- an agent that
@@ -15332,6 +15483,7 @@ async def sandbox_save_page(request: Request):
     url = (body.get('url') or '').strip()
     agent_id = body.get('agentId', 'unknown')
     sandbox_id = (body.get('sandboxId') or '').strip()
+    sandbox_id = _village_sandbox_id(agent_id, sandbox_id)  # per-village repo isolation
     purpose = (body.get('purpose') or '').strip()
     filename = (body.get('filename') or '').strip()
     content = body.get('content') or ''
@@ -15492,6 +15644,29 @@ def _sandbox_dir_for(sandbox_id):
     path = os.path.join(SANDBOXES_DIR, sandbox_id)
     os.makedirs(path, exist_ok=True)
     return path
+
+
+def _village_sandbox_id(agent_id, sandbox_id, state=None):
+    """Map a base sandbox id to a village-scoped repo for a non-main, non-admin
+    agent, so each village gets its own sandbox repos (e.g. 'winter-workroom').
+    Main agents, the player, and the admin keep the base id; non-main villages
+    get '<vid>-<base>' (e.g. 'winter-workroom-shared'). Applying the remap at
+    every sandbox endpoint (execute/pipeline/screenshot/page-probe/sandbox-download/
+    sandbox-save-page) keeps a village's code physically separate on disk: a
+    winter worker can never run against or read main's workroom repo, and vice
+    versa. The repo is provisioned lazily by _sandbox_dir_for."""
+    if not sandbox_id or not agent_id or agent_id == 'player':
+        return sandbox_id
+    state = state if state is not None else get_state_from_db()
+    if not state or _is_admin(state, agent_id):
+        return sandbox_id
+    import sim_helpers as _sh
+    vid = _sh.village_of_agent(state, agent_id)
+    if not vid or vid == 'main':
+        return sandbox_id
+    if str(sandbox_id).startswith(vid + '-'):
+        return sandbox_id
+    return f'{vid}-{sandbox_id}'
 
 
 # Real incident this exists to prevent from ever being unrecoverable
@@ -15688,13 +15863,13 @@ async def execute(request: Request):
     command = (body.get('command') or '').strip()
     purpose = (body.get('purpose') or '').strip()
     sandbox_id = body.get('sandboxId') or ('sandbox-' + secrets.token_hex(4))
+    sandbox_id = _village_sandbox_id(agent_id, sandbox_id)  # per-village repo isolation
     if not check_rate_limit(agent_id):
         log_action(agent_id, 'rate_limited', {'endpoint': 'execute'})
         return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
     if not command:
         return JSONResponse({'error': 'command is required'}, status_code=400)
-
     allowed, reason = await _classify_command(command, purpose, agent_id)
     if not allowed:
         # Blocked commands escalate rather than just vanishing --
@@ -15734,6 +15909,7 @@ async def pipeline(request: Request):
     agent_id = body.get('agentId', 'unknown')
     steps = body.get('steps') or []
     sandbox_id = body.get('sandboxId') or ('sandbox-' + secrets.token_hex(4))
+    sandbox_id = _village_sandbox_id(agent_id, sandbox_id)  # per-village repo isolation
     # Counted as ONE call regardless of step count -- a pipeline is one
     # logical request from the caller's side even though it fans out into
     # several sandbox runs internally; each individual step already goes
@@ -15895,6 +16071,7 @@ async def screenshot(request: Request):
     body = await request.json()
     agent_id = body.get('agentId', 'unknown')
     sandbox_id = body.get('sandboxId')
+    sandbox_id = _village_sandbox_id(agent_id, sandbox_id)  # per-village repo isolation
     rel_path = body.get('path', 'index.html')
     width = min(max(int(body.get('width', 900)), 200), 1600)
     height = min(max(int(body.get('height', 700)), 200), 1600)
@@ -16077,6 +16254,7 @@ async def page_probe(request: Request):
     body = await request.json()
     agent_id = body.get('agentId', 'unknown')
     sandbox_id = body.get('sandboxId')
+    sandbox_id = _village_sandbox_id(agent_id, sandbox_id)  # per-village repo isolation
     rel_path = body.get('path', 'index.html')
     actions = body.get('actions') or []
     probes = body.get('probes') or []
