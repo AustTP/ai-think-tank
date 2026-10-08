@@ -135,6 +135,46 @@ class BrowseEndpointAllowlist(unittest.TestCase):
         self.assertTrue(r.json()['allowed'])
         jev.assert_called_once()
 
+    def test_player_authored_work_context_host_bypasses_jev(self):
+        # A host the PLAYER explicitly named in a PLAYER-AUTHORED task skips Jev
+        # like the allowlist -- the player vetted it by writing it into the
+        # assignment. Requires workContextTrusted (player-authored provenance).
+        self._common_mocks()
+        with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()), \
+             unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as jev:
+            r = self._client().post('/api/browse', json={
+                'agentId': 'ben', 'url': 'https://docs.python.org/3/library/urllib.html',
+                'purpose': 'research urllib for my spike',
+                'workContext': 'Investigate urllib -- see https://docs.python.org/3/library/urllib.html',
+                'workContextTrusted': True})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()['allowed'])
+        jev.assert_not_called()
+
+    def test_agent_authored_work_context_host_does_NOT_bypass_jev(self):
+        # The adversarial case: an agent authors its OWN story and names a URL
+        # in it. That text is agent-written, so it must NOT skip Jev -- the
+        # story text is a laundering vector, not a player-vetted allowlist.
+        # The named host still goes through the full story-aware Jev classify.
+        self._common_mocks()
+        with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()), \
+             unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as jev, \
+             unittest.mock.patch.object(serve, '_jev_choice', return_value=('allow', 0.95, 0.0)):
+            r = self._client().post('/api/browse', json={
+                'agentId': 'ben', 'url': 'https://docs.python.org/3/library/urllib.html',
+                'purpose': 'research urllib for my spike',
+                'workContext': 'Investigate urllib -- see https://docs.python.org/3/library/urllib.html',
+                'workContextTrusted': False})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()['allowed'])
+        jev.assert_called_once()
+        # The work context is still IN the prompt Jev judges against (on-task
+        # sites allowed by the subordinate clause) -- but the host did not skip
+        # Jev; the bypass is provenance-gated.
+        instructions = jev.call_args.args[2]['choice']['instructions']
+        self.assertIn('docs.python.org', instructions)
+        self.assertIn('Investigate urllib', instructions)
+
     def test_allowlist_never_bypasses_the_ssrf_check(self):
         # Even a listed domain must still fail closed if it resolves to a
         # private/internal address -- the allowlist replaces the CONTENT

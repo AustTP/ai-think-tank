@@ -219,6 +219,61 @@ class SpikeContent(unittest.TestCase):
         self.assertIn('search_web', system_text)
         self.assertIn('never invent', system_text.lower())
 
+    def _capture_web_tool(self, task):
+        """Run a spike with a single browse_page tool-call in the transcript and
+        return the captured _http_json call bodies. Drives the REAL execute_tool
+        built by _run_spike_content so we can assert on what it actually sends
+        to the /api/browse gate."""
+        bodies = []
+
+        def fake_http(method, base, path, body, *a, **k):
+            bodies.append({'method': method, 'path': path, 'body': body})
+            if path == '/api/browse':
+                return {'allowed': True, 'textForModel': 'page text', 'links': [], 'modelInstruction': ''}
+            return {'ok': True}
+
+        self._common_mocks(tavily=True)
+        self._store()
+        transcript = [
+            {'role': 'system', 'content': 'sys'}, {'role': 'user', 'content': 'Go ahead.'},
+            {'role': 'assistant', 'tool_calls': [{'id': 'c1', 'function': {'name': 'browse_page',
+                                                                           'arguments': '{"url":"https://docs.python.org/3/library/urllib.html"}'}}]},
+            {'role': 'tool', 'tool_call_id': 'c1', 'content': 'PAGE TEXT'},
+        ]
+        with unittest.mock.patch.object(serve, '_http_json', side_effect=fake_http), \
+             unittest.mock.patch.object(serve, '_call_agent_tool_loop',
+                                        return_value=('summary', transcript)) as loop, \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                        side_effect=[_completion('plan'), _completion('report')]):
+            content._run_spike_content(_snapshot(), 'cora', task)
+            _, _, _, execute_tool = loop.call_args.args[:4]
+            execute_tool('browse_page', {'url': 'https://docs.python.org/3/library/urllib.html',
+                                         'purpose': 'research'})
+        browse = next(b for b in bodies if b['path'] == '/api/browse')
+        return browse['body']
+
+    def test_agent_authored_spike_threads_untrusted_work_context(self):
+        # The adversarial case end-to-end: an agent-filed spike (no
+        # playerAuthored) must carry workContextTrusted=False into the /api/
+        # browse gate, so a URL the agent named in its OWN story text goes
+        # through the story-aware Jev prompt instead of bypassing it.
+        task = {'id': 'spike-adv', 'title': 'Research urllib internals',
+                'instructions': 'Investigate https://docs.python.org/3/library/urllib.html',
+                'budgetMs': 60000}
+        body = self._capture_web_tool(task)
+        self.assertIn('docs.python.org', body['workContext'])
+        self.assertIs(body['workContextTrusted'], False)
+
+    def test_player_authored_spike_threads_trusted_work_context(self):
+        # A player-authored spike (playerAuthored=True) keeps the trusted
+        # bypass: the player vetted the host by writing it into the task.
+        task = {'id': 'spike-ply', 'title': 'Research urllib internals',
+                'instructions': 'Investigate https://docs.python.org/3/library/urllib.html',
+                'budgetMs': 60000, 'playerAuthored': True}
+        body = self._capture_web_tool(task)
+        self.assertIn('docs.python.org', body['workContext'])
+        self.assertIs(body['workContextTrusted'], True)
+
     def test_plan_prompt_requires_a_mandatory_csv_step_for_enumerable_questions(self):
         """Real refinement: a plan that only SUGGESTS a CSV lets
         the model describe one in prose instead of building it. The PLAN

@@ -27,6 +27,7 @@ reaches domains that flow has already been bypassed for by explicit player
 choice.
 """
 import os
+import json
 import re
 import socket
 import threading
@@ -50,9 +51,50 @@ ALLOWED_HOSTS = {
 # loading machinery -- it runs in a different container/image entirely.
 ALLOWED_HOSTS |= {h.strip().lower() for h in os.environ.get('SANDBOX_EGRESS_EXTRA_HOSTS', '').split(',') if h.strip()}
 
+# JEV-approved egress (2026-10-08): browser_act drives a real browser inside
+# the same sandbox network, so its egress must go through THIS proxy -- but
+# the work-context Jev gate's whole point is that a Jev-approved
+# non-allowlisted host is genuinely reachable, not blocked a second time at
+# the network layer. serve.py writes a short-lived, scoped grant (host ->
+# expiry epoch, in a file mounted into this container) the moment Jev approves
+# a browser action, and removes it when the run finishes. The grants file is a
+# per-action escape hatch with an expiry, NOT a permanent relaxation -- it is
+# re-read on every connection and only ever contains hosts Jev explicitly
+# approved for a browser action in the last ~2 minutes. Same per-host rate
+# limit as the permanent allowlist applies, so a grant can't become an
+# uncapped data exfil pipe.
+GRANTS_PATH = os.environ.get('SANDBOX_EGRESS_GRANTS_PATH', '')
+
+_grants_lock = threading.Lock()
+_grants_cache: dict = {'mtime': None, 'hosts': set()}
+
+
+def _runtime_grants():
+    """Hosts with an unexpired Jev-approval grant, cached by file mtime so the
+    hot connection path doesn't stat the disk on every request."""
+    if not GRANTS_PATH:
+        return set()
+    try:
+        mtime = os.path.getmtime(GRANTS_PATH)
+    except OSError:
+        return set()
+    if _grants_cache['mtime'] == mtime:
+        return _grants_cache['hosts']
+    try:
+        with open(GRANTS_PATH, 'r') as f:
+            raw = json.load(f) or {}
+    except (OSError, ValueError):
+        return set()
+    now = time.time()
+    hosts = {h.lower() for h, exp in raw.items() if isinstance(exp, (int, float)) and exp > now}
+    _grants_cache.update({'mtime': mtime, 'hosts': hosts})
+    return hosts
+
 
 def is_allowed(host):
-    return (host or '').lower() in ALLOWED_HOSTS
+    if (host or '').lower() in ALLOWED_HOSTS:
+        return True
+    return (host or '').lower() in _runtime_grants()
 
 
 # Real constraint, found while auditing this for a possible GET-only

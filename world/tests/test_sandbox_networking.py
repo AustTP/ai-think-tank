@@ -21,7 +21,7 @@ import serve  # noqa: E402
 
 class EnsureSandboxNetworking(unittest.TestCase):
     def _run(self, network_exists=True, container_running=False, current_extra_hosts=None,
-             allowlist=frozenset()):
+             allowlist=frozenset(), current_grants_path=None):
         calls = []
 
         def fake_run(cmd, **kwargs):
@@ -38,10 +38,21 @@ class EnsureSandboxNetworking(unittest.TestCase):
                 return False
             return container_running
 
+        # Env lookup by name: SANDBOX_EGRESS_EXTRA_HOSTS returns the allowlist
+        # env; SANDBOX_EGRESS_GRANTS_PATH returns the grants-mount env (a proxy
+        # created before the grants feature has neither, so both read as the
+        # default None).
+        def fake_env_value(name, key):
+            if key == 'SANDBOX_EGRESS_EXTRA_HOSTS':
+                return current_extra_hosts
+            if key == 'SANDBOX_EGRESS_GRANTS_PATH':
+                return current_grants_path
+            return None
+
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', allowlist), \
              unittest.mock.patch.object(serve, '_docker_network_exists', return_value=network_exists), \
              unittest.mock.patch.object(serve, '_docker_container_running', side_effect=fake_running), \
-             unittest.mock.patch.object(serve, '_docker_container_env_value', return_value=current_extra_hosts), \
+             unittest.mock.patch.object(serve, '_docker_container_env_value', side_effect=fake_env_value), \
              unittest.mock.patch.object(serve.subprocess, 'run', side_effect=fake_run):
             serve.ensure_sandbox_networking()
         return calls
@@ -62,9 +73,22 @@ class EnsureSandboxNetworking(unittest.TestCase):
 
     def test_running_proxy_with_matching_allowlist_is_left_alone(self):
         calls = self._run(container_running=True, current_extra_hosts='dreyx.com',
+                          current_grants_path=serve.EGRESS_GRANTS_PATH,
                           allowlist=frozenset({'dreyx.com'}))
         self.assertFalse(any(c[:2] == ['docker', 'run'] for c in calls))
         self.assertFalse(any('rm' in c for c in calls))
+
+    def test_running_proxy_without_grants_mount_is_recreated(self):
+        # A proxy created before the Jev-approved-egress grants feature is
+        # running the old image -- without the grants mount, Jev-approved
+        # browser hosts stay unreachable at the network layer. It must be
+        # recreated even when the allowlist env matches.
+        calls = self._run(container_running=True, current_extra_hosts='dreyx.com',
+                          current_grants_path=None,
+                          allowlist=frozenset({'dreyx.com'}))
+        self.assertTrue(any(c[:3] == ['docker', 'rm', '-f'] for c in calls))
+        run_cmds = [c for c in calls if c[:2] == ['docker', 'run']]
+        self.assertEqual(len(run_cmds), 1)
 
     def test_running_proxy_with_stale_allowlist_is_recreated(self):
         # Real scenario this protects: BROWSE_ALLOWLIST_DOMAINS changed (a
