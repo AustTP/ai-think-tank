@@ -103,23 +103,36 @@ test('reports/notes do NOT move the morale meter (they feed firing review instea
   assert.equal(moraleFor('dev'), base);
 });
 
-test('thinkTankMorale averages every agent and returns null with none', () => {
-  setGlobal('AGENTS', {});
+test('recent delivery has no score without outcomes', () => {
+  setGlobal('DELIVERY_STATE', {tasks: {}});
   assert.equal(thinkTankMorale(), null);
-
-  setGlobal('AGENTS', {
-    a: agent({ id: 'a', approvedCount: 0, droppedCount: 0, lastContactedAt: Date.now() }),
-    b: agent({ id: 'b', approvedCount: 0, droppedCount: 0, lastContactedAt: Date.now() }),
-  });
-  assert.equal(thinkTankMorale(), 100);
-
-  // One burned-out agent (6 drops + never contacted = 34) drags the
-  // tank-wide average down from 100 to 67.
-  setGlobal('AGENTS', {
-    a: agent({ id: 'a', approvedCount: 0, droppedCount: 0, lastContactedAt: Date.now() }),
-    b: agent({ id: 'b', approvedCount: 0, droppedCount: 6, lastContactedAt: null, hiredAt: Date.now() }),
-  });
-  assert.equal(thinkTankMorale(), 67);
+});
+test('completed work improves score; failures and blockers lower it', () => {
+  const now = Date.now();
+  setGlobal('DELIVERY_STATE', {tasks: {a: {id:'a', status:'done', createdAt:now, assignedTo:'dev'}}});
+  const good = thinkTankMorale();
+  assert.equal(moraleFor('dev'), good);
+  setGlobal('DELIVERY_STATE', {tasks: {a: {id:'a', status:'done', createdAt:now}, b:{status:'failed',createdAt:now}, c:{status:'blocked'}}});
+  assert.ok(thinkTankMorale() < good);
+});
+test('review subtasks and stale outcomes do not inflate delivery', () => {
+  setGlobal('DELIVERY_STATE', {tasks: {a:{status:'done',reviewOf:'parent',createdAt:Date.now()}, b:{status:'done',createdAt:Date.now()-8*DAY_MS}}});
+  assert.equal(thinkTankMorale(), null);
+});
+test('sprint rollover lowers delivery and released projects improve it', () => {
+  const now = Date.now();
+  const state = {tasks:{a:{status:'done',createdAt:now}},sprints:{s:{status:'closed',closedAt:now,items:[{},{}],rolledOver:[]}}};
+  setGlobal('DELIVERY_STATE', state);const good=thinkTankMorale();
+  state.sprints.s.rolledOver=[{},{}];setGlobal('DELIVERY_STATE', state);
+  assert.ok(thinkTankMorale()<good);const before=thinkTankMorale();
+  state.products={p:{revisions:[{at:now}]}};setGlobal('DELIVERY_STATE',state);
+  assert.ok(thinkTankMorale()>before);
+});
+test('working includes hidden agents; idle includes off-duty agents', () => {
+  setGlobal('AGENTS',{a:{busy:true,visible:false},b:{offDuty:true},c:{task:'t'}});
+  setGlobal('DELIVERY_STATE',{tasks:{t:{status:'walking'}}});
+  const counts=vm.runInContext('workActivityCounts()',context);
+  assert.equal(counts.working,2);assert.equal(counts.idle,1);assert.equal(counts.total,3);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

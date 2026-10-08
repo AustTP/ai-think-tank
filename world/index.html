@@ -408,9 +408,10 @@
   <div id="stage">
     <div id="hudBar">
       <div class="hud-brand"><span class="hud-brand-title">AI THINK TANK</span><span class="hud-brand-sub">world</span></div>
-      <div class="hud-pill"><span class="label">RESEARCHERS</span><span class="value" id="hudResearchers">0</span></div>
+      <div class="hud-pill"><span class="label">AGENTS</span><span class="value" id="hudResearchers">0</span></div>
+      <div class="hud-pill"><span class="label">IDLE</span><span class="value" id="hudIdle">0</span></div>
       <div class="hud-pill"><span class="label">WORKING</span><span class="value" id="hudWorking">0</span></div>
-      <div class="hud-pill"><span class="label">MORALE</span><span class="value" id="hudMorale">0</span></div>
+      <div class="hud-pill"><span class="label">MORALE / DELIVERY</span><span class="value" id="hudMorale">0</span></div>
       <div class="hud-gap"></div>
       <button class="hud-btn" id="hudCallMeetingBtn">Call Meeting</button>
       <button class="hud-btn" id="hudCommandCenterBtn" title="Enter Control Room -- also where you can check on anyone using it">Command Center</button>
@@ -779,7 +780,7 @@
 <script src="agents.js?v=28"></script>
 <script src="meetings.js?v=2"></script>
 <script src="reports.js?v=4"></script>
-<script src="morale.js?v=3"></script>
+<script src="morale.js?v=4"></script>
 <script src="hiring.js?v=22"></script>
 <script src="firing.js?v=9"></script>
 <script src="jev.js?v=4"></script>
@@ -2891,13 +2892,13 @@ function closeRosterList() {
 }
 
 function renderRosterList() {
-  document.getElementById('rosterListTitle').textContent = `Think Tank Roster — Morale ${thinkTankMorale()}`;
+  document.getElementById('rosterListTitle').textContent = `Think Tank Roster — Morale ${thinkTankMorale() ?? "--"}`;
   const body = document.getElementById('rosterListBody');
   body.innerHTML = '';
   for (const def of AGENT_ROSTER) {
     const btn = document.createElement('button');
     btn.className = 'roster-item';
-    btn.innerHTML = `${def.name}<span class="role">${def.role} · Morale ${moraleFor(def.id)}</span>`;
+    btn.innerHTML = `${def.name}<span class="role">${def.role} · Morale ${moraleFor(def.id) ?? "--"}</span>`;
     btn.addEventListener('click', () => openProfile(def.id));
     body.appendChild(btn);
   }
@@ -2982,7 +2983,7 @@ function renderStatusSection(agentId) {
     : 'never';
   section.innerHTML = `
     <h4>STATUS</h4>
-    <div>Morale: ${moraleFor(agentId)}</div>
+    <div>Morale: ${moraleFor(agentId) ?? "--"}</div>
     <div>Approved: ${a.approvedCount} &nbsp; Dropped: ${a.droppedCount}</div>
     <div>Last contacted: ${contact}</div>
     <div class="modal-actions" style="justify-content:flex-start; margin-top:6px;">
@@ -3739,9 +3740,13 @@ async function main() {
     // busy agents: an off-duty agent is invisible, so a stale `busy` flag
     // on a resting agent (a known ghost, e.g. theo parked at the origin)
     // must not count as someone actually working.
-    document.getElementById('hudResearchers').textContent = activeAgentCount();
-    document.getElementById('hudWorking').textContent = Object.values(AGENTS).filter(a => a.busy && a.visible).length;
-    document.getElementById('hudMorale').textContent = thinkTankMorale();
+    const activity = workActivityCounts();
+    document.getElementById('hudResearchers').textContent = activity.total;
+    document.getElementById('hudIdle').textContent = activity.idle;
+    document.getElementById('hudWorking').textContent = activity.working;
+    const delivery = recentDeliveryScore();
+    document.getElementById('hudMorale').textContent = delivery.score === null ? '--' : `${delivery.score}/100`;
+    document.getElementById('hudMorale').parentElement.title = deliveryScoreDescription(delivery);
   }
 
   function cameraFor(zoom, worldW, worldH, focusX, focusY) {

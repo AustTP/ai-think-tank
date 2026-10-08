@@ -39,6 +39,7 @@ function daysSince(ts) {
 }
 
 function moraleFor(agentId) {
+  if (DELIVERY_STATE) return recentDeliveryScore(agentId).score;
   const a = AGENTS[agentId];
   if (!a) return null;
   const approvedBonus = Math.min(a.approvedCount * MORALE_APPROVED_WEIGHT, MORALE_APPROVED_CAP);
@@ -55,8 +56,58 @@ function moraleFor(agentId) {
   return Math.max(0, Math.min(100, Math.round(raw)));
 }
 
+// Live delivery data is refreshed by the server-state bridge.
+let DELIVERY_STATE = null;
+function recentDeliveryScore(agentId = null, now = Date.now()) {
+  const state = DELIVERY_STATE || {};
+  const tasks = Object.values(state.tasks || (typeof TASKS !== 'undefined' ? TASKS : {}));
+  const cutoff = now - 7 * 86400000;
+  const recent = ts => Number(ts) >= cutoff && Number(ts) <= now;
+  const completions = new Map((state.completedDeliverables || []).map(d => [d.id, d.gradedAt]));
+  const work = tasks.filter(t => !t.reviewOf && !['review','qa','code_preflight'].includes(t.taskType)
+    && (!agentId || t.assignedTo === agentId) && !t.supersededByAutomaticRepair);
+  const completed = work.filter(t => t.status === 'done' && recent(t.completedAt || completions.get(t.id) || t.createdAt)).length;
+  const failed = work.filter(t => ['failed','abandoned'].includes(t.status) && recent(t.completedAt || t.createdAt)).length;
+  const blocked = work.filter(t => !t.boardClearedAt && !['done','cancelled','abandoned'].includes(t.status)
+    && (t.manualAttention || t.status === 'blocked' || t._peerGate?.escalated)).length;
+  const working = work.filter(t => ['walking','working'].includes(t.status)).length;
+  const review = work.filter(t => t.status === 'needs_review' && !t.manualAttention && !t._peerGate?.escalated).length;
+  const teams = (state.teams || []).filter(t => t.directorId === agentId || t.scrumMasterId === agentId
+    || (typeof AGENTS !== 'undefined' && AGENTS[agentId]?.director === t.directorId)).map(t => t.id);
+  const sprints = Object.values(state.sprints || {}).filter(s => s.status === 'closed' && recent(s.closedAt)
+    && (!agentId || (s.teamIds || []).some(id => teams.includes(id))));
+  let committed = 0, shipped = 0;
+  for (const sprint of sprints) {
+    const total = (sprint.items || []).length;
+    committed += total; shipped += Math.max(0, total - (sprint.rolledOver || []).length);
+  }
+  const released = Object.values(state.products || {}).filter(p => (p.revisions || []).some(r => recent(r.at)
+    && (!agentId || r.releasedBy === agentId))).length;
+  const evidence = completed + failed + sprints.length + released;
+  // Smoothing prevents a single success from implying perfect delivery.
+  let score = 100 * (completed + 2) / (completed + failed + 4);
+  if (committed) score = .7 * score + .3 * (100 * shipped / committed);
+  score += Math.min(15, released * 5);
+  score -= Math.min(30, blocked * 5);
+  return {score: evidence || blocked ? Math.round(Math.max(0, Math.min(100, score))) : null,
+    completed, failed, blocked, working, review, sprints: sprints.length, shipped, committed, released};
+}
+function deliveryScoreDescription(metrics) {
+  return `Last 7 days: ${metrics.completed} completed delivery tasks, ${metrics.failed} failed; `
+    + `${metrics.sprints} closed sprints (${metrics.shipped}/${metrics.committed} items completed), `
+    + `${metrics.released} projects released. Current: ${metrics.blocked} blocked, ${metrics.review} awaiting review. `
+    + 'Score uses smoothed completion rate, sprint completion and release bonuses, minus blocker penalties. No recent outcomes = no score.';
+}
 function thinkTankMorale() {
-  const scores = Object.keys(AGENTS).map(moraleFor).filter(v => v !== null);
-  if (!scores.length) return null;
-  return Math.round(scores.reduce((sum, v) => sum + v, 0) / scores.length);
+  return recentDeliveryScore().score;
+}
+function workActivityCounts() {
+  const agents = typeof AGENTS !== 'undefined' ? Object.values(AGENTS) : [];
+  const tasks = DELIVERY_STATE?.tasks || (typeof TASKS !== 'undefined' ? TASKS : {});
+  let working = 0;
+  for (const agent of agents) {
+    const task = tasks[agent.task];
+    if (agent.busy || (task && ['walking','working'].includes(task.status))) working++;
+  }
+  return {total: agents.length, working, idle: agents.length - working};
 }

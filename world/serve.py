@@ -6455,10 +6455,10 @@ def _jev_is_degraded():
 # the session never lingers to a limit Google would hit first. The tool only
 # appears in the spike toolchain when the CLI is actually installed here -- the
 # same "absent = the surface never advertises it" rule as search_web/GitHub.
-COLAB_CLI_PATH = shutil.which('colab') or os.path.expanduser('~/.local/bin/colab')
+COLAB_CLI_PATH = os.path.expanduser(str(_load_env().get('COLAB_CLI_PATH') or '').strip()) or shutil.which('colab') or os.path.expanduser('~/.local/bin/colab')
 COLAB_CLI_AVAILABLE = bool(COLAB_CLI_PATH) and os.path.exists(COLAB_CLI_PATH)
 COLAB_GPU_SESSION = 'think-tank-gpu'
-COLAB_GPU_ACCEL = 'T4'
+COLAB_GPU_ACCEL = str(_load_env().get('COLAB_GPU_ACCEL') or 'T4').strip()
 # CPU is a first-class runtime option too, not a fallback: a large task that
 # is purely CPU-bound (no CUDA/torch-GPU call) should not have to rent a T4
 # at all -- free-tier CPU runtimes are more likely to be granted than a GPU
@@ -8925,7 +8925,7 @@ async def intent_promote_spike(task_id: str, request: Request):
             return JSONResponse({'error': 'An identical grooming request is already pending.'}, status_code=409)
         now_ms = int(time.time() * 1000)
         req.update(teamId=team.get('id') or 'theo', groomerId='theo',
-                   taskType='spike', budgetMs=task.get('budgetMs') or 60_000,
+                   taskType='spike', budgetMs=task.get('budgetMs') or 120_000,
                    origin='spike_promotion', sourceSpikeId=task_id,
                    goal=task.get('goal') or title)
         task.update(promotedRequestId=req['id'], promotedTo='theo', promotedAt=now_ms)
@@ -8993,7 +8993,7 @@ async def intent_promote_spike(task_id: str, request: Request):
                              'Investigate further -- this does not need to produce a deliverable.'),
             'goal': task.get('goal') or spike_title,
             'taskType': 'spike',
-            'budgetMs': task.get('budgetMs') or 60_000,
+            'budgetMs': task.get('budgetMs') or 120_000,
         }
     else:
         new_item = {
@@ -9095,7 +9095,7 @@ async def promote_shadow_entry(idx: str, request: Request):
                              'to produce a deliverable.'),
             'goal': entry.get('projectLabel') or entry.get('title'),
             'taskType': 'spike',
-            'budgetMs': 60_000,
+            'budgetMs': 120_000,
         }
     else:
         new_item = {

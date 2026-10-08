@@ -32,6 +32,7 @@ async function refreshServerState() {
     if (!res.ok) return;
     const saved = await res.json();
     if (!saved || !saved.sim || saved.sim.owner !== 'server') return;
+    if (typeof DELIVERY_STATE !== 'undefined') DELIVERY_STATE = saved;
     if (typeof AGENT_ROSTER !== 'undefined' && Array.isArray(saved.agentRoster)) {
       AGENT_ROSTER.splice(0, AGENT_ROSTER.length, ...saved.agentRoster);
     }

@@ -2290,7 +2290,7 @@ def queue_work(state, items):
             # Phase E2b: a SPIKE's work-cycle time budget (ms). A spike has no
             # deliverable -- it completes when the budget elapses, landing a
             # findings artifact instead of a peer-reviewed story.
-            'budgetMs': item.get('budgetMs') or None,
+            'budgetMs': item.get('budgetMs') or (120_000 if item.get('taskType') == 'spike' else None),
             # Phase E addendum: a peer-rejected fix returns to the original author.
             'assignedTo': item.get('assignedTo') or None,
             # Phase E2d: an INCIDENT (bug) is pinned to the owning team's on-call
@@ -2398,12 +2398,12 @@ def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructi
         'room': room,
         'instructions': instructions or (f'Spike: investigate and report on: {title}. '
                                           f'Explore the approach, run a short experiment, and '
-                                          f'write up concrete findings. Time-boxed to ~{int((budget_ms or 60_000) / 1000)}s.'),
+                                          f'write up concrete findings. Time-boxed to ~{int((budget_ms or 120_000) / 1000)}s.'),
         'goal': goal,
         'projectLabel': project_label,
         'priority': WORK_PRIORITY['low'],
         'taskType': 'spike',
-        'budgetMs': budget_ms or 60_000,
+        'budgetMs': budget_ms or 120_000,
         'moonshot': bool(moonshot),
         'notBefore': notBefore,
     }])
@@ -3351,7 +3351,7 @@ def _pull_backlog_for_team(state, team_id, now_ms):
         'goal': item.get('goal'),
         'teamId': team_id,
         'taskType': 'spike' if is_spike else 'code',
-        'budgetMs': 60_000 if is_spike else None,
+        'budgetMs': 120_000 if is_spike else None,
         # A breakdown story's size estimate survives the shared backlog onto the
         # pulled card (same contract as _resolve_breakdown's direct queue path).
         'sizeEstimate': item.get('sizeEstimate'),
@@ -3879,7 +3879,7 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'distill': bool((extra or {}).get('distill')),
         'kbClass': (extra or {}).get('kbClass') or None,
         'dependsOn': (extra or {}).get('dependsOn') or None,
-        'budgetMs': (extra or {}).get('budgetMs'),
+        'budgetMs': (extra or {}).get('budgetMs') or (120_000 if (extra or {}).get('taskType') == 'spike' else None),
         'sizeEstimate': (extra or {}).get('sizeEstimate'),
         'reviewOf': (extra or {}).get('reviewOf'),
         'reviewAuthorId': (extra or {}).get('reviewAuthorId'),

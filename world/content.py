@@ -4117,7 +4117,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # enough to spend on up to 18 round trips), now following the plan above
     # when one was produced.
     system = (
-        f'You are {name}, running a time-boxed SPIKE (~{(budget or 60_000) / 1000:.0f}s). '
+        f'You are {name}, running a time-boxed SPIKE (~{(budget or 120_000) / 1000:.0f}s). '
         f'Question: {backlog}.'
         f'{" Method/constraints: " + instructions if instructions else ""} '
         + (f'Follow this plan:\n{plan_text}\n\n' if plan_text else '')

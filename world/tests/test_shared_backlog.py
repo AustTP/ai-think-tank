@@ -187,7 +187,7 @@ class FeaturesAndBacklog(unittest.TestCase):
         sim._pull_backlog_for_team(state, 'dev', 1_000_003)
         spike = state['workQueue'][1]
         self.assertEqual(spike['taskType'], 'spike')
-        self.assertEqual(spike['budgetMs'], 60_000)
+        self.assertEqual(spike['budgetMs'], 120_000)
         self.assertIsNone(spike['room'])
         self.assertEqual(spike['featureId'], 'feat-1')
         self.assertEqual(len(state['workQueue']), 2)  # one item per card
