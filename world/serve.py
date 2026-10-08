@@ -8363,6 +8363,55 @@ def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confiden
     return True
 
 
+async def _jev_re_gate_redirect_final(agent_id, action, noun, approved_url, final_url, purpose,
+                                      work_context, work_context_trusted, authorized, trace_id=None):
+    # Closing a REAL gap confirmed by code reading: every fetch path
+    # (_fetch_page_sync, _fetch_rendered_page_sync, _curl_request_sync,
+    # _api_request_sync, _download_file_sync) follows redirects and re-checks
+    # the FINAL host for NETWORK safety only (_is_safe_public_host) -- Jev's
+    # content classification judges the ORIGINAL url, never the destination a
+    # redirect chain lands on. A short link (bit.ly/... or any URL whose
+    # location header points elsewhere) is therefore a laundering vector: Jev
+    # approves the link's host + the agent's stated purpose, then the redirect
+    # silently delivers content from a host Jev never judged -- exactly the
+    # shape that could end with agents reading inappropriate content (CSAM
+    # among the blocked categories) off an innocently-approved shortener.
+    #
+    # This re-runs the SAME content gate on the FINAL url after the redirect
+    # resolves, and fails closed: a blocked (or unsure/escalated) final-host
+    # decision denies the whole fetch, so no content from an unjudged host
+    # reaches the agent. Same-host redirects (http->https, path moves) skip
+    # the extra round trip -- the host Jev judged is unchanged. A redirect to
+    # a host the PLAYER vetted (allowlist, or explicitly named in a
+    # player-authored task's work) skips it too -- the player vetted that
+    # destination directly by writing it into the assignment.
+    try:
+        approved_host = (urllib.parse.urlparse(approved_url).hostname or '').lower()
+        final_host = (urllib.parse.urlparse(final_url).hostname or '').lower()
+    except Exception:
+        return True, None
+    if not final_host or final_host == approved_host:
+        return True, None
+    if _is_allowlisted_host(final_host) or (work_context_trusted and _is_work_context_host(work_context, final_host)):
+        return True, None
+    criteria = {
+        'allow': 'The URL and stated purpose look like ordinary, legal browsing (reference material, news, weather, general research, public information).'
+                 + (' A URL that is clearly part of, or relevant to, the agent\'s CURRENT assigned work is allowed, provided it does not fall into any blocked category.' if work_context else ''),
+        'block': 'The URL, domain, or stated purpose suggests: ' + '; '.join(BROWSE_BLOCK_CATEGORIES) + '. A blocked category ALWAYS blocks: relevance to the assigned work or a stated purpose never overrides it -- an agent can describe its work however it likes, and that must not launder an inappropriate site.',
+    }
+    instructions = (
+        f'An in-game agent requested {approved_url}, which REDIRECTED to a different host: {final_url}\n'
+        f'Stated reason: {purpose or "not given"}\n'
+    )
+    if work_context:
+        instructions += f'The agent is currently working on this assigned task: {work_context[:600]}\n'
+    instructions += 'Decide allow or block based on the FINAL URL/domain (the redirect destination), the stated purpose, and the work it serves. If the URL falls into any blocked category, you MUST block it regardless of work relevance or stated purpose.'
+    decision, confidence, cost, redirect_trace_id = await _jev_quorum_decision(instructions, criteria)
+    if not _jev_safety_gate(agent_id, action, noun, final_url, purpose, decision, confidence, cost, authorized, redirect_trace_id):
+        return False, 'The site this URL redirected to was not approved for a think tank agent to visit.'
+    return True, None
+
+
 # Model tiers shouldn't be three slugs frozen in code --
 # Jev should pick them from OpenRouter's real, current catalog. Jev is a
 # classifier over a short candidate list, not something that should sift
@@ -13702,6 +13751,19 @@ async def library_download(request: Request):
         log_action(agent_id, 'download', {'url': url, 'purpose': purpose, 'decision': 'allowed_but_fetch_failed', 'reason': str(e)}, authorized=authorized, trace_id=trace_id)
         return JSONResponse({'allowed': True, 'ok': False, 'reason': str(e)})
 
+    # Real gap closure, mirroring /api/browse: the redirect chain's FINAL host
+    # is network-re-checked inside _download_file_sync but never re-judged for
+    # CONTENT. A short link approved by Jev can land on a host it never
+    # classified -- re-gate the final url before the file is written anywhere.
+    redirect_allowed, redirect_reason = await _jev_re_gate_redirect_final(
+        agent_id, 'download', 'This file download', url, final_url, purpose,
+        '', False, authorized, trace_id)
+    if not redirect_allowed:
+        log_action(agent_id, 'download', {'url': url, 'finalUrl': final_url, 'purpose': purpose,
+                                          'decision': 'blocked', 'reason': redirect_reason},
+                   authorized=authorized, trace_id=trace_id)
+        return JSONResponse({'allowed': False, 'reason': redirect_reason})
+
     rel_path = _download_dest_rel_path(scope, agent_id, safe_name)
     # Village isolation: a non-main agent's SHARED download lands in their own
     # village's tree (personal downloads are already scoped by owning agent).
@@ -14982,6 +15044,22 @@ async def browse(request: Request):
     except Exception as e:
         log_action(agent_id, 'browse', {'url': url, 'purpose': purpose, 'decision': 'allowed_but_fetch_failed', 'reason': str(e), 'render': render, 'viaVpnCountry': via_vpn_country or None}, authorized=authorized, trace_id=trace_id)
         return JSONResponse({'allowed': True, 'error': f'Approved, but the page could not be loaded: {e}'})
+
+    # Real gap closure: the redirect chain's FINAL host was network-re-checked
+    # inside the fetch, but never re-judged for CONTENT. Jev approved the
+    # ORIGINAL url (a short link can point anywhere); the destination it
+    # actually landed on is a host Jev never classified. Re-gate it now,
+    # before a byte of its content is wrapped for the agent.
+    redirect_allowed, redirect_reason = await _jev_re_gate_redirect_final(
+        agent_id, 'browse', 'This page', url, final_url, purpose,
+        work_context, work_context_trusted, authorized, trace_id)
+    if not redirect_allowed:
+        log_action(agent_id, 'browse', {'url': url, 'finalUrl': final_url, 'purpose': purpose,
+                                        'decision': 'blocked', 'reason': redirect_reason,
+                                        'render': render, 'viaVpnCountry': via_vpn_country or None},
+                   authorized=authorized, trace_id=trace_id)
+        return JSONResponse({'allowed': False, 'reason': redirect_reason})
+
     # `text` stays plain for human display (the Weather Station/Work Room
     # modals render this directly) -- `textForModel` is the boundary-
     # wrapped version any FUTURE code path must use instead if it ever
@@ -15449,7 +15527,7 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
              'truncated': False, 'status': 200, 'finalUrl': url}, service, True, parsed.hostname)
         return {'ok': True, 'allowed': True, 'textForModel': wrapped, 'modelInstruction': instruction,
                 'status': 200, 'service': (service or {}).get('name'), 'data': wf['data'], 'wrapped_json': wrapped,
-                'ids': wf.get('ids') or {}, 'usd': wf.get('usd')}
+                'ids': wf.get('ids') or {}, 'usd': wf.get('usd'), 'finalUrl': url}
 
     try:
         result = _api_request_sync(method, url, req_headers, req_body)
@@ -15459,7 +15537,8 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
     parsed_json, ctype, wrapped, instruction = _api_build_text(result, service, registered, parsed.hostname)
     _api_accrue(spend_kind, ctype, parsed_json)
     return {'ok': True, 'allowed': True, 'textForModel': wrapped, 'modelInstruction': instruction,
-            'status': result['status'], 'service': (service or {}).get('name'), 'data': parsed_json, 'wrapped_json': wrapped}
+            'status': result['status'], 'service': (service or {}).get('name'), 'data': parsed_json, 'wrapped_json': wrapped,
+            'finalUrl': result.get('finalUrl') or url}
 
 
 def _api_call_response(agent_id, authorized, out, trace_id=None, url='', method='', purpose=''):
@@ -15553,6 +15632,17 @@ async def api_call(request: Request):
             return _api_call_response(agent_id, authorized, {'ok': False, 'allowed': False, 'reason': 'This request was not approved for a think tank agent to make.'}, url=url, method=method, purpose=purpose, trace_id=trace_id)
 
     out = await asyncio.to_thread(_api_execute, agent_id, authorized, url, method, req_body, req_headers, purpose, workflow, None, trace_id)
+    # Real gap closure, mirroring /api/browse: the redirect chain's FINAL host
+    # is network-re-checked inside _api_request_sync but never re-judged for
+    # CONTENT. A short link approved by Jev can land on a host it never
+    # classified -- re-gate the final url before its response is returned.
+    if out.get('allowed') is True and out.get('ok') is True:
+        redirect_allowed, redirect_reason = await _jev_re_gate_redirect_final(
+            agent_id, 'api-call', 'This API request', url, out.get('finalUrl') or url, purpose,
+            work_context, work_context_trusted, authorized, trace_id)
+        if not redirect_allowed:
+            return _api_call_response(agent_id, authorized, {'ok': False, 'allowed': False, 'reason': redirect_reason},
+                                      trace_id=trace_id, url=url, method=method, purpose=purpose)
     return _api_call_response(agent_id, authorized, out, trace_id=trace_id, url=url, method=method, purpose=purpose)
 
 
@@ -15783,6 +15873,19 @@ async def curl(request: Request):
         log_action(agent_id, 'curl', {'url': url, 'method': method, 'purpose': purpose, 'decision': 'allowed_but_failed', 'reason': str(e)}, authorized=authorized, trace_id=trace_id)
         return JSONResponse({'allowed': True, 'error': f'Approved, but the request failed: {e}'})
 
+    # Real gap closure, mirroring /api/browse: the redirect chain's FINAL host
+    # is network-re-checked inside _curl_request_sync but never re-judged for
+    # CONTENT. A short link approved by Jev can land on a host it never
+    # classified -- re-gate the final url before its body is returned.
+    redirect_allowed, redirect_reason = await _jev_re_gate_redirect_final(
+        agent_id, 'curl', 'This HTTP request', url, result.get('finalUrl') or url, purpose,
+        work_context, False, authorized, trace_id)
+    if not redirect_allowed:
+        log_action(agent_id, 'curl', {'url': url, 'method': method, 'finalUrl': result.get('finalUrl'),
+                                      'purpose': purpose, 'decision': 'blocked', 'reason': redirect_reason},
+                   authorized=authorized, trace_id=trace_id)
+        return JSONResponse({'allowed': False, 'reason': redirect_reason})
+
     # Real, if narrow, residual risk (audit): a capability-handle-
     # authenticated request's response used to go back to the agent
     # completely raw. If the target API ever echoes the injected credential
@@ -15890,6 +15993,19 @@ async def sandbox_download(request: Request):
     except Exception as e:
         log_action(agent_id, 'sandbox_download', {'url': url, 'purpose': purpose, 'decision': 'allowed_but_fetch_failed', 'reason': str(e)}, authorized=authorized, trace_id=trace_id)
         return JSONResponse({'allowed': True, 'ok': False, 'reason': str(e)})
+
+    # Real gap closure, mirroring /api/browse: the redirect chain's FINAL host
+    # is network-re-checked inside _download_file_sync but never re-judged for
+    # CONTENT. A short link approved by Jev can land on a host it never
+    # classified -- re-gate the final url before the file enters the sandbox.
+    redirect_allowed, redirect_reason = await _jev_re_gate_redirect_final(
+        agent_id, 'sandbox_download', 'This sandbox download', url, final_url, purpose,
+        '', False, authorized, trace_id)
+    if not redirect_allowed:
+        log_action(agent_id, 'sandbox_download', {'url': url, 'finalUrl': final_url, 'purpose': purpose,
+                                                  'sandboxId': sandbox_id, 'decision': 'blocked', 'reason': redirect_reason},
+                   authorized=authorized, trace_id=trace_id)
+        return JSONResponse({'allowed': False, 'reason': redirect_reason})
 
     sandbox_dir = _sandbox_dir_for(sandbox_id)
     dest_dir = os.path.join(sandbox_dir, 'downloads')
