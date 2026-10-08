@@ -2,6 +2,28 @@
   "version": 1,
   "comment": "Registry of external services reachable through the generic api_call tool. Adding a service here (base_url, credential source, auth, allowed paths/methods, spend rule) is the config-not-code path: no Python adapter needed. The security gates around these entries (SSRF, Jev classification, rate limit, one-strike, page/spend accrual) live in serve.py and are never delegated to this file. path_rules prefixes are matched against the URL path under base_url.",
   "services": {
+    "open-meteo": {
+      "name": "Open-Meteo (forecast)",
+      "base_url": "https://api.open-meteo.com",
+      "credential": {"type": "none"},
+      "auth": {"type": "none"},
+      "methods": ["GET", "HEAD"],
+      "path_rules": [
+        {"prefix": "/v1/", "methods": ["GET", "HEAD"]}
+      ],
+      "spend": {"kind": "none", "note": "free keyless public weather API -- fair-use caps (10k/day), no uptime guarantee; the think tank's reference free integration"}
+    },
+    "open-meteo-geocoding": {
+      "name": "Open-Meteo Geocoding",
+      "base_url": "https://geocoding-api.open-meteo.com",
+      "credential": {"type": "none"},
+      "auth": {"type": "none"},
+      "methods": ["GET", "HEAD"],
+      "path_rules": [
+        {"prefix": "/v1/", "methods": ["GET", "HEAD"]}
+      ],
+      "spend": {"kind": "none", "note": "free keyless geocoding (place name -> lat/lon) backing weather lookups"}
+    },
     "github": {
       "name": "GitHub",
       "base_url": "https://api.github.com",
