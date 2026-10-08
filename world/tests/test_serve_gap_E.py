@@ -141,14 +141,16 @@ def _write_lib(rel_path, content, mtime=None):
 
 
 def _client():
-    return TestClient(serve.app)
+    c = TestClient(serve.app)
+    c.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
+    return c
 
 
 class DownloadFileSync(unittest.TestCase):
     def test_success_reads_and_returns_raw(self):
         fake = _FakeResp('https://example.com/data.csv', {'Content-Type': 'text/csv'}, 200, b'a,b\n1,2\n')
         with unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True), \
-             unittest.mock.patch.object(serve.urllib.request, 'urlopen', return_value=fake):
+             unittest.mock.patch.object(serve, '_safe_urlopen', return_value=fake):
             final_url, content_type, raw, truncated = serve._download_file_sync('https://example.com/data.csv', 1000)
         self.assertEqual(final_url, 'https://example.com/data.csv')
         self.assertEqual(content_type, 'text/csv')
@@ -158,7 +160,7 @@ class DownloadFileSync(unittest.TestCase):
     def test_truncates_at_max_bytes(self):
         fake = _FakeResp('https://example.com/big.bin', {'Content-Type': 'application/octet-stream'}, 200, b'x' * 50)
         with unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True), \
-             unittest.mock.patch.object(serve.urllib.request, 'urlopen', return_value=fake):
+             unittest.mock.patch.object(serve, '_safe_urlopen', return_value=fake):
             _final, _ct, raw, truncated = serve._download_file_sync('https://example.com/big.bin', 10)
         self.assertEqual(len(raw), 10)
         self.assertTrue(truncated)
@@ -166,7 +168,7 @@ class DownloadFileSync(unittest.TestCase):
     def test_redirect_to_disallowed_host_raises(self):
         fake = _FakeResp('http://10.0.0.5/steal', {'Content-Type': 'text/html'}, 200, b'x')
         with unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=False), \
-             unittest.mock.patch.object(serve.urllib.request, 'urlopen', return_value=fake):
+             unittest.mock.patch.object(serve, '_safe_urlopen', return_value=fake):
             with self.assertRaises(ValueError):
                 serve._download_file_sync('https://example.com/ok', 100)
 
@@ -1138,12 +1140,12 @@ class ResolveRequester(unittest.TestCase):
         self.assertIsNone(serve._resolve_requester(self._req('requesterId=unknown')))
 
     def test_bad_key_returns_none(self):
-        with unittest.mock.patch.object(serve, 'verify_agent_key', return_value=False):
-            self.assertIsNone(serve._resolve_requester(self._req('requesterId=ada')))
+        with unittest.mock.patch.object(serve, '_agent_id_for_key', return_value=None):
+            self.assertIsNone(serve._resolve_requester(self._req('requesterId=ada', headers=[(b'x-agent-key', b'bad')])))
 
     def test_valid_key_returns_claimed_id(self):
-        with unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True):
-            self.assertEqual(serve._resolve_requester(self._req('requesterId=ada')), 'ada')
+        with unittest.mock.patch.object(serve, '_agent_id_for_key', return_value='ada'):
+            self.assertEqual(serve._resolve_requester(self._req('requesterId=ada', headers=[(b'x-agent-key', b'good')])), 'ada')
 
 
 class AgentFilesEndpoints(unittest.TestCase):
@@ -1178,8 +1180,9 @@ class AgentFilesEndpoints(unittest.TestCase):
         self.assertEqual(paths, sorted(paths))
 
     def test_own_reports_are_hidden_from_the_subject(self):
-        with unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True):
-            r = _client().get('/api/agent-files', params={'agentId': self.agent, 'requesterId': self.agent})
+        with unittest.mock.patch.object(serve, '_agent_id_for_key', return_value=self.agent):
+            r = _client().get('/api/agent-files', params={'agentId': self.agent, 'requesterId': self.agent},
+                              headers={'X-Agent-Key': 'k'})
         self.assertEqual(r.status_code, 200)
         paths = [f['path'] for f in r.json()['files']]
         self.assertIn('notes/a.md', paths)
@@ -1196,8 +1199,9 @@ class AgentFilesEndpoints(unittest.TestCase):
         self.assertIn('not readable', r.json()['error'])
 
     def test_read_own_report_is_403(self):
-        with unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True):
-            r = _client().get('/api/agent-files/read', params={'agentId': self.agent, 'path': 'reports/r.md', 'requesterId': self.agent})
+        with unittest.mock.patch.object(serve, '_agent_id_for_key', return_value=self.agent):
+            r = _client().get('/api/agent-files/read', params={'agentId': self.agent, 'path': 'reports/r.md', 'requesterId': self.agent},
+                              headers={'X-Agent-Key': 'k'})
         self.assertEqual(r.status_code, 403)
 
     def test_read_missing_file_is_404(self):
@@ -1474,7 +1478,7 @@ class RoomGates(unittest.TestCase):
 class CurlRequestSync(unittest.TestCase):
     def _run(self, resp, headers=None, body=None, host_ok=True):
         with unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=host_ok), \
-             unittest.mock.patch.object(serve.urllib.request, 'urlopen', return_value=resp):
+             unittest.mock.patch.object(serve, '_safe_urlopen', return_value=resp):
             return serve._curl_request_sync('GET', 'https://api.example.com/x', headers or {}, body)
 
     def test_success_without_user_agent_adds_one(self):
@@ -1489,9 +1493,9 @@ class CurlRequestSync(unittest.TestCase):
     def test_body_is_encoded(self):
         resp = _FakeResp('https://api.example.com/x', {}, 200, b'accepted')
         with unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True), \
-             unittest.mock.patch.object(serve.urllib.request, 'urlopen', return_value=resp) as urlopen:
+             unittest.mock.patch.object(serve, '_safe_urlopen', return_value=resp) as safe_urlopen:
             serve._curl_request_sync('POST', 'https://api.example.com/x', {'Content-Type': 'text/plain'}, 'payload')
-        req = urlopen.call_args[0][0]
+        req = safe_urlopen.call_args[0][0]
         self.assertEqual(req.data, b'payload')
         self.assertEqual(req.method, 'POST')
         self.assertEqual(req.headers.get('User-agent'), 'AIThinkTankAgent/1.0')
@@ -1499,9 +1503,9 @@ class CurlRequestSync(unittest.TestCase):
     def test_existing_user_agent_is_kept(self):
         resp = _FakeResp('https://api.example.com/x', {}, 200, b'ok')
         with unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True), \
-             unittest.mock.patch.object(serve.urllib.request, 'urlopen', return_value=resp) as urlopen:
+             unittest.mock.patch.object(serve, '_safe_urlopen', return_value=resp) as safe_urlopen:
             serve._curl_request_sync('GET', 'https://api.example.com/x', {'User-Agent': 'custom/1.0'}, None)
-        req = urlopen.call_args[0][0]
+        req = safe_urlopen.call_args[0][0]
         self.assertEqual(req.headers.get('User-agent'), 'custom/1.0')
 
     def test_redirect_to_disallowed_host_raises(self):
@@ -1727,7 +1731,7 @@ class SandboxDownloadEndpoint(unittest.TestCase):
              unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
              unittest.mock.patch.object(serve, 'check_rate_limit', return_value=False), \
              unittest.mock.patch.object(serve, 'log_action') as log:
-            r = _client().post('/api/sandbox-download', json={'url': 'http://x', 'agentId': 'ada'})
+            r = _client().post('/api/sandbox-download', json={'url': 'http://x', 'agentId': 'ada', 'sandboxId': 's1'})
         self.assertEqual(r.status_code, 429)
         self.assertEqual(log.call_args[0][1], 'rate_limited')
 
@@ -1738,7 +1742,7 @@ class SandboxDownloadEndpoint(unittest.TestCase):
              unittest.mock.patch.object(serve, '_agent_is_in_sandbox_room', return_value=False), \
              unittest.mock.patch.object(serve, '_has_active_temp_access', return_value=False), \
              unittest.mock.patch.object(serve, 'log_action') as log:
-            r = _client().post('/api/sandbox-download', json={'url': 'http://x', 'agentId': 'ada'})
+            r = _client().post('/api/sandbox-download', json={'url': 'http://x', 'agentId': 'ada', 'sandboxId': 's1'})
         self.assertEqual(r.status_code, 200)
         self.assertFalse(r.json()['allowed'])
         self.assertEqual(log.call_args[0][2]['decision'], 'blocked')
@@ -1749,7 +1753,7 @@ class SandboxDownloadEndpoint(unittest.TestCase):
              unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True), \
              unittest.mock.patch.object(serve, '_agent_is_in_sandbox_room', return_value=True), \
              unittest.mock.patch.object(serve, '_has_active_temp_access', return_value=False):
-            r = _client().post('/api/sandbox-download', json={'url': 'http://x', 'agentId': 'ada'})
+            r = _client().post('/api/sandbox-download', json={'url': 'http://x', 'agentId': 'ada', 'sandboxId': 's1'})
         self.assertEqual(r.status_code, 400)
         self.assertIn('url, filename, and sandboxId are required', r.json()['error'])
 
@@ -1858,7 +1862,7 @@ class SandboxSavePageEndpoint(unittest.TestCase):
              unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
              unittest.mock.patch.object(serve, 'check_rate_limit', return_value=False), \
              unittest.mock.patch.object(serve, 'log_action') as log:
-            r = _client().post('/api/sandbox-save-page', json={'url': 'http://x', 'agentId': 'ada'})
+            r = _client().post('/api/sandbox-save-page', json={'url': 'http://x', 'agentId': 'ada', 'sandboxId': 's1'})
         self.assertEqual(r.status_code, 429)
         self.assertEqual(log.call_args[0][1], 'rate_limited')
 
@@ -1869,7 +1873,7 @@ class SandboxSavePageEndpoint(unittest.TestCase):
              unittest.mock.patch.object(serve, '_agent_is_in_sandbox_room', return_value=False), \
              unittest.mock.patch.object(serve, '_has_active_temp_access', return_value=False), \
              unittest.mock.patch.object(serve, 'log_action') as log:
-            r = _client().post('/api/sandbox-save-page', json={'url': 'http://x', 'agentId': 'ada'})
+            r = _client().post('/api/sandbox-save-page', json={'url': 'http://x', 'agentId': 'ada', 'sandboxId': 's1'})
         self.assertEqual(r.status_code, 200)
         self.assertFalse(r.json()['allowed'])
         self.assertEqual(log.call_args[0][2]['decision'], 'blocked')
@@ -2080,9 +2084,9 @@ class CredentialVaultEndpoints(unittest.TestCase):
             os.remove(serve.PASSPORT_PATH)
 
     def test_list_credentials_blocks_agents(self):
-        with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
-             unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True):
-            r = _client().get('/api/keys/credentials', params={'requesterId': 'ada'})
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_valid_agent_key_presented', return_value=True):
+            r = _client().get('/api/keys/credentials', headers={'X-Agent-Key': 'k'})
         self.assertEqual(r.status_code, 403)
         self.assertIn('player-only', r.json()['error'])
 
@@ -2095,9 +2099,9 @@ class CredentialVaultEndpoints(unittest.TestCase):
         self.assertEqual(r.json()['credentials'], [{'name': 'api', 'service': 'svc'}])
 
     def test_add_credential_blocks_agents(self):
-        with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
-             unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True):
-            r = _client().post('/api/keys/credentials', json={'name': 'x', 'value': 'v'}, params={'requesterId': 'ada'})
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_valid_agent_key_presented', return_value=True):
+            r = _client().post('/api/keys/credentials', json={'name': 'x', 'value': 'v'}, headers={'X-Agent-Key': 'k'})
         self.assertEqual(r.status_code, 403)
 
     def test_add_credential_missing_fields_returns_400(self):
@@ -2127,9 +2131,9 @@ class CredentialVaultEndpoints(unittest.TestCase):
         self.assertEqual(data['blocks'][0]['kind'], 'credential_stored')
 
     def test_delete_credential_blocks_agents(self):
-        with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
-             unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True):
-            r = _client().delete('/api/keys/credentials/api', params={'requesterId': 'ada'})
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_valid_agent_key_presented', return_value=True):
+            r = _client().delete('/api/keys/credentials/api', headers={'X-Agent-Key': 'k'})
         self.assertEqual(r.status_code, 403)
 
     def test_delete_credential_success(self):

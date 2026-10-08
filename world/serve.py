@@ -685,17 +685,32 @@ def init_db():
             auth_type TEXT NOT NULL DEFAULT 'header_bearer',
             auth_value_format TEXT,
             auth_field TEXT,
+            auth_token_url TEXT,
             default_headers TEXT,
             methods TEXT,
             path_rules TEXT,
             spend_kind TEXT NOT NULL DEFAULT 'none',
             spend_note TEXT,
+            spend_cap REAL,
             workflow TEXT,
             status TEXT NOT NULL DEFAULT 'active',
             proposed_by TEXT,
             created_at REAL,
             updated_at REAL
         )''')
+        # Migration for DBs created before auth_token_url (the OAuth2
+        # client-credentials token endpoint a registered service declares) or
+        # spend_cap (the daily-call budget cap): CREATE TABLE IF NOT EXISTS
+        # cannot add a column to an existing table, so ALTER it in place when
+        # missing. New DBs get the columns from the DDL above and this is a
+        # no-op.
+        try:
+            cols = [r[1] for r in conn.execute('PRAGMA table_info(api_services)')]
+            for col, col_type in (('auth_token_url', 'TEXT'), ('spend_cap', 'REAL')):
+                if col not in cols:
+                    conn.execute(f'ALTER TABLE api_services ADD COLUMN {col} {col_type}')  # nosec B608 -- fixed internal column names, never user input
+        except Exception:
+            pass
 
     _seed_api_services_if_empty()
     _load_api_services()
@@ -4435,6 +4450,15 @@ APIFY_API_KEY = _load_env().get('APIFY_API_KEY')
 # until both halves are configured.
 HIGGSFIELD_API_KEY_ID = _load_env().get('HIGGSFIELD_API_KEY_ID')
 HIGGSFIELD_API_KEY_SECRET = _load_env().get('HIGGSFIELD_API_KEY_SECRET')
+# OpenSky Network (flights): OAuth2 client-credentials pair (client id +
+# secret), created at opensky-network.org/my-opensky/account. Loaded as module
+# constants so the registry's env credential resolves them (same pattern as
+# the other service keys). The server mints a short-lived access token from
+# the pair and injects it as a Bearer header; agents never see the pair.
+# Absent (blank) means the registered opensky service reports a missing
+# credential -- the tools stay present, the calls fail clean.
+OPEN_SKY_CLIENT_ID = _load_env().get('OPEN_SKY_CLIENT_ID')
+OPEN_SKY_CLIENT_SECRET = _load_env().get('OPEN_SKY_CLIENT_SECRET')
 
 
 def _higgsfield_configured():
@@ -5080,14 +5104,16 @@ def _work_context_clause(work_context):
 # (/api/api-service/request -> player approval -> a row in the api_services
 # table), or by seeding the table from world/api_services.json. Each entry
 # declares the base URL, where the credential lives (an .env key or the
-# vault), how auth is injected (bearer header, key-pair header, or a field
-# merged into the JSON body), the allowed paths/methods, how spend is
-# accrued, and (for the multi-step generation services) a workflow spec. The
-# gates around these entries -- SSRF, Jev classification, rate limit,
-# one-strike, page/spend accrual -- live in serve.py and are never delegated
-# to a config row. This is the DB-backed replacement for the original
-# world/api_services.json seed file: the file still seeds a fresh DB, but the
-# runtime source of truth is the table.
+# vault), how auth is injected (bearer header, key-pair header, a field
+# merged into the JSON body, or the OAuth2 client-credentials flow with a
+# short-lived minted access token), the allowed paths/methods, how spend is
+# accrued (page budget, Apify USD, or a per-service daily call cap), and (for
+# the multi-step generation services) a workflow spec. The gates around these
+# entries -- SSRF, Jev classification, rate limit, one-strike, page/spend
+# accrual -- live in serve.py and are never delegated to a config row. This
+# is the DB-backed replacement for the original world/api_services.json seed
+# file: the file still seeds a fresh DB, but the runtime source of truth is
+# the table.
 API_SERVICES_PATH = os.path.join(ROOT, 'api_services.json')
 _API_SERVICES = {}
 _API_SERVICES_LOAD_ERROR = None
@@ -5098,9 +5124,9 @@ _API_SERVICE_JSON_COLUMNS = ('default_headers', 'methods', 'path_rules', 'workfl
 
 _API_SERVICE_COLUMNS = (
     'id', 'name', 'base_url', 'credential_type', 'credential_key', 'credential_key2',
-    'credential_name', 'auth_type', 'auth_value_format', 'auth_field', 'default_headers',
-    'methods', 'path_rules', 'spend_kind', 'spend_note', 'workflow', 'status',
-    'proposed_by', 'created_at', 'updated_at',
+    'credential_name', 'auth_type', 'auth_value_format', 'auth_field', 'auth_token_url',
+    'default_headers', 'methods', 'path_rules', 'spend_kind', 'spend_note', 'spend_cap',
+    'workflow', 'status', 'proposed_by', 'created_at', 'updated_at',
 )
 
 
@@ -5123,11 +5149,13 @@ def _api_service_spec_to_row(sid, spec, status='active', proposed_by=None):
         'auth_type': auth.get('type') or 'header_bearer',
         'auth_value_format': auth.get('value_format'),
         'auth_field': auth.get('field'),
+        'auth_token_url': auth.get('token_url'),
         'default_headers': json.dumps((spec or {}).get('default_headers') or {}),
         'methods': json.dumps((spec or {}).get('methods') or []),
         'path_rules': json.dumps((spec or {}).get('path_rules') or []),
         'spend_kind': spend.get('kind') or 'none',
         'spend_note': spend.get('note'),
+        'spend_cap': spend.get('cap'),
         'workflow': json.dumps((spec or {}).get('workflow') or None),
         'status': status,
         'proposed_by': proposed_by,
@@ -5161,11 +5189,13 @@ def _api_service_row_to_spec(row):
             'type': row.get('auth_type') or 'header_bearer',
             'value_format': row.get('auth_value_format'),
             'field': row.get('auth_field'),
+            'token_url': row.get('auth_token_url'),
         },
         'default_headers': _jget('default_headers', {}),
         'methods': _jget('methods', []),
         'path_rules': _jget('path_rules', []),
-        'spend': {'kind': row.get('spend_kind') or 'none', 'note': row.get('spend_note')},
+        'spend': {'kind': row.get('spend_kind') or 'none', 'note': row.get('spend_note'),
+                  'cap': row.get('spend_cap')},
         'workflow': _jget('workflow', None),
         'status': row.get('status') or 'active',
     }
@@ -5282,9 +5312,23 @@ def _validate_api_service_spec(spec):
     cred = spec.get('credential') or {}
     if cred.get('type') not in ('none', 'env', 'vault'):
         return None, None, 'credential.type must be "none", "env", or "vault"'
-    auth_type = (spec.get('auth') or {}).get('type')
-    if auth_type not in ('none', 'header_bearer', 'header_key', 'body_field'):
-        return None, None, 'auth.type must be none, header_bearer, header_key, or body_field'
+    auth = spec.get('auth') or {}
+    auth_type = auth.get('type')
+    if auth_type not in ('none', 'header_bearer', 'header_key', 'body_field', 'oauth2_client_credentials'):
+        return None, None, 'auth.type must be none, header_bearer, header_key, body_field, or oauth2_client_credentials'
+    if auth_type == 'oauth2_client_credentials':
+        # The token endpoint the OAuth2 client-credentials flow POSTs the
+        # client id/secret pair to. It must be a public https URL (SSRF-safe,
+        # same rule as base_url) and the credential must be the two-part env
+        # pair -- a minted access token is never stored in the registry.
+        token_url = str(auth.get('token_url') or '').strip().rstrip('/')
+        parsed_tok = urllib.parse.urlparse(token_url)
+        if parsed_tok.scheme != 'https' or not parsed_tok.hostname or not _is_safe_public_host(parsed_tok.hostname):
+            return None, None, 'oauth2_client_credentials requires a public https auth.token_url'
+        if cred.get('type') != 'env' or not cred.get('key') or not cred.get('key2'):
+            return None, None, 'oauth2_client_credentials requires a two-part env credential (key = client id, key2 = client secret)'
+        auth = dict(auth)
+        auth['token_url'] = token_url
     methods = spec.get('methods') or []
     if not methods or not all(m in CURL_METHODS for m in methods):
         return None, None, 'methods must be a non-empty subset of GET/POST/PUT/PATCH/DELETE/HEAD'
@@ -5292,12 +5336,17 @@ def _validate_api_service_spec(spec):
     if not path_rules or not all(isinstance(r, dict) and r.get('prefix') for r in path_rules):
         return None, None, 'path_rules must be a non-empty list of {prefix, methods} rules'
     spend_kind = ((spec.get('spend') or {}).get('kind')) or 'none'
-    if spend_kind not in ('none', 'page_request', 'apify'):
-        return None, None, 'spend.kind must be none, page_request, or apify'
+    if spend_kind not in ('none', 'page_request', 'apify', 'daily_calls'):
+        return None, None, 'spend.kind must be none, page_request, apify, or daily_calls'
+    if spend_kind == 'daily_calls':
+        cap = (spec.get('spend') or {}).get('cap')
+        if not isinstance(cap, (int, float)) or cap <= 0:
+            return None, None, 'spend.kind daily_calls requires a positive numeric spend.cap'
     normalized = dict(spec)
     normalized['id'] = sid
     normalized['name'] = str(spec.get('name') or sid)
     normalized['base_url'] = base
+    normalized['auth'] = auth
     return sid, normalized, None
 
 
@@ -5406,7 +5455,170 @@ def _api_apply_auth(spec, token, token2, method, url, headers, body):
         field = auth.get('field') or 'api_key'
         body = dict(body or {})
         body[field] = token
+    elif atype == 'oauth2_client_credentials':
+        # OAuth2 client-credentials: the registry stores the CLIENT ID/SECRET
+        # pair (token = client_id, token2 = client_secret) plus the token
+        # endpoint. A short-lived access token is minted and cached in-process
+        # (never persisted, never returned to the agent), then injected as a
+        # Bearer header. The minted bearer is the ONLY credential that ever
+        # rides on the actual API request.
+        token_url = (auth.get('token_url') or '').strip()
+        if not token_url:
+            raise ValueError('oauth2_client_credentials requires auth.token_url')
+        bearer = _oauth2_access_token(token_url, token, token2)
+        headers['Authorization'] = f'Bearer {bearer}'
     return url, headers, body
+
+
+# ---------------------------------------------------------------------------
+# OAuth2 client-credentials mint + cache. OpenSky (and other OAuth2-protected
+# APIs) take a client id/secret pair and exchange it for a SHORT-LIVED access
+# token (OpenSky: 30 minutes) -- the registry can't inject a static bearer, it
+# has to mint one. The minted token lives in a module-level cache keyed by
+# (token_url, client_id) so a long-lived think tank polls the same service all
+# day without one mint per request; it is refreshed proactively before expiry
+# and never logged, persisted, or returned to an agent. The token endpoint is
+# SSRF-gated the same way the registry base_urls are: public https only.
+# ---------------------------------------------------------------------------
+_OAUTH2_TOKEN_CACHE: dict[tuple[str, str], dict[str, object]] = {}
+_OAUTH2_TOKEN_LOCK = threading.Lock()
+OAUTH2_REFRESH_MARGIN_S = 30
+
+
+def _oauth2_token_request_sync(token_url, client_id, client_secret):
+    """POST the client-credentials grant to the token endpoint and return the
+    raw response body. Form-encoded body (OAuth2's content type), SSRF-pinned
+    like every other outbound call, redirect-final-host re-checked. Raises on
+    a non-2xx response or a redirect to a disallowed host."""
+    if not client_id or not client_secret:
+        raise ValueError('oauth2 client id/secret are not set')
+    body = urllib.parse.urlencode({
+        'grant_type': 'client_credentials',
+        'client_id': client_id,
+        'client_secret': client_secret,
+    }).encode()
+    headers = {'Content-Type': 'application/x-www-form-urlencoded',
+               'Accept': 'application/json', 'User-Agent': 'AIThinkTankAgent/1.0'}
+    req = urllib.request.Request(token_url, data=body, headers=headers, method='POST')
+    with _safe_urlopen(req, timeout=API_CALL_TIMEOUT_S) as resp:  # token URL is public-https validated at registration; _safe_urlopen pins each resolved IP so DNS cannot rebind to an internal address
+        final_url = resp.geturl()
+        final_host = urllib.parse.urlparse(final_url).hostname
+        if not _is_safe_public_host(final_host):
+            raise ValueError('oauth2 token endpoint redirected to a disallowed host')
+        raw = resp.read(API_CALL_MAX_BODY_BYTES + 1)
+    if resp.status >= 400:
+        raise ValueError(f'oauth2 token endpoint returned HTTP {resp.status}')
+    return raw.decode(errors='replace')[:API_CALL_MAX_BODY_BYTES]
+
+
+def _oauth2_access_token(token_url, client_id, client_secret):
+    """Return a valid access token for (token_url, client_id), minting and
+    caching one when the cache is empty or near expiry. Raises when the mint
+    fails so the caller (the auth-injection path) fails the request cleanly."""
+    parsed = urllib.parse.urlparse(token_url)
+    if parsed.scheme != 'https' or not parsed.hostname or not _is_safe_public_host(parsed.hostname):
+        raise ValueError('oauth2 token_url must be a public https URL')
+    cache_key = (token_url, client_id)
+    with _OAUTH2_TOKEN_LOCK:
+        cached = _OAUTH2_TOKEN_CACHE.get(cache_key)
+        if cached and time.time() + OAUTH2_REFRESH_MARGIN_S < cached['expires_at']:
+            return cached['token']
+        raw = _oauth2_token_request_sync(token_url, client_id, client_secret)
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise ValueError('oauth2 token endpoint returned non-JSON')
+        token = (data or {}).get('access_token')
+        if not token:
+            raise ValueError('oauth2 token endpoint returned no access_token')
+        try:
+            expires_in = float(data.get('expires_in') or 3600)
+        except (ValueError, TypeError):
+            expires_in = 3600.0
+        _OAUTH2_TOKEN_CACHE[cache_key] = {'token': token, 'expires_at': time.time() + expires_in}
+        return token
+
+
+# ---------------------------------------------------------------------------
+# Daily per-service call budget (spend.kind = 'daily_calls'). Some registered
+# services run on a DAILY quota rather than dollars or a monthly count --
+# OpenSky's per-account credit buckets refill every day (4,000/day per endpoint
+# family for a standard account), so the correct rollover key is a UTC date,
+# not a month. A registry entry declares a conservative spend.cap (a call count
+# well under the real credit allowance) and the chokepoint blocks before the
+# quota could be exhausted, mirroring the Apify monthly gate. Counts live in
+# their own kv_apicalls row so the accounting never touches the sim-state blob.
+# ---------------------------------------------------------------------------
+
+
+def _api_daily_calls_ledger_read():
+    try:
+        with _db() as conn:
+            conn.execute('''CREATE TABLE IF NOT EXISTS kv_apicalls (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                blob TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )''')
+            row = conn.execute('SELECT blob FROM kv_apicalls WHERE id = 1').fetchone()
+            return json.loads(row[0]) if row else {}
+    except Exception:
+        return {}
+
+
+def _api_daily_calls_ledger_write(ledger):
+    try:
+        with _db() as conn:
+            conn.execute(
+                'INSERT INTO kv_apicalls (id, blob, updated_at) VALUES (1, ?, ?) '
+                'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
+                (json.dumps(ledger), time.time()),
+            )
+    except Exception:
+        pass
+
+
+def _api_daily_calls_day(now=None):
+    """The current UTC date (2026-10-08) -- the daily rollover key: a fresh
+    date starts a new allowance for every service."""
+    return datetime.datetime.fromtimestamp(now or time.time(), datetime.timezone.utc).strftime('%Y-%m-%d')
+
+
+def _api_daily_calls_used(service):
+    """How many api_call requests this service has consumed today."""
+    sid = (service or {}).get('id')
+    if not sid:
+        return 0
+    ledger = _api_daily_calls_ledger_read()
+    bucket = ledger.get(_api_daily_calls_day()) or {}
+    return int(bucket.get(sid, 0) or 0)
+
+
+def _api_daily_calls_exceeded(service):
+    """True when a registered service with spend.kind=daily_calls has consumed
+    its configured daily cap. Never true when no cap is configured."""
+    spend = ((service or {}).get('spend') or {})
+    if spend.get('kind') != 'daily_calls':
+        return False
+    cap = spend.get('cap')
+    if not isinstance(cap, (int, float)) or cap <= 0:
+        return False
+    return _api_daily_calls_used(service) >= cap
+
+
+def _api_accrue_daily_call(service):
+    """Record ONE api_call against the service's daily budget. Best-effort like
+    the other ledgers: an accounting failure must never break the real request."""
+    sid = (service or {}).get('id')
+    if not sid:
+        return
+    try:
+        ledger = _api_daily_calls_ledger_read()
+        day = _api_daily_calls_day()
+        bucket = ledger.setdefault(day, {})
+        bucket[sid] = int(bucket.get(sid, 0) or 0) + 1
+        _api_daily_calls_ledger_write(ledger)
+    except Exception:
+        pass
 
 
 # Master switch for the generic api_call path -- fail closed like
@@ -5465,9 +5677,11 @@ _PROPOSE_API_SERVICE_TOOL = {
             'read-only (GET/HEAD) through the normal Jev gate. Provide the service spec exactly as the '
             'registry expects: a simple id, a public https base_url, where the credential lives '
             '(credential.type "env" with a .env key name, or "vault" with a vault name), how auth is '
-            'injected (auth.type header_bearer / header_key with value_format / body_field with field), '
-            'the allowed methods, and path_rules (a list of {"prefix": ..., "methods": [...]}). You '
-            'never supply the secret itself -- only where it lives.'
+            'injected (auth.type header_bearer / header_key with value_format / body_field with field '
+            '/ oauth2_client_credentials with a public https token_url plus a two-part env credential), '
+            'the allowed methods, path_rules (a list of {"prefix": ..., "methods": [...]}), and an '
+            'optional spend rule (kind none / page_request / daily_calls with a cap). You never supply '
+            'the secret itself -- only where it lives.'
         ),
         'parameters': {
             'type': 'object',
@@ -15506,6 +15720,8 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
     spend_kind = (service or {}).get('spend') or {}
     if spend_kind.get('kind') == 'apify' and _apify_budget_exceeded():
         return {'ok': False, 'allowed': False, 'reason': 'The Apify monthly budget is spent. Do not retry; runs are refused until next month.'}
+    if _api_daily_calls_exceeded(service):
+        return {'ok': False, 'allowed': False, 'reason': 'The daily call budget for this service is spent. Do not retry until the quota refills.'}
 
     # Sanitize first (strip auth-ish agent headers), then inject registry
     # credential + default headers server-side.
@@ -15513,7 +15729,13 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
         req_headers.pop(h, None)
     req_headers = {k: v for k, v in req_headers.items() if k.lower() in ('accept', 'accept-language', 'user-agent')}
     if registered and token is not None:
-        url, req_headers, req_body = _api_apply_auth(service, token, token2, method, url, req_headers, req_body)
+        try:
+            url, req_headers, req_body = _api_apply_auth(service, token, token2, method, url, req_headers, req_body)
+        except Exception as e:
+            # Auth injection can fail (e.g. the OAuth2 token mint refused or the
+            # endpoint errored). The request must NOT go out unauthenticated --
+            # fail cleanly, same shape as a blocked request.
+            return {'ok': False, 'allowed': True, 'error': f'Approved, but auth could not be applied: {e}'}
     for hdr_name, hdr_value in ((service or {}).get('default_headers') or {}).items():
         req_headers.setdefault(hdr_name, hdr_value)
 
@@ -15536,6 +15758,7 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
 
     parsed_json, ctype, wrapped, instruction = _api_build_text(result, service, registered, parsed.hostname)
     _api_accrue(spend_kind, ctype, parsed_json)
+    _api_accrue_daily_call(service)
     return {'ok': True, 'allowed': True, 'textForModel': wrapped, 'modelInstruction': instruction,
             'status': result['status'], 'service': (service or {}).get('name'), 'data': parsed_json, 'wrapped_json': wrapped,
             'finalUrl': result.get('finalUrl') or url}

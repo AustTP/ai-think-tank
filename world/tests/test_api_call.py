@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -86,11 +87,30 @@ class RegistryLoader(unittest.TestCase):
         self.assertIn('higgsfield', serve._API_SERVICES)
         self.assertIn('open-meteo', serve._API_SERVICES)
         self.assertIn('open-meteo-geocoding', serve._API_SERVICES)
+        self.assertIn('opensky', serve._API_SERVICES)
+        self.assertIn('adsb-lol', serve._API_SERVICES)
+        self.assertIn('celestrak', serve._API_SERVICES)
 
     def test_host_lookup_exact_and_subdomain(self):
         self.assertIsNotNone(serve._api_service_for_host('api.github.com'))
         self.assertIsNotNone(serve._api_service_for_host('api.apify.com'))
         self.assertEqual(serve._api_service_for_host('api.github.com').get('name'), 'GitHub')
+
+    def test_new_services_lookup_and_auth(self):
+        opensky = serve._api_service_for_host('opensky-network.org')
+        self.assertIsNotNone(opensky)
+        self.assertEqual(opensky.get('auth', {}).get('type'), 'oauth2_client_credentials')
+        self.assertTrue(opensky.get('auth', {}).get('token_url').startswith('https://auth.opensky-network.org'))
+        self.assertTrue(serve._api_service_path_allowed(opensky, 'GET', '/api/states/all'))
+        self.assertFalse(serve._api_service_path_allowed(opensky, 'POST', '/api/states/all'))
+        adsb = serve._api_service_for_host('api.adsb.lol')
+        self.assertIsNotNone(adsb)
+        self.assertEqual(adsb.get('credential', {}).get('type'), 'none')
+        self.assertEqual(adsb.get('auth', {}).get('type'), 'none')
+        self.assertTrue(serve._api_service_path_allowed(adsb, 'GET', '/v2/callsign/UAL101'))
+        celestrak = serve._api_service_for_host('celestrak.org')
+        self.assertIsNotNone(celestrak)
+        self.assertTrue(serve._api_service_path_allowed(celestrak, 'GET', '/NORAD/elements/gp.php'))
 
     def test_unknown_host_is_none(self):
         self.assertIsNone(serve._api_service_for_host('api.not-registered.com'))
@@ -191,10 +211,141 @@ class AuthInjection(unittest.TestCase):
         url, headers, body = serve._api_apply_auth({'auth': {'type': 'none'}}, None, None, 'GET', 'u', {}, None)
         self.assertEqual((url, headers, body), ('u', {}, None))
 
+    def test_oauth2_client_credentials_mints_bearer(self):
+        spec = {'auth': {'type': 'oauth2_client_credentials', 'token_url': 'https://auth.example.com/token'}}
+        with unittest.mock.patch.object(serve, '_oauth2_access_token', return_value='MINTED'):
+            url, headers, body = serve._api_apply_auth(spec, 'CLIENT_ID', 'CLIENT_SECRET', 'GET', 'u', {}, None)
+        self.assertEqual(headers['Authorization'], 'Bearer MINTED')
+        self.assertEqual((url, body), ('u', None))
+
+    def test_oauth2_client_credentials_missing_token_url_raises(self):
+        with self.assertRaises(ValueError):
+            serve._api_apply_auth({'auth': {'type': 'oauth2_client_credentials'}}, 'a', 'b', 'GET', 'u', {}, None)
+
+
+class OAuth2Token(unittest.TestCase):
+    """The client-credentials mint + in-process cache that backs OpenSky auth."""
+
+    def setUp(self):
+        serve._OAUTH2_TOKEN_CACHE.clear()
+        p = unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(serve._OAUTH2_TOKEN_CACHE.clear)
+
+    def _token_response(self, body, **kw):
+        kw.setdefault('final_url', 'https://auth.example.com/token')
+        return unittest.mock.patch.object(serve, '_safe_urlopen',
+                                          return_value=_FakeResponse(body, **kw))
+
+    def test_mint_parses_and_caches(self):
+        with self._token_response('{"access_token": "abc123", "expires_in": 1800}'):
+            tok = serve._oauth2_access_token('https://auth.example.com/token', 'cid', 'csec')
+        self.assertEqual(tok, 'abc123')
+        key = ('https://auth.example.com/token', 'cid')
+        self.assertIn(key, serve._OAUTH2_TOKEN_CACHE)
+        self.assertEqual(serve._OAUTH2_TOKEN_CACHE[key]['token'], 'abc123')
+
+    def test_cache_hit_skips_mint(self):
+        serve._OAUTH2_TOKEN_CACHE[('https://auth.example.com/token', 'cid')] = {
+            'token': 'cached', 'expires_at': time.time() + 1000}
+        with unittest.mock.patch.object(serve, '_oauth2_token_request_sync') as req:
+            tok = serve._oauth2_access_token('https://auth.example.com/token', 'cid', 'csec')
+        self.assertEqual(tok, 'cached')
+        req.assert_not_called()
+
+    def test_refreshes_near_expiry(self):
+        serve._OAUTH2_TOKEN_CACHE[('https://auth.example.com/token', 'cid')] = {
+            'token': 'stale', 'expires_at': time.time() + 10}
+        with unittest.mock.patch.object(serve, '_oauth2_token_request_sync',
+                                        return_value='{"access_token": "fresh", "expires_in": 1800}'):
+            tok = serve._oauth2_access_token('https://auth.example.com/token', 'cid', 'csec')
+        self.assertEqual(tok, 'fresh')
+
+    def test_rejects_non_https_token_url(self):
+        with self.assertRaises(ValueError):
+            serve._oauth2_access_token('http://auth.example.com/token', 'cid', 'csec')
+
+    def test_missing_credentials_raises(self):
+        with self.assertRaises(ValueError):
+            serve._oauth2_access_token('https://auth.example.com/token', '', '')
+
+    def test_non_json_response_raises(self):
+        with unittest.mock.patch.object(serve, '_oauth2_token_request_sync', return_value='not-json'):
+            with self.assertRaises(ValueError):
+                serve._oauth2_access_token('https://auth.example.com/token', 'cid', 'csec')
+
+    def test_missing_access_token_raises(self):
+        with unittest.mock.patch.object(serve, '_oauth2_token_request_sync', return_value='{"expires_in": 60}'):
+            with self.assertRaises(ValueError):
+                serve._oauth2_access_token('https://auth.example.com/token', 'cid', 'csec')
+
+    def test_request_sync_rejects_non_2xx(self):
+        with self._token_response('denied', status=401):
+            with self.assertRaises(ValueError):
+                serve._oauth2_token_request_sync('https://auth.example.com/token', 'cid', 'csec')
+
+    def test_request_sync_rejects_internal_redirect(self):
+        with unittest.mock.patch.object(serve, '_is_safe_public_host',
+                                        side_effect=lambda h: h != '127.0.0.1'), \
+             self._token_response('{}', final_url='http://127.0.0.1/token'):
+            with self.assertRaises(ValueError):
+                serve._oauth2_token_request_sync('https://auth.example.com/token', 'cid', 'csec')
+
+
+class DailyCallBudget(unittest.TestCase):
+    """The per-service daily call cap (spend.kind = 'daily_calls') that guards
+    daily-quota APIs like OpenSky, keyed by UTC date."""
+
+    def setUp(self):
+        serve._api_daily_calls_ledger_write({})  # creates the kv_apicalls table + clears it
+
+    def tearDown(self):
+        serve._api_daily_calls_ledger_write({})
+
+    def _spec(self, **over):
+        spend = {'kind': 'daily_calls', 'cap': 5, 'note': 'n'}
+        spend.update(over)
+        return {'id': 'opensky', 'spend': spend}
+
+    def test_day_format_is_utc_date(self):
+        self.assertRegex(serve._api_daily_calls_day(0), r'^\d{4}-\d{2}-\d{2}$')
+
+    def test_used_starts_at_zero(self):
+        self.assertEqual(serve._api_daily_calls_used({'id': 'opensky'}), 0)
+
+    def test_accrue_then_exceeded(self):
+        self.assertFalse(serve._api_daily_calls_exceeded(self._spec()))
+        for _ in range(5):
+            serve._api_accrue_daily_call({'id': 'opensky'})
+        self.assertEqual(serve._api_daily_calls_used({'id': 'opensky'}), 5)
+        self.assertTrue(serve._api_daily_calls_exceeded(self._spec()))
+
+    def test_exceeded_false_for_non_daily_kind(self):
+        self.assertFalse(serve._api_daily_calls_exceeded({'id': 'x', 'spend': {'kind': 'none'}}))
+
+    def test_exceeded_false_when_cap_missing(self):
+        self.assertFalse(serve._api_daily_calls_exceeded({'id': 'x', 'spend': {'kind': 'daily_calls'}}))
+
+    def test_accrue_with_no_sid_is_noop(self):
+        serve._api_accrue_daily_call({'spend': {'kind': 'daily_calls'}})
+        self.assertEqual(serve._api_daily_calls_used({'id': 'opensky'}), 0)
+
+    def test_ledger_read_isolated_from_db_failure(self):
+        with unittest.mock.patch.object(serve, '_db', side_effect=RuntimeError('no db')):
+            self.assertEqual(serve._api_daily_calls_ledger_read(), {})
+            serve._api_accrue_daily_call({'id': 'opensky'})  # must not raise
+
+
+class DailyCallBudgetLedger(unittest.TestCase):
+    def test_ledger_write_read_round_trip(self):
+        serve._api_daily_calls_ledger_write({'2026-10-08': {'opensky': 3}})
+        self.assertEqual(serve._api_daily_calls_ledger_read(), {'2026-10-08': {'opensky': 3}})
+
 
 class ApiRequestSync(unittest.TestCase):
     def test_parses_response(self):
-        with unittest.mock.patch('urllib.request.urlopen', return_value=_FakeResponse(
+        with unittest.mock.patch.object(serve, '_safe_urlopen', return_value=_FakeResponse(
                 '{"a": 1}', content_type='application/json')):
             result = serve._api_request_sync('GET', 'https://api.github.com/x', {}, None)
         self.assertEqual(result['status'], 200)
@@ -203,13 +354,13 @@ class ApiRequestSync(unittest.TestCase):
         self.assertIn('application/json', result['contentType'])
 
     def test_truncates_over_cap(self):
-        with unittest.mock.patch('urllib.request.urlopen', return_value=_FakeResponse('x' * (serve.API_CALL_MAX_BODY_BYTES + 10))):
+        with unittest.mock.patch.object(serve, '_safe_urlopen', return_value=_FakeResponse('x' * (serve.API_CALL_MAX_BODY_BYTES + 10))):
             result = serve._api_request_sync('GET', 'https://example.com/', {}, None)
         self.assertTrue(result['truncated'])
         self.assertEqual(len(result['body']), serve.API_CALL_MAX_BODY_BYTES)
 
     def test_redirect_to_internal_host_rejected(self):
-        with unittest.mock.patch('urllib.request.urlopen', return_value=_FakeResponse(
+        with unittest.mock.patch.object(serve, '_safe_urlopen', return_value=_FakeResponse(
                 '{}', final_url='http://127.0.0.1/internal')):
             with self.assertRaises(ValueError):
                 serve._api_request_sync('GET', 'https://example.com/', {}, None)
@@ -344,6 +495,72 @@ class ApiCallEndpoint(unittest.TestCase):
         self.assertTrue(r.json()['allowed'])
         accrue.assert_called_once()
 
+    def test_opensky_mints_and_injects_bearer(self):
+        # Registered OAuth2 service: the registry's client id/secret pair is
+        # minted into a short-lived access token server-side and injected as a
+        # Bearer header -- the agent never supplies a credential.
+        self._start(self._gates())
+        fake_result = {'status': 200, 'finalUrl': 'https://opensky-network.org/api/states/all',
+                       'contentType': 'application/json', 'body': '{"time": 1, "states": []}', 'truncated': False}
+        with unittest.mock.patch.object(serve, 'OPEN_SKY_CLIENT_ID', 'cid'), \
+             unittest.mock.patch.object(serve, 'OPEN_SKY_CLIENT_SECRET', 'csec'), \
+             unittest.mock.patch.object(serve, '_oauth2_access_token', return_value='MINTED'), \
+             unittest.mock.patch.object(serve, '_api_request_sync', return_value=fake_result) as fetch:
+            r = self._client().post('/api/api-call', json={
+                'agentId': 'ben', 'url': 'https://opensky-network.org/api/states/all', 'method': 'GET',
+                'purpose': 'check flights overhead'})
+        self.assertTrue(r.json()['allowed'])
+        sent_headers = fetch.call_args.args[2]
+        self.assertEqual(sent_headers.get('Authorization'), 'Bearer MINTED')
+
+    def test_daily_calls_budget_exceeded_blocks(self):
+        # A registered daily-quota service (OpenSky) must refuse once its daily
+        # call cap is consumed, before any network or auth work.
+        self._start(self._gates())
+        with unittest.mock.patch.object(serve, 'OPEN_SKY_CLIENT_ID', 'cid'), \
+             unittest.mock.patch.object(serve, 'OPEN_SKY_CLIENT_SECRET', 'csec'), \
+             unittest.mock.patch.object(serve, '_api_daily_calls_used', return_value=200), \
+             unittest.mock.patch.object(serve, '_api_request_sync') as fetch:
+            r = self._client().post('/api/api-call', json={
+                'agentId': 'ben', 'url': 'https://opensky-network.org/api/states/all', 'method': 'GET',
+                'purpose': 'check flights overhead'})
+        self.assertFalse(r.json()['allowed'])
+        self.assertIn('daily call budget', r.json()['reason'])
+        fetch.assert_not_called()
+
+    def test_oauth2_mint_failure_fails_clean(self):
+        # If the OAuth2 token mint refuses, the request must NOT go out
+        # unauthenticated -- it fails cleanly as an allowed-but-failed call.
+        self._start(self._gates())
+        with unittest.mock.patch.object(serve, 'OPEN_SKY_CLIENT_ID', 'cid'), \
+             unittest.mock.patch.object(serve, 'OPEN_SKY_CLIENT_SECRET', 'csec'), \
+             unittest.mock.patch.object(serve, '_oauth2_access_token',
+                                        side_effect=ValueError('token endpoint 401')), \
+             unittest.mock.patch.object(serve, '_api_request_sync') as fetch:
+            r = self._client().post('/api/api-call', json={
+                'agentId': 'ben', 'url': 'https://opensky-network.org/api/states/all', 'method': 'GET',
+                'purpose': 'check flights overhead'})
+        out = r.json()
+        self.assertTrue(out['allowed'])
+        self.assertIn('auth could not be applied', out['error'])
+        fetch.assert_not_called()
+
+    def test_daily_calls_accrued_on_success(self):
+        self._start(self._gates())
+        fake_result = {'status': 200, 'finalUrl': 'https://opensky-network.org/api/states/all',
+                       'contentType': 'application/json', 'body': '{"time": 1, "states": []}', 'truncated': False}
+        with unittest.mock.patch.object(serve, 'OPEN_SKY_CLIENT_ID', 'cid'), \
+             unittest.mock.patch.object(serve, 'OPEN_SKY_CLIENT_SECRET', 'csec'), \
+             unittest.mock.patch.object(serve, '_oauth2_access_token', return_value='MINTED'), \
+             unittest.mock.patch.object(serve, '_api_request_sync', return_value=fake_result), \
+             unittest.mock.patch.object(serve, '_api_accrue_daily_call') as accrue:
+            r = self._client().post('/api/api-call', json={
+                'agentId': 'ben', 'url': 'https://opensky-network.org/api/states/all', 'method': 'GET',
+                'purpose': 'check flights overhead'})
+        self.assertTrue(r.json()['allowed'])
+        accrue.assert_called_once()
+        self.assertEqual(accrue.call_args.args[0]['id'], 'opensky')
+
 
 _VALID_SPEC = {
     'id': 'my_service',
@@ -402,6 +619,46 @@ class ApiServiceRegistry(unittest.TestCase):
         self.assertEqual(sid, 'my_service')
         self.assertEqual(norm['credential']['type'], 'none')
 
+    def _oauth2_spec(self, **over):
+        spec = self._proposal_spec()
+        spec['credential'] = {'type': 'env', 'key': 'OPEN_SKY_CLIENT_ID', 'key2': 'OPEN_SKY_CLIENT_SECRET'}
+        spec['auth'] = {'type': 'oauth2_client_credentials', 'token_url': 'https://auth.example.com/token'}
+        spec.update(over)
+        return spec
+
+    def test_validation_accepts_oauth2_spec(self):
+        sid, norm, error = serve._validate_api_service_spec(self._oauth2_spec())
+        self.assertIsNone(error)
+        self.assertEqual(norm['auth']['type'], 'oauth2_client_credentials')
+        self.assertEqual(norm['auth']['token_url'], 'https://auth.example.com/token')
+
+    def test_validation_rejects_oauth2_without_token_url(self):
+        _sid, _norm, error = serve._validate_api_service_spec(
+            self._oauth2_spec(auth={'type': 'oauth2_client_credentials'}))
+        self.assertIn('token_url', error)
+
+    def test_validation_rejects_oauth2_bad_token_url(self):
+        for bad in ('http://auth.example.com/token', 'not-a-url', 'ftp://x'):
+            _sid, _norm, error = serve._validate_api_service_spec(
+                self._oauth2_spec(auth={'type': 'oauth2_client_credentials', 'token_url': bad}))
+            self.assertIsNotNone(error, bad)
+
+    def test_validation_rejects_oauth2_without_two_part_credential(self):
+        _sid, _norm, error = serve._validate_api_service_spec(self._oauth2_spec(
+            credential={'type': 'none'}))
+        self.assertIn('two-part env', error)
+
+    def test_validation_rejects_daily_calls_without_cap(self):
+        _sid, _norm, error = serve._validate_api_service_spec(self._proposal_spec(
+            spend={'kind': 'daily_calls'}))
+        self.assertIn('cap', error)
+
+    def test_validation_accepts_daily_calls_with_cap(self):
+        sid, norm, error = serve._validate_api_service_spec(self._proposal_spec(
+            spend={'kind': 'daily_calls', 'cap': 200}))
+        self.assertIsNone(error)
+        self.assertEqual(norm['spend']['cap'], 200)
+
     def test_upsert_persists_and_loads_as_active(self):
         sid, norm, error = serve._validate_api_service_spec(self._proposal_spec())
         serve._api_service_upsert(norm, status='active', proposed_by='player')
@@ -419,6 +676,25 @@ class ApiServiceRegistry(unittest.TestCase):
         serve._api_service_upsert({'id': sid, 'base_url': 'https://api.myservice.example.com'},
                                   status='denied')
         self.assertIsNone(serve._api_service_for_host('api.myservice.example.com'))
+
+    def test_upsert_roundtrips_oauth2_and_daily_cap(self):
+        # The two new registry fields must survive a DB round trip: the OAuth2
+        # token endpoint and the daily-calls spend cap. Losing either would
+        # silently disable the minted-bearer auth or the quota guard.
+        spec = self._proposal_spec(
+            credential={'type': 'env', 'key': 'OPEN_SKY_CLIENT_ID', 'key2': 'OPEN_SKY_CLIENT_SECRET'},
+            auth={'type': 'oauth2_client_credentials', 'token_url': 'https://auth.example.com/token'},
+            spend={'kind': 'daily_calls', 'cap': 200})
+        sid, norm, error = serve._validate_api_service_spec(spec)
+        self.assertIsNone(error)
+        serve._api_service_upsert(norm, status='active')
+        self.addCleanup(lambda: serve._api_service_upsert(
+            {'id': sid, 'base_url': 'https://api.myservice.example.com'}, status='denied'))
+        loaded = serve._api_service_for_host('api.myservice.example.com')
+        self.assertEqual(loaded['auth']['type'], 'oauth2_client_credentials')
+        self.assertEqual(loaded['auth']['token_url'], 'https://auth.example.com/token')
+        self.assertEqual(loaded['spend']['kind'], 'daily_calls')
+        self.assertEqual(loaded['spend']['cap'], 200)
 
     def test_request_endpoint_files_an_escalation(self):
         _start = unittest.mock.patch.multiple(
