@@ -13,12 +13,15 @@ site changes were needed.
 
 import hashlib
 import html
+import http.client
 import ipaddress
 import json
 import os
 import re
 import socket
+import urllib.error
 import urllib.parse
+import urllib.request
 
 import datetime
 import email.utils
@@ -103,27 +106,104 @@ def _parse_http_date_ms(value):
         return None
 
 
+def _resolve_public_ip(hostname):
+    # Resolve a hostname to a single public IP, or None. This is the SSRF
+    # resolution primitive: it rejects anything that maps to a private,
+    # loopback, link-local, reserved, or multicast address. Returns the first
+    # public IPv4/IPv6 address string, or None when the name is absent,
+    # unresolvable, or only resolves to non-public addresses.
+    if not hostname or hostname.lower() in ('localhost', '0.0.0.0'):  # nosec B104 -- this REJECTS localhost/0.0.0.0; it is the SSRF guard, not a bind
+        return None
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return None
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            continue
+        return addr
+    return None
+
+
 def _is_safe_public_host(hostname):
     # SSRF protection -- this is security hygiene, not a content policy:
     # regardless of what category gate is chosen, this backend must never
     # let a request reach this machine's own network. Resolves the
     # hostname and rejects anything private/loopback/link-local/reserved,
     # in addition to the obvious localhost names.
-    if not hostname or hostname.lower() in ('localhost', '0.0.0.0'):  # nosec B104 -- this REJECTS localhost/0.0.0.0; it is the SSRF guard, not a bind
-        return False
-    try:
-        infos = socket.getaddrinfo(hostname, None)
-    except socket.gaierror:
-        return False
-    for info in infos:
-        addr = info[4][0]
-        try:
-            ip = ipaddress.ip_address(addr)
-        except ValueError:
-            return False
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
-            return False
-    return True
+    return _resolve_public_ip(hostname) is not None
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    # Connects the socket to a pre-resolved IP (passed as `pinned_ip`) instead
+    # of re-resolving `self.host`. The hostname is still used for the Host
+    # header (http.client sets it from self.host). This is what closes the
+    # DNS-rebinding TOCTOU: the SSRF check resolves the name once and the
+    # actual connect uses that exact address -- an attacker can no longer
+    # hand a public IP to the check and a private one to the connect.
+
+    def __init__(self, *args, pinned_ip=None, **kwargs):
+        self._pinned_ip = pinned_ip
+        super().__init__(*args, **kwargs)
+
+    def connect(self):
+        self.sock = socket.create_connection(
+            (self._pinned_ip, self.port), self.timeout, self.source_address)
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    # Same pinning as _PinnedHTTPConnection, plus TLS: the socket connects to
+    # `pinned_ip` while the certificate is validated against, and SNI is sent
+    # for, the original hostname (self.host) -- so pinning the IP does not
+    # break TLS host verification.
+
+    def __init__(self, *args, pinned_ip=None, **kwargs):
+        self._pinned_ip = pinned_ip
+        super().__init__(*args, **kwargs)
+
+    def connect(self):
+        sock = socket.create_connection(
+            (self._pinned_ip, self.port), self.timeout, self.source_address)
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+class _PinnedIPHandler(urllib.request.HTTPHandler):
+    # An HTTPHandler that resolves and pins each request's hostname (including
+    # every redirect hop, which arrive here as fresh requests) to a public IP
+    # before connecting.
+
+    def do_open(self, http_class, req, **http_conn_args):
+        parsed = urllib.parse.urlparse(req.full_url)
+        ip = _resolve_public_ip(parsed.hostname)
+        if not ip:
+            raise urllib.error.URLError(
+                'host resolves to a private, internal, or unresolvable address')
+        http_conn_args['pinned_ip'] = ip
+        return super().do_open(http_class, req, **http_conn_args)
+
+
+def _safe_urlopen(req, timeout=20):
+    """Open `req` (a urllib.request.Request) with SSRF-safe, DNS-rebinding-
+    proof address pinning: each hostname is resolved once and the socket
+    connects to that exact public IP, so a name that is public at check time
+    cannot silently rebind to a private address for the connect. The Host
+    header and TLS SNI/cert verification still use the original hostname.
+    Raises URLError when the host is not public. `req` may be a string URL or
+    a Request."""
+    if isinstance(req, str):
+        req = urllib.request.Request(req)
+    opener = urllib.request.build_opener(_PinnedIPHandler())
+    return opener.open(req, timeout=timeout)
 
 
 def _download_dest_rel_path(scope, agent_id, safe_name):

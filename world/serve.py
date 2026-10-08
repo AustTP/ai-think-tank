@@ -48,6 +48,8 @@ from web_helpers import (  # noqa: E402,F401
     _is_safe_public_host,
     _looks_like_gmail_app_password,
     _parse_http_date_ms,
+    _resolve_public_ip,
+    _safe_urlopen,
     _sanitize_download_filename,
     _sha256_file,
     _strip_html_to_text,
@@ -946,16 +948,86 @@ def get_state_from_db():
 
 
 def save_state_to_db(data):
-    with _db() as conn:
-        conn.execute(
-            'INSERT INTO kv_state (id, blob, updated_at) VALUES (1, ?, ?) '
-            'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
-            (json.dumps(data), time.time()),
-        )
     try:
-        sync_agent_directories(data)
-    except Exception as e:
-        print(f'[agent-dirs] sync failed: {e}')  # best-effort -- a filesystem hiccup shouldn't break autosave
+        with _db() as conn:
+            conn.execute(
+                'INSERT INTO kv_state (id, blob, updated_at) VALUES (1, ?, ?) '
+                'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
+                (json.dumps(data), time.time()),
+            )
+        try:
+            sync_agent_directories(data)
+        except Exception as e:
+            print(f'[agent-dirs] sync failed: {e}')  # best-effort -- a filesystem hiccup shouldn't break autosave
+    finally:
+        # If this thread is inside a state transaction (see _state_begin /
+        # _state_writer), the save is the commit point: release the blob lock so
+        # the next writer can proceed. Non-transaction saves (boot, backfills)
+        # never hold it, so this is a no-op for them.
+        if getattr(_state_txn, 'held', False):
+            _state_txn.held = False
+            _state_txn.saved = True
+            _STATE_LOCK.release()
+
+
+# ---------------------------------------------------------------------------
+# Whole-blob read-modify-write serialization.
+#
+# The entire kv_state blob is read, mutated, and written back as one unit by
+# MANY writers: the continuous sim tick (sim.py `_sim_loop_pass`), the email
+# drain thread, and every state-mutating HTTP handler. Two of those doing an
+# unlocked get->mutate->save concurrently means the LAST save silently
+# clobbers the other's changes (client data loss). SQLite serializes the final
+# write, but not the read-modify-write that precedes it, so that alone doesn't
+# help. A single reentrant lock held across the whole get->mutate->save span
+# serializes them.
+#
+# Writers opt in via `_state_begin()` (acquire + read) instead of
+# `get_state_from_db()`, and `save_state_to_db` is the commit point (release).
+# The `@_state_writer` decorator guarantees the lock is released even on an
+# early return or an exception (its finally calls _state_abort), so a leak --
+# which would freeze the sim tick forever -- is impossible.
+# ---------------------------------------------------------------------------
+_STATE_LOCK = threading.RLock()
+_state_txn = threading.local()
+
+
+def _state_begin():
+    """Acquire the state lock and return the latest blob. The caller (or its
+    @_state_writer wrapper) is guaranteed to release via save or _state_abort.
+    Reads through get_state_from_db() so tests that mock that reader to inject
+    a state keep working."""
+    _STATE_LOCK.acquire()
+    _state_txn.held = True
+    _state_txn.saved = False
+    try:
+        return get_state_from_db()
+    except Exception:
+        _state_txn.held = False
+        _STATE_LOCK.release()
+        raise
+
+
+def _state_abort():
+    """Release the state lock WITHOUT committing, if this thread still holds it.
+    Idempotent; safe to call on every exit path (early return, exception)."""
+    if getattr(_state_txn, 'held', False):
+        _state_txn.held = False
+        _STATE_LOCK.release()
+
+
+def _state_writer(fn):
+    """Decorate an async state-writing handler so the lock taken by
+    _state_begin is ALWAYS released -- on a normal return after save, on an
+    early return, and on an exception -- no matter which path runs."""
+    import functools
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            _state_abort()
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -3673,12 +3745,15 @@ def _peer_review_loop_pass(state=None, now=None):
     filed reports before the staleness dedup could see them, re-filing the same
     worker every PEER_REVIEW_INTERVAL_S forever)."""
     if state is None:
-        state = get_state_from_db()
-        if not state:
-            return 0
-        n = _peer_review_pass(state, time.time() if now is None else now)
-        save_state_to_db(state)
-        return n
+        try:
+            state = _state_begin()
+            if not state:
+                return 0
+            n = _peer_review_pass(state, time.time() if now is None else now)
+            save_state_to_db(state)
+            return n
+        finally:
+            _state_abort()
     return _peer_review_pass(state, time.time() if now is None else now)
 
 
@@ -6058,7 +6133,7 @@ def _fetch_rendered_page_sync(url):
 
 def _fetch_page_sync(url):
     req = urllib.request.Request(url, headers={'User-Agent': 'AIThinkTankAgent/1.0'}, method='GET')
-    with urllib.request.urlopen(req, timeout=BROWSE_TIMEOUT_S) as resp:  # nosec B310 -- user URLs pre-cleared by _jev_safety_gate's SSRF hostname guard (:2157); this helper only fetches already-approved hosts
+    with _safe_urlopen(req, timeout=BROWSE_TIMEOUT_S) as resp:  # user URLs pre-cleared by _jev_safety_gate's SSRF hostname guard (:2157); _safe_urlopen pins each resolved IP so DNS cannot rebind to an internal address
         final_url = resp.geturl()
         # Re-check the FINAL host after redirects -- a redirect chain is
         # exactly how an allowed-looking URL could still end up pointed at
@@ -8927,6 +9002,7 @@ def _classify_report_severity(quote, note):
 
 
 @app.post('/api/reports')
+@_state_writer
 async def post_report(request: Request):
     # Agent-filed report into ANOTHER agent's reports/ directory (your
     # Call: "agents should be able to write reports in the
@@ -8954,7 +9030,7 @@ async def post_report(request: Request):
         # off-limits to it by design, so self-reports have nowhere legal to
         # go and would just be self-referential noise.
         return JSONResponse({'error': 'an agent cannot file a report about itself'}, status_code=403)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     roster_ids = {d.get('id') for d in state.get('agentRoster', [])}
@@ -9218,6 +9294,7 @@ def _breakdown_into_shared_backlog(state, goal, admin_id):
 
 
 @app.post('/api/intent/assign-big-task')
+@_state_writer
 async def intent_assign_big_task(request: Request):
     """Player intent: 'delegate / big task'. Server-side assignBigTask. Requires
     a logged-in session (the player). Returns {admin, subtasks:[...]} like the
@@ -9237,7 +9314,7 @@ async def intent_assign_big_task(request: Request):
     # the action is attributed to the player).
     player_id = 'player'
 
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
 
@@ -9322,6 +9399,7 @@ async def intent_assign_big_task(request: Request):
 
 
 @app.post('/api/intent/story/{task_id}/reject')
+@_state_writer
 async def intent_reject_story(task_id: str, request: Request):
     """Phase E3.4 player quality-veto: the player (session holder) sends a
     closed story back to its ORIGINAL AUTHOR for rework. Reuses the same
@@ -9345,7 +9423,7 @@ async def intent_reject_story(task_id: str, request: Request):
         body = {}
     reason = (body.get('reason') or '').strip()
 
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
 
@@ -9548,6 +9626,7 @@ async def intent_publish(request: Request):
 
 
 @app.post('/api/intent/spike/{task_id}/promote')
+@_state_writer
 async def intent_promote_spike(task_id: str, request: Request):
     """Phase E3.5 spike->triage: the player promotes a completed spike's findings
     into a REAL, queued deliverable story. A spike (E2b) lands a findings note and
@@ -9563,7 +9642,7 @@ async def intent_promote_spike(task_id: str, request: Request):
     """
     if not _require_player_session(request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
 
@@ -9684,6 +9763,7 @@ async def get_shadow_ledger(request: Request):
 
 
 @app.post('/api/shadow/{idx}/promote')
+@_state_writer
 async def promote_shadow_entry(idx: str, request: Request):
     """Promote one shadow-ledger draft into a REAL, queued deliverable story. The
     dry-run outcome (its note/libraryPath) becomes the new task's instructions, so
@@ -9692,7 +9772,7 @@ async def promote_shadow_entry(idx: str, request: Request):
     an immutable record of the dry run); a NEW task is queued. Only a non-promoted
     entry is promotable; a 409 keeps the player from double-queueing the same draft.
     Body (optional): {'room', 'taskType'} to override the dry-run's defaults."""
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     ledger = state.get('shadowLedger') or []
@@ -9778,6 +9858,7 @@ async def promote_shadow_entry(idx: str, request: Request):
 # /api/intent prefix is already session-auth'd via AUTH_PROTECTED_PREFIXES.
 # ---------------------------------------------------------------------------
 @app.post('/api/intent/sprint')
+@_state_writer
 async def intent_sprint(request: Request):
     """Seed a new sprint: {name?, goal, items:[...], targetDate?}. Returns the
     sprint record + per-item queue confirmations so the UI can report."""
@@ -9792,7 +9873,7 @@ async def intent_sprint(request: Request):
     if not goal or not isinstance(items, list) or not items:
         return JSONResponse({'error': 'goal and a non-empty items list are required'}, status_code=400)
     player_id = 'player'
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     authority = _free_authority(state)
@@ -9878,12 +9959,13 @@ async def get_sprints(request: Request):
 
 
 @app.post('/api/intent/sprint/{sprint_id}/close')
+@_state_writer
 async def close_sprint(sprint_id: str, request: Request):
     """Close a sprint container. Queued items keep flowing; close is a status,
     not a cancel. Chains the close into the product-passport."""
     if not _require_player_session(request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     import sim as _sim
@@ -9920,6 +10002,7 @@ async def get_issues(request: Request):
 
 
 @app.post('/api/intent/issues')
+@_state_writer
 async def create_issue(request: Request):
     """File a JIRA-style issue for a team. Required: teamId, type, summary,
     feature. reporterId is OPTIONAL (this endpoint is player-only, so it
@@ -9938,7 +10021,7 @@ async def create_issue(request: Request):
     if missing:
         return JSONResponse({'error': f"missing required field(s): {', '.join(missing)}"}, status_code=400)
     import sim as _sim
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     team_id = (body.get('teamId') or '').strip()
@@ -9967,6 +10050,7 @@ async def create_issue(request: Request):
 
 
 @app.post('/api/intent/issues/{key}/status')
+@_state_writer
 async def set_issue_status(key: str, request: Request):
     """Transition an issue's status (open/in_progress/done/closed). Mirrors the
     change onto any linked pending backlog request."""
@@ -9977,7 +10061,7 @@ async def set_issue_status(key: str, request: Request):
     except Exception:
         return JSONResponse({'error': 'malformed body'}, status_code=400)
     import sim as _sim
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     issue = _sim.set_issue_status(state, key, (body.get('status') or '').strip())
@@ -10008,6 +10092,7 @@ async def get_issue_detail(key: str):
 
 
 @app.post('/api/intent/issues/{key}/claim-met')
+@_state_writer
 async def claim_issue_met(key: str, request: Request):
     """An agent (or the player) files that issue `key` is requirements-met. The
     owning director/supervisor must approve before the scrum master commits the
@@ -10018,7 +10103,7 @@ async def claim_issue_met(key: str, request: Request):
     except Exception:
         return JSONResponse({'error': 'malformed body'}, status_code=400)
     import sim as _sim
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     if (state.get('issues') or {}).get(key) is None:
@@ -10036,6 +10121,7 @@ async def claim_issue_met(key: str, request: Request):
 
 
 @app.post('/api/intent/issues/{key}/block-dependency')
+@_state_writer
 async def block_issue_dependency(key: str, request: Request):
     """Agent A files that issue `key` is blocked on another agent's task
     (`dependsOnTask`). No Jev gate on this path (naming the dependency is enough);
@@ -10045,7 +10131,7 @@ async def block_issue_dependency(key: str, request: Request):
     except Exception:
         return JSONResponse({'error': 'malformed body'}, status_code=400)
     import sim as _sim
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     if (state.get('issues') or {}).get(key) is None:
@@ -10077,6 +10163,7 @@ async def get_player_inbox(request: Request):
 
 
 @app.post('/api/player-inbox/{message_id}/respond')
+@_state_writer
 async def respond_player_inbox(message_id: str, request: Request):
     """The player answers an awaiting inbox question. The reply is stamped onto
     the agent's task as context and the SM clears the blocked field. Body: {'answer'}.
@@ -10090,7 +10177,7 @@ async def respond_player_inbox(message_id: str, request: Request):
     except Exception:
         return JSONResponse({'error': 'malformed body'}, status_code=400)
     import sim as _sim
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     answer = (body.get('answer') or '').strip()
@@ -10105,6 +10192,7 @@ async def respond_player_inbox(message_id: str, request: Request):
 
 
 @app.post('/api/intent/player-task/{task_id}/complete')
+@_state_writer
 async def complete_player_task_endpoint(task_id: str, request: Request):
     """Human-in-the-loop: the player marks an assigned-to-them task done. The
     task was handed to the player by the think tank (assignedTo 'player', a
@@ -10116,7 +10204,7 @@ async def complete_player_task_endpoint(task_id: str, request: Request):
     defeat the gate)."""
     if not _require_player_session(request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     import sim as _sim
@@ -10144,6 +10232,7 @@ async def get_charter_endpoint(request: Request):
 
 
 @app.post('/api/intent/charter')
+@_state_writer
 async def set_charter_endpoint(request: Request):
     """Set the player's charter (the spine). Body: {'goal': str (required),
     'interests': [str], 'notes': str}. PLAYER-only. A missing/blank goal is a
@@ -10151,7 +10240,7 @@ async def set_charter_endpoint(request: Request):
     log + passport so the setting is attributable."""
     if not _require_player_session(request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     try:
@@ -10210,6 +10299,7 @@ async def test_player_email(request: Request):
 
 
 @app.post('/api/device/checkin')
+@_state_writer
 async def device_checkin(request: Request):
     """A phone (an iOS Shortcut, to start) reports its own current location/
     battery/Focus/Wi-Fi. Self-guarded like /api/chat -- NOT in
@@ -10234,7 +10324,7 @@ async def device_checkin(request: Request):
     if loc is not None and not (isinstance(loc, dict) and isinstance(loc.get('lat'), (int, float))
                                  and isinstance(loc.get('lon'), (int, float))):
         return JSONResponse({'error': 'location, if present, must be {lat, lon}'}, status_code=400)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     import sim as _sim
@@ -10250,6 +10340,7 @@ async def device_checkin(request: Request):
 
 
 @app.post('/api/teams/{team_id}/prefix')
+@_state_writer
 async def set_team_prefix(team_id: str, request: Request):
     """Set (or clear via empty string) an explicit issue prefix for a team.
     Director/admin-only. Returns the applied prefix."""
@@ -10259,7 +10350,7 @@ async def set_team_prefix(team_id: str, request: Request):
         body = await request.json()
     except Exception:
         return JSONResponse({'error': 'malformed body'}, status_code=400)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     if not _team_record(state, team_id):
@@ -11036,6 +11127,7 @@ def _team_digest_text(max_markdown_chars=1400, tape_window_s=86400):
 
 
 @app.post('/api/intent/ask')
+@_state_writer
 async def intent_ask(request: Request):
     """Player asks the think tank a genuinely NEW, one-off question -- something
     unrelated to existing products/work, which is exactly what makes it distinct
@@ -11065,7 +11157,7 @@ async def intent_ask(request: Request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     if not check_rate_limit(ASK_LANE_RATE_LIMIT_KEY):
         return JSONResponse({'error': 'Rate limit hit -- too many questions at once. Wait a minute and try again.'}, status_code=429)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     try:
@@ -11519,6 +11611,7 @@ async def _route_player_request(state, text):
 
 
 @app.post('/api/intent/schedule')
+@_state_writer
 async def intent_schedule(request: Request):
     """Structured parity endpoint for the schedule lane: POST
     {topic, startUrl, cadenceMs, dependsOnTask?}. `dependsOnTask` optionally
@@ -11528,7 +11621,7 @@ async def intent_schedule(request: Request):
     relationship /api/intent/ask already has to _ask_core."""
     if not _require_player_session(request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     try:
@@ -11549,6 +11642,7 @@ async def intent_schedule(request: Request):
 
 
 @app.post('/api/intent/schedule-once')
+@_state_writer
 async def intent_schedule_once(request: Request):
     """Structured parity endpoint for the one-off scheduling lane: POST
     {title, at, room?, instructions?, taskType?, goal?, dependsOnTask?,
@@ -11567,7 +11661,7 @@ async def intent_schedule_once(request: Request):
     Telegram routing layer; this takes already-structured fields."""
     if not _require_player_session(request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     try:
@@ -11612,6 +11706,7 @@ async def intent_schedule_once(request: Request):
 
 
 @app.post('/api/pipelines')
+@_state_writer
 async def pipelines_create(request: Request):
     """The player-facing ORDERED-pipeline lane: POST {name, cadenceMs, steps,
     dependsOnTask?}. Each step is {title, room, offsetMs, instructions, tool,
@@ -11621,7 +11716,7 @@ async def pipelines_create(request: Request):
     boundary until that task id is done. Same structured-parity relationship
     to _check_pipelines that /api/intent/schedule has to add_research_topic:
     this takes already-structured fields, no free-text extraction."""
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     try:
@@ -11652,9 +11747,10 @@ async def pipelines_list(request: Request):
 
 
 @app.delete('/api/pipelines/{pipeline_id}')
+@_state_writer
 async def pipelines_delete(request: Request, pipeline_id: str):
     """Delete one scheduled pipeline (and its unscheduled steps)."""
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     before = len(state.get('pipelines') or [])
@@ -11669,11 +11765,12 @@ async def pipelines_delete(request: Request, pipeline_id: str):
 
 
 @app.post('/api/intent/incidents')
+@_state_writer
 async def intent_incidents(request: Request):
     """Structured parity endpoint for the incident lane: POST {productId, title}."""
     if not _require_player_session(request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     try:
@@ -11728,6 +11825,7 @@ def _product_projects_dir(product_id):
 
 
 @app.post('/api/intent/product')
+@_state_writer
 async def intent_product(request: Request):
     """Create a product: {name, summary, spec, ownerId, sandboxId, teamId?,
     contributorIds?, handles?}. The player (session holder) seeds on behalf of
@@ -11744,7 +11842,7 @@ async def intent_product(request: Request):
         return JSONResponse({'error': 'a product name is required'}, status_code=400)
     owner_id = (body.get('ownerId') or '').strip()
     sandbox_id = (body.get('sandboxId') or '').strip()
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     authority = _free_authority(state)
@@ -11783,6 +11881,7 @@ async def get_products(request: Request):
 
 
 @app.post('/api/intent/product/{product_id}/status')
+@_state_writer
 async def set_product_status(product_id: str, request: Request):
     """Transition draft/in_progress/review. 'released' is unreachable here --
     only /release flips it. Director/admin gated."""
@@ -11791,7 +11890,7 @@ async def set_product_status(product_id: str, request: Request):
     except Exception:
         return JSONResponse({'error': 'malformed body'}, status_code=400)
     status = (body.get('status') or '').strip()
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     actor = _resolve_requester(request)
@@ -11807,6 +11906,7 @@ async def set_product_status(product_id: str, request: Request):
 
 
 @app.post('/api/intent/product/{product_id}/release')
+@_state_writer
 async def release_product(product_id: str, request: Request):
     """Release a product: snapshot its sandbox repo into
     library/projects/<id>/v<N>/ (RELEASE.md + a frozen copy), flip status ->
@@ -11819,7 +11919,7 @@ async def release_product(product_id: str, request: Request):
     except Exception:
         body = {}
     note = (body.get('revisionNote') or '').strip()
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     import sim as _sim
@@ -11913,7 +12013,20 @@ async def get_wiki_page(page_id: str, request: Request):
     return JSONResponse({'page': {**rec, 'body': body}})
 
 
+def _wiki_page_target(category, page_id):
+    """Resolve the on-disk target for a wiki page, or None if category/page_id
+    would escape library/wiki/ (defense-in-depth on top of the page_id '/\\'
+    checks -- a director-created category id must not be able to walk out of the
+    wiki tree)."""
+    base = os.path.join(LIBRARY_DIR, 'wiki')
+    target = os.path.normpath(os.path.join(base, category, f'{page_id}.md'))
+    if target != base and not target.startswith(base + os.sep):
+        return None
+    return target
+
+
 @app.post('/api/intent/wiki/page')
+@_state_writer
 async def write_wiki_page(request: Request):
     """Create or write a wiki page: {id, title, category, body}. Director/admin
     gated (like template authorship). Version bumps + history append are done in
@@ -11931,7 +12044,7 @@ async def write_wiki_page(request: Request):
         return JSONResponse({'error': 'id and category are required'}, status_code=400)
     if any(ch in page_id for ch in '/\\'):
         return JSONResponse({'error': 'invalid page id'}, status_code=400)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     categories = (state.get('wiki') or {}).get('categories') or {}
@@ -11956,9 +12069,11 @@ async def write_wiki_page(request: Request):
                                   review_after_ms=mfields['review_after_ms'],
                                   village_id=village_id)
     # Persist the body to disk under library/wiki/<category>/ (inside LIBRARY_DIR).
-    cat_dir = os.path.join(LIBRARY_DIR, 'wiki', category)
-    os.makedirs(cat_dir, exist_ok=True)
-    _write_file(os.path.join(cat_dir, f'{page_id}.md'), content)
+    target = _wiki_page_target(category, page_id)
+    if not target:
+        return JSONResponse({'error': 'invalid destination'}, status_code=400)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    _write_file(target, content)
     save_state_to_db(state)
     log_action(actor, 'wiki_page_written', {'id': page_id, 'category': category, 'version': record.get('version')}, authorized=True)
     _append_passport_decision('wiki_page_written', actor,
@@ -12069,6 +12184,7 @@ def _find_wiki_proposal(category, page_id):
 
 
 @app.post('/api/intent/wiki/proposal/{page_id}/approve')
+@_state_writer
 async def approve_wiki_proposal(page_id: str, request: Request):
     """Approve a pending wiki proposal: {category}. Director/admin gated (the
     same authority a direct wiki write needs). Promotes the proposal into the
@@ -12083,7 +12199,7 @@ async def approve_wiki_proposal(page_id: str, request: Request):
         return JSONResponse({'error': 'category is required'}, status_code=400)
     if any(ch in page_id for ch in '/\\'):
         return JSONResponse({'error': 'invalid page id'}, status_code=400)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     actor = _resolve_requester(request)
@@ -12109,9 +12225,11 @@ async def approve_wiki_proposal(page_id: str, request: Request):
                                   clock=mfields['clock'],
                                   review_after_ms=mfields['review_after_ms'],
                                   village_id=village_id)
-    cat_dir = os.path.join(LIBRARY_DIR, 'wiki', category)
-    os.makedirs(cat_dir, exist_ok=True)
-    _write_file(os.path.join(cat_dir, f'{page_id}.md'), proposal.get('body') or '')
+    target = _wiki_page_target(category, page_id)
+    if not target:
+        return JSONResponse({'error': 'invalid destination'}, status_code=400)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    _write_file(target, proposal.get('body') or '')
     save_state_to_db(state)
     log_action(actor, 'wiki_page_written', {'id': page_id, 'category': category,
                                             'version': record.get('version'),
@@ -12179,49 +12297,41 @@ def _write_wiki_server(page_id, title, category, content):
     Returns the sim record dict (or None on failure) so the executor can report
     what it wrote."""
     import sim as _sim
-    state = get_state_from_db()
-    if not state:
-        return None
-    categories = state.setdefault('wiki', {}).setdefault('categories', {})
-    if category not in categories:
-        if category != 'think_tank':
+    try:
+        state = _state_begin()
+        if not state:
             return None
-        # Gap: nothing ever seeds a default
-        # 'think_tank' category -- it's only ever created via a director
-        # manually calling POST /api/intent/wiki/category, so a think tank
-        # where nobody happened to do that had EVERY distillation attempt
-        # silently fail its wiki write, forever (the executor just reports
-        # "the wiki write failed" -- easy to miss, no loud error). 'think_tank'
-        # is a hardcoded system constant this server-owned path itself
-        # depends on to function at all (see content._DISTILL_THINK_TANK_PAGE_
-        # ID), not a director-typed string that could be a typo -- auto-
-        # seeding just this one, well-known category is safe; any other
-        # missing category still fails closed exactly as before. Mutating
-        # `categories` here (via the setdefault chain above, not a fresh
-        # copy) means the single save_state_to_db call below persists this
-        # alongside the page write, no extra read/write round trip needed.
-        categories['think_tank'] = {'label': 'Think Tank', 'order': 0}
-    record, _is_new = _sim.wiki_write_page(state, page_id, title, category,
-                                           content, 'distill')
-    _sim.record_memory_provenance(state, 'distill', page_id, title, content[:2000],
-                                  source=None, scope='team', clock=_sim.SLOW_CLOCK,
-                                  review_after_ms=None, village_id=_sim.DEFAULT_VILLAGE)
-    if record is None:
-        return None
-    cat_dir = os.path.join(LIBRARY_DIR, 'wiki', category)
-    os.makedirs(cat_dir, exist_ok=True)
-    _write_file(os.path.join(cat_dir, f'{page_id}.md'), content)
-    save_state_to_db(state)
-    log_action('distill', 'wiki_page_written',
-               {'id': page_id, 'category': category, 'version': record.get('version')},
-               authorized=True)
-    _append_passport_decision('wiki_page_written', 'distill',
-                              {'id': page_id, 'category': category,
-                               'version': record.get('version'), 'isNew': _is_new})
-    return record
+        categories = state.setdefault('wiki', {}).setdefault('categories', {})
+        if category not in categories:
+            if category != 'think_tank':
+                return None
+            categories['think_tank'] = {'label': 'Think Tank', 'order': 0}
+        record, _is_new = _sim.wiki_write_page(state, page_id, title, category,
+                                               content, 'distill')
+        _sim.record_memory_provenance(state, 'distill', page_id, title, content[:2000],
+                                      source=None, scope='team', clock=_sim.SLOW_CLOCK,
+                                      review_after_ms=None, village_id=_sim.DEFAULT_VILLAGE)
+        if record is None:
+            return None
+        target = _wiki_page_target(category, page_id)
+        if not target:
+            return None
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        _write_file(target, content)
+        save_state_to_db(state)
+        log_action('distill', 'wiki_page_written',
+                   {'id': page_id, 'category': category, 'version': record.get('version')},
+                   authorized=True)
+        _append_passport_decision('wiki_page_written', 'distill',
+                                  {'id': page_id, 'category': category,
+                                   'version': record.get('version'), 'isNew': _is_new})
+        return record
+    finally:
+        _state_abort()
 
 
 @app.post('/api/intent/wiki/category')
+@_state_writer
 async def write_wiki_category(request: Request):
     """Create or set a wiki category's label + relative order: {id, label?,
     order?, room?}. Director/admin gated. Chains wiki_category_set."""
@@ -12232,7 +12342,7 @@ async def write_wiki_category(request: Request):
     cat_id = (body.get('id') or '').strip()
     if not cat_id:
         return JSONResponse({'error': 'category id required'}, status_code=400)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     actor = _resolve_requester(request)
@@ -12321,13 +12431,14 @@ async def list_backlog(request: Request):
 
 
 @app.put('/api/teams/{team_id}')
+@_state_writer
 async def update_team(team_id: str, request: Request):
     requester = _resolve_requester(request)
     if not requester:
         return JSONResponse({'error': 'unauthenticated'}, status_code=401)
     if verify_agent_key(requester, request.headers.get('X-Agent-Key')) is not True:
         return JSONResponse({'error': 'attribution key mismatch'}, status_code=403)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     teams = state.get('teams', [])
@@ -12357,6 +12468,7 @@ async def update_team(team_id: str, request: Request):
 
 
 @app.post('/api/teams/{team_id}/promote')
+@_state_writer
 async def promote_to_director(team_id: str, request: Request):
     """Promote a MEMBER of this team to director. The promoter must be the
     team's director (or the admin). The promoted agent leaves the old team's
@@ -12367,7 +12479,7 @@ async def promote_to_director(team_id: str, request: Request):
         return JSONResponse({'error': 'unauthenticated'}, status_code=401)
     if verify_agent_key(requester, request.headers.get('X-Agent-Key')) is not True:
         return JSONResponse({'error': 'attribution key mismatch'}, status_code=403)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     teams = state.get('teams', [])
@@ -12390,6 +12502,7 @@ async def promote_to_director(team_id: str, request: Request):
 
 
 @app.post('/api/teams/{team_id}/scrum-master')
+@_state_writer
 async def set_team_scrum_master(team_id: str, request: Request):
     """Designate (or clear) a team's SCRUM MASTER -- the standing facilitator
     who runs that team's sprint ceremonies. Gate: the team director, a
@@ -12403,7 +12516,7 @@ async def set_team_scrum_master(team_id: str, request: Request):
         return JSONResponse({'error': 'unauthenticated'}, status_code=401)
     if verify_agent_key(requester, request.headers.get('X-Agent-Key')) is not True:
         return JSONResponse({'error': 'attribution key mismatch'}, status_code=403)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     teams = state.get('teams', [])
@@ -12429,6 +12542,7 @@ async def set_team_scrum_master(team_id: str, request: Request):
 
 
 @app.post('/api/rooms/{room}/purpose')
+@_state_writer
 async def update_room_purpose(room: str, request: Request):
     requester = _resolve_requester(request)
     if not requester:
@@ -12442,7 +12556,7 @@ async def update_room_purpose(room: str, request: Request):
     purpose = (body.get('purpose') or '').strip()
     if not purpose:
         return JSONResponse({'error': 'purpose is required'}, status_code=400)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     if not _is_director_or_admin(state, requester):
@@ -12489,6 +12603,7 @@ async def get_template(role: str, request: Request):
 
 
 @app.post('/api/templates')
+@_state_writer
 async def upsert_template(request: Request):
     requester = _resolve_requester(request)
     if not requester:
@@ -12505,7 +12620,7 @@ async def upsert_template(request: Request):
         return JSONResponse({'error': 'role is required'}, status_code=400)
     if not isinstance(instructions, list):
         return JSONResponse({'error': 'instructions must be a list'}, status_code=400)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     if not _is_director_or_admin(state, requester):
@@ -12528,6 +12643,7 @@ async def upsert_template(request: Request):
 
 
 @app.post('/api/templates/{role}/apply')
+@_state_writer
 async def apply_template(role: str, request: Request):
     # Explicit re-stamp without changing the template -- useful after a hire or
     # a roster change, so a director can push an existing template to the agents
@@ -12538,7 +12654,7 @@ async def apply_template(role: str, request: Request):
     authorized = verify_agent_key(requester, request.headers.get('X-Agent-Key'))
     if authorized is not True:
         return JSONResponse({'error': 'attribution key mismatch'}, status_code=403)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     if not _is_director_or_admin(state, requester):
@@ -12552,6 +12668,7 @@ async def apply_template(role: str, request: Request):
 
 
 @app.delete('/api/templates/{role}')
+@_state_writer
 async def delete_template(role: str, request: Request):
     requester = _resolve_requester(request)
     if not requester:
@@ -12559,7 +12676,7 @@ async def delete_template(role: str, request: Request):
     authorized = verify_agent_key(requester, request.headers.get('X-Agent-Key'))
     if authorized is not True:
         return JSONResponse({'error': 'attribution key mismatch'}, status_code=403)
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     if not _is_director_or_admin(state, requester):
@@ -12575,6 +12692,7 @@ async def delete_template(role: str, request: Request):
 
 
 @app.post('/api/task-budget')
+@_state_writer
 async def grant_task_budget(request: Request):
     """Item 4 runtime override: a director/admin grants a budget-exhausted card
     (status 'failed' + budgetExhausted) more model-spend money and re-opens it.
@@ -12595,7 +12713,7 @@ async def grant_task_budget(request: Request):
     if not isinstance(new_budget, (int, float)) or new_budget <= 0:
         return JSONResponse({'error': 'budgetUsd must be a positive number'}, status_code=400)
     import sim as _sim
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     if not _is_director_or_admin(state, requester):
@@ -13295,7 +13413,7 @@ DOWNLOAD_MAX_BYTES = 20_000_000  # 20MB -- generous for a real reference documen
 
 def _download_file_sync(url, max_bytes):
     req = urllib.request.Request(url, headers={'User-Agent': 'AIThinkTankAgent/1.0'}, method='GET')
-    with urllib.request.urlopen(req, timeout=BROWSE_TIMEOUT_S) as resp:  # nosec B310 -- user URLs pre-cleared by _jev_safety_gate's SSRF hostname guard (:2157); this helper only fetches already-approved hosts
+    with _safe_urlopen(req, timeout=BROWSE_TIMEOUT_S) as resp:  # user URLs pre-cleared by _jev_safety_gate's SSRF hostname guard (:2157); _safe_urlopen pins each resolved IP so DNS cannot rebind to an internal address
         final_url = resp.geturl()
         final_host = urllib.parse.urlparse(final_url).hostname
         if not _is_safe_public_host(final_host):
@@ -14015,6 +14133,7 @@ async def list_villages(request: Request):
 
 
 @app.post('/api/villages')
+@_state_writer
 async def create_village_endpoint(request: Request):
     """Create a new village (player-only). A village is the top-level identity
     + memory boundary: its agents only ever read their own wiki and their own
@@ -14023,7 +14142,7 @@ async def create_village_endpoint(request: Request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     body = await request.json()
     import sim as _sim
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     name = (body.get('name') or '').strip()
@@ -14042,6 +14161,7 @@ async def create_village_endpoint(request: Request):
 
 
 @app.post('/api/villages/assign')
+@_state_writer
 async def assign_agent_to_village(request: Request):
     """Move an agent into a village (player-only). The boundary is enforced at
     read time: after this, the agent's wiki + design-taste context come only
@@ -14052,7 +14172,7 @@ async def assign_agent_to_village(request: Request):
     agent_id = (body.get('agentId') or '').strip()
     village_id = (body.get('villageId') or '').strip()
     import sim as _sim
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     if not _sim.set_agent_village(state, agent_id, village_id):
@@ -14376,7 +14496,10 @@ async def chat(request: Request):
     # for a genuine file, not a fragment -- still per-request opt-in
     # (callers explicitly pass a higher max_tokens; the 150 default for
     # routine chat/handoff/pair-programming replies is untouched).
-    max_tokens = min(int(body.get('max_tokens', 150)), 4000)
+    try:
+        max_tokens = min(max(int(body.get('max_tokens', 150)), 1), 4000)
+    except (TypeError, ValueError):
+        max_tokens = 150
     # The Bank: attribute this call's cost to a service. Content executors
     # pass the product/room they're charging (task.get('productId')); the ask
     # lane and the player label themselves; an unlabelled call defaults to a
@@ -14865,7 +14988,7 @@ def _api_request_sync(method, url, headers, body):
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     if 'User-Agent' not in {k.title() for k in headers}:
         req.add_header('User-Agent', 'AIThinkTankAgent/1.0')
-    with urllib.request.urlopen(req, timeout=API_CALL_TIMEOUT_S) as resp:  # nosec B310 -- registry/SSRF-gated hosts only; re-checked below after redirects
+    with _safe_urlopen(req, timeout=API_CALL_TIMEOUT_S) as resp:  # registry/SSRF-gated hosts only; _safe_urlopen pins each resolved IP so DNS cannot rebind to an internal address; re-checked below after redirects
         final_url = resp.geturl()
         final_host = urllib.parse.urlparse(final_url).hostname
         if not _is_safe_public_host(final_host):
@@ -15283,7 +15406,7 @@ def _curl_request_sync(method, url, headers, body):
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     if 'User-Agent' not in {k.title() for k in (headers or {})}:
         req.add_header('User-Agent', 'AIThinkTankAgent/1.0')
-    with urllib.request.urlopen(req, timeout=CURL_TIMEOUT_S) as resp:  # nosec B310 -- _http_json target is a fixed internal SELF_BASE_URL; only pre-cleared browse/download URLs reach here
+    with _safe_urlopen(req, timeout=CURL_TIMEOUT_S) as resp:  # _safe_urlopen pins each resolved IP so DNS cannot rebind to an internal address; only pre-cleared browse/download URLs reach here
         final_url = resp.geturl()
         # Re-check the FINAL host after redirects -- same reasoning as
         # _fetch_page_sync: a redirect is exactly how an allowed-looking
@@ -15889,7 +16012,10 @@ async def add_handle(request: Request):
     purpose = (body.get('purpose') or '').strip()
     allowed_hosts = body.get('allowedHosts') or '*'
     allowed_methods = body.get('allowedMethods') or ['GET']
-    ttl_s = int(body.get('ttlSec') or 3600)
+    try:
+        ttl_s = max(1, int(body.get('ttlSec') or 3600))
+    except (TypeError, ValueError):
+        ttl_s = 3600
     if not agent_id or not credential_name or not purpose:
         return JSONResponse({'error': 'agentId, credentialName, and purpose are required'}, status_code=400)
     if isinstance(allowed_hosts, str):
@@ -16163,8 +16289,11 @@ async def screenshot(request: Request):
     if not _SANDBOX_ID_RE.match(sandbox_id or ''):
         return JSONResponse({'error': 'invalid sandboxId'}, status_code=400)
     rel_path = body.get('path', 'index.html')
-    width = min(max(int(body.get('width', 900)), 200), 1600)
-    height = min(max(int(body.get('height', 700)), 200), 1600)
+    try:
+        width = min(max(int(body.get('width', 900)), 200), 1600)
+        height = min(max(int(body.get('height', 700)), 200), 1600)
+    except (TypeError, ValueError):
+        return JSONResponse({'error': 'width and height must be integers'}, status_code=400)
     if not check_rate_limit(agent_id):
         log_action(agent_id, 'rate_limited', {'endpoint': 'screenshot'})
         return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
@@ -16267,7 +16396,11 @@ def _page_probe_sync(file_path, actions, probes):
                     elif kind == 'keydown':
                         page.keyboard.press(action['key'])
                     elif kind == 'wait':
-                        page.wait_for_timeout(min(int(action.get('ms', 200)), PAGE_PROBE_MAX_WAIT_MS))
+                        try:
+                            ms = min(int(action.get('ms', 200)), PAGE_PROBE_MAX_WAIT_MS)
+                        except (TypeError, ValueError):
+                            ms = min(200, PAGE_PROBE_MAX_WAIT_MS)
+                        page.wait_for_timeout(ms)
                     elif kind == 'eval':
                         page.evaluate(action['code'])
                     else:
