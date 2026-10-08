@@ -106,6 +106,41 @@
                  "success": ["completed"]},
         "spend": {"kind": "estimate_first", "service": "higgsfield"}
       }
+    },
+    "opensky": {
+      "name": "OpenSky Network",
+      "base_url": "https://opensky-network.org",
+      "credential": {"type": "env", "key": "OPEN_SKY_CLIENT_ID", "key2": "OPEN_SKY_CLIENT_SECRET"},
+      "auth": {"type": "oauth2_client_credentials",
+              "token_url": "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"},
+      "methods": ["GET", "HEAD"],
+      "path_rules": [
+        {"prefix": "/api/", "methods": ["GET", "HEAD"]}
+      ],
+      "spend": {"kind": "daily_calls", "cap": 200,
+                "note": "standard account: 4,000 credits/day per endpoint family (states/tracks/flights); /states/all costs 1-4 credits, /flights/* and /tracks/* cost 4+ -- cap is a conservative call count well under the real daily credit allowance"}
+    },
+    "adsb-lol": {
+      "name": "adsb.lol (ADS-B flights)",
+      "base_url": "https://api.adsb.lol",
+      "credential": {"type": "none"},
+      "auth": {"type": "none"},
+      "methods": ["GET", "HEAD"],
+      "path_rules": [
+        {"prefix": "/v2/", "methods": ["GET", "HEAD"]}
+      ],
+      "spend": {"kind": "none", "note": "free keyless live ADS-B flight data; fair-use / rate-limited, no uptime guarantee"}
+    },
+    "celestrak": {
+      "name": "CelesTrak (satellites)",
+      "base_url": "https://celestrak.org",
+      "credential": {"type": "none"},
+      "auth": {"type": "none"},
+      "methods": ["GET", "HEAD"],
+      "path_rules": [
+        {"prefix": "/NORAD/", "methods": ["GET", "HEAD"]}
+      ],
+      "spend": {"kind": "none", "note": "free keyless NORAD orbital-element sets (TLE); fair-use / rate-limited"}
     }
   }
 }

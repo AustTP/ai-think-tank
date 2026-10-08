@@ -645,7 +645,7 @@ class FetchPageSync(unittest.TestCase):
 
     def test_returns_page_metadata_and_truncates(self):
         body = b'<html>hello</html>' + b'x' * (serve.BROWSE_MAX_BYTES + 10)
-        with unittest.mock.patch('urllib.request.urlopen', return_value=self._resp(body=body)), \
+        with unittest.mock.patch.object(serve, '_safe_urlopen', return_value=self._resp(body=body)), \
              unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True):
             final_url, ctype, content, truncated, last_modified = serve._fetch_page_sync(
                 'https://example.com')
@@ -656,7 +656,7 @@ class FetchPageSync(unittest.TestCase):
         self.assertIsInstance(last_modified, int)
 
     def test_no_truncation_when_under_max(self):
-        with unittest.mock.patch('urllib.request.urlopen', return_value=self._resp()), \
+        with unittest.mock.patch.object(serve, '_safe_urlopen', return_value=self._resp()), \
              unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True):
             _f, _c, content, truncated, _lm = serve._fetch_page_sync('https://example.com')
         self.assertFalse(truncated)

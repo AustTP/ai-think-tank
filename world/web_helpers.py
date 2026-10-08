@@ -135,8 +135,26 @@ def _is_safe_public_host(hostname):
     # regardless of what category gate is chosen, this backend must never
     # let a request reach this machine's own network. Resolves the
     # hostname and rejects anything private/loopback/link-local/reserved,
-    # in addition to the obvious localhost names.
-    return _resolve_public_ip(hostname) is not None
+    # in addition to the obvious localhost names. Fails CLOSED on a
+    # mixed-resolution host: if ANY resolved address is unsafe, the whole
+    # hostname is rejected -- a name that answers public to one resolver and
+    # private to another is exactly the DNS-rebinding trick this guard
+    # exists to stop, so a host that shows both is never trusted.
+    if not hostname or hostname.lower() in ('localhost', '0.0.0.0'):  # nosec B104 -- this REJECTS localhost/0.0.0.0; it is the SSRF guard, not a bind
+        return False
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return False
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
+            return False
+    return True
 
 
 class _PinnedHTTPConnection(http.client.HTTPConnection):
