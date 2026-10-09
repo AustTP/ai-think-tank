@@ -5117,6 +5117,17 @@ def _work_context_clause(work_context):
 API_SERVICES_PATH = os.path.join(ROOT, 'api_services.json')
 _API_SERVICES = {}
 _API_SERVICES_LOAD_ERROR = None
+# Read-only CHANNELS: named capabilities (Reddit, Twitter/X, LinkedIn ...) that
+# map hostnames to an ORDERED backend chain. Each backend is a registered
+# service plus a url_template that rewrites the agent's requested URL ({url})
+# into that backend's fetch URL (e.g. Jina Reader's https://r.jina.ai/{url}).
+# The first backend that answers wins; the chain falls through on failure,
+# mirroring agent-reach's per-platform ordered backends. Channels are pure
+# config (JSON-only, not DB-backed): they grant no new credential on their own
+# -- every backend must be a registered service, and the requested host is
+# still SSRF-gated and Jev-judged exactly like any other unregistered GET/HEAD.
+_API_CHANNELS = {}
+_API_CHANNELS_LOAD_ERROR = None
 
 # Registry column names that hold JSON (lists/dicts) and need load-time
 # parsing; everything else is scalar.
@@ -5259,9 +5270,65 @@ def _load_api_services():
                 _index_api_service(spec)
         except Exception as e:
             _API_SERVICES_LOAD_ERROR = f'json seed unavailable: {e}'
+        _load_api_channels()
         return
     for row in rows:
         _index_api_service(_api_service_row_to_spec(dict(row)))
+    _load_api_channels()
+
+
+def _load_api_channels():
+    """Load the CHANNELS (ordered read-only backend chains) from the JSON seed.
+    Channels are config-only -- never DB rows, since they grant no credential on
+    their own: every backend must be a registered service, and channel hosts are
+    still SSRF-gated and Jev-judged as unregistered GET/HEAD. Keyed by channel
+    hostname (exact + subdomain match). Fail closed: on any error, no channel
+    routes (unregistered hosts just fall back to a plain GET/HEAD)."""
+    global _API_CHANNELS, _API_CHANNELS_LOAD_ERROR
+    _API_CHANNELS = {}
+    _API_CHANNELS_LOAD_ERROR = None
+    try:
+        if not os.path.exists(API_SERVICES_PATH):
+            return
+        with open(API_SERVICES_PATH, encoding='utf-8') as f:
+            data = json.load(f)
+        for chost, chan in (data.get('channels') or {}).items():
+            if chost == 'comment' or not isinstance(chan, dict):
+                continue
+            hosts = chan.get('hosts') or []
+            backends = chan.get('backends') or []
+            if not hosts or not backends:
+                _API_CHANNELS_LOAD_ERROR = f'channel {chost} missing hosts or backends'
+                return
+            for host in hosts:
+                host = (host or '').lower().lstrip('.')
+                if not host or '.' not in host:
+                    _API_CHANNELS_LOAD_ERROR = f'channel {chost} has invalid host {host!r}'
+                    return
+                spec = dict(chan)
+                spec['id'] = chost
+                _API_CHANNELS[host] = spec
+    except Exception as e:
+        _API_CHANNELS_LOAD_ERROR = str(e)
+
+
+def _api_channel_for_host(hostname):
+    """Channel spec for a hostname (exact or subdomain of a channel host), or
+    None if no channel owns that host. Mirrors _api_service_for_host."""
+    host = (hostname or '').lower()
+    if not host:
+        return None
+    for chost, spec in _API_CHANNELS.items():
+        if host == chost or host.endswith('.' + chost):
+            return spec
+    return None
+
+
+def _api_backend_url(backend, url):
+    """Expand a channel backend's url_template against the requested URL. The
+    template is trusted config; {url} is substituted with the original URL."""
+    template = (backend or {}).get('url_template') or '{url}'
+    return template.replace('{url}', url)
 
 
 def _index_api_service(spec):
@@ -9158,7 +9225,7 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/browser-act', '/api/api-call', '/api/api-service', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/villages', '/api/memory-ledger', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews', '/api/agent-files')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/browser-act', '/api/api-call', '/api/api-service', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/villages', '/api/memory-ledger', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/channel-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews', '/api/agent-files')
 # Gap: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
@@ -15681,8 +15748,51 @@ def _api_execute_workflow(service, spend_kind, base_url, method, req_headers, re
             'usd': usd if spend.get('kind') == 'estimate_first' else None, 'ids': values}
 
 
+def _api_channel_execute(agent_id, agent_key, channel, url, method, req_headers, req_body, purpose, trace_id, _channel_depth=0):
+    """Run a channel's ORDERED backend chain: the first backend that answers
+    wins; on failure the chain falls through to the next backend (agent-reach's
+    per-platform ordered-backends pattern). Each backend is a registered service
+    plus a url_template, so each hop re-enters _api_execute against the backend
+    URL -- the backend's own path rules, credential, auth injection, SSRF and
+    redirect re-check, redaction, and spend accrual all apply. Channels are
+    strictly read-only GET/HEAD. Returns an _api_execute-style result dict;
+    never raises for a blocked or failed request."""
+    if method not in ('GET', 'HEAD'):
+        return {'ok': False, 'allowed': False, 'reason': 'Channels are read-only (GET/HEAD only). Use a registered service for writes.'}
+    if _channel_depth > 1:
+        return {'ok': False, 'allowed': True, 'error': 'Channel backend chain exceeded maximum depth.'}
+    errors = []
+    for backend in channel.get('backends') or []:
+        bservice_id = backend.get('service')
+        bservice = _API_SERVICES.get(bservice_id)
+        if not bservice:
+            errors.append(f'backend {bservice_id} is not a registered service')
+            continue
+        backend_url = _api_backend_url(backend, url)
+        bparsed = urllib.parse.urlparse(backend_url)
+        if bparsed.scheme not in ('http', 'https') or not bparsed.hostname:
+            errors.append(f'backend {bservice_id}: produced a malformed URL')
+            continue
+        if not _is_safe_public_host(bparsed.hostname):
+            errors.append(f'backend {bservice_id}: resolves to a private or internal network location')
+            continue
+        out = _api_execute(agent_id, agent_key, backend_url, method, req_headers, req_body,
+                           purpose, False, None, trace_id, _channel_depth=_channel_depth + 1)
+        if out.get('allowed') is True and out.get('ok') is True:
+            out['channel'] = channel.get('name')
+            out['backend'] = bservice_id
+            out['service'] = f"{channel.get('name')} (via {bservice_id})"
+            # The content is the channel target the agent asked for, not the
+            # reader transport -- report the original URL so the Jev redirect
+            # re-gate (same-host check) treats it as the approved destination.
+            out['finalUrl'] = url
+            return out
+        errors.append(f'backend {bservice_id}: {out.get("error") or out.get("reason") or "request failed"}')
+    return {'ok': False, 'allowed': True, 'error': f"All backends for channel {channel.get('name')} failed: {'; '.join(errors)}"}
+
+
 def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_headers=None,
-                 purpose='', workflow=False, workflow_params=None, trace_id=None):
+                 purpose='', workflow=False, workflow_params=None, trace_id=None, _channel_depth=0):
     """Shared sync chokepoint for the generic api_call path. Used by BOTH the
     /api/api-call endpoint (after its async Jev gate for unregistered hosts)
     and the five curated tool executors (registered services -- registration
@@ -15701,6 +15811,16 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
         return {'ok': False, 'allowed': False, 'reason': 'Only http/https URLs are allowed.'}
     if not _is_safe_public_host(parsed.hostname):
         return {'ok': False, 'allowed': False, 'reason': 'That address resolves to a private or internal network location and cannot be reached.'}
+
+    # Channel routing: an unregistered host that a curated channel owns (e.g.
+    # reddit.com) is fetched through the channel's ordered backend chain instead
+    # of a plain direct GET -- the channel is a transport improvement, never a
+    # bypass (the host is still SSRF-gated here and Jev-gated in the endpoint).
+    if not registered and _channel_depth == 0:
+        channel = _api_channel_for_host(parsed.hostname)
+        if channel is not None:
+            return _api_channel_execute(agent_id, agent_key, channel, url, method, req_headers, req_body, purpose, trace_id, _channel_depth)
+
 
     token = token2 = None
     if registered:
@@ -15773,8 +15893,85 @@ def _api_call_response(agent_id, authorized, out, trace_id=None, url='', method=
     if out.get('ok') is False:
         log_action(agent_id, 'api-call', {'url': url, 'method': method, 'purpose': purpose, 'decision': 'allowed_but_failed', 'reason': out.get('error')}, authorized=authorized, trace_id=trace_id)
         return JSONResponse({'allowed': True, 'error': out.get('error')})
-    log_action(agent_id, 'api-call', {'url': url, 'method': method, 'purpose': purpose, 'decision': 'allowed', 'status': out.get('status'), 'service': out.get('service')}, authorized=authorized, trace_id=trace_id)
+    log_action(agent_id, 'api-call', {'url': url, 'method': method, 'purpose': purpose, 'decision': 'allowed', 'status': out.get('status'), 'service': out.get('service'), 'channel': out.get('channel'), 'backend': out.get('backend')}, authorized=authorized, trace_id=trace_id)
     return JSONResponse({'allowed': True, 'textForModel': out.get('textForModel'), 'modelInstruction': out.get('modelInstruction'), 'status': out.get('status')})
+
+
+# ---- api_call channels: per-channel probe (agent-reach doctor mirror) --------
+# A "doctor" for the read-only channels, mirroring agent-reach's `doctor`
+# command: for each channel, probe each backend in the ordered chain and report
+# which backend currently answers, so the player can see what the channel is
+# actually routing through today (and which backends are down). Player-only --
+# it makes real outbound calls, so it must not be callable by agents.
+CHANNEL_PROBE_TIMEOUT_S = 8
+
+
+def _probe_backend_sync(backend, probe_url):
+    """One backend probe: build the fetch URL from the channel's probe_url,
+    do a lightweight GET, return {ok, status, error}. Never raises."""
+    bservice_id = backend.get('service')
+    bservice = _API_SERVICES.get(bservice_id)
+    if not bservice:
+        return {'service': bservice_id, 'ok': False, 'error': 'backend service not registered'}
+    try:
+        url = _api_backend_url(backend, probe_url)
+    except Exception as e:
+        return {'service': bservice_id, 'ok': False, 'error': f'bad url template: {e}'}
+    bparsed = urllib.parse.urlparse(url)
+    if bparsed.scheme not in ('http', 'https') or not bparsed.hostname or not _is_safe_public_host(bparsed.hostname):
+        return {'service': bservice_id, 'ok': False, 'error': 'probe target not a safe public URL'}
+    try:
+        req = urllib.request.Request(url, method='GET')
+        req.add_header('User-Agent', 'AIThinkTankChannelProbe/1.0')
+        with _safe_urlopen(req, timeout=CHANNEL_PROBE_TIMEOUT_S) as resp:
+            resp.read(4096)
+            status = resp.status
+        return {'service': bservice_id, 'ok': status < 500, 'status': status, 'url': url}
+    except Exception as e:
+        return {'service': bservice_id, 'ok': False, 'error': str(e)[:200]}
+
+
+def _probe_all_channels_sync():
+    """Probe every configured channel's backend chain. Returns {channel_id: {...}}
+    where the first backend that answers is 'current'."""
+    results = {}
+    for chost, channel in sorted(_API_CHANNELS.items()):
+        cid = channel.get('id') or chost
+        if cid in results:
+            continue
+        probe_url = (channel.get('probe_url') or '').strip()
+        if not probe_url:
+            results[cid] = {'name': channel.get('name'), 'ok': False, 'error': 'no probe_url configured', 'backends': []}
+            continue
+        backends = [_probe_backend_sync(b, probe_url) for b in (channel.get('backends') or [])]
+        current = next((b.get('service') for b in backends if b.get('ok')), None)
+        results[cid] = {
+            'name': channel.get('name'),
+            'hosts': channel.get('hosts') or [],
+            'probe_url': probe_url,
+            'ok': current is not None,
+            'current': current,
+            'backends': backends,
+        }
+    return results
+
+
+@app.get('/api/channel-probe')
+async def channel_probe(request: Request):
+    """Player-only doctor for the read-only channels: reports, per channel,
+    which backend in the ordered chain currently answers (agent-reach's
+    `doctor` mirror). Makes real outbound GETs to each backend's probe URL, so
+    it is session-gated (player) and rate-limited like every other outbound
+    tool -- agents never call this."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    if not check_rate_limit('channel-probe'):
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    if _API_CHANNELS_LOAD_ERROR:
+        return JSONResponse({'error': f'channel registry failed to load: {_API_CHANNELS_LOAD_ERROR}'}, status_code=500)
+    log_action('player', 'channel-probe', {'channels': len(_API_CHANNELS)})
+    results = await asyncio.to_thread(_probe_all_channels_sync)
+    return JSONResponse({'channels': results})
 
 
 @app.post('/api/api-call')
