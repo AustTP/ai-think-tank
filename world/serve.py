@@ -89,6 +89,7 @@ from bank import (  # noqa: E402,F401
     _accrue_apify_spend,
     _accrue_colab_units,
     _accrue_high_tier_spend,
+    _agent_spend_cap_exceeded,
     _accrue_page_request,
     _accrue_spend,
     _accrue_task_spend,
@@ -816,6 +817,22 @@ def init_db():
 
     _seed_api_services_if_empty()
     _load_api_services()
+    _harden_db_perms(DB_PATH)
+
+
+def _harden_db_perms(path):
+    """Keep state/audit DB files private. The DB and its WAL/SHM siblings
+    (plus the timestamped snapshots) hold full prompts, raw model output, and
+    plaintext agent keys; a default-umask 0644 leaves them readable by any
+    local account. Best-effort, a chmod failure never takes the server down."""
+    try:
+        os.chmod(path, 0o600)
+        for suffix in ('-wal', '-shm'):
+            sibling = path + suffix
+            if os.path.exists(sibling):
+                os.chmod(sibling, 0o600)
+    except OSError:
+        pass
 
 
 def _backup_think_tank_db():
@@ -827,6 +844,11 @@ def _backup_think_tank_db():
     # from the synchronous post-run shutdown hook.
     if not os.path.isdir(DB_BACKUP_DIR):
         os.makedirs(DB_BACKUP_DIR, exist_ok=True)
+        try:
+            # snapshots inherit the DB's sensitivity
+            os.chmod(DB_BACKUP_DIR, 0o700)
+        except OSError:
+            pass
     stamp = time.strftime('%Y%m%d-%H%M%S') + f'-{int(time.time() * 1000000) % 1000000:06d}'
     dest = os.path.join(DB_BACKUP_DIR, f'think_tank.db-{stamp}.bak')
     try:
@@ -843,6 +865,7 @@ def _backup_think_tank_db():
     except Exception as e:
         print(f'[backup] snapshot failed: {e}', flush=True)
         return
+    _harden_db_perms(dest)
     # Prune to the newest DB_BACKUP_KEEP, oldest first.
     files = sorted(
         f for f in os.listdir(DB_BACKUP_DIR) if f.endswith('.bak')
@@ -4967,6 +4990,13 @@ PLAYER_EMAIL_ENABLED = _load_env().get('PLAYER_EMAIL_ENABLED', 'true').strip().l
 # real ceiling).
 SPEND_CAP_USD = float(_load_env().get('SPEND_CAP_USD', '50') or 0)
 
+# Per-agent monthly spend ceiling, checked at the model chokepoints that know
+# WHO is spending (/api/chat, _api_execute): a prompt-injected or runaway
+# agent can otherwise burn the WHOLE shared monthly budget (and every shared
+# service quota) for every other agent in one session. Default 0 = disabled
+# (keep the existing single shared ceiling unless a per-agent cap is wanted).
+AGENT_SPEND_CAP_USD = float(_load_env().get('AGENT_SPEND_CAP_USD', '0') or 0)
+
 # Page-request budget: the think tank has a MONTHLY allowance of
 # EXTERNAL page requests -- each browse_page fetch (/api/browse) and each
 # search_web call (Tavily) counts as ONE request. A count-based quota, not a
@@ -6639,7 +6669,7 @@ def ensure_sandbox_networking():
             '-e', f'SANDBOX_EGRESS_EXTRA_HOSTS={desired_extra_hosts}',
             '-e', f'SANDBOX_EGRESS_GRANTS_PATH={EGRESS_GRANTS_PATH}',
             '-v', f'{os.path.join(ROOT, "sandbox_proxy.py")}:/proxy.py:ro',
-            '-v', f'{EGRESS_GRANTS_PATH}:{EGRESS_GRANTS_PATH}',
+            '-v', f'{EGRESS_GRANTS_PATH}:{EGRESS_GRANTS_PATH}:ro',
             SANDBOX_IMAGE, 'python3', '/proxy.py',
         ], capture_output=True)
         subprocess.run(['docker', 'network', 'connect', EGRESS_NETWORK, PROXY_CONTAINER], capture_output=True)
@@ -6684,10 +6714,51 @@ def _revoke_egress_host(host):
 
 
 def _write_egress_grants(grants):
-    tmp = EGRESS_GRANTS_PATH + '.tmp'
-    with open(tmp, 'w') as f:
+    # Written IN PLACE, not via tmp+os.replace: the egress proxy bind-mounts
+    # this exact file (now :ro), and a bind mount pins the original inode --
+    # an os.replace would hand the proxy a NEW inode it never sees, silently
+    # freezing the grants it applies. In-place truncate+write updates the same
+    # inode the proxy watches by mtime. Safe on a torn write: the proxy's read
+    # fails closed (empty grants) until the file is next written fully.
+    with open(EGRESS_GRANTS_PATH, 'w') as f:
         json.dump(grants, f)
-    os.replace(tmp, EGRESS_GRANTS_PATH)
+
+
+def _run_docker_sandbox(docker_cmd, timeout_s):
+    """Run a sandbox container and REAP it if the CLI times out. A killed
+    `docker run` does not stop the container -- a command like `sleep 1000`
+    would otherwise keep eating its 256m/1cpu allocation per timed-out call
+    until the command exits on its own. A --cidfile records the container id,
+    and a timed-out run is `docker rm -f`'d explicitly before the timeout is
+    re-raised. Returns the subprocess.CompletedProcess, or re-raises the
+    TimeoutExpired after reaping (callers keep their current timedOut=True
+    path)."""
+    import tempfile as _tmp
+    cid_file = _tmp.NamedTemporaryFile(delete=False, suffix='.cid')
+    cid_path = cid_file.name
+    cid_file.close()
+    try:
+        # --cidfile is a `docker run` option and must precede the image name.
+        idx = docker_cmd.index(SANDBOX_IMAGE)
+        cmd = docker_cmd[:idx] + ['--cidfile', cid_path] + docker_cmd[idx:]
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            try:
+                with open(cid_path) as f:
+                    cid = f.read().strip()
+                if cid:
+                    subprocess.run(['docker', 'rm', '-f', cid],
+                                   capture_output=True, timeout=15)
+            except Exception:
+                pass
+            raise
+    finally:
+        try:
+            os.remove(cid_path)
+        except OSError:
+            pass
 
 
 def _run_in_sandbox_sync(sandbox_dir, command):
@@ -6721,6 +6792,8 @@ def _run_in_sandbox_sync(sandbox_dir, command):
     docker_cmd = [
         'docker', 'run', '--rm',
         '--network', SANDBOX_NETWORK,
+        '--cap-drop', 'ALL',
+        '--security-opt', 'no-new-privileges',
         '-e', f'http_proxy={proxy_url}', '-e', f'https_proxy={proxy_url}',
         '-e', f'HTTP_PROXY={proxy_url}', '-e', f'HTTPS_PROXY={proxy_url}',
         '--memory', '256m',
@@ -6732,7 +6805,7 @@ def _run_in_sandbox_sync(sandbox_dir, command):
         'sh', '-c', command,
     ]
     try:
-        result = subprocess.run(docker_cmd, capture_output=True, text=True, timeout=SANDBOX_TIMEOUT_S)
+        result = _run_docker_sandbox(docker_cmd, SANDBOX_TIMEOUT_S)
         return {
             'exitCode': result.returncode,
             'stdout': result.stdout[:SANDBOX_MAX_OUTPUT],
@@ -6790,6 +6863,8 @@ def _run_browser_act_sync(sandbox_dir, action):
     docker_cmd = [
         'docker', 'run', '--rm',
         '--network', SANDBOX_NETWORK,
+        '--cap-drop', 'ALL',
+        '--security-opt', 'no-new-privileges',
         '-e', f'http_proxy={proxy_url}', '-e', f'https_proxy={proxy_url}',
         '-e', f'HTTP_PROXY={proxy_url}', '-e', f'HTTPS_PROXY={proxy_url}',
         '-e', f'BROWSER_PROXY_URL={proxy_url}',
@@ -6804,7 +6879,7 @@ def _run_browser_act_sync(sandbox_dir, action):
     ]
     try:
         try:
-            result = subprocess.run(docker_cmd, capture_output=True, text=True, timeout=BROWSER_ACT_TIMEOUT_S)
+            result = _run_docker_sandbox(docker_cmd, BROWSER_ACT_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             return None, 'browser action timed out in sandbox'
         # Prefer the driver's own result file (not truncated by capture caps).
@@ -7839,7 +7914,12 @@ def _jev_choice(data):
     if isinstance(confidence, (int, float)) and 0.0 <= confidence <= 1.0:
         confidence = float(confidence)
     else:
-        confidence = 1.0  # no/absent confidence -> behave as before
+        # Fail closed: a missing, non-numeric, or out-of-range confidence is
+        # treated as ZERO trust, not full trust. A malformed or truncated model
+        # response (or an injected one that omits the field) must not sail past
+        # the low-confidence human-escalation floors in _jev_safety_gate and
+        # the director gate by looking maximally confident.
+        confidence = 0.0
     cost = usage.get('cost', 0.0)
     return choice, confidence, float(cost) if isinstance(cost, (int, float)) else 0.0
 
@@ -9711,7 +9791,7 @@ async def save_doors(request: Request):
 
 
 @app.get('/api/state')
-async def get_state():
+async def get_state(request: Request):
     # A genuinely empty database gets the server-owned default roster
     # seeded here (see _seed_default_roster) so the client never has to
     # generate or hardcode a single agent name -- cold start and warm
@@ -9730,21 +9810,31 @@ async def get_state():
     # ever sees a broken record, regardless of tick timing.
     if _heal_agent_identity(data):
         save_state_to_db(data)
-    # Per-agent keys (see get_or_create_agent_key) ride along with state
-    # rather than a separate endpoint -- the client already fetches this
-    # on every load, and a new hire needs a key the moment it exists, not
-    # via a second round-trip.
-    agent_keys = {}
-    for def_ in data.get('agentRoster', []):
-        agent_id = def_.get('id')
-        if agent_id:
-            agent_keys[agent_id] = get_or_create_agent_key(agent_id)
-    data['agentKeys'] = agent_keys
+    # Per-agent keys ride along with state ONLY for the player's browser (a
+    # real session), where the client uses them for attribution tags on
+    # browse/execute/pipeline calls. An agent-key-authenticated caller (a
+    # content executor loopback) must NOT be handed every other agent's key:
+    # those keys gate key-authenticated endpoints, and a hostile agent would
+    # read all of them, mint its own, and impersonate anyone.
+    if verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        agent_keys = {}
+        for def_ in data.get('agentRoster', []):
+            agent_id = def_.get('id')
+            if agent_id:
+                agent_keys[agent_id] = get_or_create_agent_key(agent_id)
+        data['agentKeys'] = agent_keys
     return JSONResponse(data)
 
 
 @app.post('/api/state')
 async def post_state(request: Request):
+    # The whole-think tank state blob is the player's domain: the browser's
+    # autosave is the only legitimate writer besides the sim itself. An
+    # agent key must not be able to overwrite village state and bypass every
+    # escalation/oversight gate, so this is player-session-only.
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse(
+            {'error': 'Unauthorized -- please log in'}, status_code=401)
     data = await request.json()
     data.pop('agentKeys', None)  # never persist keys back into the state blob itself -- agent_keys table is the one source of truth
     # The client autosave (agents.js saveState) rebuilds the state blob from a
@@ -9904,6 +9994,72 @@ def _merge_server_owned_agent(server_agent, client_agent):
     return out
 
 
+# Actions the browser may report via POST /api/log. Everything in action_log
+# feeds the agent MEMORY.md rendering, so this is a strict allowlist, not a
+# free-text channel: an arbitrary "action" from any authenticated caller was a
+# memory-poisoning vector (hostile text planted in action_log.details would
+# surface verbatim in the agent's long-term memory on the next render).
+_API_LOG_ALLOWED_ACTIONS = {
+    'firing_review', 'mail_sent', 'work_item_abandoned', 'task_assigned',
+    'big_task_delegated', 'pair_programming', 'media_digest_filed',
+    'task_completed', 'handoff', 'hire_blocked_at_cap', 'hire',
+}
+
+
+@app.post('/api/mail/send')
+async def api_mail_send(request: Request):
+    # The one sanctioned inter-agent mail path, server-validated and
+    # server-authoritative. Previously the browser pushed ``fromName: text``
+    # straight into the recipient's local mailbox, which autosave then
+    # persisted -- an unvalidated, client-controlled write into a surface that
+    # feeds model context. This endpoint validates identity (sender/recipient
+    # must be real roster agents or the player) and shape (plain bounded
+    # string) before appending to the recipient's mailbox in state. Content is
+    # still free prose -- hostile mail text is handled as DATA by the
+    # EXTERNAL_DATA boundary in context assembly, not by sanitizing it away.
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)) \
+            and not _valid_agent_key_presented(request.headers.get('X-Agent-Key')):
+        return JSONResponse(
+            {'error': 'Unauthorized -- please log in'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    from_id = (body.get('fromId') or '').strip()
+    to_id = (body.get('toId') or '').strip()
+    text = body.get('text')
+    if not isinstance(text, str) or not text.strip():
+        return JSONResponse({'error': 'text is required'}, status_code=400)
+    text = text.strip()[:2000]
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    roster = state.get('agentRoster') or []
+    ids = {d.get('id') for d in roster if isinstance(d, dict)}
+    if to_id not in ids:
+        return JSONResponse({'error': 'recipient not found'}, status_code=404)
+    if from_id != 'player' and from_id not in ids:
+        return JSONResponse({'error': 'sender not found'}, status_code=400)
+    if from_id == 'player':
+        from_name = 'You'
+    else:
+        names = [d.get('name') or d.get('id') for d in roster
+                 if isinstance(d, dict) and d.get('id') == from_id]
+        from_name = str(names[0]) if names else from_id
+    import sim as _sim
+    target = (state.get('agents') or {}).get(to_id)
+    if not isinstance(target, dict):
+        target = {'mailbox': []}
+        state.setdefault('agents', {})[to_id] = target
+    entry = {'text': f'{from_name}: {text}', 'read': False,
+             'ts': int(time.time() * 1000)}
+    _sim._append_mailbox(target, entry)
+    save_state_to_db(state)
+    log_action(from_id if from_id != 'player' else None, 'mail_sent',
+               {'to': to_id, 'text': text}, authorized=True)
+    return JSONResponse({'ok': True, 'mail': entry})
+
+
 @app.post('/api/log')
 async def api_log(request: Request):
     # A generic logging endpoint for decisions made entirely in the
@@ -9911,9 +10067,19 @@ async def api_log(request: Request):
     # behind their own serve.py route, so without this they'd be invisible
     # to the one activity log. Not itself a sensitive
     # action, just a record of one that already happened client-side.
-    body = await request.json()
+    # Player-session-only (the browser); an agent key must not be able to
+    # write rows into its own memory feed. Action names are allowlisted so a
+    # caller can only append rows for real client-side actions.
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
     action = body.get('action', 'unknown')
     details = body.get('details')
+    if action not in _API_LOG_ALLOWED_ACTIONS:
+        return PlainTextResponse('logged')  # unknown actions are dropped, not stored
     agent_id = body.get('agentId')
     log_action(agent_id, action, details)
     # Chain the consequential ones (hire, a fire verdict, big-task
@@ -11370,6 +11536,13 @@ def _clarify_in_character_messages(agent, kb_matches, product_name, question):
         kb_block = '\n'.join(f"- {m['path']}: {m['snippet']}" for m in kb_matches[:6])
     else:
         kb_block = '(no relevant Library files found for this product)'
+    # The knowledge snippets are model/player-authored content from the Library
+    # tree -- DATA, not instructions. Tag them with the same EXTERNAL_DATA
+    # boundary used for browse results so a hostile instruction planted in a
+    # library file is read as data, not obeyed, while still answering
+    # knowledge-first.
+    kb_wrapped, _n, _t, kb_inst = wrap_external_content(
+        kb_block, 'your Library knowledge base')
     system = (
         f"You are {name}, working as {role} in a small think tank. "
         f"Your mission: {mission} "
@@ -11381,7 +11554,7 @@ def _clarify_in_character_messages(agent, kb_matches, product_name, question):
         f"line {_CLARIFY_ESCALATE_TOKEN} and nothing else -- do not fabricate."
     )
     user = (
-        f"## Library knowledge (searched for this product + your question)\n{kb_block}\n\n"
+        f"## Library knowledge (searched for this product + your question)\n{kb_inst}\n\n{kb_wrapped}\n\n"
         f"## Player's question about '{product_name}'\n{question}"
     )
     # Prose answer to the player -- inherit the plain-writing directive so the
@@ -15522,6 +15695,20 @@ async def chat(request: Request):
             'taskSpendUsd': round(spent, 6),
             'taskSpendAttempts': attempts,
         }, status_code=429)
+    # Per-agent spend gate: a single agent (or one prompt-injected agent) must
+    # not be able to burn the whole shared monthly budget for everyone. The
+    # ceiling reads THIS agent's own ledger bucket for the current month.
+    if agent_id and _agent_spend_cap_exceeded(agent_id):
+        log_action(agent_id, 'agent_budget_blocked',
+                   {'model': model, 'service': service},
+                   authorized=authorized)
+        return JSONResponse({
+            'error': (f'This agent has used its full monthly model-spend budget '
+                      f'(${AGENT_SPEND_CAP_USD:.2f}) and further calls are '
+                      f'paused until a director raises it.'),
+            'agentBudgetExhausted': True,
+            'agentSpendCapUsd': AGENT_SPEND_CAP_USD,
+        }, status_code=429)
     # Plain-writing directive (token saver): by default fold the anti-AI-slop
     # ban list into the first system message so prose replies come back
     # shorter -- less filler is fewer billed input AND output tokens, without
@@ -15579,7 +15766,7 @@ async def chat(request: Request):
             usage_cost = (data.get('usage') or {}).get('cost', 0.0)
         if isinstance(usage_cost, (int, float)) and usage_cost:
             village_id = _sim_village_for_agent(agent_id)
-            _accrue_spend(service, usage_cost, village_id=village_id)
+            _accrue_spend(service, usage_cost, village_id=village_id, agent_id=agent_id)
             # Item 4 per-task accrual: count this call against the task's own
             # ledger bucket so _task_budget_exhausted sees live spend. Only
             # calls that passed the gate (or carry no taskId) reach here.
@@ -16330,7 +16517,7 @@ def _api_workflow_url(base_url, template, values):
     return base_url.rstrip('/') + ('/' + formatted.lstrip('/') if formatted else '')
 
 
-def _api_execute_workflow(service, spend_kind, base_url, method, req_headers, req_body, workflow_params):
+def _api_execute_workflow(service, spend_kind, base_url, method, req_headers, req_body, workflow_params, agent_id=None):
     """Run a registered service's multi-step workflow (submit -> poll ->
     optional finalize), with the registry's spend rule applied. This is the
     generic engine behind the higgsfield (image/video) and pixellab
@@ -16410,14 +16597,14 @@ def _api_execute_workflow(service, spend_kind, base_url, method, req_headers, re
     # generation is never charged (same rule _higgsfield_generate enforced).
     charged = bool(success) and final_status in success
     if charged and spend.get('kind') == 'estimate_first' and usd > 0:
-        _accrue_spend(spend_service, usd)
+        _accrue_spend(spend_service, usd, agent_id=agent_id)
     elif charged and spend.get('kind') == 'balance_delta':
         bal = _request(spend.get('balance_path', '/v2/balance'), None, 'GET')
         balance_after = (bal or {}).get('balance')
         if isinstance(balance_before, (int, float)) and isinstance(balance_after, (int, float)):
             real_cost = max(0.0, balance_before - balance_after)
             if real_cost > 0:
-                _accrue_spend(spend_service, real_cost)
+                _accrue_spend(spend_service, real_cost, agent_id=agent_id)
 
     return {'data': final_data, 'status': final_status, 'contentType': 'application/json',
             'usd': usd if spend.get('kind') == 'estimate_first' else None, 'ids': values}
@@ -16536,7 +16723,7 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
 
     if workflow and (service or {}).get('workflow'):
         try:
-            wf = _api_execute_workflow(service, spend_kind, url, method, req_headers, req_body, workflow_params)
+            wf = _api_execute_workflow(service, spend_kind, url, method, req_headers, req_body, workflow_params, agent_id=agent_id)
         except Exception as e:
             return {'ok': False, 'allowed': True, 'error': f'Approved, but the workflow failed: {e}'}
         parsed_json, ctype, wrapped, instruction = _api_build_text(

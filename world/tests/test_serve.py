@@ -2783,21 +2783,20 @@ class JevChoiceExtraction(unittest.TestCase):
         }
         self.assertEqual(serve._jev_choice(data), ('allow', 0.92, 0.000014))
 
-    def test_missing_confidence_defaults_to_1_0(self):
-        # No/absent confidence -> behave as before (never block a field that
-        # was always present). This is the "doesn't change behavior by itself"
-        # guarantee.
+    def test_missing_confidence_fails_closed_to_zero(self):
+        # No/absent confidence -> zero trust, so a malformed response can't
+        # bypass the low-confidence human floors by looking fully confident.
         data = {'answers': {'choice': {'choice': 'allow'}}, 'usage': {}}
-        self.assertEqual(serve._jev_choice(data), ('allow', 1.0, 0.0))
+        self.assertEqual(serve._jev_choice(data), ('allow', 0.0, 0.0))
 
-    def test_bad_confidence_defaults_to_1_0(self):
-        # Out-of-range or non-numeric confidence is treated as absent.
+    def test_bad_confidence_fails_closed_to_zero(self):
+        # Out-of-range or non-numeric confidence is treated as absent -> zero.
         data = {'answers': {'choice': {'choice': 'deny', 'confidence': 'high'}}}
-        self.assertEqual(serve._jev_choice(data), ('deny', 1.0, 0.0))
+        self.assertEqual(serve._jev_choice(data), ('deny', 0.0, 0.0))
 
     def test_empty_response_is_safe(self):
-        self.assertEqual(serve._jev_choice(None), (None, 1.0, 0.0))
-        self.assertEqual(serve._jev_choice({}), (None, 1.0, 0.0))
+        self.assertEqual(serve._jev_choice(None), (None, 0.0, 0.0))
+        self.assertEqual(serve._jev_choice({}), (None, 0.0, 0.0))
 
     def test_answer_uses_first_question_key(self):
         data = {'answers': {'pick': {'choice': 'worker_3', 'confidence': 0.7}}}
