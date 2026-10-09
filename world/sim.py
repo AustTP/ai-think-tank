@@ -3800,6 +3800,12 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'projectLabel': project_label,
         'research': (extra or {}).get('research'),
         'taskType': (extra or {}).get('taskType', 'code'),
+        # A scheduled item's notBefore rides onto the task (see _assign_due_item)
+        # so the preemption picker can recognize TIME-CRITICAL work: a card that
+        # was scheduled for a specific time must not be yanked off the agent for
+        # a one-off. Standing cadence cards already mark themselves via
+        # research/skillReview/distill; notBefore covers queue_once one-offs.
+        'notBefore': (extra or {}).get('notBefore'),
         'skillReview': bool((extra or {}).get('skillReview')),
         'distill': bool((extra or {}).get('distill')),
         'kbClass': (extra or {}).get('kbClass') or None,
@@ -6765,17 +6771,34 @@ def _restore_social_agent(state, aid, snapshot, now_ms, duration_ms):
     a['dir'] = snapshot.get('dir', a.get('dir'))
 
 
-def _suspend_busy_agent_for_scheduled(state, grid, doors, now_ms):
-    """Scheduled-item preemption: pick ONE busy on-duty agent whose current task
-    is safely suspendable (status 'working', not a peer review/incident/shadow,
-    not at the social, not already suspended), snapshot + park her task (flagged
-    _suspendedForScheduled so the orphan-reclaim and stale-work sweeps skip it),
-    and free her so a due scheduled item can be assigned at its specified time
-    even when every agent is busy -- typically at the active ceiling, where
-    can_activate_another is False so no off-duty agent can be woken. The
-    snapshot lives on the agent as `_suspendedTask`; task completion resumes it
-    (see send_agent_off_duty / _resume_suspended_task). Returns the freed agent
-    id, or None when nothing is safely suspendable."""
+def _task_is_time_critical(t):
+    """True when an in-flight task is TIME-CRITICAL -- i.e. it was itself
+    scheduled for a specific time or runs on a standing cadence -- so it must
+    never be yanked off the agent for a one-off request. Scheduled cards stamp
+    `notBefore` at assignment (see _assign_due_item / assign_task); standing
+    cadence cards (research/skillReview/distill) already mark themselves.
+    Ordinary queue work and sprint cards are NOT time-critical: a one-off may
+    interrupt them. The callers keep the sim's existing carve-outs (peer
+    review/incident/shadow/social) as hard never-suspend rules regardless."""
+    return bool(t.get('notBefore') or t.get('research')
+                or t.get('skillReview') or t.get('distill'))
+
+
+def _suspend_busy_agent_for_scheduled(state, grid, doors, now_ms,
+                                      skip_time_critical=False):
+    """Preemption for an item that must interrupt a busy agent. A due SCHEDULED
+    item (queue_once notBefore) fires at its specified time even when every
+    agent is busy -- typically at the active ceiling, where can_activate_another
+    is False so no off-duty agent can be woken. A ONE-OFF request may also
+    interrupt -- but ONLY ordinary/sprint work: with `skip_time_critical=True`
+    it never yanks an agent off a scheduled/standing (time-critical) card. Pick
+    ONE busy on-duty agent whose current task is safely suspendable (status
+    'working', not a peer review/incident/shadow, not at the social, not already
+    suspended), snapshot + park her task (flagged _suspendedForScheduled so the
+    orphan-reclaim and stale-work sweeps skip it), and free her. The snapshot
+    lives on the agent as `_suspendedTask`; task completion resumes it (see
+    send_agent_off_duty / _resume_suspended_task). Returns the freed agent id,
+    or None when nothing is safely suspendable."""
     agents = state.get('agents') or {}
     roster = state.get('agentRoster') or []
     tasks = state.get('tasks') or {}
@@ -6797,6 +6820,8 @@ def _suspend_busy_agent_for_scheduled(state, grid, doors, now_ms):
         if t.get('_inSocial') or t.get('_suspendedForScheduled'):
             continue
         if t.get('reviewOf') or t.get('incident') or t.get('shadow'):
+            continue
+        if skip_time_critical and _task_is_time_critical(t):
             continue
         # Prefer the agent furthest from completion: interrupting a task about
         # to finish would cost the most, and we give every parked task its full
@@ -11170,17 +11195,19 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         if not (pick.get('assignedTo') or '') == 'player' \
                 and _awake_idle_count(state) == 0 \
                 and not (can_wake_off_duty and _any_available_including_off_duty(state)):
-            # A due SCHEDULED item (queue_once notBefore) must still fire at its
-            # specified time even when every agent is busy -- typically at the
-            # active ceiling, where can_activate_another is False so no off-duty
-            # agent can be woken. Preempt one busy agent: park her current task
-            # (she returns to it when the scheduled item completes -- see
-            # _suspend_busy_agent_for_scheduled / send_agent_off_duty), freeing
-            # a candidate so the item lands. Only scheduled items earn this
-            # interrupt; ordinary work waits for a genuinely free agent.
-            if bool(pick.get('notBefore')):
-                preempted_for_scheduled = _suspend_busy_agent_for_scheduled(
-                    state, grid, doors, now_ms)
+            # Interrupt a busy agent so this due item can land. A SCHEDULED item
+            # (queue_once notBefore) must still fire at its specified time even
+            # when every agent is busy -- typically at the active ceiling, where
+            # can_activate_another is False so no off-duty agent can be woken.
+            # A ONE-OFF may also interrupt -- but ONLY ordinary/sprint work:
+            # skip_time_critical refuses to yank an agent off a scheduled/
+            # standing (time-critical) card (see _task_is_time_critical). In
+            # both cases the parked task resumes when the interrupting item
+            # completes (see _suspend_busy_agent_for_scheduled /
+            # send_agent_off_duty).
+            skip_time_critical = not bool(pick.get('notBefore'))
+            preempted_for_scheduled = _suspend_busy_agent_for_scheduled(
+                state, grid, doors, now_ms, skip_time_critical=skip_time_critical)
             if preempted_for_scheduled is None:
                 break  # nobody who could take this right now, of any kind
         work_queue.pop(due_index)
@@ -11793,6 +11820,12 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # the PLAYER wrote, so dropping this here would silently downgrade a
         # player-vetted task to agent-authored.
         'playerAuthored': pick.get('playerAuthored'),
+        # A scheduled item's notBefore rides onto the assigned task so the
+        # preemption picker (_suspend_busy_agent_for_scheduled) can tell
+        # TIME-CRITICAL work (this card was scheduled for a specific time; the
+        # agent must not be yanked off it for a one-off) from ordinary/sprint
+        # work. Same whitelist contract as 'distill'/'checklist'.
+        'notBefore': pick.get('notBefore'),
     }
     # Cut 2 coaching + runbook injection: append the chosen agent's pending
     # growth-plan note (applied once) and any product runbook knowledge to the

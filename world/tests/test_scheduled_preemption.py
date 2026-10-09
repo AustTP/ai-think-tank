@@ -54,9 +54,9 @@ def tearDownModule():
 
 def _busy_at_cap_state():
     """A state at the active ceiling with every agent mid-'working' on a real
-    task, plus one due scheduled item. 26 on-duty agents (25 workers + the
-    admin) keeps active_agent_count >= MAX_ACTIVE_AGENTS so no off-duty wake is
-    possible -- the exact preemption scenario."""
+    task. 26 on-duty agents (25 workers + the admin) keeps active_agent_count
+    >= MAX_ACTIVE_AGENTS so no off-duty wake is possible -- the exact preemption
+    scenario. Callers queue the item under test themselves."""
     now = 100_000.0
     now_ms = int(now * 1000)
     roster = []
@@ -92,9 +92,6 @@ def _busy_at_cap_state():
         'lastSkillReviewAt': sim.CADENCE_NEVER,
         'lastDistillAt': sim.CADENCE_NEVER,
     }
-    # A due one-off scheduled item (notBefore in the past).
-    sim.queue_once(state, 'Deploy the release', now_ms - 1000,
-                   room='house', task_type='code')
     return state, now, now_ms
 
 
@@ -106,6 +103,8 @@ class ScheduledPreemption(unittest.TestCase):
 
     def test_due_scheduled_item_fires_at_cap_via_preemption(self):
         state, now, now_ms = _busy_at_cap_state()
+        sim.queue_once(state, 'Deploy the release', now_ms - 1000,
+                       room='house', task_type='code')
         grid, doors = sim._load_outdoor_geometry()
         self._run_cycle(state, now, grid, doors)
         # The scheduled item was assigned: someone holds a task with its title.
@@ -127,6 +126,8 @@ class ScheduledPreemption(unittest.TestCase):
 
     def test_parked_task_resumes_after_scheduled_item_completes(self):
         state, now, now_ms = _busy_at_cap_state()
+        sim.queue_once(state, 'Deploy the release', now_ms - 1000,
+                       room='house', task_type='code')
         grid, doors = sim._load_outdoor_geometry()
         tid = [0]
         self._run_cycle(state, now, grid, doors, tid)
@@ -152,6 +153,8 @@ class ScheduledPreemption(unittest.TestCase):
 
     def test_parked_task_is_not_reclaimed_or_replanned_while_suspended(self):
         state, now, now_ms = _busy_at_cap_state()
+        sim.queue_once(state, 'Deploy the release', now_ms - 1000,
+                       room='house', task_type='code')
         grid, doors = sim._load_outdoor_geometry()
         self._run_cycle(state, now, grid, doors)
         a0 = state['agents'][next(aid for aid, a in state['agents'].items()
@@ -171,6 +174,74 @@ class ScheduledPreemption(unittest.TestCase):
         late = now + 200_000.0  # far past parked workUntil (110_000) + grace
         self.assertEqual(sim._stale_work_step(state, late, int(late * 1000)), 0)
         self.assertIn(parked_id, state['tasks'])
+
+
+    def test_one_off_can_preempt_ordinary_or_sprint_work(self):
+        # A ONE-OFF request may interrupt an agent on ordinary (non-scheduled)
+        # work at the cap -- same preemption machinery, but the parked task must
+        # be ordinary work, not a scheduled/standing card.
+        state, now, now_ms = _busy_at_cap_state()
+        # Queue a plain one-off (no notBefore).
+        sim.queue_work(state, [{'title': 'One-off: fetch the ledger',
+                           'room': 'house', 'instructions': 'ordinary request'}])
+        grid, doors = sim._load_outdoor_geometry()
+        self._run_cycle(state, now, grid, doors)
+        holder = next((aid for aid, a in state['agents'].items()
+                       if a.get('task') and state['tasks'][a['task']]['title']
+                       == 'One-off: fetch the ledger'), None)
+        self.assertTrue(holder, 'one-off interrupted someone and got assigned')
+        a = state['agents'][holder]
+        self.assertTrue(a.get('_suspendedTask'), 'prior ordinary task parked')
+
+    def test_one_off_does_not_preempt_scheduled_or_standing_work(self):
+        # A one-off must NOT yank an agent off time-critical work. Give every
+        # busy agent a scheduled (notBefore) task, then queue a one-off: it
+        # cannot interrupt anyone, so it stays in the queue.
+        state, now, now_ms = _busy_at_cap_state()
+        for t in (state.get('tasks') or {}).values():
+            t['notBefore'] = now_ms - 5000  # mark each in-flight card scheduled
+        sim.queue_work(state, [{'title': 'One-off: fetch the ledger',
+                           'room': 'house', 'instructions': 'ordinary request'}])
+        grid, doors = sim._load_outdoor_geometry()
+        self._run_cycle(state, now, grid, doors)
+        holders = [aid for aid, a in state['agents'].items()
+                   if a.get('task') and state['tasks'][a['task']]['title']
+                   == 'One-off: fetch the ledger']
+        self.assertEqual(holders, [], 'one-off must not interrupt scheduled work')
+        self.assertEqual([a.get('_suspendedTask') for a in state['agents'].values()
+                          if isinstance(a, dict) and a.get('_suspendedTask')],
+                         [], 'nobody was preempted')
+
+    def test_scheduled_can_preempt_standing_work(self):
+        # A due scheduled item outranks even standing cadence work: it preempts
+        # a research (standing) card, because a scheduled item is the top
+        # priority and must fire at its time.
+        state, now, now_ms = _busy_at_cap_state()
+        for t in (state.get('tasks') or {}).values():
+            t['research'] = {'topicId': 't1', 'since': 0}
+        sim.queue_once(state, 'Deploy the release', now_ms - 1000,
+                       room='house', task_type='code')
+        grid, doors = sim._load_outdoor_geometry()
+        self._run_cycle(state, now, grid, doors)
+        holder = next((aid for aid, a in state['agents'].items()
+                       if a.get('task') and state['tasks'][a['task']]['title']
+                       == 'Deploy the release'), None)
+        self.assertTrue(holder, 'scheduled item preempted a standing card')
+
+    def test_one_off_does_not_preempt_standing_work(self):
+        # Same as the scheduled case, but with a ONE-OFF: standing cadence work
+        # is time-critical, so the one-off must wait.
+        state, now, now_ms = _busy_at_cap_state()
+        for t in (state.get('tasks') or {}).values():
+            t['research'] = {'topicId': 't1', 'since': 0}
+        sim.queue_work(state, [{'title': 'One-off: fetch the ledger',
+                           'room': 'house', 'instructions': 'ordinary request'}])
+        grid, doors = sim._load_outdoor_geometry()
+        self._run_cycle(state, now, grid, doors)
+        holders = [aid for aid, a in state['agents'].items()
+                   if a.get('task') and state['tasks'][a['task']]['title']
+                   == 'One-off: fetch the ledger']
+        self.assertEqual(holders, [], 'one-off must not interrupt standing work')
 
 
 class HireGate(unittest.TestCase):
