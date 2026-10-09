@@ -4470,6 +4470,7 @@ def _check_schedules(state, now, now_ms):
     gated: a due cadence only queues work when there is actually something to
     review/merge. With no content the marker is deliberately NOT advanced, so
     the sweep fires on the first later pass where content appears."""
+    import serve
     # Research topics.
     # Long-horizon seeding first: a village's standing far-future topic is
     # created before due topics fire, so a fresh village always has its horizon
@@ -4487,12 +4488,28 @@ def _check_schedules(state, now, now_ms):
             continue
         previous_run_at = topic.get('lastRunAt') or 0
         topic['lastRunAt'] = now_ms
+        # The Research Desk's 24h overlap: search the period since the last
+        # successful run MINUS the overlap, so a discovery that landed just
+        # after the previous window is caught on this run instead of waiting a
+        # full cadence. First run (previous_run_at 0) searches the whole
+        # window. Mirrors evidence.search_since_ms / serve.RESEARCH_OVERLAP_MS.
+        since_ms = serve.search_since_ms(previous_run_at,
+                                         serve.RESEARCH_OVERLAP_MS)
         queue_work(state, [{
             'title': f"Scheduled research: {topic.get('topic')}",
             'room': 'observatory',
-            'instructions': f'Crawl starting from {topic.get("startUrl")} and update the "{topic.get("topic")}" skill file with anything genuinely new since last time.',
+            'instructions': (f'Crawl starting from {topic.get("startUrl")} and update the '
+                             f'"{topic.get("topic")}" skill file with anything genuinely new '
+                             f'since last time (searching a 24h-overlapped window for late '
+                             f'discoveries). Run three search passes and answer each one: '
+                             f'announcements (what changed), practical examples (someone '
+                             f'actually using it, with inspectable material), and limitations '
+                             f'(documented restrictions, corrections, availability problems). '
+                             f'Separate what a source supports from our inference. A repost is '
+                             f'not a second independent source. Do not manufacture a finding '
+                             f'when there is none.'),
             'goal': topic.get('topic'),
-            'research': {'topicId': topic.get('id'), 'since': previous_run_at},
+            'research': {'topicId': topic.get('id'), 'since': since_ms},
             'kbClass': 'changes_how_we_work',
         }])
     # Skill review sweep. `_cadence_due` treats the explicit CADENCE_NEVER marker

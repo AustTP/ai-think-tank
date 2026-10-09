@@ -46,8 +46,10 @@ from web_helpers import (  # noqa: E402,F401
     _download_dest_rel_path,
     _extract_links,
     _is_safe_public_host,
+    _is_short_link,
     _looks_like_gmail_app_password,
     _parse_http_date_ms,
+    _resolve_final_url,
     _resolve_public_ip,
     _safe_urlopen,
     _sanitize_download_filename,
@@ -131,6 +133,47 @@ from notify import (  # noqa: E402,F401
     provision_player_email,
     send_player_email_sync,
     send_player_telegram_sync,
+)
+# The Research Desk's claim-level evidence ledger + review-gated coverage
+# ledger (see DESIGN.md "Research Desk" and evidence.py). Extracted into its
+# own module exactly like bank.py: re-exported here so the stable public
+# surface the endpoints and tests use is `serve._evidence_read` etc.
+from evidence import (  # noqa: E402,F401
+    CLAIM_DECISIONS,
+    CLAIM_STATUSES,
+    CLAIM_TYPES,
+    COVERAGE_STATUSES,
+    DEFAULT_OVERLAP_MS,
+    UNRESOLVED_PREFIX,
+    _coverage_read,
+    _coverage_write,
+    _evidence_read,
+    _evidence_write,
+    coverage_status,
+    get_claim,
+    is_source_covered,
+    list_claims,
+    mark_covered,
+    mark_reviewed,
+    record_run_failure,
+    record_source_claim,
+    search_since_ms,
+    source_identity,
+    update_claim,
+)
+# Operator-edited policy JSON (world/plain_writing.json, browse_policy.json,
+# research_desk.json, watchlist.json) loaded by world/config.py. These are
+# DATA, not code: the operator tunes the ban list, block categories, desk
+# passes, and the research watchlist by editing the JSON files. Re-exported so
+# the stable surface the endpoints/tests use is `serve.PLAIN_WRITING_BAN_LIST`
+# etc. (see world/config.py for load discipline).
+from config import (  # noqa: E402,F401
+    ALLOW_WATCHLIST_WRITE,
+    BROWSE_BLOCK_CATEGORIES,
+    PLAIN_WRITING_BAN_LIST,
+    RESEARCH_WATCHLIST,
+    note_watchlist_topic,
+    reload_policy_config,
 )
 
 # Optional, real dependencies for document ingestion (/api/library/ingest,
@@ -378,6 +421,23 @@ def init_db():
         # a count-based quota, not a dollar cap. Mirrors kv_spend's own-table
         # independence so the accounting never depends on the whole-think tank blob.
         conn.execute('''CREATE TABLE IF NOT EXISTS kv_pagebudget (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        # The Research Desk's claim-level evidence ledger and review-gated
+        # coverage ledger (world/evidence.py). Like kv_spend, each lives in
+        # its OWN row/table -- a research run recording claims must never
+        # read-modify-write the whole kv_state blob. One single-row blob per
+        # ledger (claim id -> record, source identity -> coverage record) is
+        # enough: claims are low-volume (a handful per scheduled run) and the
+        # whole-ledger read/write keeps the accounting atomic.
+        conn.execute('''CREATE TABLE IF NOT EXISTS evidence_records (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS coverage_ledger (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             blob TEXT NOT NULL,
             updated_at REAL NOT NULL
@@ -3828,6 +3888,35 @@ async def _peer_review_loop():
             print(f'[peer] loop error: {e}', flush=True)
 
 
+def _seed_watchlist_topics(state):
+    """Seed researchTopics from the operator-edited world/watchlist.json on
+    boot. Idempotent and additive: a topic already in state (by topic +
+    startUrl) is never duplicated, so a topic the player deleted is not
+    silently re-created (same policy as the long-horizon seed). Runs only in
+    the real boot path (lifespan), never in tests. Entries that fail
+    add_research_topic's own fail-closed validation (empty topic, non-absolute
+    URL) are skipped. Returns the number of topics newly seeded."""
+    import config as _config
+    if not _config.RESEARCH_WATCHLIST:
+        return 0
+    import sim as _sim
+    existing = {(t.get('topic'), t.get('startUrl')) for t in (state.get('researchTopics') or [])}
+    seeded = 0
+    for t in _config.RESEARCH_WATCHLIST:
+        key = (t.get('topic'), t.get('startUrl'))
+        if key in existing:
+            continue
+        record = _sim.add_research_topic(
+            state, t.get('topic'), t.get('startUrl'), t.get('cadenceMs') or 0,
+            link_keyword=t.get('linkKeyword'), page_keyword=t.get('pageKeyword'))
+        if record is not None:
+            existing.add(key)
+            seeded += 1
+    if seeded:
+        log_action(None, 'watchlist_seeded', {'count': seeded, 'source': 'watchlist.json'})
+    return seeded
+
+
 @asynccontextmanager
 async def _lifespan(app):
     # The admin/manager/director information should
@@ -3862,6 +3951,18 @@ async def _lifespan(app):
         _backfill_agent_identity_in_db()
     except Exception as e:
         print(f'[identity] backfill failed: {e}', flush=True)
+    # The Research Desk's standing watchlist (world/watchlist.json) seeds
+    # researchTopics on boot. This is the REAL boot path, so it also authorizes
+    # write-back of villager-added topics into that file -- tests never run
+    # lifespan, so a test or stray import can never mutate operator-owned JSON.
+    import config
+    config.ALLOW_WATCHLIST_WRITE = True
+    try:
+        startup_state = get_state_from_db()
+        if startup_state is not None and _seed_watchlist_topics(startup_state):
+            save_state_to_db(startup_state)
+    except Exception as e:
+        print(f'[watchlist] seed failed: {e}', flush=True)
     health_task = asyncio.create_task(_health_check_loop())
     director_task = asyncio.create_task(_director_approval_loop())
     backup_task = asyncio.create_task(_backup_loop())
@@ -4974,16 +5075,9 @@ BROWSE_TIMEOUT_S = 10
 # anything onto this machine in the first place. This is the real gate;
 # everything else here (SSRF checks, GET-only, size/time caps) is
 # necessary hygiene around it, not a substitute for it.
-BROWSE_BLOCK_CATEGORIES = (
-    'child sexual abuse material or content sexualizing minors in any way',
-    'illegal drug or weapons marketplaces, or instructions for making weapons/explosives',
-    'hacking, malware, or exploit distribution, or unauthorized-access instructions',
-    'doxxing, stolen personal data, or non-consensual intimate imagery',
-    'human trafficking or exploitation',
-    'fraud, scams, or phishing',
-    'terrorism or violent extremist content',
-    'pirated copyrighted media distribution',
-)
+# BROWSE_BLOCK_CATEGORIES is loaded from world/browse_policy.json by
+# world/config.py (operator-edited; a blocked category ALWAYS blocks regardless
+# of the agent's stated purpose -- see the module docstring there).
 
 # Explicit allowlist -- player's own call: a small, deliberately
 # curated set of domains the PLAYER has already vetted, so an agent never has
@@ -6733,18 +6827,8 @@ def record_model_result(model_slug, success):
             log_action(None, 'model_circuit_broken', {'model': model_slug, 'cooldown_s': CIRCUIT_BREAKER_COOLDOWN_S})
 
 
-PLAIN_WRITING_BAN_LIST = (
-    'leverage', 'utilize', 'seamless', 'robust', 'crucial', 'ensure',
-    'delve', 'dive into', 'unpack', 'harness', 'foster', 'elevate',
-    'underscore', 'illuminate', 'showcase', 'empower', 'innovative',
-    'transformative', 'cutting-edge', 'state-of-the-art', 'significant',
-    'notably', 'moreover', 'furthermore', 'additionally', 'overall',
-    'essentially', 'fundamentally', 'ultimately', 'comprehensive',
-    'it is worth noting', 'needless to say', 'in conclusion', 'in summary',
-    'that being said', 'having said that', 'when it comes to', 'at its core',
-    'play a role', 'serve as', 'act as', 'allow for', 'facilitate',
-    'potentially', 'effectively', 'efficiently', 'appropriately',
-)
+# PLAIN_WRITING_BAN_LIST is loaded from world/plain_writing.json by
+# world/config.py (operator-edited; add a new AI-slop word there, not in code).
 # Directs the village's models to write plain, short, no-AI-flavored prose --
 # the SAME anti-slop signal the coupon scanner uses (word ban list), applied at
 # the model-call boundary so every prose-producing path inherits it. This is a
@@ -9225,7 +9309,7 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/browser-act', '/api/api-call', '/api/api-service', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/villages', '/api/memory-ledger', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/channel-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews', '/api/agent-files')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/browser-act', '/api/api-call', '/api/api-service', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/villages', '/api/memory-ledger', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/channel-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews', '/api/agent-files', '/api/evidence', '/api/coverage', '/api/policy')
 # Gap: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
@@ -12009,6 +12093,7 @@ async def _route_lane_schedule(state, text, admin_id):
                                      depends_on_task=fields.get('dependsOnTask'))
     if not record:
         return {'reply': "That didn't look like a real link I could start from -- can you double-check the URL?"}
+    note_watchlist_topic(record)  # reflect the villager's addition into world/watchlist.json
     save_state_to_db(state)
     log_action('player', 'schedule_created', {'topicId': record['id'], 'topic': record['topic'],
                                               'startUrl': record['startUrl'],
@@ -12184,6 +12269,7 @@ async def intent_schedule(request: Request):
                                      depends_on_task=(body.get('dependsOnTask') or '').strip() or None)
     if not record:
         return JSONResponse({'error': 'topic, a real absolute startUrl, and cadenceMs are required'}, status_code=400)
+    note_watchlist_topic(record)  # reflect the villager's addition into world/watchlist.json
     save_state_to_db(state)
     log_action('player', 'schedule_created', {'topicId': record['id'], 'topic': record['topic'],
                                               'dependsOnTask': record.get('dependsOnTask')}, authorized=True)
@@ -15387,6 +15473,196 @@ async def browse(request: Request):
         'lastModified': last_modified,
     })
 
+
+# ---------------------------------------------------------------------------
+# Research Desk evidence + coverage endpoints (world/evidence.py). The
+# scheduled research executor POSTs each candidate source here so every claim
+# is recorded with its RESOLVED identity (a short link's raw string is never
+# the identity -- see evidence.source_identity), and the operator/Verifier
+# reads and clears records through these same endpoints. All paths are
+# session/agent-key protected via AUTH_PROTECTED_PREFIXES.
+# ---------------------------------------------------------------------------
+@app.post('/api/evidence')
+async def evidence_record(request: Request):
+    # Record one claim into the evidence ledger. The server applies source
+    # identity (resolved landing URL), the coverage gate (skip already-covered
+    # identities without a material update), and the repost rule (a second
+    # record on the same identity is independent=False). This is the one call
+    # the research crawl makes per candidate -- it returns the decision so the
+    # crawl can skip a covered source before saving a duplicate page.
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'unknown')
+    if not check_rate_limit(agent_id):
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    if verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    record = body.get('record') or {}
+    if not isinstance(record, dict):
+        return JSONResponse({'error': 'record must be an object'}, status_code=400)
+    try:
+        result = record_source_claim(record)
+    except Exception as e:
+        return JSONResponse({'error': f'could not record claim: {e}'}, status_code=500)
+    if result.get('recorded'):
+        log_action(agent_id, 'evidence_record', {
+            'claim_id': result.get('id'),
+            'independent': result.get('independent'),
+            'repost_of': result.get('repost_of'),
+            'is_short_link': result.get('is_short_link'),
+            'resolved_ok': result.get('resolved_ok'),
+            'source_url': record.get('source_url'),
+        })
+    return JSONResponse(result)
+
+
+@app.get('/api/evidence')
+async def evidence_list(request: Request):
+    # Read view of the claim ledger for the operator/Verifier. Filters:
+    # ?status=needs_review|cleared|blocked, ?limit=N (tail).
+    status = request.query_params.get('status')
+    if status is not None and status not in CLAIM_STATUSES:
+        return JSONResponse({'error': f'status must be one of {sorted(CLAIM_STATUSES)}'}, status_code=400)
+    try:
+        limit = int(request.query_params.get('limit') or 200)
+    except (TypeError, ValueError):
+        limit = 200
+    return JSONResponse({'claims': list_claims(status=status, limit=limit)})
+
+
+@app.post('/api/evidence/review')
+async def evidence_review(request: Request):
+    # The Verifier step (article section 6): a human or reviewing agent opens
+    # the source, separates the source's claim from our inference, and returns
+    # a per-record decision. decision in usable_as_written /
+    # usable_with_narrower_wording / blocked_until_checked. A usable decision
+    # clears the claim and (when it is an independent claim) folds its
+    # identity into the coverage ledger as COVERED -- the ONLY state that
+    # suppresses a future re-report. A blocked decision blocks the claim and
+    # never marks coverage.
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'unknown')
+    if verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    claim_id = (body.get('claimId') or '').strip()
+    decision = (body.get('decision') or '').strip()
+    if not claim_id or decision not in CLAIM_DECISIONS:
+        return JSONResponse({'error': f'claimId and a decision in {sorted(CLAIM_DECISIONS)} are required'}, status_code=400)
+    try:
+        rec = mark_reviewed(claim_id, decision, artifact=body.get('artifact'))
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    if rec is None:
+        return JSONResponse({'error': 'unknown claim id'}, status_code=404)
+    log_action(agent_id, 'evidence_review', {'claim_id': claim_id, 'decision': decision})
+    return JSONResponse({'ok': True, 'claim': rec})
+
+
+@app.post('/api/evidence/resolve')
+async def evidence_resolve(request: Request):
+    # Resolve a URL to its final landing URL, SSRF-safe, WITHOUT fetching its
+    # content. This is how the desk verifies a short link before trusting it:
+    # t.co/abc and bit.ly/abc may look the same but land on different sites,
+    # and a short token can be repointed to a malicious destination. Returns
+    # the resolved URL, hop count, and the source identity derived from it.
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'unknown')
+    if verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    url = (body.get('url') or '').strip()
+    if not url:
+        return JSONResponse({'error': 'url is required'}, status_code=400)
+    if not _is_safe_public_host((urllib.parse.urlparse(url).hostname or '').lower()):
+        return JSONResponse({'error': 'that host is not a public, reachable address'}, status_code=400)
+    try:
+        final_url, hops = _resolve_final_url(url)
+    except Exception as e:
+        return JSONResponse({'error': f'could not resolve: {e}'}, status_code=500)
+    identity, meta = source_identity(url, final_url if final_url != url else None)
+    if final_url != url:
+        log_action(agent_id, 'evidence_resolve', {'url': url, 'finalUrl': final_url,
+                                                  'hops': hops, 'is_short_link': meta['is_short_link']})
+    return JSONResponse({'url': url, 'finalUrl': final_url, 'hops': hops,
+                         'resolved': final_url != url,
+                         'identity': identity, 'meta': meta})
+
+
+@app.post('/api/coverage')
+async def coverage_write(request: Request):
+    # Write a coverage entry: {identity, reviewed, artifact, event_id, ...}.
+    # reviewed=False (the crawl's default after a synthesis lands) yields
+    # 'pending_review' -- visible but NOT covered. reviewed=True is the
+    # operator/Verifier's "this brief was reviewed" move that marks 'covered'.
+    # {identity, failure: reason} records a failed run and never suppresses the
+    # next attempt.
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'unknown')
+    if verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    identity = (body.get('identity') or '').strip()
+    if not identity:
+        return JSONResponse({'error': 'identity is required'}, status_code=400)
+    if body.get('failure'):
+        rec = record_run_failure(identity, body['failure'], artifact=body.get('artifact'),
+                                 event_id=body.get('eventId'),
+                                 source_url=body.get('sourceUrl'),
+                                 resolved_url=body.get('resolvedUrl'))
+        log_action(agent_id, 'coverage_failure', {'identity': identity, 'reason': body['failure']})
+        return JSONResponse({'ok': True, 'coverage': rec})
+    rec = mark_covered(identity, artifact=body.get('artifact'),
+                       reviewed=bool(body.get('reviewed')),
+                       event_id=body.get('eventId'),
+                       source_url=body.get('sourceUrl'),
+                       resolved_url=body.get('resolvedUrl'),
+                       material_update_ms=body.get('materialUpdateMs'),
+                       run_id=body.get('runId'))
+    log_action(agent_id, 'coverage_write', {'identity': identity, 'reviewed': bool(body.get('reviewed'))})
+    return JSONResponse({'ok': True, 'coverage': rec})
+
+
+@app.get('/api/coverage')
+async def coverage_list(request: Request):
+    coverage = _coverage_read() or {}
+    status = request.query_params.get('status')
+    if status is not None and status not in COVERAGE_STATUSES:
+        return JSONResponse({'error': f'status must be one of {sorted(COVERAGE_STATUSES)}'}, status_code=400)
+    rows = list(coverage.values())
+    if status is not None:
+        rows = [r for r in rows if r.get('status') == status]
+    rows = sorted(rows, key=lambda r: r.get('updated_ts', 0))
+    return JSONResponse({'coverage': rows})
+
+
+@app.get('/api/policy')
+async def policy_view(request: Request):
+    # The operator-edited policy (world/config.py) as loaded right now: the
+    # ban list, browse block categories, desk passes, and research watchlist.
+    # This is the read surface for the operator UI and for villagers who want
+    # to see the standing desk rules.
+    import config as _config
+    return JSONResponse({
+        'plain_writing': {'banned': list(_config.PLAIN_WRITING_BAN_LIST)},
+        'browse_policy': {'block_categories': list(_config.BROWSE_BLOCK_CATEGORIES)},
+        'research_desk': {'passes': [dict(p) for p in _config.RESEARCH_DESK_PASSES]},
+        'watchlist': {'topics': [dict(t) for t in _config.RESEARCH_WATCHLIST]},
+        'writeback_enabled': bool(_config.ALLOW_WATCHLIST_WRITE),
+    })
+
+
+@app.post('/api/policy/reload')
+async def policy_reload(request: Request):
+    # Re-read the four world/*.json policy files so an operator's file edits
+    # apply without a server restart. Fails closed: a bad edit keeps the
+    # previous loaded values, and the response reports what each file loaded.
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    agent_id = (body.get('agentId') or 'unknown')
+    if agent_id != 'player' and verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    result = reload_policy_config()
+    log_action(None, 'policy_reload', {k: len(v) for k, v in result.items()})
+    return JSONResponse({'ok': True, 'loaded': result})
 
 @app.post('/api/allowlist/request')
 async def allowlist_request(request: Request):
@@ -19075,6 +19351,11 @@ SELF_BASE_URL = _load_env().get('SELF_BASE_URL', 'http://localhost:8010')
 _SANDBOX_RESEARCH_ID = 'research-shared'  # index.html: RESEARCH_SANDBOX_ID
 RESEARCH_CRAWL_MAX_PAGES = 50             # tasks.js crawlAndCollect -- raised 6->30->50 for deeper research
 RESEARCH_SKILL_SYNTHESIS_TOKENS = 900     # runResearchTask /api/chat max_tokens
+# Recurring research searches the period since the last run MINUS this
+# overlap, so a discovery landing just after the previous window is caught
+# (matches the Research Desk routine's "24-hour overlap to catch late
+# discoveries"). Mirrors evidence.DEFAULT_OVERLAP_MS.
+RESEARCH_OVERLAP_MS = 24 * 3600 * 1000
 
 
 def _http_json(method, base, path, body=None, header=None, timeout=30):

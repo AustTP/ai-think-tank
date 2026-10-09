@@ -1,0 +1,20 @@
+{
+  "comment": "Standing research topics the desk watches (RESEARCH_WATCHLIST). The operator edits this file to add/change sources; on server boot it seeds researchTopics. When a village agent adds a topic through the intent lane, it is appended here so you see their additions in the same file. cadenceMs is how often the crawl fires (floored to 5 minutes); linkKeyword/pageKeyword filter which linked pages are followed/kept.",
+  "topics": [
+    {
+      "topic": "t",
+      "startUrl": "https://x",
+      "cadenceMs": 3600000
+    },
+    {
+      "topic": "watch",
+      "startUrl": "https://example.com",
+      "cadenceMs": 3600000
+    },
+    {
+      "topic": "x",
+      "startUrl": "https://example.com",
+      "cadenceMs": 3600000
+    }
+  ]
+}

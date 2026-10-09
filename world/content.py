@@ -30,6 +30,8 @@ import urllib.parse
 
 import serve as _serve
 
+from config import RESEARCH_DESK_PASSES
+
 
 def _chat_error_result(r, fallback_note):
     """Item 4: when /api/chat refuses a call carrying a taskId because that
@@ -56,6 +58,86 @@ PREMISE_QUESTIONING_GUIDANCE = (
     'Challenge the frame -- the most valuable finding is often that the frame was '
     'wrong. Distinguish what you actually verified from what you are assuming.'
 )
+
+
+# The Research Desk's multi-pass search structure (article section 4): give
+# the desk several small questions rather than one giant query, one pass per
+# question. Each pass records its question, window, and links so the run is
+# auditable. These are folded into the research synthesis prompt; they are
+# research instructions, not a promise of exhaustive X coverage.
+# Loaded from world/research_desk.json by world/config.py (operator-edited).
+
+
+def _record_source_evidence(base, key, agent_id, source_url, resolved_url, text, lastmod,
+                            topic_id, task_id, claim_type='unclassified'):
+    """POST one candidate source to the server's evidence ledger (/api/evidence).
+    The server applies source identity (resolved landing URL -- a short link's
+    raw string is never the identity), the coverage gate, and the repost rule.
+    `agent_id` is the real research agent (its key is in `key`), so the POST
+    passes the endpoint's agent-key auth. Returns the decision dict:
+    - {'recorded': True, ...} -> keep the page
+    - {'recorded': False, 'reason': 'covered'} -> skip (already covered, no
+      material update)
+    - {'recorded': False, 'reason': 'invalid'} -> malformed; keep the page but
+      don't record (a candidate page is still useful for the crawl).
+    Best-effort: an evidence endpoint failure must never abort a crawl, so a
+    failed POST degrades to 'recorded' (the page proceeds)."""
+    record = {
+        'source_url': source_url,
+        'resolved_url': resolved_url or None,
+        'claim': (text or '')[:200] or 'Unclassified candidate from scheduled research',
+        'claim_type': claim_type,
+        'scope': 'Candidate from scheduled research crawl; not independently verified',
+        'lastModified': lastmod,
+        'topicId': topic_id,
+        'taskId': task_id,
+    }
+    try:
+        r = _serve._http_json('POST', base, '/api/evidence',
+                              {'agentId': agent_id, 'record': record}, key)
+        if isinstance(r, dict) and r.get('recorded') is False:
+            return r
+        return r if isinstance(r, dict) else {'recorded': True}
+    except Exception:
+        return {'recorded': True}
+
+
+def _note_research_coverage(base, key, agent_id, identity, artifact, reviewed=False,
+                            source_url=None, resolved_url=None, topic_id=None,
+                            run_id=None):
+    """POST a coverage entry (reviewed=False from the crawl -> pending_review;
+    the operator/Verifier later marks reviewed=True -> covered)."""
+    try:
+        _serve._http_json('POST', base, '/api/coverage', {
+            'agentId': agent_id,
+            'identity': identity,
+            'artifact': artifact,
+            'reviewed': reviewed,
+            'eventId': topic_id,
+            'sourceUrl': source_url,
+            'resolvedUrl': resolved_url,
+            'runId': run_id,
+        }, key)
+    except Exception:
+        pass
+
+
+def _note_research_failure(base, key, agent_id, identity, reason, source_url=None,
+                           resolved_url=None, topic_id=None):
+    """POST a failed run against a source identity. A failure never suppresses
+    the next attempt (only 'covered' does)."""
+    try:
+        _serve._http_json('POST', base, '/api/coverage', {
+            'agentId': agent_id,
+            'identity': identity,
+            'failure': reason,
+            'eventId': topic_id,
+            'sourceUrl': source_url,
+            'resolvedUrl': resolved_url,
+        }, key)
+    except Exception:
+        pass
+
 
 
 def _run_research_content(snapshot, agent_id, task, base_ctx=None):
@@ -87,6 +169,11 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
     in_room = 'observatory'
 
     # crawlAndCollect: BFS over the frontier, /api/browse each, save kept pages.
+    # Each kept page is ALSO routed through the Research Desk evidence ledger:
+    # the browse response carries the RESOLVED landing URL (a short link's raw
+    # string is never the source identity), and the /api/evidence decision
+    # tells us whether to skip a page whose source is already covered with no
+    # material update.
     visited = []
     frontier = [topic.get('startUrl')]
     kept = []
@@ -103,6 +190,7 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
             continue
         text = data.get('text') or ''
         lastmod = data.get('lastModified') or 0
+        resolved_url = (data.get('url') or url)
         changed = bool(lastmod) and lastmod > since
         already = url in seen
         if already and not changed:
@@ -110,6 +198,15 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
         else:
             should_keep = (not page_kw) or (page_kw in text.lower())
             if should_keep:
+                # Evidence gate first: skip a source that is already COVERED
+                # (reviewed brief) without a material update. The server's
+                # /api/evidence decides on the RESOLVED identity, so two short
+                # links that LOOK the same but land on different sites are
+                # never conflated, and a repost is never saved as a new find.
+                ev = _record_source_evidence(base, key, agent_id, url, resolved_url, text,
+                                             lastmod, topic.get('id'), task.get('id'))
+                if ev.get('recorded') is False and ev.get('reason') == 'covered':
+                    continue  # covered identity, no material update -- skip the duplicate page
                 idx = len(kept) + 1
                 saved = _serve._http_json('POST', base, '/api/sandbox-save-page',
                                    {'agentId': agent_id, 'sandboxId': sandbox_id,
@@ -117,7 +214,8 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
                                     'filename': f'crawl-{idx}.txt', 'content': text,
                                     'inRoom': in_room}, key)
                 if saved.get('allowed') and saved.get('ok'):
-                    kept.append({'url': url, 'text': text})
+                    kept.append({'url': url, 'resolved_url': resolved_url,
+                                 'text': text, 'lastModified': lastmod})
         # Extend the frontier with matching links (dedup against visited/queued).
         for link in (data.get('links') or []):
             lu = link.get('url')
@@ -130,20 +228,45 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
     # (manifest.json write is omitted -- the browser saves it, but nothing reads
     # it back server-side; skip the extra call. Kept pages are the durable out.)
 
+    # The pass log makes the multi-pass search audit-visible: which question
+    # was asked, over what window, and what the run actually saw. The article's
+    # rule -- "a missing result is not proof that nobody reported a problem" --
+    # is the point of writing this down instead of asserting coverage.
+    pass_log = [{
+        'key': p['key'],
+        'question': p['question'],
+        'window_since_ms': since,
+        'pages_checked': len(visited),
+        'candidates_found': sum(1 for k in kept if k.get('url')),
+    } for p in RESEARCH_DESK_PASSES]
+
     # Synthesize the updated skill file from freshly collected sources.
     note = None
+    artifact = f"skills/{_skill_slug(topic.get('topic'))}.md"
+    run_id = task.get('id')
     if kept:
         existing = _serve._http_json('GET', base, '/api/library/file?path=' +
-                              urllib.parse.quote(f"skills/{_skill_slug(topic.get('topic'))}.md") + '&requesterId=' + urllib.parse.quote(agent_id), None, key)
+                              urllib.parse.quote(artifact) + '&requesterId=' + urllib.parse.quote(agent_id), None, key)
         existing_content = existing.get('content') if isinstance(existing, dict) and 'content' in existing else None
         tier_slug = _serve._resolve_model_tier(f'Synthesize an updated skill-reference file for research topic: {topic.get("topic")}')
         if not tier_slug:
             note = f'Collected {len(kept)} new page(s) for "{topic.get("topic")}", but synthesis failed (no model tier).'
+            for k in kept:
+                _note_research_failure(base, key, agent_id, _serve.source_identity(k['url'], k['resolved_url'])[0],
+                                       'synthesis failed (no model tier)', source_url=k['url'],
+                                       resolved_url=k['resolved_url'], topic_id=topic.get('id'))
         else:
             sources_text = '\n\n'.join(
                 f'### {p["url"]}\n{(p.get("text") or "")[:3000]}' for p in kept)
+            passes_text = '\n'.join(
+                f'- Pass {i + 1} ({p["key"]}): {p["question"]}'
+                for i, p in enumerate(RESEARCH_DESK_PASSES))
             sys_msg = (f'You are updating a real skill-reference file for "{topic.get("topic")}". '
                        f'{_skill_file_format_guide()} '
+                       f'Answer the desk passes explicitly (one section each):\n{passes_text}\n'
+                       'Separate what a source actually supports from our inference. '
+                       'Do not treat a repost as a second independent source. '
+                       'Note limits, uncertainty, and anything you could not check. '
                        + PREMISE_QUESTIONING_GUIDANCE + ' '
                        + (f'Here is the EXISTING skill file -- preserve what still holds, update what changed, add what is genuinely new:\n\n{existing_content[:6000]}'
                           if existing_content else 'No existing skill file yet -- write one from scratch.'))
@@ -164,10 +287,18 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
             if reply:
                 _serve._http_json('POST', base, '/api/library/file',
                            {'agentId': agent_id,
-                            'path': f"skills/{_skill_slug(topic.get('topic'))}.md",
+                            'path': artifact,
                             'content': reply, 'source': 'external'}, key)
                 note = (f'Ran scheduled research for "{topic.get("topic")}" -- collected '
                         f'{len(kept)} new page(s) and wrote an updated skill file (pending review).')
+                # Coverage entries land PENDING_REVIEW (reviewed=False): visible,
+                # but they do NOT suppress a re-report until the Verifier clears
+                # them. Only a reviewed brief counts as covered.
+                for k in kept:
+                    _note_research_coverage(base, key, agent_id, _serve.source_identity(k['url'], k['resolved_url'])[0],
+                                            artifact, reviewed=False, source_url=k['url'],
+                                            resolved_url=k['resolved_url'],
+                                            topic_id=topic.get('id'), run_id=run_id)
             else:
                 budget_hit = _chat_error_result(r, f'Collected {len(kept)} new page(s) for "{topic.get("topic")}", but the skill-file synthesis call was paused because this task used its full model-spend budget.')
                 if budget_hit:
@@ -175,6 +306,11 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
                     return
                 note = (f'Collected {len(kept)} new page(s) for "{topic.get("topic")}", '
                         'but the skill-file synthesis call didn\'t produce anything usable.')
+                for k in kept:
+                    _note_research_failure(base, key, agent_id, _serve.source_identity(k['url'], k['resolved_url'])[0],
+                                           'skill-file synthesis produced nothing usable',
+                                           source_url=k['url'], resolved_url=k['resolved_url'],
+                                           topic_id=topic.get('id'))
     else:
         note = (f'Ran scheduled research for "{topic.get("topic")}" -- nothing new since '
                 f'last time (checked {len(visited)} page(s)).')
@@ -185,7 +321,8 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
     for u in visited:
         seen.add(u)
     _sim_module._store_content_result(task.get('id'),
-                                      {'note': note, 'seenUrls': sorted(seen)})
+                                      {'note': note, 'seenUrls': sorted(seen),
+                                       'passLog': pass_log})
 
 
 def _skill_slug(name):

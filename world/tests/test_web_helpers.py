@@ -11,6 +11,7 @@ import os
 import sys
 import unittest
 import unittest.mock
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -171,6 +172,76 @@ class Sha256File(unittest.TestCase):
                              web_helpers._sha256_file(path))
         finally:
             os.unlink(path)
+
+
+class _FakeResp:
+    """A stand-in for urllib's response object: geturl() + read() + close()."""
+
+    def __init__(self, final_url, content=b''):
+        self._final = final_url
+        self._content = content
+
+    def geturl(self):
+        return self._final
+
+    def read(self, n=-1):
+        return self._content[:n] if n and n > 0 else self._content
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class IsShortLink(unittest.TestCase):
+    def test_known_shortener_hosts(self):
+        self.assertTrue(web_helpers._is_short_link('https://t.co/abc123'))
+        self.assertTrue(web_helpers._is_short_link('https://bit.ly/xyz'))
+        self.assertTrue(web_helpers._is_short_link('http://tinyurl.com/abc'))
+        self.assertTrue(web_helpers._is_short_link('https://lnkd.in/abc'))
+
+    def test_subdomains_of_shorteners_count(self):
+        self.assertTrue(web_helpers._is_short_link('https://sub.bit.ly/abc'))
+
+    def test_regular_sites_are_not_shorteners(self):
+        self.assertFalse(web_helpers._is_short_link('https://example.com/abc'))
+        self.assertFalse(web_helpers._is_short_link('https://docs.python.org/3/'))
+        self.assertFalse(web_helpers._is_short_link(''))
+
+    def test_case_insensitive_and_garbage_safe(self):
+        self.assertTrue(web_helpers._is_short_link('https://T.CO/abc'))
+        self.assertFalse(web_helpers._is_short_link('not a url'))
+
+
+class ResolveFinalUrl(unittest.TestCase):
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_returns_resolved_landing_url(self):
+        # t.co/abc123 resolves to a real site; the short string is NOT the
+        # landing URL.
+        unittest.mock.patch.object(web_helpers, '_safe_urlopen',
+                                   return_value=_FakeResp('https://realcompany.com/blog/launch')).start()
+        final, hops = web_helpers._resolve_final_url('https://t.co/abc123')
+        self.assertEqual(final, 'https://realcompany.com/blog/launch')
+
+    def test_failure_returns_url_unchanged_and_zero_hops(self):
+        unittest.mock.patch.object(web_helpers, '_safe_urlopen',
+                                   side_effect=urllib.error.URLError('host not public')).start()
+        final, hops = web_helpers._resolve_final_url('https://t.co/abc123')
+        self.assertEqual(final, 'https://t.co/abc123')
+        self.assertEqual(hops, 0)
+
+    def test_non_http_scheme_returns_unchanged(self):
+        final, hops = web_helpers._resolve_final_url('ftp://example.com/x')
+        self.assertEqual(final, 'ftp://example.com/x')
+        self.assertEqual(hops, 0)
+
+    def test_empty_url_returns_unchanged(self):
+        final, hops = web_helpers._resolve_final_url('')
+        self.assertEqual(final, '')
+        self.assertEqual(hops, 0)
 
 
 if __name__ == '__main__':
