@@ -145,6 +145,63 @@ class RegistryLoader(unittest.TestCase):
         self.assertIn('apify', serve._API_SERVICES)
 
 
+class RegistryFreshness(unittest.TestCase):
+    """Config-only service registration: an operator's row edit goes live
+    without a restart. The freshness check reloads _API_SERVICES when the
+    active-row fingerprint (count + max updated_at) changes."""
+
+    def setUp(self):
+        serve._API_SERVICES_FINGERPRINT = None
+        serve._API_SERVICES_FRESH_CHECK = 0.0
+        serve._load_api_services()
+
+    def tearDown(self):
+        # Remove only the rows this class inserted; init_db's seed of the
+        # built-in services must survive so later tests load the full registry.
+        with serve._db() as conn:
+            conn.execute("DELETE FROM api_services WHERE id='brand-new'")
+        serve._API_SERVICES_FINGERPRINT = None
+        serve._API_SERVICES_FRESH_CHECK = 0.0
+        serve._load_api_services()
+
+    def _insert_service(self, sid='brand-new', status='active'):
+        spec = {'id': sid, 'name': sid, 'base_url': 'https://api.example.com',
+                'credential': {'type': 'none'}, 'auth': {'type': 'none'},
+                'methods': ['GET'], 'path_rules': [{'prefix': '/', 'methods': ['GET']}],
+                'spend': {'kind': 'none'}, 'workflow': None}
+        row = serve._api_service_spec_to_row(sid, spec, status=status, proposed_by='ops')
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO api_services (' + ','.join(serve._API_SERVICE_COLUMNS) + ') '
+                'VALUES (' + ','.join('?' * len(serve._API_SERVICE_COLUMNS)) + ')',
+                [row.get(c) for c in serve._API_SERVICE_COLUMNS])
+
+    def test_new_db_row_is_picked_up_without_restart(self):
+        self._insert_service('brand-new')
+        self.assertNotIn('brand-new', serve._API_SERVICES)
+        serve._ensure_api_services_fresh()
+        self.assertIn('brand-new', serve._API_SERVICES)
+
+    def test_revoked_row_is_dropped_without_restart(self):
+        self._insert_service('brand-new')
+        serve._ensure_api_services_fresh()
+        self.assertIn('brand-new', serve._API_SERVICES)
+        with serve._db() as conn:
+            conn.execute("UPDATE api_services SET status='denied', updated_at=? WHERE id='brand-new'",
+                         (time.time(),))
+        # The TTL gate only skips re-checks inside the window; force a re-check.
+        serve._API_SERVICES_FRESH_CHECK = 0.0
+        serve._ensure_api_services_fresh()
+        self.assertNotIn('brand-new', serve._API_SERVICES)
+
+    def test_unchanged_table_does_not_reload(self):
+        self._insert_service('brand-new')
+        serve._ensure_api_services_fresh()
+        with unittest.mock.patch.object(serve, '_load_api_services') as loader:
+            serve._ensure_api_services_fresh()  # inside the TTL window -> no reload
+        self.assertFalse(loader.called)
+
+
 class CredentialResolution(unittest.TestCase):
     def test_env_credential(self):
         spec = {'credential': {'type': 'env', 'key': 'GITHUB_TOKEN'}}
@@ -156,7 +213,8 @@ class CredentialResolution(unittest.TestCase):
 
     def test_env_missing(self):
         spec = {'credential': {'type': 'env', 'key': 'GITHUB_TOKEN'}}
-        with unittest.mock.patch.object(serve, 'GITHUB_TOKEN', None):
+        with unittest.mock.patch.object(serve, 'GITHUB_TOKEN', None), \
+             unittest.mock.patch.object(serve, '_load_env', return_value={}):
             token, token2, err = serve._api_credential_value(spec)
         self.assertIsNone(token)
         self.assertIn('GITHUB_TOKEN', err)
@@ -167,6 +225,26 @@ class CredentialResolution(unittest.TestCase):
              unittest.mock.patch.object(serve, 'HIGGSFIELD_API_KEY_SECRET', 'sec'):
             token, token2, err = serve._api_credential_value(spec)
         self.assertEqual((token, token2, err), ('id', 'sec', None))
+
+    def test_env_credential_falls_back_to_live_env_without_a_module_global(self):
+        # A brand-new service key with no module global (e.g. a fresh .env key
+        # an operator adds for a new registry row) must resolve from .env --
+        # previously this required a code change to add the global.
+        spec = {'credential': {'type': 'env', 'key': 'BRAND_NEW_API_KEY'}}
+        self.assertFalse(hasattr(serve, 'BRAND_NEW_API_KEY'))
+        with unittest.mock.patch.object(serve, '_load_env', return_value={'BRAND_NEW_API_KEY': 'secret'}):
+            token, token2, err = serve._api_credential_value(spec)
+        self.assertEqual((token, token2, err), ('secret', None, None))
+
+    def test_module_global_wins_over_live_env(self):
+        # Existing behavior preserved: a patched/rebound module global is
+        # authoritative when both it and .env hold a value.
+        spec = {'credential': {'type': 'env', 'key': 'GITHUB_TOKEN'}}
+        with unittest.mock.patch.object(serve, 'GITHUB_TOKEN', 'from-global'), \
+             unittest.mock.patch.object(serve, '_load_env', return_value={'GITHUB_TOKEN': 'from-env'}):
+            token, _, err = serve._api_credential_value(spec)
+        self.assertEqual(token, 'from-global')
+        self.assertIsNone(err)
 
     def test_vault_credential(self):
         spec = {'credential': {'type': 'vault', 'name': 'pixellab'}}
@@ -412,7 +490,8 @@ class ApiCallEndpoint(unittest.TestCase):
 
     def test_registered_credential_missing_blocked(self):
         self._start(self._gates())
-        with unittest.mock.patch.object(serve, 'GITHUB_TOKEN', None):
+        with unittest.mock.patch.object(serve, 'GITHUB_TOKEN', None), \
+             unittest.mock.patch.object(serve, '_load_env', return_value={}):
             r = self._client().post('/api/api-call', json={
                 'agentId': 'ben', 'url': 'https://api.github.com/repos/o/r', 'method': 'GET', 'purpose': 'p'})
         self.assertFalse(r.json()['allowed'])
