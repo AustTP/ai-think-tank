@@ -1,0 +1,1 @@
+source_name,source_url,update_frequency,historical_data_available,api_or_rss_available,usage_restrictions\ncoinbase_market_data,https://www.cryptodatadownload.com/data/coinbase/,daily,from 2019-03-30,api,Free tier, paid premium tier, all requests need to be made over https

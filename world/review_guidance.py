@@ -74,6 +74,19 @@ def render_form(task, action_url, agents):
 
 def apply_guidance(state, task_id, data):
     import sim
+    if data.get('action') == 'research':
+        seen = set()
+        while task_id not in seen:
+            seen.add(task_id)
+            current = (state.get('tasks') or {}).get(task_id) or {}
+            parent_id = current.get('investigationOf') or current.get('reviewOf')
+            if not parent_id or parent_id not in (state.get('tasks') or {}): break
+            task_id = parent_id
+        existing = next((q for q in state.get('workQueue',[]) if q.get('investigationOf') == task_id),None)
+        active = next((t for t in (state.get('tasks') or {}).values() if t.get('investigationOf') == task_id
+                       and t.get('status') in ('walking','working')),None)
+        if existing or active:
+            return {'ok':True,'taskId':task_id,'action':'research','status':'investigating','alreadyQueued':True}
     task = (state.get('tasks') or {}).get(task_id)
     if not task:
         raise ValueError('Unknown task.')

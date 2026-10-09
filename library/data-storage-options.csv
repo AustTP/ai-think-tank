@@ -1,0 +1,1 @@
+filename,columns,data_types,storage_size,retrieval_time\nflat_files_csv,3,3,3,3\ncolumnar_data_warehouses,4,4,4,4\ncloud_storage_solutions,4,4,4,4\npostgreSQL,5,5,5,5\nInfluxDB,5,5,5,5\nIPFS,4,4,4,4

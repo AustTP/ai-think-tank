@@ -1,0 +1,6 @@
+data_type,source,api_endpoint,retrieval_method,rate_limit,efficiency_notes,basis
+Historical Crypto Price Data,CoinGecko,/coins/{id}/contract/market_chart,API,100 requests/min,Use pagination for large data sets,Verified
+Sentiment Data,News API (example),/v2/top-headlines,API,100 requests/day (free tier),Filter by 'crypto' keyword,Estimated
+Trade Data,Coinbase,/reports/trades,API,60 requests/min,Use pagination for large data sets,Verified
+Quote Data,Coinbase,/products/{product_id}/book,API,60 requests/min,Use depth parameter for Level 2/3 data,Verified
+VWAP Data,Coinbase,/products/{product_id}/stats,API,60 requests/min,Calculate VWAP using trade data,Verified

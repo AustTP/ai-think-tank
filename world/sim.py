@@ -1851,6 +1851,11 @@ def _apply_content_result(state, task, result, now_ms=None):
     `now_ms` is threaded from the caller (the tick already has it); a caller
     that omits it falls back to wall-clock so the function stays standalone."""
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    if result.get('providerAccountBlocked'):
+        blocked = (state.get('tasks') or {}).get(task.get('reviewOf')) or task
+        blocked.update(status='blocked',manualAttention=True,blockedReason='provider_account_limit',
+                       failNote=result.get('note'),reviewFailureKind='missing_inputs')
+        blocked.setdefault('_peerGate',{})['escalated'] = True
     if result.get('ok') is False:
         task['failedAt'] = now_ms
     if result.get('reviewContract') and task.get('reviewOf'):

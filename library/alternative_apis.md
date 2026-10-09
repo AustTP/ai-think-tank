@@ -1,0 +1,1 @@
+## Alternative APIs for Hourly Cryptocurrency Price Data### CoinMarketCap API* Provides real-time and historical price data for a wide range of cryptocurrencies### CoinGecko API* Provides real-time and historical price data for a wide range of cryptocurrencies### CoinPaprika API* Provides real-time and historical price data for a wide range of cryptocurrencies

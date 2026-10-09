@@ -25,6 +25,15 @@ def state():
 
 
 class Guidance(unittest.TestCase):
+    def test_investigation_of_investigation_routes_to_original_once(self):
+        s=state()
+        s['tasks']['child']={'id':'child','status':'failed','investigationOf':'t'}
+        guidance.apply_guidance(s,'child',{'action':'research'})
+        self.assertEqual(s['workQueue'][0]['investigationOf'],'t')
+        again=guidance.apply_guidance(s,'child',{'action':'research'})
+        self.assertTrue(again['alreadyQueued'])
+        self.assertEqual(len(s['workQueue']),1)
+
     def test_retry_queues_runnable_repair_and_clears_stale_blocker(self):
         s=state();t=s['tasks']['t']
         t.update(boardClearedAt=1,failNote='Old failure',blockedReason='code_director_check',

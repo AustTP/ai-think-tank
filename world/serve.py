@@ -5439,6 +5439,15 @@ def _apply_plain_writing(messages):
     return messages
 
 
+def _research_model_fallback(model):
+    if model not in ('meta-llama/llama-3.1-70b-instruct','mistralai/mistral-nemo'):
+        return None
+    choices = [_load_env().get('OPENROUTER_LLAMA_FALLBACK_MODEL','mistralai/mistral-nemo').strip(),
+               _coding_tier_slug(), _high_tier_slug()]
+    return next((candidate for candidate in choices if candidate and candidate != model
+                 and not is_model_circuit_broken(candidate)),None)
+
+
 def _read_openrouter_response(req):
     """A provider error inside HTTP 200 is a failure, not a valid completion.
 
@@ -5449,6 +5458,17 @@ def _read_openrouter_response(req):
         try:
             return json.loads(_urlopen_with_resilience(request, timeout=30))
         except urllib.error.HTTPError as error:
+            if error.code in (401,402,403):
+                try:
+                    failure = json.loads(error.read().decode('utf-8','replace'))
+                    message = str((failure.get('error') or {}).get('message') or error.reason)
+                except (ValueError,AttributeError):
+                    message = str(error.reason)
+                message = _redact_secrets(message)[:600]
+                budget = 'budget' in message.lower() or 'credit' in message.lower()
+                action = ('Restore the model provider workspace budget or credits; model fallbacks cannot resolve this account limit.'
+                          if budget else 'Check the model provider account and API key permissions; fallbacks cannot resolve account access restrictions.')
+                raise RuntimeError(f'Model provider account blocked (HTTP {error.code}): {message} {action}') from None
             if error.code != 429 and error.code < 500:
                 raise
             return {'error':{'code':error.code,'message':'Provider HTTP request failed'}}
@@ -5464,11 +5484,7 @@ def _read_openrouter_response(req):
         raise RuntimeError('Provider returned an error and the spend cap prevents a retry')
     body = json.loads(req.data)
     original_model = body.get('model')
-    fallback = None
-    if original_model == 'meta-llama/llama-3.1-70b-instruct':
-        fallback = _load_env().get('OPENROUTER_LLAMA_FALLBACK_MODEL','mistralai/mistral-nemo').strip()
-        if fallback == original_model or (fallback and is_model_circuit_broken(fallback)):
-            fallback = None
+    fallback = _research_model_fallback(original_model)
     if fallback:
         body['model'] = fallback
         # Provider preferences for the failing model may not serve the fallback.
@@ -5482,6 +5498,19 @@ def _read_openrouter_response(req):
     retry = urllib.request.Request(req.full_url, data=json.dumps(body).encode(),
                                    headers=dict(req.header_items()), method='POST')
     recovered = read_response(retry)
+    if failed(recovered) and fallback == 'mistralai/mistral-nemo' and not _think_tank_spend_cap_exceeded():
+        record_model_result(fallback, success=False)
+        next_model = _research_model_fallback(fallback)
+        if next_model:
+            failed_cost = (recovered.get('usage') or {}).get('cost',0)
+            body['model'] = next_model
+            fallback = next_model
+            retry = urllib.request.Request(req.full_url,data=json.dumps(body).encode(),
+                                           headers=dict(req.header_items()),method='POST')
+            recovered = read_response(retry)
+            if isinstance(failed_cost,(int,float)) and failed_cost:
+                usage = recovered.setdefault('usage',{})
+                usage['cost'] = float(usage.get('cost') or 0) + failed_cost
     if failed(recovered):
         def explanation(data):
             error = data.get('error') or {}
@@ -5514,8 +5543,7 @@ def _call_openrouter_once_sync(model, messages, max_tokens):
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if is_model_circuit_broken(model):
-        fallback = (_load_env().get('OPENROUTER_LLAMA_FALLBACK_MODEL', 'mistralai/mistral-nemo').strip()
-                    if model == 'meta-llama/llama-3.1-70b-instruct' else None)
+        fallback = _research_model_fallback(model)
         if fallback and fallback != model and not is_model_circuit_broken(fallback):
             model = fallback
         else:
@@ -5585,8 +5613,7 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if is_model_circuit_broken(model):
-        fallback = (_load_env().get('OPENROUTER_LLAMA_FALLBACK_MODEL', 'mistralai/mistral-nemo').strip()
-                    if model == 'meta-llama/llama-3.1-70b-instruct' else None)
+        fallback = _research_model_fallback(model)
         if fallback and fallback != model and not is_model_circuit_broken(fallback):
             model = fallback
         else:
@@ -8926,8 +8953,47 @@ async def intent_publish(request: Request):
                          'push': (push.stdout or '')[-200:] or (push.stderr or '')[-200:]})
 
 
+@app.post('/api/intent/spike/{task_id}/deny')
+async def intent_deny_spike(task_id: str, request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    import spike_triage
+    with _STATE_UPDATE_LOCK:
+        state = get_state_from_db()
+        if not state:
+            return JSONResponse({'error': 'state unavailable'}, status_code=503)
+        task = (state.get('tasks') or {}).get(task_id)
+        if not task:
+            return JSONResponse({'error': 'Unknown spike.'}, status_code=404)
+        if task.get('taskType') != 'spike' or task.get('status') != 'done' or task.get('reviewOf'):
+            return JSONResponse({'error': 'Only completed investigations can be denied.'}, status_code=409)
+        matches = spike_triage.group(state, task)
+        if any(t.get('promotedAt') or t.get('promotedRequestId') for t in matches):
+            return JSONResponse({'error': 'This spike has already been promoted.'}, status_code=409)
+        now = int(time.time() * 1000)
+        for match in matches:
+            match.setdefault('triageDeniedAt', now)
+            match['triageDeniedBy'] = 'player'
+        save_state_to_db(state)
+        ids = [t['id'] for t in matches]
+        log_action('player', 'spike_denied', {'spikeIds': ids}, authorized=True)
+        return JSONResponse({'ok': True, 'deniedIds': ids, 'triageDeniedAt': now})
+
+
 @app.post('/api/intent/spike/{task_id}/promote')
 async def intent_promote_spike(task_id: str, request: Request):
+    # Parse before locking; the implementation reads the cached body without IO.
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    try:
+        await request.json()
+    except Exception:
+        pass
+    with _STATE_UPDATE_LOCK:
+        return await _intent_promote_spike_locked(task_id, request)
+
+
+async def _intent_promote_spike_locked(task_id: str, request: Request):
     """Phase E3.5 spike->triage: the player promotes a completed spike's findings
     into a REAL, queued deliverable story. A spike (E2b) lands a findings note and
     then dead-ends -- this is the loop-closing link: 'investigate -> player decides
@@ -8956,6 +9022,17 @@ async def intent_promote_spike(task_id: str, request: Request):
         return JSONResponse({'error': f'"{task.get("title")}" is not finished -- promote it once the spike lands.'},
                             status_code=409)
 
+    import spike_triage
+    matches = spike_triage.group(state, task)
+    if any(t.get('triageDeniedAt') for t in matches):
+        return JSONResponse({'error': 'This spike was denied during triage.'}, status_code=409)
+    promoted = next((t for t in matches if t.get('promotedRequestId')), None)
+    if promoted:
+        return JSONResponse({'ok': True, 'requestId': promoted['promotedRequestId'],
+                             'groomerId': promoted.get('promotedTo'),
+                             'promotedAt': promoted.get('promotedAt'), 'alreadyPromoted': True})
+    if any(t.get('promotedAt') for t in matches):
+        return JSONResponse({'ok': True, 'alreadyPromoted': True})
     try:
         body = await request.json()
     except Exception:
@@ -8996,7 +9073,8 @@ async def intent_promote_spike(task_id: str, request: Request):
                    taskType='spike', budgetMs=task.get('budgetMs') or 120_000,
                    origin='spike_promotion', sourceSpikeId=task_id,
                    goal=task.get('goal') or title)
-        task.update(promotedRequestId=req['id'], promotedTo='theo', promotedAt=now_ms)
+        for match in matches:
+            match.update(promotedRequestId=req['id'], promotedTo='theo', promotedAt=now_ms)
         _sim.kick_refinement_now(state, req['teamId'], now_ms)
         save_state_to_db(state)
         details = {'spikeId': task_id, 'requestId': req['id'], 'groomerId': 'theo'}
@@ -9073,6 +9151,8 @@ async def intent_promote_spike(task_id: str, request: Request):
             'taskType': task_type,
         }
     _sim.queue_work(state, [new_item])
+    for match in matches:
+        match['promotedAt'] = int(time.time() * 1000)
     save_state_to_db(state)
     player_id = 'player'
     log_action(player_id, 'spike_promoted',

@@ -59,6 +59,7 @@ class SpikeContent(unittest.TestCase):
         # so a spike (an investigation) exercises the mid path -- and the
         # underlying tier slugs are pinned so no real model resolution happens.
         patchers = [
+            unittest.mock.patch.object(content, '_library_report_saved', return_value=True),
             unittest.mock.patch.object(serve, 'get_or_create_agent_key', return_value='key-123'),
             unittest.mock.patch.object(serve, '_coding_tier_slug', return_value=None),
             unittest.mock.patch.object(serve, '_low_tier_slug', return_value='low-tier-slug'),

@@ -1,0 +1,4 @@
+strategy_name,profit_margin,efficiency_score,verification_status
+Strategy 1,0.1,0.4,verified
+Strategy 2,0.2,0.5,estimated
+Strategy 3,0.3,0.6,verified

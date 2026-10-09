@@ -1,0 +1,2 @@
+api_name,url,retrieval_method,data_interval,status,notes
+Coinbase WebSocket Feed,https://www.coinbase.com/developer-platform/products/websocket-feed,WebSocket,1m,verified,Provides real-time market data

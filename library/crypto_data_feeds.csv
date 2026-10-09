@@ -1,0 +1,4 @@
+currency,date,open,high,low,close,volume,status
+BTC-USD,2022-01-01,40000,45000,35000,42000,100000,estimated
+ETH-USD,2022-01-01,3000,3500,2500,3200,50000,estimated
+LTC-USD,2022-01-01,150,180,120,160,20000,estimated

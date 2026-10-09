@@ -1,0 +1,4 @@
+api_name,pricing_tier,daily_data_access,hourly_data_access,commercial_license
+CoinMarketCap,Enterprise,2013,-,$custom
+CoinGecko,Enterprise,2013,2021,$29/month
+CoinPaprika,WebSocket,2021,2021,custom

@@ -1,0 +1,3 @@
+"framework_name","url","pros","cons","maintained","basis"
+"Coinbase Advanced API Python SDK","https://github.com/coinbase/coinbase-advanced-py","Handles authentication, HTTP connections, and provides helpful methods for interacting with the API","Only suitable for Coinbase Advanced API","Yes","Verified"
+"coinbase-advanced-py","https://github.com/coinbase/coinbase-advanced-py","Provides best practices for handling API secrets","May require additional setup for authentication","Yes","Verified"

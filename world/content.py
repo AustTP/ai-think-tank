@@ -2418,6 +2418,11 @@ def _release_product_from_build(product_id, releasing_agent, base, key):
         return
 
 
+def _library_report_saved(path):
+    target = _serve._safe_library_path(path)
+    return bool(target and os.path.isfile(target) and os.path.getsize(target) > 0)
+
+
 def _plain_completion(model, messages, max_tokens, service='spike', task_id=None,
                       village_id=None):
     """One non-tool completion call, with the same spend accrual _http_json
@@ -4430,6 +4435,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         # breaker propagated out of the tool loop and blew up the whole task.)
         _sim_module._store_content_result(task.get('id'), {
             'note': f'Spiked "{backlog}", but the investigation could not run (model call failed): {e}', 'ok': False,
+            'providerAccountBlocked': 'Model provider account blocked' in str(e),
+            'dataUnavailable': 'Model provider account blocked' in str(e),
             'notifyPlayer': {'kind': 'spike_done',
                              'subject': f'[AI Think Tank] Spike came up empty: {backlog[:80]}',
                              'body': f'{name} tried to spike "{backlog}" but the model call failed: {e}'},
@@ -4560,6 +4567,11 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # File complete labeled tables before a reviewer tries to open their cited CSVs.
     import librarian
     custody = librarian.inspect_report({**task, 'libraryPath':library_path}, _serve)
+    if not _library_report_saved(library_path):
+        _sim_module._store_content_result(task.get('id'), {
+            'ok':False,'reviewFailureKind':'service_unavailable',
+            'note':'Research ran, but saving the Library report failed. No saved deliverable was recorded.'})
+        return
     # Data-minimization audit finding (Hermes Town comparison):
     # this was the ONE content executor (of 13) that duplicated the FULL
     # finding text into the task note -- which _apply_content_result (sim.py)

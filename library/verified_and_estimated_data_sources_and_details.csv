@@ -1,0 +1,6 @@
+source_name,url,retrieval_method,api_or_rss_available,hourly_data_available,status,pricing_model,limitations
+Coinbase Exchange API,https://docs.cdp.coinbase.com/exchange/introduction/welcome,REST,true,true,estimated,paid,dynamic fee structure for high-volume trading; insurance protection
+CoinGecko Historical Data API,https://www.coingecko.com/learn/best-historical-crypto-data-apis,REST,true,true,estimated,paid,1 year of free data including daily, and hourly data; 129$/mo after that
+CoinMarketCap API,https://www.coingecko.com/learn/best-historical-crypto-data-apis,REST,true,true,estimated,paid,10,000+ coins; 95$/mo
+CoinAPI.io,https://www.coinapi.io/blog/crypto-exchange-rates-api-real-time-historical,REST,true,true,estimated,paid,real-time and historical pricing from one source; single price feed for 300+ exchanges
+Coinbase Data API,https://docs.cdp.coinbase.com/coinbase-app/track-apis/prices,REST,true,true,estimated,paid,asset prices including Bitcoin and Ethereum; paid API key required

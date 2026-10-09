@@ -1,0 +1,7 @@
+technique,exchange,pro,con,verification_status
+connection pooling,Coinbase,reduces overhead of creating connections,can lead to resource contention,estimated
+asynchronous processing,Binance,improves responsiveness,increases complexity,estimated
+caching,Kraken,reduces load on API,can lead to stale data,estimated
+payload compression,Bitstamp,reduces bandwidth usage,increases processing time,estimated
+batching,Coinbase,reduces number of requests,can lead to increased latency,estimated
+WebSocket connections,Binance,enables real-time updates,requires additional infrastructure,estimated

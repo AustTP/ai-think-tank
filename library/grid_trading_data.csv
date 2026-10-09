@@ -1,0 +1,6 @@
+api_name,data_coverage,data_format,pricing,api_docs, basis
+CoinAPI,exchange timezone: UTC
+token,24/7, maker/taker model,limit/market/stop, CoinAPI,verified
+CoinMarketCap API,cryptocurrency data,historical and real-time,free/pricing plan,https://coinmarketcap.com/api/,verified
+CryptoCompare API,cryptocurrency data,historical and real-time,free/pricing plan,https://min-api.cryptocompare.com/,verified
+CoinGecko,cryptocurrency data,historical and real-time,free/pricing plan,https://www.coingecko.com/en/api,verified

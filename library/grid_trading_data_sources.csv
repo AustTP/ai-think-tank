@@ -1,0 +1,7 @@
+api_name,url,retrieval_method,data_frequency,historical_data_availability,rate_limits,missing_values,interval_gaps,status
+Coinbase APIs and Data Feeds,https://exchange.coinbase.com/,REST,real-time,Yes,Yes,Unknown,Unknown,Estimated
+Coinbase Market Data API,https://api.exchange.coinbase.com/,REST,real-time,Yes,Yes,Unknown,Unknown,Estimated
+Coinbase WebSocket Feed API,https://ws-feed.exchange.coinbase.com/,Websocket,real-time,Yes,Yes,Unknown,Unknown,Estimated
+Financial Modeling Prep API,https://financialmodelingprep.com/api/v3/historical-commodities/1,REST,1-hour interval,Yes,Yes,Unknown,Unknown,Estimated
+Infinox,https://infinox.com/,Web,Unknown,Unknown,Unknown,Unknown,Unknown,Estimated
+Binance API,https://api.binance.com/api/v3/klines,REST,minute-level data,Yes,Yes,Unknown,Unknown,Estimated
