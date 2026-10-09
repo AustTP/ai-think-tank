@@ -126,6 +126,30 @@ class ProbeParsing(unittest.TestCase):
         self.assertNotIn('window.7', out)
 
 
+class SelfBaseUrl(unittest.TestCase):
+    def test_matches_loopback_bind(self):
+        url, matches = serve._derive_self_base_url('127.0.0.1', 8937)
+        self.assertEqual(url, 'http://127.0.0.1:8937')
+        self.assertTrue(matches)
+
+    def test_zero_bind_maps_to_loopback(self):
+        # A client cannot connect to 0.0.0.0; self-calls must use 127.0.0.1.
+        url, _ = serve._derive_self_base_url('0.0.0.0', 8937)
+        self.assertEqual(url, 'http://127.0.0.1:8937')
+
+    def test_explicit_tailscale_host_is_used_as_is(self):
+        url, _ = serve._derive_self_base_url('100.64.0.5', 8937)
+        self.assertEqual(url, 'http://100.64.0.5:8937')
+
+    def test_drift_is_detected(self):
+        # The wiring bug: .env said 8936 while the process binds 8937, so every
+        # self-loopback (browse/evidence/save) hit a dead port and the crawl
+        # silently recorded nothing.
+        url, matches = serve._derive_self_base_url('127.0.0.1', 8937, env_url='http://127.0.0.1:8936')
+        self.assertEqual(url, 'http://127.0.0.1:8937')
+        self.assertFalse(matches)
+
+
 class SandboxContextHelpers(unittest.TestCase):
     def test_get_sandbox_context_no_output(self):
         with mock.patch.object(serve, '_http_json', return_value={'allowed': False}):
