@@ -882,6 +882,11 @@ def _reclaim_orphaned_walking_tasks(state):
         # and _resolve_social will reclaim and extend its budget on restore.
         if task.get('_inSocial'):
             continue
+        # A task parked so a due scheduled item could preempt its holder is also
+        # legitimately detached -- _resume_suspended_task reclaims it when the
+        # scheduled item completes.
+        if task.get('_suspendedForScheduled'):
+            continue
         # A task is HELD when any agent points its .task at it -- matched by the
         # assignee id when present, but also by scanning, because a task can be
         # genuinely mid-work yet carry no assignedTo (e.g. a legacy/curated
@@ -4130,6 +4135,13 @@ def send_agent_off_duty(state, agent_id, doors, grid):
         return
     if a.get('busy') or a.get('task') or a.get('pairWith') or a.get('handoff'):
         return
+    # Scheduled-item preemption: every task-completion path funnels here to go
+    # off duty -- if this agent's own task was suspended so a due scheduled item
+    # could fire, reclaim the parked task instead of resting (the scheduled
+    # item just finished and handed the agent back).
+    if a.get('_suspendedTask'):
+        if _resume_suspended_task(state, agent_id, a, grid):
+            return
     a['path'] = None
     a['pathIndex'] = 0
     a['pathTarget'] = None
@@ -5787,6 +5799,40 @@ def _end_loans_for_team(state, team_id, now_ms=None):
                          'home': d.get('director'), 'action': 'returned'})
 
 
+def _dormant_workers_will_be_woken(state, now_ms):
+    """True when an off-duty (dormant) worker is about to be re-awakened for
+    pending or scheduled work, so the active slot she vacated isn't actually
+    free for a new hire. Mirrors the assignment loop's wake rule (see
+    _task_cycle): a due, unparked, dependency-met queue item wakes a dormant
+    agent when it is pinned/scheduled (reviewOf/sprintId/notBefore) or when no
+    awake-idle agent is around to take it, and only while the active ceiling
+    has room (can_activate_another). Standing cadences (research topics, skill
+    review, distill, pipelines) queue their work in _check_schedules BEFORE
+    governance runs, so the workQueue already reflects what will wake them."""
+    roster = state.get('agentRoster') or []
+    agents = state.get('agents') or {}
+    # Any dormant (off-duty) worker at all? No dormant workers, no wake risk.
+    has_dormant = any(
+        not d.get('isAdmin')
+        and isinstance(agents.get(d.get('id')), dict)
+        and agents[d['id']].get('offDuty')
+        for d in roster)
+    if not has_dormant:
+        return False
+    if not can_activate_another(state):
+        return False  # at/over the ceiling no dormant agent can be woken
+    for item in (state.get('workQueue') or []):
+        if not is_work_item_due(item, now_ms):
+            continue
+        if _is_parked(item) or not _work_item_dependency_met(state, item):
+            continue
+        if item.get('reviewOf') or item.get('sprintId') or item.get('notBefore'):
+            return True  # pinned/scheduled work wakes regardless of idle count
+        if _awake_idle_count(state) == 0:
+            return True  # no awake-idle agent -> a dormant one gets woken
+    return False
+
+
 def _start_auto_hire(state, now_ms, grid, decider):
     """hiring.js attemptAutoHire, team-scoped: each TEAM DIRECTOR hires for
     their own team (not one global admin hiring anyone). If a director is free
@@ -5797,6 +5843,23 @@ def _start_auto_hire(state, now_ms, grid, decider):
     roster = state.get('agentRoster') or []
     if len(roster) >= MAX_TOTAL_AGENTS:
         state['_hireBlockedAtCapNote'] = len(roster)
+        return False
+    # Active-ceiling gate: stop spawning at MAX_ACTIVE_AGENTS (25). When a
+    # sprint ends and workers go dormant, active_agent_count drops below the
+    # ceiling and this gate reopens on its own. `lastHireAt` is deliberately
+    # NOT advanced, so the next governance pass retries the moment a slot frees
+    # (the note records WHY a blocked hire was blocked, for the UI).
+    if active_agent_count(state) >= MAX_ACTIVE_AGENTS:
+        state['_hireBlockedAtActiveCapNote'] = active_agent_count(state)
+        return False
+    # Dormant-wake refinement: workers going dormant only frees a slot for a
+    # new hire if those dormant workers have no scheduled task or work they
+    # will be re-awakened for. If a dormant worker is about to be woken by due
+    # scheduled/pinned work (or by a due queue item with no awake-idle agent),
+    # the slot is already spoken for -- hiring on top would overshoot the
+    # ceiling once she wakes.
+    if _dormant_workers_will_be_woken(state, now_ms):
+        state['_hireBlockedDormantWakeNote'] = True
         return False
     agents = state.get('agents') or {}
 
@@ -6700,6 +6763,101 @@ def _restore_social_agent(state, aid, snapshot, now_ms, duration_ms):
     a['x'] = snapshot.get('x', a.get('x'))
     a['y'] = snapshot.get('y', a.get('y'))
     a['dir'] = snapshot.get('dir', a.get('dir'))
+
+
+def _suspend_busy_agent_for_scheduled(state, grid, doors, now_ms):
+    """Scheduled-item preemption: pick ONE busy on-duty agent whose current task
+    is safely suspendable (status 'working', not a peer review/incident/shadow,
+    not at the social, not already suspended), snapshot + park her task (flagged
+    _suspendedForScheduled so the orphan-reclaim and stale-work sweeps skip it),
+    and free her so a due scheduled item can be assigned at its specified time
+    even when every agent is busy -- typically at the active ceiling, where
+    can_activate_another is False so no off-duty agent can be woken. The
+    snapshot lives on the agent as `_suspendedTask`; task completion resumes it
+    (see send_agent_off_duty / _resume_suspended_task). Returns the freed agent
+    id, or None when nothing is safely suspendable."""
+    agents = state.get('agents') or {}
+    roster = state.get('agentRoster') or []
+    tasks = state.get('tasks') or {}
+    best = None
+    best_remaining = -1.0
+    for d in roster:
+        if d.get('isAdmin'):
+            continue
+        aid = d.get('id')
+        a = agents.get(aid)
+        if not isinstance(a, dict) or a.get('offDuty') or not a.get('busy'):
+            continue
+        if a.get('pairWith') or a.get('handoff') or a.get('_suspendedTask'):
+            continue
+        tid = a.get('task')
+        t = tasks.get(tid) if isinstance(tasks, dict) else None
+        if not isinstance(t, dict) or t.get('status') != 'working':
+            continue
+        if t.get('_inSocial') or t.get('_suspendedForScheduled'):
+            continue
+        if t.get('reviewOf') or t.get('incident') or t.get('shadow'):
+            continue
+        # Prefer the agent furthest from completion: interrupting a task about
+        # to finish would cost the most, and we give every parked task its full
+        # budget back on resume anyway.
+        remaining = (t.get('workUntil') or 0) - now_ms / 1000.0
+        if remaining > best_remaining:
+            best_remaining = remaining
+            best = (aid, a, tid, t)
+    if best is None:
+        return None
+    aid, a, tid, t = best
+    a['_suspendedTask'] = {
+        'task': tid,
+        'workUntil': t.get('workUntil'),
+        'x': a.get('x'), 'y': a.get('y'), 'dir': a.get('dir'),
+        'inRoom': a.get('inRoom'),
+        'at': now_ms,
+    }
+    t['_suspendedForScheduled'] = now_ms
+    a['task'] = None
+    a['busy'] = False
+    a['inRoom'] = None
+    a['visible'] = True
+    a['path'] = None
+    a['pathIndex'] = 0
+    a['pathTarget'] = None
+    return aid
+
+
+def _resume_suspended_task(state, agent_id, a, grid=None):
+    """Restore an agent whose task was suspended so a due scheduled item could
+    fire: reclaim the task claim + position + busy + inRoom, clear the parked
+    flag, and give back the exact time the scheduled item consumed (workUntil
+    extended) so the preemption burned none of the parked task's budget. Mirrors
+    _restore_social_agent. Returns True when resumed; False when there was no
+    snapshot (or the parked task was reclaimed/abandoned) -- the caller then
+    proceeds to go off duty."""
+    if not isinstance(a, dict):
+        return False
+    snap = a.pop('_suspendedTask', None)
+    if not snap:
+        return False
+    tid = snap.get('task')
+    tasks = state.get('tasks') or {}
+    t = tasks.get(tid) if isinstance(tasks, dict) else None
+    if not isinstance(t, dict):
+        return False  # parked task was reclaimed/abandoned -- nothing to return to
+    a['task'] = tid
+    a['busy'] = True
+    a['inRoom'] = snap.get('inRoom')
+    a['offDuty'] = False
+    a['visible'] = True
+    t.pop('_suspendedForScheduled', None)
+    su = snap.get('workUntil')
+    elapsed_s = max(0, int(time.time() * 1000) - (snap.get('at') or 0)) // 1000
+    if t.get('status') in ('walking', 'working') and su:
+        t['workUntil'] = (su or 0) + elapsed_s
+    a['x'] = snap.get('x', a.get('x'))
+    a['y'] = snap.get('y', a.get('y'))
+    a['dir'] = snap.get('dir', a.get('dir'))
+    return True
 
 
 def _resolve_social(state, pending, now_ms, decider=None):
@@ -10428,6 +10586,8 @@ def _stale_work_step(state, now, now_ms):
             continue  # bugs own an alarm; shadows never ship; reviews -> stuck-gate
         if task.get('reviewOf'):
             continue  # review/fix subtasks are the stuck-gate watchdog's domain
+        if task.get('_suspendedForScheduled'):
+            continue  # parked for a scheduled item -- budget restored on resume
         opened = task.get('openedAt') or task.get('assignedAt') or task.get('createdAt')
         if opened is None:
             continue
@@ -11006,13 +11166,32 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         # A PLAYER card needs no awake agent at all -- the assign step delivers
         # it into the player's inbox. Only the agent-work guard below can stop
         # it, so the wake-guard break must never fire for one.
+        preempted_for_scheduled = None
         if not (pick.get('assignedTo') or '') == 'player' \
                 and _awake_idle_count(state) == 0 \
                 and not (can_wake_off_duty and _any_available_including_off_duty(state)):
-            break  # nobody who could take this right now, of any kind
+            # A due SCHEDULED item (queue_once notBefore) must still fire at its
+            # specified time even when every agent is busy -- typically at the
+            # active ceiling, where can_activate_another is False so no off-duty
+            # agent can be woken. Preempt one busy agent: park her current task
+            # (she returns to it when the scheduled item completes -- see
+            # _suspend_busy_agent_for_scheduled / send_agent_off_duty), freeing
+            # a candidate so the item lands. Only scheduled items earn this
+            # interrupt; ordinary work waits for a genuinely free agent.
+            if bool(pick.get('notBefore')):
+                preempted_for_scheduled = _suspend_busy_agent_for_scheduled(
+                    state, grid, doors, now_ms)
+            if preempted_for_scheduled is None:
+                break  # nobody who could take this right now, of any kind
         work_queue.pop(due_index)
         assigned = _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_id_holder)
         if not assigned:
+            # A preemption that didn't land: put the parked task straight back so
+            # an agent is never left floating free with a suspended task hanging.
+            if preempted_for_scheduled is not None:
+                a2 = (state.get('agents') or {}).get(preempted_for_scheduled)
+                if isinstance(a2, dict) and a2.get('_suspendedTask'):
+                    _resume_suspended_task(state, preempted_for_scheduled, a2, grid)
             pick['attempts'] = (pick.get('attempts') or 0) + 1
             # A peer-approval review/fix subtask BLOCKS its whole story: never
             # abandon it on the normal attempt cap (which exists to shed stray

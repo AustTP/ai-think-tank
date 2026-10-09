@@ -119,7 +119,8 @@ def _is_fully_idle(a, in_room):
     or room occupancy. Non-spatial flags only -- the mirror of what the
     assignment/active paths treat as 'working'."""
     return not (a.get('busy') or a.get('task') or a.get('path') or a.get('pathActive')
-                or a.get('pairWith') or a.get('handoff') or a.get('inRoom') or in_room)
+                or a.get('pairWith') or a.get('handoff') or a.get('inRoom') or in_room
+                or a.get('_suspendedTask'))
 
 
 # --- Villages -----------------------------------------------------------------
