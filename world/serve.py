@@ -7761,9 +7761,9 @@ AGENT_ASK_TOOLS = [
             'description': 'Read the most recent live AIS (ship position) frames from the think tank\'s '
                            'AISStream collector -- real vessel name/lat/lon data streaming over a '
                            'WebSocket, NOT a search result and NOT reachable through api_call. Use it '
-                           'when the question is about current ship positions/movements in the Western '
-                           'Atlantic (the collector\'s bounding box). Returns connection status and the '
-                           'most recent frames.',
+                           'when the question is about current ship positions/movements in coastal '
+                           'North Carolina waters (the collector\'s bounding box). Returns connection '
+                           'status and the most recent frames.',
             'parameters': {
                 'type': 'object',
                 'properties': {
@@ -12089,10 +12089,15 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 for m in recent:
                     msg = m.get('message') or {}
                     meta = msg.get('MetaData') or {}
+                    lat = meta.get('latitude') or meta.get('Latitude')
+                    lon = meta.get('longitude') or meta.get('Longitude')
                     rows.append(f"- {meta.get('ShipName') or msg.get('MessageType') or 'frame'} "
-                                f"@{meta.get('Latitude')},{meta.get('Longitude')}")
+                                f"@{lat},{lon}")
                 parts.append('recent frames:\n' + '\n'.join(rows[-max_msgs:]))
-            return ' | '.join(parts)
+            raw = ' | '.join(parts)
+            wrapped, _nonce, _tag, instruction = wrap_external_content(
+                raw, 'live AIS ship position data from AISStream')
+            return f'{instruction}\n\n{wrapped}'
         if name == 'browse_page':
             country = ((args or {}).get('country') or '').strip().lower()
             result = _http_json('POST', SELF_BASE_URL, '/api/browse', {
@@ -12314,7 +12319,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     # hard ceiling still bounds real runaway cost regardless of which lane
     # triggers it.
     from content import (_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL, _make_treg_tools_executor,
-                        _spike_wants_x_trending, _spike_wants_linkedin_search)
+                        _spike_wants_x_trending, _spike_wants_linkedin_search, _spike_wants_ais_feed)
     _treg_tool = _make_treg_tools_executor()
     # Same proven fix as search_web/search_library before it (twice):
     # prompt-only guidance to prefer a specific tool was NOT reliably
@@ -12326,10 +12331,12 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         ask_force_first_tool = 'x_trending_topics'
     elif _spike_wants_linkedin_search(question, None):
         ask_force_first_tool = 'search_linkedin_posts'
+    elif _spike_wants_ais_feed(question, None):
+        ask_force_first_tool = 'read_ais_feed'
 
     def execute_tool(name, args):
         # Every tool result is external data -> wrap BEFORE it can reach a model.
-        if name in ('search_web', 'browse_page'):
+        if name in ('search_web', 'browse_page', 'read_ais_feed'):
             tools_used.append(name)
             return _web_tool(name, args)
         if name == 'team_digest':
@@ -12616,7 +12623,7 @@ _AIS_STREAM_URL = 'wss://stream.aisstream.io/v0/stream'
 _AIS_BUFFER_MAX = 300
 AIS_BUFFER_WINDOW_S = 1800
 AIS_RECONNECT_BACKOFF_S = 15
-AIS_DEFAULT_BOUNDING_BOX = [[[46.0, -80.0], [24.0, -60.0]]]
+AIS_DEFAULT_BOUNDING_BOX = [[[36.9, -76.3], [33.3, -74.8]]]
 AIS_DEFAULT_FILTER_TYPES = ['PositionReport']
 
 _AIS_BUFFER = []
