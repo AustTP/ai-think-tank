@@ -42,5 +42,12 @@ class LibrarianTests(unittest.TestCase):
         self.assertEqual(librarian.embedded_csv('## data.csv\n```csv\na,b\n1,2\n```','data.csv'),'a,b\r\n1,2\r\n')
         self.assertIsNone(librarian.embedded_csv('## data.csv\n|a|b|\n|---|---|\n|1|','data.csv'))
 
+    def test_plain_fence_after_explicit_filename_is_saved(self):
+        report = 'Full contents of `project_status.csv`:\n```\ntask,status\n1,Estimated\n```'
+        self.assertEqual(librarian.embedded_csv(report, 'project_status.csv'),
+                         'task,status\r\n1,Estimated\r\n')
+        self.assertIsNone(librarian.embedded_csv(report.replace('```\n', '```python\n', 1),
+                                               'project_status.csv'))
+
 
 if __name__ == '__main__': unittest.main()

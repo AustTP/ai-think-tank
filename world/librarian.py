@@ -38,7 +38,7 @@ def embedded_csv(document, path):
     if not label:
         return None
     tail = document[label.end():].lstrip()
-    fence = re.match(r'```csv\s*\n(.*?)\n```', tail, re.S)
+    fence = re.match(r'```(?:csv)?[ \t]*\r?\n(.*?)\r?\n```', tail, re.S)
     if fence:
         rows = list(csv.reader(io.StringIO(fence.group(1))))
     elif tail.startswith('|'):

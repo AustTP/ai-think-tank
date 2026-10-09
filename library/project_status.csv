@@ -1,0 +1,5 @@
+task_id,task_description,status,start_date,end_date,basis
+1,Grid Trading Strategy,In Progress,2023-03-01,2023-03-08,Estimated
+2,APY% Strategy,Not Started,-,-,Estimated
+3,API Integration,In Progress,2023-02-20,-,Estimated
+4,Trading Bot Development,Not Started,-,-,Estimated

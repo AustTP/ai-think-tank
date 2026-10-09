@@ -1,0 +1,16 @@
+requirement_id,requirement_description,estimated_work,implementation_status,limitations_challenges,sources
+R001,Implement risk management program,High,In progress,Identify and assess risks across the organization,https://www.sec.gov/files/ib_qr-risk-management.pdf
+R002,Develop advanced transaction monitoring capabilities,High,Not started,Implement machine learning-based monitoring tools,https://www.sec.gov/files/ib_qr-risk-management.pdf
+R003,Provide sanctions screening services,Medium,In progress,Implement automated screening processes,https://www.sec.gov/files/ib_qr-risk-management.pdf
+R004,Implement audit committee requirements,Low,Not started,Establish audit committee charter and procedures,https://www.sec.gov/files/ib_qr-risk-management.pdf
+R005,Develop risk management policy,Medium,In progress,Establish risk management framework and policies,https://www.sec.gov/files/ib_qr-risk-management.pdf
+R006,Establish risk management procedures,Low,Not started,Develop procedures for risk identification and mitigation,https://www.sec.gov/files/ib_qr-risk-management.pdf
+R007,Implement risk management training,Medium,In progress,Provide risk management training to employees,https://www.sec.gov/files/ib_qr-risk-management.pdf
+R008,Develop risk management metrics,Low,Not started,Establish metrics to measure risk management effectiveness,https://www.sec.gov/files/ib_qr-risk-management.pdf
+R009,Implement risk management monitoring,Medium,In progress,Continuously monitor risk management processes,https://www.sec.gov/files/ib_qr-risk-management.pdf
+R010,Establish risk management review procedures,Low,Not started,Develop procedures for reviewing risk management effectiveness,https://www.sec.gov/files/ib_qr-risk-management.pdf
+R011,Implement risk management reporting,Medium,In progress,Provide regular risk management reports to management,https://www.sec.gov/files/ib_qr-risk-management.pdf
+R012,Develop risk management policies and procedures,Low,Not started,Establish policies and procedures for risk management,https://www.sec.gov/files/ib_qr-risk-management.pdf
+R013,Establish risk management governance,Medium,In progress,Establish risk management governance structure,https://www.sec.gov/files/ib_qr-risk-management.pdf
+R014,Implement risk management framework,Low,Not started,Establish risk management framework,https://www.sec.gov/files/ib_qr-risk-management.pdf
+R015,Develop risk management standards,Medium,In progress,Establish risk management standards,https://www.sec.gov/files/ib_qr-risk-management.pdf

@@ -1,0 +1,6 @@
+requirement_name,description,api_endpoint,implementation_status,status
+KYC_AML,Implement KYC and AML procedures for users and entities.,/users/verify,Not Started,estimated
+Transaction_Monitoring,Monitor transactions for unusual activity and risk scoring.,"/transfers, /fills",In Progress,verified
+Order_Placement,Allow users to place orders through the trading API.,/orders,Completed,verified
+Market_Data,Provide public market data through market data APIs.,"/products, /ticker",Completed,verified
+Business_API,Offer API for local businesses to accept crypto payments.,/business-payments,Not Started,estimated

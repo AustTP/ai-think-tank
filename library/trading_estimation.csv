@@ -1,0 +1,5 @@
+Strategy_Name,Daily_Profit_Estimate,Efficiency_Rating,Status
+BTC-USD_SMA_Crossover,10,High,Verified
+BTC-USD_Arbitrage,50,Medium,Verified
+ETH-USD_MACD,15,Medium,Verified
+LTC-USD_Trend,20,Low,Verified

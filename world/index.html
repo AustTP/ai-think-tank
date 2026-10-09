@@ -1966,14 +1966,38 @@ function renderBoard() {
   // the rest of the board -- no extra endpoint. Only *done* spikes are triage-
   // able; a working one isn't finished (the endpoint 409s on it).
   const spikeTasks = Object.values(TASKS).filter(t => t.taskType === 'spike');
-  const doneSpikes = spikeTasks.filter(t => t.status === 'done' && !t.promotedRequestId);
+  const spikeKey = t => JSON.stringify(['title', 'projectId', 'projectLabel', 'goal'].map(
+    field => String(t[field] || '').toLowerCase().trim().replace(/\s+/g, ' ')));
+  const completedSpikes = spikeTasks.filter(t => t.status === 'done' && !t.reviewOf);
+  const decidedSpikes = new Set(completedSpikes.filter(t => t.promotedRequestId || t.promotedAt || t.triageDeniedAt).map(spikeKey));
+  const seenSpikes = new Set();
+  const doneSpikes = completedSpikes.filter(t => {
+    const key = spikeKey(t);
+    if (decidedSpikes.has(key) || seenSpikes.has(key)) return false;
+    seenSpikes.add(key);
+    return true;
+  });
+  window.denySpike = async function (encId) {
+    const taskId = decodeURIComponent(encId);
+    try {
+      const res = await apiFetch(`/api/intent/spike/${encodeURIComponent(taskId)}/deny`, {method: 'POST'});
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || 'Could not deny that spike.');
+      for (const id of data.deniedIds) {
+        if (TASKS[id]) TASKS[id].triageDeniedAt = data.triageDeniedAt;
+      }
+      boardClearMessage = 'Spike denied. Findings remain in the Library.';
+      renderBoard();
+    } catch (error) { alert(error.message); }
+  };
   const spikeLines = doneSpikes.length
     ? doneSpikes.map(t => {
         const finding = (t.note || '').split('. ')[0]; // first sentence, enough to triage by
         const who = AGENTS[t.assignedTo] ? AGENTS[t.assignedTo].name : t.assignedTo;
         const btn = ` <button class="hud-btn" style="font-size:11px;padding:1px 6px;" onclick="promoteSpike('${encodeURIComponent(t.id)}','${encodeURIComponent(t.title)}')">promote</button>`;
+        const deny = ` <button class="hud-btn" onclick="denySpike('${encodeURIComponent(t.id).replace(/'/g, '%27')}')">Deny</button>`;
         const read = t.libraryPath ? ` <button onclick="openTaskDocument(decodeURIComponent('${encodeURIComponent(t.libraryPath).replace(/'/g, '%27')}'))">Read document</button>` : '';
-        return `<div>&bull; ${t.title} -- ${who} <span style="opacity:0.7;font-size:11px;">("${finding}")</span>${btn}${read}</div>`;
+        return `<div>&bull; ${t.title} -- ${who} <span style="opacity:0.7;font-size:11px;">("${finding}")</span>${btn}${deny}${read}</div>`;
       }).join('')
     : '<div style="opacity:0.6;">No finished spikes to triage.</div>';
 

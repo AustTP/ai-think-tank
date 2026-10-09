@@ -1,0 +1,6 @@
+requirement, description, Coinbase_provision, our_strategy, status
+PI rate limits, The rate limit is applied separately to each profile type (e.g., profile:https://docs.cloud.coinbase.com/api/v2#api-rate-limits), Implemented API keys with a unique set of permissions and rate limits., Verified
+Compliance with security standards, Compliance with the top security standards to protect customer accounts (e.g.,SOC 2 Type 2, ISO/IEC 27001, SOC 1 Type 2), Fully compliant with security standards with a focus on protecting customer accounts., Verified
+Know Your Transaction (KYT) solution, KYT solution to monitor and investigate high-risk entities and transactions across the biggest crypto assets by trading volume., Implemented a robust KYT solution to identify high-risk entities and transactions., Verified
+Anti-Money Laundering (AML) program, An AML program to detect and prevent money laundering activities., Implemented a robust AML program to detect and prevent money laundering activities., Verified
+Travel Rule, A global, secure, and industry-led Travel Rule compliance solution., Implemented a Travel Rule compliance solution with encryption and secure transmission., Verified
