@@ -156,7 +156,7 @@ class DirectorAutoApprovalTests(unittest.TestCase):
         # any Jev call -- stays pending for the human, and no auto-approval
         # (or even an unsure-decision log) happens for it.
         esc = {'status': 'pending', 'kind': 'blocked command', 'question': 'run rm -rf'}
-        with unittest.mock.patch('serve.log_action') as log, \
+        with unittest.mock.patch('serve.log_action'), \
              unittest.mock.patch('serve._call_openrouter_decision_sync') as jev:
             self._run_resolver(esc, decision=decision_payload('approve', 0.99))
         self.assertEqual(esc['status'], 'pending', 'blocked command must not be auto-approved')
@@ -259,6 +259,7 @@ class JevFailoverTests(unittest.TestCase):
         serve._set_setting('jev_model', '')  # tests set their own chain
         with serve._db() as conn:
             conn.execute('DELETE FROM decision_tape')
+            conn.execute('DELETE FROM decision_cache')
             conn.execute("DELETE FROM settings WHERE key = 'jev_model'")
         # The CLI-driven standby would append its loopback provider URL to
         # every chain here (and this class's _transport reads body['model']);
