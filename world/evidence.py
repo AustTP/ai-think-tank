@@ -32,6 +32,7 @@ something true"):
 import hashlib
 import json
 import re
+import sqlite3
 import time
 import urllib.parse
 
@@ -49,6 +50,20 @@ CLAIM_DECISIONS = frozenset({'usable_as_written', 'usable_with_narrower_wording'
                              'blocked_until_checked'})
 # Coverage entry states. Only 'covered' suppresses a re-report.
 COVERAGE_STATUSES = frozenset({'pending_review', 'covered', 'failed', 'blocked'})
+
+# Append-only audit of every ledger mutation. Each row is immutable (inserted
+# once, never updated or deleted): a compromised agent can ADD rows but can
+# never rewrite or erase history, so the audit is the trustworthy trail the
+# operator reads. It also powers the per-actor covered-flip rate cap below.
+AUDIT_ACTIONS = frozenset({'claim_recorded', 'claim_reviewed',
+                           'coverage_pending_review', 'coverage_covered',
+                           'coverage_failed'})
+
+# Per-actor cap on COVERED flips within the window: a compromised Verifier
+# cannot silently flip the whole ledger to covered in one pass. When an agent
+# hits the cap, the player must review the rest.
+VERIFIER_COVERED_MAX = 12
+VERIFIER_COVERED_WINDOW_S = 6 * 3600  # 6 hours
 
 # Recurring runs search the period since the last successful run, plus a
 # 24-hour overlap so a discovery that landed just after last run's window is
@@ -119,6 +134,76 @@ def _coverage_write(records):
             'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
             (json.dumps(records), time.time()),
         )
+
+
+def _audit_ensure():
+    import serve as _serve
+    with _serve._db() as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS evidence_audit (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            actor TEXT NOT NULL,
+            action TEXT NOT NULL,
+            claim_id TEXT,
+            identity TEXT,
+            detail TEXT NOT NULL DEFAULT '{}'
+        )''')
+
+
+def append_audit(actor, action, *, claim_id=None, identity=None, detail=None):
+    """Append one immutable row to the evidence audit. Never updated or
+    deleted -- the audit is the history the ledgers cannot rewrite. Failures
+    are silent: an audit row is a trail, never a gate on the ledger write
+    itself."""
+    if not action or action not in AUDIT_ACTIONS:
+        return None
+    try:
+        _audit_ensure()
+        import serve as _serve
+        with _serve._db() as conn:
+            cur = conn.execute(
+                'INSERT INTO evidence_audit (ts, actor, action, claim_id, identity, detail) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (time.time(), (actor or 'system')[:64], action, claim_id,
+                 identity, json.dumps(detail or {})),
+            )
+            return cur.lastrowid
+    except Exception:
+        return None
+
+
+def count_actor_action(actor, action, since_ts):
+    """Number of audit rows for `actor`/`action` at/after `since_ts` (epoch
+    seconds). Backs the covered-flip rate cap; returns 0 on any failure."""
+    if action not in AUDIT_ACTIONS:
+        return 0
+    try:
+        _audit_ensure()
+        import serve as _serve
+        with _serve._db() as conn:
+            row = conn.execute(
+                'SELECT COUNT(*) FROM evidence_audit '
+                'WHERE actor = ? AND action = ? AND ts >= ?',
+                (actor, action, since_ts)).fetchone()
+            return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def list_audit(limit=500):
+    """Read the audit trail, newest first. The operator's view of every ledger
+    mutation and who made it -- the detection layer for a compromised key."""
+    try:
+        _audit_ensure()
+        import serve as _serve
+        with _serve._db() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                'SELECT seq, ts, actor, action, claim_id, identity, detail '
+                'FROM evidence_audit ORDER BY seq DESC LIMIT ?', (int(limit),)).fetchall()
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
 
 
 def _normalize_url(url):
@@ -262,7 +347,7 @@ def _validate_claim_record(record):
         raise ValueError(f'claim_type must be one of {sorted(CLAIM_TYPES)}')
 
 
-def record_source_claim(record):
+def record_source_claim(record, actor=None):
     """Record one claim into the evidence ledger, applying the source-identity
     and coverage rules. Returns a result dict:
 
@@ -317,6 +402,9 @@ def record_source_claim(record):
             rec['updated_ts'] = now
             claims[new_id] = rec
             _evidence_write(claims)
+            append_audit(actor, 'claim_recorded', claim_id=new_id, identity=identity,
+                         detail={'independent': False, 'repost_of': cid,
+                                 'source_url': source_url})
             return {'recorded': True, 'id': new_id, 'independent': False,
                     'repost_of': cid, 'identity': identity,
                     'is_short_link': bool(meta['is_short_link']),
@@ -340,6 +428,10 @@ def record_source_claim(record):
     rec['updated_ts'] = now
     claims[new_id] = rec
     _evidence_write(claims)
+    append_audit(actor, 'claim_recorded', claim_id=new_id, identity=identity,
+                 detail={'independent': True, 'resolved_ok': bool(meta['resolved_ok']),
+                         'is_short_link': bool(meta['is_short_link']),
+                         'source_url': source_url})
 
     # An unresolved short link is its own signal: record it as a needs-review
     # claim with the question spelled out, so nobody reads it as verified.
@@ -349,6 +441,8 @@ def record_source_claim(record):
             rec['open_questions'].append('short link not resolved; destination unknown')
         claims[new_id] = rec
         _evidence_write(claims)
+        append_audit(actor, 'claim_recorded', claim_id=new_id, identity=identity,
+                     detail={'independent': True, 'unresolved': True})
 
     return {'recorded': True, 'id': new_id, 'independent': True,
             'identity': identity, 'is_short_link': bool(meta['is_short_link']),
@@ -411,7 +505,7 @@ def update_claim(claim_id, *, status=None, decision=None, open_questions=None,
     return rec
 
 
-def mark_reviewed(claim_id, decision, artifact=None):
+def mark_reviewed(claim_id, decision, artifact=None, actor=None):
     """The article's review step: a claim that survives verification becomes
     cleared (and, when independent, folds its identity into the coverage
     ledger as COVERED -- the only state that suppresses re-reporting). A
@@ -425,14 +519,20 @@ def mark_reviewed(claim_id, decision, artifact=None):
     if decision == 'blocked_until_checked':
         update_claim(claim_id, status='blocked')
         rec['status'] = 'blocked'
+        append_audit(actor, 'claim_reviewed', claim_id=claim_id,
+                     identity=rec.get('identity'), detail={'decision': decision})
         return rec
     update_claim(claim_id, status='cleared')
     rec['status'] = 'cleared'
+    append_audit(actor, 'claim_reviewed', claim_id=claim_id,
+                 identity=rec.get('identity'),
+                 detail={'decision': decision, 'independent': bool(rec.get('independent'))})
     if rec.get('independent') and rec.get('identity'):
         mark_covered(rec['identity'], artifact=artifact or rec.get('artifact'),
                      reviewed=True, event_id=rec.get('event_id'),
                      source_url=rec.get('source_url'),
-                     resolved_url=rec.get('resolved_url') or rec.get('source_url'))
+                     resolved_url=rec.get('resolved_url') or rec.get('source_url'),
+                     actor=actor)
     return rec
 
 
@@ -455,7 +555,7 @@ def is_source_covered(identity, material_update_ms=None):
 
 def mark_covered(identity, *, artifact=None, reviewed=False, event_id=None,
                  source_url=None, resolved_url=None, material_update_ms=None,
-                 run_id=None):
+                 run_id=None, actor=None):
     """Write a coverage entry for a source identity. REVIEW-GATED: `reviewed`
     is False by default and yields 'pending_review' (visible, but it does NOT
     suppress re-reporting). Only `reviewed=True` marks 'covered' and stamps
@@ -494,11 +594,14 @@ def mark_covered(identity, *, artifact=None, reviewed=False, event_id=None,
     existing['updated_ts'] = now
     coverage[identity] = existing
     _coverage_write(coverage)
+    append_audit(actor, 'coverage_covered' if reviewed else 'coverage_pending_review',
+                 identity=identity,
+                 detail={'reviewed': bool(reviewed), 'artifact': artifact})
     return existing
 
 
 def record_run_failure(identity, reason, *, artifact=None, event_id=None,
-                       source_url=None, resolved_url=None):
+                       source_url=None, resolved_url=None, actor=None):
     """Record a failed run against a source identity. A failure NEVER marks an
     item covered and NEVER suppresses the next attempt: is_source_covered()
     only returns True for status 'covered'. The failure is kept so the desk
@@ -531,6 +634,7 @@ def record_run_failure(identity, reason, *, artifact=None, event_id=None,
     existing['failures'] = failures[-20:]  # bounded tail
     coverage[identity] = existing
     _coverage_write(coverage)
+    append_audit(actor, 'coverage_failed', identity=identity, detail={'reason': reason})
     return existing
 
 

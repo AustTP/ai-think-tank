@@ -145,13 +145,18 @@ from evidence import (  # noqa: E402,F401
     COVERAGE_STATUSES,
     DEFAULT_OVERLAP_MS,
     UNRESOLVED_PREFIX,
+    VERIFIER_COVERED_MAX,
+    VERIFIER_COVERED_WINDOW_S,
     _coverage_read,
     _coverage_write,
     _evidence_read,
     _evidence_write,
+    append_audit,
+    count_actor_action,
     coverage_status,
     get_claim,
     is_source_covered,
+    list_audit,
     list_claims,
     mark_covered,
     mark_reviewed,
@@ -15500,7 +15505,7 @@ async def evidence_record(request: Request):
     if not isinstance(record, dict):
         return JSONResponse({'error': 'record must be an object'}, status_code=400)
     try:
-        result = record_source_claim(record)
+        result = record_source_claim(record, actor=agent_id)
     except Exception as e:
         return JSONResponse({'error': f'could not record claim: {e}'}, status_code=500)
     if result.get('recorded'):
@@ -15529,6 +15534,33 @@ async def evidence_list(request: Request):
     return JSONResponse({'claims': list_claims(status=status, limit=limit)})
 
 
+@app.get('/api/evidence/audit')
+async def evidence_audit_view(request: Request):
+    # The immutable audit trail of every evidence/coverage mutation (who, what,
+    # when) -- the detection layer for a compromised key. Read-only; the rows
+    # are append-only by construction.
+    try:
+        limit = int(request.query_params.get('limit') or 500)
+    except (TypeError, ValueError):
+        limit = 500
+    return JSONResponse({'audit': list_audit(limit=limit)})
+
+
+def _agent_is_verifier(agent_id):
+    """Verifier authority: the player, or a roster agent with isDirector or
+    isAdmin. A valid agent key proves IDENTITY, not authority -- the role gate
+    is separate, so a compromised ordinary agent cannot flip coverage."""
+    if agent_id == 'player':
+        return True
+    try:
+        state = get_state_from_db() or {}
+        roster = {d.get('id'): d for d in (state.get('agentRoster') or [])}
+        entry = roster.get(agent_id) or {}
+        return bool(entry.get('isDirector') or entry.get('isAdmin'))
+    except Exception:
+        return False
+
+
 @app.post('/api/evidence/review')
 async def evidence_review(request: Request):
     # The Verifier step (article section 6): a human or reviewing agent opens
@@ -15539,16 +15571,37 @@ async def evidence_review(request: Request):
     # identity into the coverage ledger as COVERED -- the ONLY state that
     # suppresses a future re-report. A blocked decision blocks the claim and
     # never marks coverage.
+    #
+    # Authority is role-gated, not key-gated: the player (session) or a
+    # director/admin agent may act as Verifier; an ordinary agent cannot, even
+    # with a valid key. Agent verifiers are additionally rate-capped on
+    # covered flips so a compromised director cannot silently cover the whole
+    # ledger in one pass.
+    is_player = _require_player_session(request)
     body = await request.json()
-    agent_id = (body.get('agentId') or 'unknown')
-    if verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
-        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    agent_id = 'player' if is_player else (body.get('agentId') or 'unknown')
+    if not is_player:
+        if verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
+            return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+        if not _agent_is_verifier(agent_id):
+            return JSONResponse({'error': 'Forbidden -- only directors/admin (or the player) can act as Verifier'}, status_code=403)
     claim_id = (body.get('claimId') or '').strip()
     decision = (body.get('decision') or '').strip()
     if not claim_id or decision not in CLAIM_DECISIONS:
         return JSONResponse({'error': f'claimId and a decision in {sorted(CLAIM_DECISIONS)} are required'}, status_code=400)
+    # Covered-flip rate cap for agent verifiers: a usable decision on an
+    # INDEPENDENT claim folds the identity into the coverage ledger as covered
+    # (suppressing re-report). Cap the number of such flips per actor per
+    # window; the player is exempt (operator discretion, fully visible).
+    if not is_player and decision in ('usable_as_written', 'usable_with_narrower_wording'):
+        prior = get_claim(claim_id)
+        if prior and prior.get('independent'):
+            used = count_actor_action(agent_id, 'coverage_covered',
+                                      time.time() - VERIFIER_COVERED_WINDOW_S)
+            if used >= VERIFIER_COVERED_MAX:
+                return JSONResponse({'error': f'Covered-flip cap reached: max {VERIFIER_COVERED_MAX} per {VERIFIER_COVERED_WINDOW_S}s for a single verifier. The player must review further claims.'}, status_code=429)
     try:
-        rec = mark_reviewed(claim_id, decision, artifact=body.get('artifact'))
+        rec = mark_reviewed(claim_id, decision, artifact=body.get('artifact'), actor=agent_id)
     except ValueError as e:
         return JSONResponse({'error': str(e)}, status_code=400)
     if rec is None:
@@ -15590,14 +15643,23 @@ async def evidence_resolve(request: Request):
 async def coverage_write(request: Request):
     # Write a coverage entry: {identity, reviewed, artifact, event_id, ...}.
     # reviewed=False (the crawl's default after a synthesis lands) yields
-    # 'pending_review' -- visible but NOT covered. reviewed=True is the
-    # operator/Verifier's "this brief was reviewed" move that marks 'covered'.
+    # 'pending_review' -- visible but NOT covered. reviewed=True marks 'covered'
+    # and is PLAYER-SESSION-ONLY: it is the "this brief was reviewed" move, and
+    # only the operator may mark an item covered directly. The research crawl
+    # (agent key, reviewed=False) records pending_review/failed only, so a
+    # compromised agent key cannot suppress re-reporting through this route.
     # {identity, failure: reason} records a failed run and never suppresses the
     # next attempt.
     body = await request.json()
-    agent_id = (body.get('agentId') or 'unknown')
-    if verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
-        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    is_player = _require_player_session(request)
+    if body.get('reviewed'):
+        if not is_player:
+            return JSONResponse({'error': 'Forbidden -- marking covered requires the player session; agents record pending_review only'}, status_code=403)
+        agent_id = 'player'
+    else:
+        agent_id = (body.get('agentId') or 'unknown')
+        if verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
+            return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     identity = (body.get('identity') or '').strip()
     if not identity:
         return JSONResponse({'error': 'identity is required'}, status_code=400)
@@ -15605,7 +15667,8 @@ async def coverage_write(request: Request):
         rec = record_run_failure(identity, body['failure'], artifact=body.get('artifact'),
                                  event_id=body.get('eventId'),
                                  source_url=body.get('sourceUrl'),
-                                 resolved_url=body.get('resolvedUrl'))
+                                 resolved_url=body.get('resolvedUrl'),
+                                 actor=agent_id)
         log_action(agent_id, 'coverage_failure', {'identity': identity, 'reason': body['failure']})
         return JSONResponse({'ok': True, 'coverage': rec})
     rec = mark_covered(identity, artifact=body.get('artifact'),
@@ -15614,7 +15677,8 @@ async def coverage_write(request: Request):
                        source_url=body.get('sourceUrl'),
                        resolved_url=body.get('resolvedUrl'),
                        material_update_ms=body.get('materialUpdateMs'),
-                       run_id=body.get('runId'))
+                       run_id=body.get('runId'),
+                       actor=agent_id)
     log_action(agent_id, 'coverage_write', {'identity': identity, 'reviewed': bool(body.get('reviewed'))})
     return JSONResponse({'ok': True, 'coverage': rec})
 
@@ -15653,13 +15717,10 @@ async def policy_reload(request: Request):
     # Re-read the four world/*.json policy files so an operator's file edits
     # apply without a server restart. Fails closed: a bad edit keeps the
     # previous loaded values, and the response reports what each file loaded.
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    agent_id = (body.get('agentId') or 'unknown')
-    if agent_id != 'player' and verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
-        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    # PLAYER-SESSION-ONLY: reloading is an operator action; an agent key never
+    # suffices, so a compromised key cannot fiddle with the reload cadence.
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- reloading policy requires the player session'}, status_code=401)
     result = reload_policy_config()
     log_action(None, 'policy_reload', {k: len(v) for k, v in result.items()})
     return JSONResponse({'ok': True, 'loaded': result})

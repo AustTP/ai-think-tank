@@ -23,7 +23,10 @@ import evidence  # noqa: E402
 
 def _patch_ledgers(evidence_rows=None, coverage_rows=None):
     """Swap the four ledger seams for in-memory dicts. Returns the backing
-    dicts so a test can inspect what was written."""
+    dicts so a test can inspect what was written. The append-only audit
+    (which owns its own SQLite row) is no-op'd so unit tests stay DB-free --
+    the audit's SQL layer is exercised against a real temp DB in
+    test_evidence_api.py."""
     store = {'evidence': evidence_rows if evidence_rows is not None else {},
              'coverage': coverage_rows if coverage_rows is not None else {}}
     patchers = [
@@ -35,6 +38,7 @@ def _patch_ledgers(evidence_rows=None, coverage_rows=None):
                             lambda: store['coverage']),
         unittest.mock.patch('evidence._coverage_write',
                             lambda rows: store.__setitem__('coverage', rows)),
+        unittest.mock.patch('evidence.append_audit', return_value=None),
     ]
     for p in patchers:
         p.start()
@@ -235,6 +239,47 @@ class SearchWindow(unittest.TestCase):
 
     def test_overlap_is_never_negative(self):
         self.assertEqual(evidence.search_since_ms(1000, overlap_ms=5000), 0)
+
+
+class AuditWiring(unittest.TestCase):
+    """The mutation functions must record WHO did WHAT in the append-only
+    audit. These tests capture the audit calls (the SQL layer itself is
+    exercised against a real temp DB in test_evidence_api.py)."""
+
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_recording_a_claim_appends_claim_recorded(self):
+        _patch_ledgers()
+        with unittest.mock.patch('evidence.append_audit') as aud:
+            evidence.record_source_claim(_claim(), actor='cora')
+        aud.assert_called()
+        action = aud.call_args[0][1]
+        self.assertEqual(action, 'claim_recorded')
+
+    def test_review_appends_claim_reviewed_and_coverage_covered(self):
+        store = _patch_ledgers()
+        res = evidence.record_source_claim(_claim(), actor='cora')
+        with unittest.mock.patch('evidence.append_audit') as aud:
+            evidence.mark_reviewed(res['id'], 'usable_as_written', actor='lex')
+        actions = [c.args[1] for c in aud.call_args_list]
+        self.assertIn('claim_reviewed', actions)
+        self.assertIn('coverage_covered', actions)
+        self.assertEqual(store['coverage'][res['identity']]['status'], 'covered')
+
+    def test_review_by_player_writes_player_as_actor(self):
+        _patch_ledgers()
+        res = evidence.record_source_claim(_claim(), actor='cora')
+        with unittest.mock.patch('evidence.append_audit') as aud:
+            evidence.mark_reviewed(res['id'], 'usable_as_written', actor='player')
+        for c in aud.call_args_list:
+            self.assertEqual(c.args[0], 'player')
+
+    def test_failure_appends_coverage_failed(self):
+        _patch_ledgers()
+        with unittest.mock.patch('evidence.append_audit') as aud:
+            evidence.record_run_failure('https://example.com/post/1', 'boom', actor='cora')
+        self.assertEqual(aud.call_args[0][1], 'coverage_failed')
 
 
 if __name__ == '__main__':
