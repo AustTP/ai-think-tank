@@ -1,0 +1,2 @@
+API Name,URL,Endpoint,Lateny,Coinbase Support,Efficiency,Verification Status
+Coinbase API,https://api.coinbase.com/v2/prices/spot?currency_pair=BTC-USD,spot, < 1 second,yes,high,verified

@@ -107,9 +107,26 @@ def step(state):
             state['agents'][AGENT_ID].setdefault('profile',{}).setdefault('notes',[]).append(
                 {'at':int(time.time()*1000),'text':f"Filed {', '.join(result['saved'])} from {task['id']}; independent review still required."})
         if not result['missing']: continue
+        if task.get('manualAttention') or (task.get('_peerGate') or {}).get('escalated'):
+            continue
+        import story_tracking
+        root = story_tracking.root(state, task)
+        repairs = root.setdefault('artifactRecoveryAttempts', {})
+        artifact_key = ','.join(sorted(result['missing']))
+        pending = any(q.get('recoveryOf') == root['id'] for q in state.get('workQueue') or [])
+        active = any(t.get('recoveryOf') == root['id'] and t.get('status') in ('walking','working') for t in state.get('tasks', {}).values())
+        if pending or active or repairs.get(artifact_key, 0) >= 1:
+            continue
+        if sum(repairs.values()) >= 2:
+            root.update(status='blocked', manualAttention=True, blockedReason='artifact_recovery_limit',
+                        failNote='Two artifact recoveries have already been attempted. Supply actual contents or change the recovery plan before opening another job.')
+            root['_peerGate'] = dict(root.get('_peerGate') or {})
+            root['_peerGate']['escalated'] = True
+            continue
         key = result['reportSha256'] + ':' + ','.join(result['missing'])
         if task.get('_librarianRepairKey') == key: continue
         task['_librarianRepairKey'] = key
+        repairs[artifact_key] = repairs.get(artifact_key, 0) + 1
         message = ('Library custody: missing ' + ', '.join(result['missing'])
             + '. The report names these files but contains no complete labeled contents to save. '
             'Lyra will investigate and request or create the actual deliverables; peer approval remains required.')
@@ -120,6 +137,7 @@ def step(state):
         sim.queue_work(state,[{'title':'Recover Library documents: '+task.get('title','deliverable'),
             'taskType':'spike','room':'observatory','assignedTo':AGENT_ID,'directRoute':True,
             'taskMasterWork':True,'budgetMs':120000,'budgetUsd':0.30,
+            'recoveryOf':root['id'], 'scrumMasterId':root.get('scrumMasterId'),
             'instructions':message+' Read '+result['reportPath']+'. Preserve original requirements: '
                 +str(task.get('acceptanceCriteria') or '')+'. Use save_library_document to save actual contents. '
                 'Do not invent evidence, change existing files, or approve the parent story. If unavailable, save a precise recovery plan with owner and missing inputs.',

@@ -5784,6 +5784,7 @@ AGENT_ASK_TOOLS = [
                     'url': {'type': 'string', 'description': 'A real, specific http(s) URL likely to contain the answer.'},
                     'purpose': {'type': 'string', 'description': 'One short sentence: why you\'re visiting this page.'},
                     'render': {'type': 'boolean', 'description': 'True to use a real rendered (headless-browser) fetch instead of raw HTML -- needed for JS-heavy sites whose real content only appears after the page runs its own scripts. Costs more time; only set true if a plain fetch of this URL already came back empty/useless.'},
+                    'refresh': {'type':'boolean', 'description':'Force a new documentation fetch instead of reusing a recent authorized copy.'},
                     'country': {'type': 'string', 'description': 'A real two-letter Mullvad relay country code (e.g. "de", "jp", "br") to fetch this page through a real VPN exit in that country. Only set this when the page genuinely needs a foreign vantage point; omit it otherwise -- this is slower and only works for allowlisted countries.'},
                 },
                 'required': ['url', 'purpose'],
@@ -9447,22 +9448,29 @@ async def get_work_orders(request: Request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     state = get_state_from_db() or {}
     orders = []
+    import story_tracking
+    cost_view = story_tracking.refresh(state, _spend_ledger_read() or {})
     for record in state.get('backlogRequests', []):
         if record.get('origin') != 'player_work_order':
             continue
         order = dict(record)
         tasks = [t for t in (state.get('tasks') or {}).values() if t.get('workOrderId') == record['id']]
+        root_tasks = [t for t in tasks if not any(t.get(k) for k in story_tracking.LINKS)]
         queued = any(q.get('workOrderId') == record['id'] for q in state.get('workQueue', []))
-        order['tasks'] = [{'id': t['id'], 'title':t.get('title'), 'status': t.get('status'), 'assignedTo': t.get('assignedTo'), 'storyId':t.get('workOrderStoryId')} for t in tasks]
+        order['cost'] = cost_view['requests'].get(record['id'], {'used': 0.0, 'calls': 0})
+        order['tasks'] = [{'id': t['id'], 'title':t.get('title'), 'status': t.get('status'), 'assignedTo': t.get('assignedTo'), 'storyId':t.get('workOrderStoryId'), 'scrumMasterId':t.get('scrumMasterId'), 'rootStoryId':t.get('rootStoryId'), 'ownSpendUsd':t.get('ownSpendUsd'), 'storySpendUsd':t.get('storySpendUsd')} for t in tasks]
         order['deliveryStatus'] = tasks[-1].get('status') if tasks else 'queued' if queued else record.get('status')
         if record.get('plan'):
-            active_statuses = {t.get('status') for t in tasks}
-            if active_statuses.intersection({'working','walking'}): order['deliveryStatus'] = 'working'
+            active_statuses = {t.get('status') for t in root_tasks}
+            completed_ids = {t.get('workOrderStoryId') for t in root_tasks if t.get('status')=='done'}
+            expected_ids = {story['id'] for story in record['plan']['stories']}
+            if expected_ids and expected_ids <= completed_ids: order['deliveryStatus'] = 'done'
+            elif active_statuses.intersection({'working','walking'}): order['deliveryStatus'] = 'working'
             elif active_statuses.intersection({'failed','blocked'}): order['deliveryStatus'] = 'blocked'
             elif 'needs_review' in active_statuses: order['deliveryStatus'] = 'needs_review'
             elif queued: order['deliveryStatus'] = 'queued'
             else:
-                completed_ids = {t.get('workOrderStoryId') for t in tasks if t.get('status')=='done'}
+                completed_ids = {t.get('workOrderStoryId') for t in root_tasks if t.get('status')=='done'}
                 expected_ids = {story['id'] for story in record['plan']['stories']}
                 order['deliveryStatus'] = 'done' if expected_ids and expected_ids <= completed_ids else record.get('status')
         if record.get('status') in ('planning','needs_input','superseded'):
@@ -9490,6 +9498,8 @@ async def queue_work_order(request: Request):
             raise ValueError()
         fields = {k: (body.get(k) or '').strip() for k in
                   ('title', 'instructions', 'teamId', 'taskType', 'acceptanceCriteria')}
+        import story_tracking
+        request_budget = story_tracking.budget(body.get('budgetUsd'))
     except (ValueError, AttributeError, TypeError):
         return JSONResponse({'error': 'Invalid work order.'}, status_code=400)
     if not fields['title'] or not fields['instructions'] or len(fields['title']) > 200 \
@@ -9509,11 +9519,36 @@ async def queue_work_order(request: Request):
         if not order:
             return JSONResponse({'error': 'An order with this title is already awaiting grooming.'}, status_code=409)
         order.update(teamId=fields['teamId'], taskType=fields['taskType'],
-                     acceptanceCriteria=fields['acceptanceCriteria'], origin='player_work_order')
+                     acceptanceCriteria=fields['acceptanceCriteria'], origin='player_work_order',
+                     requestBudgetUsd=request_budget,
+                     scrumMasterId=(sim._team_row(state, fields['teamId']) or {}).get('scrumMasterId'))
         sim.kick_refinement_now(state, fields['teamId'])
         save_state_to_db(state)
         log_action('player', 'work_order_queued', {'id': order['id'], 'teamId': fields['teamId']}, authorized=True)
         return JSONResponse({'ok': True, 'order': order}, status_code=201)
+
+
+@app.patch('/api/intent/work-orders/{order_id}/budget')
+async def set_work_order_budget(order_id: str, request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error':'Player login required.'}, status_code=401)
+    try:
+        import story_tracking
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError('Provide a budget or blank.')
+        cap = story_tracking.budget(body.get('budgetUsd'))
+        with _STATE_UPDATE_LOCK:
+            state = get_state_from_db() or {}
+            order = next((r for r in state.get('backlogRequests') or [] if r['id']==order_id and r.get('origin')=='player_work_order'), None)
+            if not order:
+                return JSONResponse({'error':'Unknown request.'}, status_code=404)
+            order.setdefault('budgetHistory', []).append({'at':int(time.time()*1000),'previousBudgetUsd':order.get('requestBudgetUsd'),'budgetUsd':cap})
+            order['requestBudgetUsd'] = cap
+            save_state_to_db(state)
+        return JSONResponse({'ok':True,'budgetUsd':cap})
+    except (ValueError, TypeError) as error:
+        return JSONResponse({'error':str(error)}, status_code=400)
 
 
 @app.get('/api/intent/issues')
@@ -10045,13 +10080,27 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             return f"{instruction}\n\n{wrapped}"
         if name == 'browse_page':
             country = ((args or {}).get('country') or '').strip().lower()
-            result = _http_json('POST', SELF_BASE_URL, '/api/browse', {
-                'agentId': agent_id,
-                'url': (args or {}).get('url') or '',
-                'purpose': (args or {}).get('purpose') or 'research',
-                'render': bool((args or {}).get('render')),
-                'viaVpnCountry': country,
-            }, agent_key, timeout=60 if not country else 60 + MULLVAD_CONNECT_TIMEOUT_S)
+            import work_reuse
+            from urllib.parse import urlsplit
+            url = (args or {}).get('url') or ''
+            parsed = urlsplit(url)
+            cacheable = (parsed.scheme == 'https' and parsed.hostname in
+                         ('docs.cdp.coinbase.com', 'docs.python.org', 'docs.influxdata.com', 'developers.openai.com')
+                         and not parsed.query and not parsed.username and not country
+                         and not (args or {}).get('render') and not (args or {}).get('refresh'))
+            doc_key = (agent_id, url)
+            result = work_reuse.doc_get(doc_key) if cacheable else None
+            reused = result is not None
+            if result is None:
+                result = _http_json('POST', SELF_BASE_URL, '/api/browse', {
+                    'agentId': agent_id,
+                    'url': url,
+                    'purpose': (args or {}).get('purpose') or 'research',
+                    'render': bool((args or {}).get('render')),
+                    'viaVpnCountry': country,
+                }, agent_key, timeout=60 if not country else 60 + MULLVAD_CONNECT_TIMEOUT_S)
+                if cacheable and isinstance(result, dict) and result.get('allowed') and result.get('textForModel'):
+                    work_reuse.doc_save(doc_key, result)
             if isinstance(result, dict) and result.get('allowed') and result.get('textForModel'):
                 # Gap: /api/browse already
                 # extracts every real <a href> on the page (_extract_links)
@@ -10071,7 +10120,8 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                              for l in links[:40] if l.get('url')]
                     links_block = ("\n\nReal links found on this page (use one of these EXACT urls "
                                    "to visit another page -- never invent a url):\n" + '\n'.join(lines))
-                return f"{result.get('modelInstruction', '')}\n\n{result['textForModel']}{links_block}"
+                source_note = 'Reused authorized documentation fetched within the last six hours; use refresh=true to fetch again.\n' if reused else ''
+                return source_note + f"{result.get('modelInstruction', '')}\n\n{result['textForModel']}{links_block}"
             if isinstance(result, dict) and result.get('allowed') is False:
                 # A real policy denial -- retrying won't change Jev's mind.
                 if struck_tools is not None:
@@ -13514,13 +13564,19 @@ async def chat(request: Request):
     task_id = (body.get('taskId') or '').strip()
     if task_id and _task_budget_exhausted(task_id):
         spent, attempts = _task_budget_spent(task_id)
+        import story_tracking
+        budget_info = story_tracking.budget_status(get_state_from_db() or {}, _spend_ledger_read() or {}, task_id)
+        closed = story_tracking.closed(get_state_from_db() or {}, task_id)
         log_action(agent_id, 'task_budget_blocked',
                    {'taskId': task_id, 'model': model, 'service': service,
                     'taskSpendUsd': round(spent, 6), 'taskSpendAttempts': attempts},
                    authorized=authorized)
         return JSONResponse({
-            'error': (f'This task has used its full model-spend budget '
-                      f'(${spent:.4f} spent) and further model calls are paused until a director raises it.'),
+            'error': ('This story was closed or cancelled. Further model calls are stopped.' if closed else
+                      f'The {budget_info["scope"]} model-spend budget is exhausted (${budget_info["used"]:.4f} spent). '
+                      'Further model calls are paused until the budget is changed.'),
+            'workCancelled': closed,
+            'budgetScope': budget_info,
             'budgetExhausted': True,
             'taskSpendUsd': round(spent, 6),
             'taskSpendAttempts': attempts,

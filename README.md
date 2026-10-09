@@ -75,6 +75,32 @@ priority and can finish admitted stories even when the concurrency limit is
 full. Supplying new recovery guidance resets the recovery allowance. Existing
 model-spend limits still apply; retries never raise budgets automatically.
 
+Player requests accept an optional model-spend budget in USD, editable from the
+request list. Blank means no request-level cap; global and individual-task
+limits still apply. Planning and all linked story, repair, investigation and
+review calls share that request budget. Limits are checked before calls; calls
+already in flight can bring recorded spend above the cap. Historical calls
+without task attribution cannot be reconstructed and external service invoices
+are not included in this model-spend rollup.
+
+Every task retains its original story, request and scrum-master IDs. The board
+and request list show individual task costs and story/request totals without
+adding duplicate service or village buckets. Blocked stories have a player-only
+**Mark complete with exceptions** action requiring a reason. This retains the
+failed reviews, cancels remaining descendants, and records exceptional acceptance
+separately from passing quality checks. It does not advance the trading workflow.
+
+Repeated unchanged failures are tracked across replacement task IDs. Two failed
+attempts with the same evidence and plan stop automatic cycling; new evidence
+or explicit changed guidance is needed. The Librarian opens at most one recovery
+for the same missing-artifact set per original story, with at most two artifact
+recoveries before a changed plan or supplied contents are required. Mechanical failures skip
+model reviews. Passing code checks can be reused for one hour when source,
+commands and the Docker image digest match; failures are never cached. Public
+documentation previously authorized for the same agent can be reused for six
+hours, with a forced-refresh option. Market-data requests remain live. Repair
+prompts keep exact original requirements and concise current feedback.
+
 ## What it is
 
 - A persistent think tank database (`think_tank.db`, SQLite). Every action is

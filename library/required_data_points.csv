@@ -1,0 +1,6 @@
+Data Point,Source API/Feed,Availability,Notes,Status
+Open Price,Coinbase API,Daily,,Estimated
+High Price,Coinbase API,Daily,,Estimated
+Low Price,Coinbase API,Daily,,Estimated
+Close Price,Coinbase API,Daily,,Estimated
+Volume (24h),Coinbase API,Daily,,Estimated

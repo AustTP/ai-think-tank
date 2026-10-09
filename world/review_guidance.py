@@ -132,6 +132,10 @@ def apply_guidance(state, task_id, data):
     task.setdefault('interventionHistory', []).append(history)
     if action in ('retry', 'provide_inputs', 'edit_scope', 'reassign', 'research'):
         task.pop('completionRecovery', None)
+        previous = (task.get('interventionHistory') or [])[-2:-1]
+        if not previous or previous[0].get('guidance') != guidance:
+            task.pop('artifactRecoveryAttempts', None)
+            task.pop('repeatWorkStop', None)
     state['workQueue'] = [it for it in state.get('workQueue', []) if it.get('reviewOf') != task_id]
     task.setdefault('_peerGate', {})['escalated'] = True
     task['manualAttention'] = True

@@ -20,7 +20,7 @@ def north_star_context(state):
 
 def _plan(request, star, master):
     import serve
-    payload = {'agentId':master, 'max_tokens':2600, 'deliberate':False,
+    payload = {'agentId':master, 'taskId':'request/' + request['id'], 'max_tokens':2600, 'deliberate':False,
         'model':serve._mid_tier_slug() or serve._low_tier_slug(),
         'messages':[{'role':'system','content':
             'You are the scrum master completing an explicit player request. Never silently reject it. '
@@ -151,7 +151,8 @@ def release_stories(state, request):
         if unanswered.intersection(story.get('dependsOnQuestions') or []): continue
         if story['taskType']=='code' and unanswered: continue
         completed={t.get('workOrderStoryId') for t in (state.get('tasks') or {}).values()
-                   if t.get('workOrderId')==request['id'] and t.get('status')=='done'}
+                   if t.get('workOrderId')==request['id'] and t.get('status')=='done'
+                   and not any(t.get(k) for k in ('reviewOf','investigationOf','recoveryOf'))}
         if not set(story.get('prerequisiteStoryIds') or []) <= completed: continue
         instructions=(north_star_context(state)+'\nOverarching player request: '+request.get('reason','')
             +'\nRelated earlier request context: '+json.dumps(request.get('relatedRequests') or [])
@@ -160,6 +161,7 @@ def release_stories(state, request):
             +'\nStory: '+story['instructions'])
         sim.queue_work(state,[{'title':story['title'][:200], 'room':'pressoffice' if story['taskType']=='code' else 'observatory',
             'taskType':story['taskType'],'workOrderId':request['id'],'workOrderStoryId':story['id'],
+            'scrumMasterId':request.get('scrumMasterId'), 'requestId':request['id'],
             'teamId':request.get('teamId'),'instructions':instructions,'acceptanceCriteria':story['acceptanceCriteria'][:6000],
             'budgetMs':120000 if story['taskType']=='spike' else None,'priority':'normal',
             'projectLabel':request['title'],

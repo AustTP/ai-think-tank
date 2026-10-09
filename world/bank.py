@@ -23,8 +23,11 @@ and friends stay the stable public surface the call sites and tests use.
 import datetime
 import json
 import time
+import threading
 import urllib.request
 from decimal import Decimal, InvalidOperation
+
+_LEDGER_LOCK = threading.RLock()
 
 
 def _trade_table(conn):
@@ -178,6 +181,11 @@ def _budget_cap_usd(service, products=None):
 
 
 def _accrue_spend(service, cost, village_id=None):
+    with _LEDGER_LOCK:
+        return _accrue_spend_locked(service, cost, village_id)
+
+
+def _accrue_spend_locked(service, cost, village_id=None):
     """Accrue a single model call's cost to a service's ledger bucket. The whole
     point is that accrual happens exactly once per model call, at the choke
     point, so whatever the ledger shows is exactly what the think tank has spent.
@@ -312,6 +320,11 @@ def _task_budget_spent(task_id):
 
 
 def _accrue_task_spend(task_id, cost):
+    with _LEDGER_LOCK:
+        return _accrue_task_spend_locked(task_id, cost)
+
+
+def _accrue_task_spend_locked(task_id, cost):
     """Accrue one real model call's cost against a task's own ledger bucket.
     Best-effort exactly like _accrue_spend: an accounting failure must never
     break the call itself."""
@@ -345,6 +358,11 @@ def _task_budget_exhausted(task_id):
         return False
     try:
         state = _serve.get_state_from_db()
+        import story_tracking
+        if story_tracking.closed(state or {}, task_id):
+            return True
+        if story_tracking.exhausted(state or {}, _serve._spend_ledger_read() or {}, task_id):
+            return True
         budget = (state or {}).get('tasks', {}).get(task_id, {}).get('budgetUsd') or 0
         if not isinstance(budget, (int, float)) or budget <= 0:
             return False
@@ -365,6 +383,11 @@ def _spend_cap_period():
 
 
 def _think_tank_spend_cap_exceeded():
+    with _LEDGER_LOCK:
+        return _think_tank_spend_cap_exceeded_locked()
+
+
+def _think_tank_spend_cap_exceeded_locked():
     """Hard, absolute MONTHLY spend-cap check -- called at the top of EVERY
     real money-spending chokepoint (_call_openrouter_sync, _post_openrouter_raw,
     _call_openrouter_decision_sync), before any network call. Disabled
@@ -698,6 +721,11 @@ def _high_tier_budget_exceeded():
 
 
 def _accrue_high_tier_spend(cost):
+    with _LEDGER_LOCK:
+        return _accrue_high_tier_spend_locked(cost)
+
+
+def _accrue_high_tier_spend_locked(cost):
     """Accrue a high-tier model call's cost against the monthly high-tier
     budget. Best-effort like _accrue_spend: an accounting failure must never
     break the actual call. Uses the SAME kv_spend ledger as _accrue_spend (so
@@ -756,6 +784,11 @@ def _apify_budget_exceeded():
 
 
 def _accrue_apify_spend(cost):
+    with _LEDGER_LOCK:
+        return _accrue_apify_spend_locked(cost)
+
+
+def _accrue_apify_spend_locked(cost):
     """Accrue an Apify actor run's real cost against the monthly budget.
     Best-effort like _accrue_spend: an accounting failure must never break the
     actual run. Uses the same kv_spend ledger so the Bank sees it, under the
@@ -831,6 +864,11 @@ def _colab_budget_exceeded():
 
 
 def _accrue_colab_units(units):
+    with _LEDGER_LOCK:
+        return _accrue_colab_units_locked(units)
+
+
+def _accrue_colab_units_locked(units):
     """Accrue a run's compute units against the monthly budget. Best-effort
     like _accrue_spend: an accounting failure must never break the real run.
     Uses the same kv_spend ledger so the Bank sees it, under the reserved

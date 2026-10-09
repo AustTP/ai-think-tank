@@ -1,0 +1,11 @@
+endpoint,functionality,rate_limit,authentication_method,status,notes
+/v2/accounts,List accounts,600 requests/10s,Bearer Token,Verified,None
+/v2/accounts/{account_id},Get account details,600 requests/10s,Bearer Token,Verified,None
+/v2/orders,List orders,600 requests/10s,Bearer Token,Verified,None
+/v2/orders/{order_id},Get order details,600 requests/10s,Bearer Token,Verified,None
+/v2/transfers,List transfers,600 requests/10s,Bearer Token,Verified,None
+/v2/transfers/{transfer_id},Get transfer details,600 requests/10s,Bearer Token,Verified,None
+/v2/time,Get current time,10 requests/s,None,Estimated,Rate limit may vary
+/v2/ticker,Get ticker price,10 requests/s,None,Estimated,Rate limit may vary
+/v2/order-book,Get order book,10 requests/s,None,Estimated,Rate limit may vary
+/v2/trades,List trades,10 requests/s,None,Estimated,Rate limit may vary

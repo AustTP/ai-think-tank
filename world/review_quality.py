@@ -66,6 +66,9 @@ def artifact_checks(document, contract, resolve, execution=None):
             with open(target, encoding='utf-8-sig') as stream: text = stream.read()
             if path.endswith('.csv'):
                 rows = list(csv.DictReader(io.StringIO(text)))
+                if any(None in row for row in rows):
+                    errors.append('CSV has rows with more values than its header; fix quoting or column counts: ' + path)
+                    continue
                 fields = list(rows[0]) if rows else []
                 duplicates = len(rows) - len({json.dumps(r, sort_keys=True) for r in rows})
                 missing = sum(any(v is None or str(v).strip() == '' for v in row.values()) for row in rows)

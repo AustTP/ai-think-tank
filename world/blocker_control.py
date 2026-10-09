@@ -194,7 +194,60 @@ def router_for(serve):
             return await asyncio.to_thread(submit_artifact, serve, task_id, body.get('libraryPath'))
         except (ValueError, TypeError) as error:
             return JSONResponse({'error': str(error)}, status_code=400)
+    @router.post('/{task_id}/complete')
+    async def accept_failures(task_id: str, request: Request):
+        if not serve._require_player_session(request):
+            return JSONResponse({'error': 'Player login required.'}, status_code=401)
+        try:
+            body = await request.json()
+            return await asyncio.to_thread(complete_with_exceptions, serve, task_id, body.get('reason') if isinstance(body, dict) else None)
+        except (ValueError, TypeError) as error:
+            return JSONResponse({'error': str(error)}, status_code=400)
     return router
+
+
+def complete_with_exceptions(serve, task_id, reason):
+    import copy
+    import story_tracking
+    import sim
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 4000:
+        raise ValueError('Explain which failed requirements you accept (maximum 4000 characters).')
+    with serve._STATE_UPDATE_LOCK:
+        state = serve.get_state_from_db() or {}
+        task = (state.get('tasks') or {}).get(task_id)
+        if not task or any(task.get(k) for k in story_tracking.LINKS):
+            raise ValueError('Choose an original story, rather than its subtask or review.')
+        if task.get('status') == 'done' and task.get('playerAcceptance'):
+            return {'ok': True, 'taskId': task_id, 'alreadyAccepted': True}
+        if task.get('status') not in ('blocked', 'failed', 'needs_review', 'repairing') or not (task.get('manualAttention') or (task.get('_peerGate') or {}).get('escalated') or task.get('status') in ('blocked','failed')):
+            raise ValueError('Only blocked or failed stories can be completed with exceptions.')
+        now = int(time.time()*1000)
+        task['playerAcceptance'] = {'at':now, 'by':'player', 'reason':reason.strip(),
+            'failedFindings':copy.deepcopy(task.get('peerReviews') or []),
+            'diagnosis':copy.deepcopy(task.get('reviewDiagnosis')),
+            'previousGate':copy.deepcopy(task.get('_peerGate')), 'failure':task.get('failNote'),
+            'qualityStatus':'accepted_with_exceptions', 'tradingAuthorized':False}
+        children = [t for t in state.get('tasks', {}).values() if t['id'] != task_id and story_tracking.root(state,t).get('id') == task_id]
+        ids = {t['id'] for t in children} | {task_id}
+        state['workQueue'] = [q for q in state.get('workQueue',[]) if not any(q.get(k) in ids for k in story_tracking.LINKS)]
+        for child in children:
+            if child.get('status') not in ('done','cancelled','abandoned'):
+                child.update(status='cancelled', cancelledAt=now, note='Parent story accepted by player with recorded exceptions.')
+            agent = state.get('agents',{}).get(child.get('assignedTo'))
+            if agent and agent.get('task') == child['id']:
+                if child.get('pairWith'):
+                    sim._release_pair_navigator(state, child['pairWith'], child['id'])
+                agent.update(task=None, busy=False, inRoom=None, path=None, offDuty=True, visible=False)
+        task.update(status='done', completedAt=now, manualAttention=False,
+                    blockedReason=None, deliveryState='accepted_with_exceptions',
+                    nextAction='Completed by the player with recorded exceptions.')
+        task.pop('_peerRepairPending', None)
+        task['_peerGate'] = dict(task.get('_peerGate') or {})
+        task['_peerGate']['escalated'] = True
+        reconcile_notices(state)
+        serve.save_state_to_db(state)
+        serve.log_action('player','story_accepted_with_exceptions', {'taskId':task_id,'reason':reason.strip()}, authorized=True)
+        return {'ok':True,'taskId':task_id,'status':'done','qualityStatus':'accepted_with_exceptions','tradingAuthorized':False}
 
 
 def submit_artifact(serve, task_id, library_path):
@@ -212,7 +265,7 @@ def submit_artifact(serve, task_id, library_path):
     with serve._STATE_UPDATE_LOCK:
         state = serve.get_state_from_db() or {}
         task = (state.get('tasks') or {}).get(task_id)
-        if not task or not task.get('manualAttention') or task.get('status') in ('done', 'cancelled', 'working', 'walking'):
+        if not task or not (task.get('manualAttention') or (task.get('_peerGate') or {}).get('escalated')) or task.get('status') in ('done', 'cancelled', 'working', 'walking'):
             raise ValueError('Only a blocked deliverable can receive replacement evidence.')
         if sim._peer_coding_class(task):
             raise ValueError('Code repairs must pass the code director and quality pipeline.')

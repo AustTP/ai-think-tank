@@ -1253,16 +1253,17 @@ def _drain_emails_from_db():
         try:
             # SMTP runs on a separate thread. Merge its delivery receipts into
             # the latest state so a slow send cannot undo intervening task ticks.
-            fresh = serve.get_state_from_db()
-            if fresh:
-                drained = {(e.get('kind'), e.get('queuedAt')) for e in original_outbox}
-                fresh['emailOutbox'] = [e for e in fresh.get('emailOutbox', [])
-                                        if (e.get('kind'), e.get('queuedAt')) not in drained]
-                fresh['emailOutbox'].extend(state.get('emailOutbox') or [])
-                for sid, record in (state.get('sprints') or {}).items():
-                    if sid in (fresh.get('sprints') or {}) and record.get('resultsEmail'):
-                        fresh['sprints'][sid]['resultsEmail'] = record['resultsEmail']
-                serve.save_state_to_db(fresh)
+            with serve._STATE_UPDATE_LOCK:
+                fresh = serve.get_state_from_db()
+                if fresh:
+                    drained = {(e.get('kind'), e.get('queuedAt')) for e in original_outbox}
+                    fresh['emailOutbox'] = [e for e in fresh.get('emailOutbox', [])
+                                            if (e.get('kind'), e.get('queuedAt')) not in drained]
+                    fresh['emailOutbox'].extend(state.get('emailOutbox') or [])
+                    for sid, record in (state.get('sprints') or {}).items():
+                        if sid in (fresh.get('sprints') or {}) and record.get('resultsEmail'):
+                            fresh['sprints'][sid]['resultsEmail'] = record['resultsEmail']
+                    serve.save_state_to_db(fresh)
         except Exception as e:  # pragma: no cover
             print(f'[sim] email drain save failed: {e}')
     return results
@@ -1891,6 +1892,8 @@ def _apply_content_result(state, task, result, now_ms=None):
     library_path = result.get('libraryPath')
     if library_path:
         task['libraryPath'] = library_path
+    if result.get('ok') is False or result.get('peerVerdict') == 'actionable':
+        __import__('repeat_work').record(state, task, result, now_ms)
     # Merge grown seenUrls back into the topic (dedup is stored per-topic).
     seen = result.get('seenUrls')
     if seen:
@@ -1932,6 +1935,7 @@ def _apply_content_result(state, task, result, now_ms=None):
                    and result.get('peerVerdict')):
         # A gate review that must go BACK to the same author + the same gate
         # carries the parent id; a free-form pressoffice fix does not.
+        qf = {**qf, 'recoveryOf':task.get('id')}
         queue_work(state, [qf])
     # W3: a worker's spike can PROPOSE an issue (a Jev verdict that the spike's
     # finding names a real, actionable gap). The executor reports a WISH -- the
@@ -2342,6 +2346,10 @@ def queue_work(state, items):
             # a whitelist that silently drops a field its consumer needs.
             'userStory': item.get('userStory') or None,
             'acceptanceCriteria': item.get('acceptanceCriteria') or None,
+            'rootStoryId': item.get('rootStoryId'),
+            'scrumMasterId': item.get('scrumMasterId'),
+            'requestId': item.get('requestId'),
+            'recoveryOf': item.get('recoveryOf'),
             'workOrderId': item.get('workOrderId'),
             'workOrderStoryId': item.get('workOrderStoryId'),
             'investigationOf': item.get('investigationOf'),
@@ -2458,6 +2466,7 @@ def queue_work(state, items):
             # is auditable, not implicit.
             'moonshot': bool(item.get('moonshot')),
         })
+        __import__('story_tracking').stamp(state, work_queue[-1])
     return len(work_queue)
 
 
@@ -4008,6 +4017,9 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'entryX': rest_x,
         'entryY': rest_y,
     }
+    for field in ('rootStoryId', 'scrumMasterId', 'requestId', 'recoveryOf'):
+        task[field] = (extra or {}).get(field)
+    __import__('story_tracking').stamp(state, task)
     state.setdefault('tasks', {})[task_id] = task
     a['task'] = task_id
     a['path'] = path
@@ -5395,7 +5407,7 @@ def _resolve_review_parent(state, review_task):
     if not pid:
         return None
     parent = (state.get('tasks') or {}).get(pid)
-    if not parent or not parent.get('_peerGate'):
+    if not parent or parent.get('status') in ('done', 'cancelled', 'abandoned') or not parent.get('_peerGate'):
         return None
     return parent
 
@@ -5461,7 +5473,7 @@ def _queue_peer_repair(state, parent, rationale=None):
     feedback = rationale or 'Address the rejected peer-review findings.'
     import review_quality
     stable_contract = review_quality.contract_for(parent)
-    instructions = (f"{stable_contract['instructions']}\n\nRepair the original deliverable: {parent.get('title')}."
+    instructions = (f"{__import__('work_reuse').compact({**parent, 'currentFailure': feedback})}\n\nRepair the original deliverable: {parent.get('title')}."
                     f"\nPeer-review findings: {feedback}\n{findings}"
                     f"\nExisting Library document: {parent.get('libraryPath') or 'not yet saved'}."
                     '\nSave the corrected deliverable and meet the original acceptance criteria before requesting review.')
@@ -5494,6 +5506,7 @@ def _queue_peer_repair(state, parent, rationale=None):
         'projectLabel': parent.get('projectLabel') or parent.get('title'),
         'productId': parent.get('productId'), 'userStory': parent.get('userStory'),
         'acceptanceCriteria': parent.get('acceptanceCriteria'), 'teamId': parent.get('teamId'),
+        'reviewContract':stable_contract,
         'budgetUsd': parent.get('budgetUsd'), 'priority': 'high',
     }])
 
@@ -10870,6 +10883,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     _mail_action_step(state, now, now_ms)
 
     __import__('completion_watchdog').step(state, now_ms)
+    __import__('story_tracking').refresh(state, __import__('serve')._spend_ledger_read())
 
     for parent in list((state.get('tasks') or {}).values()):
         if parent.get('status') != 'failed' or not parent.get('_peerRepairPending'):
@@ -11654,6 +11668,10 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         appear_from_outskirts(state, chosen_id, doors)
     extra = {
         'research': pick.get('research'),
+        'rootStoryId': pick.get('rootStoryId'),
+        'scrumMasterId': pick.get('scrumMasterId'),
+        'requestId': pick.get('requestId'),
+        'recoveryOf': pick.get('recoveryOf'),
         'workOrderId': pick.get('workOrderId'),
         'workOrderStoryId': pick.get('workOrderStoryId'),
         'investigationOf': pick.get('investigationOf'),

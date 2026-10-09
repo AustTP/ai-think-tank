@@ -1,0 +1,41 @@
+path,size_bytes,inspection,limitation
+coinbase_api_capabilities.csv,426,CSV parsed with 3 rows,File and structure checks; content claims remain unverified
+coinbase_api_details.csv,487,CSV parsed with 5 rows,File and structure checks; content claims remain unverified
+coinbase_api_endpoints.csv,395,CSV parsed with 4 rows,File and structure checks; content claims remain unverified
+coinbase_api_integration.csv,861,CSV parsed with 10 rows,File and structure checks; content claims remain unverified
+coinbase_api_integration_report.csv,282,CSV parsed with 2 rows,File and structure checks; content claims remain unverified
+coinbase_api_limits.csv,808,Dataset is empty: coinbase_api_limits.csv,File and structure checks; content claims remain unverified
+coinbase_api_optimization.csv,595,CSV parsed with 6 rows,File and structure checks; content claims remain unverified
+coinbase_api_optimization_techniques.csv,584,Cannot inspect artifact coinbase_api_optimization_techniques.csv: '<' not supported between instances of 'NoneType' and 'str',File and structure checks; content claims remain unverified
+coinbase_api_optimization_techniques_1.csv,455,Dataset contains missing values: coinbase_api_optimization_techniques_1.csv,File and structure checks; content claims remain unverified
+coinbase_data_apis.csv,614,Dataset is empty: coinbase_data_apis.csv,File and structure checks; content claims remain unverified
+coinbase_data_feeds.csv,304,CSV parsed with 2 rows,File and structure checks; content claims remain unverified
+coinbase_hourly_data_apis.csv,189,CSV parsed with 1 rows,File and structure checks; content claims remain unverified
+coinbase_hourly_data_sources.csv,214,CSV parsed with 2 rows,File and structure checks; content claims remain unverified
+coinbase_hourly_price_data.csv,202,CSV parsed with 1 rows,File and structure checks; content claims remain unverified
+coinbase_real_time_data_feeds.csv,478,Dataset is empty: coinbase_real_time_data_feeds.csv,File and structure checks; content claims remain unverified
+coinbase_risk_compliance.csv,616,CSV parsed with 5 rows,File and structure checks; content claims remain unverified
+coinbase_risk_compliance_plan.csv,551,CSV parsed with 5 rows,File and structure checks; content claims remain unverified
+coinbase_risk_compliance_verified.csv,283,CSV parsed with 4 rows,File and structure checks; content claims remain unverified
+coinbase_spot_trading_strategies.csv,1904,CSV parsed with 10 rows,File and structure checks; content claims remain unverified
+coinbase_strategies.csv,1242,CSV parsed with 5 rows,File and structure checks; content claims remain unverified
+coinbase_testing_frameworks.csv,321,CSV parsed with 3 rows,File and structure checks; content claims remain unverified
+crypto_data_feeds.csv,218,CSV parsed with 3 rows,File and structure checks; content claims remain unverified
+crypto_data_requirements.csv,670,CSV parsed with 5 rows,File and structure checks; content claims remain unverified
+crypto_data_storage_options.csv,132,CSV parsed with 2 rows,File and structure checks; content claims remain unverified
+crypto_historical_data.csv,98410,CSV parsed with 1011 rows,File and structure checks; content claims remain unverified
+crypto_strategies.csv,383,CSV parsed with 4 rows,File and structure checks; content claims remain unverified
+crypto_trading_readiness.csv,379,CSV parsed with 4 rows,File and structure checks; content claims remain unverified
+grid_trading_data.csv,521,Dataset contains missing values: grid_trading_data.csv,File and structure checks; content claims remain unverified
+grid_trading_data_sources.csv,805,CSV parsed with 6 rows,File and structure checks; content claims remain unverified
+influxdb_api_endpoints.csv,384,CSV parsed with 3 rows,File and structure checks; content claims remain unverified
+trading.csv,152,CSV parsed with 3 rows,File and structure checks; content claims remain unverified
+trading_estimation.csv,202,CSV parsed with 4 rows,File and structure checks; content claims remain unverified
+trading_readiness.csv,41,CSV parsed with 1 rows,File and structure checks; content claims remain unverified
+trading_readiness_v2.csv,556,Dataset is empty: trading_readiness_v2.csv,File and structure checks; content claims remain unverified
+trading_readiness_v3.csv,660,CSV parsed with 7 rows,File and structure checks; content claims remain unverified
+trading_strategies.csv,1486,Cannot inspect artifact trading_strategies.csv: '<' not supported between instances of 'NoneType' and 'str',File and structure checks; content claims remain unverified
+trading_strategies_2.csv,1371,Dataset is empty: trading_strategies_2.csv,File and structure checks; content claims remain unverified
+trading_strategies_risk_management.csv,1659,CSV parsed with 6 rows,File and structure checks; content claims remain unverified
+trading_strategy_performance.csv,976,Dataset is empty: trading_strategy_performance.csv,File and structure checks; content claims remain unverified
+trading_tools.csv,351,Dataset is empty: trading_tools.csv,File and structure checks; content claims remain unverified

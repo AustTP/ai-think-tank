@@ -1,0 +1,19 @@
+data_point,description,basis
+Timestamp,The date and time of each data point.,Requirement listed in source report; coverage not independently verified
+Open Price,"The opening price of a cryptocurrency during a specific time interval (e.g., daily, hourly, or minutely).",Requirement listed in source report; coverage not independently verified
+High Price,The highest price of a cryptocurrency during a specific time interval.,Requirement listed in source report; coverage not independently verified
+Low Price,The lowest price of a cryptocurrency during a specific time interval.,Requirement listed in source report; coverage not independently verified
+Close Price,The closing price of a cryptocurrency during a specific time interval.,Requirement listed in source report; coverage not independently verified
+Volume,The total quantity of a cryptocurrency traded during a specific time interval.,Requirement listed in source report; coverage not independently verified
+Order Book Data,"Detailed information about the current orders (both sell and buy) for a specific cryptocurrency, including price and quantity.",Requirement listed in source report; coverage not independently verified
+Trading Fees,"The fees charged by the exchange for trading activities, often differentiated between maker and taker fees.",Requirement listed in source report; coverage not independently verified
+Slippage,The difference between the expected price and the price at which the order is actually executed.,Requirement listed in source report; coverage not independently verified
+VWAP (Volume-Weighted Average Price),"The average price of a cryptocurrency over a specific time interval, weighted by the volume traded.",Requirement listed in source report; coverage not independently verified
+Delisted Tokens Data,Historical data of delisted tokens to neutralize survivorship bias.,Requirement listed in source report; coverage not independently verified
+Market Cap,"The total market value of a cryptocurrency, calculated by multiplying the current price by the circulating supply.",Requirement listed in source report; coverage not independently verified
+Circulating Supply,The number of coins or tokens currently available in the market.,Requirement listed in source report; coverage not independently verified
+Total Supply,The total number of coins or tokens that will ever exist in the lifetime of the cryptocurrency.,Requirement listed in source report; coverage not independently verified
+ATH (All-Time High) and ATL (All-Time Low),The highest and lowest prices a cryptocurrency has ever reached.,Requirement listed in source report; coverage not independently verified
+52-Week High/Low,The highest and lowest prices a cryptocurrency has reached in the past 52 weeks.,Requirement listed in source report; coverage not independently verified
+Price Change (%),The percentage change in the price of a cryptocurrency over a specific time interval.,Requirement listed in source report; coverage not independently verified
+Market Depth,A measure of how easily an asset can be traded without affecting its price.,Requirement listed in source report; coverage not independently verified

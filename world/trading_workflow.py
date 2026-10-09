@@ -148,6 +148,9 @@ def advance(state):
             workflow['phase'] = 'working'
             return
         if task.get('status') == 'done':
+            if task.get('playerAcceptance'):
+                workflow['phase'] = 'blocked'
+                return
             acceptance = task.get('tradingAcceptance') or {}
             if acceptance.get('accepted') and task.get('libraryPath'):
                 workflow['reports'][stage] = task['libraryPath']

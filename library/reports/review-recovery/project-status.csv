@@ -1,0 +1,94 @@
+task_id,title,status,owner,saved_report,basis
+task-58,Research realized P&L accounting for trading agents,failed,zara,No saved report,Recorded task state; independent trading readiness not established
+task-19,Collect historical data for the top 20 crypto currencies by market cap,failed,eva,No saved report,Recorded task state; independent trading readiness not established
+task-20,Gather and review Zara's research on crypto trading strategies,failed,zara,No saved report,Recorded task state; independent trading readiness not established
+task-21,Develop a scoring model to rank crypto currencies based on day trading potential,failed,ada,No saved report,Recorded task state; independent trading readiness not established
+task-22,Analyze and validate the top 5 ranked crypto currencies for day trading,failed,leo,No saved report,Recorded task state; independent trading readiness not established
+task-23,Identify key metrics for day trading crypto currencies,done,nora,archive/1791315390137-spike-task-23.md,Recorded task state; independent trading readiness not established
+task-24,Apply scoring model to the top 20 crypto currencies and rank them,failed,ben,No saved report,Recorded task state; independent trading readiness not established
+task-63,Rank top crypto candidates for day trading,failed,ada,No saved report,Recorded task state; independent trading readiness not established
+task-64,Research viable day-trading strategies,failed,zara,No saved report,Recorded task state; independent trading readiness not established
+task-65,Map strategies to candidate cryptos,done,nora,archive/1791316058709-spike-task-65.md,Recorded task state; independent trading readiness not established
+task-66,Produce the final trading research brief,failed,leo,No saved report,Recorded task state; independent trading readiness not established
+task-67,Define crypto day-trading selection criteria,done,ben,archive/1791316069259-spike-task-67.md,Recorded task state; independent trading readiness not established
+task-77,Identify trading thesis drivers,done,nora,No saved report,Recorded task state; independent trading readiness not established
+task-79,Assemble the first trading plan,failed,ada,No saved report,Recorded task state; independent trading readiness not established
+task-111,Collect sourced market inputs for the blocked trading plan,failed,zara,No saved report,Recorded task state; independent trading readiness not established
+task-136,Backtest the candidate strategy.,failed,nora,No saved report,Recorded task state; independent trading readiness not established
+task-190,Verify sourced inputs needed by the blocked trading plan,done,ada,archive/1791324011900-spike-task-190.md,Recorded task state; independent trading readiness not established
+task-194,Implement backtesting engine,failed,leo,No saved report,Recorded task state; independent trading readiness not established
+task-195,Run backtests on selected strategies,failed,ben,No saved report,Recorded task state; independent trading readiness not established
+task-197,Develop trading strategies for backtesting,failed,zara,No saved report,Recorded task state; independent trading readiness not established
+task-201,Analyze backtesting results,failed,eva,No saved report,Recorded task state; independent trading readiness not established
+task-352,Review and update trading strategies,done,ada,archive/1791389310982-spike-task-352.md,Recorded task state; independent trading readiness not established
+task-411,Audit current trading gaps,done,leo,archive/1791390551604-spike-task-411.md,Recorded task state; independent trading readiness not established
+task-508,Research a Coinbase spot trading strategy with a $50 loss limit,cancelled,owen,archive/1791410652599-spike-task-508.md,Recorded task state; independent trading readiness not established
+task-510,Coinbase spot workflow: research,cancelled,crypto-researcher,archive/1791412250800-spike-task-510.md,Recorded task state; independent trading readiness not established
+task-522,Coinbase spot workflow: research repair 1,cancelled,crypto-researcher,archive/1791414679268-spike-task-522.md,Recorded task state; independent trading readiness not established
+task-523,Coinbase spot workflow: research repair 2,cancelled,crypto-researcher,archive/1791414805090-spike-task-523.md,Recorded task state; independent trading readiness not established
+task-524,Coinbase spot workflow: research,cancelled,crypto-researcher,No saved report,Recorded task state; independent trading readiness not established
+task-529,coinbase api,cancelled,ada,archive/1791471562465-spike-task-698.md,Recorded task state; independent trading readiness not established
+task-541,Groom findings: Audit current trading gaps,done,oliver,archive/1791464328408-spike-task-541.md,Recorded task state; independent trading readiness not established
+task-545,[STORY] Owen (Research a Coinbase spot trading strategy with a $50 loss limit): **Final Findings Report**,cancelled,lila,No saved report,Recorded task state; independent trading readiness not established
+task-546,Groom findings: Research a Coinbase spot trading strategy with a $50 loss limit,failed,caleb,No saved report,Recorded task state; independent trading readiness not established
+task-547,Investigate review blocker: Coinbase spot workflow: research,done,ada,archive/1791464271871-spike-task-547.md,Recorded task state; independent trading readiness not established
+task-551,trading strategies,cancelled,maya,archive/1791471593881-spike-task-700.md,Recorded task state; independent trading readiness not established
+task-595,coinbase api,failed,oliver,archive/1791473317185-spike-task-725.md,Recorded task state; independent trading readiness not established
+task-710,trading,failed,leo,No saved report,Recorded task state; independent trading readiness not established
+task-767,trading parameters,failed,ada,No saved report,Recorded task state; independent trading readiness not established
+task-769,trading,failed,oliver,No saved report,Recorded task state; independent trading readiness not established
+task-828,trading,done,ada,archive/1791492960610-spike-task-828.md,Recorded task state; independent trading readiness not established
+task-833,Research Coinbase API documentation,done,maya,archive/1791496919085-spike-task-1005.md,Recorded task state; independent trading readiness not established
+task-834,Research linear regression for trading strategies,cancelled,zara,archive/1791568759876-spike-task-1742.md,Recorded task state; independent trading readiness not established
+task-835,Research trading strategy options,failed,eva,archive/1791568267155-spike-task-1619.md,Recorded task state; independent trading readiness not established
+task-838,Backtest Trading Parameters,done,oliver,archive/1791494894955-spike-task-838.md,Recorded task state; independent trading readiness not established
+task-839,Research existing trading strategies,blocked,nora,archive/1791569088043-spike-task-1827.md,Recorded task state; independent trading readiness not established
+task-890,Research trading tool requirements,done,oliver,archive/1791568938740-spike-task-1795.md,Recorded task state; independent trading readiness not established
+task-891,Determine API/data feed integration options,done,emma,archive/1791495450879-spike-task-891.md,Recorded task state; independent trading readiness not established
+task-892,Choose programming language for trading tools,failed,amelia,No saved report,Recorded task state; independent trading readiness not established
+task-901,Develop a customized trading strategy,failed,leo,No saved report,Recorded task state; independent trading readiness not established
+task-905,Backtest and evaluate the trading strategy,failed,leo,archive/backtest-task-905-baseline.md,Recorded task state; independent trading readiness not established
+task-906,Research Trading Strategies for $100/Day Profit,needs_review,maya,archive/1791569047885-spike-task-1830.md,Recorded task state; independent trading readiness not established
+task-907,Analyze Market Conditions for Trading Opportunities,needs_review,zara,archive/1791569131976-spike-task-1840.md,Recorded task state; independent trading readiness not established
+task-908,Define Trading Parameters for $100/Day Profit,done,eva,archive/1791495665650-spike-task-908.md,Recorded task state; independent trading readiness not established
+task-1006,Recover Library documents: Backtest and evaluate the trading strategy,failed,ada,No saved report,Recorded task state; independent trading readiness not established
+task-1031,Recover Library documents: Research trading strategy options,done,librarian,archive/1791497582065-spike-task-1031.md,Recorded task state; independent trading readiness not established
+task-1035,Recover Library documents: Research trading strategy options,done,ada,archive/1791568298716-spike-task-1628.md,Recorded task state; independent trading readiness not established
+task-1072,Recover Library documents: Research trading strategy options,done,librarian,archive/1791499386042-spike-task-1072.md,Recorded task state; independent trading readiness not established
+task-1118,Research existing Python app and Coinbase API,failed,oliver,archive/1791570748801-spike-task-1964.md,Recorded task state; independent trading readiness not established
+task-1124,Research: Identify data feed,needs_review,ada,archive/1791570601490-spike-task-1956.md,Recorded task state; independent trading readiness not established
+task-1174,Recover Library documents: Research: Identify data feed,done,librarian,archive/1791501542525-spike-task-1174.md,Recorded task state; independent trading readiness not established
+task-1191,Recover Library documents: Research: Identify data feed,done,librarian,No saved report,Recorded task state; independent trading readiness not established
+task-1194,Recover Library documents: Research: Identify data feed,done,ada,archive/1791501755242-spike-task-1194.md,Recorded task state; independent trading readiness not established
+task-1242,Research InfluxDB API endpoints for data upload,done,ada,archive/1791549758595-spike-task-1248.md,Recorded task state; independent trading readiness not established
+task-1243,Research InfluxDB API endpoints for data interaction,needs_review,ben,archive/1791569185742-spike-task-1852.md,Recorded task state; independent trading readiness not established
+task-1249,Recover Library documents: Research InfluxDB API endpoints for data upload,done,librarian,No saved report,Recorded task state; independent trading readiness not established
+task-1251,Recover Library documents: Research InfluxDB API endpoints for data interaction,done,maya,No saved report,Recorded task state; independent trading readiness not established
+task-1253,Investigate INFLUXdb setup and data ingestion,done,maya,archive/1791550151139-spike-task-1296.md,Recorded task state; independent trading readiness not established
+task-1264,Investigate trading strategy and risk management,blocked,oliver,archive/1791551662125-spike-task-1402.md,Recorded task state; independent trading readiness not established
+task-1270,Recover Library documents: Research InfluxDB API endpoints for data interaction,done,librarian,archive/1791549999040-spike-task-1270.md,Recorded task state; independent trading readiness not established
+task-1273,Research hourly price data for Grid Trading strategy,done,emma,archive/1791568712725-spike-task-1743.md,Recorded task state; independent trading readiness not established
+task-1284,Investigate InfluxDB Python client library,done,ada,archive/1791550042317-spike-task-1284.md,Recorded task state; independent trading readiness not established
+task-1300,Recover Library documents: Investigate trading strategy and risk management,done,ada,archive/1791550186487-spike-task-1300.md,Recorded task state; independent trading readiness not established
+task-1353,Recover Library documents: Research hourly price data for Grid Trading strategy,done,librarian,archive/1791550564240-spike-task-1353.md,Recorded task state; independent trading readiness not established
+task-1377,Recover Library documents: Research hourly price data for Grid Trading strategy,done,librarian,archive/1791550989206-spike-task-1377.md,Recorded task state; independent trading readiness not established
+task-1403,Research existing testing frameworks for Coinbase API,cancelled,oliver,archive/1791568869598-spike-task-1773.md,Recorded task state; independent trading readiness not established
+task-1408,Research Coinbase API capabilities,done,ada,archive/1791552114544-spike-task-1445.md,Recorded task state; independent trading readiness not established
+task-1450,Implement Coinbase API connection,failed,leo,No saved report,Recorded task state; independent trading readiness not established
+task-1451,Generate report on Coinbase account examination,failed,leo,No saved report,Recorded task state; independent trading readiness not established
+task-1468,Recover Library documents: Research existing testing frameworks for Coinbase API,done,librarian,archive/1791553954608-spike-task-1468.md,Recorded task state; independent trading readiness not established
+task-1495,Recover Library documents: Research existing testing frameworks for Coinbase API,done,librarian,No saved report,Recorded task state; independent trading readiness not established
+task-1520,Estimate work needed to start trading,done,ada,archive/1791564827452-spike-task-1520.md,Recorded task state; independent trading readiness not established
+task-1526,Research trading strategy evaluation metrics,done,ben,archive/1791565133325-spike-task-1526.md,Recorded task state; independent trading readiness not established
+task-1573,Research existing Coinbase API documentation,needs_review,oliver,archive/1791568911246-spike-task-1782.md,Recorded task state; independent trading readiness not established
+task-1574,Assess existing Python app for trading strategy evaluation,done,amelia,archive/1791567120467-spike-task-1574.md,Recorded task state; independent trading readiness not established
+task-1575,Identify gaps in trading project planning,done,emma,archive/1791567177042-spike-task-1575.md,Recorded task state; independent trading readiness not established
+task-1587,Recover Library documents: Research existing Coinbase API documentation,done,librarian,archive/1791567182999-spike-task-1587.md,Recorded task state; independent trading readiness not established
+task-1851,Recover Library documents: Research existing Coinbase API documentation,done,librarian,archive/1791569147874-spike-task-1851.md,Recorded task state; independent trading readiness not established
+task-1869,Recover Library documents: Research linear regression for trading strategies,done,librarian,archive/1791569220436-spike-task-1869.md,Recorded task state; independent trading readiness not established
+task-1879,Recover Library documents: Research: Identify data feed,done,librarian,archive/1791569268110-spike-task-1879.md,Recorded task state; independent trading readiness not established
+task-1891,Recover Library documents: Research InfluxDB API endpoints for data interaction,done,librarian,archive/1791569353664-spike-task-1891.md,Recorded task state; independent trading readiness not established
+task-1892,Recover Library documents: Research existing Coinbase API documentation,done,maya,archive/1791569414527-spike-task-1892.md,Recorded task state; independent trading readiness not established
+task-1893,Recover Library documents: Analyze Market Conditions for Trading Opportunities,done,ada,archive/1791569430147-spike-task-1893.md,Recorded task state; independent trading readiness not established
+task-1907,Recover Library documents: Analyze Market Conditions for Trading Opportunities,done,maya,archive/1791569637704-spike-task-1907.md,Recorded task state; independent trading readiness not established
+task-1911,Recover Library documents: Research InfluxDB API endpoints for data interaction,done,zara,archive/1791569581328-spike-task-1911.md,Recorded task state; independent trading readiness not established

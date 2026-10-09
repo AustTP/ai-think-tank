@@ -1,0 +1,3 @@
+strategy_name,strategy_description,pros,cons,risk_management_technique,implementation,feasibility,efficiency,basis
+Dollar-Cost Averaging (DCA),A strategy for regularly buying a fixed dollar amount of an asset regardless of its price.,Reduces timing risk,Requires discipline.,Limiting loss size,Use stop-loss orders.,High,High,verified
+Cryptocurrency risk management,A process to limit losses and protect capital during trades.,Helps stay disciplined in a highly volatile market.,None.,Diversification,Spread crypto budget across multiple coins.,Medium,Medium,estimated

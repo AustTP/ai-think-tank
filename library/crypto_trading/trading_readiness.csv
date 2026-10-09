@@ -1,0 +1,18 @@
+feature,status,basis,notes
+Bollinger Bands,Implemented,Verified,Backtested
+Moving Averages,Implemented,Verified,Backtested
+RSI,Implemented,Verified,Backtested
+MACD,Not yet implemented,Estimated,Not backtested
+Fibonacci,Not yet implemented,Estimated,Not backtested
+Coinbase API Connection,Implemented,Verified,Tested
+Market Orders,Implemented,Verified,Tested
+Limit Orders,Implemented,Verified,Tested
+Stop-Limit Orders,Implemented,Verified,Tested
+Margin Trading,Not yet implemented,Estimated,Not tested
+Advanced Order Types,Not yet implemented,Estimated,Not tested
+Historical Data,Implemented,Verified,Fetched and stored
+Real-time Data,Implemented,Verified,Fetched and displayed
+Backtesting,Incomplete,Estimated,Some strategies not yet backtested
+Optimization,Not yet implemented,Estimated,Not yet implemented
+User Guide,Not yet created,Estimated,Not yet written
+API Reference,Not yet updated,Estimated,Not yet updated

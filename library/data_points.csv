@@ -1,0 +1,11 @@
+data_point,description,frequency,source,verification_status
+Timestamp,The date and time of the data point,Minutely,Exchange,Verified
+Open,The opening price of the asset for the period,Minutely,Exchange,Verified
+High,The highest price of the asset during the period,Minutely,Exchange,Verified
+Low,The lowest price of the asset during the period,Minutely,Exchange,Verified
+Close,The closing price of the asset for the period,Minutely,Exchange,Verified
+Volume,The total volume of the asset traded during the period,Minutely,Exchange,Verified
+VWAP,The volume-weighted average price of the asset during the period,Minutely,Exchange,Estimated
+Bid,The highest price that a buyer is willing to pay for the asset,Minutely,Exchange,Estimated
+Ask,The lowest price that a seller is willing to sell the asset for,Minutely,Exchange,Estimated
+Spread,Bid-Ask spread,Minutely,Exchange,Estimated
