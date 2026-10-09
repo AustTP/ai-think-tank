@@ -1,0 +1,4 @@
+feature,description,limitation,requirement,status
+Rate Limits,The API has rate limits per minute and per second.,Exceeding limits may cause a blocker.,None,Estimated
+Permissions,Some API calls require specific permissions.,Incorrect permissions may cause a blocker.,Correct permissions,Verified
+Two-Factor Authentication,The API requires 2FA for certain actions.,Not enabling 2FA may cause a blocker.,2FA enabled,Verified

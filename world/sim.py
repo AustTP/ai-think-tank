@@ -2756,8 +2756,11 @@ def pick_next_due_index(work_queue, now_ms, exclude_items, state=None):
             continue
         if state is not None and not _work_item_dependency_met(state, item):
             continue
+        if state is not None and not __import__('completion_watchdog').can_start(state, item):
+            continue
         priority = item.get('priority', WORK_PRIORITY['normal'])
-        score = (priority, size_estimate_weight(item.get('sizeEstimate')))
+        finishing = bool(item.get('reviewOf') or item.get('investigationOf')) if state is not None else False
+        score = (finishing, priority, size_estimate_weight(item.get('sizeEstimate')))
         if best_score is None or score > best_score:
             best_score, best_index = score, i
     return best_index
@@ -10866,6 +10869,8 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # being parked-idle in this same tick before she can process it).
     _mail_action_step(state, now, now_ms)
 
+    __import__('completion_watchdog').step(state, now_ms)
+
     for parent in list((state.get('tasks') or {}).values()):
         if parent.get('status') != 'failed' or not parent.get('_peerRepairPending'):
             continue
@@ -11079,7 +11084,9 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                         # but somehow already has a stale _peerGate -- clear it
                         # instead of perpetuating the loop, and let it close
                         # normally next pass.
-                        parent['_peerGate'] = None
+                        __import__('completion_watchdog').complete_spike_repair(parent, result, now_ms)
+                        if not (parent.get('_peerGate') or {}).get('escalated'):
+                            parent['_peerGate'] = None
                         if parent.get('status') == 'needs_review':
                             parent['status'] = 'working'
                     finish_task(state, aid, grid)

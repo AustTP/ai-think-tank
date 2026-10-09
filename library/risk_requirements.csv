@@ -1,0 +1,4 @@
+requirement_id,description,estimated_work,implementation_status,source,verification_status
+req0001,Implement strong password policy for all users,3 days,Not started,https://www.sans.org/security-awareness-training-developer,Estimated
+req0002,Use multi-factor authentication,5 days,Not started,https://www.sans.org/security-awareness-training-developer,Estimated
+req0003,Keep software up-to-date,7 days,Not started,https://www.sans.org/security-awareness-training-developer,Estimated

@@ -1,0 +1,4 @@
+technique,description,pros,cons,implementation
+Batching,Grouping API requests together to reduce load,Can reduce load on the server,Can improve performance,Can be complex to implement,Need to implement logic for batching requests
+Caching,Storing frequently accessed data in a cache,Can improve performance,Can reduce load on the server,Can be complex to implement,Need to implement logic for caching data
+WebSockets,Using WebSockets for real-time communication,Can improve performance,Can reduce load on the server,Can be complex to implement,Need to implement logic for WebSockets

@@ -61,6 +61,20 @@ Tests:
 cd world && python3 -m pytest tests/
 ```
 
+Unfinished-story recovery runs on each simulation tick. Completed blocker
+investigations queue a repair of the original story; repairs return to its
+normal quality checks and independent review. Orphaned investigations and
+repairs retry with exponential backoff, then become explicit blockers requiring
+a decision. Pauses, stopped stories, frozen review gates, and exhausted budgets
+are respected. The board shows delivery state, next action, and last progress.
+
+The persisted `completionControl` settings default to five concurrent root
+stories, three recovery attempts, a 30-second initial backoff, and at most two
+recoveries per tick. Linked repairs, investigations, and reviews have scheduling
+priority and can finish admitted stories even when the concurrency limit is
+full. Supplying new recovery guidance resets the recovery allowance. Existing
+model-spend limits still apply; retries never raise budgets automatically.
+
 ## What it is
 
 - A persistent think tank database (`think_tank.db`, SQLite). Every action is

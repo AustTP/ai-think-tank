@@ -1852,10 +1852,11 @@ function renderBoard() {
     const repairs = Object.values(TASKS).filter(r => r.reviewOf === t.id && !['review','qa'].includes(r.taskType));
     const recovery = (t._peerRepairPending || t.manualAttention || t.status === 'blocked')
       ? `<div>Recovery owner: ${escapeDetails(t.assignedTo || 'Unassigned')}. ${repairs.length ? repairs.map(r => `${escapeDetails(r.id)}: ${escapeDetails(r.status)} / ${escapeDetails(r.assignedTo || '')}`).join('; ') : 'Next: inspect the blocker and choose its recovery action.'}</div>` : '';
-    if (!t.note && !t.failNote) return guide + recovery + diagnostics;
+    const progress = t.deliveryState ? `<div>Delivery: ${escapeDetails(t.deliveryState.replace(/_/g, ' '))}. Next: ${escapeDetails(t.nextAction || '')}${t.lastProgressAt ? `. Last progress: ${escapeDetails(new Date(t.lastProgressAt).toLocaleString())}` : ''}</div>` : '';
+    if (!t.note && !t.failNote) return progress + guide + recovery + diagnostics;
     const el = document.createElement('div');
     el.textContent = t.failNote || t.note;
-    return `<div style="opacity:0.8; margin:3px 0 8px;">${el.innerHTML}</div>${guide}${recovery}${diagnostics}`;
+    return `<div style="opacity:0.8; margin:3px 0 8px;">${el.innerHTML}</div>${progress}${guide}${recovery}${diagnostics}`;
   };
   const boardTasks = Object.values(TASKS).filter(t => !t.boardClearedAt ||
     (t.failedAt || 0) > t.boardClearedAt ||
@@ -1867,7 +1868,9 @@ function renderBoard() {
   // Peer-approval gate: a deliverable story awaiting two reviewer approvals is
   // neither "in progress" (its author finished) nor done. Show it separately.
   const needsReview = open.filter(t => t.status === 'needs_review');
-  const inProgress = open.filter(t => t.status !== 'needs_review');
+  const inProgress = open.filter(t => ['walking', 'working'].includes(t.status));
+  const waiting = open.filter(t => !['walking', 'working', 'needs_review'].includes(t.status));
+  const waitingLines = waiting.map(t => `<div>&bull; ${escBoard(t.title)} — ${escBoard(t.deliveryState || t.status)} / ${escBoard(AGENTS[t.assignedTo]?.name || t.assignedTo)}</div>${taskNote(t)}`).join('');
 
   const openLines = inProgress.length
     ? inProgress.map(t => {
@@ -2004,6 +2007,7 @@ function renderBoard() {
   setBoardSectionHtml(body, `
     <div style="margin-bottom:4px;"><strong>In progress (${inProgress.length})</strong></div>
     ${openLines}
+    ${waitingLines ? `<div style="margin:8px 0 4px;"><strong>Queued, recovering or blocked (${waiting.length})</strong></div>${waitingLines}` : ''}
     ${reviewLines ? `<div style="margin:8px 0 4px;"><strong>Awaiting peer review (${needsReview.length})</strong></div>${reviewLines}` : ''}
     <div style="margin:8px 0 4px;"><strong>Failed (${failed.length})</strong> ${failed.length ? '<button id="clearFailedBoardBtn" class="hud-btn" onclick="clearFailedBoardTasks(\'failed\')">Clear failed</button>' : ''}</div>
     ${failed.length ? failed.map(t => `<div>${t.title} (${t.status})</div>${taskNote(t)}`).join('') : '<div style="opacity:0.6;">No failed tasks.</div>'}

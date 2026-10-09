@@ -1,0 +1,4 @@
+endpoint_url,http_method,description,example_url,verification_status
+/api/v2/query,POST,Queries data from InfluxDB.,https://your-influxdb-instance.com/api/v2/query,verified
+/api/v2/write,POST,Writes data to InfluxDB.,https://your-influxdb-instance.com/api/v2/write,verified
+/api/v2/delete,POST,Deletes data from InfluxDB.,https://your-influxdb-instance.com/api/v2/delete,verified

@@ -1,0 +1,6 @@
+technique_name,pros,cons,source_url,basis
+Batching,Faster request processing,More complex implementation,https://www.nginx.com/blog/load-balancing-api-requests-nginx-plus/,estimated
+Caching,Faster response times,Extra memory usage,https://www.cloudflare.com/learning/cdn/glossary/caching/,estimated
+WebSocket connections,Real-time updates,More complex implementation,https://developer.mozilla.org/en-US/docs/Web/API/WebSocket,estimated
+Retry with exponential backoff,Prevents API requests from failing due to rate limits,More complex implementation,https://www.nginx.com/blog/implementing-retry-with-exponential-backoff-nginx-plus/,estimated
+Pagination,Efficient data retrieval,More complex implementation,https://www.postman.com/blog/pagination-in-apis/,estimated

@@ -1,0 +1,2 @@
+api_name,url,retrieval_method,hourly_data_available,data_format,missing_values,interval_gaps
+Coinbase API,https://api.coinbase.com/v2/prices/BTC-USD/spot,GET request,Yes,JSON,No,60 minutes

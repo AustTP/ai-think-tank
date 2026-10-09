@@ -1,0 +1,6 @@
+capability/limitation,description,verification_status
+Cryptocurrency Trading,"Allows buying, selling, and trading cryptocurrencies.",Verified
+Wallet Functionality,"Provides wallet creation, management, and transaction history.",Verified
+Real-time Notifications,"Supports real-time notifications for trades, deposits, and withdrawals.",Verified
+Rate Limits,Has rate limits to prevent API abuse.,Verified
+Documentation,Offers extensive documentation with examples and SDKs.,Verified

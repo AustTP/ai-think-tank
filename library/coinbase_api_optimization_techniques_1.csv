@@ -1,0 +1,4 @@
+technique_name,description,pros,cons,implementation_example,status
+Batching,Group multiple requests into a single one to reduce overhead,Faster request processing,More complex implementation,Verified
+Caching,Store API responses locally to avoid making the same request multiple times,Faster response times,Extra memory usage,Verified
+WebSocket connections,Use real-time updates to minimize polling,Real-time updates,More complex implementation,Verified

@@ -78,6 +78,10 @@ def step(state, now_ms=None):
                 'Save a scoped repair plan with concrete evidence, root cause, owner and measurable acceptance criteria. '
                 'If historical data is missing, use coinbase_collect_history to create an actual dated CSV and cite its path. '
                 'No live transactions are permitted.')
+        elif any(t.get('status') in ('investigating', 'recovery_planned', 'repairing', 'needs_review')
+                 and not t.get('manualAttention') for t in (state.get('tasks') or {}).values()):
+            control['status'] = 'finishing_existing_work'
+            return assigned
         else:
             key = 'workflow-audit:' + str(now_ms//86400000)
             title = 'Improve delivery workflow from recent task outcomes'

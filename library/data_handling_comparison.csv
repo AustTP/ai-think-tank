@@ -1,0 +1,7 @@
+option,methodology,pros,cons,use_cases,verification_status
+AWS S3,Server-side encryption,versioning,access control (IAM),High durability and availability,wide range of access control options,Scalability and high performance,Data retrieval fees,Suitable for large-scale data storage and distribution,verified
+Google Cloud Storage,Regional and multi-regional storage options,data lifecycle management,data retention policy,High durability and availability,built-in encryption,Scalability and high performance,Data retrieval fees,Geo-redundant and suitable for large-scale data storage and distribution,verified
+Microsoft Azure Blob Storage,Hot and cool storage options,lifecycle management,High durability and availability,built-in encryption,Scalability and high performance,Data retrieval fees,Geo-redundant and suitable for large-scale data storage and distribution,verified
+Backblaze B2,Hot and cool storage options,lifecycle management,High durability and availability,built-in encryption,Cost-effective,Scalability and high performance,Data retrieval fees,Geo-redundant and suitable for large-scale data storage and distribution,verified
+Proton Drive,End-to-end encryption,secure data sharing,Zero-access encryption,High security and privacy,secure data sharing,Limited scalability and performance,estimated
+pCloud,Client-side encryption,secure data sharing,Lifetime storage plans,High security and privacy,secure data sharing,Limited scalability and performance,estimated

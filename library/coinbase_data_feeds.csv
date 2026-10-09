@@ -1,0 +1,3 @@
+source_name,url,data_type,data_interval,data_format,api_key_required,rate_limits,basis
+Coinbase WebSocket Feed,wss://ws-feed.coinbase.com,"OHLC, Volume",Real-time,JSON,No,None specified,Verified
+Coinbase REST API,https://api.coinbase.com,"OHLC, Volume",Daily,JSON,Yes,10 requests per minute,Estimated

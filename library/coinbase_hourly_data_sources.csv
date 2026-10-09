@@ -1,0 +1,3 @@
+source_name,url,retrieval_method,data_format,hourly_data_capability,basis
+Coinbase API,https://api.coinbase.com/,REST,JSON,Yes,verified
+CoinMarketCap API,https://pro.coinmarketcap.com/api,REST,JSON,Yes,verified
