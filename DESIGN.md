@@ -68,10 +68,19 @@ blocking HTTP.
 
 **Data model:** A `kv_state` blob in SQLite holds the authoritative think tank
 state (agents, teams, work queue, tasks, sprints, research topics, room
-definitions). Decision audit logs live in two append-only tables:
+definitions). Completed tasks are NOT in the blob: `task_archive` holds every
+`done` task per-row, and `get_state_from_db` merges it back so `state['tasks']`
+keeps its shape while the per-tick serialize stays small (the blob had grown
+to multi-MB of thousands of done tasks, re-serialized every tick). The
+per-agent filesystem mirror (`sync_agent_directories`) runs at most every
+`AGENT_DIR_SYNC_INTERVAL_S` (15s) on saves, forced immediately when the roster
+or report set changes, because its per-agent `action_log` scans made it the
+dominant per-save cost. Decision audit logs live in two append-only tables:
 `action_log` (human-readable, per-agent activity feed) and `decision_tape`
 (raw JEV/LLM decisions with full prompt+response for debugging). Both are
-rolled by the prune loop.
+rolled by the prune loop. `decision_key_stats` is a measurement-only table of
+Jev request hashes, read by `/api/jev/decision-keys` to decide whether a
+decision cache is worth building.
 
 ---
 
