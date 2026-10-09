@@ -271,6 +271,7 @@ _ENV_RELOAD_FIELDS = {
     'HIGGSFIELD_API_KEY_SECRET': lambda e: e.get('HIGGSFIELD_API_KEY_SECRET'),
     'OPEN_SKY_CLIENT_ID': lambda e: e.get('OPEN_SKY_CLIENT_ID'),
     'OPEN_SKY_CLIENT_SECRET': lambda e: e.get('OPEN_SKY_CLIENT_SECRET'),
+    'AISSTREAM_API_KEY': lambda e: e.get('AISSTREAM_API_KEY'),
     'SPEND_CAP_USD': lambda e: float(e.get('SPEND_CAP_USD', '50') or 0),
     'AGENT_SPEND_CAP_USD': lambda e: float(e.get('AGENT_SPEND_CAP_USD', '0') or 0),
     'PAGE_REQUEST_MONTHLY_BUDGET': lambda e: int(e.get('PAGE_REQUEST_MONTHLY_BUDGET', '1000') or 1000),
@@ -4906,6 +4907,14 @@ HIGGSFIELD_API_KEY_SECRET = _load_env().get('HIGGSFIELD_API_KEY_SECRET')
 # credential -- the tools stay present, the calls fail clean.
 OPEN_SKY_CLIENT_ID = _load_env().get('OPEN_SKY_CLIENT_ID')
 OPEN_SKY_CLIENT_SECRET = _load_env().get('OPEN_SKY_CLIENT_SECRET')
+# AISStream (ships): API key for the real-time AIS WebSocket stream at
+# wss://stream.aisstream.io/v0/stream. Loaded as a module constant so the
+# registry's env credential can resolve it (same pattern as the other service
+# keys). The live feed is WebSocket-only, so the HTTP api_call path cannot
+# stream it today -- the registry entry documents the key for a future
+# stream collector. Absent (blank) means the registered aisstream service
+# reports a missing credential.
+AISSTREAM_API_KEY = _load_env().get('AISSTREAM_API_KEY')
 
 
 def _higgsfield_configured():

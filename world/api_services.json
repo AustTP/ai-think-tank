@@ -152,6 +152,28 @@
         {"prefix": "/", "methods": ["GET", "HEAD"]}
       ],
       "spend": {"kind": "none", "note": "free keyless reader: converts any public URL into clean markdown at https://r.jina.ai/<url>; fair-use / rate-limited, no uptime guarantee -- the free read-only backend for the social channels below"}
+    },
+    "aisstream": {
+      "name": "AISStream (ships)",
+      "base_url": "https://stream.aisstream.io",
+      "credential": {"type": "env", "key": "AISSTREAM_API_KEY"},
+      "auth": {"type": "header_bearer"},
+      "methods": ["GET"],
+      "path_rules": [
+        {"prefix": "/", "methods": ["GET"]}
+      ],
+      "spend": {"kind": "none", "note": "the live AIS feed is WebSocket-only (wss://stream.aisstream.io/v0/stream); no REST endpoint, so the HTTP api_call path cannot stream it -- this entry documents the key for a future stream collector, not a callable service today"}
+    },
+    "mullvad": {
+      "name": "Mullvad VPN (account)",
+      "base_url": "https://api.mullvad.net",
+      "credential": {"type": "env", "key": "MULLVAD_ACCOUNT_NUMBER"},
+      "auth": {"type": "body_field", "field": "account_number"},
+      "methods": ["POST"],
+      "path_rules": [
+        {"prefix": "/auth/v1/token", "methods": ["POST"]}
+      ],
+      "spend": {"kind": "none", "note": "account/device management token endpoint only (POST /auth/v1/token mints a token from the account number) -- it cannot proxy a fetch through a country exit; the real tunnel is the CLI/WireGuard integration (serve._mullvad_*), which routes the whole machine and is not an api_call service"}
     }
   },
   "channels": {
