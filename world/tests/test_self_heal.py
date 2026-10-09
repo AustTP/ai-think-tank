@@ -20,7 +20,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import sim
+import sim  # noqa: E402
 
 _NOW_MS = 1_725_000_000_000  # 2026-09, matches _task_cycle(now=1_725_000_000.0)
 
@@ -341,7 +341,7 @@ class StaleWorkSweep(unittest.TestCase):
         state['agentRoster'] = [{'id': 'ada'}, {'id': 'ben'}, {'id': 'dev'}]
         state['backlogRequests'] = []
         state['teamRefinementAt'] = {'dev': _NOW_MS}  # just refined -> kick should arm
-        state['_staleWorkReplans'] = {('Fix the weather report', 'pressoffice'): 2}
+        state['_staleWorkReplans'] = {repr(('Fix the weather report', 'pressoffice')): 2}
         n = self._run(state, _NOW_MS, 'task-1', 'walking', teamId='dev')
         self.assertEqual(n, 1)
         self.assertNotIn('task-1', state['tasks'])
@@ -358,7 +358,7 @@ class StaleWorkSweep(unittest.TestCase):
     def test_repeat_offender_with_no_team_is_dropped_not_looped(self):
         state = _state()
         state['backlogRequests'] = []
-        state['_staleWorkReplans'] = {('Fix the weather report', 'pressoffice'): 2}
+        state['_staleWorkReplans'] = {repr(('Fix the weather report', 'pressoffice')): 2}
         n = self._run(state, _NOW_MS, 'task-1', 'walking')
         self.assertEqual(n, 1)
         self.assertNotIn('task-1', state['tasks'], 'stale card is removed either way')

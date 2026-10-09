@@ -10606,6 +10606,9 @@ def _stale_work_step(state, now, now_ms):
     times for the same (title, room) -- is routed to the owning team's scrum
     master as a work-request (the "SM re-plan"): refinement's accept/reject
     decides whether the work survives, so the loop is bounded and never spins.
+    The replan counter lives in `_staleWorkReplans` keyed by a JSON-safe repr
+    of (title, room): the map is part of kv_state, which is serialized on every
+    save, so a tuple key would make the whole save fail.
     Never touches bugs (own alarm), shadow dry-runs, or review/fix subtasks
     (their deadlock lives in the stuck-gate watchdog). Pure state mutation;
     runs before the idle gate so a quiet tank still re-plans a wedged card.
@@ -10648,7 +10651,7 @@ def _stale_work_step(state, now, now_ms):
                 a['busy'] = False
                 a['inRoom'] = None
                 break
-        key = _sprint_item_id(task)
+        key = repr((task.get('title') or '', task.get('room') or ''))
         replans = replan_map.get(key, 0)
         if replans < STALE_WORK_MAX_REPLANS:
             replan_map[key] = replans + 1

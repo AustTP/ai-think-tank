@@ -176,5 +176,29 @@ class DecisionKeyInstrumentation(_StateCase):
         self.assertEqual(body['question_only']['calls'], 1)
 
 
+class StaleReplanKeyIsJsonSafe(unittest.TestCase):
+    """The stale-work sweep keys its replan counter map by (title, room). That
+    map lives in kv_state, so a tuple key made every subsequent save fail with
+    'keys must be str... not tuple'. The keys must be JSON-safe strings."""
+
+    def test_sweep_produces_string_keys_and_state_round_trips(self):
+        import sim
+        now = time.time()
+        now_ms = int(now * 1000)
+        state = {
+            'tasks': {'t1': {'id': 't1', 'status': 'walking', 'title': 'wedge',
+                             'room': 'lab', 'openedAt': now_ms - 10 ** 12}},
+            'agents': {'a': {'id': 'a', 'task': 't1', 'busy': True}},
+            'agentRoster': [{'id': 'a', 'role': 'dev'}],
+            'workQueue': [], 'teams': [], 'reports': [],
+        }
+        sim._stale_work_step(state, now, now_ms)
+        keys = list(state['_staleWorkReplans'].keys())
+        self.assertTrue(keys)
+        for k in keys:
+            self.assertIsInstance(k, str)
+        json.dumps(state)  # must not raise
+
+
 if __name__ == '__main__':
     unittest.main()
