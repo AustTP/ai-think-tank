@@ -80,7 +80,11 @@ dominant per-save cost. Decision audit logs live in two append-only tables:
 (raw JEV/LLM decisions with full prompt+response for debugging). Both are
 rolled by the prune loop. `decision_key_stats` is a measurement-only table of
 Jev request hashes, read by `/api/jev/decision-keys` to decide whether a
-decision cache is worth building.
+decision cache is worth building. It measured an ~90% exact-repeat rate, so
+`decision_cache` now serves identical Jev requests (keyed by model +
+configured chain + state + questions) with no network call and no spend,
+TTL-bounded by `DECISION_CACHE_TTL_S` (0 disables); a cached decision is still
+taped (marked cached) so the audit trail is intact.
 
 ---
 

@@ -472,6 +472,18 @@ def init_db():
             first_ts REAL NOT NULL,
             last_ts REAL NOT NULL
         )''')
+        # Cache of Jev decision RESPONSES keyed by the full request hash. The
+        # measured exact-repeat rate justified it: identical (model, state,
+        # questions) requests are common, and the answer to an identical
+        # request is stable, so a repeat can be served from here with no
+        # network call and no spend. TTL-bounded (DECISION_CACHE_TTL_S, 0
+        # disables) so a decision never goes stale indefinitely.
+        conn.execute('''CREATE TABLE IF NOT EXISTS decision_cache (
+            key TEXT PRIMARY KEY,
+            response TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            hits INTEGER NOT NULL DEFAULT 0
+        )''')
         # Runtime-switchable settings: a small key/value table
         # for values that must change without a server restart -- currently
         # just the Jev decisions-model slug (see _jev_model). Deliberately
@@ -7551,11 +7563,102 @@ def _finalize_decision(data, prompt, criteria, trace_id, model, village_id=None)
 # rate means a cache would pay; near-zero means it would not. This never
 # changes a decision and is safe to remove.
 DECISION_KEY_WINDOW_S = float(_load_env().get('DECISION_KEY_WINDOW_S', str(7 * 24 * 3600)) or (7 * 24 * 3600))
+# How long a cached Jev decision stays valid. 0 disables the cache entirely.
+DECISION_CACHE_TTL_S = float(_load_env().get('DECISION_CACHE_TTL_S', '3600') or 0)
 
 
 def _decision_key_hash(prefix, payload):
     blob = json.dumps(payload, sort_keys=True, default=str)
     return prefix + hashlib.sha256(blob.encode('utf-8', errors='replace')).hexdigest()[:32]
+
+
+def _decision_cache_key(model, state, questions, chain=None):
+    # The configured model chain is part of the request identity: an operator
+    # switching the Jev chain (via /api/jev/model) must not be served answers
+    # produced under the old chain.
+    return _decision_key_hash('c:', {'model': model, 'chain': chain,
+                                     'state': state, 'questions': questions})
+
+
+def _decision_cache_get(model, state, questions, chain=None):
+    """Return the cached response for an identical request, or None. Never
+    raises; a cache fault is just a miss (we call the model as before). An
+    expired row is deleted on access."""
+    if DECISION_CACHE_TTL_S <= 0:
+        return None
+    key = _decision_cache_key(model, state, questions, chain)
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                'SELECT response, created_at FROM decision_cache WHERE key = ?',
+                (key,)).fetchone()
+            if not row:
+                return None
+            response, created_at = row
+            if time.time() - created_at > DECISION_CACHE_TTL_S:
+                conn.execute('DELETE FROM decision_cache WHERE key = ?', (key,))
+                return None
+            conn.execute('UPDATE decision_cache SET hits = hits + 1 WHERE key = ?', (key,))
+        return json.loads(response)
+    except Exception:
+        return None
+
+
+def _decision_cache_put(model, state, questions, data, chain=None):
+    """Store the raw API response for this request, replacing any expired row
+    that a concurrent reader has not pruned yet. Best-effort; never raises."""
+    if DECISION_CACHE_TTL_S <= 0:
+        return
+    key = _decision_cache_key(model, state, questions, chain)
+    try:
+        with _db() as conn:
+            conn.execute(
+                'INSERT INTO decision_cache (key, response, created_at, hits) VALUES (?, ?, ?, 0) '
+                'ON CONFLICT(key) DO UPDATE SET response = excluded.response, created_at = excluded.created_at',
+                (key, json.dumps(data), time.time()))
+    except Exception:
+        pass
+
+
+def _finalize_cached_decision(data, prompt, criteria, trace_id, model, village_id=None):
+    """Serve a cached Jev decision: tape it (marked cached) so the audit trail
+    stays complete, but accrue no spend and hit no network. A fresh trace_id
+    keeps this decision event distinct in action_log like any other."""
+    choice, confidence, _cost = _jev_choice(data)
+    _append_decision_tape(
+        _decision_kind(prompt), model, prompt, criteria,
+        choice, confidence, 0.0, data, True,
+        trace_id=trace_id,
+    )
+    out = dict(data)
+    out['trace_id'] = trace_id
+    out['cached'] = True
+    return out
+
+
+def decision_cache_report():
+    """Hit-rate report for the decision cache over the current window. Requests
+    are counted by the measurement table (which sees every call, hit or miss);
+    hits by the cache table's per-key counters."""
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                'SELECT COUNT(*), COALESCE(SUM(hits), 0) FROM decision_cache').fetchone()
+            requests = conn.execute(
+                "SELECT COALESCE(SUM(count), 0) FROM decision_key_stats WHERE key LIKE 'r:%'"
+            ).fetchone()[0]
+        distinct, hits = int(rows[0]), int(rows[1])
+        total = int(requests)
+        return {
+            'ttl_s': DECISION_CACHE_TTL_S,
+            'cached_keys': distinct,
+            'hits': hits,
+            'requests': total,
+            'hit_pct': round(100.0 * hits / total, 1) if total else 0.0,
+        }
+    except Exception:
+        return {'ttl_s': DECISION_CACHE_TTL_S, 'cached_keys': 0,
+                'hits': 0, 'requests': 0, 'hit_pct': 0.0}
 
 
 def _record_decision_keys(model, state, questions):
@@ -7579,6 +7682,9 @@ def _prune_decision_key_stats():
         with _db() as conn:
             conn.execute('DELETE FROM decision_key_stats WHERE last_ts < ?',
                          (time.time() - DECISION_KEY_WINDOW_S,))
+            if DECISION_CACHE_TTL_S > 0:
+                conn.execute('DELETE FROM decision_cache WHERE created_at < ?',
+                             (time.time() - DECISION_CACHE_TTL_S,))
     except Exception:
         pass
 
@@ -7642,8 +7748,6 @@ def _call_openrouter_decision_sync(model, state, questions, village_id=None):
     # and (if the caller extracts it from the returned data) the resulting tool
     # action(s) in action_log, so the decision chain is queryably self-consistent.
     trace_id = secrets.token_hex(8)
-    if _think_tank_spend_cap_exceeded():
-        raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     _record_decision_keys(model, state, questions)
     prompt = (questions or {}).get('choice', {}).get('instructions') if isinstance(questions, dict) else None
     criteria = (questions or {}).get('choice', {}).get('criteria') if isinstance(questions, dict) else None
@@ -7655,6 +7759,16 @@ def _call_openrouter_decision_sync(model, state, questions, village_id=None):
     if model not in chain:
         # An explicit model (tests, forwarders) leads the chain, fallbacks follow.
         chain = [model] + [m for m in chain if m != model]
+    # An identical request answered before is served from the cache: no network,
+    # no spend (so it also works past the spend cap), still taped as a cached
+    # decision. The measured exact-repeat rate is what justified this. The
+    # configured chain is part of the key so a chain switch invalidates it.
+    cache_chain = chain
+    cached = _decision_cache_get(model, state, questions, cache_chain)
+    if cached is not None:
+        return _finalize_cached_decision(cached, prompt, criteria, trace_id, model, village_id=village_id)
+    if _think_tank_spend_cap_exceeded():
+        raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     armed = len(chain) > 1  # the breaker only arms once a real fallback exists
     if armed:
         # Skip slugs whose breaker is OPEN (cooldown not spent); a HALF_OPEN
@@ -7683,6 +7797,7 @@ def _call_openrouter_decision_sync(model, state, questions, village_id=None):
             continue
         if armed:
             record_model_result(slug, True)
+        _decision_cache_put(model, state, questions, data, cache_chain)
         return _finalize_decision(data, prompt, criteria, trace_id, slug, village_id=village_id)
     # All candidates failed (or were already open). Tape the failure -- an ok=0
     # row marks the decision as having been attempted and lost, so a gap in the
@@ -19884,6 +19999,7 @@ async def jev_decision_keys(request: Request):
         'window_s': DECISION_KEY_WINDOW_S,
         'question_only': decision_key_report('q'),
         'full_request': decision_key_report('r'),
+        'cache': decision_cache_report(),
     })
 
 

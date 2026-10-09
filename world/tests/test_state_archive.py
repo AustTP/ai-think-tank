@@ -35,6 +35,10 @@ class _StateCase(unittest.TestCase):
         serve._TASK_ARCHIVE_CACHE.update({'db': None, 'loaded': False, 'tasks': {}})
         serve._LAST_AGENT_DIR_SYNC_AT = 0.0
         serve._LAST_AGENT_DIR_FINGERPRINT = None
+        self._ttl_patch = None
+        if getattr(self, 'patch_ttl', False):
+            self._ttl_patch = unittest.mock.patch.object(serve, 'DECISION_CACHE_TTL_S', 3600)
+            self._ttl_patch.start()
         self._sync_patch = None
         if self.patch_sync:
             self._sync_patch = unittest.mock.patch.object(serve, 'sync_agent_directories')
@@ -43,6 +47,8 @@ class _StateCase(unittest.TestCase):
     def tearDown(self):
         if self._sync_patch:
             self._sync_patch.stop()
+        if self._ttl_patch:
+            self._ttl_patch.stop()
         self._db_patch.stop()
         shutil.rmtree(self._tmp, ignore_errors=True)
 
@@ -174,6 +180,77 @@ class DecisionKeyInstrumentation(_StateCase):
         self.assertIn('question_only', body)
         self.assertIn('full_request', body)
         self.assertEqual(body['question_only']['calls'], 1)
+
+
+class DecisionCache(_StateCase):
+    """The Jev decision cache: an identical request is served from decision_cache
+    (no network, no spend, still taped as cached), different questions are not
+    collapsed, TTL=0 disables it, and the report reflects real hits."""
+
+    patch_ttl = True
+
+    def _jev_response(self, choice='fire', confidence=0.9, cost=0.0001):
+        return {'answers': {'q': {'choice': choice, 'confidence': confidence}},
+                'usage': {'cost': cost}}
+
+    def _questions(self, instruction):
+        return {'choice': {'type': 'choice', 'instructions': instruction,
+                           'criteria': {'fire': 'drop them', 'keep': 'retain'}}}
+
+    def test_identical_request_is_served_from_cache(self):
+        with unittest.mock.patch('serve._urlopen_with_resilience',
+                                 return_value=json.dumps(self._jev_response()).encode()) as net:
+            first = serve._call_openrouter_decision_sync('typesafe/jev-1.13', {}, self._questions('Hire or fire?'))
+            second = serve._call_openrouter_decision_sync('typesafe/jev-1.13', {}, self._questions('Hire or fire?'))
+        self.assertEqual(net.call_count, 1, 'the repeat must not hit the network')
+        self.assertIsNotNone(first.pop('trace_id', None))
+        self.assertNotIn('cached', first, 'a fresh miss is not marked cached')
+        self.assertEqual(first, self._jev_response())
+        second.pop('trace_id', None)
+        self.assertEqual(second.pop('cached', None), True)
+        self.assertEqual(second, self._jev_response())
+        with serve._db() as conn:
+            rows = conn.execute(
+                'SELECT ok, cost, model FROM decision_tape ORDER BY id').fetchall()
+        self.assertEqual(len(rows), 2, 'both the miss and the hit are taped')
+        self.assertEqual(rows[0][0], 1)
+        self.assertEqual(rows[1][0], 1)
+        self.assertEqual(rows[1][1], 0.0, 'a cached decision accrues no cost')
+        self.assertEqual(rows[1][2], 'typesafe/jev-1.13')
+
+    def test_cached_hit_accrues_no_spend(self):
+        with unittest.mock.patch('serve._urlopen_with_resilience',
+                                 return_value=json.dumps(self._jev_response()).encode()):
+            serve._call_openrouter_decision_sync('m', {}, self._questions('x'))
+            with unittest.mock.patch.object(serve, '_accrue_spend') as spend:
+                data = serve._call_openrouter_decision_sync('m', {}, self._questions('x'))
+        spend.assert_not_called()
+        self.assertTrue(data.get('cached'))
+
+    def test_different_questions_do_not_hit(self):
+        with unittest.mock.patch('serve._urlopen_with_resilience',
+                                 return_value=json.dumps(self._jev_response()).encode()) as net:
+            serve._call_openrouter_decision_sync('m', {}, self._questions('question A'))
+            serve._call_openrouter_decision_sync('m', {}, self._questions('question B'))
+        self.assertEqual(net.call_count, 2)
+
+    def test_ttl_zero_disables_the_cache(self):
+        with unittest.mock.patch.object(serve, 'DECISION_CACHE_TTL_S', 0):
+            with unittest.mock.patch('serve._urlopen_with_resilience',
+                                     return_value=json.dumps(self._jev_response()).encode()) as net:
+                serve._call_openrouter_decision_sync('m', {}, self._questions('x'))
+                serve._call_openrouter_decision_sync('m', {}, self._questions('x'))
+            self.assertEqual(net.call_count, 2)
+
+    def test_report_reflects_hits(self):
+        with unittest.mock.patch('serve._urlopen_with_resilience',
+                                 return_value=json.dumps(self._jev_response()).encode()):
+            serve._call_openrouter_decision_sync('m', {}, self._questions('repeat me'))
+            serve._call_openrouter_decision_sync('m', {}, self._questions('repeat me'))
+        rep = serve.decision_cache_report()
+        self.assertGreaterEqual(rep['hits'], 1)
+        self.assertGreater(rep['hit_pct'], 0.0)
+        self.assertEqual(rep['ttl_s'], 3600)
 
 
 class StaleReplanKeyIsJsonSafe(unittest.TestCase):
