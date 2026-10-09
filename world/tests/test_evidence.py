@@ -161,6 +161,59 @@ class RecordSourceClaim(unittest.TestCase):
         self.assertIn('short link not resolved', ' '.join(rec['open_questions']))
 
 
+class ObservationChange(unittest.TestCase):
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_appends_a_before_after_observation_to_a_claim(self):
+        store = _patch_ledgers()
+        cid = evidence.record_source_claim(_claim())['id']
+        r = evidence.record_observation_change(
+            cid, 'price', '$100', '$95', source_url='https://example.com/price')
+        self.assertTrue(r['recorded'])
+        self.assertTrue(r['appended'])
+        obs = store['evidence'][cid]['observations']
+        self.assertEqual(len(obs), 1)
+        self.assertEqual(obs[0]['field'], 'price')
+        self.assertEqual(obs[0]['before'], '$100')
+        self.assertEqual(obs[0]['after'], '$95')
+        self.assertEqual(obs[0]['source_url'], 'https://example.com/price')
+
+    def test_observations_accumulate_a_history(self):
+        store = _patch_ledgers()
+        cid = evidence.record_source_claim(_claim())['id']
+        evidence.record_observation_change(cid, 'price', '$100', '$95')
+        evidence.record_observation_change(cid, 'price', '$95', '$90')
+        obs = store['evidence'][cid]['observations']
+        self.assertEqual([(o['before'], o['after']) for o in obs],
+                         [('$100', '$95'), ('$95', '$90')])
+
+    def test_unknown_claim_id_creates_a_claim_from_the_observation(self):
+        store = _patch_ledgers()
+        r = evidence.record_observation_change(
+            None, 'positioning', 'no LLM mentions', 'pitches itself as agent-native',
+            source_url='https://example.com/about')
+        self.assertTrue(r['recorded'])
+        rec = store['evidence'][r['id']]
+        self.assertIn('positioning changed from', rec['claim'])
+        self.assertEqual(rec['observations'][0]['after'], 'pitches itself as agent-native')
+
+    def test_requires_field_and_after(self):
+        _patch_ledgers()
+        r = evidence.record_observation_change('ev-x', 'price', '$100', None,
+                                               source_url='https://x.com')
+        self.assertFalse(r['recorded'])
+        r = evidence.record_observation_change('ev-x', '', '$100', '$95',
+                                               source_url='https://x.com')
+        self.assertFalse(r['recorded'])
+
+    def test_unknown_claim_without_source_is_rejected(self):
+        _patch_ledgers()
+        r = evidence.record_observation_change('ev-nope', 'price', '$1', '$2')
+        self.assertFalse(r['recorded'])
+        self.assertEqual(r['reason'], 'invalid')
+
+
 class ReviewAndCoverage(unittest.TestCase):
     def tearDown(self):
         unittest.mock.patch.stopall()

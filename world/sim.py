@@ -4507,7 +4507,11 @@ def _check_schedules(state, now, now_ms):
                              f'(documented restrictions, corrections, availability problems). '
                              f'Separate what a source supports from our inference. A repost is '
                              f'not a second independent source. Do not manufacture a finding '
-                             f'when there is none.'),
+                             f'when there is none. Record each detected change as a before/after '
+                             f'observation via POST /api/evidence/observation (claimId, field, '
+                             f'before, after, sourceUrl, note) and end the run by folding the '
+                             f'GET /api/research-desk/ops numbers into your summary (see the '
+                             f'research-desk skill).'),
             'goal': topic.get('topic'),
             'research': {'topicId': topic.get('id'), 'since': since_ms},
             'kbClass': 'changes_how_we_work',

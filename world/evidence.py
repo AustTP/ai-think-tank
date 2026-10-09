@@ -55,7 +55,7 @@ COVERAGE_STATUSES = frozenset({'pending_review', 'covered', 'failed', 'blocked'}
 # once, never updated or deleted): a compromised agent can ADD rows but can
 # never rewrite or erase history, so the audit is the trustworthy trail the
 # operator reads. It also powers the per-actor covered-flip rate cap below.
-AUDIT_ACTIONS = frozenset({'claim_recorded', 'claim_reviewed',
+AUDIT_ACTIONS = frozenset({'claim_recorded', 'claim_observed', 'claim_reviewed',
                            'coverage_pending_review', 'coverage_covered',
                            'coverage_failed'})
 
@@ -345,6 +345,12 @@ def _validate_claim_record(record):
     ct = record.get('claim_type') or 'unclassified'
     if ct not in CLAIM_TYPES:
         raise ValueError(f'claim_type must be one of {sorted(CLAIM_TYPES)}')
+    observed = record.get('observed')
+    if observed is not None and not isinstance(observed, dict):
+        raise ValueError('observed must be an object')
+    obs_list = record.get('observations')
+    if obs_list is not None and not isinstance(obs_list, list):
+        raise ValueError('observations must be a list')
 
 
 def record_source_claim(record, actor=None):
@@ -447,6 +453,58 @@ def record_source_claim(record, actor=None):
     return {'recorded': True, 'id': new_id, 'independent': True,
             'identity': identity, 'is_short_link': bool(meta['is_short_link']),
             'resolved_ok': bool(meta['resolved_ok'])}
+
+
+def record_observation_change(claim_id, field, before, after, *, source_url=None,
+                              note=None, actor=None):
+    """The article's change-record primitive: a structured before -> after
+    observation (pricing, positioning, feature availability, ...) appended to
+    an evidence claim, so a history of observed changes accumulates per entity
+    instead of being re-discovered from scratch. Appends to the claim's
+    `observations` list; each entry carries field, before, after, at, source_url,
+    and note. When the claim id is unknown, a new claim record is created from
+    the observation (the claim text states the change) keyed on the source, so
+    a research crawl can log a change it has no prior record for.
+    Returns {'recorded': True, 'id', 'appended': bool} or
+    {'recorded': False, 'reason', 'error'}."""
+    field = (field or '').strip()
+    before_s = '' if before is None else str(before).strip()
+    after_s = '' if after is None else str(after).strip()
+    if not field or not after_s:
+        return {'recorded': False, 'reason': 'invalid',
+                'error': 'field and after are required'}
+    now = time.time()
+    observation = {'field': field, 'before': before_s, 'after': after_s,
+                   'at': now, 'source_url': source_url or '', 'note': note or ''}
+    claims = _evidence_read()
+    rec = claims.get(claim_id) if claim_id else None
+    if rec is not None:
+        rec = dict(rec)
+        obs = list(rec.get('observations') or [])
+        obs.append(observation)
+        rec['observations'] = obs
+        rec['updated_ts'] = now
+        claims[claim_id] = rec
+        _evidence_write(claims)
+        append_audit(actor, 'claim_observed', claim_id=claim_id,
+                     identity=rec.get('identity'),
+                     detail={'field': field, 'before': before_s,
+                             'after': after_s, 'source_url': source_url or ''})
+        return {'recorded': True, 'id': claim_id, 'appended': True}
+    if not source_url:
+        return {'recorded': False, 'reason': 'invalid',
+                'error': 'claimId or source_url is required to create a claim'}
+    new_record = {
+        'source_url': source_url,
+        'claim': f'{field} changed from {before_s} to {after_s}',
+        'claim_type': 'other',
+        'observed': observation,
+        'observations': [observation],
+    }
+    result = record_source_claim(new_record, actor=actor)
+    if result.get('recorded'):
+        result['appended'] = True
+    return result
 
 
 def _material_update(covered, material_ms):

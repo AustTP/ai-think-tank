@@ -98,6 +98,43 @@ class EvidenceEndpoints(_ApiTestCase):
         self.assertEqual(len(claims), 1)
         self.assertEqual(claims[0]['status'], 'needs_review')
 
+    def test_observation_appends_to_a_claim(self):
+        c = _client()
+        c.post('/api/evidence', json={'agentId': 'testagent', 'record': _record()},
+               headers=_agent_headers())
+        claim_id = c.get('/api/evidence').json()['claims'][0]['id']
+        r = c.post('/api/evidence/observation', json={
+            'agentId': 'testagent', 'claimId': claim_id,
+            'field': 'price', 'before': '$100', 'after': '$95',
+            'sourceUrl': 'https://x.com/vendor/status/111',
+        }, headers=_agent_headers())
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body['recorded'])
+        self.assertTrue(body['appended'])
+        claims = c.get('/api/evidence').json()['claims']
+        self.assertEqual(claims[0]['observations'][0]['after'], '$95')
+
+    def test_observation_creates_a_claim_when_unknown(self):
+        c = _client()
+        r = c.post('/api/evidence/observation', json={
+            'agentId': 'testagent', 'claimId': None,
+            'field': 'positioning', 'before': 'no LLM mentions',
+            'after': 'agent-native', 'sourceUrl': 'https://example.com/about',
+        }, headers=_agent_headers())
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()['recorded'])
+        r = c.get('/api/evidence')
+        self.assertEqual(len(r.json()['claims']), 1)
+
+    def test_observation_requires_agent_key(self):
+        c = _raw_client()
+        r = c.post('/api/evidence/observation', json={
+            'agentId': 'testagent', 'field': 'price', 'before': '$1', 'after': '$2',
+            'sourceUrl': 'https://example.com/x',
+        })
+        self.assertEqual(r.status_code, 401, r.text)
+
     def test_repost_is_recorded_as_not_independent(self):
         c = _client()
         for _ in range(2):
@@ -240,6 +277,113 @@ class PolicyEndpoints(_ApiTestCase):
         r = c.post('/api/policy/reload', json={'agentId': 'player'})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(r.json()['ok'])
+
+    def test_research_desk_ops_requires_auth(self):
+        raw = _raw_client()
+        r = raw.get('/api/research-desk/ops')
+        self.assertEqual(r.status_code, 401)
+
+    def test_research_desk_ops_reports_the_operating_numbers(self):
+        c = _client()
+        r = c.get('/api/research-desk/ops', headers=_agent_headers())
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertIn('claims', body)
+        self.assertIn('coverage', body)
+        self.assertIn('watchlist', body)
+        self.assertIn('spendUsdLast7d', body)
+        self.assertEqual(body['windowDays'], 7)
+        self.assertIsInstance(body['claims']['total'], int)
+
+
+class EnvReload(_ApiTestCase):
+    def test_agent_key_alone_never_reloads_env(self):
+        raw = _raw_client()
+        r = raw.post('/api/env/reload', json={'agentId': 'testagent'},
+                     headers=_agent_headers())
+        self.assertEqual(r.status_code, 401)
+
+    def test_player_session_reloads_env(self):
+        c = _client()
+        r = c.post('/api/env/reload', json={'agentId': 'player'})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body['ok'])
+        self.assertIsInstance(body['changed'], list)
+        self.assertEqual(body['count'], len(body['changed']))
+
+    def test_env_change_rebinds_a_global_without_restart(self):
+        old_load = serve._load_env
+        old_cap = serve.SPEND_CAP_USD
+        try:
+            real = serve._load_env()
+            serve._load_env = lambda: {**real, 'SPEND_CAP_USD': '123.5'}
+            result = serve._reload_env_config()
+            self.assertIn('SPEND_CAP_USD', result['changed'])
+            self.assertEqual(serve.SPEND_CAP_USD, 123.5)
+            # Idempotent: a second reload with no further change reports nothing.
+            result = serve._reload_env_config()
+            self.assertNotIn('SPEND_CAP_USD', result['changed'])
+        finally:
+            serve._load_env = old_load
+            serve.SPEND_CAP_USD = old_cap
+
+    def test_reload_never_echoes_values(self):
+        old_load = serve._load_env
+        old_key = serve.OPENROUTER_API_KEY
+        old_cap = serve.SPEND_CAP_USD
+        try:
+            real = serve._load_env()
+            serve._load_env = lambda: {**real, 'OPENROUTER_API_KEY': 'sk-supersecret',
+                                      'SPEND_CAP_USD': '7'}
+            c = _client()
+            r = c.post('/api/env/reload', json={'agentId': 'player'})
+            self.assertEqual(r.status_code, 200, r.text)
+            body = r.json()
+            self.assertNotIn('sk-supersecret', r.text)
+            self.assertIn('OPENROUTER_API_KEY', body['changed'])
+        finally:
+            serve._load_env = old_load
+            serve.OPENROUTER_API_KEY = old_key
+            serve.SPEND_CAP_USD = old_cap
+
+    def test_allowlist_change_rebinds_and_refreshes_the_proxy(self):
+        old_load = serve._load_env
+        old_allow = serve.BROWSE_ALLOWLIST_DOMAINS
+        old_refresh = serve.ensure_sandbox_networking
+        calls = []
+        try:
+            real = serve._load_env()
+            serve._load_env = lambda: {**real, 'BROWSE_ALLOWLIST_DOMAINS': 'example.com, api.test.io'}
+            serve.ensure_sandbox_networking = lambda: calls.append(True)
+            result = serve._reload_env_config()
+            self.assertIn('BROWSE_ALLOWLIST_DOMAINS', result['changed'])
+            self.assertEqual(serve.BROWSE_ALLOWLIST_DOMAINS, {'example.com', 'api.test.io'})
+            self.assertEqual(calls, [True])
+        finally:
+            serve._load_env = old_load
+            serve.BROWSE_ALLOWLIST_DOMAINS = old_allow
+            serve.ensure_sandbox_networking = old_refresh
+
+    def test_smtp_and_publish_rebind(self):
+        old_load = serve._load_env
+        old_host = serve.SMTP_HOST
+        old_repo = serve.PUBLISH_REPO
+        old_remote = serve.PUBLISH_REMOTE_URL
+        try:
+            real = serve._load_env()
+            serve._load_env = lambda: {**real, 'SMTP_HOST': 'mail.test',
+                                      'AI_THINK_TANK_PUBLISH_REPO': 'acme/village'}
+            result = serve._reload_env_config()
+            self.assertIn('SMTP_HOST', result['changed'])
+            self.assertEqual(serve.SMTP_HOST, 'mail.test')
+            self.assertEqual(serve.PUBLISH_REPO, 'acme/village')
+            self.assertEqual(serve.PUBLISH_REMOTE_URL, 'https://github.com/acme/village.git')
+        finally:
+            serve._load_env = old_load
+            serve.SMTP_HOST = old_host
+            serve.PUBLISH_REPO = old_repo
+            serve.PUBLISH_REMOTE_URL = old_remote
 
 
 class HardeningEndpoints(_ApiTestCase):
