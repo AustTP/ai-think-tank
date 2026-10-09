@@ -200,5 +200,35 @@ class StaleReplanKeyIsJsonSafe(unittest.TestCase):
         json.dumps(state)  # must not raise
 
 
+class FreeSpikeWeekKeysSurviveRoundTrip(unittest.TestCase):
+    """The free-spike counters freeSpikeGlobal / freeSpikeRooms are keyed by
+    integer week numbers, but every save/load JSON round-trips object keys to
+    strings, so _file_free_spike's `k < week - 1` age comparison raised on
+    str-vs-int. The maps must be coerced back to int keys at entry."""
+
+    def test_stringified_week_keys_do_not_break_free_spike(self):
+        import sim
+        now = time.time()
+        now_ms = int(now * 1000)
+        week = sim._free_spike_week(now_ms)
+        state = {
+            'agents': {'ada': {'id': 'ada', 'offDuty': False, 'busy': False,
+                               'task': None}},
+            'tasks': {},
+            'freeSpikeGlobal': {str(week): 2, str(week - 2): 1},  # string keys
+            'freeSpikeRooms': {str(week - 2): ['observatory']},
+            'freeSpikeUsed': {'ada': [week, 0]},  # round-tripped tuple -> list
+        }
+        r = sim._file_free_spike(state, 'ada', {'room': 'observatory',
+                                                'title': 'x'}, now_ms)
+        self.assertEqual(r, 1)
+        self.assertEqual(state['freeSpikeGlobal'][week], 3)
+        self.assertIsInstance(state['freeSpikeGlobal'][week], int)
+        self.assertIn('observatory', state['freeSpikeRooms'][week])
+        self.assertNotIn(week - 2, state['freeSpikeGlobal'],
+                         'stale week buckets are pruned after coercion')
+        self.assertNotIn(week - 2, state['freeSpikeRooms'])
+
+
 if __name__ == '__main__':
     unittest.main()
