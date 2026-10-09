@@ -162,6 +162,7 @@ from evidence import (  # noqa: E402,F401
     mark_covered,
     mark_reviewed,
     record_run_failure,
+    record_observation_change,
     record_source_claim,
     search_since_ms,
     source_identity,
@@ -195,6 +196,17 @@ try:
     import openpyxl
 except ImportError:
     openpyxl = None
+# Same pattern for Word (python-docx) and PowerPoint (python-pptx) text
+# extraction -- guarded so a missing install degrades to a clear per-file
+# error, never a failed server boot.
+try:
+    import docx as _docx
+except ImportError:
+    _docx = None  # type: ignore[assignment]
+try:
+    import pptx as _pptx
+except ImportError:
+    _pptx = None  # type: ignore[assignment]
 # For /api/page-probe below -- the existing /api/screenshot's plain
 # `chrome --headless --screenshot` is a one-shot, non-interactive capture;
 # it can show what a page looks like after load, but it can't click a
@@ -235,6 +247,144 @@ def _load_env():
                     k, v = line.split('=', 1)
                     env[k] = v
     return env
+
+
+def _env_flag(value, default='true'):
+    return str(value or default).strip().lower() != 'false'
+
+
+# The env settings that can be rebound live without a restart. Each entry is a
+# loader (env -> value) matching the SAME formula the import-time globals used,
+# so a reload applies a new .env exactly as a reboot would for these names.
+# Consumers read the module globals at call time (e.g. _call_openrouter_sync
+# reads serve.OPENROUTER_API_KEY), so rebinding takes effect immediately. A
+# per-name loader means one malformed value fails only that name. Still
+# restart-only: TELEGRAM_* (the bridge holds its own membership set built at
+# import), SEED_* (roster seeds are boot-only), and the GOOGLE_*_RATE_PER_MIN
+# values (rebuilt in place below via _reload_google_rate_limits).
+_ENV_RELOAD_FIELDS = {
+    'OPENROUTER_API_KEY': lambda e: e.get('OPENROUTER_API_KEY'),
+    'TAVILY_API_KEY': lambda e: e.get('TAVILY_API_KEY'),
+    'GITHUB_TOKEN': lambda e: e.get('GITHUB_TOKEN'),
+    'APIFY_API_KEY': lambda e: e.get('APIFY_API_KEY'),
+    'HIGGSFIELD_API_KEY_ID': lambda e: e.get('HIGGSFIELD_API_KEY_ID'),
+    'HIGGSFIELD_API_KEY_SECRET': lambda e: e.get('HIGGSFIELD_API_KEY_SECRET'),
+    'OPEN_SKY_CLIENT_ID': lambda e: e.get('OPEN_SKY_CLIENT_ID'),
+    'OPEN_SKY_CLIENT_SECRET': lambda e: e.get('OPEN_SKY_CLIENT_SECRET'),
+    'SPEND_CAP_USD': lambda e: float(e.get('SPEND_CAP_USD', '50') or 0),
+    'AGENT_SPEND_CAP_USD': lambda e: float(e.get('AGENT_SPEND_CAP_USD', '0') or 0),
+    'PAGE_REQUEST_MONTHLY_BUDGET': lambda e: int(e.get('PAGE_REQUEST_MONTHLY_BUDGET', '1000') or 1000),
+    'HIGH_TIER_MONTHLY_BUDGET_USD': lambda e: float(e.get('HIGH_TIER_MONTHLY_BUDGET_USD', '0') or 0),
+    'HIGH_TIER_MAX_PRICE_USD': lambda e: float(e.get('HIGH_TIER_MAX_PRICE_USD', '0') or 0),
+    'COLAB_MONTHLY_UNITS': lambda e: float(e.get('COLAB_MONTHLY_UNITS', '0') or 0),
+    'DECISION_CACHE_TTL_S': lambda e: float(e.get('DECISION_CACHE_TTL_S', '3600') or 0),
+    'DECISION_KEY_WINDOW_S': lambda e: float(e.get('DECISION_KEY_WINDOW_S', str(7 * 24 * 3600)) or (7 * 24 * 3600)),
+    'JEV_MODEL': lambda e: e.get('JEV_MODEL', 'typesafe/jev-1.13'),
+    'JEV_JUDGE_MODEL': lambda e: (e.get('JEV_JUDGE_MODEL') or '').strip() or None,
+    'API_CALL_ENABLED': lambda e: _env_flag(e.get('API_CALL_ENABLED', 'true')),
+    'BROWSING_ENABLED': lambda e: _env_flag(e.get('AGENT_BROWSING_ENABLED', 'true')),
+    'EXECUTION_ENABLED': lambda e: _env_flag(e.get('AGENT_EXECUTION_ENABLED', 'true')),
+    'PLAYER_EMAIL_ENABLED': lambda e: _env_flag(e.get('PLAYER_EMAIL_ENABLED', 'true')),
+    # Sandbox execution mode + the sandbox egress allowlist. Rebinding the
+    # allowlist also refreshes the egress proxy (see _reload_env_config).
+    'SANDBOX_EXECUTION': lambda e: e.get('SANDBOX_EXECUTION', 'local').strip().lower(),
+    'BROWSE_ALLOWLIST_DOMAINS': lambda e: {d.strip().lower() for d in
+                                           (e.get('BROWSE_ALLOWLIST_DOMAINS', '') or '').split(',') if d.strip()},
+    # Player notifications (read via _serve.* from notify.py).
+    'MULLVAD_ACCOUNT_NUMBER': lambda e: e.get('MULLVAD_ACCOUNT_NUMBER'),
+    'SMTP_HOST': lambda e: e.get('SMTP_HOST'),
+    'SMTP_PORT': lambda e: int(e.get('SMTP_PORT', '587') or 587),
+    'SMTP_USER': lambda e: e.get('SMTP_USER'),
+    'SMTP_PASSWORD': lambda e: e.get('SMTP_PASSWORD'),
+    'ESCALATION_EMAIL_TO': lambda e: e.get('ESCALATION_EMAIL_TO'),
+    'ESCALATION_BASE_URL': lambda e: e.get('ESCALATION_BASE_URL', 'http://localhost:8010'),
+    # Publishing target (PUBLISH_REMOTE_URL is recomputed after the rebind).
+    'PUBLISH_REPO': lambda e: (e.get('AI_THINK_TANK_PUBLISH_REPO') or '').strip(),
+    # Caches + sync cadence (read at call time).
+    'AGENT_DIR_SYNC_INTERVAL_S': lambda e: float(e.get('AGENT_DIR_SYNC_INTERVAL_S', '15') or 15),
+    'DIGITALOCEAN_BALANCE_CACHE_TTL_S': lambda e: float(e.get('BALANCE_CACHE_TTL_S', '300') or 300),
+    'TREG_BALANCE_CACHE_TTL_S': lambda e: float(e.get('BALANCE_CACHE_TTL_S', '300') or 300),
+    'PIXELLAB_BALANCE_CACHE_TTL_S': lambda e: float(e.get('BALANCE_CACHE_TTL_S', '300') or 300),
+    'GOOGLE_ACCESS_TOKEN_TTL_S': lambda e: float(e.get('GOOGLE_ACCESS_TOKEN_TTL_S', '3000') or 3000),
+    'COLAB_ENABLED': lambda e: str(e.get('COLAB_ENABLED', '1') or '1').lower() not in ('0', 'false', 'no'),
+    'COLAB_STANDBY_ENABLED': lambda e: str(e.get('COLAB_STANDBY_ENABLED', '') or '').lower() in ('1', 'true', 'yes'),
+    'COLAB_FREE_TIER': lambda e: str(e.get('COLAB_FREE_TIER', '') or '').lower() in ('1', 'true', 'yes'),
+    # TTC cap: the clamp depends on both names, so TTC_BEST_OF is loaded here
+    # and TTC_MAX_BEST_OF is recomputed in _reload_env_config after it.
+    'TTC_BEST_OF': lambda e: max(2, min(int(e.get('TTC_BEST_OF', '2') or 2), int(e.get('TTC_MAX_BEST_OF', '3') or 3))),
+}
+
+
+def _reload_google_rate_limits(env):
+    """Rebuild the Google per-minute rate ceilings IN PLACE from .env. The
+    dict is read at call time by the limiter, so mutating it takes effect
+    without a restart; in-place (not rebind) keeps any held reference live."""
+    limits = globals().get('_GOOGLE_RATE_LIMITS')
+    if not isinstance(limits, dict):
+        return False
+    changed = False
+    specs = {
+        'calendar': ('GOOGLE_CALENDAR_RATE_PER_MIN', '400', 0.15),
+        'sheets': ('GOOGLE_SHEETS_RATE_PER_MIN', '40', 0.4),
+        'gmail': ('GOOGLE_GMAIL_RATE_PER_MIN', '80', 0.3),
+        'docs': ('GOOGLE_DOCS_RATE_PER_MIN', '80', 0.3),
+    }
+    for api, (key, default, interval) in specs.items():
+        try:
+            new = (float(env.get(key, default) or default), interval)
+        except (TypeError, ValueError):
+            continue
+        if limits.get(api) != new:
+            limits[api] = new
+            changed = True
+    return changed
+
+
+def _reload_env_config():
+    """Re-read .env and rebind the live-swappable module globals. Returns a
+    report of which names changed; values are never echoed back. Any rebind
+    failure is isolated to that name (the previous value stays)."""
+    env = _load_env()
+    g = globals()
+    changed = []
+    for name, loader in _ENV_RELOAD_FIELDS.items():
+        try:
+            value = loader(env)
+            if g.get(name) != value:
+                g[name] = value
+                changed.append(name)
+        except Exception:
+            pass  # a bad value for one name never blocks the rest
+    # Derived values that depend on a reloaded name.
+    try:
+        best_of = g.get('TTC_BEST_OF')
+        cap = int(env.get('TTC_MAX_BEST_OF', '3') or 3)
+        new_max = max(best_of, cap)
+        if g.get('TTC_MAX_BEST_OF') != new_max:
+            g['TTC_MAX_BEST_OF'] = new_max
+            changed.append('TTC_MAX_BEST_OF')
+    except Exception:
+        pass
+    try:
+        remote = ('https://github.com/' + g['PUBLISH_REPO'] + '.git') if g.get('PUBLISH_REPO') else ''
+        if g.get('PUBLISH_REMOTE_URL') != remote:
+            g['PUBLISH_REMOTE_URL'] = remote
+            changed.append('PUBLISH_REMOTE_URL')
+    except Exception:
+        pass
+    try:
+        if _reload_google_rate_limits(env):
+            changed.append('_GOOGLE_RATE_LIMITS')
+    except Exception:
+        pass
+    # A changed egress allowlist must also refresh the running proxy so the
+    # new domains are actually reachable -- best-effort, never blocks reload.
+    if 'BROWSE_ALLOWLIST_DOMAINS' in changed:
+        try:
+            ensure_sandbox_networking()
+        except Exception:
+            pass
+    return {'reloaded': True, 'changed': sorted(changed), 'count': len(changed)}
 
 # Deliberately OUTSIDE world/ -- same reasoning as the .env API key: this
 # directory is served to the browser as static files, so anything under it
@@ -9728,7 +9878,7 @@ async def no_store(request: Request, call_next):
 # scripts/assets, and the escalation resolve link, which is protected by
 # its own per-escalation token instead so it stays tappable from an email
 # with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/browser-act', '/api/api-call', '/api/api-service', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/villages', '/api/memory-ledger', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/channel-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews', '/api/agent-files', '/api/evidence', '/api/coverage', '/api/policy')
+AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/browser-act', '/api/api-call', '/api/api-service', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/villages', '/api/memory-ledger', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/channel-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews', '/api/agent-files', '/api/evidence', '/api/coverage', '/api/policy', '/api/research-desk')
 # Gap: /api/player-email/credential's OWN handler
 # rejects an agent that explicitly self-identifies via ?requesterId=, but
 # with the prefix missing here that check was the ONLY gate -- a request
@@ -14945,6 +15095,63 @@ def _ingest_xlsx_to_text(path):
         return None, str(e)
 
 
+def _ingest_docx_to_text(path):
+    """Word (.docx) text extraction: body paragraphs and tables, in document
+    order, one block per line -- a deck's prose and its tabular data both land
+    in the Library as readable text."""
+    if not _docx:
+        return None, 'python-docx is not installed on the server'
+    try:
+        d = _docx.Document(path)
+        parts = []
+        for para in d.paragraphs:
+            text = para.text.strip()
+            if text:
+                parts.append(text)
+        for table in d.tables:
+            for row in table.rows:
+                cells = [c.text.strip() for c in row.cells]
+                if any(cells):
+                    parts.append(' | '.join(cells))
+        if not parts:
+            return '', None
+        return '\n'.join(parts), None
+    except Exception as e:
+        return None, str(e)
+
+
+def _ingest_pptx_to_text(path):
+    """PowerPoint (.pptx) text extraction: every slide's shape text, slide by
+    slide, with a per-slide header. Bounded to the first 200 slides like the
+    PDF extractor; a huge deck gets a truncation note instead of unbounded
+    extraction."""
+    if not _pptx:
+        return None, 'python-pptx is not installed on the server'
+    try:
+        prs = _pptx.Presentation(path)
+        parts = []
+        for i, slide in enumerate(prs.slides):
+            if i >= 200:
+                parts.append(f'... ({max(0, len(prs.slides) - 200)} more slides not extracted)')
+                break
+            slide_text = []
+            for shape in slide.shapes:
+                if not shape.has_text_frame:
+                    continue
+                for para in shape.text_frame.paragraphs:
+                    text = ''.join(run.text for run in para.runs).strip()
+                    if text:
+                        slide_text.append(text)
+            if slide_text:
+                parts.append(f'--- slide {i + 1} ---')
+                parts.extend(slide_text)
+        if not parts:
+            return '', None
+        return '\n'.join(parts), None
+    except Exception as e:
+        return None, str(e)
+
+
 def _write_ingested_text(dest_rel, content, results, name):
     target = _safe_library_path(dest_rel)
     if not target:
@@ -14981,6 +15188,20 @@ def _ingest_one_file(src_path, dest_rel_dir, results: list[dict[str, object]]):
             results.append({'file': name, 'ok': False, 'note': f'Excel extraction failed: {err}'})
             return
         _write_ingested_text(os.path.join(dest_rel_dir, name + '.md'), f'# {name} (Excel, extracted)\n\n' + _redact_secrets(text), results, name)
+
+    elif ext == '.docx':
+        text, err = _ingest_docx_to_text(src_path)
+        if err:
+            results.append({'file': name, 'ok': False, 'note': f'Word extraction failed: {err}'})
+            return
+        _write_ingested_text(os.path.join(dest_rel_dir, name + '.md'), f'# {name} (Word, text-extracted)\n\n' + _redact_secrets(text), results, name)
+
+    elif ext in ('.pptx', '.ppt'):
+        text, err = _ingest_pptx_to_text(src_path)
+        if err:
+            results.append({'file': name, 'ok': False, 'note': f'PowerPoint extraction failed: {err}'})
+            return
+        _write_ingested_text(os.path.join(dest_rel_dir, name + '.md'), f'# {name} (PowerPoint, text-extracted)\n\n' + _redact_secrets(text), results, name)
 
     elif ext in INGEST_TEXT_EXTENSIONS:
         try:
@@ -16041,6 +16262,90 @@ async def evidence_record(request: Request):
     return JSONResponse(result)
 
 
+@app.post('/api/evidence/observation')
+async def evidence_observation(request: Request):
+    # The change-record primitive from the research-desk model: a structured
+    # before -> after observation (pricing, positioning, feature availability)
+    # appended to a claim, or turned into a new claim when there is none. Same
+    # auth/rate-limit surface as POST /api/evidence.
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'unknown')
+    if not check_rate_limit(agent_id):
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    if verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        result = record_observation_change(
+            body.get('claimId'),
+            body.get('field'),
+            body.get('before'),
+            body.get('after'),
+            source_url=body.get('sourceUrl'),
+            note=body.get('note'),
+            actor=agent_id,
+        )
+    except Exception as e:
+        return JSONResponse({'error': f'could not record observation: {e}'}, status_code=500)
+    if result.get('recorded'):
+        log_action(agent_id, 'evidence_observation', {
+            'claim_id': result.get('id'),
+            'field': body.get('field'),
+            'before': body.get('before'),
+            'after': body.get('after'),
+        })
+    return JSONResponse(result)
+
+
+@app.get('/api/research-desk/ops')
+async def research_desk_ops(request: Request):
+    # The article's weekly operating report, consolidated from data the desk
+    # already writes (evidence.py ledgers + the spend ledger): how many claims
+    # were recorded, how many before/after observations logged, how many claims
+    # are blocked vs pending review, how many identities are covered, how many
+    # sources the watchlist holds, and what the whole operation cost over the
+    # last seven days. Read-only, so the report can be scheduled and pasted
+    # into a run summary without a second mutation channel.
+    claims = _evidence_read() or {}
+    coverage = _coverage_read() or {}
+    now = time.time()
+    window_s = 7 * 86400
+    claims_since = [c for c in claims.values()
+                    if c.get('created_ts', 0) > now - window_s]
+    observed = [c for c in claims.values() if c.get('observations')]
+    blocked = [c for c in claims.values() if c.get('status') == 'blocked']
+    needs_review = [c for c in claims.values() if c.get('status') == 'needs_review']
+    covered = [v for v in coverage.values() if v.get('status') == 'covered']
+    ledger = _spend_ledger_read() or {}
+    reserved = {_SPEND_CAP_BASELINE_KEY}
+    spend_7d = 0.0
+    for key, bucket in ledger.items():
+        if key in reserved or key.startswith('__'):
+            continue
+        by_day = bucket.get('byDay') or {}
+        spend_7d += sum(v for d, v in by_day.items() if d >= time.strftime('%Y-%m-%d', time.localtime(now - window_s)))
+    import config as _config
+    return JSONResponse({
+        'windowDays': 7,
+        'claims': {
+            'total': len(claims),
+            'recorded_in_window': len(claims_since),
+            'needs_review': len(needs_review),
+            'blocked': len(blocked),
+            'with_observations': len(observed),
+        },
+        'coverage': {
+            'identities_total': len(coverage),
+            'covered': len(covered),
+        },
+        'watchlist': {
+            'topics': len(_config.RESEARCH_WATCHLIST),
+            'passes': len(_config.RESEARCH_DESK_PASSES),
+        },
+        'spendUsdLast7d': round(spend_7d, 6),
+        'at': now,
+    })
+
+
 @app.get('/api/evidence')
 async def evidence_list(request: Request):
     # Read view of the claim ledger for the operator/Verifier. Filters:
@@ -16245,6 +16550,20 @@ async def policy_reload(request: Request):
     result = reload_policy_config()
     log_action(None, 'policy_reload', {k: len(v) for k, v in result.items()})
     return JSONResponse({'ok': True, 'loaded': result})
+
+
+@app.post('/api/env/reload')
+async def env_reload(request: Request):
+    # Re-read .env and rebind the live-swappable globals (API keys, budget
+    # ceilings, feature toggles, tuning knobs) so an operator's .env edit
+    # applies without a server restart -- the same operator action as
+    # /api/policy/reload, and PLAYER-SESSION-ONLY for the same reason. Values
+    # are never echoed back; only the names that changed are reported.
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- reloading env requires the player session'}, status_code=401)
+    result = _reload_env_config()
+    log_action(None, 'env_reload', {'changed': result['changed']})
+    return JSONResponse({'ok': True, 'changed': result['changed'], 'count': result['count']})
 
 @app.post('/api/allowlist/request')
 async def allowlist_request(request: Request):

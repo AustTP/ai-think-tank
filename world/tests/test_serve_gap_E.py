@@ -478,6 +478,107 @@ class IngestXlsx(unittest.TestCase):
         self.assertIn('bad workbook', err)
 
 
+class IngestDocx(unittest.TestCase):
+    def test_missing_docx_returns_clear_error(self):
+        with unittest.mock.patch.object(serve, '_docx', None):
+            text, err = serve._ingest_docx_to_text('/x/whatever.docx')
+        self.assertIsNone(text)
+        self.assertIn('python-docx is not installed', err)
+
+    def test_success_extracts_paragraphs_and_tables(self):
+        import docx as _docx
+        tmp = tempfile.mkdtemp()
+        try:
+            path = os.path.join(tmp, 'memo.docx')
+            d = _docx.Document()
+            d.add_paragraph('The decision memo.')
+            t = d.add_table(rows=1, cols=2)
+            t.rows[0].cells[0].text = 'column one'
+            t.rows[0].cells[1].text = 'column two'
+            d.save(path)
+            text, err = serve._ingest_docx_to_text(path)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertIsNone(err)
+        self.assertIn('The decision memo.', text)
+        self.assertIn('column one | column two', text)
+
+    def test_load_exception_is_reported(self):
+        with unittest.mock.patch.object(serve, '_docx', types.SimpleNamespace(Document=lambda p: (_ for _ in ()).throw(Exception('bad docx')))):
+            text, err = serve._ingest_docx_to_text('/x/memo.docx')
+        self.assertIsNone(text)
+        self.assertIn('bad docx', err)
+
+
+class IngestPptx(unittest.TestCase):
+    def test_missing_pptx_returns_clear_error(self):
+        with unittest.mock.patch.object(serve, '_pptx', None):
+            text, err = serve._ingest_pptx_to_text('/x/whatever.pptx')
+        self.assertIsNone(text)
+        self.assertIn('python-pptx is not installed', err)
+
+    def test_success_extracts_slide_text(self):
+        from pptx import Presentation as _Pres
+        tmp = tempfile.mkdtemp()
+        try:
+            path = os.path.join(tmp, 'deck.pptx')
+            prs = _Pres()
+            slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank
+            tb = slide.shapes.add_textbox(100, 100, 400, 60)
+            tb.text = 'Q3 pricing update'
+            prs.save(path)
+            text, err = serve._ingest_pptx_to_text(path)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertIsNone(err)
+        self.assertIn('--- slide 1 ---', text)
+        self.assertIn('Q3 pricing update', text)
+
+    def test_load_exception_is_reported(self):
+        with unittest.mock.patch.object(serve, '_pptx', types.SimpleNamespace(Presentation=lambda p: (_ for _ in ()).throw(Exception('bad pptx')))):
+            text, err = serve._ingest_pptx_to_text('/x/deck.pptx')
+        self.assertIsNone(text)
+        self.assertIn('bad pptx', err)
+
+
+class IngestWordPowerPointDispatch(unittest.TestCase):
+    def test_docx_lands_as_md_in_library(self):
+        import docx as _docx
+        tmp = tempfile.mkdtemp()
+        try:
+            src = os.path.join(tmp, 'memo.docx')
+            d = _docx.Document()
+            d.add_paragraph('prose')
+            d.save(src)
+            with unittest.mock.patch.object(serve, 'LIBRARY_DIR', os.path.join(tmp, 'library')), \
+                 unittest.mock.patch.object(serve, '_redact_secrets', side_effect=lambda s: s):
+                results = []
+                serve._ingest_one_file(src, 'ingested', results)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual(results[0]['ok'], True)
+        self.assertTrue(results[0]['path'].endswith('memo.docx.md'))
+
+    def test_pptx_lands_as_md_in_library(self):
+        from pptx import Presentation as _Pres
+        tmp = tempfile.mkdtemp()
+        try:
+            src = os.path.join(tmp, 'deck.pptx')
+            prs = _Pres()
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+            tb = slide.shapes.add_textbox(100, 100, 400, 60)
+            tb.text = 'slide prose'
+            prs.save(src)
+            with unittest.mock.patch.object(serve, 'LIBRARY_DIR', os.path.join(tmp, 'library')), \
+                 unittest.mock.patch.object(serve, '_redact_secrets', side_effect=lambda s: s):
+                results = []
+                serve._ingest_one_file(src, 'ingested', results)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual(results[0]['ok'], True)
+        self.assertTrue(results[0]['path'].endswith('deck.pptx.md'))
+
+
 class IngestWriteText(unittest.TestCase):
     def test_invalid_destination_reports_failure(self):
         results = []
