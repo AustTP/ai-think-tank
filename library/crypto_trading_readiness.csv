@@ -1,0 +1,5 @@
+strategy,coinbase_integration,data_sources,profit_loss_margin,algorithm_backtest,api_management,readiness_status
+Dollar-Cost Averaging,Verified,Verified,Estimated,Estimated,Verified,Estimated
+Moving Averages,Verified,Verified,Estimated,Estimated,Verified,Estimated
+HODL,Verified,Verified,Estimated,Estimated,Verified,Estimated
+Stop-Loss Orders,N/A,N/A,N/A,N/A,N/A,Estimated

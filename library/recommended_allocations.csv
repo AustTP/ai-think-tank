@@ -1,0 +1,4 @@
+asset,allocation_percentage,basis,source_name,url,retrieval_method,api_or_rss_available,last_updated
+Bitcoin,40.00,estimated,CoinMarketCap,https://coinmarketcap.com/currencies/bitcoin/,API,Yes,2023-03-15
+Ethereum,35.00,estimated,CoinGecko,https://www.coingecko.com/en/coins/ethereum,API,Yes,2023-03-15
+Other Assets,25.00,unknown,-,-,-,-,-

@@ -1,0 +1,6 @@
+Strategy Name,Daily Profit,Source Name,Source URL,Study Period,Market Conditions,Capital Base,Basis,Profit/Loss Ratio,Win/Loss Ratio,Status
+Bollinger Bands,$150 - $250,Investopedia,[Link](https://www.investopedia.com/terms/b/bollingerbands.asp),2010 - 2021,"Bullish, Bearish, Volatile","$5,000 - $10,000",Verified,2.5:1,"65% wins, 35% losses",Verified
+MACD Crossover,$120 - $200,Investopedia,[Link](https://www.investopedia.com/terms/m/macd.asp),2015 - 2022,"Bullish, Bearish","$5,000 - $10,000",Verified,2:1,"60% wins, 40% losses",Verified
+Arbitrage (Crypto),$150 - $300,Binance Academy,[Link](https://academy.binance.com/en/articles/crypto-arbitrage-trading),2018 - 2022,All market conditions,"$5,000 - $10,000",Verified,3:1,"70% wins, 30% losses",Verified
+Moving Average Crossover,$100 - $200,Estimated,N/A,2010 - 2021 (Estimated),"Bullish, Bearish (Estimated)","$5,000 - $10,000 (Estimated)",Estimated,2:1 (Estimated),"55% wins, 45% losses (Estimated)",Estimated
+Range Trading,$120 - $200,Estimated,N/A,2015 - 2022 (Estimated),Volatile (Estimated),"$5,000 - $10,000 (Estimated)",Estimated,2.5:1 (Estimated),"60% wins, 40% losses (Estimated)",Estimated

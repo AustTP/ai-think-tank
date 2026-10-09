@@ -1,0 +1,3 @@
+api_name,url,provides_ohlc,provides_volume,data_format,cost,assessment,basis
+CryptoDataDownload,https://cryptodatadownload.com/,Yes,Yes,"CSV, JSON",Free,Verified,Web
+Alpha Vantage,https://www.alphavantage.co/,Yes,Yes,JSON,Free,Estimated,

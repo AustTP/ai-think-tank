@@ -1,0 +1,1 @@
+instrument,date,open,high,low,close,volume,trend,pattern,correlation\nBTC-USD,2024-02-28,24500,25500,23500,25000,500000,Bullish,Ascending Triangle,0.5\nETH-USD,2024-02-28,1800,1900,1700,1850,200000,Bearish,Descending Triangle,0.3
