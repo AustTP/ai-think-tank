@@ -5573,6 +5573,14 @@ def _work_context_clause(work_context):
 API_SERVICES_PATH = os.path.join(ROOT, 'api_services.json')
 _API_SERVICES = {}
 _API_SERVICES_LOAD_ERROR = None
+# Registry freshness: the api_services table is the operator-editable config,
+# so _ensure_api_services_fresh() re-loads _API_SERVICES when the table's
+# active-row fingerprint changes. The TTL bounds the cost to one aggregate
+# query at most every _API_SERVICES_REFRESH_TTL_S per process; a config edit
+# therefore goes live within that window, with no code change and no restart.
+_API_SERVICES_REFRESH_TTL_S = 5.0
+_API_SERVICES_FINGERPRINT = None
+_API_SERVICES_FRESH_CHECK = 0.0
 # Read-only CHANNELS: named capabilities (Reddit, Twitter/X, LinkedIn ...) that
 # map hostnames to an ORDERED backend chain. Each backend is a registered
 # service plus a url_template that rewrites the agent's requested URL ({url})
@@ -5731,6 +5739,31 @@ def _load_api_services():
     for row in rows:
         _index_api_service(_api_service_row_to_spec(dict(row)))
     _load_api_channels()
+
+
+def _ensure_api_services_fresh():
+    """Reload the registry from the DB when the active-row fingerprint changes,
+    so an operator's api_services row edit (add / revoke / tweak) goes live
+    without a restart. Called at the api_call chokepoint and the registry list
+    endpoint; TTL-guarded so the cost is one aggregate query per window, and
+    _load_api_services() only runs when something actually changed. On any DB
+    error, keeps the current registry -- fail closed, never a raised call."""
+    global _API_SERVICES_FINGERPRINT, _API_SERVICES_FRESH_CHECK
+    now = time.time()
+    if now - _API_SERVICES_FRESH_CHECK < _API_SERVICES_REFRESH_TTL_S:
+        return
+    _API_SERVICES_FRESH_CHECK = now
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), MAX(updated_at) FROM api_services WHERE status = 'active'"  # nosec B608 -- aggregate over a fixed table, never user input
+            ).fetchone()
+    except Exception:
+        return  # DB not ready or busy: keep the registry as-is
+    fingerprint = (row[0], row[1])
+    if fingerprint != _API_SERVICES_FINGERPRINT:
+        _API_SERVICES_FINGERPRINT = fingerprint
+        _load_api_services()
 
 
 def _load_api_channels():
@@ -5948,9 +5981,16 @@ def _api_credential_value(spec):
         return None, None, None
     if ctype == 'env':
         key = cred.get('key') or ''
+        # Module globals first (tests patch them and hot env reload rebinds
+        # them); a key with no module global falls back to the live .env so a
+        # brand-new service needs ZERO code changes -- just a row + a .env key.
         token = globals().get(key)
+        if not token:
+            token = _load_env().get(key) or ''
         key2 = cred.get('key2') or ''
         token2 = globals().get(key2) if key2 else None
+        if key2 and not token2:
+            token2 = _load_env().get(key2) or ''
         if not token:
             return None, None, f'env key {key} is not set'
         return token, token2, None
@@ -16992,6 +17032,7 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
     the registry's workflow sequence. Builds, redacts, and wraps the
     model-facing text and accrues spend. Returns a result dict; never raises
     for a blocked or failed request."""
+    _ensure_api_services_fresh()
     parsed = urllib.parse.urlparse(url)
     service = _api_service_for_host(parsed.hostname)
     registered = service is not None
@@ -17321,6 +17362,7 @@ async def api_service_request(request: Request):
 @app.get('/api/api-service/list')
 async def api_service_list():
     # Player-facing view of the registry (active services the agents can reach).
+    _ensure_api_services_fresh()
     entries = []
     for sid, spec in _API_SERVICES.items():
         if '.' in sid:  # host-key entry, skip (service-id entries only)
