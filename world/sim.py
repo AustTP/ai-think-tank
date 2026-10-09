@@ -1509,7 +1509,10 @@ FREE_SPIKE_PREMISE_GUIDANCE = (
     'This is free exploration: your only deliverable is what you actually learn. '
     'QUESTION THE PREMISE first -- state the assumption buried in the question and '
     'ask whether the question is even the right one. The most valuable finding is '
-    'often that the frame was wrong.'
+    'often that the frame was wrong. '
+    'A finding is not a finding until you can name what would prove it wrong: state '
+    'the strongest objection or the concrete observation that would overturn it. If '
+    'you cannot, you have not yet separated a real signal from a comfortable assumption.'
 )
 # Hard cap of filed-but-not-yet-groomed requests in a single ceremony, so a
 # churny think tank can't convene a backlog-refinement meeting over a runaway list.

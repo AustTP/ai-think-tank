@@ -19288,7 +19288,25 @@ def _build_weekly_review(now=None):
     prior_shipped_n = sum(1 for a in prior_actions if a[0] in _PROGRESS_ACTIONS)
     prior_ceremony_n = sum(1 for a in prior_actions if a[0] in _CEREMONY_ACTIONS)
     prior_decisions_n = len(prior_decisions)
+    prior_ok_n = sum(1 for d in prior_decisions if d[0])
     prior_cost = sum(float(d[1] or 0) for d in prior_decisions)
+
+    # Trailing-window collapse check (the "test the latest window by itself"
+    # gate): a long window can hide a dying trailing window, so the long trend
+    # is never trusted over THIS week. Flag when decision health or the shipped-
+    # work rate has collapsed against the prior week, with a minimum sample so
+    # a quiet window never reads as decay.
+    regime_decay = None
+    if n_decisions >= 5 and prior_decisions_n >= 5:
+        cur_rate = ok_decisions / n_decisions
+        prior_rate = prior_ok_n / prior_decisions_n
+        if prior_rate > 0 and cur_rate < prior_rate * 0.5:
+            regime_decay = (f'decision ok-rate collapsed to {cur_rate:.0%} this week '
+                            f'from {prior_rate:.0%} last week')
+    elif prior_shipped_n >= 5 and shipped_actions < prior_shipped_n * 0.5 \
+            and len(actions) >= max(3, prior_actions_n * 0.2):
+        regime_decay = (f'shipped work dropped to {shipped_actions} this week '
+                        f'from {prior_shipped_n} last week')
 
     # Knowledge provenance audit (the memory audit): what the colony wrote
     # this window and where it came from, plus what external content is still
@@ -19318,6 +19336,7 @@ def _build_weekly_review(now=None):
             'decisions': _delta(n_decisions, prior_decisions_n),
             'decision_cost_usd': round(jep_cost - prior_cost, 4),
         },
+        'regime_decay': regime_decay,
         'provenance': {
             'library_writes': provenance['writes'],
             'by_source': provenance['by_source'],
@@ -19344,9 +19363,12 @@ def _build_weekly_review(now=None):
         f'- Jev decisions: **{n_decisions}** ({ok_decisions} ok)',
         f'- Decision-model spend: **${round(jep_cost, 4):.4f}** ({round(jep_cost - prior_cost, 4):+.4f})',
         '',
-        '## Per-agent activity',
-        '',
     ]
+    if regime_decay:
+        lines.append(f'- **Trailing-window decay**: {regime_decay}')
+        lines.append('')
+    lines.append('## Per-agent activity')
+    lines.append('')
     if per_agent:
         for aid, b in sorted(per_agent.items(), key=lambda kv: -kv[1]['shipped']):
             lines.append(f'- **{aid}**: {b["actions"]} action(s), {b["shipped"]} shipped')

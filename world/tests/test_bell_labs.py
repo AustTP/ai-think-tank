@@ -457,5 +457,23 @@ class PremiseQuestioning(unittest.TestCase):
         self.assertGreaterEqual(src.count('PREMISE_QUESTIONING_GUIDANCE'), 3)
 
 
+class FalsificationContract(unittest.TestCase):
+    """The desk's falsification filter, applied to the think tank: a research
+    question with no named way to be proven wrong is not an answerable claim,
+    and a free spike must name the objection before it counts as a finding."""
+
+    def test_research_contract_requires_a_prove_wrong_line(self):
+        src = open(content.__file__, encoding='utf-8').read()
+        # The contract must ask for the single most likely objection and the
+        # concrete observation that would overturn the expected answer.
+        self.assertIn('PROVE WRONG', src)
+        self.assertIn('would overturn it', src)
+
+    def test_free_spike_guidance_requires_a_named_objection(self):
+        guidance = sim.FREE_SPIKE_PREMISE_GUIDANCE
+        self.assertIn('prove it wrong', guidance)
+        self.assertIn('strongest objection', guidance)
+
+
 if __name__ == '__main__':
     unittest.main()

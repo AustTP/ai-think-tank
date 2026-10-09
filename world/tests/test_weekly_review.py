@@ -116,6 +116,50 @@ class WeeklyReview(unittest.TestCase):
     def test_build_weekly_review_returns_none_when_nothing_to_review(self):
         self.assertIsNone(serve._build_weekly_review(now=2000000.0))
 
+    def test_trailing_window_decay_flags_collapsed_decision_health(self):
+        # A long window is never trusted over the trailing window: when THIS
+        # week's decision ok-rate collapses against the prior week, the review
+        # must flag it instead of reporting only the aggregate trend.
+        now = 2000000.0
+        since = now - WEEK
+        # Prior week: 10 decisions, 8 ok (80%).
+        for i in range(10):
+            self._seed_decision('browse', i < 8, 0.8, 0.01, since - i * 100)
+        # Current week: 10 decisions, 3 ok (30%) -- well under half of 80%.
+        for i in range(10):
+            self._seed_decision('browse', i < 3, 0.6, 0.01, now - i * 100)
+        review = serve._build_weekly_review(now=now)
+        self.assertIsNotNone(review)
+        self.assertIn('ok-rate collapsed', review['digest']['regime_decay'])
+        self.assertIn('Trailing-window decay', review['markdown'])
+
+    def test_trailing_window_decay_flags_shipped_work_collapse(self):
+        # Fewer than 5 decisions in either window -> the decision branch is
+        # skipped; a shipped-work collapse still flags when sample is adequate.
+        now = 2000000.0
+        since = now - WEEK
+        for i in range(8):
+            self._seed_action('ada', 'task_completed', since - i * 100)
+        # Current week: active but barely shipping (2 shipped of 5 actions).
+        self._seed_action('ada', 'task_completed', now - 100)
+        self._seed_action('ada', 'task_completed', now - 200)
+        for i in range(3):
+            self._seed_action('ada', 'chat', now - i * 100)
+        review = serve._build_weekly_review(now=now)
+        self.assertIsNotNone(review)
+        self.assertIn('shipped work dropped', review['digest']['regime_decay'])
+
+    def test_trailing_window_decay_is_absent_when_health_holds(self):
+        # Both windows healthy and comparable -> no decay flag.
+        now = 2000000.0
+        since = now - WEEK
+        for i in range(6):
+            self._seed_decision('browse', True, 0.8, 0.01, since - i * 100)
+            self._seed_decision('browse', True, 0.8, 0.01, now - i * 100)
+        review = serve._build_weekly_review(now=now)
+        self.assertIsNotNone(review)
+        self.assertIsNone(review['digest']['regime_decay'])
+
     def test_build_weekly_review_reports_library_write_provenance(self):
         # Firsthand work goes to the trusted tree; external (web-browsed)
         # content is gated into pending_review/. A write marked external that
