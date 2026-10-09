@@ -60,6 +60,13 @@ def _client():
     return c
 
 
+def _raw_client():
+    """A client with NO session cookie -- the way a bare agent (or an attacker
+    holding only an agent key) arrives."""
+    from starlette.testclient import TestClient
+    return TestClient(serve.app)
+
+
 def _agent_headers():
     key = serve.get_or_create_agent_key('testagent')
     return {'X-Agent-Key': key}
@@ -216,12 +223,15 @@ class PolicyEndpoints(_ApiTestCase):
         self.assertIsInstance(body['watchlist']['topics'], list)
         self.assertFalse(body['writeback_enabled'])  # not booted via lifespan
 
-    def test_policy_reload_is_agent_key_gated(self):
+    def test_policy_reload_requires_player_session(self):
+        # An agent key alone NEVER reloads policy -- reload is an operator
+        # action, so a compromised key cannot fiddle with it.
+        raw = _raw_client()
+        r = raw.post('/api/policy/reload', json={'agentId': 'testagent'},
+                     headers=_agent_headers())
+        self.assertEqual(r.status_code, 401)
         c = _client()
         r = c.post('/api/policy/reload', json={'agentId': 'testagent'})
-        self.assertEqual(r.status_code, 401)
-        r = c.post('/api/policy/reload', json={'agentId': 'testagent'},
-                   headers=_agent_headers())
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(r.json()['ok'])
 
@@ -230,6 +240,112 @@ class PolicyEndpoints(_ApiTestCase):
         r = c.post('/api/policy/reload', json={'agentId': 'player'})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(r.json()['ok'])
+
+
+class HardeningEndpoints(_ApiTestCase):
+    """The compromised-key defenses: player-only direct coverage, Verifier
+    role gate on review, covered-flip rate cap, and the immutable audit."""
+
+    def test_agent_key_cannot_mark_covered_directly(self):
+        raw = _raw_client()
+        r = raw.post('/api/coverage', json={'agentId': 'testagent',
+                                             'identity': 'https://x.com/vendor/status/1',
+                                             'artifact': 'skills/vendor.md',
+                                             'reviewed': True},
+                     headers=_agent_headers())
+        self.assertEqual(r.status_code, 403)
+        r = raw.get('/api/coverage', headers=_agent_headers())
+        self.assertEqual(r.json()['coverage'], [])
+
+    def test_player_session_can_mark_covered_directly(self):
+        c = _client()
+        r = c.post('/api/coverage', json={'identity': 'https://x.com/vendor/status/1',
+                                           'artifact': 'skills/vendor.md',
+                                           'reviewed': True})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['coverage']['status'], 'covered')
+
+    def test_crawl_still_records_pending_review_with_agent_key(self):
+        raw = _raw_client()
+        r = raw.post('/api/coverage', json={'agentId': 'testagent',
+                                             'identity': 'https://x.com/vendor/status/1',
+                                             'artifact': 'skills/vendor.md',
+                                             'reviewed': False},
+                     headers=_agent_headers())
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['coverage']['status'], 'pending_review')
+
+    def test_review_rejects_non_verifier_agent(self):
+        # No session, valid key, but the agent is not a director/admin: 403.
+        raw = _raw_client()
+        raw.post('/api/evidence', json={'agentId': 'testagent', 'record': _record()},
+                 headers=_agent_headers())
+        r = raw.get('/api/evidence', headers=_agent_headers())
+        claim_id = r.json()['claims'][0]['id']
+        r = raw.post('/api/evidence/review', json={
+            'agentId': 'testagent', 'claimId': claim_id, 'decision': 'usable_as_written'},
+            headers=_agent_headers())
+        self.assertEqual(r.status_code, 403)
+
+    def test_review_by_verifier_agent_succeeds(self):
+        raw = _raw_client()
+        raw.post('/api/evidence', json={'agentId': 'testagent', 'record': _record()},
+                 headers=_agent_headers())
+        r = raw.get('/api/evidence', headers=_agent_headers())
+        claim_id = r.json()['claims'][0]['id']
+        with unittest.mock.patch.object(serve, '_agent_is_verifier', return_value=True):
+            r = raw.post('/api/evidence/review', json={
+                'agentId': 'testagent', 'claimId': claim_id, 'decision': 'usable_as_written'},
+                headers=_agent_headers())
+        self.assertEqual(r.status_code, 200, r.text)
+        r = raw.get('/api/coverage', headers=_agent_headers())
+        self.assertEqual(r.json()['coverage'][0]['status'], 'covered')
+
+    def test_agent_is_verifier_checks_roster_role(self):
+        state = {'agentRoster': [{'id': 'dir', 'isDirector': True},
+                                 {'id': 'admin', 'isAdmin': True},
+                                 {'id': 'worker'}]}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state):
+            self.assertTrue(serve._agent_is_verifier('dir'))
+            self.assertTrue(serve._agent_is_verifier('admin'))
+            self.assertFalse(serve._agent_is_verifier('worker'))
+        self.assertTrue(serve._agent_is_verifier('player'))
+
+    def test_covered_flip_rate_cap_blocks_agent_verifier(self):
+        raw = _raw_client()
+        with unittest.mock.patch.object(serve, '_agent_is_verifier', return_value=True), \
+             unittest.mock.patch.object(serve, 'VERIFIER_COVERED_MAX', 1):
+            for i in range(2):
+                raw.post('/api/evidence', json={'agentId': 'testagent',
+                                                'record': _record(source_url=f'https://x.com/vendor/status/{i}',
+                                                                  resolved_url=f'https://x.com/vendor/status/{i}')},
+                         headers=_agent_headers())
+            claims = raw.get('/api/evidence', headers=_agent_headers()).json()['claims']
+            r1 = raw.post('/api/evidence/review', json={
+                'agentId': 'testagent', 'claimId': claims[0]['id'], 'decision': 'usable_as_written'},
+                headers=_agent_headers())
+            self.assertEqual(r1.status_code, 200, r1.text)
+            r2 = raw.post('/api/evidence/review', json={
+                'agentId': 'testagent', 'claimId': claims[1]['id'], 'decision': 'usable_as_written'},
+                headers=_agent_headers())
+            self.assertEqual(r2.status_code, 429)
+
+    def test_audit_trail_records_actions_and_actors(self):
+        c = _client()
+        c.post('/api/evidence', json={'agentId': 'testagent', 'record': _record()},
+               headers=_agent_headers())
+        r = c.get('/api/evidence')
+        claim_id = r.json()['claims'][0]['id']
+        c.post('/api/evidence/review', json={'claimId': claim_id, 'decision': 'usable_as_written'})
+        r = c.get('/api/evidence/audit')
+        self.assertEqual(r.status_code, 200, r.text)
+        audit = r.json()['audit']
+        self.assertTrue(any(a['action'] == 'claim_recorded' and a['actor'] == 'testagent'
+                            for a in audit))
+        self.assertTrue(any(a['action'] == 'claim_reviewed' and a['actor'] == 'player'
+                            for a in audit))
+        self.assertTrue(any(a['action'] == 'coverage_covered' and a['actor'] == 'player'
+                            for a in audit))
 
 
 if __name__ == '__main__':

@@ -554,6 +554,32 @@ flips its identity to `covered`. `blocked_until_checked` blocks the claim and
 never marks coverage. This is the operator/Verifier step, not an automatic
 one.
 
+**Compromised-key defenses.** A valid agent key proves identity, not
+authority, so the desk's consequence-bearing moves are role-gated and
+audited:
+
+- `reviewed=True` on `POST /api/coverage` is **player-session-only**. The
+  research crawl (agent key) can only record `pending_review` or `failed`, so
+  a stolen key cannot suppress re-reporting through that route.
+- `POST /api/evidence/review` accepts the player (session) or a roster
+  director/admin (checked via `_agent_is_verifier`, not just key ownership).
+  An ordinary agent gets 403 even with a valid key.
+- Agent verifiers are rate-capped: max `VERIFIER_COVERED_MAX` (12) covered
+  flips per `VERIFIER_COVERED_WINDOW_S` (6h). Past the cap, only the player
+  may review. A compromised director can still flip some claims, but not the
+  whole ledger in one pass.
+- Every mutation appends an immutable row to the `evidence_audit` table
+  (actor, action, claim/identity, detail, ts). Rows are insert-only: a bad
+  actor can add rows but never rewrite history. `GET /api/evidence/audit`
+  exposes the trail to the operator.
+- `POST /api/policy/reload` is player-session-only (reload is an operator
+  action; a keyed agent can read policy but not reload it).
+
+The residual risk is acknowledged: a compromised director can still act as
+Verifier within the cap, and over-covering is reversible and visible (the
+audit + coverage ledger), not airtight. The always-block browse categories and
+the egress grants cap what a compromised agent can reach elsewhere.
+
 ### Operator-edited policy JSON (`world/config.py`)
 
 Settings the operator tunes live in JSON files, not Python. Each loader is
