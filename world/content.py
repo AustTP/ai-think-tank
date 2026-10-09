@@ -4072,7 +4072,14 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         {'role': 'system', 'content': (
             'You are planning a real, tool-driven web investigation. Given the question below, '
             + PREMISE_QUESTIONING_GUIDANCE + ' '
-            'write a short numbered checklist (3-7 items) of concrete sub-goals needed to answer it '
+            'First pin a short RESEARCH CONTRACT (one line each, in your plan): QUESTION (the exact '
+            'thing to answer), AS OF (today\'s date, and how fresh the answer must be -- a live fact '
+            'like pricing/availability/leadership needs a same-week source, a timeless explanation '
+            'does not), SCOPE (what is in and out of bounds), COMPARE (which alternatives/axes matter, '
+            'if any), and STOP WHEN (the concrete evidence that makes the answer good enough -- a '
+            'fixed round budget is not a stop condition, verified evidence is). A question without a '
+            'contract is the #1 cause of broad-but-wrong research, so this comes first.\n'
+            'Then write a short numbered checklist (3-7 items) of concrete sub-goals needed to answer it '
             'thoroughly and honestly -- e.g. which pages/categories to visit, what to extract from '
             'each, and what a real answer must cover. The FIRST item must always be a search_web '
             'query for what OTHER sites say about the subject -- a subject\'s own pages never '            'disclose everything about it (methodology, reputation, who else covers it), and a '
@@ -4145,6 +4152,14 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         'name is not the same as what that specific item actually is. Only ever follow a URL you '
         'actually saw returned by search_web or in a page\'s real links list -- never invent or guess '
         'a URL path. '
+        + 'For every important claim, note WHICH source supports it and AS OF WHEN you checked it '
+        '(a live fact like pricing/availability/leadership carries its check date, and you must say '
+        'explicitly when a source may be stale). "Two sources confirm it" is weak if both copied the '
+        'same press release -- when a claim matters, trace it to the primary source and, if one '
+        'exists, at least one genuinely independent source. Mark each claim supported, contested, '
+        'unverified, or stale rather than leaving it implicit, and when sources disagree do not '
+        'average them -- record the disagreement and which one answers the question. Stop when the '
+        'evidence is sufficient for the question, not when it "feels complete." '
         + ("If a plan step or the question genuinely needs real computation this machine cannot do "
             "-- CUDA/GPU work, a fine-tuning experiment, a heavy numeric job -- use run_on_colab to "
             "run complete Python on a real Colab GPU and read its output, rather than skipping it or "
