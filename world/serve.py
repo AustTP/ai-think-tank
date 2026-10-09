@@ -20249,6 +20249,22 @@ def _health_digest_markdown(snapshot):
 # exactly as they do for browser-driven work. This is the lowest-drift port --
 # not a re-implementation of browse/save/chat internals.
 SELF_BASE_URL = _load_env().get('SELF_BASE_URL', 'http://localhost:8010')
+
+
+def _derive_self_base_url(bind_host, port, env_url=None):
+    """The base URL self-loopback calls must use. Every consumer of
+    SELF_BASE_URL is a call from THIS process back into THIS process (the
+    research crawl's browse/evidence/save, chat follow-ups, allowlist
+    requests), so the URL has to match the actual bind -- never a stale .env
+    guess. A dead self-loopback fails silently (the crawl's evidence POST
+    degrades to 'recorded' and the ledger stays empty), which is why boot
+    derives it instead of trusting the file. 0.0.0.0/:: map to 127.0.0.1 (a
+    client cannot connect to 0.0.0.0); an explicit bind host (e.g. a
+    Tailscale IP) is used as-is. Returns (url, is_env_default)."""
+    self_host = '127.0.0.1' if bind_host in ('0.0.0.0', '::') else bind_host
+    bound = f'http://{self_host}:{port}'
+    env_url = env_url or SELF_BASE_URL
+    return bound, (env_url == bound)
 _SANDBOX_RESEARCH_ID = 'research-shared'  # index.html: RESEARCH_SANDBOX_ID
 RESEARCH_CRAWL_MAX_PAGES = 50             # tasks.js crawlAndCollect -- raised 6->30->50 for deeper research
 RESEARCH_SKILL_SYNTHESIS_TOKENS = 900     # runResearchTask /api/chat max_tokens
@@ -20765,6 +20781,18 @@ if __name__ == '__main__':
     # LAN interface, not just the tailnet.
     _host_arg = [a for a in sys.argv if a.startswith('--host=')]
     bind_host = _host_arg[0].split('=', 1)[1] if _host_arg else '127.0.0.1'
+    # SELF_BASE_URL must point at THIS process: every use is a self-loopback
+    # (the research crawl's browse/evidence/save calls, chat follow-ups,
+    # allowlist requests). The .env value is the operator's guess at boot, but
+    # it drifts the moment the port or bind host changes -- and a dead
+    # self-loopback is silent: the crawl's evidence POST degrades to
+    # 'recorded' and the evidence ledger stays empty. Derive the URL from the
+    # real bind instead, and warn when .env disagrees.
+    _bound_base, _env_matches = _derive_self_base_url(bind_host, port)
+    if not _env_matches:
+        print(f'[env] SELF_BASE_URL in .env is {SELF_BASE_URL!r} but this process binds '
+              f'{_bound_base}; self-loopback calls will use {_bound_base}', flush=True)
+        SELF_BASE_URL = _bound_base
     init_db()
     # flush=True -- real bug hit while building this: stdout is fully
     # buffered (not line-buffered) once redirected to a file/pipe rather
