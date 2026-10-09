@@ -10253,6 +10253,38 @@ async def api_mail_send(request: Request):
     entry = {'text': f'{from_name}: {text}', 'read': False,
              'ts': int(time.time() * 1000)}
     _sim._append_mailbox(target, entry)
+    # Admin messages surface: the admin never runs content tasks, so a mailbox
+    # note alone would sit unread forever (verified against the action log --
+    # the admin's only model context is governance ceremonies, which never
+    # read the mailbox). Player mail to the admin is therefore ALSO pushed
+    # through the same request routing the Telegram bridge uses: the admin is
+    # dispatched immediately (a live answer for an ask, or the request filed as
+    # spike/story/incident work), and the reply lands in the player's inbox.
+    # The mailbox entry above stays as the durable record. Parked asks (admin
+    # busy) are handled by the standing ask-drain, so nothing is lost.
+    if from_id == 'player' and to_id == _admin_agent_id(state):
+        routed = await _route_player_request(state, text)
+        if not routed.get('queued'):
+            reply = routed.get('reply') or routed.get('error') or ''
+            if reply:
+                now_ms = int(time.time() * 1000)
+                state.setdefault('playerInbox', []).append({
+                    'id': f'mail-{now_ms}',
+                    'agentId': routed.get('agent') or to_id,
+                    'question': text[:500],
+                    'answer': reply,
+                    'status': 'answered',
+                    'answeredAt': now_ms,
+                    'createdAt': now_ms,
+                    'queued': False,
+                })
+                _sim._queue_player_email(
+                    state, 'admin_mail_answered',
+                    '[AI Think Tank] Theo replied',
+                    (f'You messaged Theo: {text[:300]}\n\nTheo answered:\n{reply}'))
+                log_action('player', 'admin_mail_answered',
+                           {'agent': to_id, 'queued': False},
+                           authorized=True)
     save_state_to_db(state)
     log_action(from_id if from_id != 'player' else None, 'mail_sent',
                {'to': to_id, 'text': text}, authorized=True)
