@@ -1701,6 +1701,23 @@ class AskCore(unittest.TestCase):
             result = self._run(state, "recent linkedin posts on AI")
         self.assertEqual(capture["force_first_tool"], "search_linkedin_posts")
 
+    def test_force_first_tool_ais_feed(self):
+        state = self._ask_state()
+        capture = {}
+        with unittest.mock.patch.object(sim, "_eligible_candidates", return_value=["agent-2"]), \
+             unittest.mock.patch.object(serve, "_resolve_model_tier", return_value="m"), \
+             unittest.mock.patch.object(serve, "get_or_create_agent_key", return_value="k"), \
+             unittest.mock.patch.object(serve, "_call_agent_tool_loop",
+                                        _loop_fake([("read_ais_feed", {})], capture=capture)), \
+             unittest.mock.patch.object(content, "_spike_wants_x_trending", return_value=False), \
+             unittest.mock.patch.object(content, "_spike_wants_linkedin_search", return_value=False), \
+             unittest.mock.patch.object(content, "_spike_wants_ais_feed", return_value=True), \
+             unittest.mock.patch.object(content, "_make_treg_tools_executor",
+                                        return_value=lambda name, args: "feed"):
+            result = self._run(state, "which ships are off the coast of North Carolina?")
+        self.assertEqual(capture["force_first_tool"], "read_ais_feed")
+        self.assertIn("read_ais_feed", result["tools"])
+
 
 class IntentAsk(unittest.TestCase):
     def test_unauthorized(self):

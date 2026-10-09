@@ -2499,6 +2499,21 @@ def _spike_wants_linkedin_search(backlog, instructions):
     return 'linkedin' in text
 
 
+def _spike_wants_ais_feed(backlog, instructions):
+    """Same forced-tool-choice reasoning as the other _spike_wants_* detectors,
+    applied preemptively for the AISStream live maritime feed: a question about
+    ships/boats/vessels at sea ("which ships are off the coast of North
+    Carolina right now") should reach for read_ais_feed FIRST -- the only tool
+    that returns real live positions -- not search_web (which has no live ship
+    data) and not a guess from training knowledge. Live-confirmed miss: the
+    admin answered a ship-position question with "can't find any information"
+    and called no tool at all."""
+    text = f'{backlog or ""} {instructions or ""}'.lower()
+    mentions_vessel = any(w in text for w in ('ship', 'ships', 'vessel', 'vessels', 'boat', 'boats'))
+    mentions_maritime = any(w in text for w in ('ais', 'maritime', 'at sea', 'off the coast', 'coast of'))
+    return mentions_vessel or mentions_maritime
+
+
 def _spike_wants_github(backlog, instructions):
     """Same forced-tool-choice reasoning as the other _spike_wants_*
     detectors, applied preemptively (day one) for the GitHub read tools: a
@@ -4472,6 +4487,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         first_tool = 'search_linkedin_posts'
     elif _spike_wants_github(backlog, instructions):
         first_tool = 'github_get_repo'
+    elif _spike_wants_ais_feed(backlog, instructions):
+        first_tool = 'read_ais_feed'
     else:
         first_tool = 'search_web' if _serve.TAVILY_API_KEY else True
     # Chunked into rounds of 4 with a reflection self-check between them
