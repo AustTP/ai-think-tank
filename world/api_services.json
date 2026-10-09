@@ -141,6 +141,44 @@
         {"prefix": "/NORAD/", "methods": ["GET", "HEAD"]}
       ],
       "spend": {"kind": "none", "note": "free keyless NORAD orbital-element sets (TLE); fair-use / rate-limited"}
+    },
+    "jina-reader": {
+      "name": "Jina Reader (read-only)",
+      "base_url": "https://r.jina.ai",
+      "credential": {"type": "none"},
+      "auth": {"type": "none"},
+      "methods": ["GET", "HEAD"],
+      "path_rules": [
+        {"prefix": "/", "methods": ["GET", "HEAD"]}
+      ],
+      "spend": {"kind": "none", "note": "free keyless reader: converts any public URL into clean markdown at https://r.jina.ai/<url>; fair-use / rate-limited, no uptime guarantee -- the free read-only backend for the social channels below"}
+    }
+  },
+  "channels": {
+    "comment": "Named read-only channels for platforms the think tank cannot fetch directly (server IPs are blocked). Each channel maps a set of hostnames to an ORDERED backend chain -- the first backend that answers wins, and the chain falls through on failure, mirroring agent-reach's per-platform ordered backends. Backends reference registered services (by id) plus a url_template that rewrites the requested URL into the backend's URL ({url} is the agent's original URL). Jina Reader is the free keyless backend; add a vetted credential-backed backend to a chain by appending it -- first working wins.",
+    "reddit": {
+      "name": "Reddit (read-only)",
+      "hosts": ["reddit.com"],
+      "probe_url": "https://www.reddit.com/r/programming/hot",
+      "backends": [
+        {"service": "jina-reader", "url_template": "https://r.jina.ai/{url}"}
+      ]
+    },
+    "twitter": {
+      "name": "Twitter/X (read-only)",
+      "hosts": ["twitter.com", "x.com"],
+      "probe_url": "https://x.com/the_modern_heretic",
+      "backends": [
+        {"service": "jina-reader", "url_template": "https://r.jina.ai/{url}"}
+      ]
+    },
+    "linkedin": {
+      "name": "LinkedIn (read-only)",
+      "hosts": ["linkedin.com"],
+      "probe_url": "https://www.linkedin.com/feed/",
+      "backends": [
+        {"service": "jina-reader", "url_template": "https://r.jina.ai/{url}"}
+      ]
     }
   }
 }
