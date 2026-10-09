@@ -168,12 +168,12 @@
       "name": "Mullvad VPN (account)",
       "base_url": "https://api.mullvad.net",
       "credential": {"type": "env", "key": "MULLVAD_ACCOUNT_NUMBER"},
-      "auth": {"type": "body_field", "field": "account_number"},
-      "methods": ["POST"],
+      "auth": {"type": "mullvad", "token_url": "https://api.mullvad.net/auth/v1/token"},
+      "methods": ["GET"],
       "path_rules": [
-        {"prefix": "/auth/v1/token", "methods": ["POST"]}
+        {"prefix": "/accounts/v1/", "methods": ["GET"]}
       ],
-      "spend": {"kind": "none", "note": "account/device management token endpoint only (POST /auth/v1/token mints a token from the account number) -- it cannot proxy a fetch through a country exit; the real tunnel is the CLI/WireGuard integration (serve._mullvad_*), which routes the whole machine and is not an api_call service"}
+      "spend": {"kind": "none", "note": "account management only (GET /accounts/v1/accounts/me: id, expiry, device slots, payment status) -- the bearer is minted server-side from the account number via the JSON /auth/v1/token grant; it cannot proxy a fetch through a country exit (the real tunnel is the CLI/WireGuard integration, which routes the whole machine and is not an api_call service)"}
     }
   },
   "channels": {

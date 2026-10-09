@@ -4326,6 +4326,7 @@ async def _lifespan(app):
         print(f'[telegram] bridge active for {len(TELEGRAM_ALLOWED_CHAT_IDS)} allowlisted chat(s)', flush=True)
     ask_drain_task = asyncio.create_task(_pending_ask_drain_loop())
     avatar_task = asyncio.create_task(_avatar_loop())
+    ais_task = asyncio.create_task(_ais_collector_loop())
     sim_task = None
     try:
         import sim as _sim_module
@@ -4358,6 +4359,7 @@ async def _lifespan(app):
     ask_drain_task.cancel()
     if avatar_task is not None:
         avatar_task.cancel()
+    ais_task.cancel()
     if sim_task is not None:
         sim_task.cancel()
 
@@ -5870,8 +5872,20 @@ def _validate_api_service_spec(spec):
         return None, None, 'credential.type must be "none", "env", or "vault"'
     auth = spec.get('auth') or {}
     auth_type = auth.get('type')
-    if auth_type not in ('none', 'header_bearer', 'header_key', 'body_field', 'oauth2_client_credentials'):
-        return None, None, 'auth.type must be none, header_bearer, header_key, body_field, or oauth2_client_credentials'
+    if auth_type not in ('none', 'header_bearer', 'header_key', 'body_field', 'mullvad', 'oauth2_client_credentials'):
+        return None, None, 'auth.type must be none, header_bearer, header_key, body_field, mullvad, or oauth2_client_credentials'
+    if auth_type == 'mullvad':
+        # Mullvad mints a bearer from the account number via its JSON token
+        # endpoint -- requires a public https auth.token_url and a single-part
+        # env credential (the account number; there is no client secret).
+        token_url = str(auth.get('token_url') or '').strip().rstrip('/')
+        parsed_tok = urllib.parse.urlparse(token_url)
+        if parsed_tok.scheme != 'https' or not parsed_tok.hostname or not _is_safe_public_host(parsed_tok.hostname):
+            return None, None, 'mullvad requires a public https auth.token_url'
+        if cred.get('type') != 'env' or not cred.get('key') or cred.get('key2'):
+            return None, None, 'mullvad requires a single-part env credential (the account number)'
+        auth = dict(auth)
+        auth['token_url'] = token_url
     if auth_type == 'oauth2_client_credentials':
         # The token endpoint the OAuth2 client-credentials flow POSTs the
         # client id/secret pair to. It must be a public https URL (SSRF-safe,
@@ -6018,6 +6032,15 @@ def _api_apply_auth(spec, token, token2, method, url, headers, body):
         field = auth.get('field') or 'api_key'
         body = dict(body or {})
         body[field] = token
+    elif atype == 'mullvad':
+        # Mullvad account API: mint a short-lived bearer from the account
+        # number via the JSON token endpoint, inject as Bearer. The minted
+        # bearer is the ONLY credential that ever rides on the actual request.
+        token_url = (auth.get('token_url') or '').strip()
+        if not token_url:
+            raise ValueError('mullvad auth requires auth.token_url')
+        bearer = _mullvad_access_token(token_url, token)
+        headers['Authorization'] = f'Bearer {bearer}'
     elif atype == 'oauth2_client_credentials':
         # OAuth2 client-credentials: the registry stores the CLIENT ID/SECRET
         # pair (token = client_id, token2 = client_secret) plus the token
@@ -6099,6 +6122,74 @@ def _oauth2_access_token(token_url, client_id, client_secret):
         except (ValueError, TypeError):
             expires_in = 3600.0
         _OAUTH2_TOKEN_CACHE[cache_key] = {'token': token, 'expires_at': time.time() + expires_in}
+        return token
+
+
+# ---------------------------------------------------------------------------
+# Mullvad account-token mint + cache. Mullvad's account API is OAuth2-ish but
+# NOT the standard client-credentials form grant: the token endpoint is POST
+# api.mullvad.net/auth/v1/token with a JSON body {"account_number": "..."}
+# (no client secret -- the account number IS the credential), and the response
+# carries an ISO-8601 `expiry` instead of `expires_in` (confirmed live: the
+# stock form-encoded grant is 415'd, and a JSON body with "client_id" is 400'd
+# with 'Either account_number or authorization_code is required'). The minted
+# bearer is cached keyed by (token_url, account_number), refreshed proactively
+# before expiry, and never logged or returned to an agent.
+# ---------------------------------------------------------------------------
+_MULLVAD_TOKEN_CACHE: dict[tuple[str, str], dict[str, object]] = {}
+_MULLVAD_TOKEN_LOCK = threading.Lock()
+MULLVAD_TOKEN_REFRESH_MARGIN_S = 60
+
+
+def _mullvad_token_request_sync(token_url, account_number):
+    """POST the JSON {account_number} grant to Mullvad's token endpoint and
+    return the raw response body. SSRF-pinned like every other outbound call,
+    redirect-final-host re-checked, raises on a non-2xx response."""
+    if not account_number:
+        raise ValueError('mullvad account number is not set')
+    body = json.dumps({'account_number': account_number}).encode()
+    headers = {'Content-Type': 'application/json', 'Accept': 'application/json',
+               'User-Agent': 'AIThinkTankAgent/1.0'}
+    req = urllib.request.Request(token_url, data=body, headers=headers, method='POST')
+    with _safe_urlopen(req, timeout=API_CALL_TIMEOUT_S) as resp:
+        final_url = resp.geturl()
+        final_host = urllib.parse.urlparse(final_url).hostname
+        if not _is_safe_public_host(final_host):
+            raise ValueError('mullvad token endpoint redirected to a disallowed host')
+        raw = resp.read(API_CALL_MAX_BODY_BYTES + 1)
+    if resp.status >= 400:
+        raise ValueError(f'mullvad token endpoint returned HTTP {resp.status}')
+    return raw.decode(errors='replace')[:API_CALL_MAX_BODY_BYTES]
+
+
+def _mullvad_access_token(token_url, account_number):
+    """Return a valid Mullvad access token for the account number, minting and
+    caching one when the cache is empty or near expiry. Raises when the mint
+    fails so the auth-injection path fails the request cleanly."""
+    parsed = urllib.parse.urlparse(token_url)
+    if parsed.scheme != 'https' or not parsed.hostname or not _is_safe_public_host(parsed.hostname):
+        raise ValueError('mullvad token_url must be a public https URL')
+    cache_key = (token_url, account_number)
+    with _MULLVAD_TOKEN_LOCK:
+        cached = _MULLVAD_TOKEN_CACHE.get(cache_key)
+        if cached and time.time() + MULLVAD_TOKEN_REFRESH_MARGIN_S < cached['expires_at']:
+            return cached['token']
+        raw = _mullvad_token_request_sync(token_url, account_number)
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise ValueError('mullvad token endpoint returned non-JSON')
+        token = (data or {}).get('access_token')
+        if not token:
+            raise ValueError('mullvad token endpoint returned no access_token')
+        expires_at = time.time() + 3600.0
+        expiry = (data or {}).get('expiry')
+        if expiry:
+            try:
+                expires_at = datetime.datetime.fromisoformat(str(expiry).replace('Z', '+00:00')).timestamp()
+            except ValueError:
+                pass
+        _MULLVAD_TOKEN_CACHE[cache_key] = {'token': token, 'expires_at': expires_at}
         return token
 
 
@@ -7662,7 +7753,26 @@ AGENT_ASK_TOOLS = [
             'required': ['query'],
         },
     },
-}] if TAVILY_API_KEY else []) + ([
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'read_ais_feed',
+            'description': 'Read the most recent live AIS (ship position) frames from the think tank\'s '
+                           'AISStream collector -- real vessel name/lat/lon data streaming over a '
+                           'WebSocket, NOT a search result and NOT reachable through api_call. Use it '
+                           'when the question is about current ship positions/movements in the Western '
+                           'Atlantic (the collector\'s bounding box). Returns connection status and the '
+                           'most recent frames.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'max': {'type': 'integer', 'description': 'Max frames to return, 1-100 (default 20).'},
+                },
+            },
+        },
+    },
+] if TAVILY_API_KEY else []) + ([
     _HIGGSFIELD_IMAGE_TOOL,
     _HIGGSFIELD_VIDEO_TOOL,
 ] if (HIGGSFIELD_API_KEY_ID and HIGGSFIELD_API_KEY_SECRET) else []) + [_API_CALL_TOOL, _PROPOSE_API_SERVICE_TOOL]
@@ -11963,6 +12073,26 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             if out.get('ok') is not True:
                 return f'Could not search the web: {out.get("reason") or out.get("error") or "failed"}'
             return f"{out.get('modelInstruction', '')}\n\n{out['textForModel']}"
+        if name == 'read_ais_feed':
+            # Live AIS vessel positions from the AISStream collector (WebSocket
+            # -- NOT reachable via api_call). Buffered in-process; returns the
+            # most recent frames within the window.
+            max_msgs = max(1, min(int((args or {}).get('max') or 20), 100))
+            recent = _ais_recent(max_msgs=max_msgs)
+            status = _AIS_STATUS.get('connected')
+            parts = [f"connection={'live' if status else 'down'}",
+                     f"frames in buffer window={len(recent)}"]
+            if not status and _AIS_STATUS.get('last_error'):
+                parts.append(f"collector error: {_AIS_STATUS['last_error']}")
+            if recent:
+                rows = []
+                for m in recent:
+                    msg = m.get('message') or {}
+                    meta = msg.get('MetaData') or {}
+                    rows.append(f"- {meta.get('ShipName') or msg.get('MessageType') or 'frame'} "
+                                f"@{meta.get('Latitude')},{meta.get('Longitude')}")
+                parts.append('recent frames:\n' + '\n'.join(rows[-max_msgs:]))
+            return ' | '.join(parts)
         if name == 'browse_page':
             country = ((args or {}).get('country') or '').strip().lower()
             result = _http_json('POST', SELF_BASE_URL, '/api/browse', {
@@ -12469,6 +12599,84 @@ def _apply_pending_ask_results(state):
                                    'question': (ask.get('question') or '')[:200]})
         delivered += 1
     return delivered
+
+
+# ---------------------------------------------------------------------------
+# AISStream live maritime feed. The service is WebSocket-ONLY
+# (wss://stream.aisstream.io/v0/stream -- provider docs: connect, then send a
+# JSON subscription {APIKey, BoundingBoxes, FilterMessageTypes}, then read
+# JSON frames; a browser cannot connect, only a server can). The HTTP api_call
+# chokepoint can never reach it, so a dedicated collector owns the connection,
+# buffers recent frames in-process, and agents/player read the buffer via the
+# read_ais_feed tool / /api/ais/recent endpoint. Bounding box defaults to the
+# US East Coast / Western Atlantic (a sensible default for a US-based operator;
+# provider limits: 3 connections per IP, 3 per account).
+# ---------------------------------------------------------------------------
+_AIS_STREAM_URL = 'wss://stream.aisstream.io/v0/stream'
+_AIS_BUFFER_MAX = 300
+AIS_BUFFER_WINDOW_S = 1800
+AIS_RECONNECT_BACKOFF_S = 15
+AIS_DEFAULT_BOUNDING_BOX = [[[46.0, -80.0], [24.0, -60.0]]]
+AIS_DEFAULT_FILTER_TYPES = ['PositionReport']
+
+_AIS_BUFFER = []
+_AIS_BUFFER_LOCK = threading.Lock()
+_AIS_STATUS = {'connected': False, 'last_error': '', 'connected_at': 0, 'last_message_at': 0}
+
+
+def _ais_append_message(message):
+    with _AIS_BUFFER_LOCK:
+        _AIS_BUFFER.append({'ts': int(time.time() * 1000), 'message': message})
+        if len(_AIS_BUFFER) > _AIS_BUFFER_MAX:
+            del _AIS_BUFFER[:len(_AIS_BUFFER) - _AIS_BUFFER_MAX]
+
+
+def _ais_recent(max_msgs=20, window_s=AIS_BUFFER_WINDOW_S):
+    """Most recent buffered AIS frames within the window, newest last. Returns
+    a capped list of {'ts', 'message'} dicts (a shallow copy of each message so
+    callers can't mutate the buffer)."""
+    cutoff = int(time.time() * 1000) - window_s * 1000
+    with _AIS_BUFFER_LOCK:
+        msgs = [dict(m) for m in _AIS_BUFFER if m['ts'] >= cutoff]
+    return msgs[-max_msgs:]
+
+
+async def _ais_collector_loop():
+    """Standing loop (created in _lifespan): hold the AISStream WebSocket,
+    send the subscription on connect, buffer frames, reconnect with backoff.
+    Reads the API key fresh on every (re)connect so a new env key takes effect
+    without a restart. Never crashes the process -- every failure loops back to
+    a backoff sleep."""
+    import asyncio
+    import websockets
+    while True:
+        try:
+            token, _, cred_error = _api_credential_value(_API_SERVICES.get('aisstream') or {})
+            if cred_error or not token:
+                _AIS_STATUS['last_error'] = f'credential unavailable: {cred_error or "no key"}'
+                await asyncio.sleep(AIS_RECONNECT_BACKOFF_S)
+                continue
+            async with websockets.connect(
+                    _AIS_STREAM_URL, max_size=2 ** 20,
+                    open_timeout=20, ping_interval=20, ping_timeout=20) as ws:
+                await ws.send(json.dumps({
+                    'APIKey': token,
+                    'BoundingBoxes': AIS_DEFAULT_BOUNDING_BOX,
+                    'FilterMessageTypes': AIS_DEFAULT_FILTER_TYPES,
+                }))
+                _AIS_STATUS.update({'connected': True, 'last_error': '', 'connected_at': time.time()})
+                print('[ais] collector connected', flush=True)
+                async for raw in ws:
+                    try:
+                        _ais_append_message(json.loads(raw))
+                        _AIS_STATUS['last_message_at'] = time.time()
+                    except ValueError:
+                        continue
+        except Exception as e:  # noqa: BLE001 -- a drop/backoff and retry is the whole point
+            _AIS_STATUS['connected'] = False
+            _AIS_STATUS['last_error'] = str(e)[:200]
+            print(f'[ais] collector error: {e}', flush=True)
+            await asyncio.sleep(AIS_RECONNECT_BACKOFF_S)
 
 
 def _team_digest_text(max_markdown_chars=1400, tape_window_s=86400):
@@ -17241,6 +17449,32 @@ async def channel_probe(request: Request):
     log_action('player', 'channel-probe', {'channels': len(_API_CHANNELS)})
     results = await asyncio.to_thread(_probe_all_channels_sync)
     return JSONResponse({'channels': results})
+
+
+@app.get('/api/ais/recent')
+async def ais_recent(request: Request):
+    """Read the AISStream collector's buffered maritime feed (see the
+    read_ais_feed tool). Any valid agent key or player session may read it --
+    it is buffered, read-only, and never exposes the API key. Returns
+    connection status, buffer health, and the most recent frames within the
+    window."""
+    agent_id = (request.query_params.get('agentId') or '').strip()
+    presented = request.headers.get('X-Agent-Key') or ''
+    authed = (agent_id and verify_agent_key(agent_id, presented) is True)
+    if not authed:
+        authed = _require_player_session(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    max_msgs = max(1, min(int(request.query_params.get('max') or 20), 100))
+    window_s = max(10, min(int(request.query_params.get('window_s') or AIS_BUFFER_WINDOW_S), 86400))
+    return JSONResponse({
+        'ok': True,
+        'connected': _AIS_STATUS.get('connected'),
+        'lastError': _AIS_STATUS.get('last_error'),
+        'connectedAt': _AIS_STATUS.get('connected_at'),
+        'lastMessageAt': _AIS_STATUS.get('last_message_at'),
+        'frames': _ais_recent(max_msgs=max_msgs, window_s=window_s),
+    })
 
 
 @app.post('/api/api-call')
