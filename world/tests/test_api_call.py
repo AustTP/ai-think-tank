@@ -521,6 +521,24 @@ class ApiCallEndpoint(unittest.TestCase):
         self.assertEqual(sent_headers.get('Authorization'), 'Bearer tok')
         self.assertEqual(sent_url, 'https://api.github.com/repos/o/r')
 
+    def test_registered_post_body_sends_json_content_type(self):
+        # A dict body is sent as JSON, so the request MUST carry
+        # Content-Type: application/json -- Tavily 422s a JSON body sent
+        # without the header ("Input should be a valid dictionary or object
+        # to extract fields from"), which broke search_web end-to-end.
+        self._start(self._gates())
+        fake_result = {'status': 200, 'finalUrl': 'https://api.tavily.com/search',
+                       'contentType': 'application/json', 'body': '{"results": []}', 'truncated': False}
+        with unittest.mock.patch.object(serve, 'TAVILY_API_KEY', 'tok'), \
+             unittest.mock.patch.object(serve, '_api_request_sync', return_value=fake_result) as fetch:
+            r = self._client().post('/api/api-call', json={
+                'agentId': 'ben', 'url': 'https://api.tavily.com/search', 'method': 'POST',
+                'purpose': 'web search', 'body': {'query': 'test'}})
+        self.assertTrue(r.json()['allowed'])
+        sent_headers = fetch.call_args.args[2]
+        self.assertEqual(sent_headers.get('Content-Type'), 'application/json')
+        self.assertIn('api_key', fetch.call_args.args[3])
+
     def test_unregistered_get_is_read_only_with_no_auth_headers(self):
         self._start(self._gates())
         fake_result = {'status': 200, 'finalUrl': 'https://example.com/',

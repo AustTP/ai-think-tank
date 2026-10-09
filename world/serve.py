@@ -17111,6 +17111,12 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
     for h in ('authorization', 'cookie', 'host'):
         req_headers.pop(h, None)
     req_headers = {k: v for k, v in req_headers.items() if k.lower() in ('accept', 'accept-language', 'user-agent')}
+    # The allowlist above strips any caller-supplied content-type, and a dict
+    # body is sent as JSON -- so say so explicitly. Services like Tavily 422 a
+    # JSON body sent without the header (confirmed live: HTTP 422
+    # "Input should be a valid dictionary or object to extract fields from").
+    if req_body is not None and not any(h.lower() == 'content-type' for h in req_headers):
+        req_headers['Content-Type'] = 'application/json'
     if registered and token is not None:
         try:
             url, req_headers, req_body = _api_apply_auth(service, token, token2, method, url, req_headers, req_body)
