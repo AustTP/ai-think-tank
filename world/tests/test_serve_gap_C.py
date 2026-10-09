@@ -970,6 +970,21 @@ class GetState(unittest.TestCase):
         self.assertEqual(body['agentKeys'], {'ada': 'key-1'})
         save.assert_called_once()
 
+    def test_agent_key_caller_gets_no_agent_keys(self):
+        # Identity fix: an agent-key-authenticated caller (a content-executor
+        # loopback) must not be handed every other agent's key -- those keys
+        # gate key-authenticated endpoints.
+        state = {'agentRoster': [{'id': 'ada'}], 'agents': {'ada': {}}}
+        with unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=state), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_valid_agent_key_presented',
+                                        return_value=True):
+            c = TestClient(serve.app)
+            r = c.get('/api/state')
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn('agentKeys', r.json())
+
 
 class PostState(unittest.TestCase):
     def test_strips_agent_keys_and_merges_server_owned(self):
@@ -990,6 +1005,20 @@ class PostState(unittest.TestCase):
         self.assertNotIn('agentKeys', saved)
         self.assertEqual(saved['templates']['T']['mission'], 'm')
         self.assertEqual(saved['agents']['ada']['busy'], True)
+
+    def test_agent_key_alone_cannot_overwrite_state(self):
+        # State mutation is the player's domain: an agent key must not be able
+        # to overwrite village state and bypass every escalation/oversight gate.
+        with unittest.mock.patch.object(
+                serve, 'get_state_from_db', return_value={}), \
+             unittest.mock.patch.object(serve, 'save_state_to_db') as save, \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_valid_agent_key_presented',
+                                        return_value=True):
+            c = TestClient(serve.app)
+            r = c.post('/api/state', json={'agents': {'ada': {'busy': True}}})
+        self.assertEqual(r.status_code, 401)
+        save.assert_not_called()
 
 
 class MergeServerOwnedExtra(unittest.TestCase):

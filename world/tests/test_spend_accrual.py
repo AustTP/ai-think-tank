@@ -228,5 +228,56 @@ class ClarifyLaneAccrual(unittest.TestCase):
                          'the completing agent\'s single call must still accrue')
 
 
+class PerAgentSpendCap(unittest.TestCase):
+    """Per-agent monthly ceiling: spend accrues to an `__agent__/<id>` bucket
+    (excluded from the shared cap total) and _agent_spend_cap_exceeded gates on
+    the current month's series for THAT agent only."""
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='think tank-agent-cap-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            THINK_TANK_DIR=self.tmp,
+            AGENTS_DIR=os.path.join(self.tmp, 'agents'),
+            LIBRARY_DIR=os.path.join(self.tmp, 'library'),
+            PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
+            AGENT_SPEND_CAP_USD=3.0,
+        )
+        self._cm.start()
+        serve.init_db()
+
+    def tearDown(self):
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_accrual_lands_in_agent_bucket_and_gates(self):
+        self.assertFalse(serve._agent_spend_cap_exceeded('ada'))
+        serve._accrue_spend('__general__', 1.0, agent_id='ada')
+        self.assertFalse(serve._agent_spend_cap_exceeded('ada'))
+        serve._accrue_spend('__general__', 2.0, agent_id='ada')
+        self.assertTrue(serve._agent_spend_cap_exceeded('ada'))
+
+    def test_cap_is_per_agent(self):
+        serve._accrue_spend('__general__', 4.0, agent_id='ada')
+        self.assertTrue(serve._agent_spend_cap_exceeded('ada'))
+        self.assertFalse(serve._agent_spend_cap_exceeded('ben'))
+        serve._accrue_spend('__general__', 1.0, agent_id='ben')
+        self.assertFalse(serve._agent_spend_cap_exceeded('ben'))
+
+    def test_disabled_when_cap_zero(self):
+        with unittest.mock.patch.object(serve, 'AGENT_SPEND_CAP_USD', 0.0):
+            serve._accrue_spend('__general__', 99.0, agent_id='ada')
+            self.assertFalse(serve._agent_spend_cap_exceeded('ada'))
+
+    def test_agent_buckets_do_not_count_toward_shared_cap(self):
+        # The shared monthly cap must keep summing only the flat service
+        # buckets -- agent rollups are attribution, never double-counted.
+        with unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 10.0), \
+             unittest.mock.patch.object(
+                 serve, '_SPEND_CAP_BASELINE_KEY', '__baseline__'):
+            serve._accrue_spend('__general__', 2.0, agent_id='ada')
+            self.assertFalse(serve._think_tank_spend_cap_exceeded())
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

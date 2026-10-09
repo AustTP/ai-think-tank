@@ -795,7 +795,7 @@ class Workflow(unittest.TestCase):
         self.assertEqual(out['status'], 'completed')
         self.assertEqual(out['usd'], 0.094)
         self.assertEqual(out['ids'], {'endpoint': 'higgsfield-ai/soul/v2/standard', 'request_id': 'r1'})
-        acc.assert_called_once_with('higgsfield', 0.094)
+        acc.assert_called_once_with('higgsfield', 0.094, agent_id=None)
 
     def test_no_charge_on_failed_terminal(self):
         out, calls, acc = self._run('failed')

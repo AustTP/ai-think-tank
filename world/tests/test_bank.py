@@ -199,6 +199,18 @@ class SpendCap(unittest.TestCase):
         write_patch.start()
         self.addCleanup(read_patch.stop)
         self.addCleanup(write_patch.stop)
+        # The JEV chokepoint tests run against the REAL decision cache (they
+        # patch the ledger holder, not DB_PATH, so _decision_cache_get reads
+        # the live think_tank.db). Disable it here: a cached answer from an
+        # earlier run would short-circuit the cap check (no RuntimeError) and
+        # skip the __jev__ accrual the tests assert. The cache is an
+        # optimization; these tests exercise the real call path.
+        get_patch = unittest.mock.patch.object(serve, '_decision_cache_get', return_value=None)
+        put_patch = unittest.mock.patch.object(serve, '_decision_cache_put')
+        get_patch.start()
+        put_patch.start()
+        self.addCleanup(get_patch.stop)
+        self.addCleanup(put_patch.stop)
 
     def test_disabled_when_cap_is_zero(self):
         self._leak()

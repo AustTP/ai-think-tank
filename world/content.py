@@ -1110,9 +1110,21 @@ def _gather_unified_context(snapshot, base, key, agent_id, sandbox_id, topic):
     else:
         mail_block = '(nothing in your mailbox)'
 
-    return (f'## Current sandbox files\n{sandbox}\n\n'
-            f'## Relevant Library knowledge (searched: "{topic or "none given"}")\n{library_block}\n\n'
-            f'## Your mailbox (most recent)\n{mail_block}')
+    # Every block below is model-authored or model-adjacent content (sandbox
+    # files, library snippets, mailbox text) -- DATA the model reads, never
+    # instructions it should follow. Each is wrapped in the same tagged
+    # EXTERNAL_DATA boundary used for browse results, so a hostile instruction
+    # hidden in a file, a library entry, or a piece of mail is read as data
+    # instead of obeyed.
+    sandbox_wrapped, _n, _t, sandbox_inst = _serve.wrap_external_content(
+        sandbox, 'files in the sandbox')
+    library_wrapped, _n, _t, library_inst = _serve.wrap_external_content(
+        library_block, 'your Library knowledge base')
+    mail_wrapped, _n, _t, mail_inst = _serve.wrap_external_content(
+        mail_block, 'mail from other agents')
+    return (f'## Current sandbox files\n{sandbox_inst}\n\n{sandbox_wrapped}\n\n'
+            f'## Relevant Library knowledge (searched: "{topic or "none given"}")\n{library_inst}\n\n{library_wrapped}\n\n'
+            f'## Your mailbox (most recent)\n{mail_inst}\n\n{mail_wrapped}')
 
 
 def _review_screenshot(base, key, agent_id, sandbox_id, path, question, task_id=None):

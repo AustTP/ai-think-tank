@@ -382,13 +382,29 @@ function markContacted(agentId, ts) {
 // another agent from ANY location, not just walk up to them -- exactly
 // the channel that's missing when the recipient is busy and a live
 // conversation or handoff (handoffs.js) isn't possible right now.
-function sendMail(fromId, toId, text) {
+// Server-validated now: /api/mail/send checks the sender/recipient against
+// the roster and bounds the text, then appends the authoritative entry to
+// the recipient's mailbox in state (mailbox content feeds model context, so
+// the write path must not be an unvalidated client append). On a server
+// failure we fall back to the local append so mail still works degraded, but
+// the normal path is server-authoritative.
+async function sendMail(fromId, toId, text) {
   const to = AGENTS[toId];
   if (!to || !text) return false;
-  const fromName = fromId === 'player' ? 'You' : (AGENTS[fromId] ? AGENTS[fromId].name : fromId);
-  to.mailbox.push({ text: `${fromName}: ${text}`, read: false, ts: Date.now() });
-  logThinkTankAction(fromId, 'mail_sent', { to: toId, text });
-  return true;
+  try {
+    const res = await apiFetch('/api/mail/send', {
+      method: 'POST',
+      body: JSON.stringify({ fromId, toId, text }),
+    });
+    if (!res.ok) return false;
+    const data = await res.json();
+    if (data && data.mail) to.mailbox.push(data.mail);
+    return true;
+  } catch (e) {
+    const fromName = fromId === 'player' ? 'You' : (AGENTS[fromId] ? AGENTS[fromId].name : fromId);
+    to.mailbox.push({ text: `${fromName}: ${text}`, read: false, ts: Date.now() });
+    return true;
+  }
 }
 
 // Mailbox entries used to be plain strings with no read/unread concept at

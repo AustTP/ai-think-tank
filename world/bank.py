@@ -65,7 +65,7 @@ def _budget_cap_usd(service, products=None):
     return DEFAULT_BUDGET_CAP_USD
 
 
-def _accrue_spend(service, cost, village_id=None):
+def _accrue_spend(service, cost, village_id=None, agent_id=None):
     """Accrue a single model call's cost to a service's ledger bucket. The whole
     point is that accrual happens exactly once per model call, at the choke
     point, so whatever the ledger shows is exactly what the think tank has spent.
@@ -75,6 +75,8 @@ def _accrue_spend(service, cost, village_id=None):
     is visible. That bucket is EXCLUDED from the shared monthly cap total (like
     per-task buckets) -- the cap still sums the flat service buckets, so adding
     a village rollup never double-counts or changes the shared-budget behavior.
+    An AGENT dimension does the same when `agent_id` is given (`__agent__/<id>`,
+    with its own per-day series so a per-agent monthly cap can be enforced).
     A call with no village_id (player, serve's own loopback, unknown agent)
     is accrued to the service bucket only."""
     import serve as _serve
@@ -99,6 +101,14 @@ def _accrue_spend(service, cost, village_id=None):
             vbucket['used'] = float(vbucket.get('used', 0) or 0) + cost
             vbucket['calls'] = int(vbucket.get('calls', 0) or 0) + 1
             vbucket['lastAt'] = now.isoformat()
+        if agent_id:
+            akey = _agent_spend_key(agent_id)
+            abucket = ledger.setdefault(akey, {'used': 0.0, 'calls': 0})
+            abucket['used'] = float(abucket.get('used', 0) or 0) + cost
+            abucket['calls'] = int(abucket.get('calls', 0) or 0) + 1
+            abucket['lastAt'] = now.isoformat()
+            aseries = abucket.setdefault('byDay', {})
+            aseries[day] = float(aseries.get(day, 0) or 0) + cost
         _serve._spend_ledger_write(ledger)
     except Exception:
         # Spend accounting must never take the think tank down: a failed read or
@@ -111,6 +121,40 @@ def _village_spend_key(village_id):
     leading double-underscore so the shared cap (which excludes `__village__/*`
     like it excludes per-task keys) never double-counts it."""
     return f'__village__/{village_id}'
+
+
+def _agent_spend_key(agent_id):
+    """The ledger bucket key for an agent's rollup spend -- same namespacing
+    rule as the village buckets: `__agent__/*` is excluded from the shared cap
+    total so the per-agent rollup never double-counts the shared budget."""
+    return f'__agent__/{agent_id}'
+
+
+def _agent_spend_cap_exceeded(agent_id):
+    """Per-agent MONTHLY spend-cap check, consulted at the model chokepoints
+    that know who is spending (before the call goes out, same shape as the
+    shared _think_tank_spend_cap_exceeded). Reads the agent's own
+    `__agent__/<id>` byDay series for the current month. Disabled when
+    AGENT_SPEND_CAP_USD is 0.
+    Best-effort: an unknown agent, a read failure, or a missing bucket is never
+    a false block."""
+    import serve as _serve
+    if not _serve.AGENT_SPEND_CAP_USD:
+        return False
+    if not agent_id:
+        return False
+    try:
+        ledger = _serve._spend_ledger_read()
+        bucket = ledger.get(_agent_spend_key(agent_id))
+    except Exception:
+        return False
+    if not isinstance(bucket, dict):
+        return False
+    month = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
+    series = bucket.get('byDay') or {}
+    month_used = sum(float(v or 0) for k, v in series.items()
+                     if isinstance(k, str) and k.startswith(month))
+    return month_used >= float(_serve.AGENT_SPEND_CAP_USD)
 
 
 def _village_spend_view():
@@ -279,7 +323,8 @@ def _think_tank_spend_cap_exceeded():
     excluded = {_serve._SPEND_CAP_BASELINE_KEY, _serve.COLAB_LEDGER_KEY}
     total = sum(float(v.get('used') or 0) for k, v in ledger.items()
                 if k not in excluded and not _is_task_spend_key(k)
-                and not k.startswith('__village__/') and isinstance(v, dict))
+                and not k.startswith('__village__/') and not k.startswith('__agent__/')
+                and isinstance(v, dict))
     period = _serve._spend_cap_period()
     rec = ledger.get(_serve._SPEND_CAP_BASELINE_KEY)
     # Legacy migration: the old format stored a bare float (the baseline at
@@ -319,8 +364,10 @@ def _bank_budget_view(snapshot):
     products = list(products)
     services = {}
     for svc, bucket in (_serve._spend_ledger_read() or {}).items():
-        if svc == _serve._SPEND_CAP_BASELINE_KEY or _is_task_spend_key(svc) or not isinstance(bucket, dict):
-            continue  # the spend-cap baseline and per-task buckets are reserved keys, not service buckets
+        if svc == _serve._SPEND_CAP_BASELINE_KEY or _is_task_spend_key(svc) \
+                or svc.startswith('__village__/') or svc.startswith('__agent__/') \
+                or not isinstance(bucket, dict):
+            continue  # reserved keys + village/agent rollups are attribution, not service buckets
         used = float(bucket.get('used', 0) or 0)
         cap = _serve._budget_cap_usd(svc, products)
         # A zero/unset cap means NO cap (e.g. __colab_compute__ with

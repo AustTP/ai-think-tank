@@ -1791,20 +1791,41 @@ class ArmIdleAndRun(unittest.TestCase):
 class ApiLogEndpoint(unittest.TestCase):
     """POST /api/log."""
 
-    def _post(self, body, log, app):
+    def _post(self, body, log, app, session_ok=True):
         with unittest.mock.patch.object(serve, 'log_action', log), \
              unittest.mock.patch.object(serve, '_append_passport_decision', app), \
-             unittest.mock.patch.object(serve, 'verify_session', return_value=True):
+             unittest.mock.patch.object(serve, 'verify_session', return_value=session_ok):
             c = TestClient(serve.app)
             return c.post('/api/log', json=body)
 
     def test_logs_routine_action(self):
         log = unittest.mock.Mock()
         app = unittest.mock.Mock()
-        r = self._post({'action': 'foo', 'details': {'a': 1}, 'agentId': 'eli'}, log, app)
+        r = self._post({'action': 'task_completed', 'details': {'a': 1}, 'agentId': 'eli'}, log, app)
         self.assertEqual(r.status_code, 200)
-        log.assert_called_once_with('eli', 'foo', {'a': 1})
+        log.assert_called_once_with('eli', 'task_completed', {'a': 1})
         app.assert_not_called()
+
+    def test_unknown_action_is_dropped_not_stored(self):
+        # Memory-poisoning fix: only allowlisted browser actions may write
+        # rows into action_log (which feeds MEMORY.md); arbitrary actions are
+        # dropped, never stored.
+        log = unittest.mock.Mock()
+        app = unittest.mock.Mock()
+        r = self._post({'action': 'inject_instructions', 'details': {'a': 1}, 'agentId': 'eli'}, log, app)
+        self.assertEqual(r.status_code, 200)
+        log.assert_not_called()
+        app.assert_not_called()
+
+    def test_agent_key_alone_cannot_log(self):
+        # Session-only: an agent key must not be able to append rows to its
+        # own memory feed (the /api/state + /api/log memory-poisoning vector).
+        log = unittest.mock.Mock()
+        app = unittest.mock.Mock()
+        r = self._post({'action': 'task_completed', 'details': {'a': 1}, 'agentId': 'eli'},
+                       log, app, session_ok=False)
+        self.assertEqual(r.status_code, 401)
+        log.assert_not_called()
 
     def test_hashed_action_chains_to_passport(self):
         log = unittest.mock.Mock()
@@ -1828,6 +1849,80 @@ class ApiLogEndpoint(unittest.TestCase):
                         'agentId': 'eli'}, log, app)
         self.assertEqual(r.status_code, 200)
         app.assert_called_once()
+
+
+class ApiMailSend(unittest.TestCase):
+    """POST /api/mail/send -- the validated inter-agent mail path."""
+
+    def _post(self, body, state=None, session_ok=True, key_ok=False,
+              log=None, app=None):
+        with unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=state), \
+             unittest.mock.patch.object(serve, 'save_state_to_db'), \
+             unittest.mock.patch.object(serve, 'verify_session',
+                                        return_value=session_ok), \
+             unittest.mock.patch.object(serve, '_valid_agent_key_presented',
+                                        return_value=key_ok), \
+             unittest.mock.patch.object(serve, 'log_action', log or unittest.mock.Mock()), \
+             unittest.mock.patch.object(serve, '_append_passport_decision',
+                                        app or unittest.mock.Mock()):
+            c = TestClient(serve.app)
+            return c.post('/api/mail/send', json=body)
+
+    def _state(self):
+        return {
+            'agentRoster': [{'id': 'ada', 'name': 'Ada'}, {'id': 'ben', 'name': 'Ben'}],
+            'agents': {'ada': {'mailbox': []}, 'ben': {'mailbox': []}},
+        }
+
+    def test_valid_mail_appends_and_logs(self):
+        log = unittest.mock.Mock()
+        r = self._post({'fromId': 'ada', 'toId': 'ben', 'text': 'ship it'},
+                       self._state(), log=log)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body['ok'])
+        self.assertTrue(body['mail']['text'].startswith('Ada: ship it'))
+
+    def test_unknown_recipient_is_404(self):
+        r = self._post({'fromId': 'ada', 'toId': 'nobody', 'text': 'hi'},
+                       self._state())
+        self.assertEqual(r.status_code, 404)
+
+    def test_unknown_sender_is_400(self):
+        r = self._post({'fromId': 'ghost', 'toId': 'ben', 'text': 'hi'},
+                       self._state())
+        self.assertEqual(r.status_code, 400)
+
+    def test_missing_or_non_string_text_is_400(self):
+        for bad in (None, 42, ''):
+            r = self._post({'fromId': 'ada', 'toId': 'ben', 'text': bad},
+                           self._state())
+            self.assertEqual(r.status_code, 400)
+
+    def test_player_session_only_forbidden_without_auth(self):
+        r = self._post({'fromId': 'ada', 'toId': 'ben', 'text': 'hi'},
+                       self._state(), session_ok=False, key_ok=False)
+        self.assertEqual(r.status_code, 401)
+
+
+class HardenDbPerms(unittest.TestCase):
+    def test_chmods_db_and_wal_shm_siblings(self):
+        tmp = tempfile.mkdtemp(prefix='harden-db-')
+        try:
+            main = os.path.join(tmp, 'think_tank.db')
+            wal = main + '-wal'
+            shm = main + '-shm'
+            for p in (main, wal, shm):
+                with open(p, 'w') as f:
+                    f.write('x')
+                os.chmod(p, 0o644)
+            serve._harden_db_perms(main)
+            self.assertEqual(os.stat(main).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(wal).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(shm).st_mode & 0o777, 0o600)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class PostReportEndpoint(unittest.TestCase):

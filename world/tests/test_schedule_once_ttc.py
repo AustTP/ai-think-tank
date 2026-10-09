@@ -520,7 +520,7 @@ class ChatEndpointDeliberation(unittest.TestCase):
                             "messages": [{"role": "user", "content": "x"}]})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(r.json()["reply"], '{"ok": true}')
-        accrue.assert_called_once_with("__general__", 0.03, village_id='main')
+        accrue.assert_called_once_with("__general__", 0.03, village_id='main', agent_id=None)
 
     def test_prose_falls_back_to_self_verification(self):
         samples = [self._sample("draft one", 0.01), self._sample("draft two", 0.02)]
@@ -537,7 +537,7 @@ class ChatEndpointDeliberation(unittest.TestCase):
         self.assertEqual(r.json()["reply"], "best draft")
         self.assertEqual(verify.call_args.kwargs["drafts"], ["draft one", "draft two"],
                          "the sampled drafts are reused for the judge pass")
-        accrue.assert_called_once_with("__general__", 0.03, village_id='main')
+        accrue.assert_called_once_with("__general__", 0.03, village_id='main', agent_id=None)
 
     def test_majority_winner_not_json_falls_back_to_self_verify(self):
         # A structured request whose drafts all "agree" on something that isn't
