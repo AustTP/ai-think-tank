@@ -1,0 +1,180 @@
+"""Tests for splitting completed tasks out of the whole-blob kv_state write.
+
+The live blob had grown to multi-MB of `done` tasks that were serialized on
+every tick; only a handful of tasks were ever active. Completed tasks now live
+in the task_archive table and are merged back on read, so state['tasks'] keeps
+its exact shape. These tests pin that round-trip, the blob shrinking, and the
+agent-directory sync throttle.
+"""
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+import unittest
+import unittest.mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import serve  # noqa: E402
+
+
+class _StateCase(unittest.TestCase):
+    # Subclasses that call save_state_to_db set this so the real agents/ tree
+    # is never written; the throttle tests need the real function, so they
+    # leave it False.
+    patch_sync = False
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='think tank-archive-')
+        self._db_patch = unittest.mock.patch.object(
+            serve, 'DB_PATH', os.path.join(self._tmp, 'test.db'))
+        self._db_patch.start()
+        serve.init_db()
+        serve._TASK_ARCHIVE_CACHE.update({'db': None, 'loaded': False, 'tasks': {}})
+        serve._LAST_AGENT_DIR_SYNC_AT = 0.0
+        serve._LAST_AGENT_DIR_FINGERPRINT = None
+        self._sync_patch = None
+        if self.patch_sync:
+            self._sync_patch = unittest.mock.patch.object(serve, 'sync_agent_directories')
+            self._sync_patch.start()
+
+    def tearDown(self):
+        if self._sync_patch:
+            self._sync_patch.stop()
+        self._db_patch.stop()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _state(self):
+        return {
+            'tasks': {
+                't-active': {'id': 't-active', 'status': 'working', 'title': 'live'},
+                't-done': {'id': 't-done', 'status': 'done', 'title': 'finished',
+                           'note': 'a big note'},
+            },
+            'agents': {},
+            'agentRoster': [],
+        }
+
+    def _blob_tasks(self):
+        with serve._db() as conn:
+            row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
+        return json.loads(row[0])['tasks']
+
+
+class TaskArchive(_StateCase):
+    patch_sync = True
+
+    def test_round_trip_preserves_active_and_done(self):
+        serve.save_state_to_db(self._state())
+        loaded = serve.get_state_from_db()
+        self.assertEqual(set(loaded['tasks']), {'t-active', 't-done'})
+        self.assertEqual(loaded['tasks']['t-done']['status'], 'done')
+
+    def test_done_tasks_are_not_written_to_the_blob(self):
+        serve.save_state_to_db(self._state())
+        blob_tasks = self._blob_tasks()
+        self.assertEqual(set(blob_tasks), {'t-active'})
+        with serve._db() as conn:
+            archived = dict(conn.execute('SELECT id, blob FROM task_archive').fetchall())
+        self.assertEqual(set(archived), {'t-done'})
+        self.assertEqual(json.loads(archived['t-done'])['title'], 'finished')
+
+    def test_archive_survives_a_fresh_process_cache(self):
+        serve.save_state_to_db(self._state())
+        # Simulate a new process: drop the in-process cache.
+        serve._TASK_ARCHIVE_CACHE.update({'db': None, 'loaded': False, 'tasks': {}})
+        loaded = serve.get_state_from_db()
+        self.assertEqual(set(loaded['tasks']), {'t-active', 't-done'})
+
+    def test_mutation_of_a_done_task_is_rearchived(self):
+        serve.save_state_to_db(self._state())
+        state = serve.get_state_from_db()
+        state['tasks']['t-done']['note'] = 'edited after done'
+        serve.save_state_to_db(state)
+        loaded = serve.get_state_from_db()
+        self.assertEqual(loaded['tasks']['t-done']['note'], 'edited after done')
+
+    def test_un_done_task_overrides_the_archived_copy(self):
+        serve.save_state_to_db(self._state())
+        state = serve.get_state_from_db()
+        state['tasks']['t-done']['status'] = 'working'  # reopened
+        serve.save_state_to_db(state)
+        loaded = serve.get_state_from_db()
+        self.assertEqual(loaded['tasks']['t-done']['status'], 'working')
+
+    def test_blob_shrinks_when_many_done_tasks_archive(self):
+        state = {'tasks': {f'big-{i}': {'id': f'big-{i}', 'status': 'done',
+                                        'note': 'x' * 2000} for i in range(200)},
+                 'agents': {}, 'agentRoster': []}
+        state['tasks']['live'] = {'id': 'live', 'status': 'working'}
+        serve.save_state_to_db(state)
+        with serve._db() as conn:
+            blob_len = conn.execute('SELECT length(blob) FROM kv_state WHERE id = 1').fetchone()[0]
+        # 200 * 2000 bytes of notes must not be in the blob.
+        self.assertLess(blob_len, 5000)
+        self.assertEqual(len(serve.get_state_from_db()['tasks']), 201)
+
+
+class SyncThrottle(_StateCase):
+    def test_throttled_sync_skips_within_the_interval(self):
+        with unittest.mock.patch.object(serve, 'AGENT_DIR_SYNC_INTERVAL_S', 999), \
+             unittest.mock.patch.object(serve, '_write_file') as wf:
+            serve._LAST_AGENT_DIR_SYNC_AT = 0.0
+            state = {'agents': {'a': {'name': 'A', 'role': 'r'}},
+                     'agentRoster': [{'id': 'a'}], 'reports': []}
+            serve.sync_agent_directories(state, throttle=True)
+            first = wf.call_count
+            self.assertGreater(first, 0)
+            serve.sync_agent_directories(state, throttle=True)
+            self.assertEqual(wf.call_count, first)  # second call throttled out
+
+    def test_unthrottled_sync_always_runs(self):
+        with unittest.mock.patch.object(serve, 'AGENT_DIR_SYNC_INTERVAL_S', 999), \
+             unittest.mock.patch.object(serve, '_write_file') as wf:
+            serve._LAST_AGENT_DIR_SYNC_AT = time.time()
+            state = {'agents': {'a': {'name': 'A', 'role': 'r'}},
+                     'agentRoster': [{'id': 'a'}], 'reports': []}
+            serve.sync_agent_directories(state)  # default: no throttle
+            first = wf.call_count
+            serve.sync_agent_directories(state)
+            self.assertEqual(wf.call_count, 2 * first)
+
+
+class DecisionKeyInstrumentation(_StateCase):
+    def test_records_and_reports_repeats(self):
+        q = {'choice': {'instructions': 'judge X', 'criteria': {'a': 'A'}}}
+        serve._record_decision_keys('m', {'messages': [], 'signals': {}}, q)
+        serve._record_decision_keys('m', {'messages': [], 'signals': {}}, q)
+        serve._record_decision_keys('m', {'messages': [], 'signals': {}},
+                                    {'choice': {'instructions': 'other'}})
+        rep = serve.decision_key_report('q')
+        self.assertEqual(rep['calls'], 3)
+        self.assertEqual(rep['distinct_keys'], 2)
+        self.assertEqual(rep['repeat_calls'], 1)
+        self.assertGreater(rep['repeat_pct'], 0.0)
+
+    def test_question_and_full_request_keys_differ_on_state(self):
+        q = {'choice': {'instructions': 'x'}}
+        serve._record_decision_keys('m', {'messages': [], 'signals': {'a': 1}}, q)
+        serve._record_decision_keys('m', {'messages': [], 'signals': {'a': 2}}, q)
+        # Same question, different state: question-only repeats, full does not.
+        self.assertEqual(serve.decision_key_report('q')['repeat_calls'], 1)
+        self.assertEqual(serve.decision_key_report('r')['repeat_calls'], 0)
+
+    def test_endpoint_reports_both_families(self):
+        from starlette.testclient import TestClient
+        serve._record_decision_keys('m', {}, {'choice': {'instructions': 'x'}})
+        c = TestClient(serve.app)
+        c.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
+        r = c.get('/api/jev/decision-keys')
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertIn('question_only', body)
+        self.assertIn('full_request', body)
+        self.assertEqual(body['question_only']['calls'], 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

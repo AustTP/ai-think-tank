@@ -447,6 +447,31 @@ def init_db():
             blob TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
+        # Completed tasks live here, NOT in the whole-blob kv_state. The blob
+        # had grown to multi-MB of `done` tasks (thousands of them) that were
+        # json.dumps'd and json.loads'd on EVERY tick and every state write,
+        # while only a handful of tasks were ever active. get_state_from_db
+        # merges this table back into state['tasks'] so every existing reader
+        # keeps its exact shape; save_state_to_db writes only the live (non-
+        # done) tasks into the blob. Per-task rows (not one blob) so a save
+        # upserts only the tasks that actually changed.
+        conn.execute('''CREATE TABLE IF NOT EXISTS task_archive (
+            id TEXT PRIMARY KEY,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        # Measurement-only: a hash of every Jev decision REQUEST, so we can
+        # see whether the same decision recurs often enough to be worth
+        # caching before building a cache. Two keys per call -- 'q:' (model +
+        # questions) and 'r:' (model + state + questions) -- so the report
+        # shows both the optimistic (question-only) and exact (full-request)
+        # repeat rates. Never read by any decision path; safe to drop.
+        conn.execute('''CREATE TABLE IF NOT EXISTS decision_key_stats (
+            key TEXT PRIMARY KEY,
+            count INTEGER NOT NULL,
+            first_ts REAL NOT NULL,
+            last_ts REAL NOT NULL
+        )''')
         # Runtime-switchable settings: a small key/value table
         # for values that must change without a server restart -- currently
         # just the Jev decisions-model slug (see _jev_model). Deliberately
@@ -1024,19 +1049,113 @@ async def _idle_shutdown_loop(poll_s=30):
 def get_state_from_db():
     with _db() as conn:
         row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
-        return json.loads(row[0]) if row else None
+        if not row:
+            return None
+        data = json.loads(row[0])
+    _merge_archived_tasks(data)
+    return data
+
+
+# Completed tasks are historical: once a task is done it is never worked
+# again (the orphan/stale reclaim loops only ever touch 'walking'/'working'
+# tasks, so a done task is never deleted). They are kept OUT of the whole-blob
+# kv_state and merged back in on read, so state['tasks'] keeps its exact shape
+# for every existing reader while the per-tick serialize shrinks from MBs to
+# the handful of live tasks.
+TASK_ARCHIVE_STATUSES = frozenset({'done'})
+_TASK_ARCHIVE_LOCK = threading.Lock()
+_TASK_ARCHIVE_CACHE: dict[str, object] = {'db': None, 'loaded': False, 'tasks': {}}
+
+
+def _is_archived_task(task):
+    return bool(task) and task.get('status') in TASK_ARCHIVE_STATUSES
+
+
+def _task_archive_load_locked():
+    # Load the archive into the in-process cache once per DB. Keyed on DB_PATH
+    # so a test that repoints DB_PATH never reads another database's cache. A
+    # DB that predates the table (or a test that built its own schema) is
+    # treated as an empty archive, never an error.
+    cache = _TASK_ARCHIVE_CACHE
+    if cache['loaded'] and cache['db'] == DB_PATH:
+        return cache['tasks']
+    try:
+        with _db() as conn:
+            rows = conn.execute('SELECT id, blob FROM task_archive').fetchall()
+        cache['tasks'] = {tid: json.loads(blob) for tid, blob in rows}
+    except sqlite3.OperationalError:
+        cache['tasks'] = {}
+    cache['db'] = DB_PATH
+    cache['loaded'] = True
+    return cache['tasks']
+
+
+def _archived_tasks():
+    with _TASK_ARCHIVE_LOCK:
+        return _task_archive_load_locked()
+
+
+def _merge_archived_tasks(data):
+    # state['tasks'] = archived done tasks, with the live blob winning on any
+    # id overlap (an un-done task's active copy must override its stale
+    # archived copy).
+    archived = _archived_tasks()
+    if not archived:
+        return
+    merged = dict(archived)
+    merged.update(data.get('tasks') or {})
+    data['tasks'] = merged
+
+
+def _reconcile_task_archive(done):
+    # Make the archive table hold exactly the currently-done tasks: upsert any
+    # that are new or changed. No deletes -- done tasks are never removed, and
+    # a task that leaves the done set is carried by the blob (which wins on
+    # merge) until it is done again. Returns True when the archive is usable
+    # (so the caller may safely omit done tasks from the blob); False when the
+    # table is missing, so the caller must keep them in the blob.
+    with _TASK_ARCHIVE_LOCK:
+        cached = _task_archive_load_locked()
+        changed = {tid: t for tid, t in done.items() if cached.get(tid) != t}
+        if not changed:
+            return True
+        now = time.time()
+        try:
+            with _db() as conn:
+                for tid, t in changed.items():
+                    conn.execute(
+                        'INSERT INTO task_archive (id, blob, updated_at) VALUES (?, ?, ?) '
+                        'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
+                        (tid, json.dumps(t), now))
+        except sqlite3.OperationalError:
+            return False
+        cached.update(changed)
+        return True
 
 
 def save_state_to_db(data):
     try:
+        # Split completed tasks out of the blob: the archive table holds every
+        # done task (upserted only when new/changed), and the blob holds only
+        # the live tasks. state['tasks'] itself is left untouched -- this is a
+        # view for the write, not a mutation of the caller's state.
+        tasks = data.get('tasks') or {}
+        done = {tid: t for tid, t in tasks.items() if _is_archived_task(t)}
+        archived_ok = _reconcile_task_archive(done) if done else True
+        if done and archived_ok:
+            blob = {**data, 'tasks': {tid: t for tid, t in tasks.items() if not _is_archived_task(t)}}
+        else:
+            # Nothing to archive, or the archive table is unavailable -- keep
+            # every task in the blob so nothing is ever lost.
+            blob = data
         with _db() as conn:
             conn.execute(
                 'INSERT INTO kv_state (id, blob, updated_at) VALUES (1, ?, ?) '
                 'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
-                (json.dumps(data), time.time()),
+                (json.dumps(blob), time.time()),
             )
         try:
-            sync_agent_directories(data)
+            sync_agent_directories(data, throttle=True)
         except Exception as e:
             print(f'[agent-dirs] sync failed: {e}')  # best-effort -- a filesystem hiccup shouldn't break autosave
     finally:
@@ -1487,7 +1606,41 @@ def _render_report_md(report):
     ]) + '\n'
 
 
-def sync_agent_directories(state):
+# Throttle for the agent-directory filesystem mirror (see sync_agent_directories).
+# The mirror is expensive (action_log scans + many file writes) and does not
+# need per-tick freshness; save_state_to_db syncs it at most this often.
+AGENT_DIR_SYNC_INTERVAL_S = float(_load_env().get('AGENT_DIR_SYNC_INTERVAL_S', '15') or 15)
+_LAST_AGENT_DIR_SYNC_AT = 0.0
+_LAST_AGENT_DIR_FINGERPRINT = None
+
+
+def _agent_dir_fingerprint(state):
+    # Cheap structural inputs of the filesystem mirror: who exists and which
+    # reports exist. A change here (hire/fire, a newly filed report) forces an
+    # immediate sync even inside the throttle window -- only the churny
+    # memory/state files are allowed to lag by the interval.
+    report_ids = tuple(sorted(r.get('id') for r in (state.get('reports') or [])
+                              if isinstance(r, dict)))
+    agent_ids = tuple(sorted((state.get('agents') or {}).keys()))
+    return (agent_ids, report_ids)
+
+
+def sync_agent_directories(state, throttle=False):
+    # The per-agent filesystem mirror (agent.json / AGENTS.md / MEMORY.md /
+    # conversation / state.json / reports) is expensive -- _render_memory_md
+    # alone scans the action_log per agent -- and it was running on EVERY
+    # save (every sim tick + every state write). Nothing it writes needs
+    # sub-15s freshness, so save_state_to_db calls it throttled; a structural
+    # change (roster or reports) still syncs immediately. Direct callers (and
+    # tests) keep the unthrottled behavior.
+    if throttle:
+        global _LAST_AGENT_DIR_SYNC_AT, _LAST_AGENT_DIR_FINGERPRINT
+        fp = _agent_dir_fingerprint(state)
+        now = time.time()
+        if fp == _LAST_AGENT_DIR_FINGERPRINT and (now - _LAST_AGENT_DIR_SYNC_AT) < AGENT_DIR_SYNC_INTERVAL_S:
+            return
+        _LAST_AGENT_DIR_SYNC_AT = now
+        _LAST_AGENT_DIR_FINGERPRINT = fp
     roster = {d['id']: d for d in state.get('agentRoster', [])}
     live = state.get('agents', {})
     reports = state.get('reports', [])
@@ -3932,6 +4085,9 @@ async def _lifespan(app):
     # seed agents.js array doesn't reach a running DB, and hired agents never
     # had a director). Idempotent: only stamps fields that are missing, so it
     # can run on every boot without clobbering a director the client set later.
+    # Drop decision-key measurements older than the rolling window so the
+    # instrumentation table stays bounded across restarts.
+    _prune_decision_key_stats()
     try:
         _backfill_directors_in_db()
     except Exception as e:
@@ -7388,6 +7544,68 @@ def _finalize_decision(data, prompt, criteria, trace_id, model, village_id=None)
     return data
 
 
+# Measurement-only instrumentation: does the same Jev decision recur often
+# enough to be worth caching? We hash each request two ways -- question-only
+# ('q:' = model + questions) and full-request ('r:' = model + state +
+# questions) -- and count occurrences over a rolling window. A high repeat
+# rate means a cache would pay; near-zero means it would not. This never
+# changes a decision and is safe to remove.
+DECISION_KEY_WINDOW_S = float(_load_env().get('DECISION_KEY_WINDOW_S', str(7 * 24 * 3600)) or (7 * 24 * 3600))
+
+
+def _decision_key_hash(prefix, payload):
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return prefix + hashlib.sha256(blob.encode('utf-8', errors='replace')).hexdigest()[:32]
+
+
+def _record_decision_keys(model, state, questions):
+    """Count this decision request by key (best-effort; never raises)."""
+    try:
+        qkey = _decision_key_hash('q:', {'model': model, 'questions': questions})
+        rkey = _decision_key_hash('r:', {'model': model, 'state': state, 'questions': questions})
+        now = time.time()
+        with _db() as conn:
+            for key in (qkey, rkey):
+                conn.execute(
+                    'INSERT INTO decision_key_stats (key, count, first_ts, last_ts) VALUES (?, 1, ?, ?) '
+                    'ON CONFLICT(key) DO UPDATE SET count = count + 1, last_ts = excluded.last_ts',
+                    (key, now, now))
+    except Exception:
+        pass
+
+
+def _prune_decision_key_stats():
+    try:
+        with _db() as conn:
+            conn.execute('DELETE FROM decision_key_stats WHERE last_ts < ?',
+                         (time.time() - DECISION_KEY_WINDOW_S,))
+    except Exception:
+        pass
+
+
+def decision_key_report(prefix):
+    """Repeat-rate summary for one key family ('q' or 'r') over the window."""
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                'SELECT COUNT(*), COALESCE(SUM(count), 0) FROM decision_key_stats WHERE key LIKE ?',
+                (prefix + ':%',)).fetchone()
+            top = conn.execute(
+                'SELECT key, count, last_ts FROM decision_key_stats WHERE key LIKE ? '
+                'ORDER BY count DESC LIMIT 10', (prefix + ':%',)).fetchall()
+        distinct, total = int(row[0]), int(row[1])
+        repeats = total - distinct
+        return {
+            'calls': total,
+            'distinct_keys': distinct,
+            'repeat_calls': repeats,
+            'repeat_pct': round(100.0 * repeats / total, 1) if total else 0.0,
+            'top': [{'key': k, 'count': c, 'last_ts': t} for k, c, t in top],
+        }
+    except Exception:
+        return {'calls': 0, 'distinct_keys': 0, 'repeat_calls': 0, 'repeat_pct': 0.0, 'top': []}
+
+
 def _call_openrouter_decision_sync(model, state, questions, village_id=None):
     # Jev (TypeSafe's System One decision model) via OpenRouter -- a
     # genuinely different endpoint from chat completions, confirmed only
@@ -7426,6 +7644,7 @@ def _call_openrouter_decision_sync(model, state, questions, village_id=None):
     trace_id = secrets.token_hex(8)
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
+    _record_decision_keys(model, state, questions)
     prompt = (questions or {}).get('choice', {}).get('instructions') if isinstance(questions, dict) else None
     criteria = (questions or {}).get('choice', {}).get('criteria') if isinstance(questions, dict) else None
     # decision_tape.prompt/.criteria are NOT NULL; calls without instructions
@@ -19651,6 +19870,21 @@ async def jev_calibration(window_s: Optional[float] = None):
     return JSONResponse({'effective_safety_confidence': _effective_safety_confidence(),
                          'effective_review_grade_confidence': _effective_review_grade_confidence(),
                          'review_grade': review_report, **report})
+
+
+@app.get('/api/jev/decision-keys')
+async def jev_decision_keys(request: Request):
+    # Measurement-only report: how often Jev decision requests repeat, so the
+    # operator can decide whether a decision cache is worth building. 'q' is
+    # model + questions (question-only), 'r' is model + state + questions
+    # (exact request). A high repeat_pct means caching would pay; near-zero
+    # means it would not. Read-only; the stats table is never read by any
+    # decision path.
+    return JSONResponse({
+        'window_s': DECISION_KEY_WINDOW_S,
+        'question_only': decision_key_report('q'),
+        'full_request': decision_key_report('r'),
+    })
 
 
 @app.post('/api/jev/model')
