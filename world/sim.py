@@ -8247,6 +8247,20 @@ def _free_spike_week(now_ms):
     return int((now_ms or int(time.time() * 1000)) // (7 * 24 * 3600 * 1000))
 
 
+def _free_spike_week_map(d):
+    """Coerce JSON round-tripped week keys (strings) back to ints. state dicts
+    keyed by week numbers -- freeSpikeGlobal / freeSpikeRooms -- lose their int
+    keys on every save/load (JSON object keys are strings), so the age
+    comparisons in _file_free_spike would otherwise mix str and int."""
+    out = {}
+    for k, v in (d or {}).items():
+        try:
+            out[int(k)] = v
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _file_free_spike(state, agent_id, completed_task, now_ms=None):
     """The spare-time lane: an agent that just finished REAL deliverable work may
     earn one FREE SPIKE this week -- a self-filed, never-groomed, lowest-priority
@@ -8275,6 +8289,11 @@ def _file_free_spike(state, agent_id, completed_task, now_ms=None):
     global_map = state.setdefault('freeSpikeGlobal', {})
     if not isinstance(global_map, dict):
         global_map = state['freeSpikeGlobal'] = {}
+    # JSON round-trips (save/load) turn every object key into a string, and
+    # these maps are keyed by WEEK NUMBERS -- so after one save the keys are
+    # strings and the `k < week - 1` age comparison below would raise on
+    # str-vs-int. Coerce back to ints at entry so the maps are always usable.
+    global_map = state['freeSpikeGlobal'] = _free_spike_week_map(global_map)
     # Roll the tank-wide week bucket + prune stale buckets (bounded growth).
     for stale in [k for k in global_map if k < week - 1]:
         del global_map[stale]
@@ -8286,6 +8305,7 @@ def _file_free_spike(state, agent_id, completed_task, now_ms=None):
     rooms_map = state.setdefault('freeSpikeRooms', {})
     if not isinstance(rooms_map, dict):
         rooms_map = state['freeSpikeRooms'] = {}
+    rooms_map = state['freeSpikeRooms'] = _free_spike_week_map(rooms_map)
     for stale in [k for k in rooms_map if k < week - 1]:
         del rooms_map[stale]
     if room in (rooms_map.get(week) or []):
