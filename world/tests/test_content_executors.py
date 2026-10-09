@@ -488,6 +488,149 @@ class PipelineStepContent(_ExecutorTestCase):
         self.assertIn('Reviewed and logged', seen['p8']['note'])
 
 
+class ResearchDeskWiring(_ExecutorTestCase):
+    """The Research Desk hooks inside _run_research_content: every candidate
+    page goes through the /api/evidence ledger on its RESOLVED identity, a
+    'covered' verdict skips the duplicate page, synthesis answers the desk
+    passes, and the run leaves coverage entries pending_review (never covered)
+    unless a failure was recorded."""
+
+    def _run_desk(self, topic, pages, chat_reply='The distilled skill file.'):
+        snapshot = _snapshot(researchTopics=[topic])
+        seen = _store()
+        _base_mocks()
+        calls = {'evidence': [], 'coverage': [], 'chat_bodies': [], 'save': 0}
+
+        def side_effect(method, base, path, body=None, header=None, timeout=30):
+            if path == '/api/browse':
+                return pages[body['url']]
+            if path == '/api/evidence':
+                calls['evidence'].append(body)
+                return {'recorded': True, 'independent': True, 'id': 'ev-1'}
+            if path == '/api/coverage':
+                calls['coverage'].append(body)
+                return {'ok': True}
+            if path == '/api/sandbox-save-page':
+                calls['save'] += 1
+                return {'allowed': True, 'ok': True}
+            if path == '/api/chat':
+                calls['chat_bodies'].append(body)
+                return {'reply': chat_reply}
+            if path.startswith('/api/library/file?'):
+                return {'content': 'old skill content'}
+            if path == '/api/library/file':
+                return {'ok': True}
+            return {'ok': True}
+
+        mock.patch.object(serve, '_http_json', side_effect=side_effect).start()
+        mock.patch.object(serve, '_resolve_model_tier', return_value='mid-tier-slug').start()
+        content._run_research_content(snapshot, 'cora', {'id': 'd1', 'research': {'topicId': topic['id'], 'since': 100}})
+        return seen['d1'], calls
+
+    def test_each_kept_page_is_recorded_on_resolved_identity(self):
+        topic = {'id': 'td', 'topic': 'D', 'startUrl': 'https://a.com',
+                 'seenUrls': [], 'pageKeyword': ''}
+        pages = {'https://a.com': {'url': 'https://landing.example/x', 'text': 'A',
+                                   'lastModified': 999, 'allowed': True, 'links': []}}
+        result, calls = self._run_desk(topic, pages)
+        self.assertEqual(len(calls['evidence']), 1)
+        rec = calls['evidence'][0]['record']
+        self.assertEqual(rec['resolved_url'], 'https://landing.example/x')
+        self.assertEqual(rec['source_url'], 'https://a.com')
+        # The evidence POST authenticates as the REAL research agent (its key
+        # rides the X-Agent-Key header) -- never a fake 'research-desk' id the
+        # endpoint's agent-key check would reject.
+        self.assertEqual(calls['evidence'][0]['agentId'], 'cora')
+
+    def test_covered_verdict_skips_duplicate_page(self):
+        topic = {'id': 'te', 'topic': 'E', 'startUrl': 'https://a.com',
+                 'seenUrls': [], 'pageKeyword': ''}
+        pages = {'https://a.com': {'url': 'https://landing.example/x', 'text': 'A',
+                                   'lastModified': 999, 'allowed': True, 'links': []}}
+        snapshot = _snapshot(researchTopics=[topic])
+        seen = _store()
+        _base_mocks()
+        calls = {'save': 0}
+
+        def side_effect(method, base, path, body=None, header=None, timeout=30):
+            if path == '/api/browse':
+                return pages[body['url']]
+            if path == '/api/evidence':
+                return {'recorded': False, 'reason': 'covered', 'identity': 'x'}
+            if path == '/api/sandbox-save-page':
+                calls['save'] += 1
+                return {'allowed': True, 'ok': True}
+            return {'ok': True}
+
+        mock.patch.object(serve, '_http_json', side_effect=side_effect).start()
+        mock.patch.object(serve, '_resolve_model_tier', return_value='mid-tier-slug').start()
+        content._run_research_content(snapshot, 'cora', {'id': 'd2', 'research': {'topicId': topic['id'], 'since': 100}})
+        # Covered -> the page is not saved and nothing is synthesized.
+        self.assertEqual(calls['save'], 0)
+        self.assertIn('nothing new since', seen['d2']['note'])
+
+    def test_synthesis_prompt_contains_desk_passes(self):
+        topic = {'id': 'tf', 'topic': 'F', 'startUrl': 'https://a.com',
+                 'seenUrls': [], 'pageKeyword': ''}
+        pages = {'https://a.com': {'url': 'https://a.com', 'text': 'A',
+                                   'lastModified': 999, 'allowed': True, 'links': []}}
+        result, calls = self._run_desk(topic, pages)
+        self.assertTrue(calls['chat_bodies'])
+        sys_msg = calls['chat_bodies'][0]['messages'][0]['content']
+        self.assertIn('announcements', sys_msg)
+        self.assertIn('practical_examples', sys_msg)
+        self.assertIn('limitations', sys_msg)
+        self.assertIn('repost', sys_msg)
+
+    def test_coverage_entries_are_pending_review_not_covered(self):
+        topic = {'id': 'tg', 'topic': 'G', 'startUrl': 'https://a.com',
+                 'seenUrls': [], 'pageKeyword': ''}
+        pages = {'https://a.com': {'url': 'https://landing.example/x', 'text': 'A',
+                                   'lastModified': 999, 'allowed': True, 'links': []}}
+        result, calls = self._run_desk(topic, pages)
+        self.assertTrue(calls['coverage'])
+        self.assertFalse(calls['coverage'][0]['reviewed'])
+        self.assertEqual(calls['coverage'][0]['artifact'], 'skills/g.md')
+
+    def test_result_carries_pass_log(self):
+        topic = {'id': 'th', 'topic': 'H', 'startUrl': 'https://a.com',
+                 'seenUrls': [], 'pageKeyword': ''}
+        pages = {'https://a.com': {'url': 'https://a.com', 'text': 'A',
+                                   'lastModified': 999, 'allowed': True, 'links': []}}
+        result, calls = self._run_desk(topic, pages)
+        self.assertEqual(len(result['passLog']), 3)
+        self.assertEqual(result['passLog'][0]['key'], 'announcements')
+
+    def test_synthesis_failure_records_coverage_failure(self):
+        topic = {'id': 'ti', 'topic': 'I', 'startUrl': 'https://a.com',
+                 'seenUrls': [], 'pageKeyword': ''}
+        pages = {'https://a.com': {'url': 'https://landing.example/x', 'text': 'A',
+                                   'lastModified': 999, 'allowed': True, 'links': []}}
+        snapshot = _snapshot(researchTopics=[topic])
+        seen = _store()
+        _base_mocks()
+        calls = {'coverage': []}
+
+        def side_effect(method, base, path, body=None, header=None, timeout=30):
+            if path == '/api/browse':
+                return pages[body['url']]
+            if path == '/api/evidence':
+                return {'recorded': True, 'id': 'ev-1'}
+            if path == '/api/coverage':
+                calls['coverage'].append(body)
+                return {'ok': True}
+            if path == '/api/sandbox-save-page':
+                return {'allowed': True, 'ok': True}
+            return {'ok': True}
+
+        mock.patch.object(serve, '_http_json', side_effect=side_effect).start()
+        mock.patch.object(serve, '_resolve_model_tier', return_value=None).start()  # no tier -> synthesis fails
+        content._run_research_content(snapshot, 'cora', {'id': 'd3', 'research': {'topicId': topic['id'], 'since': 100}})
+        self.assertTrue(calls['coverage'])
+        self.assertTrue(calls['coverage'][0]['failure'])
+        self.assertIn('no model tier', seen['d3']['note'])
+
+
 class ObservatoriesAndDispatcher(_ExecutorTestCase):
     def test_observatory_dispatches_on_task_flags(self):
         seen = _store()

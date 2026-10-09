@@ -1,0 +1,17 @@
+{
+  "comment": "The Research Desk's multi-pass search structure (RESEARCH_DESK_PASSES). Each pass is one small question the desk answers per run, instead of one giant query. Operator-edited; these fold into every research synthesis prompt and each run's passLog. A missing result is not proof that nobody reported a problem.",
+  "passes": [
+    {
+      "key": "announcements",
+      "question": "What did the watched sources announce or change in the search window?"
+    },
+    {
+      "key": "practical_examples",
+      "question": "Which items show someone using a relevant feature, with enough detail or linked material to inspect the example?"
+    },
+    {
+      "key": "limitations",
+      "question": "Are there documented restrictions, corrections, availability details, or unresolved problems with those findings?"
+    }
+  ]
+}

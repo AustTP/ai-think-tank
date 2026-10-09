@@ -210,18 +210,106 @@ class _PinnedIPHandler(urllib.request.HTTPHandler):
         return super().do_open(http_class, req, **http_conn_args)
 
 
-def _safe_urlopen(req, timeout=20):
+def _safe_urlopen(req, timeout=20, extra_handlers=()):
     """Open `req` (a urllib.request.Request) with SSRF-safe, DNS-rebinding-
     proof address pinning: each hostname is resolved once and the socket
     connects to that exact public IP, so a name that is public at check time
     cannot silently rebind to a private address for the connect. The Host
     header and TLS SNI/cert verification still use the original hostname.
     Raises URLError when the host is not public. `req` may be a string URL or
-    a Request."""
+    a Request. `extra_handlers` (e.g. a redirect-counting handler) are
+    inserted after the pinned-IP handler, so they too only ever see
+    SSRF-checked hops."""
     if isinstance(req, str):
         req = urllib.request.Request(req)
-    opener = urllib.request.build_opener(_PinnedIPHandler())
+    opener = urllib.request.build_opener(_PinnedIPHandler(), *extra_handlers)
     return opener.open(req, timeout=timeout)
+
+
+# Known URL shortener hosts. A short link's RAW STRING is never a reliable
+# source identity: t.co/abc and bit.ly/abc are different landing sites that
+# LOOK identical, and any short token can be repointed to a new (possibly
+# malicious) destination at any time. These hosts are treated as
+# redirect-anchors, never as landing hosts. Matching is by bare host or any
+# subdomain (e.g. sub.bit.ly). Deliberately registry-based -- a heuristic
+# that guesses "short" from path shape would false-positive on real content
+# hosts, which is worse than missing an unknown shortener (an unknown host is
+# simply treated as its own identity, which is the safe default).
+_SHORTENER_HOSTS = frozenset({
+    't.co', 'bit.ly', 'bitly.com', 'j.mp', 'goo.gl', 'tinyurl.com', 'tiny.cc',
+    'tiny.one', 'is.gd', 'v.gd', 'buff.ly', 'ow.ly', 'owly.com',
+    'rebrand.ly', 'snip.ly', 'shorturl.at', 'rb.gy', 'lnkd.in', 'lnk.bio',
+    'tny.im', '1url.com', 'cutt.ly', 'x.co', 'clk.im', 's.id', 'short.io',
+    'mcaf.ee', 'budurl.com', 'urx.io', 'zurl.co', 'qr.ae', 'a.gy', 'dft.ba',
+    'b.link', 'fn.gg', 'alturl.com', 'adf.ly', 'shrten.com', 'su.pr',
+    'kutt.it', 'soo.gd', 'flip.it', 'spl.io', 'spd.li', 't2m.io',
+})
+
+
+def _is_short_link(url):
+    """True when `url` points at a known shortener host. This is a RISK and
+    IDENTITY flag, not a block: a short link is allowed, but it must be
+    resolved to its final landing URL before it can serve as a source identity
+    or count as "the same source" as anything else, and its landing host must
+    pass the same public-host checks as any other destination."""
+    if not url:
+        return False
+    try:
+        host = (urllib.parse.urlparse(url).hostname or '').lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return host in _SHORTENER_HOSTS or any(
+        host.endswith('.' + short) for short in _SHORTENER_HOSTS)
+
+
+class _CountingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Counts redirect hops while urllib follows them. Sits behind the
+    pinned-IP handler, so every hop is still SSRF-checked and IP-pinned."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.hops = getattr(self, 'hops', 0) + 1
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _resolve_final_url(url, timeout=20, max_bytes=512):
+    """Resolve `url` to its FINAL landing URL by following redirects, SSRF-safe.
+
+    This is the source-identity primitive behind the evidence ledger: a short
+    link's raw string is never trusted as "which site this is" -- its resolved
+    landing URL is. Every hop runs through _safe_urlopen (public-IP pinned, so
+    a redirect cannot be used to reach a private/internal host). Only a tiny
+    prefix of the body is read to force urllib to process the redirect chain;
+    this is identity resolution, not content fetch.
+
+    Returns (final_url, hops). On any failure -- non-public host, timeout,
+    network error, unparseable URL -- returns (url, 0) unchanged: the caller
+    must then treat the source as UNRESOLVED (a blocked/needs-review record),
+    never as a verified landing site."""
+    hops = 0
+    if not url:
+        return url, 0
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            return url, 0
+        req = urllib.request.Request(url, headers={'User-Agent': 'ai-village-research-desk/1.0'})
+        counting = _CountingRedirectHandler()
+        # The counting handler rides in the SAME opener as the pinned-IP
+        # handler via _safe_urlopen, so every redirect hop is still
+        # SSRF-checked and IP-pinned -- a redirect chain can never route
+        # through a private/internal host.
+        resp = _safe_urlopen(req, timeout=timeout, extra_handlers=(counting,))
+        with resp:
+            resp.read(max_bytes)
+            final = resp.geturl()
+            hops = getattr(counting, 'hops', 0) or 0
+        if not final:
+            return url, 0
+        return final, hops
+    except Exception:
+        return url, 0
 
 
 def _download_dest_rel_path(scope, agent_id, safe_name):

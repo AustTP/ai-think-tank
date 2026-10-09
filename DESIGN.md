@@ -30,6 +30,17 @@ read-view into it.
   (extracted from serve.py; re-exported).
 - `world/web_helpers.py` — Pure HTML stripping, link extraction, HTTP-date
   parsing, SSRF host check, filename sanitization (extracted from serve.py).
+- `world/config.py` — Operator-edited policy JSON loaded from `world/*.json`:
+  `plain_writing.json` (ban list), `browse_policy.json` (block categories),
+  `research_desk.json` (desk passes), `watchlist.json` (standing research
+  topics). Fail-closed loaders with in-code defaults; the watchlist seeds
+  researchTopics on boot and reflects villager additions back to the file.
+- `world/evidence.py` — The Research Desk: a claim-level evidence ledger
+  (`evidence_records`) and a review-gated coverage ledger
+  (`coverage_ledger`), each in its own single-row SQLite table. Short-link
+  source identity resolution, repost dedup, covered-only-after-review, and
+  the 24h search-window overlap (extracted into its own module like bank.py;
+  re-exported by serve.py).
 - `world/sim_helpers.py` — Pure priority normalization, room derivation,
   team lookup, sprint/product id generation (extracted from sim.py).
 
@@ -495,3 +506,73 @@ are private and not published):
 
 No further code was added for the videos — the transcripts were ingested and
 the mapping recorded here so the review is auditable, not re-done.
+
+---
+
+## 14. Research Desk Mapping (article takeaway)
+
+The "Build Your Own AI Research Desk" article (Ichigo, 2026-10-08) was
+reviewed against the codebase. Most of its lessons are already operationalized
+(approval gating, peer review, dedup, fail-closed). Four gaps were closed; the
+implementation lives in `world/evidence.py` plus the research executor's
+desk hooks:
+
+| Article lesson | Where it lives |
+|----------------|----------------|
+| Claim-level evidence records with a status lifecycle (`needs_review` -> `cleared` / `blocked`), a source, date, and scope | `evidence_records` ledger (`world/evidence.py`), written by the research crawl and read through `/api/evidence` |
+| Claim-type taxonomy (official_announcement / user_report / opinion / benchmark_claim), honest default `unclassified` until a Verifier classifies | `CLAIM_TYPES` + `record_source_claim` (`world/evidence.py`); the Verifier sets it via `/api/evidence/review` |
+| A repost is NOT a second independent source | `record_source_claim` marks a second record on the same resolved identity `independent=False` + `repost_of=<first id>`; the coverage gate skips reposts of a covered item too |
+| Covered-only-after-review; a failed run never suppresses the next attempt; 24h overlap on recurring runs | `coverage_ledger`: `mark_covered(reviewed=False)` -> `pending_review` (not covered); `reviewed=True` (a Verifier clearing a claim) -> `covered`; `record_run_failure` never covers; `search_since_ms` / `RESEARCH_OVERLAP_MS` |
+| Search for a question, not a keyword (announcements / practical examples / limitations passes) | `RESEARCH_DESK_PASSES` folded into the research synthesis prompt + `passLog` in each run's result; scheduled research instructions carry the three passes |
+
+**Short-URL safety (the requirement that shaped the identity rules).** A
+short link's raw string is NEVER a source identity. `t.co/abc` and
+`bit.ly/abc` land on different sites and LOOK identical, and a short token
+can be repointed to a malicious destination at any time. So:
+
+1. Identity is derived from the RESOLVED landing URL (`source_identity` in
+   `world/evidence.py`), which `/api/browse` already returns after it re-gates
+   the redirect chain's FINAL host. Two short links that land on different
+   sites get different identities; a repost to the same landing site is
+   deduped to it.
+2. A short link with no resolved URL is `unresolved:<hash>` — opaque,
+   `resolved_ok=False`, recorded with an open question ("short link not
+   resolved; destination unknown"). It is never claimed to be "the same
+   source" as anything and never serves as a verified source on its own.
+3. `_is_short_link` (registry-based in `world/web_helpers.py`) flags short
+   links for the risk/identity handling; `_resolve_final_url` follows the
+   redirect chain SSRF-safe (every hop pinned to a public IP) and is exposed
+   via `/api/evidence/resolve` so an operator can verify a short link's
+   destination before trusting it.
+
+**Verifier hook.** The peer-review gate does not cover scheduled research
+crawls (see `_peer_gated_lane` — `research` tasks are exempt). Coverage is
+therefore review-gated explicitly: a crawl leaves coverage entries
+`pending_review`, and only `POST /api/evidence/review` with a usable decision
+(`usable_as_written` / `usable_with_narrower_wording`) clears the claim AND
+flips its identity to `covered`. `blocked_until_checked` blocks the claim and
+never marks coverage. This is the operator/Verifier step, not an automatic
+one.
+
+### Operator-edited policy JSON (`world/config.py`)
+
+Settings the operator tunes live in JSON files, not Python. Each loader is
+fail-closed (missing/malformed file falls back to the in-code default) and
+validated to shape; the shipped `world/*.json` files carry the same values as
+the defaults. The two desk files are deliberately agent-visible: the desk
+passes are the standing questions every research run answers, and the
+watchlist is what the desk watches.
+
+| File | Setting | Who edits |
+|------|---------|-----------|
+| `world/plain_writing.json` | `PLAIN_WRITING_BAN_LIST` (anti-slop words) | Operator |
+| `world/browse_policy.json` | `BROWSE_BLOCK_CATEGORIES` (always-block content policy) | Operator |
+| `world/research_desk.json` | `RESEARCH_DESK_PASSES` (multi-pass search questions) | Operator; villagers read them in every run |
+| `world/watchlist.json` | `RESEARCH_WATCHLIST` (standing research topics) | Operator seeds it; village agents extend it through the intent lane, and those additions are appended back to the file |
+
+Write-back and seeding discipline: `serve._seed_watchlist_topics` seeds
+researchTopics from the watchlist in the real boot path (`_lifespan`), which
+also sets `config.ALLOW_WATCHLIST_WRITE = True`. Tests never run lifespan, so
+a test or stray import cannot silently edit operator-owned JSON. The watchlist
+is a seed, not a deletion mechanism: a topic removed from the file is not
+force-removed from state (same policy as the long-horizon topic).

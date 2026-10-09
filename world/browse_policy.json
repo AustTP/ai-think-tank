@@ -1,0 +1,13 @@
+{
+  "comment": "Categories that ALWAYS block a browse/execute/save regardless of the agent's stated purpose (BROWSE_BLOCK_CATEGORIES). Operator-edited: relevance to assigned work never overrides a blocked category.",
+  "block_categories": [
+    "child sexual abuse material or content sexualizing minors in any way",
+    "illegal drug or weapons marketplaces, or instructions for making weapons/explosives",
+    "hacking, malware, or exploit distribution, or unauthorized-access instructions",
+    "doxxing, stolen personal data, or non-consensual intimate imagery",
+    "human trafficking or exploitation",
+    "fraud, scams, or phishing",
+    "terrorism or violent extremist content",
+    "pirated copyrighted media distribution"
+  ]
+}
