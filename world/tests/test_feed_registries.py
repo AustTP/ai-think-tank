@@ -26,6 +26,10 @@ _PATCHER = None
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
+    # Isolate the shared in-process rate limiter: many test files reuse agent
+    # 'ben', and a full-suite run can trip the 60s/20-call window, turning
+    # expected 400/422s into 429s. Each file starts with a clean window.
+    serve._rate_limit_calls.clear()
     _TMP_DIR = tempfile.mkdtemp(prefix='think-tank-feed-registry-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,

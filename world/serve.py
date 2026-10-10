@@ -895,6 +895,30 @@ def init_db():
             expires_at      REAL NOT NULL,
             created_at      REAL NOT NULL
         )''')
+        # Inbound SMS inbox (receive-only by design -- nothing here can send a
+        # text). Messages enter ONLY via /api/sms/inbound, which requires a
+        # shared forward secret, so a text arriving means a real forwarder
+        # delivered it. Reads are gated per-message through sms_read_grants:
+        # a director/admin/player mints one short-lived, single-use grant for
+        # ONE agent + ONE message, choosing whether the OTP code is revealed.
+        # Agents never browse the inbox; every read is an ask.
+        conn.execute('''CREATE TABLE IF NOT EXISTS sms_messages (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender      TEXT NOT NULL,
+            body        TEXT NOT NULL,
+            otp_code    TEXT,
+            received_at REAL NOT NULL,
+            consumed_at REAL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS sms_read_grants (
+            grant_id    TEXT PRIMARY KEY,
+            agent_id    TEXT NOT NULL,
+            message_id  INTEGER NOT NULL,
+            granted_by  TEXT NOT NULL,
+            otp_allowed INTEGER NOT NULL DEFAULT 0,
+            created_at  REAL NOT NULL,
+            expires_at  REAL NOT NULL
+        )''')
         # Real, persistent record of health anomalies (see
         # compute_health_snapshot) -- a table, not just a print, so an
         # alert survives even if nobody's watching stdout when it fires.
@@ -2418,6 +2442,134 @@ def _login_safe_url(url):
         return False
     host = urllib.parse.urlparse(url).hostname or ''
     return bool(host) and _is_safe_public_host(host)
+
+
+# --- Scoped file download ----------------------------------------------------
+# Agents can download files into their own filespace under a hard size cap.
+# The URL must be public https (SSRF), the stream ABORTS the instant it
+# crosses the cap (never buffered whole), the filename is sanitized so it
+# cannot escape the agent's directory, and nothing downloaded is ever
+# executed. An optional capability handle attaches a token credential and is
+# scope-checked against the URL exactly like api_call.
+MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
+_DOWNLOAD_CHUNK = 64 * 1024
+
+
+def _sanitize_filename(name):
+    base = os.path.basename((name or '').replace('\\', '/')).strip()
+    base = re.sub(r'[^A-Za-z0-9._-]', '_', base)[:120]
+    if not base or base in ('.', '..'):
+        return 'download.bin'
+    if base.startswith('.'):
+        base = 'file_' + base.lstrip('.')
+    return base
+
+
+def _download_stream_sync(url, headers, dest_path, max_bytes):
+    """Stream `url` to `dest_path` with a HARD size cap: the file is deleted
+    and a ValueError raised the instant the cap is crossed. SSRF-safe via
+    _safe_urlopen's per-IP pinning; the final host after redirects is
+    re-checked as a public host."""
+    req = urllib.request.Request(url, headers=headers or {}, method='GET')
+    if 'User-Agent' not in {k.title() for k in (headers or {})}:
+        req.add_header('User-Agent', 'AIThinkTankAgent/1.0')
+    with _safe_urlopen(req, timeout=CURL_TIMEOUT_S) as resp:
+        final_url = resp.geturl()
+        if not _is_safe_public_host(urllib.parse.urlparse(final_url).hostname):
+            raise ValueError('redirected to a disallowed host')
+        status = resp.status
+        total = 0
+        try:
+            with open(dest_path, 'wb') as f:
+                while True:
+                    chunk = resp.read(_DOWNLOAD_CHUNK)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(f'download exceeds the {max_bytes}-byte limit')
+                    f.write(chunk)
+        except Exception:
+            try:
+                os.remove(dest_path)
+            except OSError:
+                pass
+            raise
+    return {'status': status, 'bytes': total, 'finalUrl': final_url}
+
+
+# --- Inbound SMS (receive-only) ---------------------------------------------
+# See the DDL comment for sms_messages / sms_read_grants. OTP detection is
+# deliberately simple: a standalone 4-8 digit token in the body. The code is
+# stored so it can be MASKED by default and revealed only on an explicit
+# operator grant (otp_allowed), one message, one agent, one read.
+_SMS_OTP_RE = re.compile(r'(?<!\d)\d{4,8}(?!\d)')
+_SMS_MAX_KEEP = 500
+
+
+def _sms_detect_otp(body):
+    if not body:
+        return None
+    m = _SMS_OTP_RE.search(body)
+    return m.group(0) if m else None
+
+
+def _sms_ingest(sender, body):
+    otp = _sms_detect_otp(body)
+    now = time.time()
+    with _db() as conn:
+        cur = conn.execute(
+            'INSERT INTO sms_messages (sender, body, otp_code, received_at) VALUES (?, ?, ?, ?)',
+            (sender, body, otp, now))
+        mid = cur.lastrowid
+        conn.execute('DELETE FROM sms_messages WHERE id NOT IN '
+                     '(SELECT id FROM sms_messages ORDER BY id DESC LIMIT ?)', (_SMS_MAX_KEEP,))
+    return mid, otp
+
+
+def _sms_mask_otp(body, code):
+    if not code:
+        return body
+    return body.replace(code, '*' * len(code))
+
+
+def _sms_message_row(row):
+    mid, sender, body, otp, received_at, consumed_at = row
+    return {'id': mid, 'sender': sender, 'body': body, 'otpCode': otp,
+            'receivedAt': received_at, 'consumed': consumed_at is not None}
+
+
+def _sms_mint_grant(agent_id, message_id, granted_by, otp_allowed, ttl_s):
+    gid = secrets.token_hex(16)
+    now = time.time()
+    with _db() as conn:
+        conn.execute(
+            'INSERT INTO sms_read_grants (grant_id, agent_id, message_id, granted_by, '
+            'otp_allowed, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (gid, agent_id, message_id, granted_by, 1 if otp_allowed else 0, now, now + ttl_s))
+    return gid
+
+
+def _sms_consume_grant(agent_id, grant_id):
+    """Resolve + consume a single-use SMS read grant. Returns
+    (message_row, otp_allowed) or (None, None). Expired grants are swept and
+    a consumed grant is gone -- every SMS read is exactly one ask."""
+    with _db() as conn:
+        row = conn.execute(
+            'SELECT message_id, otp_allowed, expires_at FROM sms_read_grants '
+            'WHERE grant_id = ? AND agent_id = ?', (grant_id, agent_id)).fetchone()
+        if row is None:
+            return None, None
+        message_id, otp_allowed, expires_at = row
+        if time.time() > expires_at:
+            conn.execute('DELETE FROM sms_read_grants WHERE grant_id = ?', (grant_id,))
+            return None, None
+        conn.execute('DELETE FROM sms_read_grants WHERE grant_id = ?', (grant_id,))
+        msg = conn.execute('SELECT id, sender, body, otp_code, received_at, consumed_at '
+                           'FROM sms_messages WHERE id = ?', (message_id,)).fetchone()
+    if msg is None:
+        return None, None
+    return _sms_message_row(msg), bool(otp_allowed)
 
 
 _DIGITALOCEAN_BALANCE_CACHE = {'at': 0.0, 'data': None}
@@ -19899,6 +20051,200 @@ async def credential_login_action(request: Request):
         'credential': grant['credential_name'], 'service': grant['service'],
         'scope': grant['purpose'], 'action': f'{method} {url}'[:200], 'ok': ok})
     return JSONResponse({'ok': ok, 'status': status, 'result': result})
+
+
+@app.post('/api/download')
+async def download_file(request: Request):
+    """Scoped file download into the agent's own filespace, under a hard size
+    cap. The URL must be public https (SSRF); the stream aborts and deletes
+    the partial file the instant the cap is crossed; the filename is
+    sanitized so it cannot escape the agent's directory; nothing downloaded
+    is ever executed. An optional capability handle attaches a token
+    credential and is scope-checked against the URL like api_call."""
+    body = await request.json()
+    agent_id = (body.get('agentId') or '').strip()
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'download'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    if not verify_agent_key(agent_id, request.headers.get('X-Agent-Key')):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    url = (body.get('url') or '').strip()
+    filename = (body.get('filename') or '').strip()
+    purpose = (body.get('purpose') or '').strip()
+    if not url:
+        return JSONResponse({'error': 'url is required'}, status_code=400)
+    if not _login_safe_url(url):
+        return JSONResponse({'error': 'url must be a public https URL'}, status_code=400)
+    try:
+        max_bytes = int(body.get('maxBytes') or MAX_DOWNLOAD_BYTES)
+    except (TypeError, ValueError):
+        max_bytes = MAX_DOWNLOAD_BYTES
+    max_bytes = max(1024, min(max_bytes, MAX_DOWNLOAD_BYTES))
+    headers = {}
+    # Optional capability handle: attach a token credential and enforce the
+    # handle's host/method scope against this exact URL.
+    capability_handle = (body.get('capabilityHandle') or '').strip()
+    if capability_handle:
+        grant = resolve_capability_handle(agent_id, capability_handle, 'GET', url)
+        if grant is None:
+            log_action(agent_id, 'download', {'url': url[:200], 'purpose': purpose,
+                                              'decision': 'blocked', 'reason': 'handle invalid, expired, or out of scope'}, authorized=True)
+            return JSONResponse({'error': 'That capability handle is not valid for this download (expired, wrong agent, or out-of-scope host/method).'}, status_code=403)
+        if grant.get('kind') == 'login':
+            return JSONResponse({'error': 'This handle is for a login credential, which cannot be attached to a download.'}, status_code=400)
+        for hdr_name, hdr_value in _capability_auth_headers(grant['credential_name'], grant['secret']).items():
+            headers.setdefault(hdr_name, hdr_value)
+    safe_name = _sanitize_filename(filename or urllib.parse.urlparse(url).path.rsplit('/', 1)[-1])
+    dest_dir = os.path.join(AGENTS_DIR, agent_id, 'downloads')
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, safe_name)
+    try:
+        result = await asyncio.to_thread(_download_stream_sync, url, headers, dest_path, max_bytes)
+    except Exception as e:  # noqa: BLE001 -- a failed download must surface as a clean API error
+        log_action(agent_id, 'download', {'url': url[:200], 'purpose': purpose,
+                                          'decision': 'failed', 'reason': str(e)[:200]}, authorized=True)
+        return JSONResponse({'error': f'download failed: {e}'}, status_code=400)
+    try:
+        with open(dest_path, 'rb') as f:
+            sha256 = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        sha256 = None
+    rel = f"downloads/{safe_name}"
+    log_action(agent_id, 'download', {'url': url[:200], 'purpose': purpose, 'bytes': result['bytes'],
+                                      'path': rel, 'decision': 'allowed'}, authorized=True)
+    _append_passport_decision('download', agent_id, {'url': url[:200], 'purpose': purpose,
+                                                     'bytes': result['bytes'], 'path': rel})
+    return JSONResponse({'ok': True, 'path': rel, 'bytes': result['bytes'],
+                         'sha256': sha256, 'finalUrl': result['finalUrl'],
+                         'status': result['status']})
+
+
+@app.post('/api/sms/inbound')
+async def sms_inbound(request: Request):
+    """Receive-only SMS webhook. The ONLY way a text enters the inbox: a
+    forwarder (Twilio/Android-forwarder/carrier) POSTs {from, body} with the
+    shared secret. Nothing here can send a text. Fail-closed when no secret
+    is configured or the header is wrong."""
+    secret = _load_env().get('SMS_FORWARD_SECRET') or ''
+    if not secret:
+        return JSONResponse({'error': 'SMS inbound is not configured (set SMS_FORWARD_SECRET in .env)'}, status_code=501)
+    presented = (request.headers.get('X-SMS-Forward-Secret') or '').strip()
+    if not secrets.compare_digest(presented, secret):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    body = await request.json()
+    sender = (body.get('from') or '').strip()[:40]
+    text = body.get('body')
+    if not sender or not isinstance(text, str) or not text.strip():
+        return JSONResponse({'error': 'from and body are required'}, status_code=400)
+    mid, otp = _sms_ingest(sender, text.strip())
+    print(f'[sms] inbound from {sender} ({len(text.strip())} chars, otp={"yes" if otp else "no"}) -> #{mid}', flush=True)
+    return JSONResponse({'ok': True, 'messageId': mid})
+
+
+@app.get('/api/sms/inbox')
+async def sms_inbox(request: Request):
+    """Operator view of the inbox (player or director/admin). OTP codes are
+    masked by default; pass ?otp=1 to see them. Agents never reach this."""
+    authorized, _actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'SMS inbox is player/director/admin-only'}, status_code=401)
+    try:
+        limit = max(1, min(int(request.query_params.get('limit') or 20), 100))
+    except (TypeError, ValueError):
+        limit = 20
+    show_otp = (request.query_params.get('otp') or '0') == '1'
+    with _db() as conn:
+        rows = conn.execute(
+            'SELECT id, sender, body, otp_code, received_at, consumed_at '
+            'FROM sms_messages ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+    msgs = []
+    for r in rows:
+        m = _sms_message_row(r)
+        if not show_otp and m['otpCode']:
+            m['body'] = _sms_mask_otp(m['body'], m['otpCode'])
+            m['otpCode'] = None
+        msgs.append(m)
+    return JSONResponse({'messages': msgs})
+
+
+@app.post('/api/sms/grant')
+async def sms_grant(request: Request):
+    """Director/admin/player mints a single-use, short-lived read grant for ONE
+    agent + ONE message. otpAllowed defaults to false: unless the operator
+    explicitly checks it, the agent reads the text with any code masked.
+    Every SMS read is one ask, nothing more."""
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a director, the admin, or the player may grant an SMS read'}, status_code=403)
+    body = await request.json()
+    agent_id = (body.get('agentId') or '').strip()
+    try:
+        message_id = int(body.get('messageId') or 0)
+    except (TypeError, ValueError):
+        message_id = 0
+    otp_allowed = bool(body.get('otpAllowed'))
+    if not agent_id or message_id <= 0:
+        return JSONResponse({'error': 'agentId and messageId are required'}, status_code=400)
+    try:
+        ttl_s = max(60, min(int(body.get('ttlSec') or 300), 900))
+    except (TypeError, ValueError):
+        ttl_s = 300
+    with _db() as conn:
+        exists = conn.execute('SELECT 1 FROM sms_messages WHERE id = ?', (message_id,)).fetchone()
+    if not exists:
+        return JSONResponse({'error': f'no SMS message #{message_id}'}, status_code=404)
+    gid = _sms_mint_grant(agent_id, message_id, actor, otp_allowed, ttl_s)
+    log_action(actor, 'sms_grant', {'agentId': agent_id, 'messageId': message_id,
+                                    'otpAllowed': otp_allowed, 'ttlSec': ttl_s})
+    _append_passport_decision('sms_grant', actor, {'agentId': agent_id, 'messageId': message_id,
+                                                   'otpAllowed': otp_allowed})
+    return JSONResponse({'ok': True, 'grant': gid, 'expiresInSec': ttl_s})
+
+
+@app.post('/api/sms/read')
+async def sms_read(request: Request):
+    """The agent consumes its grant: ONE message, exactly once. The text is
+    returned with any OTP code masked unless the grant explicitly allowed it."""
+    body = await request.json()
+    agent_id = (body.get('agentId') or '').strip()
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'sms-read'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    if not verify_agent_key(agent_id, request.headers.get('X-Agent-Key')):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    grant_id = (body.get('grant') or '').strip()
+    if not grant_id:
+        return JSONResponse({'error': 'grant is required'}, status_code=400)
+    msg, otp_allowed = _sms_consume_grant(agent_id, grant_id)
+    if msg is None:
+        return JSONResponse({'error': 'invalid, expired, or already-used read grant'}, status_code=403)
+    result = {'id': msg['id'], 'sender': msg['sender'], 'receivedAt': msg['receivedAt']}
+    if msg['otpCode'] and not otp_allowed:
+        result['body'] = _sms_mask_otp(msg['body'], msg['otpCode'])
+        result['otpMasked'] = True
+    else:
+        result['body'] = msg['body']
+        if msg['otpCode']:
+            result['otpCode'] = msg['otpCode']
+    log_action(agent_id, 'sms_read', {'messageId': msg['id'], 'otp': 'yes' if msg['otpCode'] else 'no',
+                                      'otpMasked': bool(msg['otpCode'] and not otp_allowed)})
+    return JSONResponse({'ok': True, 'message': result})
+
+
+@app.post('/api/sms/revoke')
+async def sms_revoke(request: Request):
+    """Operator revokes an outstanding read grant before it is used."""
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a director, the admin, or the player may revoke an SMS read grant'}, status_code=403)
+    body = await request.json()
+    grant_id = (body.get('grant') or '').strip()
+    if not grant_id:
+        return JSONResponse({'error': 'grant is required'}, status_code=400)
+    with _db() as conn:
+        conn.execute('DELETE FROM sms_read_grants WHERE grant_id = ?', (grant_id,))
+    log_action(actor, 'sms_revoke', {'grant': grant_id[:8]})
+    return JSONResponse({'ok': True})
 
 
 @app.post('/api/keys/handles')

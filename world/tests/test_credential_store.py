@@ -25,6 +25,7 @@ import serve  # noqa: E402
 
 class _CredentialCase(unittest.TestCase):
     def setUp(self):
+        serve._rate_limit_calls.clear()  # full-suite isolation; see test_feed_registries setUpModule
         self.tmp = tempfile.mkdtemp(prefix='think-tank-credential-test-')
         self._cm = unittest.mock.patch.multiple(
             serve,
