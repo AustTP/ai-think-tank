@@ -2514,6 +2514,39 @@ def _spike_wants_ais_feed(backlog, instructions):
     return mentions_vessel or mentions_maritime
 
 
+def _spike_wants_rss(backlog, instructions):
+    """Same forced-tool-choice reasoning as the other _spike_wants_* detectors,
+    applied preemptively for the curated RSS aggregator: a question about
+    current events, hazards, space news, or new research papers should reach
+    for read_rss_feed FIRST (the buffered, polled feeds), not search_web and
+    not a training-knowledge guess. Broad 'news' phrasing fires it -- the
+    curated feeds are the designated news source -- and it never forces a
+    read when no feed could plausibly cover the topic."""
+    text = f'{backlog or ""} {instructions or ""}'.lower()
+    general_news = any(w in text for w in ('news', 'headlines', 'breaking', 'latest developments',
+                                           'what is happening', "what's happening", 'current events',
+                                           'this week', 'today in the world'))
+    hazard = any(w in text for w in ('earthquake', 'earthquakes', 'quake', 'quakes', 'seismic', 'tremor'))
+    space = any(w in text for w in ('nasa', 'space news', 'rocket launch', 'iss'))
+    research = any(w in text for w in ('arxiv', 'preprint', 'preprints', 'new paper', 'new papers',
+                                       'research paper', 'recent research'))
+    return general_news or hazard or space or research
+
+
+def _spike_wants_market(backlog, instructions):
+    """Same forced-tool-choice reasoning as the other _spike_wants_* detectors,
+    applied preemptively for the Kraken ticker -- but kept deliberately NARROW:
+    the feed carries crypto only (XBT/ETH/XRP/SOL/DOGE), so forcing
+    read_market_feed on a "price of SPY" question would waste the first call on
+    a tool that has no equity data. Fires only on crypto names/symbols."""
+    text = f'{backlog or ""} {instructions or ""}'.lower()
+    coins = ('bitcoin', 'ethereum', 'litecoin', 'solana', 'dogecoin', 'crypto',
+             'cryptocurrency', 'xrp', 'ripple')
+    if any(c in text for c in coins):
+        return True
+    return any(f' {sym} ' in f' {text} ' for sym in ('btc', 'eth', 'sol', 'doge', 'xbt'))
+
+
 def _spike_wants_github(backlog, instructions):
     """Same forced-tool-choice reasoning as the other _spike_wants_*
     detectors, applied preemptively (day one) for the GitHub read tools: a
@@ -4489,6 +4522,10 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         first_tool = 'github_get_repo'
     elif _spike_wants_ais_feed(backlog, instructions):
         first_tool = 'read_ais_feed'
+    elif _spike_wants_rss(backlog, instructions):
+        first_tool = 'read_rss_feed'
+    elif _spike_wants_market(backlog, instructions):
+        first_tool = 'read_market_feed'
     else:
         first_tool = 'search_web' if _serve.TAVILY_API_KEY else True
     # Chunked into rounds of 4 with a reflection self-check between them

@@ -4327,6 +4327,8 @@ async def _lifespan(app):
     ask_drain_task = asyncio.create_task(_pending_ask_drain_loop())
     avatar_task = asyncio.create_task(_avatar_loop())
     ais_task = asyncio.create_task(_ais_collector_loop())
+    rss_task = asyncio.create_task(_rss_poll_loop())
+    kraken_task = asyncio.create_task(_kraken_collector_loop())
     sim_task = None
     try:
         import sim as _sim_module
@@ -4360,6 +4362,8 @@ async def _lifespan(app):
     if avatar_task is not None:
         avatar_task.cancel()
     ais_task.cancel()
+    rss_task.cancel()
+    kraken_task.cancel()
     if sim_task is not None:
         sim_task.cancel()
 
@@ -7775,7 +7779,45 @@ AGENT_ASK_TOOLS = [
 ] if TAVILY_API_KEY else []) + ([
     _HIGGSFIELD_IMAGE_TOOL,
     _HIGGSFIELD_VIDEO_TOOL,
-] if (HIGGSFIELD_API_KEY_ID and HIGGSFIELD_API_KEY_SECRET) else []) + [_API_CALL_TOOL, _PROPOSE_API_SERVICE_TOOL]
+] if (HIGGSFIELD_API_KEY_ID and HIGGSFIELD_API_KEY_SECRET) else []) + [
+    {
+        'type': 'function',
+        'function': {
+            'name': 'read_rss_feed',
+            'description': 'Read recent items from the think tank\'s curated RSS/ATOM feeds '
+                           '(current events, space, hazards, research) -- already polled and buffered, '
+                           'NOT fetched on demand. Ask it when the question is about recent news, '
+                           'earthquakes, space/NASA items, or new research papers. Items that match a '
+                           'watchlist research topic are tagged. Pass a feed id for one feed, or omit '
+                           'for all.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'feed': {'type': 'string', 'description': 'Feed id, one of: bbc_world, nasa_breaking, '
+                                                              'usgs_quakes, arxiv_cs_lg, arxiv_cs_cl. Omit for all.'},
+                    'max': {'type': 'integer', 'description': 'Max items per feed to return, 1-30 (default 8).'},
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'read_market_feed',
+            'description': 'Read live crypto prices from the Kraken public ticker (no key) -- the '
+                           'latest bid/ask/price per pair from the think tank\'s collector. Use it for '
+                           '"what is the price of BTC/ETH/XRP/SOL/DOGE right now" type questions. '
+                           'Crypto only -- do NOT use it for stocks like SPY, it has no equity data.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'pair': {'type': 'string', 'description': 'Pair to quote, e.g. XBT/USD or BTC-USD '
+                                                              '(normalized). Omit for all pairs.'},
+                },
+            },
+        },
+    },
+] + [_API_CALL_TOOL, _PROPOSE_API_SERVICE_TOOL]
 
 # Additional tools offered to /api/intent/ask ONLY when the dispatched agent's
 # role is Red Team Auditor -- real calls through the SAME gated
@@ -12098,6 +12140,56 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             wrapped, _nonce, _tag, instruction = wrap_external_content(
                 raw, 'live AIS ship position data from AISStream')
             return f'{instruction}\n\n{wrapped}'
+        if name == 'read_rss_feed':
+            # Curated RSS/ATOM feeds (current events, space, hazards, research),
+            # polled and buffered by the aggregator -- NOT fetched on demand.
+            feed_id = ((args or {}).get('feed') or '').strip().lower()
+            max_items = max(1, min(int((args or {}).get('max') or 8), 30))
+            if feed_id and feed_id not in _RSS_FEEDS:
+                avail = ', '.join(sorted(_RSS_FEEDS))
+                return f'Unknown feed "{feed_id}". Available feeds: {avail}'
+            feeds = [feed_id] if feed_id else sorted(_RSS_FEEDS)
+            parts = []
+            for fid in feeds:
+                st = _RSS_STATUS.get(fid) or {}
+                items = _rss_recent(fid, max_items=max_items)
+                head = f"{fid} ({_RSS_FEEDS[fid]['name']}): status={'ok' if st.get('ok') else 'stale'}"
+                if not st.get('ok') and st.get('last_error'):
+                    head += f" last_error={st['last_error']}"
+                if not items:
+                    parts.append(f'{head} | no items buffered yet (first poll may not have run)')
+                    continue
+                rows = []
+                for it in items:
+                    line = f"- {it['title']}"
+                    if it['link']:
+                        line += f" | {it['link']}"
+                    if it.get('matchedTopics'):
+                        line += f" [watchlist: {', '.join(it['matchedTopics'])}]"
+                    rows.append(line)
+                parts.append(f'{head} | {len(items)} recent items\n' + '\n'.join(rows))
+            raw = '\n\n'.join(parts)
+            wrapped, _nonce, _tag, instruction = wrap_external_content(
+                raw, 'curated RSS/ATOM feed items polled by the think tank')
+            return f'{instruction}\n\n{wrapped}'
+        if name == 'read_market_feed':
+            # Live crypto quotes from the Kraken public ticker (no key). Latest
+            # per pair only; history is a short in-process ring.
+            pair = _kraken_normalize_pair((args or {}).get('pair'))
+            quotes = _kraken_quotes([pair] if pair else None)
+            parts = [f"connection={'live' if _KRAKEN_STATUS.get('connected') else 'down'}"]
+            if not _KRAKEN_STATUS.get('connected') and _KRAKEN_STATUS.get('last_error'):
+                parts.append(f"collector error: {_KRAKEN_STATUS['last_error']}")
+            if not quotes:
+                parts.append('no quotes buffered yet (collector still connecting)')
+            for p in sorted(quotes):
+                q = quotes[p]
+                parts.append(f"{p}: {q['price']} bid={q['bid']} ask={q['ask']} "
+                             f"ts={q['ts']}")
+            raw = ' | '.join(parts)
+            wrapped, _nonce, _tag, instruction = wrap_external_content(
+                raw, 'live crypto market data from the Kraken public ticker')
+            return f'{instruction}\n\n{wrapped}'
         if name == 'browse_page':
             country = ((args or {}).get('country') or '').strip().lower()
             result = _http_json('POST', SELF_BASE_URL, '/api/browse', {
@@ -12319,7 +12411,8 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     # hard ceiling still bounds real runaway cost regardless of which lane
     # triggers it.
     from content import (_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL, _make_treg_tools_executor,
-                        _spike_wants_x_trending, _spike_wants_linkedin_search, _spike_wants_ais_feed)
+                        _spike_wants_x_trending, _spike_wants_linkedin_search, _spike_wants_ais_feed,
+                        _spike_wants_rss, _spike_wants_market)
     _treg_tool = _make_treg_tools_executor()
     # Same proven fix as search_web/search_library before it (twice):
     # prompt-only guidance to prefer a specific tool was NOT reliably
@@ -12333,10 +12426,14 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         ask_force_first_tool = 'search_linkedin_posts'
     elif _spike_wants_ais_feed(question, None):
         ask_force_first_tool = 'read_ais_feed'
+    elif _spike_wants_rss(question, None):
+        ask_force_first_tool = 'read_rss_feed'
+    elif _spike_wants_market(question, None):
+        ask_force_first_tool = 'read_market_feed'
 
     def execute_tool(name, args):
         # Every tool result is external data -> wrap BEFORE it can reach a model.
-        if name in ('search_web', 'browse_page', 'read_ais_feed'):
+        if name in ('search_web', 'browse_page', 'read_ais_feed', 'read_rss_feed', 'read_market_feed'):
             tools_used.append(name)
             return _web_tool(name, args)
         if name == 'team_digest':
@@ -12684,6 +12781,289 @@ async def _ais_collector_loop():
             _AIS_STATUS['last_error'] = str(e)[:200]
             print(f'[ais] collector error: {e}', flush=True)
             await asyncio.sleep(AIS_RECONNECT_BACKOFF_S)
+
+
+# ---------------------------------------------------------------------------
+# Curated RSS/ATOM aggregator. Same architecture as the AISStream collector,
+# applied to feeds agents keep asking about (current events, space, hazards,
+# research): a standing poll loop fetches each feed on its own cadence, a
+# tolerant parser handles both RSS 2.0 (<item>) and ATOM (<entry>) XML, and the
+# most recent items per feed live in an in-process ring buffer served by the
+# read_rss_feed tool / /api/rss/recent. Items are tagged at ingest with any
+# watchlist research topics whose words appear in the title, so the Research
+# Desk's standing topics surface straight out of the feed read.
+# ---------------------------------------------------------------------------
+_RSS_FEEDS = {
+    'bbc_world': {
+        'name': 'BBC World',
+        'url': 'https://feeds.bbci.co.uk/news/world/rss.xml',
+        'interval_s': 600,
+    },
+    'nasa_breaking': {
+        'name': 'NASA Breaking News',
+        'url': 'https://www.nasa.gov/rss/breaking_news.rss',
+        'interval_s': 1800,
+    },
+    'usgs_quakes': {
+        'name': 'USGS Earthquakes (M2.5+)',
+        'url': 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.atom',
+        'interval_s': 600,
+    },
+    'arxiv_cs_lg': {
+        'name': 'arXiv cs.LG',
+        'url': 'https://rss.arxiv.org/rss/cs.LG',
+        'interval_s': 1800,
+    },
+    'arxiv_cs_cl': {
+        'name': 'arXiv cs.CL',
+        'url': 'https://rss.arxiv.org/rss/cs.CL',
+        'interval_s': 1800,
+    },
+}
+_RSS_BUFFER_MAX_PER_FEED = 50
+_RSS_WINDOW_S = 3 * 86400
+_RSS_FETCH_TIMEOUT_S = 20
+_RSS_HTTP_HEADERS = {'User-Agent': 'AIThinkTankAgent/1.0 (think-tank current-events aggregator)'}
+
+_RSS_BUFFER = {}  # feed_id -> list of {'ts', 'title', 'link', 'summary', 'matchedTopics'}
+_RSS_BUFFER_LOCK = threading.Lock()
+_RSS_STATUS = {}  # feed_id -> {'last_fetch_at', 'last_error', 'ok'}
+
+
+def _parse_rss_atom_xml(raw, feed_id):  # noqa: ARG001 -- feed_id kept for signature symmetry
+    """Parse RSS 2.0 or ATOM XML into a list of {title, link, summary} items.
+    Namespace-tolerant (strips '{...}' from tags), handles <item>/<entry> even
+    when nested inside a <channel> container, and degrades gracefully on feeds
+    that reorder fields or omit summaries."""
+    import html as _html
+    import re as _re
+    import xml.etree.ElementTree as ET
+    items = []
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return items
+    entries = []
+    for node in root.iter():
+        tag = _re.sub(r'\{.*?\}', '', node.tag).lower()
+        if tag in ('item', 'entry'):
+            entries.append(node)
+    for entry in entries:
+        fields = {}
+        for child in entry:
+            tag = _re.sub(r'\{.*?\}', '', child.tag).lower()
+            if tag in ('title', 'link', 'guid', 'id', 'description', 'summary', 'content'):
+                text = (child.text or '').strip()
+                if tag == 'link' and not text:
+                    text = child.get('href') or ''
+                if tag in ('description', 'summary', 'content'):
+                    text = _re.sub(r'<[^>]+>', ' ', text)
+                    text = _html.unescape(text)
+                    text = _re.sub(r'\s+', ' ', text).strip()
+                if tag in ('title', 'link', 'guid', 'id'):
+                    fields.setdefault(tag, text)
+                elif tag in ('description', 'summary', 'content') and not fields.get('summary'):
+                    fields['summary'] = text[:500]
+        title = fields.get('title') or ''
+        link = fields.get('link') or fields.get('guid') or fields.get('id') or ''
+        if title or link:
+            items.append({'title': title, 'link': link,
+                          'summary': fields.get('summary') or ''})
+    return items
+
+
+def _rss_match_topics(title):
+    """Tag a title with any current watchlist research topics it mentions
+    (word-boundary match on topic words, not the full topic string)."""
+    try:
+        state = get_state_from_db()
+    except Exception:  # noqa: BLE001 -- never let topic tagging break the poller
+        state = None
+    topics = [(t.get('topic') or '') for t in ((state or {}).get('researchTopics') or [])]
+    title_l = f' {title.lower()} '
+    matched = []
+    for topic in topics:
+        if not topic:
+            continue
+        words = [w for w in topic.lower().split() if len(w) > 2]
+        if words and all(f' {w} ' in title_l for w in words):
+            matched.append(topic)
+    return matched
+
+
+def _rss_ingest(feed_id, items):
+    now = int(time.time() * 1000)
+    with _RSS_BUFFER_LOCK:
+        seen = {it.get('link') for it in _RSS_BUFFER.get(feed_id, [])}
+        fresh = []
+        for it in items:
+            link = it.get('link') or ''
+            if link and link in seen:
+                continue
+            seen.add(link)
+            fresh.append({'ts': now, 'title': it.get('title') or '',
+                          'link': link, 'summary': it.get('summary') or '',
+                          'matchedTopics': _rss_match_topics(it.get('title') or '')})
+        buf = _RSS_BUFFER.setdefault(feed_id, [])
+        buf.extend(fresh)
+        if len(buf) > _RSS_BUFFER_MAX_PER_FEED:
+            del buf[:len(buf) - _RSS_BUFFER_MAX_PER_FEED]
+    return len(fresh)
+
+
+def _rss_recent(feed_id, max_items=10):
+    cutoff = int(time.time() * 1000) - _RSS_WINDOW_S * 1000
+    with _RSS_BUFFER_LOCK:
+        items = [dict(it) for it in _RSS_BUFFER.get(feed_id, []) if it['ts'] >= cutoff]
+    return items[-max_items:]
+
+
+def _fetch_feed_sync(feed_id, url):
+    """Synchronous feed fetch (poll loop runs in a thread). Returns the parsed
+    items or raises -- the loop owns retry/backoff and status tracking."""
+    req = urllib.request.Request(url, headers=_RSS_HTTP_HEADERS)
+    with _safe_urlopen(req, timeout=_RSS_FETCH_TIMEOUT_S) as resp:
+        raw = resp.read(2 ** 20 + 1)
+    return _parse_rss_atom_xml(raw, feed_id)
+
+
+async def _rss_poll_loop():
+    """Standing loop (created in _lifespan): fetch every curated feed on its
+    own cadence, ingest new items into the ring buffer, and surface per-feed
+    health in _RSS_STATUS. Polls are serialized through a thread so one slow
+    feed can't stall the rest of the event loop."""
+    import asyncio
+    while True:
+        for feed_id, feed in _RSS_FEEDS.items():
+            url = feed.get('url') or ''
+            try:
+                items = await asyncio.to_thread(_fetch_feed_sync, feed_id, url)
+                n = _rss_ingest(feed_id, items)
+                _RSS_STATUS[feed_id] = {'ok': True, 'last_fetch_at': time.time(),
+                                        'last_error': '', 'new': n}
+            except Exception as e:  # noqa: BLE001 -- a bad feed/network hiccup must never kill the loop
+                _RSS_STATUS[feed_id] = {'ok': False, 'last_fetch_at': time.time(),
+                                        'last_error': str(e)[:200], 'new': 0}
+                print(f'[rss] {feed_id} fetch failed: {e}', flush=True)
+            await asyncio.sleep(0.02)
+        # Sleep until the soonest next poll across all feeds.
+        now = time.time()
+        due = min((now + (feed.get('interval_s') or 600) - _RSS_STATUS.get(feed_id, {}).get('last_fetch_at', 0)
+                   for feed_id, feed in _RSS_FEEDS.items()), default=600)
+        await asyncio.sleep(max(1.0, due))
+
+
+# ---------------------------------------------------------------------------
+# Kraken public market-data ticker. Same collector pattern as AISStream: hold
+# the WebSocket, subscribe to a small symbol set, buffer ticks in-process, and
+# serve the latest via the read_market_feed tool / /api/market/quote. No API
+# key (public market data), reconnects with backoff. Crypto only -- equity
+# prices have no free public WebSocket, so the detector is kept narrow to
+# avoid forcing this tool on "price of SPY" questions it cannot answer.
+# ---------------------------------------------------------------------------
+_KRAKEN_WS_URL = 'wss://ws.kraken.com'
+_KRAKEN_PAIRS = ['XBT/USD', 'ETH/USD', 'XRP/USD', 'SOL/USD', 'XDG/USD']
+_KRAKEN_HISTORY_MAX = 200
+_KRAKEN_RECONNECT_BACKOFF_S = 15
+_KRAKEN_STALL_TIMEOUT_S = 90  # no data at all for this long -> force a reconnect
+
+_KRAKEN_LATEST = {}  # pair -> {'price', 'bid', 'ask', 'volume', 'ts'}
+_KRAKEN_HISTORY = []  # ring of {'ts', 'pair', 'price', 'bid', 'ask'}
+_KRAKEN_CHANNEL_PAIRS = {}  # channelID -> pair (Kraken ticker messages carry only a channel id)
+_KRAKEN_LOCK = threading.Lock()
+_KRAKEN_STATUS = {'connected': False, 'last_error': '', 'connected_at': 0, 'last_tick_at': 0}
+
+
+def _kraken_ingest_tick(ts_ms, pair, price, bid, ask, volume):
+    with _KRAKEN_LOCK:
+        _KRAKEN_LATEST[pair] = {'price': price, 'bid': bid, 'ask': ask,
+                                'volume': volume, 'ts': ts_ms}
+        _KRAKEN_HISTORY.append({'ts': ts_ms, 'pair': pair, 'price': price,
+                                'bid': bid, 'ask': ask})
+        if len(_KRAKEN_HISTORY) > _KRAKEN_HISTORY_MAX:
+            del _KRAKEN_HISTORY[:len(_KRAKEN_HISTORY) - _KRAKEN_HISTORY_MAX]
+
+
+def _kraken_quotes(pairs=None):
+    with _KRAKEN_LOCK:
+        wanted = pairs or list(_KRAKEN_LATEST.keys())
+        return {p: dict(_KRAKEN_LATEST[p]) for p in wanted if p in _KRAKEN_LATEST}
+
+
+def _kraken_normalize_pair(pair):
+    """Normalize a user-supplied pair to Kraken's canonical symbol set:
+    uppercase, '-'/'_' -> '/', and the common aliases BTC->XBT and DOGE->XDG
+    (Kraken's ticker symbols for bitcoin and dogecoin)."""
+    p = (pair or '').strip().upper().replace('-', '/').replace('_', '/')
+    p = p.replace('BTC', 'XBT').replace('DOGE', 'XDG')
+    return p
+
+
+async def _kraken_collector_loop():
+    import asyncio
+    import websockets
+    while True:
+        try:
+            async with websockets.connect(
+                    _KRAKEN_WS_URL, max_size=2 ** 20,
+                    open_timeout=15, ping_interval=20, ping_timeout=20) as ws:
+                with _KRAKEN_LOCK:
+                    _KRAKEN_CHANNEL_PAIRS.clear()
+                await ws.send(json.dumps({'event': 'subscribe', 'pair': _KRAKEN_PAIRS,
+                                          'subscription': {'name': 'ticker'}}))
+                _KRAKEN_STATUS.update({'connected': True, 'last_error': '', 'connected_at': time.time()})
+                print('[kraken] collector connected', flush=True)
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=_KRAKEN_STALL_TIMEOUT_S)
+                    except asyncio.TimeoutError:
+                        # Subscribed but zero frames for the whole window --
+                        # the subscription silently died. Reconnect.
+                        print('[kraken] no data for '
+                              f'{_KRAKEN_STALL_TIMEOUT_S}s; reconnecting', flush=True)
+                        break
+                    except Exception:  # noqa: BLE001 -- ConnectionClosed et al: reconnect
+                        break
+                    try:
+                        data = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(data, dict):
+                        # Subscription confirmations carry the channelID ->
+                        # pair mapping, used as a fallback below for ticker
+                        # frames that omit the pair.
+                        if (data.get('event') == 'subscriptionStatus'
+                                and data.get('status') == 'subscribed'):
+                            cid = data.get('channelID')
+                            if cid is not None and data.get('pair'):
+                                with _KRAKEN_LOCK:
+                                    _KRAKEN_CHANNEL_PAIRS[cid] = data['pair']
+                        continue
+                    # Ticker frame: [channelID, data, channelName, pair] -- the
+                    # pair is element [3] when present (live-confirmed), so
+                    # prefer it and fall back to the channelID map.
+                    if isinstance(data, list) and len(data) >= 2 and isinstance(data[1], dict):
+                        cid = data[0]
+                        tick = data[1]
+                        pair = (data[3] if len(data) >= 4 and isinstance(data[3], str)
+                                else _KRAKEN_CHANNEL_PAIRS.get(cid))
+                        if not pair:
+                            continue
+                        try:
+                            price = float(tick['c'][0])
+                            bid = float(tick['b'][0])
+                            ask = float(tick['a'][0])
+                            volume = float(tick['v'][0])
+                        except (KeyError, TypeError, ValueError, IndexError):
+                            continue
+                        _kraken_ingest_tick(int(time.time() * 1000), pair,
+                                            price, bid, ask, volume)
+                        _KRAKEN_STATUS['last_tick_at'] = time.time()
+        except Exception as e:  # noqa: BLE001 -- a drop/backoff and retry is the whole point
+            _KRAKEN_STATUS['connected'] = False
+            _KRAKEN_STATUS['last_error'] = str(e)[:200]
+            print(f'[kraken] collector error: {e}', flush=True)
+            await asyncio.sleep(_KRAKEN_RECONNECT_BACKOFF_S)
 
 
 def _team_digest_text(max_markdown_chars=1400, tape_window_s=86400):
@@ -17481,6 +17861,55 @@ async def ais_recent(request: Request):
         'connectedAt': _AIS_STATUS.get('connected_at'),
         'lastMessageAt': _AIS_STATUS.get('last_message_at'),
         'frames': _ais_recent(max_msgs=max_msgs, window_s=window_s),
+    })
+
+
+@app.get('/api/rss/recent')
+async def rss_recent(request: Request):
+    """Read the RSS aggregator's buffered items for a feed (or all feeds).
+    Same auth + read-only contract as /api/ais/recent: agent key or player
+    session, returns only buffered public feed data."""
+    agent_id = (request.query_params.get('agentId') or '').strip()
+    presented = request.headers.get('X-Agent-Key') or ''
+    authed = (agent_id and verify_agent_key(agent_id, presented) is True)
+    if not authed:
+        authed = _require_player_session(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    feed_id = (request.query_params.get('feed') or '').strip().lower()
+    if feed_id and feed_id not in _RSS_FEEDS:
+        return JSONResponse({'error': f'unknown feed: {feed_id}',
+                             'available': sorted(_RSS_FEEDS)}, status_code=400)
+    max_items = max(1, min(int(request.query_params.get('max') or 10), 30))
+    feeds = [feed_id] if feed_id else sorted(_RSS_FEEDS)
+    return JSONResponse({
+        'ok': True,
+        'feeds': {fid: {
+            'name': _RSS_FEEDS[fid]['name'],
+            'status': _RSS_STATUS.get(fid) or {},
+            'items': _rss_recent(fid, max_items=max_items),
+        } for fid in feeds},
+    })
+
+
+@app.get('/api/market/quote')
+async def market_quote(request: Request):
+    """Read the Kraken collector's latest crypto quotes. Same auth + read-only
+    contract as /api/ais/recent."""
+    agent_id = (request.query_params.get('agentId') or '').strip()
+    presented = request.headers.get('X-Agent-Key') or ''
+    authed = (agent_id and verify_agent_key(agent_id, presented) is True)
+    if not authed:
+        authed = _require_player_session(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    pair = _kraken_normalize_pair(request.query_params.get('pair'))
+    return JSONResponse({
+        'ok': True,
+        'connected': _KRAKEN_STATUS.get('connected'),
+        'lastError': _KRAKEN_STATUS.get('last_error'),
+        'lastTickAt': _KRAKEN_STATUS.get('last_tick_at'),
+        'quotes': _kraken_quotes([pair] if pair else None),
     })
 
 
