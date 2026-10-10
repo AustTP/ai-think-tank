@@ -151,6 +151,109 @@ class TriggerSites(unittest.TestCase):
         self.assertEqual(st.get('emailOutbox', []), [])
 
 
+class CardReport(unittest.TestCase):
+    """The player's copy of a closed card's complete report. Every card kind
+    (story/spike/bug/task) delivers once on close -- the full spec (user
+    story, acceptance criteria, NEVER constraints), the peer approval count,
+    and the agent's actual write-up. Agent-to-agent internals (review/fix
+    subtasks, shadow dry-runs, player-assigned cards) never fire it."""
+
+    def _task(self, **over):
+        task = {'id': 'task-1', 'title': 'Land the launch page', 'taskType': 'code',
+                'room': 'pressoffice', 'projectLabel': 'Summer Summit',
+                'userStory': 'As a shopper, I want to pay once, so that I can skip the queue',
+                'acceptanceCriteria': 'Given a cart, When I pay, Then I am charged once',
+                'never': '- never touch the live payment table',
+                'note': 'Shipped the checkout flow to pressoffice/checkout.html.'}
+        task.update(over)
+        return task
+
+    def test_delivers_complete_report_once(self):
+        st = _state()
+        task = self._task()
+        sim._deliver_card_report(st, task, 'completed')
+        sim._deliver_card_report(st, task, 'completed')  # idempotent
+        self.assertEqual(len(st['playerInbox']), 1)
+        card = st['playerInbox'][0]
+        self.assertEqual(card['kind'], 'card_report')
+        self.assertEqual(card['closeReason'], 'completed')
+        for fragment in ('STORY closed: Land the launch page',
+                         'Project: Summer Summit',
+                         'As a shopper, I want to pay once',
+                         'Given a cart, When I pay',
+                         'never touch the live payment table',
+                         'Shipped the checkout flow'):
+            self.assertIn(fragment, card['body'])
+        self.assertEqual(len(st['emailOutbox']), 1)
+        self.assertTrue(st['emailOutbox'][0]['kind'].startswith('card_report:task-1'))
+
+    def test_peer_approved_includes_approval_count(self):
+        st = _state()
+        sim._deliver_card_report(st, self._task(), 'peer_approved', approvals=2)
+        card = st['playerInbox'][0]
+        self.assertEqual(card['closeReason'], 'peer-approved')
+        self.assertIn('Peer approvals: 2', card['body'])
+
+    def test_internal_cards_never_report(self):
+        for mutated in ({'reviewOf': 'task-9'}, {'shadow': True},
+                        {'assignedTo': 'player'}, {}):
+            task = self._task(**mutated)
+            st = _state()
+            sim._deliver_card_report(st, task, 'completed')
+            if not mutated:
+                # no mutations = a real card -> delivered
+                self.assertEqual(len(st['playerInbox']), 1)
+            else:
+                self.assertEqual(st.get('playerInbox', []), [],
+                                 f'internal card {mutated} must not reach the player')
+                self.assertEqual(st.get('emailOutbox', []), [])
+
+    def test_spike_report_carries_library_path(self):
+        st = _state()
+        task = self._task(taskType='spike', note='Findings filed to the Library.',
+                          libraryPath='library/research/2026-10-09-ais-investigation.md')
+        sim._deliver_card_report(st, task, 'completed')
+        card = st['playerInbox'][0]
+        self.assertIn('Full artifact: library/research/2026-10-09-ais-investigation.md', card['body'])
+        self.assertIn('Findings filed to the Library.', card['body'])
+
+    def test_finish_task_delivers_report(self):
+        st = _state()
+        st['agents']['nadia'].update({'busy': True, 'inRoom': 'pressoffice',
+                                      'visible': True, 'task': 'task-1',
+                                      'approvedCount': 0, 'weekApprovals': 0,
+                                      'entryX': None, 'entryY': None, 'offDuty': False})
+        st['tasks']['task-1'] = self._task()
+        with unittest.mock.patch.object(sim, '_revoke_task_access'), \
+             unittest.mock.patch.object(sim, '_grade_completed_task'), \
+             unittest.mock.patch.object(sim, '_runbook_task'), \
+             unittest.mock.patch.object(sim, '_maybe_file_followup'):
+            sim.finish_task(st, 'nadia', grid=None)
+        self.assertEqual(st['tasks']['task-1']['status'], 'done')
+        self.assertEqual(len(st['playerInbox']), 1)
+        self.assertEqual(st['playerInbox'][0]['kind'], 'card_report')
+        self.assertIn('never touch the live payment table', st['playerInbox'][0]['body'])
+
+    def test_close_gated_story_delivers_peer_report(self):
+        st = _state()
+        parent = {'id': 'task-p1', 'title': 'Author a research brief', 'taskType': 'code',
+                  'room': 'pressoffice', 'projectLabel': 'PR-1',
+                  'userStory': 'As an analyst, I want a brief, so that I can decide',
+                  'never': '- never cite a repost as a second source',
+                  '_peerGate': {'approvals': 2, 'approvers': ['nadia', 'priya'], 'closed': False}}
+        with unittest.mock.patch.object(sim, '_revoke_task_access'):
+            ok = sim._close_gated_story(st, parent)
+        self.assertTrue(ok)
+        self.assertEqual(parent['status'], 'done')
+        self.assertEqual(len(st['playerInbox']), 1)
+        card = st['playerInbox'][0]
+        self.assertIn('Peer approvals: 2', card['body'])
+        self.assertIn('never cite a repost as a second source', card['body'])
+        # Closing again does not double-deliver.
+        sim._close_gated_story(st, parent)
+        self.assertEqual(len(st['playerInbox']), 1)
+
+
 class EndpointAuth(unittest.TestCase):
     """Gap: /api/player-email/credential's handler
     checks _resolve_requester to reject an agent that explicitly self-
