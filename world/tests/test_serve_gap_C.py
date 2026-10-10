@@ -650,14 +650,25 @@ class SyncModelCatalog(unittest.TestCase):
             )
         models = [self._model('vendor/cheap')]
         purged = serve._sync_model_catalog(models)
-        self.assertEqual(purged, 2)
+        # One unique model is genuinely gone (it appears in BOTH tables, so
+        # the count is the unique-model set, not a per-table total). The
+        # present model must survive untouched -- the regression the swapped
+        # purge params once broke (they matched every row, wiping the whole
+        # catalog and reporting a bogus count).
+        self.assertEqual(purged, 1)
         with serve._db() as conn:
             gone_cat = conn.execute(
                 "SELECT 1 FROM model_catalog WHERE model_id = 'stale/x'").fetchone()
             gone_bench = conn.execute(
                 "SELECT 1 FROM model_benchmark_scores WHERE model_id = 'stale/x'").fetchone()
+            kept_cat = conn.execute(
+                "SELECT 1 FROM model_catalog WHERE model_id = 'vendor/cheap'").fetchone()
+            kept_bench = conn.execute(
+                "SELECT 1 FROM model_benchmark_scores WHERE model_id = 'vendor/cheap'").fetchone()
         self.assertIsNone(gone_cat)
         self.assertIsNone(gone_bench)
+        self.assertIsNotNone(kept_cat)
+        self.assertIsNotNone(kept_bench)
 
     def test_skips_malformed_pricing_entries(self):
         models = [self._model('vendor/bad', prompt='not-a-number')]
@@ -773,10 +784,10 @@ class RefreshModelTiers(unittest.TestCase):
             self._model('vendor/free', '0', '0',
                         input_mods=('image', 'text')),
         ]
-        serve.set_model_benchmark_score('low/m1', 'MMLU', 0.7, 'u')
-        serve.set_model_benchmark_score('mid/m1', 'MMLU-Pro', 0.75, 'u')
-        serve.set_model_benchmark_score('mid/c1', 'SWE-bench Verified', 0.65, 'u')
-        serve.set_model_benchmark_score('high/h1', "Humanity's Last Exam", 0.55, 'u')
+        serve.set_model_benchmark_score('low/m1', 'intelligence_index', 0.7, 'u')
+        serve.set_model_benchmark_score('mid/m1', 'intelligence_index', 0.75, 'u')
+        serve.set_model_benchmark_score('mid/c1', 'coding_index', 0.65, 'u')
+        serve.set_model_benchmark_score('high/h1', 'agentic_index', 0.55, 'u')
         serve.set_model_benchmark_score('mid/v1', 'MMMU', 0.6, 'u')
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                         return_value=models), \
