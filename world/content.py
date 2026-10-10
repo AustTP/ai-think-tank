@@ -4538,9 +4538,10 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # Scoped player-folder + Notes access (world/fs.py): offered to spike
     # workers under the same condition as the ask lane -- FILE_ACCESS_ENABLED
     # AND the player has issued at least one grant. Every call is still gated
-    # by the grant (containment + trash rule + Notes ownership) inside fs.py.
+    # by the grant (containment + trash rule) inside fs.py. `read_store` (the
+    # generic SQLite + gzip + protobuf read) rides the same grant.
     if _serve.FILE_ACCESS_ENABLED and (snapshot.get('fileGrants') or []):
-        spike_tools = spike_tools + [_serve._LOCAL_FILE_TOOL]
+        spike_tools = spike_tools + [_serve._LOCAL_FILE_TOOL, _serve._READ_STORE_TOOL]
     # App control via AppleScript (world/fs.py): offered under APP_ACCESS_ENABLED
     # AND a player-issued app grant. Every call is gated inside fs.py: the
     # bundleId must be granted and the script body validated (no shell / URL /
@@ -4599,6 +4600,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             return colab_compute_tool(tool_name, args)
         if tool_name == 'local_file':
             return _serve._local_file_tool(agent_id, args)
+        if tool_name == 'read_store':
+            return _serve._read_store_tool(agent_id, args)
         if tool_name == 'app_script':
             return _serve._app_script_tool(agent_id, args)
         return web_tool(tool_name, args)
