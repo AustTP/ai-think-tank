@@ -396,7 +396,7 @@ class AskEndpoint(unittest.TestCase):
         # are restricted to the Red Team Auditor role.
         # search_web only appears when TAVILY_API_KEY is actually configured;
         # generate_image/generate_video only when the Higgsfield key pair is.
-        expected = ({'browse_page', 'request_allowlist', 'read_peer_reviews',
+        expected = ({'browse_page', 'download_file', 'request_allowlist', 'read_peer_reviews',
                      'team_digest', 'x_trending_topics', 'search_linkedin_posts', 'api_call',
                      'read_ais_feed', 'read_rss_feed', 'read_market_feed', 'read_live_feed',
                      'propose_api_service'}
