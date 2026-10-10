@@ -7,12 +7,21 @@ this module to tune the village without touching Python:
 - browse_policy.json    -> BROWSE_BLOCK_CATEGORIES      (the browse/execute/save Jev gate)
 - research_desk.json    -> RESEARCH_DESK_PASSES         (the desk's multi-pass questions)
 - watchlist.json        -> RESEARCH_WATCHLIST           (standing research topics; the seed)
+- grants.json           -> GRANTS_CONFIG                (operator-granted app/file access)
 
 The two Research Desk files are deliberately agent-visible: the passes are the
 standing questions every research run answers, and the watchlist is the list
 of sources the desk watches. Agents extend the watchlist through the intent
 lane; serve appends those additions back to watchlist.json (write-back), so
 the operator sees and edits the village's additions in the same file.
+
+grants.json is the operator's own switchboard for agent access, edited without
+touching the API: an entry in `appGrants` (a bundle id, e.g. com.apple.Notes)
+enables the `app_script` tool against that app; an entry in `fileGrants` (an
+absolute folder scope) enables scoped file/`read_store` access there. Entries
+present = granted, removed = revoked; edits apply without restarting the
+server. The /api/file-grants and /api/app-grants endpoints grant the same
+things into live state for a player session.
 
 Load discipline, matching world/api_services.json:
 - Every loader is fail-tolerant and fail-closed: a missing or malformed file
@@ -28,6 +37,7 @@ Load discipline, matching world/api_services.json:
 
 import json
 import os
+import re
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -35,6 +45,7 @@ PLAIN_WRITING_PATH = os.path.join(ROOT, 'plain_writing.json')
 BROWSE_POLICY_PATH = os.path.join(ROOT, 'browse_policy.json')
 RESEARCH_DESK_PATH = os.path.join(ROOT, 'research_desk.json')
 WATCHLIST_PATH = os.path.join(ROOT, 'watchlist.json')
+GRANTS_PATH = os.path.join(ROOT, 'grants.json')
 
 # Fail-closed defaults, kept in code so a fresh clone (or a deleted/corrupt
 # JSON file) boots with a working policy. The shipped JSON files carry the
@@ -84,6 +95,17 @@ PLAIN_WRITING_BAN_LIST = list(PLAIN_WRITING_BAN_LIST_DEFAULT)
 BROWSE_BLOCK_CATEGORIES = list(BROWSE_BLOCK_CATEGORIES_DEFAULT)
 RESEARCH_DESK_PASSES = list(RESEARCH_DESK_PASSES_DEFAULT)
 RESEARCH_WATCHLIST = list(RESEARCH_WATCHLIST_DEFAULT)
+
+# Operator-edited grants (world/grants.json). Same shape as the state grants
+# the /api endpoints manage, but authored by editing the JSON: `appGrants` is a
+# list of {id, bundleId, label, caps:{use}} entries and `fileGrants` is a list
+# of {id, scope, label, caps:{read,write,delete}} entries. Missing/invalid
+# entries are dropped (fail-closed); an absent or corrupt file grants nothing.
+GRANTS_DEFAULT: dict = {'appGrants': [], 'fileGrants': []}
+GRANTS_CONFIG: dict = {'appGrants': [], 'fileGrants': []}
+
+_BUNDLE_ID_RE = re.compile(r'^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$')
+_GRANTS_CACHE = {'mtime': None, 'data': None}
 
 _WATCHLIST_LOAD_ERROR = None
 
@@ -162,26 +184,87 @@ def _load_watchlist(path):
         return []
 
 
+def _load_grants(path):
+    """Read operator-edited grants: {appGrants: [{id, bundleId, caps}],
+    fileGrants: [{id, scope, caps}]}. Fail-closed: a missing/corrupt file
+    grants nothing, malformed entries are dropped, and capabilities default to
+    the least-privilege shape (app use on, file read on, writes off)."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        return {'appGrants': [], 'fileGrants': []}
+    apps = []
+    for g in data.get('appGrants') or []:
+        if not isinstance(g, dict):
+            continue
+        bid = (g.get('bundleId') or '').strip()
+        if not _BUNDLE_ID_RE.match(bid):
+            continue
+        caps = g.get('caps') or {}
+        apps.append({'id': (g.get('id') or '').strip() or f'cfg-app-{len(apps) + 1}',
+                     'bundleId': bid,
+                     'label': (g.get('label') or '').strip() or bid,
+                     'caps': {'use': bool(caps.get('use', True))}})
+    files = []
+    for g in data.get('fileGrants') or []:
+        if not isinstance(g, dict):
+            continue
+        scope = (g.get('scope') or '').strip()
+        if not scope:
+            continue
+        caps = g.get('caps') or {}
+        files.append({'id': (g.get('id') or '').strip() or f'cfg-file-{len(files) + 1}',
+                      'scope': os.path.expanduser(scope),
+                      'label': (g.get('label') or '').strip() or scope,
+                      'caps': {'read': bool(caps.get('read', True)),
+                               'write': bool(caps.get('write', False)),
+                               'delete': bool(caps.get('delete', False))}})
+    return {'appGrants': apps, 'fileGrants': files}
+
+
+def get_grants_config():
+    """Return the current grants.json contents, re-reading the file whenever
+    its mtime changes. This is what makes an operator edit take effect without
+    restarting the server -- every grant check (fs.py) and tool-offer decision
+    (serve.py/content.py) calls this, so adding an appGrant for Notes to the
+    JSON flips the tank's access live."""
+    try:
+        mtime = os.path.getmtime(GRANTS_PATH)
+    except OSError:
+        mtime = -1
+    if _GRANTS_CACHE['mtime'] != mtime:
+        _GRANTS_CACHE['mtime'] = mtime
+        _GRANTS_CACHE['data'] = _load_grants(GRANTS_PATH)
+    return _GRANTS_CACHE['data']
+
+
 def reload_policy_config():
-    """Re-read all four policy files. Called once at import and available for
+    """Re-read all policy files. Called once at import and available for
     tests and for an operator who edits a file without restarting the server.
 
-    The four module-level lists are MUTATED in place, never rebound: modules
+    The module-level lists are MUTATED in place, never rebound: modules
     that did `from config import PLAIN_WRITING_BAN_LIST` (serve.py, content.py)
     hold a reference to the same list objects, so an in-place update is visible
     to every consumer immediately -- a reload takes effect without a restart
-    and without anyone re-importing."""
+    and without anyone re-importing. GRANTS_CONFIG follows the same rule; it is
+    also re-read live on every grant check by get_grants_config()."""
     global _WATCHLIST_LOAD_ERROR
     PLAIN_WRITING_BAN_LIST[:] = _load_list(PLAIN_WRITING_PATH, PLAIN_WRITING_BAN_LIST_DEFAULT, key='banned')
     BROWSE_BLOCK_CATEGORIES[:] = _load_list(BROWSE_POLICY_PATH, BROWSE_BLOCK_CATEGORIES_DEFAULT, key='block_categories')
     RESEARCH_DESK_PASSES[:] = _load_research_desk(RESEARCH_DESK_PATH)
     RESEARCH_WATCHLIST[:] = _load_watchlist(WATCHLIST_PATH)
+    _grants = get_grants_config()
+    GRANTS_CONFIG['appGrants'] = [dict(g) for g in _grants.get('appGrants') or []]
+    GRANTS_CONFIG['fileGrants'] = [dict(g) for g in _grants.get('fileGrants') or []]
     _WATCHLIST_LOAD_ERROR = None
     return {
         'plain_writing': list(PLAIN_WRITING_BAN_LIST),
         'browse_policy': list(BROWSE_BLOCK_CATEGORIES),
         'research_desk': [dict(p) for p in RESEARCH_DESK_PASSES],
         'watchlist': [dict(t) for t in RESEARCH_WATCHLIST],
+        'grants': {'appGrants': [dict(g) for g in GRANTS_CONFIG['appGrants']],
+                   'fileGrants': [dict(g) for g in GRANTS_CONFIG['fileGrants']]},
     }
 
 

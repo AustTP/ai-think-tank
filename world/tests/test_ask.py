@@ -385,7 +385,9 @@ class AskEndpoint(unittest.TestCase):
             return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
         with unittest.mock.patch.object(serve, '_coding_tier_slug', return_value='fake-model'), \
              unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='fake-model'), \
-             unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post):
+             unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post), \
+             unittest.mock.patch.object(serve, 'get_grants_config',
+                                        return_value={'appGrants': [], 'fileGrants': []}):
             r = c.post('/api/intent/ask', json={'question': 'hi', 'agentId': 'ben'})
         self.assertEqual(r.status_code, 200, r.text)
         tool_names = {t['function']['name'] for t in seen['tools']}

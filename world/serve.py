@@ -179,6 +179,7 @@ from config import (  # noqa: E402,F401
     BROWSE_BLOCK_CATEGORIES,
     PLAIN_WRITING_BAN_LIST,
     RESEARCH_WATCHLIST,
+    get_grants_config,
     note_watchlist_topic,
     reload_policy_config,
 )
@@ -12841,20 +12842,47 @@ async def feedback_player_inbox(message_id: str, request: Request):
     return JSONResponse({'ok': True, 'feedback': feedback})
 
 
+# Effective grants = state grants (added by the player through the /api
+# endpoints, persisted in think_tank.db) UNION operator-edited grants from
+# world/grants.json (config.get_grants_config, re-read live on mtime change).
+# Both are player-authored sources; an operator edit takes effect without
+# restarting the server. fs.py's grant checks call these, so every scoped
+# tool honors the JSON grants too.
+def _merge_grants(primary, extra):
+    seen = set()
+    out = []
+    for g in list(primary) + list(extra):
+        gid = g.get('id')
+        if gid:
+            if gid in seen:
+                continue
+            seen.add(gid)
+        out.append(g)
+    return out
+
+
+def _effective_file_grants(state):
+    return _merge_grants(state.get('fileGrants') or [], get_grants_config()['fileGrants'])
+
+
+def _effective_app_grants(state):
+    return _merge_grants(state.get('appGrants') or [], get_grants_config()['appGrants'])
+
+
 @app.get('/api/file-grants')
 async def list_file_grants(request: Request):
-    """The player's current file-access grants (scope + capability set) and the
-    Notes ownership registry summary. PLAYER-only. Read-only."""
+    """The player's current file-access grants (scope + capability set),
+    including operator-edited grants from world/grants.json. PLAYER-only.
+    Read-only."""
     if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     state = get_state_from_db()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
-    grants = []
-    for g in state.get('fileGrants') or []:
-        grants.append({'id': g.get('id'), 'scope': g.get('scope'),
-                       'label': g.get('label'), 'caps': g.get('caps') or {}})
-    return JSONResponse({'ok': True, 'grants': grants})
+    grants = _effective_file_grants(state)
+    return JSONResponse({'ok': True, 'grants': [
+        {'id': g.get('id'), 'scope': g.get('scope'),
+         'label': g.get('label'), 'caps': g.get('caps') or {}} for g in grants]})
 
 
 @app.post('/api/file-grants')
@@ -12923,8 +12951,9 @@ async def revoke_file_grant(grant_id: str, request: Request):
 
 @app.get('/api/app-grants')
 async def list_app_grants(request: Request):
-    """The player's current app-control grants (bundleId + capability set).
-    PLAYER-only. Read-only."""
+    """The player's current app-control grants (bundleId + capability set),
+    including operator-edited grants from world/grants.json. PLAYER-only.
+    Read-only."""
     if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     state = get_state_from_db()
@@ -12932,7 +12961,7 @@ async def list_app_grants(request: Request):
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     grants = [{'id': g.get('id'), 'bundleId': g.get('bundleId'),
                'label': g.get('label'), 'caps': g.get('caps') or {}}
-              for g in state.get('appGrants') or []]
+              for g in _effective_app_grants(state)]
     return JSONResponse({'ok': True, 'grants': grants})
 
 
@@ -12959,7 +12988,7 @@ async def add_app_grant(request: Request):
     state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
-    for g in state.get('appGrants') or []:
+    for g in _effective_app_grants(state):
         if (g.get('bundleId') or '').strip() == bundle_id:
             return JSONResponse({'error': 'a grant for this app already exists'}, status_code=409)
     grant = {
@@ -13920,9 +13949,9 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
 
     tools = (AGENT_ASK_TOOLS + [_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL]
             + (SECURITY_TEST_TOOLS if is_security_test_role else []))
-    if FILE_ACCESS_ENABLED and (state.get('fileGrants') or []):
+    if FILE_ACCESS_ENABLED and _effective_file_grants(state):
         tools = tools + [_LOCAL_FILE_TOOL, _READ_STORE_TOOL]
-    if APP_ACCESS_ENABLED and (state.get('appGrants') or []):
+    if APP_ACCESS_ENABLED and _effective_app_grants(state):
         tools = tools + [_APP_SCRIPT_TOOL]
     try:
         if model:

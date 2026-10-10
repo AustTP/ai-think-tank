@@ -140,6 +140,9 @@ class ReadStoreTests(unittest.TestCase):
                                       'caps': {'read': True}}]}
         self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
         self._gs.start()
+        self._cg = unittest.mock.patch.object(
+            serve, 'get_grants_config', return_value={'appGrants': [], 'fileGrants': []})
+        self._cg.start()
         self._env = unittest.mock.patch.dict(os.environ, {'TRASH_DIR': os.path.join(self.tmp, 'Trash')})
         self._env.start()
         import sqlite3 as _s
@@ -155,6 +158,7 @@ class ReadStoreTests(unittest.TestCase):
 
     def tearDown(self):
         self._gs.stop()
+        self._cg.stop()
         self._env.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -324,6 +328,76 @@ class AppScriptTests(unittest.TestCase):
                 fs.app_script('com.apple.Notes', 'count of notes')
 
 
+class ConfigGrantTests(unittest.TestCase):
+    """The operator-edited world/grants.json path: an appGrant/fileGrant there
+    enables the tool even when state has no grants, and is revoked by removing
+    it (empty config grants nothing)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fs-cfg-')
+        self.scope = os.path.join(self.tmp, 'Data')
+        os.makedirs(self.scope)
+        self.state = {}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._gs.start()
+
+    def tearDown(self):
+        self._gs.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _patch_config(self, grants):
+        p = unittest.mock.patch.object(
+            serve, 'get_grants_config', return_value=grants)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_config_app_grant_enables_app_script(self):
+        self._patch_config({'appGrants': [{'id': 'cfg-a-1', 'bundleId': 'com.apple.Notes',
+                                            'label': 'Notes', 'caps': {'use': True}}],
+                            'fileGrants': []})
+        with unittest.mock.patch.object(fs, '_osascript', return_value=('3 notes', None)):
+            out = fs.app_script('com.apple.Notes', 'count of notes')
+        self.assertEqual(out, '3 notes')
+
+    def test_config_app_grant_revoked_by_removal(self):
+        self._patch_config({'appGrants': [], 'fileGrants': []})
+        with self.assertRaises(PermissionError):
+            fs.app_script('com.apple.Notes', 'count of notes')
+
+    def test_config_file_grant_enables_read_store(self):
+        import sqlite3 as _s
+        db = os.path.join(self.scope, 'store.sqlite')
+        conn = _s.connect(db)
+        conn.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)')
+        conn.execute('INSERT INTO t (name) VALUES (?)', ('x',))
+        conn.commit()
+        conn.close()
+        self._patch_config({'appGrants': [],
+                            'fileGrants': [{'id': 'cfg-g-1', 'scope': self.scope,
+                                            'caps': {'read': True}}]})
+        rows = fs.read_store(self.scope, 'store.sqlite', 'SELECT name FROM t')
+        self.assertEqual([r['name'] for r in rows], ['x'])
+
+    def test_config_file_grant_write_stays_off(self):
+        # _load_grants defaults file caps to read-only; a config grant that
+        # lists only read cannot write when it is the only grant.
+        self._patch_config({'appGrants': [],
+                            'fileGrants': [{'id': 'cfg-g-1', 'scope': self.scope,
+                                            'caps': {'read': True}}]})
+        self.state['fileGrants'] = []
+        with self.assertRaises(PermissionError):
+            fs.write_file(self.scope, 'new.txt', 'content')
+
+    def test_effective_merge_dedupes_by_id(self):
+        self._patch_config({'appGrants': [{'id': 'a-1', 'bundleId': 'com.apple.Calendar',
+                                            'label': 'Calendar', 'caps': {'use': True}}],
+                            'fileGrants': []})
+        state = {'appGrants': [{'id': 'a-1', 'bundleId': 'com.apple.Calendar',
+                                'label': 'Calendar', 'caps': {'use': True}}]}
+        effective = serve._effective_app_grants(state)
+        self.assertEqual(len(effective), 1)
+
+
 class AppGrantApiTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='fs-appgrant-')
@@ -334,9 +408,13 @@ class AppGrantApiTests(unittest.TestCase):
         self.state = {'appGrants': []}
         self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
         self._gs.start()
+        self._cg = unittest.mock.patch.object(
+            serve, 'get_grants_config', return_value={'appGrants': [], 'fileGrants': []})
+        self._cg.start()
 
     def tearDown(self):
         self._gs.stop()
+        self._cg.stop()
         self._cm.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
