@@ -808,6 +808,47 @@ class RefreshModelTiers(unittest.TestCase):
                 "SELECT slug FROM model_tiers WHERE band = 'low'").fetchone()
         self.assertEqual(row[0], 'low/m1')
 
+    def test_chain_prefers_primary_metric_pool(self):
+        # BAND_BENCHMARK is an ordered metric CHAIN. As long as ANY candidate in
+        # the pool is scored on the primary metric, the fallback metric does NOT
+        # let a fallback-only model compete on a different scale -- a modest
+        # intelligence_index model wins over a fallback-only MMLU-Pro star.
+        models = [
+            self._model('low/primary', '0.0000001', '0.0000001'),
+            self._model('low/fallback', '0.0000001', '0.0000001'),
+        ]
+        serve.set_model_benchmark_score('low/primary', 'intelligence_index', 0.7, 'u')
+        serve.set_model_benchmark_score('low/fallback', 'MMLU-Pro', 0.95, 'u')
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        self.assertEqual(chosen['low']['id'], 'low/primary')
+
+    def test_chain_uses_fallback_when_primary_pool_empty(self):
+        # When NO candidate in the pool has the primary metric, the band falls
+        # through to the fallback (HF Open LLM MMLU-Pro) instead of giving up
+        # and trusting Jev's classifier -- that is the point of the fallback.
+        models = [
+            self._model('low/a', '0.0000001', '0.0000001'),
+            self._model('low/b', '0.00000005', '0.00000005'),
+        ]
+        serve.set_model_benchmark_score('low/a', 'MMLU-Pro', 0.7, 'u')
+        serve.set_model_benchmark_score('low/b', 'MMLU-Pro', 0.95, 'u')
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        self.assertEqual(chosen['low']['id'], 'low/b')
+
     def test_empty_band_skips_and_classifier_fallback_picks(self):
         models = [self._model('mid/only', '0.000002', '0.000002')]
         decision = {'answers': {'q': {'choice': 'mid/only'}}, 'usage': {'cost': 0.01}}

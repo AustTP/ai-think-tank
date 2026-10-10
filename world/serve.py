@@ -786,9 +786,21 @@ def init_db():
             benchmark TEXT NOT NULL,
             score REAL NOT NULL,
             source_url TEXT,
+            evaluator TEXT,
             checked_at REAL NOT NULL,
             PRIMARY KEY (model_id, benchmark)
         )''')
+        # Migration: the evaluator column (who actually measured the score --
+        # 'artificial_analysis' for the OpenRouter/AA indices, 'huggingface_open_llm'
+        # for the Open LLM Leaderboard fallback, 'player' for hand-entered research)
+        # was added after the table first shipped. Back-fill it for the AA-index
+        # rows already in the table so an existing DB carries real evaluator data.
+        bench_cols = {r[1] for r in conn.execute('PRAGMA table_info(model_benchmark_scores)')}
+        if 'evaluator' not in bench_cols:
+            conn.execute('ALTER TABLE model_benchmark_scores ADD COLUMN evaluator TEXT')
+            conn.execute(
+                "UPDATE model_benchmark_scores SET evaluator = 'artificial_analysis' "
+                "WHERE evaluator IS NULL AND benchmark IN ('intelligence_index', 'coding_index', 'agentic_index')")
         # One-time migration for any think_tank.db created before the rename
         # above -- preserves real, already-cited research instead of
         # silently losing it the first time this runs against an existing
@@ -1041,6 +1053,21 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'active',
             proposed_by TEXT,
             created_at REAL,
+            updated_at REAL
+        )''')
+
+        # Benchmark data-source registry -- the URLs the daily model-tier
+        # refresh fetches external evaluator data from (the Artificial Analysis
+        # LLM leaderboard page, the HF Open LLM Leaderboard parquet, ...). These
+        # links drift over time, so they live HERE, not in code: a player or a
+        # director/admin agent PUTs a fresh JSON document to /api/data-sources
+        # and the next refresh picks it up with no restart. Deliberately NOT
+        # seeded -- an unset source is skipped with a log line until an
+        # operator configures it.
+        conn.execute('''CREATE TABLE IF NOT EXISTS data_sources (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_by TEXT,
             updated_at REAL
         )''')
 
@@ -10011,22 +10038,55 @@ MODEL_BAND_PURPOSE = {
 # price pool and score signal. The catalog's ONLY other benchmark block
 # (design_arena) is visual-GENERATION elo, which no band consumes, so it is
 # not ingested.
+#
+# Each band's entry is an ordered metric CHAIN, not a single benchmark. The
+# picker uses the FIRST metric that any candidate in the band's pool is scored
+# on; a later metric only matters when no candidate has any earlier one. That
+# gives a fallback a chance to make a model visible (the HF Open LLM
+# Leaderboard's MMLU-Pro for open-weights models the AA index never measured,
+# evaluator 'huggingface_open_llm') WITHOUT ever ranking a fallback-only model
+# against a primary-scored one on a different scale -- within one metric the
+# scores are comparable, across metrics they are not.
 BAND_BENCHMARK = {
-    'low': 'intelligence_index',
-    'mid': 'intelligence_index',
-    'high': 'agentic_index',
-    'coding': 'coding_index',
+    'low': ('intelligence_index', 'MMLU-Pro'),
+    'mid': ('intelligence_index', 'MMLU-Pro'),
+    'high': ('agentic_index',),
+    'coding': ('coding_index',),
     # 'vision' stays on MMMU (player-entered, cited research -- the catalog
     # carries no image-COMPREHENSION metric to back it). Listed here so one
     # place answers "what benchmark backs this pick" for every real model
     # choice this system makes.
-    'vision': 'MMMU',
+    'vision': ('MMMU',),
 }
 # The Artificial Analysis capability indices the OpenRouter catalog carries in
 # each model's `benchmarks.artificial_analysis` block, ingested automatically.
 # Source citation for auto-ingested rows is the model's own OpenRouter page.
 CATALOG_ARTIFICIAL_ANALYSIS_METRICS = ('intelligence_index', 'coding_index', 'agentic_index')
 CATALOG_BENCHMARK_SOURCE_URL = 'https://openrouter.ai/'
+# Evaluator labels (who actually measured a score). The catalog's AA block and
+# the AA leaderboard backfill are the SAME evaluator, delivered two ways.
+EVALUATOR_ARTIFICIAL_ANALYSIS = 'artificial_analysis'
+EVALUATOR_HUGGINGFACE = 'huggingface_open_llm'
+EVALUATOR_PLAYER = 'player'
+# The data-source registry keys. The KEYS are a fixed code contract (the
+# config interface); the VALUES (the actual URLs) are operator data held in the
+# data_sources table, PUT via /api/data-sources with no restart -- these links
+# drift over time and the code must not hard-code them.
+DATA_SOURCE_KEYS = ('aa_leaderboard_url', 'hf_contents_parquet_url', 'hf_contents_source_url')
+
+
+def _get_data_source(key, default=None):
+    """Current value of a benchmark data-source key, or `default` when unset.
+    Reads the registry on every call (small table, hot-applied by design --
+    an operator's PUT is picked up immediately, no cache to invalidate)."""
+    if key not in DATA_SOURCE_KEYS:
+        return default
+    try:
+        with _db() as conn:
+            row = conn.execute('SELECT value FROM data_sources WHERE key = ?', (key,)).fetchone()
+        return row[0] if row else default
+    except Exception:  # noqa: BLE001 -- registry unavailable -> default (fail closed)
+        return default
 # How many points below the single best score on file, FOR THAT BAND'S OWN
 # BENCHMARK, still counts as "good enough" to let price break the tie --
 # picked for the coding band:
@@ -10045,20 +10105,20 @@ BAND_QUALITY_FLOOR_GAP = {'high': 2}
 def get_model_benchmark_scores():
     with _db() as conn:
         rows = conn.execute(
-            'SELECT model_id, benchmark, score, source_url, checked_at FROM model_benchmark_scores'
+            'SELECT model_id, benchmark, score, source_url, evaluator, checked_at FROM model_benchmark_scores'
         ).fetchall()
     return [
-        {'model_id': r[0], 'benchmark': r[1], 'score': r[2], 'source_url': r[3], 'checked_at': r[4]}
+        {'model_id': r[0], 'benchmark': r[1], 'score': r[2], 'source_url': r[3], 'evaluator': r[4], 'checked_at': r[5]}
         for r in rows
     ]
 
 
-def set_model_benchmark_score(model_id, benchmark, score, source_url):
+def set_model_benchmark_score(model_id, benchmark, score, source_url, evaluator='player'):
     with _db() as conn:
         conn.execute(
-            'INSERT INTO model_benchmark_scores (model_id, benchmark, score, source_url, checked_at) VALUES (?, ?, ?, ?, ?) '
-            'ON CONFLICT(model_id, benchmark) DO UPDATE SET score=excluded.score, source_url=excluded.source_url, checked_at=excluded.checked_at',
-            (model_id, benchmark, score, source_url, time.time()),
+            'INSERT INTO model_benchmark_scores (model_id, benchmark, score, source_url, evaluator, checked_at) VALUES (?, ?, ?, ?, ?, ?) '
+            'ON CONFLICT(model_id, benchmark) DO UPDATE SET score=excluded.score, source_url=excluded.source_url, evaluator=excluded.evaluator, checked_at=excluded.checked_at',
+            (model_id, benchmark, score, source_url, evaluator, time.time()),
         )
 
 
@@ -10266,14 +10326,201 @@ def _ingest_catalog_benchmarks(models):
                 if not isinstance(value, (int, float)):
                     continue
                 conn.execute(
-                    'INSERT INTO model_benchmark_scores (model_id, benchmark, score, source_url, checked_at) '
-                    'VALUES (?, ?, ?, ?, ?) '
+                    'INSERT INTO model_benchmark_scores (model_id, benchmark, score, source_url, evaluator, checked_at) '
+                    'VALUES (?, ?, ?, ?, ?, ?) '
                     'ON CONFLICT(model_id, benchmark) DO UPDATE SET '
-                    'score=excluded.score, source_url=excluded.source_url, checked_at=excluded.checked_at',
-                    (m['id'], metric, float(value), CATALOG_BENCHMARK_SOURCE_URL + m['id'], now),
+                    'score=excluded.score, source_url=excluded.source_url, evaluator=excluded.evaluator, checked_at=excluded.checked_at',
+                    (m['id'], metric, float(value), CATALOG_BENCHMARK_SOURCE_URL + m['id'],
+                     'artificial_analysis', now),
                 )
                 written += 1
     return written
+
+
+def _benchmark_name_tokens(name):
+    """Normalize a model display name into a token set for fuzzy matching
+    between the catalog ('OpenAI: GPT-6 Luna Pro') and an evaluator's own
+    names ('GPT-6 Luna (max)'). Parentheticals are reasoning-effort variants,
+    not model identity, so they are dropped; the vendor prefix and punctuation
+    collapse."""
+    name = re.sub(r'\(.*?\)', '', (name or '').lower())
+    name = re.sub(r'[:/]', ' ', name)
+    name = re.sub(r'[^a-z0-9 ]', '', name)
+    return set(name.split())
+
+
+def _aa_leaderboard_scores(html):
+    """Parse the Artificial Analysis LLM leaderboard page into
+    {display_name: intelligence_index}. Tolerates the '*' flags and the
+    non-numeric cells that mark models AA has not indexed."""
+    out = {}
+    for row in re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.S):
+        cells = [' '.join(re.sub(r'<[^>]+>', ' ', c).split())
+                 for c in re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, re.S)]
+        if len(cells) >= 4 and cells[0]:
+            index = cells[3].replace('*', '').replace('.', '', 1)
+            if index.isdigit():
+                out[cells[0]] = float(index)
+    return out
+
+
+def _match_aa_score(model_name, aa_scores, min_overlap=0.6):
+    """Fuzzy-match a catalog model name against AA's display names. The score
+    is the shared-token fraction of the SMALLER token set, so 'GPT-6 Luna Pro'
+    matches 'GPT-6 Luna (max)' (3/3) but not 'GPT-6 Luna (low)' with less
+    overlap than a different model's. When several AA variants tie, prefer the
+    'max' / 'default fallback' variant -- the same variant the OpenRouter
+    catalog resolves for its own AA block. Returns None when nothing clears
+    the overlap bar."""
+    nt = _benchmark_name_tokens(model_name)
+    if not nt:
+        return None
+    candidates = []
+    for key, value in aa_scores.items():
+        at = _benchmark_name_tokens(key)
+        inter = len(nt & at)
+        if inter == 0:
+            continue
+        candidates.append((inter / min(len(nt), len(at)), key, value))
+    if not candidates:
+        return None
+    best_score = max(c[0] for c in candidates)
+    if best_score < min_overlap:
+        return None
+    best = [c for c in candidates if c[0] == best_score]
+    best.sort(key=lambda c: 0 if ('max' in c[1].lower() or 'default fallback' in c[1].lower()) else 1)
+    return best[0][2]
+
+
+def _ingest_aa_leaderboard(models):
+    """Backfill intelligence_index for catalog models the OpenRouter catalog
+    carries no AA data for (their entry has no artificial_analysis block),
+    straight from Artificial Analysis's public LLM leaderboard. The leaderboard
+    page is the same source the catalog's AA block comes from, with wider
+    coverage, and it is publicly scrapeable (the login wall is on the /models
+    charts page, not /leaderboards/models). Backfill-only: INSERT OR IGNORE, so
+    an already-resolved catalog value is never disputed. A model AA never
+    evaluated (e.g. legacy 2024 open-weights) simply gets no row -- there is no
+    number to import. Returns the number of new rows."""
+    url = _get_data_source('aa_leaderboard_url')
+    if not url:
+        print('[model-tiers] data source aa_leaderboard_url unset -- skipping AA leaderboard backfill', flush=True)
+        return 0
+    import urllib.request as _ur
+    try:
+        with _ur.urlopen(url, timeout=20) as resp:  # nosec B310 -- URL comes from the operator registry, not user input
+            html = resp.read().decode('utf-8', 'ignore')
+    except Exception:
+        return 0
+    aa_scores = _aa_leaderboard_scores(html)
+    if not aa_scores:
+        return 0
+    now = time.time()
+    added = 0
+    with _db() as conn:
+        for m in models:
+            mid = m['id']
+            have = conn.execute(
+                'SELECT 1 FROM model_benchmark_scores WHERE model_id=? AND benchmark=?',
+                (mid, 'intelligence_index'),
+            ).fetchone()
+            if have:
+                continue
+            value = _match_aa_score(m.get('name') or mid, aa_scores)
+            if value is None:
+                continue
+            cur = conn.execute(
+                'INSERT OR IGNORE INTO model_benchmark_scores (model_id, benchmark, score, source_url, evaluator, checked_at) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (mid, 'intelligence_index', value, url, EVALUATOR_ARTIFICIAL_ANALYSIS, now),
+            )
+            if cur.rowcount:
+                added += 1
+    return added
+
+
+def _parse_hf_contents(parquet_bytes):
+    """Read the Open LLM Leaderboard `contents` parquet into
+    {hub_model_id_lower: mmlu_pro}. Returns None when it cannot be read
+    (pyarrow absent, format change, ...) so callers skip quietly."""
+    try:
+        import io as _io
+        import pyarrow.parquet as pq
+        table = pq.read_table(_io.BytesIO(parquet_bytes))
+        names = table.column('fullname').to_pylist()
+        scores = table.column('MMLU-PRO').to_pylist()
+        return {
+            str(name).lower(): (float(score) if score is not None else None)
+            for name, score in zip(names, scores)
+        }
+    except Exception:
+        return None
+
+
+def _ingest_hf_open_llm_fallback(models):
+    """Fallback metric for open-weights models the Artificial Analysis index
+    never measured (Mistral NeMo, Llama 3.1 70B, ...): their MMLU-Pro score
+    from the archived HF Open LLM Leaderboard. Matched exactly through each
+    catalog entry's hugging_face_id where present, else by normalized name.
+    INSERT OR IGNORE: an existing row -- player research, an AA score -- is
+    never clobbered by a fallback. pyarrow is an optional dependency; when it
+    is not installed the fallback is skipped with a log line, exactly like the
+    other optional ingestion dependencies (openpyxl, pypdf, ...)."""
+    import urllib.request as _ur
+    try:
+        import pyarrow.parquet  # noqa: F401 -- availability guard
+    except ImportError:
+        print('[model-tiers] pyarrow not installed, skipping HF Open LLM fallback', flush=True)
+        return 0
+    parquet_url = _get_data_source('hf_contents_parquet_url')
+    source_url = _get_data_source('hf_contents_source_url') or parquet_url
+    if not parquet_url:
+        print('[model-tiers] data source hf_contents_parquet_url unset -- skipping HF Open LLM fallback', flush=True)
+        return 0
+    try:
+        with _ur.urlopen(parquet_url, timeout=20) as resp:  # nosec B310 -- URL comes from the operator registry, not user input
+            meta = json.loads(resp.read().decode('utf-8', 'ignore'))
+        data_url = (meta.get('parquet_files') or [{}])[0].get('url')
+        if not data_url:
+            return 0
+        with _ur.urlopen(data_url, timeout=60) as resp:  # nosec B310 -- URL comes from the operator registry, not user input
+            data = resp.read()
+    except Exception:
+        return 0
+    hf = _parse_hf_contents(data)
+    if not hf:
+        return 0
+    now = time.time()
+    added = 0
+    with _db() as conn:
+        for m in models:
+            mid = m['id']
+            hf_id = m.get('hugging_face_id')
+            value = hf.get(str(hf_id).lower()) if hf_id else None
+            if value is None:
+                # No exact hub id: match by name tokens. Prefer the SHORTEST
+                # hub id that contains the catalog name's tokens -- fine-tunes
+                # carry extra tokens (DPO, remix, ...), so the closest base
+                # identity wins.
+                nt = _benchmark_name_tokens(m.get('name') or mid)
+                best_id, best_len = None, None
+                for hub_id, score in hf.items():
+                    if not nt or score is None:
+                        continue
+                    if nt <= _benchmark_name_tokens(hub_id) and (best_len is None or len(_benchmark_name_tokens(hub_id)) < best_len):
+                        best_id, best_len = hub_id, len(_benchmark_name_tokens(hub_id))
+                if best_id is not None:
+                    value = hf[best_id]
+            if value is None:
+                continue
+            cur = conn.execute(
+                'INSERT OR IGNORE INTO model_benchmark_scores (model_id, benchmark, score, source_url, evaluator, checked_at) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (mid, 'MMLU-Pro', value, source_url, EVALUATOR_HUGGINGFACE, now),
+            )
+            if cur.rowcount:
+                added += 1
+    return added
 
 
 def _sync_model_catalog(models):
@@ -10285,6 +10532,11 @@ def _sync_model_catalog(models):
         model_benchmark_scores first -- _ingest_catalog_benchmarks -- then
         copied into the catalog row; player-entered research under other
         benchmark names is carried over untouched)
+      * catalog models the OpenRouter entry carries no AA data for are
+        backfilled from Artificial Analysis's own public leaderboard
+        (_ingest_aa_leaderboard), then from the HF Open LLM Leaderboard's
+        MMLU-Pro fallback for open-weights models AA never measured
+        (_ingest_hf_open_llm_fallback)
       * models that vanished from the live catalog are removed from BOTH
         model_catalog and model_benchmark_scores -- a score record for a model
         that no longer exists on OpenRouter is dead weight the value pick can
@@ -10292,6 +10544,8 @@ def _sync_model_catalog(models):
     Returns the number of models purged (0 normally), so callers can surface
     catalog churn."""
     _ingest_catalog_benchmarks(models)
+    _ingest_aa_leaderboard(models)
+    _ingest_hf_open_llm_fallback(models)
     now = time.time()
     seen_ids = set()
     with _db() as conn:
@@ -10316,8 +10570,8 @@ def _sync_model_catalog(models):
             )
         # Carry over each model's known benchmark scores into the catalog row.
         known = {}
-        for r in conn.execute('SELECT model_id, benchmark, score FROM model_benchmark_scores').fetchall():
-            known.setdefault(r[0], {})[r[1]] = r[2]
+        for r in conn.execute('SELECT model_id, benchmark, score, evaluator FROM model_benchmark_scores').fetchall():
+            known.setdefault(r[0], {})[r[1]] = {'score': r[2], 'evaluator': r[3]}
         for mid, bench_scores in known.items():
             conn.execute(
                 'UPDATE model_catalog SET scores = ? WHERE model_id = ?',
@@ -10364,8 +10618,6 @@ async def refresh_model_tiers():
     chosen = {}
     for band, purpose in MODEL_BAND_PURPOSE.items():
         pool = buckets.get(band, [])
-        benchmark = BAND_BENCHMARK[band]
-        scores = {r['model_id']: r['score'] for r in all_benchmark_rows if r['benchmark'] == benchmark}
 
         # 'coding' and 'high' (planning) both search EVERY price band's
         # candidates, not just same-named price bucket -- price bracket
@@ -10381,7 +10633,16 @@ async def refresh_model_tiers():
         capability_band = band in ('coding', 'high')
         candidate_pool = [m for band_pool in buckets.values() for m in band_pool] if capability_band else pool
         candidate_pool = _apply_band_price_ceiling(band, candidate_pool)
-        picked = await _best_value_pick(candidate_pool, scores, BAND_QUALITY_FLOOR_GAP.get(band))
+        # BAND_BENCHMARK[band] is an ordered metric CHAIN: use the first metric
+        # any candidate in this pool is scored on, fall through only when
+        # nothing is. Keeps each pick inside one evaluator's scale -- a
+        # fallback-only model is never ranked against a primary-scored one.
+        picked = None
+        for benchmark in BAND_BENCHMARK[band]:
+            scores = {r['model_id']: r['score'] for r in all_benchmark_rows if r['benchmark'] == benchmark}
+            picked = await _best_value_pick(candidate_pool, scores, BAND_QUALITY_FLOOR_GAP.get(band))
+            if picked is not None:
+                break
 
         if picked is None and not pool:
             continue
@@ -18855,6 +19116,68 @@ def _operator_gate(request):
     return False, None
 
 
+@app.get('/api/data-sources')
+async def get_data_sources(request: Request):
+    """Current benchmark data-source registry (the external URLs the daily
+    model-tier refresh fetches evaluator data from). Operator-gated read --
+    same gate as the other registries: player session or director/admin agent.
+    Returns the known KEYS (a fixed code contract) alongside whatever values
+    an operator has configured, so a fresh registry self-documents what to
+    fill in."""
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    with _db() as conn:
+        rows = conn.execute('SELECT key, value, updated_by, updated_at FROM data_sources').fetchall()
+    return JSONResponse({
+        'ok': True,
+        'knownKeys': list(DATA_SOURCE_KEYS),
+        'sources': {k: {'value': v, 'updatedBy': u, 'updatedAt': t} for k, v, u, t in rows},
+        'actor': actor,
+    })
+
+
+@app.put('/api/data-sources')
+async def put_data_sources(request: Request):
+    """Upload a fresh benchmark data-source document. Body:
+    {"sources": {"aa_leaderboard_url": "https://...", ...}}. Validated against
+    the known keys and http(s) URL shape; applied to the registry immediately
+    -- the next model-tier refresh reads the new value, no restart, no cache to
+    invalidate. Gated by _operator_gate: a player or a director/admin agent.
+    Every change is attributed in action_log so the operator who moved a
+    link is on record."""
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 -- malformed body -> 400
+        return JSONResponse({'error': 'request body must be JSON'}, status_code=400)
+    updates = body.get('sources') or {}
+    if not isinstance(updates, dict):
+        return JSONResponse({'error': 'sources must be an object of {key: url}'}, status_code=400)
+    applied = {}
+    now = time.time()
+    for key, value in updates.items():
+        if key not in DATA_SOURCE_KEYS:
+            return JSONResponse({'error': f'unknown data source key: {key}', 'knownKeys': list(DATA_SOURCE_KEYS)}, status_code=400)
+        if not isinstance(value, str) or not value.strip():
+            return JSONResponse({'error': f'{key} must be a non-empty URL string'}, status_code=400)
+        value = value.strip()
+        if not re.match(r'^https?://[^\s]+$', value):
+            return JSONResponse({'error': f'{key} must be an http(s) URL'}, status_code=400)
+        applied[key] = value
+    with _db() as conn:
+        for key, value in applied.items():
+            conn.execute(
+                'INSERT INTO data_sources (key, value, updated_by, updated_at) VALUES (?, ?, ?, ?) '
+                'ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_by=excluded.updated_by, updated_at=excluded.updated_at',
+                (key, value, actor, now),
+            )
+    log_action(actor, 'data_sources_updated', {'sources': applied})
+    return JSONResponse({'ok': True, 'updatedBy': actor, 'sources': applied})
+
+
 @app.post('/api/rss/propose')
 async def rss_propose(request: Request):
     """Agent/player-facing proposal of a new RSS feed. Validates the URL
@@ -22806,10 +23129,11 @@ async def model_benchmark_scores_post(request: Request):
     benchmark = body.get('benchmark')
     score = body.get('score')
     source_url = body.get('sourceUrl')
+    evaluator = (body.get('evaluator') or 'player').strip()
     if not model_id or not benchmark or not isinstance(score, (int, float)):
         return JSONResponse({'error': 'modelId, benchmark, and a numeric score are required'}, status_code=400)
-    set_model_benchmark_score(model_id, benchmark, float(score), source_url)
-    log_action('player', 'model_benchmark_score_recorded', {'modelId': model_id, 'benchmark': benchmark, 'score': score, 'sourceUrl': source_url})
+    set_model_benchmark_score(model_id, benchmark, float(score), source_url, evaluator)
+    log_action('player', 'model_benchmark_score_recorded', {'modelId': model_id, 'benchmark': benchmark, 'score': score, 'evaluator': evaluator, 'sourceUrl': source_url})
     return JSONResponse({'ok': True})
 
 
