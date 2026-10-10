@@ -15,6 +15,7 @@ import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import config
 import serve
 import sim
 
@@ -797,6 +798,69 @@ class SimTaskLifecycle(unittest.TestCase):
         self.assertIn('You are ' + names[seen['agent']], ctx)
         self.assertIn('pressoffice', ctx)
         self.assertIn('Build the login flow', ctx)
+
+
+class SyncResearchWatchlist(unittest.TestCase):
+    """The watchlist is a live mirror: an operator edit to world/watchlist.json
+    must reach state['researchTopics'] without a restart (the boot seed alone
+    could not), and a topic removed from the file must stop firing. Mirrors
+    the _check_schedules gate: only the real server boot enables
+    ALLOW_WATCHLIST_WRITE, so tests that enable it exercise the sync on a
+    controlled fake watchlist."""
+
+    def _call(self, state, topics, ok=True):
+        with unittest.mock.patch.object(config, 'ALLOW_WATCHLIST_WRITE', True), \
+             unittest.mock.patch.object(config, 'get_research_watchlist',
+                                        return_value=(topics, ok)):
+            return sim._sync_research_watchlist(state)
+
+    def test_adds_new_watchlist_topic_live(self):
+        state = {'researchTopics': []}
+        added, removed = self._call(state, [
+            {'topic': 'z', 'startUrl': 'https://z.example', 'cadenceMs': 3600000}])
+        self.assertEqual((added, removed), (1, 0))
+        self.assertEqual(len(state['researchTopics']), 1)
+        t = state['researchTopics'][0]
+        self.assertEqual(t['topic'], 'z')
+        self.assertGreaterEqual(t['cadenceMs'], sim.MIN_RESEARCH_CADENCE_MS)
+
+    def test_does_not_duplicate_existing_topic(self):
+        state = {'researchTopics': [
+            {'id': 't1', 'topic': 'z', 'startUrl': 'https://z.example',
+             'cadenceMs': 3600000, 'lastRunAt': 0, 'seenUrls': []}]}
+        added, removed = self._call(state, [
+            {'topic': 'z', 'startUrl': 'https://z.example', 'cadenceMs': 3600000}])
+        self.assertEqual((added, removed), (0, 0))
+        self.assertEqual(len(state['researchTopics']), 1)
+
+    def test_removes_deleted_topic_but_keeps_long_horizon(self):
+        state = {'researchTopics': [
+            {'id': 't1', 'topic': 'x', 'startUrl': 'https://x.example',
+             'cadenceMs': 3600000, 'lastRunAt': 0, 'seenUrls': []},
+            {'id': 't2', 'topic': 'horizon', 'startUrl': 'https://h.example',
+             'cadenceMs': 3600000, 'lastRunAt': 0, 'seenUrls': [], 'longHorizon': True}]}
+        added, removed = self._call(state, [])
+        self.assertEqual((added, removed), (0, 1))
+        self.assertEqual([t['id'] for t in state['researchTopics']], ['t2'])
+
+    def test_removal_skipped_when_file_unreadable(self):
+        state = {'researchTopics': [
+            {'id': 't1', 'topic': 'x', 'startUrl': 'https://x.example',
+             'cadenceMs': 3600000, 'lastRunAt': 0, 'seenUrls': []}]}
+        added, removed = self._call(state, [], ok=False)
+        self.assertEqual((added, removed), (0, 0))
+        self.assertEqual(len(state['researchTopics']), 1)
+
+    def test_inert_when_write_gate_disabled(self):
+        state = {'researchTopics': [
+            {'id': 't1', 'topic': 'x', 'startUrl': 'https://x.example',
+             'cadenceMs': 3600000, 'lastRunAt': 0, 'seenUrls': []}]}
+        with unittest.mock.patch.object(config, 'ALLOW_WATCHLIST_WRITE', False), \
+             unittest.mock.patch.object(config, 'get_research_watchlist',
+                                        return_value=([], True)):
+            added, removed = sim._sync_research_watchlist(state)
+        self.assertEqual((added, removed), (0, 0))
+        self.assertEqual(len(state['researchTopics']), 1)
 
 
 class SimAgentPerception(unittest.TestCase):
