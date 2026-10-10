@@ -182,6 +182,22 @@ from config import (  # noqa: E402,F401
     note_watchlist_topic,
     reload_policy_config,
 )
+# Conversation memory for the player's Telegram chat (see DESIGN.md "Memory
+# Architecture" and world/memory.py). Extracted into its own module exactly
+# like bank.py/evidence.py: STM stores each ask turn per chat session and
+# injects recent context into the next ask (fixes the follow-up question
+# failure); LTM distills durable facts/preferences from the conversation and
+# recalls the relevant ones on each ask. Re-exported here so the stable public
+# surface the call sites and tests use is `serve.memory_context` etc.
+from memory import (  # noqa: E402,F401
+    LTM_TYPES,
+    cleanup_expired_sessions,
+    ltm_maybe_extract,
+    ltm_recall,
+    memory_context,
+    stm_append,
+    stm_history,
+)
 
 # Optional, real dependencies for document ingestion (/api/library/ingest,
 # below) -- openpyxl (Excel) was already installed for something else in
@@ -313,6 +329,14 @@ _ENV_RELOAD_FIELDS = {
     # TTC cap: the clamp depends on both names, so TTC_BEST_OF is loaded here
     # and TTC_MAX_BEST_OF is recomputed in _reload_env_config after it.
     'TTC_BEST_OF': lambda e: max(2, min(int(e.get('TTC_BEST_OF', '2') or 2), int(e.get('TTC_MAX_BEST_OF', '3') or 3))),
+    # Conversation memory (read via serve.* from memory.py at call time).
+    'MEMORY_ENABLED': lambda e: _env_flag(e.get('MEMORY_ENABLED', 'true')),
+    'STM_MAX_TURNS': lambda e: int(e.get('STM_MAX_TURNS', '40') or 40),
+    'STM_MAX_TOKENS': lambda e: int(e.get('STM_MAX_TOKENS', '8000') or 8000),
+    'STM_TTL_HOURS': lambda e: int(e.get('STM_TTL_HOURS', '168') or 168),
+    'LTM_MAX_RECALL': lambda e: int(e.get('LTM_MAX_RECALL', '5') or 5),
+    'LTM_MAX_PER_SESSION': lambda e: int(e.get('LTM_MAX_PER_SESSION', '200') or 200),
+    'LTM_EXTRACT_EVERY_TURNS': lambda e: int(e.get('LTM_EXTRACT_EVERY_TURNS', '6') or 6),
 }
 
 
@@ -1203,9 +1227,15 @@ def _prune_logs():
             pruned_escalations = len(stale)
     except Exception as e:
         print(f'[prune] escalation prune failed: {e}', flush=True)
-    if deleted or pruned_escalations:
+    try:
+        memory_pruned = cleanup_expired_sessions()
+    except Exception as e:
+        memory_pruned = 0
+        print(f'[prune] memory cleanup failed: {e}', flush=True)
+    if deleted or pruned_escalations or memory_pruned:
         print(f'[prune] removed {deleted} rows older than {days}d from decision_tape/action_log '
-              f'and {pruned_escalations} resolved escalations', flush=True)
+              f'and {pruned_escalations} resolved escalations '
+              f'and {memory_pruned} expired conversation-memory sessions', flush=True)
     return deleted
 
 
@@ -3912,7 +3942,7 @@ async def _telegram_process_update(update):
     state = get_state_from_db()
     if not state:
         return chat_id, 'The think tank is not up right now.'
-    result = await _route_player_request(state, text)
+    result = await _route_player_request(state, text, session_id=chat_id)
     reply = result.get('reply') or result.get('error') or "Didn't get a usable reply."
     return chat_id, reply
 
@@ -6998,6 +7028,19 @@ ESCALATION_BASE_URL = _load_env().get('ESCALATION_BASE_URL', 'http://localhost:8
 TELEGRAM_BOT_TOKEN = _load_env().get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_ALLOWED_CHAT_IDS = {c.strip() for c in (_load_env().get('TELEGRAM_ALLOWED_CHAT_IDS') or '').split(',') if c.strip()}
 TELEGRAM_POLL_TIMEOUT_S = 25
+# Conversation memory for the Telegram bridge (world/memory.py). STM stores
+# each ask turn per chat session and injects the recent turns + a rolling
+# summary into the next ask, so a follow-up question is answered in context;
+# LTM distills durable facts/preferences from the conversation and recalls the
+# relevant ones on each ask. All knobs are live-rebindable via
+# _ENV_RELOAD_FIELDS (memory.py reads these serve globals at call time).
+MEMORY_ENABLED = _env_flag(_load_env().get('MEMORY_ENABLED', 'true'))
+STM_MAX_TURNS = int(_load_env().get('STM_MAX_TURNS', '40') or 40)
+STM_MAX_TOKENS = int(_load_env().get('STM_MAX_TOKENS', '8000') or 8000)
+STM_TTL_HOURS = int(_load_env().get('STM_TTL_HOURS', '168') or 168)
+LTM_MAX_RECALL = int(_load_env().get('LTM_MAX_RECALL', '5') or 5)
+LTM_MAX_PER_SESSION = int(_load_env().get('LTM_MAX_PER_SESSION', '200') or 200)
+LTM_EXTRACT_EVERY_TURNS = int(_load_env().get('LTM_EXTRACT_EVERY_TURNS', '6') or 6)
 
 
 def _load_failures():
@@ -13047,13 +13090,19 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
     return execute_tool
 
 
-async def _ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True):
+async def _ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None):
     """The real logic behind /api/intent/ask, pulled out so a non-HTTP caller
     (the Telegram bridge) can invoke it directly -- no fake Request object,
     no self-loopback HTTP hop, no auth dance for an already-trusted in-process
     caller. Returns {'reply', 'agent', 'tools'} on success or {'error', status}
     on failure, the same shape the endpoint returns as JSON. See intent_ask
     for the full behavior description; this function IS that behavior.
+
+    `session_id` (the Telegram chat id) opts an ask into conversation memory:
+    the question is answered in the context of the session's earlier turns and
+    its long-term memories (world/memory.py), and both the question and reply
+    are stored back. When omitted (the public /api/intent/ask endpoint, the
+    parked-ask drain) the ask stays fully stateless as before.
 
     Ask-lane parking (allow_park=True): when NO agent is free to answer right
     now, the ask is QUEUED rather than rejected -- a {'queued': True, 'askId',
@@ -13066,6 +13115,13 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     question = (question or '').strip()
     if not question:
         return {'error': 'a question is required', 'status': 400}
+
+    # Conversation memory (STM + LTM): when the ask rides a session (the
+    # Telegram bridge passes the chat id), the question is answered in the
+    # context of the session's earlier turns and long-term memories, and the
+    # exchange is stored back. Captured BEFORE any store so the injected
+    # history never includes the current question itself.
+    mctx = memory_context(session_id, question) if session_id else None
 
     import sim as _sim
     # A free, non-admin agent, round-robin over eligible candidates (same
@@ -13108,6 +13164,8 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
                   'location': (location or '').strip() or None,
                   'agentId': requested_agent or None, 'ts': now_ms}
         state.setdefault('_pendingAsks', []).append(parked)
+        if mctx is not None:
+            stm_append(session_id, 'user', question)
         return {'queued': True, 'askId': parked['id'],
                 'reply': 'Every agent is busy right now, so your question has been queued -- the first one to free up will answer it in your inbox shortly.'}
     else:
@@ -13124,12 +13182,16 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     checklist = ''
     if is_security_test_role and profile.get('instructions'):
         checklist = '\n' + '\n'.join(f'{i}. {line}' for i, line in enumerate(profile['instructions'], 1))
+    has_context = bool(mctx) and bool(mctx.get('history') or mctx.get('summary'))
     system = (
         f"You are {name}, working as {role} in a small think tank. "
         f"Your mission: {mission}{checklist} "
-        f"The player asks you a fresh question that has nothing to do with the think tank's "
-        f"own products or backlog. Answer it directly, in character, in 2-4 sentences. "
-        f"For any live/current real-world fact (a stock price, current news, a specific fact you don't already know), "
+        + ("The player asks you a fresh question that has nothing to do with the think tank's "
+           "own products or backlog. Answer it directly, in character, in 2-4 sentences. "
+           if not has_context else
+           "You are in an ongoing conversation with the player. Their latest message may refer "
+           "back to what came before -- answer it in that context, in character, in 2-4 sentences. ")
+        + "For any live/current real-world fact (a stock price, current news, a specific fact you don't already know), "
         + ("use search_web first if you don't already know a specific URL that has the answer, "
            "then browse_page on the best result if the search snippet alone isn't enough. "
            if TAVILY_API_KEY else
@@ -13152,8 +13214,26 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
            if is_security_test_role else "")
         + "Do not fabricate numbers or tool results you did not actually get from a tool."
     )
-    user = f"## Player's fresh question\n{question}"
-    messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}]
+    # Conversation memory: the player's long-term memories and the rolling
+    # summary of the earlier conversation are folded into the system prompt so
+    # the model answers the follow-up in full context.
+    if mctx:
+        memory_blocks = []
+        if mctx.get('ltm'):
+            memory_blocks.append('LONG-TERM MEMORY ABOUT THE PLAYER:\n' + mctx['ltm'])
+        if mctx.get('summary'):
+            memory_blocks.append("RECAP OF THE EARLIER CONVERSATION:\n" + mctx['summary'])
+        if memory_blocks:
+            system = system + '\n\n' + '\n\n'.join(memory_blocks)
+    user = (f"## Player's fresh question\n{question}" if not has_context
+            else f"## Player's latest message\n{question}")
+    messages = [{'role': 'system', 'content': system}]
+    # The session's earlier turns are injected as real messages (so roles stay
+    # intact) ahead of the current question; the question itself was captured
+    # in mctx BEFORE being stored, so it is never duplicated here.
+    for prior in ((mctx or {}).get('history') or []):
+        messages.append({'role': prior.get('role'), 'content': prior.get('content')})
+    messages.append({'role': 'user', 'content': user})
     # The ask lane answers in prose, so it inherits the plain-writing
     # directive by default -- shorter, filler-free replies at no extra cost.
     messages = _apply_plain_writing(messages)
@@ -13319,6 +13399,15 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     if not reply:
         reply = (f"I ran into trouble answering that one, {name} couldn't settle. "
                  f"Ask again shortly or reword the question.")
+
+    # Conversation memory: store the completed exchange so the next message in
+    # this session is answered in context, and kick a bounded LTM extraction
+    # when the session has accumulated enough new turns (background, best-
+    # effort -- a memory failure must never affect the reply just produced).
+    if mctx is not None:
+        stm_append(session_id, 'user', question)
+        stm_append(session_id, 'assistant', reply)
+        ltm_maybe_extract(session_id)
 
     log_action('player', 'ask', {'question': question[:200], 'agent': pick, 'tools': tools_used},
                authorized=True)
@@ -14515,18 +14604,18 @@ def _pick_team_worker(state, director_id):
     return _sim.on_call_agent(state, director_id)
 
 
-async def _route_lane_ask(state, text, admin_id):
+async def _route_lane_ask(state, text, admin_id, session_id=None):
     # Trusted internal pin: the player is texting Theo specifically, so Theo
     # (the admin) is who answers -- allow_admin_pin=True is safe here in a
     # way it is not for the public /api/intent/ask endpoint's raw player-
     # submitted agentId (see _ask_core's own comment on the parameter).
-    result = await _ask_core(state, text, admin_id, allow_admin_pin=True)
+    result = await _ask_core(state, text, admin_id, allow_admin_pin=True, session_id=session_id)
     if result.get('queued'):
         save_state_to_db(state)
     return result
 
 
-async def _route_lane_unclear(state, text, admin_id):
+async def _route_lane_unclear(state, text, admin_id, session_id=None):
     # Routing reconciliation: the 'unclear'
     # lane -- a multi-intent bundle or an ask no classifier can pin -- is a
     # director's judgment call. The SENIOR-MOST director answers directly,
@@ -14534,7 +14623,8 @@ async def _route_lane_unclear(state, text, admin_id):
     # doesn't delegate to herself first). Pinning a specific authority instead
     # of a random free agent IS the "needs a director's judgment" behavior.
     authority = _unclear_lane_authority(state)
-    result = await _ask_core(state, text, (authority or {}).get('id') or admin_id, allow_admin_pin=True)
+    result = await _ask_core(state, text, (authority or {}).get('id') or admin_id,
+                             allow_admin_pin=True, session_id=session_id)
     if result.get('queued'):
         save_state_to_db(state)
     return result
@@ -14704,13 +14794,17 @@ _ROUTING_HANDLERS = {
 }
 
 
-async def _route_player_request(state, text):
+async def _route_player_request(state, text, session_id=None):
     """Classify a free-text player request into a lane (_ROUTING_LANES) and
     dispatch to the matching handler. Entry point for the Telegram bridge
     (_telegram_process_update) -- replaces its old unconditional _ask_core
     pin. Returns the same {'reply', ...} / {'error', 'status'} shape
     _ask_core already produces, since every lane either wraps _ask_core
     directly or builds its own reply text before returning.
+
+    `session_id` (the Telegram chat id) is forwarded to the ask/unclear lanes
+    so the admin answers follow-ups in conversation context (world/memory.py);
+    the other lanes have their own handlers and ignore it.
 
     Every lane except ask/unclear mutates `state` and is responsible for its
     OWN save_state_to_db call -- _ask_core never touches state, so this
@@ -14722,6 +14816,8 @@ async def _route_player_request(state, text):
     lane = await asyncio.to_thread(_lane_decider, state, text) or 'unclear'
     log_action('player', 'route_classified', {'lane': lane, 'text': text[:200]}, authorized=True)
     handler = _ROUTING_HANDLERS.get(lane, _route_lane_unclear)
+    if lane in ('ask', 'unclear'):
+        return await handler(state, text, admin_id, session_id)
     return await handler(state, text, admin_id)
 
 

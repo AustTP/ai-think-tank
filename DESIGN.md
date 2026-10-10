@@ -43,6 +43,12 @@ read-view into it.
   re-exported by serve.py).
 - `world/sim_helpers.py` — Pure priority normalization, room derivation,
   team lookup, sprint/product id generation (extracted from sim.py).
+- `world/memory.py` — Conversation memory (STM + LTM) for the Telegram bridge,
+  ported from the magi framework's memory module: STM stores each ask turn per
+  chat session and injects the recent turns + a rolling summary into the next
+  ask; LTM distills durable facts/preferences from the conversation and recalls
+  the relevant ones on each ask (extracted into its own module like bank.py;
+  re-exported by serve.py).
 
 ---
 
@@ -426,6 +432,8 @@ session OR a valid agent key (so server-to-server loopback works).
 | `decision_tape` | Raw JEV/LLM decisions (prompt, criteria, choice, confidence, cost, raw) | Rolling prune at `LOG_RETENTION_DAYS` (default 7, override in .env) |
 | `agent_keys` | Agent attribution secrets (agent_id, secret_key) | Forever |
 | `sessions` | Player login sessions | 7-day expiry |
+| `stm_sessions` / `stm_messages` | Conversation STM per Telegram chat (rolling summary + per-turn rows, §15) | Expire with the session (`STM_TTL_HOURS`) |
+| `ltm_memories` | Typed long-term memories distilled from the conversation (§15) | Forever (global to the player) |
 
 ---
 
@@ -615,3 +623,59 @@ also sets `config.ALLOW_WATCHLIST_WRITE = True`. Tests never run lifespan, so
 a test or stray import cannot silently edit operator-owned JSON. The watchlist
 is a seed, not a deletion mechanism: a topic removed from the file is not
 force-removed from state (same policy as the long-horizon topic).
+
+---
+
+## 15. Conversation Memory (STM + LTM)
+
+The Telegram bridge answered every message with a stateless prompt ("a fresh
+question"), so a follow-up like "and the second one?" had no referent and the
+admin failed to answer. The fix ports the memory architecture from the magi
+framework wheel (`centene_agents/agents/memory`) onto the think tank's own
+SQLite DB, in `world/memory.py`:
+
+| Tier | What it does | Storage |
+|------|--------------|---------|
+| STM | Stores each (player question, admin reply) per chat session; injects the recent turns + a rolling summary ahead of the next question, so a follow-up is answered in context | `stm_sessions` (rolling summary + counters) + `stm_messages` (per-turn rows) |
+| LTM | Distills typed memories (`preference` / `fact` / `decision` / `unresolved_question`) from the conversation at a bounded cadence; recalls the relevant ones on each ask | `ltm_memories` (global to the player, never pruned by session expiry) |
+
+**Wiring.** `_telegram_process_update` passes the Telegram `chat_id` as
+`session_id` through `_route_player_request` into the ask/unclear lanes and
+then `_ask_core` (serve.py). When `session_id` is set and `MEMORY_ENABLED`,
+`_ask_core`:
+
+1. Reads `memory_context(session_id, question)` BEFORE storing anything, so the
+   injected history never contains the current question.
+2. Folds the LTM recall and the rolling STM summary into the system prompt, and
+   injects the recent turns as real message objects ahead of the current
+   question. The prompt wording switches from "a fresh question" to "an ongoing
+   conversation".
+3. After the reply, stores both turns back (`stm_append`) and kicks a bounded
+   LTM extraction (`ltm_maybe_extract`) in a background thread.
+
+The parked-ask path also records the user turn (so a queued question is still
+in context when it is later answered via email/inbox). The public
+`/api/intent/ask` endpoint and the parked-ask drain stay fully stateless —
+memory is Telegram-bridge-only.
+
+**Budgeting and fallbacks.** Every bound fails closed and never blocks an ask:
+
+- Turn/token budgets (`STM_MAX_TURNS`, `STM_MAX_TOKENS`): when exceeded, the
+  oldest turns are pruned and folded into the session's rolling summary. A
+  rule-based recap is written immediately (guaranteed — context is never lost
+  to a failing LLM); a background thread may upgrade it with an LLM summary.
+- LTM extraction cadence (`LTM_EXTRACT_EVERY_TURNS`) bounds the model spend; a
+  bad extraction reply parses to `[]` (never fabricated memory), and inserts
+  are deduplicated by content. `LTM_MAX_PER_SESSION` caps the store.
+- LTM recall is keyword-overlap scored with recency tiebreak — a cheap,
+  dependency-free stand-in for magi's vector search (the wheel itself pulls in
+  pyspark/mlflow/Databricks connectors that don't fit this stack).
+- All memory model calls (summary upgrade, LTM extraction) go through the
+  `/api/chat` choke point as the admin with a `__memory__` service label, so
+  they accrue to the Bank like any other spend and are visible per-service.
+- Expired STM sessions (`STM_TTL_HOURS`) are cleaned by the log-prune loop;
+  LTM deliberately survives session expiry.
+
+**Knobs** (all live-rebindable): `MEMORY_ENABLED`, `STM_MAX_TURNS`,
+`STM_MAX_TOKENS`, `STM_TTL_HOURS`, `LTM_MAX_RECALL`, `LTM_MAX_PER_SESSION`,
+`LTM_EXTRACT_EVERY_TURNS`.
