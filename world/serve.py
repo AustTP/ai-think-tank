@@ -966,8 +966,46 @@ def init_db():
         except Exception:
             pass
 
+        # RSS aggregator feed registry -- the curated feed list lives HERE, not
+        # in code, so a director/admin can add / tweak / remove feeds at
+        # runtime with no restart. Seeded from the module-level _RSS_FEED_SEED
+        # on first boot, exactly like api_services seeds from
+        # world/api_services.json.
+        conn.execute('''CREATE TABLE IF NOT EXISTS rss_feeds (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            interval_s INTEGER NOT NULL DEFAULT 600,
+            status TEXT NOT NULL DEFAULT 'active',
+            proposed_by TEXT,
+            created_at REAL,
+            updated_at REAL
+        )''')
+
+        # WebSocket feed registry -- same operator-managed registry idea as
+        # rss_feeds, for subscribe-and-stream feeds. Each row carries a
+        # declarative ws_spec descriptor (url, subscribe template, frame
+        # filter, field paths) that the one generic collector interprets.
+        # Seeded with the two built-ins (kraken, aisstream) on first boot.
+        conn.execute('''CREATE TABLE IF NOT EXISTS ws_feeds (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            credential_type TEXT NOT NULL DEFAULT 'none',
+            credential_key TEXT,
+            credential_key2 TEXT,
+            ws_spec TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            proposed_by TEXT,
+            created_at REAL,
+            updated_at REAL
+        )''')
+
     _seed_api_services_if_empty()
+    _seed_rss_feeds_if_empty()
+    _seed_ws_feeds_if_empty()
     _load_api_services()
+    _load_rss_feeds()
+    _load_ws_feeds()
     _harden_db_perms(DB_PATH)
 
 
@@ -4326,9 +4364,8 @@ async def _lifespan(app):
         print(f'[telegram] bridge active for {len(TELEGRAM_ALLOWED_CHAT_IDS)} allowlisted chat(s)', flush=True)
     ask_drain_task = asyncio.create_task(_pending_ask_drain_loop())
     avatar_task = asyncio.create_task(_avatar_loop())
-    ais_task = asyncio.create_task(_ais_collector_loop())
     rss_task = asyncio.create_task(_rss_poll_loop())
-    kraken_task = asyncio.create_task(_kraken_collector_loop())
+    ws_supervisor_task = asyncio.create_task(_ws_supervisor_loop())
     sim_task = None
     try:
         import sim as _sim_module
@@ -4361,9 +4398,10 @@ async def _lifespan(app):
     ask_drain_task.cancel()
     if avatar_task is not None:
         avatar_task.cancel()
-    ais_task.cancel()
     rss_task.cancel()
-    kraken_task.cancel()
+    ws_supervisor_task.cancel()
+    for _fp, task in list(_WS_TASKS.values()):
+        task.cancel()
     if sim_task is not None:
         sim_task.cancel()
 
@@ -7813,6 +7851,27 @@ AGENT_ASK_TOOLS = [
                 'properties': {
                     'pair': {'type': 'string', 'description': 'Pair to quote, e.g. XBT/USD or BTC-USD '
                                                               '(normalized). Omit for all pairs.'},
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'read_live_feed',
+            'description': 'Read live buffered records from ANY registered real-time feed service '
+                           '(operators add feeds at runtime; the registry is seeded with "kraken" '
+                           'crypto quotes and "aisstream" maritime ship positions). Omit service to '
+                           'list registered feeds. Use this for questions about data from a feed you '
+                           'do not have a dedicated tool for.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'service': {'type': 'string', 'description': 'Feed service id, e.g. kraken or '
+                                                                 'aisstream. Omit to list all.'},
+                    'topic': {'type': 'string', 'description': 'Topic/pair key to filter on (e.g. '
+                                                               'XBT/USD or a vessel name). Omit for all.'},
+                    'max': {'type': 'integer', 'description': 'Max records per service, 1-50 (default 10).'},
                 },
             },
         },
@@ -12117,24 +12176,21 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             return f"{out.get('modelInstruction', '')}\n\n{out['textForModel']}"
         if name == 'read_ais_feed':
             # Live AIS vessel positions from the AISStream collector (WebSocket
-            # -- NOT reachable via api_call). Buffered in-process; returns the
-            # most recent frames within the window.
+            # -- NOT reachable via api_call). The feed is a registered ws_feed
+            # driven by the generic collector; this tool reads its ring buffer.
             max_msgs = max(1, min(int((args or {}).get('max') or 20), 100))
-            recent = _ais_recent(max_msgs=max_msgs)
-            status = _AIS_STATUS.get('connected')
-            parts = [f"connection={'live' if status else 'down'}",
+            recent = _ws_recent('aisstream', max_items=max_msgs)
+            status = _ws_status('aisstream')
+            parts = [f"connection={'live' if status.get('connected') else 'down'}",
                      f"frames in buffer window={len(recent)}"]
-            if not status and _AIS_STATUS.get('last_error'):
-                parts.append(f"collector error: {_AIS_STATUS['last_error']}")
+            if not status.get('connected') and status.get('last_error'):
+                parts.append(f"collector error: {status['last_error']}")
             if recent:
                 rows = []
                 for m in recent:
-                    msg = m.get('message') or {}
-                    meta = msg.get('MetaData') or {}
-                    lat = meta.get('latitude') or meta.get('Latitude')
-                    lon = meta.get('longitude') or meta.get('Longitude')
-                    rows.append(f"- {meta.get('ShipName') or msg.get('MessageType') or 'frame'} "
-                                f"@{lat},{lon}")
+                    lat = m.get('lat') or m.get('latitude')
+                    lon = m.get('lon') or m.get('longitude')
+                    rows.append(f"- {m.get('topic') or 'frame'} @{lat},{lon}")
                 parts.append('recent frames:\n' + '\n'.join(rows[-max_msgs:]))
             raw = ' | '.join(parts)
             wrapped, _nonce, _tag, instruction = wrap_external_content(
@@ -12176,10 +12232,11 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             # Live crypto quotes from the Kraken public ticker (no key). Latest
             # per pair only; history is a short in-process ring.
             pair = _kraken_normalize_pair((args or {}).get('pair'))
-            quotes = _kraken_quotes([pair] if pair else None)
-            parts = [f"connection={'live' if _KRAKEN_STATUS.get('connected') else 'down'}"]
-            if not _KRAKEN_STATUS.get('connected') and _KRAKEN_STATUS.get('last_error'):
-                parts.append(f"collector error: {_KRAKEN_STATUS['last_error']}")
+            quotes = _ws_latest('kraken', [pair] if pair else None)
+            status = _ws_status('kraken')
+            parts = [f"connection={'live' if status.get('connected') else 'down'}"]
+            if not status.get('connected') and status.get('last_error'):
+                parts.append(f"collector error: {status['last_error']}")
             if not quotes:
                 parts.append('no quotes buffered yet (collector still connecting)')
             for p in sorted(quotes):
@@ -12189,6 +12246,36 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             raw = ' | '.join(parts)
             wrapped, _nonce, _tag, instruction = wrap_external_content(
                 raw, 'live crypto market data from the Kraken public ticker')
+            return f'{instruction}\n\n{wrapped}'
+        if name == 'read_live_feed':
+            # Generic read of any registered real-time feed's buffer -- new
+            # feeds added by operators via /api/ws/* become readable here with
+            # zero code changes.
+            service = ((args or {}).get('service') or '').strip().lower()
+            if service and service not in _WS_FEEDS:
+                avail = ', '.join(sorted(_WS_FEEDS)) or 'none registered'
+                return f'Unknown feed service "{service}". Registered feeds: {avail}'
+            topic = ((args or {}).get('topic') or '').strip()
+            max_items = max(1, min(int((args or {}).get('max') or 10), 50))
+            services = [service] if service else sorted(_WS_FEEDS)
+            parts = []
+            for sid in services:
+                st = _ws_status(sid)
+                items = _ws_recent(sid, max_items=max_items, topic=topic or None)
+                head = f"{sid}: connection={'live' if st.get('connected') else 'down'}, {len(items)} recent records"
+                if not st.get('connected') and st.get('last_error'):
+                    head += f" last_error={st['last_error']}"
+                if not items:
+                    parts.append(f'{head} | no records buffered yet (collector may still be connecting)')
+                    continue
+                rows = []
+                for it in items:
+                    fields = {k: v for k, v in it.items() if k not in ('ts', 'topic', 'raw')}
+                    rows.append(f"- {it['topic']}: " + ', '.join(f'{k}={v}' for k, v in fields.items()))
+                parts.append(f'{head}\n' + '\n'.join(rows))
+            raw = '\n\n'.join(parts)
+            wrapped, _nonce, _tag, instruction = wrap_external_content(
+                raw, 'live real-time feed records buffered by the think tank')
             return f'{instruction}\n\n{wrapped}'
         if name == 'browse_page':
             country = ((args or {}).get('country') or '').strip().lower()
@@ -12433,7 +12520,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
 
     def execute_tool(name, args):
         # Every tool result is external data -> wrap BEFORE it can reach a model.
-        if name in ('search_web', 'browse_page', 'read_ais_feed', 'read_rss_feed', 'read_market_feed'):
+        if name in ('search_web', 'browse_page', 'read_ais_feed', 'read_rss_feed', 'read_market_feed', 'read_live_feed'):
             tools_used.append(name)
             return _web_tool(name, args)
         if name == 'team_digest':
@@ -12710,77 +12797,14 @@ def _apply_pending_ask_results(state):
 # (wss://stream.aisstream.io/v0/stream -- provider docs: connect, then send a
 # JSON subscription {APIKey, BoundingBoxes, FilterMessageTypes}, then read
 # JSON frames; a browser cannot connect, only a server can). The HTTP api_call
-# chokepoint can never reach it, so a dedicated collector owns the connection,
-# buffers recent frames in-process, and agents/player read the buffer via the
-# read_ais_feed tool / /api/ais/recent endpoint. Bounding box defaults to the
-# US East Coast / Western Atlantic (a sensible default for a US-based operator;
-# provider limits: 3 connections per IP, 3 per account).
+# chokepoint can never reach it. It is registered in the ws_feeds table and
+# driven by the generic _ws_collector_loop (see the generic WebSocket feed
+# collector section): the connection, subscription, frame extraction, and
+# buffering are all descriptor-driven, so the bounding box, filter types, and
+# field paths are operator-editable with no code change. Agents/player read
+# the buffered frames via the read_ais_feed tool / /api/ais/recent endpoint.
+# Provider limits: 3 connections per IP, 3 per account.
 # ---------------------------------------------------------------------------
-_AIS_STREAM_URL = 'wss://stream.aisstream.io/v0/stream'
-_AIS_BUFFER_MAX = 300
-AIS_BUFFER_WINDOW_S = 1800
-AIS_RECONNECT_BACKOFF_S = 15
-AIS_DEFAULT_BOUNDING_BOX = [[[36.9, -76.3], [33.3, -74.8]]]
-AIS_DEFAULT_FILTER_TYPES = ['PositionReport']
-
-_AIS_BUFFER = []
-_AIS_BUFFER_LOCK = threading.Lock()
-_AIS_STATUS = {'connected': False, 'last_error': '', 'connected_at': 0, 'last_message_at': 0}
-
-
-def _ais_append_message(message):
-    with _AIS_BUFFER_LOCK:
-        _AIS_BUFFER.append({'ts': int(time.time() * 1000), 'message': message})
-        if len(_AIS_BUFFER) > _AIS_BUFFER_MAX:
-            del _AIS_BUFFER[:len(_AIS_BUFFER) - _AIS_BUFFER_MAX]
-
-
-def _ais_recent(max_msgs=20, window_s=AIS_BUFFER_WINDOW_S):
-    """Most recent buffered AIS frames within the window, newest last. Returns
-    a capped list of {'ts', 'message'} dicts (a shallow copy of each message so
-    callers can't mutate the buffer)."""
-    cutoff = int(time.time() * 1000) - window_s * 1000
-    with _AIS_BUFFER_LOCK:
-        msgs = [dict(m) for m in _AIS_BUFFER if m['ts'] >= cutoff]
-    return msgs[-max_msgs:]
-
-
-async def _ais_collector_loop():
-    """Standing loop (created in _lifespan): hold the AISStream WebSocket,
-    send the subscription on connect, buffer frames, reconnect with backoff.
-    Reads the API key fresh on every (re)connect so a new env key takes effect
-    without a restart. Never crashes the process -- every failure loops back to
-    a backoff sleep."""
-    import asyncio
-    import websockets
-    while True:
-        try:
-            token, _, cred_error = _api_credential_value(_API_SERVICES.get('aisstream') or {})
-            if cred_error or not token:
-                _AIS_STATUS['last_error'] = f'credential unavailable: {cred_error or "no key"}'
-                await asyncio.sleep(AIS_RECONNECT_BACKOFF_S)
-                continue
-            async with websockets.connect(
-                    _AIS_STREAM_URL, max_size=2 ** 20,
-                    open_timeout=20, ping_interval=20, ping_timeout=20) as ws:
-                await ws.send(json.dumps({
-                    'APIKey': token,
-                    'BoundingBoxes': AIS_DEFAULT_BOUNDING_BOX,
-                    'FilterMessageTypes': AIS_DEFAULT_FILTER_TYPES,
-                }))
-                _AIS_STATUS.update({'connected': True, 'last_error': '', 'connected_at': time.time()})
-                print('[ais] collector connected', flush=True)
-                async for raw in ws:
-                    try:
-                        _ais_append_message(json.loads(raw))
-                        _AIS_STATUS['last_message_at'] = time.time()
-                    except ValueError:
-                        continue
-        except Exception as e:  # noqa: BLE001 -- a drop/backoff and retry is the whole point
-            _AIS_STATUS['connected'] = False
-            _AIS_STATUS['last_error'] = str(e)[:200]
-            print(f'[ais] collector error: {e}', flush=True)
-            await asyncio.sleep(AIS_RECONNECT_BACKOFF_S)
 
 
 # ---------------------------------------------------------------------------
@@ -12792,8 +12816,13 @@ async def _ais_collector_loop():
 # read_rss_feed tool / /api/rss/recent. Items are tagged at ingest with any
 # watchlist research topics whose words appear in the title, so the Research
 # Desk's standing topics surface straight out of the feed read.
+#
+# The feed LIST is operator-managed at runtime: the rss_feeds DB table is the
+# registry, seeded from _RSS_FEED_SEED on first boot, and /api/rss/{propose,
+# approve, remove} let directors/admins add or drop feeds without a restart
+# (the poll loop re-reads the live _RSS_FEEDS dict every cycle).
 # ---------------------------------------------------------------------------
-_RSS_FEEDS = {
+_RSS_FEED_SEED = {
     'bbc_world': {
         'name': 'BBC World',
         'url': 'https://feeds.bbci.co.uk/news/world/rss.xml',
@@ -12820,6 +12849,8 @@ _RSS_FEEDS = {
         'interval_s': 1800,
     },
 }
+_RSS_FEEDS = {}  # live registry: feed_id -> {'name', 'url', 'interval_s'} (DB-backed)
+_RSS_FEEDS_LOAD_ERROR = None
 _RSS_BUFFER_MAX_PER_FEED = 50
 _RSS_WINDOW_S = 3 * 86400
 _RSS_FETCH_TIMEOUT_S = 20
@@ -12918,6 +12949,115 @@ def _rss_recent(feed_id, max_items=10):
     return items[-max_items:]
 
 
+def _rss_feed_spec_to_row(spec, status='active', proposed_by=None):
+    now = time.time()
+    return {
+        'id': spec.get('id'),
+        'name': spec.get('name') or spec.get('id'),
+        'url': spec.get('url') or '',
+        'interval_s': int(spec.get('interval_s') or 600),
+        'status': status,
+        'proposed_by': proposed_by,
+        'created_at': now,
+        'updated_at': now,
+    }
+
+
+def _rss_feed_row_to_spec(row):
+    return {'id': row['id'], 'name': row['name'], 'url': row['url'],
+            'interval_s': int(row['interval_s'] or 600), 'status': row['status'],
+            'proposed_by': row.get('proposed_by')}
+
+
+def _load_rss_feeds():
+    """Load the active rss_feeds rows into the live _RSS_FEEDS dict. Fail
+    closed like _load_api_services: on any DB error the registry stays empty
+    (the poll loop then has nothing to fetch, never a crash)."""
+    global _RSS_FEEDS, _RSS_FEEDS_LOAD_ERROR
+    _RSS_FEEDS = {}
+    _RSS_FEEDS_LOAD_ERROR = None
+    try:
+        with _db() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, name, url, interval_s, status, proposed_by FROM rss_feeds WHERE status = 'active'"  # nosec B608 -- fixed internal columns
+            ).fetchall()
+    except Exception as e:
+        _RSS_FEEDS_LOAD_ERROR = f'db unavailable: {e}'
+        return
+    for row in rows:
+        spec = _rss_feed_row_to_spec(dict(row))
+        _RSS_FEEDS[spec['id']] = spec
+
+
+def _seed_rss_feeds_if_empty():
+    """Seed the rss_feeds table from _RSS_FEED_SEED the first time it comes up
+    empty, mirroring _seed_api_services_if_empty. New DBs get the five curated
+    feeds for free; an existing registry is left untouched."""
+    try:
+        with _db() as conn:
+            count = conn.execute('SELECT COUNT(*) FROM rss_feeds').fetchone()[0]
+            if count:
+                return
+            for sid, feed in _RSS_FEED_SEED.items():
+                spec = {'id': sid, 'name': feed.get('name'), 'url': feed.get('url'),
+                        'interval_s': feed.get('interval_s') or 600}
+                row = _rss_feed_spec_to_row(spec, status='active', proposed_by='seed')
+                conn.execute(
+                    'INSERT INTO rss_feeds (id, name, url, interval_s, status, proposed_by, created_at, updated_at) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                    [row[c] for c in ('id', 'name', 'url', 'interval_s', 'status', 'proposed_by', 'created_at', 'updated_at')])
+    except Exception as e:
+        print(f'[rss] seed failed: {e}', flush=True)
+
+
+def _rss_feed_upsert(spec, status='active', proposed_by=None):
+    """Persist a feed spec as a row and refresh the live registry. Used by the
+    propose flow (status='proposed'), the approval flow (status='active' or
+    'denied'), and the remove flow (status='removed')."""
+    sid = spec.get('id')
+    row = _rss_feed_spec_to_row(spec, status=status, proposed_by=proposed_by)
+    with _db() as conn:
+        conn.execute(
+            'INSERT INTO rss_feeds (id, name, url, interval_s, status, proposed_by, created_at, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?) '
+            'ON CONFLICT(id) DO UPDATE SET name=excluded.name, url=excluded.url, '
+            'interval_s=excluded.interval_s, status=excluded.status, '
+            'proposed_by=excluded.proposed_by, updated_at=excluded.updated_at',
+            [row[c] for c in ('id', 'name', 'url', 'interval_s', 'status', 'proposed_by', 'created_at', 'updated_at')])
+    _load_rss_feeds()
+
+
+def _validate_rss_feed_spec(spec):
+    """Validate a proposed feed spec. Returns (feed_id, normalized, error) --
+    error is None when valid. Security constraints mirror _validate_api_service_spec:
+    a public https URL only (the poll loop fetches it, so an internal address
+    would be an SSRF hole), a simple alphanumeric slug id, and a sane interval."""
+    spec = spec or {}
+    fid = str(spec.get('id') or '').strip().lower()
+    if not fid or not fid.replace('_', '').replace('-', '').isalnum():
+        return None, None, 'feed id must be a simple alphanumeric slug'
+    url = str(spec.get('url') or '').strip()
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != 'https' or not parsed.hostname or not _is_safe_public_host(parsed.hostname):
+        return None, None, 'url must be a public https URL'
+    interval_s = max(60, min(int(spec.get('interval_s') or 600), 86400))
+    name = str(spec.get('name') or '').strip() or fid
+    return fid, {'id': fid, 'name': name[:120], 'url': url, 'interval_s': interval_s}, None
+
+
+def _probe_rss_url(url):
+    """Fetch + parse a feed URL ONCE, at propose time, so a garbage or dead URL
+    is caught before it is ever approved. Returns {'ok', 'itemCount',
+    'sampleTitle', 'error'} -- never raises."""
+    try:
+        items = _fetch_feed_sync('_probe', url)
+        return {'ok': True, 'itemCount': len(items),
+                'sampleTitle': (items[0].get('title') if items else '')[:120], 'error': ''}
+    except Exception as e:  # noqa: BLE001 -- a failed probe is a result, not a crash
+        return {'ok': False, 'itemCount': 0, 'sampleTitle': '', 'error': str(e)[:200]}
+
+
 def _fetch_feed_sync(feed_id, url):
     """Synchronous feed fetch (poll loop runs in a thread). Returns the parsed
     items or raises -- the loop owns retry/backoff and status tracking."""
@@ -12928,13 +13068,22 @@ def _fetch_feed_sync(feed_id, url):
 
 
 async def _rss_poll_loop():
-    """Standing loop (created in _lifespan): fetch every curated feed on its
-    own cadence, ingest new items into the ring buffer, and surface per-feed
-    health in _RSS_STATUS. Polls are serialized through a thread so one slow
-    feed can't stall the rest of the event loop."""
+    """Standing loop (created in _lifespan): fetch each curated feed whose
+    interval has elapsed, ingest new items into the ring buffer, and surface
+    per-feed health in _RSS_STATUS. Polls are serialized through a thread so one
+    slow feed can't stall the rest of the event loop. The feed list is re-read
+    each cycle (a snapshot of the live _RSS_FEEDS registry), so a director/admin
+    adding or removing a feed via /api/rss/* goes live with no restart -- and
+    the sleep is capped at 30s so a newly-approved feed is fetched promptly
+    instead of waiting for the next scheduled pass."""
     import asyncio
     while True:
-        for feed_id, feed in _RSS_FEEDS.items():
+        feeds = dict(_RSS_FEEDS)
+        now = time.time()
+        for feed_id, feed in feeds.items():
+            last = _RSS_STATUS.get(feed_id, {}).get('last_fetch_at', 0)
+            if now - last < (feed.get('interval_s') or 600):
+                continue
             url = feed.get('url') or ''
             try:
                 items = await asyncio.to_thread(_fetch_feed_sync, feed_id, url)
@@ -12946,48 +13095,350 @@ async def _rss_poll_loop():
                                         'last_error': str(e)[:200], 'new': 0}
                 print(f'[rss] {feed_id} fetch failed: {e}', flush=True)
             await asyncio.sleep(0.02)
-        # Sleep until the soonest next poll across all feeds.
+        # Sleep until the soonest next poll across all feeds, capped so a
+        # newly-added feed is picked up within ~30s.
         now = time.time()
         due = min((now + (feed.get('interval_s') or 600) - _RSS_STATUS.get(feed_id, {}).get('last_fetch_at', 0)
-                   for feed_id, feed in _RSS_FEEDS.items()), default=600)
-        await asyncio.sleep(max(1.0, due))
+                   for feed_id, feed in feeds.items()), default=600)
+        await asyncio.sleep(max(1.0, min(due, 30)))
 
 
 # ---------------------------------------------------------------------------
-# Kraken public market-data ticker. Same collector pattern as AISStream: hold
-# the WebSocket, subscribe to a small symbol set, buffer ticks in-process, and
-# serve the latest via the read_market_feed tool / /api/market/quote. No API
-# key (public market data), reconnects with backoff. Crypto only -- equity
-# prices have no free public WebSocket, so the detector is kept narrow to
-# avoid forcing this tool on "price of SPY" questions it cannot answer.
+# Generic WebSocket feed collector. One loop interprets a declarative
+# ws_spec descriptor (url, subscribe template with credential/variable
+# substitution, frame filter, field paths, buffer kind) for ANY
+# "subscribe then stream JSON" feed -- Kraken and AISStream are just two
+# registered instances (ws_feeds DB table, seeded on first boot). A supervisor
+# reconciles running collector tasks with the live registry every few seconds,
+# so a director/admin adding, editing, or removing a feed via /api/ws/*
+# takes effect with no restart. HTTP's universal contract is what makes
+# api_call generic; WebSocket has no such contract, so the descriptor language
+# IS the abstraction. Hard boundary: binary frames, protobuf, and multi-round
+# handshake protocols cannot be described and stay as code.
 # ---------------------------------------------------------------------------
-_KRAKEN_WS_URL = 'wss://ws.kraken.com'
-_KRAKEN_PAIRS = ['XBT/USD', 'ETH/USD', 'XRP/USD', 'SOL/USD', 'XDG/USD']
-_KRAKEN_HISTORY_MAX = 200
-_KRAKEN_RECONNECT_BACKOFF_S = 15
-_KRAKEN_STALL_TIMEOUT_S = 90  # no data at all for this long -> force a reconnect
+_WS_FEED_SEED = {
+    'kraken': {
+        'name': 'Kraken public crypto ticker',
+        'credential': {'type': 'none'},
+        'ws': {
+            'url': 'wss://ws.kraken.com',
+            'subscribe': {'event': 'subscribe', 'pair': ['$PAIRS'],
+                          'subscription': {'name': 'ticker'}},
+            'vars': {'$PAIRS': ['XBT/USD', 'ETH/USD', 'XRP/USD', 'SOL/USD', 'XDG/USD']},
+            'open_timeout_s': 15,
+            'stall_timeout_s': 90,
+            'reconnect_backoff_s': 15,
+            'frame_filter': {
+                'data_kind': 'list',
+                'data_index': 1,
+                # Ticker frames are [channelID, data, channelName, pair].
+                'topic_path': '[3]',
+                'fields': {'price': 'c[0]', 'bid': 'b[0]', 'ask': 'a[0]', 'volume': 'v[0]'},
+            },
+            'buffer': {'kind': 'latest_per_topic', 'max_topics': 100, 'history': 200},
+        },
+    },
+    'aisstream': {
+        'name': 'AISStream live maritime positions',
+        'credential': {'type': 'env', 'key': 'AISSTREAM_API_KEY'},
+        'ws': {
+            'url': 'wss://stream.aisstream.io/v0/stream',
+            'subscribe': {'APIKey': '$CRED',
+                          'BoundingBoxes': [[[36.9, -76.3], [33.3, -74.8]]],
+                          'FilterMessageTypes': ['PositionReport']},
+            'vars': {},
+            'open_timeout_s': 20,
+            'stall_timeout_s': 120,
+            'reconnect_backoff_s': 15,
+            'frame_filter': {
+                'data_kind': 'dict',
+                'topic_path': 'MetaData.ShipName',
+                'skip_on_key': 'MessageType',
+                'skip_values': ['SubscriptionConfirmation'],
+                'fields': {'lat': 'MetaData.latitude', 'lon': 'MetaData.longitude',
+                           'time': 'MetaData.time_utc', 'mmsi': 'MetaData.MMSI_String'},
+            },
+            'buffer': {'kind': 'ring', 'history': 300},
+        },
+    },
+}
+_WS_FEEDS = {}  # live registry: sid -> {'name', 'credential', 'ws': descriptor} (DB-backed)
+_WS_FEEDS_LOAD_ERROR = None
+_WS_BUFFERS = {}  # sid -> {'latest': {topic: rec}, 'history': [...], 'status': {...}}
+_WS_LOCK = threading.Lock()
+_WS_TASKS = {}  # sid -> (spec_fingerprint, asyncio.Task)
 
-_KRAKEN_LATEST = {}  # pair -> {'price', 'bid', 'ask', 'volume', 'ts'}
-_KRAKEN_HISTORY = []  # ring of {'ts', 'pair', 'price', 'bid', 'ask'}
-_KRAKEN_CHANNEL_PAIRS = {}  # channelID -> pair (Kraken ticker messages carry only a channel id)
-_KRAKEN_LOCK = threading.Lock()
-_KRAKEN_STATUS = {'connected': False, 'last_error': '', 'connected_at': 0, 'last_tick_at': 0}
+
+def _ws_feed_spec_to_row(spec, status='active', proposed_by=None):
+    now = time.time()
+    cred = spec.get('credential') or {}
+    return {
+        'id': spec.get('id'),
+        'name': spec.get('name') or spec.get('id'),
+        'credential_type': cred.get('type') or 'none',
+        'credential_key': cred.get('key') if cred.get('type') in ('env', 'vault') else None,
+        'credential_key2': cred.get('key2'),
+        'ws_spec': json.dumps(spec.get('ws') or {}, sort_keys=True),
+        'status': status,
+        'proposed_by': proposed_by,
+        'created_at': now,
+        'updated_at': now,
+    }
 
 
-def _kraken_ingest_tick(ts_ms, pair, price, bid, ask, volume):
-    with _KRAKEN_LOCK:
-        _KRAKEN_LATEST[pair] = {'price': price, 'bid': bid, 'ask': ask,
-                                'volume': volume, 'ts': ts_ms}
-        _KRAKEN_HISTORY.append({'ts': ts_ms, 'pair': pair, 'price': price,
-                                'bid': bid, 'ask': ask})
-        if len(_KRAKEN_HISTORY) > _KRAKEN_HISTORY_MAX:
-            del _KRAKEN_HISTORY[:len(_KRAKEN_HISTORY) - _KRAKEN_HISTORY_MAX]
+def _ws_feed_row_to_spec(row):
+    try:
+        ws = json.loads(row.get('ws_spec') or '{}')
+    except ValueError:
+        ws = {}
+    return {'id': row['id'], 'name': row['name'],
+            'credential': {'type': row.get('credential_type') or 'none',
+                           'key': row.get('credential_key'),
+                           'key2': row.get('credential_key2')},
+            'ws': ws, 'status': row['status'], 'proposed_by': row.get('proposed_by')}
 
 
-def _kraken_quotes(pairs=None):
-    with _KRAKEN_LOCK:
-        wanted = pairs or list(_KRAKEN_LATEST.keys())
-        return {p: dict(_KRAKEN_LATEST[p]) for p in wanted if p in _KRAKEN_LATEST}
+def _load_ws_feeds():
+    """Load the active ws_feeds rows into the live _WS_FEEDS registry. Fail
+    closed: on DB error the registry stays empty (no collectors start)."""
+    global _WS_FEEDS, _WS_FEEDS_LOAD_ERROR
+    _WS_FEEDS = {}
+    _WS_FEEDS_LOAD_ERROR = None
+    try:
+        with _db() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, name, credential_type, credential_key, credential_key2, ws_spec, status, proposed_by "
+                "FROM ws_feeds WHERE status = 'active'"  # nosec B608 -- fixed internal columns
+            ).fetchall()
+    except Exception as e:
+        _WS_FEEDS_LOAD_ERROR = f'db unavailable: {e}'
+        return
+    for row in rows:
+        spec = _ws_feed_row_to_spec(dict(row))
+        _WS_FEEDS[spec['id']] = spec
+
+
+def _seed_ws_feeds_if_empty():
+    """Seed the ws_feeds table from _WS_FEED_SEED the first time it comes up
+    empty, mirroring _seed_api_services_if_empty."""
+    try:
+        with _db() as conn:
+            count = conn.execute('SELECT COUNT(*) FROM ws_feeds').fetchone()[0]
+            if count:
+                return
+            for sid, feed in _WS_FEED_SEED.items():
+                spec = {'id': sid, 'name': feed.get('name'),
+                        'credential': feed.get('credential') or {},
+                        'ws': feed.get('ws') or {}}
+                row = _ws_feed_spec_to_row(spec, status='active', proposed_by='seed')
+                conn.execute(
+                    'INSERT INTO ws_feeds (id, name, credential_type, credential_key, '
+                    'credential_key2, ws_spec, status, proposed_by, created_at, updated_at) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    [row[c] for c in ('id', 'name', 'credential_type', 'credential_key',
+                                      'credential_key2', 'ws_spec', 'status', 'proposed_by',
+                                      'created_at', 'updated_at')])
+    except Exception as e:
+        print(f'[ws] seed failed: {e}', flush=True)
+
+
+def _ws_feed_upsert(spec, status='active', proposed_by=None):
+    """Persist a feed spec as a row and refresh the live registry. Used by the
+    propose flow (status='proposed'), approval flow ('active'/'denied'), and
+    remove flow ('removed')."""
+    sid = spec.get('id')
+    row = _ws_feed_spec_to_row(spec, status=status, proposed_by=proposed_by)
+    with _db() as conn:
+        conn.execute(
+            'INSERT INTO ws_feeds (id, name, credential_type, credential_key, '
+            'credential_key2, ws_spec, status, proposed_by, created_at, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
+            'ON CONFLICT(id) DO UPDATE SET name=excluded.name, '
+            'credential_type=excluded.credential_type, credential_key=excluded.credential_key, '
+            'credential_key2=excluded.credential_key2, ws_spec=excluded.ws_spec, '
+            'status=excluded.status, proposed_by=excluded.proposed_by, updated_at=excluded.updated_at',
+            [row[c] for c in ('id', 'name', 'credential_type', 'credential_key',
+                              'credential_key2', 'ws_spec', 'status', 'proposed_by',
+                              'created_at', 'updated_at')])
+    _load_ws_feeds()
+
+
+def _validate_ws_feed_spec(spec):
+    """Validate a proposed websocket feed descriptor. Returns (sid, normalized,
+    error) -- error is None when valid. Security constraints mirror the other
+    registry validators: a public wss:// URL only (the collector connects to
+    it), a known credential source, a describable frame filter, and non-empty
+    field paths. Re-validated at approval time so a forged proposal cannot
+    grant more than this allows."""
+    spec = spec or {}
+    sid = str(spec.get('id') or '').strip().lower()
+    if not sid or not sid.replace('_', '').replace('-', '').isalnum():
+        return None, None, 'feed id must be a simple alphanumeric slug'
+    ws = spec.get('ws') or {}
+    url = str(ws.get('url') or '').strip()
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != 'wss' or not parsed.hostname or not _is_safe_public_host(parsed.hostname):
+        return None, None, 'ws.url must be a public wss:// URL'
+    if not isinstance(ws.get('subscribe'), dict):
+        return None, None, 'ws.subscribe must be a JSON object (the subscription template)'
+    cred = spec.get('credential') or {}
+    if cred.get('type') not in ('none', 'env', 'vault'):
+        return None, None, 'credential.type must be "none", "env", or "vault"'
+    if cred.get('type') in ('env', 'vault') and not (cred.get('key') or '').strip():
+        return None, None, 'credential.key is required for env/vault credentials'
+    ff = ws.get('frame_filter') or {}
+    if ff.get('data_kind') not in ('list', 'dict'):
+        return None, None, 'frame_filter.data_kind must be "list" or "dict"'
+    fields = ff.get('fields') or {}
+    if not isinstance(fields, dict) or not fields:
+        return None, None, 'frame_filter.fields must be a non-empty mapping of name -> path'
+    buf = ws.get('buffer') or {}
+    if buf.get('kind') not in ('latest_per_topic', 'ring'):
+        return None, None, 'buffer.kind must be "latest_per_topic" or "ring"'
+    # Clamp every numeric knob so a bad proposal cannot DoS the collector.
+    ws['open_timeout_s'] = max(5, min(int(ws.get('open_timeout_s') or 15), 60))
+    ws['stall_timeout_s'] = max(15, min(int(ws.get('stall_timeout_s') or 90), 600))
+    ws['reconnect_backoff_s'] = max(5, min(int(ws.get('reconnect_backoff_s') or 15), 300))
+    return sid, {'id': sid, 'name': str(spec.get('name') or sid)[:120],
+                 'credential': {'type': cred.get('type') or 'none',
+                                'key': cred.get('key') if cred.get('type') in ('env', 'vault') else None,
+                                'key2': cred.get('key2')},
+                 'ws': ws}, None
+
+
+def _ws_resolve_path(obj, path):
+    """Resolve a tiny path language against a parsed frame: bare segments are
+    dict keys, bracketed numbers are list indices. 'MetaData.ShipName',
+    'c[0]', '[3]'. Returns None when any step is missing or the wrong type."""
+    tokens = re.findall(r'[^.\[\]]+|\[\d+\]', path or '')
+    cur = obj
+    for tok in tokens:
+        if tok.startswith('[') and tok.endswith(']'):
+            idx = int(tok[1:-1])
+            if not isinstance(cur, (list, tuple)) or idx >= len(cur):
+                return None
+            cur = cur[idx]
+        else:
+            if not isinstance(cur, dict) or tok not in cur:
+                return None
+            cur = cur[tok]
+    return cur
+
+
+def _ws_extract_frame(ws_cfg, data):
+    """Extract (topic, fields, raw) from one frame per the feed's frame_filter.
+    Returns (None, None, None) for control frames (heartbeats, subscription
+    confirmations, malformed shapes)."""
+    ff = ws_cfg.get('frame_filter') or {}
+    kind = ff.get('data_kind', 'dict')
+    if kind == 'list':
+        # List-framed feeds: data frames are [..., {data}, ...]; any dict is a
+        # control frame and any list without a dict payload is skipped.
+        if not isinstance(data, list):
+            return None, None, None
+        idx = int(ff.get('data_index') or 1)
+        if len(data) <= idx or not isinstance(data[idx], dict):
+            return None, None, None
+        payload = data[idx]
+        topic = _ws_resolve_path(data, ff.get('topic_path'))
+    else:
+        if not isinstance(data, dict):
+            return None, None, None
+        skip_key = ff.get('skip_on_key')
+        skip_vals = ff.get('skip_values') or []
+        if skip_key and data.get(skip_key) in skip_vals:
+            return None, None, None
+        payload = data
+        topic = _ws_resolve_path(data, ff.get('topic_path'))
+    if not topic:
+        return None, None, None
+    fields = {}
+    for fname, path in (ff.get('fields') or {}).items():
+        try:
+            val = _ws_resolve_path(payload, path)
+        except Exception:  # noqa: BLE001 -- a missing field is skipped, never a dropped frame
+            val = None
+        if val is not None:
+            fields[fname] = val
+    return topic, fields, data
+
+
+def _ws_substitute(node, token, var_map):
+    """Recursively substitute $CRED (the resolved credential) and $VARS entries
+    into a subscription template. A var whose value is a LIST splices into an
+    enclosing list (Kraken's 'pair': ['$PAIRS'] must become a flat pair array,
+    not a nested one)."""
+    if isinstance(node, dict):
+        return {k: _ws_substitute(v, token, var_map) for k, v in node.items()}
+    if isinstance(node, list):
+        out = []
+        for v in node:
+            if isinstance(v, str) and v in var_map and isinstance(var_map[v], list):
+                out.extend(var_map[v])
+            else:
+                out.append(_ws_substitute(v, token, var_map))
+        return out
+    if isinstance(node, str):
+        if node == '$CRED' and token is not None:
+            return token
+        if node in var_map:
+            return var_map[node]
+        return node
+    return node
+
+
+def _ws_subscribe_payload(ws_cfg, token):
+    return _ws_substitute(ws_cfg.get('subscribe') or {}, token, ws_cfg.get('vars') or {})
+
+
+def _ws_ingest(sid, topic, fields, raw):
+    buf = _WS_BUFFERS.setdefault(sid, {'latest': {}, 'history': [],
+                                       'status': {'connected': False, 'last_error': '',
+                                                  'connected_at': 0, 'last_tick_at': 0}})
+    spec = _WS_FEEDS.get(sid) or {}
+    cfg = (spec.get('ws') or {}).get('buffer') or {}
+    now = int(time.time() * 1000)
+    rec = {'ts': now, 'topic': topic, **fields, 'raw': raw}
+    kind = cfg.get('kind', 'latest_per_topic')
+    with _WS_LOCK:
+        buf['status']['last_tick_at'] = time.time()
+        if kind == 'ring':
+            buf['history'].append(rec)
+            cap = int(cfg.get('history') or 300)
+            if len(buf['history']) > cap:
+                del buf['history'][:len(buf['history']) - cap]
+        else:
+            buf['latest'][topic] = rec
+            max_topics = int(cfg.get('max_topics') or 100)
+            if len(buf['latest']) > max_topics:
+                oldest = min(buf['latest'], key=lambda t: buf['latest'][t]['ts'])
+                del buf['latest'][oldest]
+            buf['history'].append(rec)
+            cap = int(cfg.get('history') or 200)
+            if len(buf['history']) > cap:
+                del buf['history'][:len(buf['history']) - cap]
+
+
+def _ws_status(sid):
+    return dict((_WS_BUFFERS.get(sid) or {}).get('status') or {})
+
+
+def _ws_latest(sid, topics=None):
+    buf = _WS_BUFFERS.get(sid) or {}
+    with _WS_LOCK:
+        latest = buf.get('latest') or {}
+        wanted = topics or list(latest)
+        return {t: dict(latest[t]) for t in wanted if t in latest}
+
+
+def _ws_recent(sid, max_items=20, window_s=1800, topic=None):
+    buf = _WS_BUFFERS.get(sid) or {}
+    cutoff = time.time() - window_s
+    with _WS_LOCK:
+        items = [dict(r) for r in (buf.get('history') or [])
+                 if r['ts'] / 1000 >= cutoff and (topic is None or r.get('topic') == topic)]
+    return items[-max_items:]
 
 
 def _kraken_normalize_pair(pair):
@@ -12999,28 +13450,43 @@ def _kraken_normalize_pair(pair):
     return p
 
 
-async def _kraken_collector_loop():
+async def _ws_collector_loop(sid):
+    """One generic collector per registered feed. Reads the spec fresh from the
+    live registry on every reconnect, resolves the credential (if any),
+    subscribes, and ingests extracted frames into the service buffer. The stall
+    watchdog forces a reconnect when a subscribed-but-silent connection sits
+    idle (observed live after rapid reconnects throttled the IP)."""
     import asyncio
     import websockets
     while True:
+        spec = _WS_FEEDS.get(sid) or {}
+        ws = spec.get('ws') or {}
+        url = ws.get('url') or ''
+        stall = float(ws.get('stall_timeout_s') or 90)
+        backoff = float(ws.get('reconnect_backoff_s') or 15)
+        open_timeout = float(ws.get('open_timeout_s') or 15)
+        buf = _WS_BUFFERS.setdefault(sid, {'latest': {}, 'history': [],
+                                           'status': {'connected': False, 'last_error': '',
+                                                      'connected_at': 0, 'last_tick_at': 0}})
         try:
+            token, _t2, err = _api_credential_value(spec)
+            if err:
+                buf['status'].update(connected=False, last_error=err)
+                print(f'[ws:{sid}] credential error: {err}', flush=True)
+                await asyncio.sleep(backoff)
+                continue
+            payload = _ws_subscribe_payload(ws, token)
             async with websockets.connect(
-                    _KRAKEN_WS_URL, max_size=2 ** 20,
-                    open_timeout=15, ping_interval=20, ping_timeout=20) as ws:
-                with _KRAKEN_LOCK:
-                    _KRAKEN_CHANNEL_PAIRS.clear()
-                await ws.send(json.dumps({'event': 'subscribe', 'pair': _KRAKEN_PAIRS,
-                                          'subscription': {'name': 'ticker'}}))
-                _KRAKEN_STATUS.update({'connected': True, 'last_error': '', 'connected_at': time.time()})
-                print('[kraken] collector connected', flush=True)
+                    url, max_size=2 ** 20,
+                    open_timeout=open_timeout, ping_interval=20, ping_timeout=20) as conn:
+                await conn.send(json.dumps(payload))
+                buf['status'].update(connected=True, last_error='', connected_at=time.time())
+                print(f'[ws:{sid}] connected', flush=True)
                 while True:
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=_KRAKEN_STALL_TIMEOUT_S)
+                        raw = await asyncio.wait_for(conn.recv(), timeout=stall)
                     except asyncio.TimeoutError:
-                        # Subscribed but zero frames for the whole window --
-                        # the subscription silently died. Reconnect.
-                        print('[kraken] no data for '
-                              f'{_KRAKEN_STALL_TIMEOUT_S}s; reconnecting', flush=True)
+                        print(f'[ws:{sid}] no data for {stall}s; reconnecting', flush=True)
                         break
                     except Exception:  # noqa: BLE001 -- ConnectionClosed et al: reconnect
                         break
@@ -13028,42 +13494,35 @@ async def _kraken_collector_loop():
                         data = json.loads(raw)
                     except ValueError:
                         continue
-                    if isinstance(data, dict):
-                        # Subscription confirmations carry the channelID ->
-                        # pair mapping, used as a fallback below for ticker
-                        # frames that omit the pair.
-                        if (data.get('event') == 'subscriptionStatus'
-                                and data.get('status') == 'subscribed'):
-                            cid = data.get('channelID')
-                            if cid is not None and data.get('pair'):
-                                with _KRAKEN_LOCK:
-                                    _KRAKEN_CHANNEL_PAIRS[cid] = data['pair']
+                    topic, fields, full = _ws_extract_frame(ws, data)
+                    if topic is None:
                         continue
-                    # Ticker frame: [channelID, data, channelName, pair] -- the
-                    # pair is element [3] when present (live-confirmed), so
-                    # prefer it and fall back to the channelID map.
-                    if isinstance(data, list) and len(data) >= 2 and isinstance(data[1], dict):
-                        cid = data[0]
-                        tick = data[1]
-                        pair = (data[3] if len(data) >= 4 and isinstance(data[3], str)
-                                else _KRAKEN_CHANNEL_PAIRS.get(cid))
-                        if not pair:
-                            continue
-                        try:
-                            price = float(tick['c'][0])
-                            bid = float(tick['b'][0])
-                            ask = float(tick['a'][0])
-                            volume = float(tick['v'][0])
-                        except (KeyError, TypeError, ValueError, IndexError):
-                            continue
-                        _kraken_ingest_tick(int(time.time() * 1000), pair,
-                                            price, bid, ask, volume)
-                        _KRAKEN_STATUS['last_tick_at'] = time.time()
+                    _ws_ingest(sid, topic, fields, full)
         except Exception as e:  # noqa: BLE001 -- a drop/backoff and retry is the whole point
-            _KRAKEN_STATUS['connected'] = False
-            _KRAKEN_STATUS['last_error'] = str(e)[:200]
-            print(f'[kraken] collector error: {e}', flush=True)
-            await asyncio.sleep(_KRAKEN_RECONNECT_BACKOFF_S)
+            buf['status'].update(connected=False, last_error=str(e)[:200])
+            print(f'[ws:{sid}] collector error: {e}', flush=True)
+            await asyncio.sleep(backoff)
+
+
+async def _ws_supervisor_loop():
+    """Reconcile running collector tasks with the live _WS_FEEDS registry every
+    few seconds: spawn collectors for newly-active feeds, cancel collectors for
+    removed/denied feeds, and restart a collector whose spec fingerprint changed
+    (an operator's edit goes live without a restart)."""
+    import asyncio
+    while True:
+        for sid, spec in list(_WS_FEEDS.items()):
+            fp = json.dumps(spec, sort_keys=True)
+            entry = _WS_TASKS.get(sid)
+            if entry is None or entry[0] != fp or entry[1].done():
+                if entry is not None:
+                    entry[1].cancel()
+                _WS_TASKS[sid] = (fp, asyncio.create_task(_ws_collector_loop(sid)))
+        for sid, entry in list(_WS_TASKS.items()):
+            if sid not in _WS_FEEDS:
+                entry[1].cancel()
+                _WS_TASKS.pop(sid, None)
+        await asyncio.sleep(10)
 
 
 def _team_digest_text(max_markdown_chars=1400, tape_window_s=86400):
@@ -17853,14 +18312,15 @@ async def ais_recent(request: Request):
     if not authed:
         return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     max_msgs = max(1, min(int(request.query_params.get('max') or 20), 100))
-    window_s = max(10, min(int(request.query_params.get('window_s') or AIS_BUFFER_WINDOW_S), 86400))
+    window_s = max(10, min(int(request.query_params.get('window_s') or 1800), 86400))
+    status = _ws_status('aisstream')
     return JSONResponse({
         'ok': True,
-        'connected': _AIS_STATUS.get('connected'),
-        'lastError': _AIS_STATUS.get('last_error'),
-        'connectedAt': _AIS_STATUS.get('connected_at'),
-        'lastMessageAt': _AIS_STATUS.get('last_message_at'),
-        'frames': _ais_recent(max_msgs=max_msgs, window_s=window_s),
+        'connected': status.get('connected'),
+        'lastError': status.get('last_error'),
+        'connectedAt': status.get('connected_at'),
+        'lastMessageAt': status.get('last_tick_at'),
+        'frames': _ws_recent('aisstream', max_items=max_msgs, window_s=window_s),
     })
 
 
@@ -17904,13 +18364,297 @@ async def market_quote(request: Request):
     if not authed:
         return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     pair = _kraken_normalize_pair(request.query_params.get('pair'))
+    status = _ws_status('kraken')
     return JSONResponse({
         'ok': True,
-        'connected': _KRAKEN_STATUS.get('connected'),
-        'lastError': _KRAKEN_STATUS.get('last_error'),
-        'lastTickAt': _KRAKEN_STATUS.get('last_tick_at'),
-        'quotes': _kraken_quotes([pair] if pair else None),
+        'connected': status.get('connected'),
+        'lastError': status.get('last_error'),
+        'lastTickAt': status.get('last_tick_at'),
+        'quotes': _ws_latest('kraken', [pair] if pair else None),
     })
+
+
+@app.get('/api/ws/recent')
+async def ws_recent(request: Request):
+    """Read buffered records from ANY registered real-time feed service (the
+    generic view behind the read_live_feed tool). Same auth + read-only
+    contract as /api/ais/recent: any valid agent key or player session."""
+    agent_id = (request.query_params.get('agentId') or '').strip()
+    presented = request.headers.get('X-Agent-Key') or ''
+    authed = (agent_id and verify_agent_key(agent_id, presented) is True)
+    if not authed:
+        authed = _require_player_session(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    service = (request.query_params.get('service') or '').strip().lower()
+    if service and service not in _WS_FEEDS:
+        return JSONResponse({'error': f'unknown service: {service}',
+                             'available': sorted(_WS_FEEDS)}, status_code=400)
+    topic = (request.query_params.get('topic') or '').strip() or None
+    max_items = max(1, min(int(request.query_params.get('max') or 10), 50))
+    services = [service] if service else sorted(_WS_FEEDS)
+    return JSONResponse({
+        'ok': True,
+        'services': {sid: {
+            'name': (_WS_FEEDS.get(sid) or {}).get('name'),
+            'status': _ws_status(sid),
+            'records': _ws_recent(sid, max_items=max_items, topic=topic),
+        } for sid in services},
+    })
+
+
+def _feed_registry_status(table, fid):
+    """Current status row ('active'/'proposed'/'denied'/'removed') for a feed id
+    in one of the operator registries, or None when unknown. Table is a fixed
+    internal constant, never user input."""
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                f'SELECT status FROM {table} WHERE id = ?',  # nosec B608 -- fixed internal table constant
+                (fid,)).fetchone()
+        return row[0] if row else None
+    except Exception:  # noqa: BLE001 -- fail closed to None (unknown)
+        return None
+
+
+def _operator_gate(request):
+    """Registry-management gate: a valid PLAYER session, OR an agent who is a
+    director/admin (any agent with direct reports, per _is_director). Returns
+    (authorized, actor)."""
+    if _require_player_session(request):
+        return True, 'player'
+    actor = _resolve_requester(request)
+    if actor:
+        try:
+            state = get_state_from_db() or {}
+        except Exception:  # noqa: BLE001 -- state unavailable -> not a director
+            state = {}
+        if _is_director_or_admin(state, actor):
+            return True, actor
+    return False, None
+
+
+@app.post('/api/rss/propose')
+async def rss_propose(request: Request):
+    """Agent/player-facing proposal of a new RSS feed. Validates the URL
+    (public https only) and PROBES it live (fetch + parse once) so a dead or
+    non-XML URL is caught before it is ever approved. Inserts a 'proposed'
+    row; a director/admin then approves or denies via /api/rss/approve."""
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'player').strip() or 'player'
+    spec = body.get('feed') or {}
+    purpose = (body.get('purpose') or '').strip()
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'rss-propose'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    if not (verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is True
+            or _require_player_session(request)):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    fid, normalized, error = _validate_rss_feed_spec(spec)
+    if error:
+        return JSONResponse({'error': error}, status_code=400)
+    existing = _feed_registry_status('rss_feeds', fid)
+    if existing == 'active':
+        return JSONResponse({'error': f'feed "{fid}" is already active'}, status_code=409)
+    if existing == 'proposed':
+        return JSONResponse({'error': f'a proposal for feed "{fid}" is already pending review'}, status_code=409)
+    probe = await asyncio.to_thread(_probe_rss_url, normalized['url'])
+    if not probe['ok']:
+        return JSONResponse({'error': f'feed URL failed a live probe: {probe["error"]}',
+                             'probe': probe}, status_code=422)
+    _rss_feed_upsert(normalized, status='proposed', proposed_by=agent_id)
+    log_action(agent_id, 'rss_feed_propose', {'feedId': fid, 'name': normalized['name'],
+                                              'url': normalized['url'], 'probe': probe,
+                                              'purpose': purpose[:200]})
+    return JSONResponse({'requested': True, 'feedId': fid, 'probe': probe,
+                         'message': f'Proposal for feed "{fid}" filed (probe saw {probe["itemCount"]} items). '
+                                    'A director/admin approves or denies it via /api/rss/approve.'})
+
+
+@app.post('/api/rss/approve')
+async def rss_approve(request: Request):
+    """Director/admin/player approval or denial of a proposed RSS feed. The
+    spec is re-validated at approval time (a forged proposal cannot grant more
+    than the validator allows); an approved feed goes live on the poll loop's
+    next pass with no restart."""
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a director, the admin, or the player may approve RSS feeds'}, status_code=403)
+    body = await request.json()
+    fid = (body.get('feedId') or '').strip().lower()
+    decision = (body.get('decision') or 'approve').strip().lower()
+    if not fid:
+        return JSONResponse({'error': 'feedId is required'}, status_code=400)
+    existing = _feed_registry_status('rss_feeds', fid)
+    if existing is None:
+        return JSONResponse({'error': f'no feed row "{fid}"'}, status_code=404)
+    if existing == 'active':
+        return JSONResponse({'error': f'feed "{fid}" is already active'}, status_code=409)
+    try:
+        with _db() as conn:
+            conn.row_factory = sqlite3.Row
+            row = dict(conn.execute('SELECT * FROM rss_feeds WHERE id = ?', (fid,)).fetchone())
+    except Exception as e:  # noqa: BLE001 -- never approve on a DB hiccup
+        return JSONResponse({'error': f'db unavailable: {e}'}, status_code=503)
+    spec = _rss_feed_row_to_spec(row)
+    _fid, normalized, error = _validate_rss_feed_spec(spec)
+    if error:
+        return JSONResponse({'error': f'proposal no longer validates: {error}'}, status_code=400)
+    status = 'active' if decision != 'deny' else 'denied'
+    _rss_feed_upsert(normalized, status=status, proposed_by=actor)
+    log_action(actor, 'rss_feed_approve', {'feedId': fid, 'status': status})
+    return JSONResponse({'ok': True, 'feedId': fid, 'status': status})
+
+
+@app.post('/api/rss/remove')
+async def rss_remove(request: Request):
+    """Director/admin/player removal of an RSS feed. Sets the row to 'removed';
+    the poll loop skips it on the next pass with no restart."""
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a director, the admin, or the player may remove RSS feeds'}, status_code=403)
+    body = await request.json()
+    fid = (body.get('feedId') or '').strip().lower()
+    if not fid:
+        return JSONResponse({'error': 'feedId is required'}, status_code=400)
+    if _feed_registry_status('rss_feeds', fid) is None:
+        return JSONResponse({'error': f'no feed row "{fid}"'}, status_code=404)
+    _rss_feed_upsert({'id': fid, 'name': fid, 'url': 'https://removed.invalid/', 'interval_s': 600},
+                     status='removed', proposed_by=actor)
+    log_action(actor, 'rss_feed_remove', {'feedId': fid})
+    return JSONResponse({'ok': True, 'feedId': fid, 'status': 'removed'})
+
+
+@app.get('/api/rss/feeds')
+async def rss_feeds_list(request: Request):
+    """Operator management view of the RSS registry: every row with its status,
+    not just the active ones. Director/admin/player gated."""
+    authorized, _actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        with _db() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = [dict(r) for r in conn.execute(
+                'SELECT id, name, url, interval_s, status, proposed_by, updated_at '
+                'FROM rss_feeds ORDER BY id')]
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({'error': f'db unavailable: {e}'}, status_code=503)
+    return JSONResponse({'feeds': rows})
+
+
+@app.post('/api/ws/propose')
+async def ws_propose(request: Request):
+    """Agent/player-facing proposal of a new WebSocket feed. Validates the
+    declarative descriptor (public wss:// URL, credential source, frame filter,
+    field paths). Inserts a 'proposed' row; a director/admin approves via
+    /api/ws/approve. There is no live probe here -- a WebSocket probe would
+    itself connect and subscribe (rate-limit risk), so approval relies on the
+    validator and the collector's live status."""
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'player').strip() or 'player'
+    spec = body.get('feed') or {}
+    purpose = (body.get('purpose') or '').strip()
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'ws-propose'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    if not (verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is True
+            or _require_player_session(request)):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    sid, normalized, error = _validate_ws_feed_spec(spec)
+    if error:
+        return JSONResponse({'error': error}, status_code=400)
+    existing = _feed_registry_status('ws_feeds', sid)
+    if existing == 'active':
+        return JSONResponse({'error': f'feed "{sid}" is already active'}, status_code=409)
+    if existing == 'proposed':
+        return JSONResponse({'error': f'a proposal for feed "{sid}" is already pending review'}, status_code=409)
+    _ws_feed_upsert(normalized, status='proposed', proposed_by=agent_id)
+    log_action(agent_id, 'ws_feed_propose', {'feedId': sid, 'name': normalized['name'],
+                                             'url': (normalized.get('ws') or {}).get('url'),
+                                             'purpose': purpose[:200]})
+    return JSONResponse({'requested': True, 'feedId': sid,
+                         'message': f'Proposal for feed "{sid}" filed. A director/admin approves '
+                                    'or denies it via /api/ws/approve.'})
+
+
+@app.post('/api/ws/approve')
+async def ws_approve(request: Request):
+    """Director/admin/player approval or denial of a proposed WebSocket feed.
+    Re-validated at approval time; the supervisor picks up an approved feed
+    within seconds and its collector connects -- no restart."""
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a director, the admin, or the player may approve WebSocket feeds'}, status_code=403)
+    body = await request.json()
+    sid = (body.get('feedId') or '').strip().lower()
+    decision = (body.get('decision') or 'approve').strip().lower()
+    if not sid:
+        return JSONResponse({'error': 'feedId is required'}, status_code=400)
+    existing = _feed_registry_status('ws_feeds', sid)
+    if existing is None:
+        return JSONResponse({'error': f'no feed row "{sid}"'}, status_code=404)
+    if existing == 'active':
+        return JSONResponse({'error': f'feed "{sid}" is already active'}, status_code=409)
+    try:
+        with _db() as conn:
+            conn.row_factory = sqlite3.Row
+            row = dict(conn.execute('SELECT * FROM ws_feeds WHERE id = ?', (sid,)).fetchone())
+    except Exception as e:  # noqa: BLE001 -- never approve on a DB hiccup
+        return JSONResponse({'error': f'db unavailable: {e}'}, status_code=503)
+    spec = _ws_feed_row_to_spec(row)
+    _sid, normalized, error = _validate_ws_feed_spec(spec)
+    if error:
+        return JSONResponse({'error': f'proposal no longer validates: {error}'}, status_code=400)
+    status = 'active' if decision != 'deny' else 'denied'
+    _ws_feed_upsert(normalized, status=status, proposed_by=actor)
+    log_action(actor, 'ws_feed_approve', {'feedId': sid, 'status': status})
+    return JSONResponse({'ok': True, 'feedId': sid, 'status': status})
+
+
+@app.post('/api/ws/remove')
+async def ws_remove(request: Request):
+    """Director/admin/player removal of a WebSocket feed. Sets the row to
+    'removed'; the supervisor cancels its collector task within seconds -- no
+    restart."""
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a director, the admin, or the player may remove WebSocket feeds'}, status_code=403)
+    body = await request.json()
+    sid = (body.get('feedId') or '').strip().lower()
+    if not sid:
+        return JSONResponse({'error': 'feedId is required'}, status_code=400)
+    if _feed_registry_status('ws_feeds', sid) is None:
+        return JSONResponse({'error': f'no feed row "{sid}"'}, status_code=404)
+    _ws_feed_upsert({'id': sid, 'name': sid, 'credential': {'type': 'none'},
+                     'ws': {'url': 'wss://invalid.invalid', 'subscribe': {},
+                            'frame_filter': {'data_kind': 'dict', 'fields': {'x': 'x'}},
+                            'buffer': {'kind': 'latest_per_topic'}}},
+                    status='removed', proposed_by=actor)
+    log_action(actor, 'ws_feed_remove', {'feedId': sid})
+    return JSONResponse({'ok': True, 'feedId': sid, 'status': 'removed'})
+
+
+@app.get('/api/ws/feeds')
+async def ws_feeds_list(request: Request):
+    """Operator management view of the WebSocket registry: every row with its
+    status and descriptor (credential keys redacted). Director/admin/player
+    gated."""
+    authorized, _actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        with _db() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = [dict(r) for r in conn.execute(
+                'SELECT id, name, credential_type, credential_key, ws_spec, status, proposed_by, updated_at '
+                'FROM ws_feeds ORDER BY id')]
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({'error': f'db unavailable: {e}'}, status_code=503)
+    for r in rows:
+        if r.get('credential_key'):
+            r['credential_key'] = f'{r["credential_key"][:3]}...'
+    return JSONResponse({'feeds': rows})
 
 
 @app.post('/api/api-call')

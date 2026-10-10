@@ -99,33 +99,40 @@ class MullvadAuth(unittest.TestCase):
 
 
 class AISCollector(unittest.TestCase):
-    def test_append_caps_buffer(self):
-        serve._AIS_BUFFER.clear()
-        for i in range(serve._AIS_BUFFER_MAX + 25):
-            serve._ais_append_message({'MessageType': 'PositionReport', 'i': i})
-        with serve._AIS_BUFFER_LOCK:
-            self.assertEqual(len(serve._AIS_BUFFER), serve._AIS_BUFFER_MAX)
-            self.assertEqual(serve._AIS_BUFFER[0]['message']['i'], 25)
-        serve._AIS_BUFFER.clear()
+    def tearDown(self):
+        serve._WS_BUFFERS.pop('aisstream', None)
+
+    def test_ingest_caps_ring(self):
+        # The aisstream feed is registered as a 'ring' buffer (history 300) in
+        # the ws_feeds seed, so the generic _ws_ingest caps it at 300.
+        for i in range(325):
+            serve._ws_ingest('aisstream', f'SHIP {i}', {'lat': i, 'lon': 0}, {'i': i})
+        with serve._WS_LOCK:
+            self.assertEqual(len(serve._WS_BUFFERS['aisstream']['history']), 300)
+            self.assertEqual(serve._WS_BUFFERS['aisstream']['history'][0]['topic'], 'SHIP 25')
 
     def test_recent_filters_window_and_max(self):
-        serve._AIS_BUFFER.clear()
         now_ms = int(time.time() * 1000)
-        old = {'ts': now_ms - 3600_000, 'message': {'MessageType': 'old'}}
-        fresh = [{'ts': now_ms - i * 1000, 'message': {'MessageType': f'fresh{i}'}} for i in range(5)]
-        serve._AIS_BUFFER.extend([old] + fresh)
-        out = serve._ais_recent(max_msgs=2, window_s=1800)
-        self.assertEqual([m['message']['MessageType'] for m in out], ['fresh3', 'fresh4'])
+        buf = serve._WS_BUFFERS.setdefault('aisstream', {'latest': {}, 'history': [],
+                                                         'status': {'connected': False, 'last_error': '',
+                                                                    'connected_at': 0, 'last_tick_at': 0}})
+        with serve._WS_LOCK:
+            buf['history'].append({'ts': now_ms - 3600_000, 'topic': 'OLD',
+                                   'lat': 0, 'lon': 0, 'raw': {}})
+            for i in range(5):
+                buf['history'].append({'ts': now_ms - i * 1000, 'topic': f'FRESH{i}',
+                                       'lat': i, 'lon': 0, 'raw': {}})
+        out = serve._ws_recent('aisstream', max_items=2, window_s=1800)
+        self.assertEqual([r['topic'] for r in out], ['FRESH3', 'FRESH4'])
         # callers can't mutate the buffer through the returned copies
-        out[0]['message']['MessageType'] = 'mutated'
-        with serve._AIS_BUFFER_LOCK:
-            self.assertEqual(serve._AIS_BUFFER[1]['message']['MessageType'], 'fresh0')
-        serve._AIS_BUFFER.clear()
+        out[0]['topic'] = 'MUTATED'
+        with serve._WS_LOCK:
+            self.assertEqual(serve._WS_BUFFERS['aisstream']['history'][1]['topic'], 'FRESH0')
 
     def test_recent_endpoint_requires_auth_and_returns_frames(self):
         from starlette.testclient import TestClient
-        serve._AIS_BUFFER.clear()
-        serve._AIS_BUFFER.append({'ts': int(time.time() * 1000), 'message': {'MessageType': 'PositionReport', 'MetaData': {'ShipName': 'EVER GIVEN'}}})
+        serve._WS_BUFFERS.pop('aisstream', None)
+        serve._ws_ingest('aisstream', 'EVER GIVEN', {'lat': 36.8, 'lon': -76.2}, {})
         c = TestClient(serve.app)
         r = c.get('/api/ais/recent')
         self.assertEqual(r.status_code, 401)
@@ -135,8 +142,8 @@ class AISCollector(unittest.TestCase):
         body = r.json()
         self.assertTrue(body['ok'])
         self.assertEqual(len(body['frames']), 1)
-        self.assertEqual(body['frames'][0]['message']['MetaData']['ShipName'], 'EVER GIVEN')
-        serve._AIS_BUFFER.clear()
+        self.assertEqual(body['frames'][0]['topic'], 'EVER GIVEN')
+        serve._WS_BUFFERS.pop('aisstream', None)
 
 
 if __name__ == '__main__':

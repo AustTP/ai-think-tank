@@ -132,33 +132,35 @@ class RSSEndpoint(unittest.TestCase):
 
 class KrakenBuffer(unittest.TestCase):
     def tearDown(self):
-        with serve._KRAKEN_LOCK:
-            serve._KRAKEN_LATEST.clear()
-            serve._KRAKEN_HISTORY.clear()
+        serve._WS_BUFFERS.pop('kraken', None)
 
     def test_ingest_latest_per_pair_and_history_cap(self):
-        for i in range(serve._KRAKEN_HISTORY_MAX + 10):
-            serve._kraken_ingest_tick(i, 'XBT/USD', 100.0 + i, 99.0, 101.0, 5)
-        with serve._KRAKEN_LOCK:
-            self.assertEqual(len(serve._KRAKEN_HISTORY), serve._KRAKEN_HISTORY_MAX)
-            self.assertEqual(serve._KRAKEN_LATEST['XBT/USD']['price'], 100.0 + serve._KRAKEN_HISTORY_MAX + 9)
-        q = serve._kraken_quotes(['XBT/USD'])
+        # The kraken feed is registered as 'latest_per_topic' (history 200) in
+        # the ws_feeds seed, so the generic _ws_ingest caps history at 200 and
+        # keeps the newest quote per pair.
+        cap = serve._WS_FEEDS['kraken']['ws']['buffer']['history']
+        for i in range(cap + 10):
+            serve._ws_ingest('kraken', 'XBT/USD', {'price': 100.0 + i, 'bid': 99.0,
+                                                   'ask': 101.0, 'volume': 5}, {})
+        with serve._WS_LOCK:
+            self.assertEqual(len(serve._WS_BUFFERS['kraken']['history']), cap)
+            self.assertEqual(serve._WS_BUFFERS['kraken']['latest']['XBT/USD']['price'], 100.0 + cap + 9)
+        q = serve._ws_latest('kraken', ['XBT/USD'])
         self.assertEqual(set(q), {'XBT/USD'})
         self.assertNotIn('ETH/USD', q)
 
     def test_quote_endpoint(self):
         from starlette.testclient import TestClient
-        with serve._KRAKEN_LOCK:
-            serve._KRAKEN_LATEST['XBT/USD'] = {'price': 100.0, 'bid': 99.0, 'ask': 101.0,
-                                               'volume': 5, 'ts': int(time.time() * 1000)}
+        serve._WS_BUFFERS.pop('kraken', None)
+        serve._ws_ingest('kraken', 'XBT/USD', {'price': 100.0, 'bid': 99.0, 'ask': 101.0,
+                                               'volume': 5}, {})
         c = TestClient(serve.app)
         self.assertEqual(c.get('/api/market/quote').status_code, 401)
         key = serve.get_or_create_agent_key('ben')
         r = c.get('/api/market/quote?agentId=ben&pair=btc-usd', headers={'X-Agent-Key': key})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertIn('XBT/USD', r.json()['quotes'])
-        with serve._KRAKEN_LOCK:
-            serve._KRAKEN_LATEST.clear()
+        serve._WS_BUFFERS.pop('kraken', None)
 
 
 class Detectors(unittest.TestCase):
