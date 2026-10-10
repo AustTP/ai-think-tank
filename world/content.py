@@ -4450,6 +4450,12 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                                             _GOOGLE_CALENDAR_LIST_TOOL, _GOOGLE_CALENDAR_CREATE_TOOL,
                                             _GMAIL_SEARCH_TOOL, _GMAIL_READ_TOOL, _GMAIL_CREATE_DRAFT_TOOL,
                                             _GOOGLE_DOCS_READ_TOOL, _GOOGLE_DOCS_CREATE_TOOL]
+    # Scoped player-folder + Notes access (world/fs.py): offered to spike
+    # workers under the same condition as the ask lane -- FILE_ACCESS_ENABLED
+    # AND the player has issued at least one grant. Every call is still gated
+    # by the grant (containment + trash rule + Notes ownership) inside fs.py.
+    if _serve.FILE_ACCESS_ENABLED and (snapshot.get('fileGrants') or []):
+        spike_tools = spike_tools + [_serve._LOCAL_FILE_TOOL]
     # YouTube transcripts: offered only when APIFY_API_KEY is set -- the route
     # ALWAYS downloads the audio via the Apify actor on the Colab runtime (no
     # captions fast-path), so unset = tool simply absent, same
@@ -4498,6 +4504,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             return apify_tool(tool_name, args)
         if tool_name == 'run_on_colab' and colab_compute_tool is not None:
             return colab_compute_tool(tool_name, args)
+        if tool_name == 'local_file':
+            return _serve._local_file_tool(agent_id, args)
         return web_tool(tool_name, args)
 
     # 18/900 (was 10/600): a "list every X across the whole site" question

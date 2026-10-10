@@ -59,6 +59,16 @@ class FsScopeTests(unittest.TestCase):
         self.assertEqual([e['name'] for e in entries], ['notes.txt'])
         self.assertEqual(fs.read_file(self.scope, 'notes.txt'), 'hello world')
 
+    def test_list_subdirectory(self):
+        os.makedirs(os.path.join(self.scope, 'sub'))
+        with open(os.path.join(self.scope, 'sub', 'inner.txt'), 'w') as f:
+            f.write('inner')
+        entries = fs.list_scope(self.scope, 'sub')
+        self.assertEqual([e['name'] for e in entries], ['inner.txt'])
+        self.assertEqual([e['type'] for e in entries], ['file'])
+        with self.assertRaises(FileNotFoundError):
+            fs.list_scope(self.scope, 'missing')
+
     def test_write_and_move(self):
         p = fs.write_file(self.scope, 'draft.docx', 'v1')
         self.assertTrue(os.path.isfile(p))
