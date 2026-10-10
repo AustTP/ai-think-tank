@@ -1340,6 +1340,111 @@ class HealthEndpoints(unittest.TestCase):
         self.assertEqual(r.json()['counts']['execute'], 1)
 
 
+class CatalogBenchmarkIngest(unittest.TestCase):
+    """_ingest_catalog_benchmarks auto-fills model_benchmark_scores from the
+    OpenRouter catalog's own Artificial Analysis capability indices on every
+    sync, so the benchmark table stays fresh as models emerge and their scores
+    update -- and dies with a model that leaves the catalog via the existing
+    removal purge. Player-entered scores under other benchmark names (MMLU,
+    SWE-bench, HLE, MMMU) are separate rows and must be untouched."""
+
+    def setUp(self):
+        with serve._db() as conn:
+            conn.execute('DELETE FROM model_benchmark_scores')
+            conn.execute('DELETE FROM model_catalog')
+
+    def _model(self, mid='bench/sample', aa=None, design=None):
+        m = {'id': mid, 'pricing': {'prompt': 0.0000001, 'completion': 0.0000001}}
+        if aa is not None:
+            m['benchmarks'] = {'artificial_analysis': aa}
+            if design is not None:
+                m['benchmarks']['design_arena'] = design
+        elif design is not None:
+            m['benchmarks'] = {'design_arena': design}
+        return m
+
+    def test_ingest_writes_aa_indices_with_model_page_citation(self):
+        written = serve._ingest_catalog_benchmarks([
+            self._model('vendor/model-a', {'intelligence_index': 34.3,
+                                           'coding_index': 69.1,
+                                           'agentic_index': 41}),
+        ])
+        self.assertEqual(written, 3)
+        with serve._db() as conn:
+            rows = conn.execute(
+                'SELECT model_id, benchmark, score, source_url FROM model_benchmark_scores '
+                'ORDER BY benchmark').fetchall()
+        self.assertEqual(rows, [
+            ('vendor/model-a', 'agentic_index', 41.0, 'https://openrouter.ai/vendor/model-a'),
+            ('vendor/model-a', 'coding_index', 69.1, 'https://openrouter.ai/vendor/model-a'),
+            ('vendor/model-a', 'intelligence_index', 34.3, 'https://openrouter.ai/vendor/model-a'),
+        ])
+
+    def test_ingest_skips_models_without_aa_data(self):
+        self.assertEqual(serve._ingest_catalog_benchmarks([self._model()]), 0)
+        self.assertEqual(serve._ingest_catalog_benchmarks([self._model(design={'website': [{'elo': 1242}]})]), 0)
+        with serve._db() as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM model_benchmark_scores').fetchone()[0], 0)
+
+    def test_ingest_upserts_on_rerun(self):
+        self.assertEqual(serve._ingest_catalog_benchmarks([
+            self._model('vendor/model-a', {'intelligence_index': 30.0})]), 1)
+        self.assertEqual(serve._ingest_catalog_benchmarks([
+            self._model('vendor/model-a', {'intelligence_index': 44.0})]), 1)
+        with serve._db() as conn:
+            row = conn.execute('SELECT score FROM model_benchmark_scores '
+                               'WHERE model_id=? AND benchmark=?',
+                               ('vendor/model-a', 'intelligence_index')).fetchone()
+        self.assertEqual(row[0], 44.0)
+
+    def test_band_benchmarks_use_catalog_metrics(self):
+        # The bands now score against the catalog's own Artificial Analysis
+        # indices; vision keeps player-entered MMMU (the catalog carries no
+        # image-comprehension metric to back it).
+        self.assertEqual(serve.BAND_BENCHMARK['low'], 'intelligence_index')
+        self.assertEqual(serve.BAND_BENCHMARK['mid'], 'intelligence_index')
+        self.assertEqual(serve.BAND_BENCHMARK['high'], 'agentic_index')
+        self.assertEqual(serve.BAND_BENCHMARK['coding'], 'coding_index')
+        self.assertEqual(serve.BAND_BENCHMARK['vision'], 'MMMU')
+
+    def test_sync_model_catalog_ingests_then_carries_into_catalog_row(self):
+        models = [self._model('vendor/model-a', {'intelligence_index': 34.3})]
+        purged = serve._sync_model_catalog(models)
+        self.assertEqual(purged, 0)
+        with serve._db() as conn:
+            row = conn.execute('SELECT scores FROM model_catalog WHERE model_id=?',
+                               ('vendor/model-a',)).fetchone()
+        self.assertEqual(json.loads(row[0]), {'intelligence_index': 34.3})
+
+    def test_sync_purges_models_gone_from_catalog_with_their_scores(self):
+        # Regression: the purge's params were swapped (grace floor went into
+        # the NOT IN list, a model id into the last_seen comparison, so
+        # `number < text` matched EVERY row and a refresh wiped the whole
+        # catalog). A model absent from the fresh snapshot for longer than
+        # one refresh interval must be purged from BOTH tables; a present
+        # model must survive untouched.
+        stale = time.time() - serve.MODEL_TIER_REFRESH_INTERVAL_S - 1
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO model_catalog (model_id, name, prompt_price, completion_price, price_per_m, image_capable, first_seen, last_seen) '
+                'VALUES (?,?,?,?,?,?,?,?)',
+                ('gone/model', 'Gone', 1e-7, 1e-7, 0.0002, 0, stale, stale))
+            conn.execute(
+                'INSERT INTO model_benchmark_scores (model_id, benchmark, score, source_url, checked_at) '
+                'VALUES (?,?,?,?,?)', ('gone/model', 'intelligence_index', 30.0, 'http://x', stale))
+        purged = serve._sync_model_catalog([self._model('vendor/model-a', {'intelligence_index': 34.3})])
+        self.assertEqual(purged, 1)
+        with serve._db() as conn:
+            self.assertIsNone(conn.execute('SELECT model_id FROM model_catalog WHERE model_id=?',
+                                           ('gone/model',)).fetchone())
+            self.assertIsNone(conn.execute('SELECT model_id FROM model_benchmark_scores WHERE model_id=?',
+                                           ('gone/model',)).fetchone())
+            self.assertIsNotNone(conn.execute('SELECT model_id FROM model_catalog WHERE model_id=?',
+                                              ('vendor/model-a',)).fetchone())
+            self.assertIsNotNone(conn.execute('SELECT model_id FROM model_benchmark_scores WHERE model_id=?',
+                                              ('vendor/model-a',)).fetchone())
+
+
 class ModelTierEndpoints(unittest.TestCase):
     """model_tiers, model_tiers_refresh, model_benchmark_scores get/post."""
 

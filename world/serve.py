@@ -9998,39 +9998,35 @@ MODEL_BAND_PURPOSE = {
 # candidates sitting in the very same shortlist.
 #
 # Different bands need different benchmarks, since they do genuinely
-# different jobs (MODEL_BAND_PURPOSE above): 'high' actually writes/reviews
-# code, so SWE-bench Verified is the direct match. 'low' and 'mid' never
-# touch code -- 'low' is high-volume in-character chat/narration ("still
-# coherent, not too weak to follow basic instructions") and 'mid' is
-# judgment calls ("needs real reasoning"). Plain MMLU and MMLU-Pro were
-# picked for those two specifically because they're the benchmarks with
-# genuinely consistent, comparable public reporting across the WIDE range
-# of small/cheap vendors these two bands actually draw from (IFEval
-# coverage, by contrast, turned out to be inconsistent enough across that
-# same candidate pool -- different harnesses, non-comparable numbers -- to
-# not be usable for a fair ranking).
+# different jobs (MODEL_BAND_PURPOSE above): 'coding' actually writes/
+# reviews code, so a coding capability index is the direct match. 'low' is
+# high-volume in-character chat/narration ("still coherent, not too weak to
+# follow basic instructions") and 'mid' is judgment calls ("needs real
+# reasoning") -- both draw on the OpenRouter catalog's own Artificial
+# Analysis intelligence_index, the general reasoning blend those jobs
+# actually need. 'high' is genuinely hard, high-stakes planning work and
+# scores on agentic_index, the catalog's agentic-work benchmark -- the
+# closest available proxy for goal decomposition, and deliberately a
+# DIFFERENT metric from low/mid so the bands stay distinct through both
+# price pool and score signal. The catalog's ONLY other benchmark block
+# (design_arena) is visual-GENERATION elo, which no band consumes, so it is
+# not ingested.
 BAND_BENCHMARK = {
-    'low': 'MMLU',
-    'mid': 'MMLU-Pro',
-    'coding': 'SWE-bench Verified',
-    # Humanity's Last Exam for the planning band, NOT GPQA Diamond, which
-    # was the obvious first choice and turned out to be the wrong one:
-    # GPQA has saturated (five-plus models above 90% as of Sept 2026), so
-    # a "within N points of the best, then cheapest" policy run against it
-    # degenerates into "pick the cheapest of a dozen tied models" -- it
-    # stops selecting for planning quality at all. HLE is the benchmark
-    # explicitly built not to saturate (top scores still in the 50s), so
-    # it actually discriminates between the models this band is choosing
-    # between. It's a broad hard-reasoning proxy rather than a literal
-    # decomposition test -- no such benchmark has real cross-vendor
-    # coverage -- which is a real limitation of this pick, not a hidden one.
-    'high': "Humanity's Last Exam",
-    # 'vision' isn't one of the cost bands either (it's a capability axis,
-    # not a price tier -- see refresh_model_tiers' vision section below),
-    # but it's listed here so one place answers "what benchmark backs this
-    # pick" for every real model choice this system makes.
+    'low': 'intelligence_index',
+    'mid': 'intelligence_index',
+    'high': 'agentic_index',
+    'coding': 'coding_index',
+    # 'vision' stays on MMMU (player-entered, cited research -- the catalog
+    # carries no image-COMPREHENSION metric to back it). Listed here so one
+    # place answers "what benchmark backs this pick" for every real model
+    # choice this system makes.
     'vision': 'MMMU',
 }
+# The Artificial Analysis capability indices the OpenRouter catalog carries in
+# each model's `benchmarks.artificial_analysis` block, ingested automatically.
+# Source citation for auto-ingested rows is the model's own OpenRouter page.
+CATALOG_ARTIFICIAL_ANALYSIS_METRICS = ('intelligence_index', 'coding_index', 'agentic_index')
+CATALOG_BENCHMARK_SOURCE_URL = 'https://openrouter.ai/'
 # How many points below the single best score on file, FOR THAT BAND'S OWN
 # BENCHMARK, still counts as "good enough" to let price break the tie --
 # picked for the coding band:
@@ -10242,19 +10238,60 @@ def _apply_band_price_ceiling(band, candidate_pool):
     return candidate_pool
 
 
+def _ingest_catalog_benchmarks(models):
+    """Auto-ingest the OpenRouter catalog's own capability indices into
+    model_benchmark_scores on every sync -- this is what keeps the benchmark
+    table fresh as models appear and as scores update, without the player
+    hand-entering research for every new model. Upserts (never deletes) rows
+    keyed (model_id, benchmark); a model's rows are then retired by the same
+    removal purge that drops models gone from the catalog (checked_at goes
+    stale, the purge deletes it -- so a deleted OpenRouter model's scores
+    die with it, exactly like the catalog row).
+
+    Only the Artificial Analysis indices are ingested: they're the catalog's
+    general capability signals the bands actually consume (see BAND_BENCHMARK).
+    The catalog's other benchmark block (design_arena) is visual-GENERATION
+    elo that no band uses, so it is not stored. Player-entered scores under
+    OTHER benchmark names (MMLU, SWE-bench Verified, Humanity's Last Exam,
+    MMMU) are separate rows and are never touched here."""
+    now = time.time()
+    written = 0
+    with _db() as conn:
+        for m in models:
+            aa = (m.get('benchmarks') or {}).get('artificial_analysis')
+            if not isinstance(aa, dict):
+                continue
+            for metric in CATALOG_ARTIFICIAL_ANALYSIS_METRICS:
+                value = aa.get(metric)
+                if not isinstance(value, (int, float)):
+                    continue
+                conn.execute(
+                    'INSERT INTO model_benchmark_scores (model_id, benchmark, score, source_url, checked_at) '
+                    'VALUES (?, ?, ?, ?, ?) '
+                    'ON CONFLICT(model_id, benchmark) DO UPDATE SET '
+                    'score=excluded.score, source_url=excluded.source_url, checked_at=excluded.checked_at',
+                    (m['id'], metric, float(value), CATALOG_BENCHMARK_SOURCE_URL + m['id'], now),
+                )
+                written += 1
+    return written
+
+
 def _sync_model_catalog(models):
     """Persist the current OpenRouter catalog snapshot into model_catalog and
     reconcile it against what the DB already knows:
       * new models are inserted (first_seen = now)
       * known models get refreshed prices + carried-over benchmark scores
-        (copied from model_benchmark_scores; nothing is scraped/fetched here,
-        the player's entered research stays the only score source)
+        (the catalog's own Artificial Analysis indices are auto-ingested into
+        model_benchmark_scores first -- _ingest_catalog_benchmarks -- then
+        copied into the catalog row; player-entered research under other
+        benchmark names is carried over untouched)
       * models that vanished from the live catalog are removed from BOTH
         model_catalog and model_benchmark_scores -- a score record for a model
         that no longer exists on OpenRouter is dead weight the value pick can
         never use, and letting it accumulate would mislead later refreshes.
     Returns the number of models purged (0 normally), so callers can surface
     catalog churn."""
+    _ingest_catalog_benchmarks(models)
     now = time.time()
     seen_ids = set()
     with _db() as conn:
@@ -10304,10 +10341,10 @@ def _sync_model_catalog(models):
         if placeholders:
             gone = {r[0] for r in conn.execute(
                 f'SELECT model_id FROM model_catalog WHERE model_id NOT IN ({placeholders}) AND last_seen < ?',  # nosec B608 -- placeholders are parameterized '?'
-                (grace_floor,) + tuple(seen_ids)).fetchall()}
+                tuple(seen_ids) + (grace_floor,)).fetchall()}
             gone |= {r[0] for r in conn.execute(
                 f'SELECT model_id FROM model_benchmark_scores WHERE model_id NOT IN ({placeholders}) AND checked_at < ?',  # nosec B608 -- placeholders are parameterized '?'
-                (grace_floor,) + tuple(seen_ids)).fetchall()}
+                tuple(seen_ids) + (grace_floor,)).fetchall()}
         else:
             gone = {r[0] for r in conn.execute(
                 'SELECT model_id FROM model_catalog WHERE last_seen < ?', (grace_floor,)).fetchall()}
