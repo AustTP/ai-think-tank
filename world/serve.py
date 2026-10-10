@@ -8046,6 +8046,32 @@ AGENT_ASK_TOOLS = [
     {
         'type': 'function',
         'function': {
+            'name': 'download_file',
+            'description': 'Download a real file from a public https URL into your own agent '
+                           'filespace (agents/<you>/downloads/) under a hard size cap (default '
+                           '25 MB, per-call lower). Use this when you need an actual file saved '
+                           'locally -- a dataset, a report PDF, an image, source tarball -- rather '
+                           'than a page\'s text. Goes through the same Jev-gated, SSRF-protected '
+                           '/api/download endpoint every agent uses; the URL must be public https. '
+                           'The download aborts past the size cap, the filename is sanitized, and '
+                           'the file is never executed. Supply a short purpose; maxBytes is '
+                           'optional (bytes, e.g. 1048576 for 1 MB). If it is blocked or the cap '
+                           'is exceeded, the reason tells you which.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'url': {'type': 'string', 'description': 'A real, specific public https URL of the file to download.'},
+                    'filename': {'type': 'string', 'description': 'Optional local filename to save it as (defaults to the URL path\'s last segment).'},
+                    'purpose': {'type': 'string', 'description': 'One short sentence: why you need this file saved.'},
+                    'maxBytes': {'type': 'integer', 'description': 'Optional size cap in bytes (minimum 1024).'},
+                },
+                'required': ['url'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
             'name': 'request_allowlist',
             'description': 'Ask the player to permanently allow a domain you need to reach (browsing '
                            'AND sandboxed scripts): supply the host or url and one short sentence of '
@@ -12653,6 +12679,32 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                         "[this may be a transient error -- you may retry ONCE, e.g. with "
                         "render=true, but don't loop on it]")
             return 'Could not visit that page (unexpected response).'
+        if name == 'download_file':
+            result = _http_json('POST', SELF_BASE_URL, '/api/download', {
+                'agentId': agent_id,
+                'url': (args or {}).get('url') or '',
+                'filename': (args or {}).get('filename') or '',
+                'purpose': (args or {}).get('purpose') or 'research',
+                'maxBytes': (args or {}).get('maxBytes') or 0,
+                'workContext': work_context,
+                'workContextTrusted': bool(work_context_trusted),
+            }, agent_key, timeout=90)
+            if isinstance(result, dict) and result.get('ok'):
+                return (f"Downloaded to your own filespace at agents/{agent_id}/downloads/{result.get('path', '').rsplit('/', 1)[-1]} "
+                        f"({result.get('bytes')} bytes, sha256 {result.get('sha256', '')[:16]}...). "
+                        "The file is saved under YOUR downloads directory; read it from there if a "
+                        "later step needs its contents.")
+            if isinstance(result, dict) and result.get('error'):
+                err = result['error']
+                if 'not approved' in err or 'capability handle' in err:
+                    if struck_tools is not None:
+                        struck_tools.add('download_file')
+                    return (f"Could not download that file: {err} "
+                            "[ONE-STRIKE: this was a policy denial, not a technical error -- do not "
+                            "retry download_file, try browse_page or a different source instead]")
+                return (f"Could not download that file: {err} "
+                        "[this may be a transient error -- you may retry ONCE, but don't loop on it]")
+            return 'Could not download that file (unexpected response).'
         if name == 'api_call':
             result = _http_json('POST', SELF_BASE_URL, '/api/api-call', {
                 'agentId': agent_id,
@@ -12852,7 +12904,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
 
     def execute_tool(name, args):
         # Every tool result is external data -> wrap BEFORE it can reach a model.
-        if name in ('search_web', 'browse_page', 'read_ais_feed', 'read_rss_feed', 'read_market_feed', 'read_live_feed'):
+        if name in ('search_web', 'browse_page', 'download_file', 'read_ais_feed', 'read_rss_feed', 'read_market_feed', 'read_live_feed'):
             tools_used.append(name)
             return _web_tool(name, args)
         if name == 'team_digest':
@@ -20065,13 +20117,18 @@ async def download_file(request: Request):
     the partial file the instant the cap is crossed; the filename is
     sanitized so it cannot escape the agent's directory; nothing downloaded
     is ever executed. An optional capability handle attaches a token
-    credential and is scope-checked against the URL like api_call."""
+    credential and is scope-checked against the URL like api_call. The URL is
+    also judged by the work-context-aware Jev gate (same as /api/browse):
+    allowlist/player-named hosts skip it, everything else gets the quorum
+    classify + escalate. `workContext` / `workContextTrusted` mirror the
+    browse endpoint's contract."""
     body = await request.json()
     agent_id = (body.get('agentId') or '').strip()
     if not check_rate_limit(agent_id):
         log_action(agent_id, 'rate_limited', {'endpoint': 'download'})
         return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
-    if not verify_agent_key(agent_id, request.headers.get('X-Agent-Key')):
+    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    if not authorized:
         return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     url = (body.get('url') or '').strip()
     filename = (body.get('filename') or '').strip()
@@ -20099,7 +20156,33 @@ async def download_file(request: Request):
             return JSONResponse({'error': 'This handle is for a login credential, which cannot be attached to a download.'}, status_code=400)
         for hdr_name, hdr_value in _capability_auth_headers(grant['credential_name'], grant['secret']).items():
             headers.setdefault(hdr_name, hdr_value)
-    safe_name = _sanitize_filename(filename or urllib.parse.urlparse(url).path.rsplit('/', 1)[-1])
+    # Content/purpose judgment, work-context aware -- same gate as /api/browse.
+    # A player-vetted host (allowlist, or named in a PLAYER-authored task's
+    # work) skips Jev entirely; everything else gets the quorum classify +
+    # escalate. NEVER constraints ride inside work_context (built NEVER-FIRST
+    # by the executors -- see content._build_work_context), so they survive the
+    # 600-char slice and read as hard prohibitions. Block categories always win.
+    parsed = urllib.parse.urlparse(url)
+    work_context = (body.get('workContext') or '').strip()
+    work_context_trusted = bool(body.get('workContextTrusted'))
+    trace_id = None
+    if _is_allowlisted_host(parsed.hostname) or (work_context_trusted and _is_work_context_host(work_context, parsed.hostname)):
+        log_action(agent_id, 'download', {'url': url[:200], 'purpose': purpose,
+                                          'decision': 'allowed_by_allowlist', 'workContext': bool(work_context)}, authorized=True)
+    else:
+        criteria = {
+            'allow': 'The URL and stated purpose look like ordinary, legitimate file downloads (public data files, reports, reference material, raw datasets).'
+                     + (' A URL that is clearly part of, or relevant to, the agent\'s CURRENT assigned work is allowed, provided it does not fall into any blocked category.' if work_context else ''),
+            'block': 'The URL, domain, or stated purpose suggests: ' + '; '.join(BROWSE_BLOCK_CATEGORIES) + '. A blocked category ALWAYS blocks: relevance to the assigned work or a stated purpose never overrides it -- an agent can describe its work however it likes, and that must not launder an inappropriate download.',
+        }
+        instructions = f'An in-game agent wants to download a file from this URL: {url}\nStated reason: {purpose or "not given"}\n'
+        if work_context:
+            instructions += f'The agent is currently working on this assigned task: {work_context[:600]}\n'
+        instructions += 'Decide allow or block based on the URL/domain, the stated purpose, and the work the download serves (the file has not been fetched yet). If the URL falls into any blocked category, you MUST block it regardless of work relevance or stated purpose.'
+        decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
+        if not _jev_safety_gate(agent_id, 'download', 'This file', url, purpose, decision, confidence, cost, authorized, trace_id):
+            return JSONResponse({'error': 'This file was not approved for a think tank agent to download.'}, status_code=403)
+    safe_name = _sanitize_filename(filename or parsed.path.rsplit('/', 1)[-1])
     dest_dir = os.path.join(AGENTS_DIR, agent_id, 'downloads')
     os.makedirs(dest_dir, exist_ok=True)
     dest_path = os.path.join(dest_dir, safe_name)

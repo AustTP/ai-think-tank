@@ -2793,6 +2793,22 @@ _BROWSER_ACT_TOOL = {
 }
 
 
+def _build_work_context(backlog, instructions, never):
+    """The Jev-gate work context for a story/spike card, built NEVER-FIRST.
+
+    The browse/curl/download gates slice work_context to 600 chars, and a card's
+    NEVER constraints sit at the END of a 'backlog -- instructions' string --
+    i.e. the first thing the slice would cut. Leading with a labeled constraint
+    block keeps it inside the window AND reads as hard prohibitions to the
+    classifier instead of trailing task text."""
+    work_context = backlog
+    if never:
+        work_context = f'Hard prohibitions for this work (never do these): {never} -- {backlog}'
+    if instructions:
+        work_context = f'{work_context} -- {instructions}'
+    return work_context
+
+
 def _make_browser_act_executor(agent_id, agent_key, sandbox_id, struck_tools=None, work_context='', work_context_trusted=False):
     """Posts each op to the Jev-gated /api/browser-act endpoint and formats the
     driver's page-state result for the model. One-strike on a policy denial,
@@ -4401,9 +4417,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # judges URLs against the assigned work, not in isolation. A host the
     # player explicitly named in the task bypasses Jev like the allowlist;
     # everything else is judged with the work context in the Jev prompt.
-    work_context = backlog
-    if instructions:
-        work_context = f'{backlog} -- {instructions}'
+    work_context = _build_work_context(backlog, instructions, task.get('never'))
     # Player-authored provenance (see queue_work's playerAuthored): the Jev
     # gate's work-context HOST BYPASS (a host named in the work skips Jev like
     # the allowlist) fires ONLY for tasks the PLAYER actually wrote. An

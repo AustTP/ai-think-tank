@@ -99,6 +99,17 @@ class DownloadStream(_TestCase):
 
 
 class DownloadEndpoint(_TestCase):
+    def setUp(self):
+        super().setUp()
+        # /api/download runs the same work-context-aware Jev gate as /api/browse.
+        # example.com is not allowlisted, so hermetic tests default to a
+        # confident allow; the Jev-gate-specific tests override this.
+        self._jev = unittest.mock.patch.object(
+            serve, '_jev_quorum_decision',
+            new=unittest.mock.AsyncMock(return_value=('allow', 0.99, 0.0, 'trace-test')))
+        self._jev.start()
+        self.addCleanup(self._jev.stop)
+
     def test_rejects_non_https(self):
         from starlette.testclient import TestClient
         c = TestClient(serve.app)
@@ -151,6 +162,76 @@ class DownloadEndpoint(_TestCase):
         c = TestClient(serve.app)
         r = c.post('/api/download', json={'agentId': 'ben', 'url': 'https://example.com/f.bin'})
         self.assertEqual(r.status_code, 401, r.text)
+
+
+class DownloadJevGate(_TestCase):
+    """The download gate mirrors /api/browse: allowlist / player-named work
+    hosts skip Jev; everything else is classified with the work context
+    (which carries the card's NEVER constraints) in the prompt; a block fails
+    the download closed."""
+
+    def _do(self, body, headers=None):
+        from starlette.testclient import TestClient
+        c = TestClient(serve.app)
+        return c.post('/api/download', json=body, headers=headers or self.headers)
+
+    def test_work_context_with_never_threaded_into_jev_prompt(self):
+        calls = []
+        async def fake_quorum(instructions, criteria):
+            calls.append(instructions)
+            return ('allow', 0.99, 0.0, 'trace-1')
+        with unittest.mock.patch.object(serve, '_jev_quorum_decision', new=fake_quorum), \
+             unittest.mock.patch.object(serve, '_download_stream_sync', side_effect=lambda *a, **k: {
+                 'status': 200, 'bytes': 3, 'finalUrl': 'https://example.com/f.bin'}):
+            r = self._do({'agentId': 'ben', 'url': 'https://example.com/f.bin',
+                          'purpose': 'grab the dataset',
+                          'workContext': 'Hard prohibitions for this work (never do these): - never touch '
+                                         'the live payment table -- Inventory report -- Pull the CSV'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(calls), 1)
+        self.assertIn('never touch the live payment table', calls[0])
+        self.assertIn('Inventory report', calls[0])
+
+    def test_jev_block_returns_403_and_writes_nothing(self):
+        with unittest.mock.patch.object(serve, '_jev_quorum_decision',
+                                        new=unittest.mock.AsyncMock(return_value=('block', 0.97, 0.0, 'trace-2'))), \
+             unittest.mock.patch.object(serve, '_download_stream_sync', side_effect=lambda *a, **k: (
+                 self.fail('stream must not run on a Jev block'))) as stream:
+            r = self._do({'agentId': 'ben', 'url': 'https://example.com/f.bin', 'purpose': 'grab it'})
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertIn('not approved', r.json()['error'])
+        stream.assert_not_called()
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, 'agents', 'ben', 'downloads')))
+
+    def test_player_authored_work_context_host_bypasses_jev(self):
+        # A host the player EXPLICITLY named in a PLAYER-AUTHORED task skips Jev
+        # exactly like the allowlist (same rule /api/browse uses). The bypass
+        # requires workContextTrusted -- an agent-authored story's own text
+        # never gets it.
+        with unittest.mock.patch.object(serve, '_jev_quorum_decision') as jev, \
+             unittest.mock.patch.object(serve, '_download_stream_sync', side_effect=lambda *a, **k: {
+                 'status': 200, 'bytes': 3, 'finalUrl': 'https://example.com/f.bin'}):
+            r = self._do({'agentId': 'ben', 'url': 'https://example.com/f.bin',
+                          'workContext': 'Ship the report -- source data at https://example.com/f.bin',
+                          'workContextTrusted': True})
+        self.assertEqual(r.status_code, 200, r.text)
+        jev.assert_not_called()
+
+    def test_agent_authored_work_context_host_goes_through_jev(self):
+        # An agent-authored story naming a host must NOT bypass Jev -- the
+        # story text is a laundering vector, not a player-vetted allowlist.
+        calls = []
+        async def fake_quorum(instructions, criteria):
+            calls.append(1)
+            return ('allow', 0.99, 0.0, 'trace-3')
+        with unittest.mock.patch.object(serve, '_jev_quorum_decision', new=fake_quorum), \
+             unittest.mock.patch.object(serve, '_download_stream_sync', side_effect=lambda *a, **k: {
+                 'status': 200, 'bytes': 3, 'finalUrl': 'https://example.com/f.bin'}):
+            r = self._do({'agentId': 'ben', 'url': 'https://example.com/f.bin',
+                          'workContext': 'Investigate the data at https://example.com/f.bin',
+                          'workContextTrusted': False})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(calls), 1)
 
 
 class SmsDetection(_TestCase):

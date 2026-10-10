@@ -1336,5 +1336,40 @@ class DesignContextForTask(unittest.TestCase):
         dc.assert_called_once_with('product-1')
 
 
+class BuildWorkContext(unittest.TestCase):
+    """The Jev-gate work context is built NEVER-FIRST so a card's hard
+    prohibitions survive the gate's 600-char slice (they sit at the END of a
+    'backlog -- instructions' string, i.e. the first thing cut) and read as
+    labeled constraints rather than trailing task text."""
+
+    def test_never_leads_and_is_labeled(self):
+        ctx = content._build_work_context(
+            'Inventory report', 'Pull the CSV and summarize it',
+            '- never touch the live payment table\n- never auto-retry a payment')
+        self.assertTrue(ctx.startswith(
+            'Hard prohibitions for this work (never do these): - never touch the live payment table'))
+        self.assertIn('-- Inventory report', ctx)
+        self.assertIn('-- Pull the CSV and summarize it', ctx)
+
+    def test_never_only_no_instructions(self):
+        ctx = content._build_work_context('Inventory report', '', '- never charge twice')
+        self.assertTrue(ctx.startswith('Hard prohibitions for this work (never do these): - never charge twice'))
+        self.assertIn('-- Inventory report', ctx)
+
+    def test_no_never_keeps_plain_backlog_instructions(self):
+        self.assertEqual(content._build_work_context('Inventory report', 'Pull the CSV', None),
+                         'Inventory report -- Pull the CSV')
+        self.assertEqual(content._build_work_context('Inventory report', '', None), 'Inventory report')
+
+    def test_never_survives_600_char_gate_slice(self):
+        # The gate slices work_context[:600]; NEVER sits first, so it survives
+        # even when the instructions run long past the window.
+        never = '- never touch the live payment table' * 3
+        ctx = content._build_work_context('Inventory report', 'Long instructions. ' * 80, never)
+        self.assertGreater(len(ctx), 600)  # instructions run past the gate's slice
+        self.assertTrue(ctx[:600].startswith('Hard prohibitions for this work (never do these):'))
+        self.assertIn('never touch the live payment table', ctx[:600])
+
+
 if __name__ == '__main__':
     unittest.main()
