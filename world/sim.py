@@ -29,6 +29,7 @@ import json
 import math
 import os
 import random
+import re
 import threading
 import time
 import urllib.parse
@@ -2078,6 +2079,9 @@ def _build_agent_perception(state, agent_id, task=None):
         ac = task.get('acceptanceCriteria')
         if ac:
             parts.append(f'Acceptance criteria: {ac}')
+        never = task.get('never')
+        if never:
+            parts.append(f'NEVER:\n{never}')
         if task.get('reviewOf'):
             parts.append(f'This is a peer-review of task {task["reviewOf"]} '
                          f'-- your verdict counts on the parent story.')
@@ -2218,6 +2222,11 @@ def queue_work(state, items):
             # a whitelist that silently drops a field its consumer needs.
             'userStory': item.get('userStory') or None,
             'acceptanceCriteria': item.get('acceptanceCriteria') or None,
+            # A card's NEVER constraints ride the queue round trip onto the real
+            # task so the worker's instructions always include them (same class
+            # of gap as 'userStory'/'distill': a whitelist that silently drops
+            # a field its consumer needs).
+            'never': item.get('never') or None,
             'pair': bool(item.get('pair')),
             'notBefore': item.get('notBefore') or None,
             'priority': normalize_priority(item.get('priority')),
@@ -3195,7 +3204,7 @@ def create_or_reuse_feature(state, name, now_ms, quarter=None, target_date_ms=No
 def add_backlog_item(state, title, feature_id, created_by, now_ms,
                      item_type='story', acceptance_criteria=None,
                      size_estimate=None, goal=None, instructions=None,
-                     blocked_by=None):
+                     blocked_by=None, never=None):
     """Pure: file one unassigned STORY/SPIKE in the SHARED backlog under
     `feature_id`. Returns the item dict, or None if the cap is reached or the
     item is malformed. Mutates state['backlog'] + state['backlogCounter'] +
@@ -3223,6 +3232,7 @@ def add_backlog_item(state, title, feature_id, created_by, now_ms,
         'sizeEstimate': size_estimate or None,
         'goal': goal or None,
         'instructions': instructions or None,
+        'never': never or None,
         'createdBy': created_by or None,
         'createdAt': now_ms,
         'teamId': None,   # assigned at pickup
@@ -3285,6 +3295,8 @@ def _pull_backlog_for_team(state, team_id, now_ms):
         instructions = (f"({item.get('storyKey') or item['id']}) {item.get('title')}")
         if item.get('acceptanceCriteria'):
             instructions += f"\n\nAcceptance criteria:\n{item['acceptanceCriteria']}"
+        if item.get('never'):
+            instructions += f"\n\nNEVER:\n{item['never']}"
     queue_work(state, [{
         'title': item['title'],
         'room': None,  # the assigned agent decides where the work happens
@@ -3298,6 +3310,7 @@ def _pull_backlog_for_team(state, team_id, now_ms):
         'sizeEstimate': item.get('sizeEstimate'),
         'featureId': item.get('featureId'),
         'backlogItemId': item['id'],
+        'never': item.get('never') or None,
     }])
     _log_governance(state, team_id, 'backlog_pull',
                     {'item': item['id'], 'storyKey': item.get('storyKey'),
@@ -3833,6 +3846,7 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         # task.instructions).
         'userStory': (extra or {}).get('userStory'),
         'acceptanceCriteria': (extra or {}).get('acceptanceCriteria'),
+        'never': (extra or {}).get('never') or None,
         'pipelineStep': (extra or {}).get('pipelineStep'),
         # Bot Ops / shadow mode: a dry-run task (see queue_work). Stamped so the
         # completion path (_task_cycle) captures to the shadow ledger instead of
@@ -5389,6 +5403,8 @@ def _send_back_after_failure(state, task, fail_note=None):
         instructions += f"\n\nUser story: {task['userStory']}"
     if task.get('acceptanceCriteria'):
         instructions += f"\n\nAcceptance criteria:\n{task['acceptanceCriteria']}"
+    if task.get('never'):
+        instructions += f"\n\nNEVER:\n{task['never']}"
     queue_work(state, [{
         'title': f'Fix: {task.get("title")}',
         'room': task.get('room'),
@@ -5402,6 +5418,7 @@ def _send_back_after_failure(state, task, fail_note=None):
         'productId': task.get('productId'),
         'userStory': task.get('userStory'),
         'acceptanceCriteria': task.get('acceptanceCriteria'),
+        'never': task.get('never') or None,
         'priority': WORK_PRIORITY['high'],
     }])
 
@@ -7160,6 +7177,50 @@ def normalize_gwt_block(text):
              text[idx_w:idx_t].strip(),
              text[idx_t:].strip()]
     return ', '.join(p.strip().rstrip(',') for p in parts)
+
+
+_NEVER_MARKER_RE = re.compile(
+    r'^(never|do not|must not|constraints|don.t|under no circumstances)\s*[:.]?\s*$',
+    re.IGNORECASE)
+
+
+def normalize_never_block(value):
+    """Normalize a NEVER / constraints block to a canonical bullet list, or
+    None when empty. Accepts a list of prohibition strings or a text block.
+    Leading marker lines (NEVER:/DO NOT:/CONSTRAINTS:...) and bullet prefixes
+    are stripped; empty lines dropped. Content is kept verbatim -- the writer
+    owns the wording, and over-validating would silently delete a real
+    constraint, the exact failure this field exists to prevent."""
+    if isinstance(value, list):
+        lines = [str(v) for v in value]
+    else:
+        lines = (value or '').split('\n')
+    out = []
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if _NEVER_MARKER_RE.match(line):
+            continue
+        line = re.sub(r'^[-*\d.\s]+', '', line).strip()
+        if not line:
+            continue
+        out.append(line)
+    if not out:
+        return None
+    return '\n'.join(f'- {l}' for l in out)
+
+
+def _split_never_section(text):
+    """Split a plain-string card description into (body, never_text) at the
+    first NEVER:/DO NOT:/CONSTRAINTS: marker line. The body keeps everything
+    before the marker (the user story / GWT block); never_text is everything
+    from the marker on. Returns (text, None) when no marker is present."""
+    lines = (text or '').split('\n')
+    for i, raw in enumerate(lines):
+        if _NEVER_MARKER_RE.match(raw.strip()):
+            return '\n'.join(lines[:i]).strip(), '\n'.join(lines[i:]).strip()
+    return text, None
 def _default_team_prefix(team_id):
     """A deterministic default prefix from a team id slug (dev -> DEV). Only
     auto-derived; an explicit `prefix` on the team record always wins."""
@@ -7212,23 +7273,28 @@ def _as_block_text(value):
 
 
 def _normalize_description(description):
-    """A description dict {userStory, acceptanceCriteria} or a plain string is
-    split into the two canonical description blocks. Returns
-    (userStory, acceptanceCriteria) -- each normalized to its template, or None
-    when absent/malformed. The think tank understands exactly two Jira description
-    shapes: the user story ("As a..., I want to..., so that...") and the
-    acceptance criteria ("Given..., When..., Then..."). `acceptanceCriteria`
-    may arrive as a list of criteria strings (the natural JSON shape); the list
-    is joined into one block before normalization."""
+    """A description dict {userStory, acceptanceCriteria, never} or a plain
+    string is split into the three canonical description blocks. Returns
+    (userStory, acceptanceCriteria, never) -- each normalized to its template,
+    or None when absent/malformed. The think tank understands exactly three
+    description shapes: the user story ("As a..., I want to..., so that..."),
+    the acceptance criteria ("Given..., When..., Then..."), and the NEVER
+    constraints block (hard prohibitions that ride every card onto the
+    worker's instructions). `acceptanceCriteria` and `never` may arrive as
+    lists of strings (the natural JSON shape); the list is joined into one
+    block before normalization."""
     if isinstance(description, dict):
         return (normalize_story_block(_as_block_text(description.get('userStory'))),
-                normalize_gwt_block(_as_block_text(description.get('acceptanceCriteria'))))
+                normalize_gwt_block(_as_block_text(description.get('acceptanceCriteria'))),
+                normalize_never_block(description.get('never')))
     text = (description or '').strip()
     if not text:
-        return None, None
-    if _groups_look_like_gwt(text):
-        return None, normalize_gwt_block(text)
-    return normalize_story_block(text), None
+        return None, None, None
+    body, never_text = _split_never_section(text)
+    never = normalize_never_block(never_text)
+    if _groups_look_like_gwt(body):
+        return None, normalize_gwt_block(body), never
+    return normalize_story_block(body), None, never
 
 
 def _groups_look_like_gwt(text):
@@ -7247,9 +7313,12 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
     feature / reporter_id), the issue type is unknown, or the team is unknown.
     `feature` is the Jira project/area the work belongs to (required).
     `description` is optional but structured when present: pass a dict
-    `{'userStory': ..., 'acceptanceCriteria': ...}` or a plain string (each
-    block, when given, is normalized to "As a..., I want to..., so that..." /
-    "Given..., When..., Then..." and dropped if it doesn't follow its template).
+    `{'userStory': ..., 'acceptanceCriteria': ..., 'never': [...]}` or a plain
+    string (each block, when given, is normalized to "As a..., I want to...,
+    so that..." / "Given..., When..., Then..." / a "NEVER:" bullet list and
+    dropped if it doesn't follow its template). `never` carries hard
+    prohibitions that survive file_issue -> refinement -> queue -> task so the
+    worker's instructions always include them.
     `title` is an OPTIONAL one-line headline kept DISTINCT from `summary` so an
     agent scanning a long list can grasp the card without reading the whole
     description/criteria; defaults to `summary` when omitted.
@@ -7274,7 +7343,7 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         return None
     now_ms = time.time() * 1000 if now_ms is None else now_ms
     key = next_issue_key(state, team_id)
-    story, criteria = _normalize_description(description)
+    story, criteria, never = _normalize_description(description)
     title = (title or '').strip() or summary
     issue = {
         'key': key,
@@ -7286,6 +7355,7 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         'feature': feature,
         'userStory': story,
         'acceptanceCriteria': criteria,
+        'never': never,
         'storyPoints': story_points,
         'reporterId': reporter_id,
         'createdAt': now_ms,
@@ -7327,6 +7397,7 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         # instructions).
         'userStory': story,
         'acceptanceCriteria': criteria,
+        'never': never,
     }
     state.setdefault('backlogRequests', []).append(req)
     # Kick this team's refinement to be immediately due (next pass), not
@@ -8685,11 +8756,14 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
             # _assign_due_item / assign_task so they survive onto the task.
             story = req.get('userStory')
             criteria = req.get('acceptanceCriteria')
+            never = req.get('never')
             instructions = (f"Filed by {filed_by} during backlog refinement. {req.get('reason')}")
             if story:
                 instructions += f"\n\nUser story: {story}"
             if criteria:
                 instructions += f"\n\nAcceptance criteria:\n{criteria}"
+            if never:
+                instructions += f"\n\nNEVER:\n{never}"
             # Dependency cascade provenance: a card whose ISSUE was filed blocked
             # on another task (issue['dependsOnTask']) carries that dependency
             # onto its real task, so re-opening the dependency ripples a
@@ -8704,6 +8778,7 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
                 'teamId': req.get('teamId'),
                 'userStory': story,
                 'acceptanceCriteria': criteria,
+                'never': never,
                 'dependsOn': depends_on,
                 'issueKey': req.get('issueKey') or None,
                 # Human-in-the-loop: a card the filer marked for the PLAYER
@@ -9022,9 +9097,11 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             "Do NOT assign a room to a card -- the buildings are shared and the agent who picks the work up figures out "
             "where it needs to happen. Keep every title to ONE short sentence. For each card set \"type\" to "
             "\"story\" (deliverable work) or \"spike\" (an investigation with no committed deliverable), "
-            "a one-line \"acceptanceCriteria\" when the story has a clear test of done, and a \"sizeEstimate\" of S/M/L. "
+            "a one-line \"acceptanceCriteria\" when the story has a clear test of done, a \"never\" list "
+            "ONLY when the card has hard prohibitions the worker must never do (omit otherwise), and a "
+            "\"sizeEstimate\" of S/M/L. "
             "Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: "
-            '{"items":[{"title":"short title","type":"story|spike","acceptanceCriteria":"one line or omitted","sizeEstimate":"S|M|L"}]}'
+            '{"items":[{"title":"short title","type":"story|spike","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L"}]}'
         )
         data = decider(state, instructions, goal)
         items = []
@@ -9039,10 +9116,13 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             title = (s.get('title') or '').strip()[:120]
             task_type = 'spike' if (s.get('type') or 'story').strip().lower() == 'spike' else 'code'
             ac = (s.get('acceptanceCriteria') or '').strip()
+            never = normalize_never_block(s.get('never'))
             instructions_text = (f"Filed by {req.get('filedBy')} during a large-request breakdown by "
                                  f"{sm_name}. Requested goal: {goal[:200]}")
             if ac:
                 instructions_text += f"\n\nAcceptance criteria:\n{ac}"
+            if never:
+                instructions_text += f"\n\nNEVER:\n{never}"
             queue_work(state, [{
                 'title': title, 'goal': goal[:200], 'instructions': instructions_text,
                 'teamId': req.get('teamId'), 'taskType': task_type,
@@ -9050,6 +9130,7 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
                 # breakdown prompt); carry it so the queued item + task keep the
                 # estimate and same-priority work is ordered largest-first.
                 'sizeEstimate': s.get('sizeEstimate'),
+                'never': never,
             }])
         req['status'] = 'accepted'
         req['brokenDown'] = True
@@ -10576,6 +10657,7 @@ def _director_grant_budget_reopen(state, task_id, new_budget_usd, director_id=No
         'budgetBand': task.get('budgetBand') or 'standard',
         'userStory': task.get('userStory'),
         'acceptanceCriteria': task.get('acceptanceCriteria'),
+        'never': task.get('never') or None,
     }])
     _log_governance(state, director_id or task.get('assignedTo'), 'task_budget_granted',
                     {'taskId': task_id, 'title': (task.get('title') or '')[:120],
@@ -11608,6 +11690,7 @@ def _assign_player_task(state, pick, now_ms, task_id_holder=None):
         'dependsOn': pick.get('dependsOn') or None,
         'userStory': pick.get('userStory') or None,
         'acceptanceCriteria': pick.get('acceptanceCriteria') or None,
+        'never': pick.get('never') or None,
         'issueKey': pick.get('issueKey') or None,
         'budgetMs': pick.get('budgetMs') or None,
         'lane': pick.get('lane') or None,
@@ -11843,6 +11926,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # A player-filed card's contract survives onto the task (see assign_task).
         'userStory': pick.get('userStory'),
         'acceptanceCriteria': pick.get('acceptanceCriteria'),
+        'never': pick.get('never') or None,
         # Ordered-pipeline marker (see queue_work / assign_task): threads the
         # pipelineStep onto the real task so the strict-order sweep can read
         # completion back (and the content dispatcher can route the step).

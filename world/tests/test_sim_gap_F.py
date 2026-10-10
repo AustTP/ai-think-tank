@@ -157,7 +157,12 @@ class RequestAndDescription(SimIsolation):
     def test_normalize_description_plain_gwt_string(self):
         self.assertEqual(
             sim._normalize_description('given foo when bar then baz'),
-            (None, 'given foo, when bar, then baz'))
+            (None, 'given foo, when bar, then baz', None))
+
+    def test_normalize_description_plain_gwt_plus_never(self):
+        self.assertEqual(
+            sim._normalize_description('given foo when bar then baz\n\nNEVER:\n- never qux'),
+            (None, 'given foo, when bar, then baz', '- never qux'))
 
 
 class DeciderFallbacks(SimIsolation):

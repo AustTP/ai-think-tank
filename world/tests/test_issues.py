@@ -282,6 +282,69 @@ class IssueDescription(unittest.TestCase):
                                now_ms=_NOW_MS)
         self.assertIsNone(issue['userStory'])
         self.assertIsNone(issue['acceptanceCriteria'])
+        self.assertIsNone(issue['never'])
+
+
+class NeverBlock(unittest.TestCase):
+    """The NEVER constraints block: hard prohibitions that survive a card
+    file_issue -> refinement -> queue -> task into the worker's instructions."""
+
+    def test_dict_never_list_normalized(self):
+        state = _state()
+        issue = sim.file_issue(state, 'dev', 'story', 'Ship checkout',
+                               'checkout', 'player',
+                               description={'userStory': 'As a shopper, I want to pay once, '
+                                                         'so that I can skip the queue',
+                                            'never': ['never touch the live payment table',
+                                                      'don\'t emit the card number']},
+                               now_ms=_NOW_MS)
+        self.assertEqual(issue['never'],
+                         '- never touch the live payment table\n- don\'t emit the card number')
+        # The constraint travels on the backlog request that feeds refinement.
+        req = state['backlogRequests'][0]
+        self.assertEqual(req['never'], issue['never'])
+
+    def test_plain_string_never_section_parsed(self):
+        state = _state()
+        issue = sim.file_issue(state, 'dev', 'story', 'Ship checkout',
+                               'checkout', 'player',
+                               description=("As a shopper, I want to pay once, "
+                                            "so that I can skip the queue\n\n"
+                                            "NEVER:\n"
+                                            "- never charge twice\n"
+                                            "- do not delete the cart on failure"),
+                               now_ms=_NOW_MS)
+        self.assertEqual(issue['userStory'],
+                         'As a shopper, I want to pay once, so that I can skip the queue')
+        self.assertEqual(issue['never'],
+                         '- never charge twice\n- do not delete the cart on failure')
+
+    def test_gwt_plus_never_section(self):
+        state = _state()
+        issue = sim.file_issue(state, 'dev', 'bug', 'Fix double charge',
+                               'checkout', 'player',
+                               description=("Given a cart, When I pay, Then I am charged once\n\n"
+                                            "NEVER:\n- never auto-retry a failed payment"),
+                               now_ms=_NOW_MS)
+        self.assertIsNone(issue['userStory'])
+        self.assertIn('Given a cart, When I pay, Then I am charged once', issue['acceptanceCriteria'])
+        self.assertEqual(issue['never'], '- never auto-retry a failed payment')
+
+    def test_empty_or_marker_only_never_is_none(self):
+        state = _state()
+        issue = sim.file_issue(state, 'dev', 'story', 'Ship', 'checkout', 'player',
+                               description={'userStory': 'As a shopper, I want to pay once, '
+                                                         'so that I can skip the queue',
+                                            'never': 'NEVER:'},
+                               now_ms=_NOW_MS)
+        self.assertIsNone(issue['never'])
+
+    def test_normalize_never_block_accepts_both_shapes(self):
+        self.assertIsNone(sim.normalize_never_block(None))
+        self.assertIsNone(sim.normalize_never_block(''))
+        self.assertEqual(sim.normalize_never_block(['never do X']), '- never do X')
+        self.assertEqual(sim.normalize_never_block('NEVER:\n- never do X\n- no Y'),
+                         '- never do X\n- no Y')
 
 
 class IssueListing(unittest.TestCase):
