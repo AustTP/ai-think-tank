@@ -198,6 +198,22 @@ from memory import (  # noqa: E402,F401
     stm_append,
     stm_history,
 )
+# Scoped access to the player's own folders (Desktop, Downloads) and iCloud
+# Notes for agents, gated by player-issued grants (see DESIGN.md "Scoped File
+# and Notes Access" and world/fs.py). Every call is checked for containment,
+# the trash rule (deletes move to trash, never empty it), and Notes ownership.
+# Re-exported here so the stable surface call sites/tests use is `serve.fs_*`.
+from fs import (  # noqa: E402,F401
+    delete_to_trash as fs_delete_to_trash,
+    list_scope as fs_list_scope,
+    move_file as fs_move_file,
+    notes_create as fs_notes_create,
+    notes_delete as fs_notes_delete,
+    notes_list as fs_notes_list,
+    notes_modify as fs_notes_modify,
+    read_file as fs_read_file,
+    write_file as fs_write_file,
+)
 
 # Optional, real dependencies for document ingestion (/api/library/ingest,
 # below) -- openpyxl (Excel) was already installed for something else in
@@ -7151,6 +7167,11 @@ LTM_MAX_AGE_DAYS = int(_load_env().get('LTM_MAX_AGE_DAYS', '180') or 180)
 LTM_CONSOLIDATE_ENABLED = _load_env().get('LTM_CONSOLIDATE_ENABLED', 'true') not in ('0', 'false', 'False')
 LTM_CONSOLIDATE_EVERY_TURNS = int(_load_env().get('LTM_CONSOLIDATE_EVERY_TURNS', '12') or 12)
 LTM_CONSOLIDATE_MAX_CLUSTERS = int(_load_env().get('LTM_CONSOLIDATE_MAX_CLUSTERS', '4') or 4)
+# Scoped file + Notes access for agents (world/fs.py). When enabled, the
+# `local_file` tool is offered to the ask lane; every call is still gated by a
+# player-issued grant (scope + caps) in state, with containment + trash +
+# Notes-ownership enforced regardless.
+FILE_ACCESS_ENABLED = _load_env().get('FILE_ACCESS_ENABLED', 'true') not in ('0', 'false', 'False')
 
 
 def _load_failures():
@@ -8419,6 +8440,94 @@ AGENT_ASK_TOOLS = [
 # fabricated "test reports" that invented a nonexistent endpoint and its
 # responses rather than actually calling anything -- real tool access is
 # what makes a security-test result real instead of a guess.
+# Scoped local file + Notes access for agents (world/fs.py). Offered to the
+# ask lane only when FILE_ACCESS_ENABLED AND the player has issued at least
+# one grant; every call is still checked for containment + the trash rule +
+# Notes ownership inside fs.py.
+_LOCAL_FILE_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'local_file',
+        'description': 'Read/write/organize files in a folder the player granted you access to '
+                       '(Desktop, Downloads, etc.) and manage iCloud Notes. Every action is checked '
+                       'against the player\'s grant: you can only touch paths inside the granted scope, '
+                       'deletes move to the trash (you can never empty the trash), and for Notes you can '
+                       'read any note but only create new ones or modify/delete ones you created. '
+                       'Actions: list (list the granted folder), read (read a file\'s text), write '
+                       '(create/overwrite a file), move (move/rename within the folder), delete (move to '
+                       'trash), notes_list, notes_create, notes_modify, notes_delete. Supply the exact '
+                       '`scope` path the player granted (e.g. /Users/you/Desktop) and a relative '
+                       '`path`/`from`/`to` within it.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'action': {'type': 'string',
+                           'enum': ['list', 'read', 'write', 'move', 'delete',
+                                    'notes_list', 'notes_create', 'notes_modify', 'notes_delete']},
+                'scope': {'type': 'string', 'description': 'The granted folder path (absolute).'},
+                'path': {'type': 'string', 'description': 'Relative path within the scope (read/write/delete).'},
+                'from': {'type': 'string', 'description': 'Source relative path (move).'},
+                'to': {'type': 'string', 'description': 'Destination relative path (move).'},
+                'content': {'type': 'string', 'description': 'File or note body content (write/notes_create/notes_modify).'},
+                'title': {'type': 'string', 'description': 'Note title (notes_create).'},
+                'noteId': {'type': 'string', 'description': 'Note id (notes_modify/notes_delete).'},
+            },
+            'required': ['action'],
+        },
+    },
+}
+
+
+def _local_file_tool(agent_id, args):
+    """Dispatch a `local_file` tool call to the scoped fs layer. Every failure
+    (no grant, cap denied, containment escape, trash rule, Notes ownership) is
+    surfaced to the model as a denial -- never a bypass."""
+    import fs as _fs
+    action = (args or {}).get('action') or ''
+    scope = (args or {}).get('scope') or ''
+    try:
+        if action == 'list':
+            entries = _fs.list_scope(scope)
+            return ('Files in ' + scope + ':\n' + '\n'.join(
+                f"- {e['name']} ({e['type']})"
+                + (f", {e['size']} bytes" if e.get('size') is not None else '')
+                for e in entries)) or f'{scope} is empty'
+        if action == 'read':
+            return _fs.read_file(scope, (args or {}).get('path') or '')
+        if action == 'write':
+            p = _fs.write_file(scope, (args or {}).get('path') or '',
+                               (args or {}).get('content') or '')
+            return f'wrote {p}'
+        if action == 'move':
+            p = _fs.move_file(scope, (args or {}).get('from') or '', (args or {}).get('to') or '')
+            return f'moved to {p}'
+        if action == 'delete':
+            p = _fs.delete_to_trash(scope, (args or {}).get('path') or '')
+            return f'moved to trash: {p}'
+        if action == 'notes_list':
+            notes = _fs.notes_list()
+            return ('Notes:\n' + '\n'.join(f"- {n['title']}" for n in notes)) or 'no notes'
+        if action == 'notes_create':
+            nid = _fs.notes_create(agent_id, (args or {}).get('title') or '',
+                                   (args or {}).get('body') or '')
+            return f'created note {nid}'
+        if action == 'notes_modify':
+            _fs.notes_modify(agent_id, (args or {}).get('noteId') or '',
+                             (args or {}).get('body') or '')
+            return 'note updated'
+        if action == 'notes_delete':
+            _fs.notes_delete(agent_id, (args or {}).get('noteId') or '')
+            return 'note deleted'
+        return ('Unknown local_file action. Actions: list, read, write, move, delete, '
+                'notes_list, notes_create, notes_modify, notes_delete.')
+    except PermissionError as e:
+        return f'Denied: {e}'
+    except FileNotFoundError as e:
+        return f'Not found: {e}'
+    except Exception as e:
+        return f'local_file failed: {e}'
+
+
 SECURITY_TEST_TOOLS = [
     {
         'type': 'function',
@@ -12633,6 +12742,87 @@ async def feedback_player_inbox(message_id: str, request: Request):
     return JSONResponse({'ok': True, 'feedback': feedback})
 
 
+@app.get('/api/file-grants')
+async def list_file_grants(request: Request):
+    """The player's current file-access grants (scope + capability set) and the
+    Notes ownership registry summary. PLAYER-only. Read-only."""
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    grants = []
+    for g in state.get('fileGrants') or []:
+        grants.append({'id': g.get('id'), 'scope': g.get('scope'),
+                       'label': g.get('label'), 'caps': g.get('caps') or {}})
+    return JSONResponse({'ok': True, 'grants': grants,
+                         'noteCount': len(state.get('noteOwnership') or {})})
+
+
+@app.post('/api/file-grants')
+@_state_writer
+async def add_file_grant(request: Request):
+    """Grant the think tank scoped access to a folder. Body:
+    {scope: '/Users/you/Desktop', label: 'Desktop', caps: {read, write, delete}}.
+    `emptyTrash` is never accepted -- the trash rule is absolute. The scope must
+    be an existing absolute directory. PLAYER-only."""
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    scope = (body.get('scope') or '').strip()
+    label = (body.get('label') or '').strip() or scope
+    caps = body.get('caps') or {}
+    if not scope or not os.path.isabs(scope):
+        return JSONResponse({'error': 'scope must be an absolute path'}, status_code=400)
+    if not os.path.isdir(scope):
+        return JSONResponse({'error': 'scope must be an existing directory'}, status_code=400)
+    if caps.get('emptyTrash'):
+        return JSONResponse({'error': 'emptyTrash is never granted'}, status_code=400)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    root = os.path.realpath(scope)
+    for g in state.get('fileGrants') or []:
+        if os.path.realpath(g.get('scope') or '') == root:
+            return JSONResponse({'error': 'a grant for this scope already exists'}, status_code=409)
+    grant = {
+        'id': f'g-{len(state.get("fileGrants") or []) + 1}',
+        'scope': root,
+        'label': label,
+        'caps': {'read': bool(caps.get('read', True)),
+                 'write': bool(caps.get('write', True)),
+                 'delete': bool(caps.get('delete', True)),
+                 'emptyTrash': False},
+    }
+    state.setdefault('fileGrants', []).append(grant)
+    save_state_to_db(state)
+    log_action('player', 'file_grant_added',
+               {'grantId': grant['id'], 'scope': root, 'caps': grant['caps']}, authorized=True)
+    return JSONResponse({'ok': True, 'grant': grant})
+
+
+@app.delete('/api/file-grants/{grant_id}')
+@_state_writer
+async def revoke_file_grant(grant_id: str, request: Request):
+    """Revoke a file-access grant. PLAYER-only."""
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    grants = state.get('fileGrants') or []
+    before = len(grants)
+    state['fileGrants'] = [g for g in grants if g.get('id') != grant_id]
+    if len(state['fileGrants']) == before:
+        return JSONResponse({'error': 'unknown grant'}, status_code=404)
+    save_state_to_db(state)
+    log_action('player', 'file_grant_revoked', {'grantId': grant_id}, authorized=True)
+    return JSONResponse({'ok': True})
+
+
 @app.post('/api/intent/player-task/{task_id}/complete')
 @_state_writer
 async def complete_player_task_endpoint(task_id: str, request: Request):
@@ -13546,10 +13736,15 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
                 save_state_to_db(state)
             log_action(pick, 'adversarial_village', {'action': action, 'ok': ok})
             return msg
+        if name == 'local_file':
+            tools_used.append(name)
+            return _local_file_tool(pick, args)
         raise ValueError(f'unknown tool: {name}')
 
     tools = (AGENT_ASK_TOOLS + [_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL]
             + (SECURITY_TEST_TOOLS if is_security_test_role else []))
+    if FILE_ACCESS_ENABLED and (state.get('fileGrants') or []):
+        tools = tools + [_LOCAL_FILE_TOOL]
     try:
         if model:
             # Self-loopback deadlock (same class fixed in the

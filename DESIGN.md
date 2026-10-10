@@ -752,3 +752,38 @@ hash-chained (ported from the magi wheel's `audit_trail.py` hash-chain idea):
 - Retention prune distills each old tape row into `decision_archive` carrying
   the source row's `tape_hash`, so an archived decision cross-checks against
   the tape's chain even after the tape row is pruned.
+
+## 18. Scoped File and Notes Access
+
+Agents get read/write/organize access to the player's own folders (Desktop,
+Downloads) and iCloud Notes, gated by player-issued grants in `world/fs.py`.
+The trust root is the grant, not the agent: agents never hold macOS paths or
+Notes credentials directly -- they get a `local_file` tool whose every call is
+checked against a grant (scope root + capability set) stored in state under
+`fileGrants`. Three hard rules hold regardless of any grant:
+
+- **Containment.** Every path is realpath-resolved and must stay inside the
+  granted scope root. `..`, symlink escapes, and absolute paths outside the
+  scope are refused.
+- **Trash rule.** `~/.Trash` is never a valid target. Deletes move a file INTO
+  the trash (reversible) -- they never permanently unlink and can never empty
+  the trash. `emptyTrash` is a capability that is never granted (the grant API
+  rejects it outright).
+- **Notes ownership.** Existing notes are read-only. An agent may create a new
+  note or modify/delete a note it created, tracked in a `noteOwnership`
+  registry (note id -> creating agent); it can never touch a note someone else
+  made. Notes are read/created via AppleScript against the Notes app (needs
+  macOS automation/TCC permission for the server process), best-effort.
+
+**Player surface.** `GET /api/file-grants`, `POST /api/file-grants`
+(`{scope, label, caps:{read,write,delete}}`; `emptyTrash` rejected), and
+`DELETE /api/file-grants/{id}`. All PLAYER-only.
+
+**Agent surface.** The `local_file` tool (actions: list, read, write, move,
+delete, notes_list, notes_create, notes_modify, notes_delete) is offered to the
+ask lane only when `FILE_ACCESS_ENABLED` and the player has issued at least one
+grant. A denied call (no grant, cap missing, containment escape, trash rule,
+Notes ownership) is surfaced to the model as a denial, never a bypass.
+
+**Knob:** `FILE_ACCESS_ENABLED` (default true). Grants themselves are the real
+gate.
