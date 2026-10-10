@@ -127,9 +127,9 @@ class LtmRecall(unittest.TestCase):
     def setUp(self):
         _clear_memory()
         memory._insert_memories(self.SESSION, [
-            ('preference', 'The player prefers email over phone'),
-            ('decision', 'We agreed to use the observatory room for research'),
-            ('fact', 'The production server runs on port 8010'),
+            ('preference', 'The player prefers email over phone', 0.9, 'user_stated'),
+            ('decision', 'We agreed to use the observatory room for research', 0.9, 'user_stated'),
+            ('fact', 'The production server runs on port 8010', 0.9, 'user_stated'),
         ])
 
     def test_recall_returns_relevant_memories(self):
@@ -149,9 +149,64 @@ class LtmRecall(unittest.TestCase):
 
     def test_insert_dedupes_identical_content(self):
         memory._insert_memories(self.SESSION, [
-            ('preference', 'The player prefers email over phone')])
+            ('preference', 'The player prefers email over phone', 0.9, 'user_stated')])
         out = memory.ltm_recall('email phone preference')
         self.assertEqual(out.count('email over phone'), 1)
+
+    def test_recall_filters_below_min_confidence(self):
+        memory._insert_memories(self.SESSION, [
+            ('fact', 'the vault door is coded 4518', 0.1, 'user_stated')])
+        out = memory.ltm_recall('vault door code')
+        self.assertIsNone(out)
+
+    def test_recall_decays_old_memories(self):
+        memory._insert_memories(self.SESSION, [
+            ('fact', 'the orchard gate sticks in winter', 0.9, 'user_stated')])
+        old = time.time() - (2 * 86400)
+        with serve._db() as conn:
+            conn.execute('UPDATE ltm_memories SET created_at = ? WHERE session_id = ?',
+                         (old, self.SESSION))
+        with unittest.mock.patch.object(serve, 'LTM_MAX_AGE_DAYS', 1):
+            out = memory.ltm_recall('orchard gate winter')
+        self.assertIsNone(out)
+
+    def test_recall_boosts_user_stated_over_inferred(self):
+        memory._insert_memories(self.SESSION, [
+            ('fact', 'the greenhouse faces north', 0.9, 'user_stated'),
+            ('fact', 'the greenhouse faces north', 0.6, 'agent_inferred')])
+        out = memory.ltm_recall('greenhouse facing')
+        self.assertIsNotNone(out)
+        first = out.splitlines()[0]
+        self.assertNotIn('REDACTED', first)
+
+
+class RedactAndTrust(unittest.TestCase):
+    SESSION = '333'
+
+    def setUp(self):
+        _clear_memory()
+
+    def test_redact_secrets_scrubs_credentials(self):
+        out = memory._redact_secrets(
+            'my password is hunter2 and the api key is sk-proj-1234567890abcdef')
+        self.assertIn('[REDACTED:PASSWORD_STATEMENT]', out)
+        self.assertIn('[REDACTED:API_KEY]', out)
+        self.assertNotIn('hunter2', out)
+        self.assertNotIn('sk-proj', out)
+
+    def test_redact_secrets_scrubs_bearer_and_jwt(self):
+        out = memory._redact_secrets(
+            'Authorization: Bearer abcdef123456 and eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature')
+        self.assertIn('[REDACTED:BEARER_TOKEN]', out)
+        self.assertIn('[REDACTED:JWT]', out)
+
+    def test_insert_redacts_before_store(self):
+        memory._insert_memories(self.SESSION, [
+            ('fact', 'the api key is sk-abc12345678901234567', 0.9, 'user_stated')])
+        out = memory.ltm_recall('api key')
+        self.assertIsNotNone(out)
+        self.assertNotIn('sk-abc12345678901234567', out)
+        self.assertIn('[REDACTED:API_KEY]', out)
 
 
 class LtmParse(unittest.TestCase):
@@ -159,13 +214,13 @@ class LtmParse(unittest.TestCase):
         parsed = memory._parse_memories(
             '{"memories": [{"type": "preference", "content": "likes short replies"}, '
             '{"type": "fact", "content": "runs the village"}]}')
-        self.assertEqual(parsed, [('preference', 'likes short replies'),
-                                  ('fact', 'runs the village')])
+        self.assertEqual(parsed, [('preference', 'likes short replies', 0.6, 'agent_inferred'),
+                                  ('fact', 'runs the village', 0.6, 'agent_inferred')])
 
     def test_parse_fenced_json(self):
         parsed = memory._parse_memories(
             '```json\n{"memories": [{"type": "decision", "content": "ship on fridays"}]}\n```')
-        self.assertEqual(parsed, [('decision', 'ship on fridays')])
+        self.assertEqual(parsed, [('decision', 'ship on fridays', 0.6, 'agent_inferred')])
 
     def test_parse_bad_reply_fails_closed_to_empty(self):
         self.assertEqual(memory._parse_memories('not json at all'), [])
@@ -175,7 +230,17 @@ class LtmParse(unittest.TestCase):
     def test_parse_unknown_type_defaults_to_fact(self):
         parsed = memory._parse_memories(
             '{"memories": [{"type": "bogus", "content": "x"}]}')
-        self.assertEqual(parsed, [('fact', 'x')])
+        self.assertEqual(parsed, [('fact', 'x', 0.6, 'agent_inferred')])
+
+    def test_parse_trust_fields_and_fallbacks(self):
+        parsed = memory._parse_memories(
+            '{"memories": [{"type": "fact", "content": "user said it", "confidence": 0.95, "source": "user_stated"}, '
+            '{"type": "fact", "content": "inferred", "confidence": "bogus", "source": "bogus"}, '
+            '{"type": "fact", "content": "clamped", "confidence": 7}]}')
+        self.assertEqual(parsed, [
+            ('fact', 'user said it', 0.95, 'user_stated'),
+            ('fact', 'inferred', 0.6, 'agent_inferred'),
+            ('fact', 'clamped', 1.0, 'agent_inferred')])
 
 
 class Cleanup(unittest.TestCase):
@@ -186,7 +251,7 @@ class Cleanup(unittest.TestCase):
 
     def test_expired_session_pruned_ltm_survives(self):
         memory.stm_append(self.SESSION, 'user', 'hello')
-        memory._insert_memories(self.SESSION, [('fact', 'durable fact that must survive')])
+        memory._insert_memories(self.SESSION, [('fact', 'durable fact that must survive', 0.9, 'user_stated')])
         old = time.time() - 10000
         with serve._db() as conn:
             conn.execute('UPDATE stm_sessions SET updated_at = ? WHERE session_id = ?',
@@ -269,6 +334,77 @@ class RouteForwardsSession(unittest.TestCase):
         self.assertEqual(result['reply'], 'ok')
         self.assertEqual(seen['session_id'], '111')
         self.assertTrue(seen['allow_admin_pin'])
+
+
+class Consolidation(unittest.TestCase):
+    SESSION = '555'
+
+    def setUp(self):
+        _clear_memory()
+        memory.stm_append(self.SESSION, 'user', 'hello')
+
+    def _bump_turns(self, n):
+        with serve._db() as conn:
+            conn.execute('UPDATE stm_sessions SET turn_count = ? WHERE session_id = ?',
+                         (n, self.SESSION))
+
+    def test_find_clusters_groups_near_duplicates(self):
+        mems = [
+            (1, 'fact', 'The player works at the observatory north building'),
+            (2, 'fact', 'The player is employed at the observatory north building'),
+            (3, 'preference', 'Prefers short emails in the morning'),
+        ]
+        clusters = memory._find_consolidation_clusters(mems, max_clusters=4)
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual([m[0] for m in clusters[0]], [1, 2])
+
+    def test_consolidate_merges_near_duplicates(self):
+        memory._insert_memories(self.SESSION, [
+            ('fact', 'The player works at the observatory north building', 0.9, 'user_stated'),
+            ('fact', 'The player is employed at the observatory north building', 0.9, 'user_stated'),
+            ('preference', 'Prefers short emails in the morning', 0.9, 'user_stated'),
+        ])
+        self._bump_turns(20)
+        reply = ('{"merged": {"type": "fact", "content": '
+                 '"The player works at the observatory in the north building", "confidence": 0.9}}')
+        with unittest.mock.patch.object(memory, '_chat_call', return_value=reply):
+            merged = memory.ltm_consolidate(self.SESSION)
+        self.assertEqual(merged, 1)
+        out = memory.ltm_recall('observatory north building work')
+        self.assertIsNotNone(out)
+        self.assertLessEqual(out.count('- ['), 2)
+        with serve._db() as conn:
+            active = conn.execute('SELECT COUNT(*) FROM ltm_memories WHERE session_id = ? AND active = 1',
+                                  (self.SESSION,)).fetchone()[0]
+        self.assertEqual(active, 2)
+
+    def test_consolidate_keeps_distinct_when_model_says_no(self):
+        memory._insert_memories(self.SESSION, [
+            ('fact', 'The player works at the observatory north building', 0.9, 'user_stated'),
+            ('fact', 'The player is employed at the observatory north building', 0.9, 'user_stated'),
+        ])
+        self._bump_turns(20)
+        with unittest.mock.patch.object(memory, '_chat_call', return_value='{"merged": false}'):
+            merged = memory.ltm_consolidate(self.SESSION)
+        self.assertEqual(merged, 0)
+        with serve._db() as conn:
+            active = conn.execute('SELECT COUNT(*) FROM ltm_memories WHERE session_id = ? AND active = 1',
+                                  (self.SESSION,)).fetchone()[0]
+        self.assertEqual(active, 2)
+
+    def test_consolidate_respects_cadence(self):
+        memory._insert_memories(self.SESSION, [
+            ('fact', 'The player works at the observatory north building', 0.9, 'user_stated'),
+            ('fact', 'The player is employed at the observatory north building', 0.9, 'user_stated'),
+        ])
+        self._bump_turns(5)
+        merged = memory.ltm_consolidate(self.SESSION)
+        self.assertEqual(merged, 0)
+
+    def test_consolidate_disabled_is_noop(self):
+        with unittest.mock.patch.object(serve, 'LTM_CONSOLIDATE_ENABLED', False):
+            self.assertEqual(memory.ltm_consolidate(self.SESSION), 0)
+            self.assertFalse(memory.ltm_consolidate_due(self.SESSION))
 
 
 if __name__ == '__main__':

@@ -138,6 +138,88 @@ class DecisionTapeTests(unittest.TestCase):
         self.assertEqual(data, _jev_response())
 
 
+class DecisionTapeChainTests(unittest.TestCase):
+    """The tamper-evident HMAC chain: every tape row carries prev_hash + hash
+    (HMAC-SHA256 under the server secret), so a content edit, a reorder, or a
+    truncation inside the chain is detectable by _verify_decision_tape."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='decision-tape-chain-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            THINK_TANK_DIR=self.tmp,
+        )
+        self._cm.start()
+        serve.init_db()
+
+    def tearDown(self):
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _append(self, choice='fire', ok=True):
+        serve._append_decision_tape('personnel', 'typesafe/jev-1.13', 'p',
+                                    {'fire': 'x', 'keep': 'y'}, choice, 0.9,
+                                    0.0001, {'answers': {'q': {'choice': choice}}}, ok)
+
+    def test_append_chains_rows_and_verifies(self):
+        for _ in range(3):
+            self._append()
+        ok, problems = serve._verify_decision_tape()
+        self.assertTrue(ok, problems)
+        with serve._db() as conn:
+            rows = conn.execute(
+                'SELECT prev_hash, hash FROM decision_tape ORDER BY id').fetchall()
+        self.assertEqual(rows[1][0], rows[0][1])
+        self.assertEqual(rows[2][0], rows[1][1])
+
+    def test_edit_detected_as_hash_mismatch(self):
+        self._append()
+        self._append('fire')
+        with serve._db() as conn:
+            conn.execute("UPDATE decision_tape SET choice = 'keep' WHERE id = 2")
+        ok, problems = serve._verify_decision_tape()
+        self.assertFalse(ok)
+        self.assertIn('hash mismatch', problems[0]['issue'])
+
+    def test_deleted_middle_row_detected_as_chain_break(self):
+        for _ in range(3):
+            self._append()
+        with serve._db() as conn:
+            conn.execute('DELETE FROM decision_tape WHERE id = 2')
+        ok, problems = serve._verify_decision_tape()
+        self.assertFalse(ok)
+        self.assertTrue(any('chain break' in p['issue'] for p in problems))
+
+    def test_legacy_unhashed_rows_backfilled_then_verify(self):
+        # Rows written before the chain existed have NULL hash; init_db's
+        # backfill chains them and they verify cleanly afterward.
+        with serve._db() as conn:
+            for i in range(2):
+                conn.execute(
+                    'INSERT INTO decision_tape (ts, kind, model, prompt, criteria, choice, confidence, cost, raw, ok) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (1000.0 + i, 'personnel', 'typesafe/jev-1.13', 'p', '{}',
+                     'fire', 0.9, 0.0, '{}', 1))
+        serve.init_db()
+        ok, problems = serve._verify_decision_tape()
+        self.assertTrue(ok, problems)
+
+    def test_verify_endpoint_reports_clean_then_tampered(self):
+        self._append()
+        self._append()
+        route = {r.path: r for r in serve.app.routes if hasattr(r, 'path')}['/api/decisions/verify']
+        resp = _call_feed(route)
+        self.assertTrue(resp['ok'])
+        self.assertEqual(resp['count'], 0)
+        with serve._db() as conn:
+            conn.execute("UPDATE decision_tape SET cost = 9.99 WHERE id = 2")
+        resp = _call_feed(route)
+        self.assertFalse(resp['ok'])
+        self.assertEqual(resp['count'], 1)
+        self.assertEqual(resp['tampered'][0]['id'], 2)
+
+
 class DecisionTapeFeedTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='decision-tape-feed-')

@@ -41,11 +41,14 @@ _LTM_EXTRACT_SYSTEM = (
     'Extract durable, factual memories about the user and the project from this '
     'conversation. Respond with ONLY valid JSON, no other text and no markdown '
     'fences, in exactly this shape: '
-    '{"memories": [{"type": "preference|fact|decision|unresolved_question", "content": "..."}]}. '
+    '{"memories": [{"type": "preference|fact|decision|unresolved_question", '
+    '"content": "...", "confidence": 0.0-1.0, "source": "user_stated|agent_inferred"}]}. '
     'Types: "preference" = a standing user preference or communication style; '
     '"fact" = a stable fact about the user or project that would still be true later; '
     '"decision" = a decision made or agreed in this conversation; '
     '"unresolved_question" = a question left open that the user may follow up on. '
+    '"confidence" is how sure you are the memory is true and stable (1.0 = certain). '
+    '"source" is "user_stated" when the user said it directly, else "agent_inferred". '
     'Only include items useful in a LATER conversation. Skip small talk, one-off '
     'details, and anything already obvious. Return {"memories": []} if nothing durable.'
 )
@@ -64,6 +67,59 @@ _STOPWORDS = frozenset({
 
 _SUMMARY_CAP_CHARS = 2000
 
+# Write-side credential redaction for persisted memory (ported from the magi
+# framework's memory_write_filter.py). A player texting a password, API key,
+# token, or connection string must never have it distilled into LTM and
+# re-injected into a later ask -- REDACT instead of block, so the memory keeps
+# its context ("user asked about a password reset") while the secret value is
+# scrubbed. Also applied to the rolling STM summary so pruned turns don't bake
+# a secret into the recap.
+_CREDENTIAL_PATTERNS = (
+    ('PASSWORD_STATEMENT', re.compile(
+        r"\b(my\s+)?password\s*(is|was|:)\s*[\"']?[\w@#$%^&*!]+[\"']?", re.IGNORECASE)),
+    ('API_KEY', re.compile(
+        r"\b(api[\s_-]?key|apikey|api[\s_-]?token)\s*(:|=|is)\s+[\"']?[a-zA-Z0-9_\-]{16,}[\"']?",
+        re.IGNORECASE)),
+    ('BEARER_TOKEN', re.compile(r"\bbearer\s+[a-zA-Z0-9_\-\.]+", re.IGNORECASE)),
+    ('AWS_KEY', re.compile(r"\b(AKIA|ASIA)[A-Z0-9]{12,20}\b")),
+    ('SECRET', re.compile(
+        r"\b(secret|credential|private[_-]?key)\s*(:|=|is)\s*[\"']?[^\s\"']{8,}[\"']?",
+        re.IGNORECASE)),
+    ('CONN_STRING', re.compile(r"(password|pwd|passwd)\s*=\s*[^\s;]+", re.IGNORECASE)),
+    ('JWT', re.compile(r"eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+")),
+    ('GIT_TOKEN', re.compile(r"\b(ghp_|gho_|ghu_|ghs_|ghr_|glpat-)[a-zA-Z0-9_]{20,}\b")),
+    ('DAPI_TOKEN', re.compile(r"\bdapi[a-f0-9]{32,}\b", re.IGNORECASE)),
+)
+
+
+def _redact_secrets(text):
+    """Scrub credential values from text before it is persisted to memory.
+    Every pattern match becomes [REDACTED:TYPE] so the context survives and
+    the secret does not."""
+    out = str(text or '')
+    for name, pattern in _CREDENTIAL_PATTERNS:
+        out = pattern.sub(f'[REDACTED:{name}]', out)
+    return out
+
+# Read-side trust for LTM recall (ported from the magi framework's
+# memory_trust.py): every memory carries a confidence + source, and recall
+# filters by minimum confidence, decays stale memories, and boosts memories
+# the user stated directly. A false fact the player mentioned once in passing
+# must not carry the same weight as something stable and repeated.
+_TRUST_SOURCE_WEIGHTS = {
+    'user_stated': 0.9,
+    'agent_inferred': 0.6,
+    'system_generated': 0.8,
+    'unknown': 0.4,
+}
+_TRUST_SOURCE_BOOST = {
+    'user_stated': 0.1,
+    'system_generated': 0.05,
+    'agent_inferred': 0.0,
+    'unknown': -0.15,
+}
+_TRUST_DECAY_DAYS = 90  # beyond this age, memories lose half their trust
+
 
 def _ensure_tables():
     """Create the memory tables if they do not exist. Idempotent, and safe
@@ -78,9 +134,16 @@ def _ensure_tables():
                 turn_count INTEGER NOT NULL DEFAULT 0,
                 token_count INTEGER NOT NULL DEFAULT 0,
                 last_extract_turn INTEGER NOT NULL DEFAULT 0,
+                last_consolidate_turn INTEGER NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             )''')
+            # Migration: stm_sessions predates the consolidation cadence column.
+            existing_s = {r[1] for r in conn.execute('PRAGMA table_info(stm_sessions)')}
+            if 'last_consolidate_turn' not in existing_s:
+                conn.execute(
+                    'ALTER TABLE stm_sessions ADD COLUMN last_consolidate_turn '
+                    'INTEGER NOT NULL DEFAULT 0')
             conn.execute('''CREATE TABLE IF NOT EXISTS stm_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 session_id TEXT NOT NULL,
@@ -98,9 +161,22 @@ def _ensure_tables():
                 mem_type TEXT NOT NULL,
                 content TEXT NOT NULL,
                 created_at REAL NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1
+                active INTEGER NOT NULL DEFAULT 1,
+                confidence REAL NOT NULL DEFAULT 0.5,
+                source_type TEXT NOT NULL DEFAULT 'unknown',
+                fact_checked INTEGER NOT NULL DEFAULT 0
             )''')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_ltm_active ON ltm_memories(active)')
+            # Migration: ltm_memories predates the trust columns (confidence /
+            # source_type / fact_checked), so an existing DB needs the columns
+            # added idempotently -- CREATE TABLE IF NOT EXISTS alone cannot.
+            existing_l = {r[1] for r in conn.execute('PRAGMA table_info(ltm_memories)')}
+            for col, ddl in (
+                    ('confidence', 'REAL NOT NULL DEFAULT 0.5'),
+                    ('source_type', "TEXT NOT NULL DEFAULT 'unknown'"),
+                    ('fact_checked', 'INTEGER NOT NULL DEFAULT 0')):
+                if col not in existing_l:
+                    conn.execute(f'ALTER TABLE ltm_memories ADD COLUMN {col} {ddl}')
     except Exception:
         pass
 
@@ -227,7 +303,7 @@ def _enforce_limits(session_id):
             pruned_tokens = sum(r[4] for r in pruned)
             recap = _rule_based_summary(
                 '\n'.join(f"{r[2]}: {r[3]}" for r in pruned))
-            merged = f"{summary}\n{recap}".strip() if summary else recap
+            merged = _redact_secrets(f"{summary}\n{recap}".strip()) if summary else recap
             if len(merged) > _SUMMARY_CAP_CHARS:
                 merged = merged[-_SUMMARY_CAP_CHARS:]
             conn.execute(
@@ -272,7 +348,8 @@ def _rule_based_summary(text):
         parts.append('Key points: ' + '; '.join(decision_parts[:3]))
     if last_assistant:
         parts.append(f'Last response: {last_assistant}')
-    return ' | '.join(parts) if parts else 'Context continues from earlier in this conversation.'
+    recap = ' | '.join(parts) if parts else 'Context continues from earlier in this conversation.'
+    return _redact_secrets(recap)
 
 
 def _spawn_summary_upgrade(session_id):
@@ -309,7 +386,7 @@ def _summary_upgrade_worker(session_id):
         with _serve._db() as conn:
             conn.execute(
                 'UPDATE stm_sessions SET summary = ?, updated_at = ? WHERE session_id = ?',
-                (summary.strip()[:_SUMMARY_CAP_CHARS], time.time(), session_id),
+                (_redact_secrets(summary.strip())[:_SUMMARY_CAP_CHARS], time.time(), session_id),
             )
     except Exception as e:
         print(f'[memory] summary upgrade failed: {e}', flush=True)
@@ -317,36 +394,53 @@ def _summary_upgrade_worker(session_id):
 
 def ltm_recall(question, limit=None):
     """The most relevant long-term memories for `question`, as a formatted
-    string (or None). Relevance is keyword-overlap scored with recency as the
-    tiebreak -- a cheap, dependency-free stand-in for magi's vector search."""
+    string (or None). Relevance is keyword-overlap scored, then ranked by a
+    trust factor -- confidence, source priority (user-stated > inferred), and
+    staleness decay -- a cheap, dependency-free stand-in for magi's vector
+    search + trust filter. Memories below the minimum confidence or older than
+    the max age are not recalled at all (poisoning defense: an offhand false
+    fact the user stated once does not outrank a stable, repeated one)."""
     import serve as _serve
     if not question or not _enabled():
         return None
     limit = int(limit if limit is not None else getattr(_serve, 'LTM_MAX_RECALL', 5) or 5)
     if limit <= 0:
         return None
+    min_conf = float(getattr(_serve, 'LTM_MIN_CONFIDENCE', 0.3) or 0.0)
+    max_age_days = int(getattr(_serve, 'LTM_MAX_AGE_DAYS', 180) or 0)
     qwords = _words(question)
     if not qwords:
         return None
     _ensure_tables()
+    now = time.time()
     try:
         with _serve._db() as conn:
             rows = conn.execute(
-                'SELECT mem_type, content, created_at FROM ltm_memories '
-                'WHERE active = 1 ORDER BY created_at DESC LIMIT ?', (limit * 30,),
+                'SELECT mem_type, content, created_at, confidence, source_type FROM ltm_memories '
+                'WHERE active = 1 ORDER BY created_at DESC LIMIT ?', (limit * 60,),
             ).fetchall()
     except Exception:
         return None
     scored = []
-    for mem_type, content, created_at in rows:
+    for mem_type, content, created_at, confidence, source_type in rows:
         overlap = len(qwords & _words(content))
-        if overlap >= 1:
-            scored.append((overlap, created_at, mem_type, content))
-    scored.sort(key=lambda x: (-x[0], -x[1]))
+        if overlap < 1:
+            continue
+        confidence = max(0.0, min(1.0, float(confidence or 0.0)))
+        if confidence < min_conf:
+            continue
+        age_days = max(0.0, (now - created_at) / 86400.0)
+        if max_age_days > 0 and age_days > max_age_days:
+            continue
+        # Trust factor: source priority + staleness decay (half-life).
+        trust = _TRUST_SOURCE_BOOST.get(source_type or 'unknown', -0.15) \
+            - (age_days / _TRUST_DECAY_DAYS) * 0.2
+        scored.append((overlap + trust, overlap, created_at, mem_type, content))
+    scored.sort(key=lambda x: (-x[0], -x[2]))
     top = scored[:limit]
     if not top:
         return None
-    return '\n'.join(f"- [{mt}] {c}" for _, _, mt, c in top)
+    return '\n'.join(f"- [{mt}] {c}" for _, _, _, mt, c in top)
 
 
 def ltm_maybe_extract(session_id):
@@ -368,6 +462,11 @@ def ltm_maybe_extract(session_id):
             return None
         t = threading.Thread(target=_ltm_extract_worker, args=(session_id,), daemon=True)
         t.start()
+        # Consolidation runs on its own (slower) cadence; check whether it is
+        # due and fire it in a background thread too. Never blocks the ask.
+        if ltm_consolidate_due(session_id):
+            c = threading.Thread(target=_ltm_consolidate_worker, args=(session_id,), daemon=True)
+            c.start()
     except Exception as e:
         print(f'[memory] ltm extract launch failed: {e}', flush=True)
     return None
@@ -409,9 +508,10 @@ def _ltm_extract_worker(session_id):
 
 
 def _parse_memories(reply):
-    """Parse the extraction reply into [(type, content), ...]. Fails closed to
-    [] on anything that does not parse cleanly -- a bad reply never fabricates
-    memory."""
+    """Parse the extraction reply into [(type, content, confidence, source), ...].
+    Fails closed to [] on anything that does not parse cleanly -- a bad reply
+    never fabricates memory. Confidence defaults to the source's base weight;
+    source defaults to 'agent_inferred' (the reply is LLM-distilled)."""
     if not reply:
         return []
     cleaned = re.sub(r'^```json\s*|^```\s*|```\s*$', '', str(reply).strip())
@@ -433,8 +533,17 @@ def _parse_memories(reply):
         if mem_type not in LTM_TYPES:
             mem_type = 'fact'
         content = str(it.get('content') or '').strip()
-        if content:
-            out.append((mem_type, content))
+        if not content:
+            continue
+        source = str(it.get('source') or 'agent_inferred').strip().lower()
+        if source not in _TRUST_SOURCE_WEIGHTS:
+            source = 'agent_inferred'
+        try:
+            confidence = float(it.get('confidence'))
+        except (TypeError, ValueError):
+            confidence = _TRUST_SOURCE_WEIGHTS[source]
+        confidence = max(0.0, min(1.0, confidence))
+        out.append((mem_type, content, confidence, source))
     return out
 
 
@@ -442,7 +551,9 @@ def _insert_memories(session_id, memories):
     """Insert new LTM memories, deduplicated against the active set, and cap the
     session's store so an aging conversation cannot grow the table without
     bound. Duplicates are skipped silently -- a re-extracted fact must not
-    accumulate."""
+    accumulate. Content is redacted for secrets before it is stored (write-side
+    credential filter), so a password or API key a player texts can never be
+    re-injected into a later ask."""
     import serve as _serve
     cap = int(getattr(_serve, 'LTM_MAX_PER_SESSION', 200) or 200)
     try:
@@ -453,14 +564,15 @@ def _insert_memories(session_id, memories):
                 (session_id,),
             ).fetchall()
             seen = {_normalize(e[0]) for e in existing}
-            for mem_type, content in memories:
-                if _normalize(content) in seen:
+            for mem_type, content, confidence, source in memories:
+                content = _redact_secrets(content).strip()
+                if not content or _normalize(content) in seen:
                     continue
                 seen.add(_normalize(content))
                 conn.execute(
-                    'INSERT INTO ltm_memories (session_id, mem_type, content, created_at, active) '
-                    'VALUES (?, ?, ?, ?, 1)',
-                    (session_id, mem_type, content, now),
+                    'INSERT INTO ltm_memories (session_id, mem_type, content, created_at, active, '
+                    'confidence, source_type, fact_checked) VALUES (?, ?, ?, ?, 1, ?, ?, 0)',
+                    (session_id, mem_type, content, now, confidence, source),
                 )
             rows = conn.execute(
                 'SELECT id FROM ltm_memories WHERE session_id = ? AND active = 1 '
@@ -475,6 +587,169 @@ def _insert_memories(session_id, memories):
                 )
     except Exception as e:
         print(f'[memory] ltm insert failed: {e}', flush=True)
+
+
+_LTM_CONSOLIDATE_SYSTEM = (
+    'You are merging redundant long-term memories. Below is a list of memories '
+    'about the same user/project that may describe the same underlying fact in '
+    'different words. If they are near-duplicates of ONE underlying fact, merge '
+    'them into a single richer memory. If they are genuinely different facts, '
+    'do not merge. Respond with ONLY valid JSON: '
+    '{"merged": {"type": "preference|fact|decision|unresolved_question", "content": "...", '
+    '"confidence": 0.0-1.0}} for a merge, or {"merged": false} to keep them separate. '
+    'The merged content should keep the durable, still-true details and drop '
+    'contradicted or one-off specifics.'
+)
+
+_LTM_CONSOLIDATE_ALPHA = 0.4  # min Jaccard similarity for a merge candidate pair
+
+
+def _memory_words(content):
+    return _words(content)
+
+
+def _find_consolidation_clusters(memories, max_clusters=4):
+    """Group memories into near-duplicate candidate clusters by keyword overlap
+    (Jaccard on significant words). Returns a list of lists of
+    (id, mem_type, content) -- each cluster has >= 2 members -- capped to the
+    max clusters per run so consolidation spend stays bounded."""
+    clusters = []
+    n = len(memories)
+    word_sets = [_memory_words(c) for _, _, c in memories]
+    consumed = set()
+    for i in range(n):
+        if i in consumed:
+            continue
+        group = [i]
+        for j in range(i + 1, n):
+            if j in consumed:
+                continue
+            a, b = word_sets[i], word_sets[j]
+            if not a or not b:
+                continue
+            inter = len(a & b)
+            union = len(a | b)
+            if union and inter >= 2 and inter / union >= _LTM_CONSOLIDATE_ALPHA:
+                group.append(j)
+        if len(group) >= 2:
+            consumed.update(group)
+            clusters.append([memories[k] for k in group])
+            if len(clusters) >= max_clusters:
+                break
+    return clusters
+
+
+def ltm_consolidate_due(session_id):
+    """Cheap pre-check: is the session past its consolidation cadence? Used to
+    decide whether to spawn a consolidation worker; the worker re-checks the
+    cadence under the DB before merging anything."""
+    import serve as _serve
+    if not session_id or not _enabled():
+        return False
+    if not getattr(_serve, 'LTM_CONSOLIDATE_ENABLED', True):
+        return False
+    every = int(getattr(_serve, 'LTM_CONSOLIDATE_EVERY_TURNS', 12) or 0)
+    if every <= 0:
+        return False
+    _ensure_tables()
+    try:
+        with _serve._db() as conn:
+            row = conn.execute(
+                'SELECT last_consolidate_turn, turn_count FROM stm_sessions WHERE session_id = ?',
+                (session_id,),
+            ).fetchone()
+        return bool(row and row[1] - row[0] >= every)
+    except Exception:
+        return False
+
+
+def _ltm_consolidate_worker(session_id):
+    """Best-effort background consolidation. Fails closed to a no-op; a merge
+    error never blocks or corrupts an ask."""
+    try:
+        ltm_consolidate(session_id)
+    except Exception as e:
+        print(f'[memory] ltm consolidate worker failed: {e}', flush=True)
+
+
+def ltm_consolidate(session_id):
+    """Batch consolidation (ported from the magi framework's
+    memory_consolidation.py): scan the session's active memories for
+    near-duplicates and merge each cluster into one richer memory via a
+    bounded LLM call. Runs on its own cadence (LTM_CONSOLIDATE_EVERY_TURNS),
+    never blocks an ask, and fails closed -- a bad merge reply keeps the
+    cluster untouched. Merged memories inherit the cluster's max confidence
+    and a 'system_generated' source."""
+    import serve as _serve
+    if not session_id or not _enabled():
+        return 0
+    if not getattr(_serve, 'LTM_CONSOLIDATE_ENABLED', True):
+        return 0
+    every = int(getattr(_serve, 'LTM_CONSOLIDATE_EVERY_TURNS', 12) or 0)
+    if every <= 0:
+        return 0
+    max_clusters = int(getattr(_serve, 'LTM_CONSOLIDATE_MAX_CLUSTERS', 4) or 4)
+    _ensure_tables()
+    try:
+        with _serve._db() as conn:
+            row = conn.execute(
+                'SELECT last_consolidate_turn, turn_count FROM stm_sessions WHERE session_id = ?',
+                (session_id,),
+            ).fetchone()
+            if not row:
+                return 0
+            last_consolidate, turn_count = row
+            if turn_count - last_consolidate < every:
+                return 0
+            memories = conn.execute(
+                'SELECT id, mem_type, content FROM ltm_memories '
+                'WHERE session_id = ? AND active = 1 ORDER BY created_at DESC, id DESC LIMIT 100',
+                (session_id,),
+            ).fetchall()
+            conn.execute(
+                'UPDATE stm_sessions SET last_consolidate_turn = ?, updated_at = ? '
+                'WHERE session_id = ?', (turn_count, time.time(), session_id))
+    except Exception as e:
+        print(f'[memory] consolidate scan failed: {e}', flush=True)
+        return 0
+    clusters = _find_consolidation_clusters(memories, max_clusters=max_clusters)
+    merged_count = 0
+    for cluster in clusters:
+        try:
+            ids = [r[0] for r in cluster]
+            snippet = '\n'.join(f'- [{mt}] {c}' for _, mt, c in cluster)
+            reply = _chat_call(_LTM_CONSOLIDATE_SYSTEM, snippet, max_tokens=300)
+            if not reply:
+                continue
+            cleaned = re.sub(r'^```json\s*|^```\s*|```\s*$', '', reply.strip())
+            data = json.loads(cleaned)
+            if not isinstance(data, dict) or data.get('merged') in (None, False):
+                continue
+            m = data['merged']
+            if not isinstance(m, dict):
+                continue
+            mem_type = str(m.get('type') or 'fact').strip().lower()
+            if mem_type not in LTM_TYPES:
+                mem_type = 'fact'
+            content = str(m.get('content') or '').strip()
+            if not content:
+                continue
+            try:
+                confidence = float(m.get('confidence'))
+            except (TypeError, ValueError):
+                confidence = _TRUST_SOURCE_WEIGHTS['system_generated']
+            confidence = max(0.0, min(1.0, confidence))
+            _insert_memories(session_id, [(mem_type, content, confidence, 'system_generated')])
+            with _serve._db() as conn:
+                conn.execute(
+                    'UPDATE ltm_memories SET active = 0 WHERE id IN (%s)'  # nosec B608 -- placeholder count only, values are bound parameters
+                    % ','.join('?' * len(ids)), tuple(ids))
+            merged_count += 1
+        except Exception as e:
+            print(f'[memory] consolidate merge failed: {e}', flush=True)
+    if merged_count:
+        print(f'[memory] consolidated {merged_count} cluster(s) for session {session_id}', flush=True)
+    return merged_count
 
 
 def memory_context(session_id, question):
