@@ -1632,6 +1632,50 @@ class BenchmarkDataSources(unittest.TestCase):
                 ('mistralai/mistral-nemo', 'MMLU-Pro')).fetchone()
         self.assertEqual(row, (68.4, 'player'))
 
+    def test_tokenizer_splits_on_dashes_dots_slashes(self):
+        # Regression: a hub id like 'meta-llama/llama-3.1-70b-instruct' must
+        # tokenize to {meta, llama, 31, 70b, instruct} -- the old removal-based
+        # normalizer glued dashes/dots and produced '3170binstruct', so the HF
+        # name fallback never matched base open-weights models.
+        self.assertEqual(
+            serve._benchmark_name_tokens('meta-llama/llama-3.1-70b-instruct'),
+            {'meta', 'llama', '3', '1', '70b', 'instruct'})
+        self.assertEqual(
+            serve._benchmark_name_tokens('OpenAI: GPT-6 Luna Pro'),
+            {'openai', 'gpt', '6', 'luna', 'pro'})
+        self.assertEqual(serve._benchmark_name_tokens(''), set())
+
+    def test_hf_name_match_without_hugging_face_id(self):
+        # A catalog model with NO hugging_face_id still gets its HF fallback
+        # score via the normalized name-token match (the shortest hub id whose
+        # tokens contain the catalog name's tokens wins -- the closest base).
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            self.skipTest('pyarrow not installed')
+        self._set(hf_contents_parquet_url='https://hf.test/parquet')
+        table = pa.table({'fullname': ['meta-llama/llama-3.1-70b-instruct'], 'MMLU-PRO': [47.88]})
+        buf = io.BytesIO()
+        pq.write_table(table, buf)
+        parquet_bytes = buf.getvalue()
+        calls = [{'parquet_files': [{'url': 'https://hf.test/data.parquet'}]}, parquet_bytes]
+        def _resp(payload):
+            resp = unittest.mock.MagicMock()
+            resp.read.return_value = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+            resp.__enter__.return_value = resp
+            return resp
+        with unittest.mock.patch('urllib.request.urlopen',
+                                 side_effect=[_resp(calls[0]), _resp(calls[1])]):
+            added = serve._ingest_hf_open_llm_fallback(
+                [self._model('meta-llama/llama-3.1-70b-instruct')])
+        self.assertEqual(added, 1)
+        with serve._db() as conn:
+            row = conn.execute(
+                'SELECT score, evaluator FROM model_benchmark_scores WHERE model_id=? AND benchmark=?',
+                ('meta-llama/llama-3.1-70b-instruct', 'MMLU-Pro')).fetchone()
+        self.assertEqual(row, (47.88, 'huggingface_open_llm'))
+
 
 class ModelTierEndpoints(unittest.TestCase):
     """model_tiers, model_tiers_refresh, model_benchmark_scores get/post."""

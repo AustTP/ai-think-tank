@@ -10340,12 +10340,13 @@ def _ingest_catalog_benchmarks(models):
 def _benchmark_name_tokens(name):
     """Normalize a model display name into a token set for fuzzy matching
     between the catalog ('OpenAI: GPT-6 Luna Pro') and an evaluator's own
-    names ('GPT-6 Luna (max)'). Parentheticals are reasoning-effort variants,
-    not model identity, so they are dropped; the vendor prefix and punctuation
-    collapse."""
+    names ('GPT-6 Luna (max)', 'meta-llama/llama-3.1-70b-instruct').
+    Parentheticals are reasoning-effort variants, not model identity, so they
+    are dropped; every other run of non-alphanumerics is a SEPARATOR (a dash,
+    dot or slash in a hub id must not glue tokens like '70b' and 'instruct'
+    into '70binstruct'), and the vendor prefix and punctuation collapse."""
     name = re.sub(r'\(.*?\)', '', (name or '').lower())
-    name = re.sub(r'[:/]', ' ', name)
-    name = re.sub(r'[^a-z0-9 ]', '', name)
+    name = re.sub(r'[^a-z0-9]+', ' ', name)
     return set(name.split())
 
 
