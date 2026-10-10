@@ -4558,7 +4558,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     try:
         execute_text, transcript = _run_spike_tool_loop_with_reflection(
             tier_slug, reasoning_slug, messages, spike_tools, execute_tool,
-            total_iterations=50, max_tokens=900, force_first_tool=first_tool,
+            total_iterations=50, max_tokens=2400, force_first_tool=first_tool,
             task_id=task.get('id'),
             village_id=_sim_village_of_agent(snapshot, agent_id))
     except Exception as e:
