@@ -107,6 +107,8 @@ GRANTS_CONFIG: dict = {'appGrants': [], 'fileGrants': []}
 _BUNDLE_ID_RE = re.compile(r'^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$')
 _GRANTS_CACHE = {'mtime': None, 'data': None}
 
+_WATCHLIST_CACHE: dict = {'mtime': None, 'data': [], 'ok': False}
+
 _WATCHLIST_LOAD_ERROR = None
 
 
@@ -237,6 +239,32 @@ def get_grants_config():
         _GRANTS_CACHE['mtime'] = mtime
         _GRANTS_CACHE['data'] = _load_grants(GRANTS_PATH)
     return _GRANTS_CACHE['data']
+
+
+def get_research_watchlist():
+    """Return the current watchlist.json topics, re-reading the file whenever
+    its mtime changes -- the same live-reload pattern as get_grants_config, so
+    an operator edit applies without restarting the server. Returns
+    (topics, ok): `ok` is False when the file is missing or unparseable, so a
+    live sync can refuse to wipe the standing schedule on a transient bad read
+    instead of deleting everything. Also refreshes the module-level
+    RESEARCH_WATCHLIST on change so config consumers see the edit live."""
+    try:
+        mtime = os.path.getmtime(WATCHLIST_PATH)
+    except OSError:
+        mtime = -1
+    if _WATCHLIST_CACHE['mtime'] != mtime:
+        _WATCHLIST_CACHE['mtime'] = mtime
+        try:
+            with open(WATCHLIST_PATH, encoding='utf-8') as f:
+                json.load(f)  # parseability check: tells an empty list from a corrupt file
+        except Exception:
+            _WATCHLIST_CACHE['ok'] = False
+            return list(_WATCHLIST_CACHE['data']), False
+        _WATCHLIST_CACHE['data'] = _load_watchlist(WATCHLIST_PATH)
+        _WATCHLIST_CACHE['ok'] = True
+        RESEARCH_WATCHLIST[:] = [dict(t) for t in _WATCHLIST_CACHE['data']]
+    return list(_WATCHLIST_CACHE['data']), _WATCHLIST_CACHE['ok']
 
 
 def reload_policy_config():

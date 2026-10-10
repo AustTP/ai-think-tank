@@ -4901,6 +4901,12 @@ async def _lifespan(app):
         task.cancel()
     if sim_task is not None:
         sim_task.cancel()
+    # Shutdown restores the writeback gate: the boot path above set
+    # config.ALLOW_WATCHLIST_WRITE = True for the server's whole run, and a test
+    # that enters this lifespan (`async with serve._lifespan(...)`) must not
+    # leave the operator-owned writeback permanently authorized after it exits.
+    import config as _config
+    _config.ALLOW_WATCHLIST_WRITE = False
 
 
 # Workers report to one of the two directors (Theo — the admin, and Nora —

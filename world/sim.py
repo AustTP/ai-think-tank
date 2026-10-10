@@ -4483,6 +4483,48 @@ def _ensure_long_horizon_topic(state, now_ms):
                         {'villageId': vid, 'topic': topic, 'cadenceDays': cadence_days})
 
 
+def _sync_research_watchlist(state):
+    """Live-reconcile state['researchTopics'] against the operator-edited
+    world/watchlist.json. The boot seed only ran at startup, so an edit to the
+    file required a restart before; this runs on every _check_schedules pass
+    and applies an operator edit live: a topic added to the file is appended
+    to state (same add_research_topic validation + cadence clamp, so it fires
+    on the next pass), and a standing topic removed from the file is dropped
+    from state so it stops firing. Village long-horizon topics live only in
+    state (never in the watchlist), so they are never removed. Gated on
+    config.ALLOW_WATCHLIST_WRITE (the real server boot turns it on; tests never
+    run lifespan, so the file stays inert there -- exactly the write-back gate
+    discipline). Removal is skipped if the file cannot be read, so a transient
+    bad parse cannot wipe the schedule. Returns (added, removed)."""
+    import config as _config
+    if not _config.ALLOW_WATCHLIST_WRITE:
+        return 0, 0
+    watchlist, ok = _config.get_research_watchlist()
+    topics = state.setdefault('researchTopics', [])
+    by_key = {(t.get('topic'), t.get('startUrl')) for t in topics}
+    added = 0
+    for t in watchlist:
+        key = (t.get('topic'), t.get('startUrl'))
+        if key in by_key:
+            continue
+        record = add_research_topic(state, t.get('topic'), t.get('startUrl'),
+                                    t.get('cadenceMs') or 0,
+                                    link_keyword=t.get('linkKeyword'),
+                                    page_keyword=t.get('pageKeyword'))
+        if record is not None:
+            by_key.add(key)
+            added += 1
+    removed = 0
+    if ok:
+        wanted = {(t.get('topic'), t.get('startUrl')) for t in watchlist}
+        kept = [t for t in topics
+                if t.get('longHorizon') or (t.get('topic'), t.get('startUrl')) in wanted]
+        removed = len(topics) - len(kept)
+        if removed:
+            state['researchTopics'] = kept
+    return added, removed
+
+
 def _check_schedules(state, now, now_ms):
     """Port of tasks.js checkResearchSchedule + checkSkillReviewSchedule: queue
     due standing work, stamping lastRunAt/lastSkillReviewAt BEFORE assignment so
@@ -4493,6 +4535,9 @@ def _check_schedules(state, now, now_ms):
     review/merge. With no content the marker is deliberately NOT advanced, so
     the sweep fires on the first later pass where content appears."""
     import serve
+    # Keep state['researchTopics'] a live mirror of the operator-edited
+    # watchlist.json first, so an edit takes effect without a restart.
+    _sync_research_watchlist(state)
     # Research topics.
     # Long-horizon seeding first: a village's standing far-future topic is
     # created before due topics fire, so a fresh village always has its horizon
