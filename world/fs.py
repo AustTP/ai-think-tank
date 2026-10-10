@@ -253,3 +253,67 @@ def notes_delete(agent_id, note_id):
 
 def _esc(s):
     return str(s or '').replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+
+
+# ---------------------------------------------------------------------------
+# App control via AppleScript: agents drive player-approved apps (by bundle
+# id) for real work -- e.g. asking the current document app for its text, or
+# triggering an export in a desktop tool that has no API. Gated the same way
+# file access is: a player-issued `appGrants` entry (bundleId + caps) in
+# state, checked per call, and the script body is validated so the ONLY thing
+# it can do is talk to the granted app -- no shell, no URL opening, no
+# privilege escalation, no cross-app scripting. AppleScript primitives that
+# would escape the granted app (a raw shell is a filesystem + internet bypass
+# around the file grants and the Jev egress gates) fail CLOSED.
+# ---------------------------------------------------------------------------
+
+_APP_DENY_PATTERNS = (
+    'do shell',                    # arbitrary shell execution (filesystem + internet bypass)
+    'open location',               # open an arbitrary URL / launch a different app
+    'with administrator privileges',  # privilege escalation
+    'tell application',            # script a different app than the one granted
+    'current application',         # bridge to arbitrary Objective-C classes
+)
+
+
+def _app_grants(state):
+    return state.get('appGrants') or []
+
+
+def _app_grant_for(state, bundle_id):
+    bid = (bundle_id or '').strip()
+    for g in _app_grants(state):
+        if (g.get('bundleId') or '').strip() == bid:
+            return g
+    return None
+
+
+def _validate_app_script(script):
+    s = (script or '').strip()
+    if not s:
+        raise PermissionError('empty AppleScript body')
+    low = s.lower()
+    for pat in _APP_DENY_PATTERNS:
+        if pat in low:
+            raise PermissionError(
+                f'script uses a denied AppleScript primitive ({pat!r}) -- app_script only '
+                'talks to the granted app, never a shell, a URL, or another app')
+    return s
+
+
+def app_script(bundle_id, script):
+    """Run an AppleScript body against ONE player-approved app. The body is
+    validated (no shell / URL / escalation / cross-app primitives), wrapped in
+    `tell application id "<bundleId>"`, and executed via osascript. Returns the
+    script's text output, or raises PermissionError on any denial."""
+    state = _state()
+    grant = _app_grant_for(state, bundle_id)
+    if not grant:
+        raise PermissionError(f'no grant for app {bundle_id!r} -- the player must grant it first')
+    _require_cap(grant, 'use')
+    body = _validate_app_script(script)
+    wrapped = f'tell application id "{_esc(bundle_id)}"\n{body}\nend tell'
+    out, err = _osascript(wrapped)
+    if err:
+        raise PermissionError(f'AppleScript failed for {bundle_id}: {err}')
+    return out or '(no output)'
