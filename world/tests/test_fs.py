@@ -1,13 +1,14 @@
-"""Scoped file + Notes access (world/fs.py): containment, the trash rule, cap
-enforcement, and Notes ownership. The trust root is a player-issued grant
-(scope + caps) in state; three hard rules hold regardless of any grant:
+"""Scoped file + app + structured-data access (world/fs.py): containment, the
+trash rule, cap enforcement, read-only SQLite reads, and gated AppleScript app
+control. The trust root is a player-issued grant (scope + caps, or an app
+bundleId) in state; three hard rules hold regardless of any grant:
 
 1. CONTAINMENT -- realpath must stay inside the granted scope (no `..`, no
    symlink escape, no absolute path).
 2. TRASH RULE -- ~/.Trash is never a valid target; deletes move INTO the trash
    (reversible) and can never empty it.
-3. NOTES OWNERSHIP -- existing notes are read-only; an agent may only
-   modify/delete notes it created (tracked in noteOwnership).
+3. READ-ONLY DATA -- read_store opens SQLite read-only, bounds rows/output,
+   and refuses non-read queries.
 
 Hermetic: state is injected via patched get_state_from_db/save_state_to_db and
 the scope + trash are throwaway temp dirs (TRASH_DIR env override). No real
@@ -127,48 +128,80 @@ class FsScopeTests(unittest.TestCase):
             fs.list_scope(self.scope)
 
 
-class NotesOwnershipTests(unittest.TestCase):
+class ReadStoreTests(unittest.TestCase):
+    """read_store: grant enforcement, read-only query gate, gzip + protobuf
+    decoding, and bounded output."""
+
     def setUp(self):
-        self.state = {'noteOwnership': {}}
+        self.tmp = tempfile.mkdtemp(prefix='fs-store-')
+        self.scope = os.path.join(self.tmp, 'Data')
+        os.makedirs(self.scope)
+        self.state = {'fileGrants': [{'id': 'g-1', 'scope': self.scope, 'label': 'Data',
+                                      'caps': {'read': True}}]}
         self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
-        self._ss = unittest.mock.patch.object(serve, 'save_state_to_db', side_effect=lambda s: None)
         self._gs.start()
-        self._ss.start()
+        self._env = unittest.mock.patch.dict(os.environ, {'TRASH_DIR': os.path.join(self.tmp, 'Trash')})
+        self._env.start()
+        import sqlite3 as _s
+        self.db = os.path.join(self.scope, 'store.sqlite')
+        conn = _s.connect(self.db)
+        conn.execute('CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, payload BLOB)')
+        import gzip as _g
+        blob = _g.compress(b'hello world')
+        conn.execute('INSERT INTO items (name, payload) VALUES (?, ?)', ('a', blob))
+        conn.execute('INSERT INTO items (name, payload) VALUES (?, ?)', ('b', None))
+        conn.commit()
+        conn.close()
 
     def tearDown(self):
         self._gs.stop()
-        self._ss.stop()
+        self._env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_create_records_ownership(self):
-        with unittest.mock.patch.object(fs, '_osascript', return_value=('note-1', None)):
-            nid = fs.notes_create('agent-1', 'Title', 'Body')
-        self.assertEqual(nid, 'note-1')
-        self.assertEqual(self.state['noteOwnership']['note-1']['agentId'], 'agent-1')
-
-    def test_modify_own_allowed(self):
-        self.state['noteOwnership'] = {'note-1': {'agentId': 'agent-1', 'createdAt': 1}}
-        with unittest.mock.patch.object(fs, '_osascript', return_value=('ok', None)):
-            self.assertTrue(fs.notes_modify('agent-1', 'note-1', 'new body'))
-
-    def test_modify_others_denied(self):
-        self.state['noteOwnership'] = {'note-1': {'agentId': 'agent-2', 'createdAt': 1}}
+    def test_no_grant_denied(self):
+        self.state['fileGrants'] = []
         with self.assertRaises(PermissionError):
-            fs.notes_modify('agent-1', 'note-1', 'new body')
+            fs.read_store(self.scope, 'store.sqlite', 'SELECT * FROM items')
 
-    def test_delete_own_allowed_others_denied(self):
-        self.state['noteOwnership'] = {'note-1': {'agentId': 'agent-1', 'createdAt': 1}}
-        with unittest.mock.patch.object(fs, '_osascript', return_value=('ok', None)):
-            self.assertTrue(fs.notes_delete('agent-1', 'note-1'))
-        self.assertNotIn('note-1', self.state['noteOwnership'])
-        self.state['noteOwnership'] = {'note-2': {'agentId': 'agent-2', 'createdAt': 1}}
+    def test_read_required(self):
+        self.state['fileGrants'] = [{'id': 'g-1', 'scope': self.scope, 'caps': {'read': False}}]
         with self.assertRaises(PermissionError):
-            fs.notes_delete('agent-1', 'note-2')
+            fs.read_store(self.scope, 'store.sqlite', 'SELECT * FROM items')
 
-    def test_read_allowed_for_any_note(self):
-        with unittest.mock.patch.object(fs, '_osascript',
-                                        return_value=('A\tbody a\nB\tbody b\n', None)):
-            notes = fs.notes_list()
-        self.assertEqual([n['title'] for n in notes], ['A', 'B'])
+    def test_containment_escape_denied(self):
+        with self.assertRaises(PermissionError):
+            fs.read_store(self.scope, '../outside.sqlite', 'SELECT 1')
+
+    def test_write_query_denied(self):
+        for q in ('DELETE FROM items', 'INSERT INTO items VALUES (1,2,3)', 'DROP TABLE items', 'UPDATE items SET name=?', 'ATTACH DATABASE x AS y'):
+            with self.subTest(query=q):
+                with self.assertRaises(PermissionError):
+                    fs.read_store(self.scope, 'store.sqlite', q)
+
+    def test_select_returns_rows_and_gzip_decodes(self):
+        rows = fs.read_store(self.scope, 'store.sqlite', 'SELECT name, payload FROM items',
+                             gzip_columns=['payload'])
+        self.assertEqual(len(rows), 2)
+        by_name = {r['name']: r['payload'] for r in rows}
+        self.assertEqual(by_name['a'], 'hello world')
+        self.assertIsNone(by_name['b'])
+
+    def test_undefined_gzip_column_is_plain(self):
+        rows = fs.read_store(self.scope, 'store.sqlite', 'SELECT name, payload FROM items')
+        # No gzipColumns requested: the payload stays raw bytes (decoded lossily).
+        by_name = {r['name']: r['payload'] for r in rows}
+        self.assertNotEqual(by_name['a'], 'hello world')
+
+    def test_proto_decode_extracts_strings(self):
+        import fs as _fs
+        buf = (b'\x0a\x03abc' + b'\x12\x05hello' + b'\x1a\x06world!')
+        out = _fs.decode_proto(buf)
+        self.assertIn('abc', out)
+        self.assertIn('hello', out)
+
+    def test_row_limit_and_output_bound(self):
+        rows = fs.read_store(self.scope, 'store.sqlite', 'SELECT * FROM items', max_rows=1)
+        self.assertEqual(len(rows), 1)
 
 
 class GrantApiTests(unittest.TestCase):

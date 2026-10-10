@@ -207,10 +207,6 @@ from fs import (  # noqa: E402,F401
     delete_to_trash as fs_delete_to_trash,
     list_scope as fs_list_scope,
     move_file as fs_move_file,
-    notes_create as fs_notes_create,
-    notes_delete as fs_notes_delete,
-    notes_list as fs_notes_list,
-    notes_modify as fs_notes_modify,
     read_file as fs_read_file,
     write_file as fs_write_file,
 )
@@ -8448,38 +8444,36 @@ AGENT_ASK_TOOLS = [
 # fabricated "test reports" that invented a nonexistent endpoint and its
 # responses rather than actually calling anything -- real tool access is
 # what makes a security-test result real instead of a guess.
-# Scoped local file + Notes access for agents (world/fs.py). Offered to the
+# Scoped local file access for agents (world/fs.py). Offered to the
 # ask lane only when FILE_ACCESS_ENABLED AND the player has issued at least
-# one grant; every call is still checked for containment + the trash rule +
-# Notes ownership inside fs.py.
+# one grant; every call is still checked for containment + the trash rule
+# inside fs.py. (iCloud Notes is NOT special-cased here -- agents drive the
+# Notes app through the generic `app_script` tool once the player grants
+# com.apple.Notes, and can read the Notes SQLite store via `read_store`.)
 _LOCAL_FILE_TOOL = {
     'type': 'function',
     'function': {
         'name': 'local_file',
         'description': 'Read/write/organize files in a folder the player granted you access to '
-                       '(Desktop, Downloads, etc.) and manage iCloud Notes. Every action is checked '
+                       '(Desktop, Downloads, etc.). Every action is checked '
                        'against the player\'s grant: you can only touch paths inside the granted scope, '
-                       'deletes move to the trash (you can never empty the trash), and for Notes you can '
-                       'read any note but only create new ones or modify/delete ones you created. '
+                       'deletes move to the trash (you can never empty the trash). '
 'Actions: list (list a folder in the scope; pass `path` to list a subfolder, '
                         'omit it to list the scope root), read (read a file\'s text), write '
                         '(create/overwrite a file), move (move/rename within the folder), delete (move to '
-                        'trash), notes_list, notes_create, notes_modify, notes_delete. Supply the exact '
+                        'trash). Supply the exact '
                        '`scope` path the player granted (e.g. /Users/you/Desktop) and a relative '
                        '`path`/`from`/`to` within it.',
         'parameters': {
             'type': 'object',
             'properties': {
                 'action': {'type': 'string',
-                           'enum': ['list', 'read', 'write', 'move', 'delete',
-                                    'notes_list', 'notes_create', 'notes_modify', 'notes_delete']},
+                           'enum': ['list', 'read', 'write', 'move', 'delete']},
                 'scope': {'type': 'string', 'description': 'The granted folder path (absolute).'},
                 'path': {'type': 'string', 'description': 'Relative path within the scope (read/write/delete).'},
                 'from': {'type': 'string', 'description': 'Source relative path (move).'},
                 'to': {'type': 'string', 'description': 'Destination relative path (move).'},
-                'content': {'type': 'string', 'description': 'File or note body content (write/notes_create/notes_modify).'},
-                'title': {'type': 'string', 'description': 'Note title (notes_create).'},
-                'noteId': {'type': 'string', 'description': 'Note id (notes_modify/notes_delete).'},
+                'content': {'type': 'string', 'description': 'File content (write).'},
             },
             'required': ['action'],
         },
@@ -8489,8 +8483,8 @@ _LOCAL_FILE_TOOL = {
 
 def _local_file_tool(agent_id, args):
     """Dispatch a `local_file` tool call to the scoped fs layer. Every failure
-    (no grant, cap denied, containment escape, trash rule, Notes ownership) is
-    surfaced to the model as a denial -- never a bypass."""
+    (no grant, cap denied, containment escape, trash rule) is surfaced to the
+    model as a denial -- never a bypass."""
     import fs as _fs
     action = (args or {}).get('action') or ''
     scope = (args or {}).get('scope') or ''
@@ -8514,28 +8508,72 @@ def _local_file_tool(agent_id, args):
         if action == 'delete':
             p = _fs.delete_to_trash(scope, (args or {}).get('path') or '')
             return f'moved to trash: {p}'
-        if action == 'notes_list':
-            notes = _fs.notes_list()
-            return ('Notes:\n' + '\n'.join(f"- {n['title']}" for n in notes)) or 'no notes'
-        if action == 'notes_create':
-            nid = _fs.notes_create(agent_id, (args or {}).get('title') or '',
-                                   (args or {}).get('body') or '')
-            return f'created note {nid}'
-        if action == 'notes_modify':
-            _fs.notes_modify(agent_id, (args or {}).get('noteId') or '',
-                             (args or {}).get('body') or '')
-            return 'note updated'
-        if action == 'notes_delete':
-            _fs.notes_delete(agent_id, (args or {}).get('noteId') or '')
-            return 'note deleted'
-        return ('Unknown local_file action. Actions: list, read, write, move, delete, '
-                'notes_list, notes_create, notes_modify, notes_delete.')
+        return 'Unknown local_file action. Actions: list, read, write, move, delete.'
     except PermissionError as e:
         return f'Denied: {e}'
     except FileNotFoundError as e:
         return f'Not found: {e}'
     except Exception as e:
         return f'local_file failed: {e}'
+
+
+# Generic structured-data reads (world/fs.py read_store): SQLite inside a
+# granted scope, with optional gzip + protobuf decoding. Offered alongside
+# local_file (FILE_ACCESS_ENABLED AND a grant); the DB is opened read-only and
+# the query must be SELECT/PRAGMA/EXPLAIN/WITH. This is how an agent reads a
+# store like the macOS Notes SQLite database as JSON without AppleScript.
+_READ_STORE_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'read_store',
+        'description': 'Read structured data from a SQLite database inside a folder the player '
+                       'granted you access to (read-only). Optionally gzip-decompress and/or '
+                       'protobuf-decode chosen columns. Use this to pull data out of a local store '
+                       'like the macOS Notes database (NoteStore.sqlite) as JSON rows -- no '
+                       'AppleScript or app needed for reads. Supply the granted `scope` path, the '
+                       'DB path relative to it, a read-only SQL `query` (SELECT/PRAGMA/EXPLAIN/WITH), '
+                       'and column names to decode.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'scope': {'type': 'string', 'description': 'The granted folder path (absolute).'},
+                'path': {'type': 'string', 'description': 'Relative path to the SQLite DB within the scope.'},
+                'query': {'type': 'string', 'description': 'Read-only SQL: SELECT/PRAGMA/EXPLAIN/WITH (no writes).'},
+                'gzipColumns': {'type': 'array', 'items': {'type': 'string'},
+                                'description': 'Column names whose bytes are gzip-compressed (decompressed first).'},
+                'protoColumns': {'type': 'array', 'items': {'type': 'string'},
+                                 'description': 'Column names that are protobuf-encoded; extracts readable text.'},
+                'maxRows': {'type': 'integer', 'description': 'Max rows to return (default 50, capped at 200).'},
+            },
+            'required': ['scope', 'path', 'query'],
+        },
+    },
+}
+
+
+def _read_store_tool(agent_id, args):
+    """Dispatch a `read_store` tool call to the gated fs layer."""
+    import fs as _fs
+    try:
+        rows = _fs.read_store(
+            (args or {}).get('scope') or '',
+            (args or {}).get('path') or '',
+            (args or {}).get('query') or '',
+            gzip_columns=(args or {}).get('gzipColumns') or [],
+            proto_columns=(args or {}).get('protoColumns') or [],
+            max_rows=(args or {}).get('maxRows') or 50,
+        )
+        import json as _json
+        log_action(agent_id, 'read_store', {'scope': (args or {}).get('scope'), 'rows': len(rows)},
+                   authorized=True)
+        return _json.dumps(rows, indent=1, default=str)
+    except PermissionError as e:
+        log_action(agent_id, 'read_store_denied', {'reason': str(e)}, authorized=True)
+        return f'Denied: {e}'
+    except FileNotFoundError as e:
+        return f'Not found: {e}'
+    except Exception as e:
+        return f'read_store failed: {e}'
 
 
 # App control via AppleScript (world/fs.py): offered to lanes that also get
@@ -12816,8 +12854,7 @@ async def list_file_grants(request: Request):
     for g in state.get('fileGrants') or []:
         grants.append({'id': g.get('id'), 'scope': g.get('scope'),
                        'label': g.get('label'), 'caps': g.get('caps') or {}})
-    return JSONResponse({'ok': True, 'grants': grants,
-                         'noteCount': len(state.get('noteOwnership') or {})})
+    return JSONResponse({'ok': True, 'grants': grants})
 
 
 @app.post('/api/file-grants')
@@ -13873,6 +13910,9 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         if name == 'local_file':
             tools_used.append(name)
             return _local_file_tool(pick, args)
+        if name == 'read_store':
+            tools_used.append(name)
+            return _read_store_tool(pick, args)
         if name == 'app_script':
             tools_used.append(name)
             return _app_script_tool(pick, args)
@@ -13881,7 +13921,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     tools = (AGENT_ASK_TOOLS + [_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL]
             + (SECURITY_TEST_TOOLS if is_security_test_role else []))
     if FILE_ACCESS_ENABLED and (state.get('fileGrants') or []):
-        tools = tools + [_LOCAL_FILE_TOOL]
+        tools = tools + [_LOCAL_FILE_TOOL, _READ_STORE_TOOL]
     if APP_ACCESS_ENABLED and (state.get('appGrants') or []):
         tools = tools + [_APP_SCRIPT_TOOL]
     try:
