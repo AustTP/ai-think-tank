@@ -2366,6 +2366,60 @@ def _mask_credential_preview(payload):
     return {'kind': 'token', 'token': _mask_secret(payload.get('token'))}
 
 
+# Login adapters: the service-specific half of a username/password account.
+# The vault + capability handles make the secret reachable and per-ask scoped,
+# but actually PERFORMING an interactive login (form fields, CSRF, MFA,
+# cookies) is code that only makes sense once a real account exists. Each
+# adapter is a contract:
+#   _LOGIN_ADAPTERS[service] = {
+#       'login_url': 'https://host/...',  # SSRF-checked before dispatch
+#       'fn': callable(grant, action) -> dict,
+#   }
+# `grant` is the resolved capability grant (username/password/purpose/service);
+# `action` is {'method', 'url', 'body'} for the ONE scoped action. `fn` MUST
+# perform the login + that single action, keep the session in-process, and
+# never put the password in its result -- the skeleton scrubs secret-shaped
+# keys as a defensive last line. The action host/method are already enforced
+# by the handle scope before fn is called.
+_LOGIN_ADAPTERS = {}
+
+# Secret-shaped result keys that _login_scrub_result masks no matter what an
+# adapter returns. Never logs or returns these un-masked.
+_LOGIN_SECRET_KEYS = frozenset({
+    'password', 'passwd', 'pwd', 'token', 'access_token', 'refresh_token',
+    'secret', 'cookie', 'cookies', 'session', 'session_id', 'sessionid',
+    'set_cookie', 'auth', 'authorization', 'api_key', 'apikey', 'key',
+})
+
+
+def _login_scrub_result(result, depth=0):
+    """Mask any secret-shaped key anywhere in an adapter result. The adapter
+    contract forbids returning secrets, but a scrub here is the last line of
+    defense so a careless adapter can't leak a password to the agent."""
+    if depth > 5 or result is None or isinstance(result, (str, int, float, bool)):
+        return result
+    if isinstance(result, dict):
+        out = {}
+        for k, v in result.items():
+            if isinstance(k, str) and k.lower() in _LOGIN_SECRET_KEYS:
+                out[k] = _mask_secret(str(v)) if isinstance(v, str) else '[redacted]'
+            else:
+                out[k] = _login_scrub_result(v, depth + 1)
+        return out
+    if isinstance(result, list):
+        return [_login_scrub_result(v, depth + 1) for v in result]
+    return result
+
+
+def _login_safe_url(url):
+    """Public-https + SSRF-safe check for the URLs a login flow touches (the
+    action URL and the adapter's declared login URL). Fails closed."""
+    if not isinstance(url, str) or not url.lower().startswith('https://'):
+        return False
+    host = urllib.parse.urlparse(url).hostname or ''
+    return bool(host) and _is_safe_public_host(host)
+
+
 _DIGITALOCEAN_BALANCE_CACHE = {'at': 0.0, 'data': None}
 DIGITALOCEAN_BALANCE_CACHE_TTL_S = float(_load_env().get('BALANCE_CACHE_TTL_S', '300') or 300)
 
@@ -19767,6 +19821,84 @@ async def credential_remove(request: Request):
                      ('removed', time.time(), name))
     log_action(actor, 'credential_remove', {'name': name})
     return JSONResponse({'ok': True, 'name': name, 'status': 'removed'})
+
+
+@app.post('/api/credentials/login')
+async def credential_login_action(request: Request):
+    """Perform ONE scoped action using a login credential, capability-gated.
+
+    The agent presents a capability handle minted against a login-kind
+    credential (username + password). The server resolves the handle against
+    the ACTION url (right agent, purpose, host scope, method scope, TTL),
+    verifies both the action URL and the adapter's declared login URL are
+    public https (SSRF), then dispatches to the service's login adapter in a
+    worker thread. The adapter runs the interactive login and the single
+    action, keeps the session in-process, and its result is scrubbed of
+    secret-shaped keys before it is returned. The password never appears in
+    logs or responses.
+
+    Adapters are added as code when a real account exists: register an entry
+    in _LOGIN_ADAPTERS[service] = {'login_url': ..., 'fn': ...}. No adapter
+    yet returns 501 with the exact shape to fill in.
+    """
+    body = await request.json()
+    agent_id = (body.get('agentId') or '').strip()
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'credential-login'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    if not verify_agent_key(agent_id, request.headers.get('X-Agent-Key')):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    capability_handle = (body.get('capabilityHandle') or '').strip()
+    service = (body.get('service') or '').strip().lower()
+    action = body.get('action') or {}
+    method = (action.get('method') or 'GET').upper()
+    url = (action.get('url') or '').strip()
+    action_body = action.get('body')
+    if not capability_handle or not service or not url:
+        return JSONResponse({'error': 'capabilityHandle, service, and action.url are required'}, status_code=400)
+    # Resolving the handle against the action URL enforces grantee, purpose,
+    # host scope, method scope, and TTL in one step.
+    grant = resolve_capability_handle(agent_id, capability_handle, method, url)
+    if grant is None:
+        log_action(agent_id, 'credential_login', {'service': service, 'action': f'{method} {url}'[:200],
+                                                  'decision': 'blocked', 'reason': 'handle invalid, expired, or out of scope'}, authorized=True)
+        return JSONResponse({'error': 'That capability handle is not valid for this action (expired, wrong agent, or out-of-scope host/method).'}, status_code=403)
+    if grant.get('kind') != 'login':
+        return JSONResponse({'error': 'This handle is for a token credential. Use api_call for header-injected tokens.'}, status_code=400)
+    if not _login_safe_url(url):
+        return JSONResponse({'error': 'action URL must be a public https URL'}, status_code=400)
+    adapter = _LOGIN_ADAPTERS.get(service)
+    if not adapter:
+        return JSONResponse({'error': f'No login adapter is registered for service "{service}". '
+                                      'Adapters are added as code once an account exists: '
+                                      f'_LOGIN_ADAPTERS["{service}"] = {{"login_url": "...", "fn": callable}}'},
+                             status_code=501)
+    login_url = adapter.get('login_url') or ''
+    if not _login_safe_url(login_url):
+        return JSONResponse({'error': f'adapter for "{service}" declares a non-public login_url; refusing'}, status_code=500)
+    fn = adapter.get('fn')
+    if not callable(fn):
+        return JSONResponse({'error': f'adapter for "{service}" has no callable fn'}, status_code=500)
+    try:
+        raw = await asyncio.to_thread(fn, grant, {'method': method, 'url': url, 'body': action_body})
+    except Exception as e:  # noqa: BLE001 -- an adapter failure must surface as a clean API error
+        log_action(agent_id, 'credential_login', {'credential': grant['credential_name'],
+                                                  'service': grant['service'], 'scope': grant['purpose'],
+                                                  'action': f'{method} {url}'[:200], 'ok': False,
+                                                  'error': str(e)[:200]}, authorized=True)
+        return JSONResponse({'ok': False, 'error': f'login adapter failed: {e}'}, status_code=502)
+    if not isinstance(raw, dict):
+        return JSONResponse({'ok': False, 'error': 'adapter returned a non-dict result'}, status_code=502)
+    ok = bool(raw.get('ok', True))
+    status = raw.get('status', 200 if ok else 500)
+    result = _login_scrub_result(raw)
+    log_action(agent_id, 'credential_login', {'credential': grant['credential_name'],
+                                              'service': grant['service'], 'scope': grant['purpose'],
+                                              'action': f'{method} {url}'[:200], 'ok': ok}, authorized=True)
+    _append_passport_decision('credential_login', agent_id, {
+        'credential': grant['credential_name'], 'service': grant['service'],
+        'scope': grant['purpose'], 'action': f'{method} {url}'[:200], 'ok': ok})
+    return JSONResponse({'ok': ok, 'status': status, 'result': result})
 
 
 @app.post('/api/keys/handles')

@@ -228,5 +228,116 @@ class PlayerEndpoint(_CredentialCase):
         self.assertEqual(status, 'active')
 
 
+class LoginAdapter(_CredentialCase):
+    """The /api/credentials/login skeleton: capability-gated dispatch to a
+    per-service login adapter. No real account needed -- a fake adapter proves
+    the gating, the scope enforcement, and the secret scrubbing."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_adapters = dict(serve._LOGIN_ADAPTERS)
+        self.key = serve.get_or_create_agent_key('ben')
+        self.headers = {'X-Agent-Key': self.key}
+        serve._store_credential('portal', 'Portal', {'kind': 'login', 'username': 'alice', 'password': 'hunter2'},
+                                status='active', proposed_by='player')
+
+    def tearDown(self):
+        serve._LOGIN_ADAPTERS.clear()
+        serve._LOGIN_ADAPTERS.update(self._saved_adapters)
+        super().tearDown()
+
+    def _register_fake(self, captures):
+        def fake(grant, action):
+            captures.append((grant, action))
+            return {'ok': True, 'status': 200,
+                    'result': {'title': 'Dashboard', 'balance': 100,
+                               'password': 'hunter2', 'nested': {'token': 'secret-token'}}}
+        serve._LOGIN_ADAPTERS['portal'] = {'login_url': 'https://example.com/login', 'fn': fake}
+
+    def _mint_handle(self, host='example.com'):
+        h, reason = serve.mint_capability_handle('ben', 'portal', 'read portal balance',
+                                                 [host], ['GET'], 'player', 600)
+        self.assertTrue(h, reason)
+        return h
+
+    def test_login_dispatch_scrubs_secrets_and_scopes(self):
+        from starlette.testclient import TestClient
+        captures = []
+        self._register_fake(captures)
+        c = TestClient(serve.app)
+        h = self._mint_handle()
+        r = c.post('/api/credentials/login', json={
+            'agentId': 'ben', 'capabilityHandle': h, 'service': 'portal',
+            'action': {'method': 'GET', 'url': 'https://example.com/balance'}},
+            headers=self.headers)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body['ok'])
+        # The adapter saw the resolved username/password (that is its contract).
+        self.assertEqual(len(captures), 1)
+        grant, action = captures[0]
+        self.assertEqual(grant['username'], 'alice')
+        self.assertEqual(grant['password'], 'hunter2')
+        self.assertEqual(action['url'], 'https://example.com/balance')
+        # But the agent never sees them: the response is scrubbed.
+        self.assertNotIn('hunter2', json.dumps(body))
+        self.assertNotIn('secret-token', json.dumps(body))
+        inner = body['result']['result']
+        self.assertEqual(inner['password'], serve._mask_secret('hunter2'))
+        self.assertEqual(inner['nested']['token'], serve._mask_secret('secret-token'))
+
+    def test_out_of_scope_action_host_is_refused_before_dispatch(self):
+        from starlette.testclient import TestClient
+        captures = []
+        self._register_fake(captures)
+        c = TestClient(serve.app)
+        h = self._mint_handle('example.com')
+        r = c.post('/api/credentials/login', json={
+            'agentId': 'ben', 'capabilityHandle': h, 'service': 'portal',
+            'action': {'method': 'GET', 'url': 'https://evil.example.com/steal'}},
+            headers=self.headers)
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(captures, [])
+
+    def test_token_kind_handle_is_refused(self):
+        from starlette.testclient import TestClient
+        serve._store_credential('gh', 'github', 'secret-1', status='active')
+        h, _ = serve.mint_capability_handle('ben', 'gh', 'deploy', ['api.github.com'], ['GET'], 'player', 600)
+        c = TestClient(serve.app)
+        r = c.post('/api/credentials/login', json={
+            'agentId': 'ben', 'capabilityHandle': h, 'service': 'github',
+            'action': {'method': 'GET', 'url': 'https://api.github.com/repos/x'}},
+            headers=self.headers)
+        self.assertEqual(r.status_code, 400, r.text)
+
+    def test_missing_adapter_returns_501_with_contract(self):
+        from starlette.testclient import TestClient
+        c = TestClient(serve.app)
+        h = self._mint_handle()
+        r = c.post('/api/credentials/login', json={
+            'agentId': 'ben', 'capabilityHandle': h, 'service': 'nosuchsvc',
+            'action': {'method': 'GET', 'url': 'https://example.com/balance'}},
+            headers=self.headers)
+        self.assertEqual(r.status_code, 501, r.text)
+        self.assertIn('_LOGIN_ADAPTERS["nosuchsvc"]', r.json()['error'])
+
+    def test_invalid_handle_is_refused(self):
+        from starlette.testclient import TestClient
+        self._register_fake([])
+        c = TestClient(serve.app)
+        r = c.post('/api/credentials/login', json={
+            'agentId': 'ben', 'capabilityHandle': 'x' * 64, 'service': 'portal',
+            'action': {'method': 'GET', 'url': 'https://example.com/balance'}},
+            headers=self.headers)
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_scrub_masks_secret_keys_recursively(self):
+        result = {'ok': True, 'data': {'Password': 'a1b2', 'user': 'x', 'nested': {'auth': 'y'}}}
+        scrubbed = serve._login_scrub_result(result)
+        self.assertNotIn('a1b2', json.dumps(scrubbed))
+        self.assertNotIn('y', json.dumps(scrubbed))
+        self.assertEqual(scrubbed['data']['user'], 'x')
+
+
 if __name__ == '__main__':
     unittest.main()
