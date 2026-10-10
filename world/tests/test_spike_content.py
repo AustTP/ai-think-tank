@@ -1713,5 +1713,58 @@ class ApifyToolsExecutor(unittest.TestCase):
             self.assertNotIn(name, tool_names)
 
 
+class SkillPublisherTests(unittest.TestCase):
+    """The publish_skill executor (content._make_skill_publisher): validation,
+    the standardized provenance+interface card, and the library write path."""
+
+    def _publisher(self, http_bodies):
+        def fake_http(method, base, path, body, *a, **k):
+            http_bodies.append({'method': method, 'path': path, 'body': body})
+            return {'ok': True}
+        return content._make_skill_publisher('cora', 'key-123'), \
+            unittest.mock.patch.object(serve, '_http_json', side_effect=fake_http)
+
+    def test_requires_all_fields(self):
+        pub, _ = self._publisher([])
+        self.assertIn('requires slug', pub('publish_skill', {'slug': 'x'}))
+        self.assertIn('requires slug', pub('publish_skill', {}))
+
+    def test_rejects_body_without_distilled_headings(self):
+        pub, _ = self._publisher([])
+        args = {'slug': 'fetch-x', 'title': 'Fetch X', 'sourceTask': 'task-3',
+                'team': 'cora', 'interface': 'GET /x', 'body': 'just some notes'}
+        self.assertIn('distilled headings', pub('publish_skill', args))
+
+    def test_files_standardized_card_to_pending_review(self):
+        bodies = []
+        pub, http = self._publisher(bodies)
+        args = {'slug': 'fetch-x', 'title': 'Fetch X data', 'sourceTask': 'task-3',
+                'team': 'cora', 'interface': 'Invoke: GET /api/x with api key. Inputs: id. Outputs: json. Example: id=7.',
+                'body': '## Purpose\nGet X fast.\n## Key facts\nOne endpoint.\n## Sources\nNone.\n## Lessons learned\nNone yet.'}
+        with http:
+            out = pub('publish_skill', args)
+        self.assertIn('pending_review/skills/fetch-x.md', out)
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual(bodies[0]['path'], '/api/library/file')
+        self.assertEqual(bodies[0]['body']['path'], 'pending_review/skills/fetch-x.md')
+        self.assertEqual(bodies[0]['body']['source'], 'firsthand')
+        card = bodies[0]['body']['content']
+        self.assertIn('## Provenance', card)
+        self.assertIn('source task: `task-3`', card)
+        self.assertIn('team / agent: `cora`', card)
+        self.assertIn('## Interface', card)
+        self.assertIn('Invoke: GET /api/x', card)
+        self.assertIn('## Key facts', card)
+
+    def test_slug_is_sanitized(self):
+        bodies = []
+        pub, http = self._publisher(bodies)
+        args = {'slug': 'Fetch X!', 'title': 'Fetch X', 'sourceTask': 'task-3',
+                'team': 'cora', 'interface': 'i', 'body': '## Purpose\np\n## Key facts\nk\n## Sources\ns\n## Lessons learned\nl'}
+        with http:
+            pub('publish_skill', args)
+        self.assertEqual(bodies[0]['body']['path'], 'pending_review/skills/fetch-x.md')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -7173,6 +7173,14 @@ LTM_CONSOLIDATE_MAX_CLUSTERS = int(_load_env().get('LTM_CONSOLIDATE_MAX_CLUSTERS
 # Notes-ownership enforced regardless.
 FILE_ACCESS_ENABLED = _load_env().get('FILE_ACCESS_ENABLED', 'true') not in ('0', 'false', 'False')
 
+# App control via AppleScript (world/fs.py). When enabled, the `app_script`
+# tool is offered once the player has granted at least one app (bundleId) in
+# state; every call is gated by that grant, and the script body is validated
+# so it can only talk to the granted app -- never a shell, URL, escalation, or
+# a different app (those would bypass the file-grant containment and the Jev
+# egress gates).
+APP_ACCESS_ENABLED = _load_env().get('APP_ACCESS_ENABLED', 'true') not in ('0', 'false', 'False')
+
 
 def _load_failures():
     if os.path.exists(FAILURES_PATH):
@@ -8528,6 +8536,57 @@ def _local_file_tool(agent_id, args):
         return f'Not found: {e}'
     except Exception as e:
         return f'local_file failed: {e}'
+
+
+# App control via AppleScript (world/fs.py): offered to lanes that also get
+# local_file, under APP_ACCESS_ENABLED AND at least one player-issued
+# appGrant. Every call is gated inside fs.py: the bundleId must be granted,
+# and the script body is validated so it can only talk to that one app (no
+# `do shell script`, no `open location`, no admin escalation, no cross-app
+# `tell application`). A denial is surfaced to the model, never bypassed.
+_VALID_BUNDLE_ID_RE = re.compile(r'^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$')
+_APP_SCRIPT_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'app_script',
+        'description': 'Run AppleScript commands against ONE macOS app the player granted you '
+                       'access to (e.g. read the current document, trigger an export, fetch '
+                       'something from a desktop app that has no API). Pass the app\'s exact bundle '
+                       'id (e.g. com.apple.Notes) and the AppleScript commands for that app ONLY. '
+                       'Shell commands, opening URLs, escalating privileges, and scripting other '
+                       'apps are denied -- keep the script simple and short.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'bundleId': {'type': 'string',
+                             'description': 'The granted app bundle id (e.g. com.apple.Notes).'},
+                'script': {'type': 'string',
+                           'description': 'AppleScript body for that app only (no tell application, '
+                                          'no do shell script, no open location).'},
+            },
+            'required': ['bundleId', 'script'],
+        },
+    },
+}
+
+
+def _app_script_tool(agent_id, args):
+    """Dispatch an `app_script` tool call to the gated fs layer. Every failure
+    (no grant, denied primitive, TCC/automation refusal, script error) is
+    surfaced to the model as a denial -- never a bypass."""
+    import fs as _fs
+    bundle_id = (args or {}).get('bundleId') or ''
+    script = (args or {}).get('script') or ''
+    try:
+        out = _fs.app_script(bundle_id, script)
+        log_action(agent_id, 'app_script', {'bundleId': bundle_id, 'ok': True}, authorized=True)
+        return out
+    except PermissionError as e:
+        log_action(agent_id, 'app_script_denied', {'bundleId': bundle_id, 'reason': str(e)}, authorized=True)
+        return f'Denied: {e}'
+    except Exception as e:
+        log_action(agent_id, 'app_script_failed', {'bundleId': bundle_id, 'reason': str(e)}, authorized=True)
+        return f'app_script failed: {e}'
 
 
 SECURITY_TEST_TOOLS = [
@@ -12825,6 +12884,79 @@ async def revoke_file_grant(grant_id: str, request: Request):
     return JSONResponse({'ok': True})
 
 
+@app.get('/api/app-grants')
+async def list_app_grants(request: Request):
+    """The player's current app-control grants (bundleId + capability set).
+    PLAYER-only. Read-only."""
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    grants = [{'id': g.get('id'), 'bundleId': g.get('bundleId'),
+               'label': g.get('label'), 'caps': g.get('caps') or {}}
+              for g in state.get('appGrants') or []]
+    return JSONResponse({'ok': True, 'grants': grants})
+
+
+@app.post('/api/app-grants')
+@_state_writer
+async def add_app_grant(request: Request):
+    """Grant the think tank AppleScript control of ONE macOS app. Body:
+    {bundleId: 'com.apple.Notes', label: 'Notes', caps: {use: true}}. The
+    bundle id must be a plausible macOS bundle id (dotted, no spaces). Every
+    call still runs only inside that app -- no shell, no URLs, no escalation.
+    PLAYER-only."""
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    bundle_id = (body.get('bundleId') or '').strip()
+    label = (body.get('label') or '').strip() or bundle_id
+    caps = body.get('caps') or {}
+    if not _VALID_BUNDLE_ID_RE.match(bundle_id):
+        return JSONResponse({'error': 'bundleId must be a dotted macOS bundle id (e.g. com.apple.Notes)'},
+                            status_code=400)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    for g in state.get('appGrants') or []:
+        if (g.get('bundleId') or '').strip() == bundle_id:
+            return JSONResponse({'error': 'a grant for this app already exists'}, status_code=409)
+    grant = {
+        'id': f'a-{len(state.get("appGrants") or []) + 1}',
+        'bundleId': bundle_id,
+        'label': label,
+        'caps': {'use': bool(caps.get('use', True))},
+    }
+    state.setdefault('appGrants', []).append(grant)
+    save_state_to_db(state)
+    log_action('player', 'app_grant_added',
+               {'grantId': grant['id'], 'bundleId': bundle_id, 'caps': grant['caps']}, authorized=True)
+    return JSONResponse({'ok': True, 'grant': grant})
+
+
+@app.delete('/api/app-grants/{grant_id}')
+@_state_writer
+async def revoke_app_grant(grant_id: str, request: Request):
+    """Revoke an app-control grant. PLAYER-only."""
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    grants = state.get('appGrants') or []
+    before = len(grants)
+    state['appGrants'] = [g for g in grants if g.get('id') != grant_id]
+    if len(state['appGrants']) == before:
+        return JSONResponse({'error': 'unknown grant'}, status_code=404)
+    save_state_to_db(state)
+    log_action('player', 'app_grant_revoked', {'grantId': grant_id}, authorized=True)
+    return JSONResponse({'ok': True})
+
+
 @app.post('/api/intent/player-task/{task_id}/complete')
 @_state_writer
 async def complete_player_task_endpoint(task_id: str, request: Request):
@@ -13741,12 +13873,17 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         if name == 'local_file':
             tools_used.append(name)
             return _local_file_tool(pick, args)
+        if name == 'app_script':
+            tools_used.append(name)
+            return _app_script_tool(pick, args)
         raise ValueError(f'unknown tool: {name}')
 
     tools = (AGENT_ASK_TOOLS + [_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL]
             + (SECURITY_TEST_TOOLS if is_security_test_role else []))
     if FILE_ACCESS_ENABLED and (state.get('fileGrants') or []):
         tools = tools + [_LOCAL_FILE_TOOL]
+    if APP_ACCESS_ENABLED and (state.get('appGrants') or []):
+        tools = tools + [_APP_SCRIPT_TOOL]
     try:
         if model:
             # Self-loopback deadlock (same class fixed in the

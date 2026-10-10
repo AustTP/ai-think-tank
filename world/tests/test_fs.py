@@ -232,5 +232,125 @@ class GrantApiTests(unittest.TestCase):
         self.assertEqual(self.state['fileGrants'], [])
 
 
+class AppScriptTests(unittest.TestCase):
+    """Gated AppleScript app control (world/fs.py app_script): grant check,
+    denied-primitive validation, and one-app-only wrapping."""
+
+    def setUp(self):
+        self.state = {'appGrants': [{'id': 'a-1', 'bundleId': 'com.apple.Notes',
+                                     'label': 'Notes', 'caps': {'use': True}}]}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._gs.start()
+
+    def tearDown(self):
+        self._gs.stop()
+
+    def test_no_grant_denied(self):
+        self.state['appGrants'] = []
+        with self.assertRaises(PermissionError):
+            fs.app_script('com.apple.Notes', 'count of notes')
+
+    def test_unknown_app_denied(self):
+        with self.assertRaises(PermissionError):
+            fs.app_script('com.apple.Unknown', 'count of windows')
+
+    def test_use_cap_required(self):
+        self.state['appGrants'] = [{'id': 'a-1', 'bundleId': 'com.apple.Notes',
+                                    'label': 'Notes', 'caps': {'use': False}}]
+        with self.assertRaises(PermissionError):
+            fs.app_script('com.apple.Notes', 'count of notes')
+
+    def test_denied_primitives_fail_closed(self):
+        for bad in ('do shell script "ls"',
+                    'open location "https://evil.example"',
+                    'with administrator privileges',
+                    'tell application "Finder" to quit',
+                    'current application'):
+            with self.subTest(primitive=bad):
+                with self.assertRaises(PermissionError):
+                    fs.app_script('com.apple.Notes', bad)
+
+    def test_empty_body_denied(self):
+        with self.assertRaises(PermissionError):
+            fs.app_script('com.apple.Notes', '  ')
+
+    def test_valid_script_wrapped_and_returned(self):
+        seen = {}
+        def fake_osascript(script):
+            seen['script'] = script
+            return '3 notes', None
+        with unittest.mock.patch.object(fs, '_osascript', side_effect=fake_osascript):
+            out = fs.app_script('com.apple.Notes', 'count of notes')
+        self.assertEqual(out, '3 notes')
+        self.assertEqual(seen['script'],
+                         'tell application id "com.apple.Notes"\ncount of notes\nend tell')
+
+    def test_osascript_error_raised(self):
+        with unittest.mock.patch.object(fs, '_osascript', return_value=(None, 'not authorized')):
+            with self.assertRaises(PermissionError):
+                fs.app_script('com.apple.Notes', 'count of notes')
+
+
+class AppGrantApiTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fs-appgrant-')
+        self._cm = unittest.mock.patch.multiple(
+            serve, DB_PATH=os.path.join(self.tmp, 'test.db'), THINK_TANK_DIR=self.tmp)
+        self._cm.start()
+        serve.init_db()
+        self.state = {'appGrants': []}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._gs.start()
+
+    def tearDown(self):
+        self._gs.stop()
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _player_env(self, **patches):
+        p = {'verify_session': lambda c: True}
+        p.update(patches)
+        return unittest.mock.patch.multiple(serve, **p)
+
+    def test_add_requires_player(self):
+        from fastapi.testclient import TestClient
+        with self._player_env(verify_session=lambda c: False):
+            r = TestClient(serve.app).post('/api/app-grants',
+                                           json={'bundleId': 'com.apple.Notes'})
+        self.assertEqual(r.status_code, 401)
+
+    def test_add_rejects_bad_bundle_id(self):
+        from fastapi.testclient import TestClient
+        for bad in ('Notes', 'com apple notes', '../etc', 'a..b'):
+            with self._player_env():
+                r = TestClient(serve.app).post('/api/app-grants', json={'bundleId': bad})
+            self.assertEqual(r.status_code, 400, msg=bad)
+
+    def test_add_success_and_duplicate(self):
+        from fastapi.testclient import TestClient
+        client = TestClient(serve.app)
+        with self._player_env():
+            r = client.post('/api/app-grants', json={'bundleId': 'com.apple.Notes', 'label': 'Notes'})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()['grant']['caps']['use'])
+        with self._player_env():
+            r2 = client.post('/api/app-grants', json={'bundleId': 'com.apple.Notes'})
+        self.assertEqual(r2.status_code, 409)
+
+    def test_list_and_revoke(self):
+        from fastapi.testclient import TestClient
+        client = TestClient(serve.app)
+        with self._player_env():
+            client.post('/api/app-grants', json={'bundleId': 'com.apple.Notes'})
+            r = client.get('/api/app-grants')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(r.json()['grants']), 1)
+        gid = r.json()['grants'][0]['id']
+        with self._player_env():
+            r2 = client.delete(f'/api/app-grants/{gid}')
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(self.state['appGrants'], [])
+
+
 if __name__ == '__main__':
     unittest.main()

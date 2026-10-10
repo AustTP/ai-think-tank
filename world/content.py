@@ -3130,7 +3130,90 @@ def _make_library_tools_executor(agent_id, struck_tools=None):
     return execute_tool
 
 
-# Real, on-demand social/trend monitoring.
+# Completed work -> reusable skill cards. The ownership mechanic the player
+# asked for: a team that finishes something reusable (an integration, a
+# workflow, a data-fetch procedure) files it as a skill card carrying its own
+# provenance (source task + team) and an interface contract (how to invoke it,
+# inputs, outputs, an example). The card lands in pending_review/skills/ and
+# goes through the normal skill-review gate before it is trusted -- so reuse is
+# a search_library lookup with a documented call signature, not a rediscovery.
+_SKILL_REQUIRED_HEADINGS = ('## Purpose', '## Key facts', '## Sources', '## Lessons learned')
+
+
+def _build_skill_card(slug, title, source_task, team, interface, body):
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return (
+        f'# {title}\n\n'
+        f'## Provenance\n\n'
+        f'- skill: `{slug}`\n'
+        f'- source task: `{source_task}`\n'
+        f'- team / agent: `{team}`\n'
+        f'- published: {now}\n\n'
+        f'## Interface\n\n{interface}\n\n'
+        f'{body}'
+    )
+
+
+_PUBLISH_SKILL_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'publish_skill',
+        'description': 'Save a completed piece of work as a reusable skill card for future teams. '
+                       'Use this when you finished something another team will likely need again: an '
+                       'integration, a workflow, or a procedure for getting what you need from a '
+                       'specific resource. You must give a slug, a title, the source task id, your '
+                       'team/agent id, a short interface contract (how to invoke it, its inputs, its '
+                       'outputs, one example), and the distilled body (headings: ## Purpose, '
+                       '## Key facts, ## Sources, ## Lessons learned). The card is written to '
+                       'pending_review/skills/ and goes through skill review before it is trusted.',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'slug': {'type': 'string', 'description': 'Short kebab-case identifier, e.g. "fetch-centene-ocr".'},
+                'title': {'type': 'string', 'description': 'Human title for the skill card.'},
+                'sourceTask': {'type': 'string', 'description': 'The task id this work came from.'},
+                'team': {'type': 'string', 'description': 'Your agent/team id (provenance).'},
+                'interface': {'type': 'string', 'description': 'Interface contract: how to invoke it, inputs, outputs, one example.'},
+                'body': {'type': 'string', 'description': 'Distilled reference body with ## Purpose, ## Key facts, ## Sources, ## Lessons learned.'},
+            },
+            'required': ['slug', 'title', 'sourceTask', 'team', 'interface', 'body'],
+        },
+    },
+}
+
+
+def _make_skill_publisher(agent_id, key):
+    """publish_skill executor: validate, build the standardized card, and file
+    it into pending_review/skills/ via the real library write endpoint (so the
+    existing quarantine + passport + village logic all apply)."""
+    def execute_tool(name, args):
+        if name != 'publish_skill':
+            raise ValueError(f'unknown tool: {name}')
+        args = args or {}
+        slug = _skill_slug(args.get('slug') or '').strip('-')
+        title = (args.get('title') or '').strip()
+        source_task = (args.get('sourceTask') or '').strip()
+        team = (args.get('team') or '').strip()
+        interface = (args.get('interface') or '').strip()
+        body = (args.get('body') or '').strip()
+        if not slug or not title or not source_task or not interface or not body:
+            return ('publish_skill requires slug, title, sourceTask, interface, and a non-empty body.')
+        if not any(h in body for h in _SKILL_REQUIRED_HEADINGS):
+            return ('body should use the distilled headings (## Purpose, ## Key facts, ## Sources, '
+                    '## Lessons learned) so it reads as a real reference file.')
+        card = _build_skill_card(slug, title, source_task, team, interface, body)
+        path = f'pending_review/skills/{slug}.md'
+        try:
+            _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/library/file',
+                              {'agentId': agent_id, 'path': path, 'content': card,
+                               'source': 'firsthand'}, key)
+        except Exception as e:
+            return f'publish_skill failed to file the card: {e}'
+        _serve.log_action(agent_id, 'skill_published',
+                          {'slug': slug, 'path': path, 'sourceTask': source_task}, authorized=True)
+        return (f'Filed skill card to {path}. It is in pending review and will be judged before it '
+                f'is trusted -- keep working as if nothing is promoted yet.')
+    return execute_tool
 # Deliberately on-demand only, not a recurring cadence -- real
 # per-call cost against Treg's own $10+ balance (separate from the
 # OpenRouter spend cap), and the discipline established this same evening
@@ -4431,6 +4514,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     sandbox_tool = _make_spike_sandbox_executor(agent_id, key, sandbox_id, struck_tools=struck_tools)
     browser_act_tool = _make_browser_act_executor(agent_id, key, sandbox_id, struck_tools=struck_tools, work_context=work_context, work_context_trusted=work_context_trusted)
     library_tool = _make_library_tools_executor(agent_id, struck_tools=struck_tools)
+    skill_publisher = _make_skill_publisher(agent_id, key)
     treg_tool = _make_treg_tools_executor()
     pixellab_tool = _make_pixellab_tools_executor(agent_id, key)
     google_tool = _make_google_tools_executor()
@@ -4449,13 +4533,20 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                                             _GOOGLE_SHEETS_READ_TOOL, _GOOGLE_SHEETS_APPEND_TOOL,
                                             _GOOGLE_CALENDAR_LIST_TOOL, _GOOGLE_CALENDAR_CREATE_TOOL,
                                             _GMAIL_SEARCH_TOOL, _GMAIL_READ_TOOL, _GMAIL_CREATE_DRAFT_TOOL,
-                                            _GOOGLE_DOCS_READ_TOOL, _GOOGLE_DOCS_CREATE_TOOL]
+                                            _GOOGLE_DOCS_READ_TOOL, _GOOGLE_DOCS_CREATE_TOOL,
+                                             _PUBLISH_SKILL_TOOL]
     # Scoped player-folder + Notes access (world/fs.py): offered to spike
     # workers under the same condition as the ask lane -- FILE_ACCESS_ENABLED
     # AND the player has issued at least one grant. Every call is still gated
     # by the grant (containment + trash rule + Notes ownership) inside fs.py.
     if _serve.FILE_ACCESS_ENABLED and (snapshot.get('fileGrants') or []):
         spike_tools = spike_tools + [_serve._LOCAL_FILE_TOOL]
+    # App control via AppleScript (world/fs.py): offered under APP_ACCESS_ENABLED
+    # AND a player-issued app grant. Every call is gated inside fs.py: the
+    # bundleId must be granted and the script body validated (no shell / URL /
+    # escalation / cross-app primitives).
+    if _serve.APP_ACCESS_ENABLED and (snapshot.get('appGrants') or []):
+        spike_tools = spike_tools + [_serve._APP_SCRIPT_TOOL]
     # YouTube transcripts: offered only when APIFY_API_KEY is set -- the route
     # ALWAYS downloads the audio via the Apify actor on the Colab runtime (no
     # captions fast-path), so unset = tool simply absent, same
@@ -4490,6 +4581,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             return browser_act_tool(tool_name, args)
         if tool_name in ('search_library', 'read_library_file'):
             return library_tool(tool_name, args)
+        if tool_name == 'publish_skill':
+            return skill_publisher(tool_name, args)
         if tool_name in ('x_trending_topics', 'search_linkedin_posts'):
             return treg_tool(tool_name, args)
         if tool_name == 'youtube_transcript':
@@ -4506,6 +4599,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             return colab_compute_tool(tool_name, args)
         if tool_name == 'local_file':
             return _serve._local_file_tool(agent_id, args)
+        if tool_name == 'app_script':
+            return _serve._app_script_tool(agent_id, args)
         return web_tool(tool_name, args)
 
     # 18/900 (was 10/600): a "list every X across the whole site" question
