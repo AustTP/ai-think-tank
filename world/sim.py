@@ -4145,6 +4145,11 @@ def finish_task(state, agent_id, grid=None):
     log_action(agent_id, 'task_completed', {'taskId': task['id'] if task else None,
                                             'title': task['title'] if task else None},
                authorized=True)
+    # The player's copy of the closed card's complete report -- fires once per
+    # card, for every non-internal card kind (stories, spikes, bugs, tasks).
+    # _deliver_card_report itself filters review/fix subtasks, shadow cards,
+    # and player-assigned cards.
+    _deliver_card_report(state, task, 'completed')
 
 
 def send_agent_off_duty(state, agent_id, doors, grid):
@@ -5719,9 +5724,8 @@ def _close_gated_story(state, parent):
     # player was asking about -- called directly (not via the notifyPlayer
     # indirection content executors need) since this already runs inside the
     # tick's real read-modify-write with live, mutable `state` in hand.
-    title = parent.get('title') or parent.get('projectLabel') or 'a story'
-    _queue_player_email(state, 'story_done', f'[AI Think Tank] Shipped: {title[:80]}',
-                        f'"{title}" just landed after {review_counts.get("approvals", 0)} peer approval(s).')
+    _deliver_card_report(state, parent, 'peer_approved',
+                         approvals=review_counts.get('approvals', 0))
     return True
 
 
@@ -7614,6 +7618,75 @@ def _queue_player_email(state, kind, subject, body_text, now_ms=None):
              'queuedAt': now_ms}
     outbox.append(entry)
     return entry
+
+
+_CARD_TYPE_LABELS = {
+    'story': 'STORY', 'spike': 'SPIKE', 'bug': 'BUG', 'task': 'TASK',
+    'code': 'STORY', 'review': 'REVIEW', 'qa': 'QA',
+}
+
+
+def _deliver_card_report(state, task, close_reason, approvals=0):
+    """Give the PLAYER the complete report of a closed work card -- exactly
+    once per card, for every card kind (story/spike/bug/task). Both the
+    peer-gated story close (_close_gated_story) and the universal close
+    (finish_task) call this; the task's `_reportDelivered` flag makes it
+    idempotent. Agent-to-agent internals never fire it: a review/fix subtask
+    (reviewOf) reports through its PARENT, a shadow (dry-run) card ships
+    nothing, and a player-assigned card was the player's own hands.
+
+    The report is the full card: the type, issue key/project/room, the user
+    story, the acceptance criteria, the NEVER constraints, the peer approval
+    count, the agent's actual write-up (task.note), and where the full
+    artifact lives (task.libraryPath -- a spike's findings live in the
+    Library, not in the deliberately lean note). Delivered as an inbox card +
+    a real email, with a per-card email kind so the 30s dedupe can never
+    swallow a second card's report."""
+    if not task or task.get('_reportDelivered'):
+        return
+    if task.get('reviewOf') or task.get('shadow') or task.get('assignedTo') == 'player':
+        return
+    task['_reportDelivered'] = True
+    card_type = _CARD_TYPE_LABELS.get((task.get('taskType') or '').strip().lower(), 'CARD')
+    title = task.get('title') or task.get('projectLabel') or 'a card'
+    now_ms = int(time.time() * 1000)
+    reason = 'peer-approved' if close_reason == 'peer_approved' else 'completed'
+    parts = [f'{card_type} closed: {title}', '']
+    meta = []
+    if task.get('issueKey'):
+        meta.append(f'Issue: {task["issueKey"]}')
+    if task.get('projectLabel'):
+        meta.append(f'Project: {task["projectLabel"]}')
+    if task.get('room'):
+        meta.append(f'Room: {task["room"]}')
+    if approvals:
+        meta.append(f'Peer approvals: {approvals}')
+    if meta:
+        parts.append(' | '.join(meta))
+        parts.append('')
+    if task.get('userStory'):
+        parts.append(f'User story: {task["userStory"]}')
+    if task.get('acceptanceCriteria'):
+        parts.append(f'\nAcceptance criteria:\n{task["acceptanceCriteria"]}')
+    if task.get('never'):
+        parts.append(f'\nNEVER (constraints the work honored):\n{task["never"]}')
+    note = (task.get('note') or '').strip()
+    if note:
+        parts.append(f'\nReport from the agent:\n{note}')
+    elif task.get('libraryPath'):
+        parts.append(f'\nReport: see the full findings at {task["libraryPath"]}.')
+    if task.get('libraryPath'):
+        parts.append(f'\nFull artifact: {task["libraryPath"]}')
+    body = '\n'.join(parts)
+    subject = f"[AI Think Tank] {card_type} closed: {title[:80]}"
+    inbox = state.setdefault('playerInbox', [])
+    inbox.append({
+        'id': f'crep-{task.get("id") or int(now_ms)}', 'kind': 'card_report',
+        'taskId': task.get('id'), 'title': title, 'body': body,
+        'closeReason': reason, 'createdAt': now_ms,
+    })
+    _queue_player_email(state, f'card_report:{task.get("id") or "unknown"}',
+                        subject, body, now_ms=now_ms)
 
 
 def _drain_email_outbox_sync(state):
