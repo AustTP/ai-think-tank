@@ -398,7 +398,8 @@ class AskEndpoint(unittest.TestCase):
         # generate_image/generate_video only when the Higgsfield key pair is.
         expected = ({'browse_page', 'request_allowlist', 'read_peer_reviews',
                      'team_digest', 'x_trending_topics', 'search_linkedin_posts', 'api_call',
-                     'read_ais_feed', 'read_rss_feed', 'read_market_feed', 'propose_api_service'}
+                     'read_ais_feed', 'read_rss_feed', 'read_market_feed', 'read_live_feed',
+                     'propose_api_service'}
                     | ({'search_web'} if serve.TAVILY_API_KEY else set())
                     | ({'generate_image', 'generate_video'} if serve._higgsfield_configured() else set()))
         self.assertEqual(tool_names, expected)
