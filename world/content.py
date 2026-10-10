@@ -4537,16 +4537,18 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                                              _PUBLISH_SKILL_TOOL]
     # Scoped player-folder + Notes access (world/fs.py): offered to spike
     # workers under the same condition as the ask lane -- FILE_ACCESS_ENABLED
-    # AND the player has issued at least one grant. Every call is still gated
-    # by the grant (containment + trash rule) inside fs.py. `read_store` (the
-    # generic SQLite + gzip + protobuf read) rides the same grant.
-    if _serve.FILE_ACCESS_ENABLED and (snapshot.get('fileGrants') or []):
+    # AND a grant from state OR the operator-edited world/grants.json. Every
+    # call is still gated by the grant (containment + trash rule) inside fs.py.
+    # `read_store` (the generic SQLite + gzip + protobuf read) rides the same
+    # grant.
+    if _serve.FILE_ACCESS_ENABLED and _serve._effective_file_grants(snapshot):
         spike_tools = spike_tools + [_serve._LOCAL_FILE_TOOL, _serve._READ_STORE_TOOL]
     # App control via AppleScript (world/fs.py): offered under APP_ACCESS_ENABLED
-    # AND a player-issued app grant. Every call is gated inside fs.py: the
-    # bundleId must be granted and the script body validated (no shell / URL /
+    # AND a grant from state OR world/grants.json. Every call is gated inside
+    # fs.py: the bundleId must be granted and the script body validated (no
+    # shell / URL /
     # escalation / cross-app primitives).
-    if _serve.APP_ACCESS_ENABLED and (snapshot.get('appGrants') or []):
+    if _serve.APP_ACCESS_ENABLED and _serve._effective_app_grants(snapshot):
         spike_tools = spike_tools + [_serve._APP_SCRIPT_TOOL]
     # YouTube transcripts: offered only when APIFY_API_KEY is set -- the route
     # ALWAYS downloads the audio via the Apify actor on the Colab runtime (no

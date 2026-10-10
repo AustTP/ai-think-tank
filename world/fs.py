@@ -40,7 +40,8 @@ def _trash_dir():
 
 
 def _grants(state):
-    return state.get('fileGrants') or []
+    import serve as _serve
+    return _serve._effective_file_grants(state)
 
 
 def _grant_for(state, scope):
@@ -345,7 +346,8 @@ _APP_DENY_PATTERNS = (
 
 
 def _app_grants(state):
-    return state.get('appGrants') or []
+    import serve as _serve
+    return _serve._effective_app_grants(state)
 
 
 def _app_grant_for(state, bundle_id):
