@@ -192,6 +192,20 @@ class FeaturesAndBacklog(unittest.TestCase):
         self.assertEqual(spike['featureId'], 'feat-1')
         self.assertEqual(len(state['workQueue']), 2)  # one item per card
 
+    def test_pull_backlog_carries_never_onto_queued_work(self):
+        state = _seed()
+        feature = sim.create_or_reuse_feature(state, 'Summer Summit', 1_000_000)
+        sim.add_backlog_item(state, 'Land a launch page', feature['id'],
+                             'faye', 1_000_000,
+                             acceptance_criteria='Page loads clean',
+                             never='- never touch the live payment table')
+        sim._pull_backlog_for_team(state, 'dev', 1_000_002)
+        story = state['workQueue'][0]
+        # The constraint survives onto the queued story's instructions AND as a
+        # structured field (so assign_task stamps it onto the durable task).
+        self.assertIn('- never touch the live payment table', story['instructions'])
+        self.assertEqual(story['never'], '- never touch the live payment table')
+
     def test_assign_resolves_room_for_room_less_card(self):
         # A room-free card gets its room only at ASSIGNMENT time, chosen by the
         # nature of the work: an investigation spike -> observatory (research),

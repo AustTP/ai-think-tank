@@ -11138,10 +11138,11 @@ def _breakdown_into_shared_backlog(state, goal, admin_id):
         'Give a short FEATURE name (3-6 words) that groups these cards under one initiative. '
         'Keep every title to ONE short sentence. For each card set "type" to "story" (deliverable work) '
         'or "spike" (an investigation with no committed deliverable -- use it when the right approach is '
-        'not yet known), a one-line "acceptanceCriteria" when the story has a clear test of done, and a '
+        'not yet known), a one-line "acceptanceCriteria" when the story has a clear test of done, a '
+        '"never" list ONLY when the card has hard prohibitions the worker must never do (omit otherwise), and a '
         '"sizeEstimate" of S/M/L. '
         'Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: '
-        '{"feature":"short feature name","items":[{"title":"short title","type":"story|spike","acceptanceCriteria":"one line or omitted","sizeEstimate":"S|M|L"}]}'
+        '{"feature":"short feature name","items":[{"title":"short title","type":"story|spike","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L"}]}'
     )
     key = get_or_create_agent_key(admin_id)
     # High-stakes planning tier, JEV-gated: a large-request breakdown is exactly
@@ -11177,7 +11178,8 @@ def _breakdown_into_shared_backlog(state, goal, admin_id):
             state, s['title'], feature['id'], admin_id, now_ms,
             item_type=s.get('type') or 'story',
             acceptance_criteria=s.get('acceptanceCriteria'),
-            size_estimate=s.get('sizeEstimate'))
+            size_estimate=s.get('sizeEstimate'),
+            never=s.get('never'))
         if item:
             out.append(item)
     if not out:
@@ -11903,8 +11905,11 @@ async def create_issue(request: Request):
     defaults to 'player' -- an agent never files issues as itself here).
     Returns the issue record (key TEAM-0128) + the linked
     backlog-request id. Issue type/storyPoints pass through; `description` is
-    optional but structured when present -- pass {'userStory': ..., 'acceptance
-    Criteria': ...} or a string following one of those two templates."""
+    optional but structured when present -- pass
+    {'userStory': ..., 'acceptanceCriteria': ..., 'never': [...]} or a string
+    following one of those templates (a trailing "NEVER:" block is parsed as
+    constraints). `never` hard prohibitions survive refinement -> queue -> task
+    into the worker's instructions."""
     if not _require_player_session(request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     try:
