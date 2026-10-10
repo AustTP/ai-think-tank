@@ -306,6 +306,7 @@ _ENV_RELOAD_FIELDS = {
     'PAGE_REQUEST_MONTHLY_BUDGET': lambda e: int(e.get('PAGE_REQUEST_MONTHLY_BUDGET', '1000') or 1000),
     'HIGH_TIER_MONTHLY_BUDGET_USD': lambda e: float(e.get('HIGH_TIER_MONTHLY_BUDGET_USD', '0') or 0),
     'HIGH_TIER_MAX_PRICE_USD': lambda e: float(e.get('HIGH_TIER_MAX_PRICE_USD', '0') or 0),
+    'CODING_TIER_MAX_PRICE_USD': lambda e: float(e.get('CODING_TIER_MAX_PRICE_USD', '0') or 0),
     'COLAB_MONTHLY_UNITS': lambda e: float(e.get('COLAB_MONTHLY_UNITS', '0') or 0),
     'DECISION_CACHE_TTL_S': lambda e: float(e.get('DECISION_CACHE_TTL_S', '3600') or 0),
     'DECISION_KEY_WINDOW_S': lambda e: float(e.get('DECISION_KEY_WINDOW_S', str(7 * 24 * 3600)) or (7 * 24 * 3600)),
@@ -5727,6 +5728,11 @@ HIGH_TIER_MONTHLY_BUDGET_USD = float(_load_env().get('HIGH_TIER_MONTHLY_BUDGET_U
 # HIGH_TIER_MAX_PRICE_USD in .env (e.g. 6.00 = never pick a model over $6/M);
 # 0/unset disables the ceiling.
 HIGH_TIER_MAX_PRICE_USD = float(_load_env().get('HIGH_TIER_MAX_PRICE_USD', '0') or 0)
+# Same per-model price ceiling for the CODING tier: the refresh only offers
+# Jev/score-pick coding candidates at or below this, so a $12/M coding
+# front-runner can't win on score alone when the player wants coding spend
+# bounded too. Set CODING_TIER_MAX_PRICE_USD in .env; 0/unset disables.
+CODING_TIER_MAX_PRICE_USD = float(_load_env().get('CODING_TIER_MAX_PRICE_USD', '0') or 0)
 # Reserved spend-ledger bucket name for high-tier accrual (kept apart from
 # per-service buckets so the bank can show "how much went to the expensive
 # tier" at a glance, and so the cap reads it cleanly).
@@ -8047,6 +8053,18 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
         body['max_tokens'] = max_tokens
     if tool_choice is not None:
         body['tool_choice'] = tool_choice
+    # Same reasoning override as _call_openrouter_once_sync: the tool loop
+    # never reads reasoning output, so it is disabled outright -- except for
+    # the tiers that genuinely benefit from it, where it is capped to half
+    # the (known) request budget so hidden reasoning can't swallow the whole
+    # answer. Without this, a default_enabled-reasoning model called here
+    # would spend the entire tight token budget thinking and return nothing
+    # visible (the incident _call_openrouter_once_sync's override exists for).
+    reasoning = {'enabled': False}
+    if model in (_coding_tier_slug(), _high_tier_slug(), _mid_tier_slug(), _reasoning_tier_slug()):
+        if max_tokens is not None:
+            reasoning = {'max_tokens': max_tokens // 2}
+    body['reasoning'] = reasoning
     req = urllib.request.Request(
         'https://openrouter.ai/api/v1/chat/completions',
         data=json.dumps(body).encode(),
@@ -10434,7 +10452,7 @@ EVALUATOR_PLAYER = 'player'
 # config interface); the VALUES (the actual URLs) are operator data held in the
 # data_sources table, PUT via /api/data-sources with no restart -- these links
 # drift over time and the code must not hard-code them.
-DATA_SOURCE_KEYS = ('aa_leaderboard_url', 'hf_contents_parquet_url', 'hf_contents_source_url')
+DATA_SOURCE_KEYS = ('aa_leaderboard_url', 'hf_contents_parquet_url', 'hf_contents_source_url', 'mmmu_leaderboard_url')
 
 
 def _get_data_source(key, default=None):
@@ -10546,11 +10564,22 @@ def _bucket_models_by_price(models):
         # "high" band's actual best-available pick was GPT-4.1 (48.6% on
         # SWE-bench Verified) while Claude Haiku 4.5, cheaper at $6 vs
         # GPT-4.1's $10/M, was invisible to Jev despite scoring 73.3% on
-        # the same benchmark. Only exclude what the original incident
-        # actually was: reasoning that can't be turned off (mandatory) or
-        # that turns itself on by default without an explicit override.
+        # the same benchmark.
+        #
+        # The narrowed fix (excluding `default_enabled` too) was still too
+        # broad after the call layer grew an explicit reasoning override:
+        # _call_openrouter_once_sync and _post_openrouter_raw now always send
+        # a `reasoning` field -- disabled for every tier that doesn't read
+        # reasoning output, capped at half the request budget for the tiers
+        # that do -- so a default_enabled model can no longer burn the whole
+        # budget on hidden reasoning; the override is the explicit switch the
+        # old incident lacked. That made DeepSeek V4 Flash Vision (and the
+        # Claude 4.5/5 family, GPT-5.1, etc.) needlessly invisible again --
+        # a real cost: the vision band couldn't even consider a 76.7-MMMU
+        # model at $0.86/M. Only genuinely mandatory reasoning (can't be
+        # turned off by any request field) is excluded now.
         reasoning_info = m.get('reasoning')
-        if reasoning_info and (reasoning_info.get('mandatory') or reasoning_info.get('default_enabled')):
+        if reasoning_info and reasoning_info.get('mandatory'):
             continue
         arch = m.get('architecture') or {}
         if 'text' not in (arch.get('output_modalities') or []) or 'text' not in (arch.get('input_modalities') or []):
@@ -10650,13 +10679,16 @@ def _verify_decision_model_works_sync(model_id):
 
 
 def _apply_band_price_ceiling(band, candidate_pool):
-    """The high tier carries a per-model PRICE CEILING: the
-    expensive tier is bounded, so the daily refresh only presents candidates
-    at or below HIGH_TIER_MAX_PRICE_USD. A model over the ceiling is never
-    offered, even if it tops the score table -- price is a hard bound for
-    high, not a tiebreak. Every other band passes through unchanged."""
+    """The high and coding tiers carry a per-model PRICE CEILING: the
+    expensive tiers are bounded, so the daily refresh only presents
+    candidates at or below HIGH_TIER_MAX_PRICE_USD / CODING_TIER_MAX_PRICE_USD.
+    A model over the ceiling is never offered, even if it tops the score
+    table -- price is a hard bound for these tiers, not a tiebreak. Every
+    other band passes through unchanged."""
     if band == 'high' and HIGH_TIER_MAX_PRICE_USD:
         return [m for m in candidate_pool if m['price'] <= HIGH_TIER_MAX_PRICE_USD]
+    if band == 'coding' and CODING_TIER_MAX_PRICE_USD:
+        return [m for m in candidate_pool if m['price'] <= CODING_TIER_MAX_PRICE_USD]
     return candidate_pool
 
 
@@ -10802,6 +10834,71 @@ def _ingest_aa_leaderboard(models):
     return added
 
 
+def _mmmu_leaderboard_scores(html):
+    """Parse the MMMU leaderboard table into {display_name: mmmu}. The page
+    (pricepertoken.com/leaderboards/benchmark/mmmu, data sourced from
+    Artificial Analysis) is a six-column table: provider, model, input $/M,
+    output $/M, MMMU, actions. The '-' cells mark models AA has not measured
+    on MMMU and are skipped, as is the header row."""
+    out = {}
+    for row in re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.S):
+        cells = [' '.join(re.sub(r'<[^>]+>', ' ', c).split())
+                 for c in re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, re.S)]
+        if len(cells) < 5 or not cells[1]:
+            continue
+        try:
+            out[cells[1]] = float(cells[4])
+        except ValueError:
+            continue
+    return out
+
+
+def _ingest_mmmu_leaderboard(models):
+    """Backfill MMMU (vision) scores from the operator-registered MMMU
+    leaderboard URL -- the only benchmark the OpenRouter catalog and the AA
+    leaderboard carry no data for, and exactly why the vision band kept
+    resolving to a stale classifier placeholder instead of a score-grounded
+    pick. Mirrors the AA leaderboard backfill: INSERT OR IGNORE, so an
+    already-resolved score (player-entered, or an earlier backfill) is never
+    disputed. Matches by the same fuzzy display-name tokens as the AA
+    backfill. Returns the number of new rows."""
+    url = _get_data_source('mmmu_leaderboard_url')
+    if not url:
+        print('[model-tiers] data source mmmu_leaderboard_url unset -- skipping MMMU backfill', flush=True)
+        return 0
+    import urllib.request as _ur
+    try:
+        with _ur.urlopen(url, timeout=20) as resp:  # nosec B310 -- URL comes from the operator registry, not user input
+            html = resp.read().decode('utf-8', 'ignore')
+    except Exception:
+        return 0
+    mmmu_scores = _mmmu_leaderboard_scores(html)
+    if not mmmu_scores:
+        return 0
+    now = time.time()
+    added = 0
+    with _db() as conn:
+        for m in models:
+            mid = m['id']
+            have = conn.execute(
+                'SELECT 1 FROM model_benchmark_scores WHERE model_id=? AND benchmark=?',
+                (mid, 'MMMU'),
+            ).fetchone()
+            if have:
+                continue
+            value = _match_aa_score(m.get('name') or mid, mmmu_scores)
+            if value is None:
+                continue
+            cur = conn.execute(
+                'INSERT OR IGNORE INTO model_benchmark_scores (model_id, benchmark, score, source_url, evaluator, checked_at) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (mid, 'MMMU', value, url, EVALUATOR_ARTIFICIAL_ANALYSIS, now),
+            )
+            if cur.rowcount:
+                added += 1
+    return added
+
+
 def _parse_hf_contents(parquet_bytes):
     """Read the Open LLM Leaderboard `contents` parquet into
     {hub_model_id_lower: mmlu_pro}. Returns None when it cannot be read
@@ -10899,7 +10996,9 @@ def _sync_model_catalog(models):
         backfilled from Artificial Analysis's own public leaderboard
         (_ingest_aa_leaderboard), then from the HF Open LLM Leaderboard's
         MMLU-Pro fallback for open-weights models AA never measured
-        (_ingest_hf_open_llm_fallback)
+        (_ingest_hf_open_llm_fallback); vision MMMU scores -- carried by no
+        catalog or AA page -- come from the operator-registered MMMU
+        leaderboard (_ingest_mmmu_leaderboard)
       * models that vanished from the live catalog are removed from BOTH
         model_catalog and model_benchmark_scores -- a score record for a model
         that no longer exists on OpenRouter is dead weight the value pick can
@@ -10908,6 +11007,7 @@ def _sync_model_catalog(models):
     catalog churn."""
     _ingest_catalog_benchmarks(models)
     _ingest_aa_leaderboard(models)
+    _ingest_mmmu_leaderboard(models)
     _ingest_hf_open_llm_fallback(models)
     now = time.time()
     seen_ids = set()
@@ -11057,7 +11157,7 @@ async def refresh_model_tiers():
         if 'image' not in (arch.get('input_modalities') or []) or 'text' not in (arch.get('output_modalities') or []):
             continue
         reasoning_info = m.get('reasoning')
-        if reasoning_info and (reasoning_info.get('mandatory') or reasoning_info.get('default_enabled')):
+        if reasoning_info and reasoning_info.get('mandatory'):
             continue
         try:
             p, c = float(m['pricing']['prompt']), float(m['pricing']['completion'])
