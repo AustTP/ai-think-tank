@@ -337,6 +337,11 @@ _ENV_RELOAD_FIELDS = {
     'LTM_MAX_RECALL': lambda e: int(e.get('LTM_MAX_RECALL', '5') or 5),
     'LTM_MAX_PER_SESSION': lambda e: int(e.get('LTM_MAX_PER_SESSION', '200') or 200),
     'LTM_EXTRACT_EVERY_TURNS': lambda e: int(e.get('LTM_EXTRACT_EVERY_TURNS', '6') or 6),
+    'LTM_MIN_CONFIDENCE': lambda e: float(e.get('LTM_MIN_CONFIDENCE', '0.3') or 0.3),
+    'LTM_MAX_AGE_DAYS': lambda e: int(e.get('LTM_MAX_AGE_DAYS', '180') or 180),
+    'LTM_CONSOLIDATE_ENABLED': lambda e: e.get('LTM_CONSOLIDATE_ENABLED', 'true') not in ('0', 'false', 'False'),
+    'LTM_CONSOLIDATE_EVERY_TURNS': lambda e: int(e.get('LTM_CONSOLIDATE_EVERY_TURNS', '12') or 12),
+    'LTM_CONSOLIDATE_MAX_CLUSTERS': lambda e: int(e.get('LTM_CONSOLIDATE_MAX_CLUSTERS', '4') or 4),
 }
 
 
@@ -718,7 +723,9 @@ def init_db():
             cost REAL,
             raw TEXT NOT NULL,
             ok INTEGER NOT NULL,
-            trace_id TEXT
+            trace_id TEXT,
+            prev_hash TEXT,
+            hash TEXT
         )''')
         # Same unindexed-scan class as action_log above: decision_tape grew to
         # 641MB/223k rows with no index, so any time-windowed read full-scans
@@ -728,6 +735,17 @@ def init_db():
             conn.execute('ALTER TABLE decision_tape ADD COLUMN trace_id TEXT')
         except Exception:
             pass
+        # Tamper-evident chain: every row carries prev_hash + hash (HMAC-SHA256
+        # under the server secret over prev_hash + the row's content), so a
+        # modified or reordered row breaks the chain (see _verify_decision_tape).
+        # Backfilled idempotently for rows written before this existed -- the
+        # backfill only fills NULL-hash rows and never re-signs a hashed one.
+        for _col in ('prev_hash', 'hash'):
+            try:
+                conn.execute(f'ALTER TABLE decision_tape ADD COLUMN {_col} TEXT')
+            except Exception:
+                pass
+        _backfill_decision_tape_hashes(conn)
         # The permanent decision ARCHIVE. _prune_logs distills old decision_tape
         # rows (prompt/raw are the expensive part) into this append-only table
         # before deleting them, so the think tank's institutional memory --
@@ -735,6 +753,8 @@ def init_db():
         # NEVER lost to retention pruning. The noisy full prompt/response stays
         # on the 7-day tape; the distilled decision survives forever and is
         # folded into the weekly decision-archive wiki page (_archive_distill_step).
+        # Each archive row carries the tape hash of the row it distilled from,
+        # so an archived decision can be cross-checked against the tape's chain.
         conn.execute('''CREATE TABLE IF NOT EXISTS decision_archive (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts REAL NOT NULL,
@@ -744,8 +764,13 @@ def init_db():
             confidence REAL,
             cost REAL,
             ok INTEGER NOT NULL,
-            trace_id TEXT
+            trace_id TEXT,
+            tape_hash TEXT
         )''')
+        try:
+            conn.execute('ALTER TABLE decision_archive ADD COLUMN tape_hash TEXT')
+        except Exception:
+            pass
         conn.execute('CREATE INDEX IF NOT EXISTS idx_decision_archive_ts ON decision_archive(ts)')
         conn.execute('''CREATE TABLE IF NOT EXISTS model_tiers (
             band TEXT PRIMARY KEY,
@@ -1200,8 +1225,8 @@ def _prune_logs():
             # subquery cap as action_log so a large backlog is drained over
             # several runs, and the archive copy is bounded to the same batch.
             cur = conn.execute(
-                'INSERT INTO decision_archive (ts, kind, model, choice, confidence, cost, ok, trace_id) '
-                'SELECT ts, kind, model, choice, confidence, cost, ok, trace_id '
+                'INSERT INTO decision_archive (ts, kind, model, choice, confidence, cost, ok, trace_id, tape_hash) '
+                'SELECT ts, kind, model, choice, confidence, cost, ok, trace_id, hash '
                 'FROM decision_tape WHERE ts < ? LIMIT ?',
                 (cutoff, LOG_PRUNE_MAX_ROWS),
             )
@@ -2079,6 +2104,72 @@ def _decision_kind(instructions):
     return 'other'
 
 
+def _tape_row_hash(prev_hash, ts, kind, model, prompt, criteria, choice, confidence, cost, raw, ok, trace_id):
+    # HMAC-SHA256 over prev_hash + the canonical row, keyed by the server's
+    # boundary secret (the same trust root the external-data markers use). A
+    # row edit, a reorder, or a truncation inside the chain changes this.
+    blob = json.dumps([ts, kind, model, prompt, criteria, choice, confidence,
+                       cost, raw, ok, trace_id], sort_keys=True, default=str)
+    return hmac.new(_BOUNDARY_SECRET.encode(),
+                    f'{prev_hash or ""}|{blob}'.encode('utf-8', errors='replace'),
+                    hashlib.sha256).hexdigest()
+
+
+def _backfill_decision_tape_hashes(conn):
+    """Give legacy decision_tape rows their chain hashes, in id order. Only
+    NULL-hash rows are touched -- a row that already carries a hash is trusted
+    as-is (re-signing it would destroy its tamper evidence) and simply becomes
+    the next row's anchor. Returns how many rows were hashed."""
+    rows = conn.execute(
+        'SELECT id, hash, ts, kind, model, prompt, criteria, choice, confidence, '
+        'cost, raw, ok, trace_id FROM decision_tape ORDER BY id ASC').fetchall()
+    prev_hash = ''
+    changed = 0
+    for r in rows:
+        if r[1]:
+            prev_hash = r[1]
+            continue
+        row_hash = _tape_row_hash(prev_hash, r[2], r[3], r[4], r[5], r[6], r[7],
+                                  r[8], r[9], r[10], r[11], r[12])
+        conn.execute('UPDATE decision_tape SET prev_hash = ?, hash = ? WHERE id = ?',
+                     (prev_hash, row_hash, r[0]))
+        prev_hash = row_hash
+        changed += 1
+    return changed
+
+
+def _verify_decision_tape(limit=100000):
+    """Walk the tape's hash chain and report any row that does not verify:
+    a content edit (hash mismatch), a chain break (prev_hash doesn't match the
+    previous row's hash), or a row with no hash at all. The FIRST row's
+    prev_hash is an anchor to the (possibly pruned) past and is not itself
+    checkable -- retention pruning of old head rows is expected. Returns
+    (ok, problems) with problems a list of {id, issue} dicts."""
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                'SELECT id, prev_hash, hash, ts, kind, model, prompt, criteria, '
+                'choice, confidence, cost, raw, ok, trace_id FROM decision_tape '
+                'ORDER BY id ASC LIMIT ?', (limit,)).fetchall()
+    except Exception as e:
+        return False, [{'id': None, 'issue': f'verify unavailable: {e}'}]
+    problems = []
+    prev_hash = ''
+    for idx, r in enumerate(rows):
+        rid, row_prev, row_hash = r[0], r[1], r[2]
+        if not row_hash:
+            problems.append({'id': rid, 'issue': 'unhashed row (legacy or tampered)'})
+            continue
+        if idx > 0 and row_prev != prev_hash:
+            problems.append({'id': rid, 'issue': 'chain break (prev_hash mismatch)'})
+        expected = _tape_row_hash(row_prev, r[3], r[4], r[5], r[6], r[7], r[8],
+                                  r[9], r[10], r[11], r[12], r[13])
+        if expected != row_hash:
+            problems.append({'id': rid, 'issue': 'hash mismatch (content tampered)'})
+        prev_hash = row_hash
+    return (not problems, problems)
+
+
 def _append_decision_tape(kind, model, prompt, criteria, choice, confidence, cost, raw, ok, trace_id=None):
     # Best-effort, bounded record of a Jev decision call. A tape-write failure
     # must never fail the caller (the decision already happened), so swallow it.
@@ -2086,26 +2177,33 @@ def _append_decision_tape(kind, model, prompt, criteria, choice, confidence, cos
     # action_log entry(s) for the same execution chain. Auto-generated here if
     # the caller didn't supply one; the caller should pass it through to
     # log_action so actions are traceable back to this decision.
+    # Every row is chained to the previous row's hash (HMAC-SHA256), so the
+    # tape is tamper-evident end to end.
     try:
         with _db() as conn:
             if trace_id is None:
                 trace_id = secrets.token_hex(8)
+            prev = conn.execute(
+                'SELECT hash FROM decision_tape ORDER BY id DESC LIMIT 1').fetchone()
+            prev_hash = prev[0] if prev else ''
+            values = (
+                time.time(),
+                kind,
+                model,
+                prompt,
+                json.dumps(criteria) if criteria is not None else None,
+                choice,
+                confidence,
+                cost,
+                raw if isinstance(raw, str) else json.dumps(raw),
+                int(bool(ok)),
+                trace_id,
+            )
+            row_hash = _tape_row_hash(prev_hash, *values)
             conn.execute(
-                'INSERT INTO decision_tape (ts, kind, model, prompt, criteria, choice, confidence, cost, raw, ok, trace_id) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                (
-                    time.time(),
-                    kind,
-                    model,
-                    prompt,
-                    json.dumps(criteria) if criteria is not None else None,
-                    choice,
-                    confidence,
-                    cost,
-                    raw if isinstance(raw, str) else json.dumps(raw),
-                    int(bool(ok)),
-                    trace_id,
-                ),
+                'INSERT INTO decision_tape (ts, kind, model, prompt, criteria, choice, confidence, cost, raw, ok, trace_id, prev_hash, hash) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (*values, prev_hash, row_hash),
             )
     except Exception:
         pass
@@ -7041,6 +7139,18 @@ STM_TTL_HOURS = int(_load_env().get('STM_TTL_HOURS', '168') or 168)
 LTM_MAX_RECALL = int(_load_env().get('LTM_MAX_RECALL', '5') or 5)
 LTM_MAX_PER_SESSION = int(_load_env().get('LTM_MAX_PER_SESSION', '200') or 200)
 LTM_EXTRACT_EVERY_TURNS = int(_load_env().get('LTM_EXTRACT_EVERY_TURNS', '6') or 6)
+# LTM trust filter: a memory below LTM_MIN_CONFIDENCE is never recalled, and a
+# memory older than LTM_MAX_AGE_DAYS is not either (0 = no age cap). Prevents
+# an offhand false fact from outranking a stable, repeated one.
+LTM_MIN_CONFIDENCE = float(_load_env().get('LTM_MIN_CONFIDENCE', '0.3') or 0.3)
+LTM_MAX_AGE_DAYS = int(_load_env().get('LTM_MAX_AGE_DAYS', '180') or 180)
+# LTM consolidation: periodically merge near-duplicate memories into richer
+# single records (LLM merge on a bounded cadence). LTM_CONSOLIDATE_EVERY_TURNS
+# is the cadence in new turns; LTM_CONSOLIDATE_MAX_CLUSTERS bounds LLM spend
+# per run.
+LTM_CONSOLIDATE_ENABLED = _load_env().get('LTM_CONSOLIDATE_ENABLED', 'true') not in ('0', 'false', 'False')
+LTM_CONSOLIDATE_EVERY_TURNS = int(_load_env().get('LTM_CONSOLIDATE_EVERY_TURNS', '12') or 12)
+LTM_CONSOLIDATE_MAX_CLUSTERS = int(_load_env().get('LTM_CONSOLIDATE_MAX_CLUSTERS', '4') or 4)
 
 
 def _load_failures():
@@ -12456,6 +12566,71 @@ async def respond_player_inbox(message_id: str, request: Request):
         return JSONResponse({'error': 'unknown or already-answered message'}, status_code=404)
     log_action('player', 'player_inbox_respond', {'messageId': message_id}, authorized=True)
     return JSONResponse({'ok': True, 'message': m})
+
+
+@app.post('/api/player-inbox/{message_id}/feedback')
+@_state_writer
+async def feedback_player_inbox(message_id: str, request: Request):
+    """The player's feedback on a COMPLETED work item the think tank shared
+    with them -- a `card_report` inbox message (a closed card's full report,
+    see sim._deliver_card_report). Body: {rating: 1-5?, comment: '...'?}, at
+    least one required. The feedback is stamped onto the message (so the player
+    sees it in the inbox) and pushed into the completing agent's feedback
+    buffer (_append_feedback), so the agent carries it into its next task.
+    Re-submitting overwrites the previous feedback on that work item. PLAYER-
+    only, and only for completed work -- feedback on a chat reply or a pending
+    question is rejected, by design."""
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    import sim as _sim
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    messages = state.get('playerInbox') or []
+    m = next((x for x in messages if x.get('id') == message_id), None)
+    if not m:
+        return JSONResponse({'error': 'unknown message'}, status_code=404)
+    if m.get('kind') != 'card_report':
+        return JSONResponse({'error': 'feedback is only for completed work shared with you, '
+                                      'not for chat replies or pending questions'}, status_code=400)
+    rating = body.get('rating')
+    if rating is not None:
+        if isinstance(rating, bool) or not isinstance(rating, (int, float, str)):
+            return JSONResponse({'error': 'rating must be an integer 1-5'}, status_code=400)
+        try:
+            rating_f = float(rating)
+        except (TypeError, ValueError):
+            return JSONResponse({'error': 'rating must be an integer 1-5'}, status_code=400)
+        if rating_f != int(rating_f):
+            return JSONResponse({'error': 'rating must be an integer 1-5'}, status_code=400)
+        rating = int(rating_f)
+        if rating < 1 or rating > 5:
+            return JSONResponse({'error': 'rating must be an integer 1-5'}, status_code=400)
+    comment = (body.get('comment') or '').strip()
+    if rating is None and not comment:
+        return JSONResponse({'error': 'rating and/or comment is required'}, status_code=400)
+    now_ms = int(time.time() * 1000)
+    agent_id = m.get('agentId')
+    title = m.get('title') or 'a completed card'
+    feedback = {'rating': rating, 'comment': comment, 'at': now_ms,
+                'agentId': agent_id, 'taskId': m.get('taskId')}
+    m['feedback'] = feedback
+    text = f'Player feedback on "{title}": '
+    if rating is not None:
+        text += f'{rating}/5'
+    if comment:
+        text += (f' -- {comment}' if rating is not None else comment)
+    if agent_id:
+        _sim._append_feedback(state, agent_id, text, source='player_feedback')
+    save_state_to_db(state)
+    log_action('player', 'player_work_feedback',
+               {'messageId': message_id, 'taskId': m.get('taskId'),
+                'rating': rating, 'agentId': agent_id}, authorized=True)
+    return JSONResponse({'ok': True, 'feedback': feedback})
 
 
 @app.post('/api/intent/player-task/{task_id}/complete')
@@ -21523,6 +21698,16 @@ async def decision_tape_feed(kind: Optional[str] = None, min_conf: Optional[floa
          'confidence': r[4], 'cost': r[5], 'ok': bool(r[6])}
         for r in rows
     ]})
+
+
+@app.get('/api/decisions/verify')
+async def decision_tape_verify():
+    """Tamper check for the decision tape: walks the HMAC-SHA256 hash chain
+    (_verify_decision_tape) and reports every row that fails -- a content edit,
+    a chain break, or a row with no hash. Returns {ok, tampered: [{id, issue}],
+    count}. The head row's prev_hash anchors to the pruned past and is exempt."""
+    ok, problems = _verify_decision_tape()
+    return JSONResponse({'ok': ok, 'tampered': problems, 'count': len(problems)})
 
 
 @app.get('/api/reviews')

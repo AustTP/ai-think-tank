@@ -667,15 +667,88 @@ memory is Telegram-bridge-only.
 - LTM extraction cadence (`LTM_EXTRACT_EVERY_TURNS`) bounds the model spend; a
   bad extraction reply parses to `[]` (never fabricated memory), and inserts
   are deduplicated by content. `LTM_MAX_PER_SESSION` caps the store.
-- LTM recall is keyword-overlap scored with recency tiebreak — a cheap,
-  dependency-free stand-in for magi's vector search (the wheel itself pulls in
-  pyspark/mlflow/Databricks connectors that don't fit this stack).
+- LTM recall is keyword-overlap scored, then ranked by a trust factor — a cheap,
+  dependency-free stand-in for magi's vector search + trust filter (the wheel
+  itself pulls in pyspark/mlflow/Databricks connectors that don't fit this
+  stack).
 - All memory model calls (summary upgrade, LTM extraction) go through the
   `/api/chat` choke point as the admin with a `__memory__` service label, so
   they accrue to the Bank like any other spend and are visible per-service.
 - Expired STM sessions (`STM_TTL_HOURS`) are cleaned by the log-prune loop;
   LTM deliberately survives session expiry.
 
+**Trust and secret scrubbing** (ported from `memory_trust.py` /
+`memory_write_filter.py` in the magi wheel):
+
+- Every LTM memory carries `confidence` (0-1) and `source_type`
+  (`user_stated` / `agent_inferred`) from the extraction reply, with a source
+  weight fallback. Recall filters by `LTM_MIN_CONFIDENCE`, drops memories older
+  than `LTM_MAX_AGE_DAYS`, and boosts `user_stated` memories over inferred ones
+  with a staleness decay — so an offhand false fact the player mentioned once
+  does not outrank a stable, repeated one (poisoning defense).
+- Every write into persisted memory (LTM insert, STM summary merge) runs
+  through `_redact_secrets`: passwords, API keys, bearer tokens, JWT, git and
+  Databricks tokens, and connection-string passwords become
+  `[REDACTED:TYPE]` — REDACT, not block, so the memory keeps its context while
+  the secret value can never be re-injected into a later ask.
+- `ltm_memories` gained `confidence` / `source_type` / `fact_checked` columns;
+  `_ensure_tables` migrates an existing DB idempotently (CREATE TABLE IF NOT
+  EXISTS alone cannot add columns).
+
+**Consolidation** (ported from `memory_consolidation.py` in the magi wheel):
+near-duplicate memories are periodically merged into one richer memory.
+`ltm_consolidate_due` checks a per-session cadence (`LTM_CONSOLIDATE_EVERY_TURNS`);
+the worker clusters active memories by keyword Jaccard overlap, asks the model
+to merge each cluster (or say no), and on a merge inserts the richer record and
+deactivates the originals. Merged memories inherit max-confidence / a
+`system_generated` source. Spend is bounded per run
+(`LTM_CONSOLIDATE_MAX_CLUSTERS`), and a bad or "no" reply leaves the cluster
+untouched.
+
 **Knobs** (all live-rebindable): `MEMORY_ENABLED`, `STM_MAX_TURNS`,
 `STM_MAX_TOKENS`, `STM_TTL_HOURS`, `LTM_MAX_RECALL`, `LTM_MAX_PER_SESSION`,
-`LTM_EXTRACT_EVERY_TURNS`.
+`LTM_EXTRACT_EVERY_TURNS`, `LTM_MIN_CONFIDENCE`, `LTM_MAX_AGE_DAYS`,
+`LTM_CONSOLIDATE_ENABLED`, `LTM_CONSOLIDATE_EVERY_TURNS`,
+`LTM_CONSOLIDATE_MAX_CLUSTERS`.
+
+## 16. Player Feedback on Completed Work
+
+When an agent finishes a card, the player gets the full report as a
+`card_report` inbox message plus a real email (`sim._deliver_card_report`).
+The player can rate (1-5) and/or comment on that completed work only:
+
+- `POST /api/player-inbox/{message_id}/feedback` with `{rating, comment}`
+  (at least one required; re-submitting overwrites). PLAYER-only, and only
+  accepted on `kind == 'card_report'` messages — feedback on a chat reply or a
+  pending question is rejected by design, because the player should judge
+  delivered work, not conversation.
+- The feedback is stamped onto the inbox message (visible in the player inbox)
+  and pushed into the completing agent's feedback buffer via
+  `sim._append_feedback(..., source='player_feedback')`, so the agent carries
+  it into its next task exactly like a rejection rationale or a pipeline
+  failure. The card report carries `agentId` (the task's `assignedTo`) so the
+  right agent is fed back.
+- UI: the player-inbox modal renders each card report with a star + comment
+  control and shows prior feedback with an edit affordance.
+## 17. Tamper-Evident Decision Tape
+
+The `decision_tape` table records every Jev decision the chokepoint makes
+(prompt, candidates, parsed choice/confidence/cost, full response). It is now
+hash-chained (ported from the magi wheel's `audit_trail.py` hash-chain idea):
+
+- Every row carries `prev_hash` + `hash` = HMAC-SHA256 under the server's
+  boundary secret over `prev_hash | canonical row` (`_tape_row_hash`). A
+  content edit, a reorder, or a truncation inside the chain changes the hash
+  and is detectable.
+- `_append_decision_tape` chains each new row to the previous row's hash in
+  one transaction. `init_db` backfills legacy NULL-hash rows in id order and
+  never re-signs an already-hashed row (that would destroy its tamper
+  evidence).
+- `_verify_decision_tape()` walks the chain and reports every failing row:
+  `hash mismatch` (content edited), `chain break` (prev_hash doesn't match the
+  predecessor), or `unhashed row`. The FIRST row's prev_hash anchors to the
+  pruned past and is exempt, so normal retention pruning of old head rows does
+  not false-positive. Exposed at `GET /api/decisions/verify`.
+- Retention prune distills each old tape row into `decision_archive` carrying
+  the source row's `tape_hash`, so an archived decision cross-checks against
+  the tape's chain even after the tape row is pruned.

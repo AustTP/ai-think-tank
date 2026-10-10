@@ -2292,6 +2292,93 @@ function appendInboxMessage(log, m, waiting) {
     log.appendChild(box);
     return;
   }
+  if (m.kind === 'card_report') {
+    // Completed work the think tank shared with the player: the full card
+    // report plus a feedback control. Feedback is ONLY allowed here -- the
+    // player rates the work an agent completed and shared, not chat replies.
+    who.textContent = `Completed — ${m.title || 'a card'}`;
+    box.appendChild(who);
+    const meta = document.createElement('div');
+    meta.style.fontSize = '11px';
+    meta.style.opacity = '0.6';
+    meta.textContent = (m.closeReason ? m.closeReason + ' \u00b7 ' : '') + new Date(m.createdAt || Date.now()).toLocaleString();
+    box.appendChild(meta);
+    const body = document.createElement('div');
+    body.style.whiteSpace = 'pre-wrap';
+    body.style.fontSize = '12px';
+    body.textContent = m.body || '';
+    box.appendChild(body);
+    if (m.feedback && !m.feedback._editing) {
+      const fb = document.createElement('div');
+      fb.style.marginTop = '6px';
+      fb.style.fontSize = '12px';
+      fb.style.opacity = '0.9';
+      const ratingTxt = m.feedback.rating ? m.feedback.rating + '/5' : 'no rating';
+      fb.textContent = `Your feedback: ${ratingTxt}${m.feedback.comment ? ' \u2014 ' + m.feedback.comment : ''}`;
+      box.appendChild(fb);
+      const editBtn = document.createElement('button');
+      editBtn.textContent = 'Edit feedback';
+      editBtn.style.marginTop = '4px';
+      editBtn.addEventListener('click', () => {
+        m.feedback._editing = true;
+        renderPlayerInbox();
+      });
+      box.appendChild(editBtn);
+    } else {
+      const wrap = document.createElement('div');
+      wrap.style.marginTop = '6px';
+      const stars = document.createElement('div');
+      stars.style.display = 'flex';
+      stars.style.gap = '4px';
+      stars.style.marginBottom = '4px';
+      let picked = (m.feedback && m.feedback.rating) || 0;
+      for (let i = 1; i <= 5; i++) {
+        const star = document.createElement('button');
+        star.textContent = i <= picked ? '\u2605' : '\u2606';
+        star.style.fontSize = '16px';
+        star.style.border = 'none';
+        star.style.background = 'transparent';
+        star.style.cursor = 'pointer';
+        star.addEventListener('click', () => { picked = i; renderStars(); });
+        stars.appendChild(star);
+      }
+      const renderStars = () => {
+        Array.from(stars.children).forEach((s, idx) => {
+          s.textContent = (idx + 1) <= picked ? '\u2605' : '\u2606';
+        });
+      };
+      wrap.appendChild(stars);
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.placeholder = 'Feedback on this work (optional)...';
+      input.style.flex = '1';
+      input.style.boxSizing = 'border-box';
+      if (m.feedback && m.feedback.comment) input.value = m.feedback.comment;
+      wrap.appendChild(input);
+      const btn = document.createElement('button');
+      btn.textContent = m.feedback ? 'Update feedback' : 'Send feedback';
+      const send = async () => {
+        btn.disabled = true;
+        try {
+          const res = await apiFetch(`/api/player-inbox/${encodeURIComponent(m.id)}/feedback`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rating: picked || null, comment: input.value.trim() }),
+          });
+          if (res.ok) await renderPlayerInbox();
+          else {
+            btn.disabled = false;
+            btn.textContent = 'Failed \u2014 try again';
+          }
+        } catch (e) { btn.disabled = false; }
+      };
+      btn.addEventListener('click', send);
+      wrap.appendChild(btn);
+      box.appendChild(wrap);
+    }
+    log.appendChild(box);
+    return;
+  }
   const agentName = (AGENT_ROSTER.find(d => d.id === m.agentId) || {}).name || m.agentId;
   who.textContent = `${agentName} — ${m.issueKey || 'ask'}`;
   box.appendChild(who);

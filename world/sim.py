@@ -7682,7 +7682,8 @@ def _deliver_card_report(state, task, close_reason, approvals=0):
     inbox = state.setdefault('playerInbox', [])
     inbox.append({
         'id': f'crep-{task.get("id") or int(now_ms)}', 'kind': 'card_report',
-        'taskId': task.get('id'), 'title': title, 'body': body,
+        'taskId': task.get('id'), 'agentId': task.get('assignedTo'),
+        'title': title, 'body': body,
         'closeReason': reason, 'createdAt': now_ms,
     })
     _queue_player_email(state, f'card_report:{task.get("id") or "unknown"}',
