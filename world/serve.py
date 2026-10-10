@@ -8453,9 +8453,10 @@ _LOCAL_FILE_TOOL = {
                        'against the player\'s grant: you can only touch paths inside the granted scope, '
                        'deletes move to the trash (you can never empty the trash), and for Notes you can '
                        'read any note but only create new ones or modify/delete ones you created. '
-                       'Actions: list (list the granted folder), read (read a file\'s text), write '
-                       '(create/overwrite a file), move (move/rename within the folder), delete (move to '
-                       'trash), notes_list, notes_create, notes_modify, notes_delete. Supply the exact '
+'Actions: list (list a folder in the scope; pass `path` to list a subfolder, '
+                        'omit it to list the scope root), read (read a file\'s text), write '
+                        '(create/overwrite a file), move (move/rename within the folder), delete (move to '
+                        'trash), notes_list, notes_create, notes_modify, notes_delete. Supply the exact '
                        '`scope` path the player granted (e.g. /Users/you/Desktop) and a relative '
                        '`path`/`from`/`to` within it.',
         'parameters': {
@@ -8487,11 +8488,12 @@ def _local_file_tool(agent_id, args):
     scope = (args or {}).get('scope') or ''
     try:
         if action == 'list':
-            entries = _fs.list_scope(scope)
-            return ('Files in ' + scope + ':\n' + '\n'.join(
+            entries = _fs.list_scope(scope, (args or {}).get('path') or '')
+            where = ((args or {}).get('path') or '').strip() or scope
+            return ('Files in ' + where + ':\n' + '\n'.join(
                 f"- {e['name']} ({e['type']})"
                 + (f", {e['size']} bytes" if e.get('size') is not None else '')
-                for e in entries)) or f'{scope} is empty'
+                for e in entries)) or f'{where} is empty'
         if action == 'read':
             return _fs.read_file(scope, (args or {}).get('path') or '')
         if action == 'write':

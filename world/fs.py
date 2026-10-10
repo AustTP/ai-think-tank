@@ -56,7 +56,9 @@ def _resolve(grant, rel_path):
     """Resolve a relative path inside a grant's scope, enforcing containment.
     Returns the absolute path, or raises PermissionError."""
     scope = os.path.realpath(os.path.expanduser(grant.get('scope') or ''))
-    if not rel_path or rel_path.startswith('/'):
+    if not rel_path:
+        return scope
+    if rel_path.startswith('/'):
         raise PermissionError('path must be relative to the granted scope')
     joined = os.path.realpath(os.path.join(scope, rel_path))
     if joined != scope and not joined.startswith(scope + os.sep):
@@ -72,20 +74,24 @@ def _require_cap(grant, cap):
         raise PermissionError(f'grant does not allow {cap}')
 
 
-def list_scope(scope):
-    """List the granted scope root (top level). Returns [{name, type, size}]."""
+def list_scope(scope, rel_path=''):
+    """List a directory inside the granted scope (default: the scope root).
+    Returns [{name, type, size}]."""
     state = _state()
     grant = _grant_for(state, scope)
     if not grant:
         raise PermissionError('no grant for this scope')
     _require_cap(grant, 'read')
     root = os.path.realpath(os.path.expanduser(scope))
+    p = _resolve(grant, rel_path)
+    if not os.path.isdir(p):
+        raise FileNotFoundError(f'not a directory: {rel_path}')
     entries = []
-    for name in sorted(os.listdir(root)):
-        p = os.path.join(root, name)
+    for name in sorted(os.listdir(p)):
+        fp = os.path.join(p, name)
         entries.append({'name': name,
-                        'type': 'dir' if os.path.isdir(p) else 'file',
-                        'size': os.path.getsize(p) if os.path.isfile(p) else None})
+                        'type': 'dir' if os.path.isdir(fp) else 'file',
+                        'size': os.path.getsize(fp) if os.path.isfile(fp) else None})
     return entries
 
 
