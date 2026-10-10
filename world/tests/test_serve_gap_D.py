@@ -1718,6 +1718,43 @@ class AskCore(unittest.TestCase):
         self.assertEqual(capture["force_first_tool"], "read_ais_feed")
         self.assertIn("read_ais_feed", result["tools"])
 
+    def test_force_first_tool_rss_feed(self):
+        state = self._ask_state()
+        capture = {}
+        with unittest.mock.patch.object(sim, "_eligible_candidates", return_value=["agent-2"]), \
+             unittest.mock.patch.object(serve, "_resolve_model_tier", return_value="m"), \
+             unittest.mock.patch.object(serve, "get_or_create_agent_key", return_value="k"), \
+             unittest.mock.patch.object(serve, "_call_agent_tool_loop",
+                                        _loop_fake([("read_rss_feed", {})], capture=capture)), \
+             unittest.mock.patch.object(content, "_spike_wants_x_trending", return_value=False), \
+             unittest.mock.patch.object(content, "_spike_wants_linkedin_search", return_value=False), \
+             unittest.mock.patch.object(content, "_spike_wants_ais_feed", return_value=False), \
+             unittest.mock.patch.object(content, "_spike_wants_rss", return_value=True), \
+             unittest.mock.patch.object(content, "_make_treg_tools_executor",
+                                        return_value=lambda name, args: "feed"):
+            result = self._run(state, "any breaking news?")
+        self.assertEqual(capture["force_first_tool"], "read_rss_feed")
+        self.assertIn("read_rss_feed", result["tools"])
+
+    def test_force_first_tool_market_feed(self):
+        state = self._ask_state()
+        capture = {}
+        with unittest.mock.patch.object(sim, "_eligible_candidates", return_value=["agent-2"]), \
+             unittest.mock.patch.object(serve, "_resolve_model_tier", return_value="m"), \
+             unittest.mock.patch.object(serve, "get_or_create_agent_key", return_value="k"), \
+             unittest.mock.patch.object(serve, "_call_agent_tool_loop",
+                                        _loop_fake([("read_market_feed", {})], capture=capture)), \
+             unittest.mock.patch.object(content, "_spike_wants_x_trending", return_value=False), \
+             unittest.mock.patch.object(content, "_spike_wants_linkedin_search", return_value=False), \
+             unittest.mock.patch.object(content, "_spike_wants_ais_feed", return_value=False), \
+             unittest.mock.patch.object(content, "_spike_wants_rss", return_value=False), \
+             unittest.mock.patch.object(content, "_spike_wants_market", return_value=True), \
+             unittest.mock.patch.object(content, "_make_treg_tools_executor",
+                                        return_value=lambda name, args: "feed"):
+            result = self._run(state, "what is bitcoin worth?")
+        self.assertEqual(capture["force_first_tool"], "read_market_feed")
+        self.assertIn("read_market_feed", result["tools"])
+
 
 class IntentAsk(unittest.TestCase):
     def test_unauthorized(self):
