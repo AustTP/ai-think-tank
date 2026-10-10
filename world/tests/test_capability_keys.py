@@ -56,7 +56,8 @@ class CapabilityKeys(unittest.TestCase):
     def test_credential_roundtrip_and_never_listed(self):
         serve._store_credential('github-token', 'github', 'sk-very-secret')
         listed = serve._list_credentials()
-        self.assertEqual(listed, [{'name': 'github-token', 'service': 'github'}])
+        self.assertEqual(listed, [{'name': 'github-token', 'service': 'github',
+                                   'kind': 'token', 'status': 'active', 'proposedBy': None}])
         # The raw value must never be readable back out of the vault.
         row = None
         with serve._db() as conn:
@@ -436,7 +437,7 @@ class HandlesEndpointAuth(unittest.TestCase):
         r = c.post('/api/keys/handles', json=self._mint_body(),
                    headers={'X-Agent-Key': self.agent_key})
         self.assertEqual(r.status_code, 403, r.text)
-        self.assertIn('player-only', r.json().get('error', ''))
+        self.assertIn('handle minting', r.json().get('error', ''))
         with serve._db() as conn:
             self.assertIsNone(conn.execute('SELECT 1 FROM capability_handles').fetchone())
 

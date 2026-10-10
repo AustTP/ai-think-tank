@@ -2209,7 +2209,7 @@ class CredentialVaultEndpoints(unittest.TestCase):
         with unittest.mock.patch.object(serve, 'verify_session', return_value=True):
             r = _client().post('/api/keys/credentials', json={'name': 'x'})
         self.assertEqual(r.status_code, 400)
-        self.assertIn('name and value are required', r.json()['error'])
+        self.assertIn('required', r.json()['error'])
 
     def test_add_credential_bad_name_returns_400(self):
         with unittest.mock.patch.object(serve, 'verify_session', return_value=True):
@@ -2225,8 +2225,9 @@ class CredentialVaultEndpoints(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertTrue(body['ok'])
-        self.assertEqual(body['credential'], {'name': 'api', 'service': 'my-svc'})
-        store.assert_called_once_with('api', 'my-svc', 'secret-value')
+        self.assertEqual(body['credential'], {'name': 'api', 'service': 'my-svc', 'kind': 'token'})
+        store.assert_called_once_with('api', 'my-svc', {'kind': 'token', 'token': 'secret-value'},
+                                      status='active', proposed_by='player')
         self.assertEqual(log.call_args[0][1], 'credential_stored')
         data = serve._load_passport()
         self.assertEqual(data['blocks'][0]['kind'], 'credential_stored')

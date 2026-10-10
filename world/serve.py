@@ -852,7 +852,13 @@ def init_db():
         # Phase D external-credential vault (confused-deputy). Two tables:
         #   external_credentials -- the real secrets, encrypted at rest with a
         #     server-side Fernet key; never readable back, only decrypted in
-        #     process at use time.
+        #     process at use time. Each entry is one of two generic kinds: a
+        #     'token' (an API key injected into a request) or a 'login'
+        #     (username + password for an interactive account). 'status' is the
+        #     registry lifecycle: agents propose (encrypted immediately,
+        #     status='proposed'), a director/admin or the player approves or
+        #     denies, and removed rows are unusable -- the whole vault is
+        #     runtime-administered, no restart needed.
         #   capability_handles    -- opaque nonces an agent presents to USE a
         #     credential for a scoped purpose (allowed hosts/methods/expiry).
         #     The agent never holds the credential, only a handle; the server
@@ -861,9 +867,23 @@ def init_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS external_credentials (
             name            TEXT PRIMARY KEY,
             service         TEXT NOT NULL,
+            kind            TEXT NOT NULL DEFAULT 'token',
             encrypted_value TEXT NOT NULL,
-            created_at      REAL NOT NULL
+            status          TEXT NOT NULL DEFAULT 'active',
+            proposed_by     TEXT,
+            created_at      REAL NOT NULL,
+            updated_at      REAL
         )''')
+        try:
+            cols = [r[1] for r in conn.execute('PRAGMA table_info(external_credentials)')]
+            for col, col_type in (('kind', "TEXT NOT NULL DEFAULT 'token'"),
+                                  ('status', "TEXT NOT NULL DEFAULT 'active'"),
+                                  ('proposed_by', 'TEXT'),
+                                  ('updated_at', 'REAL')):
+                if col not in cols:
+                    conn.execute(f'ALTER TABLE external_credentials ADD COLUMN {col} {col_type}')  # nosec B608 -- fixed internal column names, never user input
+        except Exception:
+            pass
         conn.execute('''CREATE TABLE IF NOT EXISTS capability_handles (
             handle          TEXT PRIMARY KEY,
             agent_id        TEXT NOT NULL,
@@ -2240,21 +2260,57 @@ def _open_secret(token):
         return None
 
 
-def _store_credential(name, service, value):
+def _store_credential(name, service, value, status='active', proposed_by=None):
+    """Store (or replace) a credential, encrypted at rest. `value` is either a
+    raw token string (legacy callers) or a structured dict payload
+    ({'kind': 'token', 'token': ...} / {'kind': 'login', 'username': ...,
+    'password': ...}). The encrypted blob is the ONLY copy ever persisted; the
+    plaintext exists only inside the process for the instant it is used."""
+    if isinstance(value, dict):
+        payload = dict(value)
+        kind = payload.get('kind') if payload.get('kind') in ('token', 'login') else 'token'
+    else:
+        payload = {'kind': 'token', 'token': value}
+        kind = 'token'
+    now = time.time()
     with _db() as conn:
         conn.execute(
-            'INSERT INTO external_credentials (name, service, encrypted_value, created_at) '
-            'VALUES (?, ?, ?, ?) '
-            'ON CONFLICT(name) DO UPDATE SET service=excluded.service, encrypted_value=excluded.encrypted_value, created_at=excluded.created_at',
-            (name, service, _seal_secret(value), time.time()),
+            'INSERT INTO external_credentials (name, service, kind, encrypted_value, status, proposed_by, created_at, updated_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?) '
+            'ON CONFLICT(name) DO UPDATE SET service=excluded.service, kind=excluded.kind, '
+            'encrypted_value=excluded.encrypted_value, status=excluded.status, '
+            'proposed_by=excluded.proposed_by, updated_at=excluded.updated_at',
+            (name, service, kind, _seal_secret(json.dumps(payload)), status, proposed_by, now, now),
         )
 
 
 def _list_credentials():
-    """Credential names + services -- NEVER the values."""
+    """Credential names + services + kinds + statuses -- NEVER the values."""
     with _db() as conn:
-        return [{'name': r[0], 'service': r[1]} for r in conn.execute(
-            'SELECT name, service FROM external_credentials ORDER BY name')]
+        return [{'name': r[0], 'service': r[1], 'kind': r[2], 'status': r[3], 'proposedBy': r[4]}
+                for r in conn.execute(
+                    'SELECT name, service, kind, status, proposed_by FROM external_credentials ORDER BY name')]
+
+
+def _credential_payload(name):
+    """Decrypt one credential's stored value into its structured payload, or
+    None when absent/unreadable. Legacy rows that stored a raw token string
+    decrypt to {'kind': 'token', 'token': <raw>}. This is the single chokepoint
+    that turns an encrypted blob back into something usable -- everything that
+    USES a credential goes through here (or through resolve_capability_handle)."""
+    raw = _credential_token(name)
+    if raw is None:
+        return None
+    dec = _open_secret(raw)
+    if dec is None:
+        return None
+    try:
+        obj = json.loads(dec)
+        if isinstance(obj, dict) and obj.get('kind') in ('token', 'login'):
+            return obj
+    except (ValueError, TypeError):
+        pass
+    return {'kind': 'token', 'token': dec}
 
 
 def _delete_credential(name):
@@ -2263,6 +2319,51 @@ def _delete_credential(name):
     with _db() as conn:
         conn.execute('DELETE FROM capability_handles WHERE credential_name = ?', (name,))
         conn.execute('DELETE FROM external_credentials WHERE name = ?', (name,))
+
+
+def _validate_credential_body(body):
+    """Validate a credential proposal. Returns (name, service, payload, error) --
+    error is None when valid. 'token' kind stores one API key; 'login' kind
+    stores a username + password for an interactive account. The secret is
+    never echoed into error text."""
+    body = body or {}
+    name = (body.get('name') or '').strip()
+    if not name or not re.match(r'^[a-zA-Z0-9_-]+$', name):
+        return None, None, None, 'name must be [a-zA-Z0-9_-] (a slug)'
+    service = (body.get('service') or name).strip()
+    if not service:
+        return None, None, None, 'service is required'
+    kind = (body.get('kind') or 'token').strip().lower()
+    if kind == 'login':
+        username = (body.get('username') or '').strip()
+        password = body.get('password')
+        if not username or not isinstance(password, str) or not password:
+            return None, None, None, 'login credentials need a username and a password'
+        return name, service[:120], {'kind': 'login', 'username': username[:200], 'password': password}, None
+    if kind == 'token':
+        token = body.get('value') or body.get('token')
+        if not token or not isinstance(token, str) or not token.strip():
+            return None, None, None, 'token credentials need a value (the token)'
+        return name, service[:120], {'kind': 'token', 'token': token}, None
+    return None, None, None, 'kind must be "token" or "login"'
+
+
+def _mask_secret(value):
+    """A short masked preview of a secret -- never enough to reconstruct it."""
+    value = value or ''
+    if len(value) <= 4:
+        return '*' * len(value)
+    return value[:2] + '*' * (len(value) - 4) + value[-2:]
+
+
+def _mask_credential_preview(payload):
+    """Masked preview of a stored payload for approvers/lists: username is shown
+    (it is not a secret), the password/token is masked."""
+    payload = payload or {}
+    if payload.get('kind') == 'login':
+        return {'kind': 'login', 'username': payload.get('username'),
+                'password': _mask_secret(payload.get('password'))}
+    return {'kind': 'token', 'token': _mask_secret(payload.get('token'))}
 
 
 _DIGITALOCEAN_BALANCE_CACHE = {'at': 0.0, 'data': None}
@@ -3341,8 +3442,9 @@ def mint_capability_handle(agent_id, credential_name, purpose, allowed_hosts,
     credential already at/over its budget). The handle is unrelated to the
     credential -- knowing it reveals nothing."""
     with _db() as conn:
-        row = conn.execute('SELECT 1 FROM external_credentials WHERE name = ?',
-                           (credential_name,)).fetchone()
+        row = conn.execute(
+            "SELECT 1 FROM external_credentials WHERE name = ? AND status = 'active'",
+            (credential_name,)).fetchone()
         if not row:
             return None, 'unknown credential'
         # Master gate for the DigitalOcean credential: the DO
@@ -3456,8 +3558,27 @@ def resolve_capability_handle(agent_id, handle, method, url):
         secret = _open_secret(encrypted)
         if secret is None:
             return None
-    return {'credential_name': credential_name, 'purpose': purpose,
-            'service': service, 'secret': secret}
+    # Normalize the decrypted value into a structured payload: legacy rows that
+    # stored a raw token string become {'kind': 'token', 'token': <raw>}. For
+    # login-kind credentials the secret is a username/password pair, which can
+    # never be injected as a request header -- callers must use the structured
+    # fields for a service-specific login flow.
+    try:
+        obj = json.loads(secret)
+        if isinstance(obj, dict) and obj.get('kind') in ('token', 'login'):
+            payload = obj
+        else:
+            payload = {'kind': 'token', 'token': secret}
+    except (ValueError, TypeError):
+        payload = {'kind': 'token', 'token': secret}
+    kind = payload.get('kind', 'token')
+    grant = {'credential_name': credential_name, 'purpose': purpose,
+             'service': service, 'kind': kind,
+             'secret': payload.get('token') if kind == 'token' else None}
+    if kind == 'login':
+        grant['username'] = payload.get('username')
+        grant['password'] = payload.get('password')
+    return grant
 
 # Real background health checks -- see compute_health_snapshot below.
 # Runs independently of any browser tab (this loop lives in the server
@@ -18403,15 +18524,15 @@ async def ws_recent(request: Request):
     })
 
 
-def _feed_registry_status(table, fid):
-    """Current status row ('active'/'proposed'/'denied'/'removed') for a feed id
-    in one of the operator registries, or None when unknown. Table is a fixed
-    internal constant, never user input."""
+def _feed_registry_status(table, value, pk_col='id'):
+    """Current status row ('active'/'proposed'/'denied'/'removed') for a row in
+    one of the operator registries, or None when unknown. Table and pk_col are
+    fixed internal constants, never user input."""
     try:
         with _db() as conn:
             row = conn.execute(
-                f'SELECT status FROM {table} WHERE id = ?',  # nosec B608 -- fixed internal table constant
-                (fid,)).fetchone()
+                f'SELECT status FROM {table} WHERE {pk_col} = ?',  # nosec B608 -- fixed internal table/column constants
+                (value,)).fetchone()
         return row[0] if row else None
     except Exception:  # noqa: BLE001 -- fail closed to None (unknown)
         return None
@@ -18961,6 +19082,15 @@ async def curl(request: Request):
         # response or logs. Every use is chained into the hashed-product-passport
         # (a tamper-evident ledger of world-changing decisions), so "who used
         # which key, when, for what, on which host" is auditable and un-rewritable.
+        if grant.get('kind') == 'login':
+            # A login credential (username + password) is not a request header.
+            # It only makes sense through a service-specific login flow, so a
+            # handle to one must never be accepted as an api_call attachment.
+            log_action(agent_id, 'curl', {'url': url, 'method': method, 'purpose': purpose,
+                                          'decision': 'blocked', 'reason': 'login credential cannot be attached as a request header'},
+                       authorized=authorized, trace_id=trace_id)
+            return JSONResponse({'allowed': False,
+                                 'reason': 'That capability handle is for a login credential, which cannot be attached to an HTTP request as a header.'})
         for hdr_name, hdr_value in _capability_auth_headers(grant['credential_name'], grant['secret']).items():
             req_headers.setdefault(hdr_name, hdr_value)
         log_action(agent_id, 'curl', {'url': url, 'method': method, 'purpose': purpose,
@@ -19495,15 +19625,28 @@ async def add_credential(request: Request):
     body = await request.json()
     name = (body.get('name') or '').strip()
     service = (body.get('service') or name).strip()
-    value = body.get('value')
-    if not name or not value:
-        return JSONResponse({'error': 'name and value are required'}, status_code=400)
+    if not name:
+        return JSONResponse({'error': 'name is required'}, status_code=400)
     if not re.match(r'^[a-zA-Z0-9_-]+$', name):
         return JSONResponse({'error': 'name must be [a-zA-Z0-9_-] (a slug)'}, status_code=400)
-    _store_credential(name, service, value)
-    log_action('player', 'credential_stored', {'name': name, 'service': service}, authorized=True)
-    _append_passport_decision('credential_stored', 'player', {'name': name, 'service': service})
-    return JSONResponse({'ok': True, 'credential': {'name': name, 'service': service}})
+    # Two generic kinds: 'token' (an API key, the legacy single-value shape) and
+    # 'login' (username + password for an interactive account).
+    kind = (body.get('kind') or 'token').strip().lower()
+    if kind == 'login':
+        username = (body.get('username') or '').strip()
+        password = body.get('password')
+        if not username or not password:
+            return JSONResponse({'error': 'username and password are required for login credentials'}, status_code=400)
+        payload = {'kind': 'login', 'username': username, 'password': password}
+    else:
+        value = body.get('value') or body.get('token')
+        if not value:
+            return JSONResponse({'error': 'value (the token) is required'}, status_code=400)
+        payload = {'kind': 'token', 'token': value}
+    _store_credential(name, service, payload, status='active', proposed_by='player')
+    log_action('player', 'credential_stored', {'name': name, 'service': service, 'kind': payload['kind']}, authorized=True)
+    _append_passport_decision('credential_stored', 'player', {'name': name, 'service': service, 'kind': payload['kind']})
+    return JSONResponse({'ok': True, 'credential': {'name': name, 'service': service, 'kind': payload['kind']}})
 
 
 @app.delete('/api/keys/credentials/{name}')
@@ -19516,21 +19659,129 @@ async def delete_credential(name: str, request: Request):
     return JSONResponse({'ok': True})
 
 
+@app.get('/api/credentials')
+async def credential_list(request: Request):
+    """Operator management view of the credential vault: name, service, kind,
+    status, and a MASKED preview per entry -- never a full value. Gated to a
+    player session or a director/admin (agents never enumerate the vault)."""
+    authorized, _actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'credential vault is player/director/admin-only'}, status_code=401)
+    entries = []
+    for cred in _list_credentials():
+        entry = dict(cred)
+        entry['preview'] = _mask_credential_preview(_credential_payload(cred['name']) or {})
+        entries.append(entry)
+    return JSONResponse({'credentials': entries})
+
+
+@app.post('/api/credentials/propose')
+async def credential_propose(request: Request):
+    """Agent-facing proposal of a new credential (API token or username +
+    password). The value is encrypted at rest the moment it lands, and the row
+    is status='proposed' -- unusable until a director/admin or the player
+    approves it via /api/credentials/approve. The full runtime story: an agent
+    can register a new account's credentials with no restart, and approval is
+    the gate that keeps the vault player/director-controlled."""
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'player').strip() or 'player'
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'credential-propose'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    if not (verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is True
+            or _require_player_session(request)):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    name, service, payload, error = _validate_credential_body(body)
+    if error:
+        return JSONResponse({'error': error}, status_code=400)
+    existing = _feed_registry_status('external_credentials', name, pk_col='name')
+    if existing == 'active':
+        return JSONResponse({'error': f'a credential named "{name}" is already active'}, status_code=409)
+    if existing == 'proposed':
+        return JSONResponse({'error': f'a proposal for credential "{name}" is already pending review'}, status_code=409)
+    _store_credential(name, service, payload, status='proposed', proposed_by=agent_id)
+    log_action(agent_id, 'credential_propose', {'name': name, 'service': service,
+                                                'kind': payload['kind']})
+    return JSONResponse({'requested': True, 'credential': {'name': name, 'service': service,
+                                                           'kind': payload['kind']},
+                         'message': f'Proposal for credential "{name}" stored encrypted. A director/admin '
+                                    'or the player approves or denies it via /api/credentials/approve.'})
+
+
+@app.post('/api/credentials/approve')
+async def credential_approve(request: Request):
+    """Director/admin/player approval or denial of a proposed credential. The
+    stored value is decrypted, re-validated, and returned to the approver only
+    as a masked preview. An approved credential becomes mintable immediately --
+    no restart."""
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a director, the admin, or the player may approve credentials'}, status_code=403)
+    body = await request.json()
+    name = (body.get('name') or '').strip()
+    decision = (body.get('decision') or 'approve').strip().lower()
+    if not name:
+        return JSONResponse({'error': 'name is required'}, status_code=400)
+    existing = _feed_registry_status('external_credentials', name, pk_col='name')
+    if existing is None:
+        return JSONResponse({'error': f'no credential row "{name}"'}, status_code=404)
+    if existing == 'active':
+        return JSONResponse({'error': f'credential "{name}" is already active'}, status_code=409)
+    payload = _credential_payload(name)
+    if payload is None:
+        return JSONResponse({'error': 'stored credential is unreadable'}, status_code=400)
+    with _db() as conn:
+        row = conn.execute('SELECT service FROM external_credentials WHERE name = ?', (name,)).fetchone()
+    service = row[0] if row else name
+    # Re-validate the stored payload at approval time (never trust a forged or
+    # hand-edited row to bypass the validator).
+    _n, _s, normalized, error = _validate_credential_body(
+        {'name': name, 'service': service, 'kind': payload['kind'], **payload})
+    if error:
+        return JSONResponse({'error': f'proposal no longer validates: {error}'}, status_code=400)
+    status = 'active' if decision != 'deny' else 'denied'
+    _store_credential(name, service, normalized, status=status, proposed_by=actor)
+    log_action(actor, 'credential_approve', {'name': name, 'service': service,
+                                             'kind': normalized['kind'], 'status': status})
+    return JSONResponse({'ok': True, 'credential': {'name': name, 'service': service,
+                                                    'kind': normalized['kind'],
+                                                    'preview': _mask_credential_preview(normalized)}})
+
+
+@app.post('/api/credentials/remove')
+async def credential_remove(request: Request):
+    """Director/admin/player removal of a credential. Marks the row 'removed'
+    (unusable, un-mintable) and voids every outstanding handle to it."""
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a director, the admin, or the player may remove credentials'}, status_code=403)
+    body = await request.json()
+    name = (body.get('name') or '').strip()
+    if not name:
+        return JSONResponse({'error': 'name is required'}, status_code=400)
+    if _feed_registry_status('external_credentials', name, pk_col='name') is None:
+        return JSONResponse({'error': f'no credential row "{name}"'}, status_code=404)
+    with _db() as conn:
+        conn.execute('DELETE FROM capability_handles WHERE credential_name = ?', (name,))
+        conn.execute('UPDATE external_credentials SET status = ?, updated_at = ? WHERE name = ?',
+                     ('removed', time.time(), name))
+    log_action(actor, 'credential_remove', {'name': name})
+    return JSONResponse({'ok': True, 'name': name, 'status': 'removed'})
+
+
 @app.post('/api/keys/handles')
 async def add_handle(request: Request):
-    # "Player-only" must be proven by a real player session cookie, not
-    # inferred from the ABSENCE of a self-declared `requesterId` query param
-    # (_resolve_requester's job elsewhere: distinguish agents from the
-    # player for the self-reports rule, where a misclaim fails closed to
-    # "player" on purpose). Here that same fallback is backwards: an agent's
-    # own HTTP client already needed a valid X-Agent-Key just to clear the
-    # global auth middleware, and could reach this handler by simply
-    # omitting `requesterId` -- which _resolve_requester would then read as
-    # "not an agent" and let mint a handle for itself.
-    # Real handle-authenticated actions require an
-    # actual verified player session instead.
-    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
-        return JSONResponse({'error': 'handles are player-only'}, status_code=403)
+    # Handle minting is "limited by the ask": every grant is a purpose + host
+    # scope + method scope + TTL, resolved server-side so the agent never holds
+    # the secret. The authorizer is the player, or a director/admin (real
+    # in-game authority). It must NOT be inferable from the ABSENCE of a
+    # self-declared `requesterId` query param: an agent's own HTTP client can
+    # clear the global auth middleware with its key and reach this handler by
+    # simply omitting requesterId, so the gate requires an actual verified
+    # player session OR a proven director/admin identity.
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'handle minting requires a player session or a director/admin'}, status_code=403)
     body = await request.json()
     agent_id = (body.get('agentId') or '').strip()
     credential_name = (body.get('credentialName') or '').strip()
@@ -19549,15 +19800,15 @@ async def add_handle(request: Request):
         allowed_methods = [m.strip().upper() for m in allowed_methods.replace(' ', '').split(',') if m.strip()]
     handle, refusal = mint_capability_handle(agent_id, credential_name, purpose,
                                              allowed_hosts, [m.upper() for m in allowed_methods],
-                                             'player', ttl_s)
+                                             actor, ttl_s)
     if handle is None:
         status = 403 if refusal and refusal != 'unknown credential' else 404
         return JSONResponse({'error': refusal or f'unknown credential: {credential_name}'}, status_code=status)
-    log_action('player', 'handle_minted', {'agentId': agent_id, 'credential': credential_name,
-                                           'purpose': purpose, 'ttlSec': ttl_s}, authorized=True)
+    log_action(actor, 'handle_minted', {'agentId': agent_id, 'credential': credential_name,
+                                        'purpose': purpose, 'ttlSec': ttl_s}, authorized=True)
     # Chain the mint (credential shown to agent, host/method scope, TTL) -- but
     # never the handle nonce itself, which would defeat its being a secret.
-    _append_passport_decision('handle_minted', 'player', {
+    _append_passport_decision('handle_minted', actor, {
         'agentId': agent_id, 'credential': credential_name, 'purpose': purpose,
         'ttlSec': ttl_s, 'hosts': allowed_hosts if isinstance(allowed_hosts, list) else ['*']})
     # The handle nonce is shown exactly once -- like a minted token -- and is
