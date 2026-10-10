@@ -18,6 +18,7 @@ import time
 import types
 import unittest
 import unittest.mock
+from contextlib import ExitStack
 
 from fastapi.testclient import TestClient
 
@@ -694,6 +695,96 @@ class SyncModelCatalog(unittest.TestCase):
         self.assertIsNone(row)
 
 
+class IngestMmmuLeaderboard(unittest.TestCase):
+    """MMMU (vision) leaderboard backfill: the one benchmark the OpenRouter
+    catalog and the AA leaderboard carry no data for, ingested from the
+    operator-registered mmmu_leaderboard_url so the vision band can pick on
+    score instead of falling back to a stale classifier placeholder."""
+
+    def setUp(self):
+        with serve._db() as conn:
+            conn.execute('DELETE FROM model_catalog')
+            conn.execute('DELETE FROM model_benchmark_scores')
+
+    MMMU_HTML = (
+        '<table>'
+        '<tr><td>P</td><td>Model</td><td>In</td><td>Out</td><td>MMMU</td><td>A</td></tr>'
+        '<tr><td>G Google</td><td>Gemini 3 Flash Preview</td><td>$0.250</td><td>$1.500</td><td>81.7</td><td>Try</td></tr>'
+        '<tr><td>G Google</td><td>Gemini 3.7 Flash</td><td>$0.375</td><td>$1.875</td><td>-</td><td>Try</td></tr>'
+        '<tr><td>AL Alibaba</td><td>Qwen3 VL 235B A22B Instruct</td><td>$0.200</td><td>$0.880</td><td>68.2</td><td>Try</td></tr>'
+        '</table>'
+    )
+
+    def _models(self):
+        return [
+            {'id': 'google/gemini-3-flash-preview', 'name': 'Google: Gemini 3 Flash Preview',
+             'pricing': {'prompt': '0.00000025', 'completion': '0.0000015'},
+             'architecture': {'input_modalities': ['text', 'image'], 'output_modalities': ['text']}},
+            {'id': 'qwen/qwen3-vl-235b-a22b-instruct', 'name': 'Alibaba: Qwen3-VL-235B-A22B-Instruct',
+             'pricing': {'prompt': '0.0000002', 'completion': '0.00000088'},
+             'architecture': {'input_modalities': ['text', 'image'], 'output_modalities': ['text']}},
+        ]
+
+    def _fake_resp(self):
+        resp = unittest.mock.MagicMock()
+        resp.read.return_value = self.MMMU_HTML.encode()
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        return resp
+
+    def test_parser_extracts_scores_and_skips_unscored(self):
+        scores = serve._mmmu_leaderboard_scores(self.MMMU_HTML)
+        self.assertEqual(scores, {
+            'Gemini 3 Flash Preview': 81.7,
+            'Qwen3 VL 235B A22B Instruct': 68.2,
+        })
+
+    def test_sync_backfills_mmmu_from_leaderboard(self):
+        def fake_ds(key, default=None):
+            return 'https://pricepertoken.com/leaderboards/benchmark/mmmu' if key == 'mmmu_leaderboard_url' else default
+        with unittest.mock.patch.object(serve, '_get_data_source', side_effect=fake_ds), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen', return_value=self._fake_resp()), \
+             unittest.mock.patch.object(serve, '_ingest_catalog_benchmarks', return_value=0), \
+             unittest.mock.patch.object(serve, '_ingest_aa_leaderboard', return_value=0), \
+             unittest.mock.patch.object(serve, '_ingest_hf_open_llm_fallback', return_value=0):
+            purged = serve._sync_model_catalog(self._models())
+        self.assertEqual(purged, 0)
+        with serve._db() as conn:
+            rows = conn.execute(
+                "SELECT model_id, score, evaluator FROM model_benchmark_scores WHERE benchmark='MMMU'"
+            ).fetchall()
+        by_id = {r[0]: (r[1], r[2]) for r in rows}
+        self.assertEqual(by_id['google/gemini-3-flash-preview'], (81.7, 'artificial_analysis'))
+        self.assertEqual(by_id['qwen/qwen3-vl-235b-a22b-instruct'], (68.2, 'artificial_analysis'))
+
+    def test_backfill_never_overwrites_existing_row(self):
+        serve.set_model_benchmark_score('google/gemini-3-flash-preview', 'MMMU', 90.0, 'player-url', evaluator='player')
+        def fake_ds(key, default=None):
+            return 'https://pricepertoken.com/leaderboards/benchmark/mmmu' if key == 'mmmu_leaderboard_url' else default
+        with unittest.mock.patch.object(serve, '_get_data_source', side_effect=fake_ds), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen', return_value=self._fake_resp()), \
+             unittest.mock.patch.object(serve, '_ingest_catalog_benchmarks', return_value=0), \
+             unittest.mock.patch.object(serve, '_ingest_aa_leaderboard', return_value=0), \
+             unittest.mock.patch.object(serve, '_ingest_hf_open_llm_fallback', return_value=0):
+            serve._sync_model_catalog(self._models())
+        with serve._db() as conn:
+            row = conn.execute(
+                "SELECT score, evaluator FROM model_benchmark_scores "
+                "WHERE model_id='google/gemini-3-flash-preview' AND benchmark='MMMU'"
+            ).fetchone()
+        self.assertEqual(row[0], 90.0)
+        self.assertEqual(row[1], 'player')
+
+    def test_unset_url_skips(self):
+        with unittest.mock.patch.object(serve, '_get_data_source', return_value=None):
+            n = serve._ingest_mmmu_leaderboard(self._models())
+        self.assertEqual(n, 0)
+        with serve._db() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM model_benchmark_scores WHERE benchmark='MMMU'").fetchone()
+        self.assertIsNone(row)
+
+
 class FetchOpenRouterCatalog(unittest.TestCase):
     def test_fetches_catalog_json(self):
         resp = unittest.mock.MagicMock()
@@ -748,6 +839,72 @@ class BestValuePick(unittest.TestCase):
                                         return_value=False):
             picked = asyncio.run(serve._best_value_pick(candidates, scores))
         self.assertIsNone(picked)
+
+
+class PostOpenRouterRawReasoning(unittest.TestCase):
+    """The tool loop (_post_openrouter_raw) must send the same reasoning
+    override as the plain call: disabled for tiers that never read reasoning
+    output, capped to half the budget for the tiers that do. Without it a
+    default_enabled-reasoning model could burn the whole token budget on
+    hidden reasoning and return nothing visible."""
+
+    def setUp(self):
+        self.payload = None
+
+    def _capture(self, _req, timeout=30):
+        self.payload = json.loads(_req.data.decode())
+        return b'{"choices": [{"message": {"content": "ok"}}]}'
+
+    def test_non_thinking_model_disables_reasoning(self):
+        with ExitStack() as stack:
+            for name in ('_mid_tier_slug', '_coding_tier_slug', '_high_tier_slug', '_reasoning_tier_slug'):
+                stack.enter_context(unittest.mock.patch.object(serve, name, return_value='x-slug'))
+            with unittest.mock.patch.object(serve, '_urlopen_with_resilience', side_effect=self._capture):
+                serve._post_openrouter_raw('low/v1', [{'role': 'user', 'content': 'hi'}])
+        self.assertEqual(self.payload['reasoning'], {'enabled': False})
+
+    def test_thinking_model_caps_reasoning(self):
+        with ExitStack() as stack:
+            for name in ('_mid_tier_slug', '_coding_tier_slug', '_high_tier_slug', '_reasoning_tier_slug'):
+                stack.enter_context(unittest.mock.patch.object(serve, name, return_value='x-slug'))
+            stack.enter_context(unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-slug'))
+            with unittest.mock.patch.object(serve, '_urlopen_with_resilience', side_effect=self._capture):
+                serve._post_openrouter_raw('mid-slug', [{'role': 'user', 'content': 'hi'}], max_tokens=100)
+        self.assertEqual(self.payload['reasoning'], {'max_tokens': 50})
+
+
+class BandPriceCeiling(unittest.TestCase):
+    """The high and coding tiers are hard price-bounded: a model over the
+    ceiling is never offered even if it tops the score table (that is what
+    makes gpt-5.6-sol at $12/M unable to win coding once a ceiling is set)."""
+
+    def _m(self, price):
+        return {'id': f'vendor/m{price}', 'price': price}
+
+    def test_high_ceiling_filters(self):
+        pool = [self._m(1.0), self._m(9.0)]
+        with unittest.mock.patch.object(serve, 'HIGH_TIER_MAX_PRICE_USD', 5.0):
+            out = serve._apply_band_price_ceiling('high', pool)
+        self.assertEqual([m['price'] for m in out], [1.0])
+
+    def test_coding_ceiling_filters(self):
+        pool = [self._m(2.64), self._m(12.0)]
+        with unittest.mock.patch.object(serve, 'CODING_TIER_MAX_PRICE_USD', 5.0):
+            out = serve._apply_band_price_ceiling('coding', pool)
+        self.assertEqual([m['price'] for m in out], [2.64])
+
+    def test_other_bands_pass_through(self):
+        pool = [self._m(3.0)]
+        with unittest.mock.patch.object(serve, 'HIGH_TIER_MAX_PRICE_USD', 5.0), \
+             unittest.mock.patch.object(serve, 'CODING_TIER_MAX_PRICE_USD', 5.0):
+            out = serve._apply_band_price_ceiling('low', pool)
+        self.assertEqual(out, pool)
+
+    def test_unset_ceiling_disables(self):
+        pool = [self._m(12.0)]
+        with unittest.mock.patch.object(serve, 'CODING_TIER_MAX_PRICE_USD', 0):
+            out = serve._apply_band_price_ceiling('coding', pool)
+        self.assertEqual(out, pool)
 
 
 class RefreshModelTiers(unittest.TestCase):
@@ -902,6 +1059,50 @@ class RefreshModelTiers(unittest.TestCase):
             chosen = asyncio.run(serve.refresh_model_tiers())
         self.assertEqual(chosen['mid']['id'], 'mid/only')
         self.assertNotIn('vision', chosen)
+
+    def test_default_enabled_reasoning_model_is_score_eligible(self):
+        # default_enabled reasoning no longer bars a model from the pools:
+        # the call layer's explicit `reasoning` override (disabled for
+        # non-thinking tiers, capped for thinking tiers) is the safeguard
+        # against hidden token spend, so a default_enabled model that scores
+        # on the band benchmark competes on score like any other.
+        models = [
+            self._model('low/plain', '0.00000005', '0.00000005'),
+            dict(self._model('low/reason', '0.00000001', '0.00000001'),
+                 reasoning={'default_enabled': True}),
+        ]
+        serve.set_model_benchmark_score('low/plain', 'intelligence_index', 0.4, 'u')
+        serve.set_model_benchmark_score('low/reason', 'intelligence_index', 0.7, 'u')
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        self.assertEqual(chosen['low']['id'], 'low/reason')
+
+    def test_mandatory_reasoning_model_is_still_excluded(self):
+        # Mandatory reasoning cannot be turned off by any request field, so
+        # the model would always burn the tight token budget thinking: it
+        # stays out of every pool, even with a score.
+        models = [
+            self._model('low/plain', '0.00000005', '0.00000005'),
+            dict(self._model('low/mand', '0.00000005', '0.00000005'),
+                 reasoning={'mandatory': True}),
+        ]
+        serve.set_model_benchmark_score('low/plain', 'intelligence_index', 0.4, 'u')
+        serve.set_model_benchmark_score('low/mand', 'intelligence_index', 0.7, 'u')
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        self.assertEqual(chosen['low']['id'], 'low/plain')
 
     def test_no_working_candidate_is_logged_and_skipped(self):
         models = [self._model('mid/only', '0.000002', '0.000002')]

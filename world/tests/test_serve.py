@@ -344,12 +344,19 @@ class BucketModelsByPrice(unittest.TestCase):
         buckets = serve._bucket_models_by_price([self._model('vendor/reasoner', 0.000001, 0.000001, reasoning={'mandatory': True})])
         self.assertTrue(all(len(v) == 0 for v in buckets.values()))
 
-    def test_excludes_models_with_reasoning_enabled_by_default(self):
-        # Optional, but on unless a request explicitly turns it off -- this
-        # system never sends that override, so it behaves like mandatory
-        # reasoning in practice.
+    def test_includes_models_with_reasoning_enabled_by_default(self):
+        # default_enabled used to bar a model from the pools: the tight token
+        # budget could be swallowed by hidden reasoning (the mid-tier null
+        # content incident). The call layer now always sends an explicit
+        # `reasoning` override (_call_openrouter_once_sync and
+        # _post_openrouter_raw disable it for tiers that don't read reasoning
+        # output, cap it for tiers that do), so the override -- not the pool
+        # filter -- is the safeguard. Keeping these models hidden was hiding
+        # DeepSeek V4 Flash Vision (76.7 MMMU at $0.86/M) from the vision
+        # band, so default_enabled models are eligible again.
         buckets = serve._bucket_models_by_price([self._model('vendor/reasoner-default-on', 0.000001, 0.000001, reasoning={'mandatory': False, 'default_enabled': True})])
-        self.assertTrue(all(len(v) == 0 for v in buckets.values()))
+        self.assertEqual(len(buckets['mid']), 1)
+        self.assertEqual(buckets['mid'][0]['id'], 'vendor/reasoner-default-on')
 
     def test_includes_models_with_optional_off_by_default_reasoning(self):
         # Real gap this test guards against: earlier this excluded ANY
