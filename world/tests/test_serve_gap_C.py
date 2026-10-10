@@ -808,6 +808,45 @@ class RefreshModelTiers(unittest.TestCase):
                 "SELECT slug FROM model_tiers WHERE band = 'low'").fetchone()
         self.assertEqual(row[0], 'low/m1')
 
+    def test_vision_classifier_fallback_picks_when_no_mmmu(self):
+        # No MMMU scores on file (the catalog carries no image-comprehension
+        # metric and the player hasn't entered any): the vision band must
+        # still resolve through the same classifier fallback as the cost
+        # bands and land a working vision-capable model, not stay stale.
+        models = [
+            self._model('vendor/text', '0.0000001', '0.0000001'),
+            self._model('vendor/vision', '0.0000005', '0.0000005',
+                        input_mods=('image', 'text')),
+        ]
+        decision = {'answers': {'q': {'choice': 'vendor/vision'}}, 'usage': {'cost': 0.01}}
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                        return_value=decision), \
+             unittest.mock.patch.object(serve, '_jev_model', return_value='test-jev'), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        self.assertEqual(chosen['vision']['id'], 'vendor/vision')
+
+    def test_vision_skips_when_pool_empty(self):
+        # No vision-capable models in the catalog: the vision band is simply
+        # absent from the result (and the fallback is guarded off an empty
+        # shortlist -- no pointless classifier call on empty criteria).
+        models = [self._model('vendor/text', '0.0000001', '0.0000001')]
+        decision = {'answers': {'q': {'choice': 'vendor/text'}}, 'usage': {'cost': 0.01}}
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                        return_value=decision), \
+             unittest.mock.patch.object(serve, '_jev_model', return_value='test-jev'), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        self.assertNotIn('vision', chosen)
+
     def test_chain_prefers_primary_metric_pool(self):
         # BAND_BENCHMARK is an ordered metric CHAIN. As long as ANY candidate in
         # the pool is scored on the primary metric, the fallback metric does NOT

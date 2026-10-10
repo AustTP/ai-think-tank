@@ -11068,10 +11068,35 @@ async def refresh_model_tiers():
         vision_pool.append({'id': m['id'], 'name': m.get('name', m['id']), 'price': (p + c) * 1_000_000})
     vision_scores = {r['model_id']: r['score'] for r in all_benchmark_rows if r['benchmark'] == 'MMMU'}
     vision_pick = await _best_value_pick(vision_pool, vision_scores)
+    if vision_pick is None and vision_pool:
+        # Same fallback the cost bands use: MMMU is player-entered (the
+        # catalog carries no image-comprehension metric), so when no MMMU
+        # score is on file the score-grounded pick is empty and the band
+        # must still resolve -- pick from the vision-capable shortlist with
+        # the Jev classifier and live-verify (up to 3 attempts) rather than
+        # leaving the tier stale. Once the player enters real MMMU scores,
+        # _best_value_pick takes over and the score-grounded policy is
+        # restored.
+        shortlist = sorted(vision_pool, key=lambda m: m['price'])[:25]
+        candidates = [{'id': m['id'], 'description': f"{m['name']} -- ${m['price']:.3f}/M tokens"} for m in shortlist]
+        try:
+            data = await asyncio.to_thread(
+                _call_openrouter_decision_sync, _jev_model(),
+                {'messages': [], 'signals': {}},
+                {'choice': {'type': 'choice', 'instructions': 'Picking the vision model tier for a small think tank simulation: a model that can reliably read a real screenshot (a player upload or a live-URL screenshot) as text. Reading what is actually in the image is the whole job -- it must describe the visible content, not just name the file. The candidate that best fits that job wins.', 'criteria': {c['id']: c['description'] for c in candidates}}},
+            )
+            pick_id = _jev_choice(data)[0]
+        except Exception:
+            pick_id = None
+        ranked = [m for m in shortlist if m['id'] == pick_id] + [m for m in shortlist if m['id'] != pick_id]
+        for candidate in ranked[:3]:
+            if await asyncio.to_thread(_verify_model_works_sync, candidate['id']):
+                vision_pick = candidate
+                break
     if vision_pick:
         chosen['vision'] = vision_pick
     else:
-        print('[model-tiers] no working, MMMU-scored vision-capable candidate found')
+        print('[model-tiers] no working vision-capable candidate found after fallback')
 
     with _db() as conn:
         for band, m in chosen.items():
