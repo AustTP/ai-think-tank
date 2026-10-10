@@ -1372,12 +1372,12 @@ class CatalogBenchmarkIngest(unittest.TestCase):
         self.assertEqual(written, 3)
         with serve._db() as conn:
             rows = conn.execute(
-                'SELECT model_id, benchmark, score, source_url FROM model_benchmark_scores '
+                'SELECT model_id, benchmark, score, source_url, evaluator FROM model_benchmark_scores '
                 'ORDER BY benchmark').fetchall()
         self.assertEqual(rows, [
-            ('vendor/model-a', 'agentic_index', 41.0, 'https://openrouter.ai/vendor/model-a'),
-            ('vendor/model-a', 'coding_index', 69.1, 'https://openrouter.ai/vendor/model-a'),
-            ('vendor/model-a', 'intelligence_index', 34.3, 'https://openrouter.ai/vendor/model-a'),
+            ('vendor/model-a', 'agentic_index', 41.0, 'https://openrouter.ai/vendor/model-a', 'artificial_analysis'),
+            ('vendor/model-a', 'coding_index', 69.1, 'https://openrouter.ai/vendor/model-a', 'artificial_analysis'),
+            ('vendor/model-a', 'intelligence_index', 34.3, 'https://openrouter.ai/vendor/model-a', 'artificial_analysis'),
         ])
 
     def test_ingest_skips_models_without_aa_data(self):
@@ -1400,12 +1400,15 @@ class CatalogBenchmarkIngest(unittest.TestCase):
     def test_band_benchmarks_use_catalog_metrics(self):
         # The bands now score against the catalog's own Artificial Analysis
         # indices; vision keeps player-entered MMMU (the catalog carries no
-        # image-comprehension metric to back it).
-        self.assertEqual(serve.BAND_BENCHMARK['low'], 'intelligence_index')
-        self.assertEqual(serve.BAND_BENCHMARK['mid'], 'intelligence_index')
-        self.assertEqual(serve.BAND_BENCHMARK['high'], 'agentic_index')
-        self.assertEqual(serve.BAND_BENCHMARK['coding'], 'coding_index')
-        self.assertEqual(serve.BAND_BENCHMARK['vision'], 'MMMU')
+        # image-comprehension metric to back it). Each entry is an ordered
+        # metric CHAIN -- primary first, the HF Open LLM MMLU-Pro fallback
+        # second for low/mid so open-weights models AA never measured can
+        # still compete when the primary pool is empty.
+        self.assertEqual(serve.BAND_BENCHMARK['low'], ('intelligence_index', 'MMLU-Pro'))
+        self.assertEqual(serve.BAND_BENCHMARK['mid'], ('intelligence_index', 'MMLU-Pro'))
+        self.assertEqual(serve.BAND_BENCHMARK['high'], ('agentic_index',))
+        self.assertEqual(serve.BAND_BENCHMARK['coding'], ('coding_index',))
+        self.assertEqual(serve.BAND_BENCHMARK['vision'], ('MMMU',))
 
     def test_sync_model_catalog_ingests_then_carries_into_catalog_row(self):
         models = [self._model('vendor/model-a', {'intelligence_index': 34.3})]
@@ -1414,7 +1417,8 @@ class CatalogBenchmarkIngest(unittest.TestCase):
         with serve._db() as conn:
             row = conn.execute('SELECT scores FROM model_catalog WHERE model_id=?',
                                ('vendor/model-a',)).fetchone()
-        self.assertEqual(json.loads(row[0]), {'intelligence_index': 34.3})
+        self.assertEqual(json.loads(row[0]),
+                         {'intelligence_index': {'score': 34.3, 'evaluator': 'artificial_analysis'}})
 
     def test_sync_purges_models_gone_from_catalog_with_their_scores(self):
         # Regression: the purge's params were swapped (grace floor went into
@@ -1443,6 +1447,190 @@ class CatalogBenchmarkIngest(unittest.TestCase):
                                               ('vendor/model-a',)).fetchone())
             self.assertIsNotNone(conn.execute('SELECT model_id FROM model_benchmark_scores WHERE model_id=?',
                                               ('vendor/model-a',)).fetchone())
+
+
+class BenchmarkDataSources(unittest.TestCase):
+    """The data_sources registry: operator PUT/GET endpoints, hot application
+    into the AA leaderboard and HF Open LLM backfills, and the evaluator
+    column that records WHO measured each score."""
+
+    def setUp(self):
+        with serve._db() as conn:
+            conn.execute('DELETE FROM data_sources')
+            conn.execute('DELETE FROM model_benchmark_scores')
+            conn.execute('DELETE FROM model_catalog')
+
+    def tearDown(self):
+        # Leave no configured source behind: a later test's _sync_model_catalog
+        # must never attempt a real network fetch.
+        with serve._db() as conn:
+            conn.execute('DELETE FROM data_sources')
+
+    @staticmethod
+    def _model(mid, hf_id=None, price='0.0000001'):
+        m = {'id': mid, 'name': mid.replace('/', ': ').title(),
+             'pricing': {'prompt': price, 'completion': price}}
+        if hf_id:
+            m['hugging_face_id'] = hf_id
+        return m
+
+    def _set(self, **sources):
+        with serve._db() as conn:
+            for key, value in sources.items():
+                conn.execute(
+                    'INSERT INTO data_sources (key, value, updated_by, updated_at) VALUES (?,?,?,?)',
+                    (key, value, 'player', time.time()))
+
+    def test_get_put_require_operator(self):
+        c = TestClient(serve.app)
+        self.assertEqual(c.get('/api/data-sources').status_code, 401)
+        self.assertEqual(c.put('/api/data-sources', json={'sources': {}}).status_code, 401)
+
+    def test_put_round_trips_and_is_read_hot(self):
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            c = TestClient(serve.app)
+            r = c.put('/api/data-sources', json={'sources': {
+                'aa_leaderboard_url': 'https://aa.test/leaderboard',
+                'hf_contents_parquet_url': 'https://hf.test/parquet',
+            }})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['updatedBy'], 'player')
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=True):
+            c = TestClient(serve.app)
+            r = c.get('/api/data-sources')
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body['knownKeys'], list(serve.DATA_SOURCE_KEYS))
+        self.assertEqual(body['sources']['aa_leaderboard_url']['value'], 'https://aa.test/leaderboard')
+        self.assertEqual(body['sources']['aa_leaderboard_url']['updatedBy'], 'player')
+        # The consumer reads the new value on the very next call -- no restart.
+        self.assertEqual(serve._get_data_source('aa_leaderboard_url'), 'https://aa.test/leaderboard')
+
+    def test_put_rejects_unknown_key_and_bad_url(self):
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=True):
+            c = TestClient(serve.app)
+            r = c.put('/api/data-sources', json={'sources': {'aa_leaderboard_url': 'x'}})
+            self.assertEqual(r.status_code, 400, r.text)
+            self.assertIn('http(s)', r.json()['error'])
+            r = c.put('/api/data-sources', json={'sources': {'bogus_key': 'https://x.test'}})
+            self.assertEqual(r.status_code, 400, r.text)
+            self.assertIn('unknown data source key', r.json()['error'])
+            r = c.put('/api/data-sources', json={'sources': 'not-a-dict'})
+            self.assertEqual(r.status_code, 400, r.text)
+
+    def test_put_is_attributed_in_action_log(self):
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'log_action') as log:
+            c = TestClient(serve.app)
+            r = c.put('/api/data-sources', json={'sources': {'aa_leaderboard_url': 'https://aa.test/lb'}})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(log.call_args[0][0], 'player')
+        self.assertEqual(log.call_args[0][1], 'data_sources_updated')
+        self.assertIn('aa_leaderboard_url', log.call_args[0][2]['sources'])
+
+    def test_aa_ingest_skips_when_unconfigured(self):
+        with unittest.mock.patch('urllib.request.urlopen', side_effect=AssertionError('must not fetch')):
+            self.assertEqual(serve._ingest_aa_leaderboard([self._model('m/m')]), 0)
+
+    def test_aa_ingest_uses_configured_url_and_evaluator(self):
+        self._set(aa_leaderboard_url='https://aa.test/leaderboard')
+        html = ('<table><tr><td>MiMo-V2.6-Pro</td><td>1M</td><td>Xiaomi</td>'
+                '<td>46</td><td>$0.13</td></tr></table>')
+        resp = unittest.mock.MagicMock()
+        resp.read.return_value = html.encode()
+        resp.__enter__.return_value = resp
+        with unittest.mock.patch('urllib.request.urlopen', return_value=resp):
+            added = serve._ingest_aa_leaderboard([self._model('xiaomi/mimo-v2.6-pro', 'MiMo-V2.6-Pro')])
+        self.assertEqual(added, 1)
+        with serve._db() as conn:
+            row = conn.execute(
+                'SELECT model_id, benchmark, score, source_url, evaluator FROM model_benchmark_scores'
+            ).fetchone()
+        self.assertEqual(row, ('xiaomi/mimo-v2.6-pro', 'intelligence_index', 46.0,
+                               'https://aa.test/leaderboard', 'artificial_analysis'))
+
+    def test_aa_backfill_never_overwrites_catalog_value(self):
+        self._set(aa_leaderboard_url='https://aa.test/leaderboard')
+        serve.set_model_benchmark_score('xiaomi/mimo-v2.6-pro', 'intelligence_index', 37.9,
+                                        'https://openrouter.ai/xiaomi/mimo-v2.6-pro', 'artificial_analysis')
+        html = ('<tr><td>MiMo-V2.6-Pro</td><td>1M</td><td>Xiaomi</td><td>46</td><td>$0.13</td></tr>')
+        resp = unittest.mock.MagicMock()
+        resp.read.return_value = html.encode()
+        resp.__enter__.return_value = resp
+        with unittest.mock.patch('urllib.request.urlopen', return_value=resp):
+            added = serve._ingest_aa_leaderboard([self._model('xiaomi/mimo-v2.6-pro', 'MiMo-V2.6-Pro')])
+        self.assertEqual(added, 0)
+        with serve._db() as conn:
+            score = conn.execute(
+                'SELECT score FROM model_benchmark_scores WHERE model_id=? AND benchmark=?',
+                ('xiaomi/mimo-v2.6-pro', 'intelligence_index')).fetchone()[0]
+        self.assertEqual(score, 37.9)
+
+    def test_hf_ingest_skips_when_unconfigured(self):
+        with unittest.mock.patch('urllib.request.urlopen', side_effect=AssertionError('must not fetch')):
+            self.assertEqual(serve._ingest_hf_open_llm_fallback([self._model('m/m')]), 0)
+
+    def test_hf_ingest_uses_configured_url_and_evaluator(self):
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            self.skipTest('pyarrow not installed')
+        self._set(hf_contents_parquet_url='https://hf.test/parquet',
+                  hf_contents_source_url='https://hf.test/contents')
+        table = pa.table({'fullname': ['mistralai/Mistral-Nemo-Instruct-2407'], 'MMLU-PRO': [27.97]})
+        buf = io.BytesIO()
+        pq.write_table(table, buf)
+        parquet_bytes = buf.getvalue()
+        calls = [{'parquet_files': [{'url': 'https://hf.test/data.parquet'}]}, parquet_bytes]
+        def _resp(payload):
+            resp = unittest.mock.MagicMock()
+            resp.read.return_value = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+            resp.__enter__.return_value = resp
+            return resp
+        with unittest.mock.patch('urllib.request.urlopen',
+                                 side_effect=[_resp(calls[0]), _resp(calls[1])]):
+            added = serve._ingest_hf_open_llm_fallback(
+                [self._model('mistralai/mistral-nemo', hf_id='mistralai/Mistral-Nemo-Instruct-2407')])
+        self.assertEqual(added, 1)
+        with serve._db() as conn:
+            row = conn.execute(
+                'SELECT model_id, benchmark, score, source_url, evaluator FROM model_benchmark_scores'
+            ).fetchone()
+        self.assertEqual(row, ('mistralai/mistral-nemo', 'MMLU-Pro', 27.97,
+                               'https://hf.test/contents', 'huggingface_open_llm'))
+
+    def test_hf_fallback_never_clobbers_existing_row(self):
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            self.skipTest('pyarrow not installed')
+        self._set(hf_contents_parquet_url='https://hf.test/parquet')
+        # A player-entered MMLU-Pro row exists for this model.
+        serve.set_model_benchmark_score('mistralai/mistral-nemo', 'MMLU-Pro', 68.4,
+                                        'http://player-research', 'player')
+        table = pa.table({'fullname': ['mistralai/Mistral-Nemo-Instruct-2407'], 'MMLU-PRO': [27.97]})
+        buf = io.BytesIO()
+        pq.write_table(table, buf)
+        parquet_bytes = buf.getvalue()
+        calls = [{'parquet_files': [{'url': 'https://hf.test/data.parquet'}]}, parquet_bytes]
+        def _resp(payload):
+            resp = unittest.mock.MagicMock()
+            resp.read.return_value = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+            resp.__enter__.return_value = resp
+            return resp
+        with unittest.mock.patch('urllib.request.urlopen',
+                                 side_effect=[_resp(calls[0]), _resp(calls[1])]):
+            added = serve._ingest_hf_open_llm_fallback(
+                [self._model('mistralai/mistral-nemo', hf_id='mistralai/Mistral-Nemo-Instruct-2407')])
+        self.assertEqual(added, 0)
+        with serve._db() as conn:
+            row = conn.execute(
+                'SELECT score, evaluator FROM model_benchmark_scores WHERE model_id=? AND benchmark=?',
+                ('mistralai/mistral-nemo', 'MMLU-Pro')).fetchone()
+        self.assertEqual(row, (68.4, 'player'))
 
 
 class ModelTierEndpoints(unittest.TestCase):
@@ -1532,8 +1720,22 @@ class ModelTierEndpoints(unittest.TestCase):
                        json={'agentId': 'player', 'modelId': 'm', 'benchmark': 'MMLU',
                              'score': 0.7, 'sourceUrl': 'http://x'})
         self.assertEqual(r.status_code, 200, r.text)
-        set_score.assert_called_once_with('m', 'MMLU', 0.7, 'http://x')
+        set_score.assert_called_once_with('m', 'MMLU', 0.7, 'http://x', 'player')
         self.assertEqual(log.call_args[0][1], 'model_benchmark_score_recorded')
+
+    def test_benchmark_scores_post_records_explicit_evaluator(self):
+        # The evaluator column records WHO measured a score -- the player can
+        # label their own hand-entered research, distinct from the automated
+        # 'artificial_analysis' / 'huggingface_open_llm' rows.
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'set_model_benchmark_score') as set_score, \
+             unittest.mock.patch.object(serve, 'log_action'):
+            c = TestClient(serve.app)
+            r = c.post('/api/model-benchmark-scores',
+                       json={'agentId': 'player', 'modelId': 'm', 'benchmark': 'MMMU',
+                             'score': 0.6, 'sourceUrl': 'http://x', 'evaluator': 'player'})
+        self.assertEqual(r.status_code, 200, r.text)
+        set_score.assert_called_once_with('m', 'MMMU', 0.6, 'http://x', 'player')
 
 
 class JevEndpoints(unittest.TestCase):
