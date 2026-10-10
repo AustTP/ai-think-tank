@@ -307,6 +307,7 @@ _ENV_RELOAD_FIELDS = {
     'HIGH_TIER_MONTHLY_BUDGET_USD': lambda e: float(e.get('HIGH_TIER_MONTHLY_BUDGET_USD', '0') or 0),
     'HIGH_TIER_MAX_PRICE_USD': lambda e: float(e.get('HIGH_TIER_MAX_PRICE_USD', '0') or 0),
     'CODING_TIER_MAX_PRICE_USD': lambda e: float(e.get('CODING_TIER_MAX_PRICE_USD', '0') or 0),
+    'VISION_TIER_MAX_PRICE_USD': lambda e: float(e.get('VISION_TIER_MAX_PRICE_USD', '0') or 0),
     'COLAB_MONTHLY_UNITS': lambda e: float(e.get('COLAB_MONTHLY_UNITS', '0') or 0),
     'DECISION_CACHE_TTL_S': lambda e: float(e.get('DECISION_CACHE_TTL_S', '3600') or 0),
     'DECISION_KEY_WINDOW_S': lambda e: float(e.get('DECISION_KEY_WINDOW_S', str(7 * 24 * 3600)) or (7 * 24 * 3600)),
@@ -5733,6 +5734,11 @@ HIGH_TIER_MAX_PRICE_USD = float(_load_env().get('HIGH_TIER_MAX_PRICE_USD', '0') 
 # front-runner can't win on score alone when the player wants coding spend
 # bounded too. Set CODING_TIER_MAX_PRICE_USD in .env; 0/unset disables.
 CODING_TIER_MAX_PRICE_USD = float(_load_env().get('CODING_TIER_MAX_PRICE_USD', '0') or 0)
+# Same per-model price ceiling for the VISION tier: the refresh only offers
+# MMMU-scored candidates at or below this, so a frontier vision model can't
+# win on image-comprehension score alone past the bound. Set
+# VISION_TIER_MAX_PRICE_USD in .env; 0/unset disables.
+VISION_TIER_MAX_PRICE_USD = float(_load_env().get('VISION_TIER_MAX_PRICE_USD', '0') or 0)
 # Reserved spend-ledger bucket name for high-tier accrual (kept apart from
 # per-service buckets so the bank can show "how much went to the expensive
 # tier" at a glance, and so the cap reads it cleanly).
@@ -10679,16 +10685,17 @@ def _verify_decision_model_works_sync(model_id):
 
 
 def _apply_band_price_ceiling(band, candidate_pool):
-    """The high and coding tiers carry a per-model PRICE CEILING: the
-    expensive tiers are bounded, so the daily refresh only presents
-    candidates at or below HIGH_TIER_MAX_PRICE_USD / CODING_TIER_MAX_PRICE_USD.
-    A model over the ceiling is never offered, even if it tops the score
-    table -- price is a hard bound for these tiers, not a tiebreak. Every
-    other band passes through unchanged."""
+    """The high, coding and vision tiers carry a per-model PRICE CEILING:
+    the refresh only presents candidates at or below the matching
+    *_TIER_MAX_PRICE_USD constant. A model over the ceiling is never offered,
+    even if it tops the score table -- price is a hard bound for these
+    tiers, not a tiebreak. Every other band passes through unchanged."""
     if band == 'high' and HIGH_TIER_MAX_PRICE_USD:
         return [m for m in candidate_pool if m['price'] <= HIGH_TIER_MAX_PRICE_USD]
     if band == 'coding' and CODING_TIER_MAX_PRICE_USD:
         return [m for m in candidate_pool if m['price'] <= CODING_TIER_MAX_PRICE_USD]
+    if band == 'vision' and VISION_TIER_MAX_PRICE_USD:
+        return [m for m in candidate_pool if m['price'] <= VISION_TIER_MAX_PRICE_USD]
     return candidate_pool
 
 
@@ -11166,6 +11173,7 @@ async def refresh_model_tiers():
         if p <= 0 or c <= 0:
             continue
         vision_pool.append({'id': m['id'], 'name': m.get('name', m['id']), 'price': (p + c) * 1_000_000})
+    vision_pool = _apply_band_price_ceiling('vision', vision_pool)
     vision_scores = {r['model_id']: r['score'] for r in all_benchmark_rows if r['benchmark'] == 'MMMU'}
     vision_pick = await _best_value_pick(vision_pool, vision_scores)
     if vision_pick is None and vision_pool:

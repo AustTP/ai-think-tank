@@ -874,8 +874,8 @@ class PostOpenRouterRawReasoning(unittest.TestCase):
 
 
 class BandPriceCeiling(unittest.TestCase):
-    """The high and coding tiers are hard price-bounded: a model over the
-    ceiling is never offered even if it tops the score table (that is what
+    """The high, coding and vision tiers are hard price-bounded: a model over
+    the ceiling is never offered even if it tops the score table (that is what
     makes gpt-5.6-sol at $12/M unable to win coding once a ceiling is set)."""
 
     def _m(self, price):
@@ -892,6 +892,12 @@ class BandPriceCeiling(unittest.TestCase):
         with unittest.mock.patch.object(serve, 'CODING_TIER_MAX_PRICE_USD', 5.0):
             out = serve._apply_band_price_ceiling('coding', pool)
         self.assertEqual([m['price'] for m in out], [2.64])
+
+    def test_vision_ceiling_filters(self):
+        pool = [self._m(0.86), self._m(9.0)]
+        with unittest.mock.patch.object(serve, 'VISION_TIER_MAX_PRICE_USD', 5.0):
+            out = serve._apply_band_price_ceiling('vision', pool)
+        self.assertEqual([m['price'] for m in out], [0.86])
 
     def test_other_bands_pass_through(self):
         pool = [self._m(3.0)]
