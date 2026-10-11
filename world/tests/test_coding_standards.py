@@ -8,7 +8,7 @@ the quality pipeline (flake8/mypy/bandit/pytest --cov>=90, measured in TOTAL
 across all files) objectively passed.
 
 Three layers are tested, matching where the guarantee actually lives:
-  - serve._run_quality_pipeline builds the exact 4 steps and maps a red/green
+  - serve._run_quality_pipeline builds the exact 6 steps and maps a red/green
     /api/pipeline response (objective evidence).
   - serve._run_coding_content fails the AUTHOR'S task (ok=False) when the
     pipeline is red -- nothing reaches review to approve in the first place.
@@ -164,10 +164,11 @@ class ApprovalGate(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class QualityPipelineSteps(unittest.TestCase):
-    def test_builds_four_exact_steps(self):
+    def test_builds_six_exact_steps(self):
         steps = serve._quality_pipeline_steps()
         self.assertEqual([s['name'] for s in steps],
-                         ['flake8', 'mypy', 'bandit', 'pytest-cov'])
+                         ['flake8', 'mypy', 'bandit', 'pytest-cov',
+                          'node-syntax', 'node-tests'])
         by_name = {s['name']: s['command'] for s in steps}
         self.assertEqual(by_name['flake8'], 'python -m flake8 .')
         self.assertEqual(by_name['mypy'], 'python -m mypy .')
@@ -175,6 +176,11 @@ class QualityPipelineSteps(unittest.TestCase):
         # Total coverage across all files (not per-file) is what --cov-fail-under
         # expresses: pytest-cov fails only when the AGGREGATE falls below 90.
         self.assertEqual(by_name['pytest-cov'], 'python -m pytest --cov=. --cov-fail-under=90 -q')
+        # JS half of the gate (wrq-8 vanilla-JS engine): node --check parses
+        # every .js/.mjs (syntax only, never executes); node --test runs the
+        # *.test.mjs suites. Both self-skip green when no JS is present.
+        self.assertIn('node --check', by_name['node-syntax'])
+        self.assertIn('node --test', by_name['node-tests'])
 
     def test_sandbox_has_python_files_detects_py(self):
         with tempfile.TemporaryDirectory() as d:
@@ -375,7 +381,7 @@ class Wiring(unittest.TestCase):
                                   'sandbox', 'Dockerfile')
         with open(dockerfile) as f:
             text = f.read()
-        for tool in ('flake8', 'mypy', 'bandit', 'pytest-cov'):
+        for tool in ('flake8', 'mypy', 'bandit', 'pytest-cov', 'nodejs'):
             self.assertIn(tool, text, f'Dockerfile must pin {tool}')
 
 
