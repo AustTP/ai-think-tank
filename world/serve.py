@@ -859,6 +859,21 @@ def init_db():
             logged_at REAL NOT NULL,
             PRIMARY KEY (log_date, band)
         )''')
+        # Full-catalog daily price snapshot: one row per (date, model) with
+        # the blended price. model_catalog overwrites prices in place on
+        # every sync, so without this a model's price history is lost the
+        # moment it changes. This table is the market-wide series the
+        # scheduling logic reads -- when DeepSeek V4 Flash is \$0.26 one day
+        # and \$1.30 the next, both data points exist even if it never won
+        # a tier pick. Written by _sync_model_catalog on every refresh;
+        # same-day re-runs overwrite (PK log_date+model_id).
+        conn.execute('''CREATE TABLE IF NOT EXISTS catalog_price_daily (
+            log_date TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            price_per_m REAL NOT NULL,
+            logged_at REAL NOT NULL,
+            PRIMARY KEY (log_date, model_id)
+        )''')
         # Daily OpenRouter catalog snapshot -- the persistent record of "what
         # models existed, at what price, on which day" that the live fetch
         # (_fetch_openrouter_catalog_sync) otherwise leaves nowhere in the DB.
@@ -11308,6 +11323,7 @@ def _sync_model_catalog(models):
     _ingest_hf_open_llm_fallback(models)
     now = time.time()
     seen_ids = set()
+    _log_date = time.strftime('%Y-%m-%d', time.gmtime())
     with _db() as conn:
         for m in models:
             mid = m['id']
@@ -11319,6 +11335,7 @@ def _sync_model_catalog(models):
                 continue
             arch = m.get('architecture') or {}
             image_capable = 1 if 'image' in (arch.get('input_modalities') or []) else 0
+            _blended = (prompt_price + completion_price) * 1_000_000
             conn.execute(
                 'INSERT INTO model_catalog (model_id, name, prompt_price, completion_price, price_per_m, image_capable, first_seen, last_seen) '
                 'VALUES (?, ?, ?, ?, ?, ?, ?, ?) '
@@ -11326,7 +11343,15 @@ def _sync_model_catalog(models):
                 'completion_price=excluded.completion_price, price_per_m=excluded.price_per_m, '
                 'image_capable=excluded.image_capable, last_seen=excluded.last_seen',
                 (mid, m.get('name', mid), prompt_price, completion_price,
-                 (prompt_price + completion_price) * 1_000_000, image_capable, now, now),
+                 _blended, image_capable, now, now),
+            )
+            # Daily price snapshot: append today's price for every model so
+            # the market-wide history survives model_catalog's in-place
+            # overwrite. Same-day re-runs overwrite (PK log_date+model_id).
+            conn.execute(
+                'INSERT INTO catalog_price_daily (log_date, model_id, price_per_m, logged_at) VALUES (?, ?, ?, ?) '
+                'ON CONFLICT(log_date, model_id) DO UPDATE SET price_per_m=excluded.price_per_m, logged_at=excluded.logged_at',
+                (_log_date, mid, _blended, now),
             )
         # Carry over each model's known benchmark scores into the catalog row.
         known = {}
@@ -11559,6 +11584,26 @@ def get_tier_daily_log(band=None, days=30):
          'price_per_m': r[4], 'benchmark': r[5], 'score': r[6]}
         for r in rows
     ]
+
+
+def get_catalog_price_history(model_id=None, days=30):
+    """Read the full-catalog daily price history. Optional model_id filter;
+    returns at most `days` days back (most recent first). Each row:
+    {log_date, model_id, price_per_m}."""
+    with _db() as conn:
+        if model_id:
+            rows = conn.execute(
+                'SELECT log_date, model_id, price_per_m FROM catalog_price_daily '
+                'WHERE model_id = ? ORDER BY log_date DESC LIMIT ?',
+                (model_id, days),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                'SELECT log_date, model_id, price_per_m FROM catalog_price_daily '
+                'ORDER BY log_date DESC, price_per_m ASC LIMIT ?',
+                (days * 50,),
+            ).fetchall()
+    return [{'log_date': r[0], 'model_id': r[1], 'price_per_m': r[2]} for r in rows]
 
 
 # Read-only board/status GETs must NOT wake a dormant tank: the browser polls
@@ -24756,6 +24801,15 @@ async def tier_daily_log_get(band: str = '', days: int = 30):
     # benchmark score the pick was grounded on. The scheduling logic reads
     # this to see how each band's cost and quality moved day over day.
     return JSONResponse({'log': get_tier_daily_log(band=band or None, days=max(1, min(days, 365)))})
+
+
+@app.get('/api/catalog-price-history')
+async def catalog_price_history_get(modelId: str = '', days: int = 30):
+    # Market-wide daily price snapshot for every model in the catalog.
+    # Without modelId returns the cheapest models per day; with it returns
+    # one model's price series. This is how a price drop (or spike) is
+    # visible even when the model never won a tier pick.
+    return JSONResponse({'history': get_catalog_price_history(model_id=modelId or None, days=max(1, min(days, 365)))})
 
 
 @app.get('/api/model-benchmark-scores')
