@@ -971,6 +971,56 @@ class RefreshModelTiers(unittest.TestCase):
                 "SELECT slug FROM model_tiers WHERE band = 'low'").fetchone()
         self.assertEqual(row[0], 'low/m1')
 
+    def test_sublow_picks_cheapest_scored_model_under_ceiling(self):
+        # Sublow is the hard-ceilinged band for short, bounded test scenarios
+        # at scale: among intelligence-scored models at or below the $0.09/M
+        # cap, best-score-then-cheapest (same policy as every band) -- and a
+        # brighter model over the ceiling must NOT win on score. The low band
+        # pools independently, so its pick is untouched by the sublow cap.
+        models = [
+            self._model('sub/cheap', '0.00000002', '0.00000003'),   # $0.05/M blended
+            self._model('sub/mid', '0.00000003', '0.00000005'),     # $0.08/M blended
+            self._model('sub/star', '0.0000001', '0.0000002'),      # $0.30/M blended (over ceiling)
+        ]
+        serve.set_model_benchmark_score('sub/cheap', 'intelligence_index', 24.0, 'u')
+        serve.set_model_benchmark_score('sub/mid', 'intelligence_index', 20.0, 'u')
+        serve.set_model_benchmark_score('sub/star', 'intelligence_index', 50.0, 'u')
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'SUBLOW_TIER_MAX_PRICE_USD', 0.09), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        self.assertEqual(chosen['sublow']['id'], 'sub/cheap')
+        self.assertAlmostEqual(chosen['sublow']['price'], 0.05, places=6)
+        # Low band still sees the whole cheap pool and its own floor picks
+        # the brightest model there -- the sublow ceiling is not a filter on low.
+        self.assertEqual(chosen['low']['id'], 'sub/star')
+        with serve._db() as conn:
+            row = conn.execute(
+                "SELECT slug FROM model_tiers WHERE band = 'sublow'").fetchone()
+        self.assertEqual(row[0], 'sub/cheap')
+
+    def test_sublow_skips_when_nothing_qualifies_under_ceiling(self):
+        # Every candidate is over the $0.09 cap: sublow must stay absent from
+        # the result (callers then fall back to the low tier via
+        # _sublow_tier_slug), never silently pick an over-cap model.
+        models = [self._model('sub/over', '0.0000001', '0.0000002')]  # $0.30/M blended
+        serve.set_model_benchmark_score('sub/over', 'intelligence_index', 50.0, 'u')
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'SUBLOW_TIER_MAX_PRICE_USD', 0.09), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        self.assertNotIn('sublow', chosen)
+
     def test_vision_classifier_fallback_picks_when_no_mmmu(self):
         # No MMMU scores on file (the catalog carries no image-comprehension
         # metric and the player hasn't entered any): the vision band must

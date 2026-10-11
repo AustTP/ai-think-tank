@@ -75,7 +75,7 @@ async function loadModelTiers() {
     const res = await apiFetch('/api/model-tiers');
     const data = await res.json();
     if (data.error) { console.error('Model tiers load failed:', data.error); return; }
-    const map = { low: 'small', mid: 'mid', coding: 'coding', high: 'planning', vision: 'vision' };
+    const map = { low: 'small', sublow: 'sublow', mid: 'mid', coding: 'coding', high: 'planning', vision: 'vision' };
     for (const [band, tierKey] of Object.entries(map)) {
       if (data[band]) {
         MODEL_TIERS[tierKey].slug = data[band].slug;

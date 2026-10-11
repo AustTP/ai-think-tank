@@ -1405,6 +1405,7 @@ class CatalogBenchmarkIngest(unittest.TestCase):
         # second for low/mid so open-weights models AA never measured can
         # still compete when the primary pool is empty.
         self.assertEqual(serve.BAND_BENCHMARK['low'], ('intelligence_index', 'MMLU-Pro'))
+        self.assertEqual(serve.BAND_BENCHMARK['sublow'], ('intelligence_index', 'MMLU-Pro'))
         self.assertEqual(serve.BAND_BENCHMARK['mid'], ('intelligence_index', 'MMLU-Pro'))
         self.assertEqual(serve.BAND_BENCHMARK['high'], ('agentic_index',))
         self.assertEqual(serve.BAND_BENCHMARK['coding'], ('coding_index',))

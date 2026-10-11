@@ -72,6 +72,11 @@ function noteHireBlockedAtCap(adminId) {
 // resolves at startup, or if that fetch ever fails outright.
 const MODEL_TIERS = {
   small: { label: 'loading...', slug: 'amazon/nova-micro-v1' },
+  // Sublow: short, bounded test scenarios at scale (server band 'sublow',
+  // hard $0.09/M ceiling). No client consumer yet -- entry exists so the
+  // fallback map is complete and loadModelTiers() has somewhere to land
+  // the daily refresh's pick the moment a scenario caller needs it.
+  sublow: { label: 'loading...', slug: 'inclusionai/ling-3.0-flash-vl' },
   // Mid and high/planning replaced with the low
   // band's model -- most agent work doesn't need more than that. Old values
   // commented out (and preserved in think_tank.db's model_tiers.previous_* columns,
