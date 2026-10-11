@@ -840,6 +840,25 @@ def init_db():
             price_per_m REAL NOT NULL,
             chosen_at REAL NOT NULL
         )''')
+        # Daily tier price/score log: one row per (date, band) recording
+        # which model the tier picked, its blended price, and the benchmark
+        # score the pick was grounded on. model_tiers keeps only the CURRENT
+        # pick; this table is the append-only history the scheduling logic
+        # reads to see how each band's price and quality moved day over day
+        # (e.g. "coding tier was $0.26 yesterday, $1.30 today"). Written on
+        # every refresh_model_tiers run; same-day re-runs overwrite rather
+        # than duplicate (PK on log_date+band).
+        conn.execute('''CREATE TABLE IF NOT EXISTS tier_daily_log (
+            log_date TEXT NOT NULL,
+            band TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            name TEXT NOT NULL,
+            price_per_m REAL NOT NULL,
+            benchmark TEXT,
+            score REAL,
+            logged_at REAL NOT NULL,
+            PRIMARY KEY (log_date, band)
+        )''')
         # Daily OpenRouter catalog snapshot -- the persistent record of "what
         # models existed, at what price, on which day" that the live fetch
         # (_fetch_openrouter_catalog_sync) otherwise leaves nowhere in the DB.
@@ -11488,6 +11507,26 @@ async def refresh_model_tiers():
                 'ON CONFLICT(band) DO UPDATE SET slug=excluded.slug, name=excluded.name, price_per_m=excluded.price_per_m, chosen_at=excluded.chosen_at',
                 (band, m['id'], m['name'], m['price'], time.time()),
             )
+            # Daily price/score log: look up the benchmark score the pick was
+            # grounded on (first metric in the band's chain that has a score
+            # for this model) and write today's row. Same-day re-runs
+            # overwrite (PK log_date+band) so the log always reflects the
+            # latest pick for each date.
+            _score, _bench = None, None
+            for _b in BAND_BENCHMARK.get(band, ()):
+                for _r in all_benchmark_rows:
+                    if _r['model_id'] == m['id'] and _r['benchmark'] == _b:
+                        _score, _bench = _r['score'], _b
+                        break
+                if _score is not None:
+                    break
+            conn.execute(
+                'INSERT INTO tier_daily_log (log_date, band, slug, name, price_per_m, benchmark, score, logged_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?) '
+                'ON CONFLICT(log_date, band) DO UPDATE SET slug=excluded.slug, name=excluded.name, '
+                'price_per_m=excluded.price_per_m, benchmark=excluded.benchmark, score=excluded.score, logged_at=excluded.logged_at',
+                (time.strftime('%Y-%m-%d', time.gmtime()), band, m['id'], m['name'], m['price'], _bench, _score, time.time()),
+            )
     log_action(None, 'model_tiers_refreshed', {band: m['id'] for band, m in chosen.items()})
     return chosen
 
@@ -11496,6 +11535,30 @@ def get_cached_model_tiers():
     with _db() as conn:
         rows = conn.execute('SELECT band, slug, name, price_per_m FROM model_tiers').fetchall()
     return {band: {'slug': slug, 'name': name, 'price': price} for band, slug, name, price in rows}
+
+
+def get_tier_daily_log(band=None, days=30):
+    """Read the daily tier price/score history. Optional band filter;
+    returns at most `days` days back (most recent first). Each row:
+    {log_date, band, slug, name, price_per_m, benchmark, score}."""
+    with _db() as conn:
+        if band:
+            rows = conn.execute(
+                'SELECT log_date, band, slug, name, price_per_m, benchmark, score '
+                'FROM tier_daily_log WHERE band = ? ORDER BY log_date DESC LIMIT ?',
+                (band, days),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                'SELECT log_date, band, slug, name, price_per_m, benchmark, score '
+                'FROM tier_daily_log ORDER BY log_date DESC LIMIT ?',
+                (days * 6,),  # ~6 bands per day
+            ).fetchall()
+    return [
+        {'log_date': r[0], 'band': r[1], 'slug': r[2], 'name': r[3],
+         'price_per_m': r[4], 'benchmark': r[5], 'score': r[6]}
+        for r in rows
+    ]
 
 
 # Read-only board/status GETs must NOT wake a dormant tank: the browser polls
@@ -24685,6 +24748,14 @@ async def model_tiers_refresh():
         return JSONResponse({band: {'slug': m['id'], 'name': m['name'], 'price': m['price']} for band, m in fresh.items()})
     except Exception as e:
         return JSONResponse({'error': str(e)}, status_code=502)
+
+
+@app.get('/api/tier-daily-log')
+async def tier_daily_log_get(band: str = '', days: int = 30):
+    # Read-only history of each tier band's daily pick: slug, price, and the
+    # benchmark score the pick was grounded on. The scheduling logic reads
+    # this to see how each band's cost and quality moved day over day.
+    return JSONResponse({'log': get_tier_daily_log(band=band or None, days=max(1, min(days, 365)))})
 
 
 @app.get('/api/model-benchmark-scores')
