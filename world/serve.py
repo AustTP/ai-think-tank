@@ -11606,6 +11606,39 @@ def get_catalog_price_history(model_id=None, days=30):
     return [{'log_date': r[0], 'model_id': r[1], 'price_per_m': r[2]} for r in rows]
 
 
+def tier_value_ratios():
+    """Per-band value ratio: today's (score / price_per_m) divided by the
+    band's trailing 7-day median value (excluding today). >1.0 means today's
+    pick is a stronger value than usual (cheap day for that band); <1.0
+    means weaker (expensive day). Bands with fewer than 2 history days
+    return 1.0 (neutral -- not enough data to judge). Read by the sim's
+    assignment loop to throttle non-urgent work in contracted bands."""
+    today = time.strftime('%Y-%m-%d', time.gmtime())
+    with _db() as conn:
+        rows = conn.execute(
+            'SELECT band, log_date, price_per_m, score FROM tier_daily_log '
+            'WHERE score IS NOT NULL AND price_per_m > 0 '
+            'ORDER BY log_date DESC'
+        ).fetchall()
+    by_band = {}
+    for band, log_date, price, score in rows:
+        by_band.setdefault(band, []).append((log_date, price, score))
+    ratios = {}
+    for band, entries in by_band.items():
+        today_vals = [(p, s) for d, p, s in entries if d == today]
+        history = [(p, s) for d, p, s in entries if d != today]
+        if not today_vals or len(history) < 2:
+            ratios[band] = 1.0
+            continue
+        today_price, today_score = today_vals[0]
+        today_value = today_score / today_price
+        hist_values = sorted(s / p for p, s in history)
+        n = len(hist_values)
+        median = hist_values[n // 2] if n % 2 else (hist_values[n // 2 - 1] + hist_values[n // 2]) / 2
+        ratios[band] = today_value / median if median > 0 else 1.0
+    return ratios
+
+
 # Read-only board/status GETs must NOT wake a dormant tank: the browser polls
 # state/health/sim continuously, and an open tab would otherwise defeat
 # sleep-not-die dormancy (each poll would flip it awake). Pure telemetry

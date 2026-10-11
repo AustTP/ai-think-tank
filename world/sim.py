@@ -1294,6 +1294,14 @@ def _drain_emails_from_db():
 # WORK_PRIORITY / _WORK_PRIORITY_VALUES now live in sim_helpers.py (imported
 # at the top of this module) -- see normalize_priority.
 WORK_ITEM_MAX_ATTEMPTS = 3
+# Price-aware admission throttle: when a tier band's score-per-dollar
+# today is below TIER_THROTTLE_RATIO of its trailing 7-day median (a
+# bad-value day for that band), non-urgent work mapped to that band is
+# held from assignment. Bands above the ratio (good-value days) admit
+# normally. Exemptions that always bypass the throttle: high/urgent
+# priority, incidents, peer reviews, sprints, scheduled one-offs
+# (notBefore), and player cards. Neutral (1.0) when history is thin.
+TIER_THROTTLE_RATIO = 0.7
 MAX_ACTIVE_AGENTS = 25  # hiring.js:41
 MAX_TOTAL_AGENTS = 500  # hiring.js:40 -- total inventory cap, vs MAX_ACTIVE_AGENTS
 # Per-team headcount cap: a team may not exceed 6
@@ -2667,7 +2675,40 @@ def _work_item_dependency_met(state, item):
     return _dependency_landed(state, dep)
 
 
-def pick_next_due_index(work_queue, now_ms, exclude_items, state=None):
+def _band_for_work_item(item):
+    """Map a work item to the model band it would most likely use at call
+    time. Code/review/qa tasks route to the coding band (deterministic in
+    _resolve_model_tier); spikes and everything else land on low/mid/high
+    via the Jev decision -- mid is the proxy since most general work ends
+    there. Used only by the tier throttle; a wrong guess just means the
+    item is held or admitted one band off, never lost."""
+    tt = item.get('taskType') or 'code'
+    if tt in ('code', 'review', 'qa'):
+        return 'coding'
+    return 'mid'
+
+
+def _tier_throttled(item, tier_ratios):
+    """True when the item's likely band is in a contracted state (today's
+    score-per-dollar is well below the band's trailing median) and the
+    item is not exempt. Exemptions always admit regardless of tier
+    economics: high/urgent priority, incidents, peer-review subtasks,
+    sprint cards, scheduled one-offs (notBefore), and player cards."""
+    if not tier_ratios:
+        return False
+    if (item.get('priority') or WORK_PRIORITY['normal']) >= WORK_PRIORITY['high']:
+        return False
+    if item.get('incident') or item.get('reviewOf') or item.get('sprintId'):
+        return False
+    if item.get('notBefore') is not None:
+        return False
+    if (item.get('assignedTo') or '') == 'player':
+        return False
+    ratio = tier_ratios.get(_band_for_work_item(item), 1.0)
+    return ratio < TIER_THROTTLE_RATIO
+
+
+def pick_next_due_index(work_queue, now_ms, exclude_items, state=None, tier_ratios=None):
     """Port of tasks.js _pickNextDueIndex: highest due priority wins; at EQUAL
     priority, the larger size estimate (L > M > S) starts first -- an L story
     needs more wall-time than an S story, so it is pulled ahead of same-priority
@@ -2683,7 +2724,13 @@ def pick_next_due_index(work_queue, now_ms, exclude_items, state=None):
     (build 3 / open 2 / reading 1 / none 0) breaks priority ties, never
     overrides urgency: urgent always beats normal regardless of lane. With
     `state`, a `reading` card is rate-limited to ONE active per room -- the
-    slow lane moves one thread at a time, not a flood."""
+    slow lane moves one thread at a time, not a flood.
+
+    Price-aware throttle: when `tier_ratios` is supplied (the live
+    assignment loop computes it once per cycle), non-urgent items whose
+    likely band is in a bad-value day are skipped -- see _tier_throttled.
+    Callers that pass None (tests, one-off checks) get unthrottled
+    behavior, same as before."""
     best_index, best_score = -1, None
     for i, item in enumerate(work_queue):
         if not is_work_item_due(item, now_ms):
@@ -2699,6 +2746,8 @@ def pick_next_due_index(work_queue, now_ms, exclude_items, state=None):
         if state is not None and not _work_item_dependency_met(state, item):
             continue
         if state is not None and _reading_lane_busy(state, item):
+            continue
+        if tier_ratios and _tier_throttled(item, tier_ratios):
             continue
         priority = item.get('priority', WORK_PRIORITY['normal'])
         lane_weight = LANE_WEIGHT.get(item.get('lane') or '', 0)
@@ -11418,11 +11467,19 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     _sprint_staffing_step(state, now_ms)
 
     # Assignment loop (bounded by roster size, like the JS runTaskCycleBody).
+    # Price-aware throttle: compute per-band tier value ratios once per cycle
+    # so the pick loop can hold non-urgent work in bands having a bad-value
+    # day (today's score-per-dollar well below the band's trailing median).
+    try:
+        from serve import tier_value_ratios
+        _tier_ratios = tier_value_ratios()
+    except Exception:
+        _tier_ratios = None
     roster = state.get('agentRoster') or []
     roster_size = sum(1 for d in roster if not d.get('isAdmin'))
     attempted = set()
     for _ in range(max(1, roster_size)):
-        due_index = pick_next_due_index(work_queue, now_ms, attempted, state)
+        due_index = pick_next_due_index(work_queue, now_ms, attempted, state, tier_ratios=_tier_ratios)
         if due_index == -1:
             break
         pick = work_queue[due_index]
