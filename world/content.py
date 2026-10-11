@@ -916,8 +916,12 @@ CODE_CONTINUATION_ATTEMPTS = 2               # tasks.js
 MAX_CODE_PROBE_ROUNDS = 3                    # tasks.js
 MAX_CODE_COLAB_ROUNDS = 3                    # code-lane Colab compute rounds (mirrors probe rounds)
 MAX_REVIEW_PROBE_ROUNDS = 2                  # tasks.js
-_CODE_MAX_TOKENS = 3500                      # runCodingTask /api/chat
-_REVIEW_MAX_TOKENS = 900                     # runReviewTask /api/chat
+# The coding/review tiers are default-reasoning models; _post_openrouter_raw
+# caps their hidden reasoning at max_tokens // 2. A tight budget left the
+# reasoning chain truncated with content=null (the "[chat-debug] empty reply"
+# incidents), so these must be generous enough for reasoning AND the answer.
+_CODE_MAX_TOKENS = 16000                     # runCodingTask /api/chat
+_REVIEW_MAX_TOKENS = 16000                    # runReviewTask /api/chat
 _VISION_MAX_TOKENS = 500                     # reviewScreenshot /api/chat
 
 

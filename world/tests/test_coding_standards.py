@@ -176,6 +176,25 @@ class QualityPipelineSteps(unittest.TestCase):
         # expresses: pytest-cov fails only when the AGGREGATE falls below 90.
         self.assertEqual(by_name['pytest-cov'], 'python -m pytest --cov=. --cov-fail-under=90 -q')
 
+    def test_sandbox_has_python_files_detects_py(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(serve._sandbox_has_python_files(d))
+            with open(os.path.join(d, 'page.html'), 'w') as f:
+                f.write('<html></html>')
+            self.assertFalse(serve._sandbox_has_python_files(d))
+            with open(os.path.join(d, 'app.py'), 'w') as f:
+                f.write('x = 1\n')
+            self.assertTrue(serve._sandbox_has_python_files(d))
+            os.makedirs(os.path.join(d, 'sub'))
+            with open(os.path.join(d, 'sub', 'util.py'), 'w') as f:
+                f.write('y = 2\n')
+            self.assertTrue(serve._sandbox_has_python_files(d))
+
+    def test_sandbox_has_python_files_handles_bad_paths(self):
+        self.assertFalse(serve._sandbox_has_python_files(None))
+        self.assertFalse(serve._sandbox_has_python_files(''))
+        self.assertFalse(serve._sandbox_has_python_files('/nonexistent/definitely-missing'))
+
 
 class RunQualityPipeline(unittest.TestCase):
     def _run(self, pipeline_response):
