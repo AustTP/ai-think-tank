@@ -189,6 +189,22 @@ from sublow import (  # noqa: E402,F401
     revoke_sublow_grant,
     validate_sublow_grant,
 )
+# JEV experiment grants (see DESIGN.md "JEV experiment grants" and
+# jev_grants.py): the same rotating server-side token system pointed at the
+# JEV decisions model -- same restrictions, different model. Re-exported so
+# the stable public surface the endpoints/tests use is `serve.mint_jev_grant`
+# etc.
+from jev_grants import (  # noqa: E402,F401
+    JEV_FALLBACK_PRICE_PER_M,
+    JEV_LEDGER_SERVICE,
+    accrue_jev_grant,
+    expire_jev_grants,
+    mint_jev_grant,
+    quote_jev_grant,
+    revoke_agent_jev_grants,
+    revoke_jev_grant,
+    validate_jev_grant,
+)
 # Operator-edited policy JSON (world/plain_writing.json, browse_policy.json,
 # research_desk.json, watchlist.json) loaded by world/config.py. These are
 # DATA, not code: the operator tunes the ban list, block categories, desk
@@ -3897,14 +3913,15 @@ def revoke_agent_credentials(agent_id):
     fire: the per-agent attribution secret (agent_keys -- without this a fired
     agent could still sign requests it was never re-authorized for), any
     temporary capability grants, any external-capability handles, and any
-    sublow experiment grants (a live grant token would otherwise keep buying
-    inference under the dead agent's name). A later RE-hire mints a fresh key
-    on first use (get_or_create_agent_key)."""
+    sublow or JEV experiment grants (a live grant token would otherwise keep
+    buying inference under the dead agent's name). A later RE-hire mints a
+    fresh key on first use (get_or_create_agent_key)."""
     with _db() as conn:
         conn.execute('DELETE FROM agent_keys WHERE agent_id = ?', (agent_id,))
         conn.execute('DELETE FROM temp_access_grants WHERE agent_id = ?', (agent_id,))
         conn.execute('DELETE FROM capability_handles WHERE agent_id = ?', (agent_id,))
     revoke_agent_sublow_grants(agent_id)
+    revoke_agent_jev_grants(agent_id)
 
 
 def _expire_handles(now=None):
@@ -9263,6 +9280,19 @@ def _jev_model():
     of _decision_model_chain() so every existing call site keeps using the
     primary slug unchanged while the chain handles failover internally."""
     return _decision_model_chain()[0]
+
+
+def _jev_openrouter_slug():
+    """The OpenRouter slug the JEV experiment-grant proxy serves: the first
+    chain candidate that is a real model slug, skipping any URL fallback (the
+    Colab/Laya standby is a provider endpoint, not something the plain
+    chat-completions proxy can name as a model). None when the chain holds no
+    real slug -- mint and inference fail closed on that, exactly like the
+    sublow lane failing closed with no tier pick."""
+    for cand in _decision_model_chain():
+        if '://' not in cand:
+            return cand
+    return None
 
 
 # ---- Colab/Laya standby ---------------------------------
@@ -21921,6 +21951,210 @@ async def sublow_inference(request: Request):
     # above just landed); fall back to the pre-call row if it expired in the
     # meantime, since the reply is already earned either way.
     fresh = validate_sublow_grant(raw_token.strip()) or grant
+    accrued = float(fresh['accrued_usd'])
+    return JSONResponse({
+        'reply': reply,
+        'model': model,
+        'cost': float(usage_cost) if isinstance(usage_cost, (int, float)) else 0.0,
+        'grant': {'id': fresh['id'], 'estimateUsd': estimate,
+                  'accruedUsd': round(accrued, 6),
+                  'remainingUsd': round(max(0.0, estimate - accrued), 6),
+                  'calls': int(fresh['calls']),
+                  'exhausted': accrued >= estimate},
+    })
+
+
+@app.get('/api/experiments/jev/quote')
+async def jev_quote(request: Request):
+    """Cost-estimate worksheet for minting a JEV grant: the model the proxy
+    will serve (resolved JEV slug), its blended $/M price (a model_tiers row
+    when one exists, else the conservative fallback basis, with priceSource
+    saying which), a per-call and total estimate for the requested call
+    count, the agent's month-to-date spend and remaining headroom, and the
+    tank's month against the shared cap. Operator-gated, same as the sublow
+    quote."""
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'quoting requires a player session or a director/admin'}, status_code=403)
+    qp = request.query_params
+    try:
+        estimated_calls = int(qp.get('estimatedCalls') or 1)
+    except (TypeError, ValueError):
+        estimated_calls = 1
+    quote = quote_jev_grant(qp.get('agentId'), estimated_calls, qp.get('maxTokensPerCall'))
+    return JSONResponse({'ok': True, 'actor': actor, **quote})
+
+
+@app.post('/api/experiments/jev/grant')
+async def jev_grant(request: Request):
+    # Mint a JEV experiment grant. Same operator gate and same rules as the
+    # sublow mint: a verified player session OR a proven director/admin, a
+    # declared cost estimate that IS the authorization, a token shown exactly
+    # once with only its SHA-256 stored. The model is resolved server-side
+    # from the JEV chain -- never accepted from the body.
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'grant minting requires a player session or a director/admin'}, status_code=403)
+    body = await request.json()
+    token, refusal = mint_jev_grant(
+        body.get('agentId'), body.get('purpose'), body.get('estimateUsd'), actor,
+        task_id=body.get('taskId'), ttl_s=body.get('ttlSec'),
+        max_tokens_per_call=body.get('maxTokensPerCall'))
+    if token is None:
+        return JSONResponse({'error': refusal}, status_code=403)
+    grant = validate_jev_grant(token)
+    details = {'agentId': grant['agent_id'], 'grant': grant['id'], 'taskId': grant['task_id'],
+               'purpose': grant['purpose'], 'estimateUsd': grant['estimate_usd'],
+               'ttlSec': int(grant['expires_at'] - grant['created_at']),
+               'maxTokensPerCall': grant['max_tokens_per_call']}
+    log_action(actor, 'jev_grant_minted', details, authorized=True)
+    # Chain the mint (purpose, estimate, TTL) -- but never the token itself,
+    # which would defeat its being a secret.
+    _append_passport_decision('jev_grant_minted', actor, details)
+    return JSONResponse({
+        'ok': True, 'grant': grant['id'], 'token': token,
+        'expiresAt': grant['expires_at'], 'model': _jev_openrouter_slug(), **details,
+    })
+
+
+@app.post('/api/experiments/jev/revoke')
+async def jev_revoke(request: Request):
+    """Operator revokes an outstanding JEV experiment grant before it is
+    spent or after it leaks. Accepts the grant id (always shown at mint) or
+    the raw token; deletes the row outright so it can never resolve again."""
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'revoking requires a player session or a director/admin'}, status_code=403)
+    body = await request.json()
+    grant_ref = (body.get('grant') or '').strip()
+    if not grant_ref:
+        return JSONResponse({'error': 'grant is required'}, status_code=400)
+    if not revoke_jev_grant(grant_ref):
+        return JSONResponse({'error': 'unknown grant'}, status_code=404)
+    # Never log the raw token, only the opaque grant id (a token handed in
+    # for revocation is logged as a fixed marker instead of its bytes).
+    shown = grant_ref if grant_ref.startswith('jg-') else '<token>'
+    log_action(actor, 'jev_grant_revoked', {'grant': shown}, authorized=True)
+    _append_passport_decision('jev_grant_revoked', actor, {'grant': shown})
+    return JSONResponse({'ok': True})
+
+
+@app.post('/api/experiments/jev/inference')
+async def jev_inference(request: Request):
+    # Server-side JEV-model inference for experiments: the OpenRouter key
+    # never leaves this process, and the grant token is the ONLY credential
+    # (X-Jev-Grant, or Authorization: Bearer) -- not a session, not an agent
+    # key, because an off-server experiment has neither. The model is NEVER
+    # taken from the body: the proxy resolves the JEV slug server-side,
+    # clamps max_tokens to what the grant allows, runs the shared input
+    # guard, and re-checks the burn-down estimate plus every Bank gate
+    # (agent cap, per-task budget, shared tank cap) before a cent moves.
+    # NOT in AUTH_PROTECTED_PREFIXES: the grant token is the auth, the same
+    # self-guarding shape /api/chat and the sublow inference endpoint use.
+    if not OPENROUTER_API_KEY:
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
+    raw_token = request.headers.get('X-Jev-Grant') or ''
+    if not raw_token:
+        auth_header = request.headers.get('Authorization') or ''
+        if auth_header[:7].lower() == 'bearer ':
+            raw_token = auth_header[7:].strip()
+    grant = validate_jev_grant(raw_token.strip())
+    if not grant:
+        return JSONResponse({'error': 'a valid JEV grant token is required (X-Jev-Grant header)'},
+                            status_code=401)
+    body = await request.json()
+    agent_id = grant['agent_id']
+    task_id = (grant['task_id'] or '').strip()
+    messages = body.get('messages')
+    if not messages:
+        return JSONResponse({'error': 'messages is required'}, status_code=400)
+    model = _jev_openrouter_slug()
+    if not model:
+        return JSONResponse({'error': 'no JEV model slug resolved -- check JEV_MODEL / the /api/jev/model switch'},
+                            status_code=503)
+    # Shared input guard, identical rule to /api/chat and the sublow proxy.
+    violation = _input_guard_violation(messages)
+    if violation:
+        log_action(agent_id, 'jev_input_guard_blocked',
+                   {'grantId': grant['id'], 'model': model,
+                    'patterns_matched': violation['patterns'], 'snippet': violation['snippets']},
+                   authorized=True)
+        return JSONResponse({'error': 'Blocked by input guard (potential prompt injection)'}, status_code=400)
+    # The estimate gate: the declared estimate is a hard ceiling, enforced on
+    # ACCRUED ACTUAL cost. Refused at >= so the grant dies exactly when the
+    # estimate is covered -- never one call past it, never "approximately".
+    estimate = float(grant['estimate_usd'])
+    if float(grant['accrued_usd']) >= estimate:
+        log_action(agent_id, 'jev_grant_exhausted',
+                   {'grantId': grant['id'], 'model': model,
+                    'accruedUsd': round(float(grant['accrued_usd']), 6),
+                    'estimateUsd': estimate}, authorized=True)
+        return JSONResponse({
+            'error': 'This grant\'s declared cost estimate is fully spent -- mint a new grant to continue.',
+            'grantExhausted': True, 'estimateUsd': estimate,
+            'accruedUsd': round(float(grant['accrued_usd']), 6),
+        }, status_code=429)
+    # The Bank's own gates, same order and semantics as /api/chat: per-agent
+    # monthly cap, per-task budget, shared tank cap. Each is best-effort the
+    # same way it is there (an accounting hiccup never blocks; a real breach
+    # hard-refuses with 429).
+    if _agent_spend_cap_exceeded(agent_id):
+        log_action(agent_id, 'jev_agent_budget_blocked',
+                   {'grantId': grant['id'], 'model': model}, authorized=True)
+        return JSONResponse({
+            'error': (f'This agent has used its full monthly model-spend budget '
+                      f'(${AGENT_SPEND_CAP_USD:.2f}) and further calls are paused '
+                      f'until a director raises it.'),
+            'agentBudgetExhausted': True, 'agentSpendCapUsd': AGENT_SPEND_CAP_USD,
+        }, status_code=429)
+    if task_id and _task_budget_exhausted(task_id):
+        spent, attempts = _task_budget_spent(task_id)
+        log_action(agent_id, 'jev_task_budget_blocked',
+                   {'grantId': grant['id'], 'model': model, 'taskId': task_id,
+                    'taskSpendUsd': round(spent, 6)}, authorized=True)
+        return JSONResponse({
+            'error': (f'This task has used its full model-spend budget '
+                      f'(${spent:.4f} spent) and further model calls are paused '
+                      f'until a director raises it.'),
+            'budgetExhausted': True, 'taskSpendUsd': round(spent, 6),
+            'taskSpendAttempts': attempts,
+        }, status_code=429)
+    if _think_tank_spend_cap_exceeded():
+        log_action(agent_id, 'jev_tank_budget_blocked',
+                   {'grantId': grant['id'], 'model': model}, authorized=True)
+        return JSONResponse({
+            'error': (f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further '
+                      f'model calls until it is raised in .env'),
+            'tankBudgetExhausted': True, 'spendCapUsd': SPEND_CAP_USD,
+        }, status_code=429)
+    try:
+        max_tokens = min(max(int(body.get('max_tokens', grant['max_tokens_per_call'])), 1),
+                         int(grant['max_tokens_per_call']))
+    except (TypeError, ValueError):
+        max_tokens = int(grant['max_tokens_per_call'])
+    try:
+        # urllib is blocking -- off the event loop, same as /api/chat.
+        data = await asyncio.to_thread(_call_openrouter_sync, model, messages, max_tokens)
+        reply = data['choices'][0]['message'].get('content') or ''
+        usage_cost = (data.get('usage') or {}).get('cost', 0.0)
+    except urllib.error.HTTPError as e:
+        return JSONResponse({'error': e.read().decode()}, status_code=e.code)
+    except Exception as e:
+        return JSONResponse({'error': str(e)}, status_code=500)
+    if isinstance(usage_cost, (int, float)) and usage_cost:
+        village_id = _sim_village_for_agent(agent_id)
+        _accrue_spend(JEV_LEDGER_SERVICE, usage_cost, village_id=village_id, agent_id=agent_id)
+        if task_id:
+            _accrue_task_spend(task_id, usage_cost)
+        accrue_jev_grant(grant['id'], usage_cost)
+    log_action(agent_id, 'jev_experiment_call',
+               {'grantId': grant['id'], 'model': model,
+                'cost': float(usage_cost) if isinstance(usage_cost, (int, float)) else 0.0},
+               authorized=True)
+    # Re-read the grant for authoritative burn-down numbers (the accrual
+    # above just landed); fall back to the pre-call row if it expired in the
+    # meantime, since the reply is already earned either way.
+    fresh = validate_jev_grant(raw_token.strip()) or grant
     accrued = float(fresh['accrued_usd'])
     return JSONResponse({
         'reply': reply,

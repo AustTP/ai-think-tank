@@ -178,6 +178,9 @@ echo
 echo "== Python: sublow experiment grants -- rotating server-side tokens, hard estimate gate =="
 python3 tests/test_sublow_grants.py
 echo
+echo "== Python: JEV experiment grants -- same gate machinery, pointed at the JEV model =="
+python3 tests/test_jev_grants.py
+echo
 echo "== Python: idle on-duty wanderers parked off duty (vanish when idle) =="
 python3 tests/test_idle_park.py
 echo
