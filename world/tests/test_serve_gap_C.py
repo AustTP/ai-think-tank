@@ -1089,13 +1089,15 @@ class RefreshModelTiers(unittest.TestCase):
             chosen = asyncio.run(serve.refresh_model_tiers())
         self.assertEqual(chosen['low']['id'], 'low/reason')
 
-    def test_mandatory_reasoning_model_is_still_excluded(self):
-        # Mandatory reasoning cannot be turned off by any request field, so
-        # the model would always burn the tight token budget thinking: it
-        # stays out of every pool, even with a score.
+    def test_mandatory_reasoning_model_is_admissible(self):
+        # A mandatory-reasoning model is admissible now: the call layer
+        # recovers its reject-disabled 400 with a capped-reasoning retry
+        # (_openrouter_chat_post), and the live verification probe is the
+        # real gate. z-ai/glm-5.3-flash (mandatory reasoning, best value in
+        # its class) was invisible to every pool under the old exclusion.
         models = [
             self._model('low/plain', '0.00000005', '0.00000005'),
-            dict(self._model('low/mand', '0.00000005', '0.00000005'),
+            dict(self._model('low/mand', '0.00000004', '0.00000004'),
                  reasoning={'mandatory': True}),
         ]
         serve.set_model_benchmark_score('low/plain', 'intelligence_index', 0.4, 'u')
@@ -1108,7 +1110,9 @@ class RefreshModelTiers(unittest.TestCase):
                                         return_value=0), \
              unittest.mock.patch.object(serve, 'log_action'):
             chosen = asyncio.run(serve.refresh_model_tiers())
-        self.assertEqual(chosen['low']['id'], 'low/plain')
+        # low/mand scores higher AND is cheaper-or-equal, so it wins on the
+        # normal best-score-then-cheapest rule.
+        self.assertEqual(chosen['low']['id'], 'low/mand')
 
     def test_no_working_candidate_is_logged_and_skipped(self):
         models = [self._model('mid/only', '0.000002', '0.000002')]
