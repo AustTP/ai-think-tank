@@ -248,6 +248,7 @@ human-only pool. Fixes the prior 204,000-request escalation storm.
 | Band | Benchmark | Model | Price/M | Purpose |
 |------|-----------|-------|---------|---------|
 | Low | MMLU | deepseek-v4-flash | ~$0.26 | Default: everything starts here. Cheap above all else |
+| Sub-low | MMLU (intelligence index) | ling-3.0-flash-vl | ≤$0.09 (hard cap) | Short, bounded test scenarios at scale (hundreds of reenactment/testing agents). Cheapest coherent model; never real deliverables |
 | Mid | MMLU-Pro | deepseek-v3.2-exp | ~$0.68 | Lightly gated by JEV. Needs real reasoning |
 | High | HLE | deepseek-v4-pro-0813 | ~$4.60 | Heavily gated by JEV + monthly budget. Only for high-stakes planning |
 | Coding | SWE-bench | qwen3-coder | $1.30 | Deterministic: any code/review/qa task uses this tier, no JEV |
@@ -265,7 +266,45 @@ OpenRouter catalog once a day. Selection within each band:
 The high tier additionally enforces `HIGH_TIER_MAX_PRICE_USD` (default $5/M) —
 no model over the ceiling is even offered to the pool, regardless of its score.
 And `HIGH_TIER_MONTHLY_BUDGET_USD` (default $5/mo) — once the month's high-tier
-spend hits the cap, the JEV gate fails closed to mid.
+spend hits the cap, the JEV gate fails closed to mid. The sublow tier enforces
+`SUBLOW_TIER_MAX_PRICE_USD` (default $0.09/M, hard-on) — that ceiling is the
+band's definition, so a sublow pick can never drift up-market.
+
+### Sublow experiment grants
+
+Scale experiments (hundreds of reenactment agents in a Colab notebook) need
+model calls without ever holding the OpenRouter key. `world/sublow.py` solves
+it with rotating server-side grants:
+
+- **Mint** `POST /api/experiments/sublow/grant` (operator gate: player
+  session or proven director/admin, same as handle minting). Requires a
+  declared `estimateUsd > 0`; refuses when there is no sublow pick, when the
+  shared monthly cap is already hit, or when the estimate exceeds the agent's
+  remaining monthly headroom. Returns a `secrets.token_urlsafe(32)` token
+  exactly once; only its SHA-256 is stored. TTL defaults to 1800s (hard cap
+  86400s), per-call token cap defaults to 600 (hard cap 4000).
+- **Quote** `GET /api/experiments/sublow/quote` (operator gate) returns the
+  model the proxy will serve, its blended $/M price, a per-call and total
+  estimate at the requested call count, the agent's month-to-date spend and
+  remaining headroom, and the tank's month against the shared cap, so the
+  operator declares an estimate that can actually hold.
+- **Inference** `POST /api/experiments/sublow/inference` authenticates with
+  the grant token only (`X-Sublow-Grant` or `Authorization: Bearer`), and is
+  deliberately NOT in `AUTH_PROTECTED_PREFIXES` (a notebook has no session or
+  agent key, same self-guarding shape as `/api/chat`). The model is never
+  taken from the body: the proxy hard-codes `_sublow_tier_slug()`, runs the
+  shared input guard, and re-checks the burn-down estimate plus every Bank
+  gate (agent cap, per-task budget, tank cap) before a cent moves. Refused
+  with 429 the moment accrued ACTUAL cost reaches `estimateUsd`. Spend
+  accrues to the `__sublow_experiment__` ledger bucket and to the agent/task
+  buckets, so the Bank shows it like any other model spend.
+- **Revoke** `POST /api/experiments/sublow/revoke` (operator gate) deletes
+  the grant outright, by id or token. Grants also die with their agent:
+  `revoke_agent_credentials` sweeps them on a fire, and the sim tick sweeps
+  expired rows beside the capability-handle sweep.
+
+The grant is the authorization: no JEV vote, no credential, no key in a
+notebook, and no model choice for the caller to argue with.
 
 ### JEV-gated tier escalation
 

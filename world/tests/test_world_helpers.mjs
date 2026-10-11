@@ -99,6 +99,7 @@ await test('logThinkTankAction swallows a failed log post', () => {
 await test('loadModelTiers maps the server bands onto MODEL_TIERS', async () => {
   context.fetch = async () => okJson({
     low: { slug: 's1', name: 'Small!' },
+    sublow: { slug: 's6', name: 'Sublow!' },
     mid: { slug: 's2', name: 'Mid!' },
     coding: { slug: 's3', name: 'Coding!' },
     high: { slug: 's4', name: 'Plan!' },
@@ -107,6 +108,8 @@ await test('loadModelTiers maps the server bands onto MODEL_TIERS', async () => 
   await call('loadModelTiers');
   assert.equal(vm.runInContext('MODEL_TIERS.small.slug', context), 's1');
   assert.equal(vm.runInContext('MODEL_TIERS.small.label', context), 'Small!');
+  assert.equal(vm.runInContext('MODEL_TIERS.sublow.slug', context), 's6');
+  assert.equal(vm.runInContext('MODEL_TIERS.sublow.label', context), 'Sublow!');
   assert.equal(vm.runInContext('MODEL_TIERS.mid.slug', context), 's2');
   assert.equal(vm.runInContext('MODEL_TIERS.coding.slug', context), 's3');
   assert.equal(vm.runInContext('MODEL_TIERS.planning.slug', context), 's4');

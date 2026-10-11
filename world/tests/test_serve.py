@@ -317,6 +317,23 @@ class BandConfiguration(unittest.TestCase):
         # not as ignoring price entirely.
         self.assertLess(serve.BAND_QUALITY_FLOOR_GAP.get('high'), serve.BENCHMARK_QUALITY_FLOOR_GAP)
 
+    def test_sublow_ceiling_defaults_to_the_players_cap(self):
+        # The sublow ceiling IS the band's definition (cheapest coherent
+        # model for test scenarios at scale, hard-bounded) -- shipped
+        # default is the player's stated $0.09/M cap, not off.
+        self.assertEqual(serve.SUBLOW_TIER_MAX_PRICE_USD, 0.09)
+
+    def test_sublow_accessor_falls_back_to_low(self):
+        # No sublow row in model_tiers (fresh DB, or nothing qualified under
+        # the ceiling) must degrade scenario callers to the normal low tier,
+        # not hand back None.
+        def fake_slug(band):
+            return {'low': 'low-slug'}.get(band)
+        with unittest.mock.patch.object(serve, '_model_tier_slug', side_effect=fake_slug):
+            self.assertEqual(serve._sublow_tier_slug(), 'low-slug')
+        with unittest.mock.patch.object(serve, '_model_tier_slug', return_value='x'):
+            self.assertEqual(serve._sublow_tier_slug(), 'x')
+
     def test_verify_probe_budget_is_large_enough_for_a_reasoning_model(self):
         # Real bug: a 5-token probe made every hidden-reasoning model look
         # broken (it spends the budget thinking, returns content: None).

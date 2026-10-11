@@ -90,6 +90,7 @@ from bank import (  # noqa: E402,F401
     _accrue_colab_units,
     _accrue_high_tier_spend,
     _agent_spend_cap_exceeded,
+    _agent_spend_key,
     _accrue_page_request,
     _accrue_spend,
     _accrue_task_spend,
@@ -111,6 +112,7 @@ from bank import (  # noqa: E402,F401
     _page_budget_ledger_write,
     _page_budget_month,
     _page_budget_used,
+    _spend_cap_month_view,
     _spend_cap_period,
     _spend_ledger_read,
     _spend_ledger_write,
@@ -167,6 +169,25 @@ from evidence import (  # noqa: E402,F401
     search_since_ms,
     source_identity,
     update_claim,
+)
+# Sublow experiment grants (see DESIGN.md "Sublow experiment grants" and
+# sublow.py): rotating server-side tokens gating sublow-model inference
+# behind a declared cost estimate, so a Colab experiment can run at scale
+# with NO OpenRouter key in the notebook. Re-exported here so the stable
+# public surface the endpoints/tests use is `serve.mint_sublow_grant` etc.
+from sublow import (  # noqa: E402,F401
+    GRANT_TOKENS_DEFAULT,
+    GRANT_TOKENS_MAX,
+    GRANT_TTL_S_DEFAULT,
+    GRANT_TTL_S_MAX,
+    SUBLOW_LEDGER_SERVICE,
+    accrue_sublow_grant,
+    expire_sublow_grants,
+    mint_sublow_grant,
+    quote_sublow_grant,
+    revoke_agent_sublow_grants,
+    revoke_sublow_grant,
+    validate_sublow_grant,
 )
 # Operator-edited policy JSON (world/plain_writing.json, browse_policy.json,
 # research_desk.json, watchlist.json) loaded by world/config.py. These are
@@ -3875,12 +3896,15 @@ def revoke_agent_credentials(agent_id):
     """Revoke EVERY standing grant a fired agent held, so nothing survives the
     fire: the per-agent attribution secret (agent_keys -- without this a fired
     agent could still sign requests it was never re-authorized for), any
-    temporary capability grants, and any external-capability handles. A later
-    RE-hire mints a fresh key on first use (get_or_create_agent_key)."""
+    temporary capability grants, any external-capability handles, and any
+    sublow experiment grants (a live grant token would otherwise keep buying
+    inference under the dead agent's name). A later RE-hire mints a fresh key
+    on first use (get_or_create_agent_key)."""
     with _db() as conn:
         conn.execute('DELETE FROM agent_keys WHERE agent_id = ?', (agent_id,))
         conn.execute('DELETE FROM temp_access_grants WHERE agent_id = ?', (agent_id,))
         conn.execute('DELETE FROM capability_handles WHERE agent_id = ?', (agent_id,))
+    revoke_agent_sublow_grants(agent_id)
 
 
 def _expire_handles(now=None):
@@ -4128,6 +4152,17 @@ def _low_tier_slug():
     # Kept as its own accessor (like _mid_tier_slug) so tests can mock it and
     # the JEV tier gate can fail closed to it.
     return _model_tier_slug('low')
+
+
+def _sublow_tier_slug():
+    # The hard-ceilinged band for short, bounded test scenarios run at scale
+    # (hundreds of reenactment/testing agents): the cheapest coherent model
+    # under the per-model price ceiling, picked on the same intelligence
+    # signal as low. Falls back to the low tier so scenario callers degrade
+    # to the normal cheap tier on a machine whose refresh hasn't produced a
+    # sublow pick (no scores under the ceiling, or every candidate failed
+    # live verification) instead of failing outright.
+    return _model_tier_slug('sublow') or _low_tier_slug()
 
 
 def _high_tier_slug():
@@ -5753,6 +5788,14 @@ CODING_TIER_MAX_PRICE_USD = float(_load_env().get('CODING_TIER_MAX_PRICE_USD', '
 # win on image-comprehension score alone past the bound. Set
 # VISION_TIER_MAX_PRICE_USD in .env; 0/unset disables.
 VISION_TIER_MAX_PRICE_USD = float(_load_env().get('VISION_TIER_MAX_PRICE_USD', '0') or 0)
+# The SUBLOW tier's per-model price ceiling. Unlike the ceilings above, this
+# one is the band's very definition, not an optional bound on an open-ended
+# search: sublow exists to give short, bounded test scenarios run at scale
+# (hundreds of reenactment/testing agents) the cheapest model that is still
+# coherent, hard-capped at $0.09/M blended by the player's explicit call.
+# So it defaults ON at 0.09 rather than 0/off -- 0 here would let sublow
+# compete across the whole catalog and duplicate the low band's pick.
+SUBLOW_TIER_MAX_PRICE_USD = float(_load_env().get('SUBLOW_TIER_MAX_PRICE_USD', '0.09') or 0)
 # Reserved spend-ledger bucket name for high-tier accrual (kept apart from
 # per-service buckets so the bank can show "how much went to the expensive
 # tier" at a glance, and so the cap reads it cleanly).
@@ -10434,6 +10477,7 @@ MODEL_PRICE_BANDS = {
 }
 MODEL_BAND_PURPOSE = {
     'low': 'Routine, high-volume work: short in-character replies, simple task narration. Needs to be cheap above all else, but still coherent -- not a model too weak to follow basic instructions.',
+    'sublow': 'Short, bounded test scenarios run at scale (hundreds of reenactment/testing agents): brief in-character replies, throwaway probes, simple narration. The cheapest model that is still coherent -- hard per-model price ceiling, coherence is the bar, not depth. Never for real deliverables or long-running narrative work, where the coherence loss shows.',
     'mid': 'Judgment calls: classifying report severity, generating a new hire\'s onboarding file, deciding what belongs in an agent\'s own notes. Needs real reasoning, moderate cost is fine.',
     # Split out of what used to be one overloaded 'high' band:
     # writing code and planning work are different jobs that reward
@@ -10480,6 +10524,11 @@ MODEL_BAND_PURPOSE = {
 # scores are comparable, across metrics they are not.
 BAND_BENCHMARK = {
     'low': ('intelligence_index', 'MMLU-Pro'),
+    # Sublow ranks on the SAME intelligence chain as low -- it is the same
+    # job (coherent short replies/narration) done by an even cheaper model,
+    # so a different metric would make the two bands' picks incomparable.
+    # The $0.09 ceiling, not a different benchmark, is what separates it.
+    'sublow': ('intelligence_index', 'MMLU-Pro'),
     'mid': ('intelligence_index', 'MMLU-Pro'),
     'high': ('agentic_index',),
     'coding': ('coding_index',),
@@ -10744,17 +10793,20 @@ def _verify_decision_model_works_sync(model_id):
 
 
 def _apply_band_price_ceiling(band, candidate_pool):
-    """The high, coding and vision tiers carry a per-model PRICE CEILING:
-    the refresh only presents candidates at or below the matching
+    """The high, coding, vision and sublow tiers carry a per-model PRICE
+    CEILING: the refresh only presents candidates at or below the matching
     *_TIER_MAX_PRICE_USD constant. A model over the ceiling is never offered,
     even if it tops the score table -- price is a hard bound for these
-    tiers, not a tiebreak. Every other band passes through unchanged."""
+    tiers, not a tiebreak. For sublow the ceiling IS the band (see
+    SUBLOW_TIER_MAX_PRICE_USD). Every other band passes through unchanged."""
     if band == 'high' and HIGH_TIER_MAX_PRICE_USD:
         return [m for m in candidate_pool if m['price'] <= HIGH_TIER_MAX_PRICE_USD]
     if band == 'coding' and CODING_TIER_MAX_PRICE_USD:
         return [m for m in candidate_pool if m['price'] <= CODING_TIER_MAX_PRICE_USD]
     if band == 'vision' and VISION_TIER_MAX_PRICE_USD:
         return [m for m in candidate_pool if m['price'] <= VISION_TIER_MAX_PRICE_USD]
+    if band == 'sublow' and SUBLOW_TIER_MAX_PRICE_USD:
+        return [m for m in candidate_pool if m['price'] <= SUBLOW_TIER_MAX_PRICE_USD]
     return candidate_pool
 
 
@@ -11153,18 +11205,22 @@ async def refresh_model_tiers():
     for band, purpose in MODEL_BAND_PURPOSE.items():
         pool = buckets.get(band, [])
 
-        # 'coding' and 'high' (planning) both search EVERY price band's
-        # candidates, not just same-named price bucket -- price bracket
-        # says nothing about whether a model can write correct code or
-        # decompose a goal, and several of the strongest scores on file
-        # belong to models priced well under $5. (There is no 'coding'
-        # price bucket at all, which is the point: it's a capability
-        # band, not a cost band.) 'low' and 'mid' stay scoped to their own
-        # price band instead -- their purpose text ("cheap above all else"
-        # / "moderate cost is fine") is explicitly cost-conscious, so
-        # widening their search would contradict the very thing that makes
-        # them distinct, cheaper tiers.
-        capability_band = band in ('coding', 'high')
+        # 'coding', 'high' (planning) and 'sublow' all search EVERY price
+        # band's candidates, not just a same-named price bucket -- for
+        # coding/high because price bracket says nothing about whether a
+        # model can write correct code or decompose a goal, and for sublow
+        # because its $0.09 ceiling does the price scoping itself (a
+        # capability-shaped band whose bound is a hard cap, not a bracket;
+        # there is deliberately no 'sublow' price bucket to carve out of
+        # 'low', so the low band's own pool is untouched). Several of the
+        # strongest scores on file belong to models priced well under $5.
+        # (There is no 'coding' price bucket at all, which is the point:
+        # it's a capability band, not a cost band.) 'low' and 'mid' stay
+        # scoped to their own price band instead -- their purpose text
+        # ("cheap above all else" / "moderate cost is fine") is explicitly
+        # cost-conscious, so widening their search would contradict the
+        # very thing that makes them distinct, cheaper tiers.
+        capability_band = band in ('coding', 'high', 'sublow')
         candidate_pool = [m for band_pool in buckets.values() for m in band_pool] if capability_band else pool
         candidate_pool = _apply_band_price_ceiling(band, candidate_pool)
         # BAND_BENCHMARK[band] is an ordered metric CHAIN: use the first metric
@@ -18512,6 +18568,41 @@ def _taste_is_expired(taste):
     return review < datetime.date.today()
 
 
+# Input pattern guard: fast, deterministic injection-vector check applied
+# BEFORE any message list reaches a model (/api/chat and the sublow experiment
+# proxy). Scans the message text for known prompt-injection patterns (ignore
+# previous instructions, tone override, system-prompt extraction, role-play
+# inversion). A match is rejected as 400 with an audit log entry so the player
+# can see whether an agent or an external source triggered it -- not silently
+# dropped. Shared rather than inline so both chokepoints enforce the identical
+# rule (a one-pattern drift between them would be a silent hole).
+_INPUT_GUARD_PATTERNS = (
+    r'(?i)(ignore|forget|override|disregard|skip)\s+(all\s+)?(previous|prior|the\s+above)',
+    r'(?i)(you\s+are\s+now|from\s+now\s+on|your\s+new\s+role|act\s+as)',
+    r'(?i)system\s+(prompt|instruction|message|override)\s*(:|is|:)',
+    r'(?i)(reveal|show|print|output|leak|display)\s+(your|the)\s+(prompt|system|instructions)',
+)
+
+
+def _input_guard_violation(messages):
+    """None when the message list is clean; otherwise {'patterns': [the
+    matched regexes], 'snippets': [the matching windows of text]} for the
+    caller's audit log. Multimodal messages carry content as a list of parts
+    ({type: text|image_url, ...}) -- scan the text parts only, since re.search
+    on the raw list would TypeError (the vision review path hit this as a 500)."""
+    for msg in (messages or []):
+        raw = (msg.get('content') or '') if isinstance(msg, dict) else ''
+        text = raw if isinstance(raw, str) else ' '.join(
+            (p.get('text') or '') for p in raw
+            if isinstance(p, dict) and isinstance(p.get('text'), str))
+        matched = [p for p in _INPUT_GUARD_PATTERNS if re.search(p, text)]
+        if matched:
+            return {'patterns': matched,
+                    'snippets': [text[max(0, m.start() - 60):m.end() + 60]
+                                 for m in (re.search(p, text) for p in matched) if m]}
+    return None
+
+
 @app.post('/api/chat')
 async def chat(request: Request):
     # The only place OPENROUTER_API_KEY is ever used -- it never leaves
@@ -18538,32 +18629,16 @@ async def chat(request: Request):
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
     if not model or not messages:
         return JSONResponse({'error': 'model and messages are required'}, status_code=400)
-    # Input pattern guard: fast, deterministic injection-vector
-    # check BEFORE the call reaches the model. Scans the concatenated message
-    # text for known prompt-injection patterns (ignore previous instructions,
-    # tone override, system-prompt extraction, role-play inversion). A match
-    # is rejected as 400 with an audit log entry so the player can see whether
-    # an agent or an external source triggered it -- not silently dropped.
-    _INPUT_GUARD_PATTERNS = (
-        r'(?i)(ignore|forget|override|disregard|skip)\s+(all\s+)?(previous|prior|the\s+above)',
-        r'(?i)(you\s+are\s+now|from\s+now\s+on|your\s+new\s+role|act\s+as)',
-        r'(?i)system\s+(prompt|instruction|message|override)\s*(:|is|:)',
-        r'(?i)(reveal|show|print|output|leak|display)\s+(your|the)\s+(prompt|system|instructions)',
-    )
-    for msg in (messages or []):
-        raw = (msg.get('content') or '') if isinstance(msg, dict) else ''
-        # Multimodal messages carry content as a list of parts ({type:
-        # text|image_url, ...}). Scan the text parts only -- re.search on the
-        # raw list would TypeError (the vision review path hit this as a 500).
-        text = raw if isinstance(raw, str) else ' '.join(
-            (p.get('text') or '') for p in raw
-            if isinstance(p, dict) and isinstance(p.get('text'), str))
-        if any(re.search(p, text) for p in _INPUT_GUARD_PATTERNS):
-            log_action(agent_id, 'chat_input_guard_blocked',
-                       {'model': model, 'patterns_matched': [str(p) for p in _INPUT_GUARD_PATTERNS if re.search(p, text)],
-                        'snippet': [text[max(0, m.start() - 60):m.end() + 60] for m in (re.search(p, text) for p in _INPUT_GUARD_PATTERNS) if m]},
-                       authorized=authorized)
-            return JSONResponse({'error': 'Blocked by input guard (potential prompt injection)'}, status_code=400)
+    # Input pattern guard (shared _input_guard_violation): rejected as 400
+    # with an audit log entry so the player can see whether an agent or an
+    # external source triggered it -- not silently dropped.
+    violation = _input_guard_violation(messages)
+    if violation:
+        log_action(agent_id, 'chat_input_guard_blocked',
+                   {'model': model, 'patterns_matched': violation['patterns'],
+                    'snippet': violation['snippets']},
+                   authorized=authorized)
+        return JSONResponse({'error': 'Blocked by input guard (potential prompt injection)'}, status_code=400)
     # 300 was sized for a short in-character 1:1 reply -- real gap:
     # assignBigTask()'s structured multi-subtask JSON breakdown got
     # silently truncated mid-response by this same cap, producing invalid
@@ -21651,6 +21726,212 @@ async def delete_handle(handle: str, request: Request):
     log_action('player', 'handle_revoked', {'handle': handle[:8]}, authorized=True)
     _append_passport_decision('handle_revoked', 'player', {'handle': handle[:8]})
     return JSONResponse({'ok': True})
+
+
+@app.get('/api/experiments/sublow/quote')
+async def sublow_quote(request: Request):
+    """Cost-estimate worksheet for minting a grant: the model the proxy will
+    serve, its blended $/M price, a per-call and total estimate for the
+    requested call count, the agent's month-to-date spend and remaining
+    headroom, and the tank's month against the shared cap -- everything needed
+    to declare an estimate that will actually hold. Operator-gated (same gate
+    as handle minting): a player session or a proven director/admin."""
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'quoting requires a player session or a director/admin'}, status_code=403)
+    qp = request.query_params
+    try:
+        estimated_calls = int(qp.get('estimatedCalls') or 1)
+    except (TypeError, ValueError):
+        estimated_calls = 1
+    quote = quote_sublow_grant(qp.get('agentId'), estimated_calls, qp.get('maxTokensPerCall'))
+    return JSONResponse({'ok': True, 'actor': actor, **quote})
+
+
+@app.post('/api/experiments/sublow/grant')
+async def sublow_grant(request: Request):
+    # Mint a sublow experiment grant. Same operator gate as add_handle: a
+    # verified player session OR a proven director/admin -- never inferable
+    # from an omitted requesterId, because an agent's own HTTP client can
+    # clear the global middleware by simply not sending one. The declared
+    # cost estimate IS the authorization: no estimate, no grant (the proxy
+    # has nothing to enforce). The raw token is shown exactly once here and
+    # only its SHA-256 is stored, like a minted credential.
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'grant minting requires a player session or a director/admin'}, status_code=403)
+    body = await request.json()
+    token, refusal = mint_sublow_grant(
+        body.get('agentId'), body.get('purpose'), body.get('estimateUsd'), actor,
+        task_id=body.get('taskId'), ttl_s=body.get('ttlSec'),
+        max_tokens_per_call=body.get('maxTokensPerCall'))
+    if token is None:
+        return JSONResponse({'error': refusal}, status_code=403)
+    grant = validate_sublow_grant(token)
+    details = {'agentId': grant['agent_id'], 'grant': grant['id'], 'taskId': grant['task_id'],
+               'purpose': grant['purpose'], 'estimateUsd': grant['estimate_usd'],
+               'ttlSec': int(grant['expires_at'] - grant['created_at']),
+               'maxTokensPerCall': grant['max_tokens_per_call']}
+    log_action(actor, 'sublow_grant_minted', details, authorized=True)
+    # Chain the mint (purpose, estimate, TTL) -- but never the token itself,
+    # which would defeat its being a secret.
+    _append_passport_decision('sublow_grant_minted', actor, details)
+    return JSONResponse({
+        'ok': True, 'grant': grant['id'], 'token': token,
+        'expiresAt': grant['expires_at'], 'model': _sublow_tier_slug(), **details,
+    })
+
+
+@app.post('/api/experiments/sublow/revoke')
+async def sublow_revoke(request: Request):
+    """Operator revokes an outstanding experiment grant before it is spent or
+    after it leaks. Accepts the grant id (always shown at mint) or the raw
+    token; deletes the row outright so it can never resolve again."""
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'revoking requires a player session or a director/admin'}, status_code=403)
+    body = await request.json()
+    grant_ref = (body.get('grant') or '').strip()
+    if not grant_ref:
+        return JSONResponse({'error': 'grant is required'}, status_code=400)
+    if not revoke_sublow_grant(grant_ref):
+        return JSONResponse({'error': 'unknown grant'}, status_code=404)
+    # Never log the raw token, only the opaque grant id (a token handed in
+    # for revocation is logged as a fixed marker instead of its bytes).
+    shown = grant_ref if grant_ref.startswith('sg-') else '<token>'
+    log_action(actor, 'sublow_grant_revoked', {'grant': shown}, authorized=True)
+    _append_passport_decision('sublow_grant_revoked', actor, {'grant': shown})
+    return JSONResponse({'ok': True})
+
+
+@app.post('/api/experiments/sublow/inference')
+async def sublow_inference(request: Request):
+    # Server-side sublow inference for scale experiments (the Colab lane):
+    # compute runs in the notebook, every model call round-trips HERE, and
+    # the OpenRouter key never leaves this process. The grant token is the
+    # ONLY credential (X-Sublow-Grant, or Authorization: Bearer) -- not a
+    # session, not an agent key, because a notebook has neither. The model is
+    # NEVER taken from the body: the proxy hard-codes the sublow tier pick,
+    # clamps max_tokens to what the grant allows, runs the shared input
+    # guard, and re-checks the burn-down estimate plus every Bank gate
+    # (agent cap, per-task budget, shared tank cap) before a cent moves.
+    # NOT in AUTH_PROTECTED_PREFIXES: the grant token is the auth, the same
+    # self-guarding shape /api/chat uses.
+    if not OPENROUTER_API_KEY:
+        return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
+    raw_token = request.headers.get('X-Sublow-Grant') or ''
+    if not raw_token:
+        auth_header = request.headers.get('Authorization') or ''
+        if auth_header[:7].lower() == 'bearer ':
+            raw_token = auth_header[7:].strip()
+    grant = validate_sublow_grant(raw_token.strip())
+    if not grant:
+        return JSONResponse({'error': 'a valid sublow grant token is required (X-Sublow-Grant header)'},
+                            status_code=401)
+    body = await request.json()
+    agent_id = grant['agent_id']
+    task_id = (grant['task_id'] or '').strip()
+    messages = body.get('messages')
+    if not messages:
+        return JSONResponse({'error': 'messages is required'}, status_code=400)
+    model = _sublow_tier_slug()
+    if not model:
+        return JSONResponse({'error': 'no sublow model pick yet -- run a model-tier refresh first'},
+                            status_code=503)
+    # Shared input guard, identical rule to /api/chat.
+    violation = _input_guard_violation(messages)
+    if violation:
+        log_action(agent_id, 'sublow_input_guard_blocked',
+                   {'grantId': grant['id'], 'model': model,
+                    'patterns_matched': violation['patterns'], 'snippet': violation['snippets']},
+                   authorized=True)
+        return JSONResponse({'error': 'Blocked by input guard (potential prompt injection)'}, status_code=400)
+    # The estimate gate: the declared estimate is a hard ceiling, enforced on
+    # ACCRUED ACTUAL cost. Refused at >= so the grant dies exactly when the
+    # estimate is covered -- never one call past it, never "approximately".
+    estimate = float(grant['estimate_usd'])
+    if float(grant['accrued_usd']) >= estimate:
+        log_action(agent_id, 'sublow_grant_exhausted',
+                   {'grantId': grant['id'], 'model': model,
+                    'accruedUsd': round(float(grant['accrued_usd']), 6),
+                    'estimateUsd': estimate}, authorized=True)
+        return JSONResponse({
+            'error': 'This grant\'s declared cost estimate is fully spent -- mint a new grant to continue.',
+            'grantExhausted': True, 'estimateUsd': estimate,
+            'accruedUsd': round(float(grant['accrued_usd']), 6),
+        }, status_code=429)
+    # The Bank's own gates, same order and semantics as /api/chat: per-agent
+    # monthly cap, per-task budget, shared tank cap. Each is best-effort the
+    # same way it is there (an accounting hiccup never blocks; a real breach
+    # hard-refuses with 429).
+    if _agent_spend_cap_exceeded(agent_id):
+        log_action(agent_id, 'sublow_agent_budget_blocked',
+                   {'grantId': grant['id'], 'model': model}, authorized=True)
+        return JSONResponse({
+            'error': (f'This agent has used its full monthly model-spend budget '
+                      f'(${AGENT_SPEND_CAP_USD:.2f}) and further calls are paused '
+                      f'until a director raises it.'),
+            'agentBudgetExhausted': True, 'agentSpendCapUsd': AGENT_SPEND_CAP_USD,
+        }, status_code=429)
+    if task_id and _task_budget_exhausted(task_id):
+        spent, attempts = _task_budget_spent(task_id)
+        log_action(agent_id, 'sublow_task_budget_blocked',
+                   {'grantId': grant['id'], 'model': model, 'taskId': task_id,
+                    'taskSpendUsd': round(spent, 6)}, authorized=True)
+        return JSONResponse({
+            'error': (f'This task has used its full model-spend budget '
+                      f'(${spent:.4f} spent) and further model calls are paused '
+                      f'until a director raises it.'),
+            'budgetExhausted': True, 'taskSpendUsd': round(spent, 6),
+            'taskSpendAttempts': attempts,
+        }, status_code=429)
+    if _think_tank_spend_cap_exceeded():
+        log_action(agent_id, 'sublow_tank_budget_blocked',
+                   {'grantId': grant['id'], 'model': model}, authorized=True)
+        return JSONResponse({
+            'error': (f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further '
+                      f'model calls until it is raised in .env'),
+            'tankBudgetExhausted': True, 'spendCapUsd': SPEND_CAP_USD,
+        }, status_code=429)
+    try:
+        max_tokens = min(max(int(body.get('max_tokens', grant['max_tokens_per_call'])), 1),
+                         int(grant['max_tokens_per_call']))
+    except (TypeError, ValueError):
+        max_tokens = int(grant['max_tokens_per_call'])
+    try:
+        # urllib is blocking -- off the event loop, same as /api/chat.
+        data = await asyncio.to_thread(_call_openrouter_sync, model, messages, max_tokens)
+        reply = data['choices'][0]['message'].get('content') or ''
+        usage_cost = (data.get('usage') or {}).get('cost', 0.0)
+    except urllib.error.HTTPError as e:
+        return JSONResponse({'error': e.read().decode()}, status_code=e.code)
+    except Exception as e:
+        return JSONResponse({'error': str(e)}, status_code=500)
+    if isinstance(usage_cost, (int, float)) and usage_cost:
+        village_id = _sim_village_for_agent(agent_id)
+        _accrue_spend(SUBLOW_LEDGER_SERVICE, usage_cost, village_id=village_id, agent_id=agent_id)
+        if task_id:
+            _accrue_task_spend(task_id, usage_cost)
+        accrue_sublow_grant(grant['id'], usage_cost)
+    log_action(agent_id, 'sublow_experiment_call',
+               {'grantId': grant['id'], 'model': model,
+                'cost': float(usage_cost) if isinstance(usage_cost, (int, float)) else 0.0},
+               authorized=True)
+    # Re-read the grant for authoritative burn-down numbers (the accrual
+    # above just landed); fall back to the pre-call row if it expired in the
+    # meantime, since the reply is already earned either way.
+    fresh = validate_sublow_grant(raw_token.strip()) or grant
+    accrued = float(fresh['accrued_usd'])
+    return JSONResponse({
+        'reply': reply,
+        'model': model,
+        'cost': float(usage_cost) if isinstance(usage_cost, (int, float)) else 0.0,
+        'grant': {'id': fresh['id'], 'estimateUsd': estimate,
+                  'accruedUsd': round(accrued, 6),
+                  'remainingUsd': round(max(0.0, estimate - accrued), 6),
+                  'calls': int(fresh['calls']),
+                  'exhausted': accrued >= estimate},
+    })
 
 
 @app.post('/api/execute')

@@ -1170,9 +1170,11 @@ def _sim_loop_pass():
     # Returns the updated state after one tick, or None if nothing to do.
     # Runs on a worker thread (the loop calls us via asyncio.to_thread).
     import serve
-    # Cheap housekeeping: drop expired external-capability handles on each tick
-    # so a stale handle can never be presented. Idempotent; no-op when empty.
+    # Cheap housekeeping: drop expired external-capability handles and
+    # sublow experiment grants on each tick so a stale nonce can never be
+    # presented. Both idempotent; no-op when empty.
     serve._expire_handles()
+    serve.expire_sublow_grants()
     # Sleep-not-die gate: while DORMANT (idle auto-sleep armed), do NOT run the
     # engine tick. That single tick drives movement, the task cycle, the content
     # executors, and every model/OpenRouter spend -- skipping it is exactly what

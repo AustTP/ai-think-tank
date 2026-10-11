@@ -296,6 +296,23 @@ def _spend_cap_period():
     return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
 
 
+def _spend_cap_tracked_total(ledger):
+    """The sum the monthly USD cap is measured against: every dollar-
+    denominated service bucket and nothing else. COLAB_LEDGER_KEY carries
+    Colab COMPUTE UNITS, not dollars -- it has its own budget gate
+    (COLAB_MONTHLY_UNITS) and its own Bank row, so counting it here would trip
+    the USD cap on a currency that isn't money (a single T4 run accruing ~4
+    units looked like $4 of spend and failed every classifier call closed).
+    Per-task / per-village / per-agent buckets are attribution dimensions,
+    excluded so they never double-count the shared budget."""
+    import serve as _serve
+    excluded = {_serve._SPEND_CAP_BASELINE_KEY, _serve.COLAB_LEDGER_KEY}
+    return sum(float(v.get('used') or 0) for k, v in ledger.items()
+               if k not in excluded and not _is_task_spend_key(k)
+               and not k.startswith('__village__/') and not k.startswith('__agent__/')
+               and isinstance(v, dict))
+
+
 def _think_tank_spend_cap_exceeded():
     """Hard, absolute MONTHLY spend-cap check -- called at the top of EVERY
     real money-spending chokepoint (_call_openrouter_sync, _post_openrouter_raw,
@@ -313,18 +330,7 @@ def _think_tank_spend_cap_exceeded():
     if not _serve.SPEND_CAP_USD:
         return False
     ledger = _serve._spend_ledger_read()
-    # The spend cap is a USD ceiling on real money, so only dollar-
-    # denominated service buckets count. COLAB_LEDGER_KEY carries Colab
-    # COMPUTE UNITS, not dollars -- it has its own budget gate
-    # (COLAB_MONTHLY_UNITS) and its own Bank row, so counting it here
-    # would trip the USD cap on a currency that isn't money (a single T4
-    # run accruing ~4 units looked like $4 of spend and failed every
-    # classifier call closed).
-    excluded = {_serve._SPEND_CAP_BASELINE_KEY, _serve.COLAB_LEDGER_KEY}
-    total = sum(float(v.get('used') or 0) for k, v in ledger.items()
-                if k not in excluded and not _is_task_spend_key(k)
-                and not k.startswith('__village__/') and not k.startswith('__agent__/')
-                and isinstance(v, dict))
+    total = _spend_cap_tracked_total(ledger)
     period = _serve._spend_cap_period()
     rec = ledger.get(_serve._SPEND_CAP_BASELINE_KEY)
     # Legacy migration: the old format stored a bare float (the baseline at
@@ -347,6 +353,32 @@ def _think_tank_spend_cap_exceeded():
         _serve._spend_ledger_write(ledger)
         return False
     return (total - baseline) >= _serve.SPEND_CAP_USD
+
+
+def _spend_cap_month_view():
+    """Read-only month-to-date view of the shared USD spend cap: how much of
+    THIS month's budget is burned, the cap itself, and whether the cap is
+    hit. Runs _think_tank_spend_cap_exceeded() first so the lazy month
+    rollover has stored a current baseline before it is read, then computes
+    usage = tracked total - baseline. Pure read after that -- it never writes
+    the ledger itself. Returns {'usage': float|None, 'cap': float, 'exceeded':
+    bool}; usage is None when the cap is disabled (SPEND_CAP_USD == 0), since
+    there is no month budget to report against."""
+    import serve as _serve
+    cap = float(_serve.SPEND_CAP_USD)
+    if not cap:
+        return {'usage': None, 'cap': 0.0, 'exceeded': False}
+    exceeded = _think_tank_spend_cap_exceeded()
+    try:
+        ledger = _serve._spend_ledger_read() or {}
+    except Exception:
+        return {'usage': None, 'cap': cap, 'exceeded': exceeded}
+    total = _spend_cap_tracked_total(ledger)
+    rec = ledger.get(_serve._SPEND_CAP_BASELINE_KEY)
+    baseline = rec.get('baseline') if isinstance(rec, dict) else None
+    if not isinstance(baseline, (int, float)):
+        baseline = total
+    return {'usage': max(0.0, float(total) - float(baseline)), 'cap': cap, 'exceeded': exceeded}
 
 
 def _bank_budget_view(snapshot):
