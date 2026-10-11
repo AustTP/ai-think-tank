@@ -337,12 +337,16 @@ class BucketModelsByPrice(unittest.TestCase):
         buckets = serve._bucket_models_by_price([self._model('vendor/model:batch', 0.000001, 0.000001)])
         self.assertTrue(all(len(v) == 0 for v in buckets.values()))
 
-    def test_excludes_models_with_mandatory_reasoning(self):
-        # Can't be turned off -- exactly the real incident (a mid-tier pick
-        # that spent its whole token budget on hidden reasoning and
-        # returned null content) this exclusion exists to prevent.
-        buckets = serve._bucket_models_by_price([self._model('vendor/reasoner', 0.000001, 0.000001, reasoning={'mandatory': True})])
-        self.assertTrue(all(len(v) == 0 for v in buckets.values()))
+    def test_includes_models_with_mandatory_reasoning(self):
+        # Used to be excluded outright ("can't be turned off"), which hid
+        # z-ai/glm-5.3-flash -- best value in its class -- from every pool.
+        # A mandatory model rejects reasoning={'enabled': False} with a 400,
+        # but answers fine with reasoning CAPPED, which is the recovery
+        # _openrouter_chat_post performs; the live verify probe remains the
+        # gate that keeps a genuinely unusable mandatory model out.
+        buckets = serve._bucket_models_by_price([self._model('vendor/reasoner', 0.00000005, 0.00000005, reasoning={'mandatory': True})])
+        self.assertEqual(len(buckets['low']), 1)
+        self.assertEqual(buckets['low'][0]['id'], 'vendor/reasoner')
 
     def test_includes_models_with_reasoning_enabled_by_default(self):
         # default_enabled used to bar a model from the pools: the tight token
@@ -381,6 +385,53 @@ class BucketModelsByPrice(unittest.TestCase):
         buckets = serve._bucket_models_by_price([self._model('vendor/cheap', 0.00000005, 0.00000005)])
         self.assertEqual(len(buckets['low']), 1)
         self.assertEqual(buckets['low'][0]['id'], 'vendor/cheap')
+
+
+class OpenrouterChatPost(unittest.TestCase):
+    """The mandatory-reasoning recovery in _openrouter_chat_post: a 400
+    "Reasoning is mandatory" must be retried ONCE with reasoning capped to
+    half the request budget (the shape that answers fine), and every other
+    failure must propagate unchanged."""
+
+    @staticmethod
+    def _mandatory_400():
+        body = json.dumps({'error': {'message': 'Reasoning is mandatory for this endpoint and cannot be disabled.',
+                                     'code': 400}}).encode()
+        return urllib.error.HTTPError('https://openrouter.ai/api/v1/chat/completions', 400,
+                                      'Bad Request', {}, io.BytesIO(body))
+
+    def _ok_response(self):
+        return json.dumps({'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}).encode()
+
+    def test_retries_mandatory_400_with_capped_reasoning(self):
+        calls = []
+
+        def fake_urlopen(req, timeout=30):
+            calls.append(json.loads(req.data.decode()))
+            if len(calls) == 1:
+                raise self._mandatory_400()
+            return self._ok_response()
+
+        with unittest.mock.patch.object(serve, '_urlopen_with_resilience', fake_urlopen):
+            result = serve._openrouter_chat_post(
+                {'model': 'z-ai/glm-5.3-flash',
+                 'messages': [{'role': 'user', 'content': 'hi'}],
+                 'max_tokens': 64, 'reasoning': {'enabled': False}})
+        self.assertEqual(result['choices'][0]['message']['content'], 'ok')
+        self.assertEqual(len(calls), 2)
+        # First attempt kept the caller's disabled override; the retry capped it.
+        self.assertEqual(calls[0]['reasoning'], {'enabled': False})
+        self.assertEqual(calls[1]['reasoning'], {'max_tokens': 32})
+
+    def test_non_mandatory_400_propagates(self):
+        body = json.dumps({'error': {'message': 'invalid model', 'code': 400}}).encode()
+        err = urllib.error.HTTPError('https://openrouter.ai/api/v1/chat/completions', 400,
+                                     'Bad Request', {}, io.BytesIO(body))
+        with unittest.mock.patch.object(serve, '_urlopen_with_resilience',
+                                        unittest.mock.Mock(side_effect=err)):
+            with self.assertRaises(urllib.error.HTTPError):
+                serve._openrouter_chat_post(
+                    {'model': 'x/y', 'messages': [], 'max_tokens': 64, 'reasoning': {'enabled': False}})
 
 
 class ModelBenchmarkScores(unittest.TestCase):

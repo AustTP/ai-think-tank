@@ -8006,6 +8006,44 @@ def _apply_plain_writing(messages):
     return messages
 
 
+def _openrouter_chat_post(body):
+    """Single POST of a chat-completions body, shared by the two call layers
+    (_call_openrouter_once_sync and _post_openrouter_raw), with one recovery
+    retry for MANDATORY-reasoning models: OpenRouter rejects an explicit
+    reasoning={'enabled': False} on them with a 400 ("Reasoning is mandatory
+    for this endpoint and cannot be disabled" -- confirmed against
+    z-ai/glm-5.3-flash), and with no reasoning field at all they spend the
+    entire token budget on hidden reasoning and return content: null. A
+    CAPPED reasoning budget answers fine at any size (same model, verified
+    at 64 and 16000 tokens), so on that exact error retry once with
+    reasoning capped to half the request budget. Returns the parsed JSON
+    document; re-raises every other failure unchanged."""
+    def _post_once(payload):
+        req = urllib.request.Request(
+            'https://openrouter.ai/api/v1/chat/completions',
+            data=json.dumps(payload).encode(),
+            headers={
+                'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+                'Content-Type': 'application/json',
+            },
+            method='POST',
+        )
+        return json.loads(_urlopen_with_resilience(req, timeout=30))
+    try:
+        return _post_once(body)
+    except urllib.error.HTTPError as e:
+        detail = ''
+        try:
+            detail = e.read().decode('utf-8', 'ignore').lower()
+        except Exception:
+            pass
+        if e.code != 400 or 'reasoning is mandatory' not in detail:
+            raise
+        body = dict(body)
+        body['reasoning'] = {'max_tokens': max(1, (body.get('max_tokens') or 2048) // 2)}
+        return _post_once(body)
+
+
 def _call_openrouter_once_sync(model, messages, max_tokens):
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
@@ -8017,23 +8055,16 @@ def _call_openrouter_once_sync(model, messages, max_tokens):
     # still has room. The system's max_tokens is deliberately tight, and
     # hidden reasoning can otherwise consume the whole budget and come back
     # empty (the bug traced in refresh_model_tiers). Every other tier never
-    # reads reasoning output, so turning it off there is free.
+    # reads reasoning output, so turning it off there is free -- and a
+    # mandatory-reasoning model that rejects that override is recovered by
+    # _openrouter_chat_post's capped retry.
     if model in (_coding_tier_slug(), _high_tier_slug(), _mid_tier_slug(), _reasoning_tier_slug()):
         reasoning = {'max_tokens': max_tokens // 2}
     else:
         reasoning = {'enabled': False}
-    payload = json.dumps({'model': model, 'messages': messages, 'max_tokens': max_tokens, 'reasoning': reasoning}).encode()
-    req = urllib.request.Request(
-        'https://openrouter.ai/api/v1/chat/completions',
-        data=payload,
-        headers={
-            'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-            'Content-Type': 'application/json',
-        },
-        method='POST',
-    )
+    body = {'model': model, 'messages': messages, 'max_tokens': max_tokens, 'reasoning': reasoning}
     try:
-        result = json.loads(_urlopen_with_resilience(req, timeout=30))
+        result = _openrouter_chat_post(body)
     except Exception:
         record_model_result(model, success=False)
         raise
@@ -8087,22 +8118,15 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     # answer. Without this, a default_enabled-reasoning model called here
     # would spend the entire tight token budget thinking and return nothing
     # visible (the incident _call_openrouter_once_sync's override exists for).
+    # A mandatory-reasoning model that rejects the disabled override is
+    # recovered by _openrouter_chat_post's capped retry.
     reasoning = {'enabled': False}
     if model in (_coding_tier_slug(), _high_tier_slug(), _mid_tier_slug(), _reasoning_tier_slug()):
         if max_tokens is not None:
             reasoning = {'max_tokens': max_tokens // 2}
     body['reasoning'] = reasoning
-    req = urllib.request.Request(
-        'https://openrouter.ai/api/v1/chat/completions',
-        data=json.dumps(body).encode(),
-        headers={
-            'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-            'Content-Type': 'application/json',
-        },
-        method='POST',
-    )
     try:
-        result = json.loads(_urlopen_with_resilience(req, timeout=30))
+        result = _openrouter_chat_post(body)
     except Exception:
         record_model_result(model, success=False)
         raise
@@ -10603,11 +10627,21 @@ def _bucket_models_by_price(models):
         # old incident lacked. That made DeepSeek V4 Flash Vision (and the
         # Claude 4.5/5 family, GPT-5.1, etc.) needlessly invisible again --
         # a real cost: the vision band couldn't even consider a 76.7-MMMU
-        # model at $0.86/M. Only genuinely mandatory reasoning (can't be
-        # turned off by any request field) is excluded now.
-        reasoning_info = m.get('reasoning')
-        if reasoning_info and reasoning_info.get('mandatory'):
-            continue
+        # model at $0.86/M.
+        #
+        # Mandatory reasoning is admissible too, as of the z-ai/glm-5.3-flash
+        # finding: the catalog flags it `reasoning: {mandatory: true,
+        # default_effort: "max"}` and it beats the then-coding tier on every
+        # benchmark at half the price, but it never entered a pool. The old
+        # exclusion was too blunt -- a mandatory model rejects
+        # reasoning={'enabled': False} with a 400, but answers fine at any
+        # budget when reasoning is CAPPED (the exact shape the tier-aware
+        # override already sends), and _openrouter_chat_post recovers that
+        # 400 with the capped retry. Pool admission is therefore safe: the
+        # live verification probe is the real gate, and a mandatory model
+        # that cannot answer within its budget still fails verify and is
+        # skipped -- exactly what kept the broken picks out before.
+        arch = m.get('architecture') or {}
         arch = m.get('architecture') or {}
         if 'text' not in (arch.get('output_modalities') or []) or 'text' not in (arch.get('input_modalities') or []):
             continue
@@ -10633,9 +10667,13 @@ def _bucket_models_by_price(models):
 # construction -- it spends the whole budget thinking and returns
 # content: None with a perfectly successful HTTP 200. Confirmed against
 # deepseek-v4-pro-0813, which fails at 5 tokens and answers normally at a
-# realistic budget. 64 is still trivially cheap but no longer rejects a
-# model for a limit no real call here would ever impose on it.
-MODEL_VERIFY_MAX_TOKENS = 64
+# realistic budget. 64 was still too tight for the next class of model:
+# z-ai/glm-5.3-flash (mandatory reasoning, default_effort "max") ran its
+# hidden chain past 300 tokens in most probes and returned content: None
+# even with reasoning capped at 32 -- the provider enforces the reasoning
+# cap only intermittently at tiny budgets. 512 gives the chain room to
+# finish and the answer room to appear, at trivial probe cost.
+MODEL_VERIFY_MAX_TOKENS = 512
 # And a transient failure must not be cached as a permanent verdict. Also
 # Deepseek-v4-flash verified fine three times, failed once
 # mid-refresh (a blip/rate-limit), and that single failure silently
