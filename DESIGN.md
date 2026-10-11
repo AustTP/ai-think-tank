@@ -306,6 +306,47 @@ it with rotating server-side grants:
 The grant is the authorization: no JEV vote, no credential, no key in a
 notebook, and no model choice for the caller to argue with.
 
+### JEV experiment grants
+
+`world/jev_grants.py` is the sublow grant system pointed at the JEV
+decisions model -- same restrictions, different model. An experiment that
+needs bounded calls against the JEV model (a calibration sweep, a
+side-by-side probe) mints a rotating server-side token and never holds the
+OpenRouter key:
+
+- **Mint** `POST /api/experiments/jev/grant` (operator gate: player session
+  or proven director/admin). Requires a declared `estimateUsd > 0`; refuses
+  when no JEV slug resolves, when the shared monthly cap is already hit, or
+  when the estimate exceeds the agent's remaining monthly headroom. Returns
+  a `secrets.token_urlsafe(32)` token exactly once; only its SHA-256 is
+  stored. TTL defaults to 1800s (hard cap 86400s), per-call token cap
+  defaults to 600 (hard cap 4000) -- identical clamps to the sublow lane,
+  shared from `sublow.py`.
+- **Quote** `GET /api/experiments/jev/quote` (operator gate) returns the
+  model the proxy will serve (the resolved JEV slug -- `JEV_MODEL` / the
+  `/api/jev/model` operator switch, URL chain fallbacks skipped), its
+  blended $/M price (a `model_tiers` row when one exists for the slug, else
+  the conservative `JEV_FALLBACK_PRICE_PER_M` basis, with `priceSource` saying
+  which), a per-call and total estimate, and the same headroom readout as
+  the sublow quote.
+- **Inference** `POST /api/experiments/jev/inference` authenticates with the
+  grant token only (`X-Jev-Grant` or `Authorization: Bearer`), and is
+  deliberately NOT in `AUTH_PROTECTED_PREFIXES` (same self-guarding shape as
+  `/api/chat` and the sublow proxy). The model is never taken from the body:
+  the proxy hard-codes `_jev_openrouter_slug()`, runs the shared input
+  guard, and re-checks the burn-down estimate plus every Bank gate (agent
+  cap, per-task budget, tank cap) before a cent moves. Refused with 429 the
+  moment accrued ACTUAL cost reaches `estimateUsd`. Spend accrues to the
+  `__jev_experiment__` ledger bucket and to the agent/task buckets.
+- **Revoke** `POST /api/experiments/jev/revoke` (operator gate) deletes the
+  grant outright, by id or token. Grants also die with their agent:
+  `revoke_agent_credentials` sweeps both lanes on a fire, and the sim tick
+  sweeps expired rows beside the capability-handle and sublow sweeps.
+
+JEV grants are a separate lane from the tier system, not a tier: they never
+affect `_resolve_model_tier`, and the sublow pick is never routed to JEV or
+vice versa. The grant is the authorization, exactly as on the sublow lane.
+
 ### JEV-gated tier escalation
 
 `_resolve_model_tier(purpose, task_type, allow_high)`:
