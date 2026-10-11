@@ -234,7 +234,8 @@ class CreateEscalationTwoLineHandoff(unittest.TestCase):
              unittest.mock.patch.object(serve, '_save_escalations', lambda d: None), \
              unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
              unittest.mock.patch.object(serve, '_send_escalation_email_sync',
-                                        side_effect=lambda s, b: sent.update(subject=s, body=b)):
+                                        side_effect=lambda s, b: sent.update(subject=s, body=b)), \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync', return_value=False):
             serve.create_escalation('unresolved review requirement', 'Q?',
                                     what_checked='Graded 3 requirements', look_first='Q?')
         self.assertIn('What I checked: Graded 3 requirements', sent['body'])
@@ -246,10 +247,39 @@ class CreateEscalationTwoLineHandoff(unittest.TestCase):
              unittest.mock.patch.object(serve, '_save_escalations', lambda d: None), \
              unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
              unittest.mock.patch.object(serve, '_send_escalation_email_sync',
-                                        side_effect=lambda s, b: sent.update(subject=s, body=b)):
+                                        side_effect=lambda s, b: sent.update(subject=s, body=b)), \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync', return_value=False):
             serve.create_escalation('kind', 'the question')
         self.assertIn('What I checked: (see question)', sent['body'])
         self.assertIn('Look here first: the question above', sent['body'])
+
+    def test_telegram_push_carries_resolve_links(self):
+        sent = {}
+        with unittest.mock.patch.object(serve, '_load_escalations', return_value={}), \
+             unittest.mock.patch.object(serve, '_save_escalations', lambda d: None), \
+             unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
+             unittest.mock.patch.object(serve, '_send_escalation_email_sync', return_value=False), \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync',
+                                        side_effect=lambda s, b: sent.update(subject=s, body=b) or True):
+            esc_id = serve.create_escalation('stuck review loop', 'Story X is frozen')
+        self.assertIn('Approve: http://x/api/escalation/resolve?id=', sent['body'])
+        self.assertIn('Deny: http://x/api/escalation/resolve?id=', sent['body'])
+        self.assertIn(esc_id, sent['body'])
+        self.assertIn('Story X is frozen', sent['body'])
+
+    def test_telegram_truncates_body_but_keeps_urls(self):
+        sent = {}
+        huge_q = 'q' * 10000
+        with unittest.mock.patch.object(serve, '_load_escalations', return_value={}), \
+             unittest.mock.patch.object(serve, '_save_escalations', lambda d: None), \
+             unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
+             unittest.mock.patch.object(serve, '_send_escalation_email_sync', return_value=False), \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync',
+                                        side_effect=lambda s, b: sent.update(body=b) or True):
+            serve.create_escalation('blocked command', huge_q)
+        self.assertLessEqual(len(sent['body']), 4096, 'Telegram hard cap')
+        self.assertIn('Approve: http://x/api/escalation/resolve?id=', sent['body'])
+        self.assertIn('Deny: http://x/api/escalation/resolve?id=', sent['body'])
 
 
 class CreateEscalationDedup(unittest.TestCase):
@@ -263,27 +293,28 @@ class CreateEscalationDedup(unittest.TestCase):
         return unittest.mock.patch.object(serve, '_load_escalations', side_effect=lambda: store), \
             unittest.mock.patch.object(serve, '_save_escalations', lambda d: None), \
             unittest.mock.patch.object(serve, '_send_escalation_email_sync', lambda s, b: None), \
+            unittest.mock.patch.object(serve, 'send_player_telegram_sync', lambda s, b: False), \
             store
 
     def test_pending_duplicate_is_reused_not_recreated(self):
-        load, save, email, store = self._patched()
-        with load, save, email:
+        load, save, email, tg, store = self._patched()
+        with load, save, email, tg:
             first = serve.create_escalation('blocked command', 'Agent ada wants to run: cat > x.py')
             second = serve.create_escalation('blocked command', 'Agent ada wants to run: cat > x.py')
         self.assertEqual(first, second, 'same pending kind+question reuses the existing escalation')
         self.assertEqual(len(store), 1, 'no duplicate record is created')
 
     def test_different_question_creates_new(self):
-        load, save, email, store = self._patched()
-        with load, save, email:
+        load, save, email, tg, store = self._patched()
+        with load, save, email, tg:
             a = serve.create_escalation('blocked command', 'cmd one')
             b = serve.create_escalation('blocked command', 'cmd two')
         self.assertNotEqual(a, b)
         self.assertEqual(len(store), 2)
 
     def test_resolved_duplicate_allows_fresh(self):
-        load, save, email, store = self._patched()
-        with load, save, email:
+        load, save, email, tg, store = self._patched()
+        with load, save, email, tg:
             a = serve.create_escalation('kind', 'Q')
             for v in store.values():
                 v['status'] = 'approved'

@@ -366,7 +366,11 @@ _ENV_RELOAD_FIELDS = {
     'SMTP_USER': lambda e: e.get('SMTP_USER'),
     'SMTP_PASSWORD': lambda e: e.get('SMTP_PASSWORD'),
     'ESCALATION_EMAIL_TO': lambda e: e.get('ESCALATION_EMAIL_TO'),
-    'ESCALATION_BASE_URL': lambda e: e.get('ESCALATION_BASE_URL', 'http://localhost:8010'),
+    # Default follows SELF_BASE_URL's boot value, not a hardcoded port --
+    # resolve links in escalation messages must hit THIS process, and the
+    # old localhost:8010 default silently produced dead Approve/Deny URLs
+    # whenever the real server ran elsewhere (e.g. :8937).
+    'ESCALATION_BASE_URL': lambda e: e.get('ESCALATION_BASE_URL') or e.get('SELF_BASE_URL', 'http://localhost:8010'),
     # Publishing target (PUBLISH_REMOTE_URL is recomputed after the rebind).
     'PUBLISH_REPO': lambda e: (e.get('AI_THINK_TANK_PUBLISH_REPO') or '').strip(),
     # Caches + sync cadence (read at call time).
@@ -466,6 +470,11 @@ def _reload_env_config():
             ensure_sandbox_networking()
         except Exception:
             pass
+    # An env reload is the operator touching keys/config -- wipe the API-key
+    # auth-health tracker so a swapped key starts from a clean slate (the
+    # next real 401 will re-alert; a working key never re-alerts).
+    with _api_key_health_lock:
+        _api_key_health.clear()
     return {'reloaded': True, 'changed': sorted(changed), 'count': len(changed)}
 
 # Deliberately OUTSIDE world/ -- same reasoning as the .env API key: this
@@ -7211,7 +7220,12 @@ SMTP_HOST = _load_env().get('SMTP_HOST')
 SMTP_PORT = int(_load_env().get('SMTP_PORT', '587'))
 SMTP_USER = _load_env().get('SMTP_USER')
 SMTP_PASSWORD = _load_env().get('SMTP_PASSWORD')
-ESCALATION_BASE_URL = _load_env().get('ESCALATION_BASE_URL', 'http://localhost:8010')
+# Resolve links in escalation messages must hit THIS process. Prefer an
+# explicit ESCALATION_BASE_URL, else follow the .env SELF_BASE_URL (the
+# operator's boot-time guess at our own address); the old hardcoded
+# localhost:8010 default silently produced dead Approve/Deny URLs whenever
+# the real server ran on another port (e.g. :8937).
+ESCALATION_BASE_URL = _load_env().get('ESCALATION_BASE_URL') or _load_env().get('SELF_BASE_URL', 'http://localhost:8010')
 
 # Telegram bridge: lets the player talk to the think tank's admin
 # from a phone, like texting, without exposing anything to the public
@@ -8033,6 +8047,94 @@ def record_model_result(model_slug, success):
             log_action(None, 'model_circuit_broken', {'model': model_slug, 'cooldown_s': CIRCUIT_BREAKER_COOLDOWN_S})
 
 
+# API-key auth-health tracker: per-service consecutive auth failures, with
+# a hard-stop circuit breaker. A 401/403 from an external API usually means
+# the key is dead (revoked/expired/wrong); some providers also 403 on
+# temporary quota, so a single blip doesn't trip anything. Once the streak
+# crosses API_KEY_AUTH_FAILURE_THRESHOLD the service is BLOCKED: callers
+# fail fast instead of burning calls (and budget) on a key known-bad. A
+# half-open probe after API_KEY_AUTH_COOLDOWN_S lets exactly one call
+# through -- if it succeeds the service unblocks (transient blip); if it
+# 401s again the block re-arms. The operator swapping the key and hitting
+# /api/env/reload wipes the dict outright, unblocking everything.
+API_KEY_AUTH_FAILURE_THRESHOLD = 2
+API_KEY_AUTH_COOLDOWN_S = 600  # 10 min before a half-open probe is allowed
+_api_key_health: dict[str, dict[str, object]] = {}  # service -> {'consecutive_failures', 'blocked_until', 'probing', 'last_failure_ts', 'last_failure_code', 'last_success_ts'}
+_api_key_health_lock = threading.Lock()
+
+
+def _api_key_is_broken(service):
+    """True if the service must be skipped (call should fail fast). Mirrors
+    is_model_circuit_broken: CLOSED normally; once the auth-failure streak
+    crosses the threshold, OPEN until the cooldown elapses -- then HALF_OPEN
+    and EXACTLY ONE probe is allowed through; only a success closes it."""
+    with _api_key_health_lock:
+        entry = _api_key_health.get(service)
+        if not entry:
+            return False
+        blocked_until = entry.get('blocked_until') or 0
+        if blocked_until == 0:
+            return False  # CLOSED
+        if time.time() >= blocked_until:
+            if not entry.get('probing'):
+                entry['probing'] = True
+                return False  # allow the single probe through
+            return True  # probe already in flight
+        return True  # still OPEN
+
+
+def _note_api_key_failure(service, status_code):
+    """Record an auth failure (401/403) for an external API service. On the
+    first failure past the threshold the service is blocked; a probe that
+    fails re-arms the block with a fresh cooldown."""
+    with _api_key_health_lock:
+        entry = _api_key_health.setdefault(service, {})
+        was_probing = bool(entry.get('probing'))
+        entry['consecutive_failures'] = int(entry.get('consecutive_failures') or 0) + 1
+        entry['last_failure_ts'] = time.time()
+        entry['last_failure_code'] = int(status_code)
+        entry['probing'] = False
+        if entry['consecutive_failures'] >= API_KEY_AUTH_FAILURE_THRESHOLD:
+            entry['blocked_until'] = time.time() + API_KEY_AUTH_COOLDOWN_S
+    try:
+        log_action(None, 'api_key_auth_failure',
+                   {'service': service, 'status': int(status_code), 'probe_failed': was_probing})
+    except Exception:
+        pass
+
+
+def _note_api_key_success(service):
+    """Record a successful call for an external API service -- closes the
+    circuit (unblocks) the moment the key works again."""
+    with _api_key_health_lock:
+        entry = _api_key_health.setdefault(service, {})
+        entry['consecutive_failures'] = 0
+        entry['blocked_until'] = 0
+        entry['probing'] = False
+        entry['last_success_ts'] = time.time()
+
+
+def _api_key_auth_failures_snapshot():
+    """Point-in-time view for the health check: services whose consecutive
+    auth-failure streak has crossed the alert threshold (blocked or
+    recently-blocked), with streak size and last status code."""
+    now = time.time()
+    with _api_key_health_lock:
+        out = {}
+        for service, entry in _api_key_health.items():
+            streak = int(entry.get('consecutive_failures') or 0)
+            if streak >= API_KEY_AUTH_FAILURE_THRESHOLD:
+                blocked_until = entry.get('blocked_until') or 0
+                out[service] = {
+                    'status_code': entry.get('last_failure_code'),
+                    'consecutive_failures': streak,
+                    'seconds_ago': now - (entry.get('last_failure_ts') or 0),
+                    'blocked': blocked_until > now,
+                    'blocked_for_s': max(0, blocked_until - now),
+                }
+    return out
+
+
 # PLAIN_WRITING_BAN_LIST is loaded from world/plain_writing.json by
 # world/config.py (operator-edited; add a new AI-slop word there, not in code).
 # Directs the village's models to write plain, short, no-AI-flavored prose --
@@ -8107,6 +8209,8 @@ def _openrouter_chat_post(body):
 def _call_openrouter_once_sync(model, messages, max_tokens):
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
+    if _api_key_is_broken('openrouter'):
+        raise RuntimeError('OpenRouter API key is blocked after repeated auth failures -- swap the key in .env and reload env')
     if is_model_circuit_broken(model):
         raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
     # Keep reasoning for the tiers that benefit from it (coding, high, and mid --
@@ -8125,10 +8229,16 @@ def _call_openrouter_once_sync(model, messages, max_tokens):
     body = {'model': model, 'messages': messages, 'max_tokens': max_tokens, 'reasoning': reasoning}
     try:
         result = _openrouter_chat_post(body)
+    except urllib.error.HTTPError as e:
+        record_model_result(model, success=False)
+        if e.code in (401, 403):
+            _note_api_key_failure('openrouter', e.code)
+        raise
     except Exception:
         record_model_result(model, success=False)
         raise
     record_model_result(model, success=True)
+    _note_api_key_success('openrouter')
     return result
 
 
@@ -8162,6 +8272,8 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     parsed OpenRouter JSON document."""
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
+    if _api_key_is_broken('openrouter'):
+        raise RuntimeError('OpenRouter API key is blocked after repeated auth failures -- swap the key in .env and reload env')
     if is_model_circuit_broken(model):
         raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
     body = {'model': model, 'messages': messages}
@@ -8187,10 +8299,16 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     body['reasoning'] = reasoning
     try:
         result = _openrouter_chat_post(body)
+    except urllib.error.HTTPError as e:
+        record_model_result(model, success=False)
+        if e.code in (401, 403):
+            _note_api_key_failure('openrouter', e.code)
+        raise
     except Exception:
         record_model_result(model, success=False)
         raise
     record_model_result(model, success=True)
+    _note_api_key_success('openrouter')
     return result
 
 
@@ -8841,6 +8959,8 @@ def _tavily_search_sync(query, max_results=5):
     same as a browse_page fetch."""
     if not TAVILY_API_KEY:
         return '__TOOL_ERROR__: search is not configured (no TAVILY_API_KEY).'
+    if _api_key_is_broken('tavily'):
+        return '__TOOL_ERROR__: Tavily API key is blocked after repeated auth failures -- swap the key in .env and reload env.'
     if _page_budget_exhausted():
         return '__TOOL_ERROR__: the think tank has used its monthly page-request budget (browsing/search is paused until next month).'
     payload = json.dumps({
@@ -8855,8 +8975,13 @@ def _tavily_search_sync(query, max_results=5):
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:  # nosec B310 -- fixed allow-listed search API host
             data = json.loads(resp.read().decode('utf-8', errors='replace'))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            _note_api_key_failure('tavily', e.code)
+        return f'__TOOL_ERROR__: search failed: {e}'
     except Exception as e:
         return f'__TOOL_ERROR__: search failed: {e}'
+    _note_api_key_success('tavily')
     _accrue_page_request()
     parts = []
     if data.get('answer'):
@@ -23738,6 +23863,21 @@ def _health_alerts_for_signals(signals):
               f'{jev_failures}/{jev_attempts} Jev decision call(s) failed in the last hour -- '
               f'the decisions model may be down, colony running deterministic fallbacks')
 
+    # API-key auth health: a streak of 401/403s from an external service
+    # means its key is likely dead (revoked/expired/wrong). A single blip
+    # is tolerated (some providers 403 on temporary quota); the streak
+    # resets on any success. Once the streak crosses the threshold the
+    # service is BLOCKED (calls fail fast). Alert; clears automatically
+    # when a probe succeeds or the operator swaps the key + reloads env.
+    for service, info in (signals.get('api_key_auth_failures') or {}).items():
+        ago = info.get('seconds_ago') or 0
+        state = (f'blocked for {info.get("blocked_for_s"):.0f}s more' if info.get('blocked')
+                 else 'half-open -- one probe will be allowed through')
+        alert('api_keys', 'warning',
+              f'API key for "{service}" failing auth {info.get("consecutive_failures")}x in a row '
+              f'(last: HTTP {info.get("status_code")}, {ago:.0f}s ago) -- {state}; '
+              f'swap the key in .env and reload env to clear')
+
     # Coordination-imbalance scalar: replaced the raw 24h ceremony
     # COUNT-ratio check -- {ceremony} and {progress} still read as the 24h
     # counts for the message, but the TRIP is the decayed score (Reddit-Hot
@@ -24233,6 +24373,10 @@ def compute_health_snapshot():
         'bank_over_cap': bank_over_cap,
         'bank_used': bank_used,
         'bank_cap': bank_cap,
+        # API-key auth health: services whose LATEST call outcome was a
+        # 401/403 (in-process tracker, not a DB read). Cleared the instant a
+        # call succeeds again or the operator hits /api/env/reload.
+        'api_key_auth_failures': _api_key_auth_failures_snapshot(),
     }
     return {'checked_at': now, 'db_ok': True, 'alerts': _health_alerts_for_signals(signals), **signals}
 
@@ -24933,6 +25077,11 @@ if __name__ == '__main__':
         print(f'[env] SELF_BASE_URL in .env is {SELF_BASE_URL!r} but this process binds '
               f'{_bound_base}; self-loopback calls will use {_bound_base}', flush=True)
         SELF_BASE_URL = _bound_base
+        # Escalation Approve/Deny links are tapped by the player; when we
+        # didn't follow an explicit ESCALATION_BASE_URL, rebase it with
+        # SELF_BASE_URL so the links hit this process, not a stale port.
+        if not _load_env().get('ESCALATION_BASE_URL'):
+            ESCALATION_BASE_URL = _bound_base
     init_db()
     # flush=True -- real bug hit while building this: stdout is fully
     # buffered (not line-buffered) once redirected to a file/pipe rather
