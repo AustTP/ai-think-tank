@@ -197,4 +197,14 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
             f'Approve: {approve_url}\n\n'
             f'Deny: {deny_url}')
     _serve._send_escalation_email_sync(f'[AI Think Tank] Needs your call: {kind}', body)
+    # Telegram is the channel that actually reaches the player when SMTP
+    # isn't configured -- same approve/deny links, fail-closed best-effort
+    # like every other optional push. Telegram caps message text at 4096
+    # chars; truncate the free-text middle (question/checked/look) but NEVER
+    # the resolve URLs -- a truncated Approve link is a dead escalation.
+    _tg_head = f'Needs your call: {kind}\n\n{(question or "")[:1200]}'
+    _tg_tail = (f'\n\nWhat I checked: {(what_checked or "(see question)")[:400]}\n'
+                f'Look here first: {(look_first or "the question above")[:400]}\n\n'
+                f'Approve: {approve_url}\n\nDeny: {deny_url}')
+    _serve.send_player_telegram_sync('', (_tg_head + _tg_tail)[:4096])
     return esc_id

@@ -392,6 +392,9 @@ class AllowlistRequestEndpoint(unittest.TestCase):
             unittest.mock.patch.object(serve, 'check_rate_limit', return_value=True),
             unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True),
             unittest.mock.patch.object(serve, '_send_escalation_email_sync'),
+            # create_escalation now also pushes on Telegram; pin it off so
+            # tests never hit the live bot API (token is in the real .env).
+            unittest.mock.patch.object(serve, 'send_player_telegram_sync', return_value=False),
             unittest.mock.patch.object(serve, 'ensure_sandbox_networking'),
             # ESCALATIONS_PATH is a module constant from the REAL THINK_TANK_DIR
             # at import time -- same pitfall as BROWSE_TRAIL_PATH, so any test
