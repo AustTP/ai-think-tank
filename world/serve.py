@@ -22609,7 +22609,9 @@ async def pipeline(request: Request):
     # deliverables. When no *.py exists anywhere in the tree, the Python
     # quality steps are trivially green -- the deliverable simply isn't a
     # Python project. flake8/bandit already pass on an empty tree, so only
-    # mypy/bandit/pytest-cov need the skip.
+    # mypy/bandit/pytest-cov need the skip. The JS steps (node-syntax/
+    # node-tests) self-skip green inside their own command when no JS files
+    # are present, so no server-side skip is needed for them.
     has_py = _sandbox_has_python_files(sandbox_dir)
     results = []
     for step in steps:

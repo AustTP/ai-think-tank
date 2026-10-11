@@ -1376,7 +1376,11 @@ CODING_STANDARDS_PROMPT = (
     'non-negotiable: python -m flake8 ., python -m mypy ., python -m bandit -r ., and python -m pytest --cov=. '
     '--cov-fail-under=90 (all tools are pre-installed). Coverage is measured in TOTAL -- across ALL files in the '
     'workspace combined, not per-file -- so write tests that push the overall project coverage to 90% or higher. '
-    'If you wrote a JS/HTML-only change, the Python pipeline is trivially green -- fine. If you introduced real logic, '
+    'If you wrote a JS/HTML-only change, the Python pipeline is trivially green -- fine, but the JS steps then apply: '
+    'node --check must parse every .js/.mjs file you wrote (it catches syntax errors without running the code), and '
+    'any *.test.mjs you write is executed by node --test and must pass. A JS syntax error or a failing JS test is a '
+    'RED pipeline, exactly like a flake8 error -- your work will NOT be approved until both the Python and JS steps '
+    'are green. If you introduced real Python logic, '
     'structure it as an importable module with a real test_*.py your own tests would run, not a wall of untestable '
     'globals. Your task is NOT complete and your work will NOT be approved until that pipeline is green.'
 )
@@ -1388,6 +1392,21 @@ def _quality_pipeline_steps():
         {'name': 'mypy', 'command': 'python -m mypy .'},
         {'name': 'bandit', 'command': 'python -m bandit -r . -q'},
         {'name': 'pytest-cov', 'command': 'python -m pytest --cov=. --cov-fail-under=90 -q'},
+        # JS half of the gate (wrq-8: vanilla-JS engine). node --check parses
+        # every .js/.mjs WITHOUT executing (pure syntax); node --test runs the
+        # *.test.mjs suites the agents write (built-in node:test runner). Both
+        # no-op green when the sandbox has no JS (mirrors the Python steps'
+        # skip-when-no-.py in /api/pipeline), so a pure-Python project is
+        # unaffected. node is baked into SANDBOX_IMAGE (world/sandbox/Dockerfile).
+        {'name': 'node-syntax', 'command': (
+            'sh -c \'files=$(ls *.js *.mjs 2>/dev/null); '
+            'if [ -z "$files" ]; then echo "no JS files -- skipping"; exit 0; fi; '
+            'fail=0; for f in $files; do node --check "$f" || fail=1; done; '
+            'exit $fail\'')},
+        {'name': 'node-tests', 'command': (
+            'sh -c \'ls *.test.mjs *.test.js 2>/dev/null | head -1 | grep -q . || '
+            '{ echo "no JS test files -- skipping"; exit 0; }; '
+            'node --test\'')},
     ]
 
 

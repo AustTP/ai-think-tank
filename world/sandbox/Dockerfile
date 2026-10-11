@@ -25,4 +25,17 @@ RUN python -m pip install --no-cache-dir \
 RUN python -m pip install --no-cache-dir playwright==1.60.0
 RUN python -m playwright install --with-deps chromium
 COPY browser_driver.py /opt/browser_driver.py
+
+# Node.js for the JS half of the quality gate. wrq-8 asked for a vanilla-JS
+# simulation engine; the sandbox had no node, so `node --check`/`node --test`
+# died with exit 127 (command not found) and every JS task failed its quality
+# gate forever. Node 20 LTS via NodeSource (pinned major, same offline-bake
+# principle as the Python tools above: installed HERE, not at agent runtime).
+# node --check parses .mjs/.js (ESM) without executing; node --test runs the
+# *.test.mjs suites the agents write with the built-in node:test runner.
+RUN apt-get update && apt-get install -y ca-certificates curl gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /workspace
