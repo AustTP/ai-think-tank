@@ -509,7 +509,7 @@ PASSPORT_PATH = os.path.join(LIBRARY_DIR, '.passport.json')
 #      paused (no movement, no task cycle, no model spend); the DB checkpoint
 #      and handle-expiry keep running.
 DB_BACKUP_DIR = os.path.join(THINK_TANK_DIR, 'think-tank-db-backups')
-DB_BACKUP_KEEP = 24
+DB_BACKUP_KEEP = 1
 DB_BACKUP_INTERVAL_S = 5 * 60
 # Log retention: decision_tape and action_log are append-only audit
 # tables whose heavy columns (prompt/raw/details) ballooned the DB to ~1 GB. The
@@ -1190,10 +1190,18 @@ def _backup_think_tank_db():
         print(f'[backup] snapshot failed: {e}', flush=True)
         return
     _harden_db_perms(dest)
-    # Prune to the newest DB_BACKUP_KEEP, oldest first.
-    files = sorted(
-        f for f in os.listdir(DB_BACKUP_DIR) if f.endswith('.bak')
-    )
+    # Prune to the newest DB_BACKUP_KEEP by MTIME. The filenames are not
+    # sortable as a proxy for age (think_tank.db-* vs the legacy village.db-*
+    # the rename left behind: 't' < 'v' alphabetically, which used to keep the
+    # orphaned old files and delete the fresh checkpoints). Sort on the real
+    # file mtime so the newest survive and the oldest go.
+    try:
+        files = sorted(
+            (f for f in os.listdir(DB_BACKUP_DIR) if f.endswith('.bak')),
+            key=lambda f: os.path.getmtime(os.path.join(DB_BACKUP_DIR, f)),
+        )
+    except OSError:
+        files = []
     for old in files[:-DB_BACKUP_KEEP]:
         try:
             os.remove(os.path.join(DB_BACKUP_DIR, old))
