@@ -571,13 +571,27 @@ LOG_RETENTION_DAYS_DEFAULT = 7
 LOG_PRUNE_INTERVAL_S = 6 * 3600          # twice a day is plenty for a rolling prune
 LOG_PRUNE_MAX_ROWS = 50_000              # cap per run so a big backlog can't block the loop
 _LAST_LOG_PRUNE = None
-# Daily model-tier re-pick: the OpenRouter catalog + prices move
-# fast, and the player explicitly wants the think tank to re-derive the best
-# value pick per band from that day's scores AND prices rather than freezing
-# a stale choice. refresh_model_tiers() already does exactly that (best score
-# within the band's quality floor, then cheapest); this loop just runs it once
-# a day so the tiers track the market instead of a manual button.
-MODEL_TIER_REFRESH_INTERVAL_S = 24 * 3600  # daily
+# Model-tier re-pick, two cadences (player's call):
+#   1. MODEL_TIER_REFRESH_INTERVAL_S -- full re-pick of EVERY band from the
+#      live catalog + current benchmark scores (catches new/better models,
+#      availability changes, score updates even when selected prices hold).
+#   2. TIER_PRICE_WATCH_INTERVAL_S -- cheap watch of ONLY the selected tier
+#      models' catalog prices. If any selected model's price moved (or it
+#      vanished from the catalog), trigger a full re-pick so a better option
+#      at that band is found within ~30 min instead of at the next full run.
+# OpenRouter prices change with no published schedule (provider list prices
+# repriced overnight -- GLM 5.3 Flash went $0.65 -> $1.22 between two runs).
+# Both cadences share ONE pick path (refresh_model_tiers) and only log a
+# governance entry when a band's model actually CHANGED, so price-watch cycles
+# that find nothing don't bury the activity feed. Costs: catalog read is free;
+# a re-pick is ~6 sub-cent verify probes (~$0.001, measured) -- a few cents a
+# month even with both loops active. tier_daily_log keyed (log_date, band) so
+# same-day reruns overwrite in place. In-flight calls are unaffected by any
+# re-pick: the model slug is resolved once when the call starts and the
+# request is already in flight; model_tiers rows update in one transaction,
+# so readers see the old complete set or the new complete set, never a mix.
+MODEL_TIER_REFRESH_INTERVAL_S = 2 * 3600   # full re-pick: every other hour
+TIER_PRICE_WATCH_INTERVAL_S = 30 * 60      # price watch: every 30 minutes
 _MAX_IDLE_MINUTES = 0.0  # 0 = disabled; set via --max-idle-minutes (float: allows <1m)
 _LAST_REQUEST_TIME = None  # touched by the no_store middleware below
 # Sleep-not-die. When --max-idle-minutes elapses, the server does
@@ -1418,39 +1432,101 @@ def _decision_archive_summary(since_ts):
         return None
 
 
+async def _tier_refresh_logged(reason):
+    """Run one full tier re-pick (refresh_model_tiers) and log it through the
+    governance/audit path ONLY when a band's model actually CHANGED -- a cycle
+    where every band held its model is a no-op check, not a governance event,
+    so frequent runs don't bury the activity feed in identical entries. Logged
+    attributed to the admin (or the senior-most director standing in), so the
+    player can see "Theo re-picked the tiers" like a bank review. `reason`
+    records WHY this cycle ran (schedule vs price-watch trigger). Always runs
+    the Jev decision-model failover check, which self-gates on availability.
+    Returns (fresh, changed)."""
+    before = {band: m['slug'] for band, m in get_cached_model_tiers().items()}
+    fresh = await refresh_model_tiers()
+    state = get_state_from_db()
+    actor = _admin_agent_id(state) or _senior_most_director_id(state)
+    after = {band: m['id'] for band, m in fresh.items()}
+    changed = after != before
+    if changed:
+        if actor:
+            log_action(actor, 'model_tiers_refreshed',
+                       {'tiers': after, 'reason': reason,
+                        'note': 'scheduled re-pick: best scored value within each band\'s quality floor, then cheapest'},
+                       authorized=False)
+        else:
+            print(f'[model-tiers] tier refresh changed picks, no admin/director to attribute to: {after}', flush=True)
+    await _auto_failover_jev_if_gone(fresh, actor)
+    return fresh, changed
+
+
 async def _model_tier_refresh_loop():
-    """Daily model-tier re-pick, run AS a governance action by the admin (or
-    the senior-most director standing in), not a silent background chore
-    The OpenRouter catalog + prices move fast; the player wants
-    the think tank to re-derive each band's best value from THAT day's scores and
-    prices. refresh_model_tiers() already picks best-score-within-floor, then
-    cheapest -- this loop just runs it daily and logs the decision through the
-    normal governance/audit path (log_action), attributed to whoever holds the
-    admin authority, so the player can see "Theo re-picked the tiers" in the
-    activity feed exactly like a bank review or a firing review."""
+    """Full model-tier re-pick of every band, every
+    MODEL_TIER_REFRESH_INTERVAL_S (every other hour), run AS a governance
+    action (see _tier_refresh_logged). Catches what a price watch cannot:
+    a new/better model entering the catalog, an availability change, or a
+    benchmark score update while the selected models' own prices hold."""
     while True:
         await asyncio.sleep(MODEL_TIER_REFRESH_INTERVAL_S)
         try:
-            fresh = await refresh_model_tiers()
-            state = get_state_from_db()
-            actor = _admin_agent_id(state) or _senior_most_director_id(state)
-            if actor:
-                log_action(actor, 'model_tiers_refreshed',
-                           {'tiers': {band: m['id'] for band, m in fresh.items()},
-                            'note': 'daily re-pick: best scored value within each band\'s quality floor, then cheapest'},
-                           authorized=False)
-            else:
-                print(f'[model-tiers] daily refresh ran, no admin/director to attribute to: {list(fresh)}', flush=True)
-            await _auto_failover_jev_if_gone(fresh, actor)
+            await _tier_refresh_logged('scheduled full re-pick')
         except Exception as e:
             # A refresh failure is not fatal -- keep the previous tiers and
-            # retry tomorrow (fails open to the last good choice).
-            print(f'[model-tiers] daily refresh failed (keeping current tiers): {e}', flush=True)
+            # retry on the next cycle (fails open to the last good choice).
+            print(f'[model-tiers] tier refresh failed (keeping current tiers): {e}', flush=True)
+
+
+def _selected_tier_price_moves_sync():
+    """Bands whose SELECTED model's live catalog price no longer matches the
+    stored price_per_m (or whose slug vanished from the catalog entirely).
+    Uses the exact price metric _bucket_models_by_price stores --
+    (prompt + completion) * 1e6 -- so a "move" here is the same number the
+    pick would see. Returns a set of band names; empty = nothing moved.
+    Free/unparseable catalog entries count as moved (the stored pick is never
+    free, so that only fires on a real delist or repricing)."""
+    models = _fetch_openrouter_catalog_sync()
+    catalog = {}
+    for m in models:
+        if ':batch' in m['id']:
+            continue
+        try:
+            p, c = float(m['pricing']['prompt']), float(m['pricing']['completion'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        catalog[m['id']] = (p + c) * 1_000_000
+    moves = set()
+    with _db() as conn:
+        rows = conn.execute('SELECT band, slug, price_per_m FROM model_tiers').fetchall()
+    for band, slug, price in rows:
+        live = catalog.get(slug)
+        if live is None or abs(live - (price or 0.0)) > 1e-9:
+            moves.add(band)
+    return moves
+
+
+async def _tier_price_watch_loop():
+    """Every TIER_PRICE_WATCH_INTERVAL_S (30 min), re-read the catalog and
+    compare it against ONLY the currently selected tier models. When any
+    selected model's price moved (or it dropped out of the catalog), run the
+    full re-pick so a better option at that band is found now rather than at
+    the next every-other-hour sweep. A cycle where every selected price held
+    is a free catalog read and a silent no-op -- no probes, no log entry."""
+    while True:
+        await asyncio.sleep(TIER_PRICE_WATCH_INTERVAL_S)
+        try:
+            moved = await asyncio.to_thread(_selected_tier_price_moves_sync)
+            if moved:
+                print(f'[model-tiers] price watch: selected-tier price moved for {sorted(moved)}; re-running pick', flush=True)
+                await _tier_refresh_logged(f'price-watch: selected price moved for {sorted(moved)}')
+        except Exception as e:
+            # Same fail-open rule as the full loop: keep current tiers, retry
+            # on the next cycle -- a watch failure never drops a working pick.
+            print(f'[model-tiers] price watch failed (keeping current tiers): {e}', flush=True)
 
 
 async def _auto_failover_jev_if_gone(fresh, actor):
     """Jev's decision model is normally a deliberate, player-set choice that is
-    never auto-updated (see _decision_model_chain). The exception: the daily
+    never auto-updated (see _decision_model_chain). The exception: the periodic
     tier refresh should auto-determine it when the CURRENT choice disappears
     from availability -- if the primary slug no longer verifies AND no later
     OpenRouter chain entry verifies either (the Colab/Laya standby is excluded:
@@ -1475,7 +1551,7 @@ async def _auto_failover_jev_if_gone(fresh, actor):
     if actor:
         log_action(actor, 'jev_model_auto_failover',
                    {'from': current, 'to': replacement['id'],
-                    'note': 'daily refresh: current decision model no longer available; fell back to the verified planning-band pick'},
+                    'note': 'scheduled refresh: current decision model no longer available; fell back to the verified planning-band pick'},
                    authorized=False)
     print(f'[model-tiers] Jev decision model {current} unavailable; auto-fell-back to {replacement["id"]}', flush=True)
 
@@ -4978,6 +5054,7 @@ async def _lifespan(app):
     backup_task = asyncio.create_task(_backup_loop())
     prune_task = asyncio.create_task(_log_prune_loop())
     tier_refresh_task = asyncio.create_task(_model_tier_refresh_loop())
+    tier_price_watch_task = asyncio.create_task(_tier_price_watch_loop())
     calibration_task = asyncio.create_task(_calibration_loop())
     weekly_review_task = asyncio.create_task(_weekly_review_loop())
     colab_task = asyncio.create_task(_colab_failover_loop())
@@ -5018,6 +5095,7 @@ async def _lifespan(app):
         colab_compute_task.cancel()
     prune_task.cancel()
     tier_refresh_task.cancel()
+    tier_price_watch_task.cancel()
     if telegram_task is not None:
         telegram_task.cancel()
     ask_drain_task.cancel()
