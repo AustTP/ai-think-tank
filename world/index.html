@@ -749,6 +749,26 @@
       <input type="text" id="bigTaskInput" placeholder="Give the admins a large task to break down and delegate...">
       <button id="bigTaskBtn">Delegate</button>
     </div>
+    <details id="bigTaskPins" style="margin:4px 0; font-size:12px; opacity:0.9; text-align:left;">
+      <summary style="cursor:pointer; opacity:0.7;">Optional pins (skip to let the team plan freely)</summary>
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-top:6px;">
+        <label>Budget USD (total for the ask)
+          <input type="number" id="pinBudgetUsd" min="0" step="0.01" placeholder="e.g. 5" style="width:100%;">
+        </label>
+        <label>Roles / skills (comma-separated)
+          <input type="text" id="pinRoles" placeholder="e.g. backend, data" style="width:100%;">
+        </label>
+        <label style="grid-column:1/-1;">Hard constraints -- never do (one per line)
+          <textarea id="pinConstraints" rows="2" placeholder="e.g. Never touch production credentials" style="width:100%;"></textarea>
+        </label>
+        <label style="grid-column:1/-1;">Must-include tasks (comma-separated)
+          <input type="text" id="pinMustInclude" placeholder="e.g. write runbook, add tests" style="width:100%;">
+        </label>
+        <label style="grid-column:1/-1;">Order (comma-separated, earlier first)
+          <input type="text" id="pinOrder" placeholder="e.g. research, prototype, document" style="width:100%;">
+        </label>
+      </div>
+    </details>
     <p id="bigTaskStatus" class="meeting-msg"></p>
     <hr style="opacity:0.3;">
     <h4 style="margin:6px 0 2px;">Sprints <span style="opacity:0.6; font-size:11px;">(director-authored via /api/intent; teams must each have a scrum master)</span></h4>
@@ -2447,10 +2467,35 @@ async function refreshInboxCount() {
 // and delegate it, rather than you hand-assigning individual TASK_POOL
 // entries yourself. See assignBigTask() (tasks.js) for the actual
 // breakdown-then-Jev-assign flow -- this is just the UI wiring.
+function clearBigTaskPins() {
+  ['pinBudgetUsd', 'pinRoles', 'pinConstraints', 'pinMustInclude', 'pinOrder']
+    .forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  const pins = document.getElementById('bigTaskPins');
+  if (pins) pins.open = false;
+}
 async function handleBigTaskDelegate() {
   const input = document.getElementById('bigTaskInput');
   const goal = input.value.trim();
   if (!goal) return;
+  // Optional pins: only non-empty fields are sent; an all-empty form is the
+  // same as not opening the section at all (the tank plans freely).
+  const constraints = {};
+  const budgetRaw = (document.getElementById('pinBudgetUsd')?.value || '').trim();
+  if (budgetRaw) {
+    const n = parseFloat(budgetRaw);
+    if (Number.isFinite(n) && n > 0) constraints.budgetUsd = n;
+  }
+  const listify = (id) => (document.getElementById(id)?.value || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const roles = listify('pinRoles');
+  if (roles.length) constraints.roles = roles;
+  const must = listify('pinMustInclude');
+  if (must.length) constraints.mustInclude = must;
+  const order = listify('pinOrder');
+  if (order.length) constraints.order = order;
+  const neverLines = (document.getElementById('pinConstraints')?.value || '')
+    .split('\n').map(s => s.trim()).filter(Boolean);
+  if (neverLines.length) constraints.constraints = neverLines;
   const statusEl = document.getElementById('bigTaskStatus');
   const btn = document.getElementById('bigTaskBtn');
   btn.disabled = true;
@@ -2462,10 +2507,12 @@ async function handleBigTaskDelegate() {
       // delegation goes through the server intent endpoint, which plans and
       // queues the subtasks server-side and returns the same {admin, subtasks}
       // shape the UI below already expects.
+      const payload = { goal };
+      if (Object.keys(constraints).length) payload.constraints = constraints;
       const res = await apiFetch('/api/intent/assign-big-task', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ goal })
+        body: JSON.stringify(payload)
       });
       result = await res.json();
       if (!res.ok && !result.error) result.error = 'Could not delegate that right now.';
@@ -2482,6 +2529,7 @@ async function handleBigTaskDelegate() {
       statusEl.textContent = result.note ||
         `${AGENTS[result.admin] ? AGENTS[result.admin].name : result.admin} filed this with the ${result.teamName || result.team} team to break into stories at its next planning session.`;
       input.value = '';
+      clearBigTaskPins();
     } else {
       // Reports what was QUEUED, not what was assigned: assignBigTask no
       // longer assigns inline. The admin plans, the work lands in
@@ -2497,6 +2545,7 @@ async function handleBigTaskDelegate() {
       });
       statusEl.textContent = `${adminName} split this into ${result.subtasks.length} subtask(s), now queued: ${lines.join('; ')}`;
       input.value = '';
+      clearBigTaskPins();
     }
   } catch (e) {
     statusEl.textContent = 'Something went wrong delegating that.';

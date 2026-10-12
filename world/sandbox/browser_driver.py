@@ -29,7 +29,7 @@ import sys
 import traceback
 
 
-OPS = ('goto', 'read', 'fill', 'click', 'submit', 'screenshot')
+OPS = ('goto', 'read', 'fill', 'fill_many', 'login', 'click', 'submit', 'screenshot')
 MAX_TEXT = int(os.environ.get('BROWSER_ACT_MAX_TEXT', '16000'))
 MAX_FIELDS = 40
 MAX_LINKS = 40
@@ -101,8 +101,19 @@ def _launch(playwright, action):
         vp = {'width': int(w), 'height': int(h)}
     except Exception:
         vp = {'width': 1280, 'height': 900}
+    # A real Chrome UA, not Playwright's default HeadlessChrome string. Sites
+    # behind CDN WAFs (CloudFront, Fastly, Akamai) serve a 403 to any client
+    # whose UA says HeadlessChrome regardless of how real the rest of the
+    # fingerprint looks -- the sandbox is egressed through the same IP as the
+    # host (verified: a host curl with a normal UA gets 200 from HF, the
+    # sandbox browser got 403 purely on this string). Masking the UA is the
+    # least that unblocks legitimate logins to player-vetted, allowlisted
+    # sites the player explicitly wants agents to reach.
     ctx = playwright.chromium.launch_persistent_context(
         profile_dir, headless=True, args=args, viewport=vp, accept_downloads=False,
+        user_agent=('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/131.0.0.0 Safari/537.36'),
     )
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     return ctx, page
@@ -118,6 +129,10 @@ def run(action):
         return {'ok': False, 'op': op, 'error': 'goto requires url'}
     if op == 'fill' and not action.get('selector'):
         return {'ok': False, 'op': op, 'error': 'fill requires selector'}
+    if op == 'fill_many' and not action.get('fields'):
+        return {'ok': False, 'op': op, 'error': 'fill_many requires fields (list of {selector, value})'}
+    if op == 'login' and not action.get('fields'):
+        return {'ok': False, 'op': op, 'error': 'login requires fields (list of {selector, value})'}
     if op == 'click' and not action.get('selector'):
         return {'ok': False, 'op': op, 'error': 'click requires selector'}
     timeout_ms = int(action.get('timeoutMs') or 30000)
@@ -129,6 +144,15 @@ def run(action):
         with sync_playwright() as p:
             ctx, page = _launch(p, action)
             try:
+                # Every op that carries a url navigates there first. Without
+                # this, fill/click/submit/read each open a blank page (the
+                # persistent profile restores cookies but not the page itself),
+                # so a fill would time out waiting for a selector that was
+                # never on screen. goto is the only op that skips this -- it IS
+                # the navigation.
+                if op != 'goto' and action.get('url'):
+                    page.goto(action.get('url'), timeout=timeout_ms, wait_until='domcontentloaded')
+                    _settle(page, 2500)
                 if op == 'goto':
                     page.goto(action.get('url'), timeout=timeout_ms, wait_until='domcontentloaded')
                     _settle(page, 2500)
@@ -140,6 +164,22 @@ def run(action):
                 if op == 'fill':
                     page.fill(action.get('selector'), action.get('value') or '', timeout=timeout_ms)
                     _settle(page, 500)
+                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
+                    return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
+                if op == 'fill_many':
+                    for f in action.get('fields', []):
+                        page.locator(f['selector']).first.wait_for(state='visible', timeout=timeout_ms)
+                        page.fill(f['selector'], f.get('value') or '', timeout=timeout_ms)
+                    _settle(page, 500)
+                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
+                    return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
+                if op == 'login':
+                    for f in action.get('fields', []):
+                        page.locator(f['selector']).first.wait_for(state='visible', timeout=timeout_ms)
+                        page.fill(f['selector'], f.get('value') or '', timeout=timeout_ms)
+                    _settle(page, 500)
+                    page.locator(action.get('submitSelector') or 'button[type=submit]').first.click(timeout=timeout_ms)
+                    _settle(page, 3000)
                     state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
                 if op == 'click':

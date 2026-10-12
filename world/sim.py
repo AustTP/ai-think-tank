@@ -6425,7 +6425,7 @@ def _estimate_employees_for_request(goal):
 
 
 def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employees=None,
-                               chooser=None):
+                               chooser=None, constraints=None):
     """Create a brand-new team to take an incoming large request when every
     existing team is already busy in a sprint. Spawns a new
     DIRECTOR (reporting to the admin), a fresh team record, one EMPLOYEE (or
@@ -6496,6 +6496,21 @@ def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employee
         'filedAt': now_ms, 'status': 'pending',
         'origin': 'large_request', 'teamId': director_id,
     }
+    # Optional player pins ride the request so this team's refinement sees
+    # them (same shape as file_large_request's; absent = plan freely).
+    if isinstance(constraints, dict) and constraints:
+        pinned = {}
+        budget = constraints.get('budgetUsd')
+        if isinstance(budget, (int, float)) and budget > 0:
+            pinned['budgetUsd'] = float(budget)
+        for key in ('constraints', 'roles', 'order', 'mustInclude'):
+            val = constraints.get(key)
+            if isinstance(val, (list, tuple)):
+                cleaned = [str(v).strip()[:200] for v in val if str(v).strip()]
+                if cleaned:
+                    pinned[key] = cleaned[:20]
+        if pinned:
+            req['playerConstraints'] = pinned
     state.setdefault('backlogRequests', []).append(req)
     # Kick this team's refinement to be immediately due (next pass), not weekly.
     kick_refinement_now(state, director_id, now_ms)
@@ -7205,13 +7220,29 @@ def file_work_request(state, agent_id, title, room, reason=None):
     return req
 
 
-def file_large_request(state, authority_id, goal, team_id, now_ms=None):
+def file_large_request(state, authority_id, goal, team_id, now_ms=None, constraints=None):
     """File a staffable large ask as a pending BREAKDOWN request for a team's
     breakdown ceremony to card into stories/spikes. The ask is attributed to
     the free authority who chose the team and tagged with the receiving team
     so the breakdown ceremony convenes the RIGHT team's scrum master + workers.
     Never predicts subtasks up front -- the ceremony does that. Returns the new
-    request dict, or None if malformed."""
+    request dict, or None if malformed.
+
+    `constraints` is an OPTIONAL dict of player-pinned guidance the filing
+    path may attach when the player chooses to steer (all keys optional, all
+    absent = the ceremony plans freely, which is the default):
+      budgetUsd (number)    -- a total model-spend ceiling the player named
+                               for the whole ask. Passed to the breakdown as
+                               CONTEXT so the scrum master allocates it across
+                               cards with judgment, not a mechanical split.
+      constraints (list)    -- hard "never" rules, as context for the team.
+      roles (list)          -- preferred skills/roles, as context.
+      order (list)          -- sequencing hints, as context.
+      mustInclude (list)    -- concrete tasks the player wants covered.
+    These are CONTEXT for the agents' decisions, not mechanical overrides --
+    the scrum master/director weighs them like any other signal. A malformed
+    constraints dict is ignored (the ask still files -- a bad pin never blocks
+    the work)."""
     goal = (goal or '').strip()
     if not goal or not team_id:
         return None
@@ -7223,6 +7254,19 @@ def file_large_request(state, authority_id, goal, team_id, now_ms=None):
         'filedAt': now_ms, 'status': 'pending', 'teamId': team_id,
         'origin': 'large_request', 'breakdown': True,
     }
+    if isinstance(constraints, dict) and constraints:
+        pinned = {}
+        budget = constraints.get('budgetUsd')
+        if isinstance(budget, (int, float)) and budget > 0:
+            pinned['budgetUsd'] = float(budget)
+        for key in ('constraints', 'roles', 'order', 'mustInclude'):
+            val = constraints.get(key)
+            if isinstance(val, (list, tuple)):
+                cleaned = [str(v).strip()[:200] for v in val if str(v).strip()]
+                if cleaned:
+                    pinned[key] = cleaned[:20]
+        if pinned:
+            req['playerConstraints'] = pinned
     state.setdefault('backlogRequests', []).append(req)
     return req
 
@@ -8902,10 +8946,27 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
             continue
         filed_by = req.get('filedBy')
         author = (agents.get(filed_by) or {})
+        pc = req.get('playerConstraints') or {}
+        # Player pins are CONTEXT for the scrum master's judgment, not
+        # mechanical overrides -- woven in the same way the reason text is.
+        pin_bits = []
+        if pc.get('budgetUsd'):
+            pin_bits.append(f"The player named a total budget of ${pc['budgetUsd']:.2f} "
+                            "for this work -- factor it into whether/how to card it.")
+        if pc.get('constraints'):
+            pin_bits.append('The player listed these hard prohibitions: '
+                            + '; '.join(pc['constraints']) + '.')
+        if pc.get('roles'):
+            pin_bits.append('The player prefers this card to suit these roles/skills: '
+                            + '; '.join(pc['roles']) + '.')
+        if pc.get('mustInclude'):
+            pin_bits.append('The player named these tasks as important to cover: '
+                            + '; '.join(pc['mustInclude']) + '.')
+        pin_text = (' ' + ' '.join(pin_bits)) if pin_bits else ''
         instructions = (f"{sm_name} is the scrum master running backlog refinement for {filed_by}'s "
                         f"({author.get('name') or filed_by} / {author.get('role') or 'worker'}) work request "
                         f"in the {req.get('room')} room. Requested story: '{req.get('title')}'. Reason: "
-                        f"{req.get('reason')}.")
+                        f"{req.get('reason')}.{pin_text}")
         ctx = _refinement_context_for_room(state, req.get('room'))
         if ctx:
             instructions += f" Roadmap context for this room: {ctx}."
@@ -9284,9 +9345,38 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             continue
         goal = req.get('goal') or req.get('title') or 'untitled large request'
         author = agents.get(req.get('filedBy')) or {}
+        pc = req.get('playerConstraints') or {}
+        # Player pins are CONTEXT for the scrum master's judgment, not
+        # mechanical overrides. They're woven into the instructions the same
+        # way the goal itself is -- the model weighs them like any other signal.
+        pin_bits = []
+        if pc.get('budgetUsd'):
+            pin_bits.append(f"The player named a total budget of ${pc['budgetUsd']:.2f} "
+                            "for this whole ask. Allocate it across the cards with judgment "
+                            "-- larger/riskier cards may deserve more, trivial ones less. "
+                            "Set each card's \"budgetUsd\" field to its allocated share "
+                            "(a positive number).")
+        if pc.get('constraints'):
+            pin_bits.append('The player listed these hard prohibitions the team must respect: '
+                            + '; '.join(pc['constraints']) + '.')
+        if pc.get('roles'):
+            pin_bits.append('The player prefers cards suited to these roles/skills: '
+                            + '; '.join(pc['roles']) + '.')
+        if pc.get('order'):
+            pin_bits.append('The player wants this rough sequencing (earlier items '
+                            'should be planned before later ones): '
+                            + ' -> '.join(pc['order']) + '.')
+        if pc.get('mustInclude'):
+            pin_bits.append('The player named these tasks as important to cover '
+                            '(factor them into the plan): '
+                            + '; '.join(pc['mustInclude']) + '.')
+        pin_text = (' ' + ' '.join(pin_bits)) if pin_bits else ''
+        # When the player named a budget, ask the model to return per-card
+        # budgetUsd so its judgment (not a mechanical split) allocates the pot.
+        budget_field = '"budgetUsd":number-or-omit,' if pc.get('budgetUsd') else ''
         instructions = (
             f"{sm_name} is the scrum master of the receiving team breaking down a large request "
-            f"filed by {author.get('name') or req.get('filedBy')}: '{goal[:200]}'. "
+            f"filed by {author.get('name') or req.get('filedBy')}: '{goal[:200]}'.{pin_text} "
             "Break it into as many concrete stories (or spikes for investigation-first work) as the work actually "
             "requires -- at least one, never a fixed count: a small ask may be a single card, a sprawling one may need many. "
             "Do NOT assign a room to a card -- the buildings are shared and the agent who picks the work up figures out "
@@ -9296,7 +9386,7 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             "ONLY when the card has hard prohibitions the worker must never do (omit otherwise), and a "
             "\"sizeEstimate\" of S/M/L. "
             "Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: "
-            '{"items":[{"title":"short title","type":"story|spike","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L"}]}'
+            '{"items":[{"title":"short title","type":"story|spike","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L",' + budget_field + '}]}'
         )
         data = decider(state, instructions, goal)
         items = []
@@ -9318,6 +9408,15 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
                 instructions_text += f"\n\nAcceptance criteria:\n{ac}"
             if never:
                 instructions_text += f"\n\nNEVER:\n{never}"
+            # Budget: when the player named a total, the scrum master was told
+            # to allocate it across cards with judgment (see the prompt). Pick
+            # up whatever share it assigned; a missing/invalid share means the
+            # model chose not to allocate this card, so leave it unbudgeted
+            # (type default applies) rather than forcing an even split.
+            card_budget = None
+            raw_budget = s.get('budgetUsd')
+            if isinstance(raw_budget, (int, float)) and raw_budget > 0:
+                card_budget = float(raw_budget)
             queue_work(state, [{
                 'title': title, 'goal': goal[:200], 'instructions': instructions_text,
                 'teamId': req.get('teamId'), 'taskType': task_type,
@@ -9326,6 +9425,7 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
                 # estimate and same-priority work is ordered largest-first.
                 'sizeEstimate': s.get('sizeEstimate'),
                 'never': never,
+                'budgetUsd': card_budget,
             }])
         req['status'] = 'accepted'
         req['brokenDown'] = True

@@ -386,6 +386,72 @@ class EnvReload(_ApiTestCase):
             serve.PUBLISH_REMOTE_URL = old_remote
 
 
+class BudgetApi(_ApiTestCase):
+    """Player-session budget knobs: GET reports every settable name + live
+    usage; POST sets them by rewriting .env + reloading. Agent keys are
+    refused (budget is an operator control, same gate as /api/env/reload)."""
+
+    def test_agent_key_alone_is_refused(self):
+        raw = _raw_client()
+        r = raw.get('/api/budget', headers=_agent_headers())
+        self.assertEqual(r.status_code, 401)
+        r = raw.post('/api/budget', json={'SPEND_CAP_USD': 99},
+                     headers=_agent_headers())
+        self.assertEqual(r.status_code, 401)
+
+    def test_player_session_reads_knobs(self):
+        c = _client()
+        r = c.get('/api/budget')
+        self.assertEqual(r.status_code, 200, r.text)
+        knobs = r.json()['knobs']
+        for name in ('SPEND_CAP_USD', 'HIGH_TIER_MONTHLY_BUDGET_USD',
+                     'PAGE_REQUEST_MONTHLY_BUDGET', 'HIGH_TIER_MAX_PRICE_USD'):
+            self.assertIn(name, knobs)
+            self.assertIn('value', knobs[name])
+            self.assertIn('kind', knobs[name])
+
+    def test_player_sets_a_knob_and_rebinds(self):
+        old_load = serve._load_env
+        old_cap = serve.SPEND_CAP_USD
+        # Point the writer at a temp .env so the real one is never touched.
+        # _env_file_path() resolves under the module-patched THINK_TANK_DIR.
+        tmp_env = os.path.join(serve.THINK_TANK_DIR, '.env')
+        with open(tmp_env, 'w') as f:
+            f.write('SPEND_CAP_USD=50\nOPENROUTER_API_KEY=sk-keepme\n')
+        try:
+            real = serve._load_env()
+            # The reload path re-reads via _load_env; simulate the post-write
+            # read so the global rebinds to what the writer produced.
+            serve._load_env = lambda: {**real, 'SPEND_CAP_USD': '75'}
+            c = _client()
+            r = c.post('/api/budget', json={'SPEND_CAP_USD': 75})
+            self.assertEqual(r.status_code, 200, r.text)
+            body = r.json()
+            self.assertTrue(body['ok'])
+            self.assertIn('SPEND_CAP_USD', body['written'])
+            # The temp .env now has the new value and the API key is untouched.
+            with open(tmp_env) as f:
+                text = f.read()
+            self.assertIn('SPEND_CAP_USD=75', text)
+            self.assertIn('OPENROUTER_API_KEY=sk-keepme', text)
+        finally:
+            serve._load_env = old_load
+            serve.SPEND_CAP_USD = old_cap
+            if os.path.exists(tmp_env):
+                os.remove(tmp_env)
+
+    def test_unknown_or_negative_is_refused(self):
+        c = _client()
+        r = c.post('/api/budget', json={'NOT_A_KNOB': 1})
+        self.assertEqual(r.status_code, 400)
+        r = c.post('/api/budget', json={'SPEND_CAP_USD': -5})
+        self.assertEqual(r.status_code, 400)
+        r = c.post('/api/budget', json={'SPEND_CAP_USD': 'lots'})
+        self.assertEqual(r.status_code, 400)
+        r = c.post('/api/budget', json={})
+        self.assertEqual(r.status_code, 400)
+
+
 class HardeningEndpoints(_ApiTestCase):
     """The compromised-key defenses: player-only direct coverage, Verifier
     role gate on review, covered-flip rate cap, and the immutable audit."""

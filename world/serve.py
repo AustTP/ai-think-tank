@@ -338,6 +338,7 @@ _ENV_RELOAD_FIELDS = {
     'OPEN_SKY_CLIENT_ID': lambda e: e.get('OPEN_SKY_CLIENT_ID'),
     'OPEN_SKY_CLIENT_SECRET': lambda e: e.get('OPEN_SKY_CLIENT_SECRET'),
     'AISSTREAM_API_KEY': lambda e: e.get('AISSTREAM_API_KEY'),
+    'HF_TOKEN': lambda e: e.get('HF_TOKEN'),
     'SPEND_CAP_USD': lambda e: float(e.get('SPEND_CAP_USD', '50') or 0),
     'AGENT_SPEND_CAP_USD': lambda e: float(e.get('AGENT_SPEND_CAP_USD', '0') or 0),
     'PAGE_REQUEST_MONTHLY_BUDGET': lambda e: int(e.get('PAGE_REQUEST_MONTHLY_BUDGET', '1000') or 1000),
@@ -345,6 +346,8 @@ _ENV_RELOAD_FIELDS = {
     'HIGH_TIER_MAX_PRICE_USD': lambda e: float(e.get('HIGH_TIER_MAX_PRICE_USD', '0') or 0),
     'CODING_TIER_MAX_PRICE_USD': lambda e: float(e.get('CODING_TIER_MAX_PRICE_USD', '0') or 0),
     'VISION_TIER_MAX_PRICE_USD': lambda e: float(e.get('VISION_TIER_MAX_PRICE_USD', '0') or 0),
+    'SUBLOW_TIER_MAX_PRICE_USD': lambda e: float(e.get('SUBLOW_TIER_MAX_PRICE_USD', '0.09') or 0),
+    'APIFY_MONTHLY_BUDGET_USD': lambda e: float(e.get('APIFY_MONTHLY_BUDGET_USD', '5') or 0),
     'COLAB_MONTHLY_UNITS': lambda e: float(e.get('COLAB_MONTHLY_UNITS', '0') or 0),
     'DECISION_CACHE_TTL_S': lambda e: float(e.get('DECISION_CACHE_TTL_S', '3600') or 0),
     'DECISION_KEY_WINDOW_S': lambda e: float(e.get('DECISION_KEY_WINDOW_S', str(7 * 24 * 3600)) or (7 * 24 * 3600)),
@@ -3977,12 +3980,13 @@ def _expire_handles(now=None):
                      (time.time() if now is None else now,))
 
 
-def resolve_capability_handle(agent_id, handle, method, url):
-    """The confused-deputy core: an agent presents an opaque handle; the server
-    verifies the grant (right agent, unexpired, host+method in scope), decrypts
-    the real credential, and returns {'headers': {...}} to inject into the
-    outbound request. Never returns or logs the raw secret. Returns None when
-    the handle is invalid or out of scope so the caller knows to refuse."""
+def verify_capability_handle_scope(agent_id, handle, method, url):
+    """The scope-check half of resolve_capability_handle: verifies the grant
+    exists, is for this agent, is unexpired, and the host+method are in scope.
+    Returns the grant row (credential_name, purpose, service) or None. Does NOT
+    decrypt the credential -- callers that need the secret call
+    resolve_capability_handle after their own policy gate (Jev) has approved
+    the action, so a blocked action never touches the vault."""
     if not agent_id or not handle:
         return None
     with _db() as conn:
@@ -4019,8 +4023,27 @@ def resolve_capability_handle(agent_id, handle, method, url):
         if method not in (allowed_methods or []):
             return None
         cred_row = conn.execute(
-            'SELECT service, encrypted_value FROM external_credentials WHERE name = ?',
+            'SELECT service FROM external_credentials WHERE name = ?',
             (credential_name,)).fetchone()
+        if not cred_row:
+            return None
+        service = cred_row[0]
+    return {'credential_name': credential_name, 'purpose': purpose, 'service': service}
+
+
+def resolve_capability_handle(agent_id, handle, method, url):
+    """The confused-deputy core: an agent presents an opaque handle; the server
+    verifies the grant (right agent, unexpired, host+method in scope), decrypts
+    the real credential, and returns {'headers': {...}} to inject into the
+    outbound request. Never returns or logs the raw secret. Returns None when
+    the handle is invalid or out of scope so the caller knows to refuse."""
+    grant = verify_capability_handle_scope(agent_id, handle, method, url)
+    if grant is None:
+        return None
+    with _db() as conn:
+        cred_row = conn.execute(
+            'SELECT service, encrypted_value FROM external_credentials WHERE name = ?',
+            (grant['credential_name'],)).fetchone()
         if not cred_row:
             return None
         service, encrypted = cred_row
@@ -4041,13 +4064,13 @@ def resolve_capability_handle(agent_id, handle, method, url):
     except (ValueError, TypeError):
         payload = {'kind': 'token', 'token': secret}
     kind = payload.get('kind', 'token')
-    grant = {'credential_name': credential_name, 'purpose': purpose,
-             'service': service, 'kind': kind,
-             'secret': payload.get('token') if kind == 'token' else None}
+    result = {'credential_name': grant['credential_name'], 'purpose': grant['purpose'],
+              'service': service, 'kind': kind,
+              'secret': payload.get('token') if kind == 'token' else None}
     if kind == 'login':
-        grant['username'] = payload.get('username')
-        grant['password'] = payload.get('password')
-    return grant
+        result['username'] = payload.get('username')
+        result['password'] = payload.get('password')
+    return result
 
 # Real background health checks -- see compute_health_snapshot below.
 # Runs independently of any browser tab (this loop lives in the server
@@ -5567,6 +5590,12 @@ OPEN_SKY_CLIENT_SECRET = _load_env().get('OPEN_SKY_CLIENT_SECRET')
 # stream collector. Absent (blank) means the registered aisstream service
 # reports a missing credential.
 AISSTREAM_API_KEY = _load_env().get('AISSTREAM_API_KEY')
+# HuggingFace token: Hub API (model discovery/metadata) + Inference Providers
+# router (OpenAI-compatible chat at router.huggingface.co/v1). Loaded as a
+# module constant so the registry's env credential resolves it (same pattern
+# as the other service keys). Gated model repos still need a one-time license
+# accept on huggingface.co under this account; ungated models work immediately.
+HF_TOKEN = _load_env().get('HF_TOKEN')
 
 
 def _higgsfield_configured():
@@ -12379,7 +12408,7 @@ def _all_teams_busy_in_sprint(state):
     return True
 
 
-def _breakdown_into_shared_backlog(state, goal, admin_id):
+def _breakdown_into_shared_backlog(state, goal, admin_id, constraints=None):
     """WS-14: when every team is busy in a sprint, break a large ask into as
     many stories/spikes as the work actually requires (never a fixed count --
     a small ask may be a single card) and file them in the SHARED unassigned backlog under a
@@ -12389,13 +12418,44 @@ def _breakdown_into_shared_backlog(state, goal, admin_id):
     The breakdown is attributed to the admin (the standing authority); a team
     pulls the items first-come when a sprint closes. BLOCKING urllib call --
     callers must run it off-thread (asyncio.to_thread) so the /api/chat
-    loopback never deadlocks the single-worker event loop."""
+    loopback never deadlocks the single-worker event loop.
+
+    `constraints` is the OPTIONAL player-pin dict (same shape as
+    sim.file_large_request's); absent/empty means plan freely. Pins are
+    CONTEXT for the model's judgment, not mechanical overrides."""
     if not admin_id:
         return None
     import sim as _sim
+    pin_text = ''
+    budget_field = ''
+    if isinstance(constraints, dict) and constraints:
+        bits = []
+        if constraints.get('budgetUsd'):
+            bits.append(f"The player named a total budget of ${float(constraints['budgetUsd']):.2f} "
+                        "for this whole ask. Allocate it across the cards with judgment "
+                        "-- larger/riskier cards may deserve more, trivial ones less. "
+                        "Set each card's \"budgetUsd\" field to its allocated share "
+                        "(a positive number).")
+            budget_field = '"budgetUsd":number-or-omit,'
+        if constraints.get('constraints'):
+            bits.append('The player listed these hard prohibitions the team must respect: '
+                        + '; '.join(str(c) for c in constraints['constraints']) + '.')
+        if constraints.get('roles'):
+            bits.append('The player prefers cards suited to these roles/skills: '
+                        + '; '.join(str(r) for r in constraints['roles']) + '.')
+        if constraints.get('order'):
+            bits.append('The player wants this rough sequencing (earlier items '
+                        'should be planned before later ones): '
+                        + ' -> '.join(str(o) for o in constraints['order']) + '.')
+        if constraints.get('mustInclude'):
+            bits.append('The player named these tasks as important to cover '
+                        '(factor them into the plan): '
+                        + '; '.join(str(m) for m in constraints['mustInclude']) + '.')
+        if bits:
+            pin_text = ' ' + ' '.join(bits)
     system_prompt = (
         'You are the admin of a small think tank. A large task just arrived, but every '
-        'team is already committed to an active sprint, so the task cannot be staffed right now. '
+        'team is already committed to an active sprint, so the task cannot be staffed right now.' + pin_text + ' '
         'Break it into as many concrete stories (or spikes for investigation-first work) as the work actually '
         'requires -- at least one, never a fixed count: a small ask may be a single card, a sprawling one may need '
         'many. Each card is a single worker-sized card to be filed in the shared backlog and pulled by a team when '
@@ -12409,7 +12469,7 @@ def _breakdown_into_shared_backlog(state, goal, admin_id):
         '"never" list ONLY when the card has hard prohibitions the worker must never do (omit otherwise), and a '
         '"sizeEstimate" of S/M/L. '
         'Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: '
-        '{"feature":"short feature name","items":[{"title":"short title","type":"story|spike","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L"}]}'
+        '{"feature":"short feature name","items":[{"title":"short title","type":"story|spike","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L",' + budget_field + '}]}'
     )
     key = get_or_create_agent_key(admin_id)
     # High-stakes planning tier, JEV-gated: a large-request breakdown is exactly
@@ -12441,13 +12501,20 @@ def _breakdown_into_shared_backlog(state, goal, admin_id):
                                            now_ms, created_by=admin_id)
     out = []
     for s in items:
+        never = list(s.get('never') or []) if isinstance(s.get('never'), (list, tuple)) else []
         item = _sim.add_backlog_item(
             state, s['title'], feature['id'], admin_id, now_ms,
             item_type=s.get('type') or 'story',
             acceptance_criteria=s.get('acceptanceCriteria'),
             size_estimate=s.get('sizeEstimate'),
-            never=s.get('never'))
+            never=never or None)
         if item:
+            # Budget: pick up whatever share the model allocated (its
+            # judgment, informed by the player's total); a missing share means
+            # the model chose not to budget this card.
+            raw_budget = s.get('budgetUsd')
+            if isinstance(raw_budget, (int, float)) and raw_budget > 0:
+                item['budgetUsd'] = float(raw_budget)
             out.append(item)
     if not out:
         return None
@@ -12469,6 +12536,14 @@ async def intent_assign_big_task(request: Request):
     goal = (body.get('goal') or '').strip()
     if not goal:
         return JSONResponse({'error': 'no goal given'}, status_code=400)
+
+    # OPTIONAL player pins (all absent = the tank plans freely, the default).
+    # Only fields the player actually filled in are honored; a malformed pin
+    # is dropped, never a reason to refuse the whole ask.
+    constraints = None
+    raw_c = body.get('constraints')
+    if isinstance(raw_c, dict) and raw_c:
+        constraints = raw_c
 
     # Logged-in player (the /api/intent prefix is auth-protected above; the
     # session is a player login, not an agent -- there's no agent id on it, so
@@ -12494,7 +12569,8 @@ async def intent_assign_big_task(request: Request):
         admin_id_for_new = next((d.get('id') for d in (state.get('agentRoster') or [])
                                  if d.get('isAdmin')), None)
         backlogged = await asyncio.to_thread(_breakdown_into_shared_backlog,
-                                             state, goal, admin_id_for_new)
+                                             state, goal, admin_id_for_new,
+                                             constraints=constraints)
         if backlogged:
             save_state_to_db(state)
             log_action(player_id, 'big_task_backlogged',
@@ -12508,7 +12584,8 @@ async def intent_assign_big_task(request: Request):
                                  'items': len(backlogged['items']),
                                  'note': 'Every existing team was busy in a sprint, so this request was broken down and filed in the shared backlog under a feature. A team pulls from it (first-come) when a sprint closes.'})
         # Fallback: the model couldn't break it down -- spawn a fresh team.
-        new_team = _sim.spawn_new_team_for_request(state, goal, admin_id=admin_id_for_new)
+        new_team = _sim.spawn_new_team_for_request(state, goal, admin_id=admin_id_for_new,
+                                                   constraints=constraints)
         if new_team:
             save_state_to_db(state)
             log_action(player_id, 'big_task_new_team',
@@ -12543,13 +12620,15 @@ async def intent_assign_big_task(request: Request):
         return JSONResponse({'error': 'No free team is available to take this request right now -- try again shortly.'})
     team_id = team.get('id') or team.get('directorId')
     now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
-    req = _sim.file_large_request(state, admin_id, goal, team_id, now_ms)
+    req = _sim.file_large_request(state, admin_id, goal, team_id, now_ms,
+                                  constraints=constraints)
     if not req:
         return JSONResponse({'error': "Couldn't file the request -- try again shortly."}, status_code=500)
     save_state_to_db(state)
     log_action(player_id, 'big_task_staffed',
                {'admin': admin_id, 'goal': goal[:200], 'team': team_id,
-                'request': req['id']}, authorized=True)
+                'request': req['id'],
+                'pinned': sorted((req.get('playerConstraints') or {}).keys())}, authorized=True)
     team_name = team.get('name') or team_id
     return JSONResponse({'ok': True, 'staffed': True,
                          'admin': admin_id,
@@ -19670,6 +19749,182 @@ async def policy_reload(request: Request):
     return JSONResponse({'ok': True, 'loaded': result})
 
 
+# ---------------------------------------------------------------------------
+# Live budget knobs (player-session only). The monthly ceilings (SPEND_CAP_USD,
+# HIGH_TIER_MONTHLY_BUDGET_USD, APIFY_MONTHLY_BUDGET_USD, PAGE_REQUEST_MONTHLY_BUDGET,
+# COLAB_MONTHLY_UNITS) and the per-model price ceilings (HIGH/CODING/VISION_TIER_MAX_PRICE_USD)
+# are .env values that used to require a hand-edit + restart or /api/env/reload.
+# The PLAYER -- the operator -- can now set them live via POST /api/budget,
+# which rewrites the named keys in .env and rebinds the globals through the
+# existing _reload_env_config path. Agents cannot: the endpoint is
+# _require_player_session gated, same as /api/env/reload and /api/policy/reload.
+# A cap the AGENTS could silently raise isn't a real ceiling; the player raising
+# their OWN budget is exactly the intended control surface.
+# ---------------------------------------------------------------------------
+
+# name -> (loader for validation, kind) where kind is 'usd' (float >= 0) or
+# 'count' (int >= 0). Only these names are settable -- never API keys.
+_BUDGET_KNOBS = {
+    'SPEND_CAP_USD': ('usd', 'Monthly total model/API spend cap (0 = unlimited).'),
+    'AGENT_SPEND_CAP_USD': ('usd', 'Per-agent monthly spend ceiling (0 = disabled).'),
+    'HIGH_TIER_MONTHLY_BUDGET_USD': ('usd', 'High-tier monthly spend budget (0 = unlimited).'),
+    'APIFY_MONTHLY_BUDGET_USD': ('usd', 'Apify monthly spend budget (0 = disables the budget row).'),
+    'COLAB_MONTHLY_UNITS': ('usd', 'Colab monthly compute-unit budget (0 = unlimited).'),
+    'PAGE_REQUEST_MONTHLY_BUDGET': ('count', 'Monthly external page-request budget (0 = unlimited).'),
+    'HIGH_TIER_MAX_PRICE_USD': ('usd', 'Highest per-million-token price the high tier will pick (0 = no ceiling).'),
+    'CODING_TIER_MAX_PRICE_USD': ('usd', 'Highest per-million-token price the coding tier will pick (0 = no ceiling).'),
+    'VISION_TIER_MAX_PRICE_USD': ('usd', 'Highest per-million-token price the vision tier will pick (0 = no ceiling).'),
+    'SUBLOW_TIER_MAX_PRICE_USD': ('usd', 'Sublow tier per-million-token price ceiling (the band definition).'),
+}
+
+
+def _env_file_path():
+    return os.path.join(THINK_TANK_DIR, '.env')
+
+
+def _set_env_keys(updates):
+    """Rewrite named keys in .env in place, preserving comments and every other
+    line. Appends a key that isn't present yet. Returns the list of names
+    actually written. Raises on IO failure (caller reports; never half-writes
+    silently)."""
+    path = _env_file_path()
+    lines = []
+    if os.path.exists(path):
+        with open(path, encoding='utf-8') as f:
+            lines = f.readlines()
+    seen = set()
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        key = None
+        if stripped and not stripped.startswith('#') and '=' in stripped:
+            key = stripped.split('=', 1)[0].strip()
+        if key and key in updates:
+            out.append(f'{key}={updates[key]}\n')
+            seen.add(key)
+        else:
+            out.append(line)
+    for key in updates:
+        if key not in seen:
+            if out and not out[-1].endswith('\n'):
+                out[-1] += '\n'
+            out.append(f'{key}={updates[key]}\n')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.writelines(out)
+    return list(updates.keys())
+
+
+def _budget_usage_snapshot():
+    """Live usage for every budget knob, read from the ledgers (best-effort;
+    a ledger failure never blocks the view -- the missing row just omits
+    usage). Pure read."""
+    out = {}
+    try:
+        m = _spend_cap_month_view()
+        out['SPEND_CAP_USD'] = {'used': m.get('usage'), 'cap': m.get('cap'),
+                                'exceeded': m.get('exceeded')}
+    except Exception:
+        pass
+    try:
+        used = _high_tier_spend_this_month()
+        cap = HIGH_TIER_MONTHLY_BUDGET_USD
+        out['HIGH_TIER_MONTHLY_BUDGET_USD'] = {
+            'used': round(used, 6), 'cap': cap,
+            'exceeded': bool(cap) and used >= cap}
+    except Exception:
+        pass
+    try:
+        used = _apify_spend_this_month()
+        cap = APIFY_MONTHLY_BUDGET_USD
+        out['APIFY_MONTHLY_BUDGET_USD'] = {
+            'used': round(used, 6), 'cap': cap,
+            'exceeded': bool(cap) and used >= cap}
+    except Exception:
+        pass
+    try:
+        used = _page_budget_used()
+        cap = PAGE_REQUEST_MONTHLY_BUDGET
+        out['PAGE_REQUEST_MONTHLY_BUDGET'] = {
+            'used': used, 'cap': cap,
+            'exceeded': bool(cap) and used >= cap}
+    except Exception:
+        pass
+    try:
+        used = _colab_spend_this_month()
+        cap = COLAB_MONTHLY_UNITS
+        out['COLAB_MONTHLY_UNITS'] = {
+            'used': round(used, 6), 'cap': cap,
+            'exceeded': bool(cap) and used >= cap}
+    except Exception:
+        pass
+    return out
+
+
+@app.get('/api/budget')
+async def budget_view(request: Request):
+    """Player-session budget readout: every settable knob's current value plus
+    live month-to-date usage where a ledger exists. Agent keys are refused."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- budget is a player control'}, status_code=401)
+    usage = _budget_usage_snapshot()
+    knobs = {}
+    g = globals()
+    for name, (kind, desc) in _BUDGET_KNOBS.items():
+        knobs[name] = {
+            'value': g.get(name),
+            'kind': kind,
+            'description': desc,
+            'usage': usage.get(name),
+        }
+    return JSONResponse({'ok': True, 'knobs': knobs})
+
+
+@app.post('/api/budget')
+async def budget_set(request: Request):
+    """Player-session budget write: set one or more knobs by name. Body is a
+    flat object of knob names -> non-negative numbers, e.g.
+    {"SPEND_CAP_USD": 75, "HIGH_TIER_MONTHLY_BUDGET_USD": 2}. Unknown names and
+    non-numeric/negative values are refused (never a partial silent apply --
+    all-or-nothing validation first, then one .env write + one reload)."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- budget is a player control'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    if not isinstance(body, dict) or not body:
+        return JSONResponse({'error': 'provide at least one budget knob to set'}, status_code=400)
+    updates = {}
+    errors = []
+    for name, raw in body.items():
+        spec = _BUDGET_KNOBS.get(name)
+        if not spec:
+            errors.append(f'{name} is not a settable budget knob')
+            continue
+        kind, _desc = spec
+        try:
+            num = float(raw)
+        except (TypeError, ValueError):
+            errors.append(f'{name} must be a non-negative number')
+            continue
+        if num < 0 or num != num or num in (float('inf'), float('-inf')):
+            errors.append(f'{name} must be a finite non-negative number')
+            continue
+        updates[name] = str(int(num)) if kind == 'count' else (f'{num:.6f}'.rstrip('0').rstrip('.') or '0')
+    if errors:
+        return JSONResponse({'error': '; '.join(errors), 'rejected': errors}, status_code=400)
+    try:
+        written = _set_env_keys(updates)
+    except Exception as e:
+        return JSONResponse({'error': f'could not write .env: {e}'}, status_code=500)
+    result = _reload_env_config()
+    log_action(None, 'budget_set', {'changed': result['changed']}, authorized=True)
+    g = globals()
+    return JSONResponse({'ok': True, 'written': written,
+                         'reloaded': result['changed'],
+                         'values': {n: g.get(n) for n in written}})
+
+
 @app.post('/api/env/reload')
 async def env_reload(request: Request):
     # Re-read .env and rebind the live-swappable globals (API keys, budget
@@ -21381,7 +21636,7 @@ async def _classify_command(command, purpose, agent_id='unknown'):
 BROWSER_ACT_READ_OPS = frozenset({'goto', 'read', 'screenshot'})
 
 
-async def _classify_browser_action(op, url, purpose, agent_id='unknown', work_context='', work_context_trusted=False):
+async def _classify_browser_action(op, url, purpose, agent_id='unknown', work_context='', work_context_trusted=False, handle_scoped_host=False):
     try:
         host = urllib.parse.urlparse(url).hostname or ''
     except Exception:
@@ -21392,6 +21647,21 @@ async def _classify_browser_action(op, url, purpose, agent_id='unknown', work_co
     # for the bypass.
     if op in BROWSER_ACT_READ_OPS and (_is_allowlisted_host(host) or (work_context_trusted and _is_work_context_host(work_context, host))):
         return True, 'allow (allowlisted or explicitly named in the assigned work)'
+    # A fill that carries a VALID, player-minted login capability handle scoped to
+    # THIS host skips Jev, same as the allowlist bypass. Reasoning: Jev's
+    # credential-submission block exists to stop an agent from typing a secret it
+    # holds into an arbitrary/phishing site. Here the agent holds NO secret -- the
+    # server already resolved the handle against this exact host (scope-checked,
+    # unexpired, right agent) and pulls the value from the encrypted vault
+    # (see /api/browser-act's credential-injection block). The credential is
+    # player-vetted (in the vault) and the host is player-vetted (allowlisted or
+    # named in the assigned work) -- both vetting decisions are the PLAYER's, so
+    # letting Jev re-litigate them every fill only reintroduces the false-positive
+    # phishing block on the tank's own legitimate login path. `handle_scoped_host`
+    # is passed in already-verified by the caller; it is True only when the handle
+    # resolved cleanly AND its host scope matches the page host being filled.
+    if op in ('fill', 'fill_many', 'login', 'submit', 'click') and handle_scoped_host and (_is_allowlisted_host(host) or (work_context_trusted and _is_work_context_host(work_context, host))):
+        return True, 'allow (valid player-minted login handle scoped to this vetted host)'
     if not OPENROUTER_API_KEY:
         return False, 'OPENROUTER_API_KEY not set'
     criteria = {
@@ -22143,6 +22413,40 @@ async def add_handle(request: Request):
     return JSONResponse({'ok': True, 'handle': handle})
 
 
+@app.get('/api/keys/handles/mine')
+async def list_my_handles(request: Request):
+    """Agent-facing: return the calling agent's own active capability handles
+    (handle nonce + scope metadata). Safe because resolve_capability_handle
+    already scopes every handle to exactly this agent_id -- fetching your own
+    grants does not widen anything, it only lets the agent discover what a
+    director/admin or the player already minted for it (handles are otherwise
+    shown once at mint time and not re-listed, which makes them unusable in
+    autonomous work). Authenticated by the agent's own key."""
+    agent_id = (request.query_params.get('agentId') or '').strip()
+    if not agent_id or not verify_agent_key(agent_id, request.headers.get('X-Agent-Key')):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    now = time.time()
+    with _db() as conn:
+        conn.execute('DELETE FROM capability_handles WHERE expires_at <= ?', (now,))
+        rows = conn.execute(
+            'SELECT handle, credential_name, purpose, allowed_hosts, allowed_methods, expires_at '
+            'FROM capability_handles WHERE agent_id = ? ORDER BY created_at DESC',
+            (agent_id,)).fetchall()
+    handles = []
+    for r in rows:
+        try:
+            hosts = json.loads(r[3]) if isinstance(r[3], str) else r[3]
+            methods = json.loads(r[4]) if isinstance(r[4], str) else r[4]
+        except Exception:
+            hosts, methods = r[3], r[4]
+        handles.append({
+            'handle': r[0], 'credentialName': r[1], 'purpose': r[2],
+            'allowedHosts': hosts, 'allowedMethods': methods,
+            'expiresAt': r[5], 'expiresInSec': max(0, int(r[5] - now)),
+        })
+    return JSONResponse({'agentId': agent_id, 'handles': handles})
+
+
 @app.delete('/api/keys/handles/{handle}')
 async def delete_handle(handle: str, request: Request):
     # Same fix as add_handle above, same reason: require a proven player
@@ -22627,7 +22931,7 @@ async def execute(request: Request):
 # Jev-classified action runs where every other agent action runs. A persistent
 # profile dir under the sandbox makes the session survive across calls, so an
 # agent can go -> fill -> submit -> read like a real user.
-BROWSER_ACT_OPS = ('goto', 'read', 'fill', 'click', 'submit', 'screenshot')
+BROWSER_ACT_OPS = ('goto', 'read', 'fill', 'fill_many', 'login', 'click', 'submit', 'screenshot')
 
 
 @app.post('/api/browser-act')
@@ -22669,8 +22973,40 @@ async def browser_act(request: Request):
         return JSONResponse({'error': 'url is required for op=goto'}, status_code=400)
     if op == 'fill' and not selector:
         return JSONResponse({'error': 'selector is required for op=fill'}, status_code=400)
+    if op == 'fill_many' and not (body.get('fields') or []):
+        return JSONResponse({'error': 'fields is required for op=fill_many'}, status_code=400)
+    if op == 'login' and not (body.get('fields') or []):
+        return JSONResponse({'error': 'fields is required for op=login'}, status_code=400)
     if op == 'click' and not selector:
         return JSONResponse({'error': 'selector is required for op=click'}, status_code=400)
+    # Confused-deputy fill: an agent can type a vault login field WITHOUT ever
+    # holding the secret. It presents a capability handle + which field to
+    # inject (username|password). The server resolves the handle against the
+    # page host (same host/method scope as api_call), pulls the value from the
+    # encrypted vault, and puts it only into the sandbox action JSON. The
+    # response never echoes the typed value; the agent only sees the resulting
+    # page state. A plain `value` fill still works and is unchanged.
+    credential_handle = (body.get('credentialHandle') or '').strip()
+    credential_field = (body.get('credentialField') or '').strip().lower()
+    # Validate the handle's SCOPE first (agent, expiry, host, method) without
+    # touching the vault. The secret is only fetched AFTER Jev approves the
+    # action -- a blocked action never decrypts or writes a credential.
+    handle_scope = None
+    scope_url = (url or body.get('pageUrl') or '').strip()
+    if op in ('fill', 'fill_many', 'login', 'submit', 'click') and credential_handle:
+        if op == 'fill' and credential_field not in ('username', 'password'):
+            return JSONResponse({'error': 'credentialField must be "username" or "password" when credentialHandle is set'}, status_code=400)
+        if not scope_url:
+            # Fill after a prior goto often omits url; the persistent profile
+            # implies a host. Require an explicit pageUrl so the handle's host
+            # scope is always checked against a real URL, never a guess.
+            return JSONResponse({'error': 'url or pageUrl is required when credentialHandle is set'}, status_code=400)
+        handle_scope = verify_capability_handle_scope(agent_id, credential_handle, 'POST', scope_url)
+        if handle_scope is None:
+            log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': scope_url,
+                                                  'purpose': purpose, 'decision': 'blocked',
+                                                  'reason': 'credential handle invalid, expired, out of scope, or not a login credential'}, authorized=authorized)
+            return JSONResponse({'error': 'That capability handle is not valid for this login fill (expired, wrong agent, out-of-scope host, or not a login credential).'}, status_code=403)
     if op in ('goto',):
         # Same URL guardrails as /api/browse: http(s) only, and the final host
         # must be a safe public host (SSRF/private-network protection). The
@@ -22684,7 +23020,11 @@ async def browser_act(request: Request):
         if not _is_safe_public_host(parsed.hostname):
             return JSONResponse({'error': 'url host is not an allowed public host'}, status_code=400)
 
-    allowed, reason = await _classify_browser_action(op, url, purpose, agent_id, work_context, work_context_trusted)
+    # When a handle-scoped fill omits `url` (a fill after a prior goto in the
+    # persistent profile), classify against the `scope_url` the handle was
+    # resolved against so the Jev bypass sees the real host, not an empty one.
+    classify_url = url or (scope_url if (op in ('fill', 'fill_many', 'login', 'submit', 'click') and credential_handle) else '')
+    allowed, reason = await _classify_browser_action(op, classify_url, purpose, agent_id, work_context, work_context_trusted, handle_scoped_host=bool(handle_scope))
     if not allowed:
         # Same supervisor-override path as /api/execute: the director (non-Jev
         # model) gets one review before the block is final.
@@ -22695,9 +23035,47 @@ async def browser_act(request: Request):
             return JSONResponse({'allowed': False, 'reason': reason, 'supervisorNote': override_note})
         log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'allowed_supervisor_override', 'reason': reason, 'supervisorNote': override_note}, authorized=authorized)
 
+    # Jev has approved the action. NOW fetch the secret and inject it -- a
+    # blocked action never reaches here, so the vault is only read for actions
+    # the policy gate has already cleared.
+    if op in ('fill', 'fill_many', 'login') and handle_scope is not None:
+        grant = resolve_capability_handle(agent_id, credential_handle, 'POST', scope_url)
+        if grant is None or grant.get('kind') != 'login':
+            return JSONResponse({'error': 'That capability handle is not valid for this login fill (expired, wrong agent, out-of-scope host, or not a login credential).'}, status_code=403)
+        injected = grant.get(credential_field)
+        if not injected:
+            return JSONResponse({'error': f'the stored credential has no {credential_field}'}, status_code=400)
+        value = injected  # only reaches the sandbox action file; never logged or returned
+
     sandbox_dir = _sandbox_dir_for(sandbox_id)
     action = {'op': op, 'url': url, 'selector': selector, 'value': value if value is not None else '',
              'timeoutMs': 30000, 'maxText': max_text}
+    if op in ('fill', 'fill_many', 'login'):
+        # Per-field credential injection: each field may carry its own
+        # credentialHandle + credentialField. Resolve each against the
+        # already-validated scope_url and put the secret into the field's
+        # value. The driver only ever sees {selector, value} -- never the
+        # handle. A field with no handle passes its literal value through.
+        fields_out = []
+        for f in (body.get('fields') or []):
+            field_out = {'selector': f.get('selector') or ''}
+            fh = (f.get('credentialHandle') or '').strip()
+            ff = (f.get('credentialField') or '').strip().lower()
+            if fh:
+                if ff not in ('username', 'password'):
+                    return JSONResponse({'error': 'credentialField must be "username" or "password" when credentialHandle is set'}, status_code=400)
+                fgrant = resolve_capability_handle(agent_id, fh, 'POST', scope_url)
+                if fgrant is None or fgrant.get('kind') != 'login':
+                    return JSONResponse({'error': 'That capability handle is not valid for this login fill (expired, wrong agent, out-of-scope host, or not a login credential).'}, status_code=403)
+                fval = fgrant.get(ff)
+                if not fval:
+                    return JSONResponse({'error': f'the stored credential has no {ff}'}, status_code=400)
+                field_out['value'] = fval
+            else:
+                field_out['value'] = f.get('value') or ''
+            fields_out.append(field_out)
+        action['fields'] = fields_out
+        action['submitSelector'] = (body.get('submitSelector') or '').strip()
     parsed_result, run_error = await asyncio.to_thread(_run_browser_act_sync, sandbox_dir, action)
     if parsed_result is None:
         log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'error', 'reason': run_error}, authorized=authorized)
@@ -22705,7 +23083,11 @@ async def browser_act(request: Request):
     # The driver result carries page state (text/fields/links) plus an optional
     # embedded screenshot (_shotB64) for the vision-tier readback loop.
     shot = parsed_result.pop('_shotB64', None)
-    log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'allowed', 'ok': parsed_result.get('ok')}, authorized=authorized)
+    # Never echo the typed value back (credential-injected fills put a vault
+    # secret into action['value']; plain fills are also omitted for symmetry).
+    if op == 'fill':
+        parsed_result.pop('value', None)
+    log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'allowed', 'ok': parsed_result.get('ok'), 'credentialInjected': bool(credential_handle)}, authorized=authorized)
     return JSONResponse({'allowed': True, **parsed_result, 'screenshotBase64': shot})
 
 

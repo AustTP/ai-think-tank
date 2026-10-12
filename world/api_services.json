@@ -186,6 +186,18 @@
         {"prefix": "/accounts/v1/", "methods": ["GET"]}
       ],
       "spend": {"kind": "none", "note": "account management only (GET /accounts/v1/accounts/me: id, expiry, device slots, payment status) -- the bearer is minted server-side from the account number via the JSON /auth/v1/token grant; it cannot proxy a fetch through a country exit (the real tunnel is the CLI/WireGuard integration, which routes the whole machine and is not an api_call service)"}
+    },
+    "huggingface": {
+      "name": "HuggingFace (Hub + Inference)",
+      "base_url": "https://huggingface.co",
+      "credential": {"type": "env", "key": "HF_TOKEN"},
+      "auth": {"type": "header_bearer"},
+      "methods": ["GET", "POST", "HEAD"],
+      "path_rules": [
+        {"prefix": "/api/", "methods": ["GET", "HEAD"]},
+        {"prefix": "/v1/", "methods": ["GET", "POST"]}
+      ],
+      "spend": {"kind": "daily_calls", "cap": 200, "note": "Hub metadata (GET /api/models...) is free/rate-limited; /v1/ is the OpenAI-compatible Inference Providers router at router.huggingface.co (subdomain match). 200 calls/day guards runaway inference spend -- bump the cap in the registry if the tank legitimately needs more. Gated model repos require a one-time license accept on huggingface.co under this account; ungated models work immediately. Large weight downloads belong on Colab via HF_TOKEN, not api_call."}
     }
   },
   "channels": {

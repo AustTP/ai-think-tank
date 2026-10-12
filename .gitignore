@@ -86,6 +86,9 @@ library/media/transcripts/
 world/library/media/transcripts/
 sandboxes/spike-task-*/
 sandboxes/sb-*/
+# browser_act / HF login test sandboxes -- contain persistent browser
+# profiles with live session cookies, never tracked.
+sandboxes/hf-*/
 # Manual pre-cleanup DB backup -- a big one-off snapshot, not source
 think_tank.db.pre-cleanup-*
 
