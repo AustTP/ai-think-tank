@@ -8276,6 +8276,33 @@ def _call_openrouter_once_sync(model, messages, max_tokens):
     return result
 
 
+def _call_openrouter_sync_reasoning_off(model, messages, max_tokens):
+    """Same as _call_openrouter_once_sync but forces reasoning off. Used as a
+    one-shot recovery when a reasoning-tier model burns the whole token
+    budget on hidden thinking and returns content:null."""
+    if _think_tank_spend_cap_exceeded():
+        raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
+    if _api_key_is_broken('openrouter'):
+        raise RuntimeError('OpenRouter API key is blocked after repeated auth failures -- swap the key in .env and reload env')
+    if is_model_circuit_broken(model):
+        raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
+    body = {'model': model, 'messages': messages, 'max_tokens': max_tokens,
+            'reasoning': {'enabled': False}}
+    try:
+        result = _openrouter_chat_post(body)
+    except urllib.error.HTTPError as e:
+        record_model_result(model, success=False)
+        if e.code in (401, 403):
+            _note_api_key_failure('openrouter', e.code)
+        raise
+    except Exception:
+        record_model_result(model, success=False)
+        raise
+    record_model_result(model, success=True)
+    _note_api_key_success('openrouter')
+    return result
+
+
 def _call_openrouter_sync(model, messages, max_tokens, best_of=1):
     """The plain OpenRouter chat-completions call. With `best_of=1` (the
     default) it returns a single parsed result dict exactly as before.
@@ -10588,11 +10615,10 @@ def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confiden
         log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'blocked', 'confidence': confidence, 'cost': cost, 'reason': 'jev: ' + (decision or 'classifier unavailable, failed closed')}, authorized=authorized, trace_id=trace_id)
         return False
     if confidence < _effective_safety_confidence():
-        log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'escalated_unsure', 'confidence': confidence, 'cost': cost, 'reason': 'jev allow at low confidence, escalated'}, authorized=authorized, trace_id=trace_id)
-        create_escalation(
-            'unsure safety decision',
-            f'{noun} looked potentially risky but was not clearly blocked (Jev confidence {confidence:.2f} < {_effective_safety_confidence():.2f}):\n\nTarget: {target}\nStated purpose: {purpose or "not given"}',
-        )
+        # Low-confidence allow: block and log. No player escalation -- the
+        # agent adapts to the block. Access/API-key needs go through the
+        # dedicated request endpoints which DO escalate.
+        log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'blocked_unsure', 'confidence': confidence, 'cost': cost, 'reason': 'jev allow at low confidence, blocked'}, authorized=authorized, trace_id=trace_id)
         return False
     # Confident allow -- passes. Log it so cost/confidence are visible in the
     # activity feed (Phase 2c: "log cost + confidence per decision").
@@ -19057,6 +19083,20 @@ async def chat(request: Request):
             reply = data['choices'][0]['message']['content']
             if not reply:
                 print(f'[chat-debug] empty reply for model={model} raw={json.dumps(data)[:2000]}', flush=True)
+                # Reasoning-tier models sometimes burn the entire max_tokens on
+                # hidden reasoning and return content:null (finish_reason
+                # length). Retry once with reasoning off so the model must
+                # produce a visible answer in the same budget.
+                try:
+                    data = await asyncio.to_thread(
+                        _call_openrouter_sync_reasoning_off, model, messages, max_tokens)
+                    reply = data['choices'][0]['message']['content']
+                    if reply:
+                        print(f'[chat-debug] empty-reply recovered on reasoning-off retry model={model}', flush=True)
+                    else:
+                        print(f'[chat-debug] empty reply after retry model={model}', flush=True)
+                except Exception as retry_exc:
+                    print(f'[chat-debug] empty-reply retry failed model={model} err={retry_exc}', flush=True)
             usage_cost = (data.get('usage') or {}).get('cost', 0.0)
         if isinstance(usage_cost, (int, float)) and usage_cost:
             village_id = _sim_village_for_agent(agent_id)
@@ -21367,6 +21407,96 @@ async def _classify_browser_action(op, url, purpose, agent_id='unknown', work_co
     return True, 'allow'
 
 
+# Supervisor override for a Jev block (2026-10-11, per the player's directive
+# that the tank should self-handle blocks and only page the player for player
+# stories, sprint completion, or permanent access grants). When Jev blocks a
+# command / pipeline step / browser action, the agent's DIRECTOR gets one
+# autonomous review: a NON-Jev model (high tier -- this is high-stakes
+# judgment; asking Jev again would just rubber-stamp its own block) framed as
+# the boss deciding whether the block was a false positive on ordinary work.
+# Overrides are logged to action_log AND the tamper-evident passport chain
+# (kind 'supervisor_override'), so every bypass of the safety gate is
+# attributable. Fails closed on every path: no roster director, no API key,
+# no high/mid tier, an unreachable model, a non-JSON or low-confidence answer
+# -- all keep the block.
+async def _supervisor_override_decision(agent_id, action_kind, detail, purpose, block_reason, block_categories=None):
+    """Ask the agent's real roster director (via a non-Jev model) whether to
+    override a Jev block. Returns (overridden: bool, note: str). `detail` is
+    the command or browser action; `block_categories` names the hard-blocked
+    categories the supervisor is told never to wave through."""
+    if not OPENROUTER_API_KEY:
+        return False, 'no model key for the supervisor review'
+    try:
+        state = get_state_from_db()
+    except Exception:
+        state = None
+    roster = {d.get('id'): d for d in (state.get('agentRoster') or [])} if state else {}
+    me = roster.get(agent_id) or {}
+    director_id = me.get('director')
+    if not director_id or director_id not in roster:
+        # Top of the chain (or an unknown id) -- nobody above them to grant,
+        # so the block stands exactly as before.
+        return False, 'no supervisor on the roster to review the block'
+    director_name = roster[director_id].get('name') or director_id
+    agent_name = me.get('name') or agent_id
+    high = _high_tier_slug()
+    model = high or _mid_tier_slug()
+    if not model:
+        return False, 'no high/mid model tier configured for the supervisor review'
+    if high and model == high and _high_tier_budget_exceeded():
+        model = _mid_tier_slug()
+        if not model:
+            return False, 'high-tier budget spent and no mid tier to fall back to'
+    cats = list(block_categories or EXECUTE_BLOCK_CATEGORIES)
+    prompt = (
+        f'You are {director_name}, the supervisor of {agent_name} at an AI research think tank.\n'
+        f'Your subordinate tried this action and the automated safety classifier (Jev) blocked it.\n'
+        f'Action ({action_kind}): {detail}\n'
+        f'Stated purpose: {purpose or "not given"}\n'
+        f"Jev's block reason: {block_reason}\n"
+        f'Hard-blocked categories the classifier enforces: {"; ".join(cats)}\n\n'
+        f'As the supervisor, decide whether to OVERRIDE the block (let the action proceed) '
+        f'or KEEP IT BLOCKED. Override only if this is clearly ordinary, legitimate work '
+        f'the classifier misread. An action that matches a blocked category stays blocked '
+        f'regardless of the stated purpose. When genuinely unsure, keep the block -- a '
+        f'wrong override is the expensive mistake.\n'
+        f'Reply with ONLY a JSON object, no other text: '
+        f'{{"decision": "override" or "keep_blocked", "confidence": 0.0 to 1.0, "reason": "one sentence"}}'
+    )
+    try:
+        data = await asyncio.to_thread(
+            _call_openrouter_once_sync, model,
+            [{'role': 'system', 'content': 'You are a hands-on engineering supervisor. Reply with the JSON object only.'},
+             {'role': 'user', 'content': prompt}],
+            400,
+        )
+        reply = ((data.get('choices') or [{}])[0].get('message') or {}).get('content') or ''
+        parsed = json.loads(reply.strip().replace('```json', '').replace('```', '').strip())
+    except Exception as e:
+        log_action(director_id, 'supervisor_override', {'agent': agent_id, 'kind': action_kind,
+                   'detail': detail[:500], 'purpose': purpose[:300], 'blockReason': str(block_reason)[:300],
+                   'decision': 'error', 'error': str(e)[:200], 'model': model})
+        return False, f'supervisor review failed ({type(e).__name__}), block stands'
+    decision = str(parsed.get('decision') or '').strip().lower()
+    try:
+        confidence = float(parsed.get('confidence'))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    note = str(parsed.get('reason') or '')[:300]
+    if decision != 'override' or confidence < _effective_safety_confidence():
+        log_action(director_id, 'supervisor_override', {'agent': agent_id, 'kind': action_kind,
+                   'detail': detail[:500], 'purpose': purpose[:300], 'blockReason': str(block_reason)[:300],
+                   'decision': 'kept_blocked', 'modelConfidence': confidence, 'note': note, 'model': model})
+        return False, note or 'supervisor kept the block'
+    log_action(director_id, 'supervisor_override', {'agent': agent_id, 'kind': action_kind,
+               'detail': detail[:500], 'purpose': purpose[:300], 'blockReason': str(block_reason)[:300],
+               'decision': 'overridden', 'modelConfidence': confidence, 'note': note, 'model': model})
+    _append_passport_decision('supervisor_override', director_id, {'agent': agent_id, 'kind': action_kind,
+                              'detail': detail[:500], 'purpose': purpose[:300],
+                              'blockReason': str(block_reason)[:300], 'confidence': confidence, 'note': note})
+    return True, note or 'supervisor overrode the block'
+
+
 # A sandbox_id may only be a safe, flat slug -- never path separators, never
 # '..' (a traversal there would mount the repo root -- with .env -- into the
 # container via os.path.join). Letters/digits/._- only, one component, capped
@@ -22462,17 +22592,20 @@ async def execute(request: Request):
         return JSONResponse({'error': 'command is required'}, status_code=400)
     allowed, reason = await _classify_command(command, purpose, agent_id)
     if not allowed:
-        # Blocked commands escalate rather than just vanishing --
-        # admins (and this feature) need a way to reach you for
-        # something genuinely necessary. You decide by tapping a link in
-        # the email; nothing runs automatically just because you were
-        # asked.
-        esc_id = create_escalation(
-            'blocked command',
-            f'Agent {agent_id} wants to run this command in the Work Room, but it was blocked ({reason}):\n\n{command}\n\nPurpose given: {purpose or "none given"}',
-        )
-        log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'purpose': purpose, 'decision': 'blocked', 'reason': reason, 'escalationId': esc_id}, authorized=authorized)
-        return JSONResponse({'allowed': False, 'reason': reason, 'escalationId': esc_id})
+        # Blocked by Jev: the agent's supervisor (a NON-Jev model) gets one
+        # autonomous review before the block is final. Overrides are logged
+        # and passport-chained; access/API-key needs still go through the
+        # dedicated request endpoints (those escalate to the player).
+        overridden, override_note = await _supervisor_override_decision(
+            agent_id, 'command', command, purpose, reason, EXECUTE_BLOCK_CATEGORIES)
+        if not overridden:
+            # Safety blocks no longer page the player -- the agent sees the block
+            # and adapts. Access/API-key needs go through /api/allowlist/request
+            # or /api/api-service/request, which DO escalate (only those need the
+            # player's grant).
+            log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'purpose': purpose, 'decision': 'blocked', 'reason': reason, 'supervisorNote': override_note}, authorized=authorized)
+            return JSONResponse({'allowed': False, 'reason': reason, 'supervisorNote': override_note})
+        log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'purpose': purpose, 'decision': 'allowed_supervisor_override', 'reason': reason, 'supervisorNote': override_note}, authorized=authorized)
 
     sandbox_dir = _sandbox_dir_for(sandbox_id)
     # BEFORE the write, not after -- a snapshot taken after a destructive
@@ -22552,12 +22685,14 @@ async def browser_act(request: Request):
 
     allowed, reason = await _classify_browser_action(op, url, purpose, agent_id, work_context, work_context_trusted)
     if not allowed:
-        esc_id = create_escalation(
-            'blocked browser action',
-            f'Agent {agent_id} wants to drive a real browser action ({op}) {("to " + url) if url else "on the current page"}, but it was blocked ({reason}).\n\nPurpose given: {purpose or "none given"}\n\nAssigned work: {work_context[:600] or "none"}',
-        )
-        log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'blocked', 'reason': reason, 'escalationId': esc_id}, authorized=authorized)
-        return JSONResponse({'allowed': False, 'reason': reason, 'escalationId': esc_id})
+        # Same supervisor-override path as /api/execute: the director (non-Jev
+        # model) gets one review before the block is final.
+        overridden, override_note = await _supervisor_override_decision(
+            agent_id, 'browser action', f'{op} {url or "(current page)"}', purpose, reason, BROWSE_BLOCK_CATEGORIES)
+        if not overridden:
+            log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'blocked', 'reason': reason, 'supervisorNote': override_note}, authorized=authorized)
+            return JSONResponse({'allowed': False, 'reason': reason, 'supervisorNote': override_note})
+        log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'allowed_supervisor_override', 'reason': reason, 'supervisorNote': override_note}, authorized=authorized)
 
     sandbox_dir = _sandbox_dir_for(sandbox_id)
     action = {'op': op, 'url': url, 'selector': selector, 'value': value if value is not None else '',
@@ -22624,11 +22759,15 @@ async def pipeline(request: Request):
             continue
         allowed, reason = await _classify_command(command, f'CI/CD pipeline step "{name}"', agent_id)
         if not allowed:
-            esc_id = create_escalation('blocked pipeline step', f'Agent {agent_id}\'s pipeline step "{name}" was blocked ({reason}):\n\n{command}')
-            log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'decision': 'blocked', 'reason': reason, 'escalationId': esc_id}, authorized=authorized)
-            results.append({'name': name, 'allowed': False, 'reason': reason})
-            sync_prototypes(agent_id, sandbox_dir)
-            return JSONResponse({'sandboxId': sandbox_id, 'results': results, 'failedStep': name})
+            # Same supervisor-override path as /api/execute, per step.
+            overridden, override_note = await _supervisor_override_decision(
+                agent_id, f'pipeline step "{name}"', command, f'CI/CD pipeline step "{name}"', reason, EXECUTE_BLOCK_CATEGORIES)
+            if not overridden:
+                log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'decision': 'blocked', 'reason': reason, 'supervisorNote': override_note}, authorized=authorized)
+                results.append({'name': name, 'allowed': False, 'reason': reason, 'supervisorNote': override_note})
+                sync_prototypes(agent_id, sandbox_dir)
+                return JSONResponse({'sandboxId': sandbox_id, 'results': results, 'failedStep': name})
+            log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'decision': 'allowed_supervisor_override', 'reason': reason, 'supervisorNote': override_note}, authorized=authorized)
 
         await asyncio.to_thread(_snapshot_sandbox, sandbox_id, sandbox_dir)
         result = await asyncio.to_thread(_run_in_sandbox_sync, sandbox_dir, command)

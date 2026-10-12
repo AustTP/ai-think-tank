@@ -1,0 +1,9 @@
+{
+  "name": "sim-lab",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "main.js",
+  "scripts": {
+    "test": "node --test"
+  }
+}
