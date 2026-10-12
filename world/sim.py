@@ -1675,9 +1675,23 @@ def budget_usd_for_task(task_type, budget_usd=None, budget_band=None):
     return max(0.0, base * mult)
 
 # Server in-memory task-id counter (mirrors tasks.js nextTaskId). Not persisted
-# -- on restart it resets; a fresh 'task-N' id is unique for a given server run,
-# and the durable state['tasks'] mirror keyed by it is authoritative.
+# -- on restart it resets. state['tasks'] IS durable, so a bare counter would
+# re-mint task-1..task-N over live stories that survived the restart (seen live:
+# a restart re-assigned task-9..task-20 and clobbered 10 peer-gated wrq-8
+# parents). _next_task_id skips any id already held.
 _TASK_ID_HOLDER = [0]
+
+
+def _next_task_id(state, task_id_holder):
+    """Mint the next task-N id, skipping any id already in state['tasks'].
+    The counter is in-memory and resets on restart; the task dict is durable,
+    so collision-skipping is mandatory, not cosmetic."""
+    tasks = state.get('tasks') or {}
+    while True:
+        task_id_holder[0] += 1
+        task_id = 'task-' + str(task_id_holder[0])
+        if task_id not in tasks:
+            return task_id
 
 # Phase 3 slice 2: completed content-executor results, keyed by task id. A real
 # per-room executor (research for now) runs its NETWORK work on a background
@@ -1709,13 +1723,12 @@ def _store_content_result(task_id, result):
 MAX_REVIEW_CYCLES = 8
 
 
-def _maybe_escalate_stuck_gate(parent, gate, reason):
+def _maybe_escalate_stuck_gate(state, parent, gate, reason):
     """Bump the gate's cycle counter; once it crosses MAX_REVIEW_CYCLES,
-    freeze the gate (mark it escalated) and notify the player instead of
-    continuing to loop. Returns True if the gate is (now, or already)
-    frozen -- the caller must skip its normal re-queue action in that case.
-    Idempotent: only escalates once per gate (a frozen gate stays frozen;
-    it does not re-escalate every subsequent cycle)."""
+    auto-close the story (ship what exists) instead of looping or paging the
+    player. Returns True if the gate is (now, or already) finished -- the
+    caller must skip its normal re-queue action in that case.
+    Idempotent: only finishes once per gate."""
     if gate.get('escalated'):
         return True
     gate['cycleCount'] = gate.get('cycleCount', 0) + 1
@@ -1724,15 +1737,14 @@ def _maybe_escalate_stuck_gate(parent, gate, reason):
     gate['escalated'] = True
     title = parent.get('title') or 'a story'
     try:
-        from serve import create_escalation
-        create_escalation(
-            'stuck review loop',
-            f'"{title}" has gone through {gate["cycleCount"]} review cycles without closing ({reason}). '
-            'Automatic review/fix cycling has been paused for this story -- it needs manual attention '
-            '(reject it outright, edit its scope, or otherwise intervene) rather than continuing to loop.',
-        )
+        from serve import log_action
+        log_action(None, 'task_auto_closed',
+                   {'taskId': parent.get('id'), 'title': title,
+                    'cycles': gate['cycleCount'], 'reason': reason},
+                   authorized=True)
     except Exception:
         pass
+    _close_gated_story(state, parent)
     return True
 
 
@@ -1937,7 +1949,7 @@ def _apply_content_result(state, task, result, now_ms=None):
                     'atMs': now_ms,
                 })
             if verdict == 'actionable':
-                if not _maybe_escalate_stuck_gate(parent, gate, 'repeated rejections'):
+                if not _maybe_escalate_stuck_gate(state, parent, gate, 'repeated rejections'):
                     gate['approvals'] = 0
                     gate['approvers'] = []
                     _sim_notify_author(state, parent, reviewer, rationale=task.get('note'))
@@ -1966,7 +1978,7 @@ def _apply_content_result(state, task, result, now_ms=None):
                 elif _peer_coding_class(parent) and not (result.get('evidence') or '').strip():
                     verdict = 'actionable'
                 if verdict == 'actionable':
-                    if not _maybe_escalate_stuck_gate(parent, gate, 'repeated red-pipeline rejections'):
+                    if not _maybe_escalate_stuck_gate(state, parent, gate, 'repeated red-pipeline rejections'):
                         gate['approvals'] = 0
                         gate['approvers'] = []
                         _sim_notify_author(state, parent, reviewer, rationale=task.get('note'))
@@ -3035,6 +3047,19 @@ def close_sprint(state, sprint_id, now_ms=None):
         record['closedAt'] = now_ms
         _record_sprint_velocity(state, record, now_ms)
     record['status'] = 'closed'
+    # Sprint complete is one of the two moments the player should hear from
+    # the tank (the other is a player-assigned story/spike landing).
+    vel = record.get('velocity') or {}
+    _queue_player_email(
+        state, 'sprint_complete',
+        f'Sprint complete: {record.get("name") or sprint_id}',
+        (f'All {vel.get("total", "?")} items in sprint "{record.get("name") or sprint_id}" '
+         f'({record.get("teamId") or "team"}) are done and approved.\n'
+         f'Landed: {vel.get("landed", vel.get("done", "?"))}/{vel.get("total", "?")} '
+         f'({vel.get("pct", 100):.0f}%).\n'
+         + (f'Rolled over: {", ".join(r.get("title", "") for r in record.get("rolledOver") or [])}\n'
+            if record.get('rolledOver') else '')
+         + '\nNew backlog is ready for refinement.'))
     return record
 
 
@@ -3856,8 +3881,7 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
     if not path or len(path) == 0:
         return None
 
-    task_id_holder[0] += 1
-    task_id = 'task-' + str(task_id_holder[0])
+    task_id = _next_task_id(state, task_id_holder)
     rest_x = path[-1]['x']
     rest_y = path[-1]['y']
     task = {
@@ -5495,10 +5519,10 @@ def _send_back_after_failure(state, task, fail_note=None):
     task['status'] = 'failed'
     task['failedAt'] = int(time.time() * 1000)
     task['failNote'] = note[:300]
-    escalated = _maybe_escalate_stuck_gate(task, gate, 'quality pipeline keeps failing')
+    escalated = _maybe_escalate_stuck_gate(state, task, gate, 'quality pipeline keeps failing')
     _log_quality_gate_reject(state, task, note, escalated=escalated)
     if escalated:
-        return  # frozen -- escalated + player notified; no further fix cycling
+        return  # auto-closed after cycle cap -- no further fix cycling
     instructions = (f"Your work on '{task.get('title')}' failed the quality pipeline: "
                     f"{note}. Fix it so the pipeline passes clean, then it will be re-reviewed.")
     if task.get('userStory'):
@@ -5706,7 +5730,7 @@ def _sweep_stuck_gates(state, now_ms):
                 # by the shared cycle cap -- this rescue path used to be able
                 # to re-enter indefinitely (once per cooldown window, forever)
                 # with no overall bound at all.
-                if _maybe_escalate_stuck_gate(task, gate, 'repeated failed review attempts'):
+                if _maybe_escalate_stuck_gate(state, task, gate, 'repeated failed review attempts'):
                     continue
                 repl = _reenter_gate_review(state, task, locked)
                 if repl:
@@ -11854,8 +11878,7 @@ def _assign_player_task(state, pick, now_ms, task_id_holder=None):
     title = (pick.get('title') or '').strip()
     if not title:
         return None
-    task_id_holder[0] += 1
-    task_id = 'task-' + str(task_id_holder[0])
+    task_id = _next_task_id(state, task_id_holder)
     task = {
         'id': task_id,
         'title': title,
