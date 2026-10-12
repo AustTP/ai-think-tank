@@ -140,8 +140,17 @@ class PrototypeTempFix(unittest.TestCase):
 
 
 class SharedSandbox(unittest.TestCase):
+    def _require(self, name):
+        # sandboxes/workroom-shared is gitignored runtime output -- the exact
+        # files present depend on what the tank last ran. Skip rather than fail
+        # when a given module isn't on this machine / in CI.
+        path = os.path.join(SHARED, name)
+        if not os.path.exists(path):
+            self.skipTest(f'{name} not present under sandboxes/workroom-shared')
+        return path
+
     def test_luhn_class_validates(self):
-        path = os.path.join(SHARED, 'luhn.py')
+        path = self._require('luhn.py')
         mod = _load('shared_luhn', path)
         self.assertTrue(mod.Luhn('4532015112830366').valid())
         self.assertFalse(mod.Luhn('4532015112830367').valid())
@@ -150,7 +159,7 @@ class SharedSandbox(unittest.TestCase):
         self.assertTrue(mod.Luhn('4532 0151 1283 0366').valid())
 
     def test_temp_fix_extract_and_validate(self):
-        path = os.path.join(SHARED, 'temp_fix.py')
+        path = self._require('temp_fix.py')
         mod = _load('shared_tempfix', path)
         out = mod.extract_and_validate('card 4532-0151-1283-0366 and 5555 5555 5555 4444')
         self.assertEqual(len(out), 2)
@@ -160,7 +169,7 @@ class SharedSandbox(unittest.TestCase):
         self.assertTrue(mod.luhn_check('4532015112830366'))
 
     def test_app_runs(self):
-        path = os.path.join(SHARED, 'app.py')
+        path = self._require('app.py')
         mod = _load('shared_app', path)
         mod.main()
 

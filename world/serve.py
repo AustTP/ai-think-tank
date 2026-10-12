@@ -748,7 +748,7 @@ def init_db():
         # just the Jev decisions-model slug (see _jev_model). Deliberately
         # NOT auto-refreshed like model_tiers: a new decision model appearing
         # on OpenRouter is a deliberate operator decision, not something the
-        # think tank should re-pick for itself daily.
+        # think tank should re-pick for itself on the tier-refresh cadence.
         conn.execute('''CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -1218,8 +1218,8 @@ def init_db():
             updated_at REAL
         )''')
 
-        # Benchmark data-source registry -- the URLs the daily model-tier
-        # refresh fetches external evaluator data from (the Artificial Analysis
+        # Benchmark data-source registry -- the URLs the model-tier refresh
+        # fetches external evaluator data from (the Artificial Analysis
         # LLM leaderboard page, the HF Open LLM Leaderboard parquet, ...). These
         # links drift over time, so they live HERE, not in code: a player or a
         # director/admin agent PUTs a fresh JSON document to /api/data-sources
@@ -1487,14 +1487,22 @@ async def _model_tier_refresh_loop():
             print(f'[model-tiers] tier refresh failed (keeping current tiers): {e}', flush=True)
 
 
-def _selected_tier_price_moves_sync():
-    """Bands whose SELECTED model's live catalog price no longer matches the
-    stored price_per_m (or whose slug vanished from the catalog entirely).
+def _tier_watch_moves_sync():
+    """Bands whose pick should re-run NOW, for either reason:
+      (a) the SELECTED model's live catalog price no longer matches its stored
+          price_per_m (or its slug vanished from the catalog entirely), or
+      (b) a CHEAPER in-floor qualifier is live -- a value window opened (a
+          model got cheaper than usual for its tier), so the pick should move
+          to it within the watch interval instead of waiting for the next
+          full sweep. This is the half the old selected-only watch missed: a
+          non-selected model dipping cheap was invisible until the 2h sweep,
+          and a window shorter than that was missed entirely.
     Uses the exact price metric _bucket_models_by_price stores --
-    (prompt + completion) * 1e6 -- so a "move" here is the same number the
-    pick would see. Returns a set of band names; empty = nothing moved.
-    Free/unparseable catalog entries count as moved (the stored pick is never
-    free, so that only fires on a real delist or repricing)."""
+    (prompt + completion) * 1e6 -- and the SAME candidate pools + quality
+    floor the pick uses, so a "cheaper qualifier" here is exactly one the
+    next pick would choose. Free: one catalog read + local score math, no
+    verify probes (the re-pick it triggers does the probing). Returns a set
+    of band names; empty = nothing moved."""
     models = _fetch_openrouter_catalog_sync()
     catalog = {}
     for m in models:
@@ -1505,30 +1513,44 @@ def _selected_tier_price_moves_sync():
         except (KeyError, TypeError, ValueError):
             continue
         catalog[m['id']] = (p + c) * 1_000_000
+    selected = get_cached_model_tiers()
+    benchmark_rows = get_model_benchmark_scores()
+    pools = _band_candidate_pools(models)
     moves = set()
-    with _db() as conn:
-        rows = conn.execute('SELECT band, slug, price_per_m FROM model_tiers').fetchall()
-    for band, slug, price in rows:
+    for band, meta in selected.items():
+        slug, price = meta['slug'], meta['price']
         live = catalog.get(slug)
         if live is None or abs(live - (price or 0.0)) > 1e-9:
-            moves.add(band)
+            moves.add(band)  # selected model repriced or delisted
+            continue
+        for benchmark in BAND_BENCHMARK.get(band, ()):
+            scores = {r['model_id']: r['score'] for r in benchmark_rows if r['benchmark'] == benchmark}
+            qualifiers = _best_value_qualifiers_sync(
+                pools.get(band, []), scores, BAND_QUALITY_FLOOR_GAP.get(band))
+            if not qualifiers:
+                continue
+            cheapest = qualifiers[0]
+            if cheapest['id'] != slug and cheapest['price'] < price - 1e-9:
+                moves.add(band)  # a cheaper qualifier appeared -- take the window
+            break
     return moves
 
 
 async def _tier_price_watch_loop():
     """Every TIER_PRICE_WATCH_INTERVAL_S (30 min), re-read the catalog and
-    compare it against ONLY the currently selected tier models. When any
-    selected model's price moved (or it dropped out of the catalog), run the
-    full re-pick so a better option at that band is found now rather than at
-    the next every-other-hour sweep. A cycle where every selected price held
-    is a free catalog read and a silent no-op -- no probes, no log entry."""
+    decide whether any band's pick should change: a selected model repricing/
+    delisting, OR a cheaper in-floor qualifier appearing. In either case run
+    the full re-pick so the value is taken now rather than at the next
+    every-other-hour sweep. A cycle where every selected price held and no
+    cheaper qualifier appeared is a free catalog read and a silent no-op --
+    no probes, no log entry."""
     while True:
         await asyncio.sleep(TIER_PRICE_WATCH_INTERVAL_S)
         try:
-            moved = await asyncio.to_thread(_selected_tier_price_moves_sync)
+            moved = await asyncio.to_thread(_tier_watch_moves_sync)
             if moved:
-                print(f'[model-tiers] price watch: selected-tier price moved for {sorted(moved)}; re-running pick', flush=True)
-                await _tier_refresh_logged(f'price-watch: selected price moved for {sorted(moved)}')
+                print(f'[model-tiers] price watch: {sorted(moved)} moved to a better value; re-running pick', flush=True)
+                await _tier_refresh_logged(f'price-watch: {sorted(moved)} moved')
         except Exception as e:
             # Same fail-open rule as the full loop: keep current tiers, retry
             # on the next cycle -- a watch failure never drops a working pick.
@@ -1548,7 +1570,7 @@ async def _tier_price_watch_loop():
 # cooldown from the last drain so a chronically flaky model cannot stampede
 # the refresh into a loop.
 _TIER_RECHECK_QUEUE = {}      # band -> ts queued (pending drain)
-_TIER_RECHECK_DRAINED = {}    # band -> ts of last drain (cooldown source)
+_TIER_RECHECK_DRAINED: dict = {}    # band -> ts of last drain (cooldown source)
 TIER_RECHECK_COOLDOWN_S = 15 * 60
 TIER_RECHECK_DRAIN_INTERVAL_S = 60
 
@@ -2318,7 +2340,10 @@ def sync_prototypes(agent_id, sandbox_dir):
     try:
         if os.path.exists(dest):
             shutil.rmtree(dest)
-        shutil.copytree(sandbox_dir, dest)
+        # ignore .browser-act (transient driver state: shots, profile
+        # cookies) -- the prototypes mirror is "what the agent is working on,"
+        # not leftover browser session material.
+        shutil.copytree(sandbox_dir, dest, ignore=shutil.ignore_patterns('.browser-act'))
     except OSError as e:
         print(f'[agent-dirs] prototypes sync failed for {agent_id}: {e}')
 
@@ -2827,7 +2852,7 @@ def _mask_credential_preview(payload):
 # never put the password in its result -- the skeleton scrubs secret-shaped
 # keys as a defensive last line. The action host/method are already enforced
 # by the handle scope before fn is called.
-_LOGIN_ADAPTERS = {}
+_LOGIN_ADAPTERS: dict = {}
 
 # Secret-shaped result keys that _login_scrub_result masks no matter what an
 # adapter returns. Never logs or returns these un-masked.
@@ -3321,10 +3346,11 @@ def _youtube_transcript(url, lang='en', timeout=90):
         return None, f'YouTube transcript fetch failed: {e}'
 
 
-# The one route that actually serves every /api/youtube-transcript request.
-# Per the player's decision ("force it to always download ... treat them all
-# the same") the endpoint no longer special-cases videos with captions: every
-# video is treated the same, always downloading the audio and transcribing it.
+# The SPEND fallback for /api/youtube-transcript: the endpoint tries the free
+# local yt-dlp captions path (_youtube_transcript) first and only reaches this
+# when that finds no captions, so the paid download-and-transcribe route is
+# spent solely on videos captions can't serve. (This reverses the earlier
+# "force it to always download ... treat them all the same" decision.)
 # The download runs through the Apify youtube-link actor (IHDsaLO64Wge9wSWx),
 # and the WHOLE orchestration -- start the actor run, poll it to SUCCEEDED,
 # fetch the dataset item, download the audio, run faster-whisper -- executes
@@ -6026,7 +6052,7 @@ PAGE_REQUEST_BUDGET_START_KEY = '__page_budget_start__'
 # known.
 HIGH_TIER_MONTHLY_BUDGET_USD = float(_load_env().get('HIGH_TIER_MONTHLY_BUDGET_USD', '0') or 0)
 # Highest per-million-token price the HIGH tier will even CONSIDER:
-# the daily refresh only offers Jev/score-pick candidates priced at or below
+# the refresh only offers Jev/score-pick candidates priced at or below
 # this, so a $210/M model can never win the high tier no matter its score.
 # This is a per-call price ceiling (models under it), distinct from the monthly
 # spend cap above (how much aggregate high-tier spend is allowed). Set
@@ -8062,22 +8088,35 @@ def _run_browser_act_sync(sandbox_dir, action):
     """Run ONE already-classified browser_act op in the sandbox and return the
     parsed result dict from the driver's result file (falling back to parsing
     its stdout JSON). Returns None on harness-level failure (docker/IO), never
-    a browser-level 'error' -- those come back inside the parsed result."""
+    a browser-level 'error' -- those come back inside the parsed result.
+
+    The action file can carry a DECRYPTED credential (the vault injection
+    path), so it never lands in the shared /workspace mount: any concurrent
+    /api/execute command runs in that same mount and could read it, and the
+    next _snapshot_sandbox would git-commit it. It is written to a host-side
+    temp dir instead, bind-mounted read-only into ONLY this browser container
+    (never into the agent exec sandbox), and deleted in the finally below.
+    Result/screenshot stay in the mount -- they carry page state, never input
+    values (the driver strips those -- see _page_state / the fill pop)."""
     import secrets as _secrets
     work_dir = os.path.join(sandbox_dir, '.browser-act')
     os.makedirs(work_dir, exist_ok=True)
     run_id = _secrets.token_hex(4)
-    action_path = os.path.join(work_dir, f'action-{run_id}.json')
     result_path = os.path.join(work_dir, f'result-{run_id}.json')
     shot_path = os.path.join(work_dir, f'shot-{run_id}.png')
     action['workDir'] = '/workspace/.browser-act'
     action['profileDir'] = '/workspace/.browser-act/profile'
     action['resultPath'] = f'/workspace/.browser-act/result-{run_id}.json'
     action['screenshotPath'] = f'/workspace/.browser-act/shot-{run_id}.png'
+    # Host-side, outside the mount. Deleted in finally -- it is never
+    # world-readable from any other container and never survives the run.
+    action_dir = tempfile.mkdtemp(prefix='browser_act_')
+    action_path = os.path.join(action_dir, f'action-{run_id}.json')
     try:
         with open(action_path, 'w') as f:
             json.dump(action, f)
     except OSError as e:
+        shutil.rmtree(action_dir, ignore_errors=True)
         return None, f'could not write browser action to sandbox: {e}'
     # JEV-approved egress: grant the target host in the shared grants file the
     # proxy re-reads, so a Jev-approved non-allowlisted host is genuinely
@@ -8103,9 +8142,14 @@ def _run_browser_act_sync(sandbox_dir, action):
         '--pids-limit', '128',
         '--shm-size', '256m',
         '-v', f'{sandbox_dir}:/workspace',
+        # Read-only, and mounted into THIS browser container only: the agent
+        # exec sandbox never sees /browser-act, so a concurrent shell cannot
+        # read the (decrypted) action file, and nothing in the mount can be
+        # swapped between the Jev classification and the driver reading it.
+        '-v', f'{action_dir}:/browser-act:ro',
         '-w', '/workspace',
         SANDBOX_IMAGE,
-        'python3', '/opt/browser_driver.py', f'/workspace/.browser-act/action-{run_id}.json',
+        'python3', '/opt/browser_driver.py', f'/browser-act/action-{run_id}.json',
     ]
     try:
         try:
@@ -8136,6 +8180,7 @@ def _run_browser_act_sync(sandbox_dir, action):
     finally:
         if grant_host and not _is_allowlisted_host(grant_host):
             _revoke_egress_host(grant_host)
+        shutil.rmtree(action_dir, ignore_errors=True)
 
 
 # How long real JS/AJAX content gets to finish loading before the text is
@@ -9004,10 +9049,10 @@ _LOCAL_FILE_TOOL = {
                        '(Desktop, Downloads, etc.). Every action is checked '
                        'against the player\'s grant: you can only touch paths inside the granted scope, '
                        'deletes move to the trash (you can never empty the trash). '
-'Actions: list (list a folder in the scope; pass `path` to list a subfolder, '
-                        'omit it to list the scope root), read (read a file\'s text), write '
-                        '(create/overwrite a file), move (move/rename within the folder), delete (move to '
-                        'trash). Supply the exact '
+                       'Actions: list (list a folder in the scope; pass `path` to list a subfolder, '
+                       'omit it to list the scope root), read (read a file\'s text), write '
+                       '(create/overwrite a file), move (move/rename within the folder), delete (move to '
+                       'trash). Supply the exact '
                        '`scope` path the player granted (e.g. /Users/you/Desktop) and a relative '
                        '`path`/`from`/`to` within it.',
         'parameters': {
@@ -11054,6 +11099,25 @@ def set_model_benchmark_score(model_id, benchmark, score, source_url, evaluator=
         )
 
 
+def _best_value_qualifiers_sync(candidates, scores, floor_gap=None):
+    """The candidates that clear the band's quality bar, cheapest first: those
+    within `floor_gap` points of the best stored score in the pool. Pure and
+    network-free -- `_best_value_pick` live-verifies down this list, and the
+    price watch reuses the same list to spot a cheaper qualifier appearing
+    WITHOUT paying for verify probes. Returns [] when nothing in `candidates`
+    has a stored score yet."""
+    if floor_gap is None:
+        floor_gap = BENCHMARK_QUALITY_FLOOR_GAP
+    scored = [m for m in candidates if m['id'] in scores]
+    if not scored:
+        return []
+    best_score = max(scores[m['id']] for m in scored)
+    return sorted(
+        (m for m in scored if scores[m['id']] >= best_score - floor_gap),
+        key=lambda m: m['price'],
+    )
+
+
 async def _best_value_pick(candidates, scores, floor_gap=None):
     # Shared by every band (restored): score keeps its place. Among
     # candidates with a real stored score, keep only those within the band's
@@ -11063,17 +11127,7 @@ async def _best_value_pick(candidates, scores, floor_gap=None):
     # price then breaks ties among models that pass the quality bar. Returns
     # None if nothing in `candidates` has a stored score yet, or nothing
     # verified works -- callers fall back to Jev's classifier in that case.
-    if floor_gap is None:
-        floor_gap = BENCHMARK_QUALITY_FLOOR_GAP
-    scored = [m for m in candidates if m['id'] in scores]
-    if not scored:
-        return None
-    best_score = max(scores[m['id']] for m in scored)
-    qualifiers = sorted(
-        (m for m in scored if scores[m['id']] >= best_score - floor_gap),
-        key=lambda m: m['price'],
-    )
-    for candidate in qualifiers:
+    for candidate in _best_value_qualifiers_sync(candidates, scores, floor_gap):
         if await asyncio.to_thread(_verify_model_works_sync, candidate['id']):
             return candidate
     return None
@@ -11260,6 +11314,42 @@ def _apply_band_price_ceiling(band, candidate_pool):
     if band == 'sublow' and SUBLOW_TIER_MAX_PRICE_USD:
         return [m for m in candidate_pool if m['price'] <= SUBLOW_TIER_MAX_PRICE_USD]
     return candidate_pool
+
+
+def _band_candidate_pools(models):
+    """{band: candidate_pool} for every band refresh_model_tiers picks for --
+    the cost bands (low/mid/high/coding/sublow) plus 'vision'. Applies the SAME
+    rules the refresh does: capability bands (coding/high/sublow) search every
+    price bucket because a price bracket says nothing about whether a model can
+    code or decompose a goal; every band then gets its price ceiling; vision
+    additionally requires real image input. Extracted so the price watch can
+    reason about the SAME pools the pick uses, without duplicating the logic
+    and drifting from it."""
+    buckets = _bucket_models_by_price(models)
+    pools = {}
+    for band in MODEL_BAND_PURPOSE:
+        capability_band = band in ('coding', 'high', 'sublow')
+        pool = [m for bp in buckets.values() for m in bp] if capability_band else buckets.get(band, [])
+        pools[band] = _apply_band_price_ceiling(band, pool)
+    vision = []
+    for m in models:
+        if ':batch' in m['id']:
+            continue
+        arch = m.get('architecture') or {}
+        if 'image' not in (arch.get('input_modalities') or []) or 'text' not in (arch.get('output_modalities') or []):
+            continue
+        reasoning_info = m.get('reasoning')
+        if reasoning_info and reasoning_info.get('mandatory'):
+            continue
+        try:
+            p, c = float(m['pricing']['prompt']), float(m['pricing']['completion'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if p <= 0 or c <= 0:
+            continue
+        vision.append({'id': m['id'], 'name': m.get('name', m['id']), 'price': (p + c) * 1_000_000})
+    pools['vision'] = _apply_band_price_ceiling('vision', vision)
+    return pools
 
 
 def _ingest_catalog_benchmarks(models):
@@ -11663,6 +11753,7 @@ async def refresh_model_tiers():
     _sync_model_catalog(models)
     buckets = _bucket_models_by_price(models)
     all_benchmark_rows = get_model_benchmark_scores()
+    pools = _band_candidate_pools(models)
     chosen = {}
     for band, purpose in MODEL_BAND_PURPOSE.items():
         pool = buckets.get(band, [])
@@ -11682,9 +11773,7 @@ async def refresh_model_tiers():
         # ("cheap above all else" / "moderate cost is fine") is explicitly
         # cost-conscious, so widening their search would contradict the
         # very thing that makes them distinct, cheaper tiers.
-        capability_band = band in ('coding', 'high', 'sublow')
-        candidate_pool = [m for band_pool in buckets.values() for m in band_pool] if capability_band else pool
-        candidate_pool = _apply_band_price_ceiling(band, candidate_pool)
+        candidate_pool = pools[band]
         # BAND_BENCHMARK[band] is an ordered metric CHAIN: use the first metric
         # any candidate in this pool is scored on, fall through only when
         # nothing is. Keeps each pick inside one evaluator's scale -- a
@@ -11738,24 +11827,7 @@ async def refresh_model_tiers():
     # and same value policy (_best_value_pick) as every other band, so a
     # vision model that's cheap but bad at actually reading a screenshot
     # doesn't win just for being cheap.
-    vision_pool = []
-    for m in models:
-        if ':batch' in m['id']:
-            continue
-        arch = m.get('architecture') or {}
-        if 'image' not in (arch.get('input_modalities') or []) or 'text' not in (arch.get('output_modalities') or []):
-            continue
-        reasoning_info = m.get('reasoning')
-        if reasoning_info and reasoning_info.get('mandatory'):
-            continue
-        try:
-            p, c = float(m['pricing']['prompt']), float(m['pricing']['completion'])
-        except (KeyError, TypeError, ValueError):
-            continue
-        if p <= 0 or c <= 0:
-            continue
-        vision_pool.append({'id': m['id'], 'name': m.get('name', m['id']), 'price': (p + c) * 1_000_000})
-    vision_pool = _apply_band_price_ceiling('vision', vision_pool)
+    vision_pool = pools['vision']
     vision_scores = {r['model_id']: r['score'] for r in all_benchmark_rows if r['benchmark'] == 'MMMU'}
     vision_pick = await _best_value_pick(vision_pool, vision_scores)
     if vision_pick is None and vision_pool:
@@ -11797,9 +11869,12 @@ async def refresh_model_tiers():
             )
             # Daily price/score log: look up the benchmark score the pick was
             # grounded on (first metric in the band's chain that has a score
-            # for this model) and write today's row. Same-day re-runs
-            # overwrite (PK log_date+band) so the log always reflects the
-            # latest pick for each date.
+            # for this model) and write today's row. Same-day re-runs update
+            # the row in place (PK log_date+band) so it always reflects the
+            # latest pick -- EXCEPT logged_at, which marks WHEN THE CURRENT
+            # PICK FIRST APPEARED, not the last write: a same-slug re-run keeps
+            # the original timestamp so the row's age is the value window's age
+            # (read by get_tier_value_windows). A slug change resets it.
             _score, _bench = None, None
             for _b in BAND_BENCHMARK.get(band, ()):
                 for _r in all_benchmark_rows:
@@ -11812,7 +11887,9 @@ async def refresh_model_tiers():
                 'INSERT INTO tier_daily_log (log_date, band, slug, name, price_per_m, benchmark, score, logged_at) '
                 'VALUES (?, ?, ?, ?, ?, ?, ?, ?) '
                 'ON CONFLICT(log_date, band) DO UPDATE SET slug=excluded.slug, name=excluded.name, '
-                'price_per_m=excluded.price_per_m, benchmark=excluded.benchmark, score=excluded.score, logged_at=excluded.logged_at',
+                'price_per_m=excluded.price_per_m, benchmark=excluded.benchmark, score=excluded.score, '
+                'logged_at=CASE WHEN tier_daily_log.slug = excluded.slug '
+                'THEN tier_daily_log.logged_at ELSE excluded.logged_at END',
                 (time.strftime('%Y-%m-%d', time.gmtime()), band, m['id'], m['name'], m['price'], _bench, _score, time.time()),
             )
     log_action(None, 'model_tiers_refreshed', {band: m['id'] for band, m in chosen.items()})
@@ -11902,6 +11979,33 @@ def tier_value_ratios():
     return ratios
 
 
+def get_tier_value_windows():
+    """Per-band value snapshot for the operator/player: the band's current
+    score-per-dollar ratio vs its trailing 7-day median (tier_value_ratios),
+    plus HOW LONG the current pick has been held (tier_daily_log.logged_at for
+    today's row, which only advances when the slug changes). A ratio >= 1.3 on
+    a freshly-changed pick is a cheap-value window the tank is riding. The
+    operator would NOT otherwise see this -- only the resulting pick. Read-only."""
+    ratios = tier_value_ratios()
+    today = time.strftime('%Y-%m-%d', time.gmtime())
+    now = time.time()
+    with _db() as conn:
+        rows = conn.execute(
+            'SELECT band, slug, price_per_m, logged_at FROM tier_daily_log WHERE log_date = ?',
+            (today,)).fetchall()
+    windows = {}
+    for band, slug, price, logged_at in rows:
+        since = logged_at or now
+        windows[band] = {
+            'slug': slug,
+            'price_per_m': price,
+            'sinceTs': since,
+            'sinceAgeS': max(0.0, now - since),
+            'valueRatio': ratios.get(band, 1.0),
+        }
+    return {'ratios': ratios, 'windows': windows}
+
+
 # Read-only board/status GETs must NOT wake a dormant tank: the browser polls
 # state/health/sim continuously, and an open tab would otherwise defeat
 # sleep-not-die dormancy (each poll would flip it awake). Pure telemetry
@@ -11959,19 +12063,78 @@ async def no_store(request: Request, call_next):
     return response
 
 
-# Every route that reads a secret, spends money, executes code, or writes
-# real files needs a real logged-in session -- everything else (static
-# scripts/assets, and the escalation resolve link, which is protected by
-# its own per-escalation token instead so it stays tappable from an email
-# with no login needed) stays open.
-AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/api/browse', '/api/browser-act', '/api/api-call', '/api/api-service', '/api/allowlist', '/api/execute', '/api/pipeline', '/api/youtube-transcript', '/api/library', '/api/design-reference', '/api/villages', '/api/memory-ledger', '/api/model-tiers', '/api/model-benchmark-scores', '/api/activity', '/api/decisions', '/api/screenshot', '/api/curl', '/api/page-probe', '/api/channel-probe', '/api/access', '/api/sandbox-backups', '/api/sandbox-download', '/api/sandbox-save-page', '/api/health', '/api/sim/status', '/api/sim/agents', '/api/intent', '/api/pipelines', '/api/keys', '/api/player-email', '/api/player-inbox', '/api/jev', '/api/shadow', '/api/reviews', '/api/agent-files', '/api/evidence', '/api/coverage', '/api/policy', '/api/research-desk')
-# Gap: /api/player-email/credential's OWN handler
-# rejects an agent that explicitly self-identifies via ?requesterId=, but
-# with the prefix missing here that check was the ONLY gate -- a request
-# with NO session cookie and NO agent key at all reached the handler and
-# silently overwrote the player's real Gmail app-password. Same two-layer
-# shape /api/keys already uses: this middleware requires SOME valid auth
-# (session or agent key) before the handler's own player-only check ever runs.
+# DENY-BY-DEFAULT auth. Every route requires a real logged-in session (or a
+# valid agent key) UNLESS it appears in this explicit public list. The old
+# shape was the inverse -- a protected-prefix allowlist -- and it decayed the
+# way those always do: a NEW route was public until someone remembered to add
+# it, and forgetting was silent because tests inject sessions, so nothing
+# failed. Here forgetting is loud: the route just 401s until it is deliberately
+# classified, and tests/test_auth_surface.py pins the list below so an
+# accidental public addition fails CI.
+#
+# What stays public, and why:
+#   - the login surface ('/', '/index.html', '/login', '/logout') -- must
+#     work before any session exists
+#   - open UI reads the unauthenticated shell uses (rooms, teams, backlog,
+#     templates, avatars)
+#   - routes that enforce their OWN credential in the handler: session-only
+#     (_require_player_session / verify_session), operator gates
+#     (_operator_gate), agent-key checks, or their own token header (device
+#     key, SMS forward secret, sublow/jev grant, the per-escalation resolve
+#     token). Their handler gate IS the access control; the middleware must
+#     not double-gate or break them, so they are listed here.
+#
+# Everything else is protected by default with no listing required: state,
+# log, decide, browse, execute, curl, pipeline, library, intent, keys,
+# player-email, player-inbox, budget, health, sim, model tiers, tier value
+# windows, escalation status, review/escalate, sandbox-*, evidence, coverage,
+# policy, and the rest. /api/player-email/credential is the historical
+# example of why the default must be CLOSED rather than open: its own handler
+# only rejects a caller who SELF-IDENTIFIES as an agent, so under the old
+# missing-prefix shape a request carrying no credentials at all reached it
+# and silently overwrote the player's real Gmail app-password.
+AUTH_PUBLIC_PATHS = (
+    # NOTE: the login surface '/' and '/index.html' are NOT listed here --
+    # they are handled by exact match inside _is_public_path, because a
+    # startswith entry of '/' would match every path and disable the gate.
+    '/login', '/logout',                                # login surface
+    '/api/rooms', '/api/teams', '/api/backlog',         # open UI reads
+    '/api/templates', '/api/avatar',
+    '/api/escalation/resolve',                          # its own per-escalation token gate
+    '/api/chat',                                        # session OR agent key, in-handler
+    '/api/mail', '/api/reports', '/api/download',
+    '/api/file-grants', '/api/app-grants',
+    '/api/device/checkin',                              # X-Device-Key
+    '/api/task-budget', '/api/budget', '/api/env/reload',
+    '/api/ais', '/api/market', '/api/rss', '/api/ws',
+    '/api/data-sources', '/api/credentials',
+    '/api/sms',                                         # incl. inbound (X-SMS-Forward-Secret)
+    '/api/experiments',                                 # incl. inference (grant token)
+    '/api/rule-proposals', '/api/success-proposals',
+)
+# Static assets the login shell needs before any session exists. This
+# extension allowlist is what stops world/*.py, grants.json, api_services.json,
+# sandbox_egress_grants.json, and the whole tests/ tree from being fetched by
+# an anonymous GET -- the same class of exposure that once served
+# .secret_keys/edek.key unauthenticated (the key was moved instead of the
+# mount being closed; this closes the class). A path that is not a listed
+# asset extension falls through to the session requirement.
+AUTH_PUBLIC_STATIC_EXTENSIONS = ('.js', '.css', '.html', '.png', '.jpg', '.jpeg',
+                                 '.gif', '.svg', '.ico', '.webp', '.woff', '.woff2', '.map')
+
+
+def _is_public_path(path):
+    # Exact match first: '/' must never be a startswith entry (it would match
+    # every path and disable the whole gate). Prefix entries below are chosen
+    # so over-matching only ever lands on routes that self-guard in-handler
+    # (e.g. '/api/rooms' also covers '/api/rooms/{room}/purpose', which
+    # requires an agent key in its own handler).
+    if path in ('/', '/index.html'):
+        return True
+    if any(path.startswith(p) for p in AUTH_PUBLIC_PATHS):
+        return True
+    ext = os.path.splitext(urllib.parse.urlparse(path).path)[1].lower()
+    return ext in AUTH_PUBLIC_STATIC_EXTENSIONS
 
 
 def _valid_agent_key_presented(presented_key):
@@ -11990,9 +12153,53 @@ def _valid_agent_key_presented(presented_key):
     return row is not None
 
 
+# Player-authored work trust (Fix B). Three endpoints -- /api/browse,
+# /api/browser-act, /api/download -- let a host that a PLAYER-authored task
+# explicitly named skip the Jev gate, the same way the domain allowlist does.
+# That trust used to ride in a caller-set body boolean (`workContextTrusted`),
+# so any agent could set it and launder its OWN authored text (naming any URL)
+# past Jev. The trust anchor is now server-side: the executor that read
+# `task.playerAuthored` off the STORED task mints a one-time nonce here and
+# hands it to the endpoint, which redeems it against this same in-memory
+# ledger. The agent's own model call never sees or mints the nonce.
+_WORK_TRUST_TTL_MS = 30 * 60 * 1000
+_work_trust_nonces: dict = {}  # nonce -> expires_at (ms)
+
+
+def _mint_work_trust_nonce():
+    """Server-side: prove a work-context bypass is backed by a stored
+    player-authored task. Only the executors (server code) call this, after
+    reading task['playerAuthored'] from the real task -- never an agent's
+    request body. Returns an opaque nonce redeemable exactly once."""
+    nonce = secrets.token_hex(16)
+    now = int(time.time() * 1000)
+    # opportunistic GC so the ledger can't grow without bound
+    for k in [k for k, exp in _work_trust_nonces.items() if exp <= now]:
+        _work_trust_nonces.pop(k, None)
+    _work_trust_nonces[nonce] = now + _WORK_TRUST_TTL_MS
+    return nonce
+
+
+def _redeem_work_trust_nonce(nonce):
+    """True (and consume) when the nonce is a live, server-minted token for a
+    player-authored task. Anything absent, expired, or replayed is False."""
+    if not nonce or not isinstance(nonce, str):
+        return False
+    exp = _work_trust_nonces.pop(nonce, None)
+    return bool(exp and exp > int(time.time() * 1000))
+
+
+def _work_trust_from_body(body):
+    """Resolve the work-context trust for a request body. Only a redeemed
+    server-minted nonce can be trusted -- the legacy `workContextTrusted`
+    boolean is ignored (kept in the payload for older callers, but it no
+    longer grants the bypass)."""
+    return _redeem_work_trust_nonce(body.get('workTrustNonce'))
+
+
 @app.middleware('http')
 async def require_login(request: Request, call_next):
-    if any(request.url.path.startswith(p) for p in AUTH_PROTECTED_PREFIXES):
+    if not _is_public_path(request.url.path):
         if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)) \
                 and not _valid_agent_key_presented(request.headers.get('X-Agent-Key')):
             return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
@@ -13300,7 +13507,7 @@ async def promote_shadow_entry(idx: str, request: Request):
 # director, identical to assign-big-task); progress is derived server-side from
 # live task + queue state. Creating/completing is chained into the hashed
 # product-passport. The read endpoint (get_sprints) powers the board modal.
-# /api/intent prefix is already session-auth'd via AUTH_PROTECTED_PREFIXES.
+# /api/intent is protected by default (deny-by-default auth middleware).
 # ---------------------------------------------------------------------------
 @app.post('/api/intent/sprint')
 @_state_writer
@@ -13996,10 +14203,11 @@ async def test_player_email(request: Request):
 @_state_writer
 async def device_checkin(request: Request):
     """A phone (an iOS Shortcut, to start) reports its own current location/
-    battery/Focus/Wi-Fi. Self-guarded like /api/chat -- NOT in
-    AUTH_PROTECTED_PREFIXES (that middleware only recognizes a player session
-    or an agent key, neither of which a Shortcut can hold), checks its own
-    bearer credential instead. Body is deliberately open-ended -- every field
+    battery/Focus/Wi-Fi. Self-guarded like /api/chat -- listed in
+    AUTH_PUBLIC_PATHS because the deny-by-default middleware only recognizes
+    a player session or an agent key, neither of which a Shortcut can hold,
+    so it checks its own bearer credential instead. Body is deliberately
+    open-ended -- every field
     optional, no fixed schema -- so a future field or device never needs this
     endpoint redesigned, just a new key in the same dict. No LLM/Jev call
     involved (pure data storage), so unlike task-driving endpoints this is
@@ -14258,6 +14466,13 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
     from the assignment, never from what the agent claims, so an agent cannot
     manufacture its own bypass by lying about its work.
 
+    `work_context_trusted` is True only when the STORED task was player-authored
+    (`task.playerAuthored`, read server-side). When it is, this factory mints a
+    one-time work-trust nonce (see _mint_work_trust_nonce) and sends THAT to the
+    endpoints instead of the bare boolean -- the bypass is now anchored to a
+    server-minted credential, so an agent cannot set `workContextTrusted` in its
+    own request and launder self-authored text past Jev.
+
     `struck_tools`, if given a set, gets a tool name added to it the moment
     that tool is BLOCKED (a real policy denial -- Jev said no -- not a
     transient fetch error, which may still be worth one retry). The caller
@@ -14270,6 +14485,10 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
     answer). Self-checks `struck_tools` too (not just records into it) --
     defense in depth so a caller that passes the set but forgets to check
     it itself doesn't silently get a no-op."""
+    # Server-minted, single-use proof that the work-context host bypass is
+    # backed by a stored player-authored task. Minted HERE (server code, at
+    # factory time, once per tool set) -- never from an agent's request body.
+    work_trust_nonce = _mint_work_trust_nonce() if work_context_trusted else ''
     def execute_tool(name, args):
         if struck_tools is not None and name in struck_tools:
             return (f'{name} was already blocked once this investigation (one-strike) -- do not '
@@ -14413,7 +14632,9 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 'render': bool((args or {}).get('render')),
                 'viaVpnCountry': country,
                 'workContext': work_context,
-                'workContextTrusted': bool(work_context_trusted),
+                # Server-minted proof of player-authored provenance; the endpoint
+                # redeems it and ignores the legacy boolean entirely.
+                'workTrustNonce': work_trust_nonce,
             }, agent_key, timeout=60 if not country else 60 + MULLVAD_CONNECT_TIMEOUT_S)
             if isinstance(result, dict) and result.get('allowed') and result.get('textForModel'):
                 # Gap: /api/browse already
@@ -14456,7 +14677,9 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 'purpose': (args or {}).get('purpose') or 'research',
                 'maxBytes': (args or {}).get('maxBytes') or 0,
                 'workContext': work_context,
-                'workContextTrusted': bool(work_context_trusted),
+                # Server-minted proof of player-authored provenance; the endpoint
+                # redeems it and ignores the legacy boolean entirely.
+                'workTrustNonce': work_trust_nonce,
             }, agent_key, timeout=90)
             if isinstance(result, dict) and result.get('ok'):
                 return (f"Downloaded to your own filespace at agents/{agent_id}/downloads/{result.get('path', '').rsplit('/', 1)[-1]} "
@@ -14483,7 +14706,9 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 'headers': (args or {}).get('headers') or {},
                 'purpose': (args or {}).get('purpose') or 'research',
                 'workContext': work_context,
-                'workContextTrusted': bool(work_context_trusted),
+                # Server-minted proof of player-authored provenance; the endpoint
+                # redeems it and ignores the legacy boolean entirely.
+                'workTrustNonce': work_trust_nonce,
             }, agent_key, timeout=API_CALL_TIMEOUT_S + 5)
             if isinstance(result, dict) and result.get('allowed') and result.get('textForModel'):
                 return f"{result.get('modelInstruction', '')}\n\n{result['textForModel']}"
@@ -15091,9 +15316,9 @@ _RSS_WINDOW_S = 3 * 86400
 _RSS_FETCH_TIMEOUT_S = 20
 _RSS_HTTP_HEADERS = {'User-Agent': 'AIThinkTankAgent/1.0 (think-tank current-events aggregator)'}
 
-_RSS_BUFFER = {}  # feed_id -> list of {'ts', 'title', 'link', 'summary', 'matchedTopics'}
+_RSS_BUFFER: dict = {}  # feed_id -> list of {'ts', 'title', 'link', 'summary', 'matchedTopics'}
 _RSS_BUFFER_LOCK = threading.Lock()
-_RSS_STATUS = {}  # feed_id -> {'last_fetch_at', 'last_error', 'ok'}
+_RSS_STATUS: dict = {}  # feed_id -> {'last_fetch_at', 'last_error', 'ok'}
 
 
 def _parse_rss_atom_xml(raw, feed_id):  # noqa: ARG001 -- feed_id kept for signature symmetry
@@ -15250,7 +15475,6 @@ def _rss_feed_upsert(spec, status='active', proposed_by=None):
     """Persist a feed spec as a row and refresh the live registry. Used by the
     propose flow (status='proposed'), the approval flow (status='active' or
     'denied'), and the remove flow (status='removed')."""
-    sid = spec.get('id')
     row = _rss_feed_spec_to_row(spec, status=status, proposed_by=proposed_by)
     with _db() as conn:
         conn.execute(
@@ -15399,9 +15623,9 @@ _WS_FEED_SEED = {
 }
 _WS_FEEDS = {}  # live registry: sid -> {'name', 'credential', 'ws': descriptor} (DB-backed)
 _WS_FEEDS_LOAD_ERROR = None
-_WS_BUFFERS = {}  # sid -> {'latest': {topic: rec}, 'history': [...], 'status': {...}}
+_WS_BUFFERS: dict = {}  # sid -> {'latest': {topic: rec}, 'history': [...], 'status': {...}}
 _WS_LOCK = threading.Lock()
-_WS_TASKS = {}  # sid -> (spec_fingerprint, asyncio.Task)
+_WS_TASKS: dict = {}  # sid -> (spec_fingerprint, asyncio.Task)
 
 
 def _ws_feed_spec_to_row(spec, status='active', proposed_by=None):
@@ -15482,7 +15706,6 @@ def _ws_feed_upsert(spec, status='active', proposed_by=None):
     """Persist a feed spec as a row and refresh the live registry. Used by the
     propose flow (status='proposed'), approval flow ('active'/'denied'), and
     remove flow ('removed')."""
-    sid = spec.get('id')
     row = _ws_feed_spec_to_row(spec, status=status, proposed_by=proposed_by)
     with _db() as conn:
         conn.execute(
@@ -16474,7 +16697,7 @@ async def intent_incidents(request: Request):
 # by agents BEFORE they act (injected as context by the content executors).
 # Reads are open to any authenticated client; the write surface (create/
 # release/status, wiki page/category writes) is gated to directors/admins. The
-# /api/intent prefix is already session-auth'd (AUTH_PROTECTED_PREFIXES).
+# /api/intent is protected by default (deny-by-default auth middleware).
 # Governing actions are chained into the hashed product-passport like
 # sprints/teams. sim.py holds the pure state-catalog helpers; these wrappers
 # do the real sandbox snapshot + disk write + passport chaining.
@@ -19243,7 +19466,7 @@ async def chat(request: Request):
     # and gets back the reply text, nothing else.
     if not OPENROUTER_API_KEY:
         return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
-    # /api/chat is NOT in AUTH_PROTECTED_PREFIXES (it governs OpenRouter spend,
+    # /api/chat is in AUTH_PUBLIC_PATHS (it governs OpenRouter spend,
     # so it guards itself by EITHER a player session OR a valid agent key --
     # the same agent-key attribution model every other /api endpoint uses). The
     # server's own loopback (assign-big-task planning, via _http_json) has no
@@ -19467,7 +19690,7 @@ async def browse(request: Request):
     # writing it into the assignment. An agent-authored story's work text is
     # NEVER trusted for this bypass (the agent wrote the text itself), so its
     # named hosts always go through the story-aware Jev prompt.
-    work_context_trusted = bool(body.get('workContextTrusted'))
+    work_context_trusted = _work_trust_from_body(body)
     if not check_rate_limit(agent_id):
         log_action(agent_id, 'rate_limited', {'endpoint': 'browse'})
         return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
@@ -19650,7 +19873,7 @@ async def browse(request: Request):
 # is recorded with its RESOLVED identity (a short link's raw string is never
 # the identity -- see evidence.source_identity), and the operator/Verifier
 # reads and clears records through these same endpoints. All paths are
-# session/agent-key protected via AUTH_PROTECTED_PREFIXES.
+# session/agent-key protected by the deny-by-default auth middleware.
 # ---------------------------------------------------------------------------
 @app.post('/api/evidence')
 async def evidence_record(request: Request):
@@ -21218,7 +21441,7 @@ async def api_call(request: Request):
     # named in the assigned work skipping Jev like the allowlist) fires ONLY
     # for a task the PLAYER wrote. An agent-authored story can name any URL in
     # its own text -- never trusted for the bypass.
-    work_context_trusted = bool(body_json.get('workContextTrusted'))
+    work_context_trusted = _work_trust_from_body(body_json)
     workflow = bool(body_json.get('workflow'))
 
     if not check_rate_limit(agent_id):
@@ -22088,6 +22311,21 @@ def _ensure_sandbox_git_repo(sandbox_dir):
     # any global git config on the machine this happens to run on.
     _run_git_sync(sandbox_dir, ['config', 'user.email', 'sandbox-backup@ai-think-tank.local'])
     _run_git_sync(sandbox_dir, ['config', 'user.name', 'AI Think Tank sandbox backup'])
+    # Transient browser-act state (screenshots, driver result files, the
+    # persistent profile's cookies) must never land in the snapshot history.
+    # The action file itself already lives outside the mount, but the profile
+    # and shots are written here, so keep the whole dir out of git.
+    try:
+        gitignore = os.path.join(sandbox_dir, '.gitignore')
+        existing = ''
+        if os.path.isfile(gitignore):
+            with open(gitignore, 'r') as f:
+                existing = f.read()
+        if '.browser-act/' not in existing:
+            with open(gitignore, 'a') as f:
+                f.write(('\n' if existing and not existing.endswith('\n') else '') + '.browser-act/\n')
+    except OSError:
+        pass
 
 
 def _snapshot_sandbox(sandbox_id, sandbox_dir):
@@ -22400,7 +22638,7 @@ async def download_file(request: Request):
     except (TypeError, ValueError):
         max_bytes = MAX_DOWNLOAD_BYTES
     max_bytes = max(1024, min(max_bytes, MAX_DOWNLOAD_BYTES))
-    headers = {}
+    headers: dict = {}
     # Optional capability handle: attach a token credential and enforce the
     # handle's host/method scope against this exact URL.
     capability_handle = (body.get('capabilityHandle') or '').strip()
@@ -22422,7 +22660,7 @@ async def download_file(request: Request):
     # 600-char slice and read as hard prohibitions. Block categories always win.
     parsed = urllib.parse.urlparse(url)
     work_context = (body.get('workContext') or '').strip()
-    work_context_trusted = bool(body.get('workContextTrusted'))
+    work_context_trusted = _work_trust_from_body(body)
     trace_id = None
     if _is_allowlisted_host(parsed.hostname) or (work_context_trusted and _is_work_context_host(work_context, parsed.hostname)):
         log_action(agent_id, 'download', {'url': url[:200], 'purpose': purpose,
@@ -22773,7 +23011,8 @@ async def sublow_inference(request: Request):
     # clamps max_tokens to what the grant allows, runs the shared input
     # guard, and re-checks the burn-down estimate plus every Bank gate
     # (agent cap, per-task budget, shared tank cap) before a cent moves.
-    # NOT in AUTH_PROTECTED_PREFIXES: the grant token is the auth, the same
+    # NOT protected by the deny-by-default middleware (listed in
+    # AUTH_PUBLIC_PATHS): the grant token is the auth, the same
     # self-guarding shape /api/chat uses.
     if not OPENROUTER_API_KEY:
         return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
@@ -22977,7 +23216,8 @@ async def jev_inference(request: Request):
     # clamps max_tokens to what the grant allows, runs the shared input
     # guard, and re-checks the burn-down estimate plus every Bank gate
     # (agent cap, per-task budget, shared tank cap) before a cent moves.
-    # NOT in AUTH_PROTECTED_PREFIXES: the grant token is the auth, the same
+    # NOT protected by the deny-by-default middleware (listed in
+    # AUTH_PUBLIC_PATHS): the grant token is the auth, the same
     # self-guarding shape /api/chat and the sublow inference endpoint use.
     if not OPENROUTER_API_KEY:
         return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
@@ -23185,7 +23425,7 @@ async def browser_act(request: Request):
     # like the allowlist) fires ONLY for a task the PLAYER wrote. An
     # agent-authored story can name any URL in its own text -- never trusted
     # for the bypass.
-    work_context_trusted = bool(body.get('workContextTrusted'))
+    work_context_trusted = _work_trust_from_body(body)
     sandbox_id = body.get('sandboxId') or ('sandbox-' + secrets.token_hex(4))
     sandbox_id = _village_sandbox_id(agent_id, sandbox_id)  # per-village repo isolation
     if not _SANDBOX_ID_RE.match(sandbox_id or ''):
@@ -23234,13 +23474,19 @@ async def browser_act(request: Request):
                                                   'purpose': purpose, 'decision': 'blocked',
                                                   'reason': 'credential handle invalid, expired, out of scope, or not a login credential'}, authorized=authorized)
             return JSONResponse({'error': 'That capability handle is not valid for this login fill (expired, wrong agent, out-of-scope host, or not a login credential).'}, status_code=403)
-    if op in ('goto',):
+    if url:
         # Same URL guardrails as /api/browse: http(s) only, and the final host
-        # must be a safe public host (SSRF/private-network protection). The
-        # sandbox egress proxy still applies underneath -- this is the intent
-        # gate; the proxy is the hard boundary for everything except hosts Jev
-        # explicitly approved (which get a short-lived, scoped egress grant
-        # for exactly this run -- see _run_browser_act_sync).
+        # must be a safe public host (SSRF/private-network protection). Fires
+        # for ANY op that carries a url, not just goto: the driver navigates to
+        # the url for every such op (browser_driver.py navigates before
+        # fill/click/etc.), and _run_browser_act_sync grants the url's host
+        # egress op-agnostically -- so a fill with a link-local/metadata url
+        # would otherwise have skipped this check entirely while still
+        # reaching the network. The sandbox egress proxy still applies
+        # underneath -- this is the intent gate; the proxy is the hard
+        # boundary for everything except hosts Jev explicitly approved (which
+        # get a short-lived, scoped egress grant for exactly this run -- see
+        # _run_browser_act_sync).
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ('http', 'https') or not parsed.netloc:
             return JSONResponse({'error': 'url must be http(s) with a real host'}, status_code=400)
@@ -23393,14 +23639,16 @@ async def pipeline(request: Request):
 
 @app.post('/api/youtube-transcript')
 async def youtube_transcript(request: Request):
-    # Real YouTube transcript extraction, always via the download-and-transcribe
-    # route: per the player's decision ("force it to always download ... treat
-    # them all the same") there is no captions fast-path special-casing -- every
-    # video is treated the same. The Apify actor downloads the audio and
-    # faster-whisper transcribes it, both on the Colab runtime
-    # (_youtube_transcript_colab); no video audio ever touches this machine.
-    # Blocks run in a worker thread so the blocking Colab call (Apify actor +
-    # whisper) doesn't stall the event loop.
+    # Free route FIRST: YouTube's own captions via local yt-dlp (no metered API,
+    # no Colab compute). Only when captions are unavailable/empty does this fall
+    # back to the download-and-transcribe path on the Colab runtime (the Apify
+    # actor + faster-whisper in _youtube_transcript_colab), which is the
+    # expensive, metered one. This REVERSES the earlier "always download, treat
+    # them all the same" decision -- the player's call now is to prefer the free
+    # route and spend Colab only on videos captions can't serve. Both paths file
+    # to the same media/transcripts/{video_id}.txt with the same header; the
+    # header's Source line records which one produced it. Blocks run in a worker
+    # thread so the blocking fetch/transcribe calls don't stall the event loop.
     body = await request.json()
     agent_id = body.get('agentId', 'unknown')
     url = (body.get('url') or '').strip()
@@ -23411,20 +23659,26 @@ async def youtube_transcript(request: Request):
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
     if not _is_youtube_url(url):
         return JSONResponse({'error': 'a valid youtube.com or youtu.be URL is required'}, status_code=400)
-    source = 'colab-whisper'
-    text, error = await asyncio.to_thread(_youtube_transcript_colab, url, lang)
-    if error:
-        log_action(agent_id, 'youtube_transcript', {'url': url, 'decision': 'failed', 'error': error[:200]}, authorized=authorized)
-        return JSONResponse({'error': error}, status_code=422)
+    text, captions_error = await asyncio.to_thread(_youtube_transcript, url, lang)
+    source = 'yt-dlp-captions'
+    if not text:
+        text, error = await asyncio.to_thread(_youtube_transcript_colab, url, lang)
+        source = 'colab-whisper'
+        if error:
+            log_action(agent_id, 'youtube_transcript',
+                       {'url': url, 'decision': 'failed', 'error': error[:200],
+                        'captionsError': (captions_error or '')[:200]}, authorized=authorized)
+            return JSONResponse({'error': error}, status_code=422)
     # File the extracted transcript into the shared Library's media/
     # transcripts/ tree so ANY agent can read it later (the Studio's
     # media-building lane reads this same media/ area). Best-effort: the
     # transcript is returned to the caller regardless, and a write failure
     # must never fail the request.
     filed_path = _file_youtube_transcript(url, text, source)
-    log_action(agent_id, 'youtube_transcript', {'url': url, 'decision': 'ok', 'chars': len(text)}, authorized=authorized)
+    log_action(agent_id, 'youtube_transcript',
+               {'url': url, 'decision': 'ok', 'chars': len(text), 'source': source}, authorized=authorized)
     return JSONResponse({'ok': True, 'url': url, 'transcript': text, 'chars': len(text),
-                         'filed': filed_path})
+                         'source': source, 'filed': filed_path})
 
 
 @app.get('/api/sandbox-backups')
@@ -25568,10 +25822,10 @@ async def model_tiers():
 @app.post('/api/model-tiers/refresh')
 async def model_tiers_refresh():
     # An explicit, deliberate action (a button) -- but also run AUTOMATICALLY
-    # once a day by _model_tier_refresh_loop, attributed to the admin/director
-    # (The model landscape moves fast, so the think tank re-picks its
-    # best-value tier from that day's scores + prices on a schedule). This
-    # endpoint just lets the player force an immediate re-pick too.
+    # on the tier-refresh cadence by _model_tier_refresh_loop, attributed to
+    # the admin/director (the model landscape moves fast, so the think tank
+    # re-picks its best-value tier from the current scores + prices on a
+    # schedule). This endpoint just lets the player force an immediate re-pick too.
     try:
         fresh = await refresh_model_tiers()
         return JSONResponse({band: {'slug': m['id'], 'name': m['name'], 'price': m['price']} for band, m in fresh.items()})
@@ -25594,6 +25848,15 @@ async def catalog_price_history_get(modelId: str = '', days: int = 30):
     # one model's price series. This is how a price drop (or spike) is
     # visible even when the model never won a tier pick.
     return JSONResponse({'history': get_catalog_price_history(model_id=modelId or None, days=max(1, min(days, 365)))})
+
+
+@app.get('/api/tier-value-windows')
+async def tier_value_windows_get():
+    # Read-only: each band's current value ratio (score-per-dollar vs its
+    # trailing 7-day median) and how long the current pick has been held. A
+    # strong ratio on a fresh pick is a cheap-value window the tank is taking
+    # advantage of -- the operator sees the window, not just the resulting pick.
+    return JSONResponse(get_tier_value_windows())
 
 
 @app.get('/api/model-benchmark-scores')

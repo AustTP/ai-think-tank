@@ -206,20 +206,22 @@ class DownloadJevGate(_TestCase):
     def test_player_authored_work_context_host_bypasses_jev(self):
         # A host the player EXPLICITLY named in a PLAYER-AUTHORED task skips Jev
         # exactly like the allowlist (same rule /api/browse uses). The bypass
-        # requires workContextTrusted -- an agent-authored story's own text
-        # never gets it.
+        # requires a SERVER-MINTED work-trust nonce (Fix B); an agent-authored
+        # story's own text never gets one.
         with unittest.mock.patch.object(serve, '_jev_quorum_decision') as jev, \
              unittest.mock.patch.object(serve, '_download_stream_sync', side_effect=lambda *a, **k: {
                  'status': 200, 'bytes': 3, 'finalUrl': 'https://example.com/f.bin'}):
             r = self._do({'agentId': 'ben', 'url': 'https://example.com/f.bin',
                           'workContext': 'Ship the report -- source data at https://example.com/f.bin',
-                          'workContextTrusted': True})
+                          'workTrustNonce': serve._mint_work_trust_nonce()})
         self.assertEqual(r.status_code, 200, r.text)
         jev.assert_not_called()
 
     def test_agent_authored_work_context_host_goes_through_jev(self):
         # An agent-authored story naming a host must NOT bypass Jev -- the
         # story text is a laundering vector, not a player-vetted allowlist.
+        # The forged legacy boolean (workContextTrusted=True, no nonce) is the
+        # Fix B regression: it must not grant the bypass either.
         calls = []
         async def fake_quorum(instructions, criteria):
             calls.append(1)
@@ -229,7 +231,7 @@ class DownloadJevGate(_TestCase):
                  'status': 200, 'bytes': 3, 'finalUrl': 'https://example.com/f.bin'}):
             r = self._do({'agentId': 'ben', 'url': 'https://example.com/f.bin',
                           'workContext': 'Investigate the data at https://example.com/f.bin',
-                          'workContextTrusted': False})
+                          'workContextTrusted': True})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(len(calls), 1)
 

@@ -1302,6 +1302,14 @@ WORK_ITEM_MAX_ATTEMPTS = 3
 # priority, incidents, peer reviews, sprints, scheduled one-offs
 # (notBefore), and player cards. Neutral (1.0) when history is thin.
 TIER_THROTTLE_RATIO = 0.7
+# The mirror of the throttle: when a band's score-per-dollar TODAY is well
+# ABOVE its trailing 7-day median -- a cheap-value window for that band -- its
+# non-urgent backlog is pulled AHEAD of same-priority siblings so the tank
+# takes on that work while the window is open, instead of only refusing work on
+# bad days. Sits between the lane weight and the size estimate: urgency and
+# lane order are untouched (a parked/reading lane still yields), but within a
+# lane the good-value band's cards start first. Neutral when history is thin.
+GOOD_VALUE_RATIO = 1.3
 MAX_ACTIVE_AGENTS = 25  # hiring.js:41
 MAX_TOTAL_AGENTS = 500  # hiring.js:40 -- total inventory cap, vs MAX_ACTIVE_AGENTS
 # Per-team headcount cap: a team may not exceed 6
@@ -2700,6 +2708,19 @@ def _band_for_work_item(item):
     return 'mid'
 
 
+def _tier_value_boost(item, tier_ratios):
+    """1 when the item's likely band is in a cheap-value window (today's
+    score-per-dollar is well ABOVE the band's trailing median), else 0. Used
+    only as an ordering tiebreak between the lane weight and the size estimate
+    -- see pick_next_due_index. Never reorders across urgency (priority stays
+    the first key) and never reorders across lanes. Neutral (0) when history
+    is thin or no ratios are supplied."""
+    if not tier_ratios:
+        return 0
+    ratio = tier_ratios.get(_band_for_work_item(item), 1.0)
+    return 1 if ratio >= GOOD_VALUE_RATIO else 0
+
+
 def _tier_throttled(item, tier_ratios):
     """True when the item's likely band is in a contracted state (today's
     score-per-dollar is well below the band's trailing median) and the
@@ -2740,9 +2761,12 @@ def pick_next_due_index(work_queue, now_ms, exclude_items, state=None, tier_rati
 
     Price-aware throttle: when `tier_ratios` is supplied (the live
     assignment loop computes it once per cycle), non-urgent items whose
-    likely band is in a bad-value day are skipped -- see _tier_throttled.
-    Callers that pass None (tests, one-off checks) get unthrottled
-    behavior, same as before."""
+    likely band is in a bad-value day are skipped -- see _tier_throttled --
+    and items whose band is in a CHEAP-value window get a small ordering
+    boost between the lane weight and the size estimate (see
+    _tier_value_boost), so a good-value band's backlog is taken on more
+    readily while the window is open. Callers that pass None (tests, one-off
+    checks) get unthrottled, unboosted behavior, same as before."""
     best_index, best_score = -1, None
     for i, item in enumerate(work_queue):
         if not is_work_item_due(item, now_ms):
@@ -2763,7 +2787,8 @@ def pick_next_due_index(work_queue, now_ms, exclude_items, state=None, tier_rati
             continue
         priority = item.get('priority', WORK_PRIORITY['normal'])
         lane_weight = LANE_WEIGHT.get(item.get('lane') or '', 0)
-        score = (priority, lane_weight, size_estimate_weight(item.get('sizeEstimate')))
+        score = (priority, lane_weight, _tier_value_boost(item, tier_ratios),
+                 size_estimate_weight(item.get('sizeEstimate')))
         if best_score is None or score > best_score:
             best_score, best_index = score, i
     return best_index

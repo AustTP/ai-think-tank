@@ -95,6 +95,58 @@ class PickNextDueIndexThrottle(unittest.TestCase):
         self.assertEqual(sim.pick_next_due_index(q, self.NOW, set(), tier_ratios=None), 0)
 
 
+class TierValueBoost(unittest.TestCase):
+    def test_good_value_band_boosts(self):
+        self.assertEqual(sim._tier_value_boost({'taskType': 'code'}, {'coding': 1.5}), 1)
+
+    def test_neutral_and_bad_bands_do_not_boost(self):
+        self.assertEqual(sim._tier_value_boost({'taskType': 'code'}, {'coding': 1.0}), 0)
+        self.assertEqual(sim._tier_value_boost({'taskType': 'code'}, {'coding': 0.3}), 0)
+
+    def test_neutral_when_no_ratios(self):
+        self.assertEqual(sim._tier_value_boost({'taskType': 'code'}, {}), 0)
+        self.assertEqual(sim._tier_value_boost({'taskType': 'code'}, None), 0)
+
+    def test_unmapped_band_defaults_neutral(self):
+        self.assertEqual(sim._tier_value_boost({'taskType': 'spike'}, {'coding': 2.0}), 0)
+
+
+class PickNextDueIndexValueBoost(unittest.TestCase):
+    NOW = 1_000_000
+
+    def _item(self, id_, task_type, prio='normal', lane=None, size='S'):
+        it = {'id': id_, 'taskType': task_type,
+              'priority': sim.WORK_PRIORITY[prio], 'sizeEstimate': size}
+        if lane:
+            it['lane'] = lane
+        return it
+
+    def test_good_value_band_leads_same_priority_sibling(self):
+        # mid band boosted (cheap window) vs coding band neutral. Without the
+        # boost the L-sized coding card wins on size; with it the boost lands
+        # between lane and size, so the good-value mid card starts first.
+        q = [self._item('a', 'spike', size='S'), self._item('b', 'code', size='L')]
+        self.assertEqual(
+            sim.pick_next_due_index(q, self.NOW, set(), tier_ratios={'mid': 1.5, 'coding': 1.0}), 0)
+
+    def test_boost_does_not_override_urgency(self):
+        q = [self._item('a', 'spike', prio='normal'), self._item('b', 'code', prio='urgent')]
+        self.assertEqual(
+            sim.pick_next_due_index(q, self.NOW, set(), tier_ratios={'mid': 9.0, 'coding': 0.3}), 1)
+
+    def test_boost_does_not_reorder_across_lanes(self):
+        # reading lane (1) good-value vs build lane (3) neutral: lane weight
+        # comes before the boost, so the build card still leads.
+        q = [self._item('a', 'spike', lane='reading'), self._item('b', 'code', lane='build')]
+        self.assertEqual(
+            sim.pick_next_due_index(q, self.NOW, set(), tier_ratios={'mid': 2.0, 'coding': 1.0}), 1)
+
+    def test_unboosted_when_no_ratios(self):
+        # Same queue with no ratios: size tiebreak decides, as before.
+        q = [self._item('a', 'spike', size='S'), self._item('b', 'code', size='L')]
+        self.assertEqual(sim.pick_next_due_index(q, self.NOW, set()), 1)
+
+
 class TierValueRatios(unittest.TestCase):
     def test_insufficient_history_returns_neutral(self):
         # No tier_daily_log rows in a fresh test: every band defaults to 1.0

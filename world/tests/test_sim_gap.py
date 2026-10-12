@@ -621,10 +621,15 @@ class StuckGate(SimIsolation):
                  'teams': []}
         self.assertIsNone(sim._borrow_inactive_agent_for_team(state, 'd2'))
 
-    def test_maybe_escalate_stuck_gate_create_raises(self):
+    def test_maybe_escalate_stuck_gate_log_failure_still_freezes(self):
+        # The bound auto-closes the story (no create_escalation); a failing
+        # governance log must be swallowed and the gate still freezes.
+        state = {}
+        parent = {'id': 't1', 'title': 't'}
         gate = {'cycleCount': sim.MAX_REVIEW_CYCLES - 1, 'escalated': False}
-        with unittest.mock.patch('serve.create_escalation', side_effect=RuntimeError('boom')):
-            escalated = sim._maybe_escalate_stuck_gate({'title': 't'}, gate, 'reason')
+        with unittest.mock.patch('serve.log_action', side_effect=RuntimeError('boom')), \
+                unittest.mock.patch.object(sim, '_close_gated_story'):
+            escalated = sim._maybe_escalate_stuck_gate(state, parent, gate, 'reason')
         self.assertTrue(escalated)
         self.assertTrue(gate['escalated'])
 

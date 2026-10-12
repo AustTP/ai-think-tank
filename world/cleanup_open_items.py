@@ -3,7 +3,6 @@ work item, mark wrq-8 done. Run with the server STOPPED."""
 import json
 import os
 import sqlite3
-import sys
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

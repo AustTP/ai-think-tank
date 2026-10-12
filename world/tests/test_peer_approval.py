@@ -512,35 +512,41 @@ class BoundedReviewEscalation(unittest.TestCase):
         return state['tasks'][parent_id]
 
     def test_pure_counter_escalates_exactly_at_the_threshold(self):
+        state = _state()
         parent = {'id': 't1', 'title': 'A story'}
         gate = {}
-        with unittest.mock.patch.object(serve, 'create_escalation') as esc:
+        with unittest.mock.patch.object(sim, '_close_gated_story') as close, \
+                unittest.mock.patch.object(serve, 'log_action') as log:
             for i in range(sim.MAX_REVIEW_CYCLES - 1):
-                frozen = sim._maybe_escalate_stuck_gate(parent, gate, 'test reason')
+                frozen = sim._maybe_escalate_stuck_gate(state, parent, gate, 'test reason')
                 self.assertFalse(frozen, f'must not freeze before the threshold (cycle {i+1})')
-            esc.assert_not_called()
-            frozen = sim._maybe_escalate_stuck_gate(parent, gate, 'test reason')
+            close.assert_not_called()
+            frozen = sim._maybe_escalate_stuck_gate(state, parent, gate, 'test reason')
         self.assertTrue(frozen)
         self.assertTrue(gate['escalated'])
-        esc.assert_called_once()
-        self.assertIn('A story', esc.call_args.args[1])
+        # The bound now SHIPS the story (auto-close), it does not page the
+        # player through create_escalation.
+        close.assert_called_once_with(state, parent)
+        self.assertIn('task_auto_closed', [c.args[1] for c in log.call_args_list])
 
     def test_pure_counter_is_idempotent_once_escalated(self):
+        state = _state()
         parent = {'id': 't1', 'title': 'A story'}
         gate = {'escalated': True, 'cycleCount': 99}
-        with unittest.mock.patch.object(serve, 'create_escalation') as esc:
-            frozen = sim._maybe_escalate_stuck_gate(parent, gate, 'test reason')
+        with unittest.mock.patch.object(sim, '_close_gated_story') as close:
+            frozen = sim._maybe_escalate_stuck_gate(state, parent, gate, 'test reason')
         self.assertTrue(frozen)
-        esc.assert_not_called()  # already escalated once -- never re-fires
+        close.assert_not_called()  # already escalated once -- never re-fires
         self.assertEqual(gate['cycleCount'], 99)  # doesn't keep counting once frozen
 
     def test_repeated_rejections_freeze_the_gate_instead_of_looping_forever(self):
         state, task = self._gated_state()
-        with unittest.mock.patch.object(serve, 'create_escalation') as esc:
+        with unittest.mock.patch.object(serve, 'log_action') as log:
             for _ in range(sim.MAX_REVIEW_CYCLES):
                 parent = self._reject(state, task['id'])
         self.assertTrue(parent['_peerGate']['escalated'])
-        esc.assert_called_once()
+        auto_closed = [c for c in log.call_args_list if c.args[1] == 'task_auto_closed']
+        self.assertEqual(len(auto_closed), 1)
 
     def test_frozen_gate_stops_resetting_approvals_on_further_rejections(self):
         state, task = self._gated_state()

@@ -2901,9 +2901,17 @@ def _make_browser_act_executor(agent_id, agent_key, sandbox_id, struck_tools=Non
     so it is wrapped in the injection boundary like every fetched page.
     `work_context` (the player-filed task this agent is executing) is threaded
     through so the Jev gate judges URLs against the assigned work.
-    `work_context_trusted` is True only when the task was PLAYER-authored
+    `work_context_trusted` is True only when the STORED task was PLAYER-authored
     (see queue_work's playerAuthored provenance) -- the Jev gate's work-context
-    bypass fires only then, never for an agent-authored story's own text."""
+    bypass fires only then, never for an agent-authored story's own text. When
+    it is True this factory mints a one-time work-trust nonce (server-side) and
+    sends THAT to the endpoint; the agent's own model call can neither mint nor
+    forge it, so setting `workContextTrusted` in a hand-rolled request is
+    ignored."""
+    # Server-minted, single-use proof of player-authored provenance (Fix B).
+    # Minted here -- at factory time, from the real task's flag -- never read
+    # back out of an agent-controlled request body.
+    work_trust_nonce = _serve._mint_work_trust_nonce() if work_context_trusted else ''
     def execute_tool(name, args):
         if struck_tools is not None and name in struck_tools:
             return ('browser_act was already blocked once this investigation (one-strike) -- '
@@ -2920,7 +2928,9 @@ def _make_browser_act_executor(agent_id, agent_key, sandbox_id, struck_tools=Non
             'purpose': purpose,
             'maxText': int((args or {}).get('maxText') or 0) or 0,
             'workContext': work_context,
-            'workContextTrusted': bool(work_context_trusted),
+            # Server-minted proof of player-authored provenance; the endpoint
+            # redeems it and ignores the legacy boolean entirely.
+            'workTrustNonce': work_trust_nonce,
         }
         cred_handle = (args or {}).get('credentialHandle') or ''
         if cred_handle:
@@ -3372,14 +3382,18 @@ _YOUTUBE_TRANSCRIPT_TOOL = {
     'function': {
         'name': 'youtube_transcript',
         'description': (
-            "Fetch the real transcript of a YouTube video as plain text, by downloading the "
-            "video's audio (via the Apify youtube-link actor) and transcribing it with whisper "
-            "on the think tank's Colab runtime -- every video is treated the same, no captions "
-            "shortcut (metered against the Colab compute budget). Give a youtube.com or youtu.be "
-            "URL (you can paste the watch?v=, /shorts/, or youtu.be link). Returns the full "
-            "transcript text (truncated at ~50k chars). Use this when an investigation needs what "
-            "a video actually says -- e.g. to analyze a claimed method, pull quoted claims, or "
-            "research a tutorial -- never invent a plausible-sounding video summary."
+            "Fetch the real transcript of a YouTube video as plain text. Uses the FREE route "
+            "first (YouTube's own captions via yt-dlp) and only falls back to the metered "
+            "download-and-transcribe path (Apify youtube-link actor + whisper on the Colab "
+            "runtime) when the video has no usable captions. Give a youtube.com or youtu.be URL "
+            "(you can paste the watch?v=, /shorts/, or youtu.be link). Returns the full "
+            "transcript text (truncated at ~50k chars) and files a copy to "
+            "media/transcripts/<video_id>.txt. Use this when an investigation needs what a video "
+            "actually says -- e.g. to analyze a claimed method, pull quoted claims, or research a "
+            "tutorial -- never invent a plausible-sounding video summary. For a video the free "
+            "route can't cover, this is the fallback; you may also read a transcript from "
+            "youtubetotranscript.com yourself if it is reachable, but that site blocks automated "
+            "fetches."
         ),
         'parameters': {
             'type': 'object',

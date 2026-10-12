@@ -2907,15 +2907,21 @@ class JevSafetyGate(unittest.TestCase):
         allowed, _ = self._call('approve', 0.9)
         self.assertTrue(allowed)
 
-    def test_low_confidence_allow_escalates_and_denies(self):
-        allowed, save_called = self._call('allow', 0.4)
+    def test_low_confidence_allow_is_blocked_without_escalation(self):
+        # Low-confidence allow is "unsure": block + log blocked_unsure. The
+        # agent adapts to the block; no player escalation is filed.
+        with unittest.mock.patch.object(serve, 'log_action') as mock_log:
+            allowed, save_called = self._call('allow', 0.4)
         self.assertFalse(allowed, 'a low-confidence allow must NOT be flat-allowed')
-        save_called.assert_called()
+        save_called.assert_not_called()
+        self.assertEqual(mock_log.call_args[0][2]['decision'], 'blocked_unsure')
 
-    def test_low_confidence_approve_escalates_and_denies(self):
-        allowed, save_called = self._call('approve', 0.3)
+    def test_low_confidence_approve_is_blocked_without_escalation(self):
+        with unittest.mock.patch.object(serve, 'log_action') as mock_log:
+            allowed, save_called = self._call('approve', 0.3)
         self.assertFalse(allowed)
-        save_called.assert_called()
+        save_called.assert_not_called()
+        self.assertEqual(mock_log.call_args[0][2]['decision'], 'blocked_unsure')
 
     def test_block_denies_without_escalation(self):
         # A firm block is just a block -- no need to escalate an already-clear no.
@@ -3773,11 +3779,11 @@ class _ClassifyCommandJev(unittest.TestCase):
         self.assertTrue(allowed)
         self.assertEqual(reason, 'allow')
 
-    def test_low_confidence_allow_escalates_and_blocks(self):
+    def test_low_confidence_allow_blocks_without_escalation(self):
         allowed, reason, save_called = self._run('allow', 0.4)
         self.assertFalse(allowed, 'low-confidence allow must not run the command')
         self.assertIn('unsure', reason)
-        save_called.assert_called()
+        save_called.assert_not_called()
 
     def test_block_blocks_without_escalation(self):
         allowed, reason, save_called = self._run('block', 0.99)

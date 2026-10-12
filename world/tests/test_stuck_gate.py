@@ -217,7 +217,8 @@ class StuckGateSweep(unittest.TestCase):
         state = _state()
         _gated_task(state, entered_ms=0, reviewed_task_ids=['r1', 'r2'])
         total_enqueued = 0
-        with unittest.mock.patch.object(serve, 'create_escalation') as esc:
+        with unittest.mock.patch.object(sim, '_close_gated_story') as close, \
+                unittest.mock.patch.object(serve, 'log_action') as log:
             for i in range(sim.MAX_REVIEW_CYCLES + 2):
                 now_ms = (i + 1) * (sim.STUCK_GATE_RESCUE_REVIEW_TIMEOUT_MS + 1000)
                 sim._sweep_stuck_gates(state, now_ms=now_ms)
@@ -230,7 +231,10 @@ class StuckGateSweep(unittest.TestCase):
                 state['workQueue'] = [q for q in state['workQueue'] if q.get('reviewOf') != 'task-1']
         gate = state['tasks']['task-1']['_peerGate']
         self.assertTrue(gate['escalated'])
-        esc.assert_called_once()
+        # The bound ships the story once (auto-close), it does not page the
+        # player through create_escalation.
+        close.assert_called_once()
+        self.assertEqual(len([c for c in log.call_args_list if c.args[1] == 'task_auto_closed']), 1)
         # MAX_REVIEW_CYCLES-1 real re-enqueues (2 reviewers each) happened
         # before the Nth check itself froze the gate instead of rescuing --
         # not one per sweep call (there were MAX_REVIEW_CYCLES+2 sweeps total).

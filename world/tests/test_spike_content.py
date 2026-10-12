@@ -254,25 +254,34 @@ class SpikeContent(unittest.TestCase):
 
     def test_agent_authored_spike_threads_untrusted_work_context(self):
         # The adversarial case end-to-end: an agent-filed spike (no
-        # playerAuthored) must carry workContextTrusted=False into the /api/
-        # browse gate, so a URL the agent named in its OWN story text goes
-        # through the story-aware Jev prompt instead of bypassing it.
+        # playerAuthored) must send NO work-trust nonce into the /api/browse
+        # gate (Fix B), so a URL the agent named in its OWN story text goes
+        # through the story-aware Jev prompt instead of bypassing it. An empty
+        # nonce is the "untrusted" signal now; the legacy boolean is gone.
         task = {'id': 'spike-adv', 'title': 'Research urllib internals',
                 'instructions': 'Investigate https://docs.python.org/3/library/urllib.html',
                 'budgetMs': 60000}
         body = self._capture_web_tool(task)
         self.assertIn('docs.python.org', body['workContext'])
-        self.assertIs(body['workContextTrusted'], False)
+        self.assertNotIn('workContextTrusted', body)
+        self.assertFalse(body['workTrustNonce'])
 
     def test_player_authored_spike_threads_trusted_work_context(self):
         # A player-authored spike (playerAuthored=True) keeps the trusted
-        # bypass: the player vetted the host by writing it into the task.
+        # bypass: the player vetted the host by writing it into the task, and
+        # the executor mints a server-side nonce proving that provenance.
         task = {'id': 'spike-ply', 'title': 'Research urllib internals',
                 'instructions': 'Investigate https://docs.python.org/3/library/urllib.html',
                 'budgetMs': 60000, 'playerAuthored': True}
         body = self._capture_web_tool(task)
         self.assertIn('docs.python.org', body['workContext'])
-        self.assertIs(body['workContextTrusted'], True)
+        self.assertNotIn('workContextTrusted', body)
+        nonce = body['workTrustNonce']
+        self.assertTrue(nonce)
+        # It is a real, redeemable, single-use credential -- not a decorative
+        # string the endpoint would ignore.
+        self.assertTrue(serve._redeem_work_trust_nonce(nonce))
+        self.assertFalse(serve._redeem_work_trust_nonce(nonce))
 
     def test_plan_prompt_requires_a_mandatory_csv_step_for_enumerable_questions(self):
         """Real refinement: a plan that only SUGGESTS a CSV lets
