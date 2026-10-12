@@ -1140,6 +1140,7 @@ def init_db():
             auth_value_format TEXT,
             auth_field TEXT,
             auth_token_url TEXT,
+            auth_header_name TEXT,
             default_headers TEXT,
             methods TEXT,
             path_rules TEXT,
@@ -1160,7 +1161,7 @@ def init_db():
         # no-op.
         try:
             cols = [r[1] for r in conn.execute('PRAGMA table_info(api_services)')]
-            for col, col_type in (('auth_token_url', 'TEXT'), ('spend_cap', 'REAL')):
+            for col, col_type in (('auth_token_url', 'TEXT'), ('spend_cap', 'REAL'), ('auth_header_name', 'TEXT')):
                 if col not in cols:
                     conn.execute(f'ALTER TABLE api_services ADD COLUMN {col} {col_type}')  # nosec B608 -- fixed internal column names, never user input
         except Exception:
@@ -4218,11 +4219,12 @@ def _sublow_tier_slug():
     # The hard-ceilinged band for short, bounded test scenarios run at scale
     # (hundreds of reenactment/testing agents): the cheapest coherent model
     # under the per-model price ceiling, picked on the same intelligence
-    # signal as low. Falls back to the low tier so scenario callers degrade
-    # to the normal cheap tier on a machine whose refresh hasn't produced a
-    # sublow pick (no scores under the ceiling, or every candidate failed
-    # live verification) instead of failing outright.
-    return _model_tier_slug('sublow') or _low_tier_slug()
+    # signal as low. Returns None (never the low tier) when the refresh
+    # hasn't produced a sublow pick -- falling back to low would silently
+    # run sublow-scale work at ~5x the ceiling, which is exactly what the
+    # ceiling exists to prevent. Callers (mint_sublow_grant, the inference
+    # proxy, quote_sublow_grant) already refuse or 503 on a missing pick.
+    return _model_tier_slug('sublow')
 
 
 def _high_tier_slug():
@@ -6268,6 +6270,7 @@ _API_SERVICE_JSON_COLUMNS = ('default_headers', 'methods', 'path_rules', 'workfl
 _API_SERVICE_COLUMNS = (
     'id', 'name', 'base_url', 'credential_type', 'credential_key', 'credential_key2',
     'credential_name', 'auth_type', 'auth_value_format', 'auth_field', 'auth_token_url',
+    'auth_header_name',
     'default_headers', 'methods', 'path_rules', 'spend_kind', 'spend_note', 'spend_cap',
     'workflow', 'status', 'proposed_by', 'created_at', 'updated_at',
 )
@@ -6293,6 +6296,7 @@ def _api_service_spec_to_row(sid, spec, status='active', proposed_by=None):
         'auth_value_format': auth.get('value_format'),
         'auth_field': auth.get('field'),
         'auth_token_url': auth.get('token_url'),
+        'auth_header_name': auth.get('header_name'),
         'default_headers': json.dumps((spec or {}).get('default_headers') or {}),
         'methods': json.dumps((spec or {}).get('methods') or []),
         'path_rules': json.dumps((spec or {}).get('path_rules') or []),
@@ -6333,6 +6337,7 @@ def _api_service_row_to_spec(row):
             'value_format': row.get('auth_value_format'),
             'field': row.get('auth_field'),
             'token_url': row.get('auth_token_url'),
+            'header_name': row.get('auth_header_name'),
         },
         'default_headers': _jget('default_headers', {}),
         'methods': _jget('methods', []),
@@ -6693,7 +6698,7 @@ def _api_apply_auth(spec, token, token2, method, url, headers, body):
         headers['Authorization'] = f'Bearer {token}'
     elif atype == 'header_key':
         fmt = auth.get('value_format') or 'Key {key}'
-        headers['Authorization'] = fmt.format(key=token, key2=token2)
+        headers[auth.get('header_name') or 'Authorization'] = fmt.format(key=token, key2=token2)
     elif atype == 'body_field':
         field = auth.get('field') or 'api_key'
         body = dict(body or {})

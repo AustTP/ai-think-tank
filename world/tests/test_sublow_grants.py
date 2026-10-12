@@ -433,8 +433,9 @@ class SublowEndpoints(SublowGrantCase):
         token, _ = self._mint()
         with serve._db() as conn:
             conn.execute('DELETE FROM model_tiers')
-        # _sublow_tier_slug falls back to the low tier, so with NO picks at
-        # all the accessor still resolves to None and the proxy 503s.
+        # _sublow_tier_slug returns None when no sublow pick exists (it never
+        # falls back to the low tier -- that would silently run sublow-scale
+        # work at ~5x the ceiling), so the proxy 503s.
         mock_call = unittest.mock.Mock()
         with unittest.mock.patch.object(serve, '_call_openrouter_sync', mock_call):
             r = self.client.post(

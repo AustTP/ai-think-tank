@@ -323,14 +323,15 @@ class BandConfiguration(unittest.TestCase):
         # default is the player's stated $0.09/M cap, not off.
         self.assertEqual(serve.SUBLOW_TIER_MAX_PRICE_USD, 0.09)
 
-    def test_sublow_accessor_falls_back_to_low(self):
+    def test_sublow_accessor_never_falls_back_to_low(self):
         # No sublow row in model_tiers (fresh DB, or nothing qualified under
-        # the ceiling) must degrade scenario callers to the normal low tier,
-        # not hand back None.
+        # the ceiling) must return None, never the low tier: sublow-scale
+        # work running at ~5x the ceiling is exactly what the ceiling
+        # exists to prevent. Callers refuse/503 on a missing pick.
         def fake_slug(band):
             return {'low': 'low-slug'}.get(band)
         with unittest.mock.patch.object(serve, '_model_tier_slug', side_effect=fake_slug):
-            self.assertEqual(serve._sublow_tier_slug(), 'low-slug')
+            self.assertIsNone(serve._sublow_tier_slug())
         with unittest.mock.patch.object(serve, '_model_tier_slug', return_value='x'):
             self.assertEqual(serve._sublow_tier_slug(), 'x')
 
