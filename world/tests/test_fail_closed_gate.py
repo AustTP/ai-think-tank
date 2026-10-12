@@ -315,17 +315,20 @@ class SendBackAfterFailure(unittest.TestCase):
         kinds = [m.get('kind') for m in state['agents']['ben'].setdefault('mailbox', [])]
         self.assertIn('peer_review_rejected', kinds)
 
-    def test_send_back_escalates_at_cap_and_stops_queuing_fixes(self):
+    def test_send_back_freezes_at_cap_and_stops_queuing_fixes(self):
         state = _state()
         task = _task(assignedTo='ben')
         state['tasks'][task['id']] = task
-        with unittest.mock.patch.object(serve, 'create_escalation') as esc:
+        with unittest.mock.patch.object(sim, '_close_gated_story') as close, \
+                unittest.mock.patch.object(serve, 'log_action') as log:
             for _ in range(sim.MAX_REVIEW_CYCLES - 1):
                 sim._send_back_after_failure(state, task)
             self.assertFalse(task['_peerGate'].get('escalated'))
             sim._send_back_after_failure(state, task)  # the cap-crossing call
         self.assertTrue(task['_peerGate']['escalated'], 'cap crossed -> frozen')
-        esc.assert_called_once()
+        # The bound auto-closes the story (no player escalation).
+        close.assert_called_once()
+        self.assertIn('task_auto_closed', [c.args[1] for c in log.call_args_list])
         # Exactly cap-1 fixes were ever queued; the cap-crossing call queues none.
         self.assertEqual(len(state['workQueue']), sim.MAX_REVIEW_CYCLES - 1)
 

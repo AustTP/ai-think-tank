@@ -198,7 +198,11 @@ class BrowserActEndpoint(unittest.TestCase):
             unittest.mock.patch.object(serve, 'log_action'),
             unittest.mock.patch.object(serve, '_classify_browser_action',
                                        new=unittest.mock.AsyncMock(return_value=classify)),
-            unittest.mock.patch.object(serve, 'create_escalation', return_value='esc-1'),
+            # A Jev block now gets one supervisor (director) review, not an
+            # escalation; stub it so the test never reaches a real model.
+            unittest.mock.patch.object(serve, '_supervisor_override_decision',
+                                       new=unittest.mock.AsyncMock(
+                                           return_value=(False, 'blocked by supervisor'))),
         ]
         tmp = sandbox_dir or tempfile.mkdtemp(prefix='browser-act-sbx-')
         patchers.append(unittest.mock.patch.object(serve, '_sandbox_dir_for', return_value=tmp))
@@ -243,14 +247,36 @@ class BrowserActEndpoint(unittest.TestCase):
             r = _client().post('/api/browser-act', json={'agentId': 'cora', 'op': 'goto', 'url': 'http://10.0.0.5/', 'purpose': 'look'})
         self.assertEqual(r.status_code, 400)
 
-    def test_blocked_action_escalates(self):
+    def test_non_goto_op_with_url_rejects_private_host(self):
+        # Fix A: the SSRF guard used to fire ONLY for op=goto, but the driver
+        # navigates for ANY op that carries a url (browser_driver.py:153) and
+        # _run_browser_act_sync grants that url's host egress op-agnostically.
+        # So a `fill` carrying a link-local/metadata url used to skip the
+        # check entirely while still reaching the network. Every url-bearing
+        # op is now guarded, same as goto.
+        for op in ('read', 'fill', 'fill_many', 'login', 'click', 'submit', 'screenshot'):
+            with self.subTest(op=op):
+                self._common_mocks()
+                payload = {'agentId': 'cora', 'op': op,
+                           'url': 'http://169.254.169.254/latest/meta-data/', 'purpose': 'look'}
+                if op in ('fill', 'click', 'submit'):
+                    payload['selector'] = '#x'
+                if op in ('fill_many', 'login'):
+                    payload['fields'] = [{'selector': '#u', 'value': 'v'}]
+                with unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=False):
+                    r = _client().post('/api/browser-act', json=payload)
+                self.assertEqual(r.status_code, 400, f'{op} must be SSRF-guarded')
+
+    def test_blocked_action_reports_supervisor_note(self):
         self._common_mocks(classify=(False, 'blocked: payment exfil'))
         r = _client().post('/api/browser-act', json={
             'agentId': 'cora', 'op': 'submit', 'url': 'https://example.com/pay', 'purpose': 'submit credit card'})
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertFalse(body['allowed'])
-        self.assertEqual(body['escalationId'], 'esc-1')
+        # The block is final once the supervisor review declines; the response
+        # carries the reason + the supervisor's note (no escalation is filed).
+        self.assertIn('supervisorNote', body)
 
     def test_allowed_goto_runs_driver_and_returns_page_state(self):
         sbx = tempfile.mkdtemp(prefix='browser-act-sbx-')
@@ -294,19 +320,40 @@ class RunBrowserActSync(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.sbx, ignore_errors=True)
 
     def test_builds_a_docker_command_with_the_driver_and_reads_the_result_file(self):
-        import glob
+        # Fix C+D: the action file can carry a DECRYPTED credential, so it is
+        # written to a host-side temp dir OUTSIDE the shared /workspace mount
+        # and bind-mounted read-only at /browser-act -- a concurrent
+        # /api/execute shell (which shares the mount) can never read it, and
+        # nothing in the mount can be swapped between Jev classifying the op
+        # and the driver reading the action (TOCTOU). The temp dir is deleted
+        # in the finally, so it never outlives the run.
         fake_run = unittest.mock.Mock(returncode=0, stdout='', stderr='')
+        seen_mounts = []
+        action_host_paths = []
 
         def _fake_run(cmd, **kw):
             fake_run.cmd = cmd
             fake_run.kwargs = kw
-            # Simulate the driver writing its result file into the mounted
-            # /workspace dir, exactly like a real run would (same run_id as
-            # the action file the endpoint wrote).
-            for p in glob.glob(os.path.join(self.sbx, '.browser-act', 'action-*.json')):
-                run_id = os.path.basename(p).replace('action-', '').replace('.json', '')
-                with open(os.path.join(self.sbx, '.browser-act', f'result-{run_id}.json'), 'w') as f:
-                    f.write(json.dumps({'ok': True, 'url': 'https://dreyx.com/', 'title': 't', 'text': 'x'}))
+            # Where the driver will read its action from, per the argv.
+            action_arg = next(c for c in cmd if c.endswith('.json') and 'action-' in c)
+            self.assertEqual(action_arg, '/browser-act/' + os.path.basename(action_arg))
+            # Resolve the read-only mount to its host-side source dir.
+            ro_mounts = [cmd[i + 1] for i, c in enumerate(cmd) if c == '-v' and ':/browser-act:ro' in cmd[i + 1]]
+            self.assertEqual(len(ro_mounts), 1)
+            host_dir = ro_mounts[0].split(':')[0]
+            seen_mounts.append(host_dir)
+            action_path = os.path.join(host_dir, os.path.basename(action_arg))
+            action_host_paths.append(action_path)
+            # The action must NOT be inside the shared sandbox mount.
+            self.assertFalse(os.path.abspath(action_path).startswith(os.path.abspath(self.sbx) + os.sep))
+            with open(action_path) as f:
+                action = json.load(f)
+            run_id = os.path.basename(action_arg).replace('action-', '').replace('.json', '')
+            # Result/screenshot still land in the shared mount (page state, no
+            # input values) so the host can read them back directly.
+            with open(os.path.join(self.sbx, '.browser-act', f'result-{run_id}.json'), 'w') as f:
+                f.write(json.dumps({'ok': True, 'url': 'https://dreyx.com/', 'title': 't', 'text': 'x'}))
+            self.assertEqual(action['resultPath'], f'/workspace/.browser-act/result-{run_id}.json')
             return fake_run
 
         with unittest.mock.patch.object(serve, 'PROXY_CONTAINER', 'proxy-c'), \
@@ -329,6 +376,9 @@ class RunBrowserActSync(unittest.TestCase):
         # The browser needs the proxy as an explicit --proxy-server (Chromium
         # ignores http_proxy env vars), so the run passes BROWSER_PROXY_URL too.
         self.assertIn('BROWSER_PROXY_URL=http://proxy-c:8899', fake_run.cmd)
+        # The credential-bearing action dir is deleted once the run returns.
+        self.assertFalse(os.path.exists(seen_mounts[0]))
+        self.assertFalse(os.path.exists(action_host_paths[0]))
 
     def test_timeout_returns_none_and_an_error(self):
         with unittest.mock.patch.object(serve, 'SANDBOX_IMAGE', 'img'), \
@@ -404,8 +454,11 @@ class BrowserActToolExecutor(unittest.TestCase):
 
     def test_threads_work_context_into_the_endpoint(self):
         # The player-filed task must reach the gate so Jev judges URLs against
-        # the assigned work. The executor carries it on every request, plus the
-        # provenance flag that gates the Jev-free host bypass.
+        # the assigned work. The executor carries it on every request, plus a
+        # SERVER-MINTED one-time work-trust nonce that gates the Jev-free host
+        # bypass. Fix B: the legacy workContextTrusted boolean is gone from the
+        # outbound body -- provenance is now a credential the endpoint redeems,
+        # so an agent cannot forge it by setting the flag itself.
         executor = content._make_browser_act_executor(
             'cora', 'key-123', 'spike-1', work_context='Urllib research -- see https://docs.python.org/3/library/urllib.html',
             work_context_trusted=True)
@@ -416,7 +469,13 @@ class BrowserActToolExecutor(unittest.TestCase):
         self.assertIn('EXTERNAL_DATA', out)
         body = http_mock.call_args.args[3]  # _http_json(method, base, path, body, ...)
         self.assertEqual(body['workContext'], 'Urllib research -- see https://docs.python.org/3/library/urllib.html')
-        self.assertIs(body['workContextTrusted'], True)
+        # Provenance travels as a redeemable nonce, not a bare boolean.
+        self.assertNotIn('workContextTrusted', body)
+        nonce = body['workTrustNonce']
+        self.assertTrue(nonce)
+        # Single-use: the first endpoint redemption consumes it.
+        self.assertTrue(serve._redeem_work_trust_nonce(nonce))
+        self.assertFalse(serve._redeem_work_trust_nonce(nonce))
 
 
 if __name__ == '__main__':

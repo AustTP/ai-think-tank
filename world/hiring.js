@@ -75,7 +75,7 @@ const MODEL_TIERS = {
   // Sublow: short, bounded test scenarios at scale (server band 'sublow',
   // hard $0.09/M ceiling). No client consumer yet -- entry exists so the
   // fallback map is complete and loadModelTiers() has somewhere to land
-  // the daily refresh's pick the moment a scenario caller needs it.
+  // the model-tier refresh's pick the moment a scenario caller needs it.
   sublow: { label: 'loading...', slug: 'inclusionai/ling-3.0-flash-vl' },
   // Mid and high/planning replaced with the low
   // band's model -- most agent work doesn't need more than that. Old values

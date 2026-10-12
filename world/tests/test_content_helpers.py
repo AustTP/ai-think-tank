@@ -128,7 +128,10 @@ class ProbeParsing(unittest.TestCase):
 
 class SelfBaseUrl(unittest.TestCase):
     def test_matches_loopback_bind(self):
-        url, matches = serve._derive_self_base_url('127.0.0.1', 8937)
+        # env_url passed explicitly: on a real host SELF_BASE_URL may point at a
+        # Tailscale bind, and this test is about the match contract, not the
+        # machine's .env.
+        url, matches = serve._derive_self_base_url('127.0.0.1', 8937, env_url='http://127.0.0.1:8937')
         self.assertEqual(url, 'http://127.0.0.1:8937')
         self.assertTrue(matches)
 

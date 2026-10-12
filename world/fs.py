@@ -82,7 +82,6 @@ def list_scope(scope, rel_path=''):
     if not grant:
         raise PermissionError('no grant for this scope')
     _require_cap(grant, 'read')
-    root = os.path.realpath(os.path.expanduser(scope))
     p = _resolve(grant, rel_path)
     if not os.path.isdir(p):
         raise FileNotFoundError(f'not a directory: {rel_path}')

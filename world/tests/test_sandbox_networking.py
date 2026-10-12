@@ -50,6 +50,7 @@ class EnsureSandboxNetworking(unittest.TestCase):
             return None
 
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', allowlist), \
+             unittest.mock.patch.object(serve, '_runtime_allowlist_grants', return_value=set()), \
              unittest.mock.patch.object(serve, '_docker_network_exists', return_value=network_exists), \
              unittest.mock.patch.object(serve, '_docker_container_running', side_effect=fake_running), \
              unittest.mock.patch.object(serve, '_docker_container_env_value', side_effect=fake_env_value), \

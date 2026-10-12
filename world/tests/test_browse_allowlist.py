@@ -141,7 +141,9 @@ class BrowseEndpointAllowlist(unittest.TestCase):
     def test_player_authored_work_context_host_bypasses_jev(self):
         # A host the PLAYER explicitly named in a PLAYER-AUTHORED task skips Jev
         # like the allowlist -- the player vetted it by writing it into the
-        # assignment. Requires workContextTrusted (player-authored provenance).
+        # assignment. Requires a SERVER-MINTED work-trust nonce (the executor
+        # mints it from the stored task's playerAuthored flag); the legacy
+        # workContextTrusted boolean is ignored.
         self._common_mocks()
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()), \
              unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as jev:
@@ -149,7 +151,7 @@ class BrowseEndpointAllowlist(unittest.TestCase):
                 'agentId': 'ben', 'url': 'https://docs.python.org/3/library/urllib.html',
                 'purpose': 'research urllib for my spike',
                 'workContext': 'Investigate urllib -- see https://docs.python.org/3/library/urllib.html',
-                'workContextTrusted': True})
+                'workTrustNonce': serve._mint_work_trust_nonce()})
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.json()['allowed'])
         jev.assert_not_called()
@@ -159,6 +161,8 @@ class BrowseEndpointAllowlist(unittest.TestCase):
         # in it. That text is agent-written, so it must NOT skip Jev -- the
         # story text is a laundering vector, not a player-vetted allowlist.
         # The named host still goes through the full story-aware Jev classify.
+        # The forged legacy boolean (workContextTrusted=True with no server
+        # nonce) is the Fix B regression test: it must not grant the bypass.
         self._common_mocks()
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()), \
              unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as jev, \
@@ -167,7 +171,7 @@ class BrowseEndpointAllowlist(unittest.TestCase):
                 'agentId': 'ben', 'url': 'https://docs.python.org/3/library/urllib.html',
                 'purpose': 'research urllib for my spike',
                 'workContext': 'Investigate urllib -- see https://docs.python.org/3/library/urllib.html',
-                'workContextTrusted': False})
+                'workContextTrusted': True})
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.json()['allowed'])
         jev.assert_called_once()
@@ -330,7 +334,7 @@ class BrowseEndpointRedirectReGate(unittest.TestCase):
                 'agentId': 'ben', 'url': 'https://t.co/abc123',
                 'purpose': 'read the urllib docs',
                 'workContext': 'Investigate urllib -- see https://docs.python.org/3/library/urllib.html',
-                'workContextTrusted': True})
+                'workTrustNonce': serve._mint_work_trust_nonce()})
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.json()['allowed'])
         # One call (the unvetted short link); the player-vetted final host

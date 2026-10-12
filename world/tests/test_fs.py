@@ -278,9 +278,16 @@ class AppScriptTests(unittest.TestCase):
                                      'label': 'Notes', 'caps': {'use': True}}]}
         self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
         self._gs.start()
+        # Operator grants (world/grants.json) merge into the effective set, so
+        # a state-only test must blank the config or the repo's real Notes
+        # grant leaks in and defeats the empty-grant assertions.
+        self._cg = unittest.mock.patch.object(
+            serve, 'get_grants_config', return_value={'appGrants': [], 'fileGrants': []})
+        self._cg.start()
 
     def tearDown(self):
         self._gs.stop()
+        self._cg.stop()
 
     def test_no_grant_denied(self):
         self.state['appGrants'] = []

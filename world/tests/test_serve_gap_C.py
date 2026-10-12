@@ -913,6 +913,90 @@ class BandPriceCeiling(unittest.TestCase):
         self.assertEqual(out, pool)
 
 
+class BestValueQualifiers(unittest.TestCase):
+    """The pure, probe-free half of the value policy: qualifiers cheapest
+    first. Shared by _best_value_pick (which then verifies) and the price
+    watch (which uses the cheapest qualifier to spot a value window)."""
+
+    def test_cheapest_first_within_floor(self):
+        cands = [{'id': 'a', 'price': 3.0}, {'id': 'b', 'price': 1.0}, {'id': 'c', 'price': 2.0}]
+        scores = {'a': 70.0, 'b': 66.0, 'c': 69.0}  # floor gap 6 -> all qualify
+        quals = serve._best_value_qualifiers_sync(cands, scores)
+        self.assertEqual([m['id'] for m in quals], ['b', 'c', 'a'])
+
+    def test_below_floor_is_excluded(self):
+        cands = [{'id': 'a', 'price': 1.0}, {'id': 'b', 'price': 0.1}]
+        scores = {'a': 70.0, 'b': 40.0}  # b is far worse than a
+        quals = serve._best_value_qualifiers_sync(cands, scores)
+        self.assertEqual([m['id'] for m in quals], ['a'])
+
+    def test_empty_when_nothing_scored(self):
+        self.assertEqual(serve._best_value_qualifiers_sync([{'id': 'a', 'price': 1.0}], {}), [])
+
+
+class TierWatchMoves(unittest.TestCase):
+    """The 30-min price watch must fire on BOTH kinds of move: the selected
+    model repricing/delisting, and a cheaper in-floor qualifier appearing (a
+    value window). The second is the fix for missing a window that opens and
+    closes between two every-other-hour sweeps."""
+
+    def setUp(self):
+        with serve._db() as conn:
+            conn.execute('DELETE FROM model_tiers')
+            conn.execute('DELETE FROM model_benchmark_scores')
+
+    def _model(self, id_, price):
+        # blended (prompt+completion)*1e6 == price; split evenly
+        half = str(price / 2_000_000)
+        return {'id': id_, 'name': id_,
+                'pricing': {'prompt': half, 'completion': half},
+                'architecture': {'input_modalities': ['text'], 'output_modalities': ['text']}}
+
+    def _select(self, band, slug, price):
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO model_tiers (band, slug, name, price_per_m, chosen_at) VALUES (?,?,?,?,?) '
+                'ON CONFLICT(band) DO UPDATE SET slug=excluded.slug, price_per_m=excluded.price_per_m',
+                (band, slug, slug, price, 0.0))
+
+    def _watch(self, models):
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync', return_value=models):
+            return serve._tier_watch_moves_sync()
+
+    def test_cheaper_in_floor_qualifier_triggers_move(self):
+        serve.set_model_benchmark_score('low/pricey', 'intelligence_index', 70.0, 'u')
+        serve.set_model_benchmark_score('low/cheap', 'intelligence_index', 68.0, 'u')
+        self._select('low', 'low/pricey', 0.30)
+        moves = self._watch([self._model('low/pricey', 0.30), self._model('low/cheap', 0.10)])
+        self.assertEqual(moves, {'low'})
+
+    def test_no_move_when_selected_is_the_cheapest_qualifier(self):
+        serve.set_model_benchmark_score('low/a', 'intelligence_index', 70.0, 'u')
+        serve.set_model_benchmark_score('low/b', 'intelligence_index', 68.0, 'u')
+        self._select('low', 'low/a', 0.05)
+        moves = self._watch([self._model('low/a', 0.05), self._model('low/b', 0.20)])
+        self.assertEqual(moves, set())
+
+    def test_cheaper_but_below_quality_floor_is_ignored(self):
+        serve.set_model_benchmark_score('low/star', 'intelligence_index', 70.0, 'u')
+        serve.set_model_benchmark_score('low/junk', 'intelligence_index', 30.0, 'u')
+        self._select('low', 'low/star', 0.30)
+        moves = self._watch([self._model('low/star', 0.30), self._model('low/junk', 0.02)])
+        self.assertEqual(moves, set())
+
+    def test_selected_repricing_triggers_move(self):
+        serve.set_model_benchmark_score('low/a', 'intelligence_index', 70.0, 'u')
+        self._select('low', 'low/a', 0.30)
+        moves = self._watch([self._model('low/a', 0.45)])
+        self.assertEqual(moves, {'low'})
+
+    def test_delisted_selected_triggers_move(self):
+        serve.set_model_benchmark_score('low/gone', 'intelligence_index', 70.0, 'u')
+        self._select('low', 'low/gone', 0.30)
+        moves = self._watch([self._model('low/other', 0.10)])
+        self.assertEqual(moves, {'low'})
+
+
 class RefreshModelTiers(unittest.TestCase):
     def setUp(self):
         with serve._db() as conn:
@@ -1193,6 +1277,69 @@ class RefreshModelTiers(unittest.TestCase):
              unittest.mock.patch.object(serve, 'log_action'):
             chosen = asyncio.run(serve.refresh_model_tiers())
         self.assertEqual(chosen['mid']['id'], 'mid/only')
+
+    def _refresh(self, models):
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            return asyncio.run(serve.refresh_model_tiers())
+
+    def _logged_at(self, band):
+        with serve._db() as conn:
+            return conn.execute(
+                'SELECT logged_at FROM tier_daily_log WHERE band = ?', (band,)).fetchone()[0]
+
+    def test_same_slug_rerun_preserves_logged_at(self):
+        # logged_at marks when the CURRENT pick first appeared, not the last
+        # refresh -- a same-slug re-run must NOT move it, or the "value window
+        # age" it feeds would always read as ~0.
+        serve.set_model_benchmark_score('low/m1', 'intelligence_index', 70.0, 'u')
+        self._refresh([self._model('low/m1', '0.0000001', '0.0000001')])
+        first = self._logged_at('low')
+        time.sleep(0.01)
+        self._refresh([self._model('low/m1', '0.0000001', '0.0000001')])
+        self.assertEqual(self._logged_at('low'), first)
+
+    def test_slug_change_resets_logged_at(self):
+        serve.set_model_benchmark_score('low/m1', 'intelligence_index', 70.0, 'u')
+        serve.set_model_benchmark_score('low/m2', 'intelligence_index', 69.0, 'u')
+        self._refresh([self._model('low/m1', '0.0000001', '0.0000001')])
+        first = self._logged_at('low')
+        time.sleep(0.01)
+        # m1 delisted; m2 (in floor) takes over -> new pick, new window start.
+        self._refresh([self._model('low/m2', '0.0000002', '0.0000002')])
+        self.assertNotEqual(self._logged_at('low'), first)
+
+
+class TierValueWindows(unittest.TestCase):
+    def setUp(self):
+        with serve._db() as conn:
+            conn.execute('DELETE FROM tier_daily_log')
+
+    def _row(self, log_date, band, slug, price, score, logged_at):
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO tier_daily_log (log_date, band, slug, name, price_per_m, benchmark, score, logged_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                (log_date, band, slug, slug, price, 'coding_index', score, logged_at))
+
+    def test_reports_ratio_and_pick_age(self):
+        today = time.strftime('%Y-%m-%d', time.gmtime())
+        for i in range(1, 6):
+            self._row(f'2000-01-0{i}', 'coding', 'old', 1.0, 50.0, 0.0)
+        # today: twice the value (same score, half the price)
+        self._row(today, 'coding', 'cheap', 0.5, 50.0, 111.0)
+        out = serve.get_tier_value_windows()
+        self.assertAlmostEqual(out['ratios']['coding'], 2.0, places=6)
+        w = out['windows']['coding']
+        self.assertEqual(w['slug'], 'cheap')
+        self.assertEqual(w['sinceTs'], 111.0)
+        self.assertGreaterEqual(w['sinceAgeS'], 0.0)
+        self.assertAlmostEqual(w['valueRatio'], 2.0, places=6)
 
 
 class GetCachedModelTiers(unittest.TestCase):
