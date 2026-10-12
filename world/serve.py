@@ -1444,9 +1444,20 @@ async def _tier_refresh_logged(reason):
     Returns (fresh, changed)."""
     before = {band: m['slug'] for band, m in get_cached_model_tiers().items()}
     fresh = await refresh_model_tiers()
+    if not fresh:
+        # OpenRouter outage shape: catalog reachable but every verify probe
+        # failed, so refresh skipped every band and wrote NOTHING (rows keep
+        # the last good picks). Keep them and say so -- and never log this as
+        # a re-pick (comparing refresh's empty RETURN value against the table
+        # would write a bogus "tiers changed to {}" governance entry).
+        print('[model-tiers] re-pick found no live candidates (all models unavailable?) -- keeping current tiers', flush=True)
     state = get_state_from_db()
     actor = _admin_agent_id(state) or _senior_most_director_id(state)
-    after = {band: m['id'] for band, m in fresh.items()}
+    # Compare the TABLE after the write, not refresh's return value: a
+    # partial refresh (some bands picked, others skipped by failed verify)
+    # leaves skipped rows on their old picks, and the table is what calls
+    # actually resolve against -- the return value can understate it.
+    after = {band: m['slug'] for band, m in get_cached_model_tiers().items()}
     changed = after != before
     if changed:
         if actor:
@@ -1522,6 +1533,79 @@ async def _tier_price_watch_loop():
             # Same fail-open rule as the full loop: keep current tiers, retry
             # on the next cycle -- a watch failure never drops a working pick.
             print(f'[model-tiers] price watch failed (keeping current tiers): {e}', flush=True)
+
+
+# --- Third re-pick trigger: a selected model becoming UNAVAILABLE ----------
+# The catalog price watch catches a slug vanishing from /api/v1/models, and
+# the every-other-hour sweep catches scores/new models -- but a model can be
+# LISTED with valid pricing and zero serving endpoints (openai/gpt-5.2-chat
+# 404'd with "No endpoints found" despite a normal catalog entry; see the
+# note at _verify_model_works_sync). Real agent calls are the authoritative
+# signal for that case: when a chat-completions call fails with an
+# availability-class error, the CURRENT band for that slug is queued here
+# and the drain loop runs a re-pick within a minute. Queue is keyed by band
+# (concurrent failures of one model collapse to one entry) with a per-band
+# cooldown from the last drain so a chronically flaky model cannot stampede
+# the refresh into a loop.
+_TIER_RECHECK_QUEUE = {}      # band -> ts queued (pending drain)
+_TIER_RECHECK_DRAINED = {}    # band -> ts of last drain (cooldown source)
+TIER_RECHECK_COOLDOWN_S = 15 * 60
+TIER_RECHECK_DRAIN_INTERVAL_S = 60
+
+_AVAILABILITY_ERROR_MARKERS = (
+    'no endpoints found', 'model_not_found', 'model not found', 'model does not exist',
+)
+
+
+def _queue_tier_recheck_if_availability(model_slug, code, detail):
+    """Queue a tier re-pick when a chat-completions call failed because the
+    MODEL is unavailable (endpoints gone / delisted while still in catalog),
+    as opposed to a transient error (timeout, 429, 5xx) which the normal
+    retry/circuit-breaker paths already own. Only a slug that is a CURRENT
+    tier pick maps to a band; anything else (a spike's one-off model) is not
+    a tier problem and is ignored. Safe to call from any call thread."""
+    if not model_slug:
+        return
+    detail = (detail or '').lower()
+    if not any(marker in detail for marker in _AVAILABILITY_ERROR_MARKERS):
+        return
+    try:
+        with _db() as conn:
+            bands = [r[0] for r in conn.execute(
+                'SELECT band FROM model_tiers WHERE slug = ?', (model_slug,)).fetchall()]
+    except Exception:
+        return  # never let queueing break an in-flight error path
+    now = time.time()
+    for band in bands:
+        if now - _TIER_RECHECK_DRAINED.get(band, 0.0) < TIER_RECHECK_COOLDOWN_S:
+            continue  # this band was already re-picked recently; let it settle
+        if band not in _TIER_RECHECK_QUEUE:
+            _TIER_RECHECK_QUEUE[band] = now
+            print(f'[model-tiers] queued re-pick: {band} band model {model_slug} failed with an availability error', flush=True)
+
+
+async def _tier_failure_recheck_loop():
+    """Drains _TIER_RECHECK_QUEUE every TIER_RECHECK_DRAIN_INTERVAL_S (1 min):
+    if a selected model was reported unavailable by a real call, run the
+    shared re-pick path so the band lands on a live, verified alternative
+    within a minute instead of at the next scheduled sweep. One refresh
+    covers every queued band at once; queued bands drain together, and the
+    per-band cooldown (set at drain time) suppresses repeat refreshes while a
+    flaky model keeps failing."""
+    while True:
+        await asyncio.sleep(TIER_RECHECK_DRAIN_INTERVAL_S)
+        try:
+            if _TIER_RECHECK_QUEUE:
+                queued = sorted(_TIER_RECHECK_QUEUE)
+                _TIER_RECHECK_QUEUE.clear()
+                for band in queued:
+                    _TIER_RECHECK_DRAINED[band] = time.time()
+                print(f'[model-tiers] availability re-pick for queued bands: {queued}', flush=True)
+                await _tier_refresh_logged(f'model-unavailable: queued bands {queued}')
+        except Exception as e:
+            # Fail-open like the other loops -- keep current tiers, the queue
+            # admission cooldown still bounds how often this can retry.
+            print(f'[model-tiers] availability re-pick failed (keeping current tiers): {e}', flush=True)
 
 
 async def _auto_failover_jev_if_gone(fresh, actor):
@@ -5055,6 +5139,7 @@ async def _lifespan(app):
     prune_task = asyncio.create_task(_log_prune_loop())
     tier_refresh_task = asyncio.create_task(_model_tier_refresh_loop())
     tier_price_watch_task = asyncio.create_task(_tier_price_watch_loop())
+    tier_failure_recheck_task = asyncio.create_task(_tier_failure_recheck_loop())
     calibration_task = asyncio.create_task(_calibration_loop())
     weekly_review_task = asyncio.create_task(_weekly_review_loop())
     colab_task = asyncio.create_task(_colab_failover_loop())
@@ -5096,6 +5181,7 @@ async def _lifespan(app):
     prune_task.cancel()
     tier_refresh_task.cancel()
     tier_price_watch_task.cancel()
+    tier_failure_recheck_task.cancel()
     if telegram_task is not None:
         telegram_task.cancel()
     ask_drain_task.cancel()
@@ -8372,10 +8458,23 @@ def _openrouter_chat_post(body):
         except Exception:
             pass
         if e.code != 400 or 'reasoning is mandatory' not in detail:
+            # Availability-class failure of a SELECTED tier model queues a
+            # re-pick (see _queue_tier_recheck_if_availability); transient
+            # errors are ignored there and owned by retry/circuit-breaker.
+            _queue_tier_recheck_if_availability(body.get('model'), e.code, detail)
             raise
         body = dict(body)
         body['reasoning'] = {'max_tokens': max(1, (body.get('max_tokens') or 2048) // 2)}
-        return _post_once(body)
+        try:
+            return _post_once(body)
+        except urllib.error.HTTPError as e2:
+            detail2 = ''
+            try:
+                detail2 = e2.read().decode('utf-8', 'ignore').lower()
+            except Exception:
+                pass
+            _queue_tier_recheck_if_availability(body.get('model'), e2.code, detail2)
+            raise
 
 
 def _call_openrouter_once_sync(model, messages, max_tokens):
