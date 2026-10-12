@@ -21416,13 +21416,14 @@ async def _classify_browser_action(op, url, purpose, agent_id='unknown', work_co
 # that the tank should self-handle blocks and only page the player for player
 # stories, sprint completion, or permanent access grants). When Jev blocks a
 # command / pipeline step / browser action, the agent's DIRECTOR gets one
-# autonomous review: a NON-Jev model (high tier -- this is high-stakes
-# judgment; asking Jev again would just rubber-stamp its own block) framed as
+# autonomous review: a NON-Jev model (mid tier -- a binary classification
+# task the mid tier handles fine; high tier is reserved for planning. Asking
+# Jev again would just rubber-stamp its own block) framed as
 # the boss deciding whether the block was a false positive on ordinary work.
 # Overrides are logged to action_log AND the tamper-evident passport chain
 # (kind 'supervisor_override'), so every bypass of the safety gate is
 # attributable. Fails closed on every path: no roster director, no API key,
-# no high/mid tier, an unreachable model, a non-JSON or low-confidence answer
+# no mid tier, an unreachable model, a non-JSON or low-confidence answer
 # -- all keep the block.
 async def _supervisor_override_decision(agent_id, action_kind, detail, purpose, block_reason, block_categories=None):
     """Ask the agent's real roster director (via a non-Jev model) whether to
@@ -21444,14 +21445,9 @@ async def _supervisor_override_decision(agent_id, action_kind, detail, purpose, 
         return False, 'no supervisor on the roster to review the block'
     director_name = roster[director_id].get('name') or director_id
     agent_name = me.get('name') or agent_id
-    high = _high_tier_slug()
-    model = high or _mid_tier_slug()
+    model = _mid_tier_slug()
     if not model:
-        return False, 'no high/mid model tier configured for the supervisor review'
-    if high and model == high and _high_tier_budget_exceeded():
-        model = _mid_tier_slug()
-        if not model:
-            return False, 'high-tier budget spent and no mid tier to fall back to'
+        return False, 'no mid model tier configured for the supervisor review'
     cats = list(block_categories or EXECUTE_BLOCK_CATEGORIES)
     prompt = (
         f'You are {director_name}, the supervisor of {agent_name} at an AI research think tank.\n'
