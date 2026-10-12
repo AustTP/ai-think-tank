@@ -513,6 +513,61 @@ class BreakdownCeremony(unittest.TestCase):
         self.assertNotIn('dev', state.get('pendingBreakdowns', {}))
         self.assertEqual(state['backlogRequests'][0]['status'], 'pending')
 
+    def test_player_pins_shape_the_breakdown(self):
+        """Optional player pins (budgetUsd / constraints / roles / mustInclude /
+        order) ride the request into the ceremony as CONTEXT for the scrum
+        master's judgment: the decider sees them in the instructions, and any
+        per-card budgetUsd the model returns is picked up. The pins are not
+        mechanically stamped -- the model weighs them like any other signal.
+        No pins = the ceremony plans freely (the default)."""
+        state = _seed()
+        captured = {}
+
+        def decider(state, instructions, goal):
+            captured['instructions'] = instructions
+            return {'items': [
+                {'title': 'Lay the foundation', 'type': 'story', 'budgetUsd': 3.0},
+                {'title': 'Study the soil', 'type': 'spike', 'budgetUsd': 1.0},
+            ]}
+
+        sim.file_large_request(
+            state, 'faye', 'Build a new wing', 'dev', 1_000_000,
+            constraints={
+                'budgetUsd': 4.0,
+                'constraints': ['Never touch production credentials'],
+                'roles': ['backend'],
+                'mustInclude': ['write a runbook'],
+                'order': ['research', 'build'],
+            })
+        sim._breakdown_step(state, 1000.0, 1_000_001, decider=decider)
+        sim._breakdown_step(state, 1000.0, 1_000_001 + sim.BREAKDOWN_MEET_MS + 1,
+                            decider=decider)
+        # The decider was told the pins as context.
+        self.assertIn('backend', captured['instructions'])
+        self.assertIn('write a runbook', captured['instructions'])
+        self.assertIn('research -> build', captured['instructions'])
+        self.assertIn('Never touch production credentials', captured['instructions'])
+        self.assertIn('$4.00', captured['instructions'])
+        # Per-card budgets are whatever the MODEL allocated (its judgment),
+        # picked up verbatim -- not a mechanical even split.
+        self.assertEqual(len(state['workQueue']), 2)
+        story, spike = state['workQueue']
+        self.assertEqual(story['budgetUsd'], 3.0)
+        self.assertEqual(spike['budgetUsd'], 1.0)
+
+    def test_no_pins_means_free_planning(self):
+        """A request filed WITHOUT constraints has no playerConstraints and the
+        cards carry no pin-derived budget -- the ceremony plans freely."""
+        state = _seed()
+        sim.file_large_request(state, 'faye', 'Build a new wing', 'dev', 1_000_000)
+        req = state['backlogRequests'][0]
+        self.assertNotIn('playerConstraints', req)
+        sim._breakdown_step(state, 1000.0, 1_000_001, decider=self._stub_breakdown())
+        sim._breakdown_step(state, 1000.0, 1_000_001 + sim.BREAKDOWN_MEET_MS + 1,
+                            decider=self._stub_breakdown())
+        for card in state['workQueue']:
+            self.assertIsNone(card.get('budgetUsd'))
+
 
 class MergeAndWhitelist(unittest.TestCase):
     def test_merge_server_owned_carries_ws14_keys(self):
