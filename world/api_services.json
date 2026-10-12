@@ -142,6 +142,18 @@
       ],
       "spend": {"kind": "none", "note": "free keyless NORAD orbital-element sets (TLE); fair-use / rate-limited"}
     },
+    "transitland": {
+      "name": "Transitland (public transit)",
+      "base_url": "https://transit.land/api/v2/rest",
+      "credential": {"type": "env", "key": "TRANSITLAND_API_KEY"},
+      "auth": {"type": "header_key", "header_name": "apikey", "value_format": "{key}"},
+      "methods": ["GET", "HEAD"],
+      "path_rules": [
+        {"prefix": "/", "methods": ["GET", "HEAD"]}
+      ],
+      "spend": {"kind": "daily_calls", "cap": 330,
+                "note": "free tier: 10,000 REST queries/month (~330/day). Routing API (1k/month) is a separate quota -- this entry only covers /rest/. Attribution required: link https://www.transit.land/terms. CATS Charlotte feed is D-grade (sparse stop data); route/operator/feed lookups work well, stop geography can be incomplete."}
+    },
     "jina-reader": {
       "name": "Jina Reader (read-only)",
       "base_url": "https://r.jina.ai",

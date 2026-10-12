@@ -1006,8 +1006,8 @@ class RefreshModelTiers(unittest.TestCase):
 
     def test_sublow_skips_when_nothing_qualifies_under_ceiling(self):
         # Every candidate is over the $0.09 cap: sublow must stay absent from
-        # the result (callers then fall back to the low tier via
-        # _sublow_tier_slug), never silently pick an over-cap model.
+        # the result (callers then refuse / 503 -- _sublow_tier_slug never
+        # falls back to the low tier), never silently pick an over-cap model.
         models = [self._model('sub/over', '0.0000001', '0.0000002')]  # $0.30/M blended
         serve.set_model_benchmark_score('sub/over', 'intelligence_index', 50.0, 'u')
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
