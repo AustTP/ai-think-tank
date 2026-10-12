@@ -1,0 +1,4 @@
+strategy_name,estimated_profit_margin,efficiency_score,status
+Strategy1,0.05,0.85,estimated
+Strategy2,0.03,0.9,estimated
+Strategy3,0.07,0.8,estimated

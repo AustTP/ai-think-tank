@@ -1,0 +1,3 @@
+api_name,url,latency_ms,user_reviews,reliability_score
+Coinbase API,https://api.coinbase.com,unknown,unknown,unknown
+Coinbase Pro API,https://api.pro.coinbase.com,unknown,unknown,unknown

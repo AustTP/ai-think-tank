@@ -1,0 +1,138 @@
+"""Tests for historical_data.py."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+from datetime import date, timedelta
+from unittest.mock import patch
+
+import pandas as pd
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+import historical_data as hd
+
+
+# ---------------------------------------------------------------------------
+# _date_range
+# ---------------------------------------------------------------------------
+
+class TestDateRange:
+    def test_single_day(self) -> None:
+        result = hd._date_range(date(2024, 1, 1), date(2024, 1, 1))
+        assert result == [date(2024, 1, 1)]
+
+    def test_three_days(self) -> None:
+        result = hd._date_range(date(2024, 1, 1), date(2024, 1, 3))
+        assert len(result) == 3
+        assert result[0] == date(2024, 1, 1)
+        assert result[-1] == date(2024, 1, 3)
+
+    def test_empty_when_start_after_finish(self) -> None:
+        result = hd._date_range(date(2024, 1, 5), date(2024, 1, 1))
+        assert result == []
+
+    def test_year_span(self) -> None:
+        result = hd._date_range(date(2024, 1, 1), date(2024, 12, 31))
+        assert len(result) == 366  # 2024 is leap year
+
+
+# ---------------------------------------------------------------------------
+# _sha256_file
+# ---------------------------------------------------------------------------
+
+class TestSha256File:
+    def test_consistent(self, tmp_path: pytest.TempPathFactory) -> None:
+        f = tmp_path / "test.txt"  # type: ignore[operator]
+        f.write_bytes(b"hello")  # type: ignore[union-attr]
+        h1 = hd._sha256_file(str(f))
+        h2 = hd._sha256_file(str(f))
+        assert h1 == h2
+        assert len(h1) == 64
+
+    def test_known_empty_value(self, tmp_path: pytest.TempPathFactory) -> None:
+        f = tmp_path / "empty.txt"  # type: ignore[operator]
+        f.write_bytes(b"")  # type: ignore[union-attr]
+        expected = (
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        )
+        assert hd._sha256_file(str(f)) == expected
+
+    def test_different_content_different_hash(
+        self, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        f1 = tmp_path / "a.txt"  # type: ignore[operator]
+        f2 = tmp_path / "b.txt"  # type: ignore[operator]
+        f1.write_bytes(b"hello")  # type: ignore[union-attr]
+        f2.write_bytes(b"world")  # type: ignore[union-attr]
+        assert hd._sha256_file(str(f1)) != hd._sha256_file(str(f2))
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_fake_yf_df(start: date, end_excl: date) -> pd.DataFrame:
+    """Build a fake yfinance-style response DataFrame."""
+    dates = []
+    cur = start
+    while cur < end_excl:
+        dates.append(pd.Timestamp(cur.isoformat()))
+        cur += timedelta(days=1)
+    if not dates:
+        return pd.DataFrame()
+    idx = pd.DatetimeIndex(dates, name="Date")
+    df = pd.DataFrame(
+        {
+            "Open": [10000.0] * len(dates),
+            "High": [10500.0] * len(dates),
+            "Low": [9500.0] * len(dates),
+            "Close": [10200.0] * len(dates),
+            "Volume": [1000.0] * len(dates),
+        },
+        index=idx,
+    )
+    return df
+
+
+# ---------------------------------------------------------------------------
+# coinbase_collect_history
+# ---------------------------------------------------------------------------
+
+class TestCoinbaseCollectHistory:
+    def test_all_past_dates_have_source(self) -> None:
+        start = date(2024, 1, 1)
+        finish = date(2024, 1, 5)
+        fake = _make_fake_yf_df(start, finish + timedelta(days=1))
+        with patch("yfinance.download", return_value=fake):
+            df = hd.coinbase_collect_history(
+                "BTC-USD", start, finish, effective_end=finish
+            )
+        assert len(df) == 5
+        assert (df["source"] == "yfinance/coinbase").all()
+
+    def test_future_dates_flagged(self) -> None:
+        start = date(2024, 1, 1)
+        finish = date(2024, 1, 10)
+        effective_end = date(2024, 1, 5)
+        fake = _make_fake_yf_df(start, effective_end + timedelta(days=1))
+        with patch("yfinance.download", return_value=fake):
+            df = hd.coinbase_collect_history(
+                "BTC-USD", start, finish, effective_end=effective_end
+            )
+        assert len(df) == 10
+        future = df[pd.to_datetime(df["date"]).dt.date > effective_end]
+        assert (future["source"] == "future - not yet available").all()
+        past = df[pd.to_datetime(df["date"]).dt.date <= effective_end]
+        assert (past["source"] == "yfinance/coinbase").all()
+
+    def test_sorted_by_date(self) -> None:
+        start = date(2024, 3, 1)
+        finish = date(2024, 3, 7)
+        fake = _make_fake_yf_df(start, finish + timedelta(days=1))
+        with patch("yfinance.download", return_value=fake):
+            df = hd.

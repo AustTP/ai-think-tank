@@ -1,0 +1,366 @@
+"""
+Trading strategy and risk management for crypto using Coinbase.
+
+Strategy: Momentum-based mean-reversion with ATR stop-loss.
+- Rank top liquid crypto pairs by 24h volume via yfinance historical data.
+- Entry signal: RSI(14) < 35 (oversold) on 1h bars -> long.
+- Exit signal: RSI(14) > 65 or stop-loss / take-profit hit.
+- Risk management: risk 1% of account per trade; stop = 1.5x ATR(14);
+  target = 3x ATR(14) (2:1 reward/risk). Daily loss limit = $50.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+# ---------------------------------------------------------------------------
+# Technical indicators
+# ---------------------------------------------------------------------------
+
+def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """Return RSI series for a close-price series."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
+
+
+def compute_atr(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int = 14,
+) -> pd.Series:
+    """Return Average True Range series."""
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(com=period - 1, min_periods=period).mean()
+
+
+# ---------------------------------------------------------------------------
+# Signal generation
+# ---------------------------------------------------------------------------
+
+RSI_OVERSOLD = 35
+RSI_OVERBOUGHT = 65
+ATR_STOP_MULT = 1.5
+ATR_TARGET_MULT = 3.0
+
+
+@dataclass
+class TradeSignal:
+    """Encapsulates an entry or exit signal."""
+
+    symbol: str
+    side: str  # "buy" | "sell" | "hold"
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    rsi: float
+    atr: float
+
+
+def generate_signal(symbol: str, df: pd.DataFrame) -> TradeSignal:
+    """
+    Given OHLCV dataframe, return a TradeSignal.
+
+    Parameters
+    ----------
+    symbol:
+        Ticker symbol, e.g. ``"BTC-USD"``.
+    df:
+        DataFrame with columns: open, high, low, close, volume.
+        Index must be DatetimeIndex sorted ascending.
+    """
+    if df.empty or len(df) < 20:
+        return TradeSignal(
+            symbol=symbol,
+            side="hold",
+            entry_price=0.0,
+            stop_loss=0.0,
+            take_profit=0.0,
+            rsi=50.0,
+            atr=0.0,
+        )
+
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+
+    rsi_series = compute_rsi(close)
+    atr_series = compute_atr(high, low, close)
+
+    latest_rsi = float(rsi_series.iloc[-1])
+    latest_atr = float(atr_series.iloc[-1])
+    latest_close = float(close.iloc[-1])
+
+    if math.isnan(latest_atr) or latest_atr == 0:
+        latest_atr = latest_close * 0.01  # fallback: 1% of price
+
+    if latest_rsi < RSI_OVERSOLD:
+        side = "buy"
+        stop_loss = latest_close - ATR_STOP_MULT * latest_atr
+        take_profit = latest_close + ATR_TARGET_MULT * latest_atr
+    elif latest_rsi > RSI_OVERBOUGHT:
+        side = "sell"
+        stop_loss = latest_close + ATR_STOP_MULT * latest_atr
+        take_profit = latest_close - ATR_TARGET_MULT * latest_atr
+    else:
+        side = "hold"
+        stop_loss = latest_close
+        take_profit = latest_close
+
+    return TradeSignal(
+        symbol=symbol,
+        side=side,
+        entry_price=latest_close,
+        stop_loss=round(stop_loss, 8),
+        take_profit=round(take_profit, 8),
+        rsi=round(latest_rsi, 4),
+        atr=round(latest_atr, 8),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Risk management
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RiskManager:
+    """
+    Position-sizing and daily-loss-limit enforcement.
+
+    Parameters
+    ----------
+    account_balance:
+        Current account balance in USD.
+    risk_per_trade_pct:
+        Fraction of balance to risk per trade (default 1 %).
+    daily_loss_limit:
+        Maximum USD loss allowed in one trading day (default $50).
+    """
+
+    account_balance: float
+    risk_per_trade_pct: float = 0.01
+    daily_loss_limit: float = 50.0
+    daily_pnl: float = field(default=0.0, init=False)
+
+    def position_size(self, entry: float, stop: float) -> float:
+        """
+        Return position size in base currency units.
+
+        Uses fixed-fractional sizing:
+            size = (balance * risk_pct) / |entry - stop|
+        """
+        risk_amount = self.account_balance * self.risk_per_trade_pct
+        price_risk = abs(entry - stop)
+        if price_risk == 0:
+            return 0.0
+        return round(risk_amount / price_risk, 8)
+
+    def usd_position_value(self, entry: float, stop: float) -> float:
+        """Return USD value of the position."""
+        size = self.position_size(entry, stop)
+        return round(size * entry, 2)
+
+    def record_trade_pnl(self, pnl: float) -> None:
+        """Update running daily P&L."""
+        self.daily_pnl += pnl
+
+    def can_trade(self) -> bool:
+        """Return False when daily loss limit has been hit."""
+        return self.daily_pnl > -self.daily_loss_limit
+
+    def reset_daily(self) -> None:
+        """Reset daily P&L counter (call at start of each trading day)."""
+        self.daily_pnl = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Backtesting harness
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BacktestResult:
+    """Summary statistics from a backtest run."""
+
+    symbol: str
+    total_trades: int
+    winning_trades: int
+    losing_trades: int
+    total_pnl: float
+    win_rate: float
+    avg_win: float
+    avg_loss: float
+    max_drawdown: float
+    trades: List[dict] = field(default_factory=list)
+
+
+def backtest(
+    symbol: str,
+    df: pd.DataFrame,
+    initial_balance: float = 1000.0,
+    risk_pct: float = 0.01,
+    daily_loss_limit: float = 50.0,
+) -> BacktestResult:
+    """
+    Simple bar-by-bar backtest of the RSI momentum strategy.
+
+    Parameters
+    ----------
+    symbol:
+        Ticker symbol.
+    df:
+        OHLCV DataFrame indexed by datetime (ascending).
+    initial_balance:
+        Starting account balance in USD.
+    risk_pct:
+        Fraction of balance to risk per trade.
+    daily_loss_limit:
+        Max daily loss in USD.
+    """
+    if df.empty or len(df) < 21:
+        return BacktestResult(
+            symbol=symbol,
+            total_trades=0,
+            winning_trades=0,
+            losing_trades=0,
+            total_pnl=0.0,
+            win_rate=0.0,
+            avg_win=0.0,
+            avg_loss=0.0,
+            max_drawdown=0.0,
+        )
+
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+
+    rsi_series = compute_rsi(close)
+    atr_series = compute_atr(high, low, close)
+
+    balance = initial_balance
+    peak_balance = initial_balance
+    max_drawdown = 0.0
+
+    position: Optional[Tuple[float, float, float, float]] = None
+    # (entry_price, stop_loss, take_profit, size)
+
+    trades: List[dict] = []
+    daily_pnl = 0.0
+    prev_date: Optional[pd.Timestamp] = None
+
+    for i in range(20, len(df)):
+        bar_date = df.index[i]
+        if hasattr(bar_date, "date"):
+            cur_date = bar_date.date()
+        else:
+            cur_date = bar_date
+
+        if prev_date is not None and cur_date != prev_date:
+            daily_pnl = 0.0
+        prev_date = cur_date
+
+        rsi_val = float(rsi_series.iloc[i])
+        atr_val = float(atr_series.iloc[i])
+        price = float(close.iloc[i])
+        bar_high = float(high.iloc[i])
+        bar_low = float(low.iloc[i])
+
+        if math.isnan(atr_val) or atr_val == 0:
+            atr_val = price * 0.01
+
+        # Check exit for open position
+        if position is not None:
+            entry_p, stop_p, target_p, size = position
+            side = "buy" if target_p > entry_p else "sell"
+
+            if side == "buy":
+                if bar_low <= stop_p:
+                    pnl = (stop_p - entry_p) * size
+                    balance += pnl
+                    daily_pnl += pnl
+                    trades.append(
+                        {
+                            "symbol": symbol,
+                            "side": side,
+                            "entry": entry_p,
+                            "exit": stop_p,
+                            "size": size,
+                            "pnl": round(pnl, 4),
+                            "result": "stop",
+                        }
+                    )
+                    position = None
+                elif bar_high >= target_p:
+                    pnl = (target_p - entry_p) * size
+                    balance += pnl
+                    daily_pnl += pnl
+                    trades.append(
+                        {
+                            "symbol": symbol,
+                            "side": side,
+                            "entry": entry_p,
+                            "exit": target_p,
+                            "size": size,
+                            "pnl": round(pnl, 4),
+                            "result": "target",
+                        }
+                    )
+                    position = None
+            else:  # short (sell)
+                if bar_high >= stop_p:
+                    pnl = (entry_p - stop_p) * size
+                    balance += pnl
+                    daily_pnl += pnl
+                    trades.append(
+                        {
+                            "symbol": symbol,
+                            "side": side,
+                            "entry": entry_p,
+                            "exit": stop_p,
+                            "size": size,
+                            "pnl": round(pnl, 4),
+                            "result": "stop",
+                        }
+                    )
+                    position = None
+                elif bar_low <= target_p:
+                    pnl = (entry_p - target_p) * size
+                    balance += pnl
+                    daily_pnl += pnl
+                    trades.append(
+                        {
+                            "symbol": symbol,
+                            "side": side,
+                            "entry": entry_p,
+                            "exit": target_p,
+                            "size": size,
+                            "pnl": round(pnl, 4),
+                            "result": "target",
+                        }
+                    )
+                    position = None
+
+        # Update drawdown
+        if balance > peak_balance:
+            peak_balance = balance
+        drawdown = (peak_balance - balance) / peak_balance
+        if drawdown > max

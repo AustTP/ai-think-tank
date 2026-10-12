@@ -130,6 +130,7 @@ def apply_guidance(state, task_id, data):
     history = {'action': action, 'guidance': guidance, 'at': now,
                'previousGate': dict(task.get('_peerGate') or {})}
     task.setdefault('interventionHistory', []).append(history)
+    __import__('recovery_control').authorize(__import__('story_tracking').root(state, task), guidance)
     if action in ('retry', 'provide_inputs', 'edit_scope', 'reassign', 'research'):
         task.pop('completionRecovery', None)
         previous = (task.get('interventionHistory') or [])[-2:-1]

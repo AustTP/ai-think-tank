@@ -1,0 +1,22 @@
+{
+  "path": "datasets/btc-usd-daily-2023-10-10-to-2026-10-10.csv",
+  "productId": "BTC-USD",
+  "granularitySeconds": 86400,
+  "rowCount": 1096,
+  "start": "2023-10-10T00:00:00+00:00",
+  "end": "2026-10-09T00:00:00+00:00",
+  "requestedEndExclusive": "2026-10-10T00:00:00+00:00",
+  "missingDays": 0,
+  "missingDayTimestamps": [],
+  "duplicateRows": 0,
+  "missingValues": 0,
+  "sha256": "a21b5f740c35d3430069a0d59c3d85a06e1808dc0f1deec8b4b473334cec25d8",
+  "sources": [
+    "https://api.exchange.coinbase.com/products/BTC-USD/candles?start=2023-10-10T00%3A00%3A00%2B00%3A00&end=2024-08-04T00%3A00%3A00%2B00%3A00&granularity=86400",
+    "https://api.exchange.coinbase.com/products/BTC-USD/candles?start=2024-08-04T00%3A00%3A00%2B00%3A00&end=2025-05-30T00%3A00%3A00%2B00%3A00&granularity=86400",
+    "https://api.exchange.coinbase.com/products/BTC-USD/candles?start=2025-05-30T00%3A00%3A00%2B00%3A00&end=2026-03-25T00%3A00%3A00%2B00%3A00&granularity=86400",
+    "https://api.exchange.coinbase.com/products/BTC-USD/candles?start=2026-03-25T00%3A00%3A00%2B00%3A00&end=2026-10-10T00%3A00%3A00%2B00%3A00&granularity=86400"
+  ],
+  "fetchedAt": "2026-10-10T17:31:54.775369+00:00",
+  "scope": "Coinbase Exchange spot daily OHLCV; no transactions."
+}

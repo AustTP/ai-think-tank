@@ -72,6 +72,8 @@ def complete_check(state, task, result, now_ms):
         return False
     parent['_codeDirectorPassed'] = {'taskId': task['id'], 'atMs': now_ms,
                                      'evidence': result['evidence']}
+    if result.get('sourceDigest'):
+        parent['lastValidatedSourceDigest'] = result['sourceDigest']
     parent.pop('_codeDirectorPending', None)
     parent.pop('blockedReason', None)
     sim._enter_peer_review(state, parent, now_ms)

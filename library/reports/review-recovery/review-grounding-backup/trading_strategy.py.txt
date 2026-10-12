@@ -1,0 +1,65 @@
+"""Offline RSI/SMA hypothesis with bounded exposure; no live orders."""
+
+import numpy as np
+import pandas as pd
+
+
+def compute_sma(close: pd.Series, window: int = 20) -> pd.Series:
+    """Trailing average; warm-up bars remain unavailable."""
+    return close.rolling(window, min_periods=window).mean()
+
+
+def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder-style RSI; constant prices have no defined ratio."""
+    delta = close.diff()
+    gain = (
+        delta.clip(lower=0)
+        .ewm(alpha=1 / period, adjust=False, min_periods=period)
+        .mean()
+    )
+    loss = (
+        (-delta.clip(upper=0))
+        .ewm(alpha=1 / period, adjust=False, min_periods=period)
+        .mean()
+    )
+    ratio = gain / loss.replace(0, np.nan)
+    result = 100 - 100 / (1 + ratio)
+    return result.mask((loss == 0) & (gain > 0), 100)
+
+
+def generate_signals(data: pd.DataFrame) -> pd.DataFrame:
+    """Long-only hypothesis; selling closes exposure and never opens shorts."""
+    result = data.copy()
+    result["rsi"] = compute_rsi(result["close"])
+    result["sma"] = compute_sma(result["close"])
+    result["signal"] = np.select(
+        [result["rsi"] < 35, result["rsi"] > 65], [1, -1], default=0
+    )
+    return result
+
+
+def apply_risk_management(data: pd.DataFrame) -> pd.DataFrame:
+    """Cap exposure at 10%; signal is delayed to avoid same-bar fills."""
+    result = data.copy()
+    exposure = result["signal"].replace(0, np.nan).ffill().fillna(-1)
+    result["position_size"] = exposure.clip(lower=0).shift(1).fillna(0) * 0.1
+    return result
+
+
+def backtest(data: pd.DataFrame) -> dict:
+    """Daily simulation with 10bp turnover fees; no profitability guarantee."""
+    returns = data["close"].pct_change().fillna(0)
+    exposure = data["position_size"]
+    turnover = exposure.diff().fillna(exposure).abs()
+    net = exposure.shift(1).fillna(0) * returns - turnover * 0.001
+    equity = (1 + net).cumprod()
+    volatility = float(net.std())
+    sharpe = (
+        float(net.mean()) / volatility * np.sqrt(365) if volatility > 0 else 0
+    )
+    return {
+        "total_return": float(equity.iloc[-1] - 1),
+        "sharpe_ratio": float(sharpe),
+        "max_drawdown": float((equity / equity.cummax() - 1).min()),
+        "num_trades": int((turnover > 0).sum()),
+    }

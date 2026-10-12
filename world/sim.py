@@ -1572,6 +1572,7 @@ TASK_WORK_DURATION_S = 8.0
 # marked working with a _content_epoch runs up to this budget before the
 # completion loop gives up on the content and finalizes the fallback.
 TASK_CONTENT_TIMEOUT_S = 120.0
+TASK_CODE_CONTENT_TIMEOUT_S = 1200.0
 
 # Server task-loop cadence -- mirrors the browser's runTaskCycle setInterval
 # (index.html, 6s). Distinct from the movement tick (SIM_TICK_S=2).
@@ -1645,11 +1646,15 @@ _TASK_ID_HOLDER = [0]
 # In-memory like _TASK_ID_HOLDER: a restart mid-content abandons in-flight work
 # (same as the browser's in-memory TASKS on page reload).
 _content_results = {}
+_content_workers = {}
 _content_results_lock = threading.Lock()
 
 
 def _store_content_result(task_id, result):
     with _content_results_lock:
+        worker = _content_workers.get(task_id)
+        if worker:
+            worker.resultProduced = True
         _content_results[task_id] = dict(result)
 
 
@@ -1674,6 +1679,7 @@ def _maybe_escalate_stuck_gate(parent, gate, reason, failure_text=None, state=No
     it does not re-escalate every subsequent cycle)."""
     if gate.get('escalated'):
         return True
+    story_stopped = __import__('recovery_control').record(state, parent, failure_text or reason)
     gate['cycleCount'] = gate.get('cycleCount', 0) + 1
     if failure_text:
         normalized = re.sub(r':\d+:\d+:', ':LINE:', failure_text.strip())
@@ -1692,7 +1698,7 @@ def _maybe_escalate_stuck_gate(parent, gate, reason, failure_text=None, state=No
                                     'errorCount': len(codes)}
         gate.setdefault('failureHistory', []).append({'cycle': gate['cycleCount'], 'category': category,
                                                      'errorCount': len(codes), 'fingerprint': fingerprint})
-    if gate['cycleCount'] < MAX_REVIEW_CYCLES and gate.get('noProgressCount', 0) < 2:
+    if not story_stopped and gate['cycleCount'] < MAX_REVIEW_CYCLES and gate.get('noProgressCount', 0) < 2:
         return False
     gate['escalated'] = True
     parent['manualAttention'] = True
@@ -2233,6 +2239,21 @@ def _recover_content_after_restart(state):
 
 
 
+def _extend_running_work(task, now, now_ms):
+    if not task.get('_contentInFlight'):
+        return False
+    with _content_results_lock:
+        worker = _content_workers.get(task['id'])
+        still_running = bool(worker and worker.is_alive()) or task['id'] in _content_results
+    if not still_running:
+        return False
+    task.setdefault('softLimitExceededAt', now_ms)
+    task['workUntil'] = now + max(60, (now_ms - task['softLimitExceededAt']) / 1000 * .25)
+    task['timeLimitMode'] = 'soft'
+    task['nextAction'] = 'Worker is still running; wait for its actual completion result.'
+    return True
+
+
 def _dispatch_content_work(executor, state, agent_id, task, now):
     """Fire the registered content executor on a background thread for this
     arriving agent's task, if one applies. Returns True if real content work was
@@ -2251,7 +2272,12 @@ def _dispatch_content_work(executor, state, agent_id, task, now):
         return False
     # Give the content run a generous ceiling; mark the task so the completion
     # loop knows real work is in flight (not just the placeholder).
-    task['workUntil'] = now + TASK_CONTENT_TIMEOUT_S
+    code_work = task.get('taskType') in ('code', 'code_preflight', 'qa') or _peer_coding_class(task)
+    if task.get('reviewOf'):
+        code_work = code_work or _peer_coding_class((state.get('tasks') or {}).get(task['reviewOf']))
+    task['workUntil'] = now + (TASK_CODE_CONTENT_TIMEOUT_S if code_work else TASK_CONTENT_TIMEOUT_S)
+    task['timeLimitMode'] = 'soft'
+    task['softWorkUntil'] = task['workUntil']
     task['_contentInFlight'] = True
     snapshot = json.loads(json.dumps(state))
     # Item 1: situational awareness. Build the perception block here, on the
@@ -2271,7 +2297,16 @@ def _dispatch_content_work(executor, state, agent_id, task, now):
             # help signal can see it -- a crash must never complete as 'done'.
             _store_content_result(task_id, {'ok': False, 'note': f'Content execution failed: {e}', 'seenUrls': (task.get('research') or {}).get('seenUrls') or []})
 
-    threading.Thread(target=_run, daemon=True).start()
+        finally:
+            with _content_results_lock:
+                if not getattr(worker, 'resultProduced', False) and task_id not in _content_results:
+                    _content_results[task_id] = {'ok': False, 'note': 'Worker exited without a completion result.'}
+                _content_workers.pop(task_id, None)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    with _content_results_lock:
+        _content_workers[task_id] = worker
+    worker.start()
     return True
 
 
@@ -11119,6 +11154,8 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                     finish_task(state, aid, grid)
                     send_agent_off_duty(state, aid, doors, grid)
             elif now >= task['workUntil']:
+                if _extend_running_work(task, now, now_ms):
+                    continue
                 if task.get('taskType') == 'code_preflight':
                     _release_agent_after_failure(state, aid, task)
                     parent = _resolve_review_parent(state, task)

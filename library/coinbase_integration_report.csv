@@ -1,0 +1,4 @@
+file_name,coinbase_api_method,integration_status,notes,verification_status
+`coinbase/api.py`,"`get_accounts`, `get_transactions`",unknown,Uses `requests` library for API calls.,estimated
+`coinbase/errors.py`,N/A,unknown,Defines custom error classes for Coinbase API.,estimated
+`examples/example.py`,"`get_accounts`, `get_transactions`",unknown,Example usage of the SDK.,estimated

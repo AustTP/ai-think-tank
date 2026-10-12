@@ -1,0 +1,132 @@
+"""
+Trading strategy module: RSI + SMA signal generation,
+risk management, and offline backtesting.
+
+This is offline/backtesting functionality only.
+No live orders are placed here.
+"""
+
+import pandas as pd
+import numpy as np
+
+
+def compute_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
+    """Return RSI series using Wilder smoothing (EWM)."""
+    delta = prices.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.rename("rsi")
+
+
+def compute_sma(prices: pd.Series, period: int = 50) -> pd.Series:
+    """Return simple moving average."""
+    return prices.rolling(window=period, min_periods=period).mean().rename("sma")
+
+
+def generate_signals(
+    prices: pd.Series,
+    rsi_period: int = 14,
+    sma_period: int = 50,
+    rsi_oversold: float = 30.0,
+    rsi_overbought: float = 70.0,
+) -> pd.DataFrame:
+    """
+    Generate buy/sell/hold signals using RSI and SMA trend filter.
+
+    Rules
+    -----
+    Buy  (+1): RSI < oversold  AND price > SMA  (uptrend dip)
+    Sell (-1): RSI > overbought AND price < SMA (downtrend peak)
+    Hold ( 0): otherwise
+
+    Signal is shifted by one bar to avoid look-ahead bias.
+    Backtest must NOT shift again.
+    """
+    if prices.empty:
+        raise ValueError("prices series must not be empty")
+
+    rsi = compute_rsi(prices, period=rsi_period)
+    sma = compute_sma(prices, period=sma_period)
+
+    raw_signal = pd.Series(0, index=prices.index, dtype=int)
+    buy_mask = (rsi < rsi_oversold) & (prices > sma)
+    sell_mask = (rsi > rsi_overbought) & (prices < sma)
+    raw_signal[buy_mask] = 1
+    raw_signal[sell_mask] = -1
+
+    # Single shift here; backtest must not shift again.
+    signal = raw_signal.shift(1).fillna(0).astype(int)
+
+    return pd.DataFrame(
+        {"close": prices, "rsi": rsi, "sma": sma, "signal": signal}
+    )
+
+
+def apply_risk_management(
+    signals: pd.DataFrame,
+    max_position: float = 1.0,
+    stop_loss_pct: float = 0.02,
+) -> pd.DataFrame:
+    """
+    Convert signals into fractional position sizes in [-max_position, max_position].
+
+    No additional shift is applied here; signal is already look-ahead-safe.
+    stop_loss_pct is documented for a future live layer; not applied offline.
+    """
+    if not 0.0 < max_position <= 1.0:
+        raise ValueError("max_position must be in (0, 1]")
+    result = signals.copy()
+    result["position"] = signals["signal"].clip(-max_position, max_position)
+    return result
+
+
+def backtest(
+    signals: pd.DataFrame,
+    fee_per_trade: float = 0.001,
+) -> pd.DataFrame:
+    """
+    Simulate strategy returns from a DataFrame with a *position* column.
+
+    Position column must already be look-ahead-safe (shifted upstream).
+    A fee is charged on each bar where position changes (turnover).
+    """
+    if "position" not in signals.columns:
+        raise ValueError("signals must contain a 'position' column")
+
+    result = signals.copy()
+    result["market_return"] = result["close"].pct_change()
+    result["strategy_return"] = result["position"] * result["market_return"]
+
+    # Fee on turnover (absolute change in position each bar)
+    turnover = result["position"].diff().abs()
+    result["strategy_return"] -= turnover * fee_per_trade
+
+    result["cumulative_return"] = (
+        (1 + result["strategy_return"].fillna(0)).cumprod() - 1
+    )
+    return result
+
+
+def run_backtest(
+    prices: pd.Series,
+    rsi_period: int = 14,
+    sma_period: int = 50,
+    rsi_oversold: float = 30.0,
+    rsi_overbought: float = 70.0,
+    max_position: float = 1.0,
+    fee_per_trade: float = 0.001,
+) -> pd.DataFrame:
+    """End-to-end convenience runner: prices -> signals -> risk -> backtest."""
+    sigs = generate_signals(
+        prices,
+        rsi_period=rsi_period,
+        sma_period=sma_period,
+        rsi_oversold=rsi_oversold,
+        rsi_overbought=rsi_overbought,
+    )
+    managed = apply_risk_management(sigs, max_position=max_position)
+    return backtest(managed, fee_per_trade=fee_per_trade)

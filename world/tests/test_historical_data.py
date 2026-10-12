@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import datetime as dt
 import os
 import sys
@@ -29,6 +30,8 @@ class HistoricalData(unittest.TestCase):
             with open(os.path.join(root, result['path']), encoding='utf-8') as stream:
                 rows = list(csv.DictReader(stream))
             self.assertEqual(rows[0]['close'], '11.0')
+            with open(os.path.join(root, result['path']), 'rb') as stream:
+                self.assertEqual(hashlib.sha256(stream.read()).hexdigest(), result['sha256'])
             self.assertTrue(os.path.isfile(os.path.join(root, result['metadataPath'])))
 
     def test_empty_or_invalid_data_is_not_fabricated(self):

@@ -1,0 +1,23 @@
+import subprocess
+import sys
+
+
+def run_checks() -> None:
+    checks = [
+        ["python", "-m", "flake8", "."],
+        ["python", "-m", "mypy", "."],
+        ["python", "-m", "bandit", "-r", "."],
+        ["python", "-m", "pytest", "--cov=.", "--cov-fail-under=90"],
+    ]
+    for cmd in checks:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        print(f"--- {' '.join(cmd)} ---")
+        print(result.stdout)
+        if result.stderr:
+            print(result.stderr)
+        if result.returncode != 0:
+            sys.exit(result.returncode)
+
+
+if __name__ == "__main__":
+    run_checks()

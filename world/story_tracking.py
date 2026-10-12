@@ -34,7 +34,7 @@ def root(state, task):
 
 def stamp(state, task):
     parent = root(state, task)
-    request_id = parent.get('workOrderId') or task.get('workOrderId') or (parent.get('reviewContract') or {}).get('parentWorkOrderId')
+    request_id = parent.get('workOrderId') or parent.get('requestId') or task.get('workOrderId') or task.get('requestId') or (parent.get('reviewContract') or {}).get('parentWorkOrderId')
     request = next((r for r in state.get('backlogRequests') or [] if r.get('id') == request_id), {})
     roster = {r.get('id'): r for r in state.get('agentRoster') or []}
     team_id = parent.get('teamId') or request.get('teamId') or roster.get(parent.get('assignedTo'), {}).get('director')

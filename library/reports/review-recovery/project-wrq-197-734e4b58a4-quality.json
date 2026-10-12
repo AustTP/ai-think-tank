@@ -1,0 +1,35 @@
+{
+  "ok": true,
+  "results": [
+    {
+      "name": "format",
+      "exitCode": 0,
+      "stdout": "",
+      "stderr": "All done! \u2728 \ud83c\udf70 \u2728\n3 files left unchanged.\n"
+    },
+    {
+      "name": "flake8",
+      "exitCode": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "name": "mypy",
+      "exitCode": 0,
+      "stdout": "Success: no issues found in 3 source files\n",
+      "stderr": ""
+    },
+    {
+      "name": "bandit",
+      "exitCode": 0,
+      "stdout": "",
+      "stderr": "[main]\tINFO\tFound project level .bandit file: ./.bandit\n[main]\tINFO\tUsing command line arg for selected targets\n"
+    },
+    {
+      "name": "pytest-cov",
+      "exitCode": 0,
+      "stdout": "...................                                                      [100%]\n================================ tests coverage ================================\n_______________ coverage: platform linux, python 3.12.15-final-0 _______________\n\nName                             Stmts   Miss  Cover\n----------------------------------------------------\ntests/__init__.py                    0      0   100%\ntests/test_trading_strategy.py      98      0   100%\ntrading_strategy.py                 31      0   100%\n----------------------------------------------------\nTOTAL                              129      0   100%\nRequired test coverage of 90% reached. Total coverage: 100.00%\n19 passed in 1.43s\n",
+      "stderr": ""
+    }
+  ]
+}

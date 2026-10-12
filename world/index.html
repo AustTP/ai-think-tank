@@ -1834,6 +1834,8 @@ function rememberBoardActivitySection(section) {
 }
 const boardSectionHtml = new WeakMap();
 function setBoardSectionHtml(body, html) {
+  const completionForm = body.querySelector('.exception-completion-form');
+  if (completionForm && TASKS[completionForm.dataset.taskId]?.status !== 'done') return;
   if (boardSectionHtml.get(body) === html) return;
   const modal = document.querySelector('#boardModal .modal-box');
   const scrollTop = modal ? modal.scrollTop : 0;
@@ -1880,8 +1882,8 @@ function renderBoard() {
     const isRoot = !t.reviewOf && !t.investigationOf && !t.recoveryOf;
     const canAccept = isRoot && !['done','cancelled','abandoned','walking','working'].includes(t.status)
       && (t.manualAttention || t._peerGate?.escalated || ['blocked','failed'].includes(t.status));
-    const accept = actionable && canAccept ? `<button class="hud-btn" onclick="acceptBlockedStory('${encodeURIComponent(t.id).replace(/'/g,'%27')}')">Mark complete with exceptions</button>` : '';
-    const guide = actionable && (t.manualAttention || (t._peerGate || {}).escalated || t.status === 'blocked')
+    const accept = actionable && canAccept ? `<button class="hud-btn" onclick="showExceptionCompletion(this, '${encodeURIComponent(t.id).replace(/'/g,'%27')}')">Mark complete with exceptions</button>` : '';
+    const guide = actionable && (t.manualAttention || (t._peerGate || {}).escalated || ['blocked','failed'].includes(t.status))
       && !['done', 'cancelled', 'abandoned'].includes(t.status)
       ? `<a class="hud-btn" href="/api/intent/task/${encodeURIComponent(t.id)}/guidance" target="_blank" rel="noopener">Guide review</a>` : '';
     const reviewTasks = Object.values(TASKS).filter(r => r.reviewOf === t.id && r.reviewDiagnostics);
@@ -2093,19 +2095,58 @@ async function submitWorkOrder(event) {
   } finally { btn.disabled = false; }
 }
 
-async function acceptBlockedStory(encodedId) {
+function showExceptionCompletion(button, encodedId) {
+  if (button.nextElementSibling?.classList.contains('exception-completion-form')) return;
+  const form = document.createElement('form');
+  form.className = 'exception-completion-form';
+  form.dataset.taskId = decodeURIComponent(encodedId);
+  const label = document.createElement('label');
+  label.textContent = 'Which failed requirements are you accepting?';
+  const reason = document.createElement('textarea');
+  reason.required = true;
+  reason.maxLength = 4000;
+  reason.rows = 3;
+  label.appendChild(reason);
+  const explanation = document.createElement('p');
+  explanation.textContent = 'This completes the story with recorded exceptions and stops its remaining work.';
+  const submit = document.createElement('button');
+  submit.type = 'submit';
+  submit.textContent = 'Confirm completion';
+  const cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.textContent = 'Cancel';
+  cancel.onclick = () => { form.remove(); button.hidden = false; };
+  const status = document.createElement('p');
+  status.setAttribute('role', 'status');
+  form.append(label, explanation, submit, cancel, status);
+  form.onsubmit = async event => {
+    event.preventDefault();
+    if (!reason.value.trim()) { status.textContent = 'A reason is required.'; return; }
+    submit.disabled = true;
+    cancel.disabled = true;
+    status.textContent = 'Completing story?';
+    try {
+      await acceptBlockedStory(encodedId, reason.value.trim());
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      submit.disabled = false;
+      cancel.disabled = false;
+    }
+  };
+  button.after(form);
+  button.hidden = true;
+  reason.focus();
+}
+
+async function acceptBlockedStory(encodedId, reason) {
   const id = decodeURIComponent(encodedId);
-  const reason = prompt('Which failed requirements are you accepting? This completes the story with exceptions, keeps its failed findings, and stops remaining work.');
-  if (reason === null) return;
-  if (!reason.trim()) { alert('A reason is required.'); return; }
-  try {
-    const response = await apiFetch(`/api/intent/blockers/${encodeURIComponent(id)}/complete`, {
-      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({reason})});
-    const result = await response.json();
-    if (!response.ok || !result.ok) throw new Error(result.error || 'Could not complete the story.');
-    if (TASKS[id]) Object.assign(TASKS[id], {status:'done', manualAttention:false, playerAcceptance:{reason}, deliveryState:'accepted_with_exceptions'});
-    renderBoard();
-  } catch (error) { alert(error.message); }
+  const response = await apiFetch(`/api/intent/blockers/${encodeURIComponent(id)}/complete`, {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({reason})});
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || !result.ok) throw new Error(result.error || `Could not complete the story (HTTP ${response.status}).`);
+  if (TASKS[id]) Object.assign(TASKS[id], {status:'done', manualAttention:false, playerAcceptance:{reason}, deliveryState:'accepted_with_exceptions'});
+  renderBoard();
 }
 
 async function editRequestBudget(encodedId) {

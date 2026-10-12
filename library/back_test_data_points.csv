@@ -1,0 +1,10 @@
+data_point_name,description,required_for_back_testing,verification_status
+timestamp,The date and time of the data point.,Yes,Estimated
+open_price,The opening price of the contract.,Yes,Estimated
+high_price,The highest price reached by the contract.,Yes,Estimated
+low_price,The lowest price reached by the contract.,Yes,Estimated
+close_price,The closing price of the contract.,Yes,Estimated
+volume,The total number of contracts traded.,Yes,Estimated
+open_interest,The number of open contracts.,Yes,Estimated
+tick_size,The smallest price change allowed.,Yes,Estimated
+contract_month,The month of the futures contract.,Yes,Estimated

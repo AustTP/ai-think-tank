@@ -89,8 +89,8 @@ class CodeDirector(unittest.TestCase):
     def test_failed_check_repairs_correct_product_sandbox_with_actual_errors(self):
         state, _ = fixture()
         state['products'] = {'product': {'sandboxId': 'product-work'}}
-        with patch.object(content, '_run_quality_pipeline', return_value={'ok': False,
-                    'results': [{'name': 'flake8', 'stderr': 'module.py E999 SyntaxError'}]}), \
+        with patch.object(content, '_run_quality_pipeline', return_value={'ok': False, 'failedStep': 'flake8', 'note': 'flake8 failed: module.py E999 SyntaxError',
+                    'results': [{'name': 'flake8', 'exitCode': 1, 'stderr': 'module.py E999 SyntaxError'}]}), \
                 patch.object(content, '_run_coding_content') as repair, \
                 patch.object(content._serve, 'get_or_create_agent_key', return_value='test'):
             content._run_code_director_content(state, 'code-director', {'id': 'check', 'productId': 'product'})

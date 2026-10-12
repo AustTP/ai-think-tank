@@ -277,3 +277,16 @@ win rate. The Bank teller also includes these results even before any API spend.
 No currencies are combined or converted. This foundation supports linear
 instruments; derivatives with contract multipliers, partial-close fill matching,
 open-position valuations, and live broker execution need adapter work before use.
+
+
+### Recovery and spending controls
+
+Agent work deadlines are soft thresholds. A running worker keeps its assignment until it returns a real result; crossing the threshold does not fail or restart its task. Missing workers and actual execution failures still trigger recovery controls.
+
+Quality pipelines submit background jobs and poll their progress through `/api/pipeline/jobs/{job_id}`. Agent sandbox commands have no wall-clock cutoff by default; execution policy and resource constraints still apply. HTTP transport allowances scale with requested response size, pipeline step count and observed runtimes. Runtime estimates and background job records are in memory; server restarts use the existing in-flight task recovery. Explicit story closure prevents staged changes from publishing afterward.
+
+Coding tasks generate changes in a separate sandbox workspace. Only changes that pass the real quality pipeline replace the working workspace; failed stages preserve the working files and the previous successful workspace remains available for recovery.
+
+Automatic retries are recorded on the original story across subtasks, gate resets and server restarts. Two failures without new validation evidence, or four failures in one recovery window, pause the story for a specific player decision. A player decision grants one additional attempt and keeps the failure history. Policy denials, missing inputs, unavailable execution services and budget failures pause immediately instead of launching generic code repair.
+
+The optional request budget covers planning, stories, subtasks and reviews together. Blank leaves the request budget unset. Calls under a request budget run serially for that request and use configured model token prices to bound the next response against remaining funds; requests with unknown prices pause. Individual task ceilings remain additional controls. Provider billing changes can differ from configured prices, so recorded actual spending remains authoritative.

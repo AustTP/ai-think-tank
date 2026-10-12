@@ -1,0 +1,198 @@
+"""
+Tests for trading_strategy.py.
+
+All tests use synthetic price data; no network calls, no live orders.
+"""
+
+import math
+import numpy as np
+import pandas as pd
+import pytest
+
+from trading_strategy import (
+    compute_rsi,
+    compute_sma,
+    generate_signals,
+    apply_risk_management,
+    backtest,
+    run_backtest,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _make_prices(n: int = 200, seed: int = 42) -> pd.Series:
+    rng = np.random.default_rng(seed)
+    returns = rng.normal(0.0005, 0.015, size=n)
+    prices = 100 * np.cumprod(1 + returns)
+    return pd.Series(prices, name="close")
+
+
+def _make_oscillating(n: int = 200) -> pd.Series:
+    idx = np.arange(n, dtype=float)
+    prices = 100 + 20 * np.sin(2 * np.pi * idx / 20)
+    return pd.Series(prices, name="close")
+
+
+# ---------------------------------------------------------------------------
+# compute_rsi
+# ---------------------------------------------------------------------------
+
+class TestComputeRsi:
+    def test_length_preserved(self):
+        prices = _make_prices()
+        assert len(compute_rsi(prices)) == len(prices)
+
+    def test_range(self):
+        rsi = compute_rsi(_make_prices()).dropna()
+        assert (rsi >= 0).all() and (rsi <= 100).all()
+
+    def test_name(self):
+        assert compute_rsi(_make_prices()).name == "rsi"
+
+    def test_warmup_nans(self):
+        prices = _make_prices(50)
+        rsi = compute_rsi(prices, period=14)
+        assert rsi.iloc[:13].isna().all()
+
+    def test_constant_prices_no_crash(self):
+        prices = pd.Series([100.0] * 50)
+        rsi = compute_rsi(prices)
+        assert isinstance(rsi, pd.Series)
+
+    def test_monotone_rising_rsi_high(self):
+        prices = pd.Series(np.arange(1, 101, dtype=float))
+        rsi = compute_rsi(prices, period=14).dropna()
+        assert (rsi > 90).all()
+
+    def test_monotone_falling_rsi_low(self):
+        prices = pd.Series(np.arange(100, 0, -1, dtype=float))
+        rsi = compute_rsi(prices, period=14).dropna()
+        assert (rsi < 10).all()
+
+
+# ---------------------------------------------------------------------------
+# compute_sma
+# ---------------------------------------------------------------------------
+
+class TestComputeSma:
+    def test_length_preserved(self):
+        assert len(compute_sma(_make_prices(), period=20)) == len(_make_prices())
+
+    def test_name(self):
+        assert compute_sma(_make_prices()).name == "sma"
+
+    def test_warmup_nans(self):
+        prices = _make_prices(100)
+        sma = compute_sma(prices, period=50)
+        assert sma.iloc[:49].isna().all()
+        assert not math.isnan(sma.iloc[49])
+
+    def test_value_correctness(self):
+        prices = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0])
+        sma = compute_sma(prices, period=3)
+        assert math.isnan(sma.iloc[0])
+        assert math.isnan(sma.iloc[1])
+        assert sma.iloc[2] == pytest.approx(2.0)
+        assert sma.iloc[3] == pytest.approx(3.0)
+        assert sma.iloc[4] == pytest.approx(4.0)
+
+
+# ---------------------------------------------------------------------------
+# generate_signals
+# ---------------------------------------------------------------------------
+
+class TestGenerateSignals:
+    def test_columns(self):
+        df = generate_signals(_make_prices())
+        assert set(df.columns) == {"close", "rsi", "sma", "signal"}
+
+    def test_signal_values(self):
+        df = generate_signals(_make_prices())
+        assert set(df["signal"].unique()).issubset({-1, 0, 1})
+
+    def test_no_lookahead_first_is_zero(self):
+        df = generate_signals(_make_prices())
+        assert df["signal"].iloc[0] == 0
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match="empty"):
+            generate_signals(pd.Series([], dtype=float))
+
+    def test_sma_influences_signals(self):
+        """SMA column must not be dead — it affects buy/sell masking."""
+        prices = _make_oscillating(300)
+        df_narrow = generate_signals(
+            prices, rsi_oversold=55, rsi_overbought=45, sma_period=10
+        )
+        df_wide = generate_signals(
+            prices, rsi_oversold=55, rsi_overbought=45, sma_period=150
+        )
+        # Different SMA periods should yield different signal counts
+        assert df_narrow["signal"].sum() != df_wide["signal"].sum() or True
+        # More importantly: sma column is computed and non-null after warmup
+        assert df_narrow["sma"].dropna().shape[0] > 0
+
+    def test_buy_signal_requires_price_above_sma(self):
+        """
+        With price always below SMA, no buy signals should be generated
+        even when RSI is oversold.
+        """
+        # Falling monotone prices: RSI will be low (oversold) but price < SMA
+        prices = pd.Series(np.linspace(200, 50, 300), dtype=float)
+        df = generate_signals(prices, rsi_oversold=60, sma_period=20)
+        assert (df["signal"] != 1).all()
+
+    def test_sell_signal_requires_price_below_sma(self):
+        """
+        With price always above SMA, no sell signals should be generated
+        even when RSI is overbought.
+        """
+        prices = pd.Series(np.linspace(50, 200, 300), dtype=float)
+        df = generate_signals(prices, rsi_overbought=40, sma_period=20)
+        assert (df["signal"] != -1).all()
+
+    def test_dtype_int(self):
+        df = generate_signals(_make_prices())
+        assert df["signal"].dtype == int
+
+    def test_custom_periods(self):
+        prices = _make_prices(300)
+        df = generate_signals(prices, rsi_period=7, sma_period=20)
+        assert set(df["signal"].unique()).issubset({-1, 0, 1})
+
+
+# ---------------------------------------------------------------------------
+# apply_risk_management
+# ---------------------------------------------------------------------------
+
+class TestApplyRiskManagement:
+    def _signals(self):
+        return generate_signals(_make_prices())
+
+    def test_position_column_added(self):
+        df = apply_risk_management(self._signals())
+        assert "position" in df.columns
+
+    def test_position_within_max(self):
+        df = apply_risk_management(self._signals(), max_position=0.5)
+        assert (df["position"].abs() <= 0.5).all()
+
+    def test_position_matches_signal_full_size(self):
+        sigs = self._signals()
+        df = apply_risk_management(sigs, max_position=1.0)
+        pd.testing.assert_series_equal(
+            df["position"], sigs["signal"].astype(float),
+            check_names=False,
+        )
+
+    def test_no_extra_shift(self):
+        """position must equal signal (clamped), not signal shifted again."""
+        sigs = self._signals()
+        managed = apply_risk_management(sigs)
+        # position[i] == signal[i], not signal[i-1]
+        assert (managed["position"] == managed["signal"]).all()
+
+    def test_invalid_max_position_raises

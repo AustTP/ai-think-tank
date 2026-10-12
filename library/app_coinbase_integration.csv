@@ -1,0 +1,4 @@
+Feature Name,Current Functionality,Coinbase API Method Used,Constraints,Improvement Area,Basis
+Real-time market data,Fetched successfully,REST Client,Rate limits,None,Verified
+Order management,Not tested (missing API keys and secrets),REST Client,Rate limits,Requires API keys and secrets for testing,Estimated
+Trade execution,Not tested (missing API keys and secrets),REST Client,Rate limits,Requires API keys and secrets for testing,Estimated

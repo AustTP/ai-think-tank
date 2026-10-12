@@ -1,0 +1,279 @@
+"""Tests for historical_data.py."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from datetime import date
+from unittest.mock import MagicMock, patch
+
+import pandas as pd
+import pytest
+
+import historical_data as hd
+
+
+def _make_candles(start: date, days: int) -> list[list]:
+    import pandas as _pd
+
+    base_ts = int(_pd.Timestamp(start).timestamp())
+    rows = []
+    for i in range(days):
+        ts = base_ts + i * 86400
+        rows.append(
+            [ts, 20000.0 + i, 21000.0 + i, 20500.0 + i, 20800.0 + i, 100.0 + i]
+        )
+    return rows
+
+
+def _mock_ok(candles: list) -> MagicMock:
+    m = MagicMock()
+    m.status_code = 200
+    m.json.return_value = candles
+    return m
+
+
+class TestCandlesToDataframe:
+    def test_returns_dataframe(self):
+        assert isinstance(
+            hd.candles_to_dataframe(_make_candles(date(2024, 1, 1), 3)),
+            pd.DataFrame,
+        )
+
+    def test_columns_present(self):
+        df = hd.candles_to_dataframe(_make_candles(date(2024, 1, 1), 3))
+        for col in ["date", "open", "high", "low", "close", "volume"]:
+            assert col in df.columns
+
+    def test_row_count(self):
+        assert (
+            len(hd.candles_to_dataframe(_make_candles(date(2024, 1, 1), 7)))
+            == 7
+        )
+
+    def test_date_is_datetime(self):
+        df = hd.candles_to_dataframe(_make_candles(date(2024, 1, 1), 2))
+        assert pd.api.types.is_datetime64_any_dtype(df["date"])
+
+    def test_no_nulls(self):
+        df = hd.candles_to_dataframe(_make_candles(date(2024, 1, 1), 4))
+        assert df.isnull().sum().sum() == 0
+
+    def test_sorted_ascending(self):
+        candles = _make_candles(date(2024, 1, 1), 5)
+        df = hd.candles_to_dataframe(list(reversed(candles)))
+        dates = df["date"].tolist()
+        assert dates == sorted(dates)
+
+    def test_empty_input(self):
+        df = hd.candles_to_dataframe([])
+        assert isinstance(df, pd.DataFrame)
+        assert len(df) == 0
+
+
+class TestComputeSha256:
+    def test_returns_64_char_hex(self, tmp_path):
+        f = tmp_path / "x.csv"
+        f.write_text("hello")
+        result = hd.compute_sha256(str(f))
+        assert len(result) == 64
+        assert all(c in "0123456789abcdef" for c in result)
+
+    def test_correct_digest(self, tmp_path):
+        f = tmp_path / "x.csv"
+        content = b"hello world"
+        f.write_bytes(content)
+        assert hd.compute_sha256(str(f)) == hashlib.sha256(content).hexdigest()
+
+    def test_different_files_differ(self, tmp_path):
+        f1, f2 = tmp_path / "a.csv", tmp_path / "b.csv"
+        f1.write_text("aaa")
+        f2.write_text("bbb")
+        assert hd.compute_sha256(str(f1)) != hd.compute_sha256(str(f2))
+
+
+class TestSaveProvenance:
+    def test_creates_json(self, tmp_path):
+        jp = str(tmp_path / "prov.json")
+        cp = str(tmp_path / "data.csv")
+        hd.save_provenance(
+            cp, jp, "BTC-USD", date(2024, 1, 1), date(2024, 1, 2), 1, "abc"
+        )
+        assert os.path.exists(jp)
+
+    def test_json_fields(self, tmp_path):
+        jp = str(tmp_path / "prov.json")
+        cp = str(tmp_path / "data.csv")
+        hd.save_provenance(
+            cp,
+            jp,
+            "BTC-USD",
+            date(2024, 1, 1),
+            date(2024, 1, 2),
+            5,
+            "deadbeef",
+        )
+        with open(jp) as f:
+            meta = json.load(f)
+        assert meta["product_id"] == "BTC-USD"
+        assert meta["sha256"] == "deadbeef"
+        assert meta["row_count"] == 5
+        assert "collected_at" in meta
+
+    def test_notes_mention_volume(self, tmp_path):
+        jp = str(tmp_path / "prov.json")
+        cp = str(tmp_path / "data.csv")
+        hd.save_provenance(
+            cp, jp, "BTC-USD", date(2024, 1, 1), date(2024, 1, 2), 1, "x"
+        )
+        with open(jp) as f:
+            meta = json.load(f)
+        assert "volume" in meta["notes"].lower()
+
+    def test_start_end_recorded(self, tmp_path):
+        jp = str(tmp_path / "prov.json")
+        cp = str(tmp_path / "data.csv")
+        hd.save_provenance(
+            cp,
+            jp,
+            "BTC-USD",
+            date(2023, 10, 10),
+            date(2026, 10, 10),
+            1096,
+            "x",
+        )
+        with open(jp) as f:
+            meta = json.load(f)
+        assert meta["start_inclusive"] == "2023-10-10"
+        assert meta["end_exclusive"] == "2026-10-10"
+
+
+class TestCoinbaseCollectHistory:
+    @patch("historical_data.requests.get")
+    def test_returns_list(self, mock_get):
+        mock_get.return_value = _mock_ok(_make_candles(date(2024, 1, 1), 5))
+        result = hd.coinbase_collect_history(
+            "BTC-USD", date(2024, 1, 1), date(2024, 1, 6)
+        )
+        assert isinstance(result, list)
+
+    @patch("historical_data.requests.get")
+    def test_calls_api(self, mock_get):
+        mock_get.return_value = _mock_ok(_make_candles(date(2024, 1, 1), 2))
+        hd.coinbase_collect_history(
+            "BTC-USD", date(2024, 1, 1), date(2024, 1, 3)
+        )
+        assert mock_get.called
+
+    @patch("historical_data.requests.get")
+    def test_http_error_raises(self, mock_get):
+        m = MagicMock()
+        m.status_code = 429
+        m.text = "rate limited"
+        mock_get.return_value = m
+        with pytest.raises(RuntimeError):
+            hd.coinbase_collect_history(
+                "BTC-USD", date(2024, 1, 1), date(2024, 1, 3)
+            )
+
+    @patch("historical_data.time.sleep")
+    @patch("historical_data.requests.get")
+    def test_multi_chunk(self, mock_get, mock_sleep):
+        mock_get.return_value = _mock_ok(_make_candles(date(2024, 1, 1), 10))
+        result = hd.coinbase_collect_history(
+            "BTC-USD", date(2023, 1, 1), date(2024, 2, 5)
+        )
+        assert mock_get.call_count >= 2
+        assert isinstance(result, list)
+
+    @patch("historical_data.time.sleep")
+    @patch("historical_data.requests.get")
+    def test_candles_combined(self, mock_get, mock_sleep):
+        mock_get.return_value = _mock_ok(_make_candles(date(2024, 1, 1), 5))
+        result = hd.coinbase_collect_history(
+            "BTC-USD", date(2023, 1, 1), date(2024, 2, 5)
+        )
+        assert len(result) > 5
+
+
+class TestCollect:
+    @patch("historical_data.coinbase_collect_history")
+    def test_saves_csv(self, mock_fetch, tmp_path):
+        mock_fetch.return_value = _make_candles(date(2024, 1, 1), 5)
+        csv_p = str(tmp_path / "out.csv")
+        json_p = str(tmp_path / "out.json")
+        hd.collect(
+            "BTC-USD", date(2024, 1, 1), date(2024, 1, 6), csv_p, json_p
+        )
+        assert os.path.exists(csv_p)
+        assert len(pd.read_csv(csv_p)) == 5
+
+    @patch("historical_data.coinbase_collect_history")
+    def test_saves_provenance(self, mock_fetch, tmp_path):
+        mock_fetch.return_value = _make_candles(date(2024, 1, 1), 3)
+        csv_p = str(tmp_path / "out.csv")
+        json_p = str(tmp_path / "out.json")
+        hd.collect(
+            "BTC-USD", date(2024, 1, 1), date(2024, 1, 4), csv_p, json_p
+        )
+        assert os.path.exists(json_p)
+        with open(json_p) as f:
+            meta = json.load(f)
+        assert meta["product_id"] == "BTC-USD"
+
+    @patch("historical_data.coinbase_collect_history")
+    def test_deduplicates(self, mock_fetch, tmp_path):
+        candles = _make_candles(date(2024, 1, 1), 3)
+        mock_fetch.return_value = candles + candles
+        csv_p = str(tmp_path / "out.csv")
+        json_p = str(tmp_path / "out.json")
+        hd.collect(
+            "BTC-USD", date(2024, 1, 1), date(2024, 1, 4), csv_p, json_p
+        )
+        df = pd.read_csv(csv_p)
+        assert df["date"].nunique() == len(df)
+
+    @patch("historical_data.coinbase_collect_history")
+    def test_csv_columns(self, mock_fetch, tmp_path):
+        mock_fetch.return_value = _make_candles(date(2024, 1, 1), 2)
+        csv_p = str(tmp_path / "out.csv")
+        json_p = str(tmp_path / "out.json")
+        hd.collect(
+            "BTC-USD", date(2024, 1, 1), date(2024, 1, 3), csv_p, json_p
+        )
+        df = pd.read_csv(csv_p)
+        for col in ["date", "open", "high", "low", "close", "volume"]:
+            assert col in df.columns
+
+    @patch("historical_data.coinbase_collect_history")
+    def test_returns_dataframe(self, mock_fetch, tmp_path):
+        mock_fetch.return_value = _make_candles(date(2024, 1, 1), 4)
+        csv_p = str(tmp_path / "out.csv")
+        json_p = str(tmp_path / "out.json")
+        result = hd.collect(
+            "BTC-USD", date(2024, 1, 1), date(2024, 1, 5), csv_p, json_p
+        )
+        assert isinstance(result, pd.DataFrame)
+
+    @patch("historical_data.coinbase_collect_history")
+    def test_sha256_in_provenance(self, mock_fetch, tmp_path):
+        mock_fetch.return_value = _make_candles(date(2024, 1, 1), 2)
+        csv_p = str(tmp_path / "out.csv")
+        json_p = str(tmp_path / "out.json")
+        hd.collect(
+            "BTC-USD", date(2024, 1, 1), date(2024, 1, 3), csv_p, json_p
+        )
+        with open(json_p) as f:
+            meta = json.load(f)
+        assert len(meta["sha256"]) == 64
+
+    @patch("historical_data.coinbase_collect_history")
+    def test_creates_parent_dirs(self, mock_fetch, tmp_path):
+        mock_fetch.return_value = _make_candles(date(2024, 1, 1), 2)
+        csv_p = str(tmp_path / "sub" / "out.csv")
+        json_p = str(tmp_path / "sub" / "out.json")
+        hd.collect(
+            "BTC-USD", date(2024, 1, 1), date(2024, 1, 3), csv_p, json_p
+        )
+        assert os.path.exists(csv_p)

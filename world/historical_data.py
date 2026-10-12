@@ -1,10 +1,12 @@
 """Collect real Coinbase daily candles into inspectable Library CSV files."""
+
 import csv
 import datetime as dt
 import hashlib
 import io
 import json
 import math
+import re
 import os
 import tempfile
 import urllib.parse
@@ -12,75 +14,179 @@ import urllib.request
 
 
 def fetch(url):
-    request = urllib.request.Request(url, headers={'User-Agent': 'AI-Think-Tank/1.0'})
-    with urllib.request.urlopen(request, timeout=25) as response:
+    target = urllib.parse.urlsplit(url)
+    if (
+        target.scheme != "https"
+        or target.hostname != "api.exchange.coinbase.com"
+        or target.username
+        or target.password
+        or target.port not in (None, 443)
+    ):
+        raise ValueError(
+            "Only public HTTPS Coinbase Exchange URLs are supported."
+        )
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "AI-Think-Tank/1.0"}
+    )
+    with urllib.request.urlopen(request, timeout=25) as response:  # nosec B310
         return json.load(response)
 
 
 def write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=os.path.dirname(path), delete=False) as stream:
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="",
+        dir=os.path.dirname(path),
+        delete=False,
+    ) as stream:
         stream.write(text)
         temporary = stream.name
     os.replace(temporary, path)
 
 
-def collect(product='BTC-USD', start='2024-01-01', end=None, resolve=None, getter=None):
-    import coinbase_spot
-    product = coinbase_spot.product_id(product)
-    begin = dt.datetime.combine(dt.date.fromisoformat(start), dt.time(), dt.timezone.utc)
-    today = dt.datetime.now(dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    finish = dt.datetime.combine(dt.date.fromisoformat(end), dt.time(), dt.timezone.utc) if end else today
-    if begin >= finish or finish > today or (finish-begin).days > 1825:
-        raise ValueError('Use a past range of up to five years; end is exclusive.')
+def collect(
+    product="BTC-USD", start="2024-01-01", end=None, resolve=None, getter=None
+):
+    if not isinstance(product, str) or not re.fullmatch(
+        r"[A-Z0-9]{2,15}-USD", product
+    ):
+        raise ValueError("Use a USD spot pair such as BTC-USD.")
+    begin = dt.datetime.combine(
+        dt.date.fromisoformat(start), dt.time(), dt.timezone.utc
+    )
+    today = dt.datetime.now(dt.timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    finish = (
+        dt.datetime.combine(
+            dt.date.fromisoformat(end), dt.time(), dt.timezone.utc
+        )
+        if end
+        else today
+    )
+    if begin >= finish or finish > today or (finish - begin).days > 1825:
+        raise ValueError(
+            "Use a past range of up to five years; end is exclusive."
+        )
     if resolve is None:
-        import serve
+        import serve  # type: ignore[import-not-found]
+
         resolve = serve._safe_library_path
     getter = getter or fetch
     cursor, rows, sources = begin, {}, []
     while cursor < finish:
         stop = min(cursor + dt.timedelta(days=299), finish)
-        url = 'https://api.exchange.coinbase.com/products/' + product + '/candles?' + urllib.parse.urlencode({
-            'start': cursor.isoformat(), 'end': stop.isoformat(), 'granularity': 86400})
+        url = (
+            "https://api.exchange.coinbase.com/products/"
+            + product
+            + "/candles?"
+            + urllib.parse.urlencode(
+                {
+                    "start": cursor.isoformat(),
+                    "end": stop.isoformat(),
+                    "granularity": 86400,
+                }
+            )
+        )
         candles = getter(url)
         if not isinstance(candles, list):
-            raise ValueError('Coinbase did not return a candle array.')
+            raise ValueError("Coinbase did not return a candle array.")
         sources.append(url)
         for candle in candles:
             if not isinstance(candle, list) or len(candle) != 6:
-                raise ValueError('Unexpected candle schema.')
+                raise ValueError("Unexpected candle schema.")
             timestamp = int(candle[0])
             if not begin.timestamp() <= timestamp < finish.timestamp():
                 continue
             low, high, opened, closed, volume = map(float, candle[1:])
-            if not all(math.isfinite(v) for v in [low, high, opened, closed, volume]) or volume < 0 or not 0 < low <= min(opened, closed) <= max(opened, closed) <= high:
-                raise ValueError('Invalid OHLCV values.')
-            row = [dt.datetime.fromtimestamp(timestamp, dt.timezone.utc).isoformat(), timestamp, product, opened, high, low, closed, volume]
+            if (
+                not all(
+                    math.isfinite(v)
+                    for v in [low, high, opened, closed, volume]
+                )
+                or volume < 0
+                or not 0
+                < low
+                <= min(opened, closed)
+                <= max(opened, closed)
+                <= high
+            ):
+                raise ValueError("Invalid OHLCV values.")
+            row = [
+                dt.datetime.fromtimestamp(
+                    timestamp, dt.timezone.utc
+                ).isoformat(),
+                timestamp,
+                product,
+                opened,
+                high,
+                low,
+                closed,
+                volume,
+            ]
             if timestamp in rows and rows[timestamp] != row:
-                raise ValueError('Conflicting candles for one timestamp.')
+                raise ValueError("Conflicting candles for one timestamp.")
             rows[timestamp] = row
         cursor = stop
     if not rows:
-        raise ValueError('No historical candles returned; no dataset was fabricated.')
-    missing = [ts for ts in range(int(begin.timestamp()), int(finish.timestamp()), 86400) if ts not in rows]
+        raise ValueError(
+            "No historical candles returned; no dataset was fabricated."
+        )
+    missing = [
+        ts
+        for ts in range(int(begin.timestamp()), int(finish.timestamp()), 86400)
+        if ts not in rows
+    ]
     ordered = [rows[ts] for ts in sorted(rows)]
-    output = io.StringIO(newline='')
+    output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(['timestamp', 'unix_time', 'product_id', 'open', 'high', 'low', 'close', 'volume'])
+    writer.writerow(
+        [
+            "timestamp",
+            "unix_time",
+            "product_id",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        ]
+    )
     writer.writerows(ordered)
     text = output.getvalue()
-    relative = 'datasets/' + product.lower() + '-daily-' + start + '-to-' + finish.date().isoformat() + '.csv'
-    metadata = {'path': relative, 'productId': product, 'granularitySeconds': 86400, 'rowCount': len(ordered),
-                'start': ordered[0][0], 'end': ordered[-1][0], 'requestedEndExclusive': finish.isoformat(),
-                'missingDays': len(missing), 'missingDayTimestamps': missing, 'duplicateRows': 0, 'missingValues': 0,
-                'sha256': hashlib.sha256(text.encode()).hexdigest(), 'sources': sources,
-                'fetchedAt': dt.datetime.now(dt.timezone.utc).isoformat(),
-                'scope': 'Coinbase Exchange spot daily OHLCV; no transactions.'}
+    relative = (
+        "datasets/"
+        + product.lower()
+        + "-daily-"
+        + start
+        + "-to-"
+        + finish.date().isoformat()
+        + ".csv"
+    )
+    metadata = {
+        "path": relative,
+        "productId": product,
+        "granularitySeconds": 86400,
+        "rowCount": len(ordered),
+        "start": ordered[0][0],
+        "end": ordered[-1][0],
+        "requestedEndExclusive": finish.isoformat(),
+        "missingDays": len(missing),
+        "missingDayTimestamps": missing,
+        "duplicateRows": 0,
+        "missingValues": 0,
+        "sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "sources": sources,
+        "fetchedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "scope": "Coinbase Exchange spot daily OHLCV; no transactions.",
+    }
     target = resolve(relative)
     if not target:
-        raise ValueError('Dataset path is outside Library.')
+        raise ValueError("Dataset path is outside Library.")
     write(target, text)
-    metadata_path = relative[:-4] + '.json'
+    metadata_path = relative[:-4] + ".json"
     write(resolve(metadata_path), json.dumps(metadata, indent=2))
-    metadata['metadataPath'] = metadata_path
+    metadata["metadataPath"] = metadata_path
     return metadata

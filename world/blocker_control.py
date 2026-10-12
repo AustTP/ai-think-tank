@@ -20,7 +20,17 @@ def cards(state):
                   for c in review.get('checks') or []]
         combined = (evidence + ' ' + ' '.join(checks)).lower()
         failure_kind = task.get('reviewFailureKind')
-        if failure_kind == 'invalid_response':
+        routed = task.get('failureCategory')
+        if routed in ('policy', 'budget', 'syntax', 'infrastructure', 'missing_inputs', 'functional'):
+            category, action = {
+                'policy': ('policy_denial', 'provide_inputs'),
+                'budget': ('budget_exhausted', 'provide_inputs'),
+                'syntax': ('syntax_failure', 'assign_repair'),
+                'infrastructure': ('infrastructure', 'retry_infrastructure'),
+                'missing_inputs': ('missing_inputs', 'provide_inputs'),
+                'functional': ('functional_defect', 'assign_repair'),
+            }[routed]
+        elif failure_kind == 'invalid_response':
             category, action = 'invalid_review_response', 'retry_review'
         elif failure_kind == 'service_unavailable':
             category, action = 'review_service_unavailable', 'retry_review'
@@ -141,6 +151,8 @@ def apply_action(serve, tid, body):
                 'directRoute': True, 'instructions': instructions,
                 'acceptanceCriteria': trading_workflow.CONTRACTS[stage], 'priority': 'high', 'budgetUsd': 0.50}])
         elif action in ('assign_repair', 'retry_infrastructure') and sim._peer_coding_class(task):
+            __import__('recovery_control').authorize(__import__('story_tracking').root(state, task),
+                guidance or ('Execution service verified before retry.' if action == 'retry_infrastructure' else ''))
             task['_peerGate'] = {'approvals': 0, 'approvers': [], 'reviewerIds': old_gate.get('reviewerIds', []),
                                  'cycleCount': 0, 'escalated': False}
             task['manualAttention'] = False
@@ -277,7 +289,8 @@ def submit_artifact(serve, task_id, library_path):
         task.setdefault('evidenceSubmissionHistory', []).append({'at': now, 'previousLibraryPath': task.get('libraryPath'),
             'libraryPath': library_path, 'reportSha256': review_quality.digest(report), 'checks': checks})
         task.update(libraryPath=library_path, reviewContract=contract, manualAttention=False, blockedReason=None,
-                    failNote=None, note='Saved Library artifacts inspected; independent peer review pending.')
+                    failNote=None, validatedArtifactSha256=review_quality.digest(report),
+                    note='Saved Library artifacts inspected; independent peer review pending.')
         if task.get('reviewDiagnosis'):
             task.setdefault('reviewDiagnosisHistory', []).append(task.pop('reviewDiagnosis'))
         task.pop('_peerRepairPending', None)

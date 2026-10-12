@@ -1,0 +1,6 @@
+Artifact_Name,Status,Last_Updated,Verification_Status
+crypto_trading/tasks.csv,Missing,-,Estimated
+backtest_results.csv,Missing,-,Estimated
+crypto_trading/docs/introduction.md,Present,2022-01-15,Verified
+crypto_trading/scripts/backtest.py,Present,2022-02-10,Verified
+crypto_trading/scripts/trade.py,Present,2022-03-05,Verified

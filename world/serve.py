@@ -1238,7 +1238,7 @@ AGENTS_DIR = os.path.join(THINK_TANK_DIR, 'agents')
 
 def _write_file(path, content):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'w') as f:
+    with open(path, 'w', encoding='utf-8') as f:
         f.write(content)
 
 
@@ -3577,7 +3577,7 @@ async def _lifespan(app):
         sim_task.cancel()
 
 
-# Workers report to one of the two directors (Theo — the admin, and Nora —
+# Workers report to one of the two directors (Theo â€” the admin, and Nora â€”
 # the senior-most director). Kept in sync with the DB backfill so a fresh
 # start and a repaired DB agree. Assignments are deterministic: technical/
 # creative/research roles -> theo, operations/personnel/banking -> nora.
@@ -5162,7 +5162,7 @@ def ensure_sandbox_networking():
         subprocess.run(['docker', 'network', 'connect', EGRESS_NETWORK, PROXY_CONTAINER], capture_output=True)
 
 
-def _run_in_sandbox_sync(sandbox_dir, command):
+def _run_in_sandbox_sync(sandbox_dir, command, soft_limit=True):
     # Backend dispatch: SANDBOX_EXECUTION chooses WHERE agent
     # commands run. `local` (default) -> the local Docker sandbox below;
     # `digitalocean` -> a provisioned Droplet. The digitalocean branch FAILS
@@ -5205,7 +5205,7 @@ def _run_in_sandbox_sync(sandbox_dir, command):
     ]
     try:
         result = subprocess.run(docker_cmd, capture_output=True, text=True,
-                                encoding='utf-8', errors='replace', timeout=SANDBOX_TIMEOUT_S)
+                                encoding='utf-8', errors='replace', timeout=None if soft_limit else SANDBOX_TIMEOUT_S)
         return {
             'exitCode': result.returncode,
             'stdout': _sandbox_output_text(result.stdout),
@@ -5980,7 +5980,7 @@ def _weather_fetch(location):
     cond = _weather_code_human(current.get('weather_code'))
     temp = current.get('temperature_2m')
     feels = current.get('apparent_temperature')
-    return (f'Weather for {location}: temperature {temp}°C, feels like {feels}°C, '
+    return (f'Weather for {location}: temperature {temp}Â°C, feels like {feels}Â°C, '
             f'{cond}. Observation time: {current.get("time") or "not supplied"}; '
             f'timezone: {data.get("timezone") or "provider default"}. Source: external Open-Meteo data.')
 
@@ -12112,6 +12112,7 @@ async def grant_task_budget(request: Request):
     if authorized is not True:
         return JSONResponse({'error': 'attribution key mismatch'}, status_code=403)
     body = await request.json()
+    import story_tracking
     task_id = (body.get('taskId') or '').strip()
     new_budget = body.get('budgetUsd')
     if not task_id:
@@ -12628,7 +12629,7 @@ async def write_library_file(request: Request):
             log_action(agent_id, 'library_write_denied', {'path': rel_path, 'owner': own}, authorized=authorized)
             return JSONResponse({'error': f'Only {own}, {own}\'s director, or the admin may write to that agent\'s files.'}, status_code=403)
     os.makedirs(os.path.dirname(target), exist_ok=True)
-    with open(target, 'w') as f:
+    with open(target, 'w', encoding='utf-8') as f:
         f.write(content[:200_000])
     log_action(agent_id, 'library_write', {'path': rel_path, 'bytes': len(content), 'source': source}, authorized=authorized)
     # Every time an agent writes or modifies a file, it's chained into the
@@ -13487,6 +13488,17 @@ def _taste_is_expired(taste):
 
 @app.post('/api/chat')
 async def chat(request: Request):
+    import request_budget
+    body = await request.json()
+    if not isinstance(body, dict):
+        return JSONResponse({'error': 'Expected a request object.'}, status_code=400)
+    task_id = str(body.get('taskId') or '')
+    state = await asyncio.to_thread(get_state_from_db) or {}
+    async with request_budget.guard(state, task_id):
+        return await _chat_request(request)
+
+
+async def _chat_request(request: Request):
     # The only place OPENROUTER_API_KEY is ever used -- it never leaves
     # this process. The client sends the model slug + full message list
     # (it owns persona/prompt construction, this is just a secure proxy)
@@ -13561,7 +13573,15 @@ async def chat(request: Request):
     # Calls without a taskId (the ask lane, the player, serve's own loopback
     # planning calls) are never gated, and a state/ledger read failure never
     # blocks a call.
+    import story_tracking
     task_id = (body.get('taskId') or '').strip()
+    if task_id:
+        recovery_state = get_state_from_db() or {}
+        recovery_task = recovery_state.get('tasks', {}).get(task_id)
+        recovery_root = story_tracking.root(recovery_state, recovery_task) if recovery_task else {}
+        if recovery_root.get('blockedReason') == 'story_recovery_limit' and recovery_root.get('manualAttention'):
+            return JSONResponse({'error': 'Story recovery limit reached. Provide a specific recovery decision before more model calls.',
+                                 'recoveryPaused': True}, status_code=409)
     if task_id and _task_budget_exhausted(task_id):
         spent, attempts = _task_budget_spent(task_id)
         import story_tracking
@@ -13600,6 +13620,22 @@ async def chat(request: Request):
     # ({"deliberate": false, "best_of": 3}); expensive/reasoning/coding tiers
     # never deliberate. Each sample is a separate billed call and is accrued
     # against the spend ledger like any other.
+    if task_id:
+        import request_budget
+        state = get_state_from_db() or {}
+        info = story_tracking.budget_status(state, _spend_ledger_read() or {}, task_id)
+        if info['scope'] == 'request':
+            with _db() as conn:
+                row = conn.execute('SELECT prompt_price, completion_price FROM model_catalog WHERE model_id=?', (model,)).fetchone()
+            try:
+                max_tokens = request_budget.allowance(state, _spend_ledger_read() or {}, task_id,
+                    messages, max_tokens, tuple(row) if row else None)
+            except ValueError as error:
+                return JSONResponse({'error': str(error), 'budgetExhausted': True,
+                    'budgetScope': info, 'taskSpendUsd': info['used']}, status_code=429)
+            # A budgeted request gets one bounded sample, including reviews and repairs.
+            body['deliberate'] = False
+            body['best_of'] = 1
     deliberate = _ttc_should_deliberate(model, body.get('deliberate'), body.get('best_of'))
     best_n = _ttc_best_of(body.get('best_of')) if deliberate else 1
     try:
@@ -14708,8 +14744,52 @@ async def execute(request: Request):
     return JSONResponse({'allowed': True, 'sandboxId': sandbox_id, **result})
 
 
+_pipeline_jobs = {}
+
+
 @app.post('/api/pipeline')
 async def pipeline(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict) or not body.get('background'):
+        return await _pipeline_execute(request)
+    agent_id = body.get('agentId', 'unknown')
+    if not _require_player_session(request) and verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
+        return JSONResponse({'error': 'Login or agent key required.'}, status_code=401)
+    job_id = secrets.token_hex(16)
+    body['_jobId'] = job_id
+    job = {'id': job_id, 'agentId': agent_id, 'status': 'running',
+           'startedAt': time.time(), 'stepsTotal': len(body.get('steps') or []), 'stepsCompleted': 0}
+    if len(_pipeline_jobs) >= 128:
+        for old_id, old_job in list(_pipeline_jobs.items()):
+            if old_job['status'] in ('done', 'failed'):
+                _pipeline_jobs.pop(old_id, None)
+                if len(_pipeline_jobs) < 128:
+                    break
+    _pipeline_jobs[job_id] = job
+    async def run():
+        try:
+            response = await _pipeline_execute(request)
+            job['result'] = json.loads(response.body)
+            job['status'] = 'done'
+        except Exception as error:
+            job.update(status='failed', result={'error': str(error)})
+        finally:
+            job['finishedAt'] = time.time()
+    job['worker'] = asyncio.create_task(run())
+    return JSONResponse({'jobId': job_id, 'status': 'running'}, status_code=202)
+
+
+@app.get('/api/pipeline/jobs/{job_id}')
+async def pipeline_job(job_id: str, request: Request):
+    job = _pipeline_jobs.get(job_id)
+    if not job:
+        return JSONResponse({'error': 'Unknown pipeline job.'}, status_code=404)
+    if not _require_player_session(request) and verify_agent_key(job['agentId'], request.headers.get('X-Agent-Key')) is not True:
+        return JSONResponse({'error': 'Login or owning agent key required.'}, status_code=401)
+    return {k: v for k, v in job.items() if k != 'worker'}
+
+
+async def _pipeline_execute(request: Request):
     # "They would wait to see where the pipeline succeeds or fails" --
     # your words. A pipeline is just a sequence of the same primitive
     # /api/execute already provides, run in the SAME sandbox directory
@@ -14739,8 +14819,11 @@ async def pipeline(request: Request):
 
     sandbox_dir = _sandbox_dir_for(sandbox_id)
     results = []
+    job = _pipeline_jobs.get(body.get('_jobId'))
     for step in steps:
         name = step.get('name', 'step')
+        if job:
+            job['currentStep'] = name
         command = (step.get('command') or '').strip()
         allowed, reason = await _classify_command(command, f'CI/CD pipeline step "{name}"', agent_id)
         if not allowed:
@@ -14754,6 +14837,8 @@ async def pipeline(request: Request):
         result = await asyncio.to_thread(_run_in_sandbox_sync, sandbox_dir, command)
         log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'decision': 'allowed', 'exitCode': result['exitCode']}, authorized=authorized)
         results.append({'name': name, 'allowed': True, **result})
+        if job:
+            job['stepsCompleted'] = len(results)
         if result['exitCode'] != 0 or result['timedOut']:
             sync_prototypes(agent_id, sandbox_dir)
             return JSONResponse({'sandboxId': sandbox_id, 'results': results, 'failedStep': name})
@@ -16793,11 +16878,14 @@ RESEARCH_CRAWL_MAX_PAGES = 50             # tasks.js crawlAndCollect -- raised 6
 RESEARCH_SKILL_SYNTHESIS_TOKENS = 900     # runResearchTask /api/chat max_tokens
 
 
-def _http_json(method, base, path, body=None, header=None, timeout=30):
+def _http_json(method, base, path, body=None, header=None, timeout=None):
     """Thin loopback HTTP helper mirroring world.js agentFetch(apiFetch).
     `timeout` defaults to 30s; callers doing a long model decomposition (the
     big-task planning call) pass a larger ceiling -- a 4000-token plan can
     exceed 30s on a cold model, which surfaced as flaky 502s."""
+    import runtime_limits
+    timeout = max(timeout or 0, runtime_limits.transport(path, body))
+    started = time.monotonic()
     url = base + path
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method,
@@ -16805,6 +16893,7 @@ def _http_json(method, base, path, body=None, header=None, timeout=30):
                                           **({'X-Agent-Key': header} if header else {})})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- fixed SELF_BASE_URL internal calls; only SSRF-gated browse URLs use this path
+            runtime_limits.observe(path, time.monotonic() - started)
             raw = resp.read().decode('utf-8', errors='replace')
             try:
                 return json.loads(raw) if raw else {}
