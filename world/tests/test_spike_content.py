@@ -1925,19 +1925,33 @@ class SpikeReportCloseDoesNotClobber(SpikeContent):
              unittest.mock.patch.object(serve, '_http_json', side_effect=fake_http), \
              unittest.mock.patch.object(content, '_spike_file_issue_wish', return_value=None):
             content._run_spike_content(_snapshot(), 'cora', task)
-        return posts, seen, captured.get('path')
+        return posts, seen, captured.get('path'), task
 
     def test_closer_skips_write_when_report_already_exists(self):
-        posts, _seen, report_path = self._drive_close(report_file_exists=True)
+        posts, _seen, report_path, _task = self._drive_close(report_file_exists=True)
         self.assertTrue(report_path and report_path.startswith('archive/') and report_path.endswith('.md'))
         self.assertEqual(posts, [], 'closer must not clobber an already-written report')
 
     def test_closer_writes_when_no_report_exists(self):
-        posts, seen, report_path = self._drive_close(report_file_exists=False)
+        posts, seen, report_path, _task = self._drive_close(report_file_exists=False)
         self.assertEqual(len(posts), 1, 'closer must write when the tool never saved a report')
         self.assertEqual(posts[0]['path'], report_path)
         self.assertEqual(posts[0]['source'], 'firsthand')
         self.assertIn('close-guard', seen['close-guard']['libraryPath'])
+
+    def test_heartbeat_bumped_throughout_run(self):
+        # The grace mechanism (sim.TASK_CONTENT_GRACE_*) reads this field off
+        # the LIVE task dict to decide whether an expired workUntil earns
+        # another pass. The executor must bump it during the run -- a run that
+        # never heartbeats would be abandoned at the ceiling even while alive.
+        import time as _time
+        t0 = _time.time()
+        _posts, _seen, _path, task = self._drive_close(report_file_exists=False)
+        hb = task.get('_contentHeartbeat')
+        self.assertIsInstance(hb, float,
+                              '_run_spike_content must bump _contentHeartbeat on the live task')
+        self.assertGreaterEqual(hb, t0 - 0.5,
+                                'heartbeat must be stamped during this run, not left over')
 
 
 if __name__ == '__main__':

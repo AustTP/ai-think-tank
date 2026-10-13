@@ -4501,6 +4501,22 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     backlog = task.get('title') or ''
     instructions = task.get('instructions')
     budget = task.get('budgetMs')
+
+    # Liveness heartbeat (see sim.TASK_CONTENT_GRACE_*): `task` here is the
+    # LIVE task dict (the dispatch passes it, not the snapshot's copy), so
+    # these bumps are what the completion loop reads when workUntil expires.
+    # Bumped at every phase boundary AND every tool call -- the execute phase
+    # is minutes of small steps, synthesis is one long call, so between them
+    # the gap never exceeds a single model call (well under
+    # TASK_CONTENT_HB_STALE_S). A thread that dies stops bumping, which is
+    # exactly what stops the grace extension.
+    def _hb():
+        try:
+            task['_contentHeartbeat'] = time.time()
+        except Exception:
+            pass
+
+    _hb()
     # Item 4 gate up front: a spike that has already used its full model-spend
     # budget is failed closed BEFORE it resolves tiers or makes any call --
     # no further money is spent, and the sim sees budgetExhausted and runs its
@@ -4551,6 +4567,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # PLAN -- a short, concrete checklist of sub-goals, from the stronger
     # reasoning tier. Best-effort: an empty plan just means the execute step
     # falls back to its own generic instructions below, not a failure.
+    _hb()
     plan_text = _plain_completion(reasoning_slug, [
         {'role': 'system', 'content': (
             'You are planning a real, tool-driven web investigation. Given the question below, '
@@ -4770,6 +4787,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                           'read_google_doc', 'create_google_doc')
 
     def execute_tool(tool_name, args):
+        _hb()  # every tool call is live progress the completion loop can see
         if tool_name in struck_tools:
             return (f'{tool_name} was already blocked once this investigation (one-strike) -- do '
                      'not call it again, use a different tool or approach instead.')
@@ -4922,6 +4940,10 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         'summarize, or write a stub promising the full document later; this reply IS the deliverable '
         'and it is filed to the Library verbatim.'
     )
+    # Synthesis is the one long silent call -- bump right before it so its
+    # whole duration counts as live (bounded by the call timeout, well under
+    # TASK_CONTENT_HB_STALE_S).
+    _hb()
     finding = _plain_completion(
         reasoning_slug, transcript + [{'role': 'user', 'content': synth_prompt}], max_tokens=8000,
         task_id=task.get('id'))
