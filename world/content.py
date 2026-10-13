@@ -3163,16 +3163,15 @@ _WRITE_SPIKE_REPORT_TOOL = {
     'function': {
         'name': 'write_spike_report',
         'description': (
-            'Write the full text of THIS spike\'s findings report to the Library. Use this when '
-            'the deliverable is a written report/document that will not fit in a single reply -- '
-            'e.g. a long multi-section comparison, a full catalog, or a synthesis you are building '
-            'in parts. Takes the complete report markdown as `content` and writes it to the '
+            'Save a long findings report to the Library DURING the execute phase (the final '
+            'synthesis step cannot call tools -- it writes the report from its own reply). Use '
+            'this when you have already assembled a long document in stages and want it durably '
+            'saved before the spike closes, e.g. a multi-section comparison you built across '
+            'several reads. Takes the complete report markdown as `content` and writes it to the '
             'canonical report path for this task. Call it once with the finished report, or call '
             'it again with the full report text to replace what is there (it overwrites, so always '
             'send the COMPLETE report each time, not a delta). Returns the path it saved to. The '
-            'same path is also written automatically at the end of the spike from your final reply '
-            'text -- prefer this tool whenever the report is long enough that your final reply '
-            'would be cut off, since a truncated report is filed as-is.'
+            'closer honors a report saved here and will not overwrite it.'
         ),
         'parameters': {
             'type': 'object',
@@ -4869,6 +4868,17 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # (every real page fetched and every real search result), writes the
     # actual final report against the plan. Falls back to the execute step's
     # own closing text if synthesis itself comes back empty.
+    #
+    # max_tokens: 8000 (was 1800). Confirmed bug 2026-10-12 (task-282): a
+    # five-section comparison is ~4-6k tokens of prose, so the old 1800 cap
+    # cut every long report mid-sentence, and the closer filed that truncation
+    # verbatim as the whole deliverable (see the library_path write below).
+    # This step is a PLAIN COMPLETION -- _plain_completion takes no tools --
+    # so the old prompt line telling the model to call write_spike_report here
+    # was asking the impossible. The real fix is to let the document fit. The
+    # tool stays for the EXECUTE phase, where a worker that wants to stage a
+    # long report in passes can still do so; the closer honors it via the
+    # _already_written guard below.
     synth_prompt = (
         'Based on everything above -- the plan, and everything actually found via the tools -- write '
         'the complete final findings report. If the question asked for a full/exhaustive/complete list '
@@ -4884,16 +4894,12 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         'summarize or clean up. If the CSV has a basis column, briefly note in your own summary how '
         'many rows were actually verified vs estimated, so that distinction isn\'t buried in a table '
         'nobody reads closely. Organize the answer clearly (a short list or numbered sections is '
-        'fine). No filler, no release notes. IMPORTANT: if the report above is a long document that '
-        'will not fit in a single reply -- a full multi-section comparison, a complete catalog, a '
-        'long synthesis -- call write_spike_report with the COMPLETE report markdown (all of it, in '
-        'one call or a few) BEFORE you send this final reply, so the full report is saved to the '
-        'Library and not cut off. If you did that, keep this final reply short: just state that the '
-        'report was saved via write_spike_report and give a one-line summary. If the report is short '
-        'enough to fit here, do not use the tool and just write it in this reply.'
+        'fine). No filler, no release notes. Write the COMPLETE report here -- do not abbreviate, '
+        'summarize, or write a stub promising the full document later; this reply IS the deliverable '
+        'and it is filed to the Library verbatim.'
     )
     finding = _plain_completion(
-        reasoning_slug, transcript + [{'role': 'user', 'content': synth_prompt}], max_tokens=1800,
+        reasoning_slug, transcript + [{'role': 'user', 'content': synth_prompt}], max_tokens=8000,
         task_id=task.get('id'))
     if not finding:
         finding = (execute_text or '').strip()
