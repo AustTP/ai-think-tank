@@ -717,5 +717,168 @@ class MullvadEnsureLoggedIn(unittest.TestCase):
         run.assert_called_once()  # never got to a second (login) call
 
 
+class AllowlistOperatorEndpoints(unittest.TestCase):
+    """GET/POST /api/allowlist/grant + /api/allowlist/revoke -- the director/
+    admin path to add AND remove allowlist entries directly, next to the
+    player's email-link escalation. Gated by _operator_gate: a player session
+    OR a director/admin agent key; an ordinary agent is refused."""
+
+    def _client(self, session=True, agent_id=None):
+        from starlette.testclient import TestClient
+        c = TestClient(serve.app)
+        if session:
+            c.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
+        if agent_id:
+            # A real agent key: the login middleware needs it to pass, and
+            # _resolve_requester returns the KEY'S OWNER as the requester, so
+            # the director path is exercised end-to-end (no gate mocking).
+            c.headers['X-Agent-Key'] = serve.get_or_create_agent_key(agent_id)
+        return c
+
+    def _common_mocks(self):
+        patchers = [
+            unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True),
+            unittest.mock.patch.object(serve, 'ensure_sandbox_networking'),
+            unittest.mock.patch.object(serve, 'log_action'),
+        ]
+        started = [p.start() for p in patchers]
+        for p in patchers:
+            self.addCleanup(p.stop)
+        # The started patchers, so a test can reach an individual mock
+        # (e.g. the log_action mock) by index.
+        return started
+
+    def _clear_grants(self):
+        serve._set_setting(serve.ALLOWLIST_GRANTS_SETTING, '')
+
+    def test_unauthenticated_grant_and_revoke_are_rejected(self):
+        from starlette.testclient import TestClient
+        for path in ('/api/allowlist/grant', '/api/allowlist/revoke'):
+            r = TestClient(serve.app).post(path, json={'host': 'example.com', 'purpose': 'x'})
+            self.assertEqual(r.status_code, 401, path)
+
+    def test_ordinary_agent_key_is_rejected_on_grant_and_revoke(self):
+        # A valid agent key that is NOT a director/admin fails _operator_gate.
+        with unittest.mock.patch.object(serve, '_require_player_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_resolve_requester', return_value='ben'), \
+             unittest.mock.patch.object(serve, '_is_director_or_admin', return_value=False):
+            for path in ('/api/allowlist/grant', '/api/allowlist/revoke'):
+                r = self._client().post(path, json={'host': 'example.com', 'purpose': 'x'})
+                self.assertEqual(r.status_code, 401, path)
+
+    def test_player_session_can_grant_and_it_persists(self):
+        self._common_mocks()
+        self._clear_grants()
+        self.addCleanup(self._clear_grants)
+        r = self._client().post('/api/allowlist/grant', json={
+            'host': 'https://API.Example.COM/v1', 'purpose': 'quotes'})
+        body = r.json()
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(body['granted'])
+        self.assertEqual(body['host'], 'api.example.com')  # normalized
+        self.assertTrue(serve._is_allowlisted_host('api.example.com'))
+        self.assertTrue(serve._is_allowlisted_host('www.api.example.com'))
+        self.assertIn('api.example.com', serve._runtime_allowlist_grants())
+
+    def test_grant_is_idempotent_for_an_already_effective_host(self):
+        self._common_mocks()
+        with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', {'dreyx.com'}):
+            r = self._client().post('/api/allowlist/grant', json={
+                'host': 'dreyx.com', 'purpose': 'already there'})
+        body = r.json()
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(body['granted'])
+        self.assertIn('already on the allowlist', body['message'])
+
+    def test_grant_refuses_a_private_host(self):
+        self._common_mocks()
+        with unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=False):
+            r = self._client().post('/api/allowlist/grant', json={
+                'host': '10.0.0.5', 'purpose': 'internal'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('never be allowlisted', r.json()['error'])
+
+    def test_director_agent_key_can_grant_and_revoke(self):
+        # The actual director path: a real agent key passes the login
+        # middleware, then _operator_gate's role check authorizes the mutation
+        # directly (no email escalation). The role check is mocked (the test
+        # DB has no seeded roster, same approach the feed-registry tests use).
+        self._common_mocks()
+        self._clear_grants()
+        self.addCleanup(self._clear_grants)
+        c = self._client(session=False, agent_id='theo')
+        with unittest.mock.patch.object(serve, '_is_director_or_admin', return_value=True):
+            r_grant = c.post('/api/allowlist/grant', json={
+                'host': 'granted.example', 'purpose': 'director vetted'})
+            self.assertEqual(r_grant.status_code, 200)
+            self.assertTrue(r_grant.json()['granted'])
+            self.assertTrue(serve._is_allowlisted_host('granted.example'))
+            r_revoke = c.post('/api/allowlist/revoke', json={
+                'host': 'granted.example', 'purpose': 'no longer needed'})
+        self.assertEqual(r_revoke.status_code, 200)
+        self.assertTrue(r_revoke.json()['revoked'])
+        self.assertFalse(serve._is_allowlisted_host('granted.example'))
+
+    def test_revoke_removes_only_runtime_grants_not_env_baseline(self):
+        self._common_mocks()
+        self._clear_grants()
+        self.addCleanup(self._clear_grants)
+        # A runtime grant is removable...
+        serve._grant_allowlist('runtime.example', actor='theo', via='operator grant')
+        r = self._client().post('/api/allowlist/revoke', json={
+            'host': 'runtime.example', 'purpose': 'changed'})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()['revoked'])
+        self.assertFalse(serve._is_allowlisted_host('runtime.example'))
+        # ...but the code-reviewed env baseline is not -- that's a .env edit.
+        with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', {'baseline.example'}):
+            r = self._client().post('/api/allowlist/revoke', json={
+                'host': 'baseline.example', 'purpose': 'try'})
+            self.assertEqual(r.status_code, 400)
+            self.assertIn('.env', r.json()['error'])
+            self.assertTrue(serve._is_allowlisted_host('baseline.example'))
+
+    def test_revoke_of_an_absent_host_is_a_noop(self):
+        self._common_mocks()
+        self._clear_grants()
+        self.addCleanup(self._clear_grants)
+        r = self._client().post('/api/allowlist/revoke', json={
+            'host': 'never-granted.example', 'purpose': 'noop'})
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()['revoked'])
+        self.assertIn('nothing to revoke', r.json()['message'])
+
+    def test_get_lists_env_baseline_and_runtime_grants_separately(self):
+        self._common_mocks()
+        self._clear_grants()
+        self.addCleanup(self._clear_grants)
+        serve._grant_allowlist('runtime.example', actor='theo', via='operator grant')
+        with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', {'baseline.example'}):
+            r = self._client().get('/api/allowlist')
+        body = r.json()
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('baseline.example', body['envBaseline'])
+        self.assertIn('runtime.example', body['runtimeGrants'])
+        self.assertIn('baseline.example', body['effective'])
+        self.assertIn('runtime.example', body['effective'])
+
+    def test_grant_endpoint_attributes_actor_in_action_log(self):
+        # The action log must show WHO granted it and via which path, so a
+        # director's direct grant is auditable and distinguishable from the
+        # player's email-link escalation. The requester is the real key's
+        # owner (theo), resolved by _resolve_requester from the header.
+        started = self._common_mocks()
+        log = started[2]  # patchers[2] is log_action
+        self._clear_grants()
+        self.addCleanup(self._clear_grants)
+        c = self._client(session=False, agent_id='theo')
+        with unittest.mock.patch.object(serve, '_is_director_or_admin', return_value=True):
+            c.post('/api/allowlist/grant', json={
+                'host': 'audited.example', 'purpose': 'trace me'})
+        log.assert_called_with('theo', 'allowlist_grant',
+                               {'host': 'audited.example', 'via': 'operator grant'},
+                               authorized=True)
+
+
 if __name__ == '__main__':
     unittest.main()
