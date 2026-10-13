@@ -79,7 +79,11 @@ class EscalationFloorTests(unittest.TestCase):
                            serve.JEV_SAFETY_CONFIDENCE)
         self.assertEqual(serve._escalation_floor('unresolved review requirement'),
                          serve.JEV_SAFETY_CONFIDENCE)                               # routine kind keeps the old bar
-        self.assertEqual(serve._escalation_floor('allowlist request'), 1.0)   # permanent capability grant -> always human
+        # Operator decision 2026-10-13: allowlist requests escalated to the
+        # DIRECTORS (their #1 complaint was waiting on email) -- delegable at
+        # the default floor, no longer human-only.
+        self.assertEqual(serve._escalation_floor('allowlist request'),
+                         serve.JEV_SAFETY_CONFIDENCE)
 
     def test_unknown_kind_falls_back_to_default(self):
         # A new escalation kind can't silently widen auto-approval authority.

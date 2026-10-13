@@ -504,6 +504,48 @@ class ApiCallEndpoint(unittest.TestCase):
             'agentId': 'ben', 'url': 'https://example.com/data', 'method': 'GET', 'purpose': 'p'})
         self.assertFalse(r.json()['allowed'])
 
+    def test_standing_safe_host_get_skips_jev(self):
+        # STANDING_SAFE_DOMAINS read tier: a GET to a curated public-reference
+        # host skips the Jev classify entirely, with no allowlist grant
+        # involved (_is_allowlisted_host stays mocked False in _gates).
+        async def _should_not_run(instructions, criteria):
+            raise AssertionError('Jev must not run for a standing-host GET')
+        self._start([
+            unittest.mock.patch.object(serve, 'API_CALL_ENABLED', True),
+            unittest.mock.patch.object(serve, 'check_rate_limit', return_value=True),
+            unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True),
+            unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True),
+            unittest.mock.patch.object(serve, '_jev_quorum_decision', _should_not_run),
+            unittest.mock.patch.object(serve, '_is_allowlisted_host', return_value=False),
+            unittest.mock.patch.object(serve, 'log_action'),
+        ])
+        fake_result = {'status': 200, 'finalUrl': 'https://www.nasa.gov/data',
+                       'contentType': 'application/json', 'body': '{"ok": true}', 'truncated': False}
+        with unittest.mock.patch.object(serve, '_api_request_sync', return_value=fake_result):
+            r = self._client().post('/api/api-call', json={
+                'agentId': 'ben', 'url': 'https://www.nasa.gov/data', 'method': 'GET',
+                'purpose': 'read a public dataset index'})
+        self.assertTrue(r.json()['allowed'])
+
+    def test_standing_safe_host_write_still_gates(self):
+        # The standing tier is READ-ONLY: a POST to the same host goes
+        # through Jev like any unregistered host (a block is honored).
+        async def _block(instructions, criteria):
+            return ('block', 0.99, 0.0, 'trace-1')
+        self._start([
+            unittest.mock.patch.object(serve, 'API_CALL_ENABLED', True),
+            unittest.mock.patch.object(serve, 'check_rate_limit', return_value=True),
+            unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True),
+            unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True),
+            unittest.mock.patch.object(serve, '_jev_quorum_decision', _block),
+            unittest.mock.patch.object(serve, '_is_allowlisted_host', return_value=False),
+            unittest.mock.patch.object(serve, 'log_action'),
+        ])
+        r = self._client().post('/api/api-call', json={
+            'agentId': 'ben', 'url': 'https://www.nasa.gov/submit', 'method': 'POST',
+            'purpose': 'submit something'})
+        self.assertFalse(r.json()['allowed'])
+
     def test_registered_get_injects_credential_and_wraps(self):
         self._start(self._gates())
         fake_result = {'status': 200, 'finalUrl': 'https://api.github.com/repos/o/r',
