@@ -3782,7 +3782,12 @@ class _ClassifyCommandJev(unittest.TestCase):
     def test_low_confidence_allow_blocks_without_escalation(self):
         allowed, reason, save_called = self._run('allow', 0.4)
         self.assertFalse(allowed, 'low-confidence allow must not run the command')
-        self.assertIn('unsure', reason)
+        # The block reason is now actionable (names the confidence, the
+        # threshold, the block categories, and what to do differently) --
+        # the old bare "unsure (Jev confidence 0.xx), escalated" left agents
+        # with a score and no fix path.
+        self.assertIn('not confident enough', reason)
+        self.assertIn('0.40', reason)
         save_called.assert_not_called()
 
     def test_block_blocks_without_escalation(self):

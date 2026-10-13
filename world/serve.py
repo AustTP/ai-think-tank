@@ -22924,7 +22924,15 @@ async def _classify_command(command, purpose, agent_id='unknown'):
     if not _jev_safety_gate(agent_id, 'execute_classify', 'This command', command, purpose, decision, confidence, cost, None, trace_id):
         if decision not in ('allow', 'approve'):
             return False, decision or 'classifier unavailable or gave no answer'
-        return False, f'unsure (Jev confidence {confidence:.2f}), escalated'
+        # Low-confidence allow blocked. The old message was just
+        # "unsure (Jev confidence 0.16), escalated" -- agents saw a score
+        # with no reason and no fix. Name what Jev blocks and what to do.
+        _cats = '; '.join(EXECUTE_BLOCK_CATEGORIES)
+        return False, (f'Jev was not confident enough to approve this command '
+                       f'(confidence {confidence:.2f}, needed {_effective_safety_confidence():.2f}). '
+                       f'Jev blocks: {_cats}. If your command is ordinary work, rephrase the stated '
+                       f'purpose to say exactly what work task it serves, or simplify the command '
+                       f'so its intent is clearer. Do not retry the same command unchanged.')
     return True, 'allow'
 
 
@@ -22981,7 +22989,13 @@ async def _classify_browser_action(op, url, purpose, agent_id='unknown', work_co
     if not _jev_safety_gate(agent_id, 'browser_act_classify', 'This browser action', f'{op} {url or ""}', purpose, decision, confidence, cost, None, trace_id):
         if decision not in ('allow', 'approve'):
             return False, decision or 'classifier unavailable or gave no answer'
-        return False, f'unsure (Jev confidence {confidence:.2f}), escalated'
+        # Same actionable-message fix as _classify_command: agents saw a bare
+        # confidence score with no reason and no fix path.
+        return False, (f'Jev was not confident enough to approve this browser action '
+                       f'(confidence {confidence:.2f}, needed {_effective_safety_confidence():.2f}). '
+                       f'Jev blocks credential submission, data exfiltration, and CAPTCHA/auth '
+                       f'bypass. If this action is ordinary research, rephrase the stated purpose '
+                       f'to say exactly what work task it serves. Do not retry the same action unchanged.')
     return True, 'allow'
 
 
