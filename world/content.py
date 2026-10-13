@@ -3158,6 +3158,32 @@ _LIBRARY_READ_TOOL = {
     },
 }
 
+_WRITE_SPIKE_REPORT_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'write_spike_report',
+        'description': (
+            'Write the full text of THIS spike\'s findings report to the Library. Use this when '
+            'the deliverable is a written report/document that will not fit in a single reply -- '
+            'e.g. a long multi-section comparison, a full catalog, or a synthesis you are building '
+            'in parts. Takes the complete report markdown as `content` and writes it to the '
+            'canonical report path for this task. Call it once with the finished report, or call '
+            'it again with the full report text to replace what is there (it overwrites, so always '
+            'send the COMPLETE report each time, not a delta). Returns the path it saved to. The '
+            'same path is also written automatically at the end of the spike from your final reply '
+            'text -- prefer this tool whenever the report is long enough that your final reply '
+            'would be cut off, since a truncated report is filed as-is.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'content': {'type': 'string', 'description': 'The COMPLETE report markdown to save (replaces any existing content at the report path).'},
+            },
+            'required': ['content'],
+        },
+    },
+}
+
 
 def _make_library_tools_executor(agent_id, struck_tools=None):
     """search_library / read_library_file for a spike reviewing another
@@ -3228,6 +3254,39 @@ def _make_library_tools_executor(agent_id, struck_tools=None):
                               {'path': path, 'found': True}, authorized=True)
             return content_text
         raise ValueError(f'unknown tool: {name}')
+    return execute_tool
+
+
+def _make_spike_report_writer(agent_id, key, report_path):
+    """write_spike_report executor: a document-length deliverable cannot fit in
+    the single 1800-token closing _plain_completion (see _run_spike_content),
+    so a report that long was being truncated mid-sentence and filed verbatim as
+    the whole report. This gives the spike its own write to the SAME canonical
+    path the closer uses (archive/<ts>-spike-<id>.md), so a long report can be
+    written in full -- once, or in passes -- without the token cap. It routes
+    through the real /api/library/file endpoint (same as _make_skill_publisher)
+    so server-side secret redaction, path ACL, and passport chaining all still
+    apply; it is not a bypass. Overwrites by design: the caller sends the full
+    report each time, keeping the path a single canonical home for one task's
+    report rather than a growing append log."""
+    def execute_tool(name, args):
+        if name != 'write_spike_report':
+            raise ValueError(f'unknown tool: {name}')
+        args = args or {}
+        content = (args.get('content') or '').strip()
+        if not content:
+            return 'content is required -- pass the complete report markdown to save.'
+        try:
+            _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/library/file',
+                              {'agentId': agent_id, 'path': report_path,
+                               'content': content, 'source': 'firsthand'}, key)
+        except Exception as e:
+            return f'write_spike_report failed to save the report: {e}'
+        _serve.log_action(agent_id, 'spike_report_written',
+                          {'path': report_path, 'bytes': len(content)}, authorized=True)
+        return (f'Saved the report to {report_path} in the Library ({len(content)} bytes). '
+                f'Keep working -- your final reply text will also be considered for this same '
+                f'path at close, so state plainly whether the report above is complete.')
     return execute_tool
 
 
@@ -4621,6 +4680,13 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     list_handles_tool = _make_list_handles_executor(agent_id, key)
     library_tool = _make_library_tools_executor(agent_id, struck_tools=struck_tools)
     skill_publisher = _make_skill_publisher(agent_id, key)
+    # Canonical report path for THIS task, computed once here (not only at the
+    # close below) so write_spike_report can write to the SAME file the closer
+    # files -- a long report is written in full via the tool, then the closer's
+    # own short synthesis still lands on this path (see the report_path
+    # reference in the close block).
+    report_path = f"archive/{int(time.time() * 1000)}-spike-{task.get('id') or 'adhoc'}.md"
+    spike_report_writer = _make_spike_report_writer(agent_id, key, report_path)
     treg_tool = _make_treg_tools_executor()
     pixellab_tool = _make_pixellab_tools_executor(agent_id, key)
     google_tool = _make_google_tools_executor()
@@ -4639,8 +4705,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                                             _GOOGLE_SHEETS_READ_TOOL, _GOOGLE_SHEETS_APPEND_TOOL,
                                             _GOOGLE_CALENDAR_LIST_TOOL, _GOOGLE_CALENDAR_CREATE_TOOL,
                                             _GMAIL_SEARCH_TOOL, _GMAIL_READ_TOOL, _GMAIL_CREATE_DRAFT_TOOL,
-                                            _GOOGLE_DOCS_READ_TOOL, _GOOGLE_DOCS_CREATE_TOOL,
-                                             _PUBLISH_SKILL_TOOL]
+                                             _GOOGLE_DOCS_READ_TOOL, _GOOGLE_DOCS_CREATE_TOOL,
+                                             _PUBLISH_SKILL_TOOL, _WRITE_SPIKE_REPORT_TOOL]
     # Scoped player-folder + Notes access (world/fs.py): offered to spike
     # workers under the same condition as the ask lane -- FILE_ACCESS_ENABLED
     # AND a grant from state OR the operator-edited world/grants.json. Every
@@ -4694,6 +4760,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             return library_tool(tool_name, args)
         if tool_name == 'publish_skill':
             return skill_publisher(tool_name, args)
+        if tool_name == 'write_spike_report':
+            return spike_report_writer(tool_name, args)
         if tool_name in ('x_trending_topics', 'search_linkedin_posts'):
             return treg_tool(tool_name, args)
         if tool_name == 'youtube_transcript':
@@ -4816,7 +4884,13 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         'summarize or clean up. If the CSV has a basis column, briefly note in your own summary how '
         'many rows were actually verified vs estimated, so that distinction isn\'t buried in a table '
         'nobody reads closely. Organize the answer clearly (a short list or numbered sections is '
-        'fine). No filler, no release notes.'
+        'fine). No filler, no release notes. IMPORTANT: if the report above is a long document that '
+        'will not fit in a single reply -- a full multi-section comparison, a complete catalog, a '
+        'long synthesis -- call write_spike_report with the COMPLETE report markdown (all of it, in '
+        'one call or a few) BEFORE you send this final reply, so the full report is saved to the '
+        'Library and not cut off. If you did that, keep this final reply short: just state that the '
+        'report was saved via write_spike_report and give a one-line summary. If the report is short '
+        'enough to fit here, do not use the tool and just write it in this reply.'
     )
     finding = _plain_completion(
         reasoning_slug, transcript + [{'role': 'user', 'content': synth_prompt}], max_tokens=1800,
@@ -4871,12 +4945,25 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         file_issue_wish = _spike_file_issue_wish(finding, task, name, backlog)
     except Exception:
         file_issue_wish = None
-    library_path = f"archive/{int(time.time() * 1000)}-spike-{task.get('id') or 'adhoc'}.md"
-    _serve._http_json('POST', base, '/api/library/file',
-               {'agentId': agent_id,
-                'path': library_path,
-                'content': f'# Spike: {backlog}\n\nBy: {name}\n\n{finding}\n',
-                'source': 'firsthand'}, key)
+    library_path = report_path
+    # write_spike_report already saved a full, deliberately-long report to this
+    # exact path -- do NOT clobber it with this one short synthesis call (which
+    # is capped at max_tokens=1800 and would truncate a real document). Only
+    # when the tool was never used does the short closing text become the filed
+    # report, same as before the tool existed. Existence check via the read
+    # executor (in-process, no extra HTTP), so a report already written wins.
+    _already_written = False
+    try:
+        _probe = library_tool('read_library_file', {'path': library_path})
+        _already_written = isinstance(_probe, str) and not _probe.startswith('Not found:')
+    except Exception:
+        _already_written = False
+    if not _already_written:
+        _serve._http_json('POST', base, '/api/library/file',
+                   {'agentId': agent_id,
+                    'path': library_path,
+                    'content': f'# Spike: {backlog}\n\nBy: {name}\n\n{finding}\n',
+                    'source': 'firsthand'}, key)
     # Data-minimization audit finding (Hermes Town comparison):
     # this was the ONE content executor (of 13) that duplicated the FULL
     # finding text into the task note -- which _apply_content_result (sim.py)

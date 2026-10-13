@@ -1769,10 +1769,144 @@ class SkillPublisherTests(unittest.TestCase):
         bodies = []
         pub, http = self._publisher(bodies)
         args = {'slug': 'Fetch X!', 'title': 'Fetch X', 'sourceTask': 'task-3',
-                'team': 'cora', 'interface': 'i', 'body': '## Purpose\np\n## Key facts\nk\n## Sources\ns\n## Lessons learned\nl'}
+                'team': 'cora', 'interface': 'i', 'body': '## Purpose\np.\n## Key facts\nk.\n## Sources\ns.\n## Lessons learned\nl.'}
         with http:
             pub('publish_skill', args)
         self.assertEqual(bodies[0]['body']['path'], 'pending_review/skills/fetch-x.md')
+
+
+class WriteSpikeReportTool(unittest.TestCase):
+    """The write_spike_report executor (content._make_spike_report_writer): a
+    document-length spike deliverable that cannot fit in the single 1800-token
+    closing _plain_completion must be writable in full to the same canonical
+    report path the closer uses, without the closer clobbering it."""
+
+    def _writer(self, http_bodies, report_path='archive/1-spike-task-9.md'):
+        def fake_http(method, base, path, body, *a, **k):
+            http_bodies.append({'method': method, 'path': path, 'body': body})
+            return {'ok': True}
+        patcher = unittest.mock.patch.object(serve, 'log_action')
+        self.log_action = patcher.start()
+        self.addCleanup(patcher.stop)
+        return content._make_spike_report_writer('cora', 'key-123', report_path), \
+            unittest.mock.patch.object(serve, '_http_json', side_effect=fake_http)
+
+    def test_requires_content(self):
+        w, _ = self._writer([])
+        self.assertIn('content is required', w('write_spike_report', {}))
+        self.assertIn('content is required', w('write_spike_report', {'content': '   '}))
+
+    def test_writes_full_content_to_canonical_report_path(self):
+        bodies = []
+        w, http = self._writer(bodies)
+        long_report = '# Title\n\n' + ('Section body. ' * 400)
+        with http:
+            out = w('write_spike_report', {'content': long_report})
+        self.assertEqual(len(bodies), 1)
+        self.assertEqual(bodies[0]['path'], '/api/library/file')
+        self.assertEqual(bodies[0]['body']['path'], 'archive/1-spike-task-9.md')
+        self.assertEqual(bodies[0]['body']['source'], 'firsthand')
+        self.assertEqual(bodies[0]['body']['content'], long_report.rstrip())
+        self.assertIn('archive/1-spike-task-9.md', out)
+        self.log_action.assert_called_once_with(
+            'cora', 'spike_report_written',
+            {'path': 'archive/1-spike-task-9.md', 'bytes': len(long_report.rstrip())}, authorized=True)
+
+    def test_overwrites_with_full_content_each_call(self):
+        bodies = []
+        w, http = self._writer(bodies)
+        with http:
+            w('write_spike_report', {'content': 'first draft'})
+            w('write_spike_report', {'content': 'second full draft'})
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(bodies[1]['body']['content'], 'second full draft')
+
+    def test_http_failure_returns_honest_message(self):
+        def boom(*a, **k):
+            raise RuntimeError('connection refused')
+        patcher = unittest.mock.patch.object(serve, 'log_action')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        with unittest.mock.patch.object(serve, '_http_json', side_effect=boom):
+            w = content._make_spike_report_writer('cora', 'key-123', 'archive/1.md')
+            out = w('write_spike_report', {'content': 'x'})
+        self.assertIn('failed to save', out)
+
+    def test_unknown_tool_raises(self):
+        w, _ = self._writer([])
+        with self.assertRaises(ValueError):
+            w('not_a_tool', {})
+
+
+class SpikeReportCloseDoesNotClobber(SpikeContent):
+    """The close path (content._run_spike_content) must NOT overwrite a report
+    that write_spike_report already saved to the canonical path. The guard reads
+    via the in-process library_tool, which checks _safe_library_path + os.path.isfile
+    on DISK (not HTTP) -- so pointing _safe_library_path at a real temp file
+    exercises the REAL existence check. This is the regression that let the
+    1800-token closing synthesis clobber a full document-length report."""
+
+    def _drive_close(self, report_file_exists):
+        """Drive _run_spike_content to its close. If report_file_exists, patch
+        _safe_library_path to a real temp file (guard sees a report); else patch
+        it to a non-existent path (guard sees none). Returns (posts, seen,
+        report_path)."""
+        tmp = tempfile.mkdtemp(prefix='spike-close-guard-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        real_report = os.path.join(tmp, 'report.md')
+        if report_file_exists:
+            with open(real_report, 'w') as f:
+                f.write('# Full long report\n\n' + ('body ' * 200))
+        posts = []
+
+        def fake_http(method, base, path, body, *a, **k):
+            if path == '/api/library/file' and method == 'POST':
+                posts.append(body)
+                return 'saved'
+            return {'ok': True}
+
+        def fake_loop(model, messages, tools, execute_tool, *a, **k):
+            return ('closing summary', [
+                {'role': 'system', 'content': 'sys'},
+                {'role': 'user', 'content': 'Go.'},
+                {'role': 'assistant', 'tool_calls': [{'id': 'c1', 'function': {'name': 'browse_page', 'arguments': '{}'}}]},
+                {'role': 'tool', 'tool_call_id': 'c1', 'content': 'PAGE'},
+            ])
+
+        captured = {}
+        orig_writer = content._make_spike_report_writer
+        def capture(agent_id, key, report_path):
+            captured['path'] = report_path
+            return orig_writer(agent_id, key, report_path)
+
+        self._common_mocks(tavily=True)
+        seen = self._store()
+        task = {'id': 'close-guard', 'title': 'Write the long report', 'budgetMs': 60000}
+        safe_target = real_report if report_file_exists else os.path.join(tmp, 'missing.md')
+        with unittest.mock.patch.object(content, '_make_spike_report_writer', side_effect=capture), \
+             unittest.mock.patch.object(serve, '_safe_library_path', return_value=safe_target), \
+             unittest.mock.patch.object(serve, 'record_library_read'), \
+             unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch.object(serve, '_google_is_configured', return_value=False), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                        side_effect=[_completion('plan'), _completion('full report')]), \
+             unittest.mock.patch.object(serve, '_call_agent_tool_loop', side_effect=fake_loop), \
+             unittest.mock.patch.object(serve, '_http_json', side_effect=fake_http), \
+             unittest.mock.patch.object(content, '_spike_file_issue_wish', return_value=None):
+            content._run_spike_content(_snapshot(), 'cora', task)
+        return posts, seen, captured.get('path')
+
+    def test_closer_skips_write_when_report_already_exists(self):
+        posts, _seen, report_path = self._drive_close(report_file_exists=True)
+        self.assertTrue(report_path and report_path.startswith('archive/') and report_path.endswith('.md'))
+        self.assertEqual(posts, [], 'closer must not clobber an already-written report')
+
+    def test_closer_writes_when_no_report_exists(self):
+        posts, seen, report_path = self._drive_close(report_file_exists=False)
+        self.assertEqual(len(posts), 1, 'closer must write when the tool never saved a report')
+        self.assertEqual(posts[0]['path'], report_path)
+        self.assertEqual(posts[0]['source'], 'firsthand')
+        self.assertIn('close-guard', seen['close-guard']['libraryPath'])
 
 
 if __name__ == '__main__':
