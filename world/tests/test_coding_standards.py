@@ -171,7 +171,15 @@ class QualityPipelineSteps(unittest.TestCase):
                          ['flake8', 'mypy', 'bandit', 'pytest-cov',
                           'node-syntax', 'node-tests'])
         by_name = {s['name']: s['command'] for s in steps}
-        self.assertEqual(by_name['flake8'], 'python -m flake8 .')
+        # flake8 runs --isolated with the host's setup.cfg flags mirrored on
+        # the CLI (agent-written setup.cfg in the sandbox would otherwise
+        # change lint behavior; stray configs also feed the plugin loader
+        # that has crashed with _import_plugins on prose-lane tasks).
+        flake8_cmd = by_name['flake8']
+        self.assertIn('--isolated', flake8_cmd)
+        self.assertIn('--max-line-length=100', flake8_cmd)
+        self.assertIn('--extend-ignore=E501,E203,E128,E127,E221,E302,E303,E305,E306,E741,E731,E702,W292,W605', flake8_cmd)
+        self.assertIn('--exclude=tests .', flake8_cmd)
         self.assertEqual(by_name['mypy'], 'python -m mypy .')
         self.assertEqual(by_name['bandit'], 'python -m bandit -r . -q')
         # Total coverage across all files (not per-file) is what --cov-fail-under
@@ -245,6 +253,9 @@ class RunQualityPipeline(unittest.TestCase):
         self.assertIn('app.py', flake8_cmd)
         self.assertIn('utils.py', flake8_cmd)
         self.assertNotIn(' .', flake8_cmd)  # not whole-sandbox
+        # --isolated is present on BOTH the scoped and unscoped flake8 paths:
+        # a stray sandbox setup.cfg must not change lint behavior either way.
+        self.assertIn('--isolated', flake8_cmd)
         bandit_cmd = next(s['command'] for s in steps if s['name'] == 'bandit')
         self.assertIn('-f app.py', bandit_cmd)
         pytest_cmd = next(s['command'] for s in steps if s['name'] == 'pytest-cov')
@@ -253,7 +264,11 @@ class RunQualityPipeline(unittest.TestCase):
     def test_unscoped_pipeline_runs_on_whole_sandbox(self):
         steps = content._quality_pipeline_steps(None)
         flake8_cmd = next(s['command'] for s in steps if s['name'] == 'flake8')
-        self.assertIn('flake8 .', flake8_cmd)
+        # Unscoped flake8 still covers the whole tree (`--exclude=tests .`
+        # at the end) with --isolated so agent-written setup.cfg in the
+        # sandbox cannot change lint behavior or crash the plugin loader.
+        self.assertIn('--isolated', flake8_cmd)
+        self.assertTrue(flake8_cmd.endswith('--exclude=tests .'))
 
     def test_red_pipeline_reports_failing_step_and_snippet(self):
         resp = {'sandboxId': 'workroom-shared', 'failedStep': 'flake8',
@@ -264,6 +279,25 @@ class RunQualityPipeline(unittest.TestCase):
         self.assertEqual(result['failedStep'], 'flake8')
         self.assertIn('flake8', result['note'])
         self.assertIn('F841', result['note'])
+        # A normal flake8 finding is the agent's problem, not infra.
+        self.assertFalse(result.get('infra'))
+
+    def test_flake8_plugin_crash_tagged_infra(self):
+        # flake8's own plugin loader crashing (_import_plugins) is a sandbox
+        # tooling fault: tag infra so sim.py skips coaching/grade penalty and
+        # the infra-retry path can take over. The agent cannot fix this by
+        # editing files.
+        resp = {'sandboxId': 'workroom-shared', 'failedStep': 'flake8',
+                'results': [{'name': 'flake8', 'exitCode': 1, 'stdout': '',
+                             'stderr': ('Traceback (most recent call last):\n'
+                                        '  File ".../flake8/processor.py", line 49, in _import_plugins\n'
+                                        '    manager.map()\n'
+                                        'PluginError: failed to load plugin custom') }]}
+        result, _ = self._run(resp)
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['failedStep'], 'flake8')
+        self.assertTrue(result['infra'],
+                        'flake8 _import_plugins crash must be tagged infra=True')
 
     def test_bandit_failure_includes_issue_and_location_not_just_summary(self):
         # The old tail-4-lines extractor returned bandit's severity summary

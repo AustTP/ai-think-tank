@@ -108,6 +108,18 @@ class GradeCodeRequirement(unittest.TestCase):
                'section': 'example 3', 'type': 'code'}
         self.assertEqual(content._grade_code_requirement(req, {'ok': True}), content.GRADE_UNSURE)
 
+    def test_skipped_pipeline_is_unsure_not_meets(self):
+        # Fix 3: a pipeline-hint question with a SKIPPED pipeline (non-code lane)
+        # must not auto-MEET off a pipeline that never ran -- it surfaces as unsure.
+        req = {'id': 'lint-clean', 'question': 'Does the code pass flake8 with no errors?',
+               'section': 'repo', 'type': 'code'}
+        self.assertEqual(
+            content._grade_code_requirement(req, {'ok': True, 'skipped': True}),
+            content.GRADE_UNSURE)
+        self.assertEqual(
+            content._grade_code_requirement(req, {'ok': False, 'skipped': True}),
+            content.GRADE_UNSURE)
+
 
 class GradeJevRequirement(unittest.TestCase):
     def test_confident_meets_passes_through(self):
@@ -531,6 +543,38 @@ class RunReviewContentEnsemble(unittest.TestCase):
             content._run_review_content(snapshot, 'ada', task)  # no raise
         result = store.call_args[0][1]
         self.assertNotIn('checklistEscalated', result)
+
+    def test_review_of_non_code_parent_skips_quality_pipeline(self):
+        # A gate review whose parent is a pure-research card (room observatory,
+        # no productId) must skip the sandbox quality pipeline instead of
+        # flake8-ing prose -- pipeline never called, pipelineOk True with the
+        # 'skipped' note, evidence empty.
+        snapshot = {'tasks': {'parent-1': {'id': 'parent-1', 'room': 'observatory',
+                                           'title': 'Explore X'}}}
+        task = {'id': 'task-nc-review', 'title': 'Review the research',
+                'room': 'pressoffice', 'taskType': 'review',
+                'projectLabel': 'research', 'reviewOf': 'parent-1'}
+        with mock.patch.object(content, '_agent_name', return_value='Ada'), \
+             mock.patch.object(content, '_gather_unified_context', return_value='context'), \
+             mock.patch.object(content, '_run_quality_pipeline') as qp_mock, \
+             mock.patch.object(content, '_review_screenshot',
+                               return_value={'ok': True, 'review': 'visual pass'}), \
+             mock.patch.object(content._serve, 'SELF_BASE_URL', 'http://x'), \
+             mock.patch.object(content._serve, '_coding_tier_slug', return_value='gpt-4o-mini'), \
+             mock.patch.object(content._serve, '_http_json',
+                               side_effect=lambda method, base, path, body, key: {'reply': 'the review text'}), \
+             mock.patch.object(content._serve, '_call_openrouter_decision_sync',
+                               return_value=_answer('clean', 0.95)), \
+             mock.patch.object(content._serve, '_jev_choice', return_value=_HOLISTIC_CLEAN), \
+             mock.patch.object(content._serve, 'create_escalation', return_value='esc-1'), \
+             mock.patch.object(sim, '_store_content_result', return_value=None) as store:
+            content._run_review_content(snapshot, 'ada', task)
+        qp_mock.assert_not_called()
+        result = store.call_args[0][1]
+        self.assertTrue(result['ok'])
+        self.assertTrue(result['pipelineOk'])
+        self.assertIn('skipped', result['pipelineSummary'])
+        self.assertEqual(result['evidence'], '')
 
     def test_process_trace_failure_is_swallowed(self):
         checklist = [{'id': 'j1', 'question': 'Is the opening specific?', 'section': 'opening', 'type': 'jev'}]
