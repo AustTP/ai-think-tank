@@ -1921,6 +1921,19 @@ def _apply_content_result(state, task, result, now_ms=None):
     note = result.get('note')
     if note:
         task['note'] = note
+    # Persist the .py files this content pass wrote (coding executor's
+    # `writtenPy`). A gate review recovers the parent story's list from here
+    # to scope ITS quality pipeline to the story's own files instead of
+    # whole-tree linting the shared sandbox. When this task is itself a
+    # fix/QA pass (has reviewOf), merge the new filenames onto the parent
+    # story too, so the story's scope tracks the latest fix (new files a fix
+    # adds get linted by the next review; same-name overwrites are a no-op).
+    written_py = result.get('writtenPy')
+    if written_py:
+        task['writtenPy'] = sorted(set(task.get('writtenPy') or []) | set(written_py))
+        parent = (state.get('tasks') or {}).get(task.get('reviewOf') or '')
+        if parent is not None:
+            parent['writtenPy'] = sorted(set(parent.get('writtenPy') or []) | set(written_py))
     # Infrastructure-failure tag: a model-call/API failure (not the agent's
     # quality) rides the content result channel so _send_back_after_failure
     # can distinguish it -- no coaching note, no "failed the quality

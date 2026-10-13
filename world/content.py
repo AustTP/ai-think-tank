@@ -1817,10 +1817,16 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
                                    scope_files=written_py or None)
     else:
         qp = _skipped_pipeline_result('non-code lane -- quality pipeline skipped')
+    # writtenPy rides the result channel so _apply_content_result can persist
+    # it on the task record: a gate review recovers the parent story's file
+    # list from there to scope ITS quality pipeline, instead of whole-tree
+    # linting every leftover file in the shared sandbox (which poisoned
+    # concurrent reviews when any one agent's half-written copy broke flake8).
     if not qp['ok']:
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f'wrote and ran the code, but {qp["note"]}',
                                            'command': command, 'ok': False, 'tier': tier_slug,
+                                           'writtenPy': written_py,
                                            # infra=True when the failure was a sandbox
                                            # tooling crash (e.g. flake8 _import_plugins),
                                            # not a finding the agent can fix.
@@ -1832,7 +1838,8 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     _sim_module._store_content_result(task.get('id'),
                                       {'note': ((result.get('note') or ('Wrote and ran the code in the shared Work Room sandbox.'))
                                                 + f' | {pipeline_note}'),
-                                       'command': command, 'ok': True, 'tier': tier_slug})
+                                       'command': command, 'ok': True, 'tier': tier_slug,
+                                       'writtenPy': written_py})
     return True
 
 
@@ -2130,12 +2137,22 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     if task.get('reviewOf'):
         review_parent = (snapshot.get('tasks') or {}).get(task.get('reviewOf')) or {}
         pipeline_is_code_class = _sim_module._peer_coding_class(review_parent)
+        # Scope the review's pipeline to the parent story's own written files
+        # (persisted by _apply_content_result from the author/fix result's
+        # writtenPy). A gate review must not whole-tree lint every leftover
+        # file in the shared sandbox -- that let ONE agent's half-written copy
+        # (e.g. a syntax-broken stealthx_brief.py) fail every concurrent
+        # review. Ad-hoc reviews with no parent still fall back to the
+        # whole-tree signals the workroom itself uses.
+        review_scope = review_parent.get('writtenPy') or None
     else:
         pipeline_is_code_class = bool(project_label or task.get('productId')
                                       or task.get('room') == 'pressoffice')
+        review_scope = None
     if pipeline_is_code_class:
         qp = _run_quality_pipeline(base, key, agent_id, WORKROOM_SANDBOX_ID,
-                                   f'Quality gate for {("QA" if is_qa else "review")} of: {backlog_item}')
+                                   f'Quality gate for {("QA" if is_qa else "review")} of: {backlog_item}',
+                                   scope_files=review_scope)
     else:
         qp = _skipped_pipeline_result('non-code lane -- quality pipeline skipped')
 

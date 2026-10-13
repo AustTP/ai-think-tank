@@ -160,6 +160,48 @@ class ApprovalGate(unittest.TestCase):
         self.assertEqual(parent['_peerGate']['approvers'], [])
 
 
+class WrittenPyPersistence(unittest.TestCase):
+    """The coding executor's `writtenPy` rides the result channel into
+    _apply_content_result, which persists it on the task (and merges it onto
+    the parent story for fix passes). A later gate review recovers the story's
+    file list from there to scope its quality pipeline, instead of whole-tree
+    linting every leftover file in the shared sandbox -- which let ONE agent's
+    half-written copy fail every concurrent review."""
+
+    def test_written_py_persists_on_task_without_touching_unrelated_story(self):
+        state = _state()
+        story = _story()
+        state['tasks'][story['id']] = story
+        task = {'id': 'task-9', 'assignedTo': 'ben', 'reviewOf': None, 'taskType': 'code'}
+        sim._apply_content_result(state, task, {'note': 'wrote code', 'ok': True,
+                                                'writtenPy': ['app.py']})
+        self.assertEqual(task['writtenPy'], ['app.py'])
+        self.assertNotIn('writtenPy', story, 'a plain author pass must not mutate other stories')
+
+    def test_fix_pass_merges_written_py_onto_parent_story(self):
+        # A fix subtask carries reviewOf=parent; its newly written files must
+        # merge onto the parent story so the NEXT review scopes to the union
+        # (same-name overwrites are a no-op; a new module a fix adds gets linted).
+        state = _state()
+        story = _story(id='story-1')
+        story['writtenPy'] = ['stealthx_brief.py']
+        state['tasks'][story['id']] = story
+        fix = {'id': 'fix-1', 'reviewOf': 'story-1', 'assignedTo': 'ben', 'taskType': 'code'}
+        sim._apply_content_result(state, fix, {'note': 'fixed', 'ok': True,
+                                               'writtenPy': ['stealthx_brief.py', 'new_module.py']})
+        self.assertEqual(fix['writtenPy'], ['new_module.py', 'stealthx_brief.py'])
+        self.assertEqual(story['writtenPy'], ['new_module.py', 'stealthx_brief.py'],
+                         'the parent story tracks the fix pass union so the next review lints it')
+
+    def test_result_without_written_py_is_a_noop(self):
+        state = _state()
+        task = {'id': 'task-x', 'reviewOf': 'story-1'}
+        state['tasks']['story-1'] = _story(id='story-1')
+        sim._apply_content_result(state, task, {'note': 'review filed'})
+        self.assertNotIn('writtenPy', task)
+        self.assertNotIn('writtenPy', state['tasks']['story-1'])
+
+
 # ---------------------------------------------------------------------------
 # serve pipeline helper
 # ---------------------------------------------------------------------------

@@ -576,6 +576,66 @@ class RunReviewContentEnsemble(unittest.TestCase):
         self.assertIn('skipped', result['pipelineSummary'])
         self.assertEqual(result['evidence'], '')
 
+    def test_gate_review_scopes_pipeline_to_parent_written_py(self):
+        # A gate review of a coding-class story scopes flake8/mypy/bandit to
+        # the parent story's persisted writtenPy files, NOT the whole shared
+        # sandbox -- whole-tree linting let ONE agent's half-written copy
+        # (e.g. a syntax-broken stealthx_brief.py) fail every concurrent review.
+        snapshot = {'tasks': {'task-445': {'id': 'task-445', 'room': 'pressoffice',
+                                           'title': 'StealthX company brief',
+                                           'writtenPy': ['stealthx_brief.py']}}}
+        task = {'id': 'task-rev-scope', 'title': 'Review StealthX brief',
+                'room': 'pressoffice', 'taskType': 'review',
+                'projectLabel': 'stealthx', 'reviewOf': 'task-445', 'checklist': []}
+        with mock.patch.object(content, '_agent_name', return_value='Ada'), \
+             mock.patch.object(content, '_gather_unified_context', return_value='context'), \
+             mock.patch.object(content, '_run_quality_pipeline',
+                               return_value={'ok': True, 'failedStep': None, 'results': [],
+                                             'note': 'quality pipeline all green'}) as qp_mock, \
+             mock.patch.object(content, '_review_screenshot',
+                               return_value={'ok': True, 'review': 'visual pass'}), \
+             mock.patch.object(content._serve, 'SELF_BASE_URL', 'http://x'), \
+             mock.patch.object(content._serve, '_coding_tier_slug', return_value='gpt-4o-mini'), \
+             mock.patch.object(content._serve, '_http_json',
+                               side_effect=lambda method, base, path, body, key: {'reply': 'the review text'}), \
+             mock.patch.object(content._serve, '_call_openrouter_decision_sync',
+                               return_value=_answer('clean', 0.95)), \
+             mock.patch.object(content._serve, '_jev_choice', return_value=_HOLISTIC_CLEAN), \
+             mock.patch.object(content._serve, 'create_escalation', return_value='esc-1'), \
+             mock.patch.object(sim, '_store_content_result', return_value=None):
+            content._run_review_content(snapshot, 'ada', task)
+        qp_mock.assert_called_once()
+        self.assertEqual(qp_mock.call_args.kwargs.get('scope_files'), ['stealthx_brief.py'])
+
+    def test_gate_review_without_parent_written_py_falls_back_to_whole_tree(self):
+        # No persisted writtenPy on the parent (legacy story / non-code author
+        # pass): the review falls back to the whole-tree pipeline signals the
+        # workroom itself uses -- scope_files stays None.
+        snapshot = {'tasks': {'task-legacy': {'id': 'task-legacy', 'room': 'pressoffice',
+                                              'title': 'Old story'}}}
+        task = {'id': 'task-rev-legacy', 'title': 'Review old story',
+                'room': 'pressoffice', 'taskType': 'review',
+                'projectLabel': 'stealthx', 'reviewOf': 'task-legacy', 'checklist': []}
+        with mock.patch.object(content, '_agent_name', return_value='Ada'), \
+             mock.patch.object(content, '_gather_unified_context', return_value='context'), \
+             mock.patch.object(content, '_run_quality_pipeline',
+                               return_value={'ok': True, 'failedStep': None, 'results': [],
+                                             'note': 'quality pipeline all green'}) as qp_mock, \
+             mock.patch.object(content, '_review_screenshot',
+                               return_value={'ok': True, 'review': 'visual pass'}), \
+             mock.patch.object(content._serve, 'SELF_BASE_URL', 'http://x'), \
+             mock.patch.object(content._serve, '_coding_tier_slug', return_value='gpt-4o-mini'), \
+             mock.patch.object(content._serve, '_http_json',
+                               side_effect=lambda method, base, path, body, key: {'reply': 'the review text'}), \
+             mock.patch.object(content._serve, '_call_openrouter_decision_sync',
+                               return_value=_answer('clean', 0.95)), \
+             mock.patch.object(content._serve, '_jev_choice', return_value=_HOLISTIC_CLEAN), \
+             mock.patch.object(content._serve, 'create_escalation', return_value='esc-1'), \
+             mock.patch.object(sim, '_store_content_result', return_value=None):
+            content._run_review_content(snapshot, 'ada', task)
+        qp_mock.assert_called_once()
+        self.assertIsNone(qp_mock.call_args.kwargs.get('scope_files'))
+
     def test_process_trace_failure_is_swallowed(self):
         checklist = [{'id': 'j1', 'question': 'Is the opening specific?', 'section': 'opening', 'type': 'jev'}]
         snapshot = {}
