@@ -13,7 +13,7 @@ def test_long_tool_history_is_bounded_without_orphaned_results():
                      {'role':'tool','tool_call_id':str(i),'content':'evidence '*4000}]
     messages.append({'role':'user','content':'Finish the original task'})
     result = budget.compact(messages, 900)
-    assert budget.size(result) < 13048
+    assert budget.size(result) < int((8192-900-768)*2.5)
     assert result[1]['content'] == 'Original task'
     assert result[-1]['content'] == 'Finish the original task'
     calls = {c['id'] for m in result for c in m.get('tool_calls', [])}
@@ -34,3 +34,11 @@ def test_only_scrum_masters_and_reviewers_receive_direction():
     assert 'Story: implement the collector' in planning.task_context(state,'worker',text)
     for agent in ['master','reviewer']:
         assert planning.task_context(state,agent,text)==text
+
+
+def test_task_tools_are_selected_and_schema_constraints_survive():
+    tools=[{'type':'function','function':{'name':name,'description':'long '*200,'parameters':{'type':'object','required':['url'],'properties':{'url':{'type':'string'}}}}} for name in ['browse_page','search_web','create_calendar_event']]
+    selected=budget.select_tools([{'role':'user','content':'Research API documentation'}],tools)
+    assert [t['function']['name'] for t in selected]==['browse_page','search_web']
+    assert selected[0]['function']['parameters']['required']==['url']
+    assert len(selected[0]['function']['description'])==96

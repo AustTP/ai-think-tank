@@ -1,0 +1,19 @@
+{
+  "path": "datasets/btc-usd-daily-2022-01-01-to-2022-01-31.csv",
+  "productId": "BTC-USD",
+  "granularitySeconds": 86400,
+  "rowCount": 30,
+  "start": "2022-01-01T00:00:00+00:00",
+  "end": "2022-01-30T00:00:00+00:00",
+  "requestedEndExclusive": "2022-01-31T00:00:00+00:00",
+  "missingDays": 0,
+  "missingDayTimestamps": [],
+  "duplicateRows": 0,
+  "missingValues": 0,
+  "sha256": "718ee328a8e0daa7513823f8494d6afbfea7f65e6c06b03b201a8e89dd4357fe",
+  "sources": [
+    "https://api.exchange.coinbase.com/products/BTC-USD/candles?start=2022-01-01T00%3A00%3A00%2B00%3A00&end=2022-01-31T00%3A00%3A00%2B00%3A00&granularity=86400"
+  ],
+  "fetchedAt": "2026-10-13T23:10:42.601464+00:00",
+  "scope": "Coinbase Exchange spot daily OHLCV; no transactions."
+}

@@ -9,6 +9,22 @@ import librarian
 
 
 class LibrarianTests(unittest.TestCase):
+    def test_prior_work_handoff_distinguishes_help_from_possible_fulfillment(self):
+        with tempfile.TemporaryDirectory() as root:
+            for name,text in [('risk.csv','crypto risk management source evidence'),('weather.md','rain and sunshine')]:
+                with open(os.path.join(root,name),'w',encoding='utf-8') as stream: stream.write(text)
+            task={'title':'Research crypto risk management','acceptanceCriteria':'Descriptions and references'}
+            state={'tasks':{'old':{'id':'old','status':'done','libraryPath':'risk.csv',
+                                  'acceptanceCriteria':'Descriptions and references'}}}
+            librarian.attach_reuse(state,task,SimpleNamespace(LIBRARY_DIR=root))
+            docs=task['libraryReuse']['documents']
+            self.assertEqual([d['path'] for d in docs],['risk.csv'])
+            self.assertEqual(docs[0]['assessment'],'potentially_fulfills')
+            self.assertTrue(docs[0]['requiresVerification'])
+            self.assertNotIn('status',task)
+            state['tasks']['old']['status']='needs_review'
+            self.assertEqual(librarian.relevant_documents(state,task,SimpleNamespace(LIBRARY_DIR=root))[0]['assessment'],'may_help')
+
     def test_role_idempotent_and_excluded_from_workers(self):
         import task_master
         state = {}

@@ -6,6 +6,38 @@ import serve
 import company_planning as planning
 
 class Planning(unittest.TestCase):
+    def test_implementation_request_retains_visible_action_after_discovery_fallback(self):
+        state,order=self.seed()
+        order.update(title='Implement portfolio reporting', taskType='code')
+        planning.apply_plan(state,order,{'stories':[]},'owen')
+        build=next(s for s in order['plan']['stories'] if s['taskType']=='code')
+        self.assertEqual(build['planningStatus'],'waiting_for_prerequisites')
+        self.assertEqual(build['prerequisiteStoryIds'],['discover'])
+
+    def test_explicit_order_and_independent_work_and_potential_stories(self):
+        state,order=self.seed()
+        def story(sid,kind,deps,**extra):
+            return dict(id=sid,title=sid,taskType=kind,instructions='Perform '+sid,
+                        acceptanceCriteria='Saved evidence for '+sid,prerequisiteStoryIds=deps,**extra)
+        planning.apply_plan(state,order,{'stories':[
+            story('apis','research',[]),story('call','code',['apis']),
+            story('independent','code',[]),story('optional','code',['call'],potential=True,activationCondition='Call shows pagination is required')]},'owen')
+        self.assertEqual(set(order['queuedStoryIds']),{'apis','independent'})
+        state['tasks']['api-task']={'id':'api-task','status':'done','workOrderId':order['id'],
+                                   'workOrderStoryId':'apis','libraryPath':'apis.csv'}
+        planning.release_stories(state,order)
+        self.assertIn('call',order['queuedStoryIds'])
+        self.assertIn('apis.csv',next(q for q in state['workQueue'] if q.get('workOrderStoryId')=='call')['instructions'])
+        self.assertNotIn('optional',order['queuedStoryIds'])
+
+    def test_invalid_and_cyclic_dependencies_are_not_dispatched(self):
+        state,order=self.seed()
+        stories=[dict(id=sid,title=sid,taskType='research',instructions='Inspect',acceptanceCriteria='Evidence',
+                      prerequisiteStoryIds=deps) for sid,deps in [('a',['b']),('b',['a']),('c',['absent'])]]
+        planning.apply_plan(state,order,{'stories':stories},'owen')
+        self.assertFalse(state['workQueue'])
+        self.assertTrue(all(s['planningStatus']=='blocked_invalid_dependencies' for s in order['plan']['stories']))
+
     def seed(self):
         order={'id':'wrq-1','title':'tools','origin':'player_work_order','status':'pending',
             'reason':'Prepare Coinbase trading tools','teamId':'theo','acceptanceCriteria':'Tools created.'}

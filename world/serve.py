@@ -9532,8 +9532,9 @@ async def queue_work_order(request: Request):
     if not fields['title'] or not fields['instructions'] or len(fields['title']) > 200 \
             or len(fields['instructions']) > 12000 or len(fields['acceptanceCriteria']) > 6000:
         return JSONResponse({'error': 'Provide a title (up to 200 characters) and work instructions (up to 12000).'}, status_code=400)
-    if fields['taskType'] not in ('research', 'code', 'spike'):
-        return JSONResponse({'error': 'Choose research, software implementation, or investigation.'}, status_code=400)
+    fields['taskType'] = fields['taskType'] or 'auto'
+    if fields['taskType'] not in ('auto', 'research', 'code', 'spike'):
+        return JSONResponse({'error': 'Invalid work type.'}, status_code=400)
     import sim
     with _STATE_UPDATE_LOCK:
         state = get_state_from_db()
@@ -10079,6 +10080,8 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
     answer). Self-checks `struck_tools` too (not just records into it) --
     defense in depth so a caller that passes the set but forgets to check
     it itself doesn't silently get a no-op."""
+    from url_evidence import DiscoveredURLs
+    discovered = DiscoveredURLs(default_query or '')
     def execute_tool(name, args):
         if struck_tools is not None and name in struck_tools:
             return (f'{name} was already blocked once this investigation (one-strike) -- do not '
@@ -10103,6 +10106,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
         if name == 'search_web':
             query = (args or {}).get('query') or default_query or ''
             result = _tavily_search_sync(query)
+            discovered.observe(result)
             wrapped, _nonce, _tag, instruction = wrap_external_content(result, 'a web search')
             return f"{instruction}\n\n{wrapped}"
         if name == 'browse_page':
@@ -10110,6 +10114,8 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             import work_reuse
             from urllib.parse import urlsplit
             url = (args or {}).get('url') or ''
+            if not discovered.allows(url):
+                return '__TOOL_ERROR__: URL is malformed or was not discovered in search, supplied task context, Library evidence, or page links. Search for the exact page first; do not guess its path.'
             parsed = urlsplit(url)
             cacheable = (parsed.scheme == 'https' and parsed.hostname in
                          ('docs.cdp.coinbase.com', 'docs.python.org', 'docs.influxdata.com', 'developers.openai.com')
@@ -10141,6 +10147,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 # {text, url} pairs so multi-page investigation actually
                 # works.
                 links = result.get('links') or []
+                discovered.observe(result)
                 links_block = ''
                 if links:
                     lines = [f"- {(l.get('text') or l.get('url'))[:80]} -> {l.get('url')}"
@@ -10163,6 +10170,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                         "render=true, but don't loop on it]")
             return 'Could not visit that page (unexpected response).'
         raise ValueError(f'unknown tool: {name}')
+    execute_tool.observe_urls = discovered.observe
     return execute_tool
 
 
@@ -12508,7 +12516,7 @@ async def read_library_document(request: Request, path: str):
 # this is a SHARED, agent-writable space now, so a credential accidentally
 # pasted into a note shouldn't just sit there in plain text forever.
 _SECRET_PATTERNS = [
-    re.compile(r'sk-[a-zA-Z0-9_-]{16,}'),           # OpenAI/Anthropic/OpenRouter-style keys
+    re.compile(r'(?<![a-zA-Z0-9])sk-[a-zA-Z0-9_-]{16,}'),  # Key prefix, not the middle of "risk-management".
     re.compile(r'(?i)(api[_-]?key|secret|password|token)\s*[:=]\s*\S+'),
     re.compile(r'AKIA[0-9A-Z]{16}'),                  # AWS access key id
 ]

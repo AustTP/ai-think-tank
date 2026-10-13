@@ -763,7 +763,6 @@
       <form id="workOrderForm" onsubmit="submitWorkOrder(event)" style="display:grid;gap:8px;margin-top:8px;">
         <label>Title<input name="title" required maxlength="200" style="width:100%;box-sizing:border-box;"></label>
         <label>Scrum master / team<select name="teamId" id="workOrderTeam" required></select></label>
-        <label>Work type<select name="taskType"><option value="research">Research document / plan</option><option value="spike">Exploratory investigation</option><option value="code">Software implementation</option></select></label>
         <label>Instructions<textarea name="instructions" required maxlength="12000" rows="4" style="width:100%;box-sizing:border-box;"></textarea></label>
         <label>What counts as done<textarea name="acceptanceCriteria" maxlength="6000" rows="2" style="width:100%;box-sizing:border-box;"></textarea></label>
         <label>Request budget (USD, optional)<input name="budgetUsd" type="number" min="0.01" step="0.01" placeholder="Blank = no request budget"></label>
@@ -2231,7 +2230,7 @@ async function renderWorkOrders() {
     const planningDetails = order => {
       const plan = order.plan || {};
       const questions = (plan.questions || []).filter(q => q.status === 'awaiting_input');
-      const stories = (plan.stories || []).map(story => `<div style="margin-left:12px;">Story: ${esc(story.title)}<br>Done when: ${esc(story.acceptanceCriteria)}</div>`).join('');
+      const stories = (plan.stories || []).map(story => `<div style="margin-left:12px;">[${esc(story.taskType)}] ${esc(story.id)}: ${esc(story.title)}<br>Status: ${esc(story.planningStatus || 'planned')}${(story.prerequisiteStoryIds || []).length ? '<br>Depends on: '+story.prerequisiteStoryIds.map(id => esc((plan.stories || []).find(s => s.id === id)?.title || id)).join(', ') : ''}${story.potential ? '<br>Activate when: '+esc(story.activationCondition || 'Scrum master confirms the need') : ''}<br>Done when: ${esc(story.acceptanceCriteria)}</div>`).join('');
       const form = questions.length ? `<form onsubmit="answerWorkOrder(event, '${order.id}')" style="display:grid;gap:6px;">${questions.map(q => `<label>Scrum master asks: ${esc(q.question)}<textarea name="${esc(q.id)}" required maxlength="6000" rows="2" style="width:100%;box-sizing:border-box;"></textarea></label>`).join('')}<button type="submit">Send answers</button><span role="status"></span></form>` : '';
       return `${order.groomingReason ? '<div>'+esc(order.groomingReason)+'</div>' : ''}${stories}${form}`;
     };

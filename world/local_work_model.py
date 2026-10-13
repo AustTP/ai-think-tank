@@ -65,7 +65,7 @@ def complete(selection, messages, max_tokens, tools=None, tool_choice=None, resp
     import evidence_policy
     messages = evidence_policy.apply(messages)
     import context_budget
-    messages = context_budget.compact(messages, max_tokens or 1500, tools)
+    tools = context_budget.select_tools(messages, tools, tool_choice)
     return _complete(selection, messages, max_tokens, tools, tool_choice, response_format)
 
 

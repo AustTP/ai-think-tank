@@ -744,7 +744,7 @@ class OneStrikePerTool(unittest.TestCase):
 
     def test_struck_browse_page_is_refused_without_a_second_network_call(self):
         struck = set()
-        executor = serve._make_web_tools_executor('cora', 'key-123', struck_tools=struck)
+        executor = serve._make_web_tools_executor('cora', 'key-123', default_query='Task source https://x.com', struck_tools=struck)
         with unittest.mock.patch.object(serve, '_http_json',
                                         return_value={'allowed': False, 'reason': 'not approved'}) as http_mock:
             first = executor('browse_page', {'url': 'https://x.com', 'purpose': 'p'})
@@ -756,7 +756,7 @@ class OneStrikePerTool(unittest.TestCase):
 
     def test_transient_fetch_error_does_not_strike(self):
         struck = set()
-        executor = serve._make_web_tools_executor('cora', 'key-123', struck_tools=struck)
+        executor = serve._make_web_tools_executor('cora', 'key-123', default_query='Task source https://x.com', struck_tools=struck)
         with unittest.mock.patch.object(serve, '_http_json',
                                         return_value={'allowed': True, 'error': 'timeout'}):
             executor('browse_page', {'url': 'https://x.com', 'purpose': 'p'})

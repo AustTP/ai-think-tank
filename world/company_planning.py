@@ -9,6 +9,56 @@ from fastapi.responses import JSONResponse
 
 _POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='scrum-planner')
 _FUTURES = {}
+_POTENTIAL_FUTURES = {}
+
+
+def _assess_potential(request, completed):
+    import serve
+    for task in completed[:8]:
+        path=serve._safe_library_path(task.get('libraryPath') or '')
+        if path:
+            try:
+                with open(path,encoding='utf-8') as stream:
+                    task['artifactExcerpt']=stream.read(1500)
+            except OSError:
+                pass
+    payload={'agentId':request['scrumMasterId'], 'taskId':'request/'+request['id'],
+             'max_tokens':1000, 'response_format':{'type':'json_object'}, 'deliberate':False,
+             'messages':[{'role':'system','content':
+                 'As scrum master, activate only potential stories whose activationCondition is demonstrated '
+                 'by supplied completed task evidence. Never activate speculative work. Return JSON '
+                 '{"activate":[{"id":"story id","reason":"observed condition","evidenceTaskIds":["task id"]}]}.'},
+                 {'role':'user','content':json.dumps({'stories':[s for s in request['plan']['stories'] if s.get('potential') and not s.get('activated')],
+                                                    'completed':completed})}]}
+    response=serve._http_json('POST',serve.SELF_BASE_URL,'/api/chat',payload,
+                             serve.get_or_create_agent_key(request['scrumMasterId']),timeout=120)
+    try: return json.loads((response or {}).get('reply') or '{}').get('activate',[])
+    except (ValueError,AttributeError): return []
+
+
+def assess_potential(state, request):
+    potential=[s for s in request['plan']['stories'] if s.get('potential') and not s.get('activated')]
+    if not potential or not request.get('scrumMasterId'): return
+    completed=[{k:t.get(k) for k in ('id','title','note','libraryPath','workOrderStoryId')}
+               for t in (state.get('tasks') or {}).values() if t.get('workOrderId')==request['id']
+               and t.get('status')=='done' and not any(t.get(k) for k in ('reviewOf','investigationOf','recoveryOf'))]
+    ids={t['id'] for t in completed}
+    future=_POTENTIAL_FUTURES.get(request['id'])
+    if future and future.done():
+        try: decisions=future.result()
+        except Exception: decisions=[]
+        _POTENTIAL_FUTURES.pop(request['id'],None)
+        for decision in decisions if isinstance(decisions,list) else []:
+            if not isinstance(decision,dict): continue
+            evidence=decision.get('evidenceTaskIds')
+            if not isinstance(evidence,list) or not evidence or not all(isinstance(i,str) and i in ids for i in evidence): continue
+            for story in potential:
+                if story['id']==decision.get('id') and decision.get('reason'):
+                    story.update(activated=True,activationEvidence=decision,activatedAt=int(time.time()*1000))
+    signature=sorted(ids)
+    if ids and request.get('potentialAssessmentEvidence')!=signature and request['id'] not in _POTENTIAL_FUTURES:
+        request['potentialAssessmentEvidence']=signature
+        _POTENTIAL_FUTURES[request['id']]=_POOL.submit(_assess_potential,copy.deepcopy(request),completed)
 
 
 def direction_allowed(state, agent_id):
@@ -47,6 +97,14 @@ def _plan(request, star, master):
         'messages':[{'role':'system','content':
             'You are the scrum master completing an explicit player request. Never silently reject it. '
             'Break its overarching goal into testable stories, including an implementation milestone for code requests. '
+            'Determine story types from the requested outcome: code means implement and execute working changes, '
+            'research means produce evidence, and spike means resolve one specific unknown. Never replace an '
+            'implementation request with only spikes or plans. Reuse existing integrations before researching replacements. '
+            'Create ALL known stories now, including later implementation, integration and validation work. '
+            'Label ordering with prerequisiteStoryIds: collect API documentation before implementing its call, '
+            'implement before integration testing. Independent stories have an empty prerequisiteStoryIds array. '
+            'Include potential follow-ups with potential=true and a specific activationCondition; these are visible '
+            'but must not run until the scrum master confirms the condition from completed work. '
             'Inspect the existing Python app and known Coinbase decision; do not ask the player to choose APIs, '
             'data feeds or programming languages. Put technical unknowns in research stories. '
             'Ask at most three human questions ONLY for '
@@ -55,7 +113,8 @@ def _plan(request, star, master):
             'Do not request passwords or API keys in answers. Do not infer live transaction authorization. '
             'Return only JSON {"summary":"planning reason","questions":[{"id":"q1","question":"specific question"}],'
             '"stories":[{"id":"s1","title":"story","taskType":"spike|research|code",'
-            '"instructions":"specific work","acceptanceCriteria":"testable outcome","dependsOnQuestions":["q1"]}]}.'},
+            '"instructions":"specific work","acceptanceCriteria":"testable outcome","dependsOnQuestions":["q1"],'
+            '"prerequisiteStoryIds":[],"potential":false,"activationCondition":""}]}.'},
             {'role':'user','content':json.dumps({'request':request, 'northStar':star,
                 'knownTradingContext':{'exchange':'Coinbase','market':'spot','lossLimitUsd':50,
                     'executionMode':'paper','allocationAndSizing':'Agents should research proposals.'}})}]}
@@ -73,7 +132,7 @@ def _plan(request, star, master):
             data['diagnostics'] = {'model':payload['model'],'response':raw[:18000],'apiError':response.get('error')}
             return data
     return {'summary':'A discovery story will clarify the request; planner response was unavailable or invalid.',
-        'questions':[{'id':'outcome','question':'What observable outcome would make this request complete for you?'}],
+        'questions':[],
         'stories':[{'id':'discover','title':'Discover requirements: '+request['title'], 'taskType':'spike',
             'instructions':'Investigate the request using existing Library artifacts and current code. Identify missing facts and propose implementation stories. '
                 + request.get('reason',''),
@@ -100,7 +159,7 @@ def apply_plan(state, request, plan, master):
         questions.append({'id':qid,
                           'question':question['question'][:2000], 'status':'awaiting_input'})
     stories = []
-    for index, story in enumerate((plan.get('stories') or [])[:8]):
+    for index, story in enumerate((plan.get('stories') or [])[:16]):
         if not isinstance(story,dict): continue
         if not all(isinstance(story.get(k),str) and story[k].strip() for k in ('title','instructions','acceptanceCriteria')): continue
         sid=str(story.get('id') or 's'+str(index+1))[:60]
@@ -112,6 +171,7 @@ def apply_plan(state, request, plan, master):
         stories.append({**story,'id':sid,
                         'dependsOnQuestions':[v for v in dependencies if isinstance(v,str)],
                         'prerequisiteStoryIds':[v for v in prerequisites if isinstance(v,str)],
+                        'dependenciesExplicit': 'prerequisiteStoryIds' in story,
                         'taskType':story.get('taskType') if story.get('taskType') in ('spike','research','code') else 'spike'})
     if not stories:
         stories=[{'id':'discover','title':'Discover requirements: '+request['title'],'taskType':'spike',
@@ -132,7 +192,7 @@ def apply_plan(state, request, plan, master):
 
 def normalize_plan(state, request):
     plan=request['plan']
-    if plan.get('version') == 2: return
+    if plan.get('version') == 3: return
     technical=[]
     for question in plan['questions']:
         prompt=question['question'].lower()
@@ -147,7 +207,10 @@ def normalize_plan(state, request):
             'taskType':'spike','instructions':'Inspect existing code and official documentation to answer: '
                 + '; '.join(q['question'] for q in technical),'acceptanceCriteria':'Save verified technical choices and implementation prerequisites.',
             'dependsOnQuestions':[]})
-    if request.get('taskType')=='code' and not any(story['taskType']=='code' for story in plan['stories']):
+    implementation = request.get('taskType') == 'code' or bool(re.search(
+        r'\b(implement|build|integrate|automate|create (?:an? )?(?:app|application|script|service|system)|fix)\b',
+        request.get('title','') + ' ' + request.get('reason',''), re.I))
+    if implementation and not any(story['taskType']=='code' and not story.get('potential') for story in plan['stories']):
         discovery=[story['id'] for story in plan['stories']]
         plan['stories'].append({'id':'implementation','title':'Implement: '+request['title'],'taskType':'code',
             'instructions':'Complete the overarching request using the approved discovery findings and human answers. '
@@ -157,9 +220,9 @@ def normalize_plan(state, request):
             'prerequisiteStoryIds':discovery})
     discovery_ids={story['id'] for story in plan['stories'] if story['taskType'] in ('research','spike')}
     for story in plan['stories']:
-        if story['taskType']=='code' and not story.get('prerequisiteStoryIds'):
+        if story['taskType']=='code' and not story.get('prerequisiteStoryIds') and not story.get('dependenciesExplicit'):
             story['prerequisiteStoryIds']=sorted(discovery_ids)
-    plan['version']=2
+    plan['version']=3
 
 
 def release_stories(state, request):
@@ -168,19 +231,42 @@ def release_stories(state, request):
     plan=request['plan']
     unanswered={q['id'] for q in plan['questions'] if q.get('status')=='awaiting_input'}
     queued=request.setdefault('queuedStoryIds',[])
+    by_id={story['id']:story for story in plan['stories']}
+    def invalid_dependencies(sid, visiting=()):
+        if sid not in by_id or sid in visiting:
+            return True
+        return any(invalid_dependencies(dep, visiting+(sid,)) for dep in by_id[sid].get('prerequisiteStoryIds') or [])
     for story in plan['stories']:
-        if story['id'] in queued: continue
-        if unanswered.intersection(story.get('dependsOnQuestions') or []): continue
-        if story['taskType']=='code' and unanswered: continue
+        if story['id'] in queued:
+            story['planningStatus']='dispatched'
+            continue
+        if invalid_dependencies(story['id']):
+            story['planningStatus']='blocked_invalid_dependencies'
+            continue
+        if story.get('potential') and not story.get('activated'):
+            story['planningStatus']='potential'
+            continue
+        if unanswered.intersection(story.get('dependsOnQuestions') or []) or (story['taskType']=='code' and unanswered):
+            story['planningStatus']='waiting_for_answers'
+            continue
         completed={t.get('workOrderStoryId') for t in (state.get('tasks') or {}).values()
                    if t.get('workOrderId')==request['id'] and t.get('status')=='done'
                    and not any(t.get(k) for k in ('reviewOf','investigationOf','recoveryOf'))}
-        if not set(story.get('prerequisiteStoryIds') or []) <= completed: continue
+        if not set(story.get('prerequisiteStoryIds') or []) <= completed:
+            story['planningStatus']='waiting_for_prerequisites'
+            continue
         instructions=('Overarching player request: '+request.get('reason','')
             +'\nRelated earlier request context: '+json.dumps(request.get('relatedRequests') or [])
             +'\nParent request completion criteria (context; not requirements for each discovery story): '+str(request.get('acceptanceCriteria') or '')
             +'\nHuman answers: '+json.dumps({q['question']:q.get('answer') for q in plan['questions'] if q.get('answer')})
             +'\nStory: '+story['instructions'])
+        prerequisites=[t for t in (state.get('tasks') or {}).values()
+                       if t.get('workOrderId')==request['id'] and t.get('workOrderStoryId') in story.get('prerequisiteStoryIds',[])
+                       and t.get('status')=='done' and not any(t.get(k) for k in ('reviewOf','investigationOf','recoveryOf'))]
+        if prerequisites:
+            instructions += '\nCompleted prerequisite artifacts: ' + json.dumps([
+                {'storyId':t.get('workOrderStoryId'),'taskId':t['id'],'libraryPath':t.get('libraryPath'),
+                 'sandboxId':t.get('_sandboxId') or t.get('sandboxId')} for t in prerequisites])
         sim.queue_work(state,[{'title':story['title'][:200], 'room':'pressoffice' if story['taskType']=='code' else 'observatory',
             'taskType':story['taskType'],'workOrderId':request['id'],'workOrderStoryId':story['id'],
             'scrumMasterId':request.get('scrumMasterId'), 'requestId':request['id'],
@@ -190,6 +276,7 @@ def release_stories(state, request):
             'reviewContract':{'instructions':story['instructions'],'acceptanceCriteria':story['acceptanceCriteria'],
                               'parentWorkOrderId':request['id'],'scope':'work_order_story','version':1}}])
         queued.append(story['id'])
+        story['planningStatus']='dispatched'
     request['status']='needs_input' if unanswered else 'accepted'
     request['groomingReason']=plan['summary']
 
@@ -245,6 +332,7 @@ def step(state):
         elif request.get('status')=='planning' and not future and not request.get('plan'):
             begin(state,request,request.get('scrumMasterId') or 'theo')
         elif request.get('plan') and request.get('status') in ('accepted','needs_input'):
+            assess_potential(state,request)
             release_stories(state,request)
         if request.get('plan'):
             for task in (state.get('tasks') or {}).values():

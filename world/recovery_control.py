@@ -38,7 +38,7 @@ def record(state, task, text, review_rejection=False):
                              'category': category, 'action': action, 'failure': str(text or '')[:1000]})
     root['failureCategory'] = category
     root['recommendedRecoveryAction'] = action
-    stopped = (ledger['noProgress'] >= 2 and not review_rejection) or ledger['attempts'] >= ledger.get('attemptLimit', 4) or category in ('policy', 'budget', 'infrastructure', 'missing_inputs')
+    stopped = (not review_rejection and (ledger['noProgress'] >= 2 or ledger['attempts'] >= ledger.get('attemptLimit', 4))) or category in ('policy', 'budget', 'infrastructure', 'missing_inputs')
     if stopped:
         root.update(manualAttention=True, status='blocked', blockedReason='story_recovery_limit',
                     failNote=str(text or '')[:4000],

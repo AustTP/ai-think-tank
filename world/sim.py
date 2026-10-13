@@ -1699,7 +1699,7 @@ def _maybe_escalate_stuck_gate(parent, gate, reason, failure_text=None, state=No
                                     'errorCount': len(codes)}
         gate.setdefault('failureHistory', []).append({'cycle': gate['cycleCount'], 'category': category,
                                                      'errorCount': len(codes), 'fingerprint': fingerprint})
-    if not story_stopped and gate['cycleCount'] < MAX_REVIEW_CYCLES:
+    if not story_stopped:
         return False
     gate['escalated'] = True
     parent['manualAttention'] = True

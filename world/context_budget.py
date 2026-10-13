@@ -3,13 +3,37 @@ import copy
 import json
 
 
+def select_tools(messages, tools, tool_choice=None):
+    if not tools:
+        return tools
+    core = {'search_library','read_library_file','search_web','browse_page','execute_script',
+            'save_library_document','file_issue','request_allowlist'}
+    topic = ' '.join(str(m.get('content','')) for m in messages if m.get('role')=='user').lower()
+    topic += ' ' + next((str(m.get('content',''))[:600] for m in messages if m.get('role')=='system'), '').lower()
+    forced = ((tool_choice or {}).get('function') or {}).get('name') if isinstance(tool_choice,dict) else None
+    selected=[]
+    for tool in tools:
+        name=(tool.get('function') or {}).get('name','')
+        words=name.replace('_',' ').split()
+        if name in core or name==forced or any(w in topic for w in words if len(w)>3 and w not in ('search','read','create','list','append','generate')):
+            selected.append(copy.deepcopy(tool))
+    if not selected:
+        selected=copy.deepcopy(tools[:4])
+    def shorten(value):
+        if isinstance(value,dict):
+            return {k:(v[:96] if k=='description' and isinstance(v,str) else shorten(v)) for k,v in value.items()}
+        if isinstance(value,list): return [shorten(v) for v in value]
+        return value
+    return shorten(selected)
+
+
 def size(value):
     return len(json.dumps(value, ensure_ascii=False).encode('utf-8'))
 
 
 def compact(messages, max_tokens, tools=None, context_length=8192):
     # Conservative byte allowance leaves headroom for templates and tokenization.
-    budget = (context_length - max_tokens - 768) * 2 - size(tools or [])
+    budget = int((context_length - max_tokens - 768) * 2.5) - size(tools or []) - 192
     if budget <= 0:
         raise ValueError('Local context budget exhausted by output reservation and tool schemas')
     result = copy.deepcopy(messages)

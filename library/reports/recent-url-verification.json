@@ -1,0 +1,217 @@
+{
+  "paths": [
+    "archive/1791923400694-spike-task-2468.md",
+    "archive/1791923234355-spike-task-2465.md",
+    "archive/1791923302393-spike-task-2464.md",
+    "archive/1791923136267-spike-task-2458.md",
+    "archive/1791922703831-spike-task-2455.md",
+    "archive/1791922480499-spike-task-2452.md",
+    "archive/1791921645623-spike-task-2449.md",
+    "archive/1791921506766-spike-task-2446.md",
+    "archive/1791921524813-spike-task-2445.md",
+    "archive/1791921369428-spike-task-2444.md",
+    "archive/1791921291249-spike-task-2443.md",
+    "archive/1791921294773-spike-task-2442.md",
+    "archive/1791921192525-spike-task-2432.md",
+    "archive/1791921147095-spike-task-2431.md",
+    "archive/1791913894951-spike-task-2423.md",
+    "archive/1791906738022-spike-task-2418.md"
+  ],
+  "results": [
+    {
+      "url": "https://algosone.ai/the-science-of-ri[REDACTED]",
+      "result": "corrupted by redaction"
+    },
+    {
+      "url": "https://alphapoint.com/blog/crypto-risk-management",
+      "status": 200,
+      "final_url": "https://alphapoint.com/blog/crypto-risk-management"
+    },
+    {
+      "url": "https://api.coinbase.com/v2/orders",
+      "status": 404
+    },
+    {
+      "url": "https://api.coinbase.com/v2/orders-product-service-status",
+      "status": 404
+    },
+    {
+      "url": "https://bisonapp.com/en/academy/crypto-risk-management",
+      "status": 200,
+      "final_url": "https://bisonapp.com/en/academy/crypto-risk-management/"
+    },
+    {
+      "url": "https://changelly.com/blog/ri[REDACTED]",
+      "result": "corrupted by redaction"
+    },
+    {
+      "url": "https://coinbureau.com/guides/ri[REDACTED]",
+      "result": "corrupted by redaction"
+    },
+    {
+      "url": "https://cryptocompare.com/academy/crypto-risk-management/",
+      "status": 404
+    },
+    {
+      "url": "https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/introduction",
+      "status": 200,
+      "final_url": "https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/introduction"
+    },
+    {
+      "url": "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/overview",
+      "status": 200,
+      "final_url": "https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/overview"
+    },
+    {
+      "url": "https://docs.cdp.coinbase.com/exchange/introduction/welcome",
+      "status": 200,
+      "final_url": "https://docs.cdp.coinbase.com/exchange/introduction/welcome"
+    },
+    {
+      "url": "https://financialcrimeacademy.org/cryptocurrency-risk-management",
+      "status": 200,
+      "final_url": "https://financialcrimeacademy.org/cryptocurrency-risk-management/"
+    },
+    {
+      "url": "https://futures.kraken.com/risk-management",
+      "status": 200,
+      "final_url": "https://futures.kraken.com/trade"
+    },
+    {
+      "url": "https://github.com/coinbase/coinbase-advanced-py",
+      "status": 200,
+      "final_url": "https://github.com/coinbase/coinbase-advanced-py"
+    },
+    {
+      "url": "https://help.bybit.com/hc/en-us/articles/360052776891-How-to-use-take-profit-and-stop-loss-orders",
+      "status": 200,
+      "final_url": "https://www.bybit.com/en/help-center"
+    },
+    {
+      "url": "https://ig.com/ae/crypto-need-to-knows/crypto-risk-management",
+      "status": 200,
+      "final_url": "https://www.ig.com/ae/crypto-need-to-knows/crypto-risk-management"
+    },
+    {
+      "url": "https://messari.io/reports/messari-crypto-asset-portfolio-strategy",
+      "status": 429
+    },
+    {
+      "url": "https://pro.coinbase.com/trade",
+      "status": 403
+    },
+    {
+      "url": "https://www.altrady.com/crypto-trading/risk-management",
+      "status": 200,
+      "final_url": "https://www.altrady.com/crypto-trading/risk-management"
+    },
+    {
+      "url": "https://www.binance.com/en/academy/binance-futures-risk-management",
+      "status": 202,
+      "final_url": "https://www.binance.com/en/academy/binance-futures-risk-management"
+    },
+    {
+      "url": "https://www.binance.com/en/academy/defi/what-is-dollar-cost-averaging-dca",
+      "status": 202,
+      "final_url": "https://www.binance.com/en/academy/defi/what-is-dollar-cost-averaging-dca"
+    },
+    {
+      "url": "https://www.binance.com/en/academy/defi/what-is-leverage-and-how-to-use-it-in-crypto",
+      "status": 202,
+      "final_url": "https://www.binance.com/en/academy/defi/what-is-leverage-and-how-to-use-it-in-crypto"
+    },
+    {
+      "url": "https://www.binance.com/en/academy/defi/what-is-risk-reward-ratio",
+      "status": 202,
+      "final_url": "https://www.binance.com/en/academy/defi/what-is-risk-reward-ratio"
+    },
+    {
+      "url": "https://www.binance.com/en/blog/ri[REDACTED]",
+      "result": "corrupted by redaction"
+    },
+    {
+      "url": "https://www.binance.com/en/blog/ri[REDACTED]'",
+      "result": "corrupted by redaction"
+    },
+    {
+      "url": "https://www.binance.com/en/support/academy/detail/stop-limit-order-tutorial-4",
+      "status": 202,
+      "final_url": "https://www.binance.com/en/support/academy/detail/stop-limit-order-tutorial-4"
+    },
+    {
+      "url": "https://www.coinbase.com/developer-platform/products/advanced-trade-api",
+      "status": 403
+    },
+    {
+      "url": "https://www.coinbase.com/learn/crypto-basics/stop-loss-orders",
+      "status": 403
+    },
+    {
+      "url": "https://www.coinbase.com/learn/crypto-investing/diversification",
+      "status": 403
+    },
+    {
+      "url": "https://www.coinbase.com/learn/crypto-storage/cold-storage",
+      "status": 403
+    },
+    {
+      "url": "https://www.coingecko.com/academy/how-to-assess-the-health-of-a-crypto-exchange",
+      "status": 403
+    },
+    {
+      "url": "https://www.coingecko.com/academy/how-to-do-your-own-research-dyor",
+      "status": 403
+    },
+    {
+      "url": "https://www.ig.com/ae/crypto-need-to-knows/crypto-risk-management",
+      "status": 200,
+      "final_url": "https://www.ig.com/ae/crypto-need-to-knows/crypto-risk-management"
+    },
+    {
+      "url": "https://www.investopedia.com/terms/diversification/",
+      "status": 403
+    },
+    {
+      "url": "https://www.investopedia.com/terms/diversification/'",
+      "status": 403
+    },
+    {
+      "url": "https://www.investopedia.com/terms/portfolio-insurance/",
+      "status": 403
+    },
+    {
+      "url": "https://www.investopedia.com/terms/portfolio-insurance/'",
+      "status": 403
+    },
+    {
+      "url": "https://www.investopedia.com/terms/portfolio-rebalancing/",
+      "status": 403
+    },
+    {
+      "url": "https://www.investopedia.com/terms/portfolio-rebalancing/'",
+      "status": 403
+    },
+    {
+      "url": "https://www.investopedia.com/terms/stop-loss-order/",
+      "status": 403
+    },
+    {
+      "url": "https://www.investopedia.com/terms/stop-loss-order/'",
+      "status": 403
+    },
+    {
+      "url": "https://www.kraken.com/en-us/learn/what-is-position-sizing-in-crypto/",
+      "status": 404
+    }
+  ],
+  "repaired_documents": [
+    "archive/1791923400694-spike-task-2468.md",
+    "archive/1791923234355-spike-task-2465.md",
+    "archive/1791923136267-spike-task-2458.md",
+    "archive/1791922703831-spike-task-2455.md"
+  ],
+  "replacements": {
+    "https://algosone.ai/the-science-of-ri[REDACTED]": "https://algosone.ai/the-science-of-risk-management-in-crypto-trading/",
+    "https://changelly.com/blog/ri[REDACTED]": "https://changelly.com/blog/risk-management-in-crypto-trading/"
+  }
+}

@@ -9,6 +9,56 @@ import re
 import time
 
 AGENT_ID = 'librarian'
+REUSE_INSTRUCTION = ('Read upcoming task instructions and acceptance criteria, then inspect existing Library documents. '
+    'Attach relevant document paths and concrete evidence to the task and identify what can be reused, '
+    'what remains unfinished, and whether an approved artifact may already satisfy the task. '
+    'Have workers read and build on those artifacts before repeating research. Never approve a task '
+    'from a title match; existing documents can be stale or unverified and still require acceptance checks.')
+_INDEX = {}
+
+
+def relevant_documents(state, task, serve):
+    root = serve.LIBRARY_DIR
+    now = time.monotonic()
+    cached = _INDEX.get(root)
+    if not cached or now-cached[0] > 60:
+        entries=[]
+        for directory, dirs, files in os.walk(root):
+            dirs[:]=[d for d in dirs if not any(w in d.lower() for w in ('backup','pending_review')) and not d.startswith('.')]
+            for name in files:
+                if not name.endswith(('.md','.csv')) or name.startswith('.'): continue
+                path=os.path.join(directory,name)
+                if os.path.islink(path): continue
+                try:
+                    with open(path,encoding='utf-8',errors='replace') as stream: text=stream.read(24000)
+                except OSError: continue
+                entries.append((os.path.relpath(path,root).replace('\\','/'),text))
+        _INDEX[root]=(now,entries)
+    entries=_INDEX[root][1]
+    stop={'research','implement','existing','story','task','report','with','from','that','this','code','save','review','techniques'}
+    words=set(re.findall(r'[a-z]{4,}',task.get('title','').lower()))-stop
+    if not words: return []
+    candidates=[]
+    sources={t.get('libraryPath'):t for t in (state.get('tasks') or {}).values() if t.get('libraryPath') and t.get('status')=='done'}
+    for path,text in entries:
+        if path==task.get('libraryPath'): continue
+        found=words.intersection(set(re.findall(r'[a-z]{4,}',(path+' '+text).lower())))
+        if len(found)<min(2,len(words)): continue
+        score=len(found)/len(words)+sum(w in path.lower() for w in found)
+        source=sources.get(path)
+        same_contract=bool(source and task.get('acceptanceCriteria') and source.get('acceptanceCriteria')==task['acceptanceCriteria'])
+        candidates.append((score,{'path':path,'matchedTerms':sorted(found),'excerpt':text[:800],
+                                 'sourceTaskId':source.get('id') if source else None,
+                                 'assessment':'potentially_fulfills' if same_contract else 'may_help',
+                                 'requiresVerification':True}))
+    return [entry for _,entry in sorted(candidates,key=lambda x:(-x[0],x[1]['path']))[:4]]
+
+
+def attach_reuse(state, task, serve):
+    signature=hashlib.sha256(json.dumps([task.get('title'),task.get('instructions'),task.get('acceptanceCriteria')]).encode()).hexdigest()
+    if (task.get('libraryReuse') or {}).get('taskSignature')==signature and int(time.time()*1000)-(task.get('libraryReuse') or {}).get('checkedAt',0)<60000: return
+    task['libraryReuse']={'taskSignature':signature,'checkedBy':AGENT_ID,
+                          'documents':relevant_documents(state,task,serve),'checkedAt':int(time.time()*1000)}
 WRITE_TOOL = {'type':'function','function':{'name':'save_library_document',
     'description':'Save an actual document or CSV in the shared Library. Supply full contents; a filename mentioned in a report does not save a file. Returns its saved path.',
     'parameters':{'type':'object','properties':{'path':{'type':'string'},'content':{'type':'string'}},'required':['path','content']}}}
@@ -29,6 +79,9 @@ def create_role(state):
             'offDuty':True,'visible':False,'busy':False,'task':None,'inRoom':None,
             'roomX':None,'roomY':None,'meetingId':None,'mailbox':[],'conversationLog':[],
             'hiredAt':int(time.time()*1000)}
+    for agent in [state['agents'][AGENT_ID]]+[d for d in state['agentRoster'] if d.get('id')==AGENT_ID]:
+        instructions=agent.setdefault('profile',{}).setdefault('instructions',[])
+        if REUSE_INSTRUCTION not in instructions: instructions.append(REUSE_INSTRUCTION)
     return AGENT_ID
 
 
@@ -99,6 +152,10 @@ def inspect_report(task, serve):
 def step(state):
     import serve, sim
     create_role(state)
+    pending=list(state.get('workQueue') or [])+[t for t in (state.get('tasks') or {}).values()
+        if t.get('status') in ('walking','working','repairing') and not t.get('reviewOf')]
+    for task in pending:
+        attach_reuse(state,task,serve)
     for task in list((state.get('tasks') or {}).values()):
         if not task.get('libraryPath') or task.get('reviewOf') or task.get('status') not in ('needs_review','blocked','failed'):
             continue
