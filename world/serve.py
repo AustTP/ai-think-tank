@@ -13271,13 +13271,15 @@ def _breakdown_into_shared_backlog(state, goal, admin_id, constraints=None):
         'Do NOT assign a room to a card -- the rooms are shared across teams and the agent who picks a '
         'card up figures out where the work needs to happen. '
         'Give a short FEATURE name (3-6 words) that groups these cards under one initiative. '
-        'Keep every title to ONE short sentence. For each card set "type" to "story" (deliverable work) '
-        'or "spike" (an investigation with no committed deliverable -- use it when the right approach is '
-        'not yet known), a one-line "acceptanceCriteria" when the story has a clear test of done, a '
+        'Keep every title to ONE short sentence. For each card set "type" to "story" (deliverable work), '
+        '"spike" (an investigation with no committed deliverable -- use it when the right approach is '
+        'not yet known), or "research" (a fact-gathering/analysis sweep that produces findings, not a '
+        'shipped deliverable -- document studies, competitive teardown, desk research), '
+        'a one-line "acceptanceCriteria" when the story has a clear test of done, a '
         '"never" list ONLY when the card has hard prohibitions the worker must never do (omit otherwise), and a '
         '"sizeEstimate" of S/M/L. '
         'Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: '
-        '{"feature":"short feature name","items":[{"title":"short title","type":"story|spike","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L",' + budget_field + '}]}'
+        '{"feature":"short feature name","items":[{"title":"short title","type":"story|spike|research","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L",' + budget_field + '}]}'
     )
     key = get_or_create_agent_key(admin_id)
     # High-stakes planning tier, JEV-gated: a large-request breakdown is exactly
@@ -13723,12 +13725,13 @@ async def intent_promote_spike(task_id: str, request: Request):
     # investigation, not a deliverable -- it stays out of the peer gate
     # entirely (NON_GATED_LANES), exactly the case that looped before.
     task_type = (body.get('taskType') or '').strip()
-    if task_type not in ('code', 'review', 'qa', 'spike'):
+    if task_type not in ('code', 'review', 'qa', 'spike', 'research'):
         return JSONResponse({
-            'error': ('taskType is required and must be one of "code", "review", "qa", or "spike". '
+            'error': ('taskType is required and must be one of "code", "review", "qa", "spike", or "research". '
                      'Choose "spike" when the finding is informational only (no concrete '
                      'recommendation to build) -- it skips peer review entirely rather than '
-                     'looping on code no reviewer can approve.'),
+                     'looping on code no reviewer can approve. Choose "research" for open-ended '
+                     'investigation of a question (routed to the observatory, never the code pipeline).'),
         }, status_code=400)
 
     import sim as _sim
@@ -13843,7 +13846,7 @@ async def promote_shadow_entry(idx: str, request: Request):
     if room not in _DELEGATABLE_ROOMS:
         room = 'pressoffice'
     task_type = (body.get('taskType') or entry.get('taskType') or 'code').strip()
-    if task_type not in ('code', 'review', 'qa', 'spike'):
+    if task_type not in ('code', 'review', 'qa', 'spike', 'research'):
         task_type = 'code'
     finding = (entry.get('note') or '').strip()
     library_path = entry.get('libraryPath')

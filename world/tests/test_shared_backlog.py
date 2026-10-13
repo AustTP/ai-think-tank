@@ -139,6 +139,23 @@ class FeaturesAndBacklog(unittest.TestCase):
         self.assertIsNone(sim.add_backlog_item(state, 'Over the cap', None, 'faye', 1_000_000))
         self.assertEqual(len(state['backlog']), sim.MAX_BACKLOG_ITEMS)
 
+    def test_add_backlog_item_coerces_item_type(self):
+        # item_type is coerced at file time: 'spike' and 'research' survive;
+        # anything else (unknown string, None, missing) degrades to 'story'.
+        state = _seed()
+        spike = sim.add_backlog_item(state, 'Investigate the soil', None,
+                                     'faye', 1_000_000, item_type='spike')
+        research = sim.add_backlog_item(state, 'Survey the approaches', None,
+                                        'faye', 1_000_001, item_type='research')
+        junk = sim.add_backlog_item(state, 'Not a real lane', None,
+                                    'faye', 1_000_002, item_type='epic')
+        default = sim.add_backlog_item(state, 'Just a story', None,
+                                       'faye', 1_000_003, item_type=None)
+        self.assertEqual(spike['type'], 'spike')
+        self.assertEqual(research['type'], 'research')
+        self.assertEqual(junk['type'], 'story')
+        self.assertEqual(default['type'], 'story')
+
     def test_blocked_item_is_not_eligible(self):
         state = _seed()
         sim.add_backlog_item(state, 'A ready story', None, 'faye', 1_000_000)
@@ -206,11 +223,24 @@ class FeaturesAndBacklog(unittest.TestCase):
         self.assertIn('- never touch the live payment table', story['instructions'])
         self.assertEqual(story['never'], '- never touch the live payment table')
 
+    def test_pull_backlog_carries_research_as_timeboxed_investigation(self):
+        # A research card is an investigation-class lane like a spike: it queues
+        # with taskType='research' and the same 60s time-box, not as a code story.
+        state = _seed()
+        sim.add_backlog_item(state, 'Survey the approaches', None,
+                             'faye', 1_000_000, item_type='research')
+        sim._pull_backlog_for_team(state, 'dev', 1_000_001)
+        research = state['workQueue'][0]
+        self.assertEqual(research['taskType'], 'research')
+        self.assertEqual(research['budgetMs'], 60_000)
+        self.assertIsNone(research['room'])  # room resolved at assignment
+
     def test_assign_resolves_room_for_room_less_card(self):
         # A room-free card gets its room only at ASSIGNMENT time, chosen by the
         # nature of the work: an investigation spike -> observatory (research),
         # a deliverable story -> pressoffice (real files get written).
         self.assertEqual(sim._resolve_assignment_room({'taskType': 'spike'}), 'observatory')
+        self.assertEqual(sim._resolve_assignment_room({'taskType': 'research'}), 'observatory')
         self.assertEqual(sim._resolve_assignment_room({'taskType': 'code'}), 'pressoffice')
         # _assign_due_item writes the resolved room onto the pick so the
         # walk/gate/grade lifecycle (which routes by task['room']) sees it.

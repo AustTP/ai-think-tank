@@ -1403,11 +1403,23 @@ def _quality_pipeline_steps(scope_files=None):
     those files instead of running on the whole sandbox -- a README-only or
     single-file change no longer fails on pre-existing findings in unrelated
     files. pytest-cov always runs project-wide (coverage is measured in total
-    by design). JS steps already no-op when no JS files exist."""
+    by design). JS steps already no-op when no JS files exist.
+
+    flake8 runs with `--isolated` and the host's setup.cfg flags mirrored on
+    the CLI: the sandbox working dir may contain an agent-written setup.cfg/
+    pyproject.toml that would otherwise change lint behavior run-to-run, and
+    the host ignores stylistic codes the codebase deliberately uses (F-codes
+    stay enforced). Without --isolated, a stray config in the sandbox tree
+    also feeds flake8's plugin loader, which has crashed with _import_plugins
+    errors on prose-lane tasks that never should have reached this pipeline."""
+    _flake8_flags = (
+        '--isolated --max-line-length=100 '
+        '--extend-ignore=E501,E203,E128,E127,E221,E302,E303,E305,E306,E741,E731,E702,W292,W605'
+    )
     if scope_files:
         _scoped = ' '.join(scope_files)
         return [
-            {'name': 'flake8', 'command': f'python -m flake8 {_scoped}'},
+            {'name': 'flake8', 'command': f'python -m flake8 {_flake8_flags} {_scoped}'},
             {'name': 'mypy', 'command': f'python -m mypy {_scoped}'},
             {'name': 'bandit', 'command': 'python -m bandit -q ' + ' '.join(f'-f {f}' for f in scope_files)},
             {'name': 'pytest-cov', 'command': 'python -m pytest --cov=. --cov-fail-under=90 -q'},
@@ -1422,7 +1434,7 @@ def _quality_pipeline_steps(scope_files=None):
                 'node --test\'')},
         ]
     return [
-        {'name': 'flake8', 'command': 'python -m flake8 .'},
+        {'name': 'flake8', 'command': f'python -m flake8 {_flake8_flags} --exclude=tests .'},
         {'name': 'mypy', 'command': 'python -m mypy .'},
         {'name': 'bandit', 'command': 'python -m bandit -r . -q'},
         {'name': 'pytest-cov', 'command': 'python -m pytest --cov=. --cov-fail-under=90 -q'},
@@ -1514,9 +1526,30 @@ def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose, scope_files=
         code = step.get('exitCode')
         snippet = _quality_pipeline_failure_snippet(
             failed, step.get('stdout'), step.get('stderr'))
+        # A flake8 crash inside its own plugin loader (_import_plugins) is a
+        # sandbox tooling fault, not a finding in the agent's code -- the
+        # agent cannot fix it by editing files. Tag infra so sim.py skips
+        # coaching/grade penalty and the infra-retry path can take over.
+        _plugin_crash = (
+            failed == 'flake8'
+            and '_import_plugins' in ((step.get('stderr') or '') + (step.get('stdout') or ''))
+        )
         return {'ok': False, 'failedStep': failed, 'results': results,
-                'note': f'quality pipeline FAILED at {failed} (exit {code}):\n{snippet}'}
+                'note': f'quality pipeline FAILED at {failed} (exit {code}):\n{snippet}',
+                'infra': True if _plugin_crash else None}
     return {'ok': True, 'failedStep': None, 'results': results, 'note': 'quality pipeline all green'}
+
+
+def _skipped_pipeline_result(note):
+    """Synthetic quality-pipeline result used when the lane is not code-class.
+    ok=True keeps _run_coding_content / _run_review_content fail paths clean;
+    skipped=True lets pipeline_clause / _grade_code_requirement / the review
+    prompt explain that the pipeline never ran instead of claiming it is green.
+    results=[] and evidence='' are intentional: the sim's evidence done-gate
+    (sim.py:2044-2056) only requires evidence for coding-class parents, so a
+    non-code parent rests on pipelineOk alone."""
+    return {'ok': True, 'failedStep': None, 'results': [], 'skipped': True,
+            'note': note}
 
 
 def _quality_pipeline_evidence(qp):
@@ -1773,18 +1806,32 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     # to the .py files this task actually wrote -- a README-only or single-file
     # change no longer fails on pre-existing findings elsewhere in the sandbox.
     # pytest-cov still runs project-wide (coverage is measured in total).
-    qp = _run_quality_pipeline(base, key, agent_id, WORKROOM_SANDBOX_ID,
-                               f'Quality gate for coding task: {backlog_item}',
-                               scope_files=written_py or None)
+    # Lane-aware gate: only code-class work (taskType=='code', defaulting
+    # untyped legacy cards to code) runs the real pipeline. Story/spike/
+    # research cards that land here by mistake (e.g. a research card that
+    # somehow reached _run_coding_content) skip the pipeline instead of failing
+    # flake8/mypy/pytest on prose or empty sandboxes.
+    if (task.get('taskType') or 'code') == 'code':
+        qp = _run_quality_pipeline(base, key, agent_id, WORKROOM_SANDBOX_ID,
+                                   f'Quality gate for coding task: {backlog_item}',
+                                   scope_files=written_py or None)
+    else:
+        qp = _skipped_pipeline_result('non-code lane -- quality pipeline skipped')
     if not qp['ok']:
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f'wrote and ran the code, but {qp["note"]}',
-                                           'command': command, 'ok': False, 'tier': tier_slug})
+                                           'command': command, 'ok': False, 'tier': tier_slug,
+                                           # infra=True when the failure was a sandbox
+                                           # tooling crash (e.g. flake8 _import_plugins),
+                                           # not a finding the agent can fix.
+                                           'infra': bool(qp.get('infra'))})
         return False
 
+    pipeline_note = ('quality pipeline skipped (non-code lane)' if qp.get('skipped')
+                     else 'quality pipeline all green')
     _sim_module._store_content_result(task.get('id'),
                                       {'note': ((result.get('note') or ('Wrote and ran the code in the shared Work Room sandbox.'))
-                                                + ' | quality pipeline all green'),
+                                                + f' | {pipeline_note}'),
                                        'command': command, 'ok': True, 'tier': tier_slug})
     return True
 
@@ -1893,6 +1940,11 @@ def _grade_code_requirement(req, qp):
     player), never a guess."""
     text = f"{req.get('question', '')} {req.get('section', '')}".lower()
     if any(word in text for word in _PIPELINE_HINT_WORDS):
+        # A skipped pipeline (non-code lane) is not evidence the requirement was
+        # met -- fall through to GRADE_UNSURE so it surfaces to the player
+        # instead of auto-MEETING off a pipeline that never ran.
+        if qp.get('skipped'):
+            return GRADE_UNSURE
         return GRADE_MEETS if qp.get('ok') else GRADE_FAILS
     return GRADE_UNSURE
 
@@ -2070,9 +2122,22 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     # Cut 4 -- objective pipeline evidence, run by the sandbox, NOT by reviewer
     # opinion. The approval gate in sim.py refuses to count a clean vote unless
     # this is green; here we surface it to the reviewer and force actionable on
-    # a red pipeline no matter what the review text says.
-    qp = _run_quality_pipeline(base, key, agent_id, WORKROOM_SANDBOX_ID,
-                               f'Quality gate for {("QA" if is_qa else "review")} of: {backlog_item}')
+    # a red pipeline no matter what the review text says. Lane-aware: only
+    # code-class work runs the real pipeline. A gate review whose parent story
+    # is non-code (spike/bug/research) skips the pipeline instead of failing
+    # flake8/mypy/pytest on prose; an ad-hoc/workroom review with no parent
+    # falls back to the coding-class signals the workroom itself uses.
+    if task.get('reviewOf'):
+        review_parent = (snapshot.get('tasks') or {}).get(task.get('reviewOf')) or {}
+        pipeline_is_code_class = _sim_module._peer_coding_class(review_parent)
+    else:
+        pipeline_is_code_class = bool(project_label or task.get('productId')
+                                      or task.get('room') == 'pressoffice')
+    if pipeline_is_code_class:
+        qp = _run_quality_pipeline(base, key, agent_id, WORKROOM_SANDBOX_ID,
+                                   f'Quality gate for {("QA" if is_qa else "review")} of: {backlog_item}')
+    else:
+        qp = _skipped_pipeline_result('non-code lane -- quality pipeline skipped')
 
     tier_slug = _serve._coding_tier_slug() or _serve._mid_tier_slug() or _serve._low_tier_slug()
     if not tier_slug:
@@ -2092,11 +2157,17 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                 f'Be a genuine, skeptical reviewer, not a rubber stamp. Current code:\n{context}\n\nTask: {backlog_item}\n\n'
                 'List real, specific problems you actually see (bugs, broken logic, missing pieces), or say plainly if it genuinely '
                 'looks solid. Be honest either way.')
-    pipeline_clause = (f'Quality pipeline status (run live in the sandbox just now): {qp["note"]}. '
-                       'This is a HARD standard the code must meet -- if it is red, that is a real problem you must flag, even if the '
-                       'code otherwise looks fine. It is not optional.' if not qp['ok']
-                       else f'Quality pipeline status (run live in the sandbox just now): {qp["note"]}. '
-                            'This is the bar the code must clear -- taking the pipeline result as given.')
+    if qp.get('skipped'):
+        pipeline_clause = (f'Quality pipeline: {qp["note"]}. '
+                           'This deliverable is a non-code lane (e.g. research/spike), so there is no lint/type/test bar to apply '
+                           '-- judge it on the stated goal and content quality instead.')
+    elif not qp['ok']:
+        pipeline_clause = (f'Quality pipeline status (run live in the sandbox just now): {qp["note"]}. '
+                           'This is a HARD standard the code must meet -- if it is red, that is a real problem you must flag, even if the '
+                           'code otherwise looks fine. It is not optional.')
+    else:
+        pipeline_clause = (f'Quality pipeline status (run live in the sandbox just now): {qp["note"]}. '
+                           'This is the bar the code must clear -- taking the pipeline result as given.')
     system_prompt = (lead +
                      _perception_block(base_ctx) +
                      f'\n\n{pipeline_clause}' +
@@ -2190,7 +2261,7 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
             _serve._jev_model(), {'messages': [], 'signals': {}},
             {'choice': {'type': 'choice',
                         'instructions': f'A {kind} just wrote this about "{project_label}": "{full_review[:1500]}" '
-                                        f'\n\nQuality pipeline (run live): {qp["note"]}'
+                                        f'\n\nQuality pipeline ({"skipped for a non-code lane" if qp.get("skipped") else "run live"}): {qp["note"]}'
                                         f'\nDoes this identify at least one concrete, real, fixable problem (a bug, missing feature, broken integration '
                                         f'or a failed quality pipeline)? '
                                         f'Or does it say things genuinely look solid with nothing actionable?',

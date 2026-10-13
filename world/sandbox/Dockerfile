@@ -8,8 +8,15 @@ FROM python:3.12-slim
 # Build once on the host:
 #   docker build -t ai-think-tank-work-sandbox world/sandbox
 # serve.py SANDBOX_IMAGE points at it.
+# flake8's own deps (pycodestyle/pyflakes/mccabe) are pinned too: an
+# unconstrained reinstall of flake8==6.0.0 can pull newer plugin packages that
+# crash inside flake8's _import_plugins loader before any lint runs, which
+# surfaced as unfixable pipeline failures on tasks the agent never controlled.
 RUN python -m pip install --no-cache-dir \
     flake8==6.0.0 \
+    pycodestyle==2.10.0 \
+    pyflakes==3.0.1 \
+    mccabe==0.7.0 \
     mypy==1.8.0 \
     bandit==1.9.4 \
     pytest==7.4.0 \

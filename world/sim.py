@@ -3428,7 +3428,7 @@ def add_backlog_item(state, title, feature_id, created_by, now_ms,
     item = {
         'id': bid,
         'title': title,
-        'type': 'spike' if item_type == 'spike' else 'story',
+        'type': item_type if item_type in ('spike', 'research') else 'story',
         'featureId': feature_id or None,
         'status': 'blocked' if blocked_by else 'ready',  # ready / blocked / picked
         'blockedBy': blocked_by or None,
@@ -3480,7 +3480,7 @@ def _resolve_assignment_room(pick):
     work needs to happen -- realized deterministically by the card's nature: an
     investigation spike goes to the observatory, a deliverable story to the
     press office (real files get written there)."""
-    return 'observatory' if pick.get('taskType') == 'spike' else 'pressoffice'
+    return 'observatory' if pick.get('taskType') in ('spike', 'research') else 'pressoffice'
 
 
 def _pull_backlog_for_team(state, team_id, now_ms):
@@ -3494,6 +3494,7 @@ def _pull_backlog_for_team(state, team_id, now_ms):
     if not item:
         return None
     is_spike = item.get('type') == 'spike'
+    is_research = item.get('type') == 'research'
     instructions = item.get('instructions')
     if not instructions:
         instructions = (f"({item.get('storyKey') or item['id']}) {item.get('title')}")
@@ -3507,8 +3508,10 @@ def _pull_backlog_for_team(state, team_id, now_ms):
         'instructions': instructions,
         'goal': item.get('goal'),
         'teamId': team_id,
-        'taskType': 'spike' if is_spike else 'code',
-        'budgetMs': 60_000 if is_spike else None,
+        'taskType': ('spike' if is_spike else ('research' if is_research else 'code')),
+        # Both investigation-class lanes (spike and research) get the same
+        # short time-box: neither has a committed deliverable to ship.
+        'budgetMs': 60_000 if (is_spike or is_research) else None,
         # A breakdown story's size estimate survives the shared backlog onto the
         # pulled card (same contract as _resolve_breakdown's direct queue path).
         'sizeEstimate': item.get('sizeEstimate'),
@@ -5283,7 +5286,7 @@ _TAIL_GROWTH_PLANS_APPLIED = 50
 # with no committed deliverable; a BUG is incident response on a live product
 # (see the on-call phase). Neither ships a peer-reviewed story -- both land a
 # short artifact instead.
-NON_GATED_LANES = frozenset({'spike', 'bug'})
+NON_GATED_LANES = frozenset({'spike', 'bug', 'research'})
 
 
 def _peer_gated_lane(task):
@@ -7947,7 +7950,7 @@ def _queue_player_email(state, kind, subject, body_text, now_ms=None):
 
 _CARD_TYPE_LABELS = {
     'story': 'STORY', 'spike': 'SPIKE', 'bug': 'BUG', 'task': 'TASK',
-    'code': 'STORY', 'review': 'REVIEW', 'qa': 'QA',
+    'code': 'STORY', 'review': 'REVIEW', 'qa': 'QA', 'research': 'RESEARCH',
 }
 
 
@@ -8862,10 +8865,11 @@ def _maybe_file_followup(state, agent_id, completed_task, now_ms):
     a = (state.get('agents') or {}).get(agent_id)
     if not a or a.get('offDuty') or a.get('busy') or a.get('task'):
         return
-    if (completed_task.get('taskType') or 'code') in ('spike', 'bug', 'review'):
-        # spike/bug already IS the incident response; a review is meta-process
-        # work, not a fresh deliverable -- none of them should propose the next
-        # story (that's the recursion: 'Follow-up ... after completing Review:
+    if (completed_task.get('taskType') or 'code') in ('spike', 'bug', 'review', 'research'):
+        # spike/bug/research already IS the investigation itself (incident
+        # response or open-ended question); a review is meta-process work, not
+        # a fresh deliverable -- none of them should propose the next story
+        # (that's the recursion: 'Follow-up ... after completing Review:
         # Follow-up ...' cards grew indefinitely).
         return
     # A follow-up to a follow-up: a completed card that was ITSELF a follow-up
@@ -9582,12 +9586,14 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             "requires -- at least one, never a fixed count: a small ask may be a single card, a sprawling one may need many. "
             "Do NOT assign a room to a card -- the buildings are shared and the agent who picks the work up figures out "
             "where it needs to happen. Keep every title to ONE short sentence. For each card set \"type\" to "
-            "\"story\" (deliverable work) or \"spike\" (an investigation with no committed deliverable), "
+            "\"story\" (deliverable work), \"spike\" (an investigation with no committed deliverable), or "
+            "\"research\" (a fact-gathering/analysis sweep that produces findings, not a shipped deliverable -- "
+            "document studies, competitive teardown, desk research), "
             "a one-line \"acceptanceCriteria\" when the story has a clear test of done, a \"never\" list "
             "ONLY when the card has hard prohibitions the worker must never do (omit otherwise), and a "
             "\"sizeEstimate\" of S/M/L. "
             "Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: "
-            '{"items":[{"title":"short title","type":"story|spike","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L",' + budget_field + '}]}'
+            '{"items":[{"title":"short title","type":"story|spike|research","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L",' + budget_field + '}]}'
         )
         data = decider(state, instructions, goal)
         items = []
@@ -9600,7 +9606,14 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             items = [{'title': goal[:120], 'type': 'story'}]
         for s in items:
             title = (s.get('title') or '').strip()[:120]
-            task_type = 'spike' if (s.get('type') or 'story').strip().lower() == 'spike' else 'code'
+            # Preserve the model's investigation-class type ('spike' or
+            # 'research'); a story (or anything unrecognized) becomes 'code'.
+            # Without this, a research card was silently rewritten to
+            # taskType='code' and got routed into the press-office code
+            # pipeline (Jev block + flake8/mypy/pytest) on pure prose -- the
+            # exact failure class that stranded the StealthX research cards.
+            raw_type = (s.get('type') or 'story').strip().lower()
+            task_type = raw_type if raw_type in ('spike', 'research') else 'code'
             ac = (s.get('acceptanceCriteria') or '').strip()
             never = normalize_never_block(s.get('never'))
             instructions_text = (f"Filed by {req.get('filedBy')} during a large-request breakdown by "

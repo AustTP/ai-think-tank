@@ -672,6 +672,11 @@ class ObservatoriesAndDispatcher(_ExecutorTestCase):
             ({'id': 'x7', 'room': 'pressoffice'}, '_run_workroom_content'),
             ({'id': 'x8', 'room': 'observatory'}, '_run_observatory_content'),
             ({'id': 'x9', 'room': 'library'}, None),
+            # A research card is assigned room=observatory (taskType is NOT in
+            # the task_type_executors map), so it routes through the room path
+            # into _run_observatory_content, whose bare branch runs research.
+            ({'id': 'x11', 'taskType': 'research', 'room': 'observatory'},
+             '_run_observatory_content'),
         ]:
             with mock.patch.object(content, '_run_spike_content') as spike, \
                  mock.patch.object(content, '_run_review_content') as review, \

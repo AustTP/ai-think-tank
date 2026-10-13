@@ -413,8 +413,9 @@ class CodingContentBranches(unittest.TestCase):
                 'agents': {'cora': {'name': 'Cora'}}}
 
     def _run(self, chat_replies, exec_response=None, pipeline_response=None,
-             coding_tier='tier', colab_available=False):
+             coding_tier='tier', colab_available=False, task=None):
         seen = {}
+        pipeline_calls = []
         patcher = mock.patch('sim._store_content_result',
                              lambda task_id, result: seen.__setitem__(task_id, result))
         patcher.start()
@@ -437,47 +438,49 @@ class CodingContentBranches(unittest.TestCase):
                                                                         'exitCode': 0,
                                                                         'timedOut': False}
             if path == '/api/pipeline':
+                pipeline_calls.append(body)
                 return pipeline_response if pipeline_response is not None else {
                     'ok': True, 'failedStep': None, 'results': [],
                     'note': 'quality pipeline all green'}
             return {'ok': True}
         mock.patch.object(serve, '_http_json', side_effect=side_effect).start()
         self.addCleanup(mock.patch.stopall)
-        task = {'id': 'c1', 'title': 'Build the thing', 'projectLabel': 'Proj'}
+        if task is None:
+            task = {'id': 'c1', 'title': 'Build the thing', 'projectLabel': 'Proj'}
         result = content._run_coding_content(self._snapshot(), 'cora', task)
-        return result, seen.get('c1', {})
+        return result, seen.get(task.get('id', 'c1'), {}), pipeline_calls
 
     def test_no_coding_tier(self):
-        result, note = self._run([], coding_tier=None)
+        result, note, _ = self._run([], coding_tier=None)
         self.assertFalse(result)
         self.assertIn('no coding model tier', note['note'])
 
     def test_model_call_failed(self):
         # Two failed replies: the first triggers an infra retry, the second
         # is the final failure (tagged infra=True so sim.py skips coaching).
-        result, note = self._run([{'reply': ''}, {'reply': ''}])
+        result, note, _ = self._run([{'reply': ''}, {'reply': ''}])
         self.assertFalse(result)
         self.assertIn('model call failed', note['note'])
         self.assertTrue(note.get('infra'), 'final model-call failure must be tagged infra')
 
     def test_model_call_retry_succeeds(self):
         # First call fails (infra retry), second succeeds -- the task proceeds.
-        result, note = self._run([{'reply': ''},
+        result, note, _ = self._run([{'reply': ''},
                                   {'reply': 'cat > a.js << \'EOF\'\nok\nEOF'}])
         self.assertTrue(result, 'a transient model-call failure must be retried, not fatal')
 
     def test_empty_command(self):
-        result, note = self._run([{'reply': '   ```bash```  '}])
+        result, note, _ = self._run([{'reply': '   ```bash```  '}])
         self.assertFalse(result)
         self.assertIn('empty command', note['note'])
 
     def test_unbalanced_heredoc_exhausts_continuations(self):
-        result, note = self._run([{'reply': 'cat > a.js << EOF\nopen'}] * 3)
+        result, note, _ = self._run([{'reply': 'cat > a.js << EOF\nopen'}] * 3)
         self.assertFalse(result)
         self.assertIn('truncated after', note['note'])
 
     def test_continuation_completes_balanced_heredoc(self):
-        result, note = self._run([
+        result, note, _ = self._run([
             {'reply': 'cat > a.js << EOF\npart one'},
             {'reply': 'part two\nEOF'},
         ])
@@ -487,7 +490,7 @@ class CodingContentBranches(unittest.TestCase):
     def test_probe_rounds_then_final_command(self):
         # A probeRequest reply is fed page-probe feedback (not a command), and
         # after the round cap the model is told to write the final command.
-        result, note = self._run([
+        result, note, _ = self._run([
             {'reply': '{"probeRequest": {"path": "index.html", "actions": [{"type": "click", "selector": "text=Play"}], "probes": ["typeof window.G"]}}'},
             {'reply': '{"probeRequest": {"path": "index.html", "actions": [], "probes": []}}'},
             {'reply': '{"probeRequest": {"path": "index.html", "actions": [], "probes": ["document.title"]}}'},
@@ -567,13 +570,13 @@ class CodingContentBranches(unittest.TestCase):
         self.assertIn('failed', seen['c5']['note'])
 
     def test_execute_blocked(self):
-        result, note = self._run([{'reply': 'cat > a.js << EOF\nx\nEOF'}],
+        result, note, _ = self._run([{'reply': 'cat > a.js << EOF\nx\nEOF'}],
                                  exec_response={'allowed': False, 'reason': 'denied'})
         self.assertFalse(result)
         self.assertIn('blocked', note['note'])
 
     def test_execute_nonzero_exit(self):
-        result, note = self._run([{'reply': 'cat > a.js << EOF\nx\nEOF'}],
+        result, note, _ = self._run([{'reply': 'cat > a.js << EOF\nx\nEOF'}],
                                  exec_response={'allowed': True, 'exitCode': 2, 'timedOut': False})
         self.assertFalse(result)
         self.assertIn('non-zero', note['note'])
@@ -633,6 +636,18 @@ class CodingContentBranches(unittest.TestCase):
         result = content._run_coding_content(self._snapshot(), 'cora', task)
         self.assertFalse(result)
         self.assertIn('FAILED at flake8', seen['c3']['note'])
+
+    def test_non_code_lane_skips_quality_pipeline(self):
+        # Fix 3: a research/story card that reaches the coding executor must
+        # skip the real pipeline (flake8 would fail on prose) and still finish
+        # ok; the note says so instead of claiming the pipeline is green.
+        result, note, pipeline_calls = self._run(
+            [{'reply': 'cat > a.js << \'EOF\'\nok\nEOF'}],
+            task={'id': 'r1', 'title': 'Summarize findings',
+                  'taskType': 'research', 'projectLabel': 'Proj'})
+        self.assertTrue(result)
+        self.assertEqual(pipeline_calls, [])
+        self.assertIn('quality pipeline skipped (non-code lane)', note['note'])
 
 
 class ReviewChecklistBranches(unittest.TestCase):
