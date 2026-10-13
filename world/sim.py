@@ -1921,6 +1921,12 @@ def _apply_content_result(state, task, result, now_ms=None):
     note = result.get('note')
     if note:
         task['note'] = note
+    # Infrastructure-failure tag: a model-call/API failure (not the agent's
+    # quality) rides the content result channel so _send_back_after_failure
+    # can distinguish it -- no coaching note, no "failed the quality
+    # pipeline" wording, no grade penalty (see leo's round-3 review).
+    if result.get('infra'):
+        task['_infraFailure'] = True
     # Gap: a spike's FULL findings only ever
     # lived in the Library file -- task.note is deliberately kept lean (a
     # short pointer, "see the Library entry just filed"), by design (see the
@@ -5538,11 +5544,14 @@ def _sim_notify_author(state, parent, reviewer_id, rationale=None):
     author = parent.get('assignedTo')
     if not author:
         return
+    _gate = parent.get('_peerGate') or {}
+    _cycle = _gate.get('cycleCount', 0)
+    _cycle_note = f' (rejection {_cycle} of {MAX_REVIEW_CYCLES})' if _cycle else ''
     _upsert_rejection_mailbox((state.get('agents') or {}).get(author, {}), {
         'kind': 'peer_review_rejected',
         'about': parent.get('id'),
         'title': parent.get('title'),
-        'text': f'A reviewer{(" (" + reviewer_id + ")") if reviewer_id else ""} sent your work on "{parent.get("title")}" back -- it needs a fix before it can close. Fix it and it will be reviewed again.'})
+        'text': f'A reviewer{(" (" + reviewer_id + ")") if reviewer_id else ""} sent your work on "{parent.get("title")}" back{_cycle_note} -- it needs a fix before it can close. Fix it and it will be reviewed again.'})
     # W6: a denial is actionable coaching, not just a message. The reviewer's
     # rationale (the review subtask's note) is carried onto the author's next
     # task so the fix starts from the actual problem raised.
@@ -5563,26 +5572,41 @@ def _sim_notify_author(state, parent, reviewer_id, rationale=None):
                      source='peer_review')
 
 
-def _sim_notify_author_failed(state, task):
+def _sim_notify_author_failed(state, task, cycle=None, is_infra=False):
     """Fail-closed send-back signal: tell the author their deliverable was sent
     back because it FAILED the quality pipeline (a red flake8/mypy/bandit/
     pytest-cov run -- see content.py's coding executor), and a fix is queued
-    back to them. Mirrors _sim_notify_author's mailbox shape."""
+    back to them. Mirrors _sim_notify_author's mailbox shape.
+
+    `cycle` (when given) stamps "rejection N of MAX_REVIEW_CYCLES" on the
+    notice so the agent can tell a first rejection from a fifth without
+    counting copies. `is_infra` switches the wording: an infrastructure
+    failure is not the agent's quality, and the notice must say so."""
     author = task.get('assignedTo')
     if not author:
         return
+    cycle_note = f' (rejection {cycle} of {MAX_REVIEW_CYCLES})' if cycle else ''
+    if is_infra:
+        text = (f'Your work on "{task.get("title")}" hit an infrastructure '
+                f'failure{cycle_note} -- not a quality problem with your code. '
+                f'It will be retried automatically.')
+    else:
+        text = (f'Your work on "{task.get("title")}" failed the quality pipeline'
+                f'{cycle_note} and was sent back -- it needs a fix before it can '
+                f'be reviewed. Fix it and it will be reviewed again.')
     _upsert_rejection_mailbox((state.get('agents') or {}).get(author, {}), {
         'kind': 'peer_review_rejected',
         'about': task.get('id'),
         'title': task.get('title'),
-        'text': f'Your work on "{task.get("title")}" failed the quality pipeline and was sent back -- it needs a fix before it can be reviewed. Fix it and it will be reviewed again.'})
+        'text': text})
     # Item 2: the pipeline failure also lands in the author's feedback buffer, so
     # the next dispatch's perception block names the failing task.
-    _append_feedback(state, author,
-                     f"Your deliverable '{task.get('title')}' failed the quality "
-                     f"pipeline and was sent back. It will be reviewed again after "
-                     f"you fix it.",
-                     source='pipeline')
+    if not is_infra:
+        _append_feedback(state, author,
+                         f"Your deliverable '{task.get('title')}' failed the quality "
+                         f"pipeline and was sent back. It will be reviewed again after "
+                         f"you fix it.",
+                         source='pipeline')
 
 
 def _log_quality_gate_reject(state, task, note, escalated):
@@ -5614,38 +5638,53 @@ def _send_back_after_failure(state, task, fail_note=None):
     escalates (create_escalation) and stays frozen -- no further fix cycling.
     Pure state mutation; called from _task_cycle's content-result branch. The
     prior gate (if any) is kept so _maybe_escalate_stuck_gate's shared cap and
-    _enter_peer_review's carry-over both see it."""
+    _enter_peer_review's carry-over both see it.
+
+    Infra failures (`task['_infraFailure']`, a model-call/API fault, not the
+    agent's quality) get different treatment: no coaching note (there is
+    nothing the agent could have done differently), different mailbox wording,
+    and the failure note says infrastructure, not quality pipeline."""
     author = task.get('assignedTo')
     note = (fail_note or task.get('note') or 'the pipeline did not pass').strip()
-    _sim_notify_author_failed(state, task)
+    is_infra = bool(task.get('_infraFailure'))
+    # Cycle counter for the mailbox notice: "rejection N of MAX" so the agent
+    # can tell a first rejection from a fifth without counting copies.
+    if not task.get('_peerGate'):
+        task['_peerGate'] = {'approvals': 0, 'approvers': [],
+                             'reviewerIds': [], 'enteredMs': 0}
+    gate = task['_peerGate']
+    _sim_notify_author_failed(state, task, cycle=gate.get('cycleCount', 0) + 1,
+                              is_infra=is_infra)
     # Feedback injection (brunnfeld): a concrete failure reason must change the
     # author's NEXT execution, not just land as a mailbox message. Same W6
     # pattern as peer-review denial (_sim_notify_author): the pipeline failure
     # reason is routed through the growth-plan loop so it is injected once into
     # the author's next task via _coaching_note_for/_augment_task_instructions.
-    if author:
+    # SKIPPED for infra failures: a model-call fault is not coaching material --
+    # there is nothing the agent should change (leo's round-3 review).
+    if author and not is_infra:
         _write_growth_plan(
             state, author, task.get('room') or 'pressoffice',
             'pipeline_feedback', int(time.time() * 1000),
             f"Your deliverable '{task.get('title')}' failed the quality pipeline. "
             f"What failed: {(note or '')[:400]}. Address this on your next pass.",
             repeat=True)
-    if not task.get('_peerGate'):
-        # Seed a real (empty) gate: _resolve_review_parent requires a truthy
-        # _peerGate to resolve a later fix's completion, and the cycle cap needs
-        # somewhere to count.
-        task['_peerGate'] = {'approvals': 0, 'approvers': [],
-                             'reviewerIds': [], 'enteredMs': 0}
-    gate = task['_peerGate']
     task['status'] = 'failed'
     task['failedAt'] = int(time.time() * 1000)
     task['failNote'] = note[:300]
-    escalated = _maybe_escalate_stuck_gate(state, task, gate, 'quality pipeline keeps failing')
+    escalated = _maybe_escalate_stuck_gate(state, task, gate,
+                                           'infrastructure failure keeps happening' if is_infra
+                                           else 'quality pipeline keeps failing')
     _log_quality_gate_reject(state, task, note, escalated=escalated)
     if escalated:
         return  # auto-closed after cycle cap -- no further fix cycling
-    instructions = (f"Your work on '{task.get('title')}' failed the quality pipeline: "
-                    f"{note}. Fix it so the pipeline passes clean, then it will be re-reviewed.")
+    if is_infra:
+        instructions = (f"Your work on '{task.get('title')}' hit an infrastructure "
+                        f"failure (not your code): {note}. The same task is being "
+                        f"retried -- no change to your approach is needed.")
+    else:
+        instructions = (f"Your work on '{task.get('title')}' failed the quality pipeline: "
+                        f"{note}. Fix it so the pipeline passes clean, then it will be re-reviewed.")
     if task.get('userStory'):
         instructions += f"\n\nUser story: {task['userStory']}"
     if task.get('acceptanceCriteria'):

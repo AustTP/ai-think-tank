@@ -1065,6 +1065,55 @@ class SimAgentPerception(unittest.TestCase):
         self.assertEqual(len(low), 1)
         self.assertNotIn('Acceptance criteria', low[0]['note'])
 
+    def test_send_back_after_failure_stamps_cycle_count(self):
+        # Agents reported "sent back" reading the same on cycle 1 and cycle 5.
+        # The mailbox notice now carries "rejection N of MAX" so the agent can
+        # tell them apart without counting copies.
+        state = self._state()
+        task = {'id': 'task-1', 'title': 'Build thing', 'assignedTo': 'ada',
+                'room': 'pressoffice', 'status': 'working'}
+        sim._send_back_after_failure(state, task, fail_note='flake8 failed')
+        mailbox = state['agents']['ada']['mailbox']
+        self.assertEqual(len(mailbox), 1)
+        self.assertIn('rejection 1 of', mailbox[0]['text'])
+        # Second failure bumps the gate cycle counter.
+        task2 = {'id': 'task-1', 'title': 'Build thing', 'assignedTo': 'ada',
+                 'room': 'pressoffice', 'status': 'working',
+                 '_peerGate': task['_peerGate']}
+        sim._send_back_after_failure(state, task2, fail_note='flake8 failed again')
+        # The upsert updates the unread entry in place (same kind + about).
+        mailbox = state['agents']['ada']['mailbox']
+        self.assertEqual(len(mailbox), 1)
+        self.assertIn('rejection 2 of', mailbox[0]['text'])
+
+    def test_send_back_infra_failure_skips_coaching(self):
+        # An infrastructure failure (model-call fault) is not the agent's
+        # quality -- no coaching note is written, and the mailbox wording
+        # says infrastructure, not quality pipeline.
+        state = self._state()
+        task = {'id': 'task-1', 'title': 'Build thing', 'assignedTo': 'ada',
+                'room': 'pressoffice', 'status': 'working',
+                '_infraFailure': True,
+                'note': 'the model call failed or returned nothing (infrastructure error, retried once)'}
+        sim._send_back_after_failure(state, task)
+        plans = state.get('growthPlans', {}).get('ada') or []
+        pipeline_plans = [p for p in plans if p.get('kind') == 'pipeline_feedback']
+        self.assertEqual(len(pipeline_plans), 0,
+                         'infra failures must not write a pipeline coaching note')
+        mailbox = state['agents']['ada']['mailbox']
+        self.assertEqual(len(mailbox), 1)
+        self.assertIn('infrastructure', mailbox[0]['text'].lower())
+        self.assertNotIn('quality pipeline', mailbox[0]['text'])
+        # No pipeline feedback entry in the feedback buffer either.
+        fb = state.get('_feedback', {}).get('ada') or []
+        pipeline_fb = [f for f in fb if f.get('source') == 'pipeline']
+        self.assertEqual(len(pipeline_fb), 0)
+
+    def test_team_overview_tool_is_offered(self):
+        # Theo's round-3 request: a combined status+digest+allowlist view.
+        tool_names = {t['function']['name'] for t in serve.AGENT_ASK_TOOLS}
+        self.assertIn('team_overview', tool_names)
+
 
     def test_apply_content_result_consumes_executor_feedback(self):
         # Item 2: an executor-reported block/failure rides the content result

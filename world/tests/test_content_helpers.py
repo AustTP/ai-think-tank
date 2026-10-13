@@ -453,9 +453,18 @@ class CodingContentBranches(unittest.TestCase):
         self.assertIn('no coding model tier', note['note'])
 
     def test_model_call_failed(self):
-        result, note = self._run([{'reply': ''}])
+        # Two failed replies: the first triggers an infra retry, the second
+        # is the final failure (tagged infra=True so sim.py skips coaching).
+        result, note = self._run([{'reply': ''}, {'reply': ''}])
         self.assertFalse(result)
         self.assertIn('model call failed', note['note'])
+        self.assertTrue(note.get('infra'), 'final model-call failure must be tagged infra')
+
+    def test_model_call_retry_succeeds(self):
+        # First call fails (infra retry), second succeeds -- the task proceeds.
+        result, note = self._run([{'reply': ''},
+                                  {'reply': 'cat > a.js << \'EOF\'\nok\nEOF'}])
+        self.assertTrue(result, 'a transient model-call failure must be retried, not fatal')
 
     def test_empty_command(self):
         result, note = self._run([{'reply': '   ```bash```  '}])

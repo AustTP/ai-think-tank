@@ -31,6 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import serve  # noqa: E402  (sys.path insert above is the repo test convention)
 import sim  # noqa: E402
+import content  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +226,34 @@ class RunQualityPipeline(unittest.TestCase):
         self.assertIn('all green', result['note'])
         # The steps are the standard quality pipeline, run via /api/pipeline.
         self.assertEqual([s['name'] for s in called['body']['steps']], _step_names())
+
+    def test_scoped_pipeline_scopes_flake8_mypy_bandit_to_touched_files(self):
+        # A README-only or single-file change must not fail on pre-existing
+        # findings elsewhere in the sandbox. When scope_files is given,
+        # flake8/mypy/bandit are scoped to those exact files; pytest-cov
+        # still runs project-wide.
+        resp = {'sandboxId': 'workroom-shared', 'failedStep': None,
+                'results': [{'name': n, 'exitCode': 0} for n in
+                            ('flake8', 'mypy', 'bandit', 'pytest-cov')]}
+        with unittest.mock.patch.object(serve, '_http_json',
+                                        lambda *a, **k: resp) as fake:
+            serve._run_quality_pipeline('http://base', 'key', 'ada', 'shared', 'gate',
+                                        scope_files=['app.py', 'utils.py'])
+        # The fake doesn't capture the body; call the step builder directly.
+        steps = content._quality_pipeline_steps(['app.py', 'utils.py'])
+        flake8_cmd = next(s['command'] for s in steps if s['name'] == 'flake8')
+        self.assertIn('app.py', flake8_cmd)
+        self.assertIn('utils.py', flake8_cmd)
+        self.assertNotIn(' .', flake8_cmd)  # not whole-sandbox
+        bandit_cmd = next(s['command'] for s in steps if s['name'] == 'bandit')
+        self.assertIn('-f app.py', bandit_cmd)
+        pytest_cmd = next(s['command'] for s in steps if s['name'] == 'pytest-cov')
+        self.assertIn('--cov=.', pytest_cmd)  # coverage stays project-wide
+
+    def test_unscoped_pipeline_runs_on_whole_sandbox(self):
+        steps = content._quality_pipeline_steps(None)
+        flake8_cmd = next(s['command'] for s in steps if s['name'] == 'flake8')
+        self.assertIn('flake8 .', flake8_cmd)
 
     def test_red_pipeline_reports_failing_step_and_snippet(self):
         resp = {'sandboxId': 'workroom-shared', 'failedStep': 'flake8',
