@@ -1623,6 +1623,16 @@ TASK_WORK_DURATION_S = 8.0
 # completion loop gives up on the content and finalizes the fallback.
 TASK_CONTENT_TIMEOUT_S = 120.0
 
+# A content task may carry its OWN work budget (queue_spike's budgetMs is
+# documented as "a hard budgetMs for the work cycle"), but _dispatch_content_work
+# used to flatten every task to the generic 120s regardless -- so a 5-minute
+# assembly spike kept getting cut mid-synthesis and closed with an empty report
+# (task-331: reads finished, generation sliced at 120s, no note, no file).
+# Dispatch now honors a LARGER per-task budgetMs, capped here so a typo'd or
+# hostile budget cannot pin an agent for hours. Executors may still widen
+# further from inside (the review/spike +300 pattern) -- this is the floor.
+TASK_CONTENT_TIMEOUT_MAX_S = 600.0
+
 # Server task-loop cadence -- mirrors the browser's runTaskCycle setInterval
 # (index.html, 6s). Distinct from the movement tick (SIM_TICK_S=2).
 TASK_CYCLE_S = 6.0
@@ -2157,8 +2167,13 @@ def _dispatch_content_work(executor, state, agent_id, task, now):
     if not task_id or not executor:
         return False
     # Give the content run a generous ceiling; mark the task so the completion
-    # loop knows real work is in flight (not just the placeholder).
-    task['workUntil'] = now + TASK_CONTENT_TIMEOUT_S
+    # loop knows real work is in flight (not just the placeholder). The task's
+    # OWN budgetMs (when larger) wins up to the cap -- a player-authored spike
+    # asking for a 5-minute work box must not be silently flattened to 120s and
+    # cut mid-synthesis (see TASK_CONTENT_TIMEOUT_MAX_S).
+    budget_s = (float(task.get('budgetMs') or 0)) / 1000.0
+    ceiling = min(max(TASK_CONTENT_TIMEOUT_S, budget_s), TASK_CONTENT_TIMEOUT_MAX_S)
+    task['workUntil'] = now + ceiling
     task['_contentInFlight'] = True
     snapshot = json.loads(json.dumps(state))
     # Item 1: situational awareness. Build the perception block here, on the
