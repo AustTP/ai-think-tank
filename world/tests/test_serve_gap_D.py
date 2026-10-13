@@ -1987,6 +1987,9 @@ class TeamDigestText(unittest.TestCase):
         def fetchone(self):
             return self.row
 
+        def fetchall(self):
+            return self.row if isinstance(self.row, list) else []
+
     class _Conn:
         def __init__(self, review_row, tape_row):
             self.review_row = review_row
@@ -1995,6 +1998,8 @@ class TeamDigestText(unittest.TestCase):
         def execute(self, sql, *args):
             if "weekly_reviews" in sql:
                 return TeamDigestText._Cursor(self.review_row)
+            if "action_log" in sql:
+                return TeamDigestText._Cursor([])  # no actions -> empty fallback
             return TeamDigestText._Cursor(self.tape_row)
 
     def _patched_db(self, review_row, tape_row):
@@ -2006,7 +2011,9 @@ class TeamDigestText(unittest.TestCase):
     def test_no_review_row(self):
         with self._patched_db(None, (3, 2)):
             out = serve._team_digest_text()
-        self.assertIn("No weekly review has been generated yet", out)
+        # No weekly review yet -> live fallback from the action log, not a
+        # bare "none yet" (agents asked for shipped-work data, not a wall).
+        self.assertIn("Live summary from the action log", out)
         self.assertIn("Live signal (last 24h): 3 Jev decisions logged, 2 ok.", out)
 
     def test_empty_markdown(self):
