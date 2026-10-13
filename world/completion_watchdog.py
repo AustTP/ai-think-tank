@@ -38,6 +38,26 @@ def step(state, now_ms=None):
             continue
         children, queued = related(state, task)
         active = [t for t in children if t.get('status') in ACTIVE]
+        if task.get('investigationOf') and status in ('repairing', 'investigating') and not active and not queued:
+            completed_repairs = [t for t in children if (t.get('reviewOf') == task['id'] or t.get('investigationOf') == task['id'])
+                                 and t.get('status') == 'done' and t.get('libraryPath')
+                                 and t.get('taskType') not in ('review', 'qa')]
+            if completed_repairs:
+                latest = max(completed_repairs, key=lambda t: t.get('createdAt') or 0)
+                task.update(status='done', libraryPath=latest['libraryPath'],
+                            deliveryState='completed', manualAttention=False,
+                            note='Investigation follow-up completed; saved report still does not approve the original deliverable.')
+                continue
+            replacements = [t for t in (state.get('tasks') or {}).values()
+                            if t.get('investigationOf') == task['investigationOf']
+                            and t.get('status') == 'done' and t.get('libraryPath')
+                            and (t.get('createdAt') or 0) > (task.get('createdAt') or 0)]
+            if replacements:
+                latest = max(replacements, key=lambda t: t.get('createdAt') or 0)
+                task.update(status='cancelled', supersededBy=latest['id'],
+                            deliveryState='superseded', manualAttention=False,
+                            note='Superseded by completed investigation ' + latest['id'] + '; original story still requires review.')
+                continue
         signature = (status, task.get('libraryPath'), tuple((t['id'], t.get('status')) for t in children), len(queued))
         stamp = repr(signature)
         if task.get('_completionSignature') != stamp:
@@ -95,6 +115,9 @@ def step(state, now_ms=None):
             task['_peerGate'] = {'escalated': False}
         if kind in ('invalid_response', 'service_unavailable') or 'review validation failed' in failure:
             gate = task.setdefault('_peerGate', {})
+            if gate.get('formatFailures', 0) >= 3:
+                block(task, 'Review response formatting failed three times. Fix the review service and explicitly retry review; another investigation is not new validation evidence.')
+                continue
             gate.update(formatFailures=0, serviceFailures=0, inputFailures=0)
             task.update(status='needs_review', reviewFailureKind=kind or 'invalid_response')
             sim._enter_peer_review(state, task, now)

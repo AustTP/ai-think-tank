@@ -1,0 +1,3 @@
+url,required_parameters,constraints
+https://api.coinbase.com/v2/orders-product-service-status,product_id=None,None
+https://api.coinbase.com/v2/orders,product_id=None,None

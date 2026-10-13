@@ -21,7 +21,7 @@ def classify(text):
     return 'functional', 'repair_functionality'
 
 
-def record(state, task, text):
+def record(state, task, text, review_rejection=False):
     root = story_tracking.root(state, task) if state else task
     ledger = root.setdefault('recoveryLedger', {'attempts': 0, 'noProgress': 0, 'history': []})
     progress = hashlib.sha256(json.dumps([
@@ -31,11 +31,14 @@ def record(state, task, text):
     ledger['progress'] = progress
     ledger['attempts'] += 1
     category, action = classify(text)
+    if review_rejection and category == 'missing_inputs' and not any(
+            word in str(text).lower() for word in ('credentials', 'not configured', 'missing human decision', 'missing input')):
+        category, action = 'functional', 'repair_functionality'
     ledger['history'].append({'at': int(time.time()*1000), 'taskId': task.get('id'),
                              'category': category, 'action': action, 'failure': str(text or '')[:1000]})
     root['failureCategory'] = category
     root['recommendedRecoveryAction'] = action
-    stopped = ledger['noProgress'] >= 2 or ledger['attempts'] >= ledger.get('attemptLimit', 4) or category in ('policy', 'budget', 'infrastructure', 'missing_inputs')
+    stopped = (ledger['noProgress'] >= 2 and not review_rejection) or ledger['attempts'] >= ledger.get('attemptLimit', 4) or category in ('policy', 'budget', 'infrastructure', 'missing_inputs')
     if stopped:
         root.update(manualAttention=True, status='blocked', blockedReason='story_recovery_limit',
                     failNote=str(text or '')[:4000],

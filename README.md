@@ -11,6 +11,43 @@ See `DESIGN.md` for the full architecture documentation.
 
 ## Running it
 
+### Local active-work model
+
+Future training interactions can be recorded locally, with actual prompts,
+responses, tool evidence and task outcomes. See
+[recording and export instructions](datasets/INTERACTION_RECORDING.md).
+
+Active worker completions can use a fine-tuned adapter hosted by Unsloth Studio's
+OpenAI-compatible API. Set these server-side values in the git-ignored `.env`:
+
+```ini
+LOCAL_WORK_MODEL_ENABLED=true
+LOCAL_WORK_MODEL_PATH=C:\Users\Khalil\.unsloth\studio\outputs\unsloth_Qwen3.5-4B_1791825047
+LOCAL_WORK_MODEL_BASE_URL=http://127.0.0.1:8888/v1
+LOCAL_WORK_MODEL_API_KEY=<Studio API key>
+LOCAL_WORK_MODEL_TIMEOUT=120
+LOCAL_WORK_MODEL_MANAGE_STUDIO=true
+```
+
+With `LOCAL_WORK_MODEL_MANAGE_STUDIO=true`, each local call checks the loaded
+model and loads the adapter in 4-bit mode with an 8,192-token context if another
+model is resident. Studio must be running, and the API key must permit loading.
+This can switch Studio's active model while the think tank is working. The
+adapter's base weights must be available locally. The path is a LoRA adapter, not standalone
+base weights. Reviewers, the Code Director, review/QA/audit/validation tasks,
+repairs, recovery investigations and coding correction rounds retain their
+existing configured models. Policy decisions also retain their existing model.
+
+Each eligible agent gets a stable, distinct seed derived from its ID. Sampling
+uses temperature 0.6; a seed is best-effort reproducibility, not a separate
+personality or guarantee of identical GPU outputs. Local calls are serialized
+to share one GPU, have zero provider cost, and record model/provider/seed in the
+action log. Existing auth and task budget controls still apply. Local inference
+failures surface without silently switching that call to a paid model. Setting
+`LOCAL_WORK_MODEL_ENABLED=false` restores normal model routing. Restart the
+think-tank server after installing code changes; `.env` routing settings are
+read on each call. Keep Studio running.
+
 Build the agent execution sandbox once (with Docker running):
 
 ```powershell

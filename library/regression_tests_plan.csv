@@ -1,0 +1,5 @@
+strategy_name,test_case_description,expected_result,status
+Long/Short,Test with 50-day MA and 200-day MA in a trending market,Strategy enters long position,Estimated
+Mean Reversion,Test with standard deviation of 1 in a ranging market,Strategy enters long position,Estimated
+Arbitrage,Test with two correlated assets in a normal market,Strategy enters long position in the undervalued asset,Estimated
+...,...,...,...

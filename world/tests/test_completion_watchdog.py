@@ -21,6 +21,25 @@ def seed(status='recovery_planned'):
 
 
 class CompletionWatchdog(unittest.TestCase):
+    def test_completed_investigation_repair_closes_only_investigation(self):
+        state = seed('needs_review')
+        state['tasks'].update({
+            'i': {'id':'i', 'status':'repairing', 'investigationOf':'p'},
+            'r': {'id':'r', 'status':'done', 'reviewOf':'i', 'taskType':'spike', 'libraryPath':'archive/report.md'}})
+        watchdog.step(state, 100000)
+        self.assertEqual(state['tasks']['i']['status'], 'done')
+        self.assertEqual(state['tasks']['p']['status'], 'needs_review')
+
+    def test_later_saved_investigation_supersedes_stalled_old_one(self):
+        state = seed('needs_review')
+        state['tasks'].update({
+            'i': {'id':'i', 'status':'investigating', 'investigationOf':'p', 'createdAt':1},
+            'n': {'id':'n', 'status':'done', 'investigationOf':'p', 'createdAt':2, 'libraryPath':'archive/new.md'}})
+        watchdog.step(state, 100000)
+        self.assertEqual(state['tasks']['i']['status'], 'cancelled')
+        self.assertEqual(state['tasks']['i']['supersededBy'], 'n')
+        self.assertEqual(state['tasks']['p']['status'], 'needs_review')
+
     def test_plan_queues_original_repair_once_with_backoff(self):
         state = seed()
         watchdog.step(state, 100000)
@@ -83,6 +102,16 @@ class CompletionWatchdog(unittest.TestCase):
         enter.assert_called_once()
         repair.assert_not_called()
         self.assertEqual(state['tasks']['p']['status'], 'needs_review')
+
+    def test_investigation_cannot_reset_exhausted_review_format_failures(self):
+        state = seed()
+        state['tasks']['p'].update(reviewFailureKind='invalid_response', _peerGate={'formatFailures':3})
+        with patch.object(sim, '_enter_peer_review') as enter, patch.object(sim, '_queue_peer_repair') as repair:
+            watchdog.step(state, 100000)
+        enter.assert_not_called()
+        repair.assert_not_called()
+        self.assertEqual(state['tasks']['p']['status'], 'blocked')
+        self.assertEqual(state['tasks']['p']['_peerGate']['formatFailures'], 3)
 
     def test_completion_priority_and_wip_cap(self):
         state = seed('working')

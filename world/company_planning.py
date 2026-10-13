@@ -11,6 +11,28 @@ _POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix='scrum-planner')
 _FUTURES = {}
 
 
+def direction_allowed(state, agent_id):
+    role = str(((state.get('agents') or {}).get(agent_id) or {}).get('role', '')).lower()
+    return 'review' in role or 'scrum master' in role or any(
+        t.get('scrumMasterId') == agent_id for t in state.get('teams') or [])
+
+
+def task_context(state, agent_id, value):
+    """Remove previously embedded company direction from worker context."""
+    if direction_allowed(state, agent_id):
+        return value
+    direction = north_star_context(state)
+    if isinstance(value, str):
+        import re
+        value = value.replace(direction, '') if direction else value
+        return re.sub(r'Company North Star:[^\n]*\nSuccess measures:[^\n]*\nConstraints:[^\n]*', '', value)
+    if isinstance(value, dict):
+        return {k: task_context(state, agent_id, v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [task_context(state, agent_id, v) for v in value]
+    return value
+
+
 def north_star_context(state):
     star = state.get('northStar') or {}
     if not star.get('objective'): return ''
@@ -154,7 +176,7 @@ def release_stories(state, request):
                    if t.get('workOrderId')==request['id'] and t.get('status')=='done'
                    and not any(t.get(k) for k in ('reviewOf','investigationOf','recoveryOf'))}
         if not set(story.get('prerequisiteStoryIds') or []) <= completed: continue
-        instructions=(north_star_context(state)+'\nOverarching player request: '+request.get('reason','')
+        instructions=('Overarching player request: '+request.get('reason','')
             +'\nRelated earlier request context: '+json.dumps(request.get('relatedRequests') or [])
             +'\nParent request completion criteria (context; not requirements for each discovery story): '+str(request.get('acceptanceCriteria') or '')
             +'\nHuman answers: '+json.dumps({q['question']:q.get('answer') for q in plan['questions'] if q.get('answer')})

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Research dataset review</title>
+<style>
+body{font:16px system-ui;background:#f5f7fa;color:#172033;max-width:1050px;margin:30px auto;padding:0 20px}textarea{box-sizing:border-box;width:100%;min-height:140px;padding:12px;font:14px monospace;border:1px solid #bbc4d0;border-radius:6px}#response{min-height:350px}button,select{padding:10px;margin:5px;border-radius:6px;border:1px solid #bbc4d0;background:white}button{cursor:pointer}#flags{color:#9c4212}label{display:block;font-weight:600;margin-top:15px}header{position:sticky;top:0;background:#f5f7fa;padding:10px 0}#notice{font-size:14px;color:#526078}
+</style>
+<h1>Research dataset review</h1>
+<p>Approve only reports that satisfy the task, have checked citations, and are supported by the evidence you supply. Correct incomplete reports or reject them. These are reconstructed task/report pairs, not original model conversations.</p>
+<p id="notice">Progress is saved in this browser when local storage is available. Download regularly to keep a portable copy. Source evidence should include the relevant excerpts, source URL or file, and date; a URL alone is insufficient. Nothing is uploaded.</p>
+<header><button id="previous">Previous</button><select id="picker"></select><button id="next">Next</button><button id="download">Download reviewed.jsonl</button><span id="counts"></span></header>
+<p id="flags"></p><p id="source"></p>
+<label>Task / instructions<textarea id="instruction"></textarea></label>
+<label>Source evidence available when answering<textarea id="evidence" placeholder="Paste verified source excerpts with citations and dates. Do not copy the report itself here."></textarea></label>
+<label>Target report — edit to correct errors<textarea id="response"></textarea></label>
+<label>Review notes<textarea id="review_notes" style="min-height:65px"></textarea></label>
+<label>Status <select id="status"><option value="pending">Pending</option><option value="approved">Approved — checked against evidence</option><option value="rejected">Rejected</option></select></label>
+<script>
+const original=JSON.parse(new TextDecoder().decode(Uint8Array.from(atob('__DATA_BASE64__'),c=>c.charCodeAt(0))));
+let rows=original,index=0;const key='research-review-'+original.map(r=>r.id).join(',');
+try{const saved=JSON.parse(localStorage.getItem(key));if(Array.isArray(saved)&&saved.length===original.length)rows=saved;}catch{}
+const fields=['instruction','evidence','response','review_notes','status'];
+const el=id=>document.getElementById(id);
+function counts(){el('counts').textContent=rows.filter(r=>r.status==='approved').length+' approved / '+rows.length+' candidates';}
+function save(){if(!rows.length)return;for(const f of fields)rows[index][f]=el(f).value;
+if(rows[index].status==='approved'&&!rows[index].evidence.trim()){rows[index].status='pending';el('status').value='pending';alert('Add checked source evidence before approving.');}
+try{localStorage.setItem(key,JSON.stringify(rows));}catch{el('notice').textContent='Browser storage unavailable. Download reviewed.jsonl to preserve edits.';}counts();}
+function show(){if(!rows.length){el('flags').textContent='No candidates found.';return;}const r=rows[index];for(const f of fields)el(f).value=r[f];el('picker').value=String(index);el('flags').textContent='Flags: '+r.flags.join(', ');el('source').textContent=r.id+' | '+r.source_path+' | split group: '+r.group_id;counts();}
+rows.forEach((r,i)=>{const o=document.createElement('option');o.value=i;o.textContent=(i+1)+'. '+r.id;el('picker').append(o);});
+for(const f of fields)el(f).addEventListener('change',save);
+el('previous').onclick=()=>{save();index=Math.max(0,index-1);show();};el('next').onclick=()=>{save();index=Math.min(rows.length-1,index+1);show();};el('picker').onchange=()=>{save();index=Number(el('picker').value);show();};
+el('download').onclick=()=>{save();const url=URL.createObjectURL(new Blob([rows.map(r=>JSON.stringify(r)).join('\n')+'\n'],{type:'application/x-ndjson'}));const a=document.createElement('a');a.href=url;a.download='reviewed.jsonl';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};show();
+</script></html>

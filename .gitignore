@@ -1,5 +1,6 @@
 # Secrets — never commit
 .env
+datasets/local/
 .env_test
 .env.*
 !.env.template

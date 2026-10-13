@@ -555,7 +555,7 @@ class BoundedReviewEscalation(unittest.TestCase):
         parent = {'id': 't1', 'title': 'A story'}
         gate = {}
         with unittest.mock.patch.object(serve, 'create_escalation') as esc:
-            for i in range(1):
+            for i in range(3):
                 frozen = sim._maybe_escalate_stuck_gate(parent, gate, 'test reason')
                 self.assertFalse(frozen, f'must not freeze before the threshold (cycle {i+1})')
             esc.assert_not_called()
@@ -668,10 +668,10 @@ class ReviewDenialCoaching(unittest.TestCase):
         for i in range(3):
             self._reject(state, verdict='actionable', rationale=f'problem {i}')
         notes = self._denial_notes(state)
-        self.assertEqual(len(notes), 1, 'only the first denial can launch another repair')
-        self.assertTrue(task['manualAttention'])
-        self.assertEqual(task['recoveryLedger']['attempts'], 2)
-        self.assertIn('problem 0', notes[0]['note'])
+        self.assertEqual(len(notes), 3, 'each rejection returns actionable coaching')
+        self.assertFalse(task.get('manualAttention', False))
+        self.assertEqual(task['recoveryLedger']['attempts'], 3)
+        self.assertIn('problem 2', notes[-1]['note'])
 
     def test_denial_note_flows_to_the_authors_next_task(self):
         state, task = self._gated_state()

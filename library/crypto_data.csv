@@ -1,0 +1,13 @@
+currency,platform,data_frequency,indicators_available,data_format,api_efficiency,status
+BTC,Coinbase,1min,Realtime,L3 Orderbook,Good,verified
+BTC,Coinbase,1min,Predictions,OHLCV,Good,estimated
+ETH,Coinbase,1min,Realtime,L3 Orderbook,Good,verified
+ETH,Coinbase,1min,Predictions,OHLCV,Good,estimated
+BTC,Binance,1s,Realtime,L3 Orderbook,Excellent,verified
+BTC,Binance,1min,Predictions,OHLCV,Excellent,estimated
+ETH,Binance,1s,Realtime,L3 Orderbook,Excellent,verified
+ETH,Binance,1min,Predictions,OHLCV,Excellent,estimated
+XRP,Coinbase,1min,Realtime,L3 Orderbook,Good,verified
+XRP,Coinbase,1min,Predictions,OHLCV,Good,estimated
+ADA,Coinbase,1min,Realtime,L3 Orderbook,Good,verified
+ADA,Coinbase,1min,Predictions,OHLCV,Good,estimated

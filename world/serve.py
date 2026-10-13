@@ -38,6 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+import training_capture
 
 # Pure web/text/path/security helpers extracted to their own module
 # to shrink the serve.py monolith. See web_helpers.py.
@@ -909,6 +910,7 @@ def save_state_to_db(data):
         sync_agent_directories(data)
     except Exception as e:
         print(f'[agent-dirs] sync failed: {e}')  # best-effort -- a filesystem hiccup shouldn't break autosave
+    training_capture.sync_outcomes(data)
 
 
 def _backfill_task_counter_in_db():
@@ -1243,9 +1245,12 @@ def _write_file(path, content):
 
 
 def _render_agents_md(name, role, profile):
+    import evidence_policy
     lines = [f'# {name} -- {role}', '', '## Mission', '', profile.get('mission', ''), '', '## Instructions', '']
     for instr in profile.get('instructions', []):
         lines.append(f'- {instr}')
+    if not any(evidence_policy.EMAIL_INSTRUCTIONS in str(instr) for instr in profile.get('instructions', [])):
+        lines.append('- ' + evidence_policy.EMAIL_INSTRUCTIONS)
     agreement = profile.get('workAgreement')
     if isinstance(agreement, dict) and agreement.get('text'):
         lines += ['', '## Work Agreement', '', agreement['text'], '',
@@ -5454,6 +5459,7 @@ def _read_openrouter_response(req):
     Retry once, excluding the failed provider while preserving the model,
     messages, tool definitions, and token ceiling.
     """
+    @training_capture.record_call('openrouter')
     def read_response(request):
         try:
             return json.loads(_urlopen_with_resilience(request, timeout=30))
@@ -5539,7 +5545,9 @@ def _read_openrouter_response(req):
     return recovered
 
 
-def _call_openrouter_once_sync(model, messages, max_tokens):
+def _call_openrouter_once_sync(model, messages, max_tokens, response_format=None):
+    import evidence_policy
+    messages = evidence_policy.apply(messages)
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if is_model_circuit_broken(model):
@@ -5555,11 +5563,16 @@ def _call_openrouter_once_sync(model, messages, max_tokens):
     # hidden reasoning can otherwise consume the whole budget and come back
     # empty (the bug traced in refresh_model_tiers). Every other tier never
     # reads reasoning output, so turning it off there is free.
-    if model in (_coding_tier_slug(), _high_tier_slug(), _mid_tier_slug(), _reasoning_tier_slug()):
+    if response_format:
+        reasoning = {'enabled': False}
+    elif model in (_coding_tier_slug(), _high_tier_slug(), _mid_tier_slug(), _reasoning_tier_slug()):
         reasoning = {'max_tokens': max_tokens // 2}
     else:
         reasoning = {'enabled': False}
-    payload = json.dumps({'model': model, 'messages': messages, 'max_tokens': max_tokens, 'reasoning': reasoning}).encode()
+    body = {'model': model, 'messages': messages, 'max_tokens': max_tokens, 'reasoning': reasoning}
+    if response_format:
+        body['response_format'] = response_format
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         'https://openrouter.ai/api/v1/chat/completions',
         data=payload,
@@ -5582,7 +5595,7 @@ def _call_openrouter_once_sync(model, messages, max_tokens):
     return result
 
 
-def _call_openrouter_sync(model, messages, max_tokens, best_of=1):
+def _call_openrouter_sync(model, messages, max_tokens, best_of=1, response_format=None):
     """The plain OpenRouter chat-completions call. With `best_of=1` (the
     default) it returns a single parsed result dict exactly as before.
 
@@ -5593,10 +5606,10 @@ def _call_openrouter_sync(model, messages, max_tokens, best_of=1):
     through the same circuit breaker, retry, and model-result bookkeeping as
     a lone call."""
     if best_of is None or best_of <= 1:
-        return _call_openrouter_once_sync(model, messages, max_tokens)
+        return _call_openrouter_once_sync(model, messages, max_tokens, **({'response_format': response_format} if response_format else {}))
     samples = []
     for _ in range(int(best_of)):
-        samples.append(_call_openrouter_once_sync(model, messages, max_tokens))
+        samples.append(_call_openrouter_once_sync(model, messages, max_tokens, **({'response_format': response_format} if response_format else {})))
     return samples
 
 
@@ -5618,6 +5631,8 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
             model = fallback
         else:
             raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
+    import evidence_policy
+    messages = evidence_policy.apply(messages)
     body = {'model': model, 'messages': messages}
     if tools is not None:
         body['tools'] = tools
@@ -5649,7 +5664,7 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
 
 def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3, max_tokens=None,
                           service='__player_ask__', force_first_tool=False, return_transcript=False,
-                          task_id=None, village_id=None):
+                          task_id=None, village_id=None, agent_id=None):
     """Agentic tool-calling loop for /api/intent/ask. Sends `messages` with
     `tools`; while the model replies with tool_calls, executes each via
     `execute_tool(name, args)`, appends the results back as `role:tool`
@@ -5702,8 +5717,17 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
         if force_first_tool and i == 0:
             tool_choice = ({'type': 'function', 'function': {'name': force_first_tool}}
                            if isinstance(force_first_tool, str) else 'required')
-        data = _post_openrouter_raw(model, current_messages, tools=tools, max_tokens=max_tokens,
-                                    tool_choice=tool_choice)
+        import local_work_model
+        work_state = get_state_from_db() or {} if task_id else {}
+        worker_id = agent_id or (work_state.get('tasks', {}).get(task_id) or {}).get('assignedTo')
+        local = local_work_model.route(_load_env(), work_state, worker_id, task_id, messages=current_messages)
+        if local:
+            data = local_work_model.complete(local, current_messages, max_tokens, tools, tool_choice)
+            log_action(worker_id, 'chat', {'model': local['model'], 'provider': 'unsloth-local',
+                       'seed': local['seed'], 'taskId': task_id, 'cost': 0.0})
+        else:
+            data = _post_openrouter_raw(model, current_messages, tools=tools, max_tokens=max_tokens,
+                                        tool_choice=tool_choice)
         _accrue_spend(service, ((data or {}).get('usage') or {}).get('cost', 0.0), village_id=village_id)
         if task_id and isinstance(((data or {}).get('usage') or {}).get('cost'), (int, float)):
             task_cost = ((data or {}).get('usage') or {}).get('cost', 0.0)
@@ -5721,6 +5745,7 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
         # Executed results -> role:tool, back into the conversation.
         current_messages.append(message)
         for call in tool_calls:
+            name = None
             try:
                 name = (call.get('function') or {}).get('name')
                 args_raw = ((call.get('function') or {}).get('arguments')) or '{}'
@@ -5729,8 +5754,10 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
                 except json.JSONDecodeError:
                     args = {}
                 output = execute_tool(name, args)
+                training_capture.event('tool_result', task_id, {'name': name, 'arguments': args, 'result': output})
             except Exception as e:  # noqa: BLE001 - surface tool failure to the model
                 output = f'__TOOL_ERROR__: {e}'
+                training_capture.event('tool_error', task_id, {'name': name, 'error': str(e)})
             current_messages.append({'role': 'tool', 'tool_call_id': call.get('id'), 'content': output})
     return (None, current_messages) if return_transcript else None
 
@@ -8567,7 +8594,7 @@ def _breakdown_into_shared_backlog(state, goal, admin_id):
                     'messages': [{'role': 'system', 'content': system_prompt},
                                  {'role': 'user', 'content': goal}],
                     'max_tokens': _big_task_max_tokens,
-                    'agentId': admin_id}, key, timeout=90)
+                    'agentId': admin_id, 'modelPurpose': 'work'}, key, timeout=90)
     if not isinstance(r, dict) or r.get('error') or not r.get('reply'):
         return None
     cleaned = r['reply'].strip()
@@ -13498,6 +13525,7 @@ async def chat(request: Request):
         return await _chat_request(request)
 
 
+@training_capture.chat_context(lambda: get_state_from_db())
 async def _chat_request(request: Request):
     # The only place OPENROUTER_API_KEY is ever used -- it never leaves
     # this process. The client sends the model slug + full message list
@@ -13638,10 +13666,26 @@ async def _chat_request(request: Request):
             body['best_of'] = 1
     deliberate = _ttc_should_deliberate(model, body.get('deliberate'), body.get('best_of'))
     best_n = _ttc_best_of(body.get('best_of')) if deliberate else 1
+    response_format = body.get('response_format')
+    import company_planning
+    messages = company_planning.task_context(get_state_from_db() or {}, agent_id, messages)
+    if response_format:
+        if response_format != {'type': 'json_object'}:
+            return JSONResponse({'error': 'Unsupported response_format'}, status_code=400)
+        best_n = 1
     try:
+        import local_work_model
+        local = local_work_model.route(_load_env(), get_state_from_db() or {}, agent_id,
+                                       task_id, body.get('modelPurpose'), messages)
         # urllib is blocking -- run it off the event loop rather than
         # stalling every other request for the duration of the API call.
-        data = await asyncio.to_thread(_call_openrouter_sync, model, messages, max_tokens, best_of=best_n)
+        if local:
+            model, best_n = local['model'], 1
+            data = await asyncio.to_thread(local_work_model.complete, local, messages, max_tokens,
+                                          **({'response_format': response_format} if response_format else {}))
+        else:
+            data = await asyncio.to_thread(_call_openrouter_sync, model, messages, max_tokens, best_of=best_n,
+                                          **({'response_format': response_format} if response_format else {}))
         if best_n > 1:
             # Sampling path: every sample is a real completion. Fold the set
             # into ONE answer, summing each sample's cost for the single
@@ -13687,7 +13731,8 @@ async def _chat_request(request: Request):
             # by a duplicate block halving the effective budget).
             if model == _high_tier_slug():
                 _accrue_high_tier_spend(usage_cost)
-        log_action(agent_id, 'chat', {'model': model, 'service': service, 'cost': float(usage_cost) if isinstance(usage_cost, (int, float)) else 0.0, 'best_of': best_n}, authorized=authorized)
+        log_action(agent_id, 'chat', {'model': model, 'service': service, 'cost': float(usage_cost) if isinstance(usage_cost, (int, float)) else 0.0, 'best_of': best_n,
+                   **({'provider': 'unsloth-local', 'seed': local['seed']} if local else {})}, authorized=authorized)
         return JSONResponse({'reply': reply})
     except urllib.error.HTTPError as e:
         return JSONResponse({'error': e.read().decode()}, status_code=e.code)
@@ -16885,6 +16930,15 @@ def _http_json(method, base, path, body=None, header=None, timeout=None):
     exceed 30s on a cold model, which surfaced as flaky 502s."""
     import runtime_limits
     timeout = max(timeout or 0, runtime_limits.transport(path, body))
+    if path == '/api/chat' and body:
+        import local_work_model
+        local = local_work_model.route(_load_env(), get_state_from_db() or {},
+                                      body.get('agentId'), body.get('taskId'),
+                                      body.get('modelPurpose'), body.get('messages') or [])
+        if local:
+            # Allow shared-GPU waiting, adapter loading and generation to finish
+            # before the loopback caller abandons an otherwise live request.
+            timeout = max(timeout, 3 * local['timeout'] + 30)
     started = time.monotonic()
     url = base + path
     data = json.dumps(body).encode() if body is not None else None

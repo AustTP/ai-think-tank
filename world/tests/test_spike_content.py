@@ -253,9 +253,9 @@ class SpikeContent(unittest.TestCase):
             content._run_spike_content(_snapshot(), 'cora', task)
         plan_system_text = oc.call_args_list[0].args[1][0]['content']
         self.assertIn('VERIFICATION HONESTY', plan_system_text)
-        self.assertIn('"verified"', plan_system_text)
-        self.assertIn('"estimated"', plan_system_text)
-        self.assertIn('3-5 representative', plan_system_text)
+        self.assertIn('verified', plan_system_text)
+        self.assertIn('unknown', plan_system_text)
+        self.assertIn('Verify every substantive claim', plan_system_text)
 
     def test_execute_prompt_forbids_marking_estimates_as_verified(self):
         self._common_mocks()
@@ -266,7 +266,7 @@ class SpikeContent(unittest.TestCase):
                                          side_effect=[_completion('plan'), _completion('report')]):
             content._run_spike_content(_snapshot(), 'cora', task)
         execute_system_text = loop.call_args[0][1][0]['content']
-        self.assertIn('do not mark a row "verified" just because', execute_system_text)
+        self.assertIn('never include estimates or mark guesses verified', execute_system_text)
 
     def test_synthesize_prompt_preserves_the_basis_column_and_summarizes_it(self):
         self._common_mocks()
@@ -278,7 +278,7 @@ class SpikeContent(unittest.TestCase):
             content._run_spike_content(_snapshot(), 'cora', task)
         synth_user_text = oc.call_args_list[1].args[1][-1]['content']
         self.assertIn('basis', synth_user_text.lower())
-        self.assertIn('verified vs estimated', synth_user_text)
+        self.assertIn('verified vs unknown', synth_user_text)
 
     def test_missing_basis_column_gets_a_disclaimer_prepended(self):
         """Deterministic safety net: confirmed that the

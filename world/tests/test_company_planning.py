@@ -24,7 +24,7 @@ class Planning(unittest.TestCase):
         self.assertEqual(order['status'],'needs_input')
         self.assertEqual(len(state['workQueue']),1)
         self.assertEqual(state['workQueue'][0]['workOrderId'],'wrq-1')
-        self.assertIn('Company North Star',state['workQueue'][0]['instructions'])
+        self.assertNotIn('Company North Star',state['workQueue'][0]['instructions'])
         self.assertEqual(state['workQueue'][0]['reviewContract']['acceptanceCriteria'],'Save capability inventory.')
         self.assertNotIn('Tools created.',state['workQueue'][0]['reviewContract']['instructions'])
         self.assertEqual(state['playerInbox'][0]['agentId'],'owen')

@@ -2,6 +2,16 @@
 import hashlib
 import re
 import os
+from pathlib import Path
+
+
+def ensure_test_directory(root, sandbox):
+    """Provision the conventional test directory, including staged workspaces."""
+    base = Path(root).resolve()
+    directory = (base / sandbox / 'tests').resolve()
+    if base not in directory.parents:
+        raise ValueError('Test directory must stay inside the sandbox root')
+    directory.mkdir(parents=True, exist_ok=True)
 
 
 def sandbox_for(state, task):
@@ -22,6 +32,7 @@ def sandbox_for(state, task):
 
 def prepare(state, task, root):
     sandbox = sandbox_for(state, task)
+    ensure_test_directory(root, sandbox)
     if sandbox.startswith('project-'):
         directory = os.path.join(root,sandbox)
         os.makedirs(directory,exist_ok=True)

@@ -1,0 +1,4 @@
+endpoint,method,data_field,description,basis
+/api/v1/portfolios/{portfolio}/detail,GET,summary,Portfolio-level information,verified
+/api/v1/portfolios/{portfolio}/detail,GET,balances,Asset-specific information,verified
+/api/v1/portfolios/{portfolio}/detail,GET,positions,Position-specific information,verified

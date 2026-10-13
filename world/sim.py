@@ -1651,6 +1651,7 @@ _content_results_lock = threading.Lock()
 
 
 def _store_content_result(task_id, result):
+    __import__('training_capture').event('content_result', task_id, result)
     with _content_results_lock:
         worker = _content_workers.get(task_id)
         if worker:
@@ -1679,7 +1680,7 @@ def _maybe_escalate_stuck_gate(parent, gate, reason, failure_text=None, state=No
     it does not re-escalate every subsequent cycle)."""
     if gate.get('escalated'):
         return True
-    story_stopped = __import__('recovery_control').record(state, parent, failure_text or reason)
+    story_stopped = __import__('recovery_control').record(state, parent, failure_text or reason, review_rejection=True)
     gate['cycleCount'] = gate.get('cycleCount', 0) + 1
     if failure_text:
         normalized = re.sub(r':\d+:\d+:', ':LINE:', failure_text.strip())
@@ -1698,7 +1699,7 @@ def _maybe_escalate_stuck_gate(parent, gate, reason, failure_text=None, state=No
                                     'errorCount': len(codes)}
         gate.setdefault('failureHistory', []).append({'cycle': gate['cycleCount'], 'category': category,
                                                      'errorCount': len(codes), 'fingerprint': fingerprint})
-    if not story_stopped and gate['cycleCount'] < MAX_REVIEW_CYCLES and gate.get('noProgressCount', 0) < 2:
+    if not story_stopped and gate['cycleCount'] < MAX_REVIEW_CYCLES:
         return False
     gate['escalated'] = True
     parent['manualAttention'] = True
@@ -2160,7 +2161,9 @@ def _build_agent_perception(state, agent_id, task=None):
     rec = roster.get(agent_id) or {}
     parts = []
     import company_planning
-    direction = company_planning.north_star_context(state)
+    permitted = ('review' in str(rec.get('role') or me.get('role') or '').lower()
+                 or any(team.get('scrumMasterId') == agent_id for team in state.get('teams') or []))
+    direction = company_planning.north_star_context(state) if permitted else ''
     if direction:
         parts.append(direction)
     identity = f'You are {rec.get("name") or me.get("name") or agent_id}.'
