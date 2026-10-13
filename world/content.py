@@ -1169,6 +1169,17 @@ def _extract_written_js_files(command):
     return sorted(files)
 
 
+def _extract_written_python_files(command):
+    """Every .py filename a heredoc command wrote via `cat > name.py` or
+    `cat >> name.py`. Mirrors _extract_written_js_files -- used to scope the
+    quality pipeline to the files a task actually touched, so a README-only
+    change doesn't fail on unrelated Python files elsewhere in the sandbox."""
+    files = set()
+    for m in re.finditer(r"cat\s*>>?\s*([A-Za-z0-9_.\-/]+\.py)\b", command or ''):
+        files.add(m.group(1))
+    return sorted(files)
+
+
 def _find_unlinked_js_files(base, key, agent_id, sandbox_id, js_files):
     """Port of tasks.js _findUnlinkedJsFiles: mechanical grep of every *.html for
     src="<file>" -- a file never referenced by any real page is "unlinked".
@@ -1386,7 +1397,30 @@ CODING_STANDARDS_PROMPT = (
 )
 
 
-def _quality_pipeline_steps():
+def _quality_pipeline_steps(scope_files=None):
+    """Build the standard quality pipeline steps. When `scope_files` is a
+    non-empty list of .py paths, flake8/mypy/bandit are scoped to exactly
+    those files instead of running on the whole sandbox -- a README-only or
+    single-file change no longer fails on pre-existing findings in unrelated
+    files. pytest-cov always runs project-wide (coverage is measured in total
+    by design). JS steps already no-op when no JS files exist."""
+    if scope_files:
+        _scoped = ' '.join(scope_files)
+        return [
+            {'name': 'flake8', 'command': f'python -m flake8 {_scoped}'},
+            {'name': 'mypy', 'command': f'python -m mypy {_scoped}'},
+            {'name': 'bandit', 'command': 'python -m bandit -q ' + ' '.join(f'-f {f}' for f in scope_files)},
+            {'name': 'pytest-cov', 'command': 'python -m pytest --cov=. --cov-fail-under=90 -q'},
+            {'name': 'node-syntax', 'command': (
+                'sh -c \'files=$(ls *.js *.mjs 2>/dev/null); '
+                'if [ -z "$files" ]; then echo "no JS files -- skipping"; exit 0; fi; '
+                'fail=0; for f in $files; do node --check "$f" || fail=1; done; '
+                'exit $fail\'')},
+            {'name': 'node-tests', 'command': (
+                'sh -c \'ls *.test.mjs *.test.js 2>/dev/null | head -1 | grep -q . || '
+                '{ echo "no JS test files -- skipping"; exit 0; }; '
+                'node --test\'')},
+        ]
     return [
         {'name': 'flake8', 'command': 'python -m flake8 .'},
         {'name': 'mypy', 'command': 'python -m mypy .'},
@@ -1461,14 +1495,15 @@ def _quality_pipeline_failure_snippet(step_name, stdout, stderr):
     return '\n'.join(lines[-8:]) if lines else '(no output)'
 
 
-def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose):
+def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose, scope_files=None):
     """Run the standard quality pipeline in the sandbox via /api/pipeline, which
     stops at the first failing step and returns per-step {name, exitCode, stdout,
     stderr} + failedStep (None on a full pass). Always returns a plain dict; never
-    raises. Callers gate approval on `ok`."""
+    raises. Callers gate approval on `ok`. When `scope_files` is given, flake8/
+    mypy/bandit are scoped to those files (see _quality_pipeline_steps)."""
     resp = _serve._http_json('POST', base, '/api/pipeline',
                       {'agentId': agent_id, 'sandboxId': sandbox_id,
-                       'purpose': purpose, 'steps': _quality_pipeline_steps()}, key)
+                       'purpose': purpose, 'steps': _quality_pipeline_steps(scope_files)}, key)
     if not isinstance(resp, dict) or resp.get('error'):
         return {'ok': False, 'failedStep': None, 'results': [],
                 'note': f'quality pipeline did not run: {resp.get("error") if isinstance(resp, dict) else "no response"}'}
@@ -1565,6 +1600,8 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     attempts = 0
     probe_rounds = 0
     colab_rounds = 0
+    infra_retries = 0
+    MAX_INFRA_RETRIES = 1
     _opens = _closes = 0
     balanced = False
     while attempts <= CODE_CONTINUATION_ATTEMPTS:
@@ -1579,9 +1616,19 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
             if budget_hit:
                 budget_hit['tier'] = tier_slug
                 _sim_module._store_content_result(task.get('id'), budget_hit)
-            else:
-                _sim_module._store_content_result(task.get('id'),
-                                                  {'note': 'the model call failed or returned nothing', 'ok': False, 'tier': tier_slug})
+                return False
+            # Infrastructure failure (model call failed / returned nothing).
+            # Retry once before failing -- a transient API error and a
+            # permanent failure were previously treated identically. On the
+            # final failure, tag the result `infra: True` so sim.py knows
+            # this is NOT the agent's quality failing: skip the coaching
+            # note and the grade penalty (see _send_back_after_failure).
+            infra_retries += 1
+            if infra_retries <= MAX_INFRA_RETRIES:
+                continue  # retry the same messages once
+            _sim_module._store_content_result(task.get('id'),
+                                              {'note': 'the model call failed or returned nothing (infrastructure error, retried once)',
+                                               'ok': False, 'tier': tier_slug, 'infra': True})
             return False
         reply = r['reply']
 
@@ -1680,6 +1727,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
 
     # ---- The four mechanical integrity checks (mirror runCodingTask) ----
     written = _extract_written_js_files(command)
+    written_py = _extract_written_python_files(command)
     if written:
         unlinked = _find_unlinked_js_files(base, key, agent_id, WORKROOM_SANDBOX_ID, written)
         if unlinked:
@@ -1721,9 +1769,13 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     # mechanical checks succeeded, but the work is NOT done until the code meets
     # the standard (PEP 8, types, no bandit High/Medium, >=90% coverage). A red
     # pipeline fails the author's task here, before anything reaches review, so
-    # there is nothing left for a reviewer to approve.
+    # there is nothing left for a reviewer to approve. Scope flake8/mypy/bandit
+    # to the .py files this task actually wrote -- a README-only or single-file
+    # change no longer fails on pre-existing findings elsewhere in the sandbox.
+    # pytest-cov still runs project-wide (coverage is measured in total).
     qp = _run_quality_pipeline(base, key, agent_id, WORKROOM_SANDBOX_ID,
-                               f'Quality gate for coding task: {backlog_item}')
+                               f'Quality gate for coding task: {backlog_item}',
+                               scope_files=written_py or None)
     if not qp['ok']:
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f'wrote and ran the code, but {qp["note"]}',

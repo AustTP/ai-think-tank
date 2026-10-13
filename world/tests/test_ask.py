@@ -436,6 +436,7 @@ class AskEndpoint(unittest.TestCase):
         # generate_image/generate_video only when the Higgsfield key pair is.
         expected = ({'browse_page', 'download_file', 'request_allowlist', 'read_peer_reviews',
                      'team_digest', 'team_status', 'allowlist_status', 'read_mailbox',
+                     'team_overview',
                      'x_trending_topics', 'search_linkedin_posts', 'api_call',
                      'read_ais_feed', 'read_rss_feed', 'read_market_feed', 'read_live_feed',
                      'propose_api_service', 'list_services', 'grant_allowlist', 'revoke_allowlist'}

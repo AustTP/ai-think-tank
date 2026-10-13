@@ -9254,6 +9254,22 @@ AGENT_ASK_TOOLS = [
             },
         },
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'team_overview',
+            'description': 'Read-only combined view of the think tank: team_status (who is '
+                           'working, queue, stuck tasks), team_digest (what shipped recently, '
+                           'decision counts), and allowlist_status (pending access requests). '
+                           'One call instead of three -- use this when you need a full picture '
+                           'of the team\'s current state, not just one slice.',
+            'parameters': {
+                'type': 'object',
+                'properties': {},
+                'required': [],
+            },
+        },
+    },
 ] + ([{
     'type': 'function',
     'function': {
@@ -15353,6 +15369,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         # phrase (e.g. "team status" → team_status, "read my mailbox" → read_mailbox).
         # Ordered by specificity; first match wins. Names are case-insensitive.
         _status_tool_patterns = [
+            ('team_overview', re.compile(r'\bteam[_\s-]?overview\b', re.I)),
             ('team_status', re.compile(r'\bteam[_\s-]?status\b', re.I)),
             ('team_digest', re.compile(r'\bteam[_\s-]?digest\b', re.I)),
             ('allowlist_status', re.compile(r'\ballowlist[_\s-]?status\b', re.I)),
@@ -15400,6 +15417,23 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
             # request_allowlist). No state change, no email.
             tools_used.append(name)
             return _allowlist_status_text((args or {}).get('host') or '')
+        if name == 'team_overview':
+            # Combined read-only view: status + digest + allowlist in one call,
+            # so an agent that needs the full picture doesn't make three
+            # separate tool calls (theo's round-3 request). Same DB-only
+            # safety as each component.
+            tools_used.append(name)
+            parts = [
+                '=== TEAM STATUS (live queue) ===',
+                _team_status_text(),
+                '',
+                '=== TEAM DIGEST (what shipped) ===',
+                _team_digest_text(),
+                '',
+                '=== ALLOWLIST STATUS (pending access) ===',
+                _allowlist_status_text(''),
+            ]
+            return '\n'.join(parts)
         if name == 'read_peer_reviews':
             # Feedback about WORK, read DB-only (no self-loopback).
             #   no target / your own id -> everything written about YOUR work
