@@ -14325,9 +14325,11 @@ async def device_checkin(request: Request):
 @_state_writer
 async def set_team_prefix(team_id: str, request: Request):
     """Set (or clear via empty string) an explicit issue prefix for a team.
-    Director/admin-only. Returns the applied prefix."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    Operator-gated (like promote/scrum-master): a player session or a
+    director/admin agent. Returns the applied prefix."""
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -14343,7 +14345,7 @@ async def set_team_prefix(team_id: str, request: Request):
     if applied is None:
         return JSONResponse({'error': 'prefix must be 1-5 alphanumeric characters'}, status_code=400)
     save_state_to_db(state)
-    log_action('player', 'team_prefix', {'teamId': team_id, 'prefix': applied}, authorized=True)
+    log_action(actor, 'team_prefix', {'teamId': team_id, 'prefix': applied}, authorized=True)
     return JSONResponse({'ok': True, 'teamId': team_id, 'prefix': applied})
 
 
@@ -20411,10 +20413,14 @@ def _budget_usage_snapshot():
 
 @app.get('/api/budget')
 async def budget_view(request: Request):
-    """Player-session budget readout: every settable knob's current value plus
-    live month-to-date usage where a ledger exists. Agent keys are refused."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- budget is a player control'}, status_code=401)
+    """Budget readout: every settable knob's current value plus live
+    month-to-date usage where a ledger exists. Operator-gated (a player
+    session or a director/admin agent) -- the Banking role and the senior
+    director are meant to manage the treasury, so they can SEE the knobs.
+    Setting them is a separate, player-only write (budget_set below)."""
+    authed, _actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized -- budget is an operator control'}, status_code=401)
     usage = _budget_usage_snapshot()
     knobs = {}
     g = globals()
@@ -21783,12 +21789,17 @@ async def api_service_list():
 
 @app.post('/api/api-service/revoke')
 async def api_service_revoke(request: Request):
-    # Player-facing removal: sets the service row to 'denied' so it stops being
-    # served, and drops it from the in-memory registry. De-registering a service
-    # kills its reachability for the WHOLE colony -- only the player may do it,
-    # proven by a real session (an agent key must not revoke GitHub/Apify/Tavily).
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    # Operator-gated removal: sets the service row to 'denied' so it stops
+    # being served, and drops it from the in-memory registry. De-registering
+    # a service kills its reachability for the WHOLE colony, so it sits in the
+    # same unwind class as allowlist revoke: a player session OR a
+    # director/admin agent (the same authority that can APPROVE a proposal
+    # via the escalation loop must be able to pull it when something changes).
+    # An ordinary agent key is still refused -- a worker cannot revoke
+    # GitHub/Apify/Tavily out from under the colony.
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     body = await request.json()
     sid = (body.get('serviceId') or '').strip().lower()
     if not sid:
@@ -21796,8 +21807,8 @@ async def api_service_revoke(request: Request):
     if sid not in _API_SERVICES:
         return JSONResponse({'error': f'no active service "{sid}"'}, status_code=404)
     _api_service_upsert({'id': sid, 'base_url': _API_SERVICES[sid].get('base_url')},
-                        status='denied', proposed_by='player')
-    log_action('player', 'api_service_revoke', {'serviceId': sid})
+                        status='denied', proposed_by=actor)
+    log_action(actor, 'api_service_revoke', {'serviceId': sid})
     return JSONResponse({'revoked': True, 'serviceId': sid})
 
 

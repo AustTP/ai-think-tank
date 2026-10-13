@@ -5399,14 +5399,15 @@ class ChatEndpointAuth(unittest.TestCase):
         self.assertEqual(r.status_code, 401, 'an agent key is not a player credential here')
 
     def test_player_intent_surface_rejects_valid_agent_key(self):
-        # Regression: every /api/intent/* write handler (plus the team-prefix
-        # endpoint) hardcodes actor 'player' -- a valid agent key must NOT let an
-        # agent create/close a sprint, trigger a publish push, release a product,
-        # veto a story, promote a spike, file new work, or answer questions as the
-        # player. The middleware accepts a key (loopback grant for content
-        # executors), but each handler's own _require_player_session gate must
-        # reject it. The gate fires before any body parsing or state access, so a
-        # bare POST with a bogus path param is still 401.
+        # Regression: every /api/intent/* write handler hardcodes actor 'player'
+        # -- a valid agent key must NOT let an agent create/close a sprint,
+        # trigger a publish push, release a product, veto a story, promote a
+        # spike, file new work, or answer questions as the player. The
+        # middleware accepts a key (loopback grant for content executors), but
+        # each handler's own _require_player_session gate must reject it. The
+        # gate fires before any body parsing or state access, so a bare POST
+        # with a bogus path param is still 401. (The team-prefix endpoint is
+        # operator-gated, not player-only -- it lives in the test below.)
         c = TestClient(serve.app)
         paths = [
             ('/api/intent/assign-big-task', {}),
@@ -5423,7 +5424,6 @@ class ChatEndpointAuth(unittest.TestCase):
             ('/api/intent/incidents', {}),
             ('/api/intent/product', {}),
             ('/api/intent/product/p1/release', {}),
-            ('/api/teams/dev/prefix', {}),
         ]
         for path, body in paths:
             with self.subTest(path=path), \
@@ -5433,6 +5433,20 @@ class ChatEndpointAuth(unittest.TestCase):
             self.assertEqual(r.status_code, 401,
                              f'{path} must reject a valid agent key as a player credential')
             self.assertIn('log in', r.json()['error'])
+
+    def test_team_prefix_rejects_non_director_agent_key(self):
+        # Team-prefix is OPERATOR-gated (player session or director/admin), so
+        # a valid agent key is a credential here -- but only for a rostered
+        # director. An ordinary worker's key must still be refused; the error
+        # is the gate's bare "Unauthorized", not the player-only "log in".
+        c = TestClient(serve.app)
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_valid_agent_key_presented', return_value=True), \
+             unittest.mock.patch.object(serve, '_resolve_requester', return_value='worker'), \
+             unittest.mock.patch.object(serve, '_is_director_or_admin', return_value=False):
+            r = c.post('/api/teams/dev/prefix', json={})
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()['error'], 'Unauthorized')
 
     def test_require_player_session_accepts_only_a_real_session(self):
         # The gate is exactly "a valid session cookie", nothing else: an agent

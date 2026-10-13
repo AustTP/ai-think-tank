@@ -387,17 +387,39 @@ class EnvReload(_ApiTestCase):
 
 
 class BudgetApi(_ApiTestCase):
-    """Player-session budget knobs: GET reports every settable name + live
-    usage; POST sets them by rewriting .env + reloading. Agent keys are
-    refused (budget is an operator control, same gate as /api/env/reload)."""
+    """Budget knobs: GET is operator-gated (player session or a director/admin
+    agent -- the treasury roles can see the numbers); POST is player-session
+    only (setting a knob is a money lever). An ordinary agent key is refused
+    for both."""
 
-    def test_agent_key_alone_is_refused(self):
+    def test_ordinary_agent_key_is_refused_for_both(self):
         raw = _raw_client()
         r = raw.get('/api/budget', headers=_agent_headers())
         self.assertEqual(r.status_code, 401)
         r = raw.post('/api/budget', json={'SPEND_CAP_USD': 99},
                      headers=_agent_headers())
         self.assertEqual(r.status_code, 401)
+
+    def test_director_can_read_but_not_set_budget(self):
+        # GET is operator-gated: the treasury roles (Banking, senior director)
+        # may SEE the knobs. POST stays player-session-only -- a director
+        # cannot raise a spend cap on their own behalf.
+        # Director-ness is DERIVED from a real report in the roster (see
+        # _direct_reports), not the isDirector flag -- so the fixture gives
+        # 'dir' one direct report.
+        state = {'agentRoster': [{'id': 'dir', 'director': None},
+                                 {'id': 'worker', 'director': 'dir'}],
+                 'agents': {'dir': {'id': 'dir', 'director': None}}}
+        raw = _raw_client()
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, '_resolve_requester', return_value='dir'), \
+             unittest.mock.patch.object(serve, '_require_player_session', return_value=False):
+            r = raw.get('/api/budget', headers=_agent_headers())
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertIn('SPEND_CAP_USD', r.json()['knobs'])
+            r = raw.post('/api/budget', json={'SPEND_CAP_USD': 99},
+                         headers=_agent_headers())
+            self.assertEqual(r.status_code, 401)
 
     def test_player_session_reads_knobs(self):
         c = _client()
