@@ -315,6 +315,57 @@ class GrantAllowlist(unittest.TestCase):
         self.assertIn('api.example.com', serve._runtime_allowlist_grants())
 
 
+class RevokeAllowlist(unittest.TestCase):
+    """_revoke_allowlist, the mirror of _grant_allowlist: removes a RUNTIME
+    grant (never the env baseline), refreshes the egress proxy, and returns a
+    three-way result the endpoint maps to ok / not_granted / nothing."""
+
+    def test_empty_host_returns_none(self):
+        self.assertIsNone(serve._revoke_allowlist(''))
+        self.assertIsNone(serve._revoke_allowlist(None))
+        self.assertIsNone(serve._revoke_allowlist('   '))
+
+    def test_absent_host_returns_none(self):
+        self.assertIsNone(serve._revoke_allowlist('never-granted.example'))
+
+    def test_env_baseline_host_is_not_grantable_here(self):
+        # A host that exists ONLY in the code-reviewed baseline must come back
+        # as 'not_granted' -- the caller must never mistake it for a removal,
+        # and the baseline itself must stay untouched.
+        with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', {'dreyx.com'}):
+            result = serve._revoke_allowlist('Dreyx.COM')
+        self.assertEqual(result, 'not_granted')
+        self.assertTrue(serve._is_allowlisted_host('dreyx.com'))
+
+    def test_runtime_grant_is_removed_persists_and_refreshes_proxy(self):
+        # Seed the runtime list directly (no _grant_allowlist -- that would
+        # exercise the proxy refresh we only want to observe on the REVOKE).
+        serve._set_setting(serve.ALLOWLIST_GRANTS_SETTING, 'revokeme.example')
+        with unittest.mock.patch.object(serve, 'ensure_sandbox_networking') as ensure:
+            result = serve._revoke_allowlist('REVOKEME.example')
+        self.assertEqual(result, 'revokeme.example')  # normalized
+        ensure.assert_called_once()
+        self.assertNotIn('revokeme.example', serve._runtime_allowlist_grants())
+        self.assertFalse(serve._is_allowlisted_host('revokeme.example'))
+        # Durable: the settings row dropped the host too.
+        with serve._db() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key = 'allowlist_grants'").fetchone()
+        self.assertNotIn('revokeme.example', row[0] or '')
+
+    def test_proxy_refresh_failure_does_not_veto_revoke(self):
+        # A failed egress refresh leaves the PROXY stale until restart, but
+        # the Jev/browse gates re-read the effective list per call, so the
+        # removal must still persist.
+        serve._set_setting(serve.ALLOWLIST_GRANTS_SETTING, 'staleproxy.example')
+        with unittest.mock.patch.object(serve, 'ensure_sandbox_networking',
+                                        side_effect=RuntimeError('docker down')), \
+             unittest.mock.patch('builtins.print') as pr:
+            result = serve._revoke_allowlist('staleproxy.example')
+        self.assertEqual(result, 'staleproxy.example')
+        pr.assert_called()
+        self.assertNotIn('staleproxy.example', serve._runtime_allowlist_grants())
+
+
 class MullvadConnectSync(unittest.TestCase):
     def test_success_returns_ok(self):
         with unittest.mock.patch.object(serve, '_mullvad_ensure_logged_in_sync',

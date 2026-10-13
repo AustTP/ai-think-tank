@@ -850,6 +850,88 @@ class ApiServiceRegistry(unittest.TestCase):
         upsert.assert_not_called()
 
 
+class ApiServiceRevokeEndpoint(unittest.TestCase):
+    """POST /api/api-service/revoke -- the ENDPOINT, operator-gated (player
+    session OR director/admin agent). The grant path (proposal approval) is
+    director-approvable via the escalation loop, so a director must be able to
+    PULL a service when something changes (same unwind class as allowlist
+    revoke); an ordinary agent key must not."""
+
+    def setUp(self):
+        # The registry stores the example base_url; no host lookups happen on
+        # the revoke path, but keep the DNS-free convention of this file.
+        p = unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
+        p = unittest.mock.patch.object(serve, 'log_action')
+        self._log = p.start()
+        self.addCleanup(p.stop)
+
+    def _seed_active(self):
+        sid, norm, error = serve._validate_api_service_spec(json.loads(json.dumps(_VALID_SPEC)))
+        self.assertIsNone(error)
+        serve._api_service_upsert(norm, status='active')
+        self.addCleanup(lambda: serve._api_service_upsert(
+            {'id': sid, 'base_url': norm['base_url']}, status='denied'))
+        return sid
+
+    def _client(self, session=True, agent_id=None):
+        from starlette.testclient import TestClient
+        c = TestClient(serve.app)
+        if session:
+            c.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
+        if agent_id:
+            c.headers['X-Agent-Key'] = serve.get_or_create_agent_key(agent_id)
+        return c
+
+    def test_unauthenticated_is_rejected(self):
+        from starlette.testclient import TestClient
+        r = TestClient(serve.app).post('/api/api-service/revoke',
+                                       json={'serviceId': 'my_service'})
+        self.assertEqual(r.status_code, 401)
+
+    def test_ordinary_agent_key_is_refused(self):
+        # A valid agent key clears the login middleware, but the service
+        # registry is not a worker's to mutate: the operator gate refuses,
+        # and the service stays live.
+        self._seed_active()
+        r = self._client(session=False, agent_id='worker').post(
+            '/api/api-service/revoke', json={'serviceId': 'my_service'})
+        self.assertEqual(r.status_code, 401)
+        self.assertIn('my_service', serve._API_SERVICES)
+        self._log.assert_not_called()
+
+    def test_player_session_revokes_and_attributes_player(self):
+        sid = self._seed_active()
+        r = self._client().post('/api/api-service/revoke', json={'serviceId': sid.upper()})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body['revoked'])
+        self.assertEqual(body['serviceId'], sid)  # normalized to lowercase
+        self.assertNotIn(sid, serve._API_SERVICES)
+        self._log.assert_called_with('player', 'api_service_revoke', {'serviceId': sid})
+
+    def test_director_agent_key_revokes_with_director_attribution(self):
+        # The whole reason the gate moved: a director can pull a service.
+        # Role check is mocked (the module temp DB has no seeded roster --
+        # same approach as the feed-registry and allowlist tests); the
+        # requester is the REAL key owner resolved from the header.
+        sid = self._seed_active()
+        with unittest.mock.patch.object(serve, '_is_director_or_admin', return_value=True):
+            r = self._client(session=False, agent_id='theo').post(
+                '/api/api-service/revoke', json={'serviceId': sid})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()['revoked'])
+        self.assertNotIn(sid, serve._API_SERVICES)
+        self._log.assert_called_with('theo', 'api_service_revoke', {'serviceId': sid})
+
+    def test_missing_and_unknown_service_id(self):
+        r = self._client().post('/api/api-service/revoke', json={})
+        self.assertEqual(r.status_code, 400)
+        r = self._client().post('/api/api-service/revoke', json={'serviceId': 'ghost'})
+        self.assertEqual(r.status_code, 404)
+
+
 class Workflow(unittest.TestCase):
     """The config-driven submit/poll/finalize engine, with spend accrued only
     on a successful terminal."""

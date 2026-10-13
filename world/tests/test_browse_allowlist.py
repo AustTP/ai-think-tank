@@ -466,7 +466,7 @@ class AllowlistRequestEndpoint(unittest.TestCase):
         _grant_escalation_id = serve.create_escalation(
             'allowlist request', 'grant me', on_approve_note='GrantHost.example')
         esc = serve._load_escalations()[_grant_escalation_id]
-        with unittest.mock.patch.object(serve, 'log_action'), \
+        with unittest.mock.patch.object(serve, 'log_action') as log, \
              unittest.mock.patch.object(serve, 'ensure_sandbox_networking'):
             asyncio.run(serve.resolve_escalation(_grant_escalation_id, esc['token'], 'approve'))
         self.assertTrue(serve._is_allowlisted_host('GrantHost.example'))
@@ -475,6 +475,12 @@ class AllowlistRequestEndpoint(unittest.TestCase):
         with serve._db() as conn:
             row = conn.execute("SELECT value FROM settings WHERE key = 'allowlist_grants'").fetchone()
         self.assertIn('granthost.example', row[0])
+        # The email-link path keeps its DEFAULT attribution even after the
+        # helper grew actor/via params for the operator endpoints: 'admin'
+        # and 'escalation approval', never a stale endpoint actor.
+        log.assert_any_call('admin', 'allowlist_grant',
+                            {'host': 'granthost.example', 'via': 'escalation approval'},
+                            authorized=True)
 
     def test_resolve_denial_never_grants(self):
         import asyncio
@@ -751,10 +757,14 @@ class AllowlistOperatorEndpoints(unittest.TestCase):
     def _clear_grants(self):
         serve._set_setting(serve.ALLOWLIST_GRANTS_SETTING, '')
 
-    def test_unauthenticated_grant_and_revoke_are_rejected(self):
+    def test_unauthenticated_allowlist_endpoints_are_rejected(self):
         from starlette.testclient import TestClient
-        for path in ('/api/allowlist/grant', '/api/allowlist/revoke'):
-            r = TestClient(serve.app).post(path, json={'host': 'example.com', 'purpose': 'x'})
+        c = TestClient(serve.app)
+        for path in ('/api/allowlist', '/api/allowlist/grant', '/api/allowlist/revoke'):
+            if path.endswith('/grant') or path.endswith('/revoke'):
+                r = c.post(path, json={'host': 'example.com', 'purpose': 'x'})
+            else:
+                r = c.get(path)
             self.assertEqual(r.status_code, 401, path)
 
     def test_ordinary_agent_key_is_rejected_on_grant_and_revoke(self):
@@ -823,10 +833,11 @@ class AllowlistOperatorEndpoints(unittest.TestCase):
         self._common_mocks()
         self._clear_grants()
         self.addCleanup(self._clear_grants)
-        # A runtime grant is removable...
-        serve._grant_allowlist('runtime.example', actor='theo', via='operator grant')
+        # A runtime grant is removable, and the revoke input takes a URL the
+        # same way the grant does (normalized to the bare host)...
+        serve._set_setting(serve.ALLOWLIST_GRANTS_SETTING, 'runtime.example')
         r = self._client().post('/api/allowlist/revoke', json={
-            'host': 'runtime.example', 'purpose': 'changed'})
+            'host': 'https://Runtime.Example/deep/path', 'purpose': 'changed'})
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.json()['revoked'])
         self.assertFalse(serve._is_allowlisted_host('runtime.example'))
@@ -878,6 +889,64 @@ class AllowlistOperatorEndpoints(unittest.TestCase):
         log.assert_called_with('theo', 'allowlist_grant',
                                {'host': 'audited.example', 'via': 'operator grant'},
                                authorized=True)
+
+
+class AllowlistToolExecutor(unittest.TestCase):
+    """The grant_allowlist/revoke_allowlist AGENT TOOLS in the shared web-tools
+    executor (_make_web_tools_executor). The executor only FORWARDS with the
+    caller's own key; the endpoint's _operator_gate decides authority. These
+    tests pin the forward shape (path/body/key), the success message, and that
+    a server refusal is surfaced to the model verbatim -- never swallowed."""
+
+    def _drive(self, tool, args, http_result):
+        seen = {}
+
+        def fake_http(method, base, path, body=None, header=None, timeout=30):
+            seen.update(method=method, path=path, body=body, header=header)
+            return http_result
+
+        with unittest.mock.patch.object(serve, '_http_json', side_effect=fake_http):
+            execute_tool = serve._make_web_tools_executor('theo', 'theo-key-1')
+            out = execute_tool(tool, args)
+        return out, seen
+
+    def test_grant_forwards_to_the_grant_endpoint_with_the_callers_key(self):
+        out, seen = self._drive('grant_allowlist',
+                                {'host': 'X.Example', 'purpose': 'quotes'},
+                                {'ok': True, 'host': 'x.example', 'granted': True,
+                                 'message': 'x.example is now on the allowlist.'})
+        self.assertEqual(seen['method'], 'POST')
+        self.assertEqual(seen['path'], '/api/allowlist/grant')
+        self.assertEqual(seen['body'], {'agentId': 'theo', 'host': 'X.Example',
+                                        'purpose': 'quotes'})
+        # The caller's OWN key rides the forward -- the endpoint authenticates
+        # the real agent, never a bare server-side loopback.
+        self.assertEqual(seen['header'], 'theo-key-1')
+        self.assertIn('x.example is now on the allowlist.', out)
+        self.assertIn('granted', out)
+
+    def test_revoke_forwards_to_the_revoke_endpoint(self):
+        out, seen = self._drive('revoke_allowlist',
+                                {'host': 'x.example', 'purpose': 'untrusted now'},
+                                {'ok': True, 'host': 'x.example', 'revoked': True,
+                                 'message': 'x.example removed from the allowlist.'})
+        self.assertEqual(seen['path'], '/api/allowlist/revoke')
+        self.assertEqual(seen['body']['host'], 'x.example')
+        self.assertIn('x.example removed from the allowlist.', out)
+        self.assertIn('revoked', out)
+
+    def test_server_refusal_is_surfaced_to_the_model(self):
+        # An ordinary agent gets 401 from the endpoint -- that refusal must
+        # REACH the model (the tool description promises the server refuses),
+        # not vanish into a cheerful success string.
+        out, _seen = self._drive('grant_allowlist', {'host': 'x.example', 'purpose': 'p'},
+                                 {'error': 'Unauthorized'})
+        self.assertIn('Could not grant the allowlist host: Unauthorized', out)
+
+    def test_non_dict_response_is_reported_not_crashed(self):
+        out, _seen = self._drive('revoke_allowlist', {'host': 'x.example', 'purpose': 'p'},
+                                 None)
+        self.assertIn('unexpected response', out)
 
 
 if __name__ == '__main__':
