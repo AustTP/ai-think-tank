@@ -8879,7 +8879,7 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
 
 def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3, max_tokens=None,
                           service='__player_ask__', force_first_tool=False, return_transcript=False,
-                          task_id=None, village_id=None):
+                          task_id=None, village_id=None, escalate_model=None):
     """Agentic tool-calling loop for /api/intent/ask. Sends `messages` with
     `tools`; while the model replies with tool_calls, executes each via
     `execute_tool(name, args)`, appends the results back as `role:tool`
@@ -8917,8 +8917,18 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
     ask lane, still reached for search_web instead of the real tool it was
     just given access to.
 
-    Tool results are EXTERNAL data once returned by the tool, so they carry the
-    same nonce+HMAC injection boundary as any fetched web page: code later in
+    `escalate_model` (optional): when a tool is forced on turn 1 and the
+    model replies with NO tool call (prose instead of the tool), retry that
+    same first turn with each stronger model in turn before giving up.
+    Accepts a single model slug or an ordered list (e.g. [mid, high]) --
+    each is tried only if the previous one also failed to call the tool.
+    Model tiers refresh every ~30 minutes, so a static "always upgrade"
+    would either waste money when the cheap model behaves or break silently
+    when it doesn't -- this pays the upgrade cost ONLY on the failure path,
+    adapting to whatever model currently sits in each tier.
+
+    Tool results are EXTERNAL data once returned by the tool, so they carry
+    the same nonce+HMAC injection boundary as any fetched web page: code later in
     the prompt stack that pipes tool output into another model must wrap first
     (see the endpoint). This function itself only plumbers role:tool messages.
     """
@@ -8942,6 +8952,29 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
         choice = ((data or {}).get('choices') or [{}])[0]
         message = choice.get('message') or {}
         tool_calls = message.get('tool_calls') or []
+        # Dynamic tier escalation: the forced tool did not fire. Models rotate
+        # in the tiers every ~30 minutes, so instead of unconditionally
+        # upgrading (waste when the cheap model behaves), retry this same
+        # first turn with each stronger model in order -- low -> mid -> high,
+        # stopping at the first one that actually calls the tool.
+        if not tool_calls and tool_choice and escalate_model:
+            chain = escalate_model if isinstance(escalate_model, (list, tuple)) else [escalate_model]
+            for esc in chain:
+                if not esc or esc == model:
+                    continue
+                model = esc
+                data = _post_openrouter_raw(model, current_messages, tools=tools, max_tokens=max_tokens,
+                                            tool_choice=tool_choice)
+                _accrue_spend(service, ((data or {}).get('usage') or {}).get('cost', 0.0), village_id=village_id)
+                if task_id and isinstance(((data or {}).get('usage') or {}).get('cost'), (int, float)):
+                    task_cost = ((data or {}).get('usage') or {}).get('cost', 0.0)
+                    if task_cost:
+                        _accrue_task_spend(task_id, task_cost)
+                choice = ((data or {}).get('choices') or [{}])[0]
+                message = choice.get('message') or {}
+                tool_calls = message.get('tool_calls') or []
+                if tool_calls:
+                    break
         if not tool_calls:
             content = (message.get('content') or '').strip()
             if not content:
@@ -15404,13 +15437,15 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     # low-tier model (mimo-v2.6-flash) has a documented live failure mode: it
     # answers the question directly in prose with tools: [] and invented
     # output, ignoring tool_choice='required' -- the exact hallucination this
-    # force was built to prevent. Anthropic Haiku (mid tier) honors
-    # tool_choice='required' reliably, so upgrade to _mid_tier_slug() for
-    # this call only when a tool is actually forced. No force -> plain question
-    # keeps the JEV-resolved low tier (cost unchanged). No JEV, no high tier,
-    # just the cheapest model that actually obeys the required-tool contract.
+    # force was built to prevent. The model sitting in the low tier rotates
+    # every ~30 minutes, so instead of unconditionally upgrading (which wastes
+    # money whenever the cheap model behaves), the tool loop starts on the
+    # cheap low tier and escalates low -> mid -> high ONLY if a tier fails to
+    # call the forced tool. Plain question -> no force, no escalation, cheap
+    # low tier (cost unchanged).
+    ask_escalate_chain = None
     if ask_force_first_tool:
-        model = _mid_tier_slug() or model
+        ask_escalate_chain = [s for s in (_mid_tier_slug(), _model_tier_slug('high')) if s]
 
     def execute_tool(name, args):
         # Every tool result is external data -> wrap BEFORE it can reach a model.
@@ -15589,6 +15624,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
                 _call_agent_tool_loop, model, messages, tools,
                 execute_tool, 50, int(max_tokens),
                 force_first_tool=ask_force_first_tool,
+                escalate_model=ask_escalate_chain,
                 village_id=_sim_village_for_agent(pick))
         else:
             reply = None
