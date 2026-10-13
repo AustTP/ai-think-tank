@@ -1021,7 +1021,38 @@ class LibraryReviewTools(unittest.TestCase):
             out = executor('read_library_file', {'path': 'finding.md'})
         self.assertEqual(out, 'Real findings from Team A.')
         record.assert_called_once_with('finding.md')
-        self.log_action.assert_called_once_with('cora', 'read_library_file', {'path': 'finding.md', 'found': True}, authorized=True)
+        self.log_action.assert_called_once_with('cora', 'read_library_file', {'path': 'finding.md', 'found': True, 'offset': 0, 'bytes': 26}, authorized=True)
+
+    def test_read_library_file_offset_continues_past_the_20k_cap(self):
+        # Confirmed gap (2026-10-12): the old hard 20k read had no offset, so a
+        # spike could never see past byte 20k of a large file -- deep source
+        # reads kept coming back truncated with whole topics missing. Offset
+        # must resume exactly where the previous window ended.
+        tmp = tempfile.mkdtemp(prefix='think-tank-lib-tool-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, 'big.md')
+        payload = 'A' * 25_000
+        with open(path, 'w') as f:
+            f.write(payload)
+        executor = content._make_library_tools_executor('cora')
+        with unittest.mock.patch.object(serve, '_safe_library_path', return_value=path), \
+             unittest.mock.patch.object(serve, 'record_library_read'):
+            first = executor('read_library_file', {'path': 'big.md'})
+            second = executor('read_library_file', {'path': 'big.md', 'offset': 20_000})
+        self.assertEqual(len(first), 20_000)
+        self.assertEqual(second, 'A' * 5_000, 'offset must read the tail past the first window')
+
+    def test_read_library_file_offset_at_eof_says_so(self):
+        tmp = tempfile.mkdtemp(prefix='think-tank-lib-tool-')
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        path = os.path.join(tmp, 'short.md')
+        with open(path, 'w') as f:
+            f.write('short')
+        executor = content._make_library_tools_executor('cora')
+        with unittest.mock.patch.object(serve, '_safe_library_path', return_value=path), \
+             unittest.mock.patch.object(serve, 'record_library_read'):
+            out = executor('read_library_file', {'path': 'short.md', 'offset': 999})
+        self.assertIn('EOF', out, 'an offset past the end must say so, not return empty')
 
     def test_read_library_file_missing_path_reports_not_found(self):
         executor = content._make_library_tools_executor('cora')
