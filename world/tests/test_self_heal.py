@@ -465,6 +465,37 @@ class WorkerStuckHelp(unittest.TestCase):
                       'a crash must be marked ok=False, not a silent success')
         self.assertIn('Content execution failed', seen['task-1'].get('note', ''))
 
+    def test_content_ceiling_honors_task_budget_ms_up_to_the_cap(self):
+        # Confirmed bug (task-331, 2026-10-13): dispatch flattened every
+        # content task to the generic 120s regardless of the task's own
+        # budgetMs -- so a 5-minute player-authored assembly spike was cut
+        # mid-synthesis and closed with an empty report. The task's larger
+        # budgetMs must set the ceiling (capped so a hostile budget cannot
+        # pin an agent), and a task with no budget keeps the 120s default.
+        def noop(snapshot, agent_id, task, base_ctx):  # noqa: ARG001
+            pass
+
+        real_thread = sim.threading.Thread
+
+        class _InlineThread(real_thread):
+            def start(self):
+                self._target(*self._args, **self._kwargs)
+
+        now = 1000.0
+        cases = [
+            ({'id': 't-none', 'room': 'observatory'}, now + sim.TASK_CONTENT_TIMEOUT_S),
+            ({'id': 't-5min', 'room': 'observatory', 'budgetMs': 300_000}, now + 300.0),
+            ({'id': 't-tiny', 'room': 'observatory', 'budgetMs': 30_000}, now + sim.TASK_CONTENT_TIMEOUT_S),
+            ({'id': 't-huge', 'room': 'observatory', 'budgetMs': 86_400_000},
+             now + sim.TASK_CONTENT_TIMEOUT_MAX_S),
+        ]
+        with mock.patch('sim.threading.Thread', _InlineThread):
+            for task, expected in cases:
+                sim._dispatch_content_work(noop, _state(), 'ada', task, now)
+                self.assertAlmostEqual(task['workUntil'], expected,
+                                       msg=f"ceiling wrong for {task['id']}")
+                self.assertIs(task.get('_contentInFlight'), True)
+
 
 class CoachingLoopEscalation(unittest.TestCase):
     """W5: the growth-plan coaching loop. A single low grade coaches once; a
