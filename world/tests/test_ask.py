@@ -553,30 +553,65 @@ class AskEndpoint(unittest.TestCase):
         self.assertEqual(seen['tool_choice'],
                          {'type': 'function', 'function': {'name': 'list_services'}})
 
-    def test_forced_tool_upgrades_model_to_mid_tier(self):
-        # Conditional mid-tier upgrade: only when a tool is forced does the
-        # model bump from the JEV-resolved low tier to _mid_tier_slug(). The
-        # low tier (mimo-v2.6-flash) has a documented live failure mode of
-        # ignoring tool_choice='required' and answering with tools: [] and
-        # invented prose -- mid tier (Haiku) honors it. Plain questions keep
-        # their JEV-resolved low tier (cost unchanged).
+    def test_forced_tool_starts_on_low_and_escalates_on_failure(self):
+        # Dynamic escalation: models rotate in the tiers every ~30 minutes, so
+        # the ask lane no longer unconditionally upgrades to mid. It starts on
+        # the JEV-resolved low tier and escalates low -> mid -> high ONLY if a
+        # tier fails to call the forced tool. Case 1: the low tier calls the
+        # tool -> no escalation, stays on the cheap model (cost saved).
         s = _state()
         c = self._client(s)
         seen = {}
         def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
-            seen['model'] = model
-            seen['tool_choice'] = tool_choice
-            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+            if tool_choice:
+                seen.setdefault('models', []).append(model)
+                seen['tool_choice'] = tool_choice
+                return {'choices': [{'message': {'role': 'assistant', 'content': '',
+                                                 'tool_calls': [{'function': {'name': 'team_status', 'arguments': '{}'}}]}}]}
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'done'}}]}
         with unittest.mock.patch.object(serve, '_coding_tier_slug', return_value='fake-model'), \
              unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-model'), \
+             unittest.mock.patch.object(serve, '_model_tier_slug',
+                                       side_effect=lambda band: {'high': 'high-model'}.get(band, 'low-model')), \
              unittest.mock.patch.object(serve, '_resolve_model_tier', return_value='low-model'), \
-             unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post):
+             unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post), \
+             unittest.mock.patch.object(serve, '_team_status_text', return_value='ok'):
             r = c.post('/api/intent/ask', json={
                 'question': 'What is the team_status right now?', 'agentId': 'cora'})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertEqual(seen['tool_choice'],
                          {'type': 'function', 'function': {'name': 'team_status'}})
-        self.assertEqual(seen['model'], 'mid-model')
+        self.assertEqual(seen['models'], ['low-model'],
+                         'low tier honored the forced tool -- no escalation, no upgrade cost')
+
+    def test_forced_tool_escalates_low_then_mid_then_high(self):
+        # Case 2: the low tier ignores tool_choice (prose, no tool call) ->
+        # escalate to mid; if mid also fails -> escalate to high. Stops at the
+        # first tier that actually calls the tool.
+        s = _state()
+        c = self._client(s)
+        seen = {}
+        def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
+            seen.setdefault('models', []).append(model) if tool_choice else None
+            if not tool_choice:
+                return {'choices': [{'message': {'role': 'assistant', 'content': 'done'}}]}
+            if model == 'high-model':
+                return {'choices': [{'message': {'role': 'assistant', 'content': '',
+                                                 'tool_calls': [{'function': {'name': 'team_status', 'arguments': '{}'}}]}}]}
+            # low and mid ignore the forced tool and answer with prose instead
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'prose instead of a tool call'}}]}
+        with unittest.mock.patch.object(serve, '_coding_tier_slug', return_value='fake-model'), \
+             unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-model'), \
+             unittest.mock.patch.object(serve, '_model_tier_slug',
+                                       side_effect=lambda band: {'high': 'high-model'}.get(band, 'low-model')), \
+             unittest.mock.patch.object(serve, '_resolve_model_tier', return_value='low-model'), \
+             unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post), \
+             unittest.mock.patch.object(serve, '_team_status_text', return_value='ok'):
+            r = c.post('/api/intent/ask', json={
+                'question': 'What is the team_status right now?', 'agentId': 'cora'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(seen['models'], ['low-model', 'mid-model', 'high-model'],
+                         'low failed -> mid failed -> high succeeded; chain walked in order')
 
     def test_plain_question_keeps_low_tier_model(self):
         # Cost guard: a plain (no-tool-forced) question must NOT be upgraded
