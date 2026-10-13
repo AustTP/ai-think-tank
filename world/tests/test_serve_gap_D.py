@@ -1284,6 +1284,34 @@ class SetTeamPrefix(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["prefix"], "ENG")
 
+    def test_director_agent_key_can_set_prefix(self):
+        # The gate is OPERATOR (player session OR director/admin), not
+        # player-only: a rostered director's agent key must pass. Role check
+        # and requester resolution are mocked against this module's temp DB
+        # (no seeded roster); verify_session off forces the key branch.
+        state = _roster_state()
+        with _player_env(state,
+                         verify_session=lambda cookie: False,
+                         _valid_agent_key_presented=lambda k: True,
+                         _resolve_requester=lambda request: "agent-2",
+                         _is_director_or_admin=lambda s, a: a == "agent-2"), \
+             unittest.mock.patch.object(sim, "set_team_prefix", return_value="ENG"):
+            r = _post(_client(), "/api/teams/team-1/prefix", {"prefix": "ENG"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["prefix"], "ENG")
+
+    def test_non_director_agent_key_is_refused(self):
+        # A valid worker key clears the login middleware but not the gate.
+        state = _roster_state()
+        with _player_env(state,
+                         verify_session=lambda cookie: False,
+                         _valid_agent_key_presented=lambda k: True,
+                         _resolve_requester=lambda request: "agent-3",
+                         _is_director_or_admin=lambda s, a: False):
+            r = _post(_client(), "/api/teams/team-1/prefix", {"prefix": "ENG"})
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json()["error"], "Unauthorized")
+
 
 class IntentClarify(unittest.TestCase):
     def _clarify_state(self):
