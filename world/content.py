@@ -3144,14 +3144,19 @@ _LIBRARY_READ_TOOL = {
     'function': {
         'name': 'read_library_file',
         'description': (
-            'Read the full real content of one Library file by its exact path (from '
+            'Read the real content of one Library file by its exact path (from '
             "search_library's results). Use this to actually read another team's finished work -- "
-            'its findings, code notes, or CSV -- instead of relying on a search snippet alone.'
+            'its findings, code notes, or CSV -- instead of relying on a search snippet alone. '
+            'One call returns up to ~20k characters from the given byte offset; if the file is '
+            'longer, call again with offset set to the next position to read the rest (a truncated '
+            'read means there is more -- do not treat it as the whole file).'
         ),
         'parameters': {
             'type': 'object',
             'properties': {
                 'path': {'type': 'string', 'description': 'Exact Library-relative path, e.g. "archive/1234-spike-task-9.md".'},
+                'offset': {'type': 'integer', 'description': 'Byte offset to start reading from (default 0). Pass the last offset you read to continue a long file.'},
+                'limit': {'type': 'integer', 'description': 'Max characters to return (default 20000, max 50000).'},
             },
             'required': ['path'],
         },
@@ -3235,6 +3240,20 @@ def _make_library_tools_executor(agent_id, struck_tools=None):
             return '\n'.join(lines) + hint
         if name == 'read_library_file':
             path = (args.get('path') or '').strip()
+            # offset/limit: the old hard 20k cap made it impossible to read past
+            # byte 20k of a large file -- no offset, no continuation -- which is
+            # why deep source reads kept coming back truncated mid-section with
+            # whole topics (morale, work lanes) missing. A caller may pass an
+            # offset (default 0) to read the NEXT window; the default 20k limit
+            # keeps a single call bounded.
+            try:
+                offset = max(0, int(args.get('offset') or 0))
+            except (TypeError, ValueError):
+                offset = 0
+            try:
+                limit = min(max(1, int(args.get('limit') or 20_000)), 50_000)
+            except (TypeError, ValueError):
+                limit = 20_000
             target = _serve._safe_library_path(path)
             if not target or not os.path.isfile(target):
                 _serve.log_action(agent_id, 'read_library_file',
@@ -3242,7 +3261,9 @@ def _make_library_tools_executor(agent_id, struck_tools=None):
                 return f'Not found: {path}'
             try:
                 with open(target, 'r', errors='replace') as f:
-                    content_text = f.read(20_000)
+                    if offset:
+                        f.seek(offset)
+                    content_text = f.read(limit)
             except OSError:
                 return f'Could not read {path}'
             # Trail reinforcement: a real, actual read of this
@@ -3250,7 +3271,10 @@ def _make_library_tools_executor(agent_id, struck_tools=None):
             # that should make it rank higher in future search_library calls.
             _serve.record_library_read(path)
             _serve.log_action(agent_id, 'read_library_file',
-                              {'path': path, 'found': True}, authorized=True)
+                              {'path': path, 'found': True, 'offset': offset,
+                               'bytes': len(content_text)}, authorized=True)
+            if offset and not content_text:
+                return f'EOF: no content at offset {offset} in {path}'
             return content_text
         raise ValueError(f'unknown tool: {name}')
     return execute_tool
