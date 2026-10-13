@@ -1114,6 +1114,20 @@ class SimAgentPerception(unittest.TestCase):
         tool_names = {t['function']['name'] for t in serve.AGENT_ASK_TOOLS}
         self.assertIn('team_overview', tool_names)
 
+    def test_treasury_status_tool_is_offered(self):
+        # Ben's round-4 request: a read-only budget/ledger view.
+        tool_names = {t['function']['name'] for t in serve.AGENT_ASK_TOOLS}
+        self.assertIn('treasury_status', tool_names)
+
+    def test_team_digest_falls_back_to_live_summary_when_no_weekly_review(self):
+        # The weekly loop sleeps 7 days before its first run, so the table is
+        # empty on a fresh deploy. The digest must return real action-log data,
+        # not "none yet".
+        text = serve._team_digest_text()
+        self.assertNotIn('No weekly review has been generated yet', text)
+        self.assertIn('Live summary from the action log', text)
+        self.assertIn('Jev decisions logged', text)
+
 
     def test_apply_content_result_consumes_executor_feedback(self):
         # Item 2: an executor-reported block/failure rides the content result

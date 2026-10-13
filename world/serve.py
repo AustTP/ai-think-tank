@@ -9270,6 +9270,22 @@ AGENT_ASK_TOOLS = [
             },
         },
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'treasury_status',
+            'description': 'Read-only budget/treasury usage: every budget knob\'s live '
+                           'month-to-date usage against its cap (total spend, high-tier '
+                           'spend, Apify, page requests, Colab units). Use this to verify '
+                           'spend figures against a source instead of guessing. No write '
+                           'access -- setting budgets is a player-only operation.',
+            'parameters': {
+                'type': 'object',
+                'properties': {},
+                'required': [],
+            },
+        },
+    },
 ] + ([{
     'type': 'function',
     'function': {
@@ -15373,6 +15389,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
             ('team_status', re.compile(r'\bteam[_\s-]?status\b', re.I)),
             ('team_digest', re.compile(r'\bteam[_\s-]?digest\b', re.I)),
             ('allowlist_status', re.compile(r'\ballowlist[_\s-]?status\b', re.I)),
+            ('treasury_status', re.compile(r'\b(treasury|budget|ledger|balance|spend)[_\s-]?(status|usage|figure|report)?\b', re.I)),
             ('read_mailbox', re.compile(r'\b(read|my|check)[_\s-]?(my|the)?[_\s-]?(inbox|mailbox|mail|messages?)\b', re.I)),
             ('read_peer_reviews', re.compile(r'\b(peer[_\s-]?review|reviews?)[_\s-]?(about|on|for|of)?[_\s-]?(me|myself|my)\b', re.I)),
             ('list_services', re.compile(r'\blist[_\s-]?services\b|\bservices?\b.*\b(list|api|call|use|available)\b|\b(what|which)\b.*\bservices?\b', re.I)),
@@ -15434,6 +15451,30 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
                 _allowlist_status_text(''),
             ]
             return '\n'.join(parts)
+        if name == 'treasury_status':
+            # Read-only budget usage (ben's round-4 request: no ledger tool).
+            # _budget_usage_snapshot is already a pure read with best-effort
+            # per-knob try/except -- a ledger failure omits that knob, never
+            # blocks the view. No secrets, just used/cap numbers. A cap of 0
+            # means "unlimited" per the knob docs -- display that clearly
+            # instead of showing a confusing "0.0 cap (within cap)".
+            tools_used.append(name)
+            usage = _budget_usage_snapshot()
+            if not usage:
+                return 'No budget ledgers have recorded usage yet.'
+            lines = ['TREASURY / BUDGET USAGE (month-to-date):']
+            for knob, info in usage.items():
+                used = info.get('used')
+                cap = info.get('cap')
+                exceeded = info.get('exceeded')
+                if not cap:
+                    cap_desc = 'unlimited (cap 0)'
+                    state = 'within budget'
+                else:
+                    cap_desc = f'cap {cap}'
+                    state = 'OVER CAP' if exceeded else 'within cap'
+                lines.append(f'- {knob}: used {used} of {cap_desc} ({state})')
+            return '\n'.join(lines)
         if name == 'read_peer_reviews':
             # Feedback about WORK, read DB-only (no self-loopback).
             #   no target / your own id -> everything written about YOUR work
@@ -16460,7 +16501,12 @@ def _team_digest_text(max_markdown_chars=1400, tape_window_s=86400):
     agent's self-report) plus a live count of Jev decisions logged in the
     window. No LLM, no network -- safe to call as often as agents want, and
     it directly answers the isolation complaint ('I can't see what the team
-    shipped or how my work fits the bigger picture')."""
+    shipped or how my work fits the bigger picture').
+
+    When no weekly review exists yet (the weekly loop sleeps 7 days before
+    its first run, and server restarts reset that timer), a live fallback is
+    built from the action log so agents get real shipped-work data instead of
+    'none yet' -- the same ground-truth source the weekly review uses."""
     now = time.time()
     with _db() as conn:
         row = conn.execute(
@@ -16480,10 +16526,54 @@ def _team_digest_text(max_markdown_chars=1400, tape_window_s=86400):
         else:
             parts.append('No weekly review has been written yet.')
     else:
-        parts.append('No weekly review has been generated yet -- the weekly ceremony '
-                     'builds the first one.')
+        # Live fallback: the weekly review hasn't been generated yet (its loop
+        # sleeps 7 days before the first run). Build a same-shape summary from
+        # the action log over the last 7 days so agents get real data now.
+        parts.append(_live_digest_fallback(now))
     parts.append(f'Live signal (last 24h): {n} Jev decisions logged, {n_ok} ok.')
     return '\n\n'.join(parts)
+
+
+def _live_digest_fallback(now):
+    """Ground-truth shipped-work summary from the action log, used when no
+    weekly review row exists yet. Per-agent shipped counts (progress actions
+    in the last 7 days) + top action kinds + total. Same data source as
+    _build_weekly_review -- just without the markdown report and the
+    week-over-week delta (there is no prior week to compare against yet)."""
+    week_ago = now - (7 * 86400)
+    with _db() as conn:
+        rows = conn.execute(
+            'SELECT agent_id, action FROM action_log WHERE ts > ?',
+            (week_ago,),
+        ).fetchall()
+    progress = set(_PROGRESS_ACTIONS)
+    per_agent = {}
+    action_counts = {}
+    for agent_id, action in rows:
+        action_counts[action] = action_counts.get(action, 0) + 1
+        if not agent_id or agent_id in ('player', 'system'):
+            continue
+        bucket = per_agent.setdefault(agent_id, {'actions': 0, 'shipped': 0})
+        bucket['actions'] += 1
+        if action in progress:
+            bucket['shipped'] += 1
+    shipped_total = sum(b['shipped'] for b in per_agent.values())
+    top_actions = sorted(action_counts.items(), key=lambda kv: -kv[1])[:6]
+    lines = [
+        'Weekly review: not generated yet (the weekly ceremony builds the '
+        'first one). Live summary from the action log, last 7 days:',
+        f'Total actions logged: {sum(action_counts.values())}. '
+        f'Shipped-work actions (task_completed, product_released, etc.): {shipped_total}.',
+    ]
+    if per_agent:
+        ranked = sorted(per_agent.items(), key=lambda kv: (-kv[1]['shipped'], -kv[1]['actions']))
+        lines.append('Per-agent (shipped / total actions): '
+                     + ', '.join(f'{aid}: {b["shipped"]}/{b["actions"]}'
+                                 for aid, b in ranked[:14]))
+    if top_actions:
+        lines.append('Top action kinds: '
+                     + ', '.join(f'{k} ({v})' for k, v in top_actions))
+    return '\n'.join(lines)
 
 
 def _own_work_feedback_text(state, agent_id, max_chars=4000):

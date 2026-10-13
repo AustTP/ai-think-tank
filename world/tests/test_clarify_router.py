@@ -321,7 +321,9 @@ class TeamDigestTests(unittest.TestCase):
         with serve._db() as conn:
             conn.execute('DELETE FROM weekly_reviews')
         text = serve._team_digest_text()
-        self.assertIn('No weekly review has been generated yet', text)
+        # No weekly review yet -> live fallback from the action log, not a
+        # bare "none yet" (agents asked for shipped-work data, not a wall).
+        self.assertIn('Live summary from the action log', text)
 
 
 if __name__ == '__main__':
