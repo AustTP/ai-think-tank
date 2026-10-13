@@ -133,6 +133,7 @@ from notify import (  # noqa: E402,F401
     _send_escalation_email_sync,
     _send_player_email_sync,
     create_escalation,
+    notify_human_of_escalation,
     provision_player_email,
     send_player_email_sync,
     send_player_telegram_sync,
@@ -4706,18 +4707,37 @@ def _resolve_pending_escalations_sync():
         # repeatedly failed closed (judge down, disagreeing, or colluding) is
         # taken out of the director's delegation entirely and waits for the
         # human's link, exactly like the floor-1.0 kinds. Checked BEFORE the
-        # primary Jev call so a tripped circuit doesn't burn model spend.
+        # primary Jev call so a tripped circuit doesn't burn model spend. The
+        # human is notified ONCE at the moment the circuit trips -- delegable
+        # kinds are silent at creation, so this is when the ping actually
+        # means "the director cannot handle this".
         if _escalation_judge_drift(esc_kind) >= ESCALATION_JUDGE_DRIFT_CIRCUIT:
+            if not esc.get('humanNotified'):
+                esc['humanNotified'] = True
+                dirty = True
+                notify_human_of_escalation(
+                    esc_id, esc,
+                    context='The director could not resolve this automatically (judge cross-check '
+                            'has been failing closed for this kind), so it is now yours.')
             continue
         # Re-ask backoff: don't hit Jev again until the cooldown has elapsed,
         # and stop asking entirely once this escalation has exceeded the
         # attempt cap -- the human's email link is the remaining path. Without
-        # this, one long-stuck escalation is re-queried every 30s forever.
+        # this, one long-stuck escalation is re-queried every 30s forever. The
+        # transition INTO the cap notifies the human once (delegable kinds are
+        # silent at creation -- this is the give-up moment).
         last_asked = esc.get('lastAskedAt') or 0
         asks = esc.get('askCount') or 0
         if now - last_asked < DIRECTOR_ESCALATION_REASK_COOLDOWN_S:
             continue
         if asks >= DIRECTOR_ESCALATION_MAX_ASKS:
+            if not esc.get('humanNotified'):
+                esc['humanNotified'] = True
+                dirty = True
+                notify_human_of_escalation(
+                    esc_id, esc,
+                    context=f'The director tried {asks} times and could not decide this '
+                            f'automatically, so it is now yours.')
             continue
         esc['lastAskedAt'] = now
         esc['askCount'] = asks + 1
@@ -4805,9 +4825,14 @@ def _resolve_pending_escalations_sync():
         esc['resolvedBy'] = f'{director_name} ({director_id})'
         esc['resolvedAt'] = time.time()
         bloom = decision == 'approve'
-        # Re-apply whatever the approval was for, if the note says so (mirrors
-        # how the human's approve/deny link mutates the record). The note string
-        # is opaque here; the important, auditable change is the status itself.
+        # Side-effect for the one delegable kind that carries one: an approved
+        # 'allowlist candidate' applies its RUNTIME allowlist grant, mirroring
+        # how the human's approve link mutates the record. The note carries the
+        # hostname (set by record_browse_success); on deny nothing is granted.
+        # Attribution names the director (_grant_allowlist logs it), so the
+        # action log shows the grant came through delegation, not the human.
+        if bloom and esc_kind == 'allowlist candidate' and esc.get('note'):
+            _grant_allowlist(esc['note'], actor=director_id, via='director delegation')
         judge_note = {'judge': judge_model, 'judge_confidence': judge_conf} if judge_model else {}
         log_action(director_id, 'escalation_' + ('approve' if bloom else 'deny'),
                    {'escalationId': esc_id, 'kind': esc_kind, 'question': esc.get('question'),
@@ -7474,9 +7499,11 @@ def record_browse_success(hostname):
         create_escalation(
             'allowlist candidate',
             f'{host} has been confidently approved by Jev {entry["count"]} separate times -- '
-            'it may be worth adding to BROWSE_ALLOWLIST_DOMAINS in .env so agents can reach it '
-            'without a repeat Jev round trip each time. Remember: every allowlist entry is full '
-            'read+write reachability for sandboxed scripts too, not just read access.',
+            'approving adds it to the RUNTIME allowlist (not .env) so agents reach it without a '
+            'repeat Jev round trip; a director can revoke it later if its standing changes. '
+            'Remember: every allowlist entry is full read+write reachability for sandboxed '
+            'scripts too, not just read access.',
+            on_approve_note=host,
         )
     _browse_trail_write(trail)
 
@@ -24253,12 +24280,13 @@ async def resolve_escalation(id: str, token: str, decision: str):
     # circuit had routed it all to the human's link; a real human answer resets
     # that signal, exactly like a repair of the underlying failure).
     _reset_escalation_judge_drift(esc.get('kind') or 'unknown')
-    # Approval side-effect: an approved 'allowlist request' turns
-    # the requested host into a REAL runtime allowlist grant -- this is the
-    # only path that can grant one, and it is this HTML link alone (the
-    # director loop is blocked from it by the floor-1.0 kind). The note field
-    # carries the hostname; on deny nothing is granted.
-    if decision == 'approve' and esc.get('kind') == 'allowlist request':
+    # Approval side-effect: an approved 'allowlist request' or 'allowlist
+    # candidate' turns the note's host into a REAL runtime allowlist grant.
+    # For 'allowlist request' (floor 1.0) this link is the only path; for
+    # 'allowlist candidate' (delegable) the director loop can also apply it,
+    # and this link is the human override. The note field carries the
+    # hostname; on deny nothing is granted.
+    if decision == 'approve' and esc.get('kind') in ('allowlist request', 'allowlist candidate'):
         granted = _grant_allowlist(esc.get('note'))
         if granted:
             return HTMLResponse(f"<p>Recorded: <b>approved</b> for {esc['kind']}.</p>"
