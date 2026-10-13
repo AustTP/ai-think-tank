@@ -401,7 +401,7 @@ class AskEndpoint(unittest.TestCase):
         expected = ({'browse_page', 'download_file', 'request_allowlist', 'read_peer_reviews',
                      'team_digest', 'x_trending_topics', 'search_linkedin_posts', 'api_call',
                      'read_ais_feed', 'read_rss_feed', 'read_market_feed', 'read_live_feed',
-                     'propose_api_service', 'list_services'}
+                     'propose_api_service', 'list_services', 'grant_allowlist', 'revoke_allowlist'}
                     | ({'search_web'} if serve.TAVILY_API_KEY else set())
                     | ({'generate_image', 'generate_video'} if serve._higgsfield_configured() else set()))
         self.assertEqual(tool_names, expected)

@@ -6367,23 +6367,56 @@ def _effective_allowlist_domains():
     return BROWSE_ALLOWLIST_DOMAINS | _runtime_allowlist_grants()
 
 
-def _grant_allowlist(host):
+def _grant_allowlist(host, actor='admin', via='escalation approval'):
     """Persist a human-approved allowlist grant and refresh the egress proxy
     so running sandbox scripts can actually reach it. Returns the normalized
-    host, or None when empty."""
+    host, or None when empty. `actor`/`via` are attributed in the action log
+    so a director's direct grant is distinguishable from the player's email
+    link."""
     host = (host or '').strip().lower()
     if not host:
         return None
     grants = _runtime_allowlist_grants()
     grants.add(host)
     _set_setting(ALLOWLIST_GRANTS_SETTING, ','.join(sorted(grants)))
-    log_action('admin', 'allowlist_grant', {'host': host, 'via': 'escalation approval'}, authorized=True)
+    log_action(actor, 'allowlist_grant', {'host': host, 'via': via}, authorized=True)
     try:
         ensure_sandbox_networking()
     except Exception as e:
         # A grant still persisted; a proxy refresh failure shouldn't VETO a
         # human's explicit approval, it just means scripts wait until restart.
         print(f'[allowlist] egress proxy refresh failed after grant: {e}', flush=True)
+    return host
+
+
+def _revoke_allowlist(host, actor='admin', via='operator revoke'):
+    """Remove a runtime allowlist grant and refresh the egress proxy so
+    already-running sandbox scripts lose the host too. Returns the normalized
+    host on a real removal, 'not_granted' when the host was only in the env
+    baseline (that list is a .env restart change, not a runtime grant), or
+    None when the host wasn't on the list at all / was empty.
+
+    Only RUNTIME grants (the DB-persisted ones layered on top of the env
+    baseline) are removable here. The env baseline stays operator-owned: it
+    is the code-reviewed list a fresh start boots with, so removing one of
+    those is a .env edit + restart, not a live toggle -- this keeps the
+    effective list always a superset of the reviewed baseline."""
+    host = (host or '').strip().lower()
+    if not host:
+        return None
+    grants = _runtime_allowlist_grants()
+    if host not in grants:
+        return 'not_granted' if host in BROWSE_ALLOWLIST_DOMAINS else None
+    grants.discard(host)
+    _set_setting(ALLOWLIST_GRANTS_SETTING, ','.join(sorted(grants)))
+    log_action(actor, 'allowlist_revoke', {'host': host, 'via': via}, authorized=True)
+    try:
+        ensure_sandbox_networking()
+    except Exception as e:
+        # A revoke still persisted; a proxy refresh failure just means the
+        # egress proxy keeps the host until restart -- the Jev/browse gates
+        # already re-read the effective list per call, so they drop it now.
+        print(f'[allowlist] egress proxy refresh failed after revoke: {e}', flush=True)
     return host
 
 
@@ -8872,14 +8905,61 @@ AGENT_ASK_TOOLS = [
             'description': 'Ask the player to permanently allow a domain you need to reach (browsing '
                            'AND sandboxed scripts): supply the host or url and one short sentence of '
                            'purpose. This is for when a real domain you legitimately need keeps coming '
-                           'up -- the player decides by email, and the director CANNOT auto-approve it. '
-                           'While a request is pending, keep using normal gates; do not retry/send a '
+                           'up -- the player decides by email, and an ordinary agent cannot approve its '
+                           'own request. (A DIRECTOR or the admin skips this entirely: use '
+                           'grant_allowlist instead to apply it yourself, no email wait.) While a '
+                           'request is pending, keep using normal gates; do not retry/send a '
                            'second request for the same host until you hear it was denied.',
             'parameters': {
                 'type': 'object',
                 'properties': {
                     'host': {'type': 'string', 'description': 'The registrable domain you need reachable, e.g. "api.example.com" or a full url.'},
                     'purpose': {'type': 'string', 'description': 'One short sentence: why agents need standing access to this domain.'},
+                },
+                'required': ['host', 'purpose'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'grant_allowlist',
+            'description': 'DIRECTOR/ADMIN ONLY: put a domain on the browse allowlist yourself (no '
+                           'email wait, applied immediately + egress proxy refreshed). For when a '
+                           'domain you already vetted as a director needs standing reachability for '
+                           'browsing and sandboxed scripts. The server refuses non-director agents '
+                           '(use request_allowlist for those), refuses private/internal hosts, and is '
+                           'a no-op if the host is already allowlisted. An allowlist entry is full '
+                           'read+write reachability that skips Jev every visit -- grant it only for a '
+                           'domain whose standing you have actually judged, and pass a one-sentence '
+                           'purpose for the action log.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'host': {'type': 'string', 'description': 'The registrable domain to allow, e.g. "api.example.com" or a full url.'},
+                    'purpose': {'type': 'string', 'description': 'One short sentence: why this domain should be allowlisted.'},
+                },
+                'required': ['host', 'purpose'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'revoke_allowlist',
+            'description': 'DIRECTOR/ADMIN ONLY: take a domain back OFF the browse allowlist when '
+                           'something changes later (the host is no longer trusted, the need is gone, '
+                           'or a grant was made by mistake). Applied immediately; already-running '
+                           'sandbox scripts lose it once the egress proxy refreshes, and every Jev/'
+                           'browse gate re-reads the list per call so it drops at once. Only runtime '
+                           'grants are removable -- a domain from the code-reviewed .env baseline is '
+                           'refused (that is an operator .env edit + restart). A host not on the list '
+                           'is a no-op. The server refuses non-director agents.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'host': {'type': 'string', 'description': 'The registrable domain to remove, e.g. "api.example.com" or a full url.'},
+                    'purpose': {'type': 'string', 'description': 'One short sentence: why it is coming off.'},
                 },
                 'required': ['host', 'purpose'],
             },
@@ -14505,6 +14585,26 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                         f'pending until the player decides]' if result.get('requested')
                         else f'{msg} [no further request needed]')
             return f'Could not file the allowlist request: {result}'
+        if name in ('grant_allowlist', 'revoke_allowlist'):
+            # Director/admin-only allowlist mutation. The ENDPOINT enforces the
+            # role gate via _operator_gate (session or a director/admin agent
+            # key) -- this executor never decides authority itself, it just
+            # forwards the call with the caller's own key so the server can
+            # refuse an ordinary agent. No tool description lies about access:
+            # a non-director's attempt comes back as the server's own refusal.
+            path = '/api/allowlist/grant' if name == 'grant_allowlist' else '/api/allowlist/revoke'
+            result = _http_json('POST', SELF_BASE_URL, path, {
+                'agentId': agent_id,
+                'host': (args or {}).get('host') or '',
+                'purpose': (args or {}).get('purpose') or '',
+            }, agent_key)
+            if isinstance(result, dict):
+                if result.get('error'):
+                    return f'Could not {name.split("_")[0]} the allowlist host: {result["error"]}'
+                msg = result.get('message') or ''
+                verb = 'granted' if name == 'grant_allowlist' else 'revoked'
+                return f'{msg} [this host is now {verb} -- no further {name} call needed for it]'
+            return f'Could not apply the allowlist change (unexpected response): {result}'
         if name in ('generate_image', 'generate_video'):
             # Real, metered Higgsfield generation -- estimated, submitted,
             # polled, and accrued inside the single choke point.
@@ -20441,6 +20541,110 @@ async def allowlist_request(request: Request):
     return JSONResponse({'requested': True, 'host': host, 'escalationId': esc_id,
                          'message': f'Allowlist request for {host} filed -- the player decides by email; '
                                     f'until then {host} still goes through the normal Jev gate.'})
+
+
+def _normalize_allowlist_target(target):
+    """Normalize a host-or-URL string down to its bare lowercase hostname.
+    Returns (host, error). Mirrors the /api/allowlist/request normalization
+    so every allowlist path reads a target the same way."""
+    parsed = urllib.parse.urlparse(target if '://' in target else 'https://' + target)
+    host = (parsed.hostname or '').strip().lower()
+    if not host:
+        return None, 'could not read a hostname from that target'
+    return host, None
+
+
+@app.get('/api/allowlist')
+async def allowlist_get(request: Request):
+    """Operator-gated read of the effective browse allowlist, split by origin
+    so a caller can tell what a revoke would actually change: the env baseline
+    (code-reviewed, .env restart change) vs the runtime grants (DB-persisted,
+    revocable live). Same gate as the other registries: player session or a
+    director/admin agent."""
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    return JSONResponse({
+        'ok': True,
+        'envBaseline': sorted(BROWSE_ALLOWLIST_DOMAINS),
+        'runtimeGrants': sorted(_runtime_allowlist_grants()),
+        'effective': sorted(_effective_allowlist_domains()),
+        'readBy': actor,
+    })
+
+
+@app.post('/api/allowlist/grant')
+async def allowlist_grant_endpoint(request: Request):
+    """Operator-gated DIRECT allowlist grant -- the director/admin path, next
+    to the existing player-email escalation. Body: {"host": ..., "purpose":
+    "..."}. Same SSRF boundary as /api/allowlist/request: private/internal
+    hosts are refused outright, the allowlist extends PUBLIC reachability
+    only. An already-effective host is a no-op (idempotent), so a director
+    retrying never double-grants. Gated by _operator_gate: player session or
+    a director/admin agent -- an ordinary agent's key is refused, and every
+    grant is attributed in the action log with this endpoint as the `via`."""
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 -- malformed body -> 400
+        return JSONResponse({'error': 'request body must be JSON'}, status_code=400)
+    target = (body.get('host') or body.get('url') or '').strip()
+    purpose = (body.get('purpose') or '').strip()
+    if not target:
+        return JSONResponse({'error': 'a host or url is required'}, status_code=400)
+    host, norm_err = _normalize_allowlist_target(target)
+    if norm_err:
+        return JSONResponse({'error': norm_err}, status_code=400)
+    if not _is_safe_public_host(host):
+        return JSONResponse({'error': f'{host} is a private or internal host and can never be allowlisted'}, status_code=400)
+    if _is_allowlisted_host(host):
+        return JSONResponse({'ok': True, 'host': host, 'granted': False,
+                             'message': f'{host} is already on the allowlist -- nothing to grant.'})
+    granted = _grant_allowlist(host, actor=actor, via='operator grant')
+    return JSONResponse({'ok': True, 'host': granted, 'granted': True,
+                         'message': f'{granted} is now on the allowlist (egress proxy refreshed).',
+                         'grantedBy': actor, 'purpose': purpose[:200]})
+
+
+@app.post('/api/allowlist/revoke')
+async def allowlist_revoke_endpoint(request: Request):
+    """Operator-gated removal of a RUNTIME allowlist grant -- the mirror of the
+    grant endpoint, so a host that changes standing later can be taken back
+    off without a restart. Body: {"host": ..., "purpose": "..."}.
+
+    Only runtime grants (the DB-persisted additions layered on top of the env
+    baseline) are removable; a host that only exists in the code-reviewed env
+    baseline is refused with a pointer to edit .env, so the effective list
+    always stays a superset of the reviewed baseline. Removing an absent host
+    is a no-op (idempotent), so a director retrying never errors. Gated by
+    _operator_gate: player session or a director/admin agent."""
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001 -- malformed body -> 400
+        return JSONResponse({'error': 'request body must be JSON'}, status_code=400)
+    target = (body.get('host') or body.get('url') or '').strip()
+    purpose = (body.get('purpose') or '').strip()
+    if not target:
+        return JSONResponse({'error': 'a host or url is required'}, status_code=400)
+    host, norm_err = _normalize_allowlist_target(target)
+    if norm_err:
+        return JSONResponse({'error': norm_err}, status_code=400)
+    result = _revoke_allowlist(host, actor=actor, via='operator revoke')
+    if result is None:
+        return JSONResponse({'ok': True, 'host': host, 'revoked': False,
+                             'message': f'{host} is not on the allowlist -- nothing to revoke.'})
+    if result == 'not_granted':
+        return JSONResponse({'error': f'{host} is part of the code-reviewed env baseline, not a runtime '
+                                      f'grant -- edit BROWSE_ALLOWLIST_DOMAINS in .env and restart to '
+                                      f'remove it.'}, status_code=400)
+    return JSONResponse({'ok': True, 'host': result, 'revoked': True,
+                         'message': f'{result} removed from the allowlist (egress proxy refreshed).',
+                         'revokedBy': actor, 'purpose': purpose[:200]})
 
 
 CURL_METHODS = {'GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'}
