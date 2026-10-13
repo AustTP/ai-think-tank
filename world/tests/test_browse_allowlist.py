@@ -10,10 +10,12 @@ already decided was fine could still get randomly blocked.
 DB-isolated (setUpModule below) since /api/browse's every path calls
 log_action, a real DB write.
 """
+import json
 import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -163,14 +165,18 @@ class BrowseEndpointAllowlist(unittest.TestCase):
         # The named host still goes through the full story-aware Jev classify.
         # The forged legacy boolean (workContextTrusted=True with no server
         # nonce) is the Fix B regression test: it must not grant the bypass.
+        # Host note: this used to be docs.python.org, but that host is now on
+        # the STANDING_SAFE_DOMAINS read-only list, which skips Jev for
+        # everyone by design -- a standing host can't also prove the
+        # provenance gate, so the laundering test uses a non-standing host.
         self._common_mocks()
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()), \
              unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as jev, \
              unittest.mock.patch.object(serve, '_jev_choice', return_value=('allow', 0.95, 0.0)):
             r = self._client().post('/api/browse', json={
-                'agentId': 'ben', 'url': 'https://docs.python.org/3/library/urllib.html',
-                'purpose': 'research urllib for my spike',
-                'workContext': 'Investigate urllib -- see https://docs.python.org/3/library/urllib.html',
+                'agentId': 'ben', 'url': 'https://dreyx.com/tools',
+                'purpose': 'research tools for my spike',
+                'workContext': 'Investigate tools -- see https://dreyx.com/tools',
                 'workContextTrusted': True})
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.json()['allowed'])
@@ -179,8 +185,23 @@ class BrowseEndpointAllowlist(unittest.TestCase):
         # sites allowed by the subordinate clause) -- but the host did not skip
         # Jev; the bypass is provenance-gated.
         instructions = jev.call_args.args[2]['choice']['instructions']
-        self.assertIn('docs.python.org', instructions)
-        self.assertIn('Investigate urllib', instructions)
+        self.assertIn('dreyx.com', instructions)
+        self.assertIn('Investigate tools', instructions)
+
+    def test_standing_safe_domain_skips_jev_without_any_grant(self):
+        # STANDING_SAFE_DOMAINS (read-only curated tier): a public-reference
+        # host skips the Jev round trip with NO allowlist entry and NO work
+        # context -- the standing list alone carries it. The full allowlist
+        # stays empty so this proves the new tier, not the old one.
+        self._common_mocks()
+        with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()), \
+             unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as jev:
+            r = self._client().post('/api/browse', json={
+                'agentId': 'ben', 'url': 'https://en.wikipedia.org/wiki/Simulation',
+                'purpose': 'background reading'})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()['allowed'])
+        jev.assert_not_called()
 
     def test_allowlist_never_bypasses_the_ssrf_check(self):
         # Even a listed domain must still fail closed if it resolves to a
@@ -281,12 +302,15 @@ class BrowseEndpointRedirectReGate(unittest.TestCase):
     def test_same_host_redirect_needs_no_second_classification(self):
         # A redirect that stays on the SAME host (http->https, path moves,
         # www. normalizing) is the host Jev already judged -- no extra call.
-        self._common_mocks('https://docs.python.org/3/library/urllib.html#http-redirections')
+        # Host is a NON-standing site: a standing safe domain would skip the
+        # ORIGINAL classification too (by design), making the "one call only"
+        # premise untestable there.
+        self._common_mocks('https://www.sample-research.org/guide.html#http-redirections')
         with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as jev, \
              unittest.mock.patch.object(serve, '_jev_choice', return_value=('allow', 0.95, 0.0)):
             r = self._client().post('/api/browse', json={
-                'agentId': 'ben', 'url': 'https://docs.python.org/3/library/urllib.html',
-                'purpose': 'read the urllib docs'})
+                'agentId': 'ben', 'url': 'https://www.sample-research.org/guide.html',
+                'purpose': 'read the guide'})
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.json()['allowed'])
         jev.assert_called_once()  # only the original pre-fetch classification
@@ -309,7 +333,9 @@ class BrowseEndpointRedirectReGate(unittest.TestCase):
     def test_cross_host_redirect_that_jev_allows_is_returned(self):
         # A legit host-changing redirect (e.g. a shortener for a real docs
         # page) is re-classified and allowed -- one extra call, content flows.
-        self._common_mocks('https://docs.python.org/3/library/urllib.html')
+        # Final host is a NON-standing site: a standing safe domain would
+        # (by design, STANDING_SAFE_DOMAINS) skip the re-gate's Jev call.
+        self._common_mocks('https://www.dreyx.com/3/library/urllib.html')
         with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync') as jev, \
              unittest.mock.patch.object(serve, '_jev_choice', side_effect=[
                  ('allow', 0.95, 0.0),   # original short-link url: allowed
@@ -652,6 +678,141 @@ class BrowseEndpointMullvadVpn(unittest.TestCase):
         self.assertTrue(r.json()['allowed'])
         connect.assert_not_called()
         disconnect.assert_not_called()
+
+
+class StandingTierAndDelegation(unittest.TestCase):
+    """2026-10-13 agent-feedback changes: STANDING_SAFE_DOMAINS (read-only
+    tier that skips Jev but is NOT a full allowlist grant), allowlist requests
+    escalated to DIRECTORS (floor dropped to delegable, grant applies on
+    director approve), the wait estimate surfaced to agents, and the two
+    read-only status tools."""
+
+    def test_standing_host_is_not_in_the_full_allowlist(self):
+        # The read-only promise: a standing host skips Jev on browse/GET but
+        # must NOT appear in _effective_allowlist_domains -- the sandbox
+        # egress proxy and Colab gate read that set and would otherwise gain
+        # standing WRITE reachability from a reference-reading tier.
+        with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()), \
+             unittest.mock.patch.object(serve, '_runtime_allowlist_grants', return_value=set()):
+            self.assertTrue(serve._is_standing_safe_host('en.wikipedia.org'))
+            self.assertFalse(serve._is_allowlisted_host('en.wikipedia.org'))
+            self.assertNotIn('en.wikipedia.org', serve._effective_allowlist_domains())
+
+    def test_standing_suffix_matching_is_subdomain_only(self):
+        # Bare 'gov'/'edu' entries must match real institutional hosts, not
+        # lookalike strings: 'evil-gov' or 'x.edu.attacker.com' don't match.
+        self.assertTrue(serve._is_standing_safe_host('www.nih.gov'))
+        self.assertTrue(serve._is_standing_safe_host('berkeley.edu'))
+        self.assertFalse(serve._is_standing_safe_host('evil-gov.example.com'))
+        self.assertFalse(serve._is_standing_safe_host('x.edu.attacker.example'))
+
+    def test_director_auto_approve_applies_grant_for_allowlist_request(self):
+        # Operator decision 2026-10-13: an agent-filed 'allowlist request' is
+        # DELEGABLE now -- the director loop approving it must apply the
+        # runtime grant with director attribution, same as 'allowlist
+        # candidate', instead of the old floor-1.0 human-only path.
+        esc = {'status': 'pending', 'kind': 'allowlist request',
+               'question': 'Agent june requests delegationhost.example',
+               'note': 'delegationhost.example', 'askCount': 0, 'lastAskedAt': 0}
+        pending_id = 'esc-alw'
+        for name, mock_value in (
+            ('_load_escalations', unittest.mock.Mock(return_value={pending_id: esc})),
+            ('_save_escalations', unittest.mock.Mock()),
+            ('get_state_from_db', unittest.mock.Mock(return_value={
+                'agentRoster': [{'id': 'nora', 'name': 'Nora', 'isDirector': True,
+                                 'isAdmin': False}]})),
+            ('_jev_quorum_choice_sync', unittest.mock.Mock(return_value=('approve', 0.95, 0.0))),
+            ('ensure_sandbox_networking', unittest.mock.Mock()),
+            ('log_action', unittest.mock.Mock()),
+        ):
+            patcher = unittest.mock.patch.object(serve, name, mock_value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()):
+            serve._resolve_pending_escalations_sync()
+            self.assertEqual(esc['status'], 'approved')
+            self.assertIn('nora', esc.get('resolvedBy', ''))
+            self.assertTrue(serve._is_allowlisted_host('delegationhost.example'))
+        grant_calls = [c for c in serve.log_action.call_args_list
+                       if c.args[:2] == ('nora', 'allowlist_grant')]
+        self.assertTrue(grant_calls, 'director-attributed grant must be logged')
+        self.assertEqual(grant_calls[0].args[2]['via'], 'director delegation')
+
+    def test_wait_estimate_reports_median_from_real_pairs(self):
+        with unittest.mock.patch.object(serve, '_allowlist_wait_samples',
+                                        return_value=[120.0, 300.0, 600.0]):
+            self.assertIn('about 5 minutes', serve._allowlist_wait_estimate())
+        with unittest.mock.patch.object(serve, '_allowlist_wait_samples',
+                                        return_value=[40.0]):
+            self.assertIn('under a minute', serve._allowlist_wait_estimate())
+
+    def test_wait_estimate_degrades_to_honest_no_history(self):
+        with unittest.mock.patch.object(serve, '_allowlist_wait_samples', return_value=[]):
+            self.assertIn('no approval history', serve._allowlist_wait_estimate())
+
+    def test_wait_samples_pair_requests_to_grants(self):
+        # Two requests, one resolved grant: exactly one sample, sized
+        # request->grant. Unpaired rows (grant without request) are ignored.
+        now = time.time()
+        rows = [
+            ('allowlist_request', now - 1000, json.dumps({'host': 'a.example'})),
+            ('allowlist_grant', now - 400, json.dumps({'host': 'a.example', 'via': 'x'})),
+            ('allowlist_request', now - 900, json.dumps({'host': 'b.example'})),
+            ('allowlist_grant', now - 800, json.dumps({'host': 'other.example'})),
+        ]
+
+        class _Conn:
+            def execute(self, _sql, _args):
+                class _R:
+                    def fetchall(self_inner):
+                        return rows
+                return _R()
+
+        class _Ctx:
+            def __enter__(self):
+                return _Conn()
+
+            def __exit__(self, *a):
+                return False
+
+        with unittest.mock.patch.object(serve, '_db', lambda: _Ctx()):
+            samples = serve._allowlist_wait_samples()
+        self.assertEqual(samples, [600.0])
+
+    def test_allowlist_status_text_reports_tiers_pending_and_estimate(self):
+        esc = {'status': 'pending', 'kind': 'allowlist request',
+               'note': 'pendinghost.example', 'ts': time.time() - 600,
+               'askCount': 2}
+        with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()), \
+             unittest.mock.patch.object(serve, '_runtime_allowlist_grants',
+                                        return_value={'granted.example'}), \
+             unittest.mock.patch.object(serve, '_load_escalations',
+                                        return_value={'esc-1': esc}), \
+             unittest.mock.patch.object(serve, '_db', side_effect=RuntimeError('no db')), \
+             unittest.mock.patch.object(serve, '_allowlist_wait_samples', return_value=[]):
+            out = serve._allowlist_status_text('en.wikipedia.org')
+            out2 = serve._allowlist_status_text('granted.example')
+        self.assertIn('standing safe domain', out)
+        self.assertIn('pendinghost.example', out)
+        self.assertIn('director pass 2', out)
+        self.assertIn('no approval history', out)
+        self.assertIn('ALLOWLISTED (runtime grant)', out2)
+
+    def test_team_status_text_shows_queue_and_working(self):
+        fake_state = {
+            'agents': {'nora': {'task': 'task-1'}, 'ben': {}},
+            'tasks': {'task-1': {'title': 'Write the verdict section',
+                                 'status': 'working', 'workUntil': time.time() + 300},
+                      'task-2': {'title': 'A failed card', 'status': 'failed'}},
+            'workQueue': [{'taskType': 'spike', 'title': 'Survey the fleet'}],
+        }
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=fake_state), \
+             unittest.mock.patch.object(serve, '_load_escalations', return_value={}):
+            out = serve._team_status_text()
+        self.assertIn('nora: Write the verdict section [working]', out)
+        self.assertIn('[spike] Survey the fleet', out)
+        self.assertIn('failed=1', out)
+        self.assertIn('NEEDS ATTENTION', out)
 
 
 class MullvadHelpers(unittest.TestCase):

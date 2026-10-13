@@ -168,6 +168,47 @@ def provision_player_email(app_password):
     return {'ok': True, 'test_ok': bool(test_ok)}
 
 
+_ESCALATION_KIND_GUIDANCE = {
+    # kind -> (impact, suggested action). Added for the live director
+    # complaint that gates/notifications "arrive without enough context to
+    # tell whether a block matters... I can't always tell whether to wait or
+    # push" (Nora). Every escalation message now says what is actually
+    # blocked by this decision and what a sensible call looks like.
+    'allowlist request': (
+        'Agent research on this host is waiting on this decision. Meanwhile the host still works '
+        'through the normal per-request Jev gate (each visit judged individually) -- work is slowed, '
+        'not stopped. Approving grants standing read+write reachability for sandbox scripts too.',
+        'If the domain is an ordinary public source that fits the stated purpose, approve; deny '
+        'otherwise. Denying is safe -- agents keep using the per-request gate.'),
+    'allowlist candidate': (
+        'This host earned confident Jev approvals repeatedly; approving makes that standing '
+        'permanent (full read+write reach for sandbox scripts). Until then every visit re-runs Jev.',
+        'Approve for routine public sources with a clean history; deny if the host\'s standing '
+        'has changed.'),
+    'blocked command': (
+        'The command did NOT run -- the assigned task may be stalled waiting on it.',
+        'Approve only if you recognize this exact command and want it run; otherwise deny and the '
+        'worker should find another approach.'),
+    'blocked pipeline step': (
+        'The pipeline step did NOT run -- the delivery it belongs to is held up.',
+        'Approve only if the step is the one you expect from this card; otherwise deny.'),
+    'blocked browser action': (
+        'The browser action was refused -- the investigation either adapted or stalled on it.',
+        'Approve only if the page/action is clearly in scope; otherwise deny.'),
+    'unsure safety decision': (
+        'A worker paused on a genuinely unclear safety call and is waiting on yours.',
+        'Decide from the question above; deny if the case for safety is not clearly made.'),
+    'unresolved review requirement': (
+        'A review requirement could not be resolved by the team -- the card is waiting.',
+        'Approve the resolution described if it genuinely addresses the requirement; else deny '
+        'so it goes back for real work.'),
+    'personnel_strike': (
+        'A firing strike is on record for this agent -- no personnel action was taken '
+        'automatically.',
+        'Read the cited reports first; this is informational unless you act on it.'),
+}
+
+
 def notify_human_of_escalation(esc_id, esc, context=''):
     """Send the approve/deny email + Telegram for one escalation. Called at
     creation for HUMAN-ONLY kinds (risk floor >= 1.0 -- the director loop is
@@ -182,9 +223,16 @@ def notify_human_of_escalation(esc_id, esc, context=''):
     kind = esc.get('kind') or 'unknown'
     question = esc.get('question') or ''
     prefix = f'{context}\n\n' if context else ''
+    impact, action = _ESCALATION_KIND_GUIDANCE.get(
+        kind,
+        ('Something an agent asked for is waiting on this decision; nothing has been applied yet.',
+         'Approve only if the request above is clearly safe and in scope; otherwise deny -- '
+         'denying is always the safe default.'))
     approve_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=approve'
     deny_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=deny'
     body = (f'{prefix}{question}\n\n'
+            f'What is blocked: {impact}\n'
+            f'Suggested call: {action}\n'
             f'What I checked: {esc.get("whatChecked") or "(see question)"}\n'
             f'Look here first: {esc.get("lookFirst") or "the question above"}\n\n'
             f'Approve: {approve_url}\n\n'
@@ -195,9 +243,11 @@ def notify_human_of_escalation(esc_id, esc, context=''):
     # like every other optional push. Telegram caps message text at 4096
     # chars; truncate the free-text middle (question/checked/look) but NEVER
     # the resolve URLs -- a truncated Approve link is a dead escalation.
-    _tg_head = f'Needs your call: {kind}\n\n{(prefix + question)[:1200]}'
-    _tg_tail = (f'\n\nWhat I checked: {(esc.get("whatChecked") or "(see question)")[:400]}\n'
-                f'Look here first: {(esc.get("lookFirst") or "the question above")[:400]}\n\n'
+    _tg_head = f'Needs your call: {kind}\n\n{(prefix + question)[:1000]}'
+    _tg_tail = (f'\n\nWhat is blocked: {impact[:300]}\n'
+                f'Suggested call: {action[:300]}\n'
+                f'What I checked: {(esc.get("whatChecked") or "(see question)")[:300]}\n'
+                f'Look here first: {(esc.get("lookFirst") or "the question above")[:300]}\n\n'
                 f'Approve: {approve_url}\n\nDeny: {deny_url}')
     _serve.send_player_telegram_sync('', (_tg_head + _tg_tail)[:4096])
 

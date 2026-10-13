@@ -399,7 +399,8 @@ class AskEndpoint(unittest.TestCase):
         # search_web only appears when TAVILY_API_KEY is actually configured;
         # generate_image/generate_video only when the Higgsfield key pair is.
         expected = ({'browse_page', 'download_file', 'request_allowlist', 'read_peer_reviews',
-                     'team_digest', 'x_trending_topics', 'search_linkedin_posts', 'api_call',
+                     'team_digest', 'team_status', 'allowlist_status',
+                     'x_trending_topics', 'search_linkedin_posts', 'api_call',
                      'read_ais_feed', 'read_rss_feed', 'read_market_feed', 'read_live_feed',
                      'propose_api_service', 'list_services', 'grant_allowlist', 'revoke_allowlist'}
                     | ({'search_web'} if serve.TAVILY_API_KEY else set())
@@ -857,6 +858,84 @@ class TelegramBridge(unittest.TestCase):
             asyncio.run(serve._telegram_process_update(self._update(text='weird bundle')))
         self.assertEqual(seen2['agent_id_hint'], 'maya',
                          'busy senior-most director defers to the admin fallback')
+
+
+class ReasoningStarvationRecovery(unittest.TestCase):
+    """A reasoning model burning the WHOLE max_tokens budget on hidden
+    thinking returns content:null + finish_reason=length -- the live incident
+    behind the ask lane's "couldn't settle" replies (Ada's/Ben's truncated
+    operator feedback at max_tokens=600 on anthropic/claude-haiku-5.5 with
+    reasoning capped to 150). Both call layers must retry ONCE with reasoning
+    off, merging the wasted first call's cost so spend stays exact."""
+
+    def _starved(self, cost=0.001):
+        return {'choices': [{'message': {'content': None, 'reasoning': 'thinking...'},
+                             'finish_reason': 'length'}],
+                'usage': {'cost': cost}}
+
+    def _good(self, cost=0.002, text='real answer'):
+        return {'choices': [{'message': {'content': text}, 'finish_reason': 'stop'}],
+                'usage': {'cost': cost}}
+
+    def test_plain_call_retries_with_reasoning_off_and_merges_cost(self):
+        starved, good = self._starved(), self._good()
+        with unittest.mock.patch.object(serve, '_openrouter_chat_post',
+                                        side_effect=[starved, good]) as post:
+            out = serve._call_openrouter_sync('anthropic/claude-haiku-5.5',
+                                              [{'role': 'user', 'content': 'q'}], 300)
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_args_list[1].kwargs.get('reasoning')
+                         or post.call_args_list[1].args[0].get('reasoning'),
+                         {'enabled': False})
+        self.assertEqual(out['choices'][0]['message']['content'], 'real answer')
+        self.assertAlmostEqual(out['usage']['cost'], 0.003,
+                               msg='wasted starved call cost must be merged into the winner')
+
+    def test_tool_loop_layer_retries_starved_response(self):
+        starved, good = self._starved(), self._good(text='settled via tool loop')
+        with unittest.mock.patch.object(serve, '_openrouter_chat_post',
+                                        side_effect=[starved, good]) as post:
+            out = serve._post_openrouter_raw('anthropic/claude-haiku-5.5',
+                                             [{'role': 'user', 'content': 'q'}], max_tokens=600)
+        self.assertEqual(post.call_count, 2)
+        retry_body = post.call_args_list[1].args[0]
+        self.assertEqual(retry_body['reasoning'], {'enabled': False})
+        # The retry must preserve the original request's tools/tool_choice.
+        self.assertEqual(retry_body.get('tools'), None)
+        self.assertEqual(out['choices'][0]['message']['content'], 'settled via tool loop')
+
+    def test_healthy_response_is_not_retried(self):
+        with unittest.mock.patch.object(serve, '_openrouter_chat_post',
+                                        side_effect=[self._good()]) as post:
+            out = serve._call_openrouter_sync('m', [{'role': 'user', 'content': 'q'}], 300)
+        self.assertEqual(post.call_count, 1, 'a healthy reply must not pay for a second call')
+        self.assertEqual(out['choices'][0]['message']['content'], 'real answer')
+
+    def test_persistent_starvation_keeps_original_without_raising(self):
+        # Both recovery attempts starve too (e.g. a mandatory-reasoning model
+        # that rejects disabled reasoning): keep the original document, never
+        # raise -- callers already have their own empty-content handling.
+        with unittest.mock.patch.object(serve, '_openrouter_chat_post',
+                                        side_effect=[self._starved(), self._starved(0.0005),
+                                                     self._starved(0.0005)]):
+            out = serve._call_openrouter_sync('z-ai/glm-5.3-flash',
+                                              [{'role': 'user', 'content': 'q'}], 300)
+        self.assertIsNone(out['choices'][0]['message']['content'])
+
+    def test_retry_network_failure_keeps_original(self):
+        with unittest.mock.patch.object(serve, '_openrouter_chat_post',
+                                        side_effect=[self._starved(), RuntimeError('net down')]):
+            out = serve._call_openrouter_sync('m', [{'role': 'user', 'content': 'q'}], 300)
+        self.assertIsNone(out['choices'][0]['message']['content'])
+
+    def test_starved_detection_shape(self):
+        self.assertTrue(serve._reasoning_starved(self._starved()))
+        self.assertFalse(serve._reasoning_starved(self._good()))
+        self.assertFalse(serve._reasoning_starved(
+            {'choices': [{'message': {'content': '', 'tool_calls': [{'id': 't'}]},
+                          'finish_reason': 'length'}]}),
+            'a tool_call turn is a normal settle, not starvation')
+        self.assertFalse(serve._reasoning_starved({'choices': []}))
 
 
 if __name__ == '__main__':

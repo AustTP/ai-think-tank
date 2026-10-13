@@ -355,10 +355,16 @@ class CreateEscalationRouting(unittest.TestCase):
         self.assertEqual(len(sent['email']), 1)
         self.assertEqual(len(sent['tg']), 1)
 
-    def test_floor_10_allowlist_request_notifies_at_creation(self):
-        _esc_id, sent = self._create('allowlist request')
-        self.assertEqual(len(sent['email']), 1)
-        self.assertEqual(len(sent['tg']), 1)
+    def test_allowlist_request_is_delegable_silent_at_creation(self):
+        # Operator decision 2026-10-13: 'allowlist request' dropped from
+        # floor 1.0 to the delegable default -- the DIRECTOR loop resolves it
+        # (grant applies on approve), so creation must stay SILENT like every
+        # other delegable kind; the player is only emailed at director give-up.
+        for kind in ('allowlist request',):
+            _esc_id, sent = self._create(kind)
+            self.assertEqual(sent['email'], [], f'{kind} must not email at creation')
+            self.assertEqual(sent['tg'], [], f'{kind} must not telegram at creation')
+        self.assertLess(serve._escalation_floor('allowlist request'), 1.0)
 
     def test_delegable_kind_is_silent_at_creation(self):
         # 'unresolved review requirement' and unknown kinds resolve through
@@ -381,6 +387,41 @@ class CreateEscalationRouting(unittest.TestCase):
             esc_id = serve.create_escalation('allowlist candidate', 'host.example is good')
         self.assertIn(esc_id, store)
         self.assertEqual(store[esc_id]['status'], 'pending')
+
+    def test_escalation_message_carries_impact_and_suggested_call(self):
+        # Director complaint (Nora, 2026-10-13): gates and notifications
+        # "arrive without enough context to tell whether a block matters."
+        # Every escalation message must now say what the decision blocks and
+        # what a sensible call looks like -- for a human-only kind at
+        # creation, and for a delegable kind at director give-up (the only
+        # time its message reaches the human).
+        bodies = []
+        with unittest.mock.patch.object(serve, '_load_escalations', return_value={}), \
+             unittest.mock.patch.object(serve, '_save_escalations', lambda d: None), \
+             unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
+             unittest.mock.patch.object(serve, '_send_escalation_email_sync',
+                                        side_effect=lambda s, b: bodies.append(b)), \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync',
+                                        side_effect=lambda s, b: True):
+            serve.create_escalation('blocked command', 'rm -rf /tmp/x was requested')
+        self.assertEqual(len(bodies), 1, 'floor-1.0 kind still notifies at creation')
+        self.assertIn('What is blocked:', bodies[0])
+        self.assertIn('Suggested call:', bodies[0])
+        self.assertIn('did NOT run', bodies[0])
+
+        giveup_bodies = []
+        with unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
+             unittest.mock.patch.object(serve, '_send_escalation_email_sync',
+                                        side_effect=lambda s, b: giveup_bodies.append(b)), \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync',
+                                        side_effect=lambda s, b: True):
+            serve.notify_human_of_escalation(
+                'esc-x', {'id': 'esc-x', 'token': 'tok', 'kind': 'allowlist request',
+                          'question': 'Agent june requests reports.example'},
+                context='The director tried 6 times and could not decide this automatically.')
+        self.assertIn('What is blocked:', giveup_bodies[0])
+        self.assertIn('per-request Jev gate', giveup_bodies[0])
+        self.assertIn('director tried 6 times', giveup_bodies[0])
 
 
 class DirectorGivesUpNotifiesHuman(unittest.TestCase):

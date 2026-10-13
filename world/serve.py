@@ -4825,13 +4825,14 @@ def _resolve_pending_escalations_sync():
         esc['resolvedBy'] = f'{director_name} ({director_id})'
         esc['resolvedAt'] = time.time()
         bloom = decision == 'approve'
-        # Side-effect for the one delegable kind that carries one: an approved
-        # 'allowlist candidate' applies its RUNTIME allowlist grant, mirroring
-        # how the human's approve link mutates the record. The note carries the
-        # hostname (set by record_browse_success); on deny nothing is granted.
+        # Side-effect for the delegable kinds that carry one: an approved
+        # 'allowlist candidate' or 'allowlist request' applies its RUNTIME
+        # allowlist grant, mirroring how the human's approve link mutates the
+        # record. The note carries the hostname (set by record_browse_success
+        # / the request endpoint); on deny nothing is granted.
         # Attribution names the director (_grant_allowlist logs it), so the
         # action log shows the grant came through delegation, not the human.
-        if bloom and esc_kind == 'allowlist candidate' and esc.get('note'):
+        if bloom and esc_kind in ('allowlist candidate', 'allowlist request') and esc.get('note'):
             _grant_allowlist(esc['note'], actor=director_id, via='director delegation')
         judge_note = {'judge': judge_model, 'judge_confidence': judge_conf} if judge_model else {}
         log_action(director_id, 'escalation_' + ('approve' if bloom else 'deny'),
@@ -6392,6 +6393,40 @@ def _effective_allowlist_domains():
     return BROWSE_ALLOWLIST_DOMAINS | _runtime_allowlist_grants()
 
 
+# Standing safe domains (operator decision, 2026-10-13): a curated READ-ONLY
+# tier for public reference sources the agents asked for by name (their #1
+# complaint was waiting on email for routine sources). These skip the Jev
+# classify round trip on read paths -- browse, GET/HEAD api-call, and the
+# redirect re-gate -- exactly like an allowlist entry, but they are DELIBERATELY
+# NOT part of _effective_allowlist_domains(): the sandbox egress proxy, Colab
+# URL gate, and _is_allowlisted_host's full read+write semantics stay untouched.
+# A standing domain is reachable to READ, never as standing write surface.
+STANDING_SAFE_DOMAINS = {
+    # Reference / knowledge
+    'wikipedia.org', 'wikimedia.org', 'wiktionary.org', 'wikidata.org',
+    # Papers / science
+    'arxiv.org', 'biorxiv.org', 'medrxiv.org', 'plos.org',
+    # Docs (vendor developer documentation)
+    'developer.mozilla.org', 'docs.python.org', 'docs.rs', 'learn.microsoft.com',
+    'developer.apple.com', 'go.dev',
+    # Major public news
+    'bbc.com', 'bbc.co.uk', 'reuters.com', 'apnews.com', 'npr.org', 'theguardian.com',
+    # Public-institution suffixes: bare 'gov'/'edu' in the set means any
+    # *.gov / *.gov host subdomain matches via the endswith('.' + d) rule
+    # (nih.gov, www.energy.gov); a host must actually END in .gov/.edu to
+    # match, so attacker.gov.example.com does not.
+    'gov', 'edu',
+}
+
+
+def _is_standing_safe_host(hostname):
+    """True for a curated public-reference host: exact or subdomain match
+    against STANDING_SAFE_DOMAINS (same suffix rule as
+    _is_allowlisted_host). Read-only tier -- see the comment above."""
+    host = (hostname or '').lower()
+    return any(host == d or host.endswith('.' + d) for d in STANDING_SAFE_DOMAINS)
+
+
 def _grant_allowlist(host, actor='admin', via='escalation approval'):
     """Persist a human-approved allowlist grant and refresh the egress proxy
     so running sandbox scripts can actually reach it. Returns the normalized
@@ -6448,6 +6483,59 @@ def _revoke_allowlist(host, actor='admin', via='operator revoke'):
 def _is_allowlisted_host(hostname):
     host = (hostname or '').lower()
     return any(host == d or host.endswith('.' + d) for d in _effective_allowlist_domains())
+
+
+def _allowlist_wait_samples(window_days=90, cap=50):
+    """Historical seconds between each allowlist REQUEST and the GRANT that
+    resolved the same host (first request -> first later grant, per host).
+    Used only for the human-readable wait estimate agents see on blocked
+    fetches and request confirmations -- never for a decision. Returns [] on
+    any DB problem (estimate degrades to 'no history yet')."""
+    try:
+        cutoff = time.time() - window_days * 86400
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT action, ts, details FROM action_log "
+                "WHERE action IN ('allowlist_request', 'allowlist_grant') "
+                "AND ts > ? ORDER BY ts", (cutoff,)).fetchall()
+    except Exception:
+        return []
+    first_request, samples = {}, []
+    for action, ts, details in rows:
+        try:
+            host = (json.loads(details) if details else {}).get('host') or ''
+        except Exception:
+            continue
+        host = host.strip().lower()
+        if not host:
+            continue
+        if action == 'allowlist_request':
+            first_request.setdefault(host, ts)
+        elif host in first_request and ts >= first_request[host]:
+            delta = ts - first_request[host]
+            if 0 <= delta <= window_days * 86400:
+                samples.append(delta)
+            first_request.pop(host, None)
+    samples.sort()
+    return samples[-cap:]
+
+
+def _allowlist_wait_estimate():
+    """One honest sentence about how long allowlist requests have actually
+    taken recently, so a blocked agent can choose between waiting and
+    rerouting instead of guessing 'minutes or days' (live agent complaint:
+    Dev/June/Ruth). Median of real request->grant pairs; degrades to an
+    explicit 'no history' rather than inventing a number."""
+    samples = _allowlist_wait_samples()
+    if not samples:
+        return 'no approval history yet -- wait times unknown'
+    median = samples[len(samples) // 2]
+    if median < 60:
+        return 'historical median wait: under a minute'
+    if median < 3600:
+        return f'historical median wait: about {int(round(median / 60))} minutes'
+    hours = median / 3600.0
+    return f'historical median wait: about {hours:.1f} hours'.replace('.0 ', ' ')
 
 
 # Work-context-aware gating (2026-10-08): the browser-like gates
@@ -8605,6 +8693,10 @@ def _call_openrouter_once_sync(model, messages, max_tokens):
     body = {'model': model, 'messages': messages, 'max_tokens': max_tokens, 'reasoning': reasoning}
     try:
         result = _openrouter_chat_post(body)
+        if _reasoning_starved(result):
+            recovered = _retry_reasoning_starved(body, result)
+            if recovered is not None:
+                result = recovered
     except urllib.error.HTTPError as e:
         record_model_result(model, success=False)
         if e.code in (401, 403):
@@ -8616,6 +8708,51 @@ def _call_openrouter_once_sync(model, messages, max_tokens):
     record_model_result(model, success=True)
     _note_api_key_success('openrouter')
     return result
+
+
+def _reasoning_starved(data):
+    """True when a completion spent its ENTIRE max_tokens on hidden reasoning
+    and came back with content:null/empty + finish_reason=length -- the shape
+    that surfaced live as the ask lane's "couldn't settle" replies (Ada's and
+    Ben's truncated feedback, clara/theo's null content on
+    anthropic/claude-haiku-5.5 at max_tokens=300 with reasoning capped to 150).
+    A starved reply is useless to EVERY caller, so both call layers retry it
+    once with reasoning disabled."""
+    try:
+        choice = (data.get('choices') or [{}])[0]
+        msg = choice.get('message') or {}
+        return (not (msg.get('content') or '').strip()
+                and not (msg.get('tool_calls') or [])
+                and (choice.get('finish_reason') or '') == 'length')
+    except Exception:
+        return False
+
+
+def _retry_reasoning_starved(body, first):
+    """One recovery attempt for a reasoning-starved response: re-POST the same
+    body with reasoning disabled so the full max_tokens budget goes to the
+    visible answer. A mandatory-reasoning model rejects `enabled: False` with
+    a 400 that _openrouter_chat_post itself recovers into the SAME capped
+    config that just starved -- so if that retry comes back starved too, one
+    last attempt uses a verified-working tiny reasoning cap (64 tokens; the
+    cap size documented in _openrouter_chat_post's docstring). Returns the
+    improved document, or None to keep the original. On success, every cost
+    already burned (the starved original + any failed retry) is merged into
+    the winner's usage.cost so callers' spend accrual stays exact."""
+    wasted = ((first.get('usage') or {}).get('cost') or 0.0)
+    for payload in ({'enabled': False}, {'max_tokens': 64}):
+        try:
+            retry = _openrouter_chat_post(dict(body, reasoning=payload))
+        except Exception:
+            continue
+        retry_cost = ((retry.get('usage') or {}).get('cost') or 0.0)
+        msg = ((retry.get('choices') or [{}])[0].get('message') or {})
+        if (msg.get('content') or '').strip():
+            usage = retry.setdefault('usage', {})
+            usage['cost'] = (usage.get('cost') or 0.0) + wasted
+            return retry
+        wasted += retry_cost
+    return None
 
 
 def _call_openrouter_sync_reasoning_off(model, messages, max_tokens):
@@ -8702,6 +8839,10 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     body['reasoning'] = reasoning
     try:
         result = _openrouter_chat_post(body)
+        if _reasoning_starved(result):
+            recovered = _retry_reasoning_starved(body, result)
+            if recovered is not None:
+                result = recovered
     except urllib.error.HTTPError as e:
         record_model_result(model, success=False)
         if e.code in (401, 403):
@@ -8929,14 +9070,15 @@ AGENT_ASK_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'request_allowlist',
-            'description': 'Ask the player to permanently allow a domain you need to reach (browsing '
-                           'AND sandboxed scripts): supply the host or url and one short sentence of '
-                           'purpose. This is for when a real domain you legitimately need keeps coming '
-                           'up -- the player decides by email, and an ordinary agent cannot approve its '
-                           'own request. (A DIRECTOR or the admin skips this entirely: use '
-                           'grant_allowlist instead to apply it yourself, no email wait.) While a '
-                           'request is pending, keep using normal gates; do not retry/send a '
-                           'second request for the same host until you hear it was denied.',
+            'description': 'Ask for a domain you need to reach to be permanently allowlisted '
+                           '(browsing AND sandboxed scripts): supply the host or url and one short '
+                           'sentence of purpose. A DIRECTOR reviews the request automatically within '
+                           'minutes; the player is only emailed if the directors cannot decide. An '
+                           'ordinary agent cannot approve its own request. (A DIRECTOR or the admin '
+                           'skips this entirely: use grant_allowlist instead to apply it yourself, '
+                           'no wait.) While a request is pending, keep using normal gates; do not '
+                           'retry/send a second request for the same host until you hear it was '
+                           'denied -- check allowlist_status for progress.',
             'parameters': {
                 'type': 'object',
                 'properties': {
@@ -9029,6 +9171,45 @@ AGENT_ASK_TOOLS = [
             'parameters': {
                 'type': 'object',
                 'properties': {},
+                'required': [],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'team_status',
+            'description': 'Read-only FORWARD-LOOKING view of the think tank right now: who is '
+                           'working on which task, what is queued waiting to be picked up, which '
+                           'tasks failed or look stuck, and what is waiting on a human/director '
+                           'decision. Use this when you need to see how work moves between '
+                           'teammates -- the planning queue, spike status, review backlog -- e.g. '
+                           'before taking overflow work or when deciding whether a handoff is '
+                           'waiting on you. (team_digest is the retrospective "what shipped" '
+                           'view; this is the live "what is happening" view.)',
+            'parameters': {
+                'type': 'object',
+                'properties': {},
+                'required': [],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'allowlist_status',
+            'description': 'Read-only status of browse-allowlist access: pass a host to learn '
+                           'whether it is reachable now and via which tier (full allowlist, '
+                           'read-only standing safe list, or neither); omit the host to list '
+                           'PENDING allowlist requests with their age and director progress, '
+                           'recent grant/revoke activity, and the historical median wait time. '
+                           'Use this after a blocked fetch or a request_allowlist call to see '
+                           'whether a decision has landed instead of guessing or re-filing.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'host': {'type': 'string', 'description': 'Optional: the host to check, e.g. "example.com".'},
+                },
                 'required': [],
             },
         },
@@ -10823,12 +11004,17 @@ ESCALATION_KIND_RISK = {
     # Agent-driven "could not resolve a review requirement": ordinary routine
     # approval/denial is fine at the default floor.
     'unresolved review requirement': {'floor': JEV_SAFETY_CONFIDENCE},
-    # Agent-requested internet-allowlist addition: granting a
-    # domain is a PERMANENT capability change (full read+write reachability
-    # for sandboxed scripts, plus it skips every future Jev classify round
-    # trip), so it is human-only -- floor 1.0 means the director is never
-    # permitted to auto-approve it, only the player's email link can.
-    'allowlist request': {'floor': 1.0},
+    # Agent-requested internet-allowlist addition. Operator decision
+    # (2026-10-13): agents' #1 complaint was that these waited on an email
+    # that could sit for hours -- the operator wants requests escalated to
+    # the DIRECTORS first, exactly like 'allowlist candidate'. So the floor
+    # drops from 1.0 to the default delegable bar: the director loop decides
+    # within a pass (30s cadence) through the same composite+judge
+    # cross-check every delegable kind gets, the grant applies on approve
+    # (see the loop's side-effect below), and the human is only emailed when
+    # the director gives up (ask cap / judge-drift circuit) -- same fallback
+    # as every other delegable kind.
+    'allowlist request': {'floor': JEV_SAFETY_CONFIDENCE},
 }
 ESCALATION_DEFAULT_FLOOR = JEV_SAFETY_CONFIDENCE  # unknown kinds keep the old bar
 ESCALATION_ERROR_PENALTY_STEP = 0.10               # composite hit per consecutive Jev error
@@ -11044,7 +11230,7 @@ async def _jev_re_gate_redirect_final(agent_id, action, noun, approved_url, fina
         return True, None
     if not final_host or final_host == approved_host:
         return True, None
-    if _is_allowlisted_host(final_host) or (work_context_trusted and _is_work_context_host(work_context, final_host)):
+    if _is_allowlisted_host(final_host) or _is_standing_safe_host(final_host) or (work_context_trusted and _is_work_context_host(work_context, final_host)):
         return True, None
     criteria = {
         'allow': 'The URL and stated purpose look like ordinary, legal browsing (reference material, news, weather, general research, public information).'
@@ -14602,6 +14788,15 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
         if struck_tools is not None and name in struck_tools:
             return (f'{name} was already blocked once this investigation (one-strike) -- do not '
                     'call it again, use a different tool or approach instead.')
+        if name == 'team_status':
+            # Read-only live queue/assignment view (DB-only, no state change) --
+            # offered to spikes too, so a spike can see what the team is doing
+            # before it decides how to fit its findings in.
+            return _team_status_text()
+        if name == 'allowlist_status':
+            # Read-only allowlist pending-queue / host-tier view -- the
+            # observability half of request_allowlist.
+            return _allowlist_status_text((args or {}).get('host') or '')
         if name == 'request_allowlist':
             result = _http_json('POST', SELF_BASE_URL, '/api/allowlist/request', {
                 'agentId': agent_id,
@@ -14611,7 +14806,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             if isinstance(result, dict) and not result.get('error'):
                 msg = result.get('message') or ''
                 return (f'{msg} [do not call request_allowlist again for this host -- one request is '
-                        f'pending until the player decides]' if result.get('requested')
+                        f'pending director review]' if result.get('requested')
                         else f'{msg} [no further request needed]')
             return f'Could not file the allowlist request: {result}'
         if name in ('grant_allowlist', 'revoke_allowlist'):
@@ -14791,7 +14986,11 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                     struck_tools.add('browse_page')
                 return (f"Could not visit that page: {result.get('reason', 'not approved')} "
                         "[ONE-STRIKE: this was a policy denial, not a technical error -- do not "
-                        "retry browse_page, try search_web or a different real link instead]")
+                        "retry browse_page, try search_web or a different real link instead] "
+                        f"If you legitimately need this host for standing access, file ONE "
+                        f"request_allowlist call for it (directors review it automatically; "
+                        f"{_allowlist_wait_estimate()}) -- then move on with other sources "
+                        f"while it is pending.")
             if isinstance(result, dict) and result.get('error'):
                 # Transient (network/timeout) -- may be worth one retry, unlike a policy block.
                 return (f"Could not visit that page: {result['error']} "
@@ -14847,7 +15046,11 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                     struck_tools.add('api_call')
                 return (f"Could not make that API call: {result.get('reason', 'not approved')} "
                         "[ONE-STRIKE: this was a policy or registry denial, not a technical "
-                        "error -- do not retry the same api_call request]")
+                        "error -- do not retry the same api_call request] "
+                        f"If you legitimately need this host for standing access, file ONE "
+                        f"request_allowlist call for it (directors review it automatically; "
+                        f"{_allowlist_wait_estimate()}) -- then move on with other sources "
+                        f"while it is pending.")
             if isinstance(result, dict) and result.get('error'):
                 return (f"Could not make that API call: {result['error']} "
                         "[this may be a transient error -- you may retry ONCE, but don't loop on it]")
@@ -15096,6 +15299,17 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
             # never an agent self-report, never an instruction source.
             tools_used.append(name)
             return _team_digest_text()
+        if name == 'team_status':
+            # Read-only live queue/assignment view (who works on what now,
+            # what's queued, what's stuck) -- same DB-only safety as digest.
+            tools_used.append(name)
+            return _team_status_text()
+        if name == 'allowlist_status':
+            # Read-only allowlist pending-queue / host-tier view -- the
+            # observability half of the allowlist flow (the request itself is
+            # request_allowlist). No state change, no email.
+            tools_used.append(name)
+            return _allowlist_status_text((args or {}).get('host') or '')
         if name == 'read_peer_reviews':
             # Peer review directories: list, then optionally read one note.
             # Same GET endpoints the browser uses (/api/agent-files) with the
@@ -16142,6 +16356,118 @@ def _team_digest_text(max_markdown_chars=1400, tape_window_s=86400):
                      'builds the first one.')
     parts.append(f'Live signal (last 24h): {n} Jev decisions logged, {n_ok} ok.')
     return '\n\n'.join(parts)
+
+
+def _team_status_text(max_chars=1600):
+    """Read-only, DB-only FORWARD-LOOKING team view: who is working on what
+    right now, what is queued, what failed, and what is waiting on a human.
+    Complements team_digest (which is retrospective, from the action log) --
+    added for the live agent complaint 'I can't see how work moves between
+    teammates... nothing I can reach shows the planning queue, spike status,
+    or review backlog' (Clara). No LLM, no network."""
+    state = get_state_from_db() or {}
+    agents = state.get('agents') or {}
+    tasks = state.get('tasks') or {}
+    lines = []
+    working = []
+    for aid, a in agents.items():
+        if not isinstance(a, dict):
+            continue
+        tid = a.get('task')
+        if tid:
+            t = tasks.get(tid) or {}
+            working.append(f'- {aid}: {t.get("title") or tid} [{t.get("status") or "?"}]')
+    lines.append('WORKING NOW:\n' + ('\n'.join(working) if working else '- nobody is on a task right now'))
+    queue = [w for w in (state.get('workQueue') or []) if isinstance(w, dict)]
+    if queue:
+        ql = [f'- [{w.get("taskType") or "work"}] {w.get("title") or "??"}' for w in queue[:10]]
+        if len(queue) > 10:
+            ql.append(f'- ...and {len(queue) - 10} more queued')
+        lines.append('QUEUE (waiting to be picked up):\n' + '\n'.join(ql))
+    else:
+        lines.append('QUEUE: empty')
+    counts, attention = {}, []
+    for tid, t in tasks.items():
+        if not isinstance(t, dict):
+            continue
+        st = t.get('status') or '?'
+        counts[st] = counts.get(st, 0) + 1
+        if st in ('failed', 'blocked') or (st == 'working' and t.get('workUntil')
+                                           and t['workUntil'] < time.time() - 300):
+            attention.append(f'- {tid}: {st} -- {t.get("title") or "??"}')
+    lines.append('TASK STATUS COUNTS: ' + ', '.join(f'{k}={v}' for k, v in sorted(counts.items())))
+    if attention:
+        lines.append('NEEDS ATTENTION (stuck/failed):\n' + '\n'.join(attention[:8]))
+    try:
+        pending_esc = [e for e in (_load_escalations() or {}).values()
+                       if e.get('status') == 'pending']
+        if pending_esc:
+            kinds = {}
+            for e in pending_esc:
+                kinds[e.get('kind') or '?'] = kinds.get(e.get('kind') or '?', 0) + 1
+            lines.append('WAITING ON A HUMAN/DIRECTOR DECISION: '
+                         + ', '.join(f'{k} x{v}' for k, v in sorted(kinds.items())))
+    except Exception:
+        pass
+    return '\n\n'.join(lines)[:max_chars]
+
+
+def _allowlist_status_text(host=None, max_chars=1600):
+    """Read-only status of browse-allowlist access: for a named host, whether
+    it is reachable now (and via which tier -- env baseline, runtime grant, or
+    the read-only standing list); plus every PENDING allowlist request /
+    candidate with its age and how many director passes it has had, recent
+    grant/revoke/request activity, and the historical wait estimate. Answers
+    the live agent complaint 'I have no way to tell whether that wait will
+    take minutes or days' (Dev, June) without any email."""
+    host = (host or '').strip().lower()
+    lines = []
+    if host:
+        if _is_allowlisted_host(host):
+            src = 'runtime grant' if host in _runtime_allowlist_grants() else 'env baseline'
+            lines.append(f'{host}: ALLOWLISTED ({src}) -- full read+write reachability, no Jev round trip.')
+        elif _is_standing_safe_host(host):
+            lines.append(f'{host}: standing safe domain (read-only tier) -- browse/GET skip Jev; '
+                         f'sandbox scripts still need a real grant.')
+        else:
+            lines.append(f'{host}: NOT allowlisted -- normal Jev gate applies per request.')
+    now = time.time()
+    pending = [(eid, e) for eid, e in (_load_escalations() or {}).items()
+               if e.get('status') == 'pending'
+               and e.get('kind') in ('allowlist request', 'allowlist candidate')]
+    if pending:
+        lines.append('PENDING REQUESTS:')
+        for eid, e in pending[:8]:
+            target = (e.get('note') or '').strip() or '(unknown host)'
+            age_min = int((now - (e.get('ts') or now)) / 60)
+            asks = e.get('askCount') or 0
+            state_note = ('player emailed (directors gave up)' if e.get('humanNotified')
+                          else f'director pass {asks}')
+            lines.append(f'- {eid}: {target} -- waiting {age_min}m, {state_note}')
+    else:
+        lines.append('PENDING REQUESTS: none')
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT action, ts, details FROM action_log "
+                "WHERE action IN ('allowlist_request', 'allowlist_grant', "
+                "'allowlist_revoke', 'escalation_approve', 'escalation_deny') "
+                "AND ts > ? ORDER BY ts DESC LIMIT 8",
+                (now - 30 * 86400,)).fetchall()
+        if rows:
+            recent = []
+            for action, ts, details in rows:
+                d = details or ''
+                try:
+                    d = (json.loads(details) or {}).get('host') or d
+                except Exception:
+                    pass
+                recent.append(f'- {int(now - ts)}s ago: {action} {str(d)[:80]}')
+            lines.append('RECENT ACTIVITY:\n' + '\n'.join(recent))
+    except Exception:
+        pass
+    lines.append(_allowlist_wait_estimate())
+    return '\n\n'.join(lines)[:max_chars]
 
 
 @app.post('/api/intent/ask')
@@ -19839,13 +20165,16 @@ async def browse(request: Request):
     # path has no decision to trace, so default to None before the branch
     # (the outcome rows after it are threaded with whichever value applied).
     trace_id = None
-    if _is_allowlisted_host(parsed.hostname) or (work_context_trusted and _is_work_context_host(work_context, parsed.hostname)):
+    if _is_allowlisted_host(parsed.hostname) or _is_standing_safe_host(parsed.hostname) or (work_context_trusted and _is_work_context_host(work_context, parsed.hostname)):
         # Player-vetted domain (allowlist, or a host the player EXPLICITLY
         # named in THIS task's work, and the task is player-authored) -- skip
         # the Jev classify+escalate round trip entirely (gap: the SAME url got
         # a low-confidence 'escalated_unsure' from Jev on one run and a clean
         # allow on another, purely from classifier variance on a site the
-        # player had already decided was fine). SSRF/private-network protection
+        # player had already decided was fine). Standing safe domains join
+        # this skip on READ paths only (curated public reference; see
+        # STANDING_SAFE_DOMAINS) -- the egress proxy/Colab gates never see
+        # them. SSRF/private-network protection
         # above is NOT skipped -- this only replaces the content/purpose
         # judgment call, never the network-safety one. An agent-authored
         # story's own text is never trusted for this bypass: the agent wrote
@@ -20559,21 +20888,27 @@ async def allowlist_request(request: Request):
         if esc.get('kind') == 'allowlist request' and esc.get('status') == 'pending' \
                 and esc.get('note', '').strip().lower() == host:
             return JSONResponse({'requested': True, 'host': host, 'escalationId': esc_id,
-                                 'message': 'an allowlist request for this host is already pending review'})
+                                 'message': f'an allowlist request for this host is already pending '
+                                            f'director review ({_allowlist_wait_estimate()}) -- '
+                                            f'check allowlist_status for progress, do not re-file'})
     esc_id = create_escalation(
         'allowlist request',
         f'Agent {agent_id} requests {host} be added to the player-vetted allowlist.\n'
         f'Stated purpose: {purpose or "not given"}\n\n'
         f'Approving gives agents standing read+write reachability to {host} for sandboxed '
         f'scripts, AND lets them reach it without a Jev classify round trip on every call. '
-        f'Only the player can approve or deny this -- the director is not allowed to.',
+        f'A director reviews this request first (the player is only emailed if the director '
+        f'cannot decide it automatically).',
         on_approve_note=host,
     )
     log_action(agent_id, 'allowlist_request', {'host': host, 'purpose': purpose[:200],
                                                'escalationId': esc_id}, authorized=authorized)
     return JSONResponse({'requested': True, 'host': host, 'escalationId': esc_id,
-                         'message': f'Allowlist request for {host} filed -- the player decides by email; '
-                                    f'until then {host} still goes through the normal Jev gate.'})
+                         'message': f'Allowlist request for {host} filed -- escalated to the '
+                                    f'directors for review ({_allowlist_wait_estimate()}); the '
+                                    f'player is only emailed if the directors cannot decide. '
+                                    f'Until a grant lands, {host} still goes through the normal '
+                                    f'Jev gate. Check progress with allowlist_status.'})
 
 
 def _normalize_allowlist_target(target):
@@ -21702,7 +22037,12 @@ async def api_call(request: Request):
     # paths/methods are already trusted.
     registered = _api_service_for_host(parsed.hostname) is not None
     trace_id = None
-    if not registered and not _is_allowlisted_host(parsed.hostname) and not (work_context_trusted and _is_work_context_host(work_context, parsed.hostname)):
+    # Standing safe domains skip Jev on READ-ONLY methods only (GET/HEAD) --
+    # a POST/PUT/DELETE to a standing host still goes through Jev like any
+    # other unregistered host, because standing access is a read tier, never
+    # standing write surface (see STANDING_SAFE_DOMAINS).
+    standing_read = method in ('GET', 'HEAD') and _is_standing_safe_host(parsed.hostname)
+    if not registered and not _is_allowlisted_host(parsed.hostname) and not standing_read and not (work_context_trusted and _is_work_context_host(work_context, parsed.hostname)):
         criteria = {
             'allow': 'The URL, method, and stated purpose look like ordinary, legal API interaction -- reading a real response, checking raw JSON/HTML, or a registered service call.'
                      + (' A request that is clearly part of, or relevant to, the agent\'s CURRENT assigned work is allowed, provided it does not fall into any blocked category.' if work_context else ''),
@@ -21736,11 +22076,14 @@ async def api_call(request: Request):
 
 
 # ---- api_call service registry: proposal / approval ------------------------
-# Agents propose new services through the same floor-1.0 escalation the
-# allowlist uses: only the player's email link can approve, the director is
-# never allowed to. On approve the validated spec is written into the
-# api_services table as active and the in-memory registry refreshes, so the
-# new service is live without a restart. On deny nothing is granted.
+# Agents propose new services through an escalation of kind 'api service
+# proposal'. That kind is NOT in the floor table, so it takes the default
+# delegable floor -- the director loop may decide it (same composite+judge
+# cross-check as every delegable kind), and the player is emailed only if the
+# director gives up. (An older comment here claimed floor-1.0 human-only --
+# the code never had that floor.) On approve the validated spec is written
+# into the api_services table as active and the in-memory registry refreshes,
+# so the new service is live without a restart. On deny nothing is granted.
 def _api_service_spec_to_note(spec):
     """Serialize a validated spec into the escalation's on_approve_note, the
     only cross-boundary carrier (the email link hands it back on approve)."""
@@ -21784,8 +22127,8 @@ async def api_service_request(request: Request):
         f'Auth: {normalized.get("auth", {}).get("type")}\nMethods: {sorted(normalized.get("methods") or [])}\n'
         f'Stated purpose: {purpose or "not given"}\n\n'
         f'Approving adds this service to the active registry, letting agents reach its declared '
-        f'paths/methods with the credential injected server-side. Only the player can approve or '
-        f'deny this -- the director is not allowed to.',
+        f'paths/methods with the credential injected server-side. A director reviews this proposal '
+        f'automatically; the player is only emailed if the director cannot decide.',
         on_approve_note=note,
     )
     log_action(agent_id, 'api_service_request', {'serviceId': sid, 'name': normalized.get('name'),
