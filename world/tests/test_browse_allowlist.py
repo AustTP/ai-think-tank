@@ -680,6 +680,17 @@ class BrowseEndpointMullvadVpn(unittest.TestCase):
         disconnect.assert_not_called()
 
 
+def _fake_db_ctx(rows):
+    """A stand-in for `with serve._db() as conn:` whose execute() returns
+    `rows` from fetchall() -- used by the team_status note query tests."""
+    conn = unittest.mock.MagicMock()
+    conn.execute.return_value.fetchall.return_value = list(rows)
+    ctx = unittest.mock.MagicMock()
+    ctx.__enter__.return_value = conn
+    ctx.__exit__.return_value = False
+    return ctx
+
+
 class StandingTierAndDelegation(unittest.TestCase):
     """2026-10-13 agent-feedback changes: STANDING_SAFE_DOMAINS (read-only
     tier that skips Jev but is NOT a full allowlist grant), allowlist requests
@@ -813,6 +824,49 @@ class StandingTierAndDelegation(unittest.TestCase):
         self.assertIn('[spike] Survey the fleet', out)
         self.assertIn('failed=1', out)
         self.assertIn('NEEDS ATTENTION', out)
+
+    def test_team_status_text_shows_owner_room_attempt_count_and_why(self):
+        # 2026-10-13 review: agents could not see WHO owns a queued item (a
+        # 21k-attempt wedge hid behind that), WHERE work is happening, or WHY a
+        # task is stuck -- only the status word.
+        fake_state = {
+            'agents': {'nora': {'task': 'task-9'}},
+            'tasks': {'task-9': {'title': 'Draft a section', 'status': 'blocked',
+                                 'room': 'pressoffice'}},
+            'workQueue': [{'taskType': 'work', 'title': 'Act on mail (harold)',
+                           'assignedTo': 'nora', 'room': 'pressoffice', 'attempts': 21213}],
+        }
+        esc = {'e7': {'status': 'pending', 'kind': 'stuck review loop',
+                      'question': '"Document public API" has gone through 8 review cycles.',
+                      'ts': time.time() - 600, 'askCount': 2, 'humanNotified': False}}
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=fake_state), \
+             unittest.mock.patch.object(serve, '_load_escalations', return_value=esc), \
+             unittest.mock.patch.object(serve, '_db', return_value=_fake_db_ctx([
+                 ('quality_gate_reject',
+                  '{"taskId": "task-9", "note": "quality pipeline FAILED at node-tests"}')])):
+            out = serve._team_status_text()
+        self.assertIn('pinned to nora', out)
+        self.assertIn('room pressoffice', out)
+        self.assertIn('21213 attempts', out)
+        self.assertIn('why: quality pipeline FAILED at node-tests', out)
+        self.assertIn('Document public API', out)
+        self.assertIn('stuck review loop', out)
+        self.assertIn('waiting 10m, director pass 2', out)
+        self.assertIn('nora: Draft a section [blocked, pressoffice]', out)
+
+    def test_team_status_escalation_detail_falls_back_to_no_detail(self):
+        # A record with no question/note must still say so rather than render
+        # as a bare "routine x1" the reader cannot act on.
+        esc = {'e1': {'status': 'pending', 'kind': 'routine', 'question': 'q?',
+                      'ts': time.time(), 'askCount': 6}}
+        with unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value={'agents': {}, 'tasks': {}, 'workQueue': []}), \
+             unittest.mock.patch.object(serve, '_load_escalations', return_value=esc), \
+             unittest.mock.patch.object(serve, '_db', return_value=_fake_db_ctx([])):
+            out = serve._team_status_text()
+        self.assertIn('routine x1', out)
+        self.assertIn('e1 [routine] q?', out)
+        self.assertIn('director pass 6', out)
 
 
 class MullvadHelpers(unittest.TestCase):

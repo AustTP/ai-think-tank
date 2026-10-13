@@ -590,11 +590,14 @@ class SimTaskLifecycle(unittest.TestCase):
         self.assertNotIn('Maintain tooling', assigned_titles)
 
     def test_work_item_abandoned_after_max_attempts(self):
-        # A queue item that can never be assigned (here: a room with no door
-        # trigger, so assign_task fails at the `not door` guard) is retried up
-        # to WORK_ITEM_MAX_ATTEMPTS, then abandoned -- not retried forever.
-        state = self._base_state(work_queue=[
-            self._item(title='Unassignable', room='commandcenter')])
+        # An ordinary queue item that genuinely cannot be assigned is retried
+        # up to WORK_ITEM_MAX_ATTEMPTS, then abandoned -- not retried forever.
+        # (2026-10-13: a room with no door is NO LONGER that case -- it now gets
+        # rescued to a real room at assignment time; see the companion test
+        # below. Here the agent simply has no path to any door.)
+        state = self._base_state(work_queue=[self._item(title='Unassignable')])
+        for a in state['agents'].values():
+            a['x'] = a['y'] = -99999.0
         grid, doors = sim._load_outdoor_geometry()
         for _ in range(20):  # well past the 3-attempt budget
             sim._task_cycle(state, now=time.time(), grid=grid, doors=doors,
@@ -602,6 +605,23 @@ class SimTaskLifecycle(unittest.TestCase):
         self.assertEqual(state['workQueue'], [],
                          'unassignable item must leave the queue (abandoned)')
         self.assertFalse(any(a.get('task') for a in state['agents'].values()))
+
+    def test_item_with_a_room_that_has_no_door_is_rescued_not_abandoned(self):
+        # The wedge this guards: a producer hardcoded a room that exists nowhere
+        # in door_triggers.json, so assign_task failed at the `not door` guard
+        # every cycle -- 21k+ attempts over 38 hours, no agent ever able to take
+        # it. Such an item is now routed to a real room and assigned.
+        state = self._base_state(work_queue=[
+            self._item(title='Act on mail (harold)', room='commandcenter')])
+        grid, doors = sim._load_outdoor_geometry()
+        for _ in range(5):
+            sim._task_cycle(state, now=time.time(), grid=grid, doors=doors,
+                            task_id_holder=[0])
+        assigned = [t for t in (state.get('tasks') or {}).values()
+                    if t.get('title') == 'Act on mail (harold)']
+        self.assertEqual(len(assigned), 1, 'the rescued item must be assigned')
+        self.assertIn(assigned[0]['room'], doors)
+        self.assertNotEqual(assigned[0]['room'], 'commandcenter')
 
     def test_full_closed_loop_task_completes_and_agent_goes_off_duty(self):
         # The Phase-3 acceptance seed: an empty think tank with ONE queued item and

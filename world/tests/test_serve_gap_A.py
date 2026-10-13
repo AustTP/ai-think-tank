@@ -39,6 +39,15 @@ _MODULE_PATCHER = None
 def setUpModule():
     global _MODULE_TMP_DIR, _MODULE_PATCHER
     _MODULE_TMP_DIR = tempfile.mkdtemp(prefix='think-tank-serve-gap-')
+    # Every module-level path constant derived from THINK_TANK_DIR must be
+    # repointed too: they are computed AT IMPORT, so patching THINK_TANK_DIR
+    # alone leaves them pointing at the real repo root and any test that hits a
+    # write path pollutes it. That is exactly how the `e1` fixture
+    # ({"kind": "routine", "question": "q?", "askCount": MAX}) escaped
+    # test_stops_at_ask_cap into the live escalations.json on 2026-10-04 and sat
+    # there as an unresolvable "routine x1" until 2026-10-13 -- the other test
+    # modules already patch ESCALATIONS_PATH for this reason (test_browse_
+    # allowlist.py, test_failure_ledger.py, test_serve_gap_E.py).
     _MODULE_PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_MODULE_TMP_DIR, 'test.db'),
@@ -46,6 +55,13 @@ def setUpModule():
         AGENTS_DIR=os.path.join(_MODULE_TMP_DIR, 'agents'),
         LIBRARY_DIR=os.path.join(_MODULE_TMP_DIR, 'library'),
         PASSPORT_PATH=os.path.join(_MODULE_TMP_DIR, 'library', '.passport.json'),
+        ESCALATIONS_PATH=os.path.join(_MODULE_TMP_DIR, 'escalations.json'),
+        FAILURES_PATH=os.path.join(_MODULE_TMP_DIR, 'failures.json'),
+        RULE_PROPOSALS_PATH=os.path.join(_MODULE_TMP_DIR, 'rule_proposals.json'),
+        SUCCESSES_PATH=os.path.join(_MODULE_TMP_DIR, 'successes.json'),
+        SUCCESS_PROPOSALS_PATH=os.path.join(_MODULE_TMP_DIR, 'success_proposals.json'),
+        BROWSE_TRAIL_PATH=os.path.join(_MODULE_TMP_DIR, 'browse_trail.json'),
+        LIBRARY_USAGE_PATH=os.path.join(_MODULE_TMP_DIR, 'library_usage.json'),
         COLAB_STANDBY_ENABLED=False,
     )
     _MODULE_PATCHER.start()
