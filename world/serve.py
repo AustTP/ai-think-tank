@@ -5185,6 +5185,23 @@ async def _lifespan(app):
             save_state_to_db(startup_state)
     except Exception as e:
         print(f'[watchlist] seed failed: {e}', flush=True)
+    # External-feed registries live in the DB (rss_feeds / ws_feeds /
+    # api_services) but their IN-MEMORY copies are loaded by init_db -- and
+    # init_db only runs under `python3 serve.py`. This process is started as
+    # `uvicorn serve:app`, so _WS_FEEDS/_RSS_FEEDS stayed empty and the
+    # supervisor iterated nothing: read_ais_feed answered "connection=down,
+    # 0 frames" forever even with a healthy key and an ACTIVE row in ws_feeds
+    # (2026-10-13 review; GET /api/rss/recent likewise returned {"feeds": {}}).
+    # _load_api_services already runs at import -- that is why api_call still
+    # worked. Load all three here so every boot path starts with warm
+    # registries. Idempotent: each loader upserts into module-level dicts.
+    for _label, _loader in (('api', _load_api_services),
+                            ('rss', _load_rss_feeds),
+                            ('ws', _load_ws_feeds)):
+        try:
+            _loader()
+        except Exception as e:
+            print(f'[{_label}] registry load failed: {e}', flush=True)
     health_task = asyncio.create_task(_health_check_loop())
     director_task = asyncio.create_task(_director_approval_loop())
     backup_task = asyncio.create_task(_backup_loop())
@@ -6528,7 +6545,11 @@ def _allowlist_wait_estimate():
     explicit 'no history' rather than inventing a number."""
     samples = _allowlist_wait_samples()
     if not samples:
-        return 'no approval history yet -- wait times unknown'
+        return ('no approval history yet -- nothing has ever been decided through this queue, '
+                'so a wait time cannot be guessed. A standing-safe-domain host is reachable '
+                'read-only right now with no wait (allowlist_status <host>); otherwise the '
+                'request sits until the player or a director looks, and allowlist_status '
+                'shows it pending with its age')
     median = samples[len(samples) // 2]
     if median < 60:
         return 'historical median wait: under a minute'
@@ -9137,22 +9158,41 @@ AGENT_ASK_TOOLS = [
     {
         'type': 'function',
         'function': {
-            'name': 'read_peer_reviews',
-            'description': 'Read the review directory of ANOTHER agent -- the notes peers have written '
-                           'about them (performance reviews from the action log). Supply the target '
-                           'agent\'s id, e.g. "dev", and optionally a specific review filename to read '
-                           'one note; omit the filename to list the target\'s review directory first. '
-                           'You can read the reviews of any other agent, but NEVER your own review '
-                           'directory (peer notes about you are for others to read) -- asking for your '
-                           'own returns nothing. Use this to understand a colleague\'s standing before '
-                           'judging or collaborating with them.',
+            'name': 'read_mailbox',
+            'description': 'Read a mailbox. No agentId: your own (most recent messages). '
+                           'With an agentId: only if you hold the Post Office role, a '
+                           'director, or the admin -- mail is otherwise private between '
+                           'sender and recipient. Use this to see what has landed in an '
+                           'inbox without inferring it from queue summaries.',
             'parameters': {
                 'type': 'object',
                 'properties': {
-                    'targetAgentId': {'type': 'string', 'description': 'The id of the agent whose review directory you want to read (never your own).'},
-                    'filename': {'type': 'string', 'description': 'Optional: a specific review filename (from the directory listing) to read in full.'},
+                    'agentId': {'type': 'string', 'description': 'Optional: whose mailbox (requires Post Office / director / admin).'},
+                    'limit': {'type': 'integer', 'description': 'Optional: how many most-recent messages (1-20, default 10).'},
                 },
-                'required': ['targetAgentId'],
+                'required': [],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'read_peer_reviews',
+            'description': 'The feedback written about WORK. With no targetAgentId (or your own '
+                           'id) you get everything on file about YOUR work: quality-pipeline '
+                           'verdicts, review denials, and the peer-review messages in your '
+                           'mailbox, plus where to read the full review text. Supply ANOTHER '
+                           'agent\'s id for their standing instead -- that returns a short '
+                           'summary, because filed reviews are write-only for agents '
+                           '(reviewer independence: nobody can herd off a prior verdict or '
+                           'tailor a denial). Use this to see how work is landing before you '
+                           'judge or collaborate on it.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'targetAgentId': {'type': 'string', 'description': 'Optional. Another agent\'s id for their standing; omit (or pass your own id) for the feedback on your own work.'},
+                },
+                'required': [],
             },
         },
     },
@@ -14797,6 +14837,11 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             # Read-only allowlist pending-queue / host-tier view -- the
             # observability half of request_allowlist.
             return _allowlist_status_text((args or {}).get('host') or '')
+        if name == 'read_mailbox':
+            # Read-only inbox view. Own mailbox for anyone; another agent's
+            # only for the Post Office / a director / the admin (enforced in
+            # _read_mailbox_tool_text, server-side, not by prompt).
+            return _read_mailbox_tool_text(agent_id, args)
         if name == 'request_allowlist':
             result = _http_json('POST', SELF_BASE_URL, '/api/allowlist/request', {
                 'agentId': agent_id,
@@ -15105,11 +15150,11 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     on failure, the same shape the endpoint returns as JSON. See intent_ask
     for the full behavior description; this function IS that behavior.
 
-    `session_id` (the Telegram chat id) opts an ask into conversation memory:
-    the question is answered in the context of the session's earlier turns and
-    its long-term memories (world/memory.py), and both the question and reply
-    are stored back. When omitted (the public /api/intent/ask endpoint, the
-    parked-ask drain) the ask stays fully stateless as before.
+    `session_id` (the Telegram chat id, or 'player-ask:<agent>' from the HTTP
+    endpoint) opts an ask into conversation memory: the question is answered
+    in the context of the session's earlier turns and its long-term memories
+    (world/memory.py), and both the question and reply are stored back. When
+    omitted the ask is stateless.
 
     Ask-lane parking (allow_park=True): when NO agent is free to answer right
     now, the ask is QUEUED rather than rejected -- a {'queued': True, 'askId',
@@ -15194,10 +15239,16 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         f"You are {name}, working as {role} in a small think tank. "
         f"Your mission: {mission}{checklist} "
         + ("The player asks you a fresh question that has nothing to do with the think tank's "
-           "own products or backlog. Answer it directly, in character, in 2-4 sentences. "
+           "own products or backlog. Answer it directly, in character. Match the shape of the "
+           "question -- a sentence or two when it is a single fact, a short bulleted list when "
+           "the answer IS a list (tools, services, options, statuses, who is doing what), never "
+           "crammed into prose. Brevity either way; no filler. "
            if not has_context else
            "You are in an ongoing conversation with the player. Their latest message may refer "
-           "back to what came before -- answer it in that context, in character, in 2-4 sentences. ")
+           "back to what came before -- answer it in that context, in character. Match the shape "
+           "of the question -- a sentence or two when it is a single fact, a short bulleted list "
+           "when the answer IS a list (tools, services, options, statuses, who is doing what), "
+           "never crammed into prose. Brevity either way; no filler. ")
         + "For any live/current real-world fact (a stock price, current news, a specific fact you don't already know), "
         + ("use search_web first if you don't already know a specific URL that has the answer, "
            "then browse_page on the best result if the search snippet alone isn't enough. "
@@ -15276,6 +15327,16 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     # followed live -- forcing the tool choice is the only mechanism that
     # actually worked. Reusing the exact same detectors the spike pipeline
     # already uses, rather than a second, divergent heuristic.
+    # Plus the 2026-10-13 gap: the ask lane only forced tools for 5 spike-specific
+    # detectors (trending/linkedin/ais/rss/market). The low-tier model (mimo-v2.6-flash)
+    # answered *directly with prose* on generic "Use the team_status tool" questions
+    # -- tools: [] with invented output -- because no force was set and tier resolution
+    # ran BEFORE the force chain. The fix: detect any generic status/data tool the
+    # question names (team_status, team_digest, allowlist_status, read_mailbox,
+    # read_peer_reviews, list_services), force that tool on turn 1, and upgrade to
+    # _mid_tier_slug() for that call -- no JEV, no high tier, just the model that
+    # actually honors tool_choice. Plain questions keep their JEV-resolved low tier
+    # (cost unchanged); tool-forced calls pay a fraction more to never hallucinate.
     ask_force_first_tool = None
     if _spike_wants_x_trending(question, None):
         ask_force_first_tool = 'x_trending_topics'
@@ -15287,6 +15348,35 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         ask_force_first_tool = 'read_rss_feed'
     elif _spike_wants_market(question, None):
         ask_force_first_tool = 'read_market_feed'
+    else:
+        # Generic status/data tool detection -- matches on tool name OR a natural
+        # phrase (e.g. "team status" → team_status, "read my mailbox" → read_mailbox).
+        # Ordered by specificity; first match wins. Names are case-insensitive.
+        _status_tool_patterns = [
+            ('team_status', re.compile(r'\bteam[_\s-]?status\b', re.I)),
+            ('team_digest', re.compile(r'\bteam[_\s-]?digest\b', re.I)),
+            ('allowlist_status', re.compile(r'\ballowlist[_\s-]?status\b', re.I)),
+            ('read_mailbox', re.compile(r'\b(read|my|check)[_\s-]?(my|the)?[_\s-]?(inbox|mailbox|mail|messages?)\b', re.I)),
+            ('read_peer_reviews', re.compile(r'\b(peer[_\s-]?review|reviews?)[_\s-]?(about|on|for|of)?[_\s-]?(me|myself|my)\b', re.I)),
+            ('list_services', re.compile(r'\blist[_\s-]?services\b|\bservices?\b.*\b(list|api|call|use|available)\b|\b(what|which)\b.*\bservices?\b', re.I)),
+        ]
+        _q_lower = question.lower()
+        for _tool_name, _pattern in _status_tool_patterns:
+            if _pattern.search(_q_lower):
+                ask_force_first_tool = _tool_name
+                break
+
+    # When a specific tool is forced on turn 1 (any detector above fired), the
+    # low-tier model (mimo-v2.6-flash) has a documented live failure mode: it
+    # answers the question directly in prose with tools: [] and invented
+    # output, ignoring tool_choice='required' -- the exact hallucination this
+    # force was built to prevent. Anthropic Haiku (mid tier) honors
+    # tool_choice='required' reliably, so upgrade to _mid_tier_slug() for
+    # this call only when a tool is actually forced. No force -> plain question
+    # keeps the JEV-resolved low tier (cost unchanged). No JEV, no high tier,
+    # just the cheapest model that actually obeys the required-tool contract.
+    if ask_force_first_tool:
+        model = _mid_tier_slug() or model
 
     def execute_tool(name, args):
         # Every tool result is external data -> wrap BEFORE it can reach a model.
@@ -15311,39 +15401,29 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
             tools_used.append(name)
             return _allowlist_status_text((args or {}).get('host') or '')
         if name == 'read_peer_reviews':
-            # Peer review directories: list, then optionally read one note.
-            # Same GET endpoints the browser uses (/api/agent-files) with the
-            # agent's own key as requester -- that path already enforces the
-            # access rule: an agent can read ANY other agent's review dir but
-            # NEVER its own (the endpoint hides and denies own-reports), so the
-            # tool needs no extra gate; it rides the same ACL.
+            # Feedback about WORK, read DB-only (no self-loopback).
+            #   no target / your own id -> everything written about YOUR work
+            #   someone else's id       -> the standing summary, and an honest
+            #     statement of why there is no directory to read.
+            # Reviewer independence (2026-10-06, _agent_reports_off_limits) makes
+            # every reports/ dir write-only for every agent, so the old drive-by-
+            # the-file-API version of this tool always answered "no peer reviews
+            # on file" and the 2026-10-13 review heard 14 agents call that a dead
+            # signal. The feedback was never gone; it lives in state.
             tools_used.append(name)
-            target = ((args or {}).get('targetAgentId') or '').strip()
-            if not target:
-                return 'Missing targetAgentId: which agent\'s review directory do you want to read?'
-            filename = ((args or {}).get('filename') or '').strip()
-            if filename:
-                result = _http_json('GET', SELF_BASE_URL,
-                                    f'/api/agent-files/read?agentId={urllib.parse.quote(target)}'
-                                    f'&path=reports/{urllib.parse.quote(filename)}&requesterId={pick}',
-                                    None, agent_key)
-            else:
-                result = _http_json('GET', SELF_BASE_URL,
-                                    f'/api/agent-files?agentId={urllib.parse.quote(target)}&requesterId={pick}',
-                                    None, agent_key)
-                files = result.get('files') or []
-                reports = [f['path'] for f in files if f.get('path', '').startswith('reports/')]
-                if not reports:
-                    return (f'{target} has no peer reviews on file (or their directory is not readable '
-                            f'by you). Nothing to list.')
-                return ('Review directory of ' + target + ':\n' + '\n'.join(reports) +
-                        '\n\nUse read_peer_reviews with a filename to read one note in full.')
-            if isinstance(result, dict) and result.get('content') is not None:
-                return result['content'][:4000]
-            if isinstance(result, dict) and result.get('error'):
-                return (f'Could not read that review: {result["error"]} '
-                        f'[note: you can never read your OWN review directory]')
-            return json.dumps(result)[:4000]
+            target = ((args or {}).get('targetAgentId') or '').strip() or pick
+            state_now = get_state_from_db() or {}
+            if target == pick:
+                return _own_work_feedback_text(state_now, pick)
+            if target not in (state_now.get('agents') or {}):
+                return (f'No agent with id {target!r}. Omit targetAgentId (or pass your own id) '
+                        f'to read the feedback written about your own work.')
+            return (f'Standing of {target}: filed performance reviews are WRITE-ONLY for agents -- '
+                    f'no agent may read another agent\'s review notes (reviewer independence, '
+                    f'2026-10-06), so there is no directory to list and asking for one always comes '
+                    f'back empty. What you can see instead: their delivered work in the library, and '
+                    f'who is on what via team_status / team_digest. Omit targetAgentId to read the '
+                    f'feedback written about your own work.')
         if is_security_test_role and name == 'attempt_curl':
             tools_used.append(name)
             result = _http_json('POST', SELF_BASE_URL, '/api/curl', {
@@ -15398,7 +15478,20 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         if name == 'app_script':
             tools_used.append(name)
             return _app_script_tool(pick, args)
-        raise ValueError(f'unknown tool: {name}')
+        # Fall through to the shared executor: AGENT_ASK_TOOLS and
+        # _make_web_tools_executor are two views of ONE tool surface, and they
+        # drifted apart. api_call / propose_api_service / list_services /
+        # request_allowlist / grant_allowlist / revoke_allowlist /
+        # generate_image / generate_video are advertised to the model right
+        # here (they ride in AGENT_ASK_TOOLS) but this dispatcher had no case
+        # for them, so every live call came back "unknown tool" -- 8 of the 14
+        # agents hit it in the 2026-10-13 capability review, and the ask test
+        # never caught it because it asserted the OFFERED tool names, not that
+        # they dispatch. Route anything this dispatcher doesn't own to the
+        # shared executor, which already implements them; only a name NEITHER
+        # side implements still raises, with the same message.
+        tools_used.append(name)
+        return _web_tool(name, args)
 
     tools = (AGENT_ASK_TOOLS + [_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL]
             + (SECURITY_TEST_TOOLS if is_security_test_role else []))
@@ -15440,7 +15533,8 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         stm_append(session_id, 'assistant', reply)
         ltm_maybe_extract(session_id)
 
-    log_action('player', 'ask', {'question': question[:200], 'agent': pick, 'tools': tools_used},
+    log_action('player', 'ask', {'question': question[:200], 'agent': pick, 'tools': tools_used,
+                                 'reply': (reply or '')[:500]},
                authorized=True)
     _append_passport_decision('ask', pick, {
         'question': question[:200], 'tools': tools_used})
@@ -16358,6 +16452,111 @@ def _team_digest_text(max_markdown_chars=1400, tape_window_s=86400):
     return '\n\n'.join(parts)
 
 
+def _own_work_feedback_text(state, agent_id, max_chars=4000):
+    """Everything written about THIS agent's own work, gathered from the three
+    places feedback actually lands: the `_feedback` buffer (quality-pipeline
+    and executor verdicts), `growthPlans` (review denials / coaching notes with
+    their task context), and their mailbox (peer_review_request /
+    peer_review_rejected). Read-only, DB-only.
+
+    Added for the 2026-10-13 capability review: every one of the 14 agents said
+    their `reports/` directory was empty and they had "no signal on how their
+    work is actually received". That is structurally true -- the only automated
+    writer of those directories was removed on 2026-10-06 (0282597, "never
+    write productivity reports") and the directories are also off-limits to
+    every agent (reviewer independence) -- but the FEEDBACK itself is not
+    missing, it just lives in state. Point them at it."""
+    agents = state.get('agents') or {}
+    me = agents.get(agent_id) or {}
+    lines = []
+    feedback = [f for f in ((state.get('_feedback') or {}).get(agent_id) or [])
+                if isinstance(f, dict) and (f.get('text') or '').strip()]
+    seen, unique = set(), []
+    for f in reversed(feedback):  # newest first
+        text = (f.get('text') or '').strip()
+        if text in seen:
+            continue
+        seen.add(text)
+        unique.append(f)
+        if len(unique) >= 8:
+            break
+    if unique:
+        lines.append('FEEDBACK ON YOUR WORK (most recent first):\n'
+                     + '\n'.join(f'- [{f.get("source") or "note"}] {f["text"][:400]}'
+                                 for f in unique))
+    else:
+        lines.append('FEEDBACK ON YOUR WORK: nothing buffered right now.')
+    plans = [p for p in ((state.get('growthPlans') or {}).get(agent_id) or [])
+             if isinstance(p, dict) and p.get('note')]
+    plans = [p for p in plans if p.get('kind') in ('review_denial', 'pipeline_feedback',
+                                                   'low_grade', 'peer_review')][:6]
+    if plans:
+        lines.append('REVIEW / GROWTH NOTES:\n' + '\n'.join(
+            f'- {p.get("kind")}: {str(p.get("note"))[:350]}' for p in plans))
+    mail = [m for m in (me.get('mailbox') or []) if isinstance(m, dict)
+            and (m.get('kind') or '').startswith('peer_review')]
+    if mail:
+        lines.append('PEER REVIEW MESSAGES IN YOUR MAILBOX:\n' + '\n'.join(
+            f'- {m.get("kind")}: {str(m.get("text") or m.get("title") or "")[:350]}'
+            for m in mail[-5:]))
+    lines.append('FULL REVIEW TEXT: every review a peer filed on your work is in the library '
+                 'as archive/<timestamp>-review-<taskId>.md -- search_library or read_library_file '
+                 'for your task id to read the whole verdict, not just the summary above.')
+    return '\n\n'.join(lines)[:max_chars]
+
+
+def _read_mailbox_tool_text(requester_id, args=None, max_chars=4000):
+    """Read-only mailbox viewer for agents. Own mailbox: always. Someone
+    else's: only a director, an admin, or the Post Office -- the one role
+    whose actual job is the mail (2026-10-13 review: Cora, the Post Office,
+    complained she has 'no mail or package tool, I can only infer the inbox
+    from queue summaries'; the seeded 'Sort the incoming mail queue' card has
+    no executor either, so a viewer is the honest minimum).
+
+    DB-only, no LLM, no network. Mail is otherwise only reachable through the
+    browser UI and the recipient's own injected task context (the last 5)."""
+    state = get_state_from_db() or {}
+    agents = state.get('agents') or {}
+    me = agents.get(requester_id) or {}
+    if isinstance(args, dict):
+        target = (args.get('agentId') or '').strip()
+        try:
+            limit = max(1, min(20, int(args.get('limit') or 10)))
+        except (TypeError, ValueError):
+            limit = 10
+    else:
+        target = (args or '').strip()
+        limit = 10
+    target = target or requester_id
+    if target != requester_id:
+        role = me.get('role') or ''
+        is_director = any(isinstance(a, dict) and a.get('director') == requester_id
+                          for a in agents.values())
+        if not (me.get('isAdmin') or is_director or role == 'Post Office'):
+            return ('You may not read another agent\'s mailbox: mail is between the '
+                    'sender and the recipient. Your OWN mailbox is always readable '
+                    '(call read_mailbox with no agentId -- it is also injected into '
+                    'every task you work on), and a director, the admin, or the Post '
+                    'Office may read anyone\'s.')
+    target_agent = agents.get(target) or {}
+    mail = [m for m in (target_agent.get('mailbox') or []) if isinstance(m, dict)]
+    if not mail:
+        return f'{target}\'s mailbox is empty.'
+    lines = [f'MAILBOX OF {target} ({len(mail)} messages, newest last):']
+    for m in mail[-limit:]:
+        head = f'- [{m.get("kind") or "message"}]'
+        if m.get('title'):
+            head += ' ' + str(m['title'])[:120]
+        line = head
+        text = (m.get('text') or '').strip()
+        if text:
+            line += ': ' + text[:300]
+        if m.get('about'):
+            line += f' (about: {m["about"]})'
+        lines.append(line)
+    return '\n'.join(lines)[:max_chars]
+
+
 def _team_status_text(max_chars=1600):
     """Read-only, DB-only FORWARD-LOOKING team view: who is working on what
     right now, what is queued, what failed, and what is waiting on a human.
@@ -16369,6 +16568,30 @@ def _team_status_text(max_chars=1600):
     agents = state.get('agents') or {}
     tasks = state.get('tasks') or {}
     lines = []
+    # Why is it stuck? A bare status word ("blocked") is what every agent
+    # said they could see with no way to find out WHY (2026-10-13 review: the
+    # status view 'doesn't show why the loops start'). Pull the most recent
+    # rejection/stuck note per task straight from the action log -- DB-only,
+    # no LLM, same shape as the rest of this view.
+    last_note = {}
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT action, details FROM action_log "
+                "WHERE action IN ('quality_gate_reject', 'worker_stuck_help') "
+                "ORDER BY ts DESC LIMIT 400").fetchall()
+        for _action, _details in rows:
+            try:
+                _d = json.loads(_details) or {}
+            except Exception:
+                continue
+            _tid = _d.get('taskId')
+            if not _tid or _tid in last_note:
+                continue
+            _note = str(_d.get('note') or _d.get('reason') or _action)
+            last_note[_tid] = ' '.join(_note.split())[:180]
+    except Exception:
+        pass
     working = []
     for aid, a in agents.items():
         if not isinstance(a, dict):
@@ -16376,11 +16599,30 @@ def _team_status_text(max_chars=1600):
         tid = a.get('task')
         if tid:
             t = tasks.get(tid) or {}
-            working.append(f'- {aid}: {t.get("title") or tid} [{t.get("status") or "?"}]')
+            # Room included: the 2026-10-13 review asked for cross-room
+            # visibility ('I cannot see other rooms' active workflows unless
+            # they send a handoff'). Task title alone does not say WHERE.
+            working.append(f'- {aid}: {t.get("title") or tid} [{t.get("status") or "?"}'
+                           f'{", " + t["room"] if t.get("room") else ""}]')
     lines.append('WORKING NOW:\n' + ('\n'.join(working) if working else '- nobody is on a task right now'))
     queue = [w for w in (state.get('workQueue') or []) if isinstance(w, dict)]
     if queue:
-        ql = [f'- [{w.get("taskType") or "work"}] {w.get("title") or "??"}' for w in queue[:10]]
+        # Owner shown: 'nothing shows who picks up queued work' was the
+        # complaint that hid a 21k-attempt wedge -- assignedTo existed in the
+        # state the whole time and simply was not rendered here.
+        ql = []
+        for w in queue[:10]:
+            owner = w.get('assignedTo')
+            room = w.get('room')
+            tries = w.get('attempts') or 0
+            bits = [f'- [{w.get("taskType") or "work"}] {w.get("title") or "??"}']
+            if owner:
+                bits.append(f'pinned to {owner}')
+            if room:
+                bits.append(f'room {room}')
+            if tries > 1:
+                bits.append(f'{tries} attempts')
+            ql.append(', '.join(bits))
         if len(queue) > 10:
             ql.append(f'- ...and {len(queue) - 10} more queued')
         lines.append('QUEUE (waiting to be picked up):\n' + '\n'.join(ql))
@@ -16394,19 +16636,35 @@ def _team_status_text(max_chars=1600):
         counts[st] = counts.get(st, 0) + 1
         if st in ('failed', 'blocked') or (st == 'working' and t.get('workUntil')
                                            and t['workUntil'] < time.time() - 300):
-            attention.append(f'- {tid}: {st} -- {t.get("title") or "??"}')
+            entry = f'- {tid}: {st} -- {t.get("title") or "??"}'
+            if last_note.get(tid):
+                entry += f'\n    why: {last_note[tid]}'
+            attention.append(entry)
     lines.append('TASK STATUS COUNTS: ' + ', '.join(f'{k}={v}' for k, v in sorted(counts.items())))
     if attention:
         lines.append('NEEDS ATTENTION (stuck/failed):\n' + '\n'.join(attention[:8]))
     try:
-        pending_esc = [e for e in (_load_escalations() or {}).values()
-                       if e.get('status') == 'pending']
+        pending_esc = [(eid, e) for eid, e in (_load_escalations() or {}).items()
+                       if isinstance(e, dict) and e.get('status') == 'pending']
         if pending_esc:
             kinds = {}
-            for e in pending_esc:
+            for _eid, e in pending_esc:
                 kinds[e.get('kind') or '?'] = kinds.get(e.get('kind') or '?', 0) + 1
             lines.append('WAITING ON A HUMAN/DIRECTOR DECISION: '
                          + ', '.join(f'{k} x{v}' for k, v in sorted(kinds.items())))
+            # The count alone read as "routine x1" with no detail, which is
+            # what the leaked placeholder escalation looked like for a week.
+            # Show what is actually waiting, by id, so it is actionable.
+            now = time.time()
+            detail = []
+            for eid, e in pending_esc[:6]:
+                q = (e.get('question') or e.get('note') or '').strip() or '(no detail on record)'
+                age_min = max(0, int((now - (e.get('ts') or now)) / 60))
+                detail.append(
+                    f'- {eid} [{e.get("kind") or "?"}] {q[:200]} '
+                    f'(waiting {age_min}m, director pass {e.get("askCount") or 0}'
+                    f'{", player already notified" if e.get("humanNotified") else ""})')
+            lines.append('\n'.join(detail))
     except Exception:
         pass
     return '\n\n'.join(lines)[:max_chars]
@@ -16508,8 +16766,18 @@ async def intent_ask(request: Request):
         body = await request.json()
     except Exception:
         return JSONResponse({'error': 'malformed body'}, status_code=400)
+    # Conversation memory for the public ask lane: one STM/LTM bucket per
+    # named agent (a shared 'any' bucket when the player does not name one).
+    # The 2026-13 capability review could not answer "are the concerns you
+    # raised last night resolved?" for 12 of 14 agents because the lane was
+    # stateless and the reply was never stored -- the memory tables already
+    # existed for the Telegram bridge and simply were not used here. Read path
+    # is DB-only; the only model call (LTM extraction) is background and runs
+    # every LTM_EXTRACT_EVERY_TURNS, never on the ask's critical path.
+    _ask_target = (body.get('agentId') or '').strip() or 'any'
     result = await _ask_core(state, body.get('question'), body.get('agentId'),
-                             body.get('location'), body.get('max_tokens', 300))
+                             body.get('location'), body.get('max_tokens', 300),
+                             session_id=f'player-ask:{_ask_target.lower()}')
     if 'error' in result:
         return JSONResponse({'error': result['error']}, status_code=result.get('status', 500))
     if result.get('queued'):

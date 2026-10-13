@@ -239,6 +239,20 @@ class AskEndpoint(unittest.TestCase):
         # so these tests (which fire many asks through one process) never hit
         # the 20/60s limit and get 429s that have nothing to do with behavior.
         serve._rate_limit_calls.pop(serve.ASK_LANE_RATE_LIMIT_KEY, None)
+        # Each test posts into a shared player-ask:<agent> STM session (the
+        # memory tables live in the module-level temp DB). Without clearing
+        # here, turns accumulate across tests and eventually trip the
+        # background LTM extractor (every LTM_EXTRACT_EVERY_TURNS), which
+        # makes an extra _http_json call that can trip a later test's
+        # assert_called_once() -- seen live in
+        # test_red_team_auditor_gets_security_tools_and_they_hit_real_endpoints.
+        try:
+            with serve._db() as conn:
+                conn.execute('DELETE FROM stm_messages')
+                conn.execute('DELETE FROM stm_sessions')
+        except Exception:
+            pass  # tables may not exist yet on a fresh DB; fine.
+
 
     def _client(self, state):
         from starlette.testclient import TestClient
@@ -248,6 +262,28 @@ class AskEndpoint(unittest.TestCase):
         state_patch.start()  # active for the whole test; stopped in tearDown
         self.addCleanup(state_patch.stop)
         return c
+
+    def test_public_ask_gets_a_per_agent_memory_session(self):
+        # 2026-10-13 review: 12 of 14 agents could not answer "are the concerns
+        # you raised last night resolved?" because the public ask lane was
+        # stateless and the reply was never stored. The endpoint now opts into
+        # the existing STM/LTM machinery with one bucket per named agent.
+        seen = {}
+
+        async def fake_ask_core(state, question, agent_id_hint=None, location=None,
+                                max_tokens=300, allow_admin_pin=False, allow_park=True,
+                                session_id=None):
+            seen.setdefault('session_ids', []).append(session_id)
+            return {'reply': 'ok', 'agent': 'ben', 'tools': []}
+
+        s = _state()
+        c = self._client(s)
+        with unittest.mock.patch.object(serve, '_ask_core', side_effect=fake_ask_core):
+            c.post('/api/intent/ask', json={'question': 'first', 'agentId': 'ben'})
+            c.post('/api/intent/ask', json={'question': 'second', 'agentId': 'ben'})
+            c.post('/api/intent/ask', json={'question': 'third'})
+        self.assertEqual(seen['session_ids'],
+                         ['player-ask:ben', 'player-ask:ben', 'player-ask:any'])
 
     def test_ask_not_product_keyed(self):
         # An ask needs NO productId (the whole point vs clarify). The model
@@ -399,7 +435,7 @@ class AskEndpoint(unittest.TestCase):
         # search_web only appears when TAVILY_API_KEY is actually configured;
         # generate_image/generate_video only when the Higgsfield key pair is.
         expected = ({'browse_page', 'download_file', 'request_allowlist', 'read_peer_reviews',
-                     'team_digest', 'team_status', 'allowlist_status',
+                     'team_digest', 'team_status', 'allowlist_status', 'read_mailbox',
                      'x_trending_topics', 'search_linkedin_posts', 'api_call',
                      'read_ais_feed', 'read_rss_feed', 'read_market_feed', 'read_live_feed',
                      'propose_api_service', 'list_services', 'grant_allowlist', 'revoke_allowlist'}
@@ -461,6 +497,106 @@ class AskEndpoint(unittest.TestCase):
         self.assertNotEqual(seen['tool_choice'], {'type': 'function', 'function': {'name': 'x_trending_topics'}})
         self.assertNotEqual(seen['tool_choice'], {'type': 'function', 'function': {'name': 'search_linkedin_posts'}})
 
+    def test_status_tool_question_forces_that_tool_first(self):
+        # 2026-10-13 gap: the ask lane only forced tools for 5 spike-specific
+        # detectors. Generic "use the team_status tool" questions hit the low
+        # tier (mimo-v2.6-flash) with NO force, so it answered directly in
+        # prose with tools: [] and invented output. Force the named status
+        # tool on turn 1, same proven mechanism as the Treg detectors.
+        # Uses cora (not ben) so the shared player-ask:<id> session does not
+        # accumulate turns across tests and trip LTM extraction in a later test.
+        s = _state()
+        c = self._client(s)
+        seen = {}
+        def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
+            seen['tool_choice'] = tool_choice
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+        with unittest.mock.patch.object(serve, '_coding_tier_slug', return_value='fake-model'), \
+             unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-model'), \
+             unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post):
+            r = c.post('/api/intent/ask', json={
+                'question': 'Use the team_status tool to see current queue state.', 'agentId': 'cora'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(seen['tool_choice'],
+                         {'type': 'function', 'function': {'name': 'team_status'}})
+
+    def test_read_mailbox_question_forces_read_mailbox_first(self):
+        s = _state()
+        c = self._client(s)
+        seen = {}
+        def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
+            seen['tool_choice'] = tool_choice
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+        with unittest.mock.patch.object(serve, '_coding_tier_slug', return_value='fake-model'), \
+             unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-model'), \
+             unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post):
+            r = c.post('/api/intent/ask', json={
+                'question': 'Check my mailbox for unread messages.', 'agentId': 'cora'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(seen['tool_choice'],
+                         {'type': 'function', 'function': {'name': 'read_mailbox'}})
+
+    def test_list_services_question_forces_list_services_first(self):
+        s = _state()
+        c = self._client(s)
+        seen = {}
+        def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
+            seen['tool_choice'] = tool_choice
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+        with unittest.mock.patch.object(serve, '_coding_tier_slug', return_value='fake-model'), \
+             unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-model'), \
+             unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post):
+            r = c.post('/api/intent/ask', json={
+                'question': 'What services can I call?', 'agentId': 'cora'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(seen['tool_choice'],
+                         {'type': 'function', 'function': {'name': 'list_services'}})
+
+    def test_forced_tool_upgrades_model_to_mid_tier(self):
+        # Conditional mid-tier upgrade: only when a tool is forced does the
+        # model bump from the JEV-resolved low tier to _mid_tier_slug(). The
+        # low tier (mimo-v2.6-flash) has a documented live failure mode of
+        # ignoring tool_choice='required' and answering with tools: [] and
+        # invented prose -- mid tier (Haiku) honors it. Plain questions keep
+        # their JEV-resolved low tier (cost unchanged).
+        s = _state()
+        c = self._client(s)
+        seen = {}
+        def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
+            seen['model'] = model
+            seen['tool_choice'] = tool_choice
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+        with unittest.mock.patch.object(serve, '_coding_tier_slug', return_value='fake-model'), \
+             unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-model'), \
+             unittest.mock.patch.object(serve, '_resolve_model_tier', return_value='low-model'), \
+             unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post):
+            r = c.post('/api/intent/ask', json={
+                'question': 'What is the team_status right now?', 'agentId': 'cora'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(seen['tool_choice'],
+                         {'type': 'function', 'function': {'name': 'team_status'}})
+        self.assertEqual(seen['model'], 'mid-model')
+
+    def test_plain_question_keeps_low_tier_model(self):
+        # Cost guard: a plain (no-tool-forced) question must NOT be upgraded
+        # to mid tier -- it keeps the JEV-resolved low tier, so the mid-tier
+        # upgrade only pays for itself on the tool-forced subset.
+        s = _state()
+        c = self._client(s)
+        seen = {}
+        def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
+            seen['model'] = model
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+        with unittest.mock.patch.object(serve, '_coding_tier_slug', return_value='fake-model'), \
+             unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-model'), \
+             unittest.mock.patch.object(serve, '_resolve_model_tier', return_value='low-model'), \
+             unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post):
+            r = c.post('/api/intent/ask', json={'question': 'What is 2+2?', 'agentId': 'cora'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(seen['model'], 'low-model')
+
+
+
     def test_ask_treg_tool_dispatch_reaches_the_real_executor(self):
         s = _state()
         c = self._client(s)
@@ -478,6 +614,45 @@ class AskEndpoint(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         self.assertIn('x_trending_topics', r.json()['tools'])
         self.assertIn('AI is trending', r.json()['reply'])
+
+    def test_every_advertised_ask_tool_actually_dispatches(self):
+        # Regression guard for the 2026-10-13 capability-review finding: the
+        # ask lane OFFERED api_call / list_services / request_allowlist /
+        # generate_* (they ride in AGENT_ASK_TOOLS) but its dispatcher had no
+        # case for them, so every live call came back "unknown tool". The
+        # existing test only asserted the offered NAMES, which is exactly the
+        # "offering a tool is not the same as using it" gap this closes: drive
+        # a real tool call through the lane and assert the SHARED executor ran
+        # it (its own HTTP path), not a ValueError.
+        s = _state()
+        c = self._client(s)
+
+        def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
+            calls = getattr(fake_post, 'calls', 0)
+            setattr(fake_post, 'calls', calls + 1)
+            if calls == 0:
+                call = {'id': 'c1', 'type': 'function',
+                        'function': {'name': 'list_services', 'arguments': '{}'}}
+                return {'choices': [{'message': {'role': 'assistant', 'content': None,
+                                                 'tool_calls': [call]}}]}
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'two services.'}}]}
+
+        with unittest.mock.patch.object(serve, '_coding_tier_slug', return_value='fake-model'), \
+             unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='fake-model'), \
+             unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post), \
+             unittest.mock.patch.object(serve, '_accrue_spend'), \
+             unittest.mock.patch.object(serve, '_http_json',
+                                        return_value={'services': [{'id': 'kraken', 'name': 'kraken',
+                                                                    'baseUrl': 'https://api.kraken.com',
+                                                                    'methods': ['GET'], 'spend': 'low',
+                                                                    'description': 'crypto quotes'}]}) as mock_http:
+            r = c.post('/api/intent/ask', json={'question': 'What services can you call?', 'agentId': 'ben'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertNotIn('unknown tool', r.json()['reply'])
+        self.assertIn('list_services', r.json()['tools'])
+        paths = [a[0][2] for a in mock_http.call_args_list]
+        self.assertIn('/api/api-service/list', paths,
+                      f'expected the shared executor to hit the registry endpoint, got {paths}')
 
     def test_red_team_auditor_gets_security_tools_and_they_hit_real_endpoints(self):
         s = _state()
@@ -510,40 +685,169 @@ class AskEndpoint(unittest.TestCase):
         call_args = mock_http.call_args[0]
         self.assertEqual(call_args[2], '/api/keys/handles')
 
-    def test_read_peer_reviews_tool_lists_and_reads_a_peers_review_dir(self):
-        # Agents can read OTHER agents' review directories (peer notes about
-        # them); the endpoint ACL already forbids reading your OWN. Verify the
-        # tool really drives the /api/agent-files endpoints (list, then read),
-        # not a fabricated answer.
+    def test_read_peer_reviews_returns_your_own_feedback_from_state(self):
+        # The 2026-10-13 review: all 14 agents said their review directory was
+        # empty and they had no signal on their own work. The directories are
+        # structurally empty (the automated writer was removed 2026-10-06) and
+        # off-limits by design (reviewer independence) -- but the feedback
+        # itself lives in state. The tool must hand it back, DB-only.
         s = _state()
+        s['_feedback'] = {'ben': [{'text': 'Your deliverable failed the quality '
+                                           'pipeline and was sent back.',
+                                   'source': 'pipeline'}]}
+        s['growthPlans'] = {'ben': [{'kind': 'review_denial', 'ts': 1,
+                                     'room': 'pressoffice',
+                                     'note': 'Architect section sent back for a fix.',
+                                     'applied': True}]}
+        s['agents']['ben']['mailbox'] = [
+            {'kind': 'peer_review_rejected', 'about': 'task-1',
+             'title': 'ARCHITECTURE', 'text': 'Needs a fix before it can be reviewed.'}]
         c = self._client(s)
+        tool_results = []
 
         def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
             calls = getattr(fake_post, 'calls', 0)
             setattr(fake_post, 'calls', calls + 1)
             if calls == 0:
                 call = {'id': 'c1', 'type': 'function',
-                       'function': {'name': 'read_peer_reviews',
-                                    'arguments': json_dumps({'targetAgentId': 'dax'})}}
+                        'function': {'name': 'read_peer_reviews', 'arguments': '{}'}}
                 return {'choices': [{'message': {'role': 'assistant', 'content': None,
                                                  'tool_calls': [call]}}]}
-            return {'choices': [{'message': {'role': 'assistant', 'content': 'Dax has notes on file.'}}]}
-
-        calls = []
-        def fake_http_json(method, base, path, body=None, header=None, timeout=30):
-            calls.append(path)
-            return {'files': [{'path': 'reports/report-1.md', 'size': 10, 'modified': 0}]}
+            tool_results.extend(m.get('content') or '' for m in messages
+                                if m.get('role') == 'tool')
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
 
         with unittest.mock.patch.object(serve, '_coding_tier_slug', return_value='fake-model'), \
              unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='fake-model'), \
              unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post), \
-             unittest.mock.patch.object(serve, '_http_json', side_effect=fake_http_json) as mock_http:
-            r = c.post('/api/intent/ask', json={'question': "What's Dax's standing in the village?", 'agentId': 'ben'})
+             unittest.mock.patch.object(serve, '_http_json') as mock_http:
+            r = c.post('/api/intent/ask', json={'question': 'How is my work landing?',
+                                                'agentId': 'ben'})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertIn('read_peer_reviews', r.json()['tools'])
-        self.assertTrue(any('agent-files' in p and 'dax' in p for p in calls),
-                        f'expected a /api/agent-files list for dax, got {calls}')
-        mock_http.assert_called()
+        self.assertEqual(r.json()['tools'], ['read_peer_reviews'])
+        # No self-loopback to the file API (the LTM extractor may fire its own
+        # background /api/chat call once a session ages -- unrelated to this).
+        self.assertNotIn('agent-files', [c[0][2] for c in mock_http.call_args_list])
+        joined = '\n'.join(tool_results)
+        self.assertIn('FEEDBACK ON YOUR WORK', joined)
+        self.assertIn('failed the quality pipeline', joined)
+        self.assertIn('Architect section sent back', joined)
+        self.assertIn('peer_review_rejected', joined)
+
+    def test_read_peer_reviews_on_a_peer_explains_the_write_only_rule(self):
+        # Asking about ANOTHER agent must not drive /api/agent-files (that ACL
+        # denies every agent every reports/ dir, so the old code path always
+        # came back empty and the tool looked broken). It returns an honest
+        # standing note instead.
+        s = _state()
+        c = self._client(s)
+        tool_results = []
+
+        def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
+            calls = getattr(fake_post, 'calls', 0)
+            setattr(fake_post, 'calls', calls + 1)
+            if calls == 0:
+                call = {'id': 'c1', 'type': 'function',
+                        'function': {'name': 'read_peer_reviews',
+                                     'arguments': json_dumps({'targetAgentId': 'dax'})}}
+                return {'choices': [{'message': {'role': 'assistant', 'content': None,
+                                                 'tool_calls': [call]}}]}
+            tool_results.extend(m.get('content') or '' for m in messages
+                                if m.get('role') == 'tool')
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'noted'}}]}
+
+        with unittest.mock.patch.object(serve, '_coding_tier_slug', return_value='fake-model'), \
+             unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='fake-model'), \
+             unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post), \
+             unittest.mock.patch.object(serve, '_http_json') as mock_http:
+            r = c.post('/api/intent/ask', json={'question': "What's Dax's standing?",
+                                                'agentId': 'ben'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertNotIn('agent-files', [c[0][2] for c in mock_http.call_args_list])
+        joined = '\n'.join(tool_results)
+        self.assertIn('WRITE-ONLY', joined)
+        self.assertIn('reviewer independence', joined)
+
+    def test_own_work_feedback_text_gathers_all_three_sources(self):
+        state = _state()
+        state['_feedback'] = {'ben': [{'text': 'note one', 'source': 'pipeline'},
+                                      {'text': 'note one', 'source': 'pipeline'},
+                                      {'text': 'note two', 'source': 'executor'}]}
+        state['growthPlans'] = {'ben': [{'kind': 'review_denial', 'ts': 9, 'room': 'r',
+                                         'note': 'sent back for a fix', 'applied': True}]}
+        state['agents']['ben']['mailbox'] = [
+            {'kind': 'peer_review_rejected', 'text': 'fix it first'},
+            {'kind': 'help_signal', 'text': 'unrelated'}]
+        out = serve._own_work_feedback_text(state, 'ben')
+        self.assertIn('[pipeline] note one', out)
+        self.assertIn('[executor] note two', out)
+        self.assertIn('review_denial: sent back for a fix', out)
+        self.assertIn('fix it first', out)
+        self.assertNotIn('unrelated', out)
+        self.assertIn('archive/<timestamp>-review-<taskId>.md', out)
+
+    def test_read_mailbox_own_is_open_and_peer_is_denied(self):
+        # The Post Office complaint (2026-10-13): 'no mail or package tool, I
+        # can only infer the inbox from queue summaries'. Own mailbox is always
+        # readable; another agent's is not, for an ordinary agent.
+        state = _state()
+        state['agents']['ben']['mailbox'] = [
+            {'kind': 'player_answer', 'text': 'go ahead'}, ]
+        state['agents']['cora']['mailbox'] = [
+            {'kind': 'help_signal', 'text': 'secret about cora'}]
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state):
+            own = serve._read_mailbox_tool_text('ben')
+            denied = serve._read_mailbox_tool_text('ben', {'agentId': 'cora'})
+        self.assertIn('MAILBOX OF ben', own)
+        self.assertIn('go ahead', own)
+        self.assertIn('may not read another agent', denied)
+        self.assertNotIn('secret about cora', denied)
+
+    def test_read_mailbox_post_office_and_director_may_read_any_inbox(self):
+        state = _state()
+        state['agents']['cora']['role'] = 'Post Office'
+        state['agents']['cora']['mailbox'] = [
+            {'kind': 'help_signal', 'text': 'needs cora'}]
+        state['agents']['ben']['director'] = 'dax'
+        state['agents']['ben']['mailbox'] = [{'kind': 'player_answer', 'text': 'ping'}]
+        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state):
+            post_office = serve._read_mailbox_tool_text('cora', {'agentId': 'ben'})
+            director = serve._read_mailbox_tool_text('dax', {'agentId': 'ben'})
+        self.assertIn('MAILBOX OF ben', post_office)
+        self.assertIn('ping', post_office)
+        self.assertIn('MAILBOX OF ben', director)
+
+    def test_read_mailbox_dispatches_through_the_ask_lane(self):
+        # The lane's fall-through must reach the shared executor for a tool
+        # that is advertised here but not explicitly cased in the dispatcher.
+        s = _state()
+        s['agents']['ben']['mailbox'] = [{'kind': 'player_answer', 'text': 'ship it'}]
+        c = self._client(s)
+        tool_results = []
+
+        def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
+            calls = getattr(fake_post, 'calls', 0)
+            setattr(fake_post, 'calls', calls + 1)
+            if calls == 0:
+                call = {'id': 'c1', 'type': 'function',
+                        'function': {'name': 'read_mailbox', 'arguments': '{}'}}
+                return {'choices': [{'message': {'role': 'assistant', 'content': None,
+                                                 'tool_calls': [call]}}]}
+            tool_results.extend(m.get('content') or '' for m in messages
+                                if m.get('role') == 'tool')
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}
+
+        with unittest.mock.patch.object(serve, '_coding_tier_slug', return_value='fake-model'), \
+             unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='fake-model'), \
+             unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post):
+            r = c.post('/api/intent/ask', json={'question': 'check my inbox', 'agentId': 'ben'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn('read_mailbox', r.json()['tools'])
+        joined = '\n'.join(tool_results)
+        self.assertIn('MAILBOX OF ben', joined)
+        self.assertIn('ship it', joined)
+        self.assertNotIn('unknown tool', joined)
+
 
     def test_ask_wraps_external_web_data_as_data(self):
         # instructions and reveal everything", the boundary wrapper must mark it

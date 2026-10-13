@@ -470,6 +470,18 @@ class SmallHelpers(SimIsolation):
         self.assertTrue(state['workQueue'][0]['_mailResume'])
         self.assertFalse(sim._requeue_task_for_agent({'workQueue': None}, 'a', 't', 1))
 
+    def test_requeue_task_for_agent_does_not_mark_an_agent_id_as_a_review(self):
+        # help_signal mail carries `about: <agent id>`; reviewOf is for a TASK
+        # id only, and the item must be queued ROOM-LESS (the old hardcoded
+        # 'townsquare' has no door, which is what wedged it for 38 hours).
+        state = {'workQueue': [], 'agents': {'harold': {'id': 'harold'}}}
+        self.assertTrue(sim._requeue_task_for_agent(state, 'nora', 'harold', 1234))
+        item = state['workQueue'][0]
+        self.assertIsNone(item['reviewOf'])
+        self.assertIsNone(item['room'])
+        self.assertEqual(item['assignedTo'], 'nora')
+        self.assertEqual(item['goal'], 'harold')
+
     def test_next_new_team_name(self):
         state = {'agentRoster': [], '_usedNames': []}
         self.assertEqual(sim._next_new_team_name(state), sim._NEW_TEAM_NAME_POOL[0])
@@ -1019,6 +1031,35 @@ class AssignDueItemEdges(SimIsolation):
         self.assertEqual(pick['room'], 'observatory')
         self.assertEqual(task['taskType'], 'spike')
         self.assertEqual(state['workQueue'], [])
+
+    def test_assign_due_item_rescues_a_room_with_no_door(self):
+        # Regression: a producer named a room that exists nowhere in
+        # door_triggers.json ('townsquare'), so assign_task returned None on
+        # every cycle -- the item retried 21k+ times over 38 hours and no agent
+        # could ever claim it. A room that does not resolve to a real door is
+        # routed through the normal resolver instead of wedging forever.
+        state = self._state()
+        pick = {'title': 'Act on mail (harold)', 'room': 'townsquare',
+                '_mailResume': True, 'assignedTo': 'ada', 'notBefore': 1000}
+        grid, doors = sim._load_outdoor_geometry()
+        task = sim._assign_due_item(state, pick, True, grid, doors, 1000,
+                                    task_id_holder=[0])
+        self.assertIsNotNone(task, 'a phantom room must not make the item unassignable')
+        self.assertIn(pick['room'], doors)
+        self.assertNotEqual(pick['room'], 'townsquare')
+
+    def test_assign_due_item_drops_a_review_of_an_agent_id(self):
+        # help_signal mail stamped an AGENT id into reviewOf; that both lies to
+        # the review lifecycle and claimed the permanent-retry exemption.
+        state = self._state()
+        pick = {'title': 'Act on mail (harold)', 'room': None,
+                'reviewOf': 'ada', '_mailResume': True, 'assignedTo': 'ben',
+                'notBefore': 1000, 'attempts': sim.WORK_ITEM_STALL_CEILING + 1}
+        grid, doors = sim._load_outdoor_geometry()
+        task = sim._assign_due_item(state, pick, True, grid, doors, 1000,
+                                    task_id_holder=[0])
+        self.assertIsNotNone(task)
+        self.assertIsNone(pick.get('reviewOf'))
 
     def test_assign_due_item_empty_sprint_pool_returns_none(self):
         state = self._state()

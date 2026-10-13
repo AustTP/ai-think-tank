@@ -1294,6 +1294,14 @@ def _drain_emails_from_db():
 # WORK_PRIORITY / _WORK_PRIORITY_VALUES now live in sim_helpers.py (imported
 # at the top of this module) -- see normalize_priority.
 WORK_ITEM_MAX_ATTEMPTS = 3
+# A strictly-staffed item (peer-review subtask, sprint card) is exempt from the
+# NORMAL cap above -- it blocks its story, so shedding it would be wrong. But
+# "retry forever" is how a wedged item silently burned 21k+ attempts across 38
+# hours in the 2026-10-13 review with nobody noticing. Player cards still wait
+# forever (they wait for a HUMAN; there is no agent-availability failure to
+# shed them for). Review/sprint items get a generous stall ceiling instead, so
+# a real wedge surfaces as work_item_abandoned + a director help signal.
+WORK_ITEM_STALL_CEILING = 600  # ~60 min at TASK_CYCLE_S = 6
 # Price-aware admission throttle: when a tier band's score-per-dollar
 # today is below TIER_THROTTLE_RATIO of its trailing 7-day median (a
 # bad-value day for that band), non-urgent work mapped to that band is
@@ -8277,9 +8285,15 @@ def _requeue_card_task(state, agent_id, issue_key, now_ms):
     if not isinstance(queue, list):
         return False
     title = issue.get('title') or issue.get('summary') or 'Resume card work'
+    # Room: a feature slug is NOT guaranteed to be a room that has a door
+    # (a card's feature is a story lane, not geometry), and the old
+    # `or 'townsquare'` fallback named a room that exists nowhere in
+    # door_triggers.json -- so the item could never be assigned. Queue it
+    # ROOM-LESS and let _assign_due_item resolve a real one, same as a
+    # shared-backlog card.
     queue.append({
         'title': title,
-        'room': issue.get('feature') or 'townsquare',
+        'room': issue.get('feature') or None,
         'instructions': f"Resume work on {issue_key} now that you are unblocked: {issue.get('summary', '')}",
         'goal': issue_key,
         'taskType': issue.get('type'),
@@ -8297,12 +8311,24 @@ def _requeue_task_for_agent(state, agent_id, task_id, now_ms):
     queue = state.get('workQueue')
     if not isinstance(queue, list):
         return False
+    # `about` is a TASK id for peer_review_request/rejected mail, but an AGENT
+    # id for a help_signal ("Act on mail (harold)" -- the director was mailed
+    # about harold). reviewOf means "peer-review subtask of THAT task"
+    # everywhere downstream (wake rules, reporting through the parent, the
+    # attempts exemption), so stamping an agent id on it both lies to the
+    # lifecycle and made the item immortal. Keep reviewOf for a task id; drop
+    # it when the value names an employee instead.
+    agents = state.get('agents') or {}
+    real_task_id = None if task_id in agents else task_id
+    # No hardcoded room: 'townsquare' has no door, so assign_task failed on it
+    # every cycle (the 21k-attempt wedge this item caused). Room-less lets
+    # _assign_due_item resolve a real room at assignment time.
     queue.append({
         'title': f'Act on mail ({task_id})',
-        'room': 'townsquare',
+        'room': None,
         'instructions': f'Follow up on {task_id} now that you have been notified.',
         'goal': task_id,
-        'reviewOf': task_id,
+        'reviewOf': real_task_id,
         'assignedTo': agent_id,  # wake-on-mail pin: THIS agent acts on the mail
         '_mailResume': True,
         'notBefore': now_ms,
@@ -11789,14 +11815,20 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
             # normal work). It retries until a reviewer is assignable; the
             # needs_review timeout is the safety net if a reviewer never can be.
             # Sprint staffing: a sprint card is STRICTLY staffed -- it waits
-            # (forever, if need be) for a member of its chosen pool to free up
-            # and is never shed to the think-tank-wide fallback or abandoned.
+            # for a member of its chosen pool to free up and is never shed to
+            # the think-tank-wide fallback or abandoned.
             # Human-in-the-loop: a PLAYER card is likewise never abandoned --
             # it waits for the player, not for an agent, and the delivery path
             # has no agent-availability failure to shed it for.
-            if pick.get('reviewOf') or pick.get('sprintId') \
-                    or (pick.get('assignedTo') or '') == 'player' \
-                    or pick['attempts'] < WORK_ITEM_MAX_ATTEMPTS:
+            # The two "waits forever" cases are capped by WORK_ITEM_STALL_CEILING
+            # rather than exempt outright: a genuinely wedged review/sprint item
+            # must surface as work_item_abandoned (+ the director help signal
+            # _on_work_item_abandoned raises) instead of retrying invisibly --
+            # the failure mode that hid a 21k-attempt wedge for 38 hours.
+            _is_player_card = (pick.get('assignedTo') or '') == 'player'
+            _strictly_staffed = bool(pick.get('reviewOf') or pick.get('sprintId'))
+            _cap = WORK_ITEM_STALL_CEILING if _strictly_staffed else WORK_ITEM_MAX_ATTEMPTS
+            if _is_player_card or pick['attempts'] < _cap:
                 work_queue.append(pick)
             else:
                 from serve import log_action
@@ -12178,8 +12210,27 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     # figures out where the work needs to happen. Resolve the room here, at the
     # moment of assignment, and persist it onto the pick so the walk/gate/grade
     # lifecycle (which routes by task['room']) sees a concrete room.
-    if not pick.get('room'):
+    # Same rescue for a room that DOES have a value but no door: a producer can
+    # name any string it likes, and a string with no door makes assign_task
+    # return None forever (that is exactly the "Act on mail (harold)" wedge: a
+    # phantom 'townsquare', retried every 6s for 38 hours, 21k+ attempts, no
+    # agent ever able to take it). `doors` is the real geometry map in
+    # production; some callers (and tests) pass a placeholder object instead,
+    # so only judge "is this a real room?" when it actually is a non-empty
+    # mapping -- then route anything that does not resolve to a real door
+    # through the normal room resolver.
+    _room = pick.get('room')
+    _real_doors = doors if (isinstance(doors, dict) and doors) else None
+    if not _room or (_real_doors is not None and _room not in _real_doors):
         pick['room'] = _resolve_assignment_room(pick)
+    # Sanitize a misused reviewOf (see _requeue_task_for_agent): help_signal
+    # mail stamped `about` -- an AGENT id -- into reviewOf. Everywhere else
+    # reviewOf means "peer-review subtask of THAT task", so an agent id both
+    # lies to the lifecycle and claims the attempts exemption that exists for
+    # genuine review subtasks. Drop exactly that case (a real task id, however
+    # synthesized, is left alone so the reviewer pin keeps working).
+    if pick.get('reviewOf') and pick['reviewOf'] in (state.get('agents') or {}):
+        pick.pop('reviewOf', None)
     candidates = _eligible_candidates(state, can_wake_off_duty)
     # Sprint staffing: a sprint card is assigned ONLY to the sprint's chosen
     # worker pool (the director's 1-6). This is a HARD restriction, not the
