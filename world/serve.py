@@ -524,7 +524,7 @@ FAILURE_TYPE_LABELS = {
     'missing_information': 'a required fact or field is missing',
     'style': 'style, tone, or wording',
 }
-DB_PATH = os.path.join(THINK_TANK_DIR, 'think_tank.db')
+DB_PATH = os.environ.get('THINK_TANK_DB') or os.path.join(THINK_TANK_DIR, 'think_tank.db')
 # The Library's real capability -- a shared file directory
 # any agent can read from or write to (code, notes, completed-task
 # records), with archive/ specifically for completed tasks. Same
