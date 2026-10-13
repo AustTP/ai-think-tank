@@ -168,6 +168,40 @@ def provision_player_email(app_password):
     return {'ok': True, 'test_ok': bool(test_ok)}
 
 
+def notify_human_of_escalation(esc_id, esc, context=''):
+    """Send the approve/deny email + Telegram for one escalation. Called at
+    creation for HUMAN-ONLY kinds (risk floor >= 1.0 -- the director loop is
+    barred from them, so the human link is the only path), and by the director
+    loop when it GIVES UP on a delegable kind (ask cap, judge-drift circuit).
+    Delegable kinds are silent at creation on purpose: the director resolves
+    them on its next pass, and the human only hears about the ones that
+    actually need the human."""
+    import serve as _serve
+    esc_id = esc.get('id') or esc_id
+    token = esc.get('token') or ''
+    kind = esc.get('kind') or 'unknown'
+    question = esc.get('question') or ''
+    prefix = f'{context}\n\n' if context else ''
+    approve_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=approve'
+    deny_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=deny'
+    body = (f'{prefix}{question}\n\n'
+            f'What I checked: {esc.get("whatChecked") or "(see question)"}\n'
+            f'Look here first: {esc.get("lookFirst") or "the question above"}\n\n'
+            f'Approve: {approve_url}\n\n'
+            f'Deny: {deny_url}')
+    _serve._send_escalation_email_sync(f'[AI Think Tank] Needs your call: {kind}', body)
+    # Telegram is the channel that actually reaches the player when SMTP
+    # isn't configured -- same approve/deny links, fail-closed best-effort
+    # like every other optional push. Telegram caps message text at 4096
+    # chars; truncate the free-text middle (question/checked/look) but NEVER
+    # the resolve URLs -- a truncated Approve link is a dead escalation.
+    _tg_head = f'Needs your call: {kind}\n\n{(prefix + question)[:1200]}'
+    _tg_tail = (f'\n\nWhat I checked: {(esc.get("whatChecked") or "(see question)")[:400]}\n'
+                f'Look here first: {(esc.get("lookFirst") or "the question above")[:400]}\n\n'
+                f'Approve: {approve_url}\n\nDeny: {deny_url}')
+    _serve.send_player_telegram_sync('', (_tg_head + _tg_tail)[:4096])
+
+
 def create_escalation(kind, question, on_approve_note='', what_checked='', look_first=''):
     import serve as _serve
     # Escalation-storm guard: a pending escalation with the SAME kind and
@@ -189,22 +223,11 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
     escalations[esc_id] = {'kind': kind, 'question': question, 'status': 'pending', 'token': token, 'ts': time.time(), 'note': on_approve_note, 'whatChecked': what_checked, 'lookFirst': look_first}
     _serve._save_escalations(escalations)
 
-    approve_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=approve'
-    deny_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=deny'
-    body = (f'{question}\n\n'
-            f'What I checked: {what_checked or "(see question)"}\n'
-            f'Look here first: {look_first or "the question above"}\n\n'
-            f'Approve: {approve_url}\n\n'
-            f'Deny: {deny_url}')
-    _serve._send_escalation_email_sync(f'[AI Think Tank] Needs your call: {kind}', body)
-    # Telegram is the channel that actually reaches the player when SMTP
-    # isn't configured -- same approve/deny links, fail-closed best-effort
-    # like every other optional push. Telegram caps message text at 4096
-    # chars; truncate the free-text middle (question/checked/look) but NEVER
-    # the resolve URLs -- a truncated Approve link is a dead escalation.
-    _tg_head = f'Needs your call: {kind}\n\n{(question or "")[:1200]}'
-    _tg_tail = (f'\n\nWhat I checked: {(what_checked or "(see question)")[:400]}\n'
-                f'Look here first: {(look_first or "the question above")[:400]}\n\n'
-                f'Approve: {approve_url}\n\nDeny: {deny_url}')
-    _serve.send_player_telegram_sync('', (_tg_head + _tg_tail)[:4096])
+    # Human-only kinds (floor >= 1.0) notify the player immediately -- the
+    # director loop is barred from them, so the email link IS the only path.
+    # Delegable kinds (floor < 1.0) stay SILENT here: the director loop
+    # resolves them on its next pass; the human is notified only if the
+    # director gives up (ask cap / judge-drift circuit, see the loop).
+    if _serve._escalation_floor(kind) >= 1.0:
+        notify_human_of_escalation(esc_id, escalations[esc_id])
     return esc_id

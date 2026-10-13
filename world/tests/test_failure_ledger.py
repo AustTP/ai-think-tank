@@ -24,6 +24,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -228,6 +229,10 @@ class MineRuleProposals(_LedgerTestCase):
 
 
 class CreateEscalationTwoLineHandoff(unittest.TestCase):
+    # Message-FORMAT tests: they use a HUMAN-ONLY kind (floor 1.0) because
+    # that is the kind that still notifies at creation. Delegable kinds are
+    # silent at creation (see CreateEscalationRouting below) -- their notify
+    # fires when the director loop gives up, not here.
     def test_email_carries_two_line_handoff(self):
         sent = {}
         with unittest.mock.patch.object(serve, '_load_escalations', return_value={}), \
@@ -236,7 +241,7 @@ class CreateEscalationTwoLineHandoff(unittest.TestCase):
              unittest.mock.patch.object(serve, '_send_escalation_email_sync',
                                         side_effect=lambda s, b: sent.update(subject=s, body=b)), \
              unittest.mock.patch.object(serve, 'send_player_telegram_sync', return_value=False):
-            serve.create_escalation('unresolved review requirement', 'Q?',
+            serve.create_escalation('blocked command', 'Q?',
                                     what_checked='Graded 3 requirements', look_first='Q?')
         self.assertIn('What I checked: Graded 3 requirements', sent['body'])
         self.assertIn('Look here first: Q?', sent['body'])
@@ -249,7 +254,7 @@ class CreateEscalationTwoLineHandoff(unittest.TestCase):
              unittest.mock.patch.object(serve, '_send_escalation_email_sync',
                                         side_effect=lambda s, b: sent.update(subject=s, body=b)), \
              unittest.mock.patch.object(serve, 'send_player_telegram_sync', return_value=False):
-            serve.create_escalation('kind', 'the question')
+            serve.create_escalation('blocked command', 'the question')
         self.assertIn('What I checked: (see question)', sent['body'])
         self.assertIn('Look here first: the question above', sent['body'])
 
@@ -261,7 +266,7 @@ class CreateEscalationTwoLineHandoff(unittest.TestCase):
              unittest.mock.patch.object(serve, '_send_escalation_email_sync', return_value=False), \
              unittest.mock.patch.object(serve, 'send_player_telegram_sync',
                                         side_effect=lambda s, b: sent.update(subject=s, body=b) or True):
-            esc_id = serve.create_escalation('stuck review loop', 'Story X is frozen')
+            esc_id = serve.create_escalation('blocked command', 'Story X is frozen')
         self.assertIn('Approve: http://x/api/escalation/resolve?id=', sent['body'])
         self.assertIn('Deny: http://x/api/escalation/resolve?id=', sent['body'])
         self.assertIn(esc_id, sent['body'])
@@ -321,6 +326,110 @@ class CreateEscalationDedup(unittest.TestCase):
             b = serve.create_escalation('kind', 'Q')
         self.assertNotEqual(a, b, 'a resolved escalation does not block a fresh one')
         self.assertEqual(len(store), 2)
+
+
+class CreateEscalationRouting(unittest.TestCase):
+    """Who gets pinged, and when (2026-10 routing fix). Human-only kinds
+    (floor >= 1.0) notify the player at creation -- the director loop is
+    barred from them, so the email link is the only path. Delegable kinds
+    (floor < 1.0) are SILENT at creation: the director resolves them on its
+    next pass; the human is notified only when the director gives up (ask
+    cap / judge-drift circuit)."""
+
+    def _create(self, kind, question='Q?'):
+        sent = {'email': [], 'tg': []}
+        with unittest.mock.patch.object(serve, '_load_escalations', return_value={}), \
+             unittest.mock.patch.object(serve, '_save_escalations', lambda d: None), \
+             unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
+             unittest.mock.patch.object(serve, '_send_escalation_email_sync',
+                                        side_effect=lambda s, b: sent['email'].append(s)), \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync',
+                                        side_effect=lambda s, b: sent['tg'].append(b) or True):
+            esc_id = serve.create_escalation(kind, question)
+        return esc_id, sent
+
+    def test_human_only_kind_notifies_at_creation(self):
+        # floor 1.0: the director can never resolve it -- the human MUST hear
+        # about it now or it waits forever with no ping.
+        _esc_id, sent = self._create('blocked command')
+        self.assertEqual(len(sent['email']), 1)
+        self.assertEqual(len(sent['tg']), 1)
+
+    def test_floor_10_allowlist_request_notifies_at_creation(self):
+        _esc_id, sent = self._create('allowlist request')
+        self.assertEqual(len(sent['email']), 1)
+        self.assertEqual(len(sent['tg']), 1)
+
+    def test_delegable_kind_is_silent_at_creation(self):
+        # 'unresolved review requirement' and unknown kinds resolve through
+        # the live calibration threshold (< 1.0) -- the director handles
+        # them, so creation must NOT ping the player (the 2026-10 fix).
+        for kind in ('unresolved review requirement', 'allowlist candidate',
+                     'stuck review loop'):
+            _esc_id, sent = self._create(kind)
+            self.assertEqual(sent['email'], [], f'{kind} must not email at creation')
+            self.assertEqual(sent['tg'], [], f'{kind} must not telegram at creation')
+
+    def test_delegable_kind_still_creates_the_record(self):
+        # Silent at creation does NOT mean dropped: the record exists for the
+        # director loop to pick up.
+        store = {}
+        with unittest.mock.patch.object(serve, '_load_escalations', side_effect=lambda: store), \
+             unittest.mock.patch.object(serve, '_save_escalations', lambda d: None), \
+             unittest.mock.patch.object(serve, '_send_escalation_email_sync', lambda s, b: None), \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync', lambda s, b: False):
+            esc_id = serve.create_escalation('allowlist candidate', 'host.example is good')
+        self.assertIn(esc_id, store)
+        self.assertEqual(store[esc_id]['status'], 'pending')
+
+
+class DirectorGivesUpNotifiesHuman(unittest.TestCase):
+    """The director loop's give-up transitions notify the human ONCE (the
+    humanNotified flag), for the two ways it abandons a delegable kind: the
+    re-ask cap, and a tripped judge-drift circuit."""
+
+    def _run_resolver(self, esc, drift=0):
+        pending_id = 'esc-giveup'
+        for name, mock_value in (
+            ('_load_escalations', unittest.mock.Mock(return_value={pending_id: esc})),
+            ('_save_escalations', unittest.mock.Mock()),
+            ('get_state_from_db', unittest.mock.Mock(return_value={
+                'agentRoster': [{'id': 'a', 'name': 'Ada', 'isDirector': True, 'isAdmin': False}]})),
+            ('_escalation_judge_drift', unittest.mock.Mock(return_value=drift)),
+        ):
+            patcher = unittest.mock.patch.object(serve, name, mock_value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        sent = []
+        with unittest.mock.patch.object(serve, 'notify_human_of_escalation',
+                                        side_effect=lambda eid, e, context='': sent.append(context)):
+            serve._resolve_pending_escalations_sync()
+        return sent
+
+    def test_ask_cap_transition_notifies_once(self):
+        # Cooldown must be elapsed (its check fires BEFORE the cap check) and
+        # the cap already reached: this is the pass where the loop crosses
+        # into "gave up".
+        esc = {'status': 'pending', 'kind': 'allowlist candidate', 'question': 'host?',
+               'askCount': serve.DIRECTOR_ESCALATION_MAX_ASKS,
+               'lastAskedAt': time.time() - serve.DIRECTOR_ESCALATION_REASK_COOLDOWN_S - 1}
+        sent = self._run_resolver(esc)
+        self.assertEqual(len(sent), 1, 'the transition into the ask cap must notify once')
+        self.assertTrue(esc.get('humanNotified'))
+        self.assertEqual(esc['status'], 'pending', 'give-up leaves it pending for the human link')
+        # A second pass must NOT re-notify.
+        sent2 = self._run_resolver(esc)
+        self.assertEqual(sent2, [], 'humanNotified guards against repeat pings')
+
+    def test_judge_drift_tripped_notifies_once(self):
+        esc = {'status': 'pending', 'kind': 'allowlist candidate', 'question': 'host?',
+               'askCount': 0, 'lastAskedAt': 0}
+        sent = self._run_resolver(esc, drift=serve.ESCALATION_JUDGE_DRIFT_CIRCUIT)
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(esc.get('humanNotified'))
+        self.assertEqual(esc['status'], 'pending')
+        sent2 = self._run_resolver(esc, drift=serve.ESCALATION_JUDGE_DRIFT_CIRCUIT)
+        self.assertEqual(sent2, [], 'drift-branch notify is also once-only')
 
 
 class RuleProposalsEndpoint(_LedgerTestCase):

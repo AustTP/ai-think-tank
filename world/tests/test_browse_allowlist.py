@@ -493,6 +493,63 @@ class AllowlistRequestEndpoint(unittest.TestCase):
             asyncio.run(serve.resolve_escalation(_denied_id, esc['token'], 'deny'))
         self.assertFalse(serve._is_allowlisted_host('deniedhost.example'))
 
+    def test_candidate_approval_grants_runtime_host(self):
+        # The 2026-10 fix: an approved 'allowlist candidate' is NOT a no-op.
+        # Its note carries the hostname (set by record_browse_success), and the
+        # human's approve link applies the same runtime grant 'allowlist
+        # request' does -- this was the escalation the player tapped Approve on
+        # and got nothing for.
+        import asyncio
+        self._common_mocks()
+        cand_id = serve.create_escalation(
+            'allowlist candidate', 'candhost.example is a good candidate',
+            on_approve_note='candhost.example')
+        esc = serve._load_escalations()[cand_id]
+        with unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch.object(serve, 'ensure_sandbox_networking'):
+            asyncio.run(serve.resolve_escalation(cand_id, esc['token'], 'approve'))
+        self.assertTrue(serve._is_allowlisted_host('candhost.example'))
+        with serve._db() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key = 'allowlist_grants'").fetchone()
+        self.assertIn('candhost.example', row[0])
+
+
+class CandidateDirectorDelegation(unittest.TestCase):
+    """'allowlist candidate' is DELEGABLE (not floor 1.0): the director loop
+    auto-approving it must APPLY the runtime grant (the 2026-10 fix), with the
+    director named in the action log -- not leave a silent no-op approval the
+    player never hears about."""
+
+    def test_director_auto_approve_applies_grant_with_attribution(self):
+        esc = {'status': 'pending', 'kind': 'allowlist candidate',
+               'question': 'CandHost.example has been confidently approved by Jev 5 times',
+               'note': 'candhost.example', 'askCount': 0, 'lastAskedAt': 0}
+        pending_id = 'esc-cand'
+        for name, mock_value in (
+            ('_load_escalations', unittest.mock.Mock(return_value={pending_id: esc})),
+            ('_save_escalations', unittest.mock.Mock()),
+            ('get_state_from_db', unittest.mock.Mock(return_value={
+                'agentRoster': [{'id': 'nora', 'name': 'Nora', 'isDirector': True,
+                                 'isAdmin': False}]})),
+            ('_jev_quorum_choice_sync', unittest.mock.Mock(return_value=('approve', 0.95, 0.0))),
+            ('ensure_sandbox_networking', unittest.mock.Mock()),
+            ('log_action', unittest.mock.Mock()),
+        ):
+            patcher = unittest.mock.patch.object(serve, name, mock_value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()):
+            serve._resolve_pending_escalations_sync()
+            self.assertEqual(esc['status'], 'approved')
+            self.assertIn('nora', esc.get('resolvedBy', ''))
+            self.assertTrue(serve._is_allowlisted_host('candhost.example'))
+        # Attribution: the GRANT itself names the director and the delegation
+        # path, so the audit trail distinguishes it from the human's link.
+        grant_calls = [c for c in serve.log_action.call_args_list
+                       if c.args[:2] == ('nora', 'allowlist_grant')]
+        self.assertTrue(grant_calls, 'director-attributed grant must be logged')
+        self.assertEqual(grant_calls[0].args[2]['via'], 'director delegation')
+
 
 class BrowseEndpointMullvadVpn(unittest.TestCase):
     """POST /api/browse with viaVpnCountry -- real subprocess calls are
