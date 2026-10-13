@@ -49,6 +49,27 @@ class SpikeLane(unittest.TestCase):
         sim.queue_spike(state, 'Prototype the auth handshake', 'pressoffice', budget_ms=30_000)
         self.assertEqual(state['workQueue'][0]['budgetMs'], 30_000)
 
+    def test_budget_usd_carries_and_wins_over_type_default(self):
+        # Confirmed gap (task-333/335, 2026-10-13): a six-source synthesis
+        # genuinely spends ~$0.40, so the spike type-default $0.30 ceiling
+        # made /api/chat refuse the final synthesis and the card closed empty
+        # with no report. An explicit budget_usd must ride queue_work's
+        # whitelist and beat the type tier at assignment.
+        state = _state()
+        sim.queue_spike(state, 'Heavy six-source synthesis', 'pressoffice',
+                        budget_ms=300_000, budget_usd=5.0)
+        item = state['workQueue'][0]
+        self.assertEqual(item['budgetUsd'], 5.0)
+        self.assertEqual(sim.budget_usd_for_task('spike', item.get('budgetUsd'), 'standard'), 5.0)
+
+    def test_budget_usd_defaults_to_the_spike_tier(self):
+        # No explicit budget keeps the pre-existing $0.30 type default.
+        state = _state()
+        sim.queue_spike(state, 'Ordinary spike', 'observatory', budget_ms=60_000)
+        item = state['workQueue'][0]
+        self.assertIsNone(item.get('budgetUsd'))
+        self.assertEqual(sim.budget_usd_for_task('spike', item.get('budgetUsd'), 'standard'), 0.30)
+
     def test_peer_gated_lane_false_for_spike_in_deliverable_room(self):
         # A spike filed in a deliverable room must NOT open a peer gate.
         spike = _task(taskType='spike', room='pressoffice')

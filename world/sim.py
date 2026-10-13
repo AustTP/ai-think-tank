@@ -1633,6 +1633,52 @@ TASK_CONTENT_TIMEOUT_S = 120.0
 # further from inside (the review/spike +300 pattern) -- this is the floor.
 TASK_CONTENT_TIMEOUT_MAX_S = 600.0
 
+# Content-run grace (operator-approved 2026-10-13): the single fixed
+# workUntil is consumed by the READ/execute phase, so a long synthesis that
+# starts near the ceiling overruns it -- the completion loop then
+# force-finishes the task EMPTY and the result the executor stores a moment
+# later is orphaned (confirmed live: task-336 workUntil 01:25:09, completed
+# 01:25:12, no note, no file, reads had finished 26s earlier). The timeout
+# branch now grants bounded grace WHILE the run is provably alive instead of
+# abandoning it. Liveness = a recent heartbeat the executor bumps at every
+# meaningful step (phase boundaries + every tool call in content.py). Bounds,
+# so a genuinely dead/hung thread still falls through to the honest fallback:
+#   * per-pass extension step (the loop re-checks every TASK_CYCLE_S);
+#   * a TOTAL grace cap per run (never extends past this much past workUntil);
+#   * a heartbeat staleness gate (no bump within this window = thread died
+#     without storing a result -- same shape as STALE_WORK_BUDGET_GRACE_S).
+# A task with no heartbeat field (an executor that never opted in) keeps the
+# exact pre-existing behavior: timeout at workUntil, fallback completion.
+TASK_CONTENT_GRACE_STEP_S = 60.0
+TASK_CONTENT_GRACE_MAX_S = 300.0
+TASK_CONTENT_HB_STALE_S = 240.0
+
+
+def _content_run_is_live(task, now):
+    """True when a still-in-flight content run has heartbeat evidence it is
+    alive and grace remains. A missing heartbeat (executor never opted in)
+    is NOT live -- that preserves the pre-existing timeout semantics for
+    every other lane."""
+    hb = task.get('_contentHeartbeat')
+    if not isinstance(hb, (int, float)):
+        return False
+    if (task.get('_contentGraceUsed') or 0) >= TASK_CONTENT_GRACE_MAX_S:
+        return False
+    return (now - hb) < TASK_CONTENT_HB_STALE_S
+
+
+def _grant_content_grace(task, now):
+    """Extend workUntil by up to TASK_CONTENT_GRACE_STEP_S, bounded by the
+    total TASK_CONTENT_GRACE_MAX_S. Returns seconds granted (0.0 when the cap
+    is spent)."""
+    remaining = TASK_CONTENT_GRACE_MAX_S - (task.get('_contentGraceUsed') or 0)
+    if remaining <= 0:
+        return 0.0
+    step = min(TASK_CONTENT_GRACE_STEP_S, remaining)
+    task['workUntil'] = (task.get('workUntil') or now) + step
+    task['_contentGraceUsed'] = (task.get('_contentGraceUsed') or 0) + step
+    return step
+
 # Server task-loop cadence -- mirrors the browser's runTaskCycle setInterval
 # (index.html, 6s). Distinct from the movement tick (SIM_TICK_S=2).
 TASK_CYCLE_S = 6.0
@@ -2175,6 +2221,11 @@ def _dispatch_content_work(executor, state, agent_id, task, now):
     ceiling = min(max(TASK_CONTENT_TIMEOUT_S, budget_s), TASK_CONTENT_TIMEOUT_MAX_S)
     task['workUntil'] = now + ceiling
     task['_contentInFlight'] = True
+    # Fresh run: drop any heartbeat/grace residue a prior occupant of this
+    # (reusable) task id may have left, so this run earns grace only from its
+    # OWN bumps (see TASK_CONTENT_GRACE_*).
+    task['_contentHeartbeat'] = None
+    task['_contentGraceUsed'] = 0.0
     snapshot = json.loads(json.dumps(state))
     # Item 1: situational awareness. Build the perception block here, on the
     # main thread, from the FROZEN snapshot + the live task dict -- never inside
@@ -2412,7 +2463,7 @@ def queue_work(state, items):
 
 def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructions=None,
                 project_label=None, moonshot=False, notBefore=None, assigned_to=None,
-                lane=None, player_authored=False):
+                lane=None, player_authored=False, budget_usd=None):
     """Phase E2b: enqueue a time-boxed SPIKE (taskType='spike'). A spike is an
     investigation with no committed deliverable: it's LOWEST priority (fills
     gaps, never blocks committed work), carries a hard `budgetMs` for the work
@@ -2428,7 +2479,13 @@ def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructi
     moment it ships (see _assign_player_task).
     `lane` (build/reading/open/parking-lot) rides the card so it can coexist
     with other threads instead of one queue pulling all the attention (see
-    LANES)."""
+    LANES).
+    `budget_usd` is the model-spend ceiling (USD). Explicit positive wins over
+    the spike type-default ($0.30 in _TASK_BUDGET_USD). Confirmed gap
+    2026-10-13: a six-source comparison synthesis genuinely spends ~$0.40 in
+    plan+execute+synthesize, so the default $0.30 ceiling made /api/chat
+    refuse the final synthesis and the card closed empty with no report
+    (task-333/335). A heavier investigation files an explicit ceiling here."""
     return queue_work(state, [{
         'title': title,
         'room': room,
@@ -2440,6 +2497,7 @@ def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructi
         'priority': WORK_PRIORITY['low'],
         'taskType': 'spike',
         'budgetMs': budget_ms or 60_000,
+        'budgetUsd': budget_usd,
         'moonshot': bool(moonshot),
         'notBefore': notBefore,
         'assignedTo': assigned_to or None,
@@ -11598,7 +11656,41 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                     send_agent_off_duty(state, aid, doors, grid)
             elif now >= task['workUntil']:
                 # No content result within the budget (timeout OR the slice-1
-                # placeholder) -- fallback completion. Same gate branching.
+                # placeholder). BEFORE falling back: if the run is provably
+                # still alive (recent heartbeat + grace remaining), extend
+                # workUntil and give it another pass -- a slow-but-real
+                # synthesis must finish rather than be abandoned empty
+                # (task-336). Grace is bounded (see TASK_CONTENT_GRACE_*) and
+                # only available to executors that heartbeat; everyone else
+                # lands on the fallback exactly as before.
+                if task.get('_contentInFlight') and _content_run_is_live(task, now):
+                    granted = _grant_content_grace(task, now)
+                    if granted:
+                        try:
+                            from serve import log_action
+                            log_action(aid, 'content_grace_extended',
+                                       {'taskId': task['id'], 'grantedS': granted,
+                                        'graceUsedS': task.get('_contentGraceUsed'),
+                                        'workUntil': task.get('workUntil')}, authorized=False)
+                        except Exception:
+                            pass
+                        continue
+                # Fallback completion. Same gate branching.
+                if task.get('_contentInFlight'):
+                    # An in-flight run reaching the fallback means the thread
+                    # died without storing a result (or spent all grace) --
+                    # log it so an abandoned investigation is visible instead
+                    # of silently reading as a clean 'done'.
+                    try:
+                        from serve import log_action
+                        log_action(aid, 'content_run_abandoned',
+                                   {'taskId': task['id'],
+                                    'heartbeatAgeS': (round(now - task['_contentHeartbeat'])
+                                                      if isinstance(task.get('_contentHeartbeat'),
+                                                                    (int, float)) else None),
+                                    'graceUsedS': task.get('_contentGraceUsed')}, authorized=False)
+                    except Exception:
+                        pass
                 # Bot Ops / shadow mode: capture the dry-run outcome to the shadow
                 # ledger and release, never entering a gate.
                 if task.get('shadow'):

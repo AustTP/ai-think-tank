@@ -592,5 +592,140 @@ class FailClosedTaskCycle(unittest.TestCase):
         self.assertEqual(latest.get('redPipelineEscaped'), False)
 
 
+class ContentRunGraceTimeout(unittest.TestCase):
+    """The operator-approved grace mechanism (2026-10-13, task-336 incident):
+    a content run past workUntil must NOT be force-completed empty while it is
+    provably alive -- the read phase eats the fixed window and synthesis
+    overruns it, after which the late result is orphaned. The timeout branch
+    extends workUntil in bounded steps when the executor has heartbeat
+    evidence, and only falls back when the heartbeat is stale (thread died) or
+    grace is spent. Tasks with no heartbeat keep the exact pre-existing
+    behavior."""
+
+    def _spike(self, **over):
+        task = {
+            'id': 'task-9',
+            'title': 'Assemble the comparison document',
+            'room': 'pressoffice',
+            'instructions': 'assemble it',
+            'taskType': 'spike',
+            'assignedTo': 'ada',
+            'status': 'working',
+            'createdAt': 0,
+            '_contentInFlight': True,
+            'budgetMs': 300000,
+            'budgetUsd': 5.0,
+        }
+        task.update(over)
+        return task
+
+    def _quiet_base(self, task, agent_id='ada'):
+        # Same shape as FailClosedTaskCycle._quiet_base: one working,
+        # content-in-flight agent, every standing cadence stamped at now so
+        # the completion loop is the only thing that moves.
+        now_ms = int(time.time() * 1000)
+        state = {
+            'sim': {'owner': 'server'},
+            'agentRoster': [
+                {'id': 'faye', 'name': 'Faye', 'role': 'Admin', 'isAdmin': True},
+                {'id': 'ada', 'name': 'Ada', 'role': 'Research'},
+                {'id': 'ben', 'name': 'Ben', 'role': 'Engineering'},
+                {'id': 'cora', 'name': 'Cora', 'role': 'Engineering'},
+            ],
+            'agents': {
+                'faye': {'id': 'faye', 'x': 0, 'y': 0, 'busy': True, 'task': None,
+                         'offDuty': True, 'visible': False},
+                'ada': {'id': 'ada', 'x': sim.SPAWN['x'], 'y': sim.SPAWN['y'],
+                        'busy': False, 'task': None, 'offDuty': False, 'visible': True},
+                'ben': {'id': 'ben', 'x': sim.SPAWN['x'] + 30, 'y': sim.SPAWN['y'],
+                        'busy': False, 'task': None, 'offDuty': True, 'visible': False},
+                'cora': {'id': 'cora', 'x': sim.SPAWN['x'] + 60, 'y': sim.SPAWN['y'],
+                         'busy': False, 'task': None, 'offDuty': True, 'visible': False},
+            },
+            'reports': [],
+            'researchTopics': [],
+            'lastSkillReviewAt': now_ms,
+            'lastStuckGateSweep': now_ms,
+            'lastSocialAt': now_ms,
+            'lastDistillAt': now_ms,
+            'lastRuleMineAt': now_ms,
+            'workQueue': [],
+            'tasks': {task['id']: task},
+        }
+        state['agents'][agent_id]['task'] = task['id']
+        state['agents'][agent_id]['busy'] = True
+        state['agents'][agent_id]['inRoom'] = task.get('room')
+        return state, now_ms
+
+    def _cycle(self, state, now):
+        grid, doors = sim._load_outdoor_geometry()
+        sim._task_cycle(state, now=now, grid=grid, doors=doors,
+                        task_id_holder=[100])
+
+    def test_live_run_gets_grace_instead_of_empty_completion(self):
+        # The exact task-336 shape: workUntil already expired, no result yet,
+        # but the executor bumped its heartbeat 10s ago (mid-synthesis). The
+        # pass must extend workUntil, NOT finish the task.
+        task = self._spike()
+        state, now_ms = self._quiet_base(task)
+        now = now_ms / 1000.0
+        task['workUntil'] = now - 1.0
+        task['_contentHeartbeat'] = now - 10.0
+        self._cycle(state, now)
+        self.assertEqual(task['status'], 'working',
+                         'a live in-flight run must not be force-completed')
+        self.assertEqual(task['workUntil'], (now - 1.0) + sim.TASK_CONTENT_GRACE_STEP_S)
+        self.assertEqual(task['_contentGraceUsed'], sim.TASK_CONTENT_GRACE_STEP_S)
+        # A second pass 60s later with a still-fresh heartbeat extends again.
+        task['_contentHeartbeat'] = now + 50.0
+        self._cycle(state, now + sim.TASK_CONTENT_GRACE_STEP_S + 1.0)
+        self.assertEqual(task['status'], 'working')
+        self.assertEqual(task['_contentGraceUsed'], 2 * sim.TASK_CONTENT_GRACE_STEP_S)
+
+    def test_stale_heartbeat_falls_back_and_logs_abandonment(self):
+        # No heartbeat within TASK_CONTENT_HB_STALE_S = the thread died without
+        # storing a result -> the honest fallback fires (task done, agent
+        # released) and the abandonment is logged for the operator.
+        task = self._spike()
+        state, now_ms = self._quiet_base(task)
+        now = now_ms / 1000.0
+        task['workUntil'] = now - 1.0
+        task['_contentHeartbeat'] = now - (sim.TASK_CONTENT_HB_STALE_S + 5.0)
+        self._cycle(state, now)
+        self.assertEqual(task['status'], 'done',
+                         'a dead run must fall back, not hang forever')
+        self.assertIsNone(state['agents']['ada'].get('task'))
+        with serve._db() as conn:
+            rows = conn.execute(
+                "SELECT details FROM action_log WHERE action = 'content_run_abandoned' "
+                "AND details LIKE '%task-9%'").fetchall()
+        self.assertTrue(rows, 'an abandoned in-flight run must be logged')
+
+    def test_grace_cap_bounds_the_extension(self):
+        # Even a permanently-fresh heartbeat cannot extend past the total cap:
+        # once TASK_CONTENT_GRACE_MAX_S is spent the run falls back.
+        task = self._spike(_contentGraceUsed=sim.TASK_CONTENT_GRACE_MAX_S)
+        state, now_ms = self._quiet_base(task)
+        now = now_ms / 1000.0
+        task['workUntil'] = now - 1.0
+        task['_contentHeartbeat'] = now - 1.0
+        self._cycle(state, now)
+        self.assertEqual(task['status'], 'done',
+                         'grace exhaustion must fall back to completion')
+
+    def test_no_heartbeat_keeps_preexisting_timeout(self):
+        # An executor that never opts into heartbeats (every other content
+        # lane) must behave exactly as before: timeout at workUntil, fallback.
+        task = self._spike()
+        task.pop('_contentHeartbeat', None)
+        state, now_ms = self._quiet_base(task)
+        now = now_ms / 1000.0
+        task['workUntil'] = now - 1.0
+        self._cycle(state, now)
+        self.assertEqual(task['status'], 'done')
+        self.assertNotIn('_contentGraceUsed', task,
+                         'no heartbeat = no grace, pre-existing semantics')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

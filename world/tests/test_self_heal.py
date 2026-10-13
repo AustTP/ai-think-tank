@@ -497,6 +497,59 @@ class WorkerStuckHelp(unittest.TestCase):
                 self.assertIs(task.get('_contentInFlight'), True)
 
 
+class ContentGraceHelpers(unittest.TestCase):
+    """Unit surface of the content-run grace mechanism (task-336 incident):
+    _content_run_is_live decides whether an expired-but-in-flight run earns
+    another pass, _grant_content_grace extends workUntil within the total cap,
+    and dispatch clears heartbeat residue a reused task id may carry."""
+
+    def test_missing_heartbeat_is_not_live(self):
+        self.assertFalse(sim._content_run_is_live({'_contentInFlight': True}, 1000.0))
+
+    def test_fresh_heartbeat_is_live_until_grace_cap(self):
+        task = {'_contentHeartbeat': 990.0, '_contentGraceUsed': 0.0}
+        self.assertTrue(sim._content_run_is_live(task, 1000.0))
+        task['_contentGraceUsed'] = sim.TASK_CONTENT_GRACE_MAX_S
+        self.assertFalse(sim._content_run_is_live(task, 1000.0),
+                         'spent grace must stop extending')
+
+    def test_stale_heartbeat_is_not_live(self):
+        task = {'_contentHeartbeat': 1000.0 - sim.TASK_CONTENT_HB_STALE_S - 1.0}
+        self.assertFalse(sim._content_run_is_live(task, 1000.0))
+
+    def test_grant_extends_then_caps(self):
+        task = {'workUntil': 500.0, '_contentGraceUsed': 0.0}
+        granted = sim._grant_content_grace(task, 500.0)
+        self.assertEqual(granted, sim.TASK_CONTENT_GRACE_STEP_S)
+        self.assertEqual(task['workUntil'], 500.0 + sim.TASK_CONTENT_GRACE_STEP_S)
+        # Drive to the cap: floor division keeps this exact under float math.
+        rounds = int(sim.TASK_CONTENT_GRACE_MAX_S / sim.TASK_CONTENT_GRACE_STEP_S)
+        for _ in range(rounds - 1):
+            granted = sim._grant_content_grace(task, 500.0)
+        self.assertEqual(task['_contentGraceUsed'], sim.TASK_CONTENT_GRACE_MAX_S)
+        self.assertEqual(sim._grant_content_grace(task, 500.0), 0.0,
+                         'the cap must be hard')
+
+    def test_dispatch_clears_heartbeat_residue(self):
+        # Task ids are reused; a prior occupant's heartbeat/grace must not let
+        # (or deny) this run its own grace budget.
+        def noop(snapshot, agent_id, task, base_ctx):  # noqa: ARG001
+            pass
+
+        real_thread = sim.threading.Thread
+
+        class _InlineThread(real_thread):
+            def start(self):
+                self._target(*self._args, **self._kwargs)
+
+        task = {'id': 't-residue', 'room': 'observatory',
+                '_contentHeartbeat': 999999.0, '_contentGraceUsed': 250.0}
+        with unittest.mock.patch('sim.threading.Thread', _InlineThread):
+            sim._dispatch_content_work(noop, _state(), 'ada', task, 1000.0)
+        self.assertIsNone(task['_contentHeartbeat'])
+        self.assertEqual(task['_contentGraceUsed'], 0.0)
+
+
 class CoachingLoopEscalation(unittest.TestCase):
     """W5: the growth-plan coaching loop. A single low grade coaches once; a
     worker who keeps closing below the floor must be RE-coached (each low close
