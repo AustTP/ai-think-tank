@@ -1410,6 +1410,57 @@ def _quality_pipeline_steps():
     ]
 
 
+def _quality_pipeline_failure_snippet(step_name, stdout, stderr):
+    """Extract the actionable failure detail from a quality-pipeline step's
+    output, not just the tail. The old tail-4-lines approach returned bandit's
+    severity summary ('High: 11') with no file/line, and cut flake8's actual
+    error lines entirely -- agents could see THAT something failed but never
+    WHY. Each tool's real findings live in the body of its output, so extract
+    them by shape: flake8/mypy error lines start with a file path; bandit
+    findings are Issue blocks with a Location; pytest failures are FAIL/ERROR
+    lines plus the coverage line. Falls back to the last-8-lines tail when the
+    shape doesn't match any known tool (keeps some signal for unknown steps)."""
+    text = ((stderr or '') + '\n' + (stdout or '')).strip()
+    if not text:
+        return '(no output)'
+    lines = text.splitlines()
+    name = (step_name or '').lower()
+    if 'bandit' in name:
+        # Bandit findings: blocks of ">> Issue: [BXXX:...] ... Location: ./path:line"
+        # Keep each Issue line plus its Location line (the two lines an agent
+        # needs to find and fix the finding). Cap at 6 findings.
+        findings = []
+        for i, ln in enumerate(lines):
+            if ln.strip().startswith('>> Issue:'):
+                findings.append(ln.strip())
+                # The Location line is a few lines below the Issue header.
+                for j in range(i + 1, min(i + 12, len(lines))):
+                    if lines[j].strip().startswith('Location:'):
+                        findings.append('   ' + lines[j].strip())
+                        break
+                if len(findings) >= 12:  # 6 findings x 2 lines each
+                    break
+        if findings:
+            return '\n'.join(findings)
+    if 'flake8' in name or 'mypy' in name:
+        # flake8/mypy: error lines look like "./path/file.py:12:5: E501 ..."
+        # Keep up to 8 of them (the first errors are usually the real cause).
+        errs = [ln for ln in lines if '.py:' in ln and (':' in ln.split('.py:')[-1])]
+        if errs:
+            return '\n'.join(errs[:8])
+    if 'pytest' in name or 'cov' in name:
+        # pytest: FAIL/ERROR lines + the coverage summary line.
+        keep = [ln for ln in lines
+                if ln.strip().startswith(('FAIL ', 'ERROR ', 'FAILED '))
+                or 'TOTAL' in ln or 'Required test coverage' in ln
+                or 'coverage failed' in ln.lower()]
+        if keep:
+            return '\n'.join(keep[:8])
+    # Unknown step or no recognizable findings shape: last-8-lines tail so the
+    # agent still sees the end of the output (better than the old 4-line cut).
+    return '\n'.join(lines[-8:]) if lines else '(no output)'
+
+
 def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose):
     """Run the standard quality pipeline in the sandbox via /api/pipeline, which
     stops at the first failing step and returns per-step {name, exitCode, stdout,
@@ -1426,9 +1477,8 @@ def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose):
     if failed:
         step = next((s for s in results if s.get('name') == failed), {})
         code = step.get('exitCode')
-        summary = (step.get('stderr') or step.get('stdout') or '').strip().splitlines()
-        tail = summary[-4:]
-        snippet = '\n'.join(tail) if tail else '(no output)'
+        snippet = _quality_pipeline_failure_snippet(
+            failed, step.get('stdout'), step.get('stderr'))
         return {'ok': False, 'failedStep': failed, 'results': results,
                 'note': f'quality pipeline FAILED at {failed} (exit {code}):\n{snippet}'}
     return {'ok': True, 'failedStep': None, 'results': results, 'note': 'quality pipeline all green'}
@@ -1609,9 +1659,22 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     ok = bool(exec_data.get('exitCode') == 0 and not exec_data.get('timedOut'))
     result = {'ok': ok, 'exitCode': exec_data.get('exitCode'), 'command': command, 'tier': tier_slug}
     if not ok:
+        # Include a snippet of stdout/stderr so the author can see WHY the
+        # command failed, not just the exit code. Mirrors the spike sandbox
+        # executor's behavior (which already returns stdout/stderr to the
+        # model) -- the coding path was dropping them, leaving agents with
+        # "exited non-zero (code 2)" and no root cause.
+        _err_snip = (exec_data.get('stderr') or '').strip()
+        _out_snip = (exec_data.get('stdout') or '').strip()
+        _detail_parts = []
+        if _err_snip:
+            _detail_parts.append('stderr: ' + '\n'.join(_err_snip.splitlines()[-6:]))
+        if _out_snip:
+            _detail_parts.append('stdout: ' + '\n'.join(_out_snip.splitlines()[-6:]))
+        _detail = (' | '.join(_detail_parts) if _detail_parts else 'no output captured')
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f'execution exited non-zero (code {exec_data.get("exitCode")}), '
-                                                   f'timed out: {bool(exec_data.get("timedOut"))}',
+                                                   f'timed out: {bool(exec_data.get("timedOut"))} | {_detail}',
                                            'command': command, 'ok': False, 'tier': tier_slug})
         return False
 

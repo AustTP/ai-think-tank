@@ -984,6 +984,88 @@ class SimAgentPerception(unittest.TestCase):
                       state['_feedback']['ada'][-1]['text'],
                       'cap trims the OLDEST entries, newest survives')
 
+    def test_append_feedback_dedups_same_source_same_task(self):
+        # Agents reported the same rejection flooding their feedback buffer
+        # 3-5 times with no way to tell which copy was current. When the
+        # newest entry has the same source and the same first-40-char prefix
+        # (the task-title prefix both pipeline and peer-review notices carry),
+        # the old entry is REPLACED, not stacked.
+        state = self._state()
+        sim._append_feedback(state, 'ada',
+                             "Your deliverable 'Build the login flow' failed the quality pipeline and was sent back. It will be reviewed again after you fix it.",
+                             source='pipeline')
+        sim._append_feedback(state, 'ada',
+                             "Your deliverable 'Build the login flow' failed the quality pipeline and was sent back. It will be reviewed again after you fix it.",
+                             source='pipeline')
+        bucket = state['_feedback']['ada']
+        self.assertEqual(len(bucket), 1, 'same source + same task prefix must replace, not stack')
+        # A DIFFERENT task still stacks (new prefix).
+        sim._append_feedback(state, 'ada',
+                             "Your deliverable 'Fix the header layout' failed the quality pipeline and was sent back.",
+                             source='pipeline')
+        self.assertEqual(len(state['_feedback']['ada']), 2)
+        # A DIFFERENT source still stacks even for the same task.
+        sim._append_feedback(state, 'ada',
+                             "Your deliverable 'Build the login flow' failed the quality pipeline and was sent back.",
+                             source='peer_review')
+        self.assertEqual(len(state['_feedback']['ada']), 3)
+
+    def test_upsert_rejection_mailbox_dedups_unread_same_task(self):
+        # Agents reported the same rejection appearing 3-5 times in their
+        # mailbox. _upsert_rejection_mailbox updates an UNREAD entry with the
+        # same kind + about (task id) in place instead of appending.
+        state = self._state()
+        agent = state['agents']['ada']
+        sim._upsert_rejection_mailbox(agent, {
+            'kind': 'peer_review_rejected', 'about': 'task-1',
+            'title': 'Build the login flow',
+            'text': 'Your work was sent back for a fix.', 'ts': 1000})
+        sim._upsert_rejection_mailbox(agent, {
+            'kind': 'peer_review_rejected', 'about': 'task-1',
+            'title': 'Build the login flow',
+            'text': 'Still needs a fix (second cycle).', 'ts': 2000})
+        mailbox = agent['mailbox']
+        self.assertEqual(len(mailbox), 1, 'unread same-task rejection must be updated, not stacked')
+        self.assertIn('second cycle', mailbox[0]['text'])
+        # A different task appends a new entry.
+        sim._upsert_rejection_mailbox(agent, {
+            'kind': 'peer_review_rejected', 'about': 'task-2',
+            'title': 'Other task', 'text': 'Sent back.', 'ts': 3000})
+        self.assertEqual(len(agent['mailbox']), 2)
+        # A READ entry is never updated -- a new rejection is new information.
+        agent['mailbox'][0]['read'] = True
+        sim._upsert_rejection_mailbox(agent, {
+            'kind': 'peer_review_rejected', 'about': 'task-1',
+            'title': 'Build the login flow',
+            'text': 'Third cycle.', 'ts': 4000})
+        self.assertEqual(len(agent['mailbox']), 3)
+
+    def test_coach_low_grade_includes_acceptance_criteria(self):
+        # Agents reported 0.0-grade coaching that said "meet the spec" but
+        # never stated what the spec was. When the task carries acceptance
+        # criteria or a user story, the coaching note quotes them.
+        state = self._state()
+        task = {'id': 'task-1', 'title': 'Distill knowledge',
+                'room': 'pressoffice',
+                'acceptanceCriteria': 'Cover all three knowledge sources. Cite each source inline.',
+                'userStory': 'As a researcher I want distilled findings so I can reuse them.'}
+        sim._coach_low_grade(state, 'ada', 'pressoffice', 2.0, 1000,
+                             'Distill knowledge', task=task)
+        plans = state['growthPlans']['ada']
+        low = [p for p in plans if p.get('kind') == 'low_grade']
+        self.assertEqual(len(low), 1)
+        self.assertIn('Cover all three knowledge sources', low[0]['note'])
+        self.assertIn('As a researcher', low[0]['note'])
+
+    def test_coach_low_grade_without_task_has_no_spec_block(self):
+        state = self._state()
+        sim._coach_low_grade(state, 'ada', 'pressoffice', 2.0, 1000, 'Vague task')
+        plans = state['growthPlans']['ada']
+        low = [p for p in plans if p.get('kind') == 'low_grade']
+        self.assertEqual(len(low), 1)
+        self.assertNotIn('Acceptance criteria', low[0]['note'])
+
+
     def test_apply_content_result_consumes_executor_feedback(self):
         # Item 2: an executor-reported block/failure rides the content result
         # channel into the tick's single read-modify-write, where it lands in the

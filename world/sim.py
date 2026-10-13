@@ -2075,11 +2075,26 @@ def _append_feedback(state, agent_id, text, source=None):
     pipeline failure, or an executor-reported block). Pure state mutation;
     JSON-safe (a list of small dicts). Written ONLY inside the tick's single
     read-modify-write (or a pure helper it calls) -- never from an executor
-    thread, which has only a snapshot."""
+    thread, which has only a snapshot.
+
+    Dedup: when the newest entry has the same `source` AND its text shares the
+    same first 40 characters (the task-title prefix both pipeline and
+    peer-review notices carry), the old entry is REPLACED, not stacked. Agents
+    reported the same rejection flooding their feedback buffer 3-5 times with
+    no way to tell which copy was current. Deliberately scoped to the
+    rejection sources (pipeline, peer_review, executor) -- player_feedback is
+    excluded because each player comment on the same card is intentional new
+    information (e.g. upgrading a rating), not a duplicate notice."""
     text = (text or '').strip()
     if not agent_id or not text:
         return
     bucket = state.setdefault('_feedback', {}).setdefault(agent_id, [])
+    _dedup_sources = ('pipeline', 'peer_review', 'executor')
+    if source in _dedup_sources and bucket:
+        last = bucket[-1]
+        if last.get('source') == source and last.get('text', '')[:40] == text[:40]:
+            last['text'] = text[:500]
+            return
     entry = {'text': text[:500]}
     if source:
         entry['source'] = source
@@ -5523,7 +5538,7 @@ def _sim_notify_author(state, parent, reviewer_id, rationale=None):
     author = parent.get('assignedTo')
     if not author:
         return
-    _append_mailbox((state.get('agents') or {}).get(author, {}), {
+    _upsert_rejection_mailbox((state.get('agents') or {}).get(author, {}), {
         'kind': 'peer_review_rejected',
         'about': parent.get('id'),
         'title': parent.get('title'),
@@ -5556,7 +5571,7 @@ def _sim_notify_author_failed(state, task):
     author = task.get('assignedTo')
     if not author:
         return
-    _append_mailbox((state.get('agents') or {}).get(author, {}), {
+    _upsert_rejection_mailbox((state.get('agents') or {}).get(author, {}), {
         'kind': 'peer_review_rejected',
         'about': task.get('id'),
         'title': task.get('title'),
@@ -8202,6 +8217,29 @@ def _append_mailbox(agent, entry):
         agent['mailbox'] = mailbox[-MAILBOX_KEEP_COUNT:]
 
 
+def _upsert_rejection_mailbox(agent, entry):
+    """File a rejection/sent-back notice, but DEDUP: if an unread entry with
+    the same kind and the same `about` (task id) already exists, update its
+    text and timestamp in place instead of appending a duplicate. Agents
+    reported the same rejection appearing 3-5 times in their mailbox with no
+    marker for which copy was current -- this makes the latest notice the one
+    entry for that task. Falls back to a plain append when no match (a new
+    task, or all prior copies already read)."""
+    mailbox = agent.setdefault('mailbox', [])
+    kind = entry.get('kind')
+    about = entry.get('about')
+    if kind and about:
+        for existing in mailbox:
+            if (existing.get('kind') == kind and existing.get('about') == about
+                    and not existing.get('read', False)):
+                existing['text'] = entry.get('text', existing.get('text'))
+                existing['ts'] = entry.get('ts', existing.get('ts'))
+                if 'title' in entry:
+                    existing['title'] = entry['title']
+                return
+    _append_mailbox(agent, entry)
+
+
 def _deliver_mail(state, agent_id, kind, payload=None):
     """File one action-needed mail item into an agent's mailbox. If the
     recipient is OFF-DUTY, wake her (appear_from_outskirts -- lazily loads
@@ -10069,7 +10107,7 @@ def _grade_completed_task(state, agent_id, task, now_ms):
         'source': 'refinement' if (task.get('instructions') or '').find('backlog refinement') >= 0 else 'other',
     })
     if grade < DELIVERABLE_GRADE_FLOOR:
-        _coach_low_grade(state, agent_id, room, grade, now_ms, title)
+        _coach_low_grade(state, agent_id, room, grade, now_ms, title, task=task)
     elif grade >= SUCCESS_GRADE_FLOOR:
         # Positive learning loop (ChatDev ECL): a deliverable graded at/above
         # the success floor is the raw material for the weekly success-mining
@@ -10083,25 +10121,37 @@ def _grade_completed_task(state, agent_id, task, now_ms):
             pass
 
 
-def _coach_low_grade(state, agent_id, room, grade, now_ms, title):
+def _coach_low_grade(state, agent_id, room, grade, now_ms, title, task=None):
     """W5: round-aware low-grade coaching. A single _write_growth_plan deduped by
     kind coached a weak worker ONCE; a worker who keeps closing below the floor
     then absorbed the identical note forever. Each low close re-lands a fresh,
     escalating coaching note (repeat=True) up to COACHING_MAX_ROUNDS, then the
     problem escalates to the owning director (a work-request + governance entry)
     -- either the coaching works, or it surfaces. Bounded: escalation fires once
-    per round-cap, and the work-request dedups."""
+    per round-cap, and the work-request dedups.
+
+    When `task` carries acceptance criteria or a user story, the note quotes
+    them -- agents reported 0.0-grade coaching that said "meet the spec" but
+    never stated what the spec was, leaving nothing to act on."""
     plans = state.setdefault('growthPlans', {}).setdefault(agent_id, [])
     rounds = sum(1 for p in plans if p.get('kind') == 'low_grade')
     if rounds >= COACHING_MAX_ROUNDS:
         _escalate_coaching_loop(state, agent_id, room, grade, now_ms, title)
         return
+    spec_bits = []
+    if task:
+        if (task.get('acceptanceCriteria') or '').strip():
+            spec_bits.append('Acceptance criteria for this task:\n' + task['acceptanceCriteria'].strip()[:600])
+        if (task.get('userStory') or '').strip():
+            spec_bits.append('User story: ' + task['userStory'].strip()[:300])
+    spec_block = ('\n\n' + '\n\n'.join(spec_bits)) if spec_bits else ''
     _write_growth_plan(
         state, agent_id, room, 'low_grade', now_ms,
         f"Deliverable '{title}' in {room} graded {grade}/10 (below the "
         f"{DELIVERABLE_GRADE_FLOOR:.0f} floor). Coaching round {rounds + 1} of "
         f"{COACHING_MAX_ROUNDS}: you've been coached on this before and the grade "
-        f"hasn't recovered -- meet the spec and room standards end-to-end this time.",
+        f"hasn't recovered -- meet the spec and room standards end-to-end this time."
+        f"{spec_block}",
         repeat=True)
 
 

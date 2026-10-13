@@ -236,6 +236,66 @@ class RunQualityPipeline(unittest.TestCase):
         self.assertIn('flake8', result['note'])
         self.assertIn('F841', result['note'])
 
+    def test_bandit_failure_includes_issue_and_location_not_just_summary(self):
+        # The old tail-4-lines extractor returned bandit's severity summary
+        # ("High: 11") with no file/line -- agents could see THAT bandit
+        # failed but not WHICH finding to fix. The new extractor pulls the
+        # Issue + Location blocks from the body of the output.
+        bandit_out = '\n'.join([
+            '--------------------------------------------------',
+            '>> Issue: [B105:hardcoded_password_string] Possible hardcoded password: "secret"',
+            '   Severity: Medium   Confidence: High',
+            '   CWE: CWE-798',
+            '   More Info: https://bandit.readthedocs.io/en/1.9.4/plugins/b105_hardcoded_password_string.html',
+            '   Location: ./app.py:42:12',
+            '--------------------------------------------------',
+            '>> Issue: [B608:hardcoded_sql_string] Possible SQL injection string.',
+            '   Severity: High   Confidence: Medium',
+            '   Location: ./db.py:88:5',
+            '--------------------------------------------------',
+            'Code scanned:',
+            '\tTotal lines of code: 1200',
+            'Run metrics:',
+            '\tTotal issues (by severity):',
+            '\t\tHigh: 1',
+            '\t\tMedium: 1',
+        ])
+        resp = {'sandboxId': 'workroom-shared', 'failedStep': 'bandit',
+                'results': [{'name': 'bandit', 'exitCode': 1,
+                             'stdout': '', 'stderr': bandit_out}]}
+        result, _ = self._run(resp)
+        self.assertFalse(result['ok'])
+        self.assertIn('B105', result['note'])
+        self.assertIn('./app.py:42:12', result['note'])
+        self.assertIn('B608', result['note'])
+        self.assertNotIn('High: 1', result['note'])  # summary is not the payload
+
+    def test_pytest_failure_includes_fail_lines_and_coverage(self):
+        pytest_out = '\n'.join([
+            'tests/test_app.py::test_login FAILED',
+            'tests/test_app.py::test_logout ERROR',
+            '=========================== short test summary info ============================',
+            'FAILED tests/test_app.py::test_login - AssertionError: expected 200',
+            'ERROR tests/test_app.py::test_logout - RuntimeError: db locked',
+            'Required test coverage of 90.0% reached. Total coverage: 72.30%',
+        ])
+        resp = {'sandboxId': 'workroom-shared', 'failedStep': 'pytest-cov',
+                'results': [{'name': 'pytest-cov', 'exitCode': 1,
+                             'stdout': pytest_out, 'stderr': ''}]}
+        result, _ = self._run(resp)
+        self.assertFalse(result['ok'])
+        self.assertIn('FAILED', result['note'])
+        self.assertIn('72.30%', result['note'])
+
+    def test_unknown_step_falls_back_to_tail(self):
+        resp = {'sandboxId': 'workroom-shared', 'failedStep': 'node-tests',
+                'results': [{'name': 'node-tests', 'exitCode': 1,
+                             'stdout': '', 'stderr': 'line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10'}]}
+        result, _ = self._run(resp)
+        self.assertFalse(result['ok'])
+        self.assertIn('line10', result['note'])
+        self.assertIn('line3', result['note'])  # last-8 tail
+
     def test_error_response_is_never_green(self):
         result, _ = self._run({'error': 'boom'})
         self.assertFalse(result['ok'])
