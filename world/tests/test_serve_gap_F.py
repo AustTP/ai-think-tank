@@ -2919,3 +2919,32 @@ class YoutubeTranscriptColab(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+class SandboxRestoreAdminGate(unittest.TestCase):
+    """POST /api/sandbox-backups/restore widened to player session OR admin."""
+
+    def test_admin_agent_may_restore_any_sandbox(self):
+        state = {'agentRoster': [{'id': 'boss', 'isAdmin': True}], 'agents': {}}
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, '_require_player_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_resolve_requester', return_value='boss'), \
+             unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True), \
+             unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, '_restore_sandbox_backup') as restore:
+            c = TestClient(serve.app)
+            r = c.post('/api/sandbox-backups/restore',
+                       json={'agentId': 'worker1', 'sandboxId': 'sbx', 'stamp': 'abc'})
+        self.assertEqual(r.status_code, 200, r.text)
+        restore.assert_called_once_with('sbx', 'abc')
+
+    def test_ordinary_agent_may_not_restore(self):
+        state = {'agentRoster': [{'id': 'worker1', 'isAdmin': False}], 'agents': {}}
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, '_require_player_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_resolve_requester', return_value='worker1'), \
+             unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True), \
+             unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state):
+            c = TestClient(serve.app)
+            r = c.post('/api/sandbox-backups/restore',
+                       json={'agentId': 'player', 'sandboxId': 'sbx', 'stamp': 'abc'})
+        self.assertEqual(r.status_code, 401)

@@ -3748,3 +3748,63 @@ if __name__ == '__main__':
     unittest.main()
 
 
+
+
+class TeamAgreementApi(unittest.TestCase):
+    def test_player_agreement_write_and_resolved(self):
+        state = _roster_state()
+        with _player_env(state):
+            r = _client().put("/api/teams/team-1",
+                              json={"agreement": {"scrumMasterMinTeamSize": 6,
+                                                  "bogusKey": 1,
+                                                  "maxTeamMembers": 999}})
+            self.assertEqual(r.status_code, 200, r.text)
+            ag = state["teams"][0]["agreement"]
+            self.assertEqual(ag.get("scrumMasterMinTeamSize"), 6)
+            self.assertNotIn("bogusKey", ag)
+            r = _client().get("/api/teams")
+            self.assertEqual(r.status_code, 200)
+            t1 = [t for t in r.json()["teams"] if t["id"] == "team-1"][0]
+            self.assertEqual(t1["agreement"], ag)
+            self.assertEqual(len(t1["agreementResolved"]), 57)
+            self.assertEqual(t1["agreementResolved"]["scrumMasterMinTeamSize"], 6)
+            # ceiling clamp at read: team stored 999, operator cap 6 -> 6
+            self.assertEqual(t1["agreementResolved"]["maxTeamMembers"], 6)
+            # clear
+            r = _client().put("/api/teams/team-1", json={"agreement": None})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertIsNone(state["teams"][0]["agreement"])
+            # bad type
+            r = _client().put("/api/teams/team-1", json={"agreement": [1]})
+            self.assertEqual(r.status_code, 400)
+
+    def test_player_name_only_still_401(self):
+        with _player_env(_roster_state()):
+            r = _client().put("/api/teams/team-1", json={"name": "Beta"})
+        self.assertEqual(r.status_code, 401)
+
+    def test_non_director_agent_agreement_403(self):
+        state = _roster_state()
+        with _agent_env(state, requester="agent-3"):
+            r = _client().put("/api/teams/team-1",
+                              json={"agreement": {"scrumMasterMinTeamSize": 6}})
+        self.assertEqual(r.status_code, 403)
+
+    def test_director_agent_agreement_ok(self):
+        state = _roster_state()
+        with _agent_env(state, requester="agent-2"):
+            r = _client().put("/api/teams/team-1",
+                              json={"agreement": {"scrumMasterMinTeamSize": 6},
+                                    "name": "Alpha2"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(state["teams"][0]["name"], "Alpha2")
+        self.assertEqual(state["teams"][0]["agreement"]["scrumMasterMinTeamSize"], 6)
+        self.assertEqual(state["teams"][0]["updatedBy"], "agent-2")
+
+    def test_player_agreement_with_name_honored(self):
+        state = _roster_state()
+        with _player_env(state):
+            r = _client().put("/api/teams/team-1",
+                              json={"agreement": {"taskCycleS": 7.5}, "name": "Renamed"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(state["teams"][0]["name"], "Renamed")

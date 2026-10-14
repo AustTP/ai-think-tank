@@ -279,6 +279,43 @@ OPERATOR_POLICY_DEFAULT: dict = {
     'moraleDroppedWeight': 6.0,
     'moraleNeglectWeight': 3.0,
     'moraleNeglectCap': 30,
+    # Delivery shape: review-gate cycles, coaching rounds, help escalation,
+    # sprint velocity cap, and the "no one is picking this up" stall ceiling.
+    'maxReviewCycles': 8,
+    'coachingMaxRounds': 3,
+    'workerHelpAfterFails': 2,
+    'teamVelocityMax': 20,
+    'workItemStallCeiling': 600,
+    # Sim-loop timing (global: one loop serves the whole tank).
+    'taskCycleS': 6.0,
+    'taskWorkDurationS': 8.0,
+    'taskContentTimeoutS': 120.0,
+    'taskContentTimeoutMaxS': 600.0,
+    # Tier throttle: today's spend below ratio * trailing 7-day median.
+    'tierThrottleRatio': 0.7,
+    # People-process timers (ms)
+    'hireDurationMs': 8000,
+    'firingReviewDurationMs': 10000,
+    'reportStrikeWindowMs': 14 * 24 * 3600 * 1000,
+    'onboardMeetDurationMs': 10000,
+    'onboardReadinessTimeoutMs': 15 * 60 * 1000,
+    # Villager socials
+    'socialCadenceMs': 7 * 24 * 3600 * 1000,
+    'socialMeetMs': 30 * 60 * 1000,
+    'socialAdoptConfidence': 0.6,
+    # Failure cooldown (hire throttling after a bad run)
+    'failureCooldownHalfLifeS': 1800,
+    'failureCooldownThreshold': 0.5,
+    # Free spikes (spare-time moonshots)
+    'freeSpikeAllowancePerWeek': 1,
+    'freeSpikeGlobalCapPerWeek': 3,
+    'freeSpikeBudgetMs': 2 * 60 * 1000,
+    'freeSpikeDeferMs': 60 * 1000,
+    # Press Office code/review lane (content.py)
+    'codeContinuationAttempts': 2,
+    'maxCodeProbeRounds': 3,
+    'maxCodeColabRounds': 3,
+    'maxReviewProbeRounds': 2,
 }
 
 # Per-key validation: (kind, min, max). A wrong-typed or out-of-range value
@@ -314,7 +351,72 @@ _OPERATOR_SCHEMA: dict = {
     'moraleDroppedWeight': ('float', 0.0, 100.0),
     'moraleNeglectWeight': ('float', 0.0, 100.0),
     'moraleNeglectCap': ('int', 0, 100),
+    'maxReviewCycles': ('int', 1, 50),
+    'coachingMaxRounds': ('int', 1, 20),
+    'workerHelpAfterFails': ('int', 1, 10),
+    'teamVelocityMax': ('int', 1, 500),
+    'workItemStallCeiling': ('int', 10, 86400),
+    'taskCycleS': ('float', 1.0, 60.0),
+    'taskWorkDurationS': ('float', 1.0, 600.0),
+    'taskContentTimeoutS': ('float', 5.0, 3600.0),
+    'taskContentTimeoutMaxS': ('float', 10.0, 7200.0),
+    'tierThrottleRatio': ('float', 0.0, 1.0),
+    'hireDurationMs': ('int', 0, 3600000),
+    'firingReviewDurationMs': ('int', 0, 3600000),
+    'reportStrikeWindowMs': ('int', 3600000, 90 * 24 * 3600 * 1000),
+    'onboardMeetDurationMs': ('int', 0, 3600000),
+    'onboardReadinessTimeoutMs': ('int', 60000, 86400000),
+    'socialCadenceMs': ('int', 3600000, 30 * 24 * 3600 * 1000),
+    'socialMeetMs': ('int', 60000, 86400000),
+    'socialAdoptConfidence': ('float', 0.0, 1.0),
+    'failureCooldownHalfLifeS': ('int', 60, 86400),
+    'failureCooldownThreshold': ('float', 0.0, 1.0),
+    'freeSpikeAllowancePerWeek': ('int', 0, 100),
+    'freeSpikeGlobalCapPerWeek': ('int', 0, 100),
+    'freeSpikeBudgetMs': ('int', 1000, 3600000),
+    'freeSpikeDeferMs': ('int', 0, 3600000),
+    'codeContinuationAttempts': ('int', 1, 10),
+    'maxCodeProbeRounds': ('int', 1, 20),
+    'maxCodeColabRounds': ('int', 1, 20),
+    'maxReviewProbeRounds': ('int', 1, 20),
 }
+
+# --- Teamwork agreements -----------------------------------------------------
+# A team may set ANY of these keys on its own `agreement` record (state's
+# teams[i]['agreement'], written through PUT /api/teams/{id}). Everything else
+# in the operator policy is operator-only: teams can read it, never override
+# it. Unset keys fall through team -> operator_policy.json -> code default, so
+# an empty agreement behaves exactly like today.
+TEAM_AGREEABLE_KEYS: frozenset = frozenset({
+    # team shape
+    'maxTeamMembers', 'scrumMasterMinTeamSize',
+    # grading floors
+    'deliverableGradeFloor', 'successGradeFloor',
+    # governance cadences (team-scoped consumers only; tank-wide stamps
+    # like skillReviewCadenceMs/hireCooldownMs stay operator-only)
+    'refinementCadenceMs',
+    # work items / backlog
+    'workItemMaxAttempts', 'staleWorkTimeoutMs', 'staleWorkBudgetGraceS',
+    'backlogPullsPerClose', 'escalationMaxOpen',
+    # morale arithmetic
+    'moraleApprovedWeight', 'moraleApprovedCap', 'moraleDroppedWeight',
+    'moraleNeglectWeight', 'moraleNeglectCap',
+    # delivery shape
+    'maxReviewCycles', 'coachingMaxRounds', 'workerHelpAfterFails',
+    'teamVelocityMax', 'workItemStallCeiling',
+})
+
+# Of the agreeable keys, these are CAPS: the operator value is a hard ceiling
+# and the effective value is min(team, operator) at READ time. That keeps the
+# operator's limit live (raising/lowering the file takes effect without a
+# state edit) while the stored team value stays stable. All other agreeable
+# keys are plain: the team's value wins outright.
+TEAM_CEILING_KEYS: frozenset = frozenset({
+    'maxTeamMembers', 'escalationMaxOpen', 'workItemMaxAttempts',
+    'backlogPullsPerClose', 'moraleApprovedCap', 'moraleNeglectCap',
+    'maxReviewCycles', 'coachingMaxRounds', 'workerHelpAfterFails',
+    'teamVelocityMax', 'workItemStallCeiling',
+})
 
 # Loaded values (module-level dict, MUTATED IN PLACE by reload so consumers
 # that did `from config import OPERATOR_POLICY` see reloads immediately).
@@ -355,6 +457,30 @@ def _coerce_operator_value(key, value):
         return None
     if out < lo or out > hi:
         return None
+    return out
+
+
+def validate_team_agreement(raw, operator=None):
+    """Validate a teamwork agreement against TEAM_AGREEABLE_KEYS + schema.
+
+    Fail-closed per key, never per record: unknown keys, wrong types and
+    out-of-range values are dropped, the rest is kept, and the input is never
+    trusted (a non-dict yields {}). Ceilings are NOT applied here -- a team may
+    store a value above the operator's cap and get min(team, operator) at read
+    time, so a later operator edit stays live without a state rewrite.
+    `operator` is the values to range-check against; defaults to the live
+    operator policy."""
+    if not isinstance(raw, dict):
+        return {}
+    if not isinstance(operator, dict):
+        operator = get_operator_policy()
+    out = {}
+    for key, value in raw.items():
+        if key not in TEAM_AGREEABLE_KEYS:
+            continue
+        coerced = _coerce_operator_value(key, value)
+        if coerced is not None:
+            out[key] = coerced
     return out
 
 

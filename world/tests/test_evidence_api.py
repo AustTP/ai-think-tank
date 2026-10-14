@@ -582,3 +582,67 @@ class HardeningEndpoints(_ApiTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class OperatorGateAdmin(_ApiTestCase):
+    """The four operator endpoints widened to player session OR admin agent:
+    /api/policy/reload, /api/budget, /api/env/reload, sandbox restore."""
+
+    def _req(self, headers=None, cookies=None):
+        from starlette.datastructures import Headers
+        return type('Req', (), {
+            'headers': Headers(headers or {}),
+            'cookies': cookies or {},
+        })()
+
+    def _admin_state(self, is_admin=True):
+        return {'agentRoster': [{'id': 'boss', 'isAdmin': is_admin}], 'agents': {}}
+
+    def test_gate_accepts_verified_admin_only(self):
+        with unittest.mock.patch.object(serve, '_require_player_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_resolve_requester', return_value='boss'), \
+             unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True), \
+             unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=self._admin_state(True)):
+            self.assertTrue(serve._require_player_or_admin(self._req()))
+        with unittest.mock.patch.object(serve, '_require_player_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_resolve_requester', return_value='boss'), \
+             unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True), \
+             unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=self._admin_state(False)):
+            self.assertFalse(serve._require_player_or_admin(self._req()))
+        with unittest.mock.patch.object(serve, '_require_player_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_resolve_requester', return_value='boss'), \
+             unittest.mock.patch.object(serve, 'verify_agent_key', return_value='mismatch'), \
+             unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=self._admin_state(True)):
+            self.assertFalse(serve._require_player_or_admin(self._req()))
+        with unittest.mock.patch.object(serve, '_require_player_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_resolve_requester', return_value=None):
+            self.assertFalse(serve._require_player_or_admin(self._req()))
+
+    def test_admin_may_reload_policy_and_env(self):
+        raw = _raw_client()
+        with unittest.mock.patch.object(serve, '_require_player_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_resolve_requester', return_value='boss'), \
+             unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True), \
+             unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=self._admin_state(True)):
+            r = raw.post('/api/policy/reload', json={}, headers=_agent_headers())
+            self.assertEqual(r.status_code, 200, r.text)
+            r = raw.post('/api/env/reload', json={}, headers=_agent_headers())
+            self.assertEqual(r.status_code, 200, r.text)
+
+    def test_ordinary_agent_still_refused_on_admin_gate(self):
+        raw = _raw_client()
+        with unittest.mock.patch.object(serve, '_require_player_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_resolve_requester', return_value='worker1'), \
+             unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True), \
+             unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=self._admin_state(False)):
+            r = raw.post('/api/policy/reload', json={}, headers=_agent_headers())
+            self.assertEqual(r.status_code, 401)
+            r = raw.post('/api/env/reload', json={}, headers=_agent_headers())
+            self.assertEqual(r.status_code, 401)
+            r = raw.post('/api/budget', json={'SPEND_CAP_USD': 1},
+                         headers=_agent_headers())
+            self.assertEqual(r.status_code, 401)

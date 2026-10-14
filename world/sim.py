@@ -935,7 +935,7 @@ def _reclaim_orphaned_walking_tasks(state):
         # same WORK_ITEM_MAX_ATTEMPTS cap the assignment loop enforces, so a
         # genuinely un-workable task ages out instead of churning the queue.
         attempts = int(task.get('attempts') or 0) + 1
-        if attempts >= WORK_ITEM_MAX_ATTEMPTS:
+        if attempts >= team_policy(state, task.get('teamId') or _task_owner_director(state, task), 'workItemMaxAttempts'):
             from serve import log_action
             try:
                 log_action(None, 'work_item_abandoned',
@@ -1421,7 +1421,82 @@ def _team_under_cap(state, director_id, extra=0):
     to check per-SPRINT staffing capacity, NOT to gate hiring -- directors may
     hire unlimited workers; MAX_TEAM_MEMBERS only limits how many staff a
     single sprint (see _sprint_worker_pool)."""
-    return _team_member_count(state, director_id) + extra <= MAX_TEAM_MEMBERS
+    return _team_member_count(state, director_id) + extra <= team_policy(state, director_id, 'maxTeamMembers')
+
+
+# ---------------------------------------------------------------------------
+# Teamwork agreements: per-team overrides of operator-policy keys. A team
+# record may carry an `agreement` dict (written through PUT /api/teams/{id}).
+# Resolution order is team -> operator_policy.json -> shipped code default, so
+# an unset key (and an empty/missing agreement) behaves exactly like today.
+# config.TEAM_AGREEABLE_KEYS is the allowlist; config.TEAM_CEILING_KEYS are
+# clamped to min(team, operator) at READ time so the operator's cap stays
+# live without rewriting state.
+# ---------------------------------------------------------------------------
+def team_agreement(state, team_ref):
+    """The raw `agreement` dict of the team matching team_ref (a team id OR a
+    directorId -- teams are keyed by their director), or {} when nothing
+    matches or the stored value is not a dict (fail closed, never trust the
+    record's type)."""
+    if team_ref is None:
+        return {}
+    for t in (state.get('teams') or []):
+        if not isinstance(t, dict):
+            continue
+        if t.get('id') == team_ref or t.get('directorId') == team_ref:
+            agr = t.get('agreement')
+            return agr if isinstance(agr, dict) else {}
+    return {}
+
+
+def agent_team_ref(state, agent_id):
+    """The team ref for an agent: their roster `director` pointer (a team is
+    identified by its director). None when the agent is unrostered or is a
+    director without a director of their own."""
+    for d in (state.get('agentRoster') or []):
+        if isinstance(d, dict) and d.get('id') == agent_id:
+            return d.get('director')
+    return None
+
+
+def team_policy(state, team_ref, key=None):
+    """Resolve operator-policy value(s) with the team's agreement applied.
+
+    team_ref: a team id, a directorId, or None (plain operator value, so
+    call sites can stay uniform). key: one policy key, or None to get the
+    full resolved mapping of every operator-policy key.
+
+    Per key: a team-set value is re-coerced against the schema at read time
+    (an invalid/stale stored value falls back to the operator value), then
+    ceiling keys are clamped to min(team, operator). Non-agreeable keys
+    always resolve to the operator value. Reads config.OPERATOR_POLICY
+    (refreshed in place by reload) instead of get_operator_policy() so a
+    hot sim loop does not stat the policy file on every call."""
+    import config as _cfg
+    op_policy = _cfg.OPERATOR_POLICY or _cfg.get_operator_policy()
+    defaults = _cfg.OPERATOR_POLICY_DEFAULT
+    agr = team_agreement(state, team_ref)
+
+    def _resolve(k):
+        val = op_policy.get(k, defaults.get(k))
+        if k in _cfg.TEAM_AGREEABLE_KEYS and k in agr:
+            coerced = _cfg._coerce_operator_value(k, agr.get(k))
+            if coerced is not None:
+                val = coerced
+        if k in _cfg.TEAM_CEILING_KEYS:
+            op_val = op_policy.get(k, defaults.get(k))
+            try:
+                if val > op_val:
+                    val = op_val
+            except TypeError:
+                val = op_val
+        return val
+
+    if key is None:
+        return {k: _resolve(k) for k in defaults}
+    return _resolve(key)
+
+
 SKILL_REVIEW_CADENCE_MS = 30 * 60 * 1000
 
 # Hive mind: how often the think tank distills recent archive findings into its
@@ -1711,6 +1786,19 @@ def _apply_operator_policy():
     global ESCALATION_MAX_OPEN
     global MORALE_APPROVED_WEIGHT, MORALE_APPROVED_CAP
     global MORALE_DROPPED_WEIGHT, MORALE_NEGLECT_WEIGHT, MORALE_NEGLECT_CAP
+    # -- this batch: hardcoded sim/content constants promoted to policy --
+    global HIRE_DURATION_MS, FIRING_REVIEW_DURATION_MS
+    global REPORT_STRIKE_WINDOW_MS
+    global ONBOARD_MEET_DURATION_MS, ONBOARD_READINESS_TIMEOUT_MS
+    global SOCIAL_CADENCE_MS, SOCIAL_MEET_MS, SOCIAL_ADOPT_CONFIDENCE
+    global FAILURE_COOLDOWN_HALF_LIFE_S, FAILURE_COOLDOWN_THRESHOLD
+    global FREE_SPIKE_ALLOWANCE_PER_WEEK, FREE_SPIKE_GLOBAL_CAP_PER_WEEK
+    global FREE_SPIKE_BUDGET_MS, FREE_SPIKE_DEFER_MS
+    global WORKER_HELP_AFTER_FAILS, COACHING_MAX_ROUNDS
+    global TEAM_VELOCITY_MAX, WORK_ITEM_STALL_CEILING
+    global TIER_THROTTLE_RATIO
+    global TASK_WORK_DURATION_S, TASK_CONTENT_TIMEOUT_S
+    global TASK_CONTENT_TIMEOUT_MAX_S, TASK_CYCLE_S, MAX_REVIEW_CYCLES
     from config import get_operator_policy
     _p = get_operator_policy()
     MAX_TEAM_MEMBERS = _p['maxTeamMembers']
@@ -1736,6 +1824,30 @@ def _apply_operator_policy():
     MORALE_DROPPED_WEIGHT = _p['moraleDroppedWeight']
     MORALE_NEGLECT_WEIGHT = _p['moraleNeglectWeight']
     MORALE_NEGLECT_CAP = _p['moraleNeglectCap']
+    HIRE_DURATION_MS = _p['hireDurationMs']
+    FIRING_REVIEW_DURATION_MS = _p['firingReviewDurationMs']
+    REPORT_STRIKE_WINDOW_MS = _p['reportStrikeWindowMs']
+    ONBOARD_MEET_DURATION_MS = _p['onboardMeetDurationMs']
+    ONBOARD_READINESS_TIMEOUT_MS = _p['onboardReadinessTimeoutMs']
+    SOCIAL_CADENCE_MS = _p['socialCadenceMs']
+    SOCIAL_MEET_MS = _p['socialMeetMs']
+    SOCIAL_ADOPT_CONFIDENCE = _p['socialAdoptConfidence']
+    FAILURE_COOLDOWN_HALF_LIFE_S = _p['failureCooldownHalfLifeS']
+    FAILURE_COOLDOWN_THRESHOLD = _p['failureCooldownThreshold']
+    FREE_SPIKE_ALLOWANCE_PER_WEEK = _p['freeSpikeAllowancePerWeek']
+    FREE_SPIKE_GLOBAL_CAP_PER_WEEK = _p['freeSpikeGlobalCapPerWeek']
+    FREE_SPIKE_BUDGET_MS = _p['freeSpikeBudgetMs']
+    FREE_SPIKE_DEFER_MS = _p['freeSpikeDeferMs']
+    WORKER_HELP_AFTER_FAILS = _p['workerHelpAfterFails']
+    COACHING_MAX_ROUNDS = _p['coachingMaxRounds']
+    TEAM_VELOCITY_MAX = _p['teamVelocityMax']
+    WORK_ITEM_STALL_CEILING = _p['workItemStallCeiling']
+    TIER_THROTTLE_RATIO = _p['tierThrottleRatio']
+    TASK_WORK_DURATION_S = _p['taskWorkDurationS']
+    TASK_CONTENT_TIMEOUT_S = _p['taskContentTimeoutS']
+    TASK_CONTENT_TIMEOUT_MAX_S = _p['taskContentTimeoutMaxS']
+    TASK_CYCLE_S = _p['taskCycleS']
+    MAX_REVIEW_CYCLES = _p['maxReviewCycles']
 
 
 _apply_operator_policy()
@@ -1932,7 +2044,7 @@ def _maybe_escalate_stuck_gate(state, parent, gate, reason):
     if gate.get('escalated'):
         return True
     gate['cycleCount'] = gate.get('cycleCount', 0) + 1
-    if gate['cycleCount'] < MAX_REVIEW_CYCLES:
+    if gate['cycleCount'] < team_policy(state, parent.get('teamId') or _task_owner_director(state, parent), 'maxReviewCycles'):
         return False
     gate['escalated'] = True
     title = parent.get('title') or 'a story'
@@ -3190,6 +3302,11 @@ def queue_sprint(state, sprint_id, name, goal, owner_id, items, valid_rooms,
         return None
     now_ms = time.time() * 1000 if now_ms is None else now_ms
     sprints = state.setdefault('sprints', {})
+    # Sprint headcount cap: the strictest useful bound across the teams this
+    # sprint spans (max, so one permissive team doesn't squeeze another) --
+    # falls back to the creating owner's team, then the operator value.
+    _sq_caps = [team_policy(state, t, 'maxTeamMembers') for t in (team_ids or [])]
+    _sq_cap = max(_sq_caps) if _sq_caps else team_policy(state, owner_id, 'maxTeamMembers')
     record = {
         'id': sprint_id,
         'name': name or goal or 'Sprint',
@@ -3198,10 +3315,10 @@ def queue_sprint(state, sprint_id, name, goal, owner_id, items, valid_rooms,
         'createdAt': now_ms,
         'targetDate': target_date_ms or None,
         'teamIds': list(dict.fromkeys(team_ids or [])),
-        # The director-chosen sprint headcount (1..MAX_TEAM_MEMBERS). Strictly
+        # The director-chosen sprint headcount (1..maxTeamMembers). Strictly
         # staffed: only this many workers may take this sprint's cards, and
         # only from the sprint's teams (see _sprint_worker_pool).
-        'workerCount': max(1, min(MAX_TEAM_MEMBERS, int(worker_count or MAX_TEAM_MEMBERS))),
+        'workerCount': max(1, min(_sq_cap, int(worker_count or _sq_cap))),
         'status': 'active',
         'items': [_sprint_item_id(it) for it in kept],
     }
@@ -3287,6 +3404,13 @@ def sprint_progress(state, sprint_id):
 # a just-closed sprint actually landed (count + size points, when estimated).
 # Capped so the digest stays a rolling window, not a whole-of-history ledger.
 TEAM_VELOCITY_MAX = 20
+
+# Second import-time rebind: several rebound targets (TASK_WORK_DURATION_S,
+# TASK_CONTENT_TIMEOUT_S/_MAX_S, TASK_CYCLE_S, MAX_REVIEW_CYCLES, and this
+# TEAM_VELOCITY_MAX) are defined AFTER the first call above, so their module
+# level assignments would otherwise clobber the policy values. Hooks still
+# re-run the whole function on every reload, so this is import-order only.
+_apply_operator_policy()
 
 
 def close_sprint(state, sprint_id, now_ms=None):
@@ -3397,8 +3521,9 @@ def _record_sprint_velocity(state, record, now_ms):
     for tid in (record.get('teamIds') or []):
         bucket = history.setdefault(tid, [])
         bucket.append(velocity)
-        if len(bucket) > TEAM_VELOCITY_MAX:
-            del bucket[:len(bucket) - TEAM_VELOCITY_MAX]
+        _vel_cap = team_policy(state, tid, 'teamVelocityMax')
+        if len(bucket) > _vel_cap:
+            del bucket[:len(bucket) - int(_vel_cap)]
     return velocity
 
 
@@ -3694,7 +3819,7 @@ def _on_sprint_closed(state, record, now_ms):
         # Cross-team borrowing: loans to this team end at sprint close unless
         # the team still has pending work (the feature-need case keeps them).
         _end_loans_for_team(state, tid, now_ms)
-        for _ in range(BACKLOG_PULLS_PER_CLOSE):
+        for _ in range(team_policy(state, tid, 'backlogPullsPerClose')):
             _pull_backlog_for_team(state, tid, now_ms)
         kick_refinement_now(state, tid, now_ms)
     # Director gap 1: team-health review at sprint close -- each director grades
@@ -5117,13 +5242,16 @@ def morale_for(state, agent_id, now_ms=None):
     a = (state.get('agents') or {}).get(agent_id)
     if not a:
         return None
-    approved_bonus = min((a.get('approvedCount') or 0) * MORALE_APPROVED_WEIGHT, MORALE_APPROVED_CAP)
+    # Morale arithmetic is team-scoped (the agreement may retune weights/caps);
+    # resolve the whole mapping once so five keys don't rescan the team list.
+    _mor = team_policy(state, agent_team_ref(state, agent_id))
+    approved_bonus = min((a.get('approvedCount') or 0) * _mor['moraleApprovedWeight'], _mor['moraleApprovedCap'])
     days_since_hire = days_since(a.get('hiredAt'), now)
     drop_decay = max(0.0, 1 - days_since_hire / MORALE_DROPPED_DECAY_DAYS)
-    dropped_penalty = (a.get('droppedCount') or 0) * MORALE_DROPPED_WEIGHT * drop_decay
+    dropped_penalty = (a.get('droppedCount') or 0) * _mor['moraleDroppedWeight'] * drop_decay
     last_contacted = a.get('lastContactedAt')
-    neglect_penalty = (min(days_since(last_contacted, now) * MORALE_NEGLECT_WEIGHT, MORALE_NEGLECT_CAP)
-                       if last_contacted else MORALE_NEGLECT_CAP)
+    neglect_penalty = (min(days_since(last_contacted, now) * _mor['moraleNeglectWeight'], _mor['moraleNeglectCap'])
+                       if last_contacted else _mor['moraleNeglectCap'])
     raw = 100 + approved_bonus - dropped_penalty - neglect_penalty
     return int(max(0, min(100, round(raw))))
 
@@ -5690,7 +5818,8 @@ def _sim_notify_author(state, parent, reviewer_id, rationale=None):
         return
     _gate = parent.get('_peerGate') or {}
     _cycle = _gate.get('cycleCount', 0)
-    _cycle_note = f' (rejection {_cycle} of {MAX_REVIEW_CYCLES})' if _cycle else ''
+    _max_cycles = team_policy(state, parent.get('teamId') or agent_team_ref(state, author), 'maxReviewCycles')
+    _cycle_note = f' (rejection {_cycle} of {_max_cycles})' if _cycle else ''
     _upsert_rejection_mailbox((state.get('agents') or {}).get(author, {}), {
         'kind': 'peer_review_rejected',
         'about': parent.get('id'),
@@ -5729,7 +5858,8 @@ def _sim_notify_author_failed(state, task, cycle=None, is_infra=False):
     author = task.get('assignedTo')
     if not author:
         return
-    cycle_note = f' (rejection {cycle} of {MAX_REVIEW_CYCLES})' if cycle else ''
+    _max_cycles = team_policy(state, task.get('teamId') or agent_team_ref(state, author), 'maxReviewCycles')
+    cycle_note = f' (rejection {cycle} of {_max_cycles})' if cycle else ''
     if is_infra:
         text = (f'Your work on "{task.get("title")}" hit an infrastructure '
                 f'failure{cycle_note} -- not a quality problem with your code. '
@@ -9189,7 +9319,8 @@ def _refinement_scrum_master_for_team(state, team_id):
             if t.get('scrumMasterId'):
                 return t['scrumMasterId']
             director_id = t.get('directorId')
-            if director_id and _team_member_count(state, director_id) < SCRUM_MASTER_MIN_TEAM_SIZE:
+            if (director_id and _team_member_count(state, director_id)
+                    < team_policy(state, team_id, 'scrumMasterMinTeamSize')):
                 return director_id
             return None
     return None
@@ -9551,7 +9682,7 @@ def _refinement_cadence_due_for(state, team_id, now_ms, legacy=None):
         last = legacy if legacy is not None else 0
     if last - now_ms > 10 * 365 * 24 * 3600 * 1000:
         last = 0
-    return now_ms - last >= REFINEMENT_CADENCE_MS
+    return now_ms - last >= team_policy(state, team_id, 'refinementCadenceMs')
 
 
 def kick_refinement_now(state, team_id, now_ms=None):
@@ -10340,6 +10471,7 @@ def _team_health_review(state, team_ids, now_ms):
         if not team:
             continue
         director_id = team.get('directorId') or team.get('id')
+        _floor = team_policy(state, tid, 'deliverableGradeFloor')
         # Worker-only judgment: a director's own team-health review must never
         # grade another director (or the admin), matching who_needs_review.
         for worker_id in _sim_direct_reports(state, director_id):
@@ -10348,13 +10480,13 @@ def _team_health_review(state, team_ids, now_ms):
             if not wdef or wdef.get('isDirector') or wdef.get('isAdmin'):
                 continue
             grade = _agent_trailing_grade(state, worker_id)
-            if grade is None or grade >= DELIVERABLE_GRADE_FLOOR:
+            if grade is None or grade >= _floor:
                 continue
             _write_growth_plan(
                 state, worker_id, team.get('room') or 'pressoffice',
                 'team_health', now_ms,
                 f"Sprint close team-health review: trailing grade {grade}/10 is "
-                f"below the {DELIVERABLE_GRADE_FLOOR:.0f} delivery floor. Focus this "
+                f"below the {_floor:.0f} delivery floor. Focus this "
                 f"sprint's work on meeting the spec and room standards end-to-end.",
                 repeat=True)
             reviewed += 1
@@ -10398,9 +10530,12 @@ def _grade_completed_task(state, agent_id, task, now_ms):
         'lastReviewed': datetime.datetime.utcnow().isoformat() + 'Z',
         'source': 'refinement' if (task.get('instructions') or '').find('backlog refinement') >= 0 else 'other',
     })
-    if grade < DELIVERABLE_GRADE_FLOOR:
+    _tref = task.get('teamId') or agent_team_ref(state, agent_id)
+    _floor = team_policy(state, _tref, 'deliverableGradeFloor')
+    _success = team_policy(state, _tref, 'successGradeFloor')
+    if grade < _floor:
         _coach_low_grade(state, agent_id, room, grade, now_ms, title, task=task)
-    elif grade >= SUCCESS_GRADE_FLOOR:
+    elif grade >= _success:
         # Positive learning loop (ChatDev ECL): a deliverable graded at/above
         # the success floor is the raw material for the weekly success-mining
         # pass -- "what made this good" should propagate, not just "what went
@@ -10426,8 +10561,11 @@ def _coach_low_grade(state, agent_id, room, grade, now_ms, title, task=None):
     them -- agents reported 0.0-grade coaching that said "meet the spec" but
     never stated what the spec was, leaving nothing to act on."""
     plans = state.setdefault('growthPlans', {}).setdefault(agent_id, [])
+    _tref = agent_team_ref(state, agent_id)
+    _maxr = team_policy(state, _tref, 'coachingMaxRounds')
+    _floor = team_policy(state, _tref, 'deliverableGradeFloor')
     rounds = sum(1 for p in plans if p.get('kind') == 'low_grade')
-    if rounds >= COACHING_MAX_ROUNDS:
+    if rounds >= _maxr:
         _escalate_coaching_loop(state, agent_id, room, grade, now_ms, title)
         return
     spec_bits = []
@@ -10440,8 +10578,8 @@ def _coach_low_grade(state, agent_id, room, grade, now_ms, title, task=None):
     _write_growth_plan(
         state, agent_id, room, 'low_grade', now_ms,
         f"Deliverable '{title}' in {room} graded {grade}/10 (below the "
-        f"{DELIVERABLE_GRADE_FLOOR:.0f} floor). Coaching round {rounds + 1} of "
-        f"{COACHING_MAX_ROUNDS}: you've been coached on this before and the grade "
+        f"{_floor:.0f} floor). Coaching round {rounds + 1} of "
+        f"{_maxr}: you've been coached on this before and the grade "
         f"hasn't recovered -- meet the spec and room standards end-to-end this time."
         f"{spec_block}",
         repeat=True)
@@ -10469,14 +10607,17 @@ def _escalate_coaching_loop(state, agent_id, room, grade, now_ms, title):
         filer = _escalation_scrum_master_for(state, team.get('directorId') or team.get('id'))
         if not filer:
             filer = team.get('directorId') or team.get('id')
+    _tref = (team.get('directorId') or team.get('id')) if team else director_id
+    _floor = team_policy(state, _tref, 'deliverableGradeFloor')
+    _maxr = team_policy(state, _tref, 'coachingMaxRounds')
     routed = False
     if filer:
         routed = bool(file_work_request(
             state, filer,
             (f'Help: {agent_id} keeps closing below the delivery floor')[:120],
             room,
-            reason=(f'{agent_id} has closed below the {DELIVERABLE_GRADE_FLOOR:.0f} floor '
-                    f'{COACHING_MAX_ROUNDS}+ times (latest: {title}, {grade}/10). Coaching is '
+            reason=(f'{agent_id} has closed below the {_floor:.0f} floor '
+                    f'{_maxr}+ times (latest: {title}, {grade}/10). Coaching is '
                     f'not working; the scrum master decides whether to help, re-plan, or reassign.')))
     _log_governance(state, 'admin', 'coaching_loop_escalated',
                     {'agent': agent_id, 'title': (title or '')[:120], 'room': room,
@@ -10931,7 +11072,7 @@ def _start_escalation(state, product_id, director_id, title, source, now_ms):
     # Cap concurrent escalations per owning team before opening a new one.
     open_count = len([p for p in (state.get('_escalatedProducts') or {}).values()
                       if p.get('directorId') == director_id and p.get('resolved') is not True])
-    if open_count >= ESCALATION_MAX_OPEN:
+    if open_count >= team_policy(state, director_id, 'escalationMaxOpen'):
         return None
     state['_pendingEscalation'] = {
         'at': now_ms, 'embarked': False, 'scrumMasterId': sm,
@@ -11506,12 +11647,13 @@ def _stale_work_step(state, now, now_ms):
         opened = task.get('openedAt') or task.get('assignedAt') or task.get('createdAt')
         if opened is None:
             continue
+        _sref = task.get('teamId') or agent_team_ref(state, task.get('assignedTo'))
         if task.get('status') == 'walking':
-            if now_ms - opened < STALE_WORK_TIMEOUT_MS:
+            if now_ms - opened < team_policy(state, _sref, 'staleWorkTimeoutMs'):
                 continue
         else:  # 'working'
             work_until = task.get('workUntil') or 0
-            if now <= work_until + STALE_WORK_BUDGET_GRACE_S:
+            if now <= work_until + team_policy(state, _sref, 'staleWorkBudgetGraceS'):
                 continue
         # Genuinely wedged non-bug in-flight card. Release any holder so the
         # worker is never pinned by a task that will no longer resolve.
@@ -11647,7 +11789,8 @@ def _worker_stuck_help_signal(state, agent_id, task, result_ok, now_ms):
         return
     streak = a.get('_contentFailStreak', 0) + 1
     a['_contentFailStreak'] = streak
-    if streak < WORKER_HELP_AFTER_FAILS:
+    if streak < team_policy(state, task.get('teamId') or agent_team_ref(state, agent_id),
+                            'workerHelpAfterFails'):
         return
     a['_contentFailStreak'] = 0  # re-arm only after a fresh clean result
     routed = _sm_help_stuck_worker(state, task, now_ms)
@@ -11680,7 +11823,9 @@ def _coaching_loop_step(state, now_ms):
         if not any(p.get('kind') in ('low_grade', 'team_health') for p in agent_plans):
             continue
         grade = _agent_trailing_grade(state, agent_id)
-        if grade is None or grade >= DELIVERABLE_GRADE_FLOOR:
+        if (grade is None
+                or grade >= team_policy(state, agent_team_ref(state, agent_id),
+                                        'deliverableGradeFloor')):
             continue
         a = (state.get('agents') or {}).get(agent_id) or {}
         room = (a.get('room') or 'pressoffice') if isinstance(a.get('room'), str) else 'pressoffice'
@@ -12169,7 +12314,10 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
             # the failure mode that hid a 21k-attempt wedge for 38 hours.
             _is_player_card = (pick.get('assignedTo') or '') == 'player'
             _strictly_staffed = bool(pick.get('reviewOf') or pick.get('sprintId'))
-            _cap = WORK_ITEM_STALL_CEILING if _strictly_staffed else WORK_ITEM_MAX_ATTEMPTS
+            _pick_ref = pick.get('teamId') or _task_owner_director(state, pick)
+            _cap = (team_policy(state, _pick_ref, 'workItemStallCeiling')
+                    if _strictly_staffed
+                    else team_policy(state, _pick_ref, 'workItemMaxAttempts'))
             if _is_player_card or pick['attempts'] < _cap:
                 work_queue.append(pick)
             else:
@@ -12384,9 +12532,15 @@ def _sprint_worker_pool(state, sprint_id, worker_count=None):
     record = (state.get('sprints') or {}).get(sprint_id)
     if not record:
         return []
+    # Headcount cap: the LARGEST maxTeamMembers among the sprint's teams (a
+    # multi-team sprint can staff up to the biggest team's agreement); empty
+    # teamIds falls back to the owner's team, then the operator value.
+    _cap = (max([team_policy(state, t, 'maxTeamMembers')
+                 for t in (record.get('teamIds') or [])], default=0)
+            or team_policy(state, record.get('ownerId'), 'maxTeamMembers'))
     if worker_count is None:
-        worker_count = int(record.get('workerCount') or MAX_TEAM_MEMBERS)
-    worker_count = max(1, min(MAX_TEAM_MEMBERS, worker_count))
+        worker_count = int(record.get('workerCount') or _cap)
+    worker_count = max(1, min(_cap, worker_count))
     # Team ids on a sprint record may be keyed by the team's `id` OR its
     # director's id (the two keyings team records use) -- resolve each to a
     # director id so _sim_direct_reports can list its members.
@@ -12400,7 +12554,10 @@ def _sprint_worker_pool(state, sprint_id, worker_count=None):
     # never the dedicated facilitator -- she runs ceremonies, not cards. A
     # sprint at/above the floor counts the scrum master as a working member.
     excluded = set()
-    if worker_count < SCRUM_MASTER_MIN_TEAM_SIZE:
+    _sm_floor = (max([team_policy(state, t, 'scrumMasterMinTeamSize')
+                      for t in (record.get('teamIds') or [])], default=0)
+                 or team_policy(state, record.get('ownerId'), 'scrumMasterMinTeamSize'))
+    if worker_count < _sm_floor:
         for d in directors:
             t = next((x for x in (state.get('teams') or []) if x.get('directorId') == d), None)
             if t and t.get('scrumMasterId'):
@@ -12438,9 +12595,12 @@ def _sprint_staffing_step(state, now_ms=None):
     for sid, record in sprints.items():
         if record.get('status') != 'active':
             continue
-        wc = int(record.get('workerCount') or MAX_TEAM_MEMBERS)
-        if wc >= MAX_TEAM_MEMBERS:
-            continue  # already at the six-worker cap -- nothing to add
+        _cap = (max([team_policy(state, t, 'maxTeamMembers')
+                     for t in (record.get('teamIds') or [])], default=0)
+                or team_policy(state, record.get('ownerId'), 'maxTeamMembers'))
+        wc = int(record.get('workerCount') or _cap)
+        if wc >= _cap:
+            continue  # already at the team's cap -- nothing to add
         # Can the pool actually grow? The next count must name a real member
         # beyond the current pool (a team with only 3 members can't staff 6).
         next_pool = _sprint_worker_pool(state, sid, wc + 1)
