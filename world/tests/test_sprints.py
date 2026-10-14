@@ -283,9 +283,10 @@ class ScrumMasterCondition(unittest.TestCase):
 
 
 @unittest.mock.patch('sim._free_outdoor_spot', return_value={'x': 5, 'y': 5})
-class TeamSizeCap(unittest.TestCase):
-    """Team may not exceed MAX_TEAM_MEMBERS (6) members, excluding the scrum
-    master -- the cap is enforced on the DERIVED team membership at hire time."""
+class PerSprintStaffingCap(unittest.TestCase):
+    """MAX_TEAM_MEMBERS (6) caps per-SPRINT staffing, not lifetime team size.
+    Directors may hire unlimited workers; only a single sprint is limited to
+    6 staffed workers (scrum master excluded)."""
 
     def _cap_state(self, report_count, scrum_id='scrum'):
         """A roster where faye directs `report_count` workers (one of them the
@@ -313,17 +314,21 @@ class TeamSizeCap(unittest.TestCase):
     def test_count_excludes_scrum_master(self, _spot):
         state = self._cap_state(7, scrum_id='w0')  # 7 reports, 1 is scrum -> 6 non-scrum
         self.assertEqual(sim._team_member_count(state, 'faye'), 6)
+        # _team_under_cap is a pure utility (per-sprint capacity check), not a
+        # hiring gate -- it returns False past 6 but no longer blocks hiring.
         self.assertTrue(sim._team_under_cap(state, 'faye'))  # at 6 = OK
-        self.assertFalse(sim._team_under_cap(state, 'faye', extra=1))  # 7th blocked
+        self.assertFalse(sim._team_under_cap(state, 'faye', extra=1))  # past 6 = False
 
-    def test_start_auto_hire_refuses_at_cap(self, _spot):
-        state = self._cap_state(7, scrum_id='w0')  # exactly at the 6 non-scrum cap
+    def test_hire_allowed_at_old_cap(self, _spot):
+        state = self._cap_state(7, scrum_id='w0')  # exactly at the old 6 non-scrum cap
         now_ms = 1_000_000
-        # A free director with members + workload normally triggers a hire; the
-        # cap must prevent it before a _pendingHire is even set.
-        started = sim._start_auto_hire(state, now_ms, None, None)
-        self.assertFalse(started)
-        self.assertNotIn('_pendingHire', state)
+        # The lifetime team-size cap is lifted: a team already at 6 non-scrum
+        # members may still hire (only per-sprint staffing is capped at 6).
+        def decider(_s, _prompt, candidates):
+            return candidates[0]['id']
+        started = sim._start_auto_hire(state, now_ms, None, decider)
+        self.assertTrue(started)
+        self.assertIn('_pendingHire', state)
 
     def test_start_hire_works_under_cap(self, _spot):
         state = self._cap_state(6, scrum_id='w0')  # 5 non-scrum -> one slot free

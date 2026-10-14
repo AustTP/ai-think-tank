@@ -1362,9 +1362,10 @@ TIER_THROTTLE_RATIO = 0.7
 GOOD_VALUE_RATIO = 1.3
 MAX_ACTIVE_AGENTS = 25  # hiring.js:41
 MAX_TOTAL_AGENTS = 500  # hiring.js:40 -- total inventory cap, vs MAX_ACTIVE_AGENTS
-# Per-team headcount cap: a team may not exceed 6
-# members, NOT counting the scrum master. Team membership is DERIVED from the
-# `director` graph (see _derive_team_members), so this checks that derived set.
+# Per-SPRINT staffing cap: at most 6 workers may staff one sprint
+# (scrum master excluded). This is NOT a lifetime team-size limit -- a director
+# may hire unlimited workers over time; only a single sprint is capped at 6.
+# See _sprint_worker_pool / _sprint_staffing_step for enforcement.
 MAX_TEAM_MEMBERS = 6
 # Scrum-master scaling: a scrum master is a standing
 # facilitator a small team doesn't need yet -- only once a team reaches this
@@ -1394,7 +1395,10 @@ def _team_member_count(state, director_id):
 
 def _team_under_cap(state, director_id, extra=0):
     """True if adding `extra` more members keeps the team at or under the
-    MAX_TEAM_MEMBERS cap (scrum master excluded)."""
+    MAX_TEAM_MEMBERS cap (scrum master excluded). NOTE: this is now only used
+    to check per-SPRINT staffing capacity, NOT to gate hiring -- directors may
+    hire unlimited workers; MAX_TEAM_MEMBERS only limits how many staff a
+    single sprint (see _sprint_worker_pool)."""
     return _team_member_count(state, director_id) + extra <= MAX_TEAM_MEMBERS
 SKILL_REVIEW_CADENCE_MS = 30 * 60 * 1000
 
@@ -6307,10 +6311,12 @@ def _dormant_workers_will_be_woken(state, now_ms):
 def _start_auto_hire(state, now_ms, grid, decider):
     """hiring.js attemptAutoHire, team-scoped: each TEAM DIRECTOR hires for
     their own team (not one global admin hiring anyone). If a director is free
-    + under cap + someone on THEIR team needs help, busy that director at
+    + someone on THEIR team needs help, busy that director at
     Command Center and defer the actual agent creation HIRE_DURATION_MS via a
     durable `_pendingHire` record the next pass completes. Returns True if a
-    hire started."""
+    hire started. NOTE: there is no per-team lifetime size cap -- a director
+    may hire unlimited workers; MAX_TEAM_MEMBERS only limits how many staff a
+    single sprint (see _sprint_worker_pool)."""
     roster = state.get('agentRoster') or []
     if len(roster) >= MAX_TOTAL_AGENTS:
         state['_hireBlockedAtCapNote'] = len(roster)
@@ -6353,11 +6359,6 @@ def _start_auto_hire(state, now_ms, grid, decider):
         members = [m for m in _sim_direct_reports(state, did)
                    if agents.get(m)]
         if not members:
-            continue
-        # Team-size cap: a team may not grow past 6 members
-        # (scrum master excluded). A hire will add one worker, so the check must
-        # account for that extra member -- a team already at 6 cannot hire.
-        if not _team_under_cap(state, did, extra=1):
             continue
         pool_by_director[did] = _team_member_candidates(state, did, members, now_ms)
 
@@ -6465,12 +6466,6 @@ def _complete_auto_hire(state, pending, grid, now_ms):
     # drop the pending record so the next pass stages a fresh (different) hire
     # instead of retrying the same forbidden one forever.
     if _is_fired(state, new_id, name):
-        state.pop('_pendingHire', None)
-        return None
-    # Defensive re-check: a director's team may have grown to cap between the
-    # hire's approval and this completion pass; never blow past the cap. The
-    # hire itself adds one member, so the check accounts for that extra.
-    if not _team_under_cap(state, director_id, extra=1):
         state.pop('_pendingHire', None)
         return None
     roster.append({
