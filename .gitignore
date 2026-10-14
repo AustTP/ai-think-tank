@@ -79,6 +79,9 @@ library/wiki/
 library/social/
 library/pending_review/
 library/refinement/
+# Player-ingested reference material (/api/library/ingest) -- runtime content
+# like the other library dirs above, never tracked.
+library/ingested/
 # Endpoint-extracted YouTube transcripts land in the shared media/transcripts/
 # tree at runtime (readable by any agent via /api/library/file) -- generated
 # content, like the other runtime dirs above, never tracked.
@@ -86,6 +89,11 @@ library/media/transcripts/
 world/library/media/transcripts/
 sandboxes/spike-task-*/
 sandboxes/sb-*/
+# Per-deliverable-story git worktrees off workroom-shared -- runtime state
+# like spike-task-*, never tracked (both main-village story-<id> and the
+# village-scoped <vid>-story-<id> forms).
+sandboxes/story-*/
+sandboxes/*-story-*/
 # browser_act / HF login test sandboxes -- contain persistent browser
 # profiles with live session cookies, never tracked.
 sandboxes/hf-*/
