@@ -2709,10 +2709,9 @@ def _plain_completion(model, messages, max_tokens, service='spike', task_id=None
 
 
 def _parse_reflection(text):
-    """Parse a reflection self-check's JSON reply, ported (structure, not
-    code) from the user's own framework's ReflectionEngine.parse_
-    reflection -- same shape: tolerate a bare JSON object or one embedded in
-    surrounding prose, fall back to a safe default on anything else.
+    """Parse a reflection self-check's JSON reply -- same shape: tolerate
+    a bare JSON object or one embedded in surrounding prose, fall back
+    to a safe default on anything else.
     Confidence defaults to 1.0 (not 0.0 or 0.5) on parse failure -- a
     reflection call that itself failed is not evidence the investigation is
     going badly, and shouldn't inject a confusing nudge on top of a shaky
@@ -2924,8 +2923,7 @@ def _extract_execute_script_outputs(transcript):
     return outputs
 
 
-# Reflection/replan, ported (design, not code) from the user's
-# own framework's react_engine.py ReflectionEngine -- a real gap: the
+# Reflection/replan -- a real gap: the
 # EXECUTE tool loop ran as ONE flat call for its whole iteration budget,
 # with no mid-run check on whether it was actually still on track. This
 # chunks the SAME total iteration budget into rounds, with a cheap
@@ -5081,8 +5079,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     if _serve._google_is_configured():
         system += _GOOGLE_QUOTA_AWARENESS_BLOCK
     messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': 'Go ahead.'}]
-    # One-strike-per-tool (ported from the user's own framework's
-    # ReflectionEngine): a shared set across BOTH sub-executors, so a policy
+    # One-strike-per-tool: a shared set across BOTH sub-executors, so a policy
     # denial on either browse_page or execute_script is remembered and the
     # SAME tool is refused (no network call at all) if the model tries it
     # again this investigation -- it can still try a genuinely different tool.
