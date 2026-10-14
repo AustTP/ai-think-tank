@@ -343,6 +343,7 @@ _ENV_RELOAD_FIELDS = {
     'HF_TOKEN': lambda e: e.get('HF_TOKEN'),
     'SPEND_CAP_USD': lambda e: float(e.get('SPEND_CAP_USD', '50') or 0),
     'AGENT_SPEND_CAP_USD': lambda e: float(e.get('AGENT_SPEND_CAP_USD', '0') or 0),
+    'OPENROUTER_MONTHLY_BUDGET_USD': lambda e: float(e.get('OPENROUTER_MONTHLY_BUDGET_USD', '0') or 0),
     'PAGE_REQUEST_MONTHLY_BUDGET': lambda e: int(e.get('PAGE_REQUEST_MONTHLY_BUDGET', '1000') or 1000),
     'HIGH_TIER_MONTHLY_BUDGET_USD': lambda e: float(e.get('HIGH_TIER_MONTHLY_BUDGET_USD', '0') or 0),
     'HIGH_TIER_MAX_PRICE_USD': lambda e: float(e.get('HIGH_TIER_MAX_PRICE_USD', '0') or 0),
@@ -4306,6 +4307,20 @@ async def _health_check_loop():
         await asyncio.sleep(HEALTH_CHECK_INTERVAL_S)
 
 
+async def _openrouter_credits_probe_loop():
+    """Keeps the live OpenRouter account-credits cache warm (bank's
+    _openrouter_account_credits, 300s TTL, fails closed to None) so the health
+    snapshot can read the cache WITHOUT making a network call itself -- the
+    snapshot stays free of network I/O, and this loop owns the one paid-free
+    GET per interval. No key set = a cheap no-op every interval."""
+    while True:
+        try:
+            await asyncio.to_thread(_openrouter_account_credits)
+        except Exception as e:
+            print(f'[credits-probe] loop error: {e}', flush=True)
+        await asyncio.sleep(OPENROUTER_CREDITS_CACHE_TTL_S)
+
+
 def _telegram_api_sync(method, params=None, timeout=30):
     """Real, direct call to Telegram's Bot API -- not a self-loopback, so no
     asyncio.to_thread deadlock risk here (that class of bug only applies to
@@ -5309,6 +5324,7 @@ async def _lifespan(app):
         except Exception as e:
             print(f'[{_label}] registry load failed: {e}', flush=True)
     health_task = asyncio.create_task(_health_check_loop())
+    credits_probe_task = asyncio.create_task(_openrouter_credits_probe_loop())
     director_task = asyncio.create_task(_director_approval_loop())
     backup_task = asyncio.create_task(_backup_loop())
     prune_task = asyncio.create_task(_log_prune_loop())
@@ -5351,6 +5367,7 @@ async def _lifespan(app):
         print(f'[sim] failed to start loop: {e}', flush=True)
     yield
     health_task.cancel()
+    credits_probe_task.cancel()
     director_task.cancel()
     backup_task.cancel()
     calibration_task.cancel()
@@ -6252,6 +6269,31 @@ SPEND_CAP_USD = float(_load_env().get('SPEND_CAP_USD', '50') or 0)
 # service quota) for every other agent in one session. Default 0 = disabled
 # (keep the existing single shared ceiling unless a per-agent cap is wanted).
 AGENT_SPEND_CAP_USD = float(_load_env().get('AGENT_SPEND_CAP_USD', '0') or 0)
+
+# OpenRouter funding model, split in two so the numbers mean what the
+# operator actually said:
+#
+#   * LIVE ACCOUNT FUNDS -- the real dollars sitting in the OpenRouter
+#     account right now, read from the /api/v1/credits probe (account-wide
+#     total_credits purchased minus total_usage spent). The percentage
+#     ALERTS fire on THIS: warn when >= 80% of the deposited funds have been
+#     spent, critical at >= 90%. E.g. deposit $10, spend $8 -> warn (80%
+#     used); spend $9 -> critical (90% used). No deposit -> no divide, no
+#     alert from this path.
+#
+#   * MONTHLY PLAN -- the operator's expected total funding for the month
+#     (may be topped up gradually, not one lump sum). Purely planning
+#     CONTEXT for the /api/budget gauge and the admin health view: "only
+#     $10 is in the account right now, but I expect to add $50 this month."
+#     It is NOT the alert denominator and NOT an enforced cap. 0/unset just
+#     means the gauge skips the plan line.
+OPENROUTER_MONTHLY_BUDGET_USD = float(_load_env().get('OPENROUTER_MONTHLY_BUDGET_USD', '0') or 0)
+# Fixed alert thresholds as fractions of the LIVE account funds (remaining /
+# totalCredits). Named constants (not env knobs) so the 20%/10% shape the
+# operator asked for is one obvious place and tests can pin the exact
+# thresholds.
+OPENROUTER_CREDITS_WARN_PCT = 0.20   # remaining <= 20% of live funds -> warning push
+OPENROUTER_CREDITS_CRIT_PCT = 0.10   # remaining <= 10% of live funds -> critical push
 
 # Page-request budget: the think tank has a MONTHLY allowance of
 # EXTERNAL page requests -- each browse_page fetch (/api/browse) and each
@@ -21300,6 +21342,7 @@ async def policy_reload(request: Request):
 _BUDGET_KNOBS = {
     'SPEND_CAP_USD': ('usd', 'Monthly total model/API spend cap (0 = unlimited).'),
     'AGENT_SPEND_CAP_USD': ('usd', 'Per-agent monthly spend ceiling (0 = disabled).'),
+    'OPENROUTER_MONTHLY_BUDGET_USD': ('usd', 'Expected total OpenRouter funding for the month (planning context for the gauge, not an alert trigger).'),
     'HIGH_TIER_MONTHLY_BUDGET_USD': ('usd', 'High-tier monthly spend budget (0 = unlimited).'),
     'APIFY_MONTHLY_BUDGET_USD': ('usd', 'Apify monthly spend budget (0 = disables the budget row).'),
     'COLAB_MONTHLY_UNITS': ('usd', 'Colab monthly compute-unit budget (0 = unlimited).'),
@@ -21413,7 +21456,29 @@ async def budget_view(request: Request):
             'description': desc,
             'usage': usage.get(name),
         }
-    return JSONResponse({'ok': True, 'knobs': knobs})
+    # OpenRouter funding gauge: the live account funds (from the warmed cache,
+    # no network call here) beside the monthly plan, so the operator can see
+    # "only $10 deposited right now, expecting to add $50 this month" in one
+    # place. used_pct is against the live deposit, matching the alert math.
+    credits = _OPENROUTER_CREDITS_CACHE['data']
+    openrouter = {
+        'monthly_budget_usd': OPENROUTER_MONTHLY_BUDGET_USD,
+        'warn_pct_remaining': OPENROUTER_CREDITS_WARN_PCT,
+        'crit_pct_remaining': OPENROUTER_CREDITS_CRIT_PCT,
+        'api_key_set': bool(OPENROUTER_API_KEY),
+        'credits': credits,
+        'credits_age_s': (
+            (time.time() - _OPENROUTER_CREDITS_CACHE['at'])
+            if _OPENROUTER_CREDITS_CACHE['at'] else None),
+    }
+    if credits and (credits.get('totalCredits') or 0) > 0:
+        total = float(credits.get('totalCredits') or 0)
+        used = float(credits.get('totalUsage') or 0)
+        openrouter['deposited_usd'] = round(total, 4)
+        openrouter['spent_usd'] = round(used, 4)
+        openrouter['remaining_usd'] = round(max(0.0, total - used), 4)
+        openrouter['used_pct'] = round(used / total, 4)
+    return JSONResponse({'ok': True, 'knobs': knobs, 'openrouter': openrouter})
 
 
 @app.post('/api/budget')
@@ -26541,6 +26606,40 @@ def _health_alerts_for_signals(signals):
               f'${signals.get("bank_used", 0.0):.2f} of ${signals.get("bank_cap", 0.0):.2f} '
               f'cumulative; directors should reallocate or raise a cap')
 
+    # OpenRouter live account funds: the LIVE account-wide balance from the
+    # /api/v1/credits probe (account-wide total_credits purchased minus
+    # total_usage spent), distinct from the think tank's own spend ledger
+    # above. The percentage alerts fire on THIS deposit, not on the monthly
+    # plan -- e.g. $10 deposited and $8 spent is 80% used (warning); $9 spent
+    # is 90% (critical). No deposit (totalCredits <= 0) skips the math so a
+    # never-funded account doesn't divide by zero or cry wolf. The monthly
+    # plan ($50 expected) is separate gauge context, not this denominator.
+    credits = signals.get('openrouter_credits')
+    if credits and (credits.get('totalCredits') or 0) > 0:
+        total = float(credits.get('totalCredits') or 0)
+        used = float(credits.get('totalUsage') or 0)
+        remaining = max(0.0, total - used)
+        used_pct = used / total
+        spent_msg = (f'${used:.2f} of the ${total:.2f} deposited ({used_pct:.0%} used), '
+                     f'${remaining:.2f} remaining')
+        if used_pct >= 1 - OPENROUTER_CREDITS_CRIT_PCT:
+            alert('budget', 'critical',
+                  f'OpenRouter has spent {used_pct:.0%} of deposited funds -- {spent_msg}. '
+                  f'Top up now or model calls will fail closed')
+        elif used_pct >= 1 - OPENROUTER_CREDITS_WARN_PCT:
+            alert('budget', 'warning',
+                  f'OpenRouter has spent {used_pct:.0%} of deposited funds -- {spent_msg}. '
+                  f'Top up soon or model calls will fail closed')
+    elif not credits and signals.get('openrouter_api_key_set'):
+        # Key is set but the probe yielded nothing (network failure or a
+        # revoked key the auth tracker hasn't seen yet). Info severity +
+        # the 1h (category, severity) dedup window keeps a flaky network
+        # from becoming a push-spam source; a dead key also trips the
+        # api_keys auth-streak alert once real calls start 401/403-ing.
+        alert('budget', 'info',
+              'OpenRouter credits probe unavailable (network error or invalid key) -- '
+              'account balance gauge is empty until the next successful probe')
+
     return alerts
 
 
@@ -26930,6 +27029,20 @@ def compute_health_snapshot():
         # 401/403 (in-process tracker, not a DB read). Cleared the instant a
         # call succeeds again or the operator hits /api/env/reload.
         'api_key_auth_failures': _api_key_auth_failures_snapshot(),
+        # OpenRouter account credits: live purchased-minus-spent from the
+        # /api/v1/credits probe (bank cache, warmed by
+        # _openrouter_credits_probe_loop -- no network call here, the
+        # snapshot stays I/O-free). None = no key set or last probe failed;
+        # age_s lets the admin tell a cold probe from a live one. The monthly
+        # plan is separate planning context ("expect to add $50 this month"),
+        # NOT the alert denominator -- the percentage alerts key off the live
+        # totalCredits deposit instead.
+        'openrouter_credits': _OPENROUTER_CREDITS_CACHE['data'],
+        'openrouter_credits_age_s': (
+            (now - _OPENROUTER_CREDITS_CACHE['at'])
+            if _OPENROUTER_CREDITS_CACHE['at'] else None),
+        'openrouter_monthly_budget_usd': OPENROUTER_MONTHLY_BUDGET_USD,
+        'openrouter_api_key_set': bool(OPENROUTER_API_KEY),
     }
     return {'checked_at': now, 'db_ok': True, 'alerts': _health_alerts_for_signals(signals), **signals}
 
