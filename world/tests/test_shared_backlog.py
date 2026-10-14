@@ -346,6 +346,39 @@ class Retrospective(unittest.TestCase):
         sim._retro_step(state, 1000.0, 2_000_000, decider=_stub_retro())
         self.assertEqual(state['retrospectives']['spr-1']['start'], ['Ship smaller slices'])
 
+    def test_retro_resolve_queues_feedback_push(self):
+        state = self._closed_state()
+        sim._retro_step(state, 1000.0, 1_000_001, decider=_stub_retro())
+        sim._retro_step(state, 1000.0, 1_000_001 + sim.RETRO_MEET_MS + 1,
+                        decider=_stub_retro())
+        pushes = [e for e in state['emailOutbox']
+                  if e['kind'] == 'sprint_retro:spr-1']
+        self.assertEqual(len(pushes), 1)
+        # The team's START/STOP/CONTINUE feedback, verbatim.
+        self.assertIn('Retrospective for sprint "Launch"', pushes[0]['body'])
+        self.assertIn('START:', pushes[0]['body'])
+        self.assertIn('Ship smaller slices', pushes[0]['body'])
+        self.assertIn('STOP:', pushes[0]['body'])
+        self.assertIn('Review late in the cycle', pushes[0]['body'])
+        self.assertIn('CONTINUE:', pushes[0]['body'])
+        self.assertIn('Peer approvals', pushes[0]['body'])
+        self.assertIn('Landed: Land a launch page', pushes[0]['body'])
+        # The retro is a message the player wants on every channel.
+        self.assertNotIn('channels', pushes[0])
+        self.assertIn('[AI Think Tank] Sprint retrospective: Launch',
+                      pushes[0]['subject'])
+
+    def test_retro_resolve_with_empty_feedback_is_still_honest(self):
+        state = self._closed_state()
+        sim._retro_step(state, 1000.0, 1_000_001,
+                        decider=lambda *a: {})
+        sim._retro_step(state, 1000.0, 1_000_001 + sim.RETRO_MEET_MS + 1,
+                        decider=lambda *a: {})
+        pushes = [e for e in state['emailOutbox']
+                  if e['kind'] == 'sprint_retro:spr-1']
+        self.assertEqual(len(pushes), 1)
+        self.assertIn('(no feedback captured)', pushes[0]['body'])
+
     def test_retro_uses_own_director_then_borrows_when_no_sm(self):
         state = _seed()
         del state['teams'][1]['scrumMasterId']  # dev's crew has no real scrum master

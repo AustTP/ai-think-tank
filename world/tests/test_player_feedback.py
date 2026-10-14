@@ -1,7 +1,9 @@
 """Coverage for the player's work feedback: /api/player-inbox/{id}/feedback.
 
 The player can rate and comment ONLY on completed work the think tank shared
-with them (card_report inbox messages, see sim._deliver_card_report) -- never
+with them. The sim no longer creates card_report inbox messages (closed cards
+are silent; the sprint retro is the close signal), so these tests fabricate
+such messages directly to keep covering the endpoint's contract -- never
 on chat replies or pending questions. The feedback is stamped onto the inbox
 message and pushed into the completing agent's feedback buffer via
 sim._append_feedback, so the agent carries it into its next task.
@@ -187,15 +189,13 @@ class WorkFeedback(unittest.TestCase):
         self.assertEqual(m["feedback"]["comment"], "fixed it")
         self.assertEqual(len(state["_feedback"]["agent-1"]), 2)
 
-    def test_card_report_carries_agent_id(self):
+    def test_card_close_no_longer_reaches_the_inbox(self):
         state = _roster_state()
         task = {"id": "task-9", "assignedTo": "agent-1", "title": "Deploy release",
                 "taskType": "task", "note": "done", "userStory": "ship it"}
         sim._deliver_card_report(state, task, "completed")
-        card = state["playerInbox"][0]
-        self.assertEqual(card["kind"], "card_report")
-        self.assertEqual(card["agentId"], "agent-1")
-        self.assertEqual(card["taskId"], "task-9")
+        # Closed cards are silent on every channel: the retro is the signal.
+        self.assertEqual(state["playerInbox"], [])
 
 
 if __name__ == "__main__":

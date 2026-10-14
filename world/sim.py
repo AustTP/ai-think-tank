@@ -4626,10 +4626,9 @@ def finish_task(state, agent_id, grid=None):
     log_action(agent_id, 'task_completed', {'taskId': task['id'] if task else None,
                                             'title': task['title'] if task else None},
                authorized=True)
-    # The player's copy of the closed card's complete report -- fires once per
-    # card, for every non-internal card kind (stories, spikes, bugs, tasks).
-    # _deliver_card_report itself filters review/fix subtasks, shadow cards,
-    # and player-assigned cards.
+    # Card close reports no longer reach the player on any
+    # channel -- the sprint retro is the player's close signal.
+    # The call keeps its once-per-card idempotency flag.
     _deliver_card_report(state, task, 'completed')
 
 
@@ -6303,12 +6302,12 @@ def _close_gated_story(state, parent):
                     'approvers': review_counts.get('approvers', [])}, authorized=True)
     except Exception:
         pass
-    # Entering review deliberately stays quiet
-    # (peer review is agent-to-agent) but a story
-    # actually SHIPPING is exactly the "you'll want to know this" moment the
-    # player was asking about -- called directly (not via the notifyPlayer
-    # indirection content executors need) since this already runs inside the
-    # tick's real read-modify-write with live, mutable `state` in hand.
+    # Entering review deliberately stays quiet (peer review is
+    # agent-to-agent), and a story SHIPPING is quiet too now -- the
+    # player's close signal is the sprint retro. Called directly
+    # (not via the notifyPlayer indirection content executors need)
+    # since this already runs inside the tick's real read-modify-write
+    # with live, mutable `state` in hand.
     _deliver_card_report(state, parent, 'peer_approved',
                          approvals=review_counts.get('approvals', 0))
     return True
@@ -8226,10 +8225,13 @@ def _player_ask_decider_default(state, issue_key, director_id, question, context
 _EMAIL_DEDUP_MS = 30_000
 
 
-def _queue_player_email(state, kind, subject, body_text, now_ms=None):
+def _queue_player_email(state, kind, subject, body_text, now_ms=None,
+                        channels=None):
     """Queue a one-way player notification for the serve loop to email out.
     Pure mutation of state['emailOutbox']. Skips a duplicate of the same `kind`
-    within _EMAIL_DEDUP_MS of the last one. Returns the outbox entry or None."""
+    within _EMAIL_DEDUP_MS of the last one. `channels` optionally restricts
+    delivery (['email'] keeps a chatty kind off Telegram); the default is both
+    channels. Returns the outbox entry or None."""
     now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
     outbox = state.setdefault('emailOutbox', [])
     last = state.get('_lastEmailAt') or {}
@@ -8239,78 +8241,31 @@ def _queue_player_email(state, kind, subject, body_text, now_ms=None):
     state['_lastEmailAt'] = last
     entry = {'kind': kind, 'subject': subject, 'body': body_text,
              'queuedAt': now_ms}
+    if channels is not None:
+        entry['channels'] = list(channels)
     outbox.append(entry)
     return entry
 
 
-_CARD_TYPE_LABELS = {
-    'story': 'STORY', 'spike': 'SPIKE', 'bug': 'BUG', 'task': 'TASK',
-    'code': 'STORY', 'review': 'REVIEW', 'qa': 'QA', 'research': 'RESEARCH',
-}
-
-
 def _deliver_card_report(state, task, close_reason, approvals=0):
-    """Give the PLAYER the complete report of a closed work card -- exactly
-    once per card, for every card kind (story/spike/bug/task). Both the
-    peer-gated story close (_close_gated_story) and the universal close
-    (finish_task) call this; the task's `_reportDelivered` flag makes it
-    idempotent. Agent-to-agent internals never fire it: a review/fix subtask
-    (reviewOf) reports through its PARENT, a shadow (dry-run) card ships
-    nothing, and a player-assigned card was the player's own hands.
-
-    The report is the full card: the type, issue key/project/room, the user
-    story, the acceptance criteria, the NEVER constraints, the peer approval
-    count, the agent's actual write-up (task.note), and where the full
-    artifact lives (task.libraryPath -- a spike's findings live in the
-    Library, not in the deliberately lean note). Delivered as an inbox card +
-    a real email, with a per-card email kind so the 30s dedupe can never
-    swallow a second card's report."""
+    """No-op kept for call-site compatibility. A closed card's report
+    (story/spike/bug/task) no longer reaches the player on ANY
+    channel -- not the player inbox, not email, not Telegram: the
+    player asked for the sprint retrospective to be the close signal
+    (_resolve_retrospective queues the sprint_retro push with the
+    team's START/STOP/CONTINUE feedback). Both the peer-gated story
+    close (_close_gated_story) and the universal close (finish_task)
+    still call this; the task's `_reportDelivered` flag keeps the
+    once-per-card contract should delivery ever be re-enabled.
+    Agent-to-agent internals never fired this either: a review/fix
+    subtask (reviewOf) reports through its PARENT, a shadow (dry-run)
+    card ships nothing, and a player-assigned card was the player's
+    own hands."""
     if not task or task.get('_reportDelivered'):
         return
     if task.get('reviewOf') or task.get('shadow') or task.get('assignedTo') == 'player':
         return
     task['_reportDelivered'] = True
-    card_type = _CARD_TYPE_LABELS.get((task.get('taskType') or '').strip().lower(), 'CARD')
-    title = task.get('title') or task.get('projectLabel') or 'a card'
-    now_ms = int(time.time() * 1000)
-    reason = 'peer-approved' if close_reason == 'peer_approved' else 'completed'
-    parts = [f'{card_type} closed: {title}', '']
-    meta = []
-    if task.get('issueKey'):
-        meta.append(f'Issue: {task["issueKey"]}')
-    if task.get('projectLabel'):
-        meta.append(f'Project: {task["projectLabel"]}')
-    if task.get('room'):
-        meta.append(f'Room: {task["room"]}')
-    if approvals:
-        meta.append(f'Peer approvals: {approvals}')
-    if meta:
-        parts.append(' | '.join(meta))
-        parts.append('')
-    if task.get('userStory'):
-        parts.append(f'User story: {task["userStory"]}')
-    if task.get('acceptanceCriteria'):
-        parts.append(f'\nAcceptance criteria:\n{task["acceptanceCriteria"]}')
-    if task.get('never'):
-        parts.append(f'\nNEVER (constraints the work honored):\n{task["never"]}')
-    note = (task.get('note') or '').strip()
-    if note:
-        parts.append(f'\nReport from the agent:\n{note}')
-    elif task.get('libraryPath'):
-        parts.append(f'\nReport: see the full findings at {task["libraryPath"]}.')
-    if task.get('libraryPath'):
-        parts.append(f'\nFull artifact: {task["libraryPath"]}')
-    body = '\n'.join(parts)
-    subject = f"[AI Think Tank] {card_type} closed: {title[:80]}"
-    inbox = state.setdefault('playerInbox', [])
-    inbox.append({
-        'id': f'crep-{task.get("id") or int(now_ms)}', 'kind': 'card_report',
-        'taskId': task.get('id'), 'agentId': task.get('assignedTo'),
-        'title': title, 'body': body,
-        'closeReason': reason, 'createdAt': now_ms,
-    })
-    _queue_player_email(state, f'card_report:{task.get("id") or "unknown"}',
-                        subject, body, now_ms=now_ms)
 
 
 def _drain_email_outbox_sync(state):
@@ -8332,16 +8287,23 @@ def _drain_email_outbox_sync(state):
         state['emailOutbox'] = []
         return [('import', False, False)]
     for entry in list(outbox):
-        try:
-            email_ok = send_player_email_sync(entry.get('subject'), entry.get('body'))
-        except Exception as e:  # pragma: no cover
-            email_ok = False
-            print(f'[email] send raised: {e}')
-        try:
-            telegram_ok = send_player_telegram_sync(entry.get('subject'), entry.get('body'))
-        except Exception as e:  # pragma: no cover
-            telegram_ok = False
-            print(f'[telegram] player push raised: {e}')
+        # An entry may restrict its delivery channels; the
+        # default is both channels.
+        channels = entry.get('channels') or ('email', 'telegram')
+        email_ok = False
+        telegram_ok = False
+        if 'email' in channels:
+            try:
+                email_ok = send_player_email_sync(entry.get('subject'), entry.get('body'))
+            except Exception as e:  # pragma: no cover
+                email_ok = False
+                print(f'[email] send raised: {e}')
+        if 'telegram' in channels:
+            try:
+                telegram_ok = send_player_telegram_sync(entry.get('subject'), entry.get('body'))
+            except Exception as e:  # pragma: no cover
+                telegram_ok = False
+                print(f'[telegram] player push raised: {e}')
         results.append((entry.get('kind'), bool(email_ok), bool(telegram_ok)))
     state['emailOutbox'] = []
     return results
@@ -10242,6 +10204,30 @@ def _resolve_retrospective(state, pending, now_ms, decider=None):
         'stop': buckets['stop'],
         'continue': buckets['continue'],
     }
+    # The START/STOP/CONTINUE feedback the team just gave is one of the
+    # moments the player should hear from the tank (alongside the sprint
+    # closing itself). Both channels, with a per-sprint kind so the 30s
+    # dedupe can never swallow a second sprint's retro.
+    retro = state['retrospectives'][sprint_id]
+    feedback = []
+    for label, key in (('START', 'start'), ('STOP', 'stop'),
+                       ('CONTINUE', 'continue')):
+        items = retro.get(key) or []
+        if items:
+            feedback.append(f'{label}:')
+            feedback.extend(f'  - {item}' for item in items)
+    if not feedback:
+        feedback.append('(no feedback captured)')
+    _queue_player_email(
+        state, f'sprint_retro:{sprint_id}',
+        f'[AI Think Tank] Sprint retrospective: '
+        f'{retro.get("sprintName") or sprint_id}',
+        (f'Retrospective for sprint "{retro.get("sprintName") or sprint_id}" '
+         f'({", ".join(retro.get("teamIds") or []) or "team"}):\n'
+         + '\n'.join(feedback)
+         + (f'\nLanded: {", ".join(landed)}' if landed
+            else '\nLanded: (nothing landed)')),
+        now_ms=now_ms)
     _log_governance(state, scrum_master_id, 'retrospective',
                     {'action': 'meeting_end', 'sprint': sprint_id,
                      'start': len(buckets['start']), 'stop': len(buckets['stop']),
