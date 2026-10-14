@@ -5189,6 +5189,75 @@ except Exception:
     pass
 
 
+# Sim-loop failure escalation ladder (R6). Counts consecutive watchdog failure
+# events since the last healthy tick. The in-tank ladder (senior director, then
+# the admin once restarts >= 2) runs in sim._deliver_watchdog_event; the PLAYER
+# is told only when nothing in the think tank can resolve the outage -- i.e.
+# a restart attempt itself failed, or the streak reaches
+# _SIM_WATCHDOG_PLAYER_ALERT_AFTER (repeated restarts that never restore a
+# healthy tick). One Telegram per streak.
+_SIM_WATCHDOG_RESTARTS = 0
+_SIM_WATCHDOG_PLAYER_ALERTED = False
+_SIM_WATCHDOG_LAST_EVENT_AT = 0.0
+_SIM_WATCHDOG_PLAYER_ALERT_AFTER = 3
+
+
+def _sim_watchdog_note_failure(kind, detail, restarted):
+    """Record one watchdog failure on the escalation ladder.
+
+    Stamps sim._SIM_WATCHDOG_EVENT -- the side channel _sim_loop_pass consumes
+    inside its single read-modify-write; this function runs on the watchdog
+    thread and must NEVER touch the DB. Bumps the streak counter, then decides
+    the player alert: immediate when the restart attempt itself failed, else at
+    _SIM_WATCHDOG_PLAYER_ALERT_AFTER consecutive failures (best-effort
+    Telegram, one per streak). Synchronous and side-effect-light so tests can
+    drive it directly. Returns the streak count."""
+    global _SIM_WATCHDOG_RESTARTS, _SIM_WATCHDOG_PLAYER_ALERTED
+    global _SIM_WATCHDOG_LAST_EVENT_AT
+    _SIM_WATCHDOG_RESTARTS += 1
+    _SIM_WATCHDOG_LAST_EVENT_AT = time.time()
+    evt_kind = kind if restarted else f'{kind}_restart_failed'
+    evt = {
+        'kind': evt_kind,
+        'detail': detail,
+        'restarts': _SIM_WATCHDOG_RESTARTS,
+        'at': _SIM_WATCHDOG_LAST_EVENT_AT,
+        'player_alert': False,
+    }
+    try:
+        import sim as _sim_module
+        _sim_module._SIM_WATCHDOG_EVENT = evt
+    except Exception as e:
+        print(f'[sim-watchdog] failed to stamp sim event: {e}', flush=True)
+    should_alert = ((not restarted)
+                    or _SIM_WATCHDOG_RESTARTS >= _SIM_WATCHDOG_PLAYER_ALERT_AFTER)
+    if should_alert and not _SIM_WATCHDOG_PLAYER_ALERTED:
+        _SIM_WATCHDOG_PLAYER_ALERTED = True
+        evt['player_alert'] = True  # same dict reference as the stamp above
+        body = (f'The simulation loop is down ({evt_kind}: {detail}) after '
+                f'{_SIM_WATCHDOG_RESTARTS} consecutive failure(s). Nothing in '
+                f'the think tank can resolve this -- check the server logs.')
+        print(f'[sim-watchdog] player alert: {body}', flush=True)
+        try:
+            from notify import send_player_telegram_sync
+            send_player_telegram_sync('[AI Think Tank] sim loop down', body)
+        except Exception as e:
+            print(f'[sim-watchdog] player alert send failed: {e}', flush=True)
+    return _SIM_WATCHDOG_RESTARTS
+
+
+def _sim_watchdog_note_healthy(last_tick_epoch):
+    """Reset the escalation ladder once a successful tick lands at/after the
+    last stamped failure event (wall-clock seconds, same clock as
+    sim._LAST_TICK_WALL_EPOCH). A tick older than the failure keeps the
+    streak."""
+    global _SIM_WATCHDOG_RESTARTS, _SIM_WATCHDOG_PLAYER_ALERTED
+    if (last_tick_epoch >= _SIM_WATCHDOG_LAST_EVENT_AT
+            and (_SIM_WATCHDOG_RESTARTS or _SIM_WATCHDOG_PLAYER_ALERTED)):
+        _SIM_WATCHDOG_RESTARTS = 0
+        _SIM_WATCHDOG_PLAYER_ALERTED = False
+
+
 async def _sim_watchdog_loop(sim_holder, interval_s=None, stale_s=None):
     """Supervise the sim loop task; recreate it if it dies or its tick freezes.
 
@@ -5225,11 +5294,17 @@ async def _sim_watchdog_loop(sim_holder, interval_s=None, stale_s=None):
                         except BaseException as e:
                             detail = f'exception lookup failed {e!r}'
                 print(f'[sim-watchdog] sim loop dead ({detail}); restarting', flush=True)
+                restarted = False
                 try:
                     import sim as _sim_module
                     sim_holder['task'] = asyncio.create_task(_sim_module._sim_loop())
+                    restarted = True
                 except Exception as e:
                     print(f'[sim-watchdog] restart failed: {e}', flush=True)
+                try:
+                    _sim_watchdog_note_failure('dead', detail, restarted)
+                except Exception as e:
+                    print(f'[sim-watchdog] note failure error: {e}', flush=True)
                 continue
             # Alive: check tick staleness via the pass's wall-clock stamp.
             # Skip while dormant -- _sim_loop_pass is intentionally idle then.
@@ -5238,6 +5313,12 @@ async def _sim_watchdog_loop(sim_holder, interval_s=None, stale_s=None):
                 last = float(getattr(_sim_module, '_LAST_TICK_WALL_EPOCH', 0.0) or 0.0)
             except Exception:
                 last = 0.0
+            # A tick at/after the last failure means the loop recovered: reset
+            # the escalation ladder (consecutive-failure count + alert latch).
+            try:
+                _sim_watchdog_note_healthy(last)
+            except Exception as e:
+                print(f'[sim-watchdog] healthy reset error: {e}', flush=True)
             if last and not _dormant():
                 gap = time.time() - last
                 if gap > stale_s:
@@ -5247,10 +5328,17 @@ async def _sim_watchdog_loop(sim_holder, interval_s=None, stale_s=None):
                         await asyncio.wait_for(task, timeout=5.0)
                     except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                         pass
+                    restarted = False
                     try:
                         sim_holder['task'] = asyncio.create_task(_sim_module._sim_loop())
+                        restarted = True
                     except Exception as e:
                         print(f'[sim-watchdog] restart failed: {e}', flush=True)
+                    try:
+                        _sim_watchdog_note_failure(
+                            'stale', f'no successful tick for {gap:.0f}s', restarted)
+                    except Exception as e:
+                        print(f'[sim-watchdog] note failure error: {e}', flush=True)
         except asyncio.CancelledError:
             raise
         except Exception as e:
