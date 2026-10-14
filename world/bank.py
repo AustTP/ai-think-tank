@@ -109,6 +109,23 @@ def _accrue_spend(service, cost, village_id=None, agent_id=None):
             abucket['lastAt'] = now.isoformat()
             aseries = abucket.setdefault('byDay', {})
             aseries[day] = float(aseries.get(day, 0) or 0) + cost
+            # A DIRECTOR dimension rides along on every agent call: the
+            # cost also lands in `__director__/<director_id>` (a byMonth
+            # series) so each director's team burn is visible at the bank
+            # and a per-director monthly ceiling can be enforced. The
+            # roster walk is best-effort -- an unknown agent accrues to
+            # the service/agent buckets only.
+            director_id = _director_of_agent(agent_id)
+            if director_id:
+                dkey = _director_spend_key(director_id)
+                dbucket = ledger.setdefault(
+                    dkey, {'used': 0.0, 'calls': 0, 'byMonth': {}})
+                dbucket['used'] = float(dbucket.get('used', 0) or 0) + cost
+                dbucket['calls'] = int(dbucket.get('calls', 0) or 0) + 1
+                dbucket['lastAt'] = now.isoformat()
+                dseries = dbucket.setdefault('byMonth', {})
+                dmonth = now.strftime('%Y-%m')
+                dseries[dmonth] = float(dseries.get(dmonth, 0) or 0) + cost
         _serve._spend_ledger_write(ledger)
     except Exception:
         # Spend accounting must never take the think tank down: a failed read or
@@ -155,6 +172,107 @@ def _agent_spend_cap_exceeded(agent_id):
     month_used = sum(float(v or 0) for k, v in series.items()
                      if isinstance(k, str) and k.startswith(month))
     return month_used >= float(_serve.AGENT_SPEND_CAP_USD)
+
+
+# ---------------------------------------------------------------------------
+# Per-director monthly budgets. The admin slices the tank's overall
+# budget between directors (POST /api/budget/director); each slice is a
+# hard monthly ceiling for that director's WHOLE team. Every model call
+# an agent makes also accrues to a `__director__/<id>` rollup bucket
+# (byMonth series, same shape as the high-tier bucket), so the bank
+# teller sees each team's burn. A director who exhausts their slice
+# pauses their own team's calls only -- other directors keep working --
+# and asks the admin for a raise (POST /api/budget/request).
+# ---------------------------------------------------------------------------
+
+
+def _director_spend_key(director_id):
+    """The ledger bucket key for a director's team rollup spend -- same
+    namespacing rule as the agent/village buckets: `__director__/*` is
+    excluded from the shared cap total so the per-director rollup never
+    double-counts the shared budget."""
+    return f'__director__/{director_id}'
+
+
+def _director_budget_map():
+    """The admin-set per-director monthly budgets from state:
+    {director_id: usd}. An empty map means no director is capped."""
+    import serve as _serve
+    try:
+        state = _serve.get_state_from_db() or {}
+        budgets = state.get('directorBudgets')
+    except Exception:
+        return {}
+    if not isinstance(budgets, dict):
+        return {}
+    out = {}
+    for k, v in budgets.items():
+        try:
+            cap = float(v)
+        except (TypeError, ValueError):
+            continue
+        if cap > 0:
+            out[str(k)] = cap
+    return out
+
+
+def _director_of_agent(agent_id, state=None):
+    """The director whose budget an agent's spend counts against.
+    Roster workers carry a `director` pointer; a director (and the
+    admin) has none, so their own spend answers to their OWN budget.
+    An unknown agent answers to no one (never a false block)."""
+    import serve as _serve
+    if not agent_id:
+        return None
+    try:
+        if state is None:
+            state = _serve.get_state_from_db() or {}
+    except Exception:
+        return None
+    for d in (state.get('agentRoster') or []):
+        if isinstance(d, dict) and d.get('id') == agent_id:
+            return d.get('director') or d.get('id')
+    return None
+
+
+def _director_spend_status(agent_id):
+    """Per-director MONTHLY spend-cap status for the agent's director.
+    Returns None when the director is not capped (feature off, no
+    budget set, or the agent is unknown) -- never a false block.
+    Otherwise {'directorId', 'cap', 'used'} with used >= cap."""
+    import serve as _serve
+    if not agent_id:
+        return None
+    try:
+        state = _serve.get_state_from_db() or {}
+    except Exception:
+        return None
+    budgets = state.get('directorBudgets')
+    if not isinstance(budgets, dict) or not budgets:
+        return None
+    director_id = _director_of_agent(agent_id, state)
+    if not director_id or director_id not in budgets:
+        return None
+    try:
+        cap = float(budgets.get(director_id))
+    except (TypeError, ValueError):
+        return None
+    if cap <= 0:
+        return None
+    try:
+        ledger = _serve._spend_ledger_read()
+        bucket = ledger.get(_director_spend_key(director_id))
+    except Exception:
+        return None
+    if not isinstance(bucket, dict):
+        return None
+    month = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
+    series = bucket.get('byMonth') or {}
+    used = sum(float(v or 0) for k, v in series.items()
+               if isinstance(k, str) and k.startswith(month))
+    if used < cap:
+        return None
+    return {'directorId': director_id, 'cap': cap, 'used': used}
 
 
 def _village_spend_view():
