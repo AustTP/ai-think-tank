@@ -14556,7 +14556,7 @@ async def close_sprint(sprint_id: str, request: Request):
 # ---------------------------------------------------------------------------
 # JIRA-like issue register (TEAM-0128). A first-class, durable, per-team-issued
 # ticket store fed by POST /api/intent/issues. Required fields: teamId, type
-# (story|spike|bug|task), summary, reporterId. Listing + status transitions also
+# (story|spike|bug|task|meeting), summary, reporterId. Listing + status transitions also
 # live here. Filing dually writes into the backlogRequests pipe (tagged with
 # issueKey + teamId), so the owning team's scrum master grooms the card into a
 # sprint and the think tank actually works it -- not a dead ledger.
@@ -14587,7 +14587,12 @@ async def create_issue(request: Request):
     {'userStory': ..., 'acceptanceCriteria': ..., 'never': [...]} or a string
     following one of those templates (a trailing "NEVER:" block is parsed as
     constraints). `never` hard prohibitions survive refinement -> queue -> task
-    into the worker's instructions."""
+    into the worker's instructions. MEETING cards: `attendees` is a list of
+    roster agent ids or a scope string ('team'/'all'/'pair', resolved to
+    concrete ids at grooming), and `facilitatorId` is the roster agent who
+    convenes the meeting and writes the minutes (defaults to the filer, then
+    the team's scrum master). Both survive refinement -> queue -> task so the
+    meeting executor can name the participants."""
     authed, actor = _operator_gate(request)
     if not authed:
         return JSONResponse({'error': 'Unauthorized'}, status_code=401)
@@ -14614,7 +14619,9 @@ async def create_issue(request: Request):
         (body.get('reporterId') or 'player').strip(),
         description=(body.get('description') or ''),
         title=(body.get('title') or ''),
-        story_points=body.get('storyPoints'))
+        story_points=body.get('storyPoints'),
+        attendees=body.get('attendees'),
+        facilitator_id=body.get('facilitatorId'))
     if issue is None:
         return JSONResponse({'error': 'issue could not be filed'}, status_code=400)
     save_state_to_db(state)

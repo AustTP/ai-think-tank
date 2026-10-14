@@ -1971,6 +1971,10 @@ _TASK_BUDGET_USD = {
     'media': 0.15,
     'distill': 0.10,
     'skillReview': 0.10,
+    # A MEETING is a single minutes-writing completion call (no tool loop,
+    # no plan/synthesize bookends -- see _run_meeting_content), so it shares
+    # the cheapest ceremony tier with distill/skillReview.
+    'meeting': 0.10,
 }
 _TASK_BUDGET_USD_DEFAULT = 0.25
 
@@ -2748,6 +2752,15 @@ def queue_work(state, items):
             # story must not be able to manufacture its own work-context
             # bypass by naming a URL in its own text).
             'playerAuthored': bool(item.get('playerAuthored')),
+            # A MEETING card's attendee list (concrete roster ids, resolved
+            # at grooming -- see _resolve_meeting_attendees) and its
+            # facilitator (the agent who convenes it and writes the minutes).
+            # Both survive the queue round trip onto the real task (same
+            # whitelist contract as 'distill'/'checklist': the meeting
+            # executor reads task['attendees']/task['facilitatorId'] to
+            # name the participants in the minutes it writes).
+            'attendees': list(item.get('attendees') or []),
+            'facilitatorId': item.get('facilitatorId') or None,
         })
     return len(work_queue)
 
@@ -2797,6 +2810,58 @@ def queue_spike(state, title, room, budget_ms, now_ms=None, goal=None, instructi
         # (the player chat lane) -- see queue_work's whitelist comment.
         'playerAuthored': bool(player_authored),
     }])
+
+
+def queue_meeting(state, title, room, facilitator_id, attendees=None,
+                  now_ms=None, goal=None, instructions=None,
+                  project_label=None, notBefore=None, assigned_to=None,
+                  lane=None, player_authored=False, budget_usd=None,
+                  budget_ms=900_000):
+    """Queue a deliberate MEETING card (taskType='meeting'): a
+    conversation with a named facilitator and a resolved attendee
+    list, held in a real room (pressoffice by default -- it has a
+    door, so the facilitator can actually walk there). A meeting is a
+    NON-GATED lane: nothing ships, so no peer gate opens; the
+    facilitator's agent convenes the attendees, discusses the topic,
+    and writes the minutes into the card's note (the completion
+    artifact -- see _run_meeting_content). `attendees` is either a
+    list of roster ids (kept as-is, invalid ids dropped at grooming)
+    or a scope string ('team' = the owning team's people, 'all' =
+    the whole think tank, 'pair' = facilitator + one teammate) --
+    resolved to concrete ids by _resolve_meeting_attendees during
+    backlog refinement, BEFORE the sprint starts. `facilitator_id`
+    is the agent who convenes it; _assign_due_item PINS the card to
+    them (waking them off-duty if needed) the same way an incident
+    pins to the on-call. `budget_ms` defaults to a 15-minute box --
+    the work cycle only needs to cover one minutes-writing call."""
+    return queue_work(state, [{
+        'title': title,
+        'room': room,
+        'instructions': instructions or (f'Meeting: {title}. '
+                                         f'Convene the listed attendees, '
+                                         f'discuss the topic, and write up '
+                                         f'the minutes (topic, attendees, '
+                                         f'discussion, decisions, action '
+                                         f'items with owners) into the '
+                                         f'card note.'),
+        'goal': goal,
+        'projectLabel': project_label,
+        'priority': WORK_PRIORITY['low'],
+        'taskType': 'meeting',
+        'budgetMs': budget_ms,
+        'budgetUsd': budget_usd,
+        'attendees': list(attendees or []),
+        'facilitatorId': facilitator_id or None,
+        'notBefore': notBefore,
+        'assignedTo': assigned_to or None,
+        'lane': lane,
+        # Player-authored provenance: True only when the PLAYER filed this
+        # meeting (the player chat lane) -- see queue_work's whitelist
+        # comment.
+        'playerAuthored': bool(player_authored),
+    }])
+
+
 def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None,
                goal=None, priority=None, project_label=None, depends_on_task=None,
                assigned_to=None, lane=None):
@@ -4357,6 +4422,11 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         # must never be able to manufacture a bypass by naming a URL in its
         # own story text.
         'playerAuthored': bool((extra or {}).get('playerAuthored')),
+        # MEETING card fields (queue_work whitelists them): the resolved
+        # attendee list the minutes name, and the facilitator who convenes
+        # (the assignment pin -- see _assign_due_item).
+        'attendees': list((extra or {}).get('attendees') or []),
+        'facilitatorId': (extra or {}).get('facilitatorId') or None,
         'assignedTo': agent_id,
         'status': 'walking',
         'createdAt': now_ms,
@@ -5538,6 +5608,77 @@ def _sim_direct_reports(state, director_id):
             if d.get('director') == director_id]
 
 
+def _normalize_attendees(attendees):
+    """Normalize a meeting card's attendee spec for storage: a list of
+    roster ids kept in given order (non-strings dropped), a scope string
+    ('team'/'all'/'pair') kept as-is for grooming-time resolution, or
+    None (defaults to the team scope at grooming)."""
+    if isinstance(attendees, (list, tuple)):
+        return [a for a in attendees if isinstance(a, str) and a.strip()]
+    if isinstance(attendees, str) and attendees.strip():
+        return attendees.strip().lower()
+    return None
+
+
+def _meeting_team_members(state, team_id):
+    """The owning team's people: its director, its scrum master, and the
+    director's direct reports -- the same pool the team's own ceremonies
+    convene. Stable order (director, scrum master, then roster order),
+    deduped."""
+    team = _team_row(state, team_id)
+    if not team:
+        return []
+    director = team.get('directorId')
+    scm = team.get('scrumMasterId')
+    out = []
+    seen = set()
+    for m in [director, scm] + _sim_direct_reports(state, director):
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def _resolve_meeting_attendees(state, attendees, team_id, facilitator_id=None):
+    """Resolve a meeting card's attendee spec to concrete roster ids at
+    GROOMING time (backlog refinement, before the sprint starts). A list
+    of ids is validated against the roster (unknown ids dropped, order
+    kept); a scope string expands: 'team' = the owning team's people
+    (director + scrum master + direct reports), 'all' = the full think
+    tank roster, 'pair' = the facilitator plus ONE teammate (the smallest
+    useful meeting). None/unknown defaults to the team scope. Returns a
+    stable, deduped list -- possibly empty (a meeting with nobody to
+    convene still runs; the facilitator is always an attendee in spirit,
+    but only appears in the list when the scope puts them there)."""
+    roster_ids = {d.get('id') for d in (state.get('agentRoster') or [])
+                  if d.get('id')}
+    if isinstance(attendees, (list, tuple)):
+        out = []
+        seen = set()
+        for a in attendees:
+            if a in roster_ids and a not in seen:
+                seen.add(a)
+                out.append(a)
+        return out
+    scope = (attendees or 'team')
+    scope = scope.strip().lower() if isinstance(scope, str) else 'team'
+    if scope == 'all':
+        return sorted(roster_ids)
+    if scope == 'pair':
+        team = _meeting_team_members(state, team_id)
+        pair = []
+        if facilitator_id in team:
+            pair.append(facilitator_id)
+        for m in team:
+            if m != facilitator_id:
+                pair.append(m)
+                break
+        if not pair and team:
+            pair = team[:2]
+        return pair
+    return _meeting_team_members(state, team_id)
+
+
 # Peer-approval gate (Phase E addendum): a deliverable-room task's story is not
 # 'done' when its primary work finishes -- it moves to 'needs_review' and waits
 # for TWO distinct same-team peers to approve it. Only rooms with real content
@@ -5561,9 +5702,10 @@ _TAIL_ISSUES_CLOSED = 100
 _TAIL_GROWTH_PLANS_APPLIED = 50
 # Non-gated work lanes (Phase E2b/E2d): a SPIKE is a time-boxed investigation
 # with no committed deliverable; a BUG is incident response on a live product
-# (see the on-call phase). Neither ships a peer-reviewed story -- both land a
-# short artifact instead.
-NON_GATED_LANES = frozenset({'spike', 'bug', 'research'})
+# (see the on-call phase); a MEETING is a deliberate conversation whose
+# minutes land on the card itself (see _run_meeting_content). None ships a
+# peer-reviewed story -- all three land a short artifact instead.
+NON_GATED_LANES = frozenset({'spike', 'bug', 'research', 'meeting'})
 
 
 def _peer_gated_lane(task):
@@ -7738,7 +7880,7 @@ def file_large_request(state, authority_id, goal, team_id, now_ms=None, constrai
 # turning a card into worked agent labor) -- it is not a dead ledger.
 # ---------------------------------------------------------------------------
 
-ISSUE_TYPES = ('story', 'spike', 'bug', 'task')
+ISSUE_TYPES = ('story', 'spike', 'bug', 'task', 'meeting')
 # `blocked` is a boolean FIELD on an issue (issue['blocked'], default False), NOT
 # a status. Only the owning team's scrum master commits it (via _file_block_change
 # + _block_step), so it stays a single player-facing "this card can't be or needn't
@@ -7933,7 +8075,8 @@ def _groups_look_like_gwt(text):
 
 def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
                description='', story_points=None, title=None, now_ms=None,
-               assigned_to=None, lane=None):
+               assigned_to=None, lane=None, attendees=None,
+               facilitator_id=None):
     """File a JIRA-style issue for team_id. Returns the issue record dict, or
     None if a required field is missing (team_id / issue_type / summary /
     feature / reporter_id), the issue type is unknown, or the team is unknown.
@@ -7953,6 +8096,12 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
     card is handed to the player (not an agent) at assignment. An agent (the
     scrum master filing the issue) uses this to hand a story/spike to the
     player when the next step genuinely needs human hands.
+    MEETING cards: `attendees` is a list of roster ids or a scope string
+    ('team'/'all'/'pair' -- resolved to concrete ids at grooming, see
+    _resolve_meeting_attendees); `facilitator_id` is the agent who
+    convenes the meeting and writes the minutes. Both survive
+    file_issue -> refinement -> queue -> task (queue_work whitelists
+    them), so the meeting executor can name the participants.
     Pure: mutates state['issues'], state['issueCounters'], and appends a
     backlogRequests record (tagged issueKey + teamId) so the owning scrum
     master can groom the card into a sprint -- the think tank does the work."""
@@ -7991,6 +8140,12 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         'blockedBy': None,
         'assignedTo': assigned_to or None,  # 'player' = the human does this one
         'lane': normalize_lane(lane),       # attention lane (build/reading/open/parking-lot)
+        # MEETING provenance: the attendee spec (roster ids or a
+        # 'team'/'all'/'pair' scope, resolved at grooming) and the
+        # facilitator who convenes the meeting. Rides the issue ->
+        # backlogRequests -> refinement -> queue -> task round trip.
+        'attendees': _normalize_attendees(attendees),
+        'facilitatorId': (facilitator_id or '').strip() or None,
     }
     state.setdefault('issues', {})[key] = issue
     # Feed the backlog pipe: a backlogRequests record the refinement ceremony
@@ -8024,6 +8179,12 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         'userStory': story,
         'acceptanceCriteria': criteria,
         'never': never,
+        # MEETING provenance (same round trip as the issue record
+        # above): the attendee spec + facilitator the scrum master's
+        # grooming ceremony resolves into a concrete queue item (see
+        # _resolve_refinement's meeting branch).
+        'attendees': _normalize_attendees(attendees),
+        'facilitatorId': (facilitator_id or '').strip() or None,
     }
     state.setdefault('backlogRequests', []).append(req)
     # Kick this team's refinement to be immediately due (next pass), not
@@ -9206,10 +9367,11 @@ def _maybe_file_followup(state, agent_id, completed_task, now_ms):
     a = (state.get('agents') or {}).get(agent_id)
     if not a or a.get('offDuty') or a.get('busy') or a.get('task'):
         return
-    if (completed_task.get('taskType') or 'code') in ('spike', 'bug', 'review', 'research'):
+    if (completed_task.get('taskType') or 'code') in ('spike', 'bug', 'review', 'research', 'meeting'):
         # spike/bug/research already IS the investigation itself (incident
         # response or open-ended question); a review is meta-process work, not
-        # a fresh deliverable -- none of them should propose the next story
+        # a fresh deliverable; a meeting is a conversation whose minutes ARE
+        # the artifact -- none of them should propose the next story
         # (that's the recursion: 'Follow-up ... after completing Review:
         # Follow-up ...' cards grew indefinitely).
         return
@@ -9472,6 +9634,59 @@ def _reassign_rolled_over_cards(state, team_id):
     return len(picked)
 
 
+def _queue_refined_meeting(state, req, pending):
+    """Groom a MEETING card out of a refinement request: resolve the
+    facilitator (the named facilitator if they're a real roster agent,
+    else the filer, else the grooming scrum master) and the attendee
+    list (explicit roster ids, or a 'team'/'all'/'pair' scope resolved
+    against the card's team -- see _resolve_meeting_attendees), then
+    queue the meeting task. The facilitator is who the minutes task
+    pins to (_assign_due_item wakes even an off-duty facilitator), so a
+    named scribe convenes the meeting regardless of the team's load.
+    The spend ceiling + band were already priced onto the request by
+    the groomer's budget calc."""
+    roster_ids = {d.get('id') for d in (state.get('agentRoster') or [])
+                  if d.get('id')}
+    filed_by = req.get('filedBy')
+    scrum_master_id = pending.get('scrumMasterId')
+    facilitator = req.get('facilitatorId') or None
+    if facilitator not in roster_ids:
+        facilitator = filed_by if filed_by in roster_ids else scrum_master_id
+    attendees = _resolve_meeting_attendees(state, req.get('attendees'),
+                                           req.get('teamId'), facilitator)
+    agenda = f"Filed by {filed_by} during backlog refinement. {req.get('reason')}"
+    story = req.get('userStory')
+    if story:
+        agenda += f"\n\nUser story: {story}"
+    never = req.get('never')
+    if never:
+        agenda += f"\n\nNEVER:\n{never}"
+    queue_work(state, [{
+        'title': req['title'],
+        'room': req.get('room') or 'pressoffice',
+        'goal': req.get('title'),
+        'instructions': agenda,
+        'teamId': req.get('teamId'),
+        'issueKey': req.get('issueKey') or None,
+        'taskType': 'meeting',
+        'attendees': attendees,
+        'facilitatorId': facilitator,
+        'budgetUsd': req.get('budgetUsd'),
+        'budgetBand': req.get('budgetBand'),
+        'lane': req.get('lane'),
+        'priority': WORK_PRIORITY['low'],
+        'playerAuthored': bool(filed_by == 'player'),
+    }])
+    _log_governance(state, facilitator, 'meeting_scheduled', {
+        'request': req.get('id'),
+        'issueKey': req.get('issueKey') or None,
+        'teamId': req.get('teamId'),
+        'title': (req.get('title') or '')[:120],
+        'facilitatorId': facilitator,
+        'attendees': attendees,
+    })
+
+
 def _resolve_refinement(state, pending, now_ms, decider=None):
     """When the ceremony window elapses, the scrum master grooms every pending
     request: the injectable refinement decider picks accept/reject per request,
@@ -9538,12 +9753,23 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
         # band -- the band only scales the TYPE default, never an explicit number.
         band = 'generous' if choice == 'accept_generous' else 'standard'
         req['budgetBand'] = band
+        # A meeting card prices off the 'meeting' tier -- a meeting
+        # issue carries no taskType (file_issue leaves it unset).
+        groom_type = ('meeting'
+                      if (req.get('issueType') or '').strip().lower() == 'meeting'
+                      else (req.get('taskType') or 'code'))
         req['budgetUsd'] = budget_usd_for_task(
-            req.get('taskType') or 'code',
+            groom_type,
             req.get('budgetUsd'),
             band)
         if choice in ('accept', 'accept_generous'):
             req['status'] = 'accepted'
+            meeting_card = (req.get('issueType') or '').strip().lower() == 'meeting'
+            if meeting_card:
+                # Meeting cards are scheduled directly (facilitator +
+                # resolved attendees), not via the generic story queue
+                # below -- their minutes close the card.
+                _queue_refined_meeting(state, req, pending)
             # queue_work whitelists fields, so the provenance (filer/groomer/
             # room/title) lives on the durable `backlogRequests` record + the
             # digest -- not on the queue item. teamId is the one exception
@@ -9575,7 +9801,8 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
             linked_issue = (state.get('issues') or {}).get(req.get('issueKey'))
             if linked_issue and linked_issue.get('dependsOnTask'):
                 depends_on = linked_issue['dependsOnTask']
-            queue_work(state, [{
+            if not meeting_card:
+                queue_work(state, [{
                 'title': req['title'], 'room': req['room'], 'goal': req.get('title'),
                 'instructions': instructions,
                 'teamId': req.get('teamId'),
@@ -12751,10 +12978,14 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     # a spike the classifier attributed to a specific team's worker.
     # Sprint rollover: a card re-planned by refinement carries `_reassignedTo`,
     # a fresh explicit owner for the next sprint -- honored as a (soft) pin.
+    # MEETING cards pin to their facilitator -- the agent who convenes the
+    # meeting and writes the minutes -- with the same wake semantics (an
+    # off-duty facilitator is woken at the meeting room's door).
     pin_kind = (pick.get('reviewOf') or pick.get('incident')
                 or pick.get('_mailResume') or pick.get('directRoute')
-                or pick.get('_reassignedTo'))
-    pinned = (pick.get('assignedTo') or pick.get('_reassignedTo')) if pin_kind else None
+                or pick.get('_reassignedTo') or pick.get('facilitatorId'))
+    pinned = (pick.get('assignedTo') or pick.get('facilitatorId')
+              or pick.get('_reassignedTo')) if pin_kind else None
     # Sprint staffing: a pin to someone OUTSIDE the sprint's worker pool is
     # dropped -- strict staffing wins over the soft reassignment pin (a card
     # re-planned by refinement pins to the team's least-loaded member, but if
@@ -12936,9 +13167,15 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # A scheduled item's notBefore rides onto the assigned task so the
         # preemption picker (_suspend_busy_agent_for_scheduled) can tell
         # TIME-CRITICAL work (this card was scheduled for a specific time; the
-        # agent must not be yanked off it for a one-off) from ordinary/sprint
+        # agent must not be yanked off it for a one-off) from ordinary
         # work. Same whitelist contract as 'distill'/'checklist'.
         'notBefore': pick.get('notBefore'),
+        # MEETING card fields ride onto the assigned task (see assign_task)
+        # so the minutes executor names the resolved participants and the
+        # convening facilitator -- dropping them here would leave the task
+        # with an empty attendee list even though queue_work preserved them.
+        'attendees': pick.get('attendees'),
+        'facilitatorId': pick.get('facilitatorId'),
     }
     # Cut 2 coaching + runbook injection: append the chosen agent's pending
     # growth-plan note (applied once) and any product runbook knowledge to the
