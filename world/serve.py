@@ -634,6 +634,13 @@ def _set_dormant(value):
 DECIDE_BURST_ALLOW = 6          # how many calls an agent may issue in one burst
 DECIDE_BURST_WINDOW_S = 5.0     # the burst is measured over these many seconds
 DECIDE_MIN_INTERVAL_S = 0.4     # hard floor between any two calls from one agent
+# Chat/ask per-request token cap and OTP SMS TTL bounds. Literals are
+# the operator-policy seeds; _apply_operator_policy rebinds them from
+# operator_policy.json (chatMaxTokensCap / smsTtl*).
+CHAT_MAX_TOKENS_CAP = 4000
+SMS_TTL_DEFAULT_S = 300
+SMS_TTL_MIN_S = 60
+SMS_TTL_MAX_S = 900
 _decide_stamps: dict[str, list[float]] = {}   # agentId -> list[monotonic timestamps]
 _decide_lock = threading.Lock()
 
@@ -5174,6 +5181,9 @@ def _apply_operator_policy():
     global PEER_REVIEW_INTERVAL_S, PEER_REVIEW_FILE_PROBABILITY
     global DIRECTOR_ESCALATION_REASK_COOLDOWN_S, DIRECTOR_ESCALATION_MAX_ASKS
     global _SIM_WATCHDOG_INTERVAL_S, _SIM_WATCHDOG_STALE_S
+    global CHAT_MAX_TOKENS_CAP
+    global SMS_TTL_DEFAULT_S, SMS_TTL_MIN_S, SMS_TTL_MAX_S
+    global DECIDE_BURST_ALLOW, DECIDE_BURST_WINDOW_S, DECIDE_MIN_INTERVAL_S
     _p = get_operator_policy()
     SUCCESS_GRADE_FLOOR = _p['successGradeFloor']
     PEER_REVIEW_INTERVAL_S = _p['peerReviewIntervalS']
@@ -5182,6 +5192,13 @@ def _apply_operator_policy():
     DIRECTOR_ESCALATION_MAX_ASKS = _p['directorEscalationMaxAsks']
     _SIM_WATCHDOG_INTERVAL_S = float(_SimWatchdogIntervalSEnv) if _SimWatchdogIntervalSEnv else float(_p['simWatchdogIntervalS'])
     _SIM_WATCHDOG_STALE_S = float(_SimWatchdogStaleSEnv) if _SimWatchdogStaleSEnv else float(_p['simWatchdogStaleS'])
+    CHAT_MAX_TOKENS_CAP = _p['chatMaxTokensCap']
+    SMS_TTL_DEFAULT_S = _p['smsTtlDefaultS']
+    SMS_TTL_MIN_S = _p['smsTtlMinS']
+    SMS_TTL_MAX_S = _p['smsTtlMaxS']
+    DECIDE_BURST_ALLOW = _p['decideBurstAllow']
+    DECIDE_BURST_WINDOW_S = _p['decideBurstWindowS']
+    DECIDE_MIN_INTERVAL_S = _p['decideMinIntervalS']
 
 
 _apply_operator_policy()
@@ -5618,18 +5635,42 @@ def _backfill_directors_in_db():
             if target and target != d.get('director'):
                 d['director'] = target
                 changed = True
+    # Flat-chart repair: every director answers to the admin directly,
+    # never to another director. A director (flagged, or with reports)
+    # whose own pointer names a non-admin is re-pointed at the admin --
+    # the standing every director shares. A missing pointer is already
+    # compliant (it answers to the admin by fallback). Pure workers
+    # keep pointing at directors.
+    reports_now = {}
+    for d in roster:
+        reports_now[d.get('director')] = reports_now.get(d.get('director'), 0) + 1
+    admin_agent = next((d.get('id') for d in roster if d.get('isAdmin')), None)
+    for d in roster:
+        aid = d.get('id')
+        if aid in admin_ids:
+            continue
+        if not (d.get('isDirector') or reports_now.get(aid, 0) > 0):
+            continue  # a pure worker: any director pointer is legal
+        parent = d.get('director')
+        if parent is None or parent in admin_ids:
+            continue  # already directly under the admin (or equivalent)
+        d['director'] = admin_agent
+        changed = True
     if changed:
         save_state_to_db(state)
 
 
 # ---------------------------------------------------------------------------
-# Walk-the-chain director model ("admin -> director ->
-# director -> employee"). Authority is NOT a boolean stamped per-agent; it is
-# DERIVED from the `director` reporting pointers the backfill above assigns.
-# ANY agent who has one or more direct reports (someone whose `director`
-# points at them) is a director, at any depth. So a mid-level lead like dev or
-# sam becomes a director for free the moment someone reports to them, and
-# restructuring a team is just re-pointing a `director` -- no flag to maintain.
+# Flat-chart director model ("admin -> director -> employee", with every
+# director sitting DIRECTLY under the admin). Authority is NOT a boolean
+# stamped per-agent; it is DERIVED from the `director` reporting pointers
+# the backfill above assigns. ANY agent who has one or more direct reports
+# (someone whose `director` points at them) is a director. A lead like dev
+# or sam becomes a director for free the moment someone reports to them, and
+# restructuring a team is just re-pointing a `director` -- no flag to
+# maintain. Directors never director other directors: the repair sweep below
+# flattens any such pointer up to the admin, and POST /api/state rejects a
+# roster that would create one.
 #
 # The three derivations every approval/write check in this file needs:
 #   _direct_reports(state, id)  -- who reports directly to this agent
@@ -5679,21 +5720,120 @@ def _direct_reports(state, agent_id):
     return [d.get('id') for d in roster if d.get('director') == agent_id]
 
 
+def _supervisor_of(state, agent_id):
+    """Who supervises `agent_id`: the roster `director` field, else
+    the admin (the chain root) when the entry names no director, else
+    the player. 'player' means the human is the decision authority --
+    true for the player itself, for the admin (whose requests route
+    to the player), and when no admin exists."""
+    if not agent_id or agent_id == 'player':
+        return 'player'
+    admin = _admin_agent_id(state)
+    if agent_id == admin:
+        return 'player'
+    if state:
+        for d in state.get('agentRoster') or []:
+            if isinstance(d, dict) and d.get('id') == agent_id:
+                return d.get('director') or admin or 'player'
+    return admin or 'player'
+
+
+def _is_direct_supervisor(state, supervisor_id, agent_id):
+    """True when `supervisor_id` is the DIRECT supervisor of
+    `agent_id` -- the roster `director` field names them exactly.
+    Never a grand-supervisor, a sibling director, or a worker."""
+    if not supervisor_id or not agent_id or supervisor_id == agent_id:
+        return False
+    if not state:
+        return False
+    for d in state.get('agentRoster') or []:
+        if isinstance(d, dict) and d.get('id') == agent_id:
+            return d.get('director') == supervisor_id
+    return False
+
+
+def _subtree_agent_ids(state, root_id):
+    """`root_id` plus every agent below it in the roster chain (BFS
+    over `director` fields) -- the full team a director's slice
+    covers, for subtree spend rollups. Cycle-safe via a seen set."""
+    reports = {}
+    if state:
+        for d in state.get('agentRoster') or []:
+            if isinstance(d, dict) and d.get('id'):
+                reports.setdefault(d.get('director'), []).append(d.get('id'))
+    seen = [root_id]
+    queue = [root_id]
+    while queue:
+        current = queue.pop(0)
+        for child in reports.get(current, []):
+            if child not in seen:
+                seen.append(child)
+                queue.append(child)
+    return seen
+
+
+def _director_parent_ok(state, proposed_director_id):
+    """Flat org chart guard for a DIRECTOR's own parent: the only
+    legal parent is the admin (or nobody -- a missing pointer answers
+    to the admin by fallback). Any other parent is a
+    director-under-director, the one shape the flattened chart
+    forbids. Pure workers are not judged here: they may name any
+    director."""
+    if not proposed_director_id:
+        return True
+    roster = state.get('agentRoster', []) if state else []
+    parent = next((d for d in roster if isinstance(d, dict)
+                   and d.get('id') == proposed_director_id), None)
+    return bool(parent and parent.get('isAdmin'))
+
+
+def _flat_director_chart_violations(state):
+    """Ids of every director (flagged, or with direct reports) whose
+    own `director` pointer climbs to a non-admin -- the shape the
+    flattened org chart forbids. A missing pointer is compliant: it
+    answers to the admin by fallback."""
+    if not state:
+        return []
+    roster = state.get('agentRoster', [])
+    reports = {}
+    for d in roster:
+        if isinstance(d, dict) and d.get('id'):
+            reports[d.get('director')] = reports.get(d.get('director'), 0) + 1
+    bad = []
+    for d in roster:
+        if not isinstance(d, dict) or not d.get('id'):
+            continue
+        if not (d.get('isDirector') or reports.get(d.get('id'), 0) > 0):
+            continue  # a pure worker: any parent is legal
+        if d.get('director') is None:
+            continue  # answers to the admin by fallback
+        if not _director_parent_ok(state, d.get('director')):
+            bad.append(d.get('id'))
+    return bad
+
+
 def _safe_director(state, agent_id, proposed_director_id):
-    """R2 guard for director-pointer writes: an admin must never DIRECTLY
-    director a pure worker (no reports and not isDirector). Returns a pointer
-    that keeps a director between the admin and every worker. Directors and
-    non-admin targets pass through unchanged; a pure worker proposed under an
-    admin falls back to the senior director (or any non-admin director)."""
+    """R2 + flat-chart guard for director-pointer writes. An admin must
+    never DIRECTLY director a pure worker (no reports and not
+    isDirector) -- such a pointer falls back to the senior director
+    (or any non-admin director), so a director always sits between the
+    admin and every worker. A DIRECTOR's own parent must be the admin
+    (or nobody): a director proposed under another director is
+    flattened to the admin, so every director sits directly under the
+    admin. A worker proposed under a director passes through."""
     if not proposed_director_id:
         return proposed_director_id
     roster = state.get('agentRoster', []) if state else []
     admins = {d.get('id') for d in roster if d.get('isAdmin')}
-    if proposed_director_id not in admins:
-        return proposed_director_id  # target is not an admin: fine
     agent = next((d for d in roster if d.get('id') == agent_id), None)
     if agent and (agent.get('isDirector') or _direct_reports(state, agent_id)):
-        return proposed_director_id  # agent is a director: admin->director allowed
+        # a director: the admin is the only legal parent
+        if proposed_director_id in admins:
+            return proposed_director_id
+        admin_agent = next((d.get('id') for d in roster if d.get('isAdmin')), None)
+        return admin_agent if admin_agent else proposed_director_id
+    if proposed_director_id not in admins:
+        return proposed_director_id  # worker under a director: fine
     # pure worker under an admin: re-point to a non-admin director
     senior = next((d.get('id') for d in roster
                    if d.get('isDirector') and d.get('id') not in admins), None)
@@ -5985,8 +6125,11 @@ def _backfill_agent_identity_in_db():
 def _promote_to_director(state, promotee_id, promoter_id):
     """Promote an employee to director: they stop reporting into the old team's
     daily work and instead become the director of a NEW team they can hire for.
-    They stay under the promoter's reporting chain (their `director` is set to
-    the promoter, not themselves) so authority still resolves to the admin.
+    They sit DIRECTLY under the admin, in equal standing with every other
+    director -- the org chart shows no director-to-director edge (the operator
+    keeps the chart flat; a promoting director gains no subordinate director).
+    Authority still resolves to the admin because the admin is the chain root.
+    With no admin in the roster this falls back to the promoter's chain.
     Mutates `state` in place; returns the new team dict."""
     roster = state.get('agentRoster', [])
     promotee = next((d for d in roster if d.get('id') == promotee_id), None)
@@ -5995,7 +6138,9 @@ def _promote_to_director(state, promotee_id, promoter_id):
     # Stamp isDirector first so the R2 guard below sees the promotee as a
     # director (an admin MAY directly director another director).
     promotee['isDirector'] = True
-    promotee['director'] = _safe_director(state, promotee_id, promoter_id)
+    admin_id = _admin_agent_id(state)
+    proposed = admin_id if admin_id else promoter_id
+    promotee['director'] = _safe_director(state, promotee_id, proposed)
     promotee['directorSince'] = time.time()
     # Spawn a fresh team for the new director (no reports yet, so the backfill
     # would skip them -- the explicit record is what keeps it alive).
@@ -13039,6 +13184,14 @@ async def post_state(request: Request):
     # are replaced exactly as before; only truly server-owned keys survive, and
     # a brand-new server field never needs a client change to stop vanishing.
     data = _merge_server_owned(get_state_from_db() or {}, data)
+    violations = _flat_director_chart_violations(data)
+    if violations:
+        return JSONResponse(
+            {'error': 'flat org chart violated: every director sits directly '
+                      'under the admin, never under another director -- '
+                      'offending directors: '
+                      + ', '.join(str(v) for v in violations)},
+            status_code=400)
     save_state_to_db(data)
     # Not logged -- this fires every 5s from the client's own autosave
     # timer (agents.js), and a heartbeat isn't an "action" worth an
@@ -13210,15 +13363,22 @@ async def api_mail_send(request: Request):
     # string) before appending to the recipient's mailbox in state. Content is
     # still free prose -- hostile mail text is handled as DATA by the
     # EXTERNAL_DATA boundary in context assembly, not by sanitizing it away.
-    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)) \
-            and not _valid_agent_key_presented(request.headers.get('X-Agent-Key')):
+    player = bool(verify_session(request.cookies.get(SESSION_COOKIE_NAME)))
+    key_owner = _agent_id_for_key(request.headers.get('X-Agent-Key'))
+    if not player and not key_owner:
         return JSONResponse(
             {'error': 'Unauthorized -- please log in'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({'error': 'malformed body'}, status_code=400)
-    from_id = (body.get('fromId') or '').strip()
+    # Sender binding: the credential decides the sender, never the
+    # body. A presented agent key sends AS its owner (world.js sends
+    # the acting agent's own X-Agent-Key, even alongside the player
+    # session); without one, a player session sends AS the player.
+    # Trusting fromId would let any caller forge any agent's -- or
+    # the player's -- mail into a mailbox that feeds model context.
+    from_id = key_owner or ('player' if player else None)
     to_id = (body.get('toId') or '').strip()
     text = body.get('text')
     if not isinstance(text, str) or not text.strip():
@@ -13689,8 +13849,9 @@ async def intent_assign_big_task(request: Request):
     """Player intent: 'delegate / big task'. Server-side assignBigTask. Requires
     a logged-in session (the player). Returns {admin, subtasks:[...]} like the
     client's assignBigTask, so the UI can report what was queued."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -13817,8 +13978,9 @@ async def intent_reject_story(task_id: str, request: Request):
     veto). This is a rare, heavy principal signal -- the player is the EXTERNAL
     gauge the internal peer gate can never be, since agents only approve agents.
     """
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -13967,8 +14129,9 @@ async def intent_publish(request: Request):
     the player (session holder) explicitly asks -- agents stay scoped to their
     own work. Stages released projects/wiki/skills into a gitignored staging
     dir, commits with a passport-linked message, and pushes."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     state = get_state_from_db()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -14042,8 +14205,9 @@ async def intent_promote_spike(task_id: str, request: Request):
     (a working one isn't finished); 409 otherwise keeps the player from half-baking
     an investigation into real work.
     """
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -14267,8 +14431,9 @@ async def promote_shadow_entry(idx: str, request: Request):
 async def intent_sprint(request: Request):
     """Seed a new sprint: {name?, goal, items:[...], targetDate?}. Returns the
     sprint record + per-item queue confirmations so the UI can report."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -14371,8 +14536,9 @@ async def get_sprints(request: Request):
 async def close_sprint(sprint_id: str, request: Request):
     """Close a sprint container. Queued items keep flowing; close is a status,
     not a cancel. Chains the close into the product-passport."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -14422,8 +14588,9 @@ async def create_issue(request: Request):
     following one of those templates (a trailing "NEVER:" block is parsed as
     constraints). `never` hard prohibitions survive refinement -> queue -> task
     into the worker's instructions."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -14465,8 +14632,9 @@ async def create_issue(request: Request):
 async def set_issue_status(key: str, request: Request):
     """Transition an issue's status (open/in_progress/done/closed). Mirrors the
     change onto any linked pending backlog request."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -14859,8 +15027,9 @@ async def complete_player_task_endpoint(task_id: str, request: Request):
     blocked on it is auto-unblocked with its waiting agent woken. PLAYER-only
     -- an agent key is NOT a credential here (an agent answering for you would
     defeat the gate)."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -14879,8 +15048,9 @@ async def get_charter_endpoint(request: Request):
     roadmap recompute and refinement weigh, and every task's instructions open
     with. PLAYER-only: the charter is player-owned by design (you decide, the
     tank plans)."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     state = get_state_from_db()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -14895,8 +15065,9 @@ async def set_charter_endpoint(request: Request):
     'interests': [str], 'notes': str}. PLAYER-only. A missing/blank goal is a
     400 -- the tank never invents a direction for you. Stamps the governance
     log + passport so the setting is attributable."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -15104,8 +15275,9 @@ async def intent_clarify(request: Request):
     agent, answers KNOWLEDGE-BASE-FIRST (real Library search), and only
     escalates to the completing agent if the on-call can't answer. Returns
     {reply, onCall, completing, escalatedTo}."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     if not check_rate_limit(ASK_LANE_RATE_LIMIT_KEY):
         return JSONResponse({'error': 'Rate limit hit -- too many questions at once. Wait a minute and try again.'}, status_code=429)
     state = get_state_from_db()
@@ -17273,8 +17445,9 @@ async def intent_ask(request: Request):
     Thin wrapper: all real behavior lives in _ask_core (also called directly
     by the Telegram bridge, added with no HTTP hop in between).
     """
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     if not check_rate_limit(ASK_LANE_RATE_LIMIT_KEY):
         return JSONResponse({'error': 'Rate limit hit -- too many questions at once. Wait a minute and try again.'}, status_code=429)
     state = _state_begin()
@@ -17757,8 +17930,9 @@ async def intent_schedule(request: Request):
     extraction step (_extract_schedule_fields_sync) is exclusive to the
     Telegram routing layer; this takes already-structured fields -- the same
     relationship /api/intent/ask already has to _ask_core."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -17798,8 +17972,9 @@ async def intent_schedule_once(request: Request):
     `at`, then runs the normal lifecycle exactly once. The free-text
     extraction step (_extract_schedule_once_fields_sync) is exclusive to the
     Telegram routing layer; this takes already-structured fields."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -17907,8 +18082,9 @@ async def pipelines_delete(request: Request, pipeline_id: str):
 @_state_writer
 async def intent_incidents(request: Request):
     """Structured parity endpoint for the incident lane: POST {productId, title}."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -17974,8 +18150,9 @@ async def intent_product(request: Request):
     contributorIds?, handles?}. The player (session holder) seeds on behalf of
     an acting authority (admin, else senior-most director) -- identical to
     sprint create. Chains product_created into the passport."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -18055,8 +18232,9 @@ async def release_product(product_id: str, request: Request):
     library/projects/<id>/v<N>/ (RELEASE.md + a frozen copy), flip status ->
     'released', chain product_released into the passport. The release is run by
     the senior-most free authority; revision content is never returned."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     try:
         body = await request.json() or {}
     except Exception:
@@ -18667,7 +18845,8 @@ async def promote_to_director(team_id: str, request: Request):
     """Promote a MEMBER of this team to director. The promoter must be the
     team's director (or the admin). The promoted agent leaves the old team's
     daily work, becomes the director of a brand-new team they can hire for, and
-    stays under the promoter's reporting chain. Body: {promoteeId}."""
+    sits directly under the admin -- the same flat standing as every other
+    director, never under the promoting director. Body: {promoteeId}."""
     requester = _resolve_requester(request)
     if not requester:
         return JSONResponse({'error': 'unauthenticated'}, status_code=401)
@@ -20156,8 +20335,9 @@ async def ingest_library(request: Request):
     # Player-only -- see the module comment above. The gate is a REAL player
     # session, not the body's self-declared agentId: an agent key bearer must
     # not be able to point this at arbitrary host paths (~/.ssh/id_rsa, .env).
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     body = await request.json()
     agent_id = body.get('agentId', 'player')
     # Deliberately not agent-callable -- see the module comment above.
@@ -20416,8 +20596,9 @@ async def create_village_endpoint(request: Request):
     """Create a new village (player-only). A village is the top-level identity
     + memory boundary: its agents only ever read their own wiki and their own
     design taste. {name} required; optionally {agentIds} to seed membership."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     body = await request.json()
     import sim as _sim
     state = _state_begin()
@@ -20444,8 +20625,9 @@ async def assign_agent_to_village(request: Request):
     """Move an agent into a village (player-only). The boundary is enforced at
     read time: after this, the agent's wiki + design-taste context come only
     from the target village."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     body = await request.json()
     agent_id = (body.get('agentId') or '').strip()
     village_id = (body.get('villageId') or '').strip()
@@ -20462,19 +20644,25 @@ async def assign_agent_to_village(request: Request):
 
 @app.post('/api/design-reference')
 async def design_reference(request: Request):
-    """Designmind-style design brief from an uploaded image. Player-only (same
-    reasoning as /api/library/ingest -- a human handing the tank a file is a
-    different, narrower risk than letting an agent choose files). Saves the
+    """Designmind-style design brief from an uploaded image.
+    Operator-gated (player session or a director/admin agent -- a human
+    or the org's own management handing the tank a file is a different,
+    narrower risk than letting a worker choose files). Saves the
     image into library/design-references/, runs the vision tier over it, and
     writes a <name>.txt brief next to it that any agent can read via
     /api/library/file and find via /api/library/search. Returns the brief and
     the library-relative paths."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     body = await request.json()
-    agent_id = body.get('agentId', 'player')
-    if agent_id != 'player':
-        return JSONResponse({'error': 'design references are player-only'}, status_code=403)
+    # The authenticated operator is the actor; a body agentId claim is
+    # honored only when it names the verified requester itself, never an
+    # arbitrary agent (an operator cannot forge another agent's action).
+    claimed = (body.get('agentId') or '').strip() or None
+    if claimed and claimed != actor:
+        return JSONResponse({'error': 'design references require the operator itself'}, status_code=403)
+    agent_id = claimed or actor
     name = _safe_design_reference_name(body.get('name'))
     image_b64 = (body.get('imageBase64') or '').strip()
     project = _design_project_rel(body.get('project'), village=body.get('village') or 'main')
@@ -20532,14 +20720,20 @@ async def design_reference(request: Request):
 async def design_reference_url(request: Request):
     """Designmind-style design brief from a live URL: fetch the page, take a
     real screenshot, run the vision tier, and write a design-references/<host>.txt
-    brief any agent can read. Player-only, and the URL goes through the same
+    brief any agent can read. Operator-gated (player session or a
+    director/admin agent), and the URL goes through the same
     SSRF/public-host guard as /api/browse (never a private/internal address)."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     body = await request.json()
-    agent_id = body.get('agentId', 'player')
-    if agent_id != 'player':
-        return JSONResponse({'error': 'design references are player-only'}, status_code=403)
+    # The authenticated operator is the actor; a body agentId claim is
+    # honored only when it names the verified requester itself, never an
+    # arbitrary agent (an operator cannot forge another agent's action).
+    claimed = (body.get('agentId') or '').strip() or None
+    if claimed and claimed != actor:
+        return JSONResponse({'error': 'design references require the operator itself'}, status_code=403)
+    agent_id = claimed or actor
     url = (body.get('url') or '').strip()
     if not url:
         return JSONResponse({'error': 'url is required'}, status_code=400)
@@ -20646,14 +20840,20 @@ def _fold_design_taste(briefs, project, owner='player', review_after_days=None,
 async def design_reference_taste(request: Request):
     """Fold a project's collected design briefs into one distilled taste doc
     (design-references/<project>/taste.md), the single source of truth agents
-    are required to load before design work on that project. Player-only.
+    are required to load before design work on that project. Operator-gated
+    (player session or a director/admin agent).
     Overwrites taste.md in place -- re-run after adding briefs."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     body = await request.json()
-    agent_id = body.get('agentId', 'player')
-    if agent_id != 'player':
-        return JSONResponse({'error': 'design references are player-only'}, status_code=403)
+    # The authenticated operator is the actor; a body agentId claim is
+    # honored only when it names the verified requester itself, never an
+    # arbitrary agent (an operator cannot forge another agent's action).
+    claimed = (body.get('agentId') or '').strip() or None
+    if claimed and claimed != actor:
+        return JSONResponse({'error': 'design references require the operator itself'}, status_code=403)
+    agent_id = claimed or actor
     project = _design_project_rel(body.get('project'), village=body.get('village') or 'main')
     briefs = _list_design_briefs(body.get('project'), village=body.get('village') or 'main')
     if not briefs:
@@ -20830,7 +21030,7 @@ async def chat(request: Request):
     # (callers explicitly pass a higher max_tokens; the 150 default for
     # routine chat/handoff/pair-programming replies is untouched).
     try:
-        max_tokens = min(max(int(body.get('max_tokens', 150)), 1), 4000)
+        max_tokens = min(max(int(body.get('max_tokens', 150)), 1), CHAT_MAX_TOKENS_CAP)
     except (TypeError, ValueError):
         max_tokens = 150
     # The Bank: attribute this call's cost to a service. Content executors
@@ -21693,8 +21893,11 @@ async def budget_view(request: Request):
         openrouter['used_pct'] = round(used / total, 4)
     # Per-director slices: the admin-set monthly ceiling each
     # director's team draws on, with live month-to-date usage from
-    # the ledger, plus the raise requests the admin has not
-    # answered yet (filed via POST /api/budget/request).
+    # the ledger (own burn plus the WHOLE subtree's -- each agent's
+    # spend accrues to its roster director, so a director's team
+    # total is the sum down the reporting chain), plus the raise
+    # requests the admin has not answered yet (filed via
+    # POST /api/budget/request).
     director_budgets = {}
     budget_requests = []
     try:
@@ -21716,9 +21919,15 @@ async def budget_view(request: Request):
             except (TypeError, ValueError):
                 continue
             if cap_usd > 0:
-                director_budgets[str(did)] = {
+                did = str(did)
+                subtree = round(sum(
+                    float(usage.get(d) or 0)
+                    for d in _subtree_agent_ids(state, did)
+                    if d in usage), 6)
+                director_budgets[did] = {
                     'capUsd': round(cap_usd, 6),
-                    'usedUsd': usage.get(str(did), 0.0),
+                    'usedUsd': usage.get(did, 0.0),
+                    'subtreeUsedUsd': subtree,
                 }
         budget_requests = [r for r in (state.get('budgetRequests') or [])
                            if isinstance(r, dict)]
@@ -21735,9 +21944,11 @@ async def budget_set(request: Request):
     flat object of knob names -> non-negative numbers, e.g.
     {"SPEND_CAP_USD": 75, "HIGH_TIER_MONTHLY_BUDGET_USD": 2}. Unknown names and
     non-numeric/negative values are refused (never a partial silent apply --
-    all-or-nothing validation first, then one .env write + one reload)."""
-    if not _require_player_or_admin(request):
-        return JSONResponse({'error': 'Unauthorized -- budget is a player-or-admin control'}, status_code=401)
+    all-or-nothing validation first, then one .env write + one reload).
+    PLAYER-ONLY (not even the admin): these are the .env spend caps --
+    real-money ceilings, the one surface agents never hold."""
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- spend caps are a player-only control'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -21779,11 +21990,13 @@ async def budget_set(request: Request):
 @_state_writer
 async def budget_director_set(request: Request):
     """Set (or clear) one director's monthly model-spend slice -- the
-    hard ceiling for that director's WHOLE team. The admin decides the
-    slices (a player session or the admin agent); 0/null clears the
-    cap. A raise also answers the pending requests it covers."""
-    if not _require_player_or_admin(request):
-        return JSONResponse({'error': 'Unauthorized -- director budgets are a player-or-admin control'}, status_code=401)
+    hard ceiling for that director's WHOLE team. The player and
+    the admin decide every slice; a director decides only a
+    DIRECT sub-director's slice. 0/null clears the cap. A raise
+    also answers the pending requests it covers."""
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized -- director budgets are an operator control'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -21815,6 +22028,13 @@ async def budget_director_set(request: Request):
                     for t in teams)
     if not known:
         return JSONResponse({'error': f'unknown director: {director_id}'}, status_code=400)
+    # The player and the admin decide every slice; a director may
+    # decide only a DIRECT sub-director's slice -- never their own,
+    # a sibling's, or a worker's (a worker has no slice to set).
+    player = bool(verify_session(request.cookies.get(SESSION_COOKIE_NAME)))
+    if not player and not _is_admin(state, actor) \
+            and not _is_direct_supervisor(state, actor, director_id):
+        return JSONResponse({'error': "a director may set only a direct report's slice"}, status_code=403)
     budgets = state.get('directorBudgets')
     if not isinstance(budgets, dict):
         budgets = {}
@@ -21847,11 +22067,12 @@ async def budget_director_set(request: Request):
 @app.post('/api/budget/request')
 @_state_writer
 async def budget_request(request: Request):
-    """Ask the admin for a bigger monthly slice. A director files for
-    their OWN slice (agent key matching their id -- a worker cannot
-    ask, and no one asks for another director); the player and the
-    admin may file for any director. The request is recorded on state
-    (visible at GET /api/budget) and mailed to the admin's mailbox."""
+    """Ask for a bigger monthly slice. A director files for their OWN
+    slice (agent key matching their id -- a worker cannot ask, and no
+    one asks for another director); the player and the admin may file
+    for any director. The request is recorded on state (visible at
+    GET /api/budget) and mailed straight to the admin -- never
+    relayed up a chain of directors."""
     player = bool(verify_session(request.cookies.get(SESSION_COOKIE_NAME)))
     requester = 'player' if player else _resolve_requester(request)
     if not requester:
@@ -21900,26 +22121,35 @@ async def budget_request(request: Request):
         'requestedAt': now_ms,
     }
     state.setdefault('budgetRequests', []).append(entry)
-    admin_id = _admin_agent_id(state)
     mail_text = (f'Budget request from director {director_id}: raise the '
                  f"monthly slice from ${entry['currentUsd']:.2f} to "
                  f'${requested:.2f}.'
                  + (f' Reason: {reason}' if reason else '')
                  + ' Grant it via POST /api/budget/director.')
-    if admin_id:
+    # Flat routing on purpose: every director's raise request goes
+    # straight to the admin -- the grantor of any slice -- never
+    # relayed up a chain of directors one hop at a time (the operator
+    # keeps the org chart flat and the chains short). When the
+    # requester IS the admin, the player is the only authority left:
+    # no mail, the request rides on GET /api/budget for the player.
+    admin_id = _admin_agent_id(state)
+    mail_to = admin_id if admin_id and admin_id != requester else 'player'
+    mailed = False
+    if mail_to != 'player':
         try:
             import sim as _sim
-            _sim._deliver_mail(state, admin_id, 'budget_request',
+            _sim._deliver_mail(state, mail_to, 'budget_request',
                                {'text': mail_text})
+            mailed = True
         except Exception as e:
             print(f'[budget] request mail to admin failed: {e}', flush=True)
     save_state_to_db(state)
     log_action(requester if requester != 'player' else None,
                'budget_request',
                {'directorId': director_id, 'requestedUsd': round(requested, 6),
-                'requestId': entry['id']}, authorized=True)
+                'requestId': entry['id'], 'mailedTo': mail_to}, authorized=True)
     return JSONResponse({'ok': True, 'request': entry,
-                         'mailedToAdmin': bool(admin_id)})
+                         'mailedTo': mail_to, 'mailed': mailed})
 
 
 @app.post('/api/env/reload')
@@ -22632,8 +22862,9 @@ async def channel_probe(request: Request):
     `doctor` mirror). Makes real outbound GETs to each backend's probe URL, so
     it is session-gated (player) and rate-limited like every other outbound
     tool -- agents never call this."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     if not check_rate_limit('channel-probe'):
         return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
     if _API_CHANNELS_LOAD_ERROR:
@@ -24637,7 +24868,7 @@ async def sms_grant(request: Request):
     if not agent_id or message_id <= 0:
         return JSONResponse({'error': 'agentId and messageId are required'}, status_code=400)
     try:
-        ttl_s = max(60, min(int(body.get('ttlSec') or 300), 900))
+        ttl_s = max(SMS_TTL_MIN_S, min(int(body.get('ttlSec') or SMS_TTL_DEFAULT_S), SMS_TTL_MAX_S))
     except (TypeError, ValueError):
         ttl_s = 300
     with _db() as conn:
@@ -27746,12 +27977,21 @@ async def model_tiers():
 
 
 @app.post('/api/model-tiers/refresh')
-async def model_tiers_refresh():
-    # An explicit, deliberate action (a button) -- but also run AUTOMATICALLY
-    # on the tier-refresh cadence by _model_tier_refresh_loop, attributed to
-    # the admin/director (the model landscape moves fast, so the think tank
-    # re-picks its best-value tier from the current scores + prices on a
-    # schedule). This endpoint just lets the player force an immediate re-pick too.
+async def model_tiers_refresh(request: Request):
+    # An explicit, deliberate operator action (a button) -- but also
+    # run AUTOMATICALLY on the tier-refresh cadence by
+    # _model_tier_refresh_loop (that loop calls refresh_model_tiers()
+    # directly, not this endpoint, so the gate does not affect it).
+    # Operator-gated and rate-limited: a re-pick walks the whole live
+    # catalog and re-scores every model, so it is real cost, not a
+    # free-for-all -- the same operator boundary as the other
+    # registries (player session or a director/admin agent).
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized -- tier refresh is an operator control'}, status_code=401)
+    if not check_rate_limit(f'tier-refresh:{actor}'):
+        log_action(actor, 'rate_limited', {'endpoint': 'model-tiers-refresh'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
     try:
         fresh = await refresh_model_tiers()
         return JSONResponse({band: {'slug': m['id'], 'name': m['name'], 'price': m['price']} for band, m in fresh.items()})
@@ -27909,22 +28149,23 @@ async def jev_decision_keys(request: Request):
 
 @app.post('/api/jev/model')
 async def jev_model_set(request: Request):
-    # Player-only, same session proof as the credential vault/handle minting
-    # (_resolve_requester falls closed to "player" for a misclaimed agent,
-    # which is exactly backwards here): switching the think tank's decisions
-    # model is an operator action. Writes the `settings` DB row so the switch
-    # survives restarts and takes effect immediately -- no process restart,
-    # and (unlike model_tiers) it is never auto-updated; a new decision model
-    # on OpenRouter is something the player chooses to adopt, deliberately.
-    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
-        return JSONResponse({'error': 'Jev model switching is player-only'}, status_code=403)
+    # Operator-gated (player session or a director/admin agent), same
+    # gate as the other registries: switching the think tank's decisions
+    # model is an operator action. Writes the `settings` DB row so the
+    # switch survives restarts and takes effect immediately -- no process
+    # restart, and (unlike model_tiers) it is never auto-updated; a new
+    # decision model on OpenRouter is something the operator chooses to
+    # adopt, deliberately.
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Jev model switching is operator-only'}, status_code=403)
     body = await request.json()
     model = (body.get('model') or '').strip()
     if not model:
         return JSONResponse({'error': 'model is required'}, status_code=400)
     _set_setting('jev_model', model)
-    log_action('player', 'jev_model_set', {'model': model}, authorized=True)
-    _append_passport_decision('jev_model_set', 'player', {'model': model})
+    log_action(actor, 'jev_model_set', {'model': model}, authorized=True)
+    _append_passport_decision('jev_model_set', actor, {'model': model})
     return JSONResponse({'ok': True, 'model': model})
 
 

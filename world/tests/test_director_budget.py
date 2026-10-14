@@ -261,6 +261,29 @@ class DirectorBudgetEndpoints(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(state["directorBudgets"]["dir-2"], 10.0)
 
+    def test_set_director_budget_sibling_director_forbidden(self):
+        # dir-1 and dir-2 are siblings under the admin (neither
+        # supervises the other): a director may set only a DIRECT
+        # report's slice, never a sibling's.
+        state = _state()
+        with _api_env(state, agent="dir-1"):
+            resp = _client().post("/api/budget/director",
+                                  json={"directorId": "dir-2", "budgetUsd": 10})
+        self.assertEqual(resp.status_code, 403)
+        self.assertNotIn("dir-2", state.get("directorBudgets", {}))
+
+    def test_set_director_budget_own_report_allowed(self):
+        # Make dir-2 a direct report of dir-1: dir-1 may then set
+        # dir-2's slice (the admin-grant equivalence for a director's
+        # own report).
+        state = _state()
+        state["agentRoster"][2]["director"] = "dir-1"
+        with _api_env(state, agent="dir-1"):
+            resp = _client().post("/api/budget/director",
+                                  json={"directorId": "dir-2", "budgetUsd": 10})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(state["directorBudgets"]["dir-2"], 10.0)
+
     def test_set_director_budget_worker_forbidden(self):
         state = _state()
         with _api_env(state, agent="worker-1"):
@@ -333,7 +356,8 @@ class DirectorBudgetEndpoints(unittest.TestCase):
         self.assertEqual(req["reason"], "sprint backlog")
         # The admin is mailed so the request is never silent.
         self.assertEqual(mails, [("admin-1", "budget_request")])
-        self.assertTrue(resp.json()["mailedToAdmin"])
+        self.assertEqual(resp.json()["mailedTo"], "admin-1")
+        self.assertTrue(resp.json()["mailed"])
 
     def test_request_raise_worker_forbidden(self):
         state = _state()

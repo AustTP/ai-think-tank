@@ -1799,6 +1799,12 @@ def _apply_operator_policy():
     global TIER_THROTTLE_RATIO
     global TASK_WORK_DURATION_S, TASK_CONTENT_TIMEOUT_S
     global TASK_CONTENT_TIMEOUT_MAX_S, TASK_CYCLE_S, MAX_REVIEW_CYCLES
+    global PLACEMENT_MIN_DIST, RULE_MINE_CADENCE_MS
+    global RUNBOOK_MAX_ENTRIES_PER_PRODUCT, STALE_WORK_MAX_REPLANS
+    global REFINEMENT_MAX_REQUESTS, BREAKDOWN_MAX_REQUESTS
+    global TASK_CONTENT_GRACE_MAX_S, _FEEDBACK_MAX
+    global MIN_RESEARCH_CADENCE_MS, MIN_PIPELINE_CADENCE_MS
+    global _DEVICE_CHECKIN_HISTORY_MAX
     from config import get_operator_policy
     _p = get_operator_policy()
     MAX_TEAM_MEMBERS = _p['maxTeamMembers']
@@ -1848,20 +1854,23 @@ def _apply_operator_policy():
     TASK_CONTENT_TIMEOUT_MAX_S = _p['taskContentTimeoutMaxS']
     TASK_CYCLE_S = _p['taskCycleS']
     MAX_REVIEW_CYCLES = _p['maxReviewCycles']
+    PLACEMENT_MIN_DIST = _p['placementMinDist']
+    RULE_MINE_CADENCE_MS = _p['ruleMineCadenceMs']
+    RUNBOOK_MAX_ENTRIES_PER_PRODUCT = _p['runbookMaxEntriesPerProduct']
+    STALE_WORK_MAX_REPLANS = _p['staleWorkMaxReplans']
+    REFINEMENT_MAX_REQUESTS = _p['refinementMaxRequests']
+    BREAKDOWN_MAX_REQUESTS = _p['breakdownMaxRequests']
+    TASK_CONTENT_GRACE_MAX_S = _p['taskContentGraceMaxS']
+    _FEEDBACK_MAX = _p['feedbackMax']
+    MIN_RESEARCH_CADENCE_MS = _p['minResearchCadenceMs']
+    MIN_PIPELINE_CADENCE_MS = _p['minPipelineCadenceMs']
+    _DEVICE_CHECKIN_HISTORY_MAX = _p['deviceCheckinHistoryMax']
 
-
-_apply_operator_policy()
-try:
-    import config as _config_for_hooks
-    if _apply_operator_policy not in _config_for_hooks.ON_RELOAD_HOOKS:
-        _config_for_hooks.ON_RELOAD_HOOKS.append(_apply_operator_policy)
-except Exception:
-    pass
 
 # How long an arriving agent "works" before completing, when the server owns
 # the lifecycle but the real per-room executor hasn't been ported yet (the
 # accepted short-circuit of this slice). Room content execution is next.
-TASK_WORK_DURATION_S = 8.0
+# Bound via operator policy 'taskWorkDurationS' (default 8.0).
 
 # Phase 3 slice 2 (research executor): a dispatched content run may take longer
 # than the 8s work-budget placeholder -- the JS fires the real async work and
@@ -1869,7 +1878,7 @@ TASK_WORK_DURATION_S = 8.0
 # gates completion, only the work or that ceiling does). Mirror that: an agent
 # marked working with a _content_epoch runs up to this budget before the
 # completion loop gives up on the content and finalizes the fallback.
-TASK_CONTENT_TIMEOUT_S = 120.0
+# Bound via operator policy 'taskContentTimeoutS' (default 120.0).
 
 # A content task may carry its OWN work budget (queue_spike's budgetMs is
 # documented as "a hard budgetMs for the work cycle"), but _dispatch_content_work
@@ -12962,3 +12971,20 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         _recruit_pair_navigator(state, chosen_id, task, can_wake_off_duty,
                                 grid, doors, now_ms)
     return task
+
+# ---------------------------------------------------------------------------
+# Operator-policy binding runs LAST: every policy-backed literal above is
+# defined by this point, so the rebind sees the module's own defaults and
+# then overrides them from config.OPERATOR_POLICY (in-place dict, refreshed
+# by get_operator_policy / reload_policy_config). Registered on
+# config.ON_RELOAD_HOOKS; also called once here because
+# config.reload_policy_config() ran before this module was imported (hooks
+# registered after that call do not re-run until the next reload).
+# ---------------------------------------------------------------------------
+_apply_operator_policy()
+try:
+    import config as _config_for_hooks
+    if _apply_operator_policy not in _config_for_hooks.ON_RELOAD_HOOKS:
+        _config_for_hooks.ON_RELOAD_HOOKS.append(_apply_operator_policy)
+except Exception:
+    pass

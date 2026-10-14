@@ -1735,6 +1735,29 @@ class ModelTierEndpoints(unittest.TestCase):
             r = c.post('/api/model-tiers/refresh')
         self.assertEqual(r.status_code, 502)
 
+    def test_model_tiers_refresh_rejects_worker_key(self):
+        # The refresh is an OPERATOR control (player session or a
+        # director/admin agent): a worker's key is refused 401 before
+        # any catalog walk runs.
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
+             unittest.mock.patch.object(serve, '_resolve_requester', return_value='worker'), \
+             unittest.mock.patch.object(serve, '_is_director_or_admin', return_value=False):
+            c = TestClient(serve.app)
+            r = c.post('/api/model-tiers/refresh')
+        self.assertEqual(r.status_code, 401)
+        self.assertIn('Unauthorized', r.json()['error'])
+
+    def test_model_tiers_refresh_rate_limited_is_429(self):
+        refresh = unittest.mock.AsyncMock()
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'check_rate_limit', return_value=False), \
+             unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch.object(serve, 'refresh_model_tiers', new=refresh):
+            c = TestClient(serve.app)
+            r = c.post('/api/model-tiers/refresh')
+        self.assertEqual(r.status_code, 429)
+        refresh.assert_not_awaited()
+
     def test_benchmark_scores_get(self):
         scores = {'s': {'MMLU': 0.7}}
         with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
@@ -1888,14 +1911,49 @@ class JevEndpoints(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()['slugs'], {'a': 'available', 'b': 'available'})
 
-    def test_jev_model_set_requires_session(self):
-        # Middleware passes (valid agent key) so the handler's own player-only
-        # check is what rejects the request.
-        with unittest.mock.patch.object(serve, 'verify_session', side_effect=[True, False]):
-            c = TestClient(serve.app)
-            r = c.post('/api/jev/model', json={'model': 'x/y'})
-        self.assertEqual(r.status_code, 403)
-        self.assertIn('player-only', r.json()['error'])
+    def test_jev_model_set_is_operator_gated(self):
+        # require_login middleware admits a real session OR a valid
+        # agent key; the handler's _operator_gate then admits a
+        # player session or a director/admin agent. verify_session is
+        # consulted once by the middleware, once by
+        # _require_player_session, and once by _resolve_requester.
+        with self.subTest('anonymous is rejected by the middleware'):
+            with unittest.mock.patch.object(serve, 'verify_session',
+                                            return_value=False):
+                c = TestClient(serve.app)
+                r = c.post('/api/jev/model', json={'model': 'x/y'})
+            self.assertEqual(r.status_code, 401)
+            self.assertIn('Unauthorized', r.json()['error'])
+        with self.subTest('worker key is not an operator'):
+            with unittest.mock.patch.object(serve, 'verify_session',
+                                            side_effect=[False, False, False]), \
+                 unittest.mock.patch.object(serve, '_valid_agent_key_presented',
+                                            return_value=True), \
+                 unittest.mock.patch.object(serve, '_agent_id_for_key',
+                                            return_value='worker-1'), \
+                 unittest.mock.patch.object(serve, '_is_director_or_admin',
+                                            return_value=False):
+                c = TestClient(serve.app)
+                r = c.post('/api/jev/model', json={'model': 'x/y'})
+            self.assertEqual(r.status_code, 403)
+            self.assertIn('operator-only', r.json()['error'])
+        with self.subTest('director key switches the model'):
+            with unittest.mock.patch.object(serve, 'verify_session',
+                                            side_effect=[False, False, False]), \
+                 unittest.mock.patch.object(serve, '_valid_agent_key_presented',
+                                            return_value=True), \
+                 unittest.mock.patch.object(serve, '_agent_id_for_key',
+                                            return_value='nora'), \
+                 unittest.mock.patch.object(serve, '_is_director_or_admin',
+                                            return_value=True), \
+                 unittest.mock.patch.object(serve, '_set_setting') as set_setting, \
+                 unittest.mock.patch.object(serve, 'log_action'), \
+                 unittest.mock.patch.object(serve, '_append_passport_decision'):
+                c = TestClient(serve.app)
+                r = c.post('/api/jev/model', json={'model': 'x/y'})
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()['ok'], True)
+            set_setting.assert_called_once_with('jev_model', 'x/y')
 
     def test_jev_model_set_requires_model(self):
         with unittest.mock.patch.object(serve, 'verify_session', return_value=True):
@@ -2210,15 +2268,15 @@ class ApiLogEndpoint(unittest.TestCase):
 class ApiMailSend(unittest.TestCase):
     """POST /api/mail/send -- the validated inter-agent mail path."""
 
-    def _post(self, body, state=None, session_ok=True, key_ok=False,
+    def _post(self, body, state=None, session_ok=True, key_owner=None,
               log=None, app=None):
         with unittest.mock.patch.object(serve, 'get_state_from_db',
                                         return_value=state), \
              unittest.mock.patch.object(serve, 'save_state_to_db'), \
              unittest.mock.patch.object(serve, 'verify_session',
                                         return_value=session_ok), \
-             unittest.mock.patch.object(serve, '_valid_agent_key_presented',
-                                        return_value=key_ok), \
+             unittest.mock.patch.object(serve, '_agent_id_for_key',
+                                        return_value=key_owner), \
              unittest.mock.patch.object(serve, 'log_action', log or unittest.mock.Mock()), \
              unittest.mock.patch.object(serve, '_append_passport_decision',
                                         app or unittest.mock.Mock()):
@@ -2238,17 +2296,27 @@ class ApiMailSend(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertTrue(body['ok'])
-        self.assertTrue(body['mail']['text'].startswith('Ada: ship it'))
+        # A player session sends AS the player: the credential decides
+        # the sender, so the body's fromId claim ('ada') is ignored and
+        # the prefix is 'You', not 'Ada'.
+        self.assertTrue(body['mail']['text'].startswith('You: ship it'))
 
     def test_unknown_recipient_is_404(self):
         r = self._post({'fromId': 'ada', 'toId': 'nobody', 'text': 'hi'},
                        self._state())
         self.assertEqual(r.status_code, 404)
 
-    def test_unknown_sender_is_400(self):
-        r = self._post({'fromId': 'ghost', 'toId': 'ben', 'text': 'hi'},
-                       self._state())
-        self.assertEqual(r.status_code, 400)
+    def test_agent_key_sends_as_owner_not_body_claim(self):
+        # An agent key is the sender identity: the body's fromId is
+        # ignored, so the mail goes out as the KEY OWNER ('Ada') no
+        # matter whether the body claims the player or another agent.
+        for claimed in ('player', 'ben'):
+            r = self._post({'fromId': claimed, 'toId': 'ben',
+                            'text': 'ship it'},
+                           self._state(), session_ok=False, key_owner='ada')
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertTrue(r.json()['mail']['text'].startswith('Ada: ship it'),
+                            'the key owner, not the body fromId, is the sender')
 
     def test_missing_or_non_string_text_is_400(self):
         for bad in (None, 42, ''):
@@ -2258,7 +2326,7 @@ class ApiMailSend(unittest.TestCase):
 
     def test_player_session_only_forbidden_without_auth(self):
         r = self._post({'fromId': 'ada', 'toId': 'ben', 'text': 'hi'},
-                       self._state(), session_ok=False, key_ok=False)
+                       self._state(), session_ok=False, key_owner=None)
         self.assertEqual(r.status_code, 401)
 
 
