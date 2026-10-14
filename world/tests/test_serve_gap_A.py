@@ -1362,15 +1362,29 @@ class PromoteAndTeamRecords(unittest.TestCase):
     def test_teams_missing_scrum_master_flags_big_team(self):
         fake_sim = types.ModuleType('sim')
         fake_sim.SCRUM_MASTER_MIN_TEAM_SIZE = 4
+        fake_sim.team_policy = lambda state, ref, key=None: 4
         fake_sim._team_member_count = lambda state, did: 5
         state = {'teams': [{'id': 't1', 'directorId': 'nora', 'name': 'Team One'}]}
         with unittest.mock.patch.dict(sys.modules, {'sim': fake_sim}):
             missing = serve._teams_missing_scrum_master(state, ['t1'])
         self.assertEqual(missing, [{'id': 't1', 'name': 'Team One'}])
 
+    def test_teams_missing_scrum_master_uses_team_policy_floor(self):
+        # The gate reads the floor through sim.team_policy (team agreement ->
+        # operator policy -> default), so a team whose agreement raises the
+        # floor above its size is no longer flagged.
+        fake_sim = types.ModuleType('sim')
+        fake_sim.SCRUM_MASTER_MIN_TEAM_SIZE = 4
+        fake_sim.team_policy = lambda state, ref, key=None: 6
+        fake_sim._team_member_count = lambda state, did: 5
+        state = {'teams': [{'id': 't1', 'directorId': 'nora', 'name': 'Team One'}]}
+        with unittest.mock.patch.dict(sys.modules, {'sim': fake_sim}):
+            self.assertEqual(serve._teams_missing_scrum_master(state, ['t1']), [])
+
     def test_teams_missing_scrum_master_small_team_ok(self):
         fake_sim = types.ModuleType('sim')
         fake_sim.SCRUM_MASTER_MIN_TEAM_SIZE = 4
+        fake_sim.team_policy = lambda state, ref, key=None: 4
         fake_sim._team_member_count = lambda state, did: 2
         state = {'teams': [{'id': 't1', 'directorId': 'nora'}]}
         with unittest.mock.patch.dict(sys.modules, {'sim': fake_sim}):

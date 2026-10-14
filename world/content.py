@@ -912,10 +912,10 @@ def _run_research_bare_content(snapshot, agent_id, task, base_ctx=None):
 # /api/execute calls (probe-before-writing, heredoc-continuation, orphaned and
 # phantom script detection) and /api/chat for the code itself.
 WORKROOM_SANDBOX_ID = 'workroom-shared'      # index.html WORKROOM_SANDBOX_ID
-CODE_CONTINUATION_ATTEMPTS = 2               # tasks.js
-MAX_CODE_PROBE_ROUNDS = 3                    # tasks.js
+CODE_CONTINUATION_ATTEMPTS = 2               # tasks.js:1536 (mirror; JS side stays at these defaults)
+MAX_CODE_PROBE_ROUNDS = 3                    # tasks.js:1547 (mirror)
 MAX_CODE_COLAB_ROUNDS = 3                    # code-lane Colab compute rounds (mirrors probe rounds)
-MAX_REVIEW_PROBE_ROUNDS = 2                  # tasks.js
+MAX_REVIEW_PROBE_ROUNDS = 2                  # tasks.js (mirror)
 # The coding/review tiers are default-reasoning models; _post_openrouter_raw
 # caps their hidden reasoning at max_tokens // 2. A tight budget left the
 # reasoning chain truncated with content=null (the "[chat-debug] empty reply"
@@ -923,6 +923,30 @@ MAX_REVIEW_PROBE_ROUNDS = 2                  # tasks.js
 _CODE_MAX_TOKENS = 32000                     # runCodingTask /api/chat
 _REVIEW_MAX_TOKENS = 32000                    # runReviewTask /api/chat
 _VISION_MAX_TOKENS = 500                     # reviewScreenshot /api/chat
+
+
+# Rebind the code-lane constants above from config.OPERATOR_POLICY. Registered
+# on config.ON_RELOAD_HOOKS and called once here (config.reload_policy_config
+# ran before this module was imported, so late hooks don't re-run until an
+# explicit reload) -- same pattern as sim/serve _apply_operator_policy.
+def _apply_operator_policy():
+    global CODE_CONTINUATION_ATTEMPTS, MAX_CODE_PROBE_ROUNDS
+    global MAX_CODE_COLAB_ROUNDS, MAX_REVIEW_PROBE_ROUNDS
+    from config import get_operator_policy
+    _p = get_operator_policy()
+    CODE_CONTINUATION_ATTEMPTS = _p['codeContinuationAttempts']
+    MAX_CODE_PROBE_ROUNDS = _p['maxCodeProbeRounds']
+    MAX_CODE_COLAB_ROUNDS = _p['maxCodeColabRounds']
+    MAX_REVIEW_PROBE_ROUNDS = _p['maxReviewProbeRounds']
+
+
+_apply_operator_policy()
+try:
+    import config as _config_for_hooks
+    if _apply_operator_policy not in _config_for_hooks.ON_RELOAD_HOOKS:
+        _config_for_hooks.ON_RELOAD_HOOKS.append(_apply_operator_policy)
+except Exception:
+    pass
 
 
 def _resolve_story_root(snapshot, task):

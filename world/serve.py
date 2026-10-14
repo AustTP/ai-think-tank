@@ -5654,6 +5654,22 @@ def _admin_agent_id(state):
     return None
 
 
+def _require_player_or_admin(request):
+    """Operator gate: the player's real session, OR a verified agent key whose
+    roster entry is isAdmin. Widens the four player-only operator endpoints
+    (/api/policy/reload, /api/budget, /api/env/reload,
+    /api/sandbox-backups/restore) to the admin agent -- the two operator
+    identities -- without opening them to ordinary agents. Fail closed."""
+    if _require_player_session(request):
+        return True
+    requester = _resolve_requester(request)
+    if not requester:
+        return False
+    if verify_agent_key(requester, request.headers.get('X-Agent-Key')) is not True:
+        return False
+    return _is_admin(get_state_from_db() or {}, requester)
+
+
 def _direct_reports(state, agent_id):
     roster = state.get('agentRoster', []) if state else []
     return [d.get('id') for d in roster if d.get('director') == agent_id]
@@ -6025,6 +6041,20 @@ def _can_write_team(state, writer_id, team_id):
     return writer_id in _director_chain(state, t.get('directorId'))
 
 
+def _can_set_team_agreement(state, writer_id, team_id):
+    """Who may edit a team's teamwork agreement: the player, the admin, or
+    THIS team's director only. Deliberately stricter than _can_write_team --
+    shared-space writes also let chain-above directors and members through,
+    but an agreement changes that team's sim behavior, so it stays with the
+    team's own director (plus the operator)."""
+    if writer_id == 'player' or _is_admin(state, writer_id):
+        return True
+    t = next((x for x in ((state or {}).get('teams') or []) if x.get('id') == team_id), None)
+    if not t:
+        return False
+    return writer_id in (t.get('directorId'), t.get('id'))
+
+
 def _team_record(state, team_id):
     """The live team record for team_id, refreshed with DERIVED members (never
     the stored snapshot -- same invariant as list_teams)."""
@@ -6055,7 +6085,7 @@ def _teams_missing_scrum_master(state, team_ids):
         if t.get('scrumMasterId'):
             continue
         director_id = t.get('directorId')
-        if director_id and _sim._team_member_count(state, director_id) < _sim.SCRUM_MASTER_MIN_TEAM_SIZE:
+        if director_id and _sim._team_member_count(state, director_id) < _sim.team_policy(state, tid, 'scrumMasterMinTeamSize'):
             continue  # small team -- the director stands in
         missing.append({'id': tid, 'name': t.get('name') or tid})
     return missing
@@ -14286,12 +14316,15 @@ async def intent_sprint(request: Request):
     # strict check here gives the player a clean error.)
     worker_count = body.get('workerCount')
     if worker_count is not None:
+        _wc_cap = (max([_sim.team_policy(state, t, 'maxTeamMembers')
+                        for t in team_ids], default=0)
+                   or _sim.team_policy(state, owner_id, 'maxTeamMembers'))
         try:
             worker_count = int(worker_count)
         except (TypeError, ValueError):
-            return JSONResponse({'error': f'workerCount must be a whole number from 1 to {_sim.MAX_TEAM_MEMBERS}'}, status_code=400)
-        if worker_count < 1 or worker_count > _sim.MAX_TEAM_MEMBERS:
-            return JSONResponse({'error': f'workerCount must be a whole number from 1 to {_sim.MAX_TEAM_MEMBERS}'}, status_code=400)
+            return JSONResponse({'error': f'workerCount must be a whole number from 1 to {_wc_cap}'}, status_code=400)
+        if worker_count < 1 or worker_count > _wc_cap:
+            return JSONResponse({'error': f'workerCount must be a whole number from 1 to {_wc_cap}'}, status_code=400)
     from sim import next_sprint_id
     sprint_id = next_sprint_id(state)
     sprint = _sim.queue_sprint(
@@ -18499,9 +18532,16 @@ async def list_teams(request: Request):
     state = get_state_from_db() or {}
     out = []
     roster = {d.get('id'): d for d in (state.get('agentRoster') or [])}
+    import sim as _sim
     for t in state.get('teams', []):
         tcopy = dict(t)
         tcopy['sharedDir'] = _team_shared_dir(t.get('id'))
+        # Teamwork agreement: `agreement` is the team's stored overrides (or
+        # None when the team set nothing), `agreementResolved` is the full
+        # 57-key map the sim actually uses (agreement -> operator policy ->
+        # code default, ceilings already clamped at read time).
+        tcopy['agreement'] = t.get('agreement') or None
+        tcopy['agreementResolved'] = _sim.team_policy(state, t.get('id'))
         # Members are always DERIVED live from the `director` graph, never read
         # from the stored snapshot -- so a promotion updates membership
         # immediately without a backfill pass.
@@ -18539,10 +18579,36 @@ async def list_backlog(request: Request):
 @app.put('/api/teams/{team_id}')
 @_state_writer
 async def update_team(team_id: str, request: Request):
+    """Edit a team's name/purpose and/or its teamwork agreement.
+
+    Credentials:
+    - Agent path: X-Agent-Key identity + _can_write_team (unchanged).
+    - Player path: a real player session may issue an edit that CONTAINS an
+      `agreement` key, with no agent key; agreement authority is
+      _can_set_team_agreement (player/admin/this-team's-director), and once
+      the player is in, name/purpose in the same body are honored too --
+      the player is the operator of the whole village.
+    - A session without `agreement` in the body still 401s (no agent key),
+      so this endpoint never becomes a general player write surface.
+
+    Body agreement values: an object of TEAM_AGREEABLE_KEYS (merged over the
+    stored overrides, fail-closed per key via config.validate_team_agreement)
+    or null to clear the overrides entirely."""
+    body = None
+    try:
+        parsed = await request.json()
+        if isinstance(parsed, dict):
+            body = parsed
+    except Exception:
+        body = None
+    is_agreement_edit = bool(body) and 'agreement' in body
     requester = _resolve_requester(request)
     if not requester:
-        return JSONResponse({'error': 'unauthenticated'}, status_code=401)
-    if verify_agent_key(requester, request.headers.get('X-Agent-Key')) is not True:
+        if is_agreement_edit and _require_player_session(request):
+            requester = 'player'
+        else:
+            return JSONResponse({'error': 'unauthenticated'}, status_code=401)
+    if requester != 'player' and verify_agent_key(requester, request.headers.get('X-Agent-Key')) is not True:
         return JSONResponse({'error': 'attribution key mismatch'}, status_code=403)
     state = _state_begin()
     if not state:
@@ -18551,9 +18617,12 @@ async def update_team(team_id: str, request: Request):
     t = next((x for x in teams if x.get('id') == team_id), None)
     if not t:
         return JSONResponse({'error': 'unknown team'}, status_code=404)
-    if not _can_write_team(state, requester, team_id):
+    if is_agreement_edit and not _can_set_team_agreement(state, requester, team_id):
+        return JSONResponse({'error': "only this team's director, the admin, or the player may edit the teamwork agreement"}, status_code=403)
+    if requester != 'player' and not _can_write_team(state, requester, team_id):
         return JSONResponse({'error': 'only a team director, a chain-above director, or the admin may edit this team'}, status_code=403)
-    body = await request.json()
+    if body is None:
+        body = {}
     changed = False
     if 'name' in body:
         name = (body.get('name') or '').strip()
@@ -18565,6 +18634,21 @@ async def update_team(team_id: str, request: Request):
         if purpose != t.get('purpose'):
             t['purpose'] = purpose
             changed = True
+    if is_agreement_edit:
+        import config as _config
+        raw = body.get('agreement')
+        if raw is None:
+            if t.get('agreement') is not None:
+                t['agreement'] = None
+                changed = True
+        elif isinstance(raw, dict):
+            base = t.get('agreement') if isinstance(t.get('agreement'), dict) else {}
+            cleaned = _config.validate_team_agreement({**base, **raw}) or None
+            if cleaned != (t.get('agreement') or None):
+                t['agreement'] = cleaned
+                changed = True
+        else:
+            return JSONResponse({'error': 'agreement must be an object of teamwork-agreement keys or null to clear it'}, status_code=400)
     if changed:
         t['updatedBy'] = requester
         t['updatedAt'] = int(time.time() * 1000)
@@ -21401,10 +21485,11 @@ async def policy_reload(request: Request):
     # Re-read the four world/*.json policy files so an operator's file edits
     # apply without a server restart. Fails closed: a bad edit keeps the
     # previous loaded values, and the response reports what each file loaded.
-    # PLAYER-SESSION-ONLY: reloading is an operator action; an agent key never
-    # suffices, so a compromised key cannot fiddle with the reload cadence.
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- reloading policy requires the player session'}, status_code=401)
+    # OPERATOR-ONLY (player session or the admin agent): reloading is an
+    # operator action; an ordinary agent key never suffices, so a compromised
+    # key cannot fiddle with the reload cadence.
+    if not _require_player_or_admin(request):
+        return JSONResponse({'error': 'Unauthorized -- reloading policy requires the player session or the admin'}, status_code=401)
     result = reload_policy_config()
     log_action(None, 'policy_reload', {
         k: (len(v) if isinstance(v, (list, dict)) else v) for k, v in result.items()
@@ -21576,8 +21661,8 @@ async def budget_set(request: Request):
     {"SPEND_CAP_USD": 75, "HIGH_TIER_MONTHLY_BUDGET_USD": 2}. Unknown names and
     non-numeric/negative values are refused (never a partial silent apply --
     all-or-nothing validation first, then one .env write + one reload)."""
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- budget is a player control'}, status_code=401)
+    if not _require_player_or_admin(request):
+        return JSONResponse({'error': 'Unauthorized -- budget is a player-or-admin control'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -21620,10 +21705,11 @@ async def env_reload(request: Request):
     # Re-read .env and rebind the live-swappable globals (API keys, budget
     # ceilings, feature toggles, tuning knobs) so an operator's .env edit
     # applies without a server restart -- the same operator action as
-    # /api/policy/reload, and PLAYER-SESSION-ONLY for the same reason. Values
-    # are never echoed back; only the names that changed are reported.
-    if not _require_player_session(request):
-        return JSONResponse({'error': 'Unauthorized -- reloading env requires the player session'}, status_code=401)
+    # /api/policy/reload, OPERATOR-ONLY (player session or the admin agent)
+    # for the same reason. Values are never echoed back; only the names that
+    # changed are reported.
+    if not _require_player_or_admin(request):
+        return JSONResponse({'error': 'Unauthorized -- reloading env requires the player session or the admin'}, status_code=401)
     result = _reload_env_config()
     log_action(None, 'env_reload', {'changed': result['changed']})
     return JSONResponse({'ok': True, 'changed': result['changed'], 'count': result['count']})
@@ -25249,17 +25335,19 @@ async def sandbox_backups(sandboxId: str):
 
 @app.post('/api/sandbox-backups/restore')
 async def sandbox_backups_restore(request: Request):
-    # Player-only, same reasoning as /api/library/ingest -- restoring
+    # Player-or-admin, same reasoning as /api/library/ingest -- restoring
     # overwrites whatever's currently there (itself snapshotted first, so
     # even a bad restore is undoable), which is a meaningfully
-    # consequential action, not something an agent should trigger on its
-    # own judgment about another agent's work.
-    if not _require_player_session(request):
+    # consequential action, not something an ordinary agent should trigger
+    # on its own judgment about another agent's work.
+    if not _require_player_or_admin(request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     body = await request.json()
     agent_id = body.get('agentId')
     if agent_id != 'player':
-        return JSONResponse({'error': 'only the player can restore a sandbox backup'}, status_code=403)
+        requester = _resolve_requester(request)
+        if not (requester and _is_admin(get_state_from_db() or {}, requester)):
+            return JSONResponse({'error': "only the player (or the admin) can restore a sandbox backup"}, status_code=403)
     sandbox_id = body.get('sandboxId')
     stamp = body.get('stamp')
     if not sandbox_id or not stamp:
