@@ -43,8 +43,8 @@ read-view into it.
   re-exported by serve.py).
 - `world/sim_helpers.py` — Pure priority normalization, room derivation,
   team lookup, sprint/product id generation (extracted from sim.py).
-- `world/memory.py` — Conversation memory (STM + LTM) for the Telegram bridge,
-  ported from the magi framework's memory module: STM stores each ask turn per
+- `world/memory.py` — Conversation memory (STM + LTM) for the Telegram bridge.
+  STM stores each ask turn per
   chat session and injects the recent turns + a rolling summary into the next
   ask; LTM distills durable facts/preferences from the conversation and recalls
   the relevant ones on each ask (extracted into its own module like bank.py;
@@ -710,9 +710,8 @@ force-removed from state (same policy as the long-horizon topic).
 
 The Telegram bridge answered every message with a stateless prompt ("a fresh
 question"), so a follow-up like "and the second one?" had no referent and the
-admin failed to answer. The fix ports the memory architecture from the magi
-framework wheel (`centene_agents/agents/memory`) onto the think tank's own
-SQLite DB, in `world/memory.py`:
+admin failed to answer. The fix adds conversation memory on the think tank's
+own SQLite DB, in `world/memory.py`:
 
 | Tier | What it does | Storage |
 |------|--------------|---------|
@@ -747,18 +746,15 @@ memory is Telegram-bridge-only.
 - LTM extraction cadence (`LTM_EXTRACT_EVERY_TURNS`) bounds the model spend; a
   bad extraction reply parses to `[]` (never fabricated memory), and inserts
   are deduplicated by content. `LTM_MAX_PER_SESSION` caps the store.
-- LTM recall is keyword-overlap scored, then ranked by a trust factor — a cheap,
-  dependency-free stand-in for magi's vector search + trust filter (the wheel
-  itself pulls in pyspark/mlflow/Databricks connectors that don't fit this
-  stack).
+- LTM recall is keyword-overlap scored, then ranked by a trust factor: a cheap,
+  dependency-free stand-in for vector search + a trust filter.
 - All memory model calls (summary upgrade, LTM extraction) go through the
   `/api/chat` choke point as the admin with a `__memory__` service label, so
   they accrue to the Bank like any other spend and are visible per-service.
 - Expired STM sessions (`STM_TTL_HOURS`) are cleaned by the log-prune loop;
   LTM deliberately survives session expiry.
 
-**Trust and secret scrubbing** (ported from `memory_trust.py` /
-`memory_write_filter.py` in the magi wheel):
+**Trust and secret scrubbing**:
 
 - Every LTM memory carries `confidence` (0-1) and `source_type`
   (`user_stated` / `agent_inferred`) from the extraction reply, with a source
@@ -775,7 +771,7 @@ memory is Telegram-bridge-only.
   `_ensure_tables` migrates an existing DB idempotently (CREATE TABLE IF NOT
   EXISTS alone cannot add columns).
 
-**Consolidation** (ported from `memory_consolidation.py` in the magi wheel):
+**Consolidation**:
 near-duplicate memories are periodically merged into one richer memory.
 `ltm_consolidate_due` checks a per-session cadence (`LTM_CONSOLIDATE_EVERY_TURNS`);
 the worker clusters active memories by keyword Jaccard overlap, asks the model
@@ -814,7 +810,7 @@ The player can rate (1-5) and/or comment on that completed work only:
 
 The `decision_tape` table records every Jev decision the chokepoint makes
 (prompt, candidates, parsed choice/confidence/cost, full response). It is now
-hash-chained (ported from the magi wheel's `audit_trail.py` hash-chain idea):
+hash-chained:
 
 - Every row carries `prev_hash` + `hash` = HMAC-SHA256 under the server's
   boundary secret over `prev_hash | canonical row` (`_tape_row_hash`). A

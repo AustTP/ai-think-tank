@@ -690,6 +690,12 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
     task_type_executors = {
         # A spike is room-agnostic: an investigation, not the room's craft.
         'spike': _run_spike_content,
+        # A MEETING is room-agnostic too: a convened discussion, not
+        # the room's craft. Checked before room so a meeting queued
+        # into ANY room still writes minutes -- the room executors
+        # produce craft/research notes and would silently drop the
+        # card's attendee/facilitator contract.
+        'meeting': _run_meeting_content,
         # A peer-gate review/QA pass inherits its PARENT story's room (the
         # deliverable is where it was built -- e.g. an observatory research
         # bulletin). Checked before room so a review in ANY room emits the
@@ -3651,7 +3657,7 @@ _PUBLISH_SKILL_TOOL = {
         'parameters': {
             'type': 'object',
             'properties': {
-                'slug': {'type': 'string', 'description': 'Short kebab-case identifier, e.g. "fetch-centene-ocr".'},
+                'slug': {'type': 'string', 'description': 'Short kebab-case identifier, e.g. "fetch-weather-forecast".'},
                 'title': {'type': 'string', 'description': 'Human title for the skill card.'},
                 'sourceTask': {'type': 'string', 'description': 'The task id this work came from.'},
                 'team': {'type': 'string', 'description': 'Your agent/team id (provenance).'},
@@ -4768,6 +4774,89 @@ def _spike_file_issue_wish(finding, task, name, backlog):
         'description': (finding or '')[:3000],
         'teamId': task.get('teamId'),
     }
+
+
+def _run_meeting_content(snapshot, agent_id, task, base_ctx=None):
+    """A MEETING card: the facilitator (task['facilitatorId'], falling
+    back to the assigned agent) convenes the meeting and writes the
+    minutes into the card's note -- the note IS the deliverable, and
+    the card closes on it (taskType 'meeting' is a non-gated lane, so
+    no peer gate opens). One non-tool completion: a meeting is a
+    single deliberation, not a multi-phase investigation. The
+    facilitator role-plays the convened attendees discussing the
+    agenda, then records topic / attendees / discussion / decisions /
+    action items with owners. Fail-closed like every executor: a
+    meeting that cannot write minutes still lands an explicit note
+    (completion evidence is mandatory -- never a silent empty card)."""
+    import sim as _sim_module
+    name = _agent_name(snapshot, agent_id)
+    title = task.get('title') or ''
+    agenda = (task.get('instructions') or '').strip()
+    facilitator_id = task.get('facilitatorId')
+    facilitator_name = _agent_name(snapshot, facilitator_id) if facilitator_id else name
+    attendee_names = [_agent_name(snapshot, aid)
+                      for aid in (task.get('attendees') or [])]
+    if facilitator_name not in attendee_names:
+        attendee_names = [facilitator_name] + attendee_names
+
+    # Item 4 gate up front: a meeting that has already used its full
+    # model-spend budget is failed closed BEFORE it resolves a tier or
+    # makes any call -- no further money is spent, and the sim sees
+    # budgetExhausted and runs its notify + fail-closed branch.
+    if _serve._task_budget_exhausted(task.get('id')):
+        spent, attempts = _serve._task_budget_spent(task.get('id'))
+        _sim_module._store_content_result(task.get('id'), {
+            'ok': False,
+            'budgetExhausted': True,
+            'taskSpendUsd': spent,
+            'taskSpendAttempts': attempts,
+            'note': f'Meeting "{title}" was paused before it started: this task '
+                    f'already used its full model-spend budget (${spent:.4f} spent).',
+        })
+        return
+    tier_slug = _serve._resolve_model_tier(
+        f'Facilitate a team meeting and write up the minutes: {title[:200]}')
+    if not tier_slug:
+        _sim_module._store_content_result(task.get('id'), {
+            'note': f'Held "{title}", but no model tier is configured yet.',
+            'ok': False,
+        })
+        return
+    system = (
+        'You are the scribe for a team meeting in an AI think tank. The '
+        'meeting has already happened in-world: the facilitator convened the '
+        'listed attendees, they discussed the agenda, and you are writing the '
+        'minutes now. Write plain Markdown with exactly these sections:\n'
+        '- **Topic**: the meeting title/goal, one line.\n'
+        '- **Attendees**: the named participants, facilitator first.\n'
+        '- **Discussion**: 2-4 bullets of what was said, in the participants\' '
+        'voices -- grounded in the agenda only; invent no external facts and '
+        'no decisions the agenda cannot support.\n'
+        '- **Decisions**: what the group committed to, or "None yet".\n'
+        '- **Action items**: "owner: concrete next step", one per line, or '
+        '"None".\n'
+        'Stay inside the agenda. If the agenda names hard prohibitions (a '
+        'NEVER section), the minutes must respect them. Under 200 words.'
+    )
+    user = (f"Meeting: {title}\n\nAgenda:\n{agenda or '(none given)'}\n\n"
+            f"Facilitator: {facilitator_name}\n"
+            f"Attendees: {', '.join(attendee_names) or '(none)'}\n\n"
+            'Write the minutes now.')
+    minutes = _plain_completion(tier_slug, [
+        {'role': 'system', 'content': system},
+        {'role': 'user', 'content': user},
+    ], 1200, service='meeting', task_id=task.get('id'))
+    if minutes:
+        _sim_module._store_content_result(task.get('id'), {
+            'note': minutes, 'ok': True,
+        })
+        return
+    _sim_module._store_content_result(task.get('id'), {
+        'note': f'Meeting "{title}" was convened by {facilitator_name} with '
+                f"{', '.join(attendee_names) or 'no attendees'}, but the "
+                'minutes could not be written (the model call failed).',
+        'ok': False,
+    })
 
 
 def _run_spike_content(snapshot, agent_id, task, base_ctx=None):

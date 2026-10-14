@@ -1,7 +1,7 @@
 """Tests for the conversation memory (STM + LTM) wired into the Telegram ask path.
 
-Ports the magi framework's memory architecture onto the think tank's own
-SQLite DB (world/memory.py). STM stores each ask turn per chat session and
+Covers world/memory.py's conversation memory on the think tank's own SQLite
+DB. STM stores each ask turn per chat session and
 injects recent context into the next ask -- the fix for the admin failing to
 answer a follow-up question. LTM distills durable facts/preferences from the
 conversation and recalls the relevant ones on each ask.

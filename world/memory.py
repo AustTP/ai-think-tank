@@ -2,10 +2,9 @@
 
 The Telegram bridge used to answer every message with a stateless prompt ("a
 fresh question"): a follow-up like "and the second one?" had no referent, so
-the admin failed to answer. This module ports the memory architecture from the
-magi framework wheel (centene_agents/agents/memory) -- the short-term store of
-the conversation plus a long-term store of durable facts extracted from it --
-onto the think tank's own SQLite DB.
+the admin failed to answer. This module adds conversation memory on the think
+tank's own SQLite DB: a short-term store of the conversation plus a long-term
+store of durable facts extracted from it.
 
 STM (short-term memory): each (user question, assistant reply) is stored per
 session_id (the Telegram chat id). On the next ask the recent turns and a
@@ -14,7 +13,7 @@ answered in the context of what came before. When a session exceeds the turn
 or token budget, the oldest turns are pruned and folded into the rolling
 summary -- a rule-based recap is written immediately (guaranteed), then an LLM
 upgrade is attempted in a background thread (same guaranteed-then-upgraded
-discipline as magi's _enforce_session_limits).
+discipline).
 
 LTM (long-term memory): typed memories (preference / fact / decision /
 unresolved_question) are distilled from the conversation by an LLM at a
@@ -67,8 +66,8 @@ _STOPWORDS = frozenset({
 
 _SUMMARY_CAP_CHARS = 2000
 
-# Write-side credential redaction for persisted memory (ported from the magi
-# framework's memory_write_filter.py). A player texting a password, API key,
+# Write-side credential redaction for persisted memory. A player texting a
+# password, API key,
 # token, or connection string must never have it distilled into LTM and
 # re-injected into a later ask -- REDACT instead of block, so the memory keeps
 # its context ("user asked about a password reset") while the secret value is
@@ -101,8 +100,8 @@ def _redact_secrets(text):
         out = pattern.sub(f'[REDACTED:{name}]', out)
     return out
 
-# Read-side trust for LTM recall (ported from the magi framework's
-# memory_trust.py): every memory carries a confidence + source, and recall
+# Read-side trust for LTM recall: every memory carries a confidence + source,
+# and recall
 # filters by minimum confidence, decays stale memories, and boosts memories
 # the user stated directly. A false fact the player mentioned once in passing
 # must not carry the same weight as something stable and repeated.
@@ -187,7 +186,7 @@ def _enabled():
 
 
 def _token_count(text):
-    # Cheap deterministic estimate (magi's crude fallback): ~1.3 tokens/word.
+    # Cheap deterministic estimate: ~1.3 tokens/word.
     return max(1, int(len((text or '').split()) * 1.3))
 
 
@@ -322,7 +321,7 @@ def _enforce_limits(session_id):
 
 
 def _rule_based_summary(text):
-    """Cheap deterministic recap of pruned turns (magi's rule-based fallback):
+    """Cheap deterministic recap of pruned turns (rule-based fallback):
     the first user message, any decision lines, and the last assistant reply.
     Guaranteed to return something, so context is never lost to a failing LLM."""
     lines = (text or '').strip().split('\n')
@@ -396,7 +395,7 @@ def ltm_recall(question, limit=None):
     """The most relevant long-term memories for `question`, as a formatted
     string (or None). Relevance is keyword-overlap scored, then ranked by a
     trust factor -- confidence, source priority (user-stated > inferred), and
-    staleness decay -- a cheap, dependency-free stand-in for magi's vector
+    staleness decay -- a cheap, dependency-free stand-in for vector
     search + trust filter. Memories below the minimum confidence or older than
     the max age are not recalled at all (poisoning defense: an offhand false
     fact the user stated once does not outrank a stable, repeated one)."""
@@ -673,8 +672,7 @@ def _ltm_consolidate_worker(session_id):
 
 
 def ltm_consolidate(session_id):
-    """Batch consolidation (ported from the magi framework's
-    memory_consolidation.py): scan the session's active memories for
+    """Batch consolidation: scan the session's active memories for
     near-duplicates and merge each cluster into one richer memory via a
     bounded LLM call. Runs on its own cadence (LTM_CONSOLIDATE_EVERY_TURNS),
     never blocks an ask, and fails closed -- a bad merge reply keeps the
