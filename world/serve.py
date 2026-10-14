@@ -5136,6 +5136,81 @@ def _seed_watchlist_topics(state):
     return seeded
 
 
+# Sim-loop watchdog thresholds (seconds). Env-overridable so an operator can
+# tighten or relax supervision without a code edit. 30s polls; 180s of no
+# successful tick (while not dormant) is treated as a freeze worth recycling.
+_SIM_WATCHDOG_INTERVAL_S = float(_load_env().get('SIM_WATCHDOG_INTERVAL_S', '30') or 30)
+_SIM_WATCHDOG_STALE_S = float(_load_env().get('SIM_WATCHDOG_STALE_S', '180') or 180)
+
+
+async def _sim_watchdog_loop(sim_holder, interval_s=None, stale_s=None):
+    """Supervise the sim loop task; recreate it if it dies or its tick freezes.
+
+    2026-10-13: the live village froze mid-sprint with every executor worker
+    idle, CPU ~1%, and NO error logged. The sim task had died silently --
+    `except Exception` in _sim_loop missed whatever BaseException escaped, and
+    the lifespan (the only holder of the task reference) never awaits it, so
+    Python's "Task exception was never retrieved" warning never fired. The
+    loop itself now catches BaseException; this watchdog is the second layer:
+    if the task object is done, or a successful tick has not landed for
+    `stale_s` wall-clock seconds while the sim is not dormant (dormancy
+    intentionally runs no ticks), cancel/recycle the task and log loudly.
+
+    `sim_holder` is the lifespan-owned dict  {'task': Task|None,
+    'shutting_down': bool}  so restarts are visible to teardown and shutdown
+    stops the recycle loop before cancelling the final task.
+    """
+    interval_s = _SIM_WATCHDOG_INTERVAL_S if interval_s is None else interval_s
+    stale_s = _SIM_WATCHDOG_STALE_S if stale_s is None else stale_s
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            if sim_holder.get('shutting_down'):
+                return
+            task = sim_holder.get('task')
+            if task is None or task.done():
+                detail = 'missing'
+                if task is not None:
+                    if task.cancelled():
+                        detail = 'cancelled'
+                    else:
+                        try:
+                            detail = f'exception {task.exception()!r}'
+                        except BaseException as e:
+                            detail = f'exception lookup failed {e!r}'
+                print(f'[sim-watchdog] sim loop dead ({detail}); restarting', flush=True)
+                try:
+                    import sim as _sim_module
+                    sim_holder['task'] = asyncio.create_task(_sim_module._sim_loop())
+                except Exception as e:
+                    print(f'[sim-watchdog] restart failed: {e}', flush=True)
+                continue
+            # Alive: check tick staleness via the pass's wall-clock stamp.
+            # Skip while dormant -- _sim_loop_pass is intentionally idle then.
+            try:
+                import sim as _sim_module
+                last = float(getattr(_sim_module, '_LAST_TICK_WALL_EPOCH', 0.0) or 0.0)
+            except Exception:
+                last = 0.0
+            if last and not _dormant():
+                gap = time.time() - last
+                if gap > stale_s:
+                    print(f'[sim-watchdog] tick stale {gap:.0f}s (> {stale_s:.0f}s); recycling sim loop', flush=True)
+                    task.cancel()
+                    try:
+                        await asyncio.wait_for(task, timeout=5.0)
+                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                        pass
+                    try:
+                        sim_holder['task'] = asyncio.create_task(_sim_module._sim_loop())
+                    except Exception as e:
+                        print(f'[sim-watchdog] restart failed: {e}', flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f'[sim-watchdog] error: {e}', flush=True)
+
+
 @asynccontextmanager
 async def _lifespan(app):
     # The admin/manager/director information should
@@ -5222,7 +5297,12 @@ async def _lifespan(app):
     avatar_task = asyncio.create_task(_avatar_loop())
     rss_task = asyncio.create_task(_rss_poll_loop())
     ws_supervisor_task = asyncio.create_task(_ws_supervisor_loop())
-    sim_task = None
+    # Sim task + watchdog. sim_holder is shared with _sim_watchdog_loop so a
+    # dead or frozen loop can be recreated mid-run (2026-10-13 freeze: the
+    # task died silently and nothing restarted it). shutting_down stops the
+    # watchdog's recycle loop before teardown cancels the final task.
+    sim_holder = {'task': None, 'shutting_down': False}
+    watchdog_task = asyncio.create_task(_sim_watchdog_loop(sim_holder))
     try:
         import sim as _sim_module
         # Phase 3 slice 2: register the research content executor so an arriving
@@ -5235,7 +5315,7 @@ async def _lifespan(app):
         # so a top-level import would be the import-time cycle).
         from content import _server_content_dispatcher
         _sim_module._content_executor = _server_content_dispatcher
-        sim_task = asyncio.create_task(_sim_module._sim_loop())
+        sim_holder['task'] = asyncio.create_task(_sim_module._sim_loop())
     except Exception as e:
         print(f'[sim] failed to start loop: {e}', flush=True)
     yield
@@ -5260,8 +5340,13 @@ async def _lifespan(app):
     ws_supervisor_task.cancel()
     for _fp, task in list(_WS_TASKS.values()):
         task.cancel()
-    if sim_task is not None:
-        sim_task.cancel()
+    # Stop the sim watchdog's recycle loop FIRST, then cancel the final sim
+    # task it owns -- otherwise a mid-teardown done-check could spawn a new
+    # loop we never cancel.
+    sim_holder['shutting_down'] = True
+    watchdog_task.cancel()
+    if sim_holder.get('task') is not None:
+        sim_holder['task'].cancel()
     # Shutdown restores the writeback gate: the boot path above set
     # config.ALLOW_WATCHLIST_WRITE = True for the server's whole run, and a test
     # that enters this lifespan (`async with serve._lifespan(...)`) must not
