@@ -8227,7 +8227,12 @@ def _run_in_sandbox_sync(sandbox_dir, command):
         '-v', f'{sandbox_dir}:/workspace',
         '-w', '/workspace',
         SANDBOX_IMAGE,
-        'sh', '-c', command,
+        # bash, not dash (sh): agents author bash (arrays, [[ ]], process
+        # substitution). dash dies with `Syntax error: "(" unexpected` on those
+        # and the command never ran -- observed killing tasks 445/447/448/449.
+        # bash is already in the image (Debian slim ships it); POSIX-only
+        # scripts keep working under it.
+        'bash', '-c', command,
     ]
     try:
         result = _run_docker_sandbox(docker_cmd, SANDBOX_TIMEOUT_S)
@@ -17591,11 +17596,15 @@ async def intent_incidents(request: Request):
 def _valid_sandbox_ids():
     # The real sandbox repos on disk (workroom-shared, research-shared, ...).
     # Only these may back a product; validated against the filesystem so a
-    # typo'd id fails at create time, not at first release.
+    # typo'd id fails at create time, not at first release. Per-story git
+    # worktrees (sandboxes/story-<task-id>) are ephemeral isolation trees
+    # merged back into their base workroom on gate close -- they must never
+    # appear as product-binding candidates.
     if os.path.isdir(SANDBOXES_DIR):
         try:
             return sorted(d for d in os.listdir(SANDBOXES_DIR)
-                          if os.path.isdir(os.path.join(SANDBOXES_DIR, d))) or ['workroom-shared']
+                          if os.path.isdir(os.path.join(SANDBOXES_DIR, d))
+                          and not is_story_sandbox_id(d)) or ['workroom-shared']
         except OSError:
             pass
     return ['workroom-shared']
@@ -23334,7 +23343,11 @@ def _run_git_sync(sandbox_dir, args):
 
 
 def _ensure_sandbox_git_repo(sandbox_dir):
-    if os.path.isdir(os.path.join(sandbox_dir, '.git')):
+    # os.path.exists, not isdir: a linked worktree's .git is a FILE (gitdir:
+    # pointer), not a directory. The old isdir check returned False there and
+    # re-ran `git init` inside the worktree, silently detaching it from the
+    # main repo's history.
+    if os.path.exists(os.path.join(sandbox_dir, '.git')):
         return
     _run_git_sync(sandbox_dir, ['init', '-q'])
     # A real identity scoped to just this repo -- doesn't touch or require
@@ -23373,7 +23386,8 @@ def _snapshot_sandbox(sandbox_id, sandbox_dir):
 
 def _list_sandbox_backups(sandbox_id):
     sandbox_dir = _sandbox_dir_for(sandbox_id)
-    if not os.path.isdir(os.path.join(sandbox_dir, '.git')):
+    # exists, not isdir -- a linked worktree's .git is a file.
+    if not os.path.exists(os.path.join(sandbox_dir, '.git')):
         return []
     result = _run_git_sync(sandbox_dir, ['log', '--format=%H %cI'])
     if result.returncode != 0:
@@ -23397,6 +23411,182 @@ def _restore_sandbox_backup(sandbox_id, stamp):
     # linear and undoable, rather than leaving the working tree ahead of
     # HEAD with nothing recording that a restore happened.
     _snapshot_sandbox(sandbox_id, sandbox_dir)
+
+
+# ---------------------------------------------------------------------------
+# Per-story git worktrees (concurrent-edit isolation).
+#
+# Root problem this exists to fix: every coding/review/fix pass for every
+# deliverable story shared ONE sandbox dir (WORKROOM_SANDBOX_ID). Two agents
+# writing different stories into the same tree overwrote each other, and one
+# agent's half-written file failed every other agent's whole-tree lint. The
+# writtenPy scope fix stopped the *lint* half of that; this stops the
+# *filesystem* half by giving each deliverable story its own git worktree
+# (branch story/<task-id> of the shared workroom's main) and merging it back
+# only when the story's peer gate is satisfied.
+#
+# A worktree, not a clone: the main workroom repo's object store is shared
+# (cheap), each story is a real branch off main, and the merge is a real
+# `git merge` inside the main repo -- real history, real conflict detection,
+# no GitHub remote anywhere (same local-git-only reasoning as the snapshot
+# path above). Worktrees live as sibling dirs under SANDBOXES_DIR so
+# _sandbox_dir_for / the docker mount already work unchanged.
+# ---------------------------------------------------------------------------
+STORY_SANDBOX_PREFIX = 'story-'    # sandboxes/story-<task-id>
+STORY_BRANCH_PREFIX = 'story/'     # branch story/<task-id>
+# The village-scoped form is '<vid>-story-<task-id>' (see _village_sandbox_id).
+_STORY_SANDBOX_RE = re.compile(r'^(?:[A-Za-z0-9][A-Za-z0-9._-]*-)?story-([A-Za-z0-9][A-Za-z0-9._-]{0,63})$')
+BASE_SANDBOX_ID = 'workroom-shared'
+_STORY_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
+_STORY_WORKTREE_TIMEOUT_S = 15
+
+
+def story_sandbox_id(task_id):
+    """Canonical story sandbox id for a deliverable story (main village)."""
+    if not task_id or not _STORY_ID_RE.match(str(task_id)):
+        raise ValueError(f'invalid story/task id: {task_id!r}')
+    return STORY_SANDBOX_PREFIX + str(task_id)
+
+
+def is_story_sandbox_id(sandbox_id):
+    return bool(sandbox_id and isinstance(sandbox_id, str) and _STORY_SANDBOX_RE.match(sandbox_id))
+
+
+def _story_id_from_sandbox(sandbox_id):
+    """Story/task id from a (possibly village-scoped) story sandbox id, or None."""
+    m = _STORY_SANDBOX_RE.match(sandbox_id or '')
+    return m.group(1) if m else None
+
+
+def _village_prefix(sandbox_id):
+    """'winter-' for 'winter-story-x', '' for 'story-x'. The village-scoped
+    story worktree must branch the matching village workroom
+    ('winter-workroom-shared'), not main's."""
+    m = _STORY_SANDBOX_RE.match(sandbox_id or '')
+    if not m:
+        return ''
+    head = (sandbox_id or '')[:-(len(m.group(1)) + len(STORY_SANDBOX_PREFIX))]
+    return head
+
+
+def _story_branch_name(sandbox_id):
+    """Branch name for a story sandbox id. The village prefix is dropped: task
+    ids are globally unique, so 'story/task-444' is unambiguous and a village
+    story still merges cleanly into its own base workroom's history."""
+    story_id = _story_id_from_sandbox(sandbox_id)
+    if not story_id:
+        raise ValueError(f'not a story sandbox id: {sandbox_id!r}')
+    return STORY_BRANCH_PREFIX + story_id
+
+
+def _base_sandbox_for_story(sandbox_id):
+    """The base (shared) workroom sandbox this story worktree branches from."""
+    return f'{_village_prefix(sandbox_id)}{BASE_SANDBOX_ID}'
+
+
+def _git_identity_configured(sandbox_dir):
+    r = _run_git_sync(sandbox_dir, ['config', '--get', 'user.email'])
+    return r.returncode == 0 and bool((r.stdout or '').strip())
+
+
+def _worktree_is_linked(worktree_dir, base_dir):
+    """True when worktree_dir is already a git worktree whose main repo is
+    base_dir. Checks the resolved common-dir, not just .git-exists, so a
+    stale/orphaned dir is never silently reused."""
+    if not os.path.isdir(worktree_dir):
+        return False
+    if not os.path.exists(os.path.join(worktree_dir, '.git')):
+        return False
+    base_real = os.path.realpath(base_dir)
+    # `git rev-parse --git-common-dir` is the portable way to ask.
+    r = _run_git_sync(worktree_dir, ['rev-parse', '--git-common-dir'])
+    common = (r.stdout or '').strip()
+    if r.returncode != 0 or not common:
+        return False
+    if not os.path.isabs(common):
+        common = os.path.join(worktree_dir, common)
+    return os.path.realpath(common) == os.path.join(base_real, '.git')
+
+
+def ensure_story_worktree(sandbox_id, base_sandbox_id=None):
+    """Create (idempotently) the story worktree `sandbox_id` as a linked
+    worktree of `base_sandbox_id` on branch `story/<task-id>`, branching from
+    the base repo's current main. Returns the absolute worktree path.
+
+    Safe to call on every coding/review/fix pass for the same story: the
+    second call finds the linked worktree and returns it unchanged, so a fix
+    cycle and its reviews keep working in the SAME tree the author used.
+    Falls back to raising ValueError on a bad id; the caller decides whether
+    to degrade to the shared sandbox."""
+    base_dir = _sandbox_dir_for(base_sandbox_id or _base_sandbox_for_story(sandbox_id))
+    _ensure_sandbox_git_repo(base_dir)
+    if not _git_identity_configured(base_dir):
+        _run_git_sync(base_dir, ['config', 'user.email', 'sandbox-backup@ai-think-tank.local'])
+        _run_git_sync(base_dir, ['config', 'user.name', 'AI Think Tank sandbox backup'])
+    # The base must have at least one commit for worktree/branch to point at.
+    if _run_git_sync(base_dir, ['rev-parse', '--verify', 'HEAD']).returncode != 0:
+        _run_git_sync(base_dir, ['add', '-A'])
+        _run_git_sync(base_dir, ['commit', '--allow-empty', '-q', '-m', 'seed workroom repo for story worktrees'])
+    worktree_dir = os.path.join(SANDBOXES_DIR, sandbox_id)
+    branch = _story_branch_name(sandbox_id)
+    if _worktree_is_linked(worktree_dir, base_dir):
+        return worktree_dir
+    # An existing but unlinked dir (e.g. a pre-worktree story sandbox, or a
+    # half-created one): refuse rather than clobber possible real work.
+    if os.path.isdir(worktree_dir) and os.listdir(worktree_dir) and not os.path.exists(os.path.join(worktree_dir, '.git')):
+        raise ValueError(f'story sandbox dir exists but is not a linked worktree: {worktree_dir}')
+    os.makedirs(os.path.dirname(worktree_dir), exist_ok=True)
+    # Branch from the base's current HEAD so the story starts with the shared
+    # workroom's existing files (not an empty tree). If the branch already
+    # exists (story resumed), attach a new worktree to it instead of -b.
+    if _run_git_sync(base_dir, ['rev-parse', '--verify', branch]).returncode == 0:
+        result = _run_git_sync(base_dir, ['worktree', 'add', worktree_dir, branch], )
+    else:
+        result = _run_git_sync(base_dir, ['worktree', 'add', '-b', branch, worktree_dir, 'HEAD'])
+    if result.returncode != 0:
+        raise ValueError(f'failed to create story worktree {sandbox_id}: {(result.stderr or result.stdout or "").strip()}')
+    if not _git_identity_configured(worktree_dir):
+        _run_git_sync(worktree_dir, ['config', 'user.email', 'sandbox-backup@ai-think-tank.local'])
+        _run_git_sync(worktree_dir, ['config', 'user.name', 'AI Think Tank sandbox backup'])
+    return worktree_dir
+
+
+def _merge_story_branch(sandbox_id, base_sandbox_id=None):
+    """Merge a story branch back into the base workroom's current branch.
+    Auto-resolves textual conflicts in favor of the story branch (the story's
+    reviewed work wins) and commits the merge; if git still fails, leaves the
+    branch unmerged and reports the reason so the caller can escalate."""
+    story_id = _story_id_from_sandbox(sandbox_id)
+    if not story_id:
+        return {'ok': False, 'storyId': None, 'reason': f'not a story sandbox id: {sandbox_id!r}'}
+    branch = _story_branch_name(sandbox_id)
+    base_dir = _sandbox_dir_for(base_sandbox_id or _base_sandbox_for_story(sandbox_id))
+    if not os.path.exists(os.path.join(base_dir, '.git')):
+        return {'ok': False, 'storyId': story_id, 'reason': f'base repo missing: {base_dir}'}
+    if _run_git_sync(base_dir, ['rev-parse', '--verify', branch]).returncode != 0:
+        return {'ok': False, 'storyId': story_id, 'reason': f'branch {branch} does not exist in {base_dir}'}
+    if _git_identity_configured(base_dir) is False:
+        _run_git_sync(base_dir, ['config', 'user.email', 'sandbox-backup@ai-think-tank.local'])
+        _run_git_sync(base_dir, ['config', 'user.name', 'AI Think Tank sandbox backup'])
+    # Commit any uncommitted base-tree work first so the merge doesn't refuse
+    # on a dirty tree and nothing real is lost.
+    _run_git_sync(base_dir, ['add', '-A'])
+    _run_git_sync(base_dir, ['commit', '-q', '-m', f'snapshot before merging {branch}'])
+    merge = _run_git_sync(base_dir, ['merge', '--no-ff', '--no-edit', '-m',
+                                     f'merge {branch} (peer gate satisfied for task-{story_id})', branch])
+    if merge.returncode != 0:
+        # Real conflict: take the story side for every conflicted path, then
+        # complete the merge. The story branch is the reviewed deliverable;
+        # the base side is whatever else was in the shared workroom.
+        _run_git_sync(base_dir, ['checkout', '--theirs', '--', '.'])
+        _run_git_sync(base_dir, ['add', '-A'])
+        finish = _run_git_sync(base_dir, ['commit', '-q', '--no-edit'])
+        if finish.returncode != 0:
+            _run_git_sync(base_dir, ['merge', '--abort'])
+            return {'ok': False, 'storyId': story_id, 'conflict': True,
+                    'reason': (merge.stderr or merge.stdout or 'merge conflict').strip()}
+    return {'ok': True, 'storyId': story_id, 'branch': branch, 'base': base_dir,
+            'worktree': os.path.join(SANDBOXES_DIR, sandbox_id)}
 
 
 @app.get('/api/keys/credentials')
