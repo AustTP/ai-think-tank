@@ -17547,31 +17547,86 @@ def _classify_team_default(state, text):
 _team_decider = _classify_team_default  # injectable test seam
 
 
+def _room_keyword_pick(text):
+    """Deterministic first pass for room routing: score each room's own
+    craft vocabulary (sim's _ROOM_KEYWORDS, the same word map charter
+    alignment already keys on) against the text and return the single
+    clear winner. Free, no network, no quorum resampling. A wash or a
+    tie is NOT a classification -- it returns None so the Jev choice
+    below still gets the fuzzy-paraphase cases exactly as before.
+    Word-boundary matching so 'press' never matches inside 'pressure'
+    and 'art' never matches inside 'article'."""
+    import sim as _sim
+    low = (text or '').lower()
+    scores = {}
+    for room, words in (_sim._ROOM_KEYWORDS or {}).items():
+        if room not in _DELEGATABLE_ROOMS:
+            continue
+        hits = 0
+        for w in words:
+            if w and re.search(r'(?<![a-z0-9])' + re.escape(w) + r'(?![a-z0-9])', low):
+                hits += 1
+        if hits:
+            scores[room] = hits
+    if not scores:
+        return None
+    best = max(scores.values())
+    winners = sorted(r for r, s in scores.items() if s == best)
+    return winners[0] if len(winners) == 1 else None
+
+
 def _classify_room_default(state, text):
-    """Jev choice over _DELEGATABLE_ROOMS, reusing the same purpose text
+    """Two-rung room router: a deterministic keyword pass over the room
+    craft vocabulary first (no model call, no quorum), then the Jev
+    choice over _DELEGATABLE_ROOMS, reusing the same purpose text
     assign-big-task's own prompt already uses. Falls back to 'observatory'
     (the general investigate/research room) on outage rather than returning
     None -- every spike needs SOME room to be queued into."""
+    keyword_pick = _room_keyword_pick(text)
+    if keyword_pick:
+        return keyword_pick
     room_defs = _room_definitions(state)
     candidates = [{'id': r, 'description': room_defs[r]['purpose']} for r in _DELEGATABLE_ROOMS]
     choice, _confidence, _cost = _jev_quorum_choice_sync(
-        f'Which room\'s real capability best fits investigating this: "{text}"',
+        f"Which room's real capability best fits investigating this: \"{text}\"",
         {c['id']: c['description'] for c in candidates})
     return choice if any(c['id'] == choice for c in candidates) else 'observatory'
 
 
+def _product_name_pin(products, text):
+    """Deterministic first pass for product routing: pin the product only
+    when exactly one product's full name appears verbatim (word-bounded,
+    case-insensitive) in the text. Partial, short-name, or multi-product
+    matches return None -- the incident lane must never guess which
+    product is broken, so anything ambiguous stays with the Jev choice."""
+    low = (text or '').lower()
+    hits = []
+    for pid, p in products.items():
+        name = (p.get('name') or pid or '').strip()
+        if len(name) < 4:
+            continue
+        if re.search(r'(?<![a-z0-9])' + re.escape(name.lower()) + r'(?![a-z0-9])', low):
+            hits.append(pid)
+    return hits[0] if len(hits) == 1 else None
+
+
 def _classify_product_default(state, text):
-    """Jev choice over state['products']. Returns a product id, or None on
-    outage/no products/no confident match -- the incident lane must never
-    guess which product is broken (a mis-pinned incident is worse than an
-    unattributed investigation, see _route_lane_incident's fallback)."""
+    """Two-rung product router for the incident lane: a deterministic
+    full-name pin first (an unambiguous verbatim product mention needs no
+    judgment call), then the Jev choice over state['products']. Returns a
+    product id, or None on outage/no products/no confident match -- the
+    incident lane must never guess which product is broken (a mis-pinned
+    incident is worse than an unattributed investigation)."""
     products = state.get('products') or {}
     if not products:
         return None
+    pinned = _product_name_pin(products, text)
+    if pinned:
+        return pinned
     candidates = [{'id': pid, 'description': (p.get('name') or pid) + (f" -- {p.get('summary')}" if p.get('summary') else '')}
                   for pid, p in products.items()]
     choice, _confidence, _cost = _jev_quorum_choice_sync(
-        f'Which product does this incident report describe: "{text}"',
+        f"Which product does this incident report describe: \"{text}\"",
         {c['id']: c['description'] for c in candidates})
     return choice if any(c['id'] == choice for c in candidates) else None
 
