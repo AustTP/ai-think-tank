@@ -151,9 +151,8 @@ class SpikeContent(unittest.TestCase):
         # "There might be a deliverable although
         # it is a spike" (a CSV of sources, a processed dataset, etc.).
         self.assertIn('execute_script', tool_names)
-        # Chunked into rounds now (reflection/replan, ported from the user's
-        # own framework) -- 18 total, spent _REFLECTION_CHUNK_SIZE at a
-        # time, not one flat 18-iteration call.
+        # Chunked into rounds now (reflection/replan) -- 18 total, spent
+        # _REFLECTION_CHUNK_SIZE at a time, not one flat 18-iteration call.
         self.assertEqual(kwargs.get('max_iterations'), content._REFLECTION_CHUNK_SIZE)
         self.assertEqual(kwargs.get('force_first_tool'), 'search_web')
         self.assertTrue(kwargs.get('return_transcript'))
@@ -801,8 +800,7 @@ class SpikeSandboxExecutor(unittest.TestCase):
 
 
 class OneStrikePerTool(unittest.TestCase):
-    """Ported (design) from the user's own framework's ReflectionEngine:
-    a real policy denial (Jev said no) must never be retried -- the SAME
+    """A real policy denial (Jev said no) must never be retried -- the SAME
     tool, called again, is refused locally with no second network call."""
 
     def test_struck_browse_page_is_refused_without_a_second_network_call(self):
@@ -870,9 +868,9 @@ class OneStrikePerTool(unittest.TestCase):
 
 
 class ReflectionAndReplan(unittest.TestCase):
-    """Ported (design) from the user's own framework's ReflectionEngine:
-    the EXECUTE budget is chunked into rounds with a cheap confidence check
-    between them, never exceeding the original total iteration ceiling."""
+    """The EXECUTE budget is chunked into rounds with a cheap confidence
+    check between them, never exceeding the original total iteration
+    ceiling."""
 
     def test_settling_in_the_first_round_never_triggers_reflection(self):
         with unittest.mock.patch.object(serve, '_call_agent_tool_loop',

@@ -8942,7 +8942,7 @@ def _urlopen_with_resilience(req, timeout, max_attempts=3, base_delay=0.5):
     raise last_exc
 
 
-# react_engine.py ReflectionEngine research: a "one-strike"
+# Circuit-breaker research: a "one-strike"
 # style breaker, but for repeated PERSISTENT failures (not transient ones
 # already handled by retry above) -- if a specific model slug fails
 # `CIRCUIT_BREAKER_THRESHOLD` times in a row, stop spending calls on it
@@ -8953,8 +8953,7 @@ def _urlopen_with_resilience(req, timeout, max_attempts=3, base_delay=0.5):
 # that was built specifically to catch them before caching a pick.
 CIRCUIT_BREAKER_THRESHOLD = 3
 CIRCUIT_BREAKER_COOLDOWN_S = 300
-# Half-open probe (see memory: external codebase eval magi
-# circuit_breaker). The old breaker was OPEN-or-CLOSED: after the cooldown
+# Half-open probe. The old breaker was OPEN-or-CLOSED: after the cooldown
 # expired, the very next call went straight through, and if it happened to
 # fail (a transient blip right at recovery) it re-tripped immediately. That
 # made recovery brittle. Now a single PROBE is allowed through once the
@@ -11570,8 +11569,7 @@ def _jev_quorum_choice_sync(instructions, criteria):
     return winner_id, max(winner_confidences), total_cost
 
 
-# Composite multi-signal trust gate for the DIRECTOR auto-approval path (see
-# memory: external codebase eval magi hitl_engine.ConfidenceAssessor).
+# Composite multi-signal trust gate for the DIRECTOR auto-approval path.
 # The old check was single-signal: a lone Jev `confidence` above the floor let the
 # delegated director auto-approve/deny ANY pending escalation. That gave a
 # high-confidence Jev answer the same authority regardless of (a) how risky the
@@ -15417,10 +15415,10 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
     is expected to check this set itself before calling in again; this
     function only records strikes, on the ask lane's request it never
     enforces them (None here -- the ask lane's plain Q&A doesn't need this;
-    spikes opt in by passing a real set). Ported from the user's own
-    framework's ReflectionEngine ("one-strike-per-service": never retry a
-    tool that just told you no, don't burn budget hoping for a different
-    answer). Self-checks `struck_tools` too (not just records into it) --
+    spikes opt in by passing a real set). The rule is one-strike-per-
+    service: never retry a tool that just told you no, don't burn budget
+    hoping for a different answer. Self-checks `struck_tools` too (not just
+    records into it) --
     defense in depth so a caller that passes the set but forgets to check
     it itself doesn't silently get a no-op."""
     # Server-minted, single-use proof that the work-context host bypass is
