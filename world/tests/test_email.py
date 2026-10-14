@@ -152,11 +152,12 @@ class TriggerSites(unittest.TestCase):
 
 
 class CardReport(unittest.TestCase):
-    """The player's copy of a closed card's complete report. Every card kind
-    (story/spike/bug/task) delivers once on close -- the full spec (user
-    story, acceptance criteria, NEVER constraints), the peer approval count,
-    and the agent's actual write-up. Agent-to-agent internals (review/fix
-    subtasks, shadow dry-runs, player-assigned cards) never fire it."""
+    """Closed cards are silent: a story/spike/bug/task close reaches the
+    player on NO channel (no inbox card, no email, no Telegram). The sprint
+    retrospective is the player's close signal. Internal cards (review/fix
+    subtasks, shadow dry-runs, player-assigned) were always quiet and still
+    are; _deliver_card_report is a no-op kept so the finish_task and
+    _close_gated_story call sites keep working."""
 
     def _task(self, **over):
         task = {'id': 'task-1', 'title': 'Land the launch page', 'taskType': 'code',
@@ -168,56 +169,24 @@ class CardReport(unittest.TestCase):
         task.update(over)
         return task
 
-    def test_delivers_complete_report_once(self):
+    def test_card_close_reaches_no_channel(self):
         st = _state()
         task = self._task()
         sim._deliver_card_report(st, task, 'completed')
-        sim._deliver_card_report(st, task, 'completed')  # idempotent
-        self.assertEqual(len(st['playerInbox']), 1)
-        card = st['playerInbox'][0]
-        self.assertEqual(card['kind'], 'card_report')
-        self.assertEqual(card['closeReason'], 'completed')
-        for fragment in ('STORY closed: Land the launch page',
-                         'Project: Summer Summit',
-                         'As a shopper, I want to pay once',
-                         'Given a cart, When I pay',
-                         'never touch the live payment table',
-                         'Shipped the checkout flow'):
-            self.assertIn(fragment, card['body'])
-        self.assertEqual(len(st['emailOutbox']), 1)
-        self.assertTrue(st['emailOutbox'][0]['kind'].startswith('card_report:task-1'))
+        sim._deliver_card_report(st, task, 'completed')  # still silent
+        self.assertEqual(st.get('playerInbox', []), [])
+        self.assertEqual(st.get('emailOutbox', []), [])
 
-    def test_peer_approved_includes_approval_count(self):
-        st = _state()
-        sim._deliver_card_report(st, self._task(), 'peer_approved', approvals=2)
-        card = st['playerInbox'][0]
-        self.assertEqual(card['closeReason'], 'peer-approved')
-        self.assertIn('Peer approvals: 2', card['body'])
-
-    def test_internal_cards_never_report(self):
+    def test_internal_cards_stay_quiet(self):
         for mutated in ({'reviewOf': 'task-9'}, {'shadow': True},
                         {'assignedTo': 'player'}, {}):
             task = self._task(**mutated)
             st = _state()
             sim._deliver_card_report(st, task, 'completed')
-            if not mutated:
-                # no mutations = a real card -> delivered
-                self.assertEqual(len(st['playerInbox']), 1)
-            else:
-                self.assertEqual(st.get('playerInbox', []), [],
-                                 f'internal card {mutated} must not reach the player')
-                self.assertEqual(st.get('emailOutbox', []), [])
+            self.assertEqual(st.get('playerInbox', []), [])
+            self.assertEqual(st.get('emailOutbox', []), [])
 
-    def test_spike_report_carries_library_path(self):
-        st = _state()
-        task = self._task(taskType='spike', note='Findings filed to the Library.',
-                          libraryPath='library/research/2026-10-09-ais-investigation.md')
-        sim._deliver_card_report(st, task, 'completed')
-        card = st['playerInbox'][0]
-        self.assertIn('Full artifact: library/research/2026-10-09-ais-investigation.md', card['body'])
-        self.assertIn('Findings filed to the Library.', card['body'])
-
-    def test_finish_task_delivers_report(self):
+    def test_finish_task_delivers_nothing(self):
         st = _state()
         st['agents']['nadia'].update({'busy': True, 'inRoom': 'pressoffice',
                                       'visible': True, 'task': 'task-1',
@@ -230,11 +199,10 @@ class CardReport(unittest.TestCase):
              unittest.mock.patch.object(sim, '_maybe_file_followup'):
             sim.finish_task(st, 'nadia', grid=None)
         self.assertEqual(st['tasks']['task-1']['status'], 'done')
-        self.assertEqual(len(st['playerInbox']), 1)
-        self.assertEqual(st['playerInbox'][0]['kind'], 'card_report')
-        self.assertIn('never touch the live payment table', st['playerInbox'][0]['body'])
+        self.assertEqual(st.get('playerInbox', []), [])
+        self.assertEqual(st.get('emailOutbox', []), [])
 
-    def test_close_gated_story_delivers_peer_report(self):
+    def test_close_gated_story_delivers_nothing(self):
         st = _state()
         parent = {'id': 'task-p1', 'title': 'Author a research brief', 'taskType': 'code',
                   'room': 'pressoffice', 'projectLabel': 'PR-1',
@@ -245,13 +213,12 @@ class CardReport(unittest.TestCase):
             ok = sim._close_gated_story(st, parent)
         self.assertTrue(ok)
         self.assertEqual(parent['status'], 'done')
-        self.assertEqual(len(st['playerInbox']), 1)
-        card = st['playerInbox'][0]
-        self.assertIn('Peer approvals: 2', card['body'])
-        self.assertIn('never cite a repost as a second source', card['body'])
-        # Closing again does not double-deliver.
+        self.assertEqual(st.get('playerInbox', []), [])
+        self.assertEqual(st.get('emailOutbox', []), [])
+        # Closing again stays silent too.
         sim._close_gated_story(st, parent)
-        self.assertEqual(len(st['playerInbox']), 1)
+        self.assertEqual(st.get('playerInbox', []), [])
+        self.assertEqual(st.get('emailOutbox', []), [])
 
 
 class EndpointAuth(unittest.TestCase):
@@ -338,6 +305,54 @@ class PlayerEmailDisabled(unittest.TestCase):
         serve._delete_credential(serve._GMAIL_CRED_NAME)
         with unittest.mock.patch.object(serve, 'PLAYER_EMAIL_ENABLED', True):
             self.assertIs(serve.send_player_email_sync('subj', 'body'), False)
+
+
+class DrainChannels(unittest.TestCase):
+    """The drain sends each outbox entry on the channels the entry
+    declares -- a per-card close report is email-only, everything
+    else defaults to both email and Telegram."""
+
+    def test_channels_field_restricts_delivery(self):
+        st = _state()
+        sim._queue_player_email(st, 'card_report:task-1', 's1', 'b1',
+                                now_ms=_NOW_MS, channels=['email'])
+        sim._queue_player_email(st, 'sprint_complete', 's2', 'b2',
+                                now_ms=_NOW_MS + 1)
+        with unittest.mock.patch.object(serve, 'send_player_email_sync',
+                                        return_value=True) as email, \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync',
+                                        return_value=True) as tg:
+            results = sim._drain_email_outbox_sync(st)
+        self.assertEqual(email.call_count, 2)
+        self.assertEqual(tg.call_count, 1)
+        self.assertEqual(tg.call_args[0][0], 's2')
+        self.assertEqual(results,
+                         [('card_report:task-1', True, False),
+                          ('sprint_complete', True, True)])
+        self.assertEqual(st.get('emailOutbox', []), [])
+
+    def test_default_entry_uses_both_channels(self):
+        st = _state()
+        sim._queue_player_email(st, 'card_blocked', 's', 'b',
+                                now_ms=_NOW_MS)
+        with unittest.mock.patch.object(serve, 'send_player_email_sync',
+                                        return_value=False), \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync',
+                                        return_value=True) as tg:
+            results = sim._drain_email_outbox_sync(st)
+        self.assertEqual(tg.call_count, 1)
+        self.assertEqual(results, [('card_blocked', False, True)])
+
+    def test_email_only_entry_never_touches_telegram(self):
+        st = _state()
+        sim._queue_player_email(st, 'card_report:task-9', 's', 'b',
+                                now_ms=_NOW_MS, channels=['email'])
+        with unittest.mock.patch.object(serve, 'send_player_email_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync',
+                                        return_value=True) as tg:
+            sim._drain_email_outbox_sync(st)
+        tg.assert_not_called()
 
 
 if __name__ == '__main__':

@@ -14774,8 +14774,9 @@ async def respond_player_inbox(message_id: str, request: Request):
 @_state_writer
 async def feedback_player_inbox(message_id: str, request: Request):
     """The player's feedback on a COMPLETED work item the think tank shared
-    with them -- a `card_report` inbox message (a closed card's full report,
-    see sim._deliver_card_report). Body: {rating: 1-5?, comment: '...'?}, at
+    with them -- historically a `card_report` inbox message (the sim no
+    longer creates those; closed cards are silent and the sprint retro is
+    the close signal). Body: {rating: 1-5?, comment: '...'?}, at
     least one required. The feedback is stamped onto the message (so the player
     sees it in the inbox) and pushed into the completing agent's feedback
     buffer (_append_feedback), so the agent carries it into its next task.
