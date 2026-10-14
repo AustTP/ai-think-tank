@@ -2143,6 +2143,9 @@ class ServerOwnedSeed(unittest.TestCase):
         # Seed identities are config-driven (SEED_ROSTER / SEED_DIRECTOR_MAP /
         # SEED_ADMIN_IDS / SEED_SENIOR_DIRECTOR in .env, so this
         # hermetic test injects them rather than relying on a real .env.
+        # The map deliberately includes ada/dev/eli -> theo (a pure admin
+        # direct-report shape) to exercise the R2 repair sweep: those three
+        # are pure workers, so the sweep must re-point them to nora.
         self._env_patch = unittest.mock.patch.object(
             serve, '_load_env', return_value={
                 'SEED_ROSTER': ('ada|Ada|#e06666|Research|small,'
@@ -2204,16 +2207,32 @@ class ServerOwnedSeed(unittest.TestCase):
         # the base roster is authoritative and connected from the first read.
         # (nadia/maya/priya are NOT part of the base seed -- they exist only
         # once real hires add them; the backfill stamps whomever IS present.)
+        # R2: the SEED_DIRECTOR_MAP points ada/dev/eli at the admin (theo),
+        # but the repair sweep re-points pure workers up to the senior director
+        # (nora) so no admin ever DIRECTLY directors a pure worker.
         serve._seed_default_roster()
         state = serve.get_state_from_db()
         by_id = {d['id']: d for d in state['agentRoster']}
-        self.assertEqual(by_id['dev']['director'], 'theo')
-        self.assertEqual(by_id['eli']['director'], 'theo')
+        self.assertEqual(by_id['dev']['director'], 'nora')
+        self.assertEqual(by_id['eli']['director'], 'nora')
         self.assertEqual(by_id['ben']['director'], 'nora')
+        self.assertEqual(by_id['ada']['director'], 'nora')
+        self.assertEqual(by_id['cora']['director'], 'nora')
         self.assertFalse(by_id['nora'].get('director'))       # senior-most director
         self.assertFalse(by_id['theo'].get('director'))       # admin at top
         self.assertTrue(by_id['theo']['isAdmin'])
         self.assertTrue(by_id['nora']['isDirector'])          # stamped, not literal
+        # R2 invariant holds after backfill: the admin has NO pure-worker
+        # direct reports (theo's direct reports must all be directors).
+        theo_reports = [d['id'] for d in state['agentRoster']
+                        if d.get('director') == 'theo']
+        for rid in theo_reports:
+            rd = by_id[rid]
+            self.assertTrue(
+                rd.get('isDirector') or
+                any(x.get('director') == rid for x in state['agentRoster']),
+                f'{rid} reports to admin but is neither flagged a director '
+                f'nor has direct reports (R2 violation)')
 
 
 class WalkTheChainDirectorAuth(unittest.TestCase):
@@ -2270,6 +2289,124 @@ class WalkTheChainDirectorAuth(unittest.TestCase):
         self.assertFalse(serve._can_write_agent(s, 'nadia', 'zara'))          # unrelated
         self.assertFalse(serve._can_write_agent(s, 'zara', 'maya'))           # another chain
         self.assertFalse(serve._can_write_agent(s, 'player', 'nadia'))        # player is never an agent
+
+
+class AdminNeverDirectorsPureWorkers(unittest.TestCase):
+    # R2: an admin must never DIRECTLY director a pure worker (no reports,
+    # not isDirector). The boot repair sweep in _backfill_directors_in_db
+    # re-points such pure workers up to the senior director (or any non-admin
+    # director). Mid-level directors under the admin are legal and untouched.
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='think tank-r2-sweep-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            THINK_TANK_DIR=self.tmp,
+            AGENTS_DIR=os.path.join(self.tmp, 'agents'),
+            LIBRARY_DIR=os.path.join(self.tmp, 'library'),
+            PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
+        )
+        self._cm.start()
+        # Env: theo admin, nora senior director, NO seed director map (the
+        # violating shape is built directly in the DB state below).
+        self._env_patch = unittest.mock.patch.object(
+            serve, '_load_env', return_value={
+                'SEED_ROSTER': '',
+                'SEED_DIRECTOR_MAP': '',
+                'SEED_ADMIN_IDS': 'theo',
+                'SEED_SENIOR_DIRECTOR': 'nora',
+            })
+        self._env_patch.start()
+        serve.init_db()
+
+    def tearDown(self):
+        self._cm.stop()
+        self._env_patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _install_state(self, roster):
+        # Build state with agents mirroring the roster so save/load round-trips.
+        state = {
+            'agentRoster': roster,
+            'agents': {d['id']: {'profile': {}, 'role': 'Research'} for d in roster},
+        }
+        serve.save_state_to_db(state)
+        return state
+
+    def test_pure_worker_under_admin_is_repointed_to_senior_director(self):
+        # Violating seed: ada (pure worker, no reports, no isDirector flag)
+        # has the admin (theo) as her director. The sweep must move her to
+        # nora.
+        self._install_state([
+            {'id': 'theo', 'isAdmin': True, 'isDirector': True, 'director': None},
+            {'id': 'nora', 'isDirector': True, 'director': None},
+            {'id': 'ada', 'director': 'theo'},
+            {'id': 'ben', 'director': 'nora'},
+        ])
+        serve._backfill_directors_in_db()
+        by_id = {d['id']: d for d in serve.get_state_from_db()['agentRoster']}
+        self.assertEqual(by_id['ada']['director'], 'nora',
+                         'pure worker under admin must be re-pointed to senior director')
+        self.assertEqual(by_id['ben']['director'], 'nora')  # untouched
+
+    def test_mid_level_director_under_admin_is_left_alone(self):
+        # dev has a direct report (nadia) -- dev is a director by structure.
+        # admin -> director is the legal shape; the sweep must NOT re-point.
+        self._install_state([
+            {'id': 'theo', 'isAdmin': True, 'isDirector': True, 'director': None},
+            {'id': 'nora', 'isDirector': True, 'director': None},
+            {'id': 'dev', 'director': 'theo'},
+            {'id': 'nadia', 'director': 'dev'},
+        ])
+        serve._backfill_directors_in_db()
+        by_id = {d['id']: d for d in serve.get_state_from_db()['agentRoster']}
+        self.assertEqual(by_id['dev']['director'], 'theo',
+                         'a director with reports under the admin is the legal shape')
+        self.assertEqual(by_id['nadia']['director'], 'dev')
+
+    def test_flagged_director_under_admin_is_left_alone(self):
+        # isDirector flag alone (even without reports yet) marks a director;
+        # admin -> flagged-director is legal, no re-point.
+        self._install_state([
+            {'id': 'theo', 'isAdmin': True, 'isDirector': True, 'director': None},
+            {'id': 'nora', 'isDirector': True, 'director': None},
+            {'id': 'sam', 'isDirector': True, 'director': 'theo'},
+        ])
+        serve._backfill_directors_in_db()
+        by_id = {d['id']: d for d in serve.get_state_from_db()['agentRoster']}
+        self.assertEqual(by_id['sam']['director'], 'theo')
+
+    def test_sweep_is_idempotent(self):
+        self._install_state([
+            {'id': 'theo', 'isAdmin': True, 'isDirector': True, 'director': None},
+            {'id': 'nora', 'isDirector': True, 'director': None},
+            {'id': 'ada', 'director': 'theo'},
+        ])
+        serve._backfill_directors_in_db()
+        first = serve.get_state_from_db()
+        serve._backfill_directors_in_db()
+        second = serve.get_state_from_db()
+        self.assertEqual(
+            {d['id']: d.get('director') for d in first['agentRoster']},
+            {d['id']: d.get('director') for d in second['agentRoster']},
+            'a second backfill run must be a no-op once the shape is legal')
+
+    def test_safe_director_guard_repoints_pure_worker(self):
+        s = {
+            'agentRoster': [
+                {'id': 'theo', 'isAdmin': True, 'isDirector': True},
+                {'id': 'nora', 'isDirector': True},
+                {'id': 'ada', 'director': 'nora'},  # pure worker
+            ],
+        }
+        # Proposing the admin as ada's director must fall back to nora.
+        self.assertEqual(serve._safe_director(s, 'ada', 'theo'), 'nora')
+        # A non-admin target passes through unchanged.
+        self.assertEqual(serve._safe_director(s, 'ada', 'nora'), 'nora')
+        # A director (flagged) proposed under the admin also passes through.
+        self.assertEqual(serve._safe_director(s, 'nora', 'theo'), 'theo')
+        # None (top-level) passes through unchanged.
+        self.assertIsNone(serve._safe_director(s, 'nora', None))
 
 
 class DirectorOwnedTemplates(unittest.TestCase):

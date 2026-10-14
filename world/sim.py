@@ -6759,9 +6759,12 @@ def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employee
     _spawn_team_agent(state, director_name, 'Director', director_id, now_ms, grid,
                       is_director=True, elevated=True)
     # New director reports to the admin so authority still resolves upward.
+    # The new agent is isDirector=True, so an admin -> director pointer is the
+    # legal R2 shape; the guard documents that and protects the invariant.
     dir_roster = next((d for d in state['agentRoster'] if d.get('id') == director_id), None)
     if dir_roster:
-        dir_roster['director'] = admin_id
+        import serve as _serve_mod
+        dir_roster['director'] = _serve_mod._safe_director(state, director_id, admin_id)
     # Team record -- the director is the id (matches _promote_to_director).
     teams = state.setdefault('teams', [])
     team = {

@@ -5386,24 +5386,30 @@ async def _lifespan(app):
     _config.ALLOW_WATCHLIST_WRITE = False
 
 
-# Workers report to one of the two directors (Theo — the admin, and Nora —
-# the senior-most director). Kept in sync with the DB backfill so a fresh
-# start and a repaired DB agree. Assignments are deterministic: technical/
-# creative/research roles -> theo, operations/personnel/banking -> nora.
-# Everyone ultimately resolves to a director (theo or nora) by the time the
-# chain is walked. Mid-level team LEADS get their own direct reports below
-# them, which is what makes them directors too under the walk-the-chain model
-# (anyone with a direct report is a director). dev (Studio lead) and sam
-# (a team lead) get direct reports, giving REAL
-# admin -> director -> director -> employee nesting:
+# Workers report to a DIRECTOR -- never directly to the admin. Kept in sync
+# with the DB backfill so a fresh start and a repaired DB agree. The invariant
+# (enforced by the repair sweep in _backfill_directors_in_db and by
+# _safe_director on every write): an admin's direct reports must themselves be
+# directors (isDirector, or anyone with their own reports). Pure workers with
+# an admin as director are re-pointed to the senior director.
+#
+# The admin (theo) stays top-level (director=None) with authority via isAdmin,
+# and the senior director (nora) is the other top-level root. A single agent
+# can hold both roles, but R2 keeps the authority path explicit:
+#   admin (theo) --> director(s) (nora, dev once it has reports, ...) --> workers
+# A REAL admin -> director -> director -> employee nesting only exists once a
+# mid-level lead (e.g. dev, the Studio lead) has its own reports AND is
+# explicitly re-moved under the admin in the roster:
 #   theo -> dev -> nadia/priya/omar/yuki/greta/sam2/mira
-#   theo -> sam -> maya
+# (theo no longer carries any seed workers; those report to nora.)
 # and the rest of the roster reports straight up to a director.
 def _director_backfill_map():
-    # NO agent names hardcoded: the director reporting map comes
-    # from the per-install SEED_DIRECTOR_MAP env key so a cloned repo carries
-    # zero identities. Format: comma-separated  id:directorId  pairs,
-    # e.g.  ada:theo,dev:theo,eli:theo,ben:nora
+# NO agent names hardcoded: the director reporting map comes
+# from the per-install SEED_DIRECTOR_MAP env key so a cloned repo carries
+# zero identities. Format: comma-separated  id:directorId  pairs,
+# e.g.  ada:nora,dev:nora,eli:nora,ben:nora,cora:nora
+# NOTE: an admin id is an invalid director target -- the boot repair sweep
+# re-points any pure worker under an admin to the senior director.
     raw = _load_env().get('SEED_DIRECTOR_MAP', '').strip()
     out = {}
     for pair in (raw.split(',') if raw else []):
@@ -5429,8 +5435,9 @@ def _director_backfill_map():
 # requests and passes everything else down to the directors; the senior-most
 # director approves/denies on the admin's behalf. So:
 #   - Theo (renamed from Faye, its original id/name) stays the single admin (isAdmin: true). He is
-#     also a director, and being at the top of the chain supervises no other
-#     director.
+#     also a director, sits at the top of the chain (no own director), and
+#     under R2 his direct reports are always other directors -- never pure
+#     workers (the repair sweep enforces this on every boot).
 #   - Nora is demoted from admin to the SENIOR-MOST DIRECTOR (isDirector: true,
 #     no isAdmin, no own `director`), standing in for Theo on approvals.
 #   - Everything below reports up to a director.
@@ -5472,6 +5479,36 @@ def _backfill_directors_in_db():
         elif d.get('director') is None:
             d['director'] = backfill_map.get(aid, senior_dir)
             changed = True
+    # R2 repair sweep: an admin must never DIRECTLY director a pure worker.
+    # A pure worker = no direct reports AND not isDirector. Runs AFTER the
+    # stamping loop above (not mid-loop) because it needs every isAdmin /
+    # isDirector / director pointer stamped before it can tell a pure worker
+    # from a mid-level director. Re-points any pure worker whose director is
+    # an admin up to the senior director (or any non-admin director) so there
+    # is always a director between the admin and every worker. Mid-level
+    # directors (someone who HAS reports) are left under the admin -- that is
+    # the legal admin -> director -> worker shape.
+    report_counts = {}
+    for d in roster:
+        report_counts[d.get('director')] = report_counts.get(d.get('director'), 0) + 1
+    for d in roster:
+        aid = d.get('id')
+        if aid in admin_ids:
+            continue
+        if d.get('isDirector') or report_counts.get(aid, 0) > 0:
+            continue  # a director (flagged or has reports): admin->director is fine
+        if d.get('director') in admin_ids:
+            target = senior_dir if senior_dir and senior_dir not in admin_ids else None
+            if target is None:
+                for other in roster:
+                    oid = other.get('id')
+                    if (oid and oid != aid and oid not in admin_ids and
+                            (other.get('isDirector') or report_counts.get(oid, 0) > 0)):
+                        target = oid
+                        break
+            if target and target != d.get('director'):
+                d['director'] = target
+                changed = True
     if changed:
         save_state_to_db(state)
 
@@ -5515,6 +5552,34 @@ def _admin_agent_id(state):
 def _direct_reports(state, agent_id):
     roster = state.get('agentRoster', []) if state else []
     return [d.get('id') for d in roster if d.get('director') == agent_id]
+
+
+def _safe_director(state, agent_id, proposed_director_id):
+    """R2 guard for director-pointer writes: an admin must never DIRECTLY
+    director a pure worker (no reports and not isDirector). Returns a pointer
+    that keeps a director between the admin and every worker. Directors and
+    non-admin targets pass through unchanged; a pure worker proposed under an
+    admin falls back to the senior director (or any non-admin director)."""
+    if not proposed_director_id:
+        return proposed_director_id
+    roster = state.get('agentRoster', []) if state else []
+    admins = {d.get('id') for d in roster if d.get('isAdmin')}
+    if proposed_director_id not in admins:
+        return proposed_director_id  # target is not an admin: fine
+    agent = next((d for d in roster if d.get('id') == agent_id), None)
+    if agent and (agent.get('isDirector') or _direct_reports(state, agent_id)):
+        return proposed_director_id  # agent is a director: admin->director allowed
+    # pure worker under an admin: re-point to a non-admin director
+    senior = next((d.get('id') for d in roster
+                   if d.get('isDirector') and d.get('id') not in admins), None)
+    if senior:
+        return senior
+    for other in roster:
+        oid = other.get('id')
+        if (oid and oid != agent_id and oid not in admins and
+                (other.get('isDirector') or _direct_reports(state, oid))):
+            return oid
+    return proposed_director_id  # nothing better available
 
 
 def _director_chain(state, agent_id):
@@ -5802,8 +5867,10 @@ def _promote_to_director(state, promotee_id, promoter_id):
     promotee = next((d for d in roster if d.get('id') == promotee_id), None)
     if not promotee:
         return None
-    promotee['director'] = promoter_id
+    # Stamp isDirector first so the R2 guard below sees the promotee as a
+    # director (an admin MAY directly director another director).
     promotee['isDirector'] = True
+    promotee['director'] = _safe_director(state, promotee_id, promoter_id)
     promotee['directorSince'] = time.time()
     # Spawn a fresh team for the new director (no reports yet, so the backfill
     # would skip them -- the explicit record is what keeps it alive).
