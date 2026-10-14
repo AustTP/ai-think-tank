@@ -6007,6 +6007,27 @@ def _close_gated_story(state, parent):
     parent['status'] = 'done'
     # The gated story shipped: its per-story capability grant dies with it.
     _revoke_task_access(parent.get('id'))
+    # The peer gate is satisfied: merge the story's isolated git worktree back
+    # into the base workroom's main. Only coding-class parents ever got a
+    # worktree (see content._review_sandbox_id); a non-coding gate skips this.
+    # Village-scoped parents merge into their own village workroom. Merge
+    # failure NEVER blocks the close: the branch stays unmerged and the
+    # result dict records why (escalation/manual recovery stays possible).
+    if _peer_coding_class(parent):
+        try:
+            from serve import (story_sandbox_id as _story_sandbox_id,
+                               _merge_story_branch,
+                               _village_sandbox_id)
+            _sid = _story_sandbox_id(parent.get('id'))
+            _sid = _village_sandbox_id(parent.get('assignedTo'), _sid, state=state)
+            _merged = _merge_story_branch(_sid)
+            if isinstance(_merged, dict) and not _merged.get('ok'):
+                print(f'[story-merge] task {parent.get("id")}: '
+                      f'{_merged.get("reason", "merge failed")}')
+        except Exception as _e:
+            # A missing worktree/branch (story ran entirely in the shared
+            # sandbox, git hiccup, etc.) must not prevent the story closing.
+            print(f'[story-merge] task {parent.get("id")}: {_e}')
     try:
         from serve import log_action
         log_action(None, 'task_peer_approved',

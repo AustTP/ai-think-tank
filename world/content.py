@@ -925,6 +925,59 @@ _REVIEW_MAX_TOKENS = 32000                    # runReviewTask /api/chat
 _VISION_MAX_TOKENS = 500                     # reviewScreenshot /api/chat
 
 
+def _resolve_story_root(snapshot, task):
+    """Root deliverable-story task id for a coding/review/fix pass, following
+    the `reviewOf` chain back to the original story (max depth 10, cycle-safe).
+    Returns the task's own id when it has no reviewOf (it IS the root)."""
+    tasks = (snapshot.get('tasks') or {})
+    cur = task
+    seen = set()
+    for _ in range(10):
+        rid = cur.get('reviewOf')
+        if not rid or rid in seen or rid not in tasks:
+            break
+        seen.add(rid)
+        cur = tasks.get(rid) or {}
+    return cur.get('id')
+
+
+def _review_sandbox_id(snapshot, task, agent_id):
+    """Sandbox for a coding/review/fix pass.
+
+    Deliverable stories (the code-class lane: pressoffice room or productId
+    parent) get an isolated per-story git worktree (serve.story_sandbox_id /
+    ensure_story_worktree) so two agents writing different stories no longer
+    share one working tree. Reviews and fixes resolve to the SAME worktree as
+    the story they belong to, by walking the reviewOf chain back to the root
+    task. Ad-hoc workroom tasks, and any failure to ensure the worktree,
+    fall back to the shared sandbox so nothing hard-fails on sandbox
+    plumbing. Village remap is handled inside serve._village_sandbox_id."""
+    import sim as _sim_module
+    root_id = _resolve_story_root(snapshot, task)
+    root = (snapshot.get('tasks') or {}).get(root_id) if root_id else task
+    # Only code-class stories are isolated; everything else keeps the shared tree.
+    if not _sim_module._peer_coding_class(root):
+        return WORKROOM_SANDBOX_ID
+    story_id = root_id or task.get('id')
+    if not story_id:
+        return WORKROOM_SANDBOX_ID
+    try:
+        sandbox_id = _serve.story_sandbox_id(story_id)
+        # Remap by the STORY AUTHOR's village, not the currently executing
+        # agent: a reviewer in a different village than the author would
+        # otherwise resolve a different sandbox and never see the author's
+        # worktree. assignedTo is never cleared after release; fall back to
+        # the executing agent only when the root carries no author id.
+        author_id = (root.get('assignedTo') or task.get('reviewAuthorId')
+                     or agent_id)
+        sandbox_id = _serve._village_sandbox_id(author_id, sandbox_id, state=snapshot)
+        _serve.ensure_story_worktree(sandbox_id)
+        return sandbox_id
+    except Exception as e:
+        print(f'[story-sandbox] ensure failed for task {story_id}: {e}')
+        return WORKROOM_SANDBOX_ID
+
+
 def _heredoc_balance(command):
     """Port of tasks.js _heredocBalance: count heredoc-open delimiters and the
     bare 'EOF' close lines; balanced means either no opens or equal opens/closes."""
@@ -1399,11 +1452,14 @@ CODING_STANDARDS_PROMPT = (
 
 def _quality_pipeline_steps(scope_files=None):
     """Build the standard quality pipeline steps. When `scope_files` is a
-    non-empty list of .py paths, flake8/mypy/bandit are scoped to exactly
-    those files instead of running on the whole sandbox -- a README-only or
-    single-file change no longer fails on pre-existing findings in unrelated
-    files. pytest-cov always runs project-wide (coverage is measured in total
-    by design). JS steps already no-op when no JS files exist.
+    non-empty list of .py paths, flake8/mypy/bandit AND pytest-cov are scoped
+    to exactly those files instead of running on the whole sandbox -- a
+    README-only or single-file change no longer fails on pre-existing findings
+    in unrelated files, and --cov-fail-under=90 measures just the touched
+    files (a one-file story in a worktree that also holds the base tree's
+    files must not be failed by the OTHER files' coverage). The unscoped path
+    keeps the whole-project total-coverage measure for full-tree deliverables.
+    JS steps already no-op when no JS files exist.
 
     flake8 runs with `--isolated` and the host's setup.cfg flags mirrored on
     the CLI: the sandbox working dir may contain an agent-written setup.cfg/
@@ -1418,11 +1474,20 @@ def _quality_pipeline_steps(scope_files=None):
     )
     if scope_files:
         _scoped = ' '.join(scope_files)
+        # Coverage is scoped to the same files as lint when scope_files is
+        # given, so a one-file story in a worktree that also holds the base
+        # tree's files is not failed by --cov-fail-under=90 on the OTHER
+        # files' coverage. Each file is a repeated --cov= flag: a space-
+        # joined --cov=a.py b.py would pass b.py to pytest as a test path,
+        # not a coverage source. bandit takes positional targets (its -f
+        # is --format, not a file flag). The unscoped path below keeps the
+        # whole-project measure for full-tree work.
+        _cov_flags = ' '.join(f'--cov={f}' for f in scope_files)
         return [
             {'name': 'flake8', 'command': f'python -m flake8 {_flake8_flags} {_scoped}'},
             {'name': 'mypy', 'command': f'python -m mypy {_scoped}'},
-            {'name': 'bandit', 'command': 'python -m bandit -q ' + ' '.join(f'-f {f}' for f in scope_files)},
-            {'name': 'pytest-cov', 'command': 'python -m pytest --cov=. --cov-fail-under=90 -q'},
+            {'name': 'bandit', 'command': f'python -m bandit -q {_scoped}'},
+            {'name': 'pytest-cov', 'command': f'python -m pytest {_cov_flags} --cov-fail-under=90 -q'},
             {'name': 'node-syntax', 'command': (
                 'sh -c \'files=$(ls *.js *.mjs 2>/dev/null); '
                 'if [ -z "$files" ]; then echo "no JS files -- skipping"; exit 0; fi; '
@@ -1512,7 +1577,8 @@ def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose, scope_files=
     stops at the first failing step and returns per-step {name, exitCode, stdout,
     stderr} + failedStep (None on a full pass). Always returns a plain dict; never
     raises. Callers gate approval on `ok`. When `scope_files` is given, flake8/
-    mypy/bandit are scoped to those files (see _quality_pipeline_steps)."""
+    mypy/bandit AND pytest-cov are scoped to those files (see
+    _quality_pipeline_steps)."""
     resp = _serve._http_json('POST', base, '/api/pipeline',
                       {'agentId': agent_id, 'sandboxId': sandbox_id,
                        'purpose': purpose, 'steps': _quality_pipeline_steps(scope_files)}, key)
@@ -1587,6 +1653,9 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     backlog = task.get('title') or ''
     instructions = task.get('instructions')
     backlog_item = f'{backlog} -- {instructions}' if instructions else backlog
+    # Per-story isolated worktree (falls back to the shared sandbox for
+    # ad-hoc workroom tasks, non-code-class stories, or ensure failures).
+    sandbox_id = _review_sandbox_id(snapshot, task, agent_id)
     context_summary = base_ctx or ''
     name = _agent_name(snapshot, agent_id)
     tier_slug = _serve._coding_tier_slug()
@@ -1670,7 +1739,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
             probe_rounds += 1
             messages.append({'role': 'assistant', 'content': reply})
             probe_data = _serve._http_json('POST', base, '/api/page-probe',
-                                    {'agentId': agent_id, 'sandboxId': WORKROOM_SANDBOX_ID,
+                                    {'agentId': agent_id, 'sandboxId': sandbox_id,
                                      'path': probe_req['path'], 'actions': probe_req['actions'],
                                      'probes': probe_req['probes']}, key)
             feedback = _format_page_probe_result(probe_data)
@@ -1724,7 +1793,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
 
     exec_data = _serve._http_json('POST', base, '/api/execute',
                            {'agentId': agent_id, 'command': command,
-                            'purpose': f'Coding task: {backlog_item}', 'sandboxId': WORKROOM_SANDBOX_ID}, key)
+                            'purpose': f'Coding task: {backlog_item}', 'sandboxId': sandbox_id}, key)
     if not isinstance(exec_data, dict) or not exec_data.get('allowed'):
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f"blocked: {exec_data.get('reason') if isinstance(exec_data, dict) else 'no response'}",
@@ -1762,9 +1831,9 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     written = _extract_written_js_files(command)
     written_py = _extract_written_python_files(command)
     if written:
-        unlinked = _find_unlinked_js_files(base, key, agent_id, WORKROOM_SANDBOX_ID, written)
+        unlinked = _find_unlinked_js_files(base, key, agent_id, sandbox_id, written)
         if unlinked:
-            linked = _auto_link_js_files(base, key, agent_id, WORKROOM_SANDBOX_ID, unlinked, messages, tier_slug,
+            linked = _auto_link_js_files(base, key, agent_id, sandbox_id, unlinked, messages, tier_slug,
                                          task_id=task.get('id'))
             if linked['ok']:
                 result['note'] = f'auto-linked previously-orphaned file(s) into index.html: {", ".join(unlinked)}'
@@ -1780,16 +1849,16 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
                 result['note'] = (f'WARNING: created {", ".join(unlinked)} but {"they are" if plural else "it is"} not referenced '
                                   f'by a <script src> tag in index.html, and the automatic follow-up to link {"them" if plural else "it"} '
                                   f'failed -- {linked["note"]}')
-    phantom_refs = _find_phantom_script_refs(base, key, agent_id, WORKROOM_SANDBOX_ID)
+    phantom_refs = _find_phantom_script_refs(base, key, agent_id, sandbox_id)
     if phantom_refs:
-        cleaned = _remove_phantom_script_refs(base, key, agent_id, WORKROOM_SANDBOX_ID, phantom_refs)
+        cleaned = _remove_phantom_script_refs(base, key, agent_id, sandbox_id, phantom_refs)
         ref_list = ', '.join(f'{p["file"]} (in {p["html"]})' for p in phantom_refs)
         phantom_note = (f'removed <script src> reference(s) to file(s) that don\'t actually exist: {ref_list}' if cleaned['ok']
                         else f'WARNING: HTML file(s) reference file(s) that were never written and don\'t exist: {ref_list} '
                              f'-- automatic cleanup failed ({cleaned["note"]})')
         result['note'] = f"{result.get('note')} | {phantom_note}" if result.get('note') else phantom_note
 
-    dangling = _find_dangling_selector_refs(base, key, agent_id, WORKROOM_SANDBOX_ID)
+    dangling = _find_dangling_selector_refs(base, key, agent_id, sandbox_id)
     if dangling:
         pieces = []
         for d in dangling:
@@ -1812,7 +1881,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     # somehow reached _run_coding_content) skip the pipeline instead of failing
     # flake8/mypy/pytest on prose or empty sandboxes.
     if (task.get('taskType') or 'code') == 'code':
-        qp = _run_quality_pipeline(base, key, agent_id, WORKROOM_SANDBOX_ID,
+        qp = _run_quality_pipeline(base, key, agent_id, sandbox_id,
                                    f'Quality gate for coding task: {backlog_item}',
                                    scope_files=written_py or None)
     else:
@@ -2116,7 +2185,10 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     instructions = task.get('instructions')
     backlog_item = f'{backlog} -- {instructions}' if instructions else backlog
     name = _agent_name(snapshot, agent_id)
-    context = _gather_unified_context(snapshot, base, key, agent_id, WORKROOM_SANDBOX_ID, backlog)
+    # Same per-story worktree the author's coding pass used (walks reviewOf),
+    # so the reviewer reads the exact tree the author wrote, not the shared one.
+    sandbox_id = _review_sandbox_id(snapshot, task, agent_id)
+    context = _gather_unified_context(snapshot, base, key, agent_id, sandbox_id, backlog)
     # Real review work (quality pipeline + up to 2 probe-round model calls + a
     # screenshot pass + the Jev verdict) can genuinely take longer than the
     # generic 120s content ceiling _dispatch_content_work installs -- widen it
@@ -2150,7 +2222,7 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                                       or task.get('room') == 'pressoffice')
         review_scope = None
     if pipeline_is_code_class:
-        qp = _run_quality_pipeline(base, key, agent_id, WORKROOM_SANDBOX_ID,
+        qp = _run_quality_pipeline(base, key, agent_id, sandbox_id,
                                    f'Quality gate for {("QA" if is_qa else "review")} of: {backlog_item}',
                                    scope_files=review_scope)
     else:
@@ -2227,7 +2299,7 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
             probe_rounds += 1
             messages.append({'role': 'assistant', 'content': reply})
             probe_data = _serve._http_json('POST', base, '/api/page-probe',
-                                    {'agentId': agent_id, 'sandboxId': WORKROOM_SANDBOX_ID,
+                                    {'agentId': agent_id, 'sandboxId': sandbox_id,
                                      'path': probe_req['path'], 'actions': probe_req['actions'],
                                      'probes': probe_req['probes']}, key)
             feedback = _format_page_probe_result(probe_data)
@@ -2246,7 +2318,7 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                                            'ok': False})
         return
 
-    visual = _review_screenshot(base, key, agent_id, WORKROOM_SANDBOX_ID, 'index.html',
+    visual = _review_screenshot(base, key, agent_id, sandbox_id, 'index.html',
                                 f'You\'re reviewing a real screenshot of this project\'s main page. Task: {backlog_item}. '
                                 'Describe what you actually see, and call out anything that looks visually broken -- elements in the '
                                 'wrong place, overlapping, cut off, or missing.',
@@ -5267,11 +5339,17 @@ def _run_workroom_content(snapshot, agent_id, task, base_ctx=None):
     if project_label:
         backlog = f"{task.get('title') or ''} -- {task.get('instructions')}" if task.get('instructions') else (task.get('title') or '')
         context_summary = ''
+        # Same per-story worktree the coding executor below will write into
+        # (walks reviewOf), so the file listing is the story's tree, not the
+        # shared one.
+        ls_sandbox = _review_sandbox_id(snapshot, task, agent_id)
         ls = _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/execute',
-                        {'agentId': agent_id, 'sandboxId': WORKROOM_SANDBOX_ID, 'command': 'ls -la'},
+                        {'agentId': agent_id, 'sandboxId': ls_sandbox, 'command': 'ls -la'},
                         _serve.get_or_create_agent_key(agent_id))
         if isinstance(ls, dict) and ls.get('allowed') and ls.get('stdout'):
-            context_summary = f'Current files in the shared Work Room sandbox:\n{ls["stdout"]}'
+            where = ('this story\'s worktree' if ls_sandbox != WORKROOM_SANDBOX_ID
+                     else 'shared Work Room sandbox')
+            context_summary = f'Current files in the {where}:\n{ls["stdout"]}'
         # Item 1: the sim's perception (base_ctx) must survive this path -- the
         # file listing is extra context, not a replacement for who/where/why.
         if base_ctx:

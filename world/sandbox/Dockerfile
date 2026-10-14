@@ -45,4 +45,17 @@ RUN apt-get update && apt-get install -y ca-certificates curl gnupg \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# autopep8: agents reach for `python -m autopep8 --in-place ...` to auto-fix
+# the flake8 E/W errors the gate rejects on. It was not in the image, so every
+# attempt burned a review cycle on "No module named autopep8" before the agent
+# could hand-fix the file. 2.0.4 is the only release whose dependency range
+# still accepts pycodestyle==2.10.0 (flake8 6.0.0's hard pin): 2.1.2+ require
+# pycodestyle>=2.11, which would either ResolutionImpossible against the pin
+# or silently upgrade pycodestyle and crash flake8's plugin loader (the
+# _import_plugins failure this file's header already documents). Placed AFTER
+# the node layer on purpose: this RUN reuses the cached flake8/mypy/bandit/
+# pytest/chromium layers above and only executes this one pip install, instead
+# of invalidating the whole build.
+RUN python -m pip install --no-cache-dir autopep8==2.0.4 pycodestyle==2.10.0
+
 WORKDIR /workspace

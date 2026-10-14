@@ -280,8 +280,9 @@ class RunQualityPipeline(unittest.TestCase):
     def test_scoped_pipeline_scopes_flake8_mypy_bandit_to_touched_files(self):
         # A README-only or single-file change must not fail on pre-existing
         # findings elsewhere in the sandbox. When scope_files is given,
-        # flake8/mypy/bandit are scoped to those exact files; pytest-cov
-        # still runs project-wide.
+        # flake8/mypy/bandit AND pytest-cov are scoped to those exact files
+        # (a one-file story worktree must not be failed by other files'
+        # coverage or lint).
         resp = {'sandboxId': 'workroom-shared', 'failedStep': None,
                 'results': [{'name': n, 'exitCode': 0} for n in
                             ('flake8', 'mypy', 'bandit', 'pytest-cov')]}
@@ -299,9 +300,18 @@ class RunQualityPipeline(unittest.TestCase):
         # a stray sandbox setup.cfg must not change lint behavior either way.
         self.assertIn('--isolated', flake8_cmd)
         bandit_cmd = next(s['command'] for s in steps if s['name'] == 'bandit')
-        self.assertIn('-f app.py', bandit_cmd)
+        # Bandit takes positional file targets (its -f is --format), so the
+        # scoped command must list the files bare, not with -f.
+        self.assertIn('app.py', bandit_cmd)
+        self.assertIn('utils.py', bandit_cmd)
+        self.assertNotIn('-f app.py', bandit_cmd)
+        self.assertNotIn('-r .', bandit_cmd)  # not whole-tree
+        # pytest-cov is scoped to the same files (repeated --cov= flags, one
+        # per file) so --cov-fail-under=90 measures just the touched files.
         pytest_cmd = next(s['command'] for s in steps if s['name'] == 'pytest-cov')
-        self.assertIn('--cov=.', pytest_cmd)  # coverage stays project-wide
+        self.assertIn('--cov=app.py', pytest_cmd)
+        self.assertIn('--cov=utils.py', pytest_cmd)
+        self.assertNotIn('--cov=.', pytest_cmd)  # not whole-tree
 
     def test_unscoped_pipeline_runs_on_whole_sandbox(self):
         steps = content._quality_pipeline_steps(None)
