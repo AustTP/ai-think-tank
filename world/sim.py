@@ -96,6 +96,14 @@ _SimCancelledError = asyncio.CancelledError
 # tick without touching the DB. 0.0 = no tick has completed yet this process.
 _LAST_TICK_WALL_EPOCH = 0.0
 
+# Sim-loop failure event (R6 escalation ladder), stamped by serve's watchdog
+# thread and consumed ONCE by the next non-dormant _sim_loop_pass (clear-on-read,
+# inside the single read-modify-write -- the watchdog thread must never touch
+# the DB). Shape: {'kind': 'dead'|'stale'|'dead_restart_failed'|...,
+# 'detail': str, 'restarts': int, 'at': float, 'player_alert': bool}.
+# None = nothing pending; a stamp that lands while DORMANT waits for the wake.
+_SIM_WATCHDOG_EVENT = None
+
 # Locate the world files (collision_grid.json, door_triggers.json) relative to
 # this module -- serve.py runs from world/ so a plain relative path works, but
 # tests import sim from tests/ too, so anchor on this file's directory.
@@ -1228,6 +1236,20 @@ def _sim_loop_pass():
             serve._adversarial_village_tick(state)
         except Exception as e:
             print(f'[sim] adversarial village tick error: {e}', flush=True)
+        # Consume ONE pending sim-watchdog failure event (R6): stamped on the
+        # module side channel by serve's watchdog thread, delivered here
+        # INSIDE the single read-modify-write so the mailbox/work-queue writes
+        # ride the same save. Clear-on-read: a re-stamp during delivery waits
+        # for the next tick; a stamp landing while DORMANT waits for the wake
+        # (the dormant early-return above leaves it untouched).
+        global _SIM_WATCHDOG_EVENT
+        if _SIM_WATCHDOG_EVENT is not None:
+            _watchdog_evt = _SIM_WATCHDOG_EVENT
+            _SIM_WATCHDOG_EVENT = None
+            try:
+                _deliver_watchdog_event(state, _watchdog_evt)
+            except Exception as e:
+                print(f'[sim] watchdog event deliver error: {e}', flush=True)
         serve.save_state_to_db(state)
         # Stamp the watchdog heartbeat only after a fully successful pass
         # (tick + save). A pass that dies mid-way leaves the old stamp so the
@@ -8471,6 +8493,13 @@ def _mail_action_step(state, now, now_ms):
         if queued:
             a.pop('_mailAwake', None)
             routed += 1
+        elif not isinstance(payload, dict) or not (
+                payload.get('issueKey') or payload.get('taskId')
+                or payload.get('about')):
+            # Unroutable system notice (no card/task to re-arm -- e.g. the
+            # admin's watchdog escalation copy): stop retrying, or the marker
+            # holds her awake (and unparkable) forever with nothing to queue.
+            a.pop('_mailAwake', None)
     return routed
 
 
@@ -8478,7 +8507,12 @@ def _queue_mail_work(state, agent_id, kind, payload, now_ms):
     """Push a workQueue item so `aid` acts on the mail's referenced card/task.
     Menu of kinds: `player_answer` / `dependency_landed` re-arm the card's task
     for its owner; `peer_review_request` / `peer_review_rejected` re-arm the
-    target task for a (re)review. Returns True if an item was queued."""
+    target task for a (re)review; `sim_watchdog` queues the thin investigate
+    item (its goal names no issue/task, so it must never reach
+    _requeue_task_for_agent, which would stamp the sentinel as reviewOf).
+    Returns True if an item was queued."""
+    if kind == 'sim_watchdog':
+        return _queue_watchdog_alert(state, agent_id, payload, now_ms)
     issue_key = (payload or {}).get('issueKey')
     task_id = (payload or {}).get('taskId') or (payload or {}).get('about')
     if issue_key:
@@ -8486,6 +8520,78 @@ def _queue_mail_work(state, agent_id, kind, payload, now_ms):
     if task_id:
         return _requeue_task_for_agent(state, agent_id, task_id, now_ms)
     return False
+
+
+def _queue_watchdog_alert(state, agent_id, payload, now_ms):
+    """Queue the director's investigate item for a `sim_watchdog` mail. Thin on
+    purpose: the alert text is the instructions, the goal is a fixed sentinel
+    (help_signal precedent: a goal that names no issue/task), no reviewOf
+    (nothing to peer-review a system notice against), room-less so
+    _assign_due_item resolves a real room. Returns True if queued."""
+    queue = state.get('workQueue')
+    if not isinstance(queue, list):
+        return False
+    text = (payload or {}).get('text') or ''
+    queue.append({
+        'title': 'Investigate sim-loop watchdog alert',
+        'room': None,
+        'instructions': text or 'Investigate the sim-loop watchdog alert now that you have been notified.',
+        'goal': 'sim-watchdog',
+        'assignedTo': agent_id,  # wake-on-mail pin: THIS agent investigates
+        '_mailResume': True,
+        'notBefore': now_ms,
+    })
+    return True
+
+
+def _deliver_watchdog_event(state, evt):
+    """Deliver one sim-watchdog failure event (R6) inside the sim's single
+    read-modify-write. Ladder: the senior director is mailed AND pinned an
+    investigate work item (directly when on-duty -- no _mailAwake marker, so
+    _mail_action_step would never route it; via the marker when off-duty);
+    once the streak reaches 2 restarts the admin is ALSO mailed (distinct
+    kind -- isAdmin is excluded from assignment, so the admin copy must never
+    queue work) and an audit row is filed. The player is NEVER messaged here:
+    serve's watchdog owns the last-resort Telegram when nothing in the tank
+    can resolve the outage. Pure state mutation (log_action writes only the
+    action_log table, same as help_signal)."""
+    now_ms = int(time.time() * 1000)
+    kind = (evt or {}).get('kind') or 'unknown'
+    detail = (evt or {}).get('detail') or ''
+    try:
+        restarts = int((evt or {}).get('restarts') or 1)
+    except Exception:
+        restarts = 1
+    text = (f'Sim-loop watchdog alert ({kind}): {detail}. '
+            f'Consecutive restart attempt #{restarts}. Investigate the root '
+            f'cause now; if it keeps recurring, escalate to the admin.')
+    senior = _senior_director(state)
+    senior_id = senior.get('id') if senior else None
+    if not senior_id:
+        print('[sim] watchdog event: no senior director to notify', flush=True)
+    else:
+        _deliver_mail(state, senior_id, 'sim_watchdog', {'text': text})
+        a = (state.get('agents') or {}).get(senior_id)
+        if isinstance(a, dict) and not a.get('_mailAwake'):
+            # On-duty: no marker, so route the pinned item now (an off-duty
+            # director's marker routes it on the next tick instead).
+            _queue_mail_work(state, senior_id, 'sim_watchdog',
+                             {'text': text}, now_ms)
+    if restarts >= 2:
+        admin = next((d for d in (state.get('agentRoster') or [])
+                      if d.get('isAdmin')), None)
+        admin_id = admin.get('id') if admin else None
+        if admin_id and admin_id != senior_id:
+            _deliver_mail(state, admin_id, 'sim_watchdog_escalated',
+                          {'text': f'Watchdog escalation (senior director '
+                                   f'notified): {text}'})
+        try:
+            import serve
+            serve.log_action(admin_id or senior_id, 'sim_watchdog_escalated',
+                             {'kind': kind, 'restarts': restarts,
+                              'directorId': senior_id}, authorized=False)
+        except Exception as e:
+            print(f'[sim] watchdog escalation log error: {e}', flush=True)
 
 
 def _requeue_card_task(state, agent_id, issue_key, now_ms):
