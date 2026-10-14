@@ -84,6 +84,18 @@ SIM_TICK_S = 1.0
 # like per-frame movement. 0.1s -> 6px/step, well under TASK_ARRIVE_DIST.
 SIM_SUBSTEP_S = 0.1
 
+# Bind the real CancelledError at import time. Tests patch `sim.asyncio`
+# wholesale with a Mock, so writing `except asyncio.CancelledError` inside
+# _sim_loop would resolve to a Mock attribute (not an exception class) and
+# raise TypeError during exception matching. This name is unaffected by that
+# patch; _sim_loop must re-raise it so lifespan shutdown still works.
+_SimCancelledError = asyncio.CancelledError
+
+# Wall-clock of the last SUCCESSFUL _sim_loop_pass (set after save_state_to_db).
+# The serve.py sim watchdog reads this cheap module global to detect a frozen
+# tick without touching the DB. 0.0 = no tick has completed yet this process.
+_LAST_TICK_WALL_EPOCH = 0.0
+
 # Locate the world files (collision_grid.json, door_triggers.json) relative to
 # this module -- serve.py runs from world/ so a plain relative path works, but
 # tests import sim from tests/ too, so anchor on this file's directory.
@@ -1217,25 +1229,55 @@ def _sim_loop_pass():
         except Exception as e:
             print(f'[sim] adversarial village tick error: {e}', flush=True)
         serve.save_state_to_db(state)
+        # Stamp the watchdog heartbeat only after a fully successful pass
+        # (tick + save). A pass that dies mid-way leaves the old stamp so the
+        # watchdog can notice repeated failures.
+        global _LAST_TICK_WALL_EPOCH
+        _LAST_TICK_WALL_EPOCH = time.time()
         return state
     finally:
         serve._state_abort()
 
 
 async def _sim_loop():
+    # 2026-10-13 hardening. The live village froze mid-sprint: the tick
+    # stopped, every executor worker sat idle, CPU ~1% (a block, not a spin),
+    # and NOTHING was logged. Post-mortem: this asyncio task had DIED
+    # silently. Two structural holes made it invisible --
+    #   (a) `except Exception` cannot catch BaseException subclasses
+    #       (CancelledError, KeyboardInterrupt, or anything else that skips
+    #       Exception), so such an escape ended `while True` with no log;
+    #   (b) the lifespan holds the only reference to this task and never
+    #       awaits it, so Python's "Task exception was never retrieved"
+    #       warning never fires -- a fully invisible death.
+    # Fix: every await is guarded with BaseException (re-raising
+    # CancelledError so shutdown still works), and serve.py's sim watchdog
+    # supervises the task object itself (recreate on done / tick-stale).
     while True:
-        await asyncio.sleep(SIM_TICK_S)
+        try:
+            await asyncio.sleep(SIM_TICK_S)
+        except _SimCancelledError:
+            raise
+        except BaseException as e:
+            # Keep looping; the while re-enters sleep next iteration. Never
+            # let a stray BaseException end the task without a trace.
+            print(f'[sim] sleep error: {e!r}', flush=True)
+            continue
         try:
             await asyncio.to_thread(_sim_loop_pass)
-        except Exception as e:
-            print(f'[sim] loop error: {e}', flush=True)
+        except _SimCancelledError:
+            raise
+        except BaseException as e:
+            print(f'[sim] loop error: {e!r}', flush=True)
         # Drain any queued player emails OUTSIDE the tick (its own thread) so a
         # slow SMTP round-trip never stalls the think tank tick. Best-effort -- the
         # sender fail-closes and the drain clears the outbox regardless.
         try:
             await asyncio.to_thread(_drain_emails_from_db)
-        except Exception as e:
-            print(f'[sim] email drain error: {e}', flush=True)
+        except _SimCancelledError:
+            raise
+        except BaseException as e:
+            print(f'[sim] email drain error: {e!r}', flush=True)
 
 
 def _drain_emails_from_db():
