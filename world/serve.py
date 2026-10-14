@@ -110,7 +110,9 @@ from bank import (  # noqa: E402,F401
     _high_tier_budget_exceeded,
     _high_tier_budget_month,
     _high_tier_spend_this_month,
+    _ledger_month_to_date,
     _openrouter_account_credits,
+    _openrouter_month_to_date,
     _page_budget_exhausted,
     _page_budget_ledger_read,
     _page_budget_ledger_write,
@@ -21886,6 +21888,11 @@ async def budget_view(request: Request):
         'crit_pct_remaining': OPENROUTER_CREDITS_CRIT_PCT,
         'api_key_set': bool(OPENROUTER_API_KEY),
         'credits': credits,
+        # The credits gauge is a LIFETIME account balance: money the
+        # player deposited into the OpenRouter account, which does NOT
+        # reset on the first of the month. The monthToDateUsd field
+        # below is the slice that does.
+        'credits_scope': 'account-lifetime',
         'credits_age_s': (
             (time.time() - _OPENROUTER_CREDITS_CACHE['at'])
             if _OPENROUTER_CREDITS_CACHE['at'] else None),
@@ -21897,6 +21904,31 @@ async def budget_view(request: Request):
         openrouter['spent_usd'] = round(used, 4)
         openrouter['remaining_usd'] = round(max(0.0, total - used), 4)
         openrouter['used_pct'] = round(used / total, 4)
+    # Month-to-date spend: the slice that rolls over at each month
+    # boundary, for the OpenRouter account and per service. Best-effort
+    # -- a ledger failure leaves the knobs and the lifetime account
+    # gauge as the readout.
+    month_view = {}
+    services_view = []
+    try:
+        ledger = _spend_ledger_read() or {}
+        month_view = {
+            'month': _spend_cap_period(),
+            'openrouterUsd': _openrouter_month_to_date(ledger),
+            'allServicesUsd': _ledger_month_to_date(ledger),
+        }
+        openrouter['monthToDateUsd'] = month_view['openrouterUsd']
+        for svc, row in _bank_budget_view(get_state_from_db() or {}).items():
+            services_view.append({
+                'service': svc,
+                'monthUsedUsd': row.get('monthUsed'),
+                'totalUsedUsd': row.get('used'),
+                'calls': row.get('calls'),
+                'cap': row.get('cap'),
+                'currency': 'units' if svc == COLAB_LEDGER_KEY else 'usd',
+            })
+    except Exception:
+        pass
     # Per-director slices: the admin-set monthly ceiling each
     # director's team draws on, with live month-to-date usage from
     # the ledger (own burn plus the WHOLE subtree's -- each agent's
@@ -21940,6 +21972,7 @@ async def budget_view(request: Request):
     except Exception:
         pass  # the slice view is best-effort; the knobs stay primary
     return JSONResponse({'ok': True, 'knobs': knobs, 'openrouter': openrouter,
+                         'monthToDate': month_view, 'services': services_view,
                          'directorBudgets': director_budgets,
                          'budgetRequests': budget_requests})
 

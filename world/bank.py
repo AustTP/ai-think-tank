@@ -414,21 +414,28 @@ def _spend_cap_period():
     return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
 
 
-def _spend_cap_tracked_total(ledger):
-    """The sum the monthly USD cap is measured against: every dollar-
-    denominated service bucket and nothing else. COLAB_LEDGER_KEY carries
-    Colab COMPUTE UNITS, not dollars -- it has its own budget gate
-    (COLAB_MONTHLY_UNITS) and its own Bank row, so counting it here would trip
-    the USD cap on a currency that isn't money (a single T4 run accruing ~4
-    units looked like $4 of spend and failed every classifier call closed).
-    Per-task / per-village / per-agent buckets are attribution dimensions,
-    excluded so they never double-count the shared budget."""
+def _is_tracked_service_bucket(key, value):
+    """The membership test for the bucket set the monthly USD cap is
+    measured against: every dollar-denominated service bucket and nothing
+    else. COLAB_LEDGER_KEY carries Colab COMPUTE UNITS, not dollars -- it
+    has its own budget gate (COLAB_MONTHLY_UNITS) and its own Bank row,
+    so counting it here would trip the USD cap on a currency that isn't
+    money (a single T4 run accruing ~4 units looked like $4 of spend and
+    failed every classifier call closed). Per-task / per-village /
+    per-agent buckets are attribution dimensions, excluded so they never
+    double-count the shared budget."""
     import serve as _serve
-    excluded = {_serve._SPEND_CAP_BASELINE_KEY, _serve.COLAB_LEDGER_KEY}
-    return sum(float(v.get('used') or 0) for k, v in ledger.items()
-               if k not in excluded and not _is_task_spend_key(k)
-               and not k.startswith('__village__/') and not k.startswith('__agent__/')
-               and isinstance(v, dict))
+    return (isinstance(value, dict)
+            and key not in {_serve._SPEND_CAP_BASELINE_KEY, _serve.COLAB_LEDGER_KEY}
+            and not _is_task_spend_key(key)
+            and not key.startswith('__village__/') and not key.startswith('__agent__/'))
+
+
+def _spend_cap_tracked_total(ledger):
+    """The sum the monthly USD cap is measured against: every tracked
+    service bucket's lifetime `used`."""
+    return sum(float(v.get('used') or 0) for k, v in (ledger or {}).items()
+               if _is_tracked_service_bucket(k, v))
 
 
 def _think_tank_spend_cap_exceeded():
@@ -499,9 +506,62 @@ def _spend_cap_month_view():
     return {'usage': max(0.0, float(total) - float(baseline)), 'cap': cap, 'exceeded': exceeded}
 
 
+def _service_month_to_date(ledger, service):
+    """A service's spend accrued within the current UTC month: the sum of
+    its ledger series entries keyed this month. Regular service buckets
+    keep a byDay series ('YYYY-MM-DD'); the reserved vendor buckets
+    (__high_tier__, __apify__, __colab_compute__) keep a byMonth series
+    ('YYYY-MM'). A bucket with no series predates the series or is a lane
+    that keeps none -- its month split is unknowable, so it reads as 0.0
+    rather than guessing the whole `used` total is this month's."""
+    import serve as _serve
+    bucket = (ledger or {}).get(service)
+    if not isinstance(bucket, dict):
+        return 0.0
+    month = _serve._spend_cap_period()
+    total = 0.0
+    for series in (bucket.get('byDay'), bucket.get('byMonth')):
+        for k, v in (series or {}).items():
+            if isinstance(k, str) and k.startswith(month):
+                total += float(v or 0)
+    return total
+
+
+def _ledger_month_to_date(ledger):
+    """The whole think tank's month-to-date USD spend: every tracked
+    service bucket's this-month slice. Unlike the OpenRouter account's
+    lifetime totals (totalCredits/totalUsage -- a deposited prepaid
+    balance that never resets), this is the number that rolls over at
+    each month boundary, and it is the slice the monthly SPEND_CAP_USD
+    is measured against."""
+    return round(sum(_service_month_to_date(ledger, k) for k, v in (ledger or {}).items()
+                     if _is_tracked_service_bucket(k, v)), 6)
+
+
+# Vendor lanes in the shared dollar ledger whose costs are NOT OpenRouter
+# model spend: Treg (a separate scraping API) and Apify (its own actor
+# account with its own monthly budget). The OpenRouter month-to-date
+# gauge excludes them; the per-service Bank view still shows each one's
+# own month-to-date.
+_NON_OPENROUTER_LEDGER_KEYS = frozenset({'treg'})
+
+
+def _openrouter_month_to_date(ledger):
+    """Month-to-date USD spent through the OpenRouter account: every
+    tracked dollar lane except the non-OpenRouter vendor buckets. This is
+    the monthly counterpart to the account's lifetime totalUsage -- the
+    slice the operator sees "instead of all time" -- and it rolls over
+    at each month boundary even though the deposited balance does not."""
+    import serve as _serve
+    excluded = _NON_OPENROUTER_LEDGER_KEYS | {_serve.APIFY_LEDGER_KEY}
+    return round(sum(_service_month_to_date(ledger, svc)
+                     for svc, v in (ledger or {}).items()
+                     if svc not in excluded and _is_tracked_service_bucket(svc, v)), 6)
+
+
 def _bank_budget_view(snapshot):
     """Snap the spend ledger + per-service caps into a director-facing view:
-       used / cap / left / a forecast (trailing-7-day burn rate projected to
+       used / monthUsed (this month's slice) / cap / left / a forecast (trailing-7-day burn rate projected to
        when the cap is hit) for every service that has spent anything, plus a
        cumulative row across all services so directors can see the whole
        think tank and not exceed cumulatively. Pure read -- never mutates state.
@@ -513,7 +573,8 @@ def _bank_budget_view(snapshot):
         else (snapshot.get('products') or [])
     products = list(products)
     services = {}
-    for svc, bucket in (_serve._spend_ledger_read() or {}).items():
+    ledger = _serve._spend_ledger_read() or {}
+    for svc, bucket in ledger.items():
         if svc == _serve._SPEND_CAP_BASELINE_KEY or _is_task_spend_key(svc) \
                 or svc.startswith('__village__/') or svc.startswith('__agent__/') \
                 or not isinstance(bucket, dict):
@@ -529,6 +590,7 @@ def _bank_budget_view(snapshot):
         service_row = {
             'service': svc,
             'used': round(used, 6),
+            'monthUsed': round(_service_month_to_date(ledger, svc), 6),
             'cap': cap,
             'left': None if uncapped else round(max(0.0, cap - used), 6),
             'over': False if uncapped else used > cap,
@@ -552,7 +614,8 @@ def _bank_budget_view(snapshot):
         if not svc or svc in services or not isinstance(cap, (int, float)) or cap <= 0:
             continue
         services[svc] = {
-            'service': svc, 'used': 0.0, 'cap': float(cap), 'left': float(cap),
+            'service': svc, 'used': 0.0, 'monthUsed': 0.0, 'cap': float(cap),
+            'left': float(cap),
             'over': False, 'calls': 0, 'lastAt': None,
             'burnPerDay': 0.0, 'daysLeft': None,
         }
@@ -567,7 +630,7 @@ def _bank_budget_view(snapshot):
             and _serve.APIFY_LEDGER_KEY not in services:
         services[_serve.APIFY_LEDGER_KEY] = {
             'service': _serve.APIFY_LEDGER_KEY,
-            'used': 0.0, 'cap': float(_serve.APIFY_MONTHLY_BUDGET_USD),
+            'used': 0.0, 'monthUsed': 0.0, 'cap': float(_serve.APIFY_MONTHLY_BUDGET_USD),
             'left': float(_serve.APIFY_MONTHLY_BUDGET_USD), 'over': False,
             'calls': 0, 'lastAt': None, 'burnPerDay': 0.0, 'daysLeft': None,
         }
@@ -582,7 +645,8 @@ def _bank_budget_view(snapshot):
         _usage = _serve._colab_account_usage()
         services[_serve.COLAB_LEDGER_KEY] = {
             'service': _serve.COLAB_LEDGER_KEY,
-            'used': round(_used, 3), 'cap': float(_serve.COLAB_MONTHLY_UNITS),
+            'used': round(_used, 3), 'monthUsed': round(_used, 3),
+            'cap': float(_serve.COLAB_MONTHLY_UNITS),
             'left': round(max(0.0, _serve.COLAB_MONTHLY_UNITS - _used), 3),
             'over': _used > _serve.COLAB_MONTHLY_UNITS,
             'calls': 0, 'lastAt': None, 'burnPerDay': 0.0, 'daysLeft': None,
