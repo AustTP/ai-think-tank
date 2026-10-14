@@ -2083,6 +2083,59 @@ class ClassifyDefaults(unittest.TestCase):
                                         return_value=("prod-9", 0.9, 0.1)):
             self.assertIsNone(serve._classify_product_default(state, "text"))
 
+    def test_room_keyword_fast_path_skips_jev(self):
+        state = _roster_state()
+        with unittest.mock.patch.object(serve, "_jev_quorum_choice_sync",
+                                        side_effect=AssertionError("Jev must not run")):
+            self.assertEqual(serve._classify_room_default(state, "write and publish an article"), "pressoffice")
+
+    def test_room_keyword_no_match_falls_to_jev(self):
+        state = _roster_state()
+        with unittest.mock.patch.object(serve, "_jev_quorum_choice_sync",
+                                        return_value=("bank", 0.9, 0.1)):
+            self.assertEqual(serve._classify_room_default(state, "text"), "bank")
+
+    def test_room_keyword_tie_falls_to_jev(self):
+        # "email" (postoffice) and "article" (pressoffice) hit one
+        # keyword each: a tie is not a classification, Jev decides.
+        state = _roster_state()
+        with unittest.mock.patch.object(serve, "_jev_quorum_choice_sync",
+                                        return_value=("postoffice", 0.9, 0.1)):
+            self.assertEqual(serve._classify_room_default(state, "email the article"), "postoffice")
+
+    def test_room_keyword_word_boundary(self):
+        # 'art' is a media keyword but must not match inside
+        # 'article' -- with real boundaries pressoffice wins
+        # outright and Jev never runs.
+        state = _roster_state()
+        with unittest.mock.patch.object(serve, "_jev_quorum_choice_sync",
+                                        side_effect=AssertionError("Jev must not run")):
+            self.assertEqual(serve._classify_room_default(state, "an article draft"), "pressoffice")
+
+    def test_product_name_pin_skips_jev(self):
+        state = _roster_state()
+        state["products"] = {"prod-1": {"name": "Atlas"}, "prod-2": {"name": "Boreal"}}
+        with unittest.mock.patch.object(serve, "_jev_quorum_choice_sync",
+                                        side_effect=AssertionError("Jev must not run")):
+            self.assertEqual(serve._classify_product_default(state, "Atlas is down for everyone"), "prod-1")
+
+    def test_product_ambiguous_name_falls_to_jev(self):
+        # "Atlas Pro" contains both product names verbatim: ambiguous,
+        # so the Jev choice (here pinned to prod-2) decides.
+        state = _roster_state()
+        state["products"] = {"prod-1": {"name": "Atlas"}, "prod-2": {"name": "Atlas Pro"}}
+        with unittest.mock.patch.object(serve, "_jev_quorum_choice_sync",
+                                        return_value=("prod-2", 0.9, 0.1)):
+            self.assertEqual(serve._classify_product_default(state, "Atlas Pro is down"), "prod-2")
+
+    def test_product_short_name_not_pinned(self):
+        # Names under 4 chars never pin (too false-positive-prone).
+        state = _roster_state()
+        state["products"] = {"prod-1": {"name": "AI"}}
+        with unittest.mock.patch.object(serve, "_jev_quorum_choice_sync",
+                                        return_value=("prod-1", 0.9, 0.1)):
+            self.assertEqual(serve._classify_product_default(state, "the AI is down"), "prod-1")
+
 
 class ExtractScheduleFields(unittest.TestCase):
     def test_http_json_raises(self):
