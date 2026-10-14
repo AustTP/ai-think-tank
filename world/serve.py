@@ -102,6 +102,10 @@ from bank import (  # noqa: E402,F401
     _colab_budget_exceeded,
     _colab_budget_month,
     _colab_spend_this_month,
+    _director_budget_map,
+    _director_of_agent,
+    _director_spend_key,
+    _director_spend_status,
     _forecast,
     _high_tier_budget_exceeded,
     _high_tier_budget_month,
@@ -20750,6 +20754,35 @@ def _input_guard_violation(messages):
     return None
 
 
+def _director_budget_gate(agent_id, model, service, authorized, lane):
+    """The per-director monthly spend gate, shared by every model
+    chokepoint (same shape and position as the per-agent gate): each
+    director's team draws on its own admin-set monthly slice of the
+    tank budget (POST /api/budget/director), so a director who burns
+    their slice pauses their OWN team's calls -- other directors keep
+    working -- until the admin grants a raise (the 429 tells the
+    caller to ask via POST /api/budget/request). Returns the 429
+    response to return, or None when the director is not capped
+    (feature off, no slice set, or the agent is unknown)."""
+    if not agent_id:
+        return None
+    status = _director_spend_status(agent_id)
+    if not status:
+        return None
+    log_action(agent_id, f'{lane}_director_budget_blocked',
+               {'directorId': status['directorId'], 'model': model,
+                'service': service}, authorized=authorized)
+    return JSONResponse({
+        'error': (f"Director {status['directorId']}'s team has used its "
+                  f"monthly model-spend budget (${status['cap']:.2f}) and "
+                  f"further calls are paused until the admin grants more "
+                  f"(ask via POST /api/budget/request)."),
+        'directorBudgetExhausted': True,
+        'directorId': status['directorId'],
+        'directorBudgetUsd': status['cap'],
+    }, status_code=429)
+
+
 @app.post('/api/chat')
 async def chat(request: Request):
     # The only place OPENROUTER_API_KEY is ever used -- it never leaves
@@ -20848,6 +20881,13 @@ async def chat(request: Request):
             'agentBudgetExhausted': True,
             'agentSpendCapUsd': AGENT_SPEND_CAP_USD,
         }, status_code=429)
+    # Per-director spend gate: each director's team draws on its own
+    # monthly slice (admin-set); exhausting it pauses this director's
+    # team only, not the whole tank.
+    _dir_blocked = _director_budget_gate(agent_id, model, service,
+                                         authorized, 'chat')
+    if _dir_blocked:
+        return _dir_blocked
     # Plain-writing directive (token saver): by default fold the anti-AI-slop
     # ban list into the first system message so prose replies come back
     # shorter -- less filler is fewer billed input AND output tokens, without
@@ -21651,7 +21691,42 @@ async def budget_view(request: Request):
         openrouter['spent_usd'] = round(used, 4)
         openrouter['remaining_usd'] = round(max(0.0, total - used), 4)
         openrouter['used_pct'] = round(used / total, 4)
-    return JSONResponse({'ok': True, 'knobs': knobs, 'openrouter': openrouter})
+    # Per-director slices: the admin-set monthly ceiling each
+    # director's team draws on, with live month-to-date usage from
+    # the ledger, plus the raise requests the admin has not
+    # answered yet (filed via POST /api/budget/request).
+    director_budgets = {}
+    budget_requests = []
+    try:
+        state = get_state_from_db() or {}
+        month = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
+        ledger = _spend_ledger_read()
+        usage = {}
+        for key, bucket in (ledger or {}).items():
+            if (isinstance(key, str) and key.startswith('__director__/')
+                    and isinstance(bucket, dict)):
+                did = key.split('__director__/', 1)[1]
+                series = bucket.get('byMonth') or {}
+                usage[did] = round(sum(
+                    float(v or 0) for k, v in series.items()
+                    if isinstance(k, str) and k.startswith(month)), 6)
+        for did, cap in ((state.get('directorBudgets') or {}) or {}).items():
+            try:
+                cap_usd = float(cap)
+            except (TypeError, ValueError):
+                continue
+            if cap_usd > 0:
+                director_budgets[str(did)] = {
+                    'capUsd': round(cap_usd, 6),
+                    'usedUsd': usage.get(str(did), 0.0),
+                }
+        budget_requests = [r for r in (state.get('budgetRequests') or [])
+                           if isinstance(r, dict)]
+    except Exception:
+        pass  # the slice view is best-effort; the knobs stay primary
+    return JSONResponse({'ok': True, 'knobs': knobs, 'openrouter': openrouter,
+                         'directorBudgets': director_budgets,
+                         'budgetRequests': budget_requests})
 
 
 @app.post('/api/budget')
@@ -21698,6 +21773,153 @@ async def budget_set(request: Request):
     return JSONResponse({'ok': True, 'written': written,
                          'reloaded': result['changed'],
                          'values': {n: g.get(n) for n in written}})
+
+
+@app.post('/api/budget/director')
+@_state_writer
+async def budget_director_set(request: Request):
+    """Set (or clear) one director's monthly model-spend slice -- the
+    hard ceiling for that director's WHOLE team. The admin decides the
+    slices (a player session or the admin agent); 0/null clears the
+    cap. A raise also answers the pending requests it covers."""
+    if not _require_player_or_admin(request):
+        return JSONResponse({'error': 'Unauthorized -- director budgets are a player-or-admin control'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    director_id = str(body.get('directorId') or '').strip()
+    if not director_id:
+        return JSONResponse({'error': 'directorId is required'}, status_code=400)
+    raw = body.get('budgetUsd')
+    if raw is None:
+        cap = 0.0
+    else:
+        try:
+            cap = float(raw)
+        except (TypeError, ValueError):
+            return JSONResponse({'error': 'budgetUsd must be a non-negative number or null'}, status_code=400)
+    if cap < 0 or cap != cap or cap in (float('inf'), float('-inf')):
+        return JSONResponse({'error': 'budgetUsd must be a non-negative number or null'}, status_code=400)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    roster = state.get('agentRoster') or []
+    teams = state.get('teams') or []
+    known = any(isinstance(d, dict) and d.get('id') == director_id
+                for d in roster)
+    if not known:
+        known = any(isinstance(t, dict) and director_id in (t.get('directorId'), t.get('id'))
+                    for t in teams)
+    if not known:
+        return JSONResponse({'error': f'unknown director: {director_id}'}, status_code=400)
+    budgets = state.get('directorBudgets')
+    if not isinstance(budgets, dict):
+        budgets = {}
+    if cap > 0:
+        budgets[director_id] = round(cap, 6)
+    else:
+        budgets.pop(director_id, None)
+    state['directorBudgets'] = budgets
+    granted = 0
+    for r in (state.get('budgetRequests') or []):
+        if (isinstance(r, dict) and r.get('directorId') == director_id
+                and r.get('status') == 'pending'):
+            try:
+                asked = float(r.get('requestedUsd') or 0)
+            except (TypeError, ValueError):
+                asked = 0.0
+            if cap >= asked:
+                r['status'] = 'granted'
+                r['grantedAt'] = int(time.time() * 1000)
+                granted += 1
+    save_state_to_db(state)
+    log_action(None, 'director_budget_set',
+               {'directorId': director_id, 'capUsd': round(cap, 6),
+                'requestsGranted': granted}, authorized=True)
+    return JSONResponse({'ok': True, 'directorId': director_id,
+                         'capUsd': round(cap, 6),
+                         'requestsGranted': granted})
+
+
+@app.post('/api/budget/request')
+@_state_writer
+async def budget_request(request: Request):
+    """Ask the admin for a bigger monthly slice. A director files for
+    their OWN slice (agent key matching their id -- a worker cannot
+    ask, and no one asks for another director); the player and the
+    admin may file for any director. The request is recorded on state
+    (visible at GET /api/budget) and mailed to the admin's mailbox."""
+    player = bool(verify_session(request.cookies.get(SESSION_COOKIE_NAME)))
+    requester = 'player' if player else _resolve_requester(request)
+    if not requester:
+        return JSONResponse({'error': 'unauthenticated'}, status_code=401)
+    if requester != 'player':
+        if verify_agent_key(requester, request.headers.get('X-Agent-Key')) is not True:
+            return JSONResponse({'error': 'attribution key mismatch'}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    director_id = str(body.get('directorId') or '').strip()
+    if not director_id:
+        return JSONResponse({'error': 'directorId is required'}, status_code=400)
+    try:
+        requested = float(body.get('requestedUsd'))
+    except (TypeError, ValueError):
+        return JSONResponse({'error': 'requestedUsd must be a positive number'}, status_code=400)
+    if requested <= 0 or requested != requested or requested in (float('inf'), float('-inf')):
+        return JSONResponse({'error': 'requestedUsd must be a positive number'}, status_code=400)
+    reason = str(body.get('reason') or '').strip()[:500]
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    teams = state.get('teams') or []
+    is_director = any(isinstance(t, dict) and director_id in (t.get('directorId'), t.get('id'))
+                      for t in teams)
+    is_admin_actor = _is_admin(state, requester)
+    if not is_director:
+        return JSONResponse({'error': f'unknown director: {director_id}'}, status_code=400)
+    # An agent may only ask for its OWN slice; the player and the
+    # admin may ask for any director's.
+    if requester != 'player' and not is_admin_actor and requester != director_id:
+        return JSONResponse({'error': 'a director may only request a raise for their own slice'}, status_code=403)
+    now_ms = int(time.time() * 1000)
+    entry = {
+        'id': f'br-{now_ms}',
+        'directorId': director_id,
+        'requestedUsd': round(requested, 6),
+        'currentUsd': round(float(((state.get('directorBudgets') or {}).get(director_id)) or 0), 6),
+        'reason': reason,
+        'status': 'pending',
+        'requestedBy': requester,
+        'requestedAt': now_ms,
+    }
+    state.setdefault('budgetRequests', []).append(entry)
+    admin_id = _admin_agent_id(state)
+    mail_text = (f'Budget request from director {director_id}: raise the '
+                 f"monthly slice from ${entry['currentUsd']:.2f} to "
+                 f'${requested:.2f}.'
+                 + (f' Reason: {reason}' if reason else '')
+                 + ' Grant it via POST /api/budget/director.')
+    if admin_id:
+        try:
+            import sim as _sim
+            _sim._deliver_mail(state, admin_id, 'budget_request',
+                               {'text': mail_text})
+        except Exception as e:
+            print(f'[budget] request mail to admin failed: {e}', flush=True)
+    save_state_to_db(state)
+    log_action(requester if requester != 'player' else None,
+               'budget_request',
+               {'directorId': director_id, 'requestedUsd': round(requested, 6),
+                'requestId': entry['id']}, authorized=True)
+    return JSONResponse({'ok': True, 'request': entry,
+                         'mailedToAdmin': bool(admin_id)})
 
 
 @app.post('/api/env/reload')
@@ -24715,6 +24937,10 @@ async def sublow_inference(request: Request):
                       f'until a director raises it.'),
             'agentBudgetExhausted': True, 'agentSpendCapUsd': AGENT_SPEND_CAP_USD,
         }, status_code=429)
+    _dir_blocked = _director_budget_gate(
+        agent_id, model, grant['id'], True, 'sublow')
+    if _dir_blocked:
+        return _dir_blocked
     if task_id and _task_budget_exhausted(task_id):
         spent, attempts = _task_budget_spent(task_id)
         log_action(agent_id, 'sublow_task_budget_blocked',
@@ -24920,6 +25146,10 @@ async def jev_inference(request: Request):
                       f'until a director raises it.'),
             'agentBudgetExhausted': True, 'agentSpendCapUsd': AGENT_SPEND_CAP_USD,
         }, status_code=429)
+    _dir_blocked = _director_budget_gate(
+        agent_id, model, grant['id'], True, 'jev')
+    if _dir_blocked:
+        return _dir_blocked
     if task_id and _task_budget_exhausted(task_id):
         spent, attempts = _task_budget_spent(task_id)
         log_action(agent_id, 'jev_task_budget_blocked',
