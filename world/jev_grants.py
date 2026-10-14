@@ -27,11 +27,8 @@ endpoints and tests use.
 import secrets
 import time
 
+import sublow as _sublow_policy
 from sublow import (
-    GRANT_TOKENS_DEFAULT,
-    GRANT_TOKENS_MAX,
-    GRANT_TTL_S_DEFAULT,
-    GRANT_TTL_S_MAX,
     _agent_month_spend,
     _clamp_tokens,
     _clamp_ttl,
@@ -267,8 +264,8 @@ def quote_jev_grant(agent_id, estimated_calls=1, max_tokens_per_call=None):
         'tankMonthUsd': round(tank['usage'], 6) if tank.get('usage') is not None else None,
         'tankCapUsd': tank.get('cap'),
         'tankCapExceeded': bool(tank.get('exceeded')),
-        'grantTtlS': GRANT_TTL_S_DEFAULT,
-        'grantTtlMaxS': GRANT_TTL_S_MAX,
-        'grantTokensDefault': GRANT_TOKENS_DEFAULT,
-        'grantTokensMax': GRANT_TOKENS_MAX,
+        'grantTtlS': _sublow_policy.GRANT_TTL_S_DEFAULT,
+        'grantTtlMaxS': _sublow_policy.GRANT_TTL_S_MAX,
+        'grantTokensDefault': _sublow_policy.GRANT_TOKENS_DEFAULT,
+        'grantTokensMax': _sublow_policy.GRANT_TOKENS_MAX,
     }

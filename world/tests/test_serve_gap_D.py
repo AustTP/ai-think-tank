@@ -3766,7 +3766,12 @@ class TeamAgreementApi(unittest.TestCase):
             self.assertEqual(r.status_code, 200)
             t1 = [t for t in r.json()["teams"] if t["id"] == "team-1"][0]
             self.assertEqual(t1["agreement"], ag)
-            self.assertEqual(len(t1["agreementResolved"]), 57)
+            # The resolved surface mirrors the operator-policy
+            # schema key for key, so it grows when the JSON
+            # policy grows (no hardcoded count).
+            import config as _cfg
+            self.assertEqual(len(t1["agreementResolved"]),
+                             len(_cfg.OPERATOR_POLICY_DEFAULT))
             self.assertEqual(t1["agreementResolved"]["scrumMasterMinTeamSize"], 6)
             # ceiling clamp at read: team stored 999, operator cap 6 -> 6
             self.assertEqual(t1["agreementResolved"]["maxTeamMembers"], 6)

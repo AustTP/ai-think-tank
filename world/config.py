@@ -316,6 +316,32 @@ OPERATOR_POLICY_DEFAULT: dict = {
     'maxCodeProbeRounds': 3,
     'maxCodeColabRounds': 3,
     'maxReviewProbeRounds': 2,
+    # Request/response ceilings (serve.py). Were hardcoded constants;
+    # now operator data like every other ceiling.
+    'chatMaxTokensCap': 4000,
+    'smsTtlDefaultS': 300,
+    'smsTtlMinS': 60,
+    'smsTtlMaxS': 900,
+    'decideBurstAllow': 6,
+    'decideBurstWindowS': 5.0,
+    'decideMinIntervalS': 0.4,
+    # Sim-loop ceilings (sim.py), same promotion.
+    'placementMinDist': 60,
+    'ruleMineCadenceMs': 7 * 24 * 3600 * 1000,
+    'runbookMaxEntriesPerProduct': 20,
+    'staleWorkMaxReplans': 2,
+    'refinementMaxRequests': 20,
+    'breakdownMaxRequests': 3,
+    'taskContentGraceMaxS': 300.0,
+    'feedbackMax': 10,
+    'minResearchCadenceMs': 5 * 60 * 1000,
+    'minPipelineCadenceMs': 60 * 60 * 1000,
+    'deviceCheckinHistoryMax': 50,
+    # Experiment grant caps (sublow.py; shared with jev_grants.py).
+    'grantTtlDefaultS': 1800,
+    'grantTtlMaxS': 86400,
+    'grantTokensDefault': 600,
+    'grantTokensMax': 4000,
 }
 
 # Per-key validation: (kind, min, max). A wrong-typed or out-of-range value
@@ -379,6 +405,28 @@ _OPERATOR_SCHEMA: dict = {
     'maxCodeProbeRounds': ('int', 1, 20),
     'maxCodeColabRounds': ('int', 1, 20),
     'maxReviewProbeRounds': ('int', 1, 20),
+    'chatMaxTokensCap': ('int', 1, 32000),
+    'smsTtlDefaultS': ('int', 1, 86400),
+    'smsTtlMinS': ('int', 1, 3600),
+    'smsTtlMaxS': ('int', 1, 86400),
+    'decideBurstAllow': ('int', 1, 100),
+    'decideBurstWindowS': ('float', 0.1, 3600.0),
+    'decideMinIntervalS': ('float', 0.0, 60.0),
+    'placementMinDist': ('int', 0, 500),
+    'ruleMineCadenceMs': ('int', 60000, 30 * 24 * 3600 * 1000),
+    'runbookMaxEntriesPerProduct': ('int', 1, 200),
+    'staleWorkMaxReplans': ('int', 0, 100),
+    'refinementMaxRequests': ('int', 1, 500),
+    'breakdownMaxRequests': ('int', 1, 100),
+    'taskContentGraceMaxS': ('float', 0.0, 3600.0),
+    'feedbackMax': ('int', 1, 100),
+    'minResearchCadenceMs': ('int', 0, 24 * 3600 * 1000),
+    'minPipelineCadenceMs': ('int', 0, 7 * 24 * 3600 * 1000),
+    'deviceCheckinHistoryMax': ('int', 1, 10000),
+    'grantTtlDefaultS': ('int', 1, 86400),
+    'grantTtlMaxS': ('int', 1, 7 * 86400),
+    'grantTokensDefault': ('int', 1, 100000),
+    'grantTokensMax': ('int', 1, 1000000),
 }
 
 # --- Teamwork agreements -----------------------------------------------------

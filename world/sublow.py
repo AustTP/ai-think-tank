@@ -82,6 +82,24 @@ def _clamp_tokens(max_tokens_per_call):
     return max(1, min(tokens, GRANT_TOKENS_MAX))
 
 
+# ---------------------------------------------------------------------------
+# Registered on config.ON_RELOAD_HOOKS; also called once here because
+# config.reload_policy_config() ran before this module was imported
+# (hooks registered after that call do not re-run until the next
+# reload). Rebinds the grant default/cap constants so an operator
+# tightens or loosens grant bounds via operator_policy.json.
+# ---------------------------------------------------------------------------
+def _apply_operator_policy():
+    global GRANT_TTL_S_DEFAULT, GRANT_TTL_S_MAX
+    global GRANT_TOKENS_DEFAULT, GRANT_TOKENS_MAX
+    from config import get_operator_policy
+    _p = get_operator_policy()
+    GRANT_TTL_S_DEFAULT = _p['grantTtlDefaultS']
+    GRANT_TTL_S_MAX = _p['grantTtlMaxS']
+    GRANT_TOKENS_DEFAULT = _p['grantTokensDefault']
+    GRANT_TOKENS_MAX = _p['grantTokensMax']
+
+
 def _agent_month_spend(agent_id):
     """$ this agent has accrued in the current UTC month, from its own
     `__agent__/<id>` byDay series. Best-effort: 0.0 on a missing agent or a
@@ -281,3 +299,12 @@ def quote_sublow_grant(agent_id, estimated_calls=1, max_tokens_per_call=None):
         'grantTokensDefault': GRANT_TOKENS_DEFAULT,
         'grantTokensMax': GRANT_TOKENS_MAX,
     }
+
+
+_apply_operator_policy()
+try:
+    import config as _config_for_hooks
+    if _apply_operator_policy not in _config_for_hooks.ON_RELOAD_HOOKS:
+        _config_for_hooks.ON_RELOAD_HOOKS.append(_apply_operator_policy)
+except Exception:
+    pass

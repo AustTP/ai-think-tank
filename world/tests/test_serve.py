@@ -2467,6 +2467,177 @@ class AdminNeverDirectorsPureWorkers(unittest.TestCase):
         self.assertIsNone(serve._safe_director(s, 'nora', None))
 
 
+class FlatOrgChartDerivations(unittest.TestCase):
+    # Pure derivations over a compliant flat chart: the admin, one
+    # director directly under the admin, and workers under that director.
+    def _state(self):
+        return {
+            'agentRoster': [
+                {'id': 'theo', 'isAdmin': True, 'isDirector': True},
+                {'id': 'nora', 'isDirector': True, 'director': 'theo'},
+                {'id': 'ada', 'director': 'nora'},
+                {'id': 'ben', 'director': 'nora'},
+            ],
+        }
+
+    def test_supervisor_of(self):
+        s = self._state()
+        self.assertEqual(serve._supervisor_of(s, 'ada'), 'nora')
+        self.assertEqual(serve._supervisor_of(s, 'nora'), 'theo')
+        # The admin answers to the player, not to any agent.
+        self.assertEqual(serve._supervisor_of(s, 'theo'), 'player')
+
+    def test_is_direct_supervisor(self):
+        s = self._state()
+        self.assertTrue(serve._is_direct_supervisor(s, 'nora', 'ada'))
+        # A grand-supervisor is not a DIRECT supervisor; nor is a
+        # worker, nor oneself.
+        self.assertFalse(serve._is_direct_supervisor(s, 'theo', 'ada'))
+        self.assertFalse(serve._is_direct_supervisor(s, 'ada', 'nora'))
+        self.assertFalse(serve._is_direct_supervisor(s, 'ada', 'ada'))
+
+    def test_subtree_agent_ids(self):
+        s = self._state()
+        self.assertEqual(serve._subtree_agent_ids(s, 'nora'),
+                         ['nora', 'ada', 'ben'])
+        self.assertEqual(serve._subtree_agent_ids(s, 'theo'),
+                         ['theo', 'nora', 'ada', 'ben'])
+
+    def test_flat_chart_violations_mixed_roster(self):
+        # Only a director (flagged, or with direct reports) whose own
+        # pointer climbs to a non-admin is a violation: a pointer-less
+        # director answers to the admin by fallback, and a pure worker
+        # under a director is the legal worker shape.
+        s = {
+            'agentRoster': [
+                {'id': 'theo', 'isAdmin': True, 'isDirector': True,
+                 'director': None},
+                {'id': 'nora', 'isDirector': True, 'director': 'theo'},
+                {'id': 'ruth', 'isDirector': True, 'director': 'nora'},
+                {'id': 'ada', 'director': 'ruth'},
+                {'id': 'dev', 'director': None},
+                {'id': 'eli', 'director': 'dev'},
+            ],
+        }
+        self.assertEqual(serve._flat_director_chart_violations(s), ['ruth'])
+
+
+class FlatOrgChart(unittest.TestCase):
+    # The org chart is FLAT: every director sits DIRECTLY under the
+    # admin, never under another director. The boot repair sweep
+    # flattens any director-under-director pointer up to the admin, and
+    # POST /api/state (the one client-owned roster writer) rejects a
+    # roster that would create one.
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='think tank-flat-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            THINK_TANK_DIR=self.tmp,
+            AGENTS_DIR=os.path.join(self.tmp, 'agents'),
+            LIBRARY_DIR=os.path.join(self.tmp, 'library'),
+            PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
+        )
+        self._cm.start()
+        self._env_patch = unittest.mock.patch.object(
+            serve, '_load_env', return_value={
+                'SEED_ROSTER': '',
+                'SEED_DIRECTOR_MAP': '',
+                'SEED_ADMIN_IDS': 'theo',
+                'SEED_SENIOR_DIRECTOR': 'nora',
+            })
+        self._env_patch.start()
+        serve.init_db()
+
+    def tearDown(self):
+        self._cm.stop()
+        self._env_patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _install_state(self, roster):
+        # No 'sim' key: with sim.owner == 'server' the merge would
+        # carry the installed roster forward over the incoming one.
+        state = {
+            'agentRoster': roster,
+            'agents': {d['id']: {'profile': {}, 'role': 'Research'} for d in roster},
+        }
+        serve.save_state_to_db(state)
+        return state
+
+    def test_backfill_flattens_director_under_director(self):
+        # ruth is a flagged director pointing at nora (a director). The
+        # sweep must move her up to the admin (theo); ada's
+        # worker->director pointer is legal and untouched.
+        self._install_state([
+            {'id': 'theo', 'isAdmin': True, 'isDirector': True, 'director': None},
+            {'id': 'nora', 'isDirector': True, 'director': None},
+            {'id': 'ruth', 'isDirector': True, 'director': 'nora'},
+            {'id': 'ada', 'director': 'ruth'},
+        ])
+        serve._backfill_directors_in_db()
+        by_id = {d['id']: d for d in serve.get_state_from_db()['agentRoster']}
+        self.assertEqual(by_id['ruth']['director'], 'theo',
+                         'a director must sit directly under the admin')
+        self.assertEqual(by_id['ada']['director'], 'ruth')
+
+    def test_backfill_flattens_derived_director_under_director(self):
+        # dev is a director by STRUCTURE (a direct report, nadia) but
+        # carries no isDirector flag, and points at nora. The sweep
+        # flattens derived directors too.
+        self._install_state([
+            {'id': 'theo', 'isAdmin': True, 'isDirector': True, 'director': None},
+            {'id': 'nora', 'isDirector': True, 'director': None},
+            {'id': 'dev', 'director': 'nora'},
+            {'id': 'nadia', 'director': 'dev'},
+        ])
+        serve._backfill_directors_in_db()
+        by_id = {d['id']: d for d in serve.get_state_from_db()['agentRoster']}
+        self.assertEqual(by_id['dev']['director'], 'theo')
+        self.assertEqual(by_id['nadia']['director'], 'dev')
+
+    def test_post_state_rejects_director_under_director(self):
+        # A roster that would place a director under a director is
+        # rejected 400 naming the offender, and never saved.
+        self._install_state([
+            {'id': 'theo', 'isAdmin': True, 'isDirector': True, 'director': None},
+            {'id': 'nora', 'isDirector': True, 'director': None},
+        ])
+        roster = [
+            {'id': 'theo', 'isAdmin': True, 'isDirector': True, 'director': None},
+            {'id': 'nora', 'isDirector': True, 'director': None},
+            {'id': 'ruth', 'isDirector': True, 'director': 'nora'},
+        ]
+        saved = []
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+                unittest.mock.patch.object(serve, 'save_state_to_db',
+                                           side_effect=lambda s: saved.append(s)):
+            c = TestClient(serve.app, raise_server_exceptions=False)
+            r = c.post('/api/state', json={'agentRoster': roster})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn('ruth', r.json()['error'])
+        self.assertEqual(saved, [])
+
+    def test_post_state_accepts_flat_roster(self):
+        self._install_state([
+            {'id': 'theo', 'isAdmin': True, 'isDirector': True, 'director': None},
+            {'id': 'nora', 'isDirector': True, 'director': None},
+        ])
+        roster = [
+            {'id': 'theo', 'isAdmin': True, 'isDirector': True, 'director': None},
+            {'id': 'nora', 'isDirector': True, 'director': 'theo'},
+            {'id': 'ada', 'director': 'nora'},
+        ]
+        saved = []
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+                unittest.mock.patch.object(serve, 'save_state_to_db',
+                                           side_effect=lambda s: saved.append(s)):
+            c = TestClient(serve.app)
+            r = c.post('/api/state', json={'agentRoster': roster})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.text, 'saved')
+        self.assertEqual(len(saved), 1)
+
+
 class DirectorOwnedTemplates(unittest.TestCase):
     # Directors + admin may author the role-template library; rank-and-file may
     # not. Director-ness is structural (has direct reports, or is admin), not
@@ -5598,17 +5769,16 @@ class ChatEndpointAuth(unittest.TestCase):
             r = c.post('/api/player-inbox/ask-1/respond', json={'answer': 'x'})
         self.assertEqual(r.status_code, 401, 'an agent key is not a player credential here')
 
-    def test_player_intent_surface_rejects_valid_agent_key(self):
-        # Regression: every /api/intent/* write handler hardcodes actor 'player'
-        # -- a valid agent key must NOT let an agent create/close a sprint,
-        # trigger a publish push, release a product, veto a story, promote a
-        # spike, file new work, or answer questions as the player. The
-        # middleware accepts a key (loopback grant for content executors), but
-        # each handler's own _require_player_session gate must reject it. The
-        # gate fires before any body parsing or state access, so a bare POST
-        # with a bogus path param is still 401. (The team-prefix endpoint is
-        # operator-gated, not player-only -- it lives in the test below.)
-        c = TestClient(serve.app)
+    def test_intent_surface_is_operator_gated(self):
+        # Regression: every /api/intent/* write handler runs the OPERATOR
+        # gate (_operator_gate: a valid player session, or an agent who
+        # is a director/admin). An anonymous caller and a worker's key
+        # both get the gate's bare 401 before any body parsing, so a
+        # bare POST with a bogus path param is still 401; a
+        # director/admin key passes the gate and meets the route's own
+        # field validation (which is never 401). (The team-prefix
+        # endpoint is operator-gated too -- it lives in the test below.)
+        c = TestClient(serve.app, raise_server_exceptions=False)
         paths = [
             ('/api/intent/assign-big-task', {}),
             ('/api/intent/story/story-1/reject', {}),
@@ -5626,13 +5796,32 @@ class ChatEndpointAuth(unittest.TestCase):
             ('/api/intent/product/p1/release', {}),
         ]
         for path, body in paths:
-            with self.subTest(path=path), \
+            with self.subTest(path=path, who='anonymous'), \
                  unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
-                 unittest.mock.patch.object(serve, '_valid_agent_key_presented', return_value=True):
+                 unittest.mock.patch.object(serve, '_valid_agent_key_presented', return_value=False):
                 r = c.post(path, json=body)
             self.assertEqual(r.status_code, 401,
-                             f'{path} must reject a valid agent key as a player credential')
-            self.assertIn('log in', r.json()['error'])
+                             f'{path} must reject an anonymous caller')
+            # The require_login middleware fires first with no
+            # credential at all.
+            self.assertEqual(r.json()['error'], 'Unauthorized -- please log in')
+            with self.subTest(path=path, who='worker'), \
+                 unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
+                 unittest.mock.patch.object(serve, '_valid_agent_key_presented', return_value=True), \
+                 unittest.mock.patch.object(serve, '_resolve_requester', return_value='worker'), \
+                 unittest.mock.patch.object(serve, '_is_director_or_admin', return_value=False):
+                r = c.post(path, json=body)
+            self.assertEqual(r.status_code, 401,
+                             f'{path} must reject a worker key as an operator')
+            self.assertEqual(r.json()['error'], 'Unauthorized')
+            with self.subTest(path=path, who='director'), \
+                 unittest.mock.patch.object(serve, 'verify_session', return_value=False), \
+                 unittest.mock.patch.object(serve, '_valid_agent_key_presented', return_value=True), \
+                 unittest.mock.patch.object(serve, '_resolve_requester', return_value='nora'), \
+                 unittest.mock.patch.object(serve, '_is_director_or_admin', return_value=True):
+                r = c.post(path, json=body)
+            self.assertNotEqual(r.status_code, 401,
+                                f'{path} must admit a director/admin through the gate')
 
     def test_team_prefix_rejects_non_director_agent_key(self):
         # Team-prefix is OPERATOR-gated (player session or director/admin), so
