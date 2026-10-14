@@ -1309,6 +1309,64 @@ class HealthChecks(unittest.TestCase):
             bank_over_cap=[], bank_used=4.0, bank_cap=100.0,
         )), [])
 
+    # --- OpenRouter live-deposit spend alerts -----------------------------
+    # Alerts fire on the LIVE account funds (percent of total_credits
+    # actually spent), not on the monthly plan. $10 deposited / $8 spent =
+    # 80% used -> warning; $9 spent = 90% -> critical. The monthly budget
+    # ($50 expected) is separate gauge context and never triggers these.
+    def test_openrouter_80pct_of_deposit_spent_raises_warning(self):
+        alerts = serve._health_alerts_for_signals(self._signals(
+            openrouter_credits={'totalCredits': 10.0, 'totalUsage': 8.0, 'remaining': 2.0},
+            openrouter_api_key_set=True,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['category'], 'budget')
+        self.assertEqual(alerts[0]['severity'], 'warning')
+        self.assertIn('80%', alerts[0]['message'])
+        self.assertIn('8.00', alerts[0]['message'])
+        self.assertIn('10.00', alerts[0]['message'])
+
+    def test_openrouter_90pct_of_deposit_spent_raises_critical(self):
+        alerts = serve._health_alerts_for_signals(self._signals(
+            openrouter_credits={'totalCredits': 10.0, 'totalUsage': 9.0, 'remaining': 1.0},
+            openrouter_api_key_set=True,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['severity'], 'critical')
+        self.assertIn('90%', alerts[0]['message'])
+
+    def test_openrouter_below_80pct_spent_raises_nothing(self):
+        self.assertEqual(serve._health_alerts_for_signals(self._signals(
+            openrouter_credits={'totalCredits': 10.0, 'totalUsage': 7.9, 'remaining': 2.1},
+            openrouter_api_key_set=True,
+        )), [])
+
+    def test_openrouter_no_deposit_skips_the_divide(self):
+        # Never-funded account: totalCredits == 0 must not divide by zero or
+        # fire a percentage alert.
+        self.assertEqual(serve._health_alerts_for_signals(self._signals(
+            openrouter_credits={'totalCredits': 0.0, 'totalUsage': 0.0, 'remaining': 0.0},
+            openrouter_api_key_set=True,
+        )), [])
+
+    def test_openrouter_monthly_budget_does_not_trigger_the_alert(self):
+        # The $50 monthly plan is planning context only -- a large plan with a
+        # healthy live deposit raises nothing.
+        self.assertEqual(serve._health_alerts_for_signals(self._signals(
+            openrouter_credits={'totalCredits': 10.0, 'totalUsage': 1.0, 'remaining': 9.0},
+            openrouter_monthly_budget_usd=50.0,
+            openrouter_api_key_set=True,
+        )), [])
+
+    def test_openrouter_probe_unavailable_with_key_raises_info(self):
+        alerts = serve._health_alerts_for_signals(self._signals(
+            openrouter_credits=None,
+            openrouter_api_key_set=True,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['severity'], 'info')
+        self.assertIn('probe unavailable', alerts[0]['message'])
+
 
 class AgingInFlightWork(unittest.TestCase):
     """Admin gap 1: the health snapshot's mirror of sim's stale-work sweep --
