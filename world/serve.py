@@ -218,6 +218,7 @@ from config import (  # noqa: E402,F401
     PLAIN_WRITING_BAN_LIST,
     RESEARCH_WATCHLIST,
     get_grants_config,
+    get_operator_policy,
     note_watchlist_topic,
     reload_policy_config,
 )
@@ -5136,11 +5137,41 @@ def _seed_watchlist_topics(state):
     return seeded
 
 
-# Sim-loop watchdog thresholds (seconds). Env-overridable so an operator can
-# tighten or relax supervision without a code edit. 30s polls; 180s of no
-# successful tick (while not dormant) is treated as a freeze worth recycling.
-_SIM_WATCHDOG_INTERVAL_S = float(_load_env().get('SIM_WATCHDOG_INTERVAL_S', '30') or 30)
-_SIM_WATCHDOG_STALE_S = float(_load_env().get('SIM_WATCHDOG_STALE_S', '180') or 180)
+# Sim-loop watchdog thresholds (seconds). Env SIM_WATCHDOG_*_S still
+# overrides operator_policy.json when set (one escape hatch for operators who
+# live in .env); otherwise the operator JSON / rebind hooks own these.
+_SimWatchdogIntervalSEnv = _load_env().get('SIM_WATCHDOG_INTERVAL_S')
+_SimWatchdogStaleSEnv = _load_env().get('SIM_WATCHDOG_STALE_S')
+_SIM_WATCHDOG_INTERVAL_S = float(_SimWatchdogIntervalSEnv) if _SimWatchdogIntervalSEnv else 30.0
+_SIM_WATCHDOG_STALE_S = float(_SimWatchdogStaleSEnv) if _SimWatchdogStaleSEnv else 180.0
+
+
+# Operator policy rebind (world/operator_policy.json -> serve-owned scalars).
+# Called once here (config.reload_policy_config ran before this module was
+# imported, so late hooks don't re-run until an explicit reload) and on every
+# subsequent reload via config.ON_RELOAD_HOOKS.
+def _apply_operator_policy():
+    global SUCCESS_GRADE_FLOOR
+    global PEER_REVIEW_INTERVAL_S, PEER_REVIEW_FILE_PROBABILITY
+    global DIRECTOR_ESCALATION_REASK_COOLDOWN_S, DIRECTOR_ESCALATION_MAX_ASKS
+    global _SIM_WATCHDOG_INTERVAL_S, _SIM_WATCHDOG_STALE_S
+    _p = get_operator_policy()
+    SUCCESS_GRADE_FLOOR = _p['successGradeFloor']
+    PEER_REVIEW_INTERVAL_S = _p['peerReviewIntervalS']
+    PEER_REVIEW_FILE_PROBABILITY = _p['peerReviewFileProbability']
+    DIRECTOR_ESCALATION_REASK_COOLDOWN_S = _p['directorEscalationReaskCooldownS']
+    DIRECTOR_ESCALATION_MAX_ASKS = _p['directorEscalationMaxAsks']
+    _SIM_WATCHDOG_INTERVAL_S = float(_SimWatchdogIntervalSEnv) if _SimWatchdogIntervalSEnv else float(_p['simWatchdogIntervalS'])
+    _SIM_WATCHDOG_STALE_S = float(_SimWatchdogStaleSEnv) if _SimWatchdogStaleSEnv else float(_p['simWatchdogStaleS'])
+
+
+_apply_operator_policy()
+try:
+    import config as _config_for_hooks
+    if _apply_operator_policy not in _config_for_hooks.ON_RELOAD_HOOKS:
+        _config_for_hooks.ON_RELOAD_HOOKS.append(_apply_operator_policy)
+except Exception:
+    pass
 
 
 async def _sim_watchdog_loop(sim_holder, interval_s=None, stale_s=None):
@@ -21164,6 +21195,7 @@ async def policy_view(request: Request):
         'research_desk': {'passes': [dict(p) for p in _config.RESEARCH_DESK_PASSES]},
         'watchlist': {'topics': [dict(t) for t in _config.RESEARCH_WATCHLIST]},
         'writeback_enabled': bool(_config.ALLOW_WATCHLIST_WRITE),
+        'operator': dict(_config.get_operator_policy()),
     })
 
 
@@ -21177,7 +21209,9 @@ async def policy_reload(request: Request):
     if not _require_player_session(request):
         return JSONResponse({'error': 'Unauthorized -- reloading policy requires the player session'}, status_code=401)
     result = reload_policy_config()
-    log_action(None, 'policy_reload', {k: len(v) for k, v in result.items()})
+    log_action(None, 'policy_reload', {
+        k: (len(v) if isinstance(v, (list, dict)) else v) for k, v in result.items()
+    })
     return JSONResponse({'ok': True, 'loaded': result})
 
 

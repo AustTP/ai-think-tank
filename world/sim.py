@@ -1660,6 +1660,66 @@ MORALE_NEGLECT_WEIGHT = 3
 MORALE_NEGLECT_CAP = 30
 MORALE_DROPPED_DECAY_DAYS = 14  # morale.js:33
 
+
+# ---------------------------------------------------------------------------
+# Operator policy rebind: world/operator_policy.json is the DATA; the scalar
+# constants above are the code mirror. This function re-reads the live policy
+# and rebinds every sim-owned knob in place, so an operator edit + reload
+# (import time + POST /api/policy/reload) takes effect without a restart.
+# Registered on config.ON_RELOAD_HOOKS; also called once here because
+# config.reload_policy_config() ran before this module was imported (hooks
+# registered after that call do not re-run until the next reload).
+# ---------------------------------------------------------------------------
+def _apply_operator_policy():
+    """Rebind sim.py module constants from config.OPERATOR_POLICY (in-place
+    dict, refreshed by get_operator_policy / reload_policy_config)."""
+    global MAX_TEAM_MEMBERS, SCRUM_MASTER_MIN_TEAM_SIZE
+    global MAX_ACTIVE_AGENTS, MAX_TOTAL_AGENTS
+    global DELIVERABLE_GRADE_FLOOR, SUCCESS_GRADE_FLOOR
+    global HIRE_COOLDOWN_MS, FIRING_COOLDOWN_MS
+    global SKILL_REVIEW_CADENCE_MS, DISTILL_CADENCE_MS
+    global REFINEMENT_CADENCE_MS, ROADMAP_CADENCE_MS
+    global WORK_ITEM_MAX_ATTEMPTS
+    global STALE_WORK_TIMEOUT_MS, STALE_WORK_BUDGET_GRACE_S
+    global MAX_BACKLOG_ITEMS, BACKLOG_PULLS_PER_CLOSE
+    global ESCALATION_MAX_OPEN
+    global MORALE_APPROVED_WEIGHT, MORALE_APPROVED_CAP
+    global MORALE_DROPPED_WEIGHT, MORALE_NEGLECT_WEIGHT, MORALE_NEGLECT_CAP
+    from config import get_operator_policy
+    _p = get_operator_policy()
+    MAX_TEAM_MEMBERS = _p['maxTeamMembers']
+    SCRUM_MASTER_MIN_TEAM_SIZE = _p['scrumMasterMinTeamSize']
+    MAX_ACTIVE_AGENTS = _p['maxActiveAgents']
+    MAX_TOTAL_AGENTS = _p['maxTotalAgents']
+    DELIVERABLE_GRADE_FLOOR = _p['deliverableGradeFloor']
+    SUCCESS_GRADE_FLOOR = _p['successGradeFloor']
+    HIRE_COOLDOWN_MS = _p['hireCooldownMs']
+    FIRING_COOLDOWN_MS = _p['firingCooldownMs']
+    SKILL_REVIEW_CADENCE_MS = _p['skillReviewCadenceMs']
+    DISTILL_CADENCE_MS = _p['distillCadenceMs']
+    REFINEMENT_CADENCE_MS = _p['refinementCadenceMs']
+    ROADMAP_CADENCE_MS = _p['roadmapCadenceMs']
+    WORK_ITEM_MAX_ATTEMPTS = _p['workItemMaxAttempts']
+    STALE_WORK_TIMEOUT_MS = _p['staleWorkTimeoutMs']
+    STALE_WORK_BUDGET_GRACE_S = _p['staleWorkBudgetGraceS']
+    MAX_BACKLOG_ITEMS = _p['maxBacklogItems']
+    BACKLOG_PULLS_PER_CLOSE = _p['backlogPullsPerClose']
+    ESCALATION_MAX_OPEN = _p['escalationMaxOpen']
+    MORALE_APPROVED_WEIGHT = _p['moraleApprovedWeight']
+    MORALE_APPROVED_CAP = _p['moraleApprovedCap']
+    MORALE_DROPPED_WEIGHT = _p['moraleDroppedWeight']
+    MORALE_NEGLECT_WEIGHT = _p['moraleNeglectWeight']
+    MORALE_NEGLECT_CAP = _p['moraleNeglectCap']
+
+
+_apply_operator_policy()
+try:
+    import config as _config_for_hooks
+    if _apply_operator_policy not in _config_for_hooks.ON_RELOAD_HOOKS:
+        _config_for_hooks.ON_RELOAD_HOOKS.append(_apply_operator_policy)
+except Exception:
+    pass
+
 # How long an arriving agent "works" before completing, when the server owns
 # the lifecycle but the real per-room executor hasn't been ported yet (the
 # accepted short-circuit of this slice). Room content execution is next.

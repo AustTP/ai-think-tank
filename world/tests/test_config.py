@@ -190,5 +190,142 @@ class BootSeeding(unittest.TestCase):
         self.assertEqual(state['researchTopics'][0]['topic'], 'good')
 
 
+class _TempOperatorPolicy(unittest.TestCase):
+    """Point OPERATOR_POLICY_PATH at a temp file, restore the real shipped
+    file after each test (same discipline as _TempPolicy)."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='think tank-op-policy-test-')
+        self._path = os.path.join(self._tmp, 'operator_policy.json')
+        self._patch = unittest.mock.patch.object(
+            config, 'OPERATOR_POLICY_PATH', self._path)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        config.reload_policy_config()  # restore real shipped-file values
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _write(self, data):
+        with open(self._path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+
+
+class OperatorPolicy(_TempOperatorPolicy):
+    def test_shipped_json_matches_incode_defaults(self):
+        # The shipped operator_policy.json must load and match every default.
+        shipped = config._load_operator_policy(
+            os.path.join(os.path.dirname(config.__file__), 'operator_policy.json'))
+        self.assertEqual(shipped, config.OPERATOR_POLICY_DEFAULT)
+
+    def test_missing_file_falls_back_to_defaults(self):
+        # No file written: _load returns the defaults for every key.
+        data = config._load_operator_policy(self._path)
+        self.assertEqual(data, config.OPERATOR_POLICY_DEFAULT)
+
+    def test_valid_edit_applies(self):
+        self._write({'maxTeamMembers': 8, 'simWatchdogIntervalS': 45.0,
+                     'peerReviewFileProbability': 0.9})
+        config.reload_policy_config()
+        self.assertEqual(config.op('maxTeamMembers'), 8)
+        self.assertEqual(config.op('simWatchdogIntervalS'), 45.0)
+        self.assertEqual(config.op('peerReviewFileProbability'), 0.9)
+        # Unedited keys keep their defaults.
+        self.assertEqual(config.op('maxActiveAgents'),
+                         config.OPERATOR_POLICY_DEFAULT['maxActiveAgents'])
+
+    def test_wrong_type_or_out_of_range_keeps_default(self):
+        self._write({'maxTeamMembers': 'bogus',        # wrong type
+                     'simWatchdogIntervalS': -5,       # below min
+                     'peerReviewFileProbability': True,  # bool is not a float
+                     'workItemMaxAttempts': 3.5})      # non-integer float
+        config.reload_policy_config()
+        self.assertEqual(config.op('maxTeamMembers'),
+                         config.OPERATOR_POLICY_DEFAULT['maxTeamMembers'])
+        self.assertEqual(config.op('simWatchdogIntervalS'),
+                         config.OPERATOR_POLICY_DEFAULT['simWatchdogIntervalS'])
+        self.assertEqual(config.op('peerReviewFileProbability'),
+                         config.OPERATOR_POLICY_DEFAULT['peerReviewFileProbability'])
+        self.assertEqual(config.op('workItemMaxAttempts'),
+                         config.OPERATOR_POLICY_DEFAULT['workItemMaxAttempts'])
+
+    def test_unknown_keys_and_notes_ignored(self):
+        self._write({'maxTeamMembers': 7, '_notes': ['doc'], 'notARealKey': 1})
+        config.reload_policy_config()
+        self.assertEqual(config.op('maxTeamMembers'), 7)
+        self.assertNotIn('notARealKey', config.OPERATOR_POLICY)
+
+    def test_reload_calls_registered_hooks(self):
+        calls = []
+        config.ON_RELOAD_HOOKS.append(lambda: calls.append(1))
+        self.addCleanup(config.ON_RELOAD_HOOKS.remove, config.ON_RELOAD_HOOKS[-1])
+        self._write({'maxTeamMembers': 5})
+        config.reload_policy_config()
+        self.assertEqual(calls, [1])
+
+    def test_reload_returns_operator_section(self):
+        self._write({'maxTeamMembers': 9})
+        result = config.reload_policy_config()
+        self.assertIn('operator', result)
+        self.assertEqual(result['operator']['maxTeamMembers'], 9)
+        self.assertEqual(
+            sorted(result['operator'].keys()),
+            sorted(config.OPERATOR_POLICY_DEFAULT.keys()))
+
+
+class OperatorPolicySimServeBind(unittest.TestCase):
+    """Import-time + reload rebind of the sim.py / serve.py scalar mirrors."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='think tank-op-bind-test-')
+        self._path = os.path.join(self._tmp, 'operator_policy.json')
+        self._patch = unittest.mock.patch.object(
+            config, 'OPERATOR_POLICY_PATH', self._path)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        config.reload_policy_config()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _write(self, data):
+        with open(self._path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+
+    def test_reload_rebinds_sim_and_serve_scalars(self):
+        import serve
+        import sim
+        self._write({'maxTeamMembers': 8,
+                     'workItemMaxAttempts': 5,
+                     'successGradeFloor': 9.5,
+                     'peerReviewIntervalS': 120,
+                     'simWatchdogIntervalS': 45.0,
+                     'moraleNeglectCap': 50})
+        config.reload_policy_config()
+        self.assertEqual(sim.MAX_TEAM_MEMBERS, 8)
+        self.assertEqual(sim.WORK_ITEM_MAX_ATTEMPTS, 5)
+        self.assertEqual(sim.SUCCESS_GRADE_FLOOR, 9.5)
+        self.assertEqual(sim.MORALE_NEGLECT_CAP, 50)
+        self.assertEqual(serve.SUCCESS_GRADE_FLOOR, 9.5)
+        self.assertEqual(serve.PEER_REVIEW_INTERVAL_S, 120)
+        self.assertEqual(serve._SIM_WATCHDOG_INTERVAL_S, 45.0)
+
+    def test_env_watchdog_overrides_operator_config(self):
+        # Env key present in .env wins; when absent, operator config wins.
+        # Simulate the env-present path by patching the capture variables serve
+        # snapshotted at import.
+        import serve
+        with unittest.mock.patch.object(serve, '_SimWatchdogIntervalSEnv', '11'):
+            self._write({'simWatchdogIntervalS': 60.0})
+            config.reload_policy_config()
+            self.assertEqual(serve._SIM_WATCHDOG_INTERVAL_S, 11.0)
+
+    def test_hooks_are_registered(self):
+        import serve  # noqa: F401  (ensures serve hook is registered)
+        import sim    # noqa: F401  (ensures sim hook is registered)
+        self.assertIn(sim._apply_operator_policy, config.ON_RELOAD_HOOKS)
+        self.assertIn(serve._apply_operator_policy, config.ON_RELOAD_HOOKS)
+
+
 if __name__ == '__main__':
     unittest.main()

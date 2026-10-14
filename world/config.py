@@ -225,6 +225,184 @@ def _load_grants(path):
     return {'appGrants': apps, 'fileGrants': files}
 
 
+# ---------------------------------------------------------------------------
+# Operator policy (world/operator_policy.json). The director/admin knobs that
+# used to be hardcoded constants in sim.py/serve.py -- team-size caps, grade
+# floors, hire/fire cooldowns, governance cadences, peer-review cadence,
+# escalation caps, morale weights, the sim-loop watchdog thresholds. DATA, not
+# code: the operator edits the JSON; sim/serve rebind their module constants
+# through ON_RELOAD_HOOKS when reload_policy_config() runs (import time and
+# POST /api/policy/reload). Spend ceilings stay in .env / POST /api/budget --
+# one source of truth per knob.
+# ---------------------------------------------------------------------------
+OPERATOR_POLICY_PATH = os.path.join(ROOT, 'operator_policy.json')
+
+# Fail-closed defaults, kept in code so a fresh clone (or a deleted/corrupt
+# JSON file) boots with the shipped behavior. The shipped operator_policy.json
+# carries the SAME values; the operator edits the JSON, not these.
+OPERATOR_POLICY_DEFAULT: dict = {
+    # Teams & workforce
+    'maxTeamMembers': 6,
+    'scrumMasterMinTeamSize': 4,
+    'maxActiveAgents': 25,
+    'maxTotalAgents': 500,
+    # Grading floors (a deliverable graded below is coaching-worthy; at/above
+    # the success floor it counts as a success).
+    'deliverableGradeFloor': 5.0,
+    'successGradeFloor': 8.0,
+    # Hiring / firing cooldowns (ms)
+    'hireCooldownMs': 45000,
+    'firingCooldownMs': 60000,
+    # Governance cadences (ms)
+    'skillReviewCadenceMs': 30 * 60 * 1000,
+    'distillCadenceMs': 30 * 60 * 1000,
+    'refinementCadenceMs': 7 * 24 * 3600 * 1000,
+    'roadmapCadenceMs': 7 * 24 * 3600 * 1000,
+    # Work items / sprints / backlog
+    'workItemMaxAttempts': 3,
+    'staleWorkTimeoutMs': 3 * 3600 * 1000,
+    'staleWorkBudgetGraceS': 900,
+    'maxBacklogItems': 200,
+    'backlogPullsPerClose': 1,
+    'escalationMaxOpen': 3,
+    # Peer review + director escalations (serve.py)
+    'peerReviewIntervalS': 90,
+    'peerReviewFileProbability': 0.4,
+    'directorEscalationMaxAsks': 6,
+    'directorEscalationReaskCooldownS': 15 * 60,
+    # Sim-loop watchdog (serve.py; .env SIM_WATCHDOG_*_S still overrides)
+    'simWatchdogIntervalS': 30.0,
+    'simWatchdogStaleS': 180.0,
+    # Morale arithmetic
+    'moraleApprovedWeight': 0.5,
+    'moraleApprovedCap': 15,
+    'moraleDroppedWeight': 6.0,
+    'moraleNeglectWeight': 3.0,
+    'moraleNeglectCap': 30,
+}
+
+# Per-key validation: (kind, min, max). A wrong-typed or out-of-range value
+# keeps the default for THAT key rather than crashing boot (fail-closed per
+# field, same discipline as the other policy loaders).
+_OPERATOR_SCHEMA: dict = {
+    'maxTeamMembers': ('int', 1, 12),
+    'scrumMasterMinTeamSize': ('int', 1, 12),
+    'maxActiveAgents': ('int', 1, 100),
+    'maxTotalAgents': ('int', 1, 1000),
+    'deliverableGradeFloor': ('float', 0.0, 10.0),
+    'successGradeFloor': ('float', 0.0, 10.0),
+    'hireCooldownMs': ('int', 0, 3600000),
+    'firingCooldownMs': ('int', 0, 3600000),
+    'skillReviewCadenceMs': ('int', 60000, 7 * 24 * 3600 * 1000),
+    'distillCadenceMs': ('int', 60000, 7 * 24 * 3600 * 1000),
+    'refinementCadenceMs': ('int', 60000, 30 * 24 * 3600 * 1000),
+    'roadmapCadenceMs': ('int', 60000, 30 * 24 * 3600 * 1000),
+    'workItemMaxAttempts': ('int', 1, 10),
+    'staleWorkTimeoutMs': ('int', 60000, 24 * 3600 * 1000),
+    'staleWorkBudgetGraceS': ('int', 0, 86400),
+    'maxBacklogItems': ('int', 1, 1000),
+    'backlogPullsPerClose': ('int', 1, 10),
+    'escalationMaxOpen': ('int', 1, 20),
+    'peerReviewIntervalS': ('int', 10, 3600),
+    'peerReviewFileProbability': ('float', 0.0, 1.0),
+    'directorEscalationMaxAsks': ('int', 1, 20),
+    'directorEscalationReaskCooldownS': ('int', 60, 86400),
+    'simWatchdogIntervalS': ('float', 5.0, 600.0),
+    'simWatchdogStaleS': ('float', 30.0, 3600.0),
+    'moraleApprovedWeight': ('float', 0.0, 10.0),
+    'moraleApprovedCap': ('int', 0, 100),
+    'moraleDroppedWeight': ('float', 0.0, 100.0),
+    'moraleNeglectWeight': ('float', 0.0, 100.0),
+    'moraleNeglectCap': ('int', 0, 100),
+}
+
+# Loaded values (module-level dict, MUTATED IN PLACE by reload so consumers
+# that did `from config import OPERATOR_POLICY` see reloads immediately).
+OPERATOR_POLICY: dict = dict(OPERATOR_POLICY_DEFAULT)
+
+_OPERATOR_CACHE = {'mtime': None, 'data': None}
+
+# Consumer refresh hooks. sim.py and serve.py define module-level scalar
+# constants (MAX_TEAM_MEMBERS, PEER_REVIEW_INTERVAL_S, ...); a rebind of
+# config.OPERATOR_POLICY cannot rebind those copies, so each module registers
+# a zero-arg callback here that re-reads OPERATOR_POLICY and rebinds its own
+# globals. Run at the end of reload_policy_config (import time + the
+# player-session POST /api/policy/reload endpoint). Exceptions are swallowed
+# per-hook: one bad consumer refresh must not abort the others' reload.
+ON_RELOAD_HOOKS: list = []
+
+
+def _coerce_operator_value(key, value):
+    """Validate one operator-policy field against _OPERATOR_SCHEMA. Returns the
+    coerced value, or None when the key is unknown or the value is invalid
+    (caller keeps the default for that key)."""
+    spec = _OPERATOR_SCHEMA.get(key)
+    if spec is None:
+        return None
+    kind, lo, hi = spec
+    try:
+        if kind == 'int':
+            if isinstance(value, bool):
+                return None
+            out = int(value)
+            if out != float(value):
+                return None
+        else:
+            if isinstance(value, bool):
+                return None
+            out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if out < lo or out > hi:
+        return None
+    return out
+
+
+def _load_operator_policy(path):
+    """Read operator_policy.json and return a fully-populated validated dict
+    (every key in OPERATOR_POLICY_DEFAULT present). Missing/corrupt file ->
+    the defaults. A wrong-typed or out-of-range field keeps the default for
+    that field; unknown keys (including the shipped `_notes` doc block) are
+    ignored."""
+    data = dict(OPERATOR_POLICY_DEFAULT)
+    try:
+        with open(path, encoding='utf-8') as f:
+            raw = json.load(f)
+    except Exception:
+        return data
+    if not isinstance(raw, dict):
+        return data
+    for key in data:
+        coerced = _coerce_operator_value(key, raw.get(key))
+        if coerced is not None:
+            data[key] = coerced
+    return data
+
+
+def get_operator_policy():
+    """Return the current operator_policy.json contents, re-reading the file
+    whenever its mtime changes -- the same live-reload pattern as
+    get_grants_config. Also refreshes the module-level OPERATOR_POLICY dict in
+    place so `from config import OPERATOR_POLICY` consumers see the edit."""
+    try:
+        mtime = os.path.getmtime(OPERATOR_POLICY_PATH)
+    except OSError:
+        mtime = -1
+    if _OPERATOR_CACHE['mtime'] != mtime:
+        _OPERATOR_CACHE['mtime'] = mtime
+        _OPERATOR_CACHE['data'] = _load_operator_policy(OPERATOR_POLICY_PATH)
+        OPERATOR_POLICY.clear()
+        OPERATOR_POLICY.update(_OPERATOR_CACHE['data'])
+    return _OPERATOR_CACHE['data']
+
+
+def op(key):
+    """One operator-policy field: the validated live value, or the shipped
+    default when the key is unknown. Consumers that need a scalar copy at
+    import time should register an ON_RELOAD_HOOKS callback instead."""
+    return get_operator_policy().get(key, OPERATOR_POLICY_DEFAULT.get(key))
+
+
 def get_grants_config():
     """Return the current grants.json contents, re-reading the file whenever
     its mtime changes. This is what makes an operator edit take effect without
@@ -285,6 +463,17 @@ def reload_policy_config():
     _grants = get_grants_config()
     GRANTS_CONFIG['appGrants'] = [dict(g) for g in _grants.get('appGrants') or []]
     GRANTS_CONFIG['fileGrants'] = [dict(g) for g in _grants.get('fileGrants') or []]
+    # Operator policy: refresh the in-place dict, then notify consumers so
+    # their scalar module constants (sim.MAX_TEAM_MEMBERS and friends) rebind.
+    # Force the mtime check to re-run even if nothing changed on disk -- an
+    # explicit reload must always re-derive from the current file.
+    _OPERATOR_CACHE['mtime'] = None
+    _op_data = get_operator_policy()
+    for _hook in list(ON_RELOAD_HOOKS):
+        try:
+            _hook()
+        except Exception:
+            pass
     _WATCHLIST_LOAD_ERROR = None
     return {
         'plain_writing': list(PLAIN_WRITING_BAN_LIST),
@@ -293,6 +482,7 @@ def reload_policy_config():
         'watchlist': [dict(t) for t in RESEARCH_WATCHLIST],
         'grants': {'appGrants': [dict(g) for g in GRANTS_CONFIG['appGrants']],
                    'fileGrants': [dict(g) for g in GRANTS_CONFIG['fileGrants']]},
+        'operator': dict(_op_data),
     }
 
 
