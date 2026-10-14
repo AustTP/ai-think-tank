@@ -244,6 +244,34 @@ class DirectorBudgetEndpoints(unittest.TestCase):
         self.assertNotIn("dir-2", data["directorBudgets"])
         self.assertEqual(data["budgetRequests"], [])
 
+    def test_budget_view_shows_month_to_date(self):
+        # The month-to-date slice (rolls over at each month
+        # boundary) beside the lifetime account gauge (a
+        # deposit that never resets). Treg is a separate
+        # vendor, so it counts in allServicesUsd but not in
+        # the OpenRouter figure.
+        state = _state()
+        ledger = {
+            "__general__": {"used": 3.0, "calls": 2, "lastAt": "x",
+                            "byDay": {f"{MONTH}-01": 1.0, f"{MONTH}-02": 2.0}},
+            "treg": {"used": 0.5, "calls": 1,
+                     "byDay": {f"{MONTH}-01": 0.5}},
+        }
+        with _api_env(state, player=True), \
+                unittest.mock.patch.multiple(serve,
+                                             _spend_ledger_read=lambda: ledger):
+            resp = _client().get("/api/budget")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["monthToDate"]["month"], MONTH)
+        self.assertAlmostEqual(data["monthToDate"]["openrouterUsd"], 3.0)
+        self.assertAlmostEqual(data["monthToDate"]["allServicesUsd"], 3.5)
+        self.assertAlmostEqual(data["openrouter"]["monthToDateUsd"], 3.0)
+        self.assertEqual(data["openrouter"]["credits_scope"], "account-lifetime")
+        services = {s["service"]: s for s in data["services"]}
+        self.assertAlmostEqual(services["__general__"]["monthUsedUsd"], 3.0)
+        self.assertAlmostEqual(services["treg"]["monthUsedUsd"], 0.5)
+
     def test_set_director_budget_player(self):
         state = _state()
         with _api_env(state, player=True):

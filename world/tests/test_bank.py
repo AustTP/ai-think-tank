@@ -20,6 +20,7 @@ import unittest.mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import serve  # noqa: E402
+import bank  # noqa: E402
 
 
 def _roster():
@@ -393,6 +394,112 @@ class BudgetView(unittest.TestCase):
         with unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 0), \
              unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}):
             self.assertEqual(serve._bank_budget_view(_snapshot()), {})
+
+
+class MonthToDate(unittest.TestCase):
+    """Month-to-date spend: the slice that rolls over at each
+    month boundary, read from the byDay (regular services) and
+    byMonth (reserved vendor buckets) series. The OpenRouter
+    account's lifetime totals never reset; these numbers do."""
+
+    MONTH = '2026-10'
+
+    def _ledger(self):
+        return {
+            'alpha': {'used': 9.0, 'calls': 3, 'lastAt': 'x',
+                      'byDay': {'2026-09-28': 4.0,
+                                '2026-10-01': 2.0,
+                                '2026-10-14': 3.0}},
+            serve.HIGH_TIER_LEDGER_KEY: {
+                'used': 6.5, 'calls': 3, 'lastAt': 'x',
+                'byMonth': {'2026-09': 5.0, '2026-10': 1.5}},
+            serve.APIFY_LEDGER_KEY: {
+                'used': 2.0, 'calls': 1, 'lastAt': 'x',
+                'byMonth': {'2026-10': 2.0}},
+            'treg': {'used': 0.5, 'calls': 5, 'lastAt': 'x',
+                     'byDay': {'2026-10-02': 0.5}},
+            serve._task_spend_key('t1'): {'used': 7.0, 'calls': 1},
+            bank._village_spend_key('main'): {'used': 8.0, 'calls': 1},
+            bank._agent_spend_key('ada'): {'used': 6.0, 'calls': 1,
+                                            'byDay': {'2026-10-01': 6.0}},
+            serve.COLAB_LEDGER_KEY: {'used': 12.0, 'calls': 2,
+                                      'byMonth': {'2026-10': 12.0}},
+            serve._SPEND_CAP_BASELINE_KEY: {'period': self.MONTH, 'baseline': 1.0},
+        }
+
+    def _patched_period(self):
+        return unittest.mock.patch.object(serve, '_spend_cap_period',
+                                          return_value=self.MONTH)
+
+    def test_service_month_to_date_sums_both_series(self):
+        with self._patched_period():
+            self.assertAlmostEqual(
+                bank._service_month_to_date(self._ledger(), 'alpha'), 5.0)
+            self.assertAlmostEqual(
+                bank._service_month_to_date(
+                    self._ledger(), serve.HIGH_TIER_LEDGER_KEY), 1.5)
+
+    def test_service_month_to_date_ignores_other_months(self):
+        # September's spend in the same bucket must not land in
+        # October's slice.
+        with self._patched_period():
+            self.assertAlmostEqual(
+                bank._service_month_to_date(
+                    self._ledger(), serve.HIGH_TIER_LEDGER_KEY), 1.5)
+        with unittest.mock.patch.object(serve, '_spend_cap_period',
+                                         return_value='2026-09'):
+            self.assertAlmostEqual(
+                bank._service_month_to_date(
+                    self._ledger(), serve.HIGH_TIER_LEDGER_KEY), 5.0)
+            self.assertAlmostEqual(
+                bank._service_month_to_date(self._ledger(), 'alpha'), 4.0)
+
+    def test_service_month_to_date_without_a_series_reads_zero(self):
+        # Task buckets (and any legacy row) keep no daily/monthly
+        # series -- the month split is unknowable, so it reads 0.0
+        # rather than guessing the whole `used` total is this month's.
+        with self._patched_period():
+            ledger = self._ledger()
+            self.assertAlmostEqual(
+                bank._service_month_to_date(
+                    ledger, serve._task_spend_key('t1')), 0.0)
+            self.assertAlmostEqual(
+                bank._service_month_to_date(ledger, 'never-seen'), 0.0)
+            self.assertAlmostEqual(
+                bank._service_month_to_date({}, 'alpha'), 0.0)
+
+    def test_ledger_month_to_date_counts_dollars_not_rollups_or_units(self):
+        # Tracked dollar buckets only: alpha + high-tier + apify +
+        # treg. Task/village/agent rollups, Colab UNITS and the
+        # baseline key are excluded (they would double-count or
+        # trip the USD cap on a currency that isn't money).
+        with self._patched_period():
+            self.assertAlmostEqual(
+                bank._ledger_month_to_date(self._ledger()), 9.0)
+
+    def test_openrouter_month_to_date_excludes_other_vendor_lanes(self):
+        # Treg (scraping API) and Apify (its own actor account)
+        # spend real money but NOT through the OpenRouter account,
+        # so the OpenRouter month-to-date is alpha + high-tier only.
+        with self._patched_period():
+            ledger = self._ledger()
+            self.assertAlmostEqual(
+                bank._openrouter_month_to_date(ledger), 6.5)
+            self.assertAlmostEqual(
+                bank._ledger_month_to_date(ledger), 9.0)
+
+    def test_bank_view_rows_carry_month_used(self):
+        ledger = self._ledger()
+        with unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 0), \
+             unittest.mock.patch.object(serve, '_spend_ledger_read',
+                                        return_value=ledger), \
+             self._patched_period():
+            view = serve._bank_budget_view(_snapshot())
+        self.assertAlmostEqual(view['alpha']['monthUsed'], 5.0)
+        self.assertAlmostEqual(view['alpha']['used'], 9.0)
+        self.assertAlmostEqual(
+            view[serve.HIGH_TIER_LEDGER_KEY]['monthUsed'], 1.5)
+        self.assertAlmostEqual(view['treg']['monthUsed'], 0.5)
 
 
 class ApifyBudget(unittest.TestCase):
