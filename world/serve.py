@@ -256,6 +256,11 @@ from fs import (  # noqa: E402,F401
     read_file as fs_read_file,
     write_file as fs_write_file,
 )
+# Local, credential-redacted interaction recording for fine-tuning
+# datasets (opt-in via TRAINING_CAPTURE_ENABLED; see
+# datasets/INTERACTION_RECORDING.md). Stdlib-only module, so
+# importing it here cannot create a cycle.
+import training_capture  # noqa: E402
 
 # Optional, real dependencies for document ingestion (/api/library/ingest,
 # below) -- openpyxl (Excel) was already installed for something else in
@@ -1793,6 +1798,9 @@ def _reconcile_task_archive(done):
 
 
 def save_state_to_db(data):
+    # Training capture (opt-in): link task outcomes to recorded
+    # interactions whenever the sim state is committed.
+    training_capture.sync_outcomes(data)
     try:
         # Split completed tasks out of the blob: the archive table holds every
         # done task (upserted only when new/changed), and the blob holds only
@@ -9174,8 +9182,24 @@ def _openrouter_chat_post(body):
             method='POST',
         )
         return json.loads(_urlopen_with_resilience(req, timeout=30))
+
+    def _post_once_tracked(payload):
+        # Training capture (opt-in): one row per POST, so the
+        # recovery retry below gets its own record too. Recording
+        # is fail-open -- record() swallows its own errors.
+        start = time.monotonic()
+        try:
+            result = _post_once(payload)
+        except Exception as error:
+            training_capture.record('openrouter', payload, error=error,
+                                    duration_ms=int((time.monotonic() - start) * 1000))
+            raise
+        training_capture.record('openrouter', payload, result,
+                                duration_ms=int((time.monotonic() - start) * 1000))
+        return result
+
     try:
-        return _post_once(body)
+        return _post_once_tracked(body)
     except urllib.error.HTTPError as e:
         detail = ''
         try:
@@ -9191,7 +9215,7 @@ def _openrouter_chat_post(body):
         body = dict(body)
         body['reasoning'] = {'max_tokens': max(1, (body.get('max_tokens') or 2048) // 2)}
         try:
-            return _post_once(body)
+            return _post_once_tracked(body)
         except urllib.error.HTTPError as e2:
             detail2 = ''
             try:
@@ -21130,6 +21154,14 @@ async def chat(request: Request):
     # planning calls) are never gated, and a state/ledger read failure never
     # blocks a call.
     task_id = (body.get('taskId') or '').strip()
+    # Training capture (opt-in): attribute every provider call in
+    # this request to its agent and task. All model calls flow
+    # through _openrouter_chat_post, which reads this context; the
+    # contextvar is request-scoped (each /api/chat runs in its own
+    # task), so it never leaks to other requests.
+    if training_capture.enabled():
+        training_capture.CURRENT.set(training_capture.metadata(
+            get_state_from_db(), agent_id, task_id, body.get('purpose')))
     if task_id and _task_budget_exhausted(task_id):
         spent, attempts = _task_budget_spent(task_id)
         log_action(agent_id, 'task_budget_blocked',
@@ -28217,6 +28249,11 @@ async def decide(request: Request):
         return JSONResponse({'error': reason,
                              'throttled': True,
                              'retry_after_ms': int(1000 * DECIDE_MIN_INTERVAL_S)}, status_code=429)
+    # Training capture (opt-in): attribute Jev's decision calls to
+    # the deciding agent; the request body carries the full state.
+    if training_capture.enabled():
+        training_capture.CURRENT.set(training_capture.metadata(
+            state, agent_id, None, 'decision'))
     try:
         data = await asyncio.to_thread(_call_openrouter_decision_sync, model, state, questions)
         _choice, confidence, cost = _jev_choice(data)
