@@ -1252,6 +1252,31 @@ class HealthDigest(unittest.TestCase):
                                (serve._DIGEST_STAMP_KEY,)).fetchone()
         self.assertIsNotNone(row)
 
+    def test_prune_keeps_newest_digests(self):
+        os.makedirs(self.admin_dir, exist_ok=True)
+        for i in range(serve._DIGEST_KEEP + 5):
+            with open(os.path.join(self.admin_dir, f'health-{1000 + i}.md'),
+                      'w') as f:
+                f.write('x')
+        serve._prune_old_health_digests()
+        files = sorted(os.listdir(self.admin_dir))
+        self.assertEqual(len(files), serve._DIGEST_KEEP)
+        self.assertEqual(files[0], f'health-{1005}.md')
+        self.assertEqual(files[-1], f'health-{1000 + serve._DIGEST_KEEP + 4}.md')
+
+    def test_corrupt_stamp_self_heals_and_writes(self):
+        # CAST('garbage' AS REAL) = 0.0 <= now - INTERVAL, so a
+        # corrupt stamp must be treated as stale and repaired.
+        with serve._db() as conn:
+            conn.execute('INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)',
+                         (serve._DIGEST_STAMP_KEY, 'garbage', time.time()))
+        serve._write_health_digest(self._snapshot())
+        self.assertEqual(len(os.listdir(self.admin_dir)), 1)
+        with serve._db() as conn:
+            row = conn.execute('SELECT value FROM settings WHERE key = ?',
+                               (serve._DIGEST_STAMP_KEY,)).fetchone()
+        self.assertAlmostEqual(float(row[0]), time.time(), delta=60)
+
 
 class HealthEndpoints(unittest.TestCase):
     """/api/health, /api/sim/status, /api/sim/agents, /api/health/alerts, /api/activity/summary."""

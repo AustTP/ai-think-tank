@@ -568,7 +568,11 @@ PASSPORT_PATH = os.path.join(LIBRARY_DIR, '.passport.json')
 #      and handle-expiry keep running.
 DB_BACKUP_DIR = os.path.join(THINK_TANK_DIR, 'think-tank-db-backups')
 DB_BACKUP_KEEP = 1
-DB_BACKUP_INTERVAL_S = 5 * 60
+# Hourly, not every 5 min: the DB is ~33 MB, so the old cadence
+# wrote ~9.5 GB/day of snapshots. Only DB_BACKUP_KEEP files are
+# kept, so the interval just sets how stale a crash-recovery
+# point may be.
+DB_BACKUP_INTERVAL_S = 60 * 60
 # Log retention: decision_tape and action_log are append-only audit
 # tables whose heavy columns (prompt/raw/details) ballooned the DB to ~1 GB. The
 # /api/decisions feed and activity feed only ever READ the recent window, so old
@@ -27847,30 +27851,57 @@ def _push_new_health_alerts(alerts):
 # warnings; an admin also wants a readable periodic record of the whole picture
 # -- alerts + Bank + aging work + escalations -- even when nothing is new. This
 # writes a markdown digest to the shared library on HEALTH_DIGEST_INTERVAL_S
-# (a cadence guard via the settings table, so a restart doesn't reset the clock
-# into spamming a digest every loop). Never load-bearing (a write failure must
-# not crash the health loop)."""
+# (a cadence guard via an atomic conditional upsert on the settings
+# table, so neither a restart nor a concurrent process can reset the
+# clock into spamming near-identical digests seconds apart). Never
+# load-bearing (a write failure must not crash the health loop).
+# Retention: only the newest _DIGEST_KEEP digests are kept -- the
+# admin dir had no prune before and accumulated 450+ files."""
 _DIGEST_LOCK = threading.Lock()
 _DIGEST_STAMP_KEY = 'last_health_digest_at'
+_DIGEST_KEEP = 14
+
+
+def _prune_old_health_digests():
+    """Delete oldest health-*.md digests beyond _DIGEST_KEEP.
+    Best-effort: a prune failure must never break the digest write."""
+    try:
+        admin_dir = os.path.join(LIBRARY_DIR, 'admin')
+        digests = sorted(f for f in os.listdir(admin_dir)
+                         if f.startswith('health-') and f.endswith('.md'))
+    except OSError:
+        return
+    for stale in digests[:-_DIGEST_KEEP]:
+        try:
+            os.remove(os.path.join(admin_dir, stale))
+        except OSError:
+            pass
 
 
 def _write_health_digest(snapshot):
     with _DIGEST_LOCK:
         now = time.time()
+        # The conditional upsert IS the cadence guard: only a stamp
+        # older than HEALTH_DIGEST_INTERVAL_S (or a corrupt, non-
+        # numeric one, which CAST reads as 0.0) can be overwritten,
+        # so a second process that read the same stale stamp loses
+        # this race instead of both writing a digest. rowcount 0 =
+        # the window is already claimed.
         with _db() as conn:
-            row = conn.execute('SELECT value FROM settings WHERE key = ?', (_DIGEST_STAMP_KEY,)).fetchone()
-            last = float(row[0]) if row and row[0] else 0.0
-            if now - last < HEALTH_DIGEST_INTERVAL_S:
-                return
-            conn.execute(
+            cur = conn.execute(
                 'INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) '
-                'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at',
-                (_DIGEST_STAMP_KEY, str(now), now))
+                'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at '
+                'WHERE CAST(settings.value AS REAL) <= ?',
+                (_DIGEST_STAMP_KEY, str(now), now, now - HEALTH_DIGEST_INTERVAL_S))
+            if cur.rowcount == 0:
+                return
         try:
-            os.makedirs(os.path.join(LIBRARY_DIR, 'admin'), exist_ok=True)
-            path = os.path.join(LIBRARY_DIR, 'admin', f'health-{int(now)}.md')
+            admin_dir = os.path.join(LIBRARY_DIR, 'admin')
+            os.makedirs(admin_dir, exist_ok=True)
+            path = os.path.join(admin_dir, f'health-{int(now)}.md')
             with open(path, 'w') as f:
                 f.write(_health_digest_markdown(snapshot))
+            _prune_old_health_digests()
         except Exception:
             pass
 
