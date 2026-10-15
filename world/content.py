@@ -29,6 +29,7 @@ import time
 import urllib.parse
 
 import serve as _serve
+import training_capture
 
 from config import RESEARCH_DESK_PASSES
 
@@ -718,7 +719,21 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
     if task.get('pipelineStep'):
         executor = _run_pipeline_step_content
     if executor:
-        executor(snapshot, agent_id, task, base_ctx)
+        # Training capture (opt-in): attribute the provider calls
+        # this executor makes to the agent and task it runs for.
+        # The dispatcher runs on a dedicated background thread per
+        # dispatch (sim._dispatch_content_work), so the contextvar
+        # set here is scoped to this task's run and cannot leak
+        # back into the sim loop.
+        _capture_token = None
+        if training_capture.enabled():
+            _capture_token = training_capture.CURRENT.set(
+                training_capture.metadata(snapshot, agent_id, task.get('id')))
+        try:
+            executor(snapshot, agent_id, task, base_ctx)
+        finally:
+            if _capture_token is not None:
+                training_capture.CURRENT.reset(_capture_token)
 
 
 def _run_pipeline_step_content(snapshot, agent_id, task, base_ctx=None):

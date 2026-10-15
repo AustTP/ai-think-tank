@@ -87,6 +87,9 @@ library/ingested/
 # content, like the other runtime dirs above, never tracked.
 library/media/transcripts/
 world/library/media/transcripts/
+# Training-capture recordings and exports (datasets/INTERACTION_RECORDING.md
+# is the tracked doc; the SQLite DB and exported JSONL are runtime data).
+datasets/local/
 sandboxes/spike-task-*/
 sandboxes/sb-*/
 # Per-deliverable-story git worktrees off workroom-shared -- runtime state
