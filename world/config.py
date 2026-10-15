@@ -273,6 +273,13 @@ OPERATOR_POLICY_DEFAULT: dict = {
     # Sim-loop watchdog (serve.py; .env SIM_WATCHDOG_*_S still overrides)
     'simWatchdogIntervalS': 30.0,
     'simWatchdogStaleS': 180.0,
+    # Background health-check loop cadences (serve.py). The health loop
+    # reads these per-iteration/per-call, so a policy reload applies
+    # without a restart (the check interval takes effect on the next
+    # loop sleep).
+    'healthCheckIntervalS': 300,
+    'healthAlertDedupWindowS': 12 * 3600,
+    'healthDigestIntervalS': 6 * 3600,
     # Morale arithmetic
     'moraleApprovedWeight': 0.5,
     'moraleApprovedCap': 15,
@@ -372,6 +379,9 @@ _OPERATOR_SCHEMA: dict = {
     'directorEscalationReaskCooldownS': ('int', 60, 86400),
     'simWatchdogIntervalS': ('float', 5.0, 600.0),
     'simWatchdogStaleS': ('float', 30.0, 3600.0),
+    'healthCheckIntervalS': ('int', 60, 86400),
+    'healthAlertDedupWindowS': ('int', 60, 7 * 86400),
+    'healthDigestIntervalS': ('int', 3600, 7 * 86400),
     'moraleApprovedWeight': ('float', 0.0, 10.0),
     'moraleApprovedCap': ('int', 0, 100),
     'moraleDroppedWeight': ('float', 0.0, 100.0),
