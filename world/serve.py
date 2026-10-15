@@ -4278,12 +4278,16 @@ def resolve_capability_handle(agent_id, handle, method, url):
 # Runs independently of any browser tab (this loop lives in the server
 # process itself), which is the whole point: the previous state of things
 # was that nothing got noticed until a human looked or a browser-side bug
-# surfaced visibly.
+# surfaced visibly. All three health cadences are operator-policy knobs
+# (operator_policy.json healthCheckIntervalS / healthAlertDedupWindowS /
+# healthDigestIntervalS), rebound by _apply_operator_policy on
+# POST /api/policy/reload; these literals are the shipped defaults.
 HEALTH_CHECK_INTERVAL_S = 300
 # Admin gap 1: how often the periodic health DIGEST (a readable markdown
 # combining alerts + Bank + aging work + escalations) is written to the shared
 # library -- an inspectable record an admin reads, distinct from the 5-min
-# alert push that only fires on new warnings.
+# alert push that only fires on new warnings. Operator-policy knob
+# (healthDigestIntervalS), rebound on reload.
 HEALTH_DIGEST_INTERVAL_S = 6 * 3600
 
 # Coordination-pathology signal (prompted by comparing this
@@ -5186,6 +5190,8 @@ def _apply_operator_policy():
     global CHAT_MAX_TOKENS_CAP
     global SMS_TTL_DEFAULT_S, SMS_TTL_MIN_S, SMS_TTL_MAX_S
     global DECIDE_BURST_ALLOW, DECIDE_BURST_WINDOW_S, DECIDE_MIN_INTERVAL_S
+    global HEALTH_CHECK_INTERVAL_S, HEALTH_ALERT_DEDUP_WINDOW_S
+    global HEALTH_DIGEST_INTERVAL_S
     _p = get_operator_policy()
     SUCCESS_GRADE_FLOOR = _p['successGradeFloor']
     PEER_REVIEW_INTERVAL_S = _p['peerReviewIntervalS']
@@ -5201,6 +5207,9 @@ def _apply_operator_policy():
     DECIDE_BURST_ALLOW = _p['decideBurstAllow']
     DECIDE_BURST_WINDOW_S = _p['decideBurstWindowS']
     DECIDE_MIN_INTERVAL_S = _p['decideMinIntervalS']
+    HEALTH_CHECK_INTERVAL_S = _p['healthCheckIntervalS']
+    HEALTH_ALERT_DEDUP_WINDOW_S = _p['healthAlertDedupWindowS']
+    HEALTH_DIGEST_INTERVAL_S = _p['healthDigestIntervalS']
 
 
 _apply_operator_policy()
@@ -27051,7 +27060,8 @@ EXPECTED_MODEL_BANDS = ('low', 'mid', 'coding', 'high', 'vision')
 HEALTH_STATE_STALE_AFTER_S = 30
 # Don't re-log the same standing condition every 5-minute check -- an
 # alert this old is either already seen or already acted on.
-HEALTH_ALERT_DEDUP_WINDOW_S = 3600
+# Operator-policy knob (healthAlertDedupWindowS), rebound on reload.
+HEALTH_ALERT_DEDUP_WINDOW_S = 12 * 3600
 # Behavioral anomaly detection: an agent firing more than this
 # many spend-inducing tool calls (browse/execute/curl/chat) within this
 # window is treated as a likely runaway loop / injection-driven churn -- the
@@ -27364,7 +27374,7 @@ def _health_alerts_for_signals(signals):
     elif not credits and signals.get('openrouter_api_key_set'):
         # Key is set but the probe yielded nothing (network failure or a
         # revoked key the auth tracker hasn't seen yet). Info severity +
-        # the 1h (category, severity) dedup window keeps a flaky network
+        # the 12h (category, severity) dedup window keeps a flaky network
         # from becoming a push-spam source; a dead key also trips the
         # api_keys auth-streak alert once real calls start 401/403-ing.
         alert('budget', 'info',
@@ -27782,7 +27792,7 @@ def _persist_new_health_alerts(alerts):
     """Persist each alert that isn't already standing within the dedup window,
     and RETURN the newly-persisted ones so the health loop can push exactly
     those to the player (never the repeated standing ones -- the dedup window
-    is what stops an hourly push from becoming a 5-min-spam).
+    is what stops a repeat push from becoming a 5-min-spam).
 
     The dedup key is (category, severity) within the window -- NOT the full
     message. Exact-message dedup failed the day the first real outage hit:
