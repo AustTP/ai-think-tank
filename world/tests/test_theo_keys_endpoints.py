@@ -323,6 +323,46 @@ class TheoAsk(_KeyFixture):
         response = self._ask(raw_key=raw)
         self.assertEqual(response.status_code, 401)
 
+    def _bare_client(self):
+        # No session cookie anywhere: the way an
+        # external agent actually calls the ask lane.
+        from starlette.testclient import TestClient
+        return TestClient(serve.app)
+
+    def test_a_key_only_ask_passes_the_login_door(self):
+        # Regression: the require_login middleware used to
+        # bounce key-only asks as "please log in" before the
+        # route ever ran, so the key lane only worked for
+        # callers that also held a player session.
+        raw, _ = self.registry.grant_key(
+            'owner', 'cora', 'worker')
+        response = self._bare_client().post(
+            '/api/theo/ask', json={'text': 'hello'},
+            headers={'X-Agent-Key': raw})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['reply'],
+                         'handled')
+        self.assertEqual(len(self.handled), 1)
+
+    def test_a_bad_key_still_bounces_at_the_door(self):
+        response = self._bare_client().post(
+            '/api/theo/ask', json={'text': 'hello'},
+            headers={'X-Agent-Key': 'not-a-key'})
+        self.assertEqual(response.status_code, 401)
+        self.assertIn('please log in',
+                      response.json()['error'])
+
+    def test_a_theo_key_opens_no_other_door(self):
+        # The key is scoped to the ask lane: it must not
+        # pass the login door for any other protected route.
+        raw, _ = self.registry.grant_key(
+            'owner', 'cora', 'worker')
+        response = self._bare_client().get(
+            '/api/state', headers={'X-Agent-Key': raw})
+        self.assertEqual(response.status_code, 401)
+        self.assertIn('please log in',
+                      response.json()['error'])
+
 
 if __name__ == '__main__':
     unittest.main()
