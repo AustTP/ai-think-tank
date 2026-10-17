@@ -13320,6 +13320,24 @@ def _valid_agent_key_presented(presented_key):
     return row is not None
 
 
+def _valid_theo_ask_credential(request):
+    # A granted Theo key (ask 3) is a bearer credential, but a
+    # SCOPED one: it opens /api/theo/ask and no other door. The
+    # registry verifies hash, revocation, and expiry together --
+    # the same check the ask route itself runs -- so a revoked or
+    # expired key stops passing the door too. Every other protected
+    # route still requires a player session or a real agent key:
+    # a brand bot holding a Theo key cannot read the rest of the
+    # think tank, and a Theo key is never accepted as a sim agent
+    # identity anywhere else.
+    if request.url.path != '/api/theo/ask':
+        return False
+    presented = request.headers.get('X-Agent-Key')
+    if not presented or _KEY_REGISTRY is None:
+        return False
+    return _KEY_REGISTRY.verify(presented) is not None
+
+
 # Player-authored work trust (Fix B). Three endpoints -- /api/browse,
 # /api/browser-act, /api/download -- let a host that a PLAYER-authored task
 # explicitly named skip the Jev gate, the same way the domain allowlist does.
@@ -13368,7 +13386,8 @@ def _work_trust_from_body(body):
 async def require_login(request: Request, call_next):
     if not _is_public_path(request.url.path):
         if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)) \
-                and not _valid_agent_key_presented(request.headers.get('X-Agent-Key')):
+                and not _valid_agent_key_presented(request.headers.get('X-Agent-Key')) \
+                and not _valid_theo_ask_credential(request):
             return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     return await call_next(request)
 

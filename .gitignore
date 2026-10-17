@@ -69,6 +69,9 @@ agents/*/state.json
 browse_trail.json
 library_usage.json
 library/.passport.json
+# Theo key registry (ask 3) -- runtime state; only key HASHES are
+# persisted (raw keys are shown once at grant time), never tracked.
+library/theo-keys.json
 
 # Runtime-generated think tank content: spike findings, wiki pages,
 # social/pending-review artifacts, and sandbox project dirs are all produced by
@@ -100,6 +103,8 @@ sandboxes/*-story-*/
 # browser_act / HF login test sandboxes -- contain persistent browser
 # profiles with live session cookies, never tracked.
 sandboxes/hf-*/
+# VPN sandbox tree -- holds live Mullvad relay keys.json, never tracked.
+sandboxes/vpn-sandbox/
 # Manual pre-cleanup DB backup -- a big one-off snapshot, not source
 think_tank.db.pre-cleanup-*
 
