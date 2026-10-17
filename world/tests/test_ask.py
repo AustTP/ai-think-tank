@@ -439,7 +439,8 @@ class AskEndpoint(unittest.TestCase):
                      'team_overview', 'treasury_status',
                      'x_trending_topics', 'search_linkedin_posts', 'api_call',
                      'read_ais_feed', 'read_rss_feed', 'read_market_feed', 'read_live_feed',
-                     'propose_api_service', 'list_services', 'grant_allowlist', 'revoke_allowlist'}
+                     'propose_api_service', 'list_services', 'grant_allowlist', 'revoke_allowlist',
+                     'send_mail', 'mark_mailbox_read'}
                     | ({'search_web'} if serve.TAVILY_API_KEY else set())
                     | ({'generate_image', 'generate_video'} if serve._higgsfield_configured() else set()))
         self.assertEqual(tool_names, expected)

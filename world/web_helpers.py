@@ -192,25 +192,97 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         if self._tunnel_host:
             self.sock = sock
             self._tunnel()
-        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        # A tunneled connection's TLS peer is the ORIGIN behind the
+        # proxy (http.client's own HTTPSConnection does the same), so
+        # SNI and certificate validation must use the tunnel host --
+        # self.host here is the proxy, not the origin.
+        self.sock = self._context.wrap_socket(
+            sock, server_hostname=self._tunnel_host or self.host)
+
+
+def _resolve_proxy_ip(hostport):
+    # Resolve an operator-configured proxy address ("host" or
+    # "host:port", possibly a literal IP) to a single IP. Unlike
+    # _resolve_public_ip this deliberately accepts loopback/private
+    # addresses: a sandbox VPN container's published proxy is
+    # SUPPOSED to be 127.0.0.1 or a docker bridge IP. It is still
+    # resolved-and-pinned rather than trusted verbatim, so even the
+    # proxy hop keeps the same resolve-once/connect-once discipline
+    # as the origin hop. Returns the first resolved address string,
+    # or None when the name is absent or unresolvable.
+    host = (hostport or '').strip()
+    if not host:
+        return None
+    if host.startswith('[') and ']' in host:  # bracketed IPv6 literal
+        host = host.split(']', 1)[0] + ']'
+    elif ':' in host:
+        host = host.rsplit(':', 1)[0]
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return None
+    for info in infos:
+        return info[4][0]
+    return None
+
+
+def _pinned_ip_for(req):
+    # Which address this request's socket must be pinned to. A
+    # proxied request (rewritten by urllib's own ProxyHandler:
+    # _tunnel_host set for https, absolute-URI selector for http)
+    # connects to the PROXY, whose address sits in req.host as
+    # "host:port" -- pin that, operator-configured and all. Every
+    # other request pins its origin's public IP as before.
+    if getattr(req, '_tunnel_host', None) or req.has_proxy():
+        return _resolve_proxy_ip(req.host)
+    parsed = urllib.parse.urlparse(req.full_url)
+    return _resolve_public_ip(parsed.hostname)
 
 
 class _PinnedIPHandler(urllib.request.HTTPHandler):
-    # An HTTPHandler that resolves and pins each request's hostname (including
-    # every redirect hop, which arrive here as fresh requests) to a public IP
-    # before connecting.
-
+    # An HTTPHandler that resolves and pins each request's connection
+    # target (including every redirect hop, which arrive here as fresh
+    # requests) before connecting. For proxied requests the target is
+    # the operator-configured proxy; otherwise the origin, which must
+    # resolve to a public IP.
     def do_open(self, http_class, req, **http_conn_args):
-        parsed = urllib.parse.urlparse(req.full_url)
-        ip = _resolve_public_ip(parsed.hostname)
+        ip = _pinned_ip_for(req)
         if not ip:
+            kind = 'proxy' if (getattr(req, '_tunnel_host', None) or req.has_proxy()) else 'host'
             raise urllib.error.URLError(
-                'host resolves to a private, internal, or unresolvable address')
+                f'{kind} resolves to a private, internal, or unresolvable address')
         http_conn_args['pinned_ip'] = ip
+        # do_open's http_class is the STANDARD http.client connection,
+        # which does not accept pinned_ip -- swap in the pinned
+        # subclass (or keep an already-pinned one) so the kwarg lands
+        # on a constructor that takes it.
+        if not issubclass(http_class, _PinnedHTTPConnection):
+            http_class = _PinnedHTTPConnection
         return super().do_open(http_class, req, **http_conn_args)
 
 
-def _safe_urlopen(req, timeout=20, extra_handlers=()):
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    # The https twin of _PinnedIPHandler. urllib dispatches https
+    # requests to HTTPSHandler, NOT to HTTPHandler -- so without this
+    # subclass, https fetches silently bypassed the IP pinning above
+    # (a real gap: DNS-rebinding protection only ever covered plain
+    # http). Same pinning rules, including pinning the proxy for
+    # CONNECT-tunneled requests.
+    def do_open(self, http_class, req, **http_conn_args):
+        ip = _pinned_ip_for(req)
+        if not ip:
+            kind = 'proxy' if (getattr(req, '_tunnel_host', None) or req.has_proxy()) else 'host'
+            raise urllib.error.URLError(
+                f'{kind} resolves to a private, internal, or unresolvable address')
+        http_conn_args['pinned_ip'] = ip
+        # Same swap as _PinnedIPHandler: the pinned kwarg only exists
+        # on the pinned HTTPS subclass, not on http.client's own.
+        if not issubclass(http_class, _PinnedHTTPSConnection):
+            http_class = _PinnedHTTPSConnection
+        return super().do_open(http_class, req, **http_conn_args)
+
+
+def _safe_urlopen(req, timeout=20, extra_handlers=(), proxy=None):
     """Open `req` (a urllib.request.Request) with SSRF-safe, DNS-rebinding-
     proof address pinning: each hostname is resolved once and the socket
     connects to that exact public IP, so a name that is public at check time
@@ -219,10 +291,19 @@ def _safe_urlopen(req, timeout=20, extra_handlers=()):
     Raises URLError when the host is not public. `req` may be a string URL or
     a Request. `extra_handlers` (e.g. a redirect-counting handler) are
     inserted after the pinned-IP handler, so they too only ever see
-    SSRF-checked hops."""
+    SSRF-checked hops. `proxy` (a full URL like 'http://127.0.0.1:18801')
+    routes the request through an operator-configured proxy using urllib's
+    own ProxyHandler rewrite semantics (absolute-URI request line for http,
+    CONNECT tunnel for https), with the PROXY's address pinned the same way
+    -- the proxy URL must come from trusted configuration, never from a
+    fetched URL, since it is exempt from the public-IP rule by design."""
     if isinstance(req, str):
         req = urllib.request.Request(req)
-    opener = urllib.request.build_opener(_PinnedIPHandler(), *extra_handlers)
+    handlers = [_PinnedIPHandler(), _PinnedHTTPSHandler()]
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler(
+            {'http': proxy, 'https': proxy}))
+    opener = urllib.request.build_opener(*handlers, *extra_handlers)
     return opener.open(req, timeout=timeout)
 
 

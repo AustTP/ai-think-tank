@@ -1241,14 +1241,15 @@ def _review_screenshot(base, key, agent_id, sandbox_id, path, question, task_id=
     vision_slug = _serve._vision_tier_slug()
     if not vision_slug:
         return {'ok': False, 'note': 'vision model tier not available'}
+    guarded_question = _serve.VISION_ANTI_INSTRUCTION_GUARD + '\n' + (question or '')
     r = _serve._http_json('POST', base, '/api/chat',
                    {'model': vision_slug,
                     'messages': [{'role': 'user',
-                                  'content': [{'type': 'text', 'text': question},
+                                  'content': [{'type': 'text', 'text': guarded_question},
                                               {'type': 'image_url',
                                                'image_url': {'url': 'data:image/png;base64,' + (shot.get('imageBase64') or '')}}]}],
-                    'max_tokens': _VISION_MAX_TOKENS, 'agentId': agent_id,
-                    'taskId': task_id}, key)
+                     'max_tokens': _VISION_MAX_TOKENS, 'agentId': agent_id,
+                     'taskId': task_id}, key)
     if isinstance(r, dict) and not r.get('error') and r.get('reply'):
         return {'ok': True, 'review': r['reply'].strip()}
     budget_hit = _chat_error_result(r, 'the vision call was paused because this task used its full model-spend budget')
