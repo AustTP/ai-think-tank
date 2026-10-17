@@ -504,7 +504,7 @@
       ],
       "spend": {
         "kind": "none",
-        "note": "Account status for the think tank's Mullvad VPN account (expiry, device slots, payment). It cannot route a fetch through a foreign exit -- the real tunnel is a system-wide WireGuard/CLI integration, not an api_call. To fetch a page as if from another country, use browse_page's country parameter instead."
+        "note": "Account status for the think tank's Mullvad VPN account (expiry, device slots, payment). It cannot route a fetch through a foreign exit. To fetch a page as if from another country, use browse_page's exit parameter -- a named sandbox VPN container with its own WireGuard tunnel (see GET /api/vpn-exits) -- or its country parameter for the host's own Mullvad tunnel."
       }
     },
     "huggingface": {

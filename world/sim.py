@@ -66,6 +66,25 @@ from sim_helpers import (  # noqa: E402, F401
     SLOW_CLOCK,
 )
 
+# Standing-task scheduling, event-driven signal wake-ups, and
+# pre-refinement comprehension -- pure modules that import
+# nothing from the sim, so the top-level import cannot create
+# a cycle (serve is the one module imported inline below).
+import comprehension  # noqa: E402
+import schedule  # noqa: E402
+import signals  # noqa: E402
+import roster  # noqa: E402
+
+# The standing-task scheduler (schedule.py) keeps per-task
+# runtime state in-process: the sim owns the clock and supplies
+# `now` on every _check_schedules pass. Runtime state is
+# deliberately NOT persisted -- a restart re-anchors hours-mode
+# tasks and forgets occurrence counts. The durable declarations
+# are the state['standingTasks'] records themselves; the
+# scheduler's state is only "what was running at the last
+# tick". _standing_task_sweep is the wiring point.
+_STANDING_SCHEDULER = schedule.StandingScheduler()
+
 # 1.0s (was 2.0s). The server only PUBLISHES new positions ~once
 # per tick, and the client renders whatever the server last published -- so the
 # visible map animation is gated by SIM_TICK_S regardless of the client's 60fps
@@ -1984,20 +2003,45 @@ _TASK_BUDGET_USD_DEFAULT = 0.25
 _REFINEMENT_BAND_MULTIPLIER = {'standard': 1.0, 'generous': 2.0}
 
 
-def budget_usd_for_task(task_type, budget_usd=None, budget_band=None):
+def budget_usd_for_task(task_type, budget_usd=None, budget_band=None,
+                        overrun_factor=None):
     """The model-spend ceiling for a task, in USD. Explicit positive
-    `budget_usd` wins outright (a player/director can always name a number);
-    otherwise the type tier applies, and the refinement `budget_band` scales
-    ONLY that tier (a generous-band story gets 2x the type default -- the band
-    is a judgment about worth, never a reason to shrink an explicit budget).
-    Returns a non-negative float; a card with no ceiling at all is 0.0 (gate
-    off)."""
+    `budget_usd` wins outright (a player/director can always name a
+    number); otherwise the type tier applies, and the refinement
+    `budget_band` scales ONLY that tier (a generous-band story gets 2x
+    the type default -- the band is a judgment about worth, never a
+    reason to shrink an explicit budget). An optional `overrun_factor`
+    (budget.overrun_factor, from this room/team/product's overrun
+    history) scales the type-derived ceiling too -- the mechanism that
+    lets past overruns raise future budgets for similar work; it never
+    applies to an explicit budget. Returns a non-negative float; a card
+    with no ceiling at all is 0.0 (gate off)."""
     if isinstance(budget_usd, (int, float)) and budget_usd > 0:
         return float(budget_usd)
     tier = _TASK_BUDGET_USD.get((task_type or '').strip().lower())
     base = _TASK_BUDGET_USD_DEFAULT if tier is None else tier
     mult = _REFINEMENT_BAND_MULTIPLIER.get((budget_band or 'standard').strip().lower(), 1.0)
-    return max(0.0, base * mult)
+    factor = (float(overrun_factor)
+              if isinstance(overrun_factor, (int, float)) and overrun_factor > 0
+              else 1.0)
+    return max(0.0, base * mult * factor)
+
+
+def _overrun_factor_for(state, room=None, scope=None):
+    """budget.overrun_factor for an assignment's room/team/product/type
+    scope, guarded so an analysis hiccup never blocks the assignment
+    itself. `scope` is the queue-work extra dict (or a backlog req)
+    carrying teamId/productId/taskType."""
+    scope = scope or {}
+    try:
+        import budget as _budget
+        return _budget.overrun_factor(
+            state, room=room,
+            team_id=scope.get('teamId'),
+            product_id=scope.get('productId'),
+            task_type=scope.get('taskType'))
+    except Exception:
+        return 1.0
 
 # Server in-memory task-id counter (mirrors tasks.js nextTaskId). Not persisted
 # -- on restart it resets. state['tasks'] IS durable, so a bare counter would
@@ -2712,6 +2756,13 @@ def queue_work(state, items):
             # mandate; ordinary deliverables are required to land a completion
             # NOTE (evidence of what was done) but never a KB write.
             'kbClass': item.get('kbClass') or None,
+            # Standing scheduler (see _standing_task_sweep): the
+            # standingTaskId this card was queued from, so a
+            # standing task's completion can be read back off the
+            # durable task mirror. Same whitelist contract as
+            # 'distill'/'checklist': a field the consumer needs
+            # must survive the queue round trip.
+            'standingTaskId': item.get('standingTaskId') or None,
             # Dependency cascade (ripple re-review): the task A this card is
             # blocked on (issue['dependsOnTask'], filed via
             # request_block_dependency). When A is re-opened (player veto) the
@@ -4408,7 +4459,10 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'budgetUsd': budget_usd_for_task(
             (extra or {}).get('taskType', 'code'),
             (extra or {}).get('budgetUsd'),
-            (extra or {}).get('budgetBand')),
+            (extra or {}).get('budgetBand'),
+            # Wave 3: this room/team/product/type's overrun history
+            # scales the type-derived ceiling (never an explicit one).
+            _overrun_factor_for(state, room, extra)),
         # Bell-style spare-time lane: the protected-exploration flag (a free
         # spike's failures are never mined into operator rules).
         'moonshot': bool((extra or {}).get('moonshot')),
@@ -4639,6 +4693,194 @@ def _revoke_task_access(task_id):
         pass
 
 
+def roster_view_from_state(state):
+    """A roster.Roster view of the sim state, or None when
+    the state carries no agentRoster at all.
+
+    agentRoster supplies team membership (a team is keyed
+    by its director), each agent's offDuty flag supplies
+    duty status, and each team record's optional `focus`
+    and `doNotDisturb` keys supply the disturbance policy
+    that focused and do-not-disturb teams enforce. Callers
+    that get None fall back to a weaker gate; the view is
+    rebuilt per use so it always reflects the live state."""
+    entries = state.get('agentRoster')
+    if not isinstance(entries, list) or not entries:
+        return None
+    view = roster.Roster()
+    for team in (state.get('teams') or []):
+        if not isinstance(team, dict) or not team.get('id'):
+            continue
+        view.add_team(
+            team['id'],
+            focused_task=team.get('focus'),
+            do_not_disturb=bool(team.get('doNotDisturb')),
+        )
+    agents = state.get('agents')
+    agents = agents if isinstance(agents, dict) else {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        agent_id = entry.get('id')
+        team = entry.get('director')
+        if not agent_id or not team:
+            continue
+        if view.agent(agent_id) is None:
+            view.add_agent(agent_id, team)
+        agent = agents.get(agent_id)
+        off_duty = bool(agent.get('offDuty')) if isinstance(agent, dict) else False
+        view.set_status(agent_id, roster.OFF_DUTY if off_duty else roster.ON_DUTY)
+    return view
+
+
+def _signal_plans_from_state(state):
+    """Rebuild the durable signal plans (state['signalPlans'])
+    as signals.WakePlan objects. Each plan's scenario dicts
+    carry their own `armed` flag -- the durable home of arming
+    -- so a restart resumes exactly where the think tank left
+    off: a scenario that fired stays disarmed, a rearm-marked
+    one fires again on the next match."""
+    plans = []
+    for declaration in (state.get('signalPlans') or []):
+        if not isinstance(declaration, dict) or not declaration.get('planId'):
+            continue
+        scenarios = []
+        for scenario in (declaration.get('scenarios') or []):
+            if not isinstance(scenario, dict) or not scenario.get('scenarioId'):
+                continue
+            scenarios.append(signals.Scenario(
+                scenario_id=scenario['scenarioId'],
+                name=scenario.get('name') or scenario['scenarioId'],
+                condition=scenario.get('condition') or '',
+                action=scenario.get('action') or '',
+                exit_strategy=scenario.get('exitStrategy') or '',
+                armed=bool(scenario.get('armed', True)),
+                rearm=bool(scenario.get('rearm')),
+            ))
+        plans.append(signals.WakePlan(
+            plan_id=declaration['planId'],
+            agent_id=declaration.get('agentId') or '',
+            team=declaration.get('team') or '',
+            subject=declaration.get('subject') or '',
+            task=declaration.get('task'),
+            active_when=declaration.get('activeWhen'),
+            scenarios=scenarios,
+        ))
+    return plans
+
+
+def _write_back_signal_plans(state, plans):
+    """Persist scenario arming back into state['signalPlans']
+    (the durable home): a scenario that fired without `rearm`
+    stays disarmed across restarts. Declarations and scenarios
+    that vanished between the rebuild and the write are left
+    untouched."""
+    by_id = {plan.plan_id: plan for plan in plans}
+    for declaration in (state.get('signalPlans') or []):
+        if not isinstance(declaration, dict):
+            continue
+        plan = by_id.get(declaration.get('planId'))
+        if plan is None:
+            continue
+        scenario_declarations = {s.get('scenarioId'): s for s in
+                                 (declaration.get('scenarios') or [])
+                                 if isinstance(s, dict) and s.get('scenarioId')}
+        for scenario in plan.scenarios:
+            target = scenario_declarations.get(scenario.scenario_id)
+            if target is not None:
+                target['armed'] = scenario.armed
+
+
+def _signal_condition_matches(data_text, condition):
+    """The wiring's condition evaluator: token containment.
+    The data string is a flat line of key=value tokens, so a
+    multi-token condition like 'status=done room=observatory'
+    must match a completion whose data names BOTH tokens, in
+    any order, with other tokens in between -- which a raw
+    substring test cannot express. An empty condition matches
+    everything (as an empty substring would)."""
+    tokens = set(data_text.split())
+    return all(token in tokens for token in condition.split())
+
+
+def _task_completed_data(task):
+    """The signal data string a completed task emits: a flat
+    key=value line. Condition matching is token containment
+    (the evaluator emit_signals installs), so a scenario
+    condition like 'status=done room=observatory' fires on
+    exactly the completions whose data names both."""
+    bits = ['status=done',
+            f"title={task.get('title') or ''}",
+            f"room={task.get('room') or ''}"]
+    if task.get('teamId'):
+        bits.append(f"team={task['teamId']}")
+    if task.get('taskType'):
+        bits.append(f"taskType={task['taskType']}")
+    return ' '.join(bits)
+
+
+def task_completed_data(task):
+    """Public alias for _task_completed_data: the signal
+    data line a completed task emits. serve.py exposes
+    it to signal feeds (a trading ticker watcher, a
+    cron) that name a task instead of a raw data
+    string."""
+    return _task_completed_data(task)
+
+
+def emit_signals(state, subject, data):
+    """Evaluate every durable signal plan against one emission
+    (subject + data string) and wake the matching agents. The
+    plans are rebuilt from state and evaluated by a SignalWaker
+    constructed from THOSE SAME plan objects -- a second
+    rebuild would make the arming write-back below a no-op,
+    since the disarming a fired scenario performs happens on
+    the objects the waker holds. Every wake is logged as
+    governance. Never raises: a signal failure must not break
+    the emission point (a task completion, a browse, ...).
+    Returns the WakeEvents fired."""
+    try:
+        agents = state.get('agents') or {}
+        plans = _signal_plans_from_state(state)
+        if not plans:
+            return []
+
+        view = roster_view_from_state(state)
+
+        def _wakeable(agent_id, _task):
+            agent = agents.get(agent_id)
+            if agent is None or not _is_fully_idle(agent, None):
+                return False
+            # A roster view adds the disturbance policy: signals
+            # wake OFF-DUTY agents only, and a focused or
+            # do-not-disturb team is not disturbed for work it
+            # did not focus on. The plan's task field is the
+            # work tag a focused team matches on. No roster in
+            # state keeps the weaker idle-only gate.
+            if view is not None:
+                return view.wakeable(agent_id, _task)
+            return True
+
+        waker = signals.SignalWaker(
+            evaluator=_signal_condition_matches,
+            wakeable=_wakeable,
+        )
+        for plan in plans:
+            waker.arm(plan)
+        events = waker.evaluate(subject, data)
+        _write_back_signal_plans(state, plans)
+        for event in events:
+            _log_governance(state, event.agent_id, 'signal_wake', {
+                'planId': event.plan_id, 'agentId': event.agent_id,
+                'team': event.team, 'subject': subject,
+                'task': event.task, 'scenarioId': event.scenario_id,
+                'action': event.action, 'exitStrategy': event.exit_strategy,
+            })
+        return events
+    except Exception:
+        return []
+
+
 def finish_task(state, agent_id, grid=None):
     """Port of tasks.js finishTask: clear task/busy/inRoom, return to entry point
     (with the full-agent-width step-aside deadlock avoidance), bump approvedCount,
@@ -4674,6 +4916,14 @@ def finish_task(state, agent_id, grid=None):
     # follow-up work-request so the scrum master can turn the observed gap into
     # a story at the next ceremony.
     _maybe_file_followup(state, agent_id, task, int(time.time() * 1000))
+    # Signal wake-ups (ask 7): a completed task is an emission
+    # point. The event data describes the landed work; any armed
+    # signal plan whose scenario condition appears in it wakes
+    # its agent (when that agent is fully idle). Best-effort --
+    # emit_signals never raises, so a signal failure can never
+    # break task completion.
+    if task:
+        emit_signals(state, 'task.completed', _task_completed_data(task))
     if task and task.get('entryX') is not None:
         ex, ey = task['entryX'], task['entryY']
         for oid, other in agents.items():
@@ -5075,6 +5325,95 @@ def _sync_research_watchlist(state):
     return added, removed
 
 
+def _standing_task_sweep(state, now, now_ms):
+    """The standing-task (cron scheduling) sweep, ported into
+    the same _check_schedules pass as the research-topic
+    cadence: every state['standingTasks'] declaration is ticked
+    through the module's StandingScheduler, and the scheduler's
+    verdict becomes sim behavior -- a 'start' queues a real
+    queue_work card (title/room/instructions/standingTaskId/
+    teamId, kbClass 'changes_how_we_work'), a 'stop' is logged,
+    continue/idle are silent (the running work is already
+    represented by the card the start queued). The scheduler
+    owns per-task runtime state in-process; the declarations in
+    state are the durable records.
+
+    Malformed declarations (an unknown mode, a window without
+    times, a weekly without days) raise inside the StandingTask
+    constructor -- the sweep skips them and keeps ticking the
+    rest rather than wedging every standing task behind one bad
+    record. `now` is a float epoch (the _check_schedules
+    convention) or a datetime; both are accepted."""
+    tasks = []
+    for declaration in (state.get('standingTasks') or []):
+        if not isinstance(declaration, dict) or not declaration.get('taskId'):
+            continue
+        try:
+            tasks.append(schedule.StandingTask(
+                task_id=declaration['taskId'],
+                name=declaration.get('name') or declaration['taskId'],
+                mode=declaration.get('mode') or schedule.ALWAYS,
+                agent_count=declaration.get('agentCount'),
+                duration_hours=declaration.get('durationHours'),
+                start_time=declaration.get('startTime'),
+                end_time=declaration.get('endTime'),
+                days_of_week=set(declaration.get('daysOfWeek') or ()),
+                day_of_month=declaration.get('dayOfMonth'),
+                yearly_date=(tuple(declaration['yearlyDate'])
+                             if declaration.get('yearlyDate') else None),
+                max_occurrences=declaration.get('maxOccurrences'),
+                max_consecutive_hours=declaration.get('maxConsecutiveHours'),
+                max_total_hours=declaration.get('maxTotalHours'),
+                consecutive_reset_after=(
+                    datetime.timedelta(
+                        hours=declaration['consecutiveResetAfterHours'])
+                    if declaration.get('consecutiveResetAfterHours') is not None
+                    else None),
+                team=declaration.get('team'),
+            ))
+        except (TypeError, ValueError):
+            continue  # a malformed declaration never wedges the sweep
+    if not tasks:
+        return
+    now_dt = (now if isinstance(now, datetime.datetime)
+              else datetime.datetime.fromtimestamp(now))
+    results = _STANDING_SCHEDULER.tick_all(tasks, now_dt)
+    for task in tasks:
+        result = results.get(task.task_id)
+        if result is None:
+            continue
+        if result.action == 'start':
+            declaration = next((d for d in (state.get('standingTasks') or [])
+                                if d.get('taskId') == task.task_id), {})
+            crew = (result.agent_count
+                    if result.agent_count is not None else 0)
+            queue_work(state, [{
+                'title': f"Standing task: {task.name}",
+                'room': declaration.get('room') or 'observatory',
+                'instructions': (
+                    f'Standing task "{task.name}" is due -- its schedule '
+                    f'just opened ({result.reason}). Work it with a crew '
+                    f'of {crew}; the lead role for a crew that size is '
+                    f'{result.lead_role}.'),
+                'standingTaskId': task.task_id,
+                'teamId': task.team or None,
+                'kbClass': 'changes_how_we_work',
+            }])
+            _log_governance(state, (state.get('sim') or {}).get('owner')
+                            or 'server', 'standing_task_tick', {
+                                'action': 'start', 'taskId': task.task_id,
+                                'reason': result.reason,
+                                'agentCount': crew,
+                                'leadRole': result.lead_role,
+                            })
+        elif result.action == 'stop':
+            _log_governance(state, (state.get('sim') or {}).get('owner')
+                            or 'server', 'standing_task_tick', {
+                                'action': 'stop', 'taskId': task.task_id,
+                                'reason': result.reason,
+                            })
+
+
 def _check_schedules(state, now, now_ms):
     """Port of tasks.js checkResearchSchedule + checkSkillReviewSchedule: queue
     due standing work, stamping lastRunAt/lastSkillReviewAt BEFORE assignment so
@@ -5188,6 +5527,11 @@ def _check_schedules(state, now, now_ms):
     # is actually old enough to decide.
     _pending_player_ask_sweep(state, now_ms)
     _supervisor_block_vote_sweep(state, now_ms)
+
+    # Standing tasks (the cron scheduling ask): tick every
+    # state['standingTasks'] declaration; a 'start' queues real
+    # work through the same queue_work lane as every sweep above.
+    _standing_task_sweep(state, now, now_ms)
 
 
 def _pipeline_step_task(state, pipeline_id, run_id, step_index):
@@ -8670,7 +9014,11 @@ def _append_mailbox(agent, entry):
     Every mailbox write goes through here so retention is enforced on ALL
     append paths (peer-review requests, rejected-author notes, gate re-picks,
     wake-on-mail) -- not just _deliver_mail, which is what MAILBOX_KEEP_COUNT
-    originally forgot (audit)."""
+    originally forgot (audit). Every entry also carries the `read` flag the
+    unread surfaces filter on: absent means unread to every reader
+    (`.get('read')` is falsy), so stamping it here makes the flag uniform
+    across append paths instead of only the browser-mail and wake paths."""
+    entry.setdefault('read', False)
     mailbox = agent.setdefault('mailbox', [])
     mailbox.append(entry)
     if len(mailbox) > MAILBOX_KEEP_COUNT:
@@ -9687,19 +10035,40 @@ def _queue_refined_meeting(state, req, pending):
     })
 
 
-def _resolve_refinement(state, pending, now_ms, decider=None):
+def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
     """When the ceremony window elapses, the scrum master grooms every pending
     request: the injectable refinement decider picks accept/reject per request,
     accepted ones become real `queue_work` stories (source:'refinement' +
-    groomedBy), and everyone returns to their prior state. Marks the requests
-    accepted/rejected, resets the cadence stamp, logs the digest, pops the
-    pending record. Idempotent if a request vanished."""
+    groomedBy), and everyone returns to their prior state. Before judging, the
+    injectable comprehension reader (comprehension.py) reads each request and
+    writes a short structured read-back: it is threaded into the decider's
+    instructions and the refinement digest, and it is CONTEXT for the judgment
+    -- a needs-clarification read-back never mechanically rejects a request.
+    Marks the requests accepted/rejected, resets the cadence stamp, logs the
+    digest, pops the pending record. Idempotent if a request vanished."""
     decider = decider or _refinement_decider
     agents = state.get('agents') or {}
     scrum_master_id = pending.get('scrumMasterId')
     scrum_master = (agents.get(scrum_master_id) or {})
     sm_def = next((d for d in (state.get('agentRoster') or []) if d.get('id') == scrum_master_id), {})
     sm_name = sm_def.get('name') or scrum_master.get('name') or scrum_master_id
+    # Pre-refinement comprehension (ask 2): before the decider
+    # judges, read every request this ceremony will groom and
+    # record what the scrum master understood -- a short summary,
+    # the readiness verdict, and the gaps. Stored on the pending
+    # record so the digest (and any later pass) can read it
+    # back, and logged as governance.
+    due_requests = [req for req in (state.get('backlogRequests') or [])
+                    if req.get('id') in pending.get('reqIds', [])
+                    and req.get('status') == 'pending']
+    comprehensions = {request_id: comp.to_dict() for request_id, comp in
+                      comprehension.comprehend_batch(due_requests,
+                                                   reader=reader).items()}
+    pending['comprehensions'] = comprehensions
+    if comprehensions:
+        _log_governance(state, scrum_master_id, 'refinement_comprehension',
+                        {'team': pending.get('teamId'),
+                         'comprehensions': comprehensions})
     accepted = []
     for req in (state.get('backlogRequests') or []):
         if req.get('id') not in pending.get('reqIds', []):
@@ -9732,6 +10101,14 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
         ctx = _refinement_context_for_room(state, req.get('room'))
         if ctx:
             instructions += f" Roadmap context for this room: {ctx}."
+        # The scrum master's own read-back of this request,
+        # written down before the judgment: what they understood
+        # of it, and whether it looks ready to card or needs
+        # clarification first.
+        read_back = comprehensions.get(req.get('id'))
+        if read_back:
+            instructions += (f" Read-back: \"{read_back['summary']}\" "
+                             f"(readiness: {read_back['readiness']}).")
         instructions += (" Turn it into a real story (accept) or groom it back to the "
                          "requester because it's not ready / not needed / doesn't fit the roadmap (reject). "
                          + ABSOLUTE_ZERO_SCOPING_GUIDANCE)
@@ -9761,7 +10138,10 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
         req['budgetUsd'] = budget_usd_for_task(
             groom_type,
             req.get('budgetUsd'),
-            band)
+            band,
+            # Wave 3: the room/team/product/type's overrun history
+            # scales the type-derived ceiling (never an explicit one).
+            _overrun_factor_for(state, req.get('room'), req))
         if choice in ('accept', 'accept_generous'):
             req['status'] = 'accepted'
             meeting_card = (req.get('issueType') or '').strip().lower() == 'meeting'
@@ -9864,7 +10244,9 @@ def _resolve_refinement(state, pending, now_ms, decider=None):
         state['lastBacklogRefinementAt'] = now_ms
     from serve import log_refinement_digest
     try:
-        log_refinement_digest(state, agents, {'scrumMasterId': scrum_master_id, 'accepted': accepted})
+        log_refinement_digest(state, agents, {'scrumMasterId': scrum_master_id,
+                                               'accepted': accepted,
+                                               'comprehensions': comprehensions})
     except Exception:
         pass
     state.setdefault('pendingRefinements', {}).pop(team_id, None) if team_id else state.pop('_pendingRefinement', None)
@@ -9903,7 +10285,7 @@ def kick_refinement_now(state, team_id, now_ms=None):
     return True
 
 
-def _refinement_step(state, now, now_ms, decider=None):
+def _refinement_step(state, now, now_ms, decider=None, reader=None):
     """One backlog-refinement pass, called from _task_cycle ungated (each team's
     ceremony is the point even on a quiet think tank). EVENT-DRIVEN: there is no
     weekly cadence gate -- a ceremony convenes as soon as a team has pending
@@ -9932,7 +10314,8 @@ def _refinement_step(state, now, now_ms, decider=None):
             _start_refinement(state, team_id, pending.get('reqIds', []),
                               facilitator, now_ms)
         else:
-            _resolve_refinement(state, pending, now_ms, decider=decider)
+            _resolve_refinement(state, pending, now_ms, decider=decider,
+                                reader=reader)
     # (b) Convene a ceremony for every team that has groomable requests and a
     # free facilitator. Each team gets its own slot, so multiple teams can
     # refine in the same pass (spread apart in the room).
@@ -11698,14 +12081,18 @@ def _task_owner_director(state, task):
     return None
 
 
-def _notify_task_budget_exhausted(state, task, spent=None, attempts=None):
+def _notify_task_budget_exhausted(state, task, spent=None, attempts=None,
+                                  analysis=None, completed=None):
     """One-time director notification when a task's model-spend ceiling is hit
     (see the budgetExhausted content result). Fires once per task (stamped
     `_budgetExhaustedNotified`); the owning director gets a NON-DISRUPTIVE
     mailbox note (kind task_budget_exhausted, no wake -- the card is already
     closed, waking her to act would be churn) + a governance log row carrying
-    the diagnostic (budget / actual spend / attempt count / author) so she can
-    investigate and re-open the card with more budget. Pure state mutation."""
+    the diagnostic (budget / actual spend / attempt count / author / overrun
+    cause / work landed / future-budget factor) so she can investigate and
+    re-open the card with more budget. `analysis` and `completed` (budget.py)
+    may be passed in from the budgetExhausted branch or are derived here.
+    Pure state mutation."""
     if task.get('_budgetExhaustedNotified'):
         return
     task['_budgetExhaustedNotified'] = True
@@ -11715,9 +12102,32 @@ def _notify_task_budget_exhausted(state, task, spent=None, attempts=None):
     budget_line = f" of ${budget:.2f}" if isinstance(budget, (int, float)) else ''
     spent_line = f" after spending ${spent:.4f}" if isinstance(spent, (int, float)) else ''
     attempts_line = f" across {int(attempts)} attempt(s)" if isinstance(attempts, (int, float)) else ''
+    # Wave 3: the cause analysis, what had landed, and the
+    # future-budget factor (already including this overrun, since
+    # record_overrun ran first) ride along, so the director can
+    # decide grant-more-budget vs close without a separate
+    # investigation.
+    cause_line = (f" Cause: {analysis.get('detail')}."
+                  if analysis and analysis.get('detail') else '')
+    if completed:
+        work_line = (f" Work landed before the stop: {completed.get('verdict')}."
+                     if completed.get('landed')
+                     else ' No work landed before the stop.')
+    else:
+        work_line = ''
+    try:
+        import budget as _budget
+        factor = _budget.overrun_factor(
+            state, room=task.get('room'), team_id=task.get('teamId'),
+            product_id=task.get('productId'), task_type=task.get('taskType'))
+    except Exception:
+        factor = 1.0
+    factor_line = (f" Similar future cards now budget {factor:.2f}x "
+                   f"their type default." if factor > 1.0 else '')
     text = (f'The task "{title}" exhausted its model-spend budget{budget_line}'
-            f"{spent_line}{attempts_line} and was closed as failed. Investigate the "
-            f"task and either grant it more budget and re-open it, or close the work.")
+            f"{spent_line}{attempts_line} and was closed as failed."
+            f"{cause_line}{work_line}{factor_line} Investigate the "
+            f'task and either grant it more budget and re-open it, or close the work.')
     director = (state.get('agents') or {}).get(director_id) if director_id else None
     if director:
         _append_mailbox(director, {
@@ -11725,12 +12135,22 @@ def _notify_task_budget_exhausted(state, task, spent=None, attempts=None):
             'taskId': task.get('id'),
             'title': title,
             'text': text,
+            'reason': (analysis or {}).get('reason'),
+            'overrunRatio': (analysis or {}).get('overrunRatio'),
+            'perCallUsd': (analysis or {}).get('perCallUsd'),
+            'workLanded': (completed or {}).get('landed'),
+            'futureFactor': factor,
         })
     _log_governance(state, director_id or task.get('assignedTo'),
                     'task_budget_exhausted',
                     {'taskId': task.get('id'), 'title': title[:120],
                      'budgetUsd': budget, 'spentUsd': spent,
-                     'attempts': attempts, 'assignedTo': task.get('assignedTo')})
+                     'attempts': attempts, 'assignedTo': task.get('assignedTo'),
+                     'reason': (analysis or {}).get('reason'),
+                     'overrunRatio': (analysis or {}).get('overrunRatio'),
+                     'perCallUsd': (analysis or {}).get('perCallUsd'),
+                     'workLanded': (completed or {}).get('landed'),
+                     'futureFactor': factor})
 
 
 def _director_grant_budget_reopen(state, task_id, new_budget_usd, director_id=None, now_ms=None):
@@ -12289,6 +12709,21 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                     task['failedAt'] = now_ms
                     task['failNote'] = (result.get('note') or task.get('note')
                                         or 'task model-spend budget exhausted').strip()[:300]
+                    # Budget overrun intelligence: evaluate what had
+                    # landed, classify the cause, and record it in the
+                    # durable history that scales future budgets for
+                    # similar work (budget.py). Computed once here and
+                    # shared with the director notification below.
+                    import budget as _budget
+                    analysis = _budget.analyze_overrun(
+                        task, result.get('taskSpendUsd'),
+                        result.get('taskSpendAttempts'))
+                    completed = _budget.evaluate_completed_work(task)
+                    _budget.record_overrun(
+                        state, task,
+                        spent=result.get('taskSpendUsd'),
+                        attempts=result.get('taskSpendAttempts'),
+                        analysis=analysis, completed=completed)
                     a['task'] = None
                     a['busy'] = False
                     a['inRoom'] = None
@@ -12296,7 +12731,8 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                     _notify_task_budget_exhausted(
                         state, task,
                         spent=result.get('taskSpendUsd'),
-                        attempts=result.get('taskSpendAttempts'))
+                        attempts=result.get('taskSpendAttempts'),
+                        analysis=analysis, completed=completed)
                     send_agent_off_duty(state, aid, doors, grid)
                     continue
                 # Fail-closed quality gate: a content result that FAILED the
@@ -12798,6 +13234,53 @@ def _sprint_worker_pool(state, sprint_id, worker_count=None):
     return pool[:worker_count]
 
 
+def _one_off_routing_applies(pick):
+    """Does the one-off/scheduled routing rule cover this item? It
+    covers a fire-at-a-time card (`notBefore` set -- queue_once
+    one-offs and work scheduled for a specific time) and the
+    standing cadence sweeps (research / skillReview / distill,
+    the schedule lane's recurring work). Ordinary backlog cards
+    keep the generic round-robin. A sprint card never reaches the
+    rule at all: its hard pool restriction (sprint staffing always
+    wins for its own cards) is checked by the caller."""
+    return bool(pick.get('notBefore') or pick.get('research')
+                or pick.get('skillReview') or pick.get('distill'))
+
+
+def _agent_sprint_work_done(state, agent_id):
+    """Has this agent completed all sprint work? She is staffed
+    (via _sprint_worker_pool, the same strict pool the sprint
+    itself uses) on no ACTIVE sprint that still has a queued
+    card -- every sprint she is on has drained its queue, so only
+    in-flight work can remain. Vacuously true when she is staffed
+    on no active sprint at all. Pure state reads, no JEV."""
+    work_queue = state.get('workQueue') or []
+    for sid, record in (state.get('sprints') or {}).items():
+        if record.get('status') != 'active':
+            continue
+        if agent_id not in (_sprint_worker_pool(state, sid) or []):
+            continue
+        if any(it.get('sprintId') == sid for it in work_queue):
+            return False
+    return True
+
+
+def _on_item_team(state, agent_id, team_id):
+    """Is this agent on the team that owns this item's work? A
+    direct report of the team's director (a team is identified by
+    its director id, the same membership _sim_direct_reports
+    gives), or an agent loaned to the team (roster `loan` tag)
+    for the loan's duration -- the same membership the generic
+    team preference uses. Teamless items have no owning team."""
+    if not team_id:
+        return False
+    if agent_id in _sim_direct_reports(state, team_id):
+        return True
+    return any(d.get('id') == agent_id and d.get('loan')
+               and d['loan'].get('teamId') == team_id
+               for d in (state.get('agentRoster') or []))
+
+
 def _sprint_staffing_step(state, now_ms=None):
     """Sprint staffing expansion: a director grows an ACTIVE sprint's staff when
     the agents need help. "Needs help" is modeled deterministically (no JEV
@@ -13035,6 +13518,37 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         pointer = rr.get('task', 0)
         # First eligible index at/after the pointer.
         ordered = [cid for cid in candidates if cid in agents]
+        # One-off and scheduled work (a fire-at-a-time card
+        # from queue_once, or a standing cadence sweep) goes
+        # to an OFF-DUTY agent: first one who has completed
+        # all her sprint work -- the owning team's finisher,
+        # or any finisher for teamless work -- else an
+        # off-duty agent on a team OTHER than the work's
+        # own, so a focus team mid-sprint is never disturbed
+        # by borrowed work. SOFT preference, never a hard
+        # lock: when no off-duty candidate qualifies the
+        # generic preferences below pick as before. Sprint
+        # cards never reach this branch -- their hard pool
+        # restriction already narrowed `candidates`.
+        one_off_routed = False
+        if _one_off_routing_applies(pick) and sprint_pool is None:
+            off_duty = [cid for cid in ordered
+                        if (agents.get(cid) or {}).get('offDuty')]
+            if off_duty:
+                item_team = pick.get('teamId')
+                finished = [cid for cid in off_duty
+                            if _agent_sprint_work_done(state, cid)
+                            and (not item_team
+                                 or _on_item_team(state, cid, item_team))]
+                if finished:
+                    ordered = finished
+                    one_off_routed = True
+                elif item_team:
+                    borrowed = [cid for cid in off_duty
+                                if not _on_item_team(state, cid, item_team)]
+                    if borrowed:
+                        ordered = borrowed
+                        one_off_routed = True
         # Gap: a story filed against a specific team
         # (pick['teamId']) had zero team preference at assignment -- only
         # reviewer selection (_pick_reviewer_ids) ever preferred same-team.
@@ -13044,7 +13558,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # on-call pin) -- a small think tank can't afford to starve one team's
         # queue while another sits idle just because its own members are busy.
         team_id = pick.get('teamId')
-        if team_id:
+        if team_id and not one_off_routed:
             team_members = set(_sim_direct_reports(state, team_id))
             # Cross-team borrowing: an agent loaned to this team (roster `loan`
             # tag) is part of the assignment pool for the loan's duration, so
