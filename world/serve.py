@@ -29,6 +29,7 @@ import re
 import random
 import secrets
 import shutil
+import statistics
 import sqlite3
 import threading
 import subprocess
@@ -978,6 +979,21 @@ def init_db():
             first_seen REAL NOT NULL,
             last_seen REAL NOT NULL
         )''')
+        # BP-63 observed-latency samples: one row per successful OpenRouter
+        # POST, wall-clock ms written by _post_once_tracked through
+        # _record_model_latency. The tier pick reads a per-model median as a
+        # speed tie-break inside the cheapest qualifier's price parity band
+        # (OpenRouter's own latency numbers are not exposed anywhere we can
+        # pull -- only through request-time routing prefs -- so the tank
+        # measures its own). Rows older than the retention window are pruned
+        # opportunistically, at most once per hour. Failed calls are never
+        # recorded: a failed POST's duration is queue noise, not model speed.
+        conn.execute('''CREATE TABLE IF NOT EXISTS model_latency_samples (
+            model TEXT NOT NULL,
+            ts REAL NOT NULL,
+            duration_ms REAL NOT NULL
+        )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_latency_model_ts ON model_latency_samples(model, ts)')
         # Real login sessions -- replaces the old "anyone who loads the
         # page gets the same baked-in key" model (see the removed
         # SERVER_ACCESS_KEY) now that you're considering a public
@@ -1592,9 +1608,16 @@ def _tier_watch_moves_sync():
                 pools.get(band, []), scores, BAND_QUALITY_FLOOR_GAP.get(band))
             if not qualifiers:
                 continue
-            cheapest = qualifiers[0]
-            if cheapest['id'] != slug and cheapest['price'] < price - 1e-9:
-                moves.add(band)  # a cheaper qualifier appeared -- take the window
+            # Mirror the pick's own order (BP-63 speed tie-break inside the
+            # cheapest qualifier's price parity band): the watch fires only
+            # on a candidate a fresh pick would try FIRST. Without the
+            # mirror, a speed pick (slightly pricier, clearly faster) would
+            # look like a perpetually available "cheaper qualifier" and
+            # re-trigger a probe + re-pick on every watch cycle. A within-
+            # band speed pick is a policy choice, not an open value window.
+            top = _speed_tie_order(qualifiers)[0]
+            if top['id'] != slug and top['price'] < price - 1e-9:
+                moves.add(band)  # a better-in-policy qualifier appeared -- take the window
             break
     return moves
 
@@ -9454,14 +9477,21 @@ def _openrouter_chat_post(body):
         # recovery retry below gets its own record too. Recording
         # is fail-open -- record() swallows its own errors.
         start = time.monotonic()
+        model_slug = payload.get('model')
         try:
             result = _post_once(payload)
         except Exception as error:
             training_capture.record('openrouter', payload, error=error,
                                     duration_ms=int((time.monotonic() - start) * 1000))
             raise
+        duration_ms = int((time.monotonic() - start) * 1000)
         training_capture.record('openrouter', payload, result,
-                                duration_ms=int((time.monotonic() - start) * 1000))
+                                duration_ms=duration_ms)
+        # BP-63: the same wall-clock measurement feeds the tier pick's
+        # speed tie-break. Only successful POSTs count -- a failed call's
+        # duration is queue noise, not model speed.
+        if isinstance(result, dict):
+            _record_model_latency(model_slug, duration_ms)
         return result
 
     try:
@@ -12344,6 +12374,95 @@ BENCHMARK_QUALITY_FLOOR_GAP = 6
 BAND_QUALITY_FLOOR_GAP = {'high': 2}
 
 
+# BP-63: observed-latency speed tie-break. OpenRouter's own speed numbers
+# are only consumable through request-time routing prefs (provider.sort etc.)
+# -- the models catalog carries no latency field at all -- so the tank
+# measures its own: every successful POST through _openrouter_chat_post
+# records wall-clock duration per model slug, and the tier pick orders
+# near-price qualifiers by the per-model observed median. Motivation
+# (2026-10-18): two similarly priced qualifiers can differ enormously in
+# real felt speed, and for agent loops wall-clock IS throughput. Boundaries
+# the tie-break must never cross: the quality floor and the price rank do
+# not move. Latency only reorders models already within
+# TIER_SPEED_TIE_PARITY of the cheapest qualifier, and any band whose data
+# is missing or under-sampled keeps the plain cheapest-first order.
+TIER_SPEED_TIE_PARITY = 0.15  # share of the cheapest qualifier's price inside which speed decides
+MODEL_LATENCY_WINDOW_S = 7 * 86400    # recency window the median reads
+MODEL_LATENCY_MIN_SAMPLES = 5         # below this a model has no usable speed opinion
+MODEL_LATENCY_FETCH_LIMIT = 400       # most recent rows read per median query
+MODEL_LATENCY_RETENTION_S = 7 * 86400  # older samples are pruned
+MODEL_LATENCY_PRUNE_INTERVAL_S = 3600  # prune at most once per hour
+
+_LAST_LATENCY_PRUNE = 0.0
+
+
+def _record_model_latency(model, duration_ms):
+    """Persist one successful model POST's wall-clock duration for the BP-63
+    speed tie-break. Fail-open: stats collection must never break the call
+    it is observing."""
+    global _LAST_LATENCY_PRUNE
+    if not model or not duration_ms or duration_ms <= 0:
+        return
+    try:
+        with _db() as conn:
+            conn.execute('INSERT INTO model_latency_samples (model, ts, duration_ms) VALUES (?, ?, ?)',
+                         (model, time.time(), float(duration_ms)))
+            now = time.time()
+            if now - _LAST_LATENCY_PRUNE >= MODEL_LATENCY_PRUNE_INTERVAL_S:
+                _LAST_LATENCY_PRUNE = now
+                conn.execute('DELETE FROM model_latency_samples WHERE ts < ?',
+                             (now - MODEL_LATENCY_RETENTION_S,))
+    except Exception:  # noqa: BLE001 -- fail-open: stats never break the call
+        pass
+
+
+def _model_median_latency_ms(model_id, now=None):
+    """Median wall-clock duration of this model's recent successful POSTs,
+    or None when the model has fewer than MODEL_LATENCY_MIN_SAMPLES inside
+    MODEL_LATENCY_WINDOW_S (an under-sampled model keeps the plain
+    cheapest-first order instead of pretending to know its speed)."""
+    if not model_id:
+        return None
+    try:
+        now = time.time() if now is None else now
+        with _db() as conn:
+            rows = conn.execute(
+                'SELECT duration_ms FROM model_latency_samples WHERE model = ? AND ts >= ? '
+                'ORDER BY ts DESC LIMIT ?',
+                (model_id, now - MODEL_LATENCY_WINDOW_S, MODEL_LATENCY_FETCH_LIMIT)).fetchall()
+    except Exception:  # noqa: BLE001 -- a stats read must never break a pick
+        return None
+    if len(rows) < MODEL_LATENCY_MIN_SAMPLES:
+        return None
+    return statistics.median(float(r[0]) for r in rows)
+
+
+def _speed_tie_order(qualifiers):
+    """BP-63 reorder of price-sorted qualifiers: among models within
+    TIER_SPEED_TIE_PARITY of the cheapest qualifier, models with a usable
+    observed-median latency lead, fastest first (price breaks latency ties);
+    models with no latency data follow them in price order, and models
+    beyond the parity band keep the cheapest-first order after everyone.
+    Returns the SAME members, possibly reordered -- never adds, drops or
+    re-scores anything, and short lists or lists with no latency data pass
+    through unchanged. The price watch mirrors this exact order so a speed
+    pick is never misread as a perpetually-available cheaper qualifier."""
+    if len(qualifiers) < 2:
+        return list(qualifiers)
+    near = [m for m in qualifiers if m['price'] <= qualifiers[0]['price'] * (1 + TIER_SPEED_TIE_PARITY)]
+    if len(near) < 2:
+        return list(qualifiers)
+    latencies = {m['id']: _model_median_latency_ms(m['id']) for m in near}
+    timed = sorted(
+        (m for m in near if latencies[m['id']] is not None),
+        key=lambda m: (latencies[m['id']], m['price']))
+    if not timed:
+        return list(qualifiers)
+    return (timed
+            + [m for m in near if latencies[m['id']] is None]
+            + [m for m in qualifiers if m not in near])
+
+
 def get_model_benchmark_scores():
     with _db() as conn:
         rows = conn.execute(
@@ -12386,13 +12505,17 @@ def _best_value_qualifiers_sync(candidates, scores, floor_gap=None):
 async def _best_value_pick(candidates, scores, floor_gap=None):
     # Shared by every band (restored): score keeps its place. Among
     # candidates with a real stored score, keep only those within the band's
-    # quality floor of the best score present, then take the cheapest of those
-    # that actually still work (live-verified, same as every other pick here).
-    # Score guards against picking a meaningfully worse model purely on price;
-    # price then breaks ties among models that pass the quality bar. Returns
-    # None if nothing in `candidates` has a stored score yet, or nothing
-    # verified works -- callers fall back to Jev's classifier in that case.
-    for candidate in _best_value_qualifiers_sync(candidates, scores, floor_gap):
+    # quality floor of the best score present, then take the first one on
+    # the walk order that actually still works (live-verified, same as every
+    # other pick here). Score guards against picking a meaningfully worse
+    # model purely on price; price then breaks ties among models that pass
+    # the quality bar -- with the BP-63 speed tie-break acting as the final
+    # reorder inside a narrow parity of the cheapest qualifier, so the
+    # cheapest-and-slowest model no longer wins a band it barely deserved on
+    # price alone. Returns None if nothing in `candidates` has a stored
+    # score yet, or nothing verified works -- callers fall back to Jev's
+    # classifier in that case.
+    for candidate in _speed_tie_order(_best_value_qualifiers_sync(candidates, scores, floor_gap)):
         if await asyncio.to_thread(_verify_model_works_sync, candidate['id']):
             return candidate
     return None

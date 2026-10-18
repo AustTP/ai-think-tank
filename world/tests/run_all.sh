@@ -256,6 +256,9 @@ echo
 echo "== Python: governed policy_edit tool (Phase 3 externalized serve knobs) =="
 python3 tests/test_policy_edit.py
 echo
+echo "== Python: tier pick speed tie-break (BP-63 observed latency) =="
+python3 tests/test_tier_speed_tie.py
+echo
 echo "== Python: sandbox browser_act driver (fake playwright) =="
 python3 tests/test_browser_driver.py
 

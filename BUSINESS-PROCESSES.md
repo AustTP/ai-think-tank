@@ -2033,6 +2033,51 @@ no wake, quiet self-mail, retention by the shared mailbox trim.
 `issue_started`, `issue_done`, `issue_closed`; issues and backlogRequests
 status fields stay the queryable source of truth.
 
+### BP-63 Speed tie-break in tier picks
+
+**Purpose.** Stop a cheap-but-slow model from winning a band purely on
+price when an equally scored, slightly pricier model answers far faster.
+For agent loops, wall-clock per call is throughput; OpenRouter exposes no
+pullable latency numbers, so the tank measures its own.
+
+**Trigger.** Every tier re-pick (`refresh_model_tiers`) and every
+price-watch cycle reads the latest per-model observed latency.
+
+**Steps.**
+
+1. Measure. `_openrouter_chat_post` wraps every OpenRouter POST in a
+   monotonic timer. Successful POSTs append one row per call to
+   `model_latency_samples` (model, timestamp, duration). Failed calls are
+   never recorded: their duration is queue noise, not model speed.
+2. Gate. A model has a usable speed opinion only with at least
+   `MODEL_LATENCY_MIN_SAMPLES` successful samples inside
+   `MODEL_LATENCY_WINDOW_S` (7 days). Under-sampled models carry no
+   opinion instead of a misleading one.
+3. Order. Among score qualifiers already inside the band's quality floor,
+   models within `TIER_SPEED_TIE_PARITY` (15%) of the cheapest qualifier's
+   price lead, ordered by observed median duration (price breaks latency
+   ties), then unsampled models, then qualifiers beyond the parity band in
+   plain cheapest-first order. The walk still live-verifies and returns
+   the first candidate that answers.
+4. Boundaries. The quality floor and the price rank never move: latency
+   only reorders near-price equals. A band with no latency data anywhere
+   picks exactly as before.
+5. Mirror. The 30-minute price watch compares the current pick against the
+   pick policy's first candidate (the same reorder), so a within-parity
+   speed pick is not misread as a perpetually available cheaper qualifier
+   and does not re-probe and re-pick every cycle. A genuinely cheaper
+   qualifier outside the parity band still fires the window.
+
+**Controls.** Recording is fail-open (a stats write can never break the
+call it observes); reads latch to the most recent samples capped per
+query; rows older than the retention window are pruned at most hourly;
+median over the freshest window resists both slow-agent outliers and
+one-off stalls.
+
+**Records.** `model_latency_samples` rows are the raw measurement; the
+existing `tier_daily_log` stays the auditable record of what each band
+picked and at what price.
+
 ## 11. Player and operator processes
 
 | Process | Surface | What the owner does |
