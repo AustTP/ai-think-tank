@@ -2345,7 +2345,8 @@ def _render_report_md(report):
 # Throttle for the agent-directory filesystem mirror (see sync_agent_directories).
 # The mirror is expensive (action_log scans + many file writes) and does not
 # need per-tick freshness; save_state_to_db syncs it at most this often.
-AGENT_DIR_SYNC_INTERVAL_S = float(_load_env().get('AGENT_DIR_SYNC_INTERVAL_S', '15') or 15)
+_AGENT_DIR_SYNC_ENV_S = str(_load_env().get('AGENT_DIR_SYNC_INTERVAL_S', '') or '')
+AGENT_DIR_SYNC_INTERVAL_S = float(_AGENT_DIR_SYNC_ENV_S or 15)
 _LAST_AGENT_DIR_SYNC_AT = 0.0
 _LAST_AGENT_DIR_FINGERPRINT = None
 
@@ -5291,10 +5292,42 @@ def _watchdog_stale_s(policy):
     return float(env) if env else float(policy['simWatchdogStaleS'])
 
 
+def _agent_dir_sync_interval_s(policy):
+    env = globals().get('_AGENT_DIR_SYNC_ENV_S')
+    return float(env) if env else float(policy['agentDirSyncIntervalS'])
+
+
 bind_policy(__name__, [
     ('SUCCESS_GRADE_FLOOR', 'successGradeFloor'),
     ('PEER_REVIEW_INTERVAL_S', 'peerReviewIntervalS'),
     ('PEER_REVIEW_FILE_PROBABILITY', 'peerReviewFileProbability'),
+    # Phase 3 externalization (2026-10-18): the remaining serve statics
+    # moved into operator_policy.json. Every loop that consumes an interval
+    # reads it per iteration, so a reload takes effect on the next sleep.
+    ('DB_BACKUP_KEEP', 'dbBackupKeep'),
+    ('DB_BACKUP_INTERVAL_S', 'dbBackupIntervalS'),
+    ('LOG_RETENTION_DAYS_DEFAULT', 'logRetentionDaysDefault'),
+    ('LOG_PRUNE_INTERVAL_S', 'logPruneIntervalS'),
+    ('LOG_PRUNE_MAX_ROWS', 'logPruneMaxRows'),
+    ('MODEL_TIER_REFRESH_INTERVAL_S', 'modelTierRefreshIntervalS'),
+    ('TIER_PRICE_WATCH_INTERVAL_S', 'tierPriceWatchIntervalS'),
+    ('TIER_RECHECK_COOLDOWN_S', 'tierRecheckCooldownS'),
+    ('TIER_GATE_MIN_CONFIDENCE', 'tierGateMinConfidence'),
+    ('FAILURE_MAX_RECORDS', 'failureMaxRecords'),
+    ('SUCCESS_MAX_RECORDS', 'successMaxRecords'),
+    ('RULE_PROPOSALS_MAX', 'ruleProposalsMax'),
+    ('SUCCESS_PROPOSALS_MAX', 'successProposalsMax'),
+    ('RULE_MIN_RECURRENCE', 'ruleMinRecurrence'),
+    ('SUCCESS_MIN_RECURRENCE', 'successMinRecurrence'),
+    ('MEMORY_MAX_AGE_DAYS', 'memoryMaxAgeDays'),
+    ('MEMORY_DECAY_FACTOR', 'memoryDecayFactor'),
+    ('MEMORY_KEEP_COUNT', 'memoryKeepCount'),
+    ('MAX_DOWNLOAD_BYTES', 'maxDownloadBytes'),
+    ('YOUTUBE_TRANSCRIPT_MAX_CHARS', 'youtubeTranscriptMaxChars'),
+    ('YOUTUBE_TRANSCRIPT_MAX_SEGMENTS', 'youtubeTranscriptMaxSegments'),
+    ('AGENT_DIR_SYNC_INTERVAL_S', 'agentDirSyncIntervalS'),
+    ('PEER_REVIEW_MIN_LOOKBACK_S', 'peerReviewMinLookbackS'),
+    ('PEER_REVIEW_SIGNAL_STALE_S', 'peerReviewSignalStaleS'),
     ('DIRECTOR_ESCALATION_REASK_COOLDOWN_S',
      'directorEscalationReaskCooldownS'),
     ('DIRECTOR_ESCALATION_MAX_ASKS', 'directorEscalationMaxAsks'),
@@ -5313,6 +5346,7 @@ bind_policy(__name__, [
 ], overrides={
     '_SIM_WATCHDOG_INTERVAL_S': _watchdog_interval_s,
     '_SIM_WATCHDOG_STALE_S': _watchdog_stale_s,
+    'AGENT_DIR_SYNC_INTERVAL_S': _agent_dir_sync_interval_s,
 })
 
 
@@ -10393,6 +10427,43 @@ AGENT_ASK_TOOLS = [
                                        'path; omit for the listing.',
                     },
                 },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'policy_edit',
+            'description': 'Governed policy knob change: propose ONE '
+                           'key/value change to the operator policy '
+                           '(agent-editable keys only; DB/log hygiene keys '
+                           'stay operator-only). The JEV quorum reviews the '
+                           'change, the value is validated against the '
+                           'schema range, operator_policy.json is updated '
+                           'atomically, and every bound module rebinds '
+                           'immediately -- no restart, no change window. A '
+                           'denied review changes nothing.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'key': {
+                        'type': 'string',
+                        'description': 'One operator-policy key that is '
+                                       'agent-editable (keys and ranges '
+                                       'live in world/operator_policy.json).',
+                    },
+                    'value': {
+                        'description': 'The new value, typed per the '
+                                       "schema for that key.",
+                    },
+                    'reason': {
+                        'type': 'string',
+                        'description': 'Why the new value helps the tank '
+                                       'right now; the reviewer judges '
+                                       'this.',
+                    },
+                },
+                'required': ['key', 'value', 'reason'],
             },
         },
     },
@@ -16497,6 +16568,29 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                         + ']')
                 return f'{result.get("path")} {note}\n{(result.get("text") or "")}'
             return 'selfedit_read returned an unexpected response.'
+        if name == 'policy_edit':
+            key = ((args or {}).get('key') or '').strip()
+            value = (args or {}).get('value')
+            reason = (args or {}).get('reason')
+            if not key or value is None:
+                return ('policy_edit requires key and value.')
+            if not (reason or '').strip():
+                return ('policy_edit requires reason: say WHY the new value '
+                        'helps the tank -- the reviewer judges the reason.')
+            body = {'agentId': agent_id, 'key': key, 'value': value,
+                    'reason': reason}
+            result = _http_json('POST', SELF_BASE_URL,
+                                '/api/policy/agent_edit', body, agent_key,
+                                timeout=120)
+            if isinstance(result, dict) and result.get('error'):
+                return f'policy_edit: {result["error"]}'
+            if isinstance(result, dict) and result.get('ok'):
+                previous = result.get('previous')
+                applied = result.get('value')
+                return (f'Policy applied after review ({result.get("key")!r} '
+                        f'{previous!r} -> {applied!r}); bound modules '
+                        'rebind already, no restart needed.')
+            return 'policy_edit returned an unexpected response.'
         raise ValueError(f'unknown tool: {name}')
     return execute_tool
 
@@ -24403,6 +24497,147 @@ async def selfedit_read(request: Request):
                {'ok': ok, 'path': body.get('path') or '*listing*',
                 'note': ((payload or {}).get('error') or '')[:160]},
                authorized=authorized)
+    return JSONResponse(payload, status_code=200 if ok else 400)
+
+
+# Governed agent policy_edit (Phase 3, 2026-10-18). Policy values are DATA,
+# not code: an agent proposes ONE key/value change against the operator-policy
+# schema. The same JEV quorum that reviews code splices judges the change, the
+# key must be on config.AGENT_EDITABLE_POLICY_KEYS (fail-closed otherwise),
+# the value must pass _coerce_operator_value, and the write is a read-merge-
+# write against the player's operator_policy.json (atomic temp+rename under a
+# module lock), followed by config.reload_policy_config() so every bound
+# module -- serve, sim, content, sublow -- rebinds without a restart. The
+# player keeps final authority: the JSON itself and POST /api/policy/reload
+# are untouched, so any agent change can simply be reverted by editing the
+# file. No change window is needed: this is decision data landing between
+# ticks, not code entering the applied tree.
+_POLICY_FILE_LOCK = threading.Lock()
+
+_POLICY_EDIT_INSTRUCTIONS = (
+    'You are the policy-change reviewer for a governed self-governing think '
+    'tank. Agents may tune DATA knobs (cadences, thresholds, caps) without a '
+    'code change, but only through this review. Approve ONLY if the change is '
+    'inside the allowed schema range, the reason is concrete and honest, and '
+    'the new value plausibly helps the tank more than it hurts it. Refuse '
+    'repeated gaming, values that reduce oversight quality, or reasons that '
+    'do not match the change.')
+_POLICY_EDIT_CRITERIA = (
+    'One of: approve, reject, escalate.\n'
+    'The key and its allowed range are stated; values outside the range are '
+    'impossible by construction.\n')
+
+_POLICY_EDIT_REASONS = (
+    'reject', 'escalate')
+
+
+def _policy_edit_apply(agent_id, key, raw_value, reason):
+    """Synchronous governed policy change. Returns (ok, payload) with the
+    applied change or a typed error; every attempt is action-logged."""
+    import config as _cfg
+    key = (key or '').strip()
+    reason = (reason or '').strip()
+    if not key:
+        return False, {'error': 'key is required'}
+    if len(reason) > 400:
+        return False, {'error': 'the reason needs 400 characters or fewer'}
+    if key not in _cfg.OPERATOR_POLICY_DEFAULT:
+        return False, {'error': f'{key!r} is not an operator-policy key '
+                                 '(keys and ranges live in world/'
+                                 'operator_policy.json)'}
+    if key not in _cfg.AGENT_EDITABLE_POLICY_KEYS:
+        return False, {'error': f'{key!r} is operator-only in v1 of '
+                                 'policy_edit'}
+    value = _cfg._coerce_operator_value(key, raw_value)
+    if value is None:
+        kind, lo, hi = _cfg._OPERATOR_SCHEMA[key]
+        return False, {'error': f'value for {key} must be a {kind} between '
+                                f'{lo} and {hi}'}
+    current = _cfg.OPERATOR_POLICY.get(key)
+    question = (f'Policy change request from {agent_id}.\n'
+                f'Key: {key}\n'
+                f'Current value: {current!r}\n'
+                f'Proposed value: {value!r}\n'
+                f'Schema range: {_cfg._OPERATOR_SCHEMA[key]}\n'
+                f'Reason: {reason}')
+    try:
+        decision, confidence, _cost = _jev_quorum_choice_sync(
+            _POLICY_EDIT_INSTRUCTIONS, _POLICY_EDIT_CRITERIA + question)
+    except Exception as e:
+        decision, confidence = None, 1.0
+        log_action(agent_id, 'policy_edit_review_failed',
+                   {'error': str(e)[:200]}, authorized=False)
+        return False, {'error': f'review transport failed: {str(e)[:120]} -- '
+                                'nothing changed'}
+    if decision not in ('approve',):
+        note = _POLICY_EDIT_REASONS[0] if decision == 'reject' else 'refused'
+        log_action(agent_id, 'policy_edit_rejected',
+                   {'key': key, 'decision': decision,
+                    'confidence': round(float(confidence or 0.0), 2),
+                    'value': value},
+                   authorized=True)
+        return False, {'error': f'the policy reviewer said {decision!r} '
+                                f'({note}); nothing changed'}
+    path = _cfg.OPERATOR_POLICY_PATH
+    with _POLICY_FILE_LOCK:
+        try:
+            with open(path, encoding='utf-8') as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as e:
+            log_action(agent_id, 'policy_edit_file_error',
+                       {'error': str(e)[:200]}, authorized=False)
+            return False, {'error': f'cannot read the policy file: '
+                                    f'{str(e)[:120]}'}
+        previous = data.get(key, current)
+        data[key] = value
+        tmp = f'{path}.tmp-{os.getpid()}-{threading.get_ident()}'
+        try:
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(data, fh, indent=2)
+                fh.write('\n')
+            os.replace(tmp, path)
+        except OSError as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            log_action(agent_id, 'policy_edit_file_error',
+                       {'error': str(e)[:200]}, authorized=False)
+            return False, {'error': f'cannot write the policy file: '
+                                    f'{str(e)[:120]}'}
+        _cfg.reload_policy_config()
+    applied = _cfg.OPERATOR_POLICY.get(key)
+    log_action(agent_id, 'policy_edit',
+               {'key': key, 'previous': previous, 'value': applied,
+                'confidence': round(float(confidence or 0.0), 2)},
+               authorized=True)
+    return True, {'ok': True, 'key': key, 'previous': previous,
+                  'value': applied,
+                  'confidence': round(float(confidence or 0.0), 2),
+                  'message': f'{key} is now {applied!r}; every bound module '
+                             'rebinds live'}
+
+
+@app.post('/api/policy/agent_edit')
+async def policy_agent_edit(request: Request):
+    """The agent lane for policy data changes: one reviewed key/value edit
+    against the AGENT_EDITABLE_POLICY_KEYS allowlist. Fails closed on
+    unknown keys, out-of-range values, and review refusals."""
+    body = await request.json()
+    agent_id = body.get('agentId') or 'unknown'
+    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    if not authorized:
+        return JSONResponse({'error': 'unauthorized'}, status_code=401)
+    try:
+        ok, payload = await asyncio.to_thread(
+            _policy_edit_apply, agent_id, body.get('key'),
+            body.get('value'), body.get('reason'))
+    except Exception as exc:
+        print(f'[policy-edit] crashed for {agent_id}: {exc}', flush=True)
+        log_action(agent_id, 'policy_edit_crashed',
+                   {'error': str(exc)[:300]}, authorized=authorized)
+        return JSONResponse({'error': f'the policy harness failed: {exc}'},
+                            status_code=500)
     return JSONResponse(payload, status_code=200 if ok else 400)
 
 

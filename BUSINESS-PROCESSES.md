@@ -1833,9 +1833,11 @@ with `--max-idle-minutes`.
 3. Binding scan: selfedit raises the module's top-level importers and
    refuses a target imported by any consumer that is not on its tolerated
    list (`jev` tolerates `serve.py` because serve re-reads jev's exports
-   after an apply). `config.py` is refused naturally by this scan in v1 --
-   content, sublow, and serve import it, and no topological reload exists
-   yet.
+   after an apply; `sublow` tolerates `jev_grants.py`, reloaded after;
+   `config` tolerates `content.py`, `sim.py`, `sublow.py`, `serve.py` --
+   the apply chain reloads the three consumer modules and refreshes serve's
+   config-import block, so a config.py edit IS allowed, Phase 2,
+   2026-10-18).
 4. Review gate: the same three-judge JEV quorum the tank uses for
    consequential choices decides the proposal from its summary. A reject,
    or a review transport failure, fails closed.
@@ -1950,10 +1952,50 @@ window approvals.
 (`jev.ESCALATION_KIND_RISK`), which is itself inside the self-editable
 surface: the same review gates apply to it, and since the 2026-10-18
 surface audit, edits to `jev.py` additionally need the player's signature
-(Tier B). The v1 scope stops here --
-closing the surface gap that would allow topological reload of `config.py`
-is a Phase 2 improvement candidate, and the superset design lives in the
-selfedit.py docstring.
+(Tier B). The Phase 2 topological reload for `config.py` (reload
+config, then sublow, content, sim, then refresh serve's config-import
+names) is LIVE -- it runs only while the tank is dormant, between
+simulation ticks, since the engine tick is skipped entirely during
+dormancy. The superset design lives in the selfedit.py docstring.
+
+### BP-61 Governed policy knob edits
+
+One of the 107 operator-policy knobs is DATA, not code: the player and the
+agents share it, and changing it never needs a restart or a dormancy
+window.
+
+1. Scopes. `world/operator_policy.json` is the single source of truth.
+   The player edits it or the settings UI; agents read it through the
+   selfedit_read surface and change it only through the `policy_edit` tool.
+   Secrets stay in `.env`, never in the JSON.
+2. Keys. `config._OPERATOR_SCHEMA` owns every key's type and range; the
+   in-code defaults keep a fresh clone booting identical. Since Phase 3
+   (2026-10-18), all 24 former serve.py statics are policy keys, and the
+   loops that consume them read the live value every iteration, so a
+   rebind lands on the next sleep.
+3. Allowlist. `config.AGENT_EDITABLE_POLICY_KEYS` names the 19 keys an
+   agent may propose (tier/mine/memory/browse/peer-review cadences and
+   thresholds). The DB/log hygiene keys stay operator-only to keep the
+   audit trail's retention shape out of agent hands; the allowlist lives
+   in self-editable code, so the tank can widen it through the normal
+   pipeline.
+4. Review. One `policy_edit` call proposes one key, one value, one reason.
+   The same JEV quorum that reviews code splices judges the change
+   (approve / reject / escalate). Refuse, unknown key, out-of-range
+   value, non-editable key, or transport failure: nothing changes.
+5. Apply. On approve, a locked read-merge-write lands the validated value
+   in the JSON atomically (temp file + rename), then
+   `config.reload_policy_config()` re-applies every binding: serve, sim,
+   content, sublow rebind live. The write preserves `_notes` and any keys
+   the player added.
+6. Records. Every attempt is action-logged (`policy_edit`,
+   `policy_edit_rejected`, `policy_edit_review_failed`), the review runs
+   through the decision tape like every other JEV call, and the player
+   keeps final authority: reverting is editing the JSON back.
+
+**Why no window.** Code changes need quiescence because they re-import
+modules mid-tick. A policy value is a number the next loop iteration reads;
+the tick boundary is irrelevant and the change is one JSON write.
 
 ## 11. Player and operator processes
 
@@ -1966,6 +2008,7 @@ selfedit.py docstring.
 | Answer agent asks | Player inbox | Answer a blocked agent's question |
 | Rate delivered work | Player inbox | 1 to 5 stars and a comment on a card report |
 | Set policy | `world/*.json` | Edit plain writing, browse policy, research desk passes, watchlist |
+| Set operator policy | `world/operator_policy.json`, settings | Tune the 107 policy knobs, including every former serve.py static (cadences, thresholds, caps) |
 | Reload policy | `POST /api/policy/reload` | Reload operator policy without a restart |
 | Set budgets | `.env`, settings | Spend cap, high-tier cap, page budget, agent cap |
 | Switch models | Settings | JEV model and judge model |
@@ -2270,10 +2313,10 @@ rather than gate-integrity questions.
 | `SUBLOW_TIER_MAX_PRICE_USD` | `.env` | Hard cap |
 | `PAGE_REQUEST_MONTHLY_BUDGET` | `.env` | 1000 |
 | `LOG_RETENTION_DAYS` | `.env` | 7 |
-| `DB_BACKUP_INTERVAL_S` | `world/serve.py` | 3600 |
-| `DB_BACKUP_KEEP` | `world/serve.py` | 1 |
-| `MODEL_TIER_REFRESH_INTERVAL_S` | `world/serve.py` | 7200 |
-| `TIER_PRICE_WATCH_INTERVAL_S` | `world/serve.py` | 1800 |
+| `DB_BACKUP_INTERVAL_S` | `world/operator_policy.json` (`dbBackupIntervalS`) | 3600 |
+| `DB_BACKUP_KEEP` | `world/operator_policy.json` (`dbBackupKeep`) | 1 |
+| `MODEL_TIER_REFRESH_INTERVAL_S` | `world/operator_policy.json` (`modelTierRefreshIntervalS`) | 7200 |
+| `TIER_PRICE_WATCH_INTERVAL_S` | `world/operator_policy.json` (`tierPriceWatchIntervalS`) | 1800 |
 | `TIER_RECHECK_DRAIN_INTERVAL_S` | `world/serve.py` | 60 |
 | `SCRUM_MASTER_MIN_TEAM_SIZE` | `world/operator_policy.json` | 4 |
 | `MAX_TOTAL_AGENTS` | `world/sim.py` | 500 |
@@ -2300,7 +2343,8 @@ rather than gate-integrity questions.
 | `PLAIN_WRITING_BAN_LIST` | `world/plain_writing.json` | Anti-slop words |
 | `RESEARCH_DESK_PASSES` | `world/research_desk.json` | Three-pass questions |
 | `RESEARCH_WATCHLIST` | `world/watchlist.json` | Standing topics |
-| Operator policy knobs | `world/operator_policy.json` | Cadences, cooldowns, team rules, memory and device knobs |
+| Operator policy knobs | `world/operator_policy.json` | 107 knobs: cadences, cooldowns, team rules, memory and device knobs, and every former serve.py static (Phase 3, 2026-10-18) |
+| Agent policy edits | `policy_edit` tool | Agents tune the 19 agent-editable keys through a JEV-reviewed key/value change; effective immediately, no restart; the player reverts by editing the JSON |
 | `GRANTS_CONFIG` | `world/grants.json` | App and file grants; applies live on file change |
 | `DEVICE_API_KEY` | `.env` | Device check-in bearer; auto-generated on first boot if unset |
 | `--max-idle-minutes` | launch flag | Dormancy arm; 0 or unset disables |

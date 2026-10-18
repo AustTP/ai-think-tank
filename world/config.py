@@ -350,6 +350,40 @@ OPERATOR_POLICY_DEFAULT: dict = {
     'grantTtlMaxS': 86400,
     'grantTokensDefault': 600,
     'grantTokensMax': 4000,
+    # Ops hygiene (serve.py backup + prune loops; the loops sleep on the
+    # live module value, so a reload takes effect on the next iteration).
+    'dbBackupKeep': 1,
+    'dbBackupIntervalS': 3600,
+    'logRetentionDaysDefault': 7,
+    'logPruneIntervalS': 21600,
+    'logPruneMaxRows': 50000,
+    # Model-tier watch loops (serve.py: full re-pick, price watch,
+    # failed-tier recheck cooldown, tier-gate confidence floor).
+    'modelTierRefreshIntervalS': 7200,
+    'tierPriceWatchIntervalS': 1800,
+    'tierRecheckCooldownS': 900,
+    'tierGateMinConfidence': 0.55,
+    # Rule/success mining bounds (serve.py proposal lanes).
+    'failureMaxRecords': 200,
+    'successMaxRecords': 200,
+    'ruleProposalsMax': 50,
+    'successProposalsMax': 50,
+    'ruleMinRecurrence': 2,
+    'successMinRecurrence': 2,
+    # Memory maintenance (serve.py age decay/keep scan).
+    'memoryMaxAgeDays': 90,
+    'memoryDecayFactor': 0.2,
+    'memoryKeepCount': 20,
+    # Browse download cap and YouTube transcript caps (serve.py).
+    'maxDownloadBytes': 25 * 1024 * 1024,
+    'youtubeTranscriptMaxChars': 50000,
+    'youtubeTranscriptMaxSegments': 800,
+    # Agent-directory sync throttle (serve.py; env
+    # AGENT_DIR_SYNC_INTERVAL_S keeps precedence through the rebind).
+    'agentDirSyncIntervalS': 15.0,
+    # Peer-review gate depth (serve.py lookback and signal staleness).
+    'peerReviewMinLookbackS': 3600,
+    'peerReviewSignalStaleS': 21600,
 }
 
 # Per-key validation: (kind, min, max). A wrong-typed or out-of-range value
@@ -438,6 +472,30 @@ _OPERATOR_SCHEMA: dict = {
     'grantTtlMaxS': ('int', 1, 7 * 86400),
     'grantTokensDefault': ('int', 1, 100000),
     'grantTokensMax': ('int', 1, 1000000),
+    'dbBackupKeep': ('int', 1, 20),
+    'dbBackupIntervalS': ('int', 300, 86400),
+    'logRetentionDaysDefault': ('int', 1, 365),
+    'logPruneIntervalS': ('int', 600, 86400),
+    'logPruneMaxRows': ('int', 1000, 500000),
+    'modelTierRefreshIntervalS': ('int', 1800, 7 * 86400),
+    'tierPriceWatchIntervalS': ('int', 300, 86400),
+    'tierRecheckCooldownS': ('int', 60, 86400),
+    'tierGateMinConfidence': ('float', 0.0, 1.0),
+    'failureMaxRecords': ('int', 10, 5000),
+    'successMaxRecords': ('int', 10, 5000),
+    'ruleProposalsMax': ('int', 1, 500),
+    'successProposalsMax': ('int', 1, 500),
+    'ruleMinRecurrence': ('int', 2, 100),
+    'successMinRecurrence': ('int', 2, 100),
+    'memoryMaxAgeDays': ('int', 1, 3650),
+    'memoryDecayFactor': ('float', 0.0, 1.0),
+    'memoryKeepCount': ('int', 1, 1000),
+    'maxDownloadBytes': ('int', 1048576, 1073741824),
+    'youtubeTranscriptMaxChars': ('int', 1000, 1000000),
+    'youtubeTranscriptMaxSegments': ('int', 10, 100000),
+    'agentDirSyncIntervalS': ('float', 1.0, 3600.0),
+    'peerReviewMinLookbackS': ('int', 300, 86400),
+    'peerReviewSignalStaleS': ('int', 300, 7 * 86400),
 }
 
 # --- Teamwork agreements -----------------------------------------------------
@@ -475,6 +533,26 @@ TEAM_CEILING_KEYS: frozenset = frozenset({
     'backlogPullsPerClose', 'moraleApprovedCap', 'moraleNeglectCap',
     'maxReviewCycles', 'coachingMaxRounds', 'workerHelpAfterFails',
     'teamVelocityMax', 'workItemStallCeiling',
+})
+
+# Agent-editable operator-policy keys (surface audit follow-up, 2026-10-18).
+# The governed policy_edit tool may write ONLY these keys into
+# operator_policy.json, and only after a JEV quorum review of each change.
+# Everything else stays operator-only. Seeded with the Phase 3 migrated
+# serve knobs the tank could plausibly tune itself; the DB/log hygiene keys
+# stay player-only on purpose (they protect the audit trail's retention
+# shape). The player keeps final authority either way: the JSON itself and
+# POST /api/policy/reload are untouched, so any agent change can simply be
+# reverted by editing the file.
+AGENT_EDITABLE_POLICY_KEYS: frozenset = frozenset({
+    'modelTierRefreshIntervalS', 'tierPriceWatchIntervalS',
+    'tierRecheckCooldownS', 'tierGateMinConfidence',
+    'failureMaxRecords', 'successMaxRecords', 'ruleProposalsMax',
+    'successProposalsMax', 'ruleMinRecurrence', 'successMinRecurrence',
+    'memoryMaxAgeDays', 'memoryDecayFactor', 'memoryKeepCount',
+    'maxDownloadBytes', 'youtubeTranscriptMaxChars',
+    'youtubeTranscriptMaxSegments', 'agentDirSyncIntervalS',
+    'peerReviewMinLookbackS', 'peerReviewSignalStaleS',
 })
 
 # Loaded values (module-level dict, MUTATED IN PLACE by reload so consumers

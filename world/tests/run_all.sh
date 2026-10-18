@@ -247,6 +247,15 @@ python3 tests/test_imessage_fetch.py
 echo "== Python: training interaction export -- review + dataset export =="
 python3 tests/test_export_training_interactions.py
 
+echo "== Python: operator policy loaders (config.py) =="
+python3 tests/test_config.py
+echo
+echo "== Python: self-edit pipeline (proposal/change windows/remediation) =="
+python3 tests/test_selfedit.py
+echo
+echo "== Python: governed policy_edit tool (Phase 3 externalized serve knobs) =="
+python3 tests/test_policy_edit.py
+echo
 echo "== Python: sandbox browser_act driver (fake playwright) =="
 python3 tests/test_browser_driver.py
 
