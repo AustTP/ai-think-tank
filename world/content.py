@@ -1605,6 +1605,14 @@ def _quality_pipeline_failure_snippet(step_name, stdout, stderr):
     return '\n'.join(lines[-8:]) if lines else '(no output)'
 
 
+# Client ceiling for the whole /api/pipeline call. The server runs up to 6
+# steps (flake8/mypy/bandit/pytest-cov/node-syntax/node-tests), each with its
+# own SANDBOX_TIMEOUT_S (serve.py) -- 6 x 30s of legitimate server-side work
+# -- while _http_json's default is 30s for the WHOLE call, so real pipelines
+# died as "request failed: timed out" rejections (329 in one 24h window).
+_QUALITY_PIPELINE_TIMEOUT_S = 300
+
+
 def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose, scope_files=None):
     """Run the standard quality pipeline in the sandbox via /api/pipeline, which
     stops at the first failing step and returns per-step {name, exitCode, stdout,
@@ -1614,9 +1622,17 @@ def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose, scope_files=
     _quality_pipeline_steps)."""
     resp = _serve._http_json('POST', base, '/api/pipeline',
                       {'agentId': agent_id, 'sandboxId': sandbox_id,
-                       'purpose': purpose, 'steps': _quality_pipeline_steps(scope_files)}, key)
+                       'purpose': purpose, 'steps': _quality_pipeline_steps(scope_files)}, key,
+                      timeout=_QUALITY_PIPELINE_TIMEOUT_S)
     if not isinstance(resp, dict) or resp.get('error'):
+        # A client-side timeout is infrastructure -- the sandbox pipeline is
+        # still grinding server-side and there is nothing in the agent's code
+        # to fix -- so it rides the same `infra` channel as the flake8
+        # _import_plugins crash: no coaching note, no grade penalty, infra
+        # wording on the send-back instead of "failed the quality pipeline".
+        _err = str(resp.get('error') or '') if isinstance(resp, dict) else ''
         return {'ok': False, 'failedStep': None, 'results': [],
+                'infra': 'timed out' in _err,
                 'note': f'quality pipeline did not run: {resp.get("error") if isinstance(resp, dict) else "no response"}'}
     results = resp.get('results') or []
     failed = resp.get('failedStep')

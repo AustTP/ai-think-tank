@@ -257,9 +257,10 @@ class RunQualityPipeline(unittest.TestCase):
     def _run(self, pipeline_response):
         called = {}
 
-        def fake_http(method, base, path, body=None, header=None):
+        def fake_http(method, base, path, body=None, header=None, timeout=None):
             if path == '/api/pipeline':
                 called['body'] = body
+                called['timeout'] = timeout
                 return pipeline_response
             return {'error': f'unexpected {method} {path}'}
 
@@ -276,6 +277,10 @@ class RunQualityPipeline(unittest.TestCase):
         self.assertIn('all green', result['note'])
         # The steps are the standard quality pipeline, run via /api/pipeline.
         self.assertEqual([s['name'] for s in called['body']['steps']], _step_names())
+        # The client ceiling must exceed the server's legitimate budget:
+        # up to 6 steps x SANDBOX_TIMEOUT_S(30) of sandbox work per call.
+        self.assertEqual(called['timeout'], content._QUALITY_PIPELINE_TIMEOUT_S)
+        self.assertGreater(called['timeout'], 6 * serve.SANDBOX_TIMEOUT_S)
 
     def test_scoped_pipeline_scopes_flake8_mypy_bandit_to_touched_files(self):
         # A README-only or single-file change must not fail on pre-existing
@@ -350,6 +355,30 @@ class RunQualityPipeline(unittest.TestCase):
         self.assertEqual(result['failedStep'], 'flake8')
         self.assertTrue(result['infra'],
                         'flake8 _import_plugins crash must be tagged infra=True')
+
+    def test_pipeline_timeout_tagged_infra(self):
+        # The sandbox pipeline keeps grinding server-side after the client
+        # gives up; a client timeout is infrastructure, not a finding in the
+        # agent's code. It must ride the `infra` channel (no coaching note,
+        # no grade penalty, infra wording on the send-back) the same way the
+        # flake8 _import_plugins crash does -- otherwise a slow pytest-cov
+        # run burns a review cycle and spawns a pointless Fix: child
+        # (measured: 329 timeout rejections in one 24h window, 85 tasks).
+        resp = {'error': 'request failed: timed out'}
+        result, _ = self._run(resp)
+        self.assertFalse(result['ok'])
+        self.assertIsNone(result['failedStep'])
+        self.assertTrue(result['infra'], 'client timeout must be tagged infra=True')
+        self.assertIn('did not run', result['note'])
+
+    def test_pipeline_non_timeout_error_not_infra(self):
+        # Other transport errors keep the plain rejection shape (infra=False)
+        # so a genuinely broken pipeline endpoint still surfaces as a normal
+        # failure rather than being excused as infrastructure.
+        resp = {'error': 'HTTP 500: Internal Server Error'}
+        result, _ = self._run(resp)
+        self.assertFalse(result['ok'])
+        self.assertFalse(result.get('infra'))
 
     def test_bandit_failure_includes_issue_and_location_not_just_summary(self):
         # The old tail-4-lines extractor returned bandit's severity summary
@@ -453,7 +482,7 @@ class CodingExecutorQualityGate(unittest.TestCase):
             'sandboxId': 'x', 'failedStep': None,
             'results': [{'name': n, 'exitCode': 0} for n in _step_names()]}
 
-        def fake(method, base, path, body=None, header=None):
+        def fake(method, base, path, body=None, header=None, timeout=None):
             self.http_log.append((method, path))
             if path == '/api/chat':
                 return {'reply': "cat > app.py << 'EOF'\nx = 1\nEOF"}

@@ -4295,7 +4295,7 @@ class ResearchContentExecutor(unittest.TestCase):
         # Returns a mapped fake for serve._http_json.
         pages = list(browse_pages)  # [{url, text, links:[...], lastModified}]
 
-        def fake(method, base, path, body=None, header=None):
+        def fake(method, base, path, body=None, header=None, timeout=None):
             self.http_log.append((method, path))
             if path == '/api/browse':
                 p = pages.pop(0) if pages else None
@@ -4423,7 +4423,7 @@ class RemainingExecutors(unittest.TestCase):
         feeds_content = kw.get('feeds_content')
         pipeline_ok = kw.get('pipeline_ok', True)
 
-        def fake(method, base, path, body=None, header=None):
+        def fake(method, base, path, body=None, header=None, timeout=None):
             self.http_log.append((method, path))
             # library file reads carry ?path= in the query string (urllib puts it
             # in the URL, not the body); parse it for GETs and strip the query so
@@ -4671,7 +4671,7 @@ class PressOfficeContentExecutors(unittest.TestCase):
         route is routed by the request body's command/path."""
         chat_chain = list(chat_chain) if chat_chain else []
 
-        def fake(method, base, path, body=None, header=None):
+        def fake(method, base, path, body=None, header=None, timeout=None):
             self.http_log.append((method, path))
             # library file reads carry ?path= in the query string.
             if path.startswith('/api/library/file') and '?' in path:
