@@ -2279,6 +2279,12 @@ def _apply_content_result(state, task, result, now_ms=None):
                 elif reviewer and reviewer not in gate['approvers']:
                     gate['approvers'].append(reviewer)
                     gate['approvals'] += 1
+    # BP-31 close probe: an incident card is judged here, inside the tick's
+    # single read-modify-write, before the completion flow closes it -- a
+    # bare "fixed it" (no landed files, no verification note) closes loud
+    # instead of silent. Stories/reviews/spikes never touch this path.
+    if task.get('taskType') == 'bug':
+        _verify_incident_restore(state, task, result, now_ms)
 
 
 def _take_content_result(task_id):
@@ -9077,6 +9083,63 @@ def _mail_card_update(state, to_id, kind, key, title, team_name, extra=''):
     return True
 
 
+def _register_card_appeal(state, reporter_id, issue_key, reply_text, now_ms=None,
+                          via_sm=None):
+    """BP-62 appeal path: the reporter of a DECLINED card replied in mail with
+    new information, and the reply re-surfaces the card exactly once. The
+    rejected backlogRequest goes back to 'pending' carrying the reply snippet,
+    so the very next refinement ceremony for the owning team reconsiders it in
+    the open instead of past the reporter's head.
+
+    Guards: the replier must be the card's own reporter (a bystander citing
+    the issue key never triggers an appeal), the request must be currently
+    'rejected' (a pending/accepted card needs no appeal), and each card gets
+    ONE appeal -- a second reply after a second decline ends the conversation
+    through the standing process (file a follow-up with sharper scope), keeping
+    the ceremony from being revived indefinitely.
+
+    Pure: mutates the request record and appends the SM's mailbox note.
+    Returns True when an appeal landed, else False."""
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    key = (issue_key or '').strip()
+    if not key or reporter_id == 'player' or not reporter_id:
+        return False
+    req = next((r for r in (state.get('backlogRequests') or [])
+                if r.get('issueKey') == key and r.get('status') == 'rejected'),
+               None)
+    if not isinstance(req, dict) or req.get('appealedAt'):
+        return False
+    if req.get('filedBy') != reporter_id:
+        return False
+    issue = (state.get('issues') or {}).get(key)
+    if not issue:
+        return False
+    team = _team_row(state, req.get('teamId'))
+    sm_id = (team or {}).get('scrumMasterId')
+    if not sm_id or (via_sm is not None and via_sm != sm_id):
+        return False
+    sm = (state.get('agents') or {}).get(sm_id)
+    if not sm:
+        return False
+    snippet = ((reply_text or '').strip())[:300] or '(the reply carried no text)'
+    req['status'] = 'pending'
+    req['appealedAt'] = now_ms
+    req['appeal'] = snippet
+    reporter = next((d for d in (state.get('agentRoster') or [])
+                     if isinstance(d, dict) and d.get('id') == reporter_id), {}) or {}
+    _append_mailbox(sm, {
+        'kind': 'issue_appeal', 'about': key,
+        'title': f'Appeal: {issue.get("title") or key}',
+        'text': (f'{reporter.get("name") or reporter_id} appealed the earlier decline '
+                 f'of card {key}: "{snippet}" -- it re-enters your NEXT refinement '
+                 f'ceremony. One appeal per card: after a second decline, the reply '
+                 'path is filed follow-ups with sharper scope.'),
+    })
+    _log_governance(state, sm_id, 'issue_appeal_registered',
+                    {'issue': key, 'reporter': reporter_id})
+    return True
+
+
 def _upsert_rejection_mailbox(agent, entry):
     """File a rejection/sent-back notice, but DEDUP: if an unread entry with
     the same kind and the same `about` (task id) already exists, update its
@@ -10153,6 +10216,14 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
         ctx = _refinement_context_for_room(state, req.get('room'))
         if ctx:
             instructions += f" Roadmap context for this room: {ctx}."
+        # A reporter appeal rides the record: the reply text is the exact new
+        # information the card came back with, so the ceremony judges it in
+        # the open instead of past the requester.
+        if req.get('appeal'):
+            instructions += (f" APPEAL: the reporter appealed this card's earlier decline "
+                             f'with this new information: "{req["appeal"]}" '
+                             f'(one appeal per card — a second decline closes the '
+                             f'reply path).')
         # The scrum master's own read-back of this request,
         # written down before the judgment: what they understood
         # of it, and whether it looks ready to card or needs
@@ -11297,6 +11368,74 @@ def _escalate_coaching_loop(state, agent_id, room, grade, now_ms, title):
                      'grade': grade, 'routed': routed})
 
 
+VERIFY_EVIDENCE_MAX_FILES = 4
+
+
+def _verify_incident_restore(state, task, result, now_ms):
+    """BP-31 close probe: an incident (bug task) may not close on a bare
+    "fixed it". Deterministic evidence check, no model involved: the coding
+    executor's `writtenPy` (the files the fix actually landed in), an
+    executor-supplied `restoreCheck` note, or a Library artifact count as
+    restore evidence; an ok-completion with NONE of those is closed loud --
+    `restoreVerified` False on the task, a feedback note to the on-call saying
+    exactly what was missing, an escalation to the owning team's scrum master
+    (the same bounded pipeline an abandoned incident rides), and a plain
+    `restoreVerified` mark in the product runbook entry so the astronaut-grade
+    lesson ("we fixed it" / but nothing changed) never reads as a verified
+    restore. Called from _apply_content_result, which runs once per completed
+    content pass, in the tick's single read-modify-write. Pure state
+    mutation."""
+    if not task or task.get('taskType') != 'bug' or task.get('restoreCheck'):
+        return
+    if not isinstance(result, dict) or not result.get('ok'):
+        return
+    files = result.get('writtenPy') or []
+    check_note = (result.get('restoreCheck') or '').strip()
+    artifact = bool(result.get('libraryPath'))
+    verified = bool(files) or bool(check_note) or artifact
+    receipt = {
+        'ok': verified,
+        'ts': now_ms,
+        # Name the actual evidence: the landed files win (the strongest, most
+        # mechanical kind), then the executor's own verification note, then a
+        # Library artifact; 'none' is the loud empty that triggers the rest.
+        'evidence': (', '.join([str(f) for f in files[:VERIFY_EVIDENCE_MAX_FILES]])[:240]
+                     if files
+                     else (check_note[:240] if check_note
+                           else ('library: ' + str(result.get('libraryPath'))[:200]
+                                 if artifact else 'none'))),
+    }
+    task['restoreCheck'] = receipt
+    task['restoreVerified'] = verified
+    aid = task.get('assignedTo')
+    title = task.get('title') or 'incident'
+    if not verified:
+        if aid:
+            _append_feedback(state, aid, (
+                f'Your fix for "{title}" closed WITHOUT restore evidence: no files '
+                f'were written (writtenPy empty), no restore check was attached, '
+                f'and no Library artifact was recorded. If the restore was real, '
+                f'say how you verified it when you file your next card.'),
+                             source='incident_restore')
+        _oncall_restore_escalate(state, task, title, now_ms)
+
+
+def _oncall_restore_escalate(state, task, title, now_ms):
+    """Route an evidence-free incident close to the owning team's scrum master
+    via the existing bounded escalation pipeline (dedup + per-team cap):
+    'restore_unverified' is the new source tag, so the SM ceremony can weigh a
+    no-activity card exactly like an unrestored one instead of it dying
+    silently. Mirrors _on_work_item_abandoned's guard set."""
+    product_id = task.get('productId')
+    if not product_id:
+        return
+    director_id = _product_director(state, product_id)
+    if not director_id:
+        return
+    _escalate_oncall_failure(state, product_id, director_id, title,
+                             'restore_unverified', now_ms)
+
+
 def _runbook_task(state, task, now_ms):
     """Fire-and-forget runbook writer for a completed INCIDENT (bug): one line
     captured for the owning product so future handlers learn, not re-discover."""
@@ -11317,7 +11456,14 @@ def _runbook_task(state, task, now_ms):
     # Hermes Town lesson: mark a fallback template line as such --
     # a reader shouldn't mistake a generic "X -- fixed by Y" filler for a real,
     # model-written account of what actually broke and how.
-    rb.append({'ts': now_ms, 'room': task.get('room'), 'summary': summary, 'summaryIsReal': summary_is_real})
+    receipt = task.get('restoreCheck') or {}
+    rb.append({'ts': now_ms, 'room': task.get('room'), 'summary': summary,
+               'summaryIsReal': summary_is_real,
+               # BP-31 close probe: None (no completion run), True, or False --
+               # never a fake check.
+               'restoreVerified': receipt.get('ok')
+               if task.get('restoreCheck') else None,
+               'evidence': receipt.get('evidence')})
     if len(rb) > RUNBOOK_MAX_ENTRIES_PER_PRODUCT:
         del rb[:-RUNBOOK_MAX_ENTRIES_PER_PRODUCT]
 

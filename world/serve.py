@@ -14045,6 +14045,19 @@ async def api_mail_send(request: Request):
     entry = {'text': f'{from_name}: {text}', 'read': False,
              'ts': int(time.time() * 1000)}
     _sim._append_mailbox(target, entry)
+    # BP-62 appeal path: an agent reporter replying about a declined card may
+    # re-surface it once. The reply text names the issue key (our decline mail
+    # carries it), so an agent-to-SM reply on a declined card registers the
+    # appeal -- the card re-enters that team's next refinement ceremony with
+    # the reply attached. Bystanders citing the key, replies to anyone else,
+    # and player mail are ignored (players re-file cards; the appeal guard
+    # lives in _register_card_appeal). Best-effort: a malformed reply must
+    # never fail the mail delivery itself.
+    if from_id and from_id != 'player' and from_id != to_id and isinstance(text, str):
+        try:
+            _maybe_register_card_appeal(state, from_id, text, to_id)
+        except Exception:  # noqa: BLE001 -- mail must land even if appeals misbehave
+            pass
     # Admin messages surface: the admin never runs content tasks, so a mailbox
     # note alone would sit unread forever (verified against the action log --
     # the admin's only model context is governance ceremonies, which never
@@ -14081,6 +14094,20 @@ async def api_mail_send(request: Request):
     log_action(from_id if from_id != 'player' else None, 'mail_sent',
                {'to': to_id, 'text': text}, authorized=True)
     return JSONResponse({'ok': True, 'mail': entry})
+
+
+_CARD_KEY_RE = re.compile(r'[A-Z][A-Z0-9]{1,3}-\d+')
+
+
+def _maybe_register_card_appeal(state, from_id, text, to_id):
+    """BP-62: find which issue keys an agent's reply names and register an
+    appeal for each one the sender actually owns and that is currently
+    declined and addressed to the owning team's scrum master. Capped per
+    reply; pure state mutation via the sim helper."""
+    import sim as _sim_module
+    keys = list(dict.fromkeys(_CARD_KEY_RE.findall(text or '')))[:5]
+    for key in keys:
+        _sim_module._register_card_appeal(state, from_id, key, text, via_sm=to_id)
 
 
 @app.post('/api/mail/read')

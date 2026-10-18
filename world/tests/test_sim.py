@@ -1847,5 +1847,159 @@ class IssueDuplicateStamp(unittest.TestCase):
         self.assertIsNone(refill['duplicateOf'])
 
 
+class CardAppealMailReply(unittest.TestCase):
+    """BP-62 appeal path: the reporter of a declined card can reply in mail
+    with new information; the reply re-surfaces the card exactly once into the
+    owning team's next refinement ceremony. Only the reporter, only a truly
+    rejected card, addressed to the owning team's scrum master; a bystander
+    citing the key, a second reply, or a pending/accepted card never
+    triggers one."""
+
+    def _state(self, req_status='rejected'):
+        return {
+            'agentRoster': [{'id': 'rep', 'name': 'Repa', 'role': 'Research'},
+                            {'id': 'ada', 'name': 'Ada', 'role': 'SM'},
+                            {'id': 'xi', 'name': 'Xi', 'role': 'Worker'}],
+            'agents': {
+                'rep': {'id': 'rep', 'inRoom': 'pressoffice', 'offDuty': False},
+                'ada': {'id': 'ada', 'inRoom': 'command', 'offDuty': False},
+                'xi': {'id': 'xi', 'inRoom': 'observatory', 'offDuty': False},
+            },
+            'teams': [{'id': 't1', 'name': 'Fixers', 'directorId': 'faye',
+                       'scrumMasterId': 'ada'},
+                      {'id': 't2', 'name': 'Builders', 'directorId': 'bo',
+                       'scrumMasterId': 'sm2'}],
+            'issues': {'T1-1': {'key': 'T1-1', 'teamId': 't1',
+                                'title': 'Add dark mode', 'status': 'open'}},
+            'issueCounters': {},
+            'backlogRequests': [{'id': 'iss-T1-1', 'issueKey': 'T1-1',
+                                 'status': req_status, 'filedBy': 'rep',
+                                 'teamId': 't1', 'title': 'Add dark mode'}],
+        }
+
+    def test_reporter_reply_resurfaces_the_card_once(self):
+        state = self._state()
+        self.assertTrue(sim._register_card_appeal(
+            state, 'rep', 'T1-1', 'I checked again: it also breaks on Safari, not just on mobile.'))
+        req = state['backlogRequests'][0]
+        self.assertEqual(req['status'], 'pending')
+        self.assertTrue(req['appealedAt'])
+        self.assertIn('Safari', req['appeal'])
+        mail = state['agents']['ada']['mailbox'][0]
+        self.assertEqual(mail['kind'], 'issue_appeal')
+        self.assertEqual(mail['about'], 'T1-1')
+        self.assertIn('Safari', mail['text'])
+        self.assertFalse(state['agents']['xi'].get('mailbox'))
+
+    def test_bystander_and_second_and_nondeclined_are_refused(self):
+        state = self._state()
+        self.assertFalse(sim._register_card_appeal(state, 'xi', 'T1-1', 'me too'))
+        self.assertTrue(sim._register_card_appeal(state, 'rep', 'T1-1', 'new info'))
+        self.assertFalse(sim._register_card_appeal(state, 'rep', 'T1-1', 'again'))
+        fresh = self._state(req_status='pending')
+        self.assertFalse(sim._register_card_appeal(fresh, 'rep', 'T1-1', 'nope'))
+        # An appeal only lands when the reply is addressed to the OWNING
+        # team's scrum master -- a reply to anyone else stays quiet.
+        wrong_sm = self._state(req_status='rejected')
+        self.assertFalse(sim._register_card_appeal(wrong_sm, 'rep', 'T1-1', 'x', via_sm='sm2'))
+
+    def test_unknown_issue_key_is_refused(self):
+        state = self._state()
+        self.assertFalse(sim._register_card_appeal(state, 'rep', 'T1-99', 'hi'))
+
+    def test_serve_replies_find_the_named_card_key(self):
+        state = self._state()
+        serve._maybe_register_card_appeal(
+            state, 'rep', 'Re T1-1: it also breaks on Safari, and my other card T2-99 too.',
+            'ada')
+        req = state['backlogRequests'][0]
+        self.assertEqual(req['status'], 'pending')
+        self.assertIn('Safari', req['appeal'])
+
+
+class IncidentRestoreProbe(unittest.TestCase):
+    """BP-31 close probe: a bug task closing on a bare 'fixed it' (ok result,
+    zero evidence) is loud, not silent -- restoreVerified False on the task,
+    a feedback note to the on-call, and an escalation to the owning team's
+    scrum master. Real fix evidence (writtenPy, an executor restore check, a
+    Library artifact) closes verified; stories and failed results never probe."""
+
+    def _state(self):
+        return {
+            'agents': {'rep': {'id': 'rep', 'inRoom': 'pressoffice', 'offDuty': False}},
+            'agentRoster': [{'id': 'rep', 'name': 'Repa', 'role': 'Research'}],
+            'teams': [{'id': 't1', 'name': 'Fixers', 'directorId': 'faye',
+                       'scrumMasterId': 'ada'}],
+            'products': {'p1': {'id': 'p1', 'teamId': 'faye'}},
+            'tasks': {},
+        }
+
+    def _bug(self, task_type='bug', product='p1'):
+        return {'id': 'k1', 'taskType': task_type, 'title': 'Login loop',
+                'assignedTo': 'rep', 'productId': product, 'room': 'pressoffice'}
+
+    def test_landed_files_close_verified(self):
+        state = self._state()
+        task = self._bug()
+        result = {'ok': True, 'writtenPy': ['app.py', 'screens.py']}
+        sim._apply_content_result(state, task, result, 1000)
+        self.assertTrue(task['restoreVerified'])
+        self.assertEqual(task['restoreCheck']['evidence'], 'app.py, screens.py')
+        self.assertFalse(state['agents']['rep'].get('feedback'))
+
+    def test_bare_fixed_it_closes_loud(self):
+        state = self._state()
+        task = self._bug()
+        sim._apply_content_result(state, task, {'ok': True, 'note': 'tweaked it'}, 1000)
+        self.assertFalse(task['restoreVerified'])
+        self.assertEqual(task['restoreCheck']['evidence'], 'none')
+        self.assertEqual(state['_pendingEscalation']['source'], 'restore_unverified')
+        feedback = ' '.join(f.get('text', '')
+                            for f in (state.get('_feedback') or {}).get('rep', []))
+        self.assertIn('restore evidence', feedback)
+
+    def test_executor_check_and_library_count_as_evidence(self):
+        state = self._state()
+        task = self._bug()
+        sim._apply_content_result(state, task,
+                                  {'ok': True, 'restoreCheck': 'reloaded the page, error gone'}, 1000)
+        self.assertTrue(task['restoreVerified'])
+        self.assertIn('error gone', task['restoreCheck']['evidence'])
+        task2 = self._bug()
+        sim._apply_content_result(state, task2,
+                                  {'ok': True, 'libraryPath': 'library/notes/fix.md'}, 1000)
+        self.assertTrue(task2['restoreVerified'])
+
+    def test_stories_failed_results_and_no_product_do_not_probe(self):
+        state = self._state()
+        story = self._bug(task_type='story')
+        sim._apply_content_result(state, story, {'ok': True, 'note': 'shipped'}, 1000)
+        self.assertNotIn('restoreVerified', story)
+        bug = self._bug()
+        sim._apply_content_result(state, bug, {'ok': False, 'note': 'no model tier'}, 1000)
+        self.assertNotIn('restoreVerified', bug)
+        self.assertIsNone(state.get('_pendingEscalation'))
+        orphan = self._bug(product=None)
+        orphan['productId'] = None
+        sim._apply_content_result(state, orphan, {'ok': True}, 1000)
+        # Evidence check still runs (recorded), but there is no owning team to
+        # escalate to -- and no escalation must be filed for a bare claim.
+        self.assertFalse(orphan['restoreVerified'])
+        self.assertIsNone(state.get('_pendingEscalation'))
+
+    def test_runbook_records_the_probe_verdict(self):
+        state = self._state()
+        task = self._bug()
+        task['restoreVerified'] = False
+        task['restoreCheck'] = {'ok': False, 'evidence': 'none', 'ts': 1000}
+        sim._runbook_task(state, task, 1000)
+        entry = state['runbooks']['p1'][-1]
+        self.assertFalse(entry['restoreVerified'])
+        self.assertEqual(entry['evidence'], 'none')
+        fresh = self._bug()
+        sim._runbook_task(state, fresh, 1000)
+        self.assertIsNone(state['runbooks']['p1'][-1]['restoreVerified'])
+
+
 if __name__ == '__main__':
     unittest.main()

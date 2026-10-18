@@ -971,17 +971,25 @@ intent endpoint.
    bugs.
 3. The bug is assigned to the on-call.
 4. The team restores service.
-5. An open incident past the restore window escalates to the product team's
+5. Before the card is counted closed, the restore must carry evidence: files
+   the fix landed in (`writtenPy`), an executor-supplied restore check, or a
+   Library artifact. A bare "fixed it" with none of those closes loud --
+   marked unverified, the on-call is told what was missing, and the
+   owning team's scrum master gets the same bounded escalation an abandoned
+   incident rides.
+6. An open incident past the restore window escalates to the product team's
    scrum master.
-6. Bugs are not peer-gated. They complete directly.
+7. Bugs are not peer-gated. They complete directly.
 
 **Controls.** Product resolution, on-call rotation, duplicate check, restore
-window, escalation.
+window, escalation, restore-evidence close probe.
 
-**Records.** Issue or task, on-call state, escalation record, action log.
+**Records.** Issue or task, on-call state, escalation record, restore receipt
+(on the task and as `restoreVerified` + `evidence` on the runbook entry),
+action log.
 
-**Review note.** Incident fixes skip the peer gate by design. Confirm whether a
-restored incident should require a post-fix review before closure.
+**Review note.** Incidents skip the peer gate; the close probe (step 5)
+answers the verification gap mechanically at close time.
 
 ### BP-32 Page probes, screenshots, and browser act
 
@@ -2031,13 +2039,22 @@ finishes.
    cycle. Same-status transitions mail nothing. Self-filed cards stay
    quiet for the scrum master, and player reporters are skipped -- the
    player-facing surfaces carry the same information.
+6. Reply path (one appeal per card). When the REPORTER replies in mail to
+   the owning team's scrum master and the reply names the declined card, the
+   card re-enters the next refinement ceremony carrying the reply as new
+   information. Guards: bystanders citing the key, replies addressed to
+   anyone else, player reporters, and already-pending or accepted cards
+   never trigger one; after a second decline the reply path is the standing
+   "file a follow-up with sharper scope" one.
 
 **Controls.** Fail-closed delivery (an unknown reporter id is a no-op),
-no wake, quiet self-mail, retention by the shared mailbox trim.
+no wake, quiet self-mail, retention by the shared mailbox trim, single
+appeal per card, reporter-only, SM-addressed.
 
 **Records.** Mailbox kinds `request_carded`, `request_declined`,
-`issue_started`, `issue_done`, `issue_closed`; issues and backlogRequests
-status fields stay the queryable source of truth.
+`issue_started`, `issue_done`, `issue_closed`, `issue_appeal`; issues and
+backlogRequests status fields stay the queryable source of truth, with the
+appeal stamped on the request record (`appealedAt`, `appeal`).
 
 ### BP-63 Speed tie-break in tier picks
 
