@@ -18,7 +18,7 @@ Scope: the operating processes of the AI think tank as implemented in this repos
 - 7. Knowledge and evidence (BP-34 to BP-41)
 - 8. Money and resources (BP-42 to BP-46)
 - 9. Security, risk, and human oversight (BP-47 to BP-56)
-- 10. Communication and lifecycle (BP-57 to BP-59)
+- 10. Communication and lifecycle (BP-57 to BP-60)
 - 11. Player and operator processes
 - 12. Control framework
 - 13. State and record model
@@ -249,6 +249,7 @@ Owner request
 | BP-57 | Player feedback | Owner rates a report | On demand | Owner, sim | Rating, agent feedback |
 | BP-58 | Peer help signals | Peer help-signal pass | 90s | Serve, director | Help signal to a director |
 | BP-59 | Dormancy and wake | Idle with the flag armed | 30s poll | Serve | Dormant flag, wake on request |
+| BP-60 | Code self-edits and dormancy windows | Armed edit or agent window request | Per edit or window | JEV, player | Armed edit, applied module, scheduled window |
 
 ## 4. Core delivery processes
 
@@ -1806,6 +1807,101 @@ telemetry sets before the method test, so a check-in lands while the tank
 sleeps and does not wake it. That matches the endpoint's contract: pure
 telemetry never produces work (BP-33).
 
+### BP-60 Code self-edits and dormancy windows
+
+**Purpose.** Give the think tank a governed path to improve its OWN code:
+propose a precise splice, pass independent review and sandboxed validation,
+and land it only while the tank is asleep, through an operator-approved
+change request for a scheduled sleep window.
+
+**Trigger.** An agent calls the `self_edit` tool (propose an edit) or
+`schedule_dormant_apply` (file a dormancy-window change request); the player
+reverts a landed edit or cancels a window; the idle watcher arms dormancy
+with `--max-idle-minutes`.
+
+**Steps.**
+
+1. Proposal contract (everything in `world/selfedit.py`, with its docstring
+   as the contract). The agent proposes a find/replace splice on one file
+   under `world/`. Protected names are refused outright: `serve.py` and
+   every `BUSINESS-PROCESSES.md` in the repo. No path escapes the
+   repository, and `config.py` is refused in v1 (see step 3).
+2. Mechanical checks come first: the result must compile, and the find text
+   must appear in the file exactly once. A rejected proposal never touches
+   the file tree.
+3. Binding scan: selfedit raises the module's top-level importers and
+   refuses a target imported by any consumer that is not on its tolerated
+   list (`jev` tolerates `serve.py` because serve re-reads jev's exports
+   after an apply). `config.py` is refused naturally by this scan in v1 --
+   content, sublow, and serve import it, and no topological reload exists
+   yet.
+4. Review gate: the same three-judge JEV quorum the tank uses for
+   consequential choices decides the proposal from its summary. A reject,
+   or a review transport failure, fails closed.
+5. Validator gate: a subprocess quarantine copies the tree and runs
+   compileall, flake8 on the changed file, and an import smoke of the
+   changed module. A broken candidate cannot reach this step's copy.
+6. A proposal that passes all gates is ARMED, not applied: the candidate
+   byte file and the original's digest are recorded under
+   `world/.selfedit_staging/`, and the row lands in the `self_edit_log`
+   table with status `armed`.
+7. Apply is DORMANT ONLY. One always-running serve loop
+   (`serve._dormancy_window_loop`) polls 30 seconds, and while the tank is
+   dormant it calls `selfedit.apply_pass`: it writes the candidate bytes,
+   records a backup under `world/.selfedit_backups/`, re-imports the
+   module, and marks the row `applied`. If the file drifted since arming,
+   the row becomes `conflict` and nothing is written. `jev.py` edits also
+   refresh all ten re-exported names in serve after the reload.
+8. The tank sleeps through TWO paths: operator idle (`--max-idle-minutes`,
+   BP-59), or an approved one-shot dormancy window (step 9). Both end with
+   the same wake rule: the next request flips the tank awake.
+
+**Dormancy windows (the change-request process).** An agent requests a
+one-shot slot -- a date, an `HH:MM` start at least 5 minutes ahead, and a
+duration of 5-240 minutes (default 15). The chain is strict:
+
+1. Conflict scan: the slot is refused with a LIST if any standing-task
+   schedule window covers a minute of it, or another pending, approved, or
+   fired dormancy window overlaps. The refusal names every colliding item,
+   so the agent can pick a different time.
+2. Supervisor pre-clearance: the server resolves the agent's supervisor
+   (`_supervisor_of`: roster director, else admin, else the player) and a
+   JEV quorum judges the request as the supervisor's call -- vague reasons,
+   prime-work-hours slots, or oversized durations are rejected.
+3. Player approval: the request escalates as a floor-1.0 'dormancy window
+   request' kind, which the director loop is barred from; the player's
+   email or telegram link is the final, mandatory signature. Approve
+   schedules the window; deny schedules nothing.
+4. When a window fires, the loop forces the tank dormant so EVERY armed
+   edit present applies inside it (each edit already passed its own review
+   and validator), and keeps it dormant to the end of the slot. A window
+   missed while the server was down is recorded `missed`. The player or
+   admin agent can cancel a window before it fires.
+
+**Revert.** Only the player session or the admin agent may revert an
+APPLIED edit: the pre-edit bytes are restored, the module is re-imported,
+and the row is marked `reverted`.
+
+**Controls.** Every gate fails closed; protected names are hard-refused
+with no carve-out; the anchor must be unique; the reviewer and validator
+each run on untrusted-free paths (quorum, subprocess on a copy); applies
+and window firing run only while dormant; both approval signatures are
+recorded in the action log; spans of idempotency (two loops never apply the
+same row twice).
+
+**Records.** `self_edit_log` and `dormancy_windows` tables,
+`world/.selfedit_staging/` candidates, `world/.selfedit_backups/` pre-edit
+bytes, decision-tape rows for every model call, action-log rows for
+propose/validate/apply/revert/request/resolve/cancel, escalations.json for
+window approvals.
+
+**Review note.** The floor-1.0 kind lives in `jev.Escalation floors`
+(`jev.ESCALATION_KIND_RISK`), which is itself inside the self-editable
+surface: the same review gates apply to it. The v1 scope stops here --
+closing the surface gap that would allow topological reload of `config.py`
+is a Phase 2 improvement candidate, and the superset design lives in the
+selfedit.py docstring.
+
 ## 11. Player and operator processes
 
 | Process | Surface | What the owner does |
@@ -2219,6 +2315,7 @@ rather than gate-integrity questions.
 | BP-57 | `serve` player feedback endpoint, `sim._append_feedback` |
 | BP-58 | `serve._peer_review_pass`, `_peer_review_tick` |
 | BP-59 | `serve._idle_shutdown_loop`, `no_store` wake, `_NON_WAKING_READS`, `_NON_WAKING_WRITES` |
+| BP-60 | `world/selfedit.py` (propose, apply_pass, request_window), `serve._dormancy_window_loop`, selfedit endpoints |
 
 ## 20. Appendix D: review checklist
 
