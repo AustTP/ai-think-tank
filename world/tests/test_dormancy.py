@@ -17,6 +17,7 @@ Invariants pinned here:
 """
 import os
 import sys
+import types
 import unittest
 from unittest import mock
 
@@ -78,6 +79,43 @@ class DormancyGatesSim(unittest.TestCase):
 
     def tearDown(self):
         serve._set_dormant(False)
+
+
+
+class WakeRules(unittest.TestCase):
+    """Which requests flip a dormant tank back awake.
+
+    The device check-in is a POST but is pure telemetry: it must land while
+    asleep and must NOT wake the tank (an automated Shortcut must never keep
+    the think tank awake). Everything else non-GET wakes. The device path
+    used to sit in _NON_WAKING_READS, but the non-GET check in _should_wake
+    ran first, so the entry was dead code for POSTs and every check-in woke
+    the tank -- contradicting the endpoint's own contract.
+    """
+
+    @staticmethod
+    def _req(method, path):
+        return types.SimpleNamespace(method=method,
+                                     url=types.SimpleNamespace(path=path))
+
+    def test_device_checkin_post_does_not_wake(self):
+        self.assertFalse(serve._should_wake(self._req('POST', '/api/device/checkin')))
+
+    def test_device_checkin_get_would_still_be_non_waking(self):
+        self.assertFalse(serve._should_wake(self._req('GET', '/api/device/checkin')))
+
+    def test_other_writes_wake(self):
+        self.assertTrue(serve._should_wake(self._req('POST', '/api/intent/story')))
+        self.assertTrue(serve._should_wake(self._req('POST', '/api/teams')))
+        self.assertTrue(serve._should_wake(self._req('DELETE', '/api/keys/session-token')))
+
+    def test_read_only_board_gets_do_not_wake(self):
+        for path in ('/api/state', '/api/health', '/api/activity/summary', '/'):
+            self.assertFalse(serve._should_wake(self._req('GET', path)))
+
+    def test_escalation_views_do_not_wake_but_resolve_does(self):
+        self.assertFalse(serve._should_wake(self._req('GET', '/api/escalation/pending')))
+        self.assertTrue(serve._should_wake(self._req('GET', '/api/escalation/resolve')))
 
 
 if __name__ == '__main__':

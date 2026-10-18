@@ -13184,7 +13184,8 @@ def get_tier_value_windows():
 # is reserved for anything that produces work, writes state, or is an explicit
 # player command (non-GET), plus /api/escalation/resolve -- a GET that MUTATES
 # (the player approving a pending escalation must wake the tank so the grant
-# actually lands and the egress proxy refreshes).
+# actually lands and the egress proxy refreshes). The one exception: pure
+# telemetry writes (device check-in) are exempted separately, below.
 _NON_WAKING_READS = {
     '/api/state', '/api/health', '/api/health/alerts', '/api/sim/status',
     '/api/sim/agents', '/api/activity', '/api/activity/summary', '/api/decisions',
@@ -13195,18 +13196,27 @@ _NON_WAKING_READS = {
     '/api/intent/sprints', '/api/intent/issues', '/api/intent/products',
     '/api/intent/wiki', '/api/passport/verify', '/api/player-inbox',
     '/api/pipelines', '/api/keys/credentials', '/api/sandbox-backups',
-    '/api/shadow', '/api/device/checkin', '/', '/index.html',
+    '/api/shadow', '/', '/index.html',
 }
+# Pure telemetry that may WRITE while dormant WITHOUT waking the tank. Kept
+# separate from the GET-only _NON_WAKING_READS and checked by _should_wake
+# BEFORE the method test: the device check-in is a POST, but a phone Shortcut
+# must never keep the think tank awake. Check-ins still land while asleep
+# (the endpoint itself is not gated on _dormant()).
+_NON_WAKING_WRITES = {'/api/device/checkin'}
 
 
 def _should_wake(request):
     """True when a request should flip a dormant tank back awake: any write
-    (non-GET) or any GET outside the read-only board/status/telemetry set."""
+    (non-GET) outside the telemetry set, or any GET outside the read-only
+    board/status/telemetry set."""
+    path = request.url.path
+    if path in _NON_WAKING_READS and request.method == 'GET':
+        return False
+    if path in _NON_WAKING_WRITES:
+        return False
     if request.method != 'GET':
         return True
-    path = request.url.path
-    if path in _NON_WAKING_READS:
-        return False
     if path.startswith('/api/escalation/') and path != '/api/escalation/resolve':
         return False
     return True

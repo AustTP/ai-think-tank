@@ -1017,8 +1017,9 @@ redesigned.
    appended to a bounded history. The cap is `deviceCheckinHistoryMax`
    (default 50, operator-settable 1 to 10,000) because the bucket lives in
    the hot state blob and must never grow unbounded.
-4. The endpoint is not gated by dormancy: a check-in is stored even while the
-   think tank is asleep. Being a POST, it also wakes the tank (see BP-59).
+4. The endpoint is not gated by dormancy, and it does not wake a dormant
+   tank either: it is pure telemetry, in the non-waking write set (BP-59). A
+   check-in lands while the tank sleeps and the tank stays asleep.
 5. An action log row records the check-in trigger and whether a location was
    present. No consumer reads the history yet. The ingestion pipe is all
    that exists today.
@@ -1784,10 +1785,12 @@ flag arms the mechanism. The default is 0, which leaves dormancy off.
    loop.
 5. Any non-GET request wakes the tank in the middleware, before the handler
    runs, so the request lands on an already-warm tank.
-6. Read-only board and status GETs do not wake. The `_NON_WAKING_READS` list
-   holds `/api/state`, `/api/health`, `/api/activity`, `/api/decisions`,
-   `/api/escalation/*` except resolve, and similar. An open dashboard tab
-   cannot defeat dormancy.
+6. Read-only board and status GETs do not wake, and neither does the device
+   check-in poster. `_NON_WAKING_READS` holds `/api/state`, `/api/health`,
+   `/api/activity`, `/api/decisions`, `/api/escalation/*` except resolve, and
+   similar. `_NON_WAKING_WRITES` holds `/api/device/checkin`, checked before
+   the method test. An open dashboard tab cannot defeat dormancy, and neither
+   can an automated check-in.
 7. The health snapshot reports the dormant flag, so the operator can see the
    state from the outside.
 
@@ -1798,11 +1801,10 @@ watchdog aware of dormancy.
 **Records.** Idle and wake log lines, health snapshot `dormant` field,
 snapshot files, device check-ins stored around a pause.
 
-**Review note.** A device check-in is a POST, so it wakes the tank even though
-the endpoint treats itself as landable while asleep and its path sits in the
-non-waking list. The non-GET check in `_should_wake` runs before the path
-check, so that list entry is unreachable for POSTs. Either the entry or the
-method check is wrong; pick one (BP-33).
+**Review note.** A device check-in is a POST. The wake rule checks the
+telemetry sets before the method test, so a check-in lands while the tank
+sleeps and does not wake it. That matches the endpoint's contract: pure
+telemetry never produces work (BP-33).
 
 ## 11. Player and operator processes
 
@@ -2216,7 +2218,7 @@ rather than gate-integrity questions.
 | BP-56 | `serve.compute_health_snapshot`, `_health_check_loop` |
 | BP-57 | `serve` player feedback endpoint, `sim._append_feedback` |
 | BP-58 | `serve._peer_review_pass`, `_peer_review_tick` |
-| BP-59 | `serve._idle_shutdown_loop`, `no_store` wake, `_NON_WAKING_READS` |
+| BP-59 | `serve._idle_shutdown_loop`, `no_store` wake, `_NON_WAKING_READS`, `_NON_WAKING_WRITES` |
 
 ## 20. Appendix D: review checklist
 
