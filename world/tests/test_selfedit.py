@@ -5,12 +5,16 @@ world/ directory and serve.DB_PATH at a throwaway database, so the real
 world tree and the live think_tank.db are never touched. The reviewer is
 the patched serve._jev_quorum_choice_sync -- the same seam selfedit uses.
 """
+import sys
+import os
 import sqlite3
 
 import pytest
 
-import selfedit
-import serve
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import selfedit  # noqa: E402
+import serve  # noqa: E402
 
 
 @pytest.fixture()
@@ -114,18 +118,32 @@ def test_propose_refuses_non_unique_anchor(fake_repo):
     assert ok is False and 'exactly once' in payload['error']
 
 
-def test_propose_refuses_config_and_hostile_importers(fake_repo):
-    # config.py is refused NATURALLY (no code carve-out): its top-level
-    # importers are not in TOLERATED_IMPORTERS, and v1 cannot reload them.
+def test_propose_refuses_config_and_hostile_importers(fake_repo,
+                                                      monkeypatch):
+    # Fresh state of the binding contract (Phase 2, operator decision
+    # 2026-10-18): config.py is now EDITABLE -- its four top-level importers
+    # are tolerated because the apply chain reloads sublow/content/sim and
+    # refreshes serve's import block. Unregistered importers of an ordinary
+    # module are still refused.
     _, world = fake_repo
     (world / 'config.py').write_text('X = 1\n', encoding='utf-8')
     (world / 'content.py').write_text('from config import X\n',
                                       encoding='utf-8')
+    (world / 'sim.py').write_text('from config import bind_policy\n',
+                                  encoding='utf-8')
+    (world / 'sublow.py').write_text('from config import bind_policy\n',
+                                     encoding='utf-8')
+    (world / 'serve.py').write_text('from config import X\n',
+                                    encoding='utf-8')
+    assert selfedit.TOLERATED_IMPORTERS['config'] == {
+        'content.py', 'sim.py', 'sublow.py', 'serve.py'}
+    assert selfedit.RELOAD_IMPORTERS_AFTER['config'] == (
+        'sublow', 'content', 'sim')
+    _approve(monkeypatch)
     ok, payload = selfedit.propose(
         'worker', 'config.py', 'X = 1', 'X = 2', 'why')
-    assert ok is False and 'top-level imported by' in payload['error']
-    assert 'content.py' in payload['error']
-    # Same refusal for an unregistered importer of an ordinary module.
+    assert ok is True and payload['status'] == 'armed', payload
+    # Same refusal stays for an unregistered importer of an ordinary module.
     (world / 'subx.py').write_text('F = 1\n', encoding='utf-8')
     (world / 'user.py').write_text('import subx\n', encoding='utf-8')
     ok, payload = selfedit.propose(
@@ -731,3 +749,46 @@ def test_read_module_surface(fake_repo):
         ok, payload = selfedit.read_module(guarded[0])
         assert ok is False and guarded[1] in payload['error'], (
             guarded, payload)
+
+
+def test_config_reload_chain_and_serve_refresh(monkeypatch, fake_repo):
+    # Phase 2 (operator decision 2026-10-18): after a config.py apply, the
+    # chain reloads sublow/content/sim whose `from config import` bindings
+    # re-execute, then refreshes serve's ten config-import names. The reload
+    # itself never runs except while dormant; this test spies on it.
+    _, world = fake_repo
+    names = ('ALLOW_WATCHLIST_WRITE', 'BROWSE_BLOCK_CATEGORIES',
+             'PLAIN_WRITING_BAN_LIST', 'RESEARCH_WATCHLIST', 'ROOT',
+             'bind_policy', 'get_grants_config', 'get_operator_policy',
+             'note_watchlist_topic', 'reload_policy_config')
+    reloaded = []
+
+    def fake_reload(mod):
+        reloaded.append(mod.__name__)
+        return mod
+
+    monkeypatch.setattr('importlib.reload', fake_reload)
+    config_stub = type('StubModule', (), {'__name__': 'config'})()
+    for name in names:
+        setattr(config_stub, name, 'sentinel-' + name)
+    for name in ('sublow', 'content', 'sim'):
+        monkeypatch.setitem(
+            sys.modules, name, type('StubModule', (), {'__name__': name})())
+    monkeypatch.setitem(sys.modules, 'config', config_stub)
+    saved = {name: getattr(serve, name) for name in names}
+    try:
+        (world / 'config.py').write_text('X = 1\n', encoding='utf-8')
+        selfedit._reload(str(world / 'config.py'))
+        assert reloaded == ['config', 'sublow', 'content', 'sim']
+        for name in names:
+            assert getattr(serve, name) == 'sentinel-' + name
+    finally:
+        # Plain setattr, not monkeypatch: monkeypatch.setattr would register
+        # the sentinel value as its own undo target and re-leak it into
+        # later tests in the same process.
+        for name in names:
+            setattr(serve, name, saved[name])
+
+
+if __name__ == '__main__':
+    raise SystemExit(pytest.main([__file__, '-q']))

@@ -108,16 +108,25 @@ UNREADABLE_BASENAMES = ('serve.py', 'BUSINESS-PROCESSES.md')
 READ_TEXT_CAP = 48000
 
 # Loading contract, target module -> importer basenames that ARE tolerated,
-# because apply-time refresh handles their specific binding shape:
+# because apply-time refresh/reload handles their specific binding shape:
 #   jev    -> serve's `from jev import (...)` names are refreshed explicitly.
 #   sublow -> jev_grants.py imports sublow at top level and is reloaded after.
+#   config -> content/sim/sublow get a `from config import ...` binding that
+#             importlib.reload re-executes, and serve's import block is
+#             refreshed explicitly; apply re-applies every registered
+#             policy binding through config.apply_policy_bindings().
 # Everything else tolerates ZERO outside importers in v1.
 TOLERATED_IMPORTERS = {
     'jev': {'serve.py'},
     'sublow': {'jev_grants.py'},
+    'config': {'content.py', 'sim.py', 'sublow.py', 'serve.py'},
 }
+# Reload chain, extras refreshed after the target module itself, in order.
+# The order matters only for readability here: importers of importers are
+# refreshed through their own module-dict attribute lookups, not reloads.
 RELOAD_IMPORTERS_AFTER = {
     'sublow': ('jev_grants',),
+    'config': ('sublow', 'content', 'sim'),
 }
 
 MAX_TARGET_FILE_BYTES = 4 * 1024 * 1024
@@ -985,6 +994,8 @@ def _reload(target):
         importlib.reload(mod)
     if modname == 'jev':
         _refresh_serve_jev_exports()
+    if modname == 'config':
+        _refresh_serve_config_exports()
     for extra in RELOAD_IMPORTERS_AFTER.get(modname, ()):
         extra_mod = sys.modules.get(extra)
         if extra_mod:
@@ -1003,6 +1014,22 @@ def _refresh_serve_jev_exports():
                  'ESCALATION_ERROR_PENALTY_CAP', '_jev_choice',
                  '_jev_quorum_choice_sync', '_jev_quorum_decision'):
         setattr(serve, name, getattr(jev, name))
+
+
+def _refresh_serve_config_exports():
+    """serve.py's `from config import (...)` block (line ~222) must point at
+    the reloaded config module after a config.py self-edit, and sim/content/
+    sublow are reloaded by the RELOAD_IMPORTERS_AFTER chain -- their
+    `from config import` bindings re-execute against the updated module.
+    The reload only ever runs while the tank is dormant, so it lands between
+    simulation ticks."""
+    import config
+    serve = _s()
+    for name in ('ALLOW_WATCHLIST_WRITE', 'BROWSE_BLOCK_CATEGORIES',
+                 'PLAIN_WRITING_BAN_LIST', 'RESEARCH_WATCHLIST', 'ROOT',
+                 'bind_policy', 'get_grants_config', 'get_operator_policy',
+                 'note_watchlist_topic', 'reload_policy_config'):
+        setattr(serve, name, getattr(config, name))
 
 
 def revert(edit_id, by='operator'):
