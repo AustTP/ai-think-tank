@@ -196,6 +196,9 @@ echo
 echo "== Python: round-robin on-call (Phase E2d) =="
 python3 tests/test_oncall.py
 echo
+echo "== Python: serve gap F coverage (extra serve.py regression batch) =="
+python3 tests/test_serve_gap_F.py
+echo
 echo "== Python: fault-aware routing memory (insect-colony pheromone routing, 2026-09-26) =="
 python3 tests/test_fault_aware_routing.py
 echo

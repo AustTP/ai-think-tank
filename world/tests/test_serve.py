@@ -1164,6 +1164,51 @@ class HealthChecks(unittest.TestCase):
         self.assertIn('$3.50', alerts[0]['message'])
         self.assertIn('40%', alerts[0]['message'])
 
+    def test_rework_warning_without_spirals_unchanged(self):
+        # No spirals in signals -> the rework block emits exactly what it did
+        # before the spiral note existed.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            rework_loops_last_24h=6, looped_tasks_last_24h=2,
+            loop_cost_usd_last_24h=3.5, straight_through_rate=0.4,
+            fix_spawn_spirals_last_24h=0, fix_spawn_tasks_last_24h=0,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertNotIn('Fix:', alerts[0]['message'])
+
+    def test_fix_retry_spiral_alone_raises_rework_info(self):
+        # A "Fix:" spiral with quiet loop metrics: each retry is a fresh task
+        # id, so the loop counter never fires -- the spiral detector must.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            rework_loops_last_24h=0,
+            fix_spawn_spirals_last_24h=1, fix_spawn_tasks_last_24h=7,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['category'], 'rework')
+        self.assertEqual(alerts[0]['severity'], 'info')
+        self.assertIn('spiral', alerts[0]['message'])
+        self.assertIn('7 task id(s)', alerts[0]['message'])
+
+    def test_fix_retry_spiral_mentions_auto_closed_wreckage(self):
+        # The churn usually ends in auto-closes ("quality pipeline keeps
+        # failing") -- the alert should quantify them when present.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            rework_loops_last_24h=0,
+            fix_spawn_spirals_last_24h=1, fix_spawn_tasks_last_24h=574,
+            task_auto_closed_last_24h=82,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertIn('82 task(s) auto-closed', alerts[0]['message'])
+
+    def test_fix_retry_spiral_note_appends_to_rework_warning(self):
+        alerts = serve._health_alerts_for_signals(self._signals(
+            rework_loops_last_24h=6, looped_tasks_last_24h=2,
+            loop_cost_usd_last_24h=3.5, straight_through_rate=0.4,
+            fix_spawn_spirals_last_24h=2, fix_spawn_tasks_last_24h=9,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['severity'], 'warning')
+        self.assertIn('2 "Fix:" retry spiral(s)', alerts[0]['message'])
+
     def test_self_proposed_rejection_pattern_raises_coordination_info(self):
         alerts = serve._health_alerts_for_signals(self._signals(
             self_proposed_rejected_last_24h=serve.SELF_PROPOSED_REJECT_THRESHOLD,
@@ -1593,6 +1638,64 @@ class TaskHorizonMetrics(unittest.TestCase):
         m = serve._task_horizon_metrics(1_000_000.0)
         self.assertEqual(m['assigned'], 0)
         self.assertIsNone(m['fast_completion_rate'])
+
+    def test_standing_card_echoes_pair_each_completion_with_its_epoch(self):
+        # The incident shape: one standing card ("Maintain tooling") is
+        # re-assigned every duty cycle and completes between cycles. The old
+        # join kept "first completion wins", so every later assignment paired
+        # with the PAST completion and the median went (-13.5)h-negative. The
+        # card is one distinct task and its evidenced cycles are all fast.
+        now = 1_000_000.0
+        self._insert('task_assigned', 'duty', now - 7000)
+        self._insert('task_completed', 'duty', now - 6900)
+        self._insert('task_assigned', 'duty', now - 4000)
+        self._insert('task_completed', 'duty', now - 500)
+        self._insert('task_assigned', 'duty', now - 100)   # still in flight
+        m = serve._task_horizon_metrics(now)
+        self.assertEqual(m['assigned'], 1)
+        self.assertEqual(m['completed'], 1)
+        self.assertEqual(m['fast_completion_rate'], 1.0)
+        # Pairs of [100, 3500] -> median 1800s -> 0.5h, never negative.
+        self.assertAlmostEqual(m['median_completion_hours'], 0.5, places=2)
+
+    def test_completion_older_than_the_assignment_is_skipped(self):
+        # Exact production bug regression: a completion that predates the
+        # (windowed) assignment must be skipped, not paired into a negative
+        # duration -- and the task still counts against the fast rate
+        # because its in-window epoch shows no completion.
+        now = 1_000_000.0
+        self._insert('task_completed', 'z', now - 8000)
+        self._insert('task_assigned', 'z', now - 2000)
+        m = serve._task_horizon_metrics(now)
+        self.assertEqual(m['assigned'], 1)
+        self.assertEqual(m['completed'], 0)
+        self.assertEqual(m['fast_completion_rate'], 0.0)
+        self.assertIsNone(m['median_completion_hours'])
+
+    def test_fix_spiral_counts_distinct_task_ids_for_same_root_title(self):
+        row = ('INSERT INTO action_log (agent_id, action, details, authorized, ts, trace_id) '
+               'VALUES (?, ?, ?, 1, ?, NULL)')
+        now = time.time()
+        with serve._db() as conn:
+            conn.execute('DELETE FROM action_log')
+            for i in range(3):
+                conn.execute(row, ('sue', 'task_assigned',
+                                   json.dumps({'taskId': 'fix-%d' % i,
+                                               'title': 'Fix: Act on mail (trudy)'}), now - 100 - i))
+            # one legit non-fix task must not join the spiral
+            conn.execute(row, ('sue', 'task_assigned',
+                               json.dumps({'taskId': 'ok-1', 'title': 'Act on mail (trudy)'}),
+                               now - 90))
+        s = serve._task_fix_spirals(now)
+        self.assertEqual(s['spirals'], 1)
+        self.assertEqual(s['tasks'], 3)
+        # a single "Fix:" card is not a spiral
+        with serve._db() as conn:
+            conn.execute('DELETE FROM action_log')
+            conn.execute(row, ('sue', 'task_assigned',
+                               json.dumps({'taskId': 'fix-a', 'title': 'Fix: Act on mail (trudy)'}),
+                               now - 100))
+        self.assertEqual(serve._task_fix_spirals(now)['spirals'], 0)
 
 
 class HealthAlertPersistence(unittest.TestCase):

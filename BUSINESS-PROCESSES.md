@@ -1698,10 +1698,16 @@ relying on the backup window.
      service blocked after the streak threshold
    - coordination: ceremony weight versus shipped work, decayed over a week,
      plus self-proposed requests rejected at refinement
-   - rework: repeated review loops and a low straight-through rate
+   - rework: repeated review loops and a low straight-through rate, plus
+     "Fix:" retry spirals (same root title re-minted as fresh task ids, a
+     churn shape the taskId-based loop counter cannot see) with the
+     auto-closed-as-failing count in the same window
    - quality gate: red-pipeline results caught, and any red result that
      escaped to done
-   - throughput: assignment-to-finish reliability within the horizon
+   - throughput: assignment-to-finish reliability within the horizon; each
+     completion pairs with the latest assignment preceding it (never a past
+     completion), distinct task ids form the denominator, and auto-closed
+     tasks are not counted as completions
    - escalations: open or aging escalations
    - bank and budget: services over cap, spend-rate warnings, budget headroom
    - OpenRouter credits, from a separately warmed cache

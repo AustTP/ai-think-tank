@@ -2210,7 +2210,8 @@ class ArmIdleAndRun(unittest.TestCase):
              unittest.mock.patch.object(serve.asyncio, 'create_task', create_task):
             asyncio.run(serve._arm_idle_and_run())
             self.assertIsNotNone(serve._LAST_REQUEST_TIME)
-            create_task.assert_called_once()
+            # The idle loop plus the unconditional dormancy window loop.
+            self.assertEqual(create_task.call_count, 2)
         server.serve.assert_awaited_once()
 
     def test_disabled_idle_loop(self):
@@ -2223,7 +2224,8 @@ class ArmIdleAndRun(unittest.TestCase):
              unittest.mock.patch.object(serve.asyncio, 'create_task', create_task):
             asyncio.run(serve._arm_idle_and_run())
             self.assertIsNone(serve._LAST_REQUEST_TIME)
-            create_task.assert_not_called()
+            # Idle watching is off, but the dormancy window loop still arms.
+            self.assertEqual(create_task.call_count, 1)
         server.serve.assert_awaited_once()
 
 

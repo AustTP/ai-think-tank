@@ -29852,6 +29852,13 @@ def _health_alerts_for_signals(signals):
     # requeues is noise) and a straight-through rate below the floor.
     loops = signals.get('rework_loops_last_24h', 0)
     straight_through = signals.get('straight_through_rate')
+    spirals = signals.get('fix_spawn_spirals_last_24h', 0)
+    spiral_tasks = signals.get('fix_spawn_tasks_last_24h', 0)
+    spiral_note = ''
+    if spirals:
+        spiral_note = (f' Also {spirals} "Fix:" retry spiral(s) minted {spiral_tasks} task id(s) '
+                       f'for the same root work -- each retry is a fresh task id, so loop '
+                       f'detection over task ids cannot see the churn.')
     if (loops >= _REWORK_MIN_LOOPS_FOR_ALERT and straight_through is not None
             and straight_through < _REWORK_LOW_STRAIGHT_THROUGH):
         alert('rework', 'warning',
@@ -29859,7 +29866,17 @@ def _health_alerts_for_signals(signals):
               f'{signals.get("looped_tasks_last_24h", 0)} task(s) '
               f'(${signals.get("loop_cost_usd_last_24h", 0.0):.2f} accrued on looped work) '
               f'-- straight-through rate {straight_through:.0%}; the review pipeline is '
-              f'redoing work instead of finishing it')
+              f'redoing work instead of finishing it' + spiral_note)
+    elif spirals:
+        # A spiral with quiet loop metrics is exactly the shape the taskId
+        # join misses (7 "Fix: Act on mail" cards in 30 minutes looked like
+        # unrelated fresh work) -- speak up at info so the digest shows it.
+        alert('rework', 'info',
+              f'{spirals} "Fix:" retry spiral(s) minted {spiral_tasks} task id(s) for the '
+              f'same root work in the last 24h -- each retry is a fresh task id, so the '
+              f'rework loop counter cannot see it; the root task is churning without resolving'
+              + (f' ({auto_closed_n} task(s) auto-closed as quality pipeline failures '
+                 f'in the same window)' if (auto_closed_n := signals.get('task_auto_closed_last_24h', 0)) else ''))
 
     # Absolute Zero rejection signal: a rising count of self-proposed
     # work-requests groomed OUT at refinement means the think tank's own proposals are
@@ -30062,11 +30079,23 @@ def _task_horizon_metrics(now):
     """METR reliability-at-horizon, computed from action_log's
     task_assigned -> task_completed pairs (joined in Python on the taskId the
     details JSON carries -- no JSON SQL, matching the rest of this file). Pure
-    DB reads, no network. Returns a dict with the median completion time
-    (hours), and the fraction of tasks ASSIGNED in the window that were
-    completed within the fast (1h) and full (24h) horizons. Tasks still
-    in-flight or never completed count against the rates -- that is precisely
-    the reliability being measured."""
+    DB reads, no network.
+
+    Pairing rules (retuned after the standing-duty-card incident):
+
+    - Each completion pairs with the LATEST assignment of the same task id
+      that STRICTLY PRECEDES it. The previous join kept the first completion
+      per task id, so a duty card re-assigned after completing (task-1
+      "Maintain tooling": 39 pickups/24h) paired its later assignments with
+      the old completion and produced impossible NEGATIVE durations
+      (median -13h) that made a healthy colony read as stalled.
+    - Distinct task ids are the denominator. Re-assignment echoes of one
+      standing card count once, not 39 times.
+    - A task counts as fast/horizon-completed when ANY of its evidenced
+      assign->complete cycles fits the horizon; its most recent pickup may
+      still be in flight at snapshot time, which must not erase the finished
+      cycles before it. Tasks with no completion yet count against the
+      rates -- that is precisely the reliability being measured."""
     with _db() as conn:
         assigns = conn.execute(
             "SELECT details, ts FROM action_log WHERE action = 'task_assigned' AND ts > ?",
@@ -30076,34 +30105,52 @@ def _task_horizon_metrics(now):
             "SELECT details, ts FROM action_log WHERE action = 'task_completed' AND ts > ?",
             (now - METR_HORIZON_S,),
         ).fetchall()
-    done_at = {}
-    for details, ts in completions:
+
+    def _tid(details):
         try:
             tid = json.loads(details).get('taskId') if details else None
         except Exception:
             tid = None
-        if tid and tid not in done_at:
-            done_at[tid] = ts  # first completion wins for a re-assigned task
-    durations = []
-    assigned_count = 0
-    fast = full = 0
+        return tid
+
+    assigns_by = {}
     for details, ts in assigns:
-        try:
-            tid = json.loads(details).get('taskId') if details else None
-        except Exception:
-            tid = None
-        if not tid:
-            continue
-        assigned_count += 1
-        end = done_at.get(tid)
-        if end is None:
-            continue  # never completed / still in flight -- counts against the rates
-        dur = end - ts
-        durations.append(dur)
-        if dur <= METR_FAST_HORIZON_S:
+        tid = _tid(details)
+        if tid and tid not in assigns_by:
+            assigns_by[tid] = []
+        if tid:
+            assigns_by[tid].append(ts)
+    comps_by = {}
+    for details, ts in completions:
+        tid = _tid(details)
+        if tid and tid not in comps_by:
+            comps_by[tid] = []
+        if tid:
+            comps_by[tid].append(ts)
+
+    durations = []
+    fast = full = 0
+    completed_count = 0
+    for tid in assigns_by:          # distinct tasks = the denominator
+        epochs = sorted(assigns_by[tid])
+        pairs = []
+        for comp_ts in sorted(comps_by.get(tid, ())):
+            prev = None
+            for a_ts in epochs:
+                if a_ts < comp_ts:
+                    prev = a_ts
+                else:
+                    break
+            if prev is not None:
+                pairs.append(comp_ts - prev)
+        if not pairs:
+            continue                # assigned in-window, never finished
+        completed_count += 1
+        if min(pairs) <= METR_FAST_HORIZON_S:
             fast += 1
-        if dur <= METR_HORIZON_S:
+        if min(pairs) <= METR_HORIZON_S:
             full += 1
+        durations.extend(pairs)
     sorted_durs = sorted(durations)
     n = len(sorted_durs)
     if n == 0:
@@ -30113,12 +30160,46 @@ def _task_horizon_metrics(now):
     else:
         median_h = (sorted_durs[n // 2 - 1] + sorted_durs[n // 2]) / 2 / 3600.0
     return {
-        'assigned': assigned_count,
-        'completed': len(durations),
+        'assigned': len(assigns_by),
+        'completed': completed_count,
         'median_completion_hours': round(median_h, 2) if median_h is not None else None,
-        'fast_completion_rate': round(fast / assigned_count, 4) if assigned_count else None,
-        'horizon_completion_rate': round(full / assigned_count, 4) if assigned_count else None,
+        'fast_completion_rate': round(fast / len(assigns_by), 4) if assigns_by else None,
+        'horizon_completion_rate': round(full / len(assigns_by), 4) if assigns_by else None,
     }
+
+
+def _task_fix_spirals(now, min_tasks=3):
+    """"Fix:" retry spirals: distinct task ids minted in the last 24h whose
+    titles reduce to the same root after stripping the 'Fix: ' prefix and the
+    '(agent)' suffix. Each review retry creates a NEW task id, so loop
+    detection over task ids never sees a spiral (trudy churned 7 "Fix: Act on
+    mail" cards in 30 minutes) -- counting title roots catches it. Pure DB
+    reads; returns {'spirals': n, 'tasks': total task ids involved}."""
+    fix_re = re.compile(r'^\s*fix\s*:\s*(.+?)\s*$', re.IGNORECASE)
+    by_root = {}
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT details FROM action_log WHERE action = 'task_assigned' AND ts > ?",
+            (now - METR_HORIZON_S,),
+        ).fetchall()
+    for (details,) in rows:
+        try:
+            data = json.loads(details) if details else {}
+        except Exception:
+            continue
+        title = (data.get('title') or '').strip()
+        tid = data.get('taskId')
+        if not title or not tid:
+            continue
+        m = fix_re.match(title)
+        if not m:
+            continue
+        root = re.sub(r'\s*\([^)]*\)\s*$', '', m.group(1)).strip().lower()
+        if not root:
+            continue
+        by_root.setdefault(root, set()).add(tid)
+    spirals = [s for s in by_root.values() if len(s) >= min_tasks]
+    return {'spirals': len(spirals), 'tasks': sum(len(s) for s in spirals)}
 
 
 def compute_health_snapshot():
@@ -30265,6 +30346,17 @@ def compute_health_snapshot():
         # whether the colony finishes the work it starts, measured as a rate
         # at 1h/24h, not a raw completion count.
         metr = _task_horizon_metrics(now)
+        spirals = _task_fix_spirals(now)
+        # Auto-closed tasks: the lifecycle's give-up terminal ("quality
+        # pipeline keeps failing" after N review cycles). Deliberately NOT
+        # counted as completion for the METR rates -- an auto-close is
+        # finished-but-failed, and hiding it would mask the churn -- but
+        # surfaced so the spiral alert can quantify the wreckage.
+        auto_closed = conn.execute(
+            "SELECT COUNT(*) FROM action_log WHERE action = 'task_auto_closed' "
+            "AND ts > ?",
+            (now - METR_HORIZON_S,),
+        ).fetchone()[0]
         # Rework/loop telemetry: how much finished work had to go back and
         # what that rework cost (see _rework_metrics).
         rework = _rework_metrics(now)
@@ -30322,6 +30414,12 @@ def compute_health_snapshot():
         # nothing to measure. The inverse of "61% of requests looped back".
         'straight_through_rate': (progress_count / (progress_count + rework['loops'])
                                   if (progress_count + rework['loops']) else None),
+        # "Fix:" retry spirals: same root title re-minted as fresh task ids,
+        # a rework shape loop detection over task ids cannot see. Counted
+        # separately; the rework alert speaks up when a spiral is live.
+        'fix_spawn_spirals_last_24h': spirals['spirals'],
+        'fix_spawn_tasks_last_24h': spirals['tasks'],
+        'task_auto_closed_last_24h': auto_closed,
         # Grader agreement: samples, raw agreement, and kappa against the
         # mechanical pipeline anchor -- surfaced so the review-grade judge is
         # audited next to the grades it produces (the evals two-numbers rule).
