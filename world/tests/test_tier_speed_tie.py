@@ -1,5 +1,6 @@
 """BP-63 speed tie-break tests: observed-latency recording, the per-model
-median gate, the parity-band reorder used by _best_value_pick, and the
+median gate, the parity-band reorder used by _best_value_pick (restricted
+to the high-frequency bands in TIER_SPEED_BANDS: low, coding), and the
 price-watch mirror that keeps a speed pick from churning every watch cycle.
 The network, the real model calls and the live think_tank.db are patched or
 redirected into a temp dir.
@@ -145,54 +146,66 @@ class SpeedTieOrder(unittest.TestCase):
     def tearDown(self):
         _clear()
 
+    def test_only_tier_speed_bands_participate(self):
+        self.assertEqual(serve.TIER_SPEED_BANDS, ('low', 'coding'))
+
+    def test_non_speed_band_never_reorders(self):
+        # Same setup as the faster-wins test below, but through a band the
+        # restriction covers: the price order is returned untouched even
+        # with usable latency data for both members.
+        quals = _cands(('slow', 1.0), ('fast', 1.1))
+        _seed('slow', 900)
+        _seed('fast', 100)
+        self.assertEqual(serve._speed_tie_order(quals, 'mid'), quals)
+
     def test_short_list_passes_through(self):
         quals = _cands(('a', 1.0))
-        self.assertEqual(serve._speed_tie_order(quals), quals)
+        self.assertEqual(serve._speed_tie_order(quals, 'low'), quals)
 
     def test_no_latency_data_keeps_price_order(self):
         quals = _cands(('a', 1.0), ('b', 1.1), ('c', 3.0))
-        self.assertEqual(serve._speed_tie_order(quals), quals)
+        self.assertEqual(serve._speed_tie_order(quals, 'low'), quals)
 
     def test_faster_slightly_pricier_model_leads_within_band(self):
         quals = _cands(('slow', 1.0), ('fast', 1.1))
         _seed('slow', 900)
         _seed('fast', 100)
         self.assertEqual(
-            [m['id'] for m in serve._speed_tie_order(quals)], ['fast', 'slow'])
+            [m['id'] for m in serve._speed_tie_order(quals, 'low')], ['fast', 'slow'])
 
     def test_latency_ties_break_by_price(self):
         quals = _cands(('a', 1.1), ('b', 1.0))
         _seed('a', 200)
         _seed('b', 200)
         self.assertEqual(
-            [m['id'] for m in serve._speed_tie_order(quals)], ['b', 'a'])
+            [m['id'] for m in serve._speed_tie_order(quals, 'low')], ['b', 'a'])
 
     def test_untimed_band_members_rank_behind_timed_ones(self):
         quals = _cands(('cheap', 1.0), ('mid', 1.05), ('late', 1.08))
         _seed('cheap', 500)
         _seed('mid', 100)
         self.assertEqual(
-            [m['id'] for m in serve._speed_tie_order(quals)], ['mid', 'cheap', 'late'])
+            [m['id'] for m in serve._speed_tie_order(quals, 'low')], ['mid', 'cheap', 'late'])
 
     def test_boundary_model_exactly_at_parity_stays_in_band(self):
         quals = _cands(('a', 1.0), ('edge', 1.0 * (1 + serve.TIER_SPEED_TIE_PARITY)))
         _seed('a', 900)
         _seed('edge', 100)
         self.assertEqual(
-            [m['id'] for m in serve._speed_tie_order(quals)], ['edge', 'a'])
+            [m['id'] for m in serve._speed_tie_order(quals, 'low')], ['edge', 'a'])
 
     def test_beyond_band_never_reorders_even_when_fast(self):
         quals = _cands(('a', 1.0), ('far', 2.0))
         _seed('a', 900)
         _seed('far', 100)  # a real outlier speed; still out of the parity band
         self.assertEqual(
-            [m['id'] for m in serve._speed_tie_order(quals)], ['a', 'far'])
+            [m['id'] for m in serve._speed_tie_order(quals, 'low')], ['a', 'far'])
 
     def test_membership_and_scores_untouched(self):
         quals = _cands(('a', 1.0), ('b', 1.1), ('c', 1.2), ('d', 5.0))
         _seed('a', 800)
         _seed('c', 100)
-        out = serve._speed_tie_order(quals)
+        out = serve._speed_tie_order(quals, 'low')
         self.assertEqual(len(out), len(quals))
         self.assertEqual({m['id'] for m in out}, {m['id'] for m in quals})
         self.assertEqual(
@@ -201,13 +214,13 @@ class SpeedTieOrder(unittest.TestCase):
     def test_only_untimed_models_pass_through(self):
         quals = _cands(('a', 1.0), ('b', 1.1))
         _seed('vendor/other', 100)
-        self.assertEqual(serve._speed_tie_order(quals), quals)
+        self.assertEqual(serve._speed_tie_order(quals, 'low'), quals)
 
 
 class BestValuePickSpeed(unittest.TestCase):
-    def _pick(self, candidates, scores):
+    def _pick(self, candidates, scores, band='low'):
         with unittest.mock.patch.object(serve, '_verify_model_works_sync', return_value=True):
-            return asyncio.run(serve._best_value_pick(candidates, scores))['id']
+            return asyncio.run(serve._best_value_pick(candidates, scores, band=band))['id']
 
     def setUp(self):
         _clear()
@@ -227,6 +240,18 @@ class BestValuePickSpeed(unittest.TestCase):
         picked = self._pick(
             _cands(('low/slow-cheap', 1.0), ('low/fast-pricier', 1.1)),
             {'low/slow-cheap': 70.0, 'low/fast-pricier': 69.0})
+        self.assertEqual(picked, 'low/slow-cheap')
+
+    def test_pick_without_band_keeps_cheapest_despite_latency(self):
+        # band=None is the call signature's safe default (and what any
+        # caller that predates TIER_SPEED_BANDS does): parity-band members
+        # with usable medians are still NOT reordered for speed.
+        _seed('low/slow-cheap', 900)
+        _seed('low/fast-pricier', 100)
+        picked = self._pick(
+            _cands(('low/slow-cheap', 1.0), ('low/fast-pricier', 1.1)),
+            {'low/slow-cheap': 70.0, 'low/fast-pricier': 69.0},
+            band=None)
         self.assertEqual(picked, 'low/slow-cheap')
 
     def test_quality_floor_still_guards_the_pick(self):

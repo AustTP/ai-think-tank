@@ -1629,7 +1629,9 @@ def _tier_watch_moves_sync():
             # look like a perpetually available "cheaper qualifier" and
             # re-trigger a probe + re-pick on every watch cycle. A within-
             # band speed pick is a policy choice, not an open value window.
-            top = _speed_tie_order(qualifiers)[0]
+            # The band passes through untouched, so for any band outside
+            # TIER_SPEED_BANDS both sides see the plain price order.
+            top = _speed_tie_order(qualifiers, band)[0]
             if top['id'] != slug and top['price'] < price - 1e-9:
                 moves.add(band)  # a better-in-policy qualifier appeared -- take the window
             break
@@ -12399,8 +12401,23 @@ BAND_QUALITY_FLOOR_GAP = {'high': 2}
 # the tie-break must never cross: the quality floor and the price rank do
 # not move. Latency only reorders models already within
 # TIER_SPEED_TIE_PARITY of the cheapest qualifier, and any band whose data
-# is missing or under-sampled keeps the plain cheapest-first order.
+# is missing or under-sampled keeps the plain cheapest-first order. Which
+# bands participate at all is deliberate (TIER_SPEED_BANDS below): only the
+# high-frequency bands can build a median that describes the provider
+# state *now*; a rare band's 5 samples accrue over days and can describe a
+# transient provider event for the rest of the week, while the money at
+# stake there is fractions of a cent per occurrence.
 TIER_SPEED_TIE_PARITY = 0.15  # share of the cheapest qualifier's price inside which speed decides
+# Bands whose qualifiers may be latency-reordered at all. low/coding are
+# called constantly (every background completion and every coding task),
+# so their samples arrive within minutes and the tie-break reflects the
+# provider's current reality. mid/vision/high/sublow are called rarely or
+# are budget-capped, so their medians go stale inside the 7-day window and
+# speed-buying there trades real price caps for noise -- they keep the
+# plain cheapest-first order forever (2026-10-18). Recording and the
+# audit columns still cover every band, so relative latencies are learned
+# for free and a future widening of this tuple is evidence-based.
+TIER_SPEED_BANDS = ('low', 'coding')
 MODEL_LATENCY_WINDOW_S = 7 * 86400    # recency window the median reads
 MODEL_LATENCY_MIN_SAMPLES = 5         # below this a model has no usable speed opinion
 MODEL_LATENCY_FETCH_LIMIT = 400       # most recent rows read per median query
@@ -12487,16 +12504,21 @@ def _attach_latency_audit(picked, cheapest_qual):
     return picked
 
 
-def _speed_tie_order(qualifiers):
+def _speed_tie_order(qualifiers, band):
     """BP-63 reorder of price-sorted qualifiers: among models within
     TIER_SPEED_TIE_PARITY of the cheapest qualifier, models with a usable
     observed-median latency lead, fastest first (price breaks latency ties);
     models with no latency data follow them in price order, and models
     beyond the parity band keep the cheapest-first order after everyone.
+    Only bands listed in TIER_SPEED_BANDS participate at all -- any other
+    band (and callers with no band) gets the qualifiers back unchanged in
+    price order, exactly as before the tie-break existed.
     Returns the SAME members, possibly reordered -- never adds, drops or
     re-scores anything, and short lists or lists with no latency data pass
     through unchanged. The price watch mirrors this exact order so a speed
     pick is never misread as a perpetually-available cheaper qualifier."""
+    if band not in TIER_SPEED_BANDS:
+        return list(qualifiers)
     if len(qualifiers) < 2:
         return list(qualifiers)
     near = [m for m in qualifiers if m['price'] <= qualifiers[0]['price'] * (1 + TIER_SPEED_TIE_PARITY)]
@@ -12552,7 +12574,7 @@ def _best_value_qualifiers_sync(candidates, scores, floor_gap=None):
     )
 
 
-async def _best_value_pick(candidates, scores, floor_gap=None):
+async def _best_value_pick(candidates, scores, floor_gap=None, band=None):
     # Shared by every band (restored): score keeps its place. Among
     # candidates with a real stored score, keep only those within the band's
     # quality floor of the best score present, then take the first one on
@@ -12562,10 +12584,12 @@ async def _best_value_pick(candidates, scores, floor_gap=None):
     # the quality bar -- with the BP-63 speed tie-break acting as the final
     # reorder inside a narrow parity of the cheapest qualifier, so the
     # cheapest-and-slowest model no longer wins a band it barely deserved on
-    # price alone. Returns None if nothing in `candidates` has a stored
-    # score yet, or nothing verified works -- callers fall back to Jev's
-    # classifier in that case.
-    for candidate in _speed_tie_order(_best_value_qualifiers_sync(candidates, scores, floor_gap)):
+    # price alone. The reorder only runs for bands in TIER_SPEED_BANDS;
+    # band=None (and every band outside the tuple) keeps cheapest-first.
+    # Returns None if nothing in `candidates` has a stored score yet, or
+    # nothing verified works -- callers fall back to Jev's classifier in
+    # that case.
+    for candidate in _speed_tie_order(_best_value_qualifiers_sync(candidates, scores, floor_gap), band):
         if await asyncio.to_thread(_verify_model_works_sync, candidate['id']):
             return candidate
     return None
@@ -13220,7 +13244,7 @@ async def refresh_model_tiers():
         cheapest_qual = None
         for benchmark in BAND_BENCHMARK[band]:
             scores = {r['model_id']: r['score'] for r in all_benchmark_rows if r['benchmark'] == benchmark}
-            picked = await _best_value_pick(candidate_pool, scores, BAND_QUALITY_FLOOR_GAP.get(band))
+            picked = await _best_value_pick(candidate_pool, scores, BAND_QUALITY_FLOOR_GAP.get(band), band=band)
             if picked is not None:
                 # Cheapest in-floor qualifier under the winning benchmark's
                 # scores: the baseline the BP-63 audit compares this pick
@@ -13276,7 +13300,7 @@ async def refresh_model_tiers():
     # doesn't win just for being cheap.
     vision_pool = pools['vision']
     vision_scores = {r['model_id']: r['score'] for r in all_benchmark_rows if r['benchmark'] == 'MMMU'}
-    vision_pick = await _best_value_pick(vision_pool, vision_scores)
+    vision_pick = await _best_value_pick(vision_pool, vision_scores, band='vision')
     if vision_pick is None and vision_pool:
         # Same fallback the cost bands use: MMMU is player-entered (the
         # catalog carries no image-comprehension metric), so when no MMMU
