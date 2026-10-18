@@ -17,17 +17,18 @@ Scope: the operating processes of the AI think tank as implemented in this repos
 - 6. Scheduling and standing operations (BP-26 to BP-33)
 - 7. Knowledge and evidence (BP-34 to BP-41)
 - 8. Money and resources (BP-42 to BP-46)
-- 9. Security, risk, compliance, and cross-cutting oversight (BP-47 to BP-58)
-- 10. Player and operator processes
-- 11. Control framework
-- 12. State and record model
-- 13. Cadence and SLA table
-- 14. Roles and permissions matrix
-- 15. Improvement candidates
-- 16. Appendix A: glossary
-- 17. Appendix B: configuration and policy files
-- 18. Appendix C: process to code map
-- 19. Appendix D: review checklist
+- 9. Security, risk, and human oversight (BP-47 to BP-56)
+- 10. Communication and lifecycle (BP-57 to BP-59)
+- 11. Player and operator processes
+- 12. Control framework
+- 13. State and record model
+- 14. Cadence and SLA table
+- 15. Roles and permissions matrix
+- 16. Improvement candidates
+- 17. Appendix A: glossary
+- 18. Appendix B: configuration and policy files
+- 19. Appendix C: process to code map
+- 20. Appendix D: review checklist
 
 ## 0. How to use this document
 
@@ -64,9 +65,10 @@ The operating model has five properties:
    consequence-bearing choice. A budget gate sits in front of every model call.
 3. **Idle is free.** If no work is due and no agent is active, the task cycle
    returns without spending.
-4. **Delivery is reviewed.** Deliverable work passes a two-reviewer peer gate.
-   Research passes a claim-level evidence review. Failures become rule
-   proposals.
+4. **Deliverable work is reviewed.** Deliverable work passes a two-reviewer
+   peer gate. Research passes a claim-level evidence review. The gates cover
+   deliverables only: bugs, spikes, and meeting cards close with no review
+   gate. Failures become rule proposals.
 5. **Authority is structural.** The `director` pointer defines teams and
    escalation. The owner is the only human. Theo is the admin agent, not the
    owner.
@@ -84,6 +86,8 @@ The operating model has five properties:
 | Social cadence | Weekly | `sim.SOCIAL_CADENCE_MS` |
 | Roadmap and mining | Weekly, silent | `sim.ROADMAP_CADENCE_MS`, `RULE_MINE_CADENCE_MS` |
 | Model tier refresh | Every 2 hours | `serve.MODEL_TIER_REFRESH_INTERVAL_S` |
+| Tier price watch | Every 30 minutes | `serve.TIER_PRICE_WATCH_INTERVAL_S` |
+| Idle dormancy poll | 30s when armed by `--max-idle-minutes` | `serve._idle_shutdown_loop` |
 | Health snapshot | Every 300s | `serve.HEALTH_CHECK_INTERVAL_S` |
 | Peer help-signal pass | Every 90s | `serve.PEER_REVIEW_INTERVAL_S` |
 | Director escalation loop | Every 30s | `serve.DIRECTOR_APPROVAL_INTERVAL_S` |
@@ -238,12 +242,13 @@ Owner request
 | BP-50 | Credential vault and handles | Agent needs a service | On demand | Owner, director | Encrypted credential, handle |
 | BP-51 | API service proposals | Agent proposes a service | On demand | Owner, director | Registered service |
 | BP-52 | Browse, command, egress, VPN | Agent reaches outside | Per call | JEV, proxy | Allow, block, escalate |
-| BP-53 | File grants and Notes | Owner issues a grant | On demand | Owner | Scoped file access |
+| BP-53 | File and app grants | Owner grants or revokes | On demand | Owner | Scoped file and app access |
 | BP-54 | Prompt-injection boundaries | External content enters | Per call | Serve | Wrapped content, verification |
 | BP-55 | Audit, retention, backups | Continuous | Hourly and 6-hourly | Serve | Logs, tape, snapshots |
 | BP-56 | Health monitoring | Continuous | 300s | Serve | Alerts, digest |
 | BP-57 | Player feedback | Owner rates a report | On demand | Owner, sim | Rating, agent feedback |
 | BP-58 | Peer help signals | Peer help-signal pass | 90s | Serve, director | Help signal to a director |
+| BP-59 | Dormancy and wake | Idle with the flag armed | 30s poll | Serve | Dormant flag, wake on request |
 
 ## 4. Core delivery processes
 
@@ -992,16 +997,39 @@ validation, sandbox isolation, timeout, prompt-injection wrapper.
 
 ### BP-33 Device check-in
 
-**Trigger.** The owner's phone posts a check-in.
+**Purpose.** Give the owner's phone a durable ingestion pipe for ambient
+context, with no fixed schema, so a future signal never needs the endpoint
+redesigned.
+
+**Trigger.** An iOS Shortcut posts to `/api/device/checkin`.
 
 **Steps.**
 
-1. Accept a generic field set: location, battery, focus, Wi-Fi, trigger, and
-   similar.
-2. Append to a bounded ring buffer of 50 entries.
-3. No consumer is wired yet.
+1. The endpoint authenticates itself: the request must carry `X-Device-Key`
+   equal to `DEVICE_API_KEY`, compared in constant time. It accepts no player
+   session and no agent key, so it is exempt from the deny-by-default
+   middleware and guards itself instead.
+2. The body is an open-ended dict. Every field is optional. `location`, when
+   present, must be `{lat, lon}` with numeric values. An empty body is
+   rejected.
+3. `record_device_checkin` stores the entry: `None` values are dropped, the
+   entry is stamped with `receivedAt`, `last` is replaced, and the entry is
+   appended to a bounded history. The cap is `deviceCheckinHistoryMax`
+   (default 50, operator-settable 1 to 10,000) because the bucket lives in
+   the hot state blob and must never grow unbounded.
+4. The endpoint is not gated by dormancy: a check-in is stored even while the
+   think tank is asleep. Being a POST, it also wakes the tank (see BP-59).
+5. An action log row records the check-in trigger and whether a location was
+   present. No consumer reads the history yet. The ingestion pipe is all
+   that exists today.
 
-**Records.** `deviceCheckins`.
+**Controls.** Device key, constant-time compare, field validation, bounded
+history, dormancy exemption.
+
+**Records.** `deviceCheckins` (`last` plus bounded `history`), action log.
+
+**Review note.** There is no consumer yet. Decide what the first consumer
+should be before the buffer fills with data nobody reads.
 
 ## 7. Knowledge and evidence
 
@@ -1291,7 +1319,13 @@ forecast.
 - High requires both confidence and budget headroom.
 - An outage or low confidence fails closed to low.
 
-**Refresh.** Every 2 hours, as a governance task.
+**Refresh.** A full re-pick of every band every 2 hours, as a governance task.
+A cheaper price watch runs every 30 minutes and checks only the selected
+tiers' catalog prices; a moved or vanished price triggers a full re-pick
+within about 30 minutes instead of at the next scheduled run. A real
+availability error on a live call queues an out-of-band re-pick that drains
+within a minute, so the band lands on a working model without waiting for
+either cadence.
 
 **Controls.** Cited scores, quality floor, cheapest pick, test call, price
 ceilings, monthly cap, JEV gate, fail-closed.
@@ -1358,11 +1392,10 @@ factor.
 
 **Records.** Page request ledger.
 
-## 9. Security, risk, compliance, and cross-cutting oversight
+## 9. Security, risk, and human oversight
 
-This section covers controls. It also holds two cross-cutting processes that
-observe work across teams: player feedback (BP-57) and peer help signals
-(BP-58).
+This section covers the controls that bound what agents may do, and the
+oversight loops that catch what slips past.
 
 ### BP-47 JEV decision gates
 
@@ -1535,10 +1568,51 @@ network, egress proxy, VPN conflict check.
 
 **Records.** `browse_policy.json`, egress grants, action log, decision tape.
 
-### BP-53 File grants and Notes
+### BP-53 File and app grants
 
-See BP-38. The trust root is the owner-issued grant, not the agent. The three
-hard rules are containment, the trash rule, and Notes ownership.
+**Purpose.** Give the owner a working control surface for what agents may
+touch on the local machine. BP-38 describes enforcement during tool use; this
+process is the grant lifecycle.
+
+**Trigger.** The owner grants, lists, or revokes access.
+
+**Grant families.**
+
+| Family | Shape | Tool it unlocks |
+|---|---|---|
+| File grant | `scope` (absolute existing directory), `label`, `caps` (`read`, `write`, `delete`) | `local_file`, scoped `read_store` |
+| App grant | `bundleId` (dotted macOS bundle id, e.g. `com.apple.Notes`), `label`, `caps` (`use`) | `app_script` against that app |
+
+**Steps.**
+
+1. The owner issues a grant through the player-only `/api/file-grants` or
+   `/api/app-grants` endpoints. A file scope must be an absolute path to an
+   existing directory, and a duplicate scope is refused (409 by realpath).
+2. `emptyTrash` is never accepted. It is not a capability the owner can
+   grant, not one the code can lose, and not one the operator JSON can add.
+3. Effective grants are the union of live state grants and the
+   operator-edited `world/grants.json`, re-read whenever the file changes. An
+   entry present means granted; removed means revoked. JSON edits apply
+   without a restart or a reload call.
+4. Revocation is player-only, by grant id, through `DELETE`. The next tool
+   call re-checks the grant, so revocation is immediate.
+5. The `local_file` tool is offered to agents only when `FILE_ACCESS_ENABLED`
+   and at least one file grant exists. Notes is not special-cased: agents
+   drive the Notes app through `app_script` once `com.apple.Notes` is
+   granted, and read the Notes SQLite store through `read_store`.
+6. Notes ownership is tracked per note in state: existing notes are
+   read-only, and an agent may create a note, or modify and delete a note it
+   created.
+
+**Controls.** Player-only endpoints, realpath dedup, containment at the call
+site, absolute trash rule, per-note ownership, grant union with the live
+operator file.
+
+**Records.** `fileGrants` and `appGrants` in state, `world/grants.json`,
+`noteOwnership`, action log.
+
+**Trust root.** The owner-issued grant, never the agent. An agent cannot
+argue its way into a scope; it can only ask the owner for a wider grant.
 
 ### BP-54 Prompt-injection boundaries
 
@@ -1626,10 +1700,37 @@ effort delivery.
 
 **Records.** `health_alerts`, digest, action log.
 
+## 10. Communication and lifecycle
+
+This section holds the owner-facing feedback loop, the peer help-signal pass,
+and the dormancy lifecycle.
+
 ### BP-57 Player feedback
 
-See BP-11. Feedback is accepted only on completed card reports, only from the
-player, and is carried into the agent's next task.
+**Purpose.** Let the owner rate delivered work so the rating reaches the exact
+agent that produced it.
+
+**Trigger.** The owner rates a completed card report in the player inbox.
+
+**Steps.**
+
+1. The endpoint accepts a rating (integer 1 to 5) and/or a comment. At least
+   one is required.
+2. It serves only a player session, and only a `card_report` message. Feedback
+   on a chat reply or a pending question is rejected.
+3. The feedback is stamped onto the inbox message, so the owner sees it in
+   place, and appended to the completing agent's feedback buffer as
+   `player_feedback`. The agent carries it into its next task.
+4. Re-submitting overwrites the previous feedback on the same work item
+   instead of stacking a second copy.
+5. Player feedback is excluded from the feedback dedup rule. A new comment on
+   the same card is new information, not a duplicate notice.
+6. An action log row records the rating, the agent, and the task.
+
+**Controls.** Player session gate, card-report-only target, rating range
+check, overwrite on resubmit.
+
+**Records.** Inbox message feedback, agent `_feedback` buffer, action log.
 
 ### BP-58 Peer help signals
 
@@ -1658,7 +1759,52 @@ staleness dedup, no report write, no firing weight.
 **Review note.** The pass is a help mechanism, not a performance ledger. Keep
 that distinction clear if the signal data is ever surfaced in a review.
 
-## 10. Player and operator processes
+### BP-59 Dormancy and wake
+
+**Purpose.** Stop all spend and churn when nobody is around, without giving up
+the port, the wake path, or the security sweeps.
+
+**Trigger.** The operator starts the server with `--max-idle-minutes N`. The
+flag arms the mechanism. The default is 0, which leaves dormancy off.
+
+**Steps.**
+
+1. Every request touches the idle clock in the no-store middleware, whether
+   authenticated or not.
+2. An idle-watch loop polls every 30 seconds. When no request has arrived for
+   `N` minutes, the flag flips to dormant exactly once per idle streak and the
+   transition is logged.
+3. While dormant, the sim tick is skipped: no movement, no task cycle, no
+   content executors, no model spend. The process stays alive and the port
+   stays bound.
+4. Housekeeping keeps running while paused: the database checkpoint, and the
+   expiry sweeps for capability handles and sub-low and JEV grants. An expired
+   capability does not wait for the wake. The sim watchdog also holds its
+   staleness escalations while dormant, so idleness is not misread as a dead
+   loop.
+5. Any non-GET request wakes the tank in the middleware, before the handler
+   runs, so the request lands on an already-warm tank.
+6. Read-only board and status GETs do not wake. The `_NON_WAKING_READS` list
+   holds `/api/state`, `/api/health`, `/api/activity`, `/api/decisions`,
+   `/api/escalation/*` except resolve, and similar. An open dashboard tab
+   cannot defeat dormancy.
+7. The health snapshot reports the dormant flag, so the operator can see the
+   state from the outside.
+
+**Controls.** Explicit opt-in flag, single transition per streak, wake
+exemption list for read-only traffic, housekeeping independent of dormancy,
+watchdog aware of dormancy.
+
+**Records.** Idle and wake log lines, health snapshot `dormant` field,
+snapshot files, device check-ins stored around a pause.
+
+**Review note.** A device check-in is a POST, so it wakes the tank even though
+the endpoint treats itself as landable while asleep and its path sits in the
+non-waking list. The non-GET check in `_should_wake` runs before the path
+check, so that list entry is unreachable for POSTs. Either the entry or the
+method check is wrong; pick one (BP-33).
+
+## 11. Player and operator processes
 
 | Process | Surface | What the owner does |
 |---|---|---|
@@ -1683,7 +1829,7 @@ that distinction clear if the signal data is ever surfaced in a review.
 | Manage experiments | Grant endpoints | Mint, quote, revoke sub-low or JEV grants |
 | Back up and restore | Backup files | Use the newest snapshot |
 
-## 11. Control framework
+## 12. Control framework
 
 | Control | What it protects | Failure behavior | Evidence |
 |---|---|---|---|
@@ -1715,9 +1861,9 @@ that distinction clear if the signal data is ever surfaced in a review.
 | Retention prune | Unbounded growth | Old rows pruned, tape archived first | Log tables |
 | Health alerts | Silent failure | New alert -> push | Health alerts |
 
-## 12. State and record model
+## 13. State and record model
 
-### 12.1 Primary tables
+### 13.1 Primary tables
 
 | Table | Purpose | Lifetime |
 |---|---|---|
@@ -1743,7 +1889,7 @@ that distinction clear if the signal data is ever surfaced in a review.
 | `stm_sessions`, `stm_messages` | Conversation short-term memory | TTL |
 | `ltm_memories` | Long-term memories | Forever |
 
-### 12.2 Task states
+### 13.2 Task states
 
 ```
 queued (work item)
@@ -1758,7 +1904,7 @@ queued (work item)
 A task in `needs_review` may return to `working` through a fix task, or freeze
 after the cycle cap.
 
-### 12.3 Issue states
+### 13.3 Issue states
 
 ```
 open -> in_progress -> done
@@ -1768,7 +1914,7 @@ open -> in_progress -> done
 `blocked` is a separate boolean committed by the scrum master. It is not a
 status.
 
-### 12.4 Sprint and product states
+### 13.4 Sprint and product states
 
 | Record | States |
 |---|---|
@@ -1781,7 +1927,7 @@ status.
 | Claim | `needs_review` -> `cleared` or `blocked` |
 | Coverage | `pending_review` -> `covered` or `blocked`; `failed` is separate |
 
-### 12.5 Review gate state
+### 13.5 Review gate state
 
 | Field | Meaning |
 |---|---|
@@ -1792,7 +1938,7 @@ status.
 | `cycleCount` | Total review and fix cycles across re-entries |
 | `escalated` | Frozen after the cap |
 
-## 13. Cadence and SLA table
+## 14. Cadence and SLA table
 
 | Activity | Cadence | Clock | Notes |
 |---|---|---|---|
@@ -1828,7 +1974,7 @@ status.
 | Escalation re-ask | 15 min cooldown, 6 asks | Wall | Then human |
 | Verifier coverage cap | 12 flips per 6h | Wall | Agent verifiers |
 
-## 14. Roles and permissions matrix
+## 15. Roles and permissions matrix
 
 | Capability | Owner | Theo / director | Worker | Key holder |
 |---|---|---|---|---|
@@ -1851,17 +1997,28 @@ status.
 | Review evidence | Yes | Director/admin | No | No |
 | Mark coverage reviewed | Yes | No | No | No |
 
-## 15. Improvement candidates
+## 16. Improvement candidates
 
 These are observations from reading the implementation. They are not defects.
 Each one is a question for the process review.
 
-1. **Documentation drift.** `DESIGN.md` says the backup loop runs every 5
-   minutes and keeps 24 snapshots. The code runs hourly and keeps 1. It also
-   says the model refresh is daily; the code refreshes every 2 hours. It says
-   the high-tier budget defaults to $5; the code defaults to 0, which disables
-   the band. The spend cap default is $50, not $5. Pick one source of truth and
-   correct the other.
+### Start here
+
+If the review reads only three items, read these. They decide whether the
+quality gates mean what this document says they mean:
+
+1. Item 5: the one-vote peer-gate timeout.
+2. Item 4: bugs and spikes close with no review.
+3. Item 2: the single-slot player ask.
+
+The remaining items are real but lower stakes, or are operator preferences
+rather than gate-integrity questions.
+
+1. **Action item: correct `DESIGN.md`.** The code is the source of truth, so
+   `DESIGN.md` moves, not the code. Fix four numbers: backups are hourly and
+   keep 1 snapshot, not every 5 minutes keeping 24; the model refresh runs
+   every 2 hours, not daily; the high-tier monthly budget defaults to 0
+   (disabled), not $5; the spend cap defaults to $50, not $5.
 2. **Single-slot player asks.** `_pendingPlayerAsk` holds one issue. A second
    issue's ask replaces the first. If concurrent blockers are possible, this
    drops a question. Consider a queue keyed by issue.
@@ -1900,12 +2057,24 @@ Each one is a question for the process review.
 13. **Model refresh cadence.** Re-picking models every 2 hours can change cost
     and behavior mid-day. If stability matters more than price, lengthen the
     interval or pin bands during a sprint.
-14. **Policy surface.** Four JSON files are operator-edited. Only the watchlist
-    writes back. The other three require a file edit and a reload. A small
+14. **Policy surface.** Six operator-edited JSON files sit beside the code
+    (`plain_writing`, `browse_policy`, `research_desk`, `operator_policy`,
+    `grants`, `watchlist`). Only the watchlist writes back. `grants.json`
+    applies live on file change; the rest apply on policy reload. A small
     operator UI would reduce edit mistakes, but it also adds a write path to
     policy. Decide which risk matters more.
 
-## 16. Appendix A: glossary
+15. **Quality-floor knob.** The value rule keeps only candidates within 6
+    benchmark points of the best scored model in a band (2 points for the
+    high band), then picks the cheapest. The gap is a hard-coded constant
+    (`BENCHMARK_QUALITY_FLOOR_GAP`), and it silently sets the cost-versus-
+    quality trade for every band: under current catalog prices it leaves the
+    mid tier about 3 points and the coding tier about 5 points of benchmark
+    score on the table in exchange for a 2x to 20x price cut. That trade is
+    the owner's call per band, not a global constant. Expose the gap as an
+    operator-settable knob, the same way the price ceilings already are.
+
+## 17. Appendix A: glossary
 
 | Term | Meaning |
 |---|---|
@@ -1920,6 +2089,7 @@ Each one is a question for the process review.
 | Coverage | Whether a source has been reviewed and counted as covered |
 | Critic | First peer reviewer, instructed to find the flaw |
 | Decision tape | Hash-chained record of JEV decisions |
+| Dormancy | Sleep-not-die: sim paused, port bound, wake on any request |
 | Deliverable room | A room whose work is peer-gated |
 | Escalation | A decision the normal gate could not make |
 | Idle gate | No due work and no active agent means no spend |
@@ -1937,7 +2107,7 @@ Each one is a question for the process review.
 | Verifier | Actor who clears or blocks evidence claims |
 | Village | Identity and memory boundary for agents and pages |
 
-## 17. Appendix B: configuration and policy files
+## 18. Appendix B: configuration and policy files
 
 | Setting | Where | Default or note |
 |---|---|---|
@@ -1949,26 +2119,28 @@ Each one is a question for the process review.
 | `SUBLOW_TIER_MAX_PRICE_USD` | `.env` | Hard cap |
 | `PAGE_REQUEST_MONTHLY_BUDGET` | `.env` | 1000 |
 | `LOG_RETENTION_DAYS` | `.env` | 7 |
-| `DB_BACKUP_INTERVAL_S` | code | 3600 |
-| `DB_BACKUP_KEEP` | code | 1 |
-| `MODEL_TIER_REFRESH_INTERVAL_S` | code | 7200 |
-| `SCRUM_MASTER_MIN_TEAM_SIZE` | policy JSON | 4 |
-| `MAX_TOTAL_AGENTS` | code | 500 |
-| `MAX_REVIEW_CYCLES` | policy JSON | 8 |
-| `PEER_REVIEW_TIMEOUT_MS` | code | 15 minutes |
-| `REPORT_STRIKE_WINDOW_MS` | policy JSON | 14 days |
-| `HIRE_COOLDOWN_MS` | policy JSON | 45 seconds |
-| `FIRING_COOLDOWN_MS` | policy JSON | 60 seconds |
-| `REFINEMENT_CADENCE_MS` | policy JSON | 7 days |
-| `SOCIAL_CADENCE_MS` | policy JSON | 7 days |
-| `ROADMAP_CADENCE_MS` | policy JSON | 7 days |
-| `RULE_MINE_CADENCE_MS` | policy JSON | 7 days |
-| `MIN_RESEARCH_CADENCE_MS` | code | 5 minutes |
-| `MIN_PIPELINE_CADENCE_MS` | code | 1 hour |
-| `VERIFIER_COVERED_MAX` | code | 12 |
-| `VERIFIER_COVERED_WINDOW_S` | code | 6 hours |
-| `DIRECTOR_ESCALATION_REASK_COOLDOWN_S` | policy JSON | 15 minutes |
-| `DIRECTOR_ESCALATION_MAX_ASKS` | policy JSON | 6 |
+| `DB_BACKUP_INTERVAL_S` | `world/serve.py` | 3600 |
+| `DB_BACKUP_KEEP` | `world/serve.py` | 1 |
+| `MODEL_TIER_REFRESH_INTERVAL_S` | `world/serve.py` | 7200 |
+| `TIER_PRICE_WATCH_INTERVAL_S` | `world/serve.py` | 1800 |
+| `TIER_RECHECK_DRAIN_INTERVAL_S` | `world/serve.py` | 60 |
+| `SCRUM_MASTER_MIN_TEAM_SIZE` | `world/operator_policy.json` | 4 |
+| `MAX_TOTAL_AGENTS` | `world/sim.py` | 500 |
+| `MAX_REVIEW_CYCLES` | `world/operator_policy.json` | 8 |
+| `PEER_REVIEW_TIMEOUT_MS` | `world/sim.py` | 15 minutes |
+| `REPORT_STRIKE_WINDOW_MS` | `world/operator_policy.json` | 14 days |
+| `HIRE_COOLDOWN_MS` | `world/operator_policy.json` | 45 seconds |
+| `FIRING_COOLDOWN_MS` | `world/operator_policy.json` | 60 seconds |
+| `REFINEMENT_CADENCE_MS` | `world/operator_policy.json` | 7 days |
+| `SOCIAL_CADENCE_MS` | `world/operator_policy.json` | 7 days |
+| `ROADMAP_CADENCE_MS` | `world/operator_policy.json` | 7 days |
+| `RULE_MINE_CADENCE_MS` | `world/operator_policy.json` | 7 days |
+| `MIN_RESEARCH_CADENCE_MS` | `world/operator_policy.json` | 5 minutes |
+| `MIN_PIPELINE_CADENCE_MS` | `world/sim.py` | 1 hour |
+| `VERIFIER_COVERED_MAX` | `world/evidence.py` | 12 |
+| `VERIFIER_COVERED_WINDOW_S` | `world/evidence.py` | 6 hours |
+| `DIRECTOR_ESCALATION_REASK_COOLDOWN_S` | `world/operator_policy.json` | 15 minutes |
+| `DIRECTOR_ESCALATION_MAX_ASKS` | `world/operator_policy.json` | 6 |
 | `MEMORY_ENABLED` | `.env` | Conversation memory |
 | `STM_MAX_TURNS`, `STM_MAX_TOKENS` | `.env` | Memory budgets |
 | `LTM_MAX_RECALL`, `LTM_MAX_PER_SESSION` | `.env` | Memory caps |
@@ -1977,8 +2149,12 @@ Each one is a question for the process review.
 | `PLAIN_WRITING_BAN_LIST` | `world/plain_writing.json` | Anti-slop words |
 | `RESEARCH_DESK_PASSES` | `world/research_desk.json` | Three-pass questions |
 | `RESEARCH_WATCHLIST` | `world/watchlist.json` | Standing topics |
+| Operator policy knobs | `world/operator_policy.json` | Cadences, cooldowns, team rules, memory and device knobs |
+| `GRANTS_CONFIG` | `world/grants.json` | App and file grants; applies live on file change |
+| `DEVICE_API_KEY` | `.env` | Device check-in bearer; auto-generated on first boot if unset |
+| `--max-idle-minutes` | launch flag | Dormancy arm; 0 or unset disables |
 
-## 18. Appendix C: process to code map
+## 19. Appendix C: process to code map
 
 | Process | Primary code |
 |---|---|
@@ -2014,7 +2190,7 @@ Each one is a question for the process review.
 | BP-30 | `sim._check_schedules`, `content._run_skill_review_content`, `_run_distill_content` |
 | BP-31 | `sim.queue_bug`, `on_call_agent`, `_escalation_step` |
 | BP-32 | `serve.page_probe`, `_screenshot_url_sync`, `_run_browser_act_sync` |
-| BP-33 | `sim.record_device_checkin` |
+| BP-33 | `serve` device check-in endpoint, `sim.record_device_checkin` |
 | BP-34 | `sim.wiki_write_page`, `wiki_read_pages`, `serve.propose_wiki_page`, `approve_wiki_proposal` |
 | BP-35 | `sim.record_memory_provenance` |
 | BP-36 | `evidence.py`, `serve` evidence endpoints |
@@ -2034,14 +2210,15 @@ Each one is a question for the process review.
 | BP-50 | `serve` credential endpoints, `mint_capability_handle`, `resolve_capability_handle` |
 | BP-51 | `serve._validate_api_service_spec`, `_approve_api_service_proposal` |
 | BP-52 | `serve` browse, curl, execute, egress, VPN code |
-| BP-53 | `fs.py`, `serve` file grant endpoints |
+| BP-53 | `serve` grant endpoints, `config.get_grants_config`, `world/grants.json` |
 | BP-54 | `serve.wrap_external_content`, `verify_boundary_intact` |
 | BP-55 | `serve._prune_logs`, `_backup_loop`, `_verify_decision_tape` |
 | BP-56 | `serve.compute_health_snapshot`, `_health_check_loop` |
 | BP-57 | `serve` player feedback endpoint, `sim._append_feedback` |
 | BP-58 | `serve._peer_review_pass`, `_peer_review_tick` |
+| BP-59 | `serve._idle_shutdown_loop`, `no_store` wake, `_NON_WAKING_READS` |
 
-## 19. Appendix D: review checklist
+## 20. Appendix D: review checklist
 
 Use this list when reviewing the document and the process.
 
