@@ -139,10 +139,16 @@ def test_propose_tolerates_serve_rebind_for_jev(fake_repo, monkeypatch):
     (world / 'serve.py').write_text('from jev import FLOOR\n',
                                     encoding='utf-8')
     _approve(monkeypatch)
+    # jev.py is a Tier B oversight file, so a passing quorum+validator run
+    # parks the edit at pending_signature instead of arming directly.
+    _patch_player_approval(monkeypatch)
     ok, payload = selfedit.propose(
         'worker', 'jev.py', 'FLOOR = 1.0', 'FLOOR = 2.0',
         'raise the risk floor')
-    assert ok is True and payload['status'] == 'armed', payload
+    assert ok is True and payload['status'] == 'pending_signature', payload
+    assert selfedit.resolve_oversight_signature('esc-x12345', True)
+    cand = world / '.selfedit_staging' / f"{payload['id']}.cand"
+    assert cand.read_text(encoding='utf-8') == 'FLOOR = 2.0\n'
 
 
 def test_review_rejection_leaves_nothing_behind(fake_repo, monkeypatch):
@@ -630,3 +636,98 @@ def test_remediation_executor_tools_attach_slot_headers(monkeypatch, fake_repo):
     out = exec_tool('selfedit_recheck', {})
     assert captured[-1]['headers']['X-Dormancy-Agent'] == 'worker'
     assert 'PASSES' in out
+
+
+def test_propose_refuses_test_gate_files(fake_repo):
+    # Tier A (audit 2026-10-18): the repo's own test gate may never be
+    # edited -- rewriting it would rewrite the acceptance bar itself.
+    _, world = fake_repo
+    (world / 'conftest.py').write_text('# gate helper\n', encoding='utf-8')
+    ok, payload = selfedit.propose(
+        'worker', 'conftest.py', '# gate helper', '# rigged', 'why')
+    assert ok is False and 'test gate' in payload['error'], payload
+    assert (world / 'conftest.py').read_text(encoding='utf-8') \
+        == '# gate helper\n'
+    (world / 'tests').mkdir()
+    (world / 'tests' / 'run_all.sh').write_text('# gate\n', encoding='utf-8')
+    assert selfedit.is_gate_file(str(world / 'tests' / 'run_all.sh'))
+
+
+def test_oversight_signature_flow(fake_repo, monkeypatch):
+    # Tier B (audit 2026-10-18): oversight-enforcement files pass quorum and
+    # validation but arm only after the player's emailed signature.
+    _, world = fake_repo
+    (world / 'jev.py').write_text('FLOOR = 1.0\n', encoding='utf-8')
+    _approve(monkeypatch)
+    _patch_player_approval(monkeypatch)
+
+    ok, payload = selfedit.propose(
+        'worker', 'jev.py', 'FLOOR = 1.0', 'FLOOR = 2.0', 'raise the floor')
+    assert ok is True, payload
+    assert payload['status'] == 'pending_signature'
+    assert payload['escalationId'] == 'esc-x12345'
+    cand = world / '.selfedit_staging' / f"{payload['id']}.cand"
+    assert cand.read_text(encoding='utf-8') == 'FLOOR = 2.0\n'
+    assert (world / 'jev.py').read_text(encoding='utf-8') == 'FLOOR = 1.0\n'
+    with sqlite3.connect(serve.DB_PATH) as conn:
+        row = conn.execute(
+            'SELECT status, signature_esc FROM self_edit_log WHERE id = ?',
+            (payload['id'],)).fetchone()
+    assert row[0] == 'pending_signature' and row[1] == 'esc-x12345'
+    # unknown ids and stale ids never mutate anything
+    assert not selfedit.resolve_oversight_signature('esc-missing', True)
+    assert selfedit.resolve_oversight_signature('esc-x12345', True)
+    with sqlite3.connect(serve.DB_PATH) as conn:
+        status = conn.execute(
+            'SELECT status FROM self_edit_log WHERE id = ?',
+            (payload['id'],)).fetchone()[0]
+    assert status == 'armed'
+    assert not selfedit.resolve_oversight_signature('esc-x12345', True)
+
+    # a second signature request can be denied outright (the first edit was
+    # armed, not applied, so the live anchor is still the original line)
+    ok2, payload2 = selfedit.propose(
+        'worker', 'jev.py', 'FLOOR = 1.0', 'FLOOR = 3.0', 'lower again')
+    assert ok2 is True and payload2['status'] == 'pending_signature'
+    assert selfedit.resolve_oversight_signature('esc-x12345', False)
+    with sqlite3.connect(serve.DB_PATH) as conn:
+        row2 = conn.execute(
+            'SELECT status, note FROM self_edit_log WHERE id = ?',
+            (payload2['id'],)).fetchone()
+    assert row2[0] == 'refused'
+    assert 'player signature denied' in row2[1]
+    assert (world / 'jev.py').read_text(encoding='utf-8') == 'FLOOR = 1.0\n'
+
+
+def test_read_module_surface(fake_repo):
+    # Tier A/B stays closed for reads too: the read surface is deliberately
+    # smaller than the write surface.
+    import hashlib
+    _, world = fake_repo
+    (world / 'gear.py').write_text('SPEED = 2\n', encoding='utf-8')
+    (world / 'serve.py').write_text('# kernel\n', encoding='utf-8')
+    (world / 'jev.py').write_text('FLOOR = 1.0\n', encoding='utf-8')
+    (world / 'conftest.py').write_text('# gate\n', encoding='utf-8')
+    (world / 'BUSINESS-PROCESSES.md').write_text('rule\n', encoding='utf-8')
+
+    ok, listing = selfedit.read_module('')
+    assert ok is True
+    paths = [m['path'] for m in listing['modules']]
+    assert paths == ['world/gear.py']
+    assert listing['modules'][0]['bytes'] == len('SPEED = 2\n')
+
+    ok, head = selfedit.read_module('gear.py')
+    assert ok is True, head
+    assert head['path'] == 'world/gear.py'
+    assert head['text'] == 'SPEED = 2\n'
+    assert head['truncated'] is False
+    assert head['totalBytes'] == len('SPEED = 2\n')
+    assert head['sha256'] == hashlib.sha256(b'SPEED = 2\n').hexdigest()
+
+    for guarded in (('serve.py', 'outside the readable'),
+                    ('world/BUSINESS-PROCESSES.md', 'outside the readable'),
+                    ('jev.py', 'outside the readable'),
+                    ('conftest.py', 'outside the readable')):
+        ok, payload = selfedit.read_module(guarded[0])
+        assert ok is False and guarded[1] in payload['error'], (
+            guarded, payload)

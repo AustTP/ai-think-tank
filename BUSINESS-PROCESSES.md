@@ -1824,8 +1824,9 @@ with `--max-idle-minutes`.
 1. Proposal contract (everything in `world/selfedit.py`, with its docstring
    as the contract). The agent proposes a find/replace splice on one file
    under `world/`. Protected names are refused outright: `serve.py` and
-   every `BUSINESS-PROCESSES.md` in the repo. No path escapes the
-   repository, and `config.py` is refused in v1 (see step 3).
+   every `BUSINESS-PROCESSES.md` in the repo, and the audit tiers below
+   add a hard test-gate refusal plus a player-signature tier. No path
+   escapes the repository, and `config.py` is refused in v1 (see step 3).
 2. Mechanical checks come first: the result must compile, and the find text
    must appear in the file exactly once. A rejected proposal never touches
    the file tree.
@@ -1904,8 +1905,29 @@ LIVE tree. The outcome splits the window in two:
    window. Nothing else about the tank is disturbed, and a fresh window
    means a fresh conflict scan and fresh approvals.
 4. Applies that land OUTSIDE any window (the idle path) get the same
-   post-apply tests. With no window to remediate in, a failure there rolls
-   back immediately and mails the agents.
+    post-apply tests. With no window to remediate in, a failure there rolls
+    back immediately and mails the agents.
+
+**Surface audit (operator decision, 2026-10-18).** Three tiers now bound
+what agents may edit and read, layered on the constant protected names
+(`serve.py`, every `BUSINESS-PROCESSES.md`):
+
+1. Tier A -- the test gate (`world/tests/`, `conftest.py`, the run
+   scripts): refused outright for edits AND fixes, with no approval path.
+   An edit that could rewrite its own acceptance bar proves nothing, so no
+   quorum review can legitimize it.
+2. Tier B -- oversight-enforcement files (`jev.py`, `selfedit.py`,
+   `notify.py`, `theo_policy.py`, `sublow.py`, `jev_grants.py`, `bank.py`,
+   `budget.py`): they pass the normal gates, but arm only after a
+   floor-1.0 'oversight self-edit' escalation the PLAYER signs. Approve
+   arms the waiting edit; deny refuses it. Enforcement code is exactly
+   what a corner-cutting agent would want to weaken quietly.
+3. Reads -- `selfedit_read` gives bounded read access mirroring the write
+   rule, with a SMALLER surface: the full listing and one-file heads (up
+   to 48 KB with sha256) for the editable world modules, but `serve.py`,
+   `BUSINESS-PROCESSES.md`, the Tier B files, and the test gate stay
+   closed. Exact anchors make proposals better; reading the gates or the
+   enforcement internals is what gaming would target first.
 
 **Revert.** Only the player session or the admin agent may revert an
 APPLIED edit: the pre-edit bytes are restored, the module is re-imported,
@@ -1926,7 +1948,9 @@ window approvals.
 
 **Review note.** The floor-1.0 kind lives in `jev.Escalation floors`
 (`jev.ESCALATION_KIND_RISK`), which is itself inside the self-editable
-surface: the same review gates apply to it. The v1 scope stops here --
+surface: the same review gates apply to it, and since the 2026-10-18
+surface audit, edits to `jev.py` additionally need the player's signature
+(Tier B). The v1 scope stops here --
 closing the surface gap that would allow topological reload of `config.py`
 is a Phase 2 improvement candidate, and the superset design lives in the
 selfedit.py docstring.

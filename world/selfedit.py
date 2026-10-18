@@ -54,6 +54,19 @@ The self-modification contract (operator decisions, locked 2026-10-18):
     OFF-window and schedule a fresh window. Applies outside any window (the
     idle path) get the same post-apply tests; with no window to remediate
     in, a failure there rolls back immediately and mails the agents.
+  * AUDIT TIERS (operator decision, 2026-10-18):
+      Tier A: the repo test gate itself -- world/tests/, conftest.py, run
+        scripts -- is refused outright for edits and in-window fixes. An
+        edit that could rewrite its own acceptance bar proves nothing.
+      Tier B: oversight-enforcement files (jev, selfedit, notify,
+        theo_policy, sublow, jev_grants, bank, budget) stay editable but
+        need the PLAYER's emailed signature (OVERSIGHT_KIND, floor 1.0, the
+        same human-in-the-loop as dormancy windows). The row waits as
+        pending_signature and arms only after resolve_oversight_signature.
+      READS mirror the write rule minus a smaller deliberate core
+        (read_module): test expectations, gate internals, and oversight
+        files are also UNREADABLE, since those are exactly what gaming
+        would read first.
   * Failure posture: every gate fails closed. A refused, rejected, or
     unverifiable proposal never touches the file tree.
 """
@@ -70,6 +83,29 @@ import time
 # NEVER self-editable, by operator decision (2026-10-18): the HTTP kernel
 # and the enforcement documents themselves.
 PROTECTED_BASENAMES = ('serve.py', 'BUSINESS-PROCESSES.md')
+
+# Tier A of the 2026-10-18 audit: the post-apply rollback gate must be
+# beyond proposer reach. A broken edit that could rewrite the tests (or the
+# runner) would let the change-window contract "prove" its own success --
+# so world/tests/ and the bare gate helpers are refused outright.
+GATE_DIRS = ('tests',)
+GATE_BASENAMES = ('conftest.py',)
+
+# Tier B: oversight-enforcement files. They stay editable so the tank can
+# improve its own judgment, but only through a mandatory PLAYER signature
+# (floor-1.0 escalation kind, like 'dormancy window request'). One quorum
+# review is not enough authority for the files that govern the reviews.
+PLAYER_SIGNATURE_BASENAMES = ('jev.py', 'selfedit.py', 'notify.py',
+                              'theo_policy.py', 'sublow.py', 'jev_grants.py',
+                              'bank.py', 'budget.py')
+OVERSIGHT_KIND = 'oversight self-edit'
+
+# Read access mirrors the write rule: an agent may read exactly what it may
+# edit (audit Q3), MINUS a smaller deliberate core. Also UNREADABLE on top
+# of uneditable: test expectations and gate/oversight internals are the two
+# things a gaming attempt would read first.
+UNREADABLE_BASENAMES = ('serve.py', 'BUSINESS-PROCESSES.md')
+READ_TEXT_CAP = 48000
 
 # Loading contract, target module -> importer basenames that ARE tolerated,
 # because apply-time refresh handles their specific binding shape:
@@ -132,6 +168,47 @@ def is_protected(resolved_path):
         return os.path.realpath(resolved_path) == os.path.realpath(
             os.path.join(_world(), 'serve.py'))
     return name in PROTECTED_BASENAMES
+
+
+def is_gate_file(resolved_path):
+    """Tier A: the repo's own test gate -- tests/ trees, the run scripts,
+    and bare gate helpers. Refused outright for edits AND fixes."""
+    real = os.path.realpath(resolved_path)
+    world_real = os.path.realpath(_world())
+    rel = os.path.relpath(real, world_real)
+    head = rel.split(os.sep)[0]
+    if head in GATE_DIRS:
+        return True
+    return os.path.basename(real) in GATE_BASENAMES
+
+
+def is_player_signature(resolved_path):
+    """Tier B: oversight-enforcement files need the player's signature
+    before they can arm, and their contents stay unreadable."""
+    name = os.path.basename(os.path.realpath(resolved_path))
+    return name in PLAYER_SIGNATURE_BASENAMES
+
+
+def is_unreadable(resolved_path):
+    name = os.path.basename(os.path.realpath(resolved_path))
+    if name in UNREADABLE_BASENAMES or name in GATE_BASENAMES:
+        return True
+    if name in PLAYER_SIGNATURE_BASENAMES:
+        return True
+    return is_gate_file(resolved_path)
+
+
+def _path_refusal(resolved_path, display):
+    """Shared edit/fix gate for the audit tiers. Returns an error string or
+    None when the path is acceptable."""
+    if is_protected(resolved_path):
+        return (f'{display} is PROTECTED: self-edits may never touch '
+                'serve.py or BUSINESS-PROCESSES.md, even with approval')
+    if is_gate_file(resolved_path):
+        return (f'{display} is part of the repo test gate (tests/, '
+                'conftest.py, run scripts): refused. An edit that could '
+                'rewrite its own acceptance bar proves nothing')
+    return None
 
 
 def _resolve_path(path):
@@ -203,6 +280,10 @@ def _ensure_table(conn):
         conn.execute('ALTER TABLE self_edit_log ADD COLUMN window_id TEXT')
     except sqlite3.OperationalError:
         pass  # column already exists
+    try:  # Tier B (audit 2026-10-18): mandatory player signature linkage
+        conn.execute('ALTER TABLE self_edit_log ADD COLUMN signature_esc TEXT')
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.execute('CREATE INDEX IF NOT EXISTS idx_self_edit_status '
                  'ON self_edit_log (status, created)')
 
@@ -268,10 +349,9 @@ def propose(agent_id, path, find, replace, summary):
     resolved, display = _resolve_path(path)
     if resolved is None:
         return False, {'error': display}
-    if is_protected(resolved):
-        return False, {'error': f'{display} is PROTECTED: self-edits may '
-                                'never touch serve.py or '
-                                'BUSINESS-PROCESSES.md, even with approval'}
+    refusal = _path_refusal(resolved, display)
+    if refusal:
+        return False, {'error': refusal}
     try:
         with open(resolved, 'r', encoding='utf-8') as fh:
             original = fh.read()
@@ -323,6 +403,31 @@ def propose(agent_id, path, find, replace, summary):
     os.makedirs(os.path.dirname(_staging_candidate(edit_id)), exist_ok=True)
     with open(_staging_candidate(edit_id), 'w', encoding='utf-8') as fh:
         fh.write(candidate)
+    if is_player_signature(resolved):
+        # Tier B (audit 2026-10-18): oversight-enforcement files arm only
+        # after the player's emailed signature. The quorum review and the
+        # validator already passed; the human signs (or refuses) a fully
+        # vetted artifact.
+        serve = _s()
+        question = (f'Signature requested for a player-signature self-edit '
+                    f'of {display} by {agent_id}.\n'
+                    f'Summary: {summary}\n'
+                    f'Approving ARMS this edit to apply the next time the '
+                    f'tank goes dormant. Denying refuses it.')
+        esc_id = serve.create_escalation(
+            OVERSIGHT_KIND, question, on_approve_note=edit_id,
+            what_checked='JEV quorum review passed; quarantine validation '
+                         'passed')
+        _update(edit_id, status='pending_signature', signature_esc=esc_id)
+        serve.log_action(edit_id, 'self_edit_signature_pending',
+                         {'path': display, 'escalation': esc_id},
+                         authorized=True)
+        return True, {'id': edit_id, 'status': 'pending_signature',
+                      'escalationId': esc_id,
+                      'message': f'{display} governs oversight, so this edit '
+                                 f'needs the player signature: an approval '
+                                 f'link was emailed and the edit arms only '
+                                 f'after it is signed'}
     _update(edit_id, status='armed', armed_at=time.time())
     _s().log_action(edit_id, 'self_edit_armed',
                     {'path': display, 'apply': 'dormant-only via idle loop'},
@@ -330,6 +435,79 @@ def propose(agent_id, path, find, replace, summary):
     return True, {'id': edit_id, 'status': 'armed',
                   'message': 'edit armed -- it applies the next time the tank '
                              'goes dormant; check self_edit_status'}
+
+
+def resolve_oversight_signature(esc_id, approved):
+    """Player link driver for OVERSIGHT_KIND escalations: approves arm the
+    waiting row, denies refuse it. Returns False for unknown/already-set."""
+    serve = _s()
+    with serve._db() as conn:
+        _ensure_table(conn)
+        row = conn.execute(
+            "SELECT id FROM self_edit_log WHERE signature_esc = ? "
+            "AND status = 'pending_signature'", (esc_id,)).fetchone()
+    if not row:
+        return False
+    edit_id = row[0]
+    if approved:
+        _update(edit_id, status='armed', armed_at=time.time())
+        serve.log_action(edit_id, 'self_edit_signed',
+                         {'escalation': esc_id}, authorized=True)
+    else:
+        _update(edit_id, status='refused',
+                note='player signature denied (oversight self-edit)')
+        serve.log_action(edit_id, 'self_edit_signature_denied',
+                         {'escalation': esc_id}, authorized=True)
+    return True
+
+
+def read_module(path=''):
+    """Audit Q3: bounded READ access to the editable surface, mirroring the
+    write rule. Empty path lists the readable world modules; a path reads
+    one file's head up to READ_TEXT_CAP with its sha256 so proposals anchor
+    against known bytes. serve.py, BUSINESS-PROCESSES.md, tests/, and the
+    Tier B oversight files are excluded on purpose: smaller read than write
+    surface, because test expectations and gate/oversight internals are
+    what gaming would target first."""
+    if not (path or '').strip():
+        modules = []
+        world = _world()
+        for fn in sorted(os.listdir(world)):
+            full = os.path.join(world, fn)
+            if not os.path.isfile(full):
+                continue
+            display = f'world/{fn}'
+            if is_unreadable(full):
+                continue
+            modules.append({'path': display,
+                            'bytes': os.path.getsize(full)})
+        return True, {'modules': modules}
+    resolved, display = _resolve_path(path)
+    if resolved is None:
+        return False, {'error': display}
+    if is_unreadable(resolved):
+        return False, {'error': f'{display} is outside the readable '
+                                'self-edit surface (oversight internals and '
+                                'the repo test gate stay closed)'}
+    try:
+        with open(resolved, 'r', encoding='utf-8') as fh:
+            head = fh.read(READ_TEXT_CAP + 1)
+    except (OSError, UnicodeDecodeError) as e:
+        return False, {'error': f'cannot read target: {e}'}
+    truncated = len(head) > READ_TEXT_CAP
+    if truncated:
+        head = head[:READ_TEXT_CAP]
+    with open(resolved, 'rb') as fh:
+        data = fh.read()
+    return True, {
+        'path': display,
+        'sha256': hashlib.sha256(data).hexdigest(),
+        'totalBytes': len(data),
+        'truncated': truncated,
+        'text': head,
+        'note': 'read-only context for proposing exact anchors; the file '
+                'may change between this read and an apply',
+    }
 
 
 def _review(edit_id, display, find, replace, summary):
@@ -401,9 +579,10 @@ def _validate(edit_id, resolved, candidate):
         else:
             checks.append('flake8 ok')
         modname = os.path.splitext(os.path.basename(resolved))[0]
+        smoke_src = (f'import sys; sys.path.insert(0, {tmp!r}); '
+                     f'import {modname}')
         smoke = subprocess.run(
-            [py, '-c', f'import sys; sys.path.insert(0, {tmp!r}); '
-                        f'import {modname}'],
+            [py, '-c', smoke_src],
             capture_output=True, text=True, timeout=180, cwd=tmp,
             env={**os.environ, 'PYTHONPATH': tmp})
         if smoke.returncode != 0:
@@ -739,10 +918,9 @@ def submit_remediation_fix(agent_id, path, find, replace, summary):
     resolved, display = _resolve_path(path)
     if resolved is None:
         return False, {'error': display}
-    if is_protected(resolved):
-        return False, {'error': f'{display} is PROTECTED: self-edits may '
-                                'never touch serve.py or '
-                                'BUSINESS-PROCESSES.md, even with approval'}
+    refusal = _path_refusal(resolved, display)
+    if refusal:
+        return False, {'error': refusal}
     try:
         with open(resolved, 'r', encoding='utf-8') as fh:
             original = fh.read()

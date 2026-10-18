@@ -10371,6 +10371,31 @@ AGENT_ASK_TOOLS = [
             'parameters': {'type': 'object', 'properties': {}},
         },
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'selfedit_read',
+            'description': 'Read-only access to the self-edit surface so '
+                           'proposals can use exact, current anchors. '
+                           'Omit `path` to list the readable modules '
+                           '(name + size); pass a path to fetch one '
+                           "file's head with its sha256 and total "
+                           'size. The read surface is deliberately '
+                           'smaller than the write surface: serve.py, '
+                           'BUSINESS-PROCESSES.md, tests/, and '
+                           'oversight-enforcement files stay closed.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'path': {
+                        'type': 'string',
+                        'description': 'World module or repo-root-relative '
+                                       'path; omit for the listing.',
+                    },
+                },
+            },
+        },
+    },
 ]
 
 # Additional tools offered to /api/intent/ask ONLY when the dispatched agent's
@@ -16448,6 +16473,30 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 tail = (result.get('tail') or '')[-1200:]
                 return ('Repo test gate still FAILING:\n' + tail)
             return 'selfedit_recheck returned an unexpected response.'
+        if name == 'selfedit_read':
+            path = ((args or {}).get('path') or '').strip()
+            result = _http_json('POST', SELF_BASE_URL, '/api/selfedit/read',
+                                {'agentId': agent_id, 'path': path},
+                                agent_key, timeout=60,
+                                extra_headers=_selfedit_fix_headers(agent_id))
+            if isinstance(result, dict) and result.get('error'):
+                return f'selfedit_read: {result["error"]}'
+            if isinstance(result, dict) and result.get('modules'):
+                lines = [f'READABLE self-edit surface ({len(result["modules"])} '
+                         'modules, name + size):']
+                for m in result['modules'][:60]:
+                    lines.append(f"- {m.get('path')} ({m.get('bytes')} bytes)")
+                if len(result['modules']) > 60:
+                    lines.append(f'... {len(result["modules"]) - 60} more; '
+                                 'use selfedit_read with a path')
+                return '\n'.join(lines)
+            if isinstance(result, dict) and result.get('text'):
+                note = (f"[sha256 {result.get('sha256')}, "
+                        f"{result.get('totalBytes')} bytes total"
+                        + (', truncated' if result.get('truncated') else '')
+                        + ']')
+                return f'{result.get("path")} {note}\n{(result.get("text") or "")}'
+            return 'selfedit_read returned an unexpected response.'
         raise ValueError(f'unknown tool: {name}')
     return execute_tool
 
@@ -24333,6 +24382,30 @@ async def selfedit_fix_checks(request: Request):
     return JSONResponse(payload, status_code=200 if ok else 400)
 
 
+@app.post('/api/selfedit/read')
+async def selfedit_read(request: Request):
+    """Agent-facing bounded READ access to the self-edit surface (audit Q3,
+    2026-10-18): empty path lists readable world modules; a path reads one
+    file's head with its sha256 so exact anchors can be proposed. The read
+    rule is smaller than the write rule on purpose; the refusals say why."""
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'unknown')
+    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    try:
+        ok, payload = await asyncio.to_thread(
+            _selfedit.read_module, body.get('path') or '')
+    except Exception as exc:
+        print(f'[selfedit] read crashed: {exc}', flush=True)
+        log_action(agent_id, 'selfedit_read_crashed',
+                   {'error': str(exc)[:300]}, authorized=authorized)
+        return JSONResponse({'error': f'the read harness failed: {exc}'}, status_code=500)
+    log_action(agent_id, 'selfedit_read',
+               {'ok': ok, 'path': body.get('path') or '*listing*',
+                'note': ((payload or {}).get('error') or '')[:160]},
+               authorized=authorized)
+    return JSONResponse(payload, status_code=200 if ok else 400)
+
+
 def _normalize_allowlist_target(target):
     """Normalize a host-or-URL string down to its bare lowercase hostname.
     Returns (host, error). Mirrors the /api/allowlist/request normalization
@@ -28293,6 +28366,18 @@ async def resolve_escalation(id: str, token: str, decision: str):
                        if decision == 'approve' else
                        'Nothing was scheduled.')
             return HTMLResponse(f"<p>Recorded: <b>{esc['status']}</b> for the dormancy window.</p>"
+                                f"<p>{html.escape(esc['question'])}</p><p>{verdict}</p>")
+    # Side effect (approve OR deny) for Tier B oversight files (audit
+    # 2026-10-18): the player's link signature arms the waiting self-edit
+    # row, or refuses it. Both quorum review and quarantine validation
+    # already passed, so the human signs a known-good artifact.
+    if esc.get('kind') == 'oversight self-edit':
+        resolved = _selfedit.resolve_oversight_signature(id, decision == 'approve')
+        if resolved:
+            verdict = ('The edit is armed: it applies the next time the '
+                       'tank goes dormant.' if decision == 'approve' else
+                       'The edit was refused by your signature.')
+            return HTMLResponse(f"<p>Recorded: <b>{esc['status']}</b> for the oversight self-edit.</p>"
                                 f"<p>{html.escape(esc['question'])}</p><p>{verdict}</p>")
     return HTMLResponse(f"<p>Recorded: <b>{esc['status']}</b> for {esc['kind']}.</p><p>{html.escape(esc['question'])}</p>")
 
