@@ -41,7 +41,8 @@ def test_self_edit_is_offered_and_dispatches(monkeypatch):
     assert 'self_edit' in names and 'self_edit_status' in names
     sent = {}
 
-    def fake_http(method, base, path, body, key, timeout=None):
+    def fake_http(method, base, path, body, key, timeout=None,
+                  extra_headers=None):
         sent.update({'method': method, 'path': path, 'body': body,
                      'key': key, 'timeout': timeout})
         return {'status': 'armed', 'id': 'ed-x', 'message': 'edit armed'}
@@ -202,6 +203,7 @@ def test_apply_pass_dormant_gate_and_revert_round_trip(
     assert selfedit.apply_pass() == 0
     assert target.read_text(encoding='utf-8') == 'SPEED = 2\n'
     monkeypatch.setattr(serve, '_dormant', lambda: True)
+    _fake_test_gate(monkeypatch, [(True, 'ALL TEST FILES PASSED')])
     assert selfedit.apply_pass() == 1
     assert target.read_text(encoding='utf-8') == 'SPEED = 3\n'
     with sqlite3.connect(serve.DB_PATH) as conn:
@@ -400,7 +402,7 @@ def test_window_tick_fires_forces_dormancy_and_marks_missed(
     assert selfedit.window_tick() == []
     assert dormancy == [True]
     ok, payload = selfedit.cancel_window('win-due', by='player')
-    assert ok is False and 'fired' in payload['error']
+    assert ok is False  # a finished window cannot be cancelled
 
 
 def test_dormancy_tools_surface_and_executor_forwarding(monkeypatch):
@@ -408,7 +410,8 @@ def test_dormancy_tools_surface_and_executor_forwarding(monkeypatch):
     assert 'schedule_dormant_apply' in names
     sent = []
 
-    def fake_http(method, base, path, body, key, timeout=None):
+    def fake_http(method, base, path, body, key, timeout=None,
+                  extra_headers=None):
         sent.append({'method': method, 'path': path, 'body': body,
                      'key': key, 'timeout': timeout})
         return {'id': 'win-y', 'status': 'pending', 'escalationId': 'esc-z',
@@ -435,3 +438,195 @@ def test_dormancy_tools_surface_and_executor_forwarding(monkeypatch):
         'date': _window_slot(), 'start': '03:10',
         'reason': 'nightly maintenance'})
     assert 'Engineering ritual block' in out
+
+
+# ---------------------------------------------------------------------------
+# CHANGE-WINDOW semantics: post-apply tests, in-window remediation, and the
+# automatic end-of-window rollback (operator decision, 2026-10-18).
+# ---------------------------------------------------------------------------
+
+_MARK = '# marker module\nMARKER_VALUE = 1\n'
+
+
+def _fake_test_gate(monkeypatch, sequence):
+    """Replace _run_post_apply_tests with a scripted source: sequence is a
+    list of (ok, tail) consumed per run."""
+    runs = iter(sequence)
+    monkeypatch.setattr(
+        selfedit, '_run_post_apply_tests',
+        lambda: next(runs))
+
+
+def _notify_log(monkeypatch):
+    notes = []
+    monkeypatch.setattr(
+        selfedit, '_notify_agent',
+        lambda agent_id, text, about='': notes.append((agent_id, text)))
+    return notes
+
+
+def _fire_window(start_ts, duration_min=15):
+    selfedit._window_record('win-live', selfedit.time.time(), 'worker',
+                            _window_slot(), '03:10', start_ts,
+                            start_ts + duration_min * 60, duration_min,
+                            'reason', 'approved')
+    fired = selfedit.window_tick()
+    assert 'win-live' in fired
+    return 'win-live'
+
+
+def test_idle_path_failed_tests_rollback_and_save(monkeypatch, fake_repo):
+    _, world = fake_repo
+    _approve(monkeypatch)
+    monkeypatch.setattr(serve, '_set_dormant', lambda v: None)
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    (world / 'marker.py').write_text(_MARK)
+    notes = _notify_log(monkeypatch)
+    ok, payload = selfedit.propose('worker', 'world/marker.py', 'MARKER_VALUE = 1',
+                                   'MARKER_VALUE = 2', 'bump the marker')
+    assert ok is True, payload
+    _fake_test_gate(monkeypatch, [(False, 'ssl contract failed at the shipyard')])
+    applied = selfedit.apply_pass()
+    assert applied == 1
+    row = selfedit.status_snapshot()[0]
+    assert row['status'] == 'rolled_back'
+    assert (world / 'marker.py').read_text() == _MARK
+    saved = world / '.selfedit_failed' / 'no-window'
+    saved_files = list(saved.glob('*.py'))
+    assert saved_files, 'rejected candidate must survive under another name'
+    assert any(notes and 'REVERTED' in t for _a, t in notes)
+    monkeypatch.setattr(serve, '_dormant', lambda: False)
+    selfedit.apply_pass()
+
+
+def test_window_remediation_fix_recheck_recover(monkeypatch, fake_repo):
+    _, world = fake_repo
+    _approve(monkeypatch)
+    now = selfedit.time.time()
+    dormancy = []
+    monkeypatch.setattr(serve, '_set_dormant', lambda v: dormancy.append(v))
+    monkeypatch.setattr(serve, '_dormant', lambda: False)
+    (world / 'marker.py').write_text(_MARK)
+    _notify_log(monkeypatch)
+    ok, payload = selfedit.propose('worker', 'world/marker.py', 'MARKER_VALUE = 1',
+                                   'MARKER_VALUE = 2', 'bump the marker')
+    assert ok is True, payload
+    window_id = _fire_window(now - 60)
+    assert dormancy == [True]
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    _fake_test_gate(monkeypatch, [(False, 'boom: marker tests broken')])
+    selfedit.apply_pass()
+    assert selfedit.status_snapshot()[0]['status'] == 'failed'
+    assert selfedit.remediation_window() == window_id
+    ok, payload = selfedit.submit_remediation_fix(
+        'worker', 'world/marker.py', 'MARKER_VALUE = 2', 'MARKER_VALUE = 3',
+        'the shipped bump broke assertions; smaller bump')
+    assert ok is True, payload
+    assert (world / 'marker.py').read_text() == '# marker module\nMARKER_VALUE = 3\n'
+    _fake_test_gate(monkeypatch, [(True, 'ALL TEST FILES PASSED')])
+    ok, payload = selfedit.run_remediation_checks('worker')
+    assert payload.get('tests') == 'pass', payload
+    rows = selfedit.status_snapshot()
+    assert all(r['status'] == 'applied' for r in rows
+               if r['path'] == 'world/marker.py')
+    assert selfedit.remediation_window() is None
+    # a healthy ending: no rollback file trash, window closes as done
+    selfedit._update_window(window_id, end_ts=selfedit.time.time() - 10)
+    selfedit.window_tick()
+    windows = selfedit.windows_snapshot()
+    assert windows[0]['status'] == 'done'
+    assert not (world / '.selfedit_failed').exists()
+
+
+def test_window_end_unresolved_rolls_back(monkeypatch, fake_repo):
+    _, world = fake_repo
+    _approve(monkeypatch)
+    now = selfedit.time.time()
+    monkeypatch.setattr(serve, '_set_dormant', lambda v: None)
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    (world / 'marker.py').write_text(_MARK)
+    notes = _notify_log(monkeypatch)
+    ok, payload = selfedit.propose('worker', 'world/marker.py', 'MARKER_VALUE = 1',
+                                   'MARKER_VALUE = 2', 'bump the marker')
+    window_id = _fire_window(now - 60)
+    _fake_test_gate(monkeypatch, [(False, 'still failing')])
+    selfedit.apply_pass()
+    # nobody fixes in time: the slot ends
+    selfedit._update_window(window_id, end_ts=selfedit.time.time() - 10)
+    selfedit.window_tick()
+    row = selfedit.status_snapshot()[0]
+    assert row['status'] == 'rolled_back'
+    assert (world / 'marker.py').read_text() == _MARK
+    saved = world / '.selfedit_failed' / window_id
+    assert list(saved.glob('*.py')), 'candidate must survive by another name'
+    windows = selfedit.windows_snapshot()
+    assert windows[0]['status'] == 'rolled_back'
+    assert any('REVERTED' in t and 'schedule a new change window' in t
+               for _a, t in notes)
+
+
+def test_remediation_gates_and_wake_exemption(monkeypatch, fake_repo):
+    _, world = fake_repo
+    ok, payload = selfedit.submit_remediation_fix(
+        'worker', 'world/marker.py', 'A', 'B', 'why')
+    assert ok is False and 'no remediation session' in payload['error']
+    ok, payload = selfedit.run_remediation_checks('worker')
+    assert ok is False and 'no remediation session' in payload['error']
+    # open one for real to check the middleware boundary reply
+    now = selfedit.time.time()
+    monkeypatch.setattr(serve, '_set_dormant', lambda v: None)
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    window_id = _fire_window(now - 60)
+    # a failed row makes the session open
+    key = serve.get_or_create_agent_key('worker')
+    selfedit._record('ed-fail', now, 'worker', 'world/marker.py', 'why',
+                     'x' * 64, 'y' * 64, 'failed')
+    selfedit._update('ed-fail', window_id=window_id, status='failed')
+
+    class _Req:
+        class url:
+            path = '/api/selfedit/fix/edit'
+        headers = {'X-Dormancy-Window': window_id,
+                   'X-Dormancy-Agent': 'worker', 'X-Agent-Key': key}
+
+    assert serve._selfedit_remediation_exempt(_Req()) is True
+    _Req.headers['X-Dormancy-Window'] = 'win-other'
+    assert serve._selfedit_remediation_exempt(_Req()) is False
+    _Req.headers['X-Dormancy-Window'] = window_id
+    _Req.headers['X-Agent-Key'] = 'wrong-key'
+    assert serve._selfedit_remediation_exempt(_Req()) is False
+    _Req.url.path = '/api/browse'
+    _Req.headers['X-Agent-Key'] = key
+    assert serve._selfedit_remediation_exempt(_Req()) is False
+
+
+def test_remediation_executor_tools_attach_slot_headers(monkeypatch, fake_repo):
+    _, world = fake_repo
+    now = selfedit.time.time()
+    monkeypatch.setattr(serve, '_set_dormant', lambda v: None)
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    (world / 'marker.py').write_text(_MARK)
+    key = serve.get_or_create_agent_key('worker')
+    selfedit._record('ed-fail', now, 'worker', 'world/marker.py', 'why',
+                     'x' * 64, 'y' * 64, 'failed')
+    selfedit._update('ed-fail', window_id='win-live-0', status='failed')
+    selfedit._window_record('win-live-0', now, 'worker', _window_slot(),
+                            '03:10', now - 60, now + 600, 15, 'r', 'fired')
+    captured = []
+
+    def fake_http(method, base, path, body, key, timeout=None, extra_headers=None):
+        captured.append({'path': path, 'headers': extra_headers})
+        if 'fix/edit' in path:
+            return {'id': 'fix-x', 'status': 'applied', 'window': 'win-live-0'}
+        return {'ok': True, 'tests': 'pass'}
+
+    monkeypatch.setattr(serve, '_http_json', fake_http)
+    exec_tool = serve._make_web_tools_executor('worker', key)
+    out = exec_tool('selfedit_fix', {
+        'path': 'world/marker.py', 'find': 'MARKER_VALUE = 2',
+        'replace': 'MARKER_VALUE = 3', 'summary': 'correction'})
+    assert captured[-1]['headers']['X-Dormancy-Window'] == 'win-live-0'
+    assert 'fix-x' in out and 'selfedit_recheck' in out
+    out = exec_tool('selfedit_recheck', {})
+    assert captured[-1]['headers']['X-Dormancy-Agent'] == 'worker'
+    assert 'PASSES' in out

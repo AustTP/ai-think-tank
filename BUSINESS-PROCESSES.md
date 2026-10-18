@@ -1878,6 +1878,35 @@ duration of 5-240 minutes (default 15). The chain is strict:
    missed while the server was down is recorded `missed`. The player or
    admin agent can cancel a window before it fires.
 
+**Change windows test what they land (operator decision, 2026-10-18).**
+
+Immediately after applying, the window runs the repo's OWN test gate (the
+same `tests/run_all.sh` bar every contributed change must meet) against the
+LIVE tree. The outcome splits the window in two:
+
+1. Tests pass: every landed edit stays applied; the window proceeds
+   normally and closes `done` when its slot ends.
+2. Tests fail: the window opens an in-window REMEDIATION session. Every
+   responsible proposer is mailed the failing tail plus the deadline. Until
+   the slot ends, they may submit corrective splices (`selfedit_fix`, the
+   player's window approval already covers them, so only the mechanical
+   checks apply) and rerun the gate on demand (`selfedit_recheck`). This
+   remediation traffic reaches the server WITHOUT waking the tank -- the
+   wake exemption is narrow: only `/api/selfedit/*` paths, only while a
+   session is actually open, and only with a verified agent key. A passing
+   rerun recovers the failed edits to `applied` and closes the session.
+3. Failures unresolved at the end of the slot: the window ROLLS BACK
+   automatically. Each rejected candidate is copied, under ANOTHER FILE
+   NAME, to `world/.selfedit_failed/<window>/<edit>-<module>.py`; every
+   edit applied in that window is reverted to its pre-window bytes; the
+   modules reload; the rows land as `rolled_back`; and each responsible
+   agent is mailed to resolve the issues OFF-window and schedule a fresh
+   window. Nothing else about the tank is disturbed, and a fresh window
+   means a fresh conflict scan and fresh approvals.
+4. Applies that land OUTSIDE any window (the idle path) get the same
+   post-apply tests. With no window to remediate in, a failure there rolls
+   back immediately and mails the agents.
+
 **Revert.** Only the player session or the admin agent may revert an
 APPLIED edit: the pre-edit bytes are restored, the module is re-imported,
 and the row is marked `reverted`.

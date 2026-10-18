@@ -40,6 +40,20 @@ The self-modification contract (operator decisions, locked 2026-10-18):
     applies whatever armed edits exist when it fires (each edit already
     passed its own quorum + validator), then consumes itself; the tank
     normally re-awakes on the next request, exactly like the idle path.
+  * CHANGE WINDOW semantics (operator decision, 2026-10-18): edits landed in
+    a window are TESTED after they apply (the repo's own gate script runs
+    inside the window). If tests fail, an in-window remediation session
+    opens: every proposer is mailed the failing output and, until the
+    window's end, may submit corrective fixes and rerun the checks through
+    remediation traffic that does NOT wake the tank (selfedit_* request
+    paths only). If the failures are not resolved BY THE END of the window,
+    the window ROLLS BACK automatically: each candidate that did not
+    survive is copied to world/.selfedit_failed/<window>/<new-name>, every
+    edit applied in that window is reverted to its pre-edit bytes, modules
+    re-load, and each responsible agent is mailed to fix the issues
+    OFF-window and schedule a fresh window. Applies outside any window (the
+    idle path) get the same post-apply tests; with no window to remediate
+    in, a failure there rolls back immediately and mails the agents.
   * Failure posture: every gate fails closed. A refused, rejected, or
     unverifiable proposal never touches the file tree.
 """
@@ -48,6 +62,7 @@ import hashlib
 import os
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -184,6 +199,10 @@ def _ensure_table(conn):
         'sha_before TEXT NOT NULL, sha_after TEXT NOT NULL, '
         'status TEXT NOT NULL, note TEXT, jev_confidence REAL, jev_cost REAL, '
         'validator_note TEXT, armed_at REAL, applied_at REAL, reverted_at REAL)')
+    try:  # change-window linkage landed after the v1 table
+        conn.execute('ALTER TABLE self_edit_log ADD COLUMN window_id TEXT')
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.execute('CREATE INDEX IF NOT EXISTS idx_self_edit_status '
                  'ON self_edit_log (status, created)')
 
@@ -410,9 +429,14 @@ def _validate(edit_id, resolved, candidate):
 
 
 def apply_pass():
-    """Apply every armed edit while the tank is DORMANT. Thread-safe from
-    the idle loop (called through asyncio.to_thread); returns the number of
-    edits applied."""
+    """Apply every armed edit while the tank is DORMANT, then TEST the live
+    tree with the repo's own gate script (change-window semantics). Thread-
+    safe from the serve loop (called through asyncio.to_thread).
+
+    Returns the number of edits landed. On test failure the edits either
+    enter the window's remediation session (fixable until the window ends,
+    else automatic rollback) or, outside a window, roll back immediately;
+    every proposer is mailed either way."""
     serve = _s()
     if not serve._dormant():
         return 0
@@ -421,15 +445,231 @@ def apply_pass():
         rows = conn.execute(
             "SELECT id, path, sha_before FROM self_edit_log "
             "WHERE status = 'armed' ORDER BY created").fetchall()
+    if not rows:
+        return 0
+    window_id = _active_window_id()
     applied = 0
+    landed = []
     for row_id, display, sha_before in rows:
         try:
-            applied += _apply_one(row_id, display, sha_before)
+            if _apply_one(row_id, display, sha_before, window_id):
+                applied += 1
+                landed.append(row_id)
         except Exception as e:  # one bad edit must never stall the loop
             _update(row_id, status='failed', note=str(e)[:200])
             serve.log_action(row_id, 'self_edit_apply_failed',
                              {'error': str(e)[:200]}, authorized=False)
+    if not landed:
+        return 0
+    ok, tail = _run_post_apply_tests()
+    serve.log_action('selfedit', 'self_edit_post_apply_tests',
+                     {'result': 'pass' if ok else 'fail',
+                      'edits': applied, 'window': window_id,
+                      'tail': tail[:POST_APPLY_TAIL_LEN]}, authorized=True)
+    if ok:
+        return applied
+    if window_id:
+        _mark_remediation(window_id, landed, tail)
+        return applied
+    _rollback_rows(landed,
+                   'post-apply tests failed and no change window was open',
+                   'no-window')
     return applied
+
+
+def _run_post_apply_tests():
+    """Test the edited tree after applying: run the repo's own gate script
+    from the repo root and return (ok, tail). The command is a module
+    constant so tests can substitute a fast fake."""
+    serve = _s()
+    repo_root = os.path.dirname(os.path.abspath(_world()))
+    try:
+        done = subprocess.run(
+            POST_APPLY_TEST_CMD, cwd=repo_root,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=POST_APPLY_TEST_TIMEOUT_S)
+        raw = (done.stdout or b'').decode('utf-8', errors='replace')
+        ok = done.returncode == 0
+    except subprocess.TimeoutExpired:
+        raw = 'post-apply test run timed out'
+        ok = False
+    except Exception as exc:  # a broken test harness fails closed
+        raw = f'post-apply test run could not start: {exc}'
+        ok = False
+    tail = raw.strip()[-POST_APPLY_TAIL_LEN:]
+    if ok:
+        return True, tail
+    serve.log_action('selfedit', 'self_edit_post_apply_tests_failed',
+                     {'tail': tail[:POST_APPLY_TAIL_LEN]}, authorized=True)
+    return False, tail
+
+
+def _active_window_id():
+    """The fired change window covering NOW, or None (idle-path applies
+    get no window linkage)."""
+    import math
+    now = time.time()
+    with _s()._db() as conn:
+        _ensure_windows_table(conn)
+        row = conn.execute(
+            "SELECT id FROM dormancy_windows WHERE status = 'fired' "
+            'AND start_ts <= ? AND end_ts >= ? '
+            'ORDER BY start_ts DESC LIMIT 1',
+            (now, math.floor(now))).fetchone()
+    return row[0] if row else None
+
+
+def remediation_window():
+    """The open remediation session for serve's wake exemption: a fired
+    window still inside its slot with failing edits left. None otherwise.
+    Called per request by the middleware -- cheap by design (two small
+    indexed queries)."""
+    import math
+    serve = _s()
+    now = time.time()
+    with serve._db() as conn:
+        _ensure_windows_table(conn)
+        window = conn.execute(
+            "SELECT id FROM dormancy_windows WHERE status = 'fired' "
+            'AND end_ts >= ? ORDER BY start_ts DESC LIMIT 1',
+            (math.floor(now),)).fetchone()
+        if not window:
+            return None
+        failing = conn.execute(
+            "SELECT COUNT(*) FROM self_edit_log WHERE window_id = ? "
+            "AND status = 'failed'", (window[0],)).fetchone()[0]
+    return window[0] if failing else None
+
+
+def _window_participants(window_id, status):
+    with _s()._db() as conn:
+        _ensure_table(conn)
+        return [r[0] for r in conn.execute(
+            'SELECT id FROM self_edit_log WHERE window_id = ? '
+            'AND status = ?', (window_id, status)).fetchall()]
+
+
+def _mark_remediation(window_id, landed_ids, tail):
+    """Open the remediation session: failed rows keep the latest test tail,
+    and every responsible proposer is mailed with what to do until the
+    window ends."""
+    serve = _s()
+    for row_id in landed_ids:
+        _update(row_id, status='failed',
+                note=f'change window {window_id}: repo tests failed; '
+                     f'latest tail: {tail[-200:]}')
+    serve.log_action(window_id, 'selfedit_remediation_opened',
+                     {'edits': landed_ids}, authorized=True)
+    for row_id in landed_ids:
+        row = _row_meta(row_id)
+        if row:
+            agent_id, display = row['agent'], row['path']
+            _notify_agent(agent_id, (
+                f'Your self-edit {row_id} ({display}) applied inside change '
+                f'window {window_id}, but the repo test gate FAILED right '
+                f'after. You have until the window ends to fix it: use the '
+                f'selfedit_fix tool to splice a correction into the current '
+                f'file, then selfedit_recheck to rerun the tests. If the '
+                f'issues are not resolved by the end of the window the '
+                f'window rolls back automatically, your candidate is '
+                f'saved under .selfedit_failed/{window_id}/, and you will '
+                f'need to fix the code off-window and schedule again.\n'
+                f'Test tail:\n{tail[-POST_APPLY_TAIL_LEN:]}'),
+                about=f'selfedit:{row_id}')
+
+
+def _row_meta(row_id):
+    with _s()._db() as conn:
+        _ensure_table(conn)
+        row = conn.execute(
+            'SELECT agent, path FROM self_edit_log '
+            'WHERE id = ?', (row_id,)).fetchone()
+    return {'agent': row[0], 'path': row[1]} if row else None
+
+
+def _rollback_rows(row_ids, reason, subfolder):
+    """Revert each edit to its pre-edit bytes, save the (rejected)
+    candidate under ANOTHER FILE NAME, and re-load the modules. The
+    candidate copy is what the responsible agent fixes off-window."""
+    serve = _s()
+    saved = []
+    for row_id in row_ids:
+        meta = _row_meta(row_id)
+        if not meta:
+            continue
+        display = meta['path']
+        target = _target_from_display(display)
+        backups = os.path.join(_world(), '.selfedit_backups')
+        pre_bytes = os.path.join(backups, row_id)
+        cand_path = os.path.join(backups, f'{row_id}.cand')
+        try:
+            failed_dir = os.path.join(_world(), '.selfedit_failed', subfolder)
+            os.makedirs(failed_dir, exist_ok=True)
+            module_name = os.path.splitext(os.path.basename(display))[0]
+            new_name = f'{row_id}-{module_name}.py'
+            if os.path.isfile(cand_path):
+                shutil.copyfile(cand_path, os.path.join(failed_dir, new_name))
+                saved.append(new_name)
+            if os.path.isfile(pre_bytes):
+                shutil.copyfile(pre_bytes, target)
+                _reload(target)
+            _update(row_id, status='rolled_back',
+                    note=f'{reason}; candidate saved as '
+                         f'.selfedit_failed/{subfolder}/{new_name}')
+            serve.log_action(row_id, 'self_edit_rolled_back',
+                             {'reason': reason[:200],
+                              'savedAs': (new_name if os.path.isfile(cand_path)
+                                          else '')[:160]},
+                             authorized=True)
+        except Exception as exc:
+            _update(row_id, status='failed',
+                    note=f'rollback itself failed: {str(exc)[:200]}')
+            serve.log_action(row_id, 'self_edit_rollback_failed',
+                             {'error': str(exc)[:200]}, authorized=False)
+        if meta.get('agent'):
+            _notify_agent(meta['agent'], (
+                f'Your self-edit {row_id} ({display}) was REVERTED: '
+                f'{reason}. The rejected candidate is saved as '
+                f'.selfedit_failed/{subfolder}/{new_name} -- use it, '
+                f'resolve the issues OFF-window, then file a fresh '
+                f'self_edit proposal and schedule a new change window '
+                f'with schedule_dormant_apply. nothing changed server-side '
+                f'otherwise; the tank is back to the way it was.'),
+                about=f'selfedit:{row_id}')
+    return saved
+
+
+def run_remediation_checks(agent_id):
+    """Rerun the repo gate NOW during an open remediation session. On pass,
+    failing rows recover to applied and the session closes."""
+    serve = _s()
+    window_id = remediation_window()
+    if not window_id:
+        return False, {'error': 'no remediation session is open right now '
+                                '(the tests pass, or no window is firing)'}
+    ok, tail = _run_post_apply_tests()
+    serve.log_action(window_id, 'selfedit_remediation_checks',
+                     {'by': agent_id or 'unknown',
+                      'result': 'pass' if ok else 'fail',
+                      'tail': tail[:POST_APPLY_TAIL_LEN]}, authorized=True)
+    if ok:
+        for row_id in _window_participants(window_id, 'failed'):
+            meta = _row_meta(row_id)
+            _update(row_id, status='applied',
+                    note='tests pass after in-window fixes; recovered to '
+                         'applied')
+            if meta and meta.get('agent'):
+                _notify_agent(meta['agent'], (
+                    f'Change window {window_id} checks PASS after the '
+                    f'in-window fixes. Your edit is back to applied and '
+                    f'clean; nothing else to do.'), about=f'selfedit:{row_id}')
+        serve.log_action(window_id, 'selfedit_remediation_cleared', {},
+                         authorized=True)
+        return True, {'ok': True, 'tests': 'pass',
+                      'message': 'the repo gate passes now -- failing '
+                                 'edits recovered to applied'}
+    return True, {'ok': False, 'tests': 'fail',
+                  'tail': tail[-POST_APPLY_TAIL_LEN:]}
 
 
 def _target_from_display(display):
@@ -438,7 +678,7 @@ def _target_from_display(display):
     return os.path.join(_world(), os.path.basename(display))
 
 
-def _apply_one(row_id, display, sha_before):
+def _apply_one(row_id, display, sha_before, window_id=None):
     serve = _s()
     target = _target_from_display(display)
     if not os.path.isfile(target):
@@ -462,10 +702,101 @@ def _apply_one(row_id, display, sha_before):
     with open(target, 'w', encoding='utf-8') as fh:
         fh.write(candidate)
     _reload(target)
-    _update(row_id, status='applied', applied_at=time.time())
+    _update(row_id, status='applied', applied_at=time.time(),
+            window_id=window_id)
     serve.log_action(row_id, 'self_edit_applied',
-                     {'path': display, 'dormant': True}, authorized=True)
+                     {'path': display, 'dormant': True,
+                      'window': window_id}, authorized=True)
     return 1
+
+
+def submit_remediation_fix(agent_id, path, find, replace, summary):
+    """One corrective splice DURING an open remediation session (inside a
+    live change window). The player's window approval already covers
+    in-window corrections, so there is no second JEV review: the gates here
+    are the mechanical ones (real path, protected refusal, unique anchor,
+    compiled splice) and the changes are TESTED by the next recheck. The
+    fix itself is what the change window exists to enable."""
+    serve = _s()
+    agent_id = (agent_id or '').strip() or 'unknown'
+    window_id = remediation_window()
+    if not window_id:
+        return False, {'error': 'no remediation session is open -- submit '
+                                'a normal self_edit proposal instead, or '
+                                'schedule a change window'}
+    summary = (summary or '').strip()[:MAX_SUMMARY_LEN]
+    find = find if isinstance(find, str) else ''
+    replace = replace if isinstance(replace, str) else ''
+    if not find or len(find) > MAX_FIND_LEN:
+        return False, {'error': f'find text is required (max {MAX_FIND_LEN} chars)'}
+    if len(replace) > MAX_REPLACE_LEN:
+        return False, {'error': f'replacement too long (max {MAX_REPLACE_LEN} chars)'}
+    if find == replace:
+        return False, {'error': 'this fix changes nothing'}
+    if not summary:
+        return False, {'error': 'a summary is required -- say WHAT broke '
+                                'and WHAT this correction changes'}
+    resolved, display = _resolve_path(path)
+    if resolved is None:
+        return False, {'error': display}
+    if is_protected(resolved):
+        return False, {'error': f'{display} is PROTECTED: self-edits may '
+                                'never touch serve.py or '
+                                'BUSINESS-PROCESSES.md, even with approval'}
+    try:
+        with open(resolved, 'r', encoding='utf-8') as fh:
+            original = fh.read()
+    except (OSError, UnicodeDecodeError) as e:
+        return False, {'error': f'cannot read target: {e}'}
+    occurrences = original.count(find)
+    if occurrences != 1:
+        where = 'appears 0 times' if occurrences == 0 else \
+            f'appears {occurrences} times'
+        return False, {'error': f'the find text must appear exactly once; it '
+                                f'{where}. Include more surrounding context '
+                                'to make the anchor unique'}
+    candidate = original.replace(find, replace, 1)
+    syntax_err = _compile_error(candidate)
+    if syntax_err:
+        return False, {'error': f'fix does not compile: {syntax_err} -- '
+                                'correct the splice and resubmit'}
+    fix_id = f'fix-{secrets.token_hex(6)}'
+    backups = os.path.join(_world(), '.selfedit_backups')
+    os.makedirs(backups, exist_ok=True)
+    with open(os.path.join(backups, fix_id), 'w', encoding='utf-8') as fh:
+        fh.write(original)
+    with open(resolved, 'w', encoding='utf-8') as fh:
+        fh.write(candidate)
+    _reload(resolved)
+    _record(fix_id, time.time(), agent_id, display, summary,
+            hashlib.sha256(original.encode('utf-8')).hexdigest(),
+            hashlib.sha256(candidate.encode('utf-8')).hexdigest(), 'applied')
+    _update(fix_id, status='applied', window_id=window_id,
+            note=f'in-window fix; pre-fix bytes under backup {fix_id}')
+    serve.log_action(fix_id, 'selfedit_fix_applied',
+                     {'agent': agent_id, 'path': display,
+                      'window': window_id}, authorized=True)
+    return True, {'id': fix_id, 'status': 'applied', 'window': window_id,
+                  'message': 'fix applied in-window -- run selfedit_recheck '
+                             'to test the tree now'}
+
+
+def _revert_one_from_backup(row_id):
+    """Restore one edit's pre-edit bytes from its backup and re-load the
+    module. Used by the end-of-window rollback."""
+    meta = _row_meta(row_id)
+    if not meta:
+        return False
+    target = _target_from_display(meta['path'])
+    backup = os.path.join(_world(), '.selfedit_backups', row_id)
+    if not os.path.isfile(backup):
+        return False
+    shutil.copyfile(backup, target)
+    try:
+        _reload(target)
+    except Exception:
+        pass
+    return True
 
 
 def _reload(target):
@@ -528,11 +859,13 @@ def status_snapshot(limit=25):
         _ensure_table(conn)
         rows = conn.execute(
             'SELECT id, created, agent, path, summary, status, note, '
-            'jev_confidence, validator_note, applied_at FROM self_edit_log '
+            'jev_confidence, validator_note, applied_at, window_id '
+            'FROM self_edit_log '
             'ORDER BY created DESC LIMIT ?', (int(limit),)).fetchall()
     return [{'id': r[0], 'created': r[1], 'agent': r[2], 'path': r[3],
              'summary': r[4], 'status': r[5], 'note': r[6],
-             'jevConfidence': r[7], 'validator': r[8], 'appliedAt': r[9]}
+             'jevConfidence': r[7], 'validator': r[8], 'appliedAt': r[9],
+             'windowId': r[10]}
             for r in rows]
 
 
@@ -550,6 +883,16 @@ WINDOW_DEFAULT_DURATION_MIN = 15
 WINDOW_MIN_LEAD_S = 5 * 60
 WINDOW_MAX_LEAD_S = 30 * 24 * 60 * 60
 MAX_WINDOW_REASON_LEN = 500
+
+# The post-apply gate: the change window tests the LIVE tree after edits
+# land, using the repo's own test gate (the same bar every contributors'
+# change must meet). A long window is not needed for tests to finish, but a
+# window shorter than the test script would roll back half-seen work -- keep
+# the default 15 minutes and the gate capped so a stuck runner cannot eat a
+# whole window.
+POST_APPLY_TEST_CMD = ['bash', 'tests/run_all.sh']
+POST_APPLY_TEST_TIMEOUT_S = 900
+POST_APPLY_TAIL_LEN = 2000
 
 _WINDOW_JEV_KIND = 'dormancy window request'
 
@@ -585,6 +928,28 @@ def _ensure_windows_table(conn):
         'escalation_id TEXT, fired_at REAL)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_dormancy_windows_status '
                  'ON dormancy_windows (status, start_ts)')
+
+
+def _notify_agent(agent_id, text, about=''):
+    """File one action-needed mail item for an agent (the sim mailbox is
+    how server-originated directions reach them). Reads and saves the full
+    state around the mailbox mutation, mirroring sim's own callers."""
+    serve = _s()
+    try:
+        import sim as _sim
+        state = serve.get_state_from_db() or {}
+        payload = {'text': text}
+        if about:
+            payload['about'] = about
+        dispatched = _sim._deliver_mail(state, agent_id, 'selfedit', payload)
+        if dispatched:
+            serve.save_state_to_db(state)
+        return dispatched
+    except Exception as exc:
+        serve.log_action('selfedit', 'selfedit_mail_failed',
+                         {'agent': agent_id, 'error': str(exc)[:200]},
+                         authorized=False)
+        return False
 
 
 def _window_record(window_id, created, agent, date, start, start_ts, end_ts,
@@ -834,6 +1199,27 @@ def window_tick():
         holding = conn.execute(
             "SELECT id, end_ts FROM dormancy_windows WHERE status = 'fired' "
             'ORDER BY start_ts').fetchall()
+    # END OF WINDOW: a fired window whose slot has passed either finished
+    # healthy (done) or still has failing edits -- per the change-window
+    # contract, rolling back automatically. The responsible agents are
+    # mailed to fix off-window and schedule again.
+    for row_id, end_ts in holding:
+        if end_ts > now:
+            continue
+        failing = _window_participants(row_id, 'failed')
+        if failing:
+            _rollback_rows(failing,
+                           f'change window {row_id} ended with failing tests',
+                           row_id)
+            _update_window(row_id, status='rolled_back',
+                           note='ended with unresolved test failures; '
+                                'candidates saved and edits reverted')
+            serve.log_action(row_id, 'dormancy_window_rolled_back',
+                             {'edits': failing}, authorized=True)
+        else:
+            _update_window(row_id, status='done')
+            serve.log_action(row_id, 'dormancy_window_done', {},
+                             authorized=True)
     fired = []
     for (row_id,) in due:
         _update_window(row_id, status='fired', fired_at=now)

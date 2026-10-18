@@ -10328,6 +10328,49 @@ AGENT_ASK_TOOLS = [
             },
         },
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'selfedit_fix',
+            'description': 'Submit a corrective find/replace splice DURING an open '
+                           'remediation session, i.e., when your self-edit applied '
+                           'inside a change window but the repo test gate failed '
+                           'right after. You will be emailed with the failing '
+                           'tail and the window deadline. Only mechanical checks '
+                           'apply here; the tree is retested by selfedit_recheck. '
+                           'If the window ends with tests still failing, the '
+                           'window ROLLS BACK: your candidate is saved under '
+                           '.selfedit_failed/<window>/, the tree returns to its '
+                           'pre-window bytes, and you fix off-window and '
+                           'schedule a fresh window.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'path': {'type': 'string', 'description': 'Repo-root-relative path '
+                              'of the module your flawed edit landed in.'},
+                    'find': {'type': 'string', 'description': 'Exact current text to '
+                              'replace; must appear exactly once in the file.'},
+                    'replace': {'type': 'string', 'description': 'Replacement text.'},
+                    'summary': {'type': 'string', 'description': 'What broke and what '
+                                 'this correction changes.'},
+                },
+                'required': ['path', 'find', 'replace', 'summary'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'selfedit_recheck',
+            'description': 'Rerun the repo test gate NOW during an open remediation '
+                           'session. Takes no arguments. A passing run recovers '
+                           'your failed edit to applied and closes the session; a '
+                           'failing run returns the current failing tail. Keep '
+                           'rerunning while you still have windows of time left '
+                           'before the slot ends.',
+            'parameters': {'type': 'object', 'properties': {}},
+        },
+    },
 ]
 
 # Additional tools offered to /api/intent/ask ONLY when the dispatched agent's
@@ -13177,6 +13220,44 @@ def _should_wake(request):
     return True
 
 
+def _selfedit_remediation_exempt(request):
+    """True when this request is in-window remediation traffic that must
+    NOT wake a dormant tank (see no_store). Narrow on purpose: only
+    /api/selfedit/* paths, only while a remediation session is actually
+    open (fired window + failing rows), and only when the caller proves a
+    real agent key for the identity it names."""
+    if not request.url.path.startswith('/api/selfedit/'):
+        return False
+    try:
+        active = _selfedit.remediation_window()
+    except Exception:
+        return False
+    if not active or request.headers.get('X-Dormancy-Window') != active:
+        return False
+    agent_id = request.headers.get('X-Dormancy-Agent') or ''
+    if not agent_id or not verify_agent_key(
+            agent_id, request.headers.get('X-Agent-Key')):
+        return False
+    log_action(agent_id, 'selfedit_remediation_traffic',
+               {'window': active, 'path': request.url.path}, authorized=True)
+    return True
+
+
+def _selfedit_fix_headers(agent_id):
+    """Slot headers the executor attaches to selfedit traffic while an
+    in-window remediation session is open; the wake exemption
+    (_selfedit_remediation_exempt) validates the same pair. Without an
+    open session these calls still work, they just wake the tank if it is
+    dormant like any other write."""
+    try:
+        active = _selfedit.remediation_window()
+    except Exception:
+        active = None
+    if not active:
+        return None
+    return {'X-Dormancy-Window': active, 'X-Dormancy-Agent': agent_id or ''}
+
+
 @app.middleware('http')
 async def no_store(request: Request, call_next):
     # Local dev server for actively-edited files -- a cached stale
@@ -13192,8 +13273,16 @@ async def no_store(request: Request, call_next):
     # server. Read-only board/status GETs and pure telemetry do NOT wake
     # (see _NON_WAKING_READS) -- an open tab must not defeat dormancy.
     if _dormant() and _should_wake(request):
-        _set_dormant(False)
-        print(f'[idle] wake request from {request.client.host if request.client else "?"} -- think tank resumed', flush=True)
+        if _selfedit_remediation_exempt(request):
+            # An open change-window remediation session: the responsible
+            # agents MUST be able to reach the fix endpoints (and read their
+            # mail) without waking the tank, since a wake exits the quiet
+            # window their fixes are happening inside. Narrow by path,
+            # remediation state, and verified agent identity.
+            pass
+        else:
+            _set_dormant(False)
+            print(f'[idle] wake request from {request.client.host if request.client else "?"} -- think tank resumed', flush=True)
     response = await call_next(request)
     response.headers['Cache-Control'] = 'no-store'
     return response
@@ -16254,7 +16343,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 limit = 15
             result = _http_json('POST', SELF_BASE_URL, '/api/selfedit/status', {
                 'agentId': agent_id, 'limit': limit,
-            }, agent_key, timeout=30)
+            }, agent_key, timeout=30, extra_headers=_selfedit_fix_headers(agent_id))
             if isinstance(result, dict) and isinstance(result.get('edits'), list):
                 edits = result['edits']
                 if not edits:
@@ -16321,6 +16410,44 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                         f'{result.get("status")}]')
             return ('schedule_dormant_apply returned an unexpected response '
                     '(nothing scheduled).')
+        if name == 'selfedit_fix':
+            path = ((args or {}).get('path') or '').strip()
+            find = (args or {}).get('find')
+            replace = (args or {}).get('replace')
+            summary = (args or {}).get('summary')
+            if not path or not find or replace is None:
+                return ('selfedit_fix requires path, find, replace and a '
+                        'summary of what this correction changes.')
+            body = {'agentId': agent_id, 'path': path, 'find': find,
+                    'replace': replace, 'summary': summary}
+            result = _http_json('POST', SELF_BASE_URL,
+                                '/api/selfedit/fix/edit', body, agent_key,
+                                timeout=300,
+                                extra_headers=_selfedit_fix_headers(agent_id))
+            if isinstance(result, dict) and result.get('error'):
+                return (f'selfedit_fix not applied: {result["error"]} '
+                        f'[fixes only work while a remediation session is '
+                        f'open -- check self_edit_status]')
+            if isinstance(result, dict) and result.get('id'):
+                return (f'Correction applied inside the change window '
+                        f'[{result.get("id")}] -- run selfedit_recheck next '
+                        f'to test the tree.')
+            return 'selfedit_fix returned an unexpected response (nothing changed).'
+        if name == 'selfedit_recheck':
+            result = _http_json('POST', SELF_BASE_URL,
+                                '/api/selfedit/fix/checks',
+                                {'agentId': agent_id}, agent_key, timeout=900,
+                                extra_headers=_selfedit_fix_headers(agent_id))
+            if isinstance(result, dict) and result.get('error'):
+                return f'selfedit_recheck: {result["error"]}'
+            if isinstance(result, dict):
+                if result.get('tests') == 'pass':
+                    return ('Repo test gate PASSES now: your failing edits '
+                            'recovered to applied and the remediation '
+                            'session is closed.')
+                tail = (result.get('tail') or '')[-1200:]
+                return ('Repo test gate still FAILING:\n' + tail)
+            return 'selfedit_recheck returned an unexpected response.'
         raise ValueError(f'unknown tool: {name}')
     return execute_tool
 
@@ -24158,6 +24285,54 @@ async def selfedit_window_cancel(request: Request):
     return JSONResponse(payload, status_code=200 if ok else 400)
 
 
+@app.post('/api/selfedit/fix/edit')
+async def selfedit_fix_edit(request: Request):
+    """Agent-facing IN-WINDOW corrective splice for an open remediation
+    session (change-window contract). Agent-key gated; refuse when no
+    session is open. This path is wake-exempt while the session runs, so
+    the body must carry the agent identity (agentId) plus the slot headers
+    set by the executor."""
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'unknown')
+    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    try:
+        ok, payload = await asyncio.to_thread(
+            _selfedit.submit_remediation_fix, agent_id, body.get('path'),
+            body.get('find'), body.get('replace'), body.get('summary'))
+    except Exception as exc:
+        print(f'[selfedit] fix crashed for {agent_id}: {exc}', flush=True)
+        log_action(agent_id, 'selfedit_fix_crashed', {'error': str(exc)[:300]},
+                   authorized=authorized)
+        return JSONResponse({'error': f'the fix harness failed: {exc}'}, status_code=500)
+    log_action(agent_id, 'selfedit_fix_edit',
+               {'ok': ok, 'id': (payload or {}).get('id'),
+                'window': (payload or {}).get('window'),
+                'note': ((payload or {}).get('error') or '')[:160]},
+               authorized=authorized)
+    return JSONResponse(payload, status_code=200 if ok else 400)
+
+
+@app.post('/api/selfedit/fix/checks')
+async def selfedit_fix_checks(request: Request):
+    """Rerun the repo test gate NOW for an open remediation session; a pass
+    recovers the failed rows to applied and closes the session."""
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'unknown')
+    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    try:
+        ok, payload = await asyncio.to_thread(
+            _selfedit.run_remediation_checks, agent_id)
+    except Exception as exc:
+        print(f'[selfedit] recheck crashed: {exc}', flush=True)
+        log_action(agent_id, 'selfedit_recheck_crashed',
+                   {'error': str(exc)[:300]}, authorized=authorized)
+        return JSONResponse({'error': f'the recheck harness failed: {exc}'}, status_code=500)
+    log_action(agent_id, 'selfedit_recheck',
+               {'ok': ok, 'tests': (payload or {}).get('tests')},
+               authorized=authorized)
+    return JSONResponse(payload, status_code=200 if ok else 400)
+
+
 def _normalize_allowlist_target(target):
     """Normalize a host-or-URL string down to its bare lowercase hostname.
     Returns (host, error). Mirrors the /api/allowlist/request normalization
@@ -29840,16 +30015,22 @@ RESEARCH_SKILL_SYNTHESIS_TOKENS = 900     # runResearchTask /api/chat max_tokens
 RESEARCH_OVERLAP_MS = 24 * 3600 * 1000
 
 
-def _http_json(method, base, path, body=None, header=None, timeout=30):
+def _http_json(method, base, path, body=None, header=None, timeout=30,
+               extra_headers=None):
     """Thin loopback HTTP helper mirroring world.js agentFetch(apiFetch).
     `timeout` defaults to 30s; callers doing a long model decomposition (the
     big-task planning call) pass a larger ceiling -- a 4000-token plan can
-    exceed 30s on a cold model, which surfaced as flaky 502s."""
+    exceed 30s on a cold model, which surfaced as flaky 502s. `extra_headers`
+    carries remediation identity for change-window traffic (see
+    _selfedit_remediation_exempt)."""
     url = base + path
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method,
-                                 headers={'Content-Type': 'application/json',
-                                          **({'X-Agent-Key': header} if header else {})})
+    headers = {'Content-Type': 'application/json'}
+    if header:
+        headers['X-Agent-Key'] = header
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- fixed SELF_BASE_URL internal calls; only SSRF-gated browse URLs use this path
             raw = resp.read().decode('utf-8', errors='replace')
