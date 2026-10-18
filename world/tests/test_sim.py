@@ -1803,5 +1803,49 @@ class IssueReporterMail(unittest.TestCase):
         self.assertTrue(state2['issues'][issue2['key']]['status'] == 'done')
 
 
+class IssueDuplicateStamp(unittest.TestCase):
+    """file_issue stamps an exact-title match against an OPEN card in the same
+    team with duplicateOf instead of rejecting: the record survives, the
+    scrum master sees why, and a decline can name the real key. Cross-team
+    same-title cards stay unlinked; closed originals never suppress."""
+
+    def _state(self):
+        return {
+            'agentRoster': [{'id': 'rep', 'name': 'Repa', 'role': 'Research'}],
+            'agents': {'rep': {'id': 'rep', 'inRoom': 'pressoffice', 'offDuty': False}},
+            'teams': [{'id': 't1', 'name': 'Fixers', 'directorId': 'faye',
+                       'scrumMasterId': 'ada'},
+                      {'id': 't2', 'name': 'Builders', 'directorId': 'bo',
+                       'scrumMasterId': 'sm2'}],
+            'issues': {},
+            'issueCounters': {},
+            'backlogRequests': [],
+        }
+
+    def _file(self, state, title, team='t1'):
+        issue = sim.file_issue(state, team, 'story', 'Add dark mode', 'Sh Theme',
+                               'rep', title=title)
+        return state, issue
+
+    def test_open_same_title_case_and_space_insensitive(self):
+        state, first = self._file(self._state(), 'Add dark mode')
+        _, second = self._file(state, '  add  DARK mode ')
+        self.assertEqual(second['duplicateOf'], first['key'])
+
+    def test_first_card_carries_no_stamp(self):
+        state, first = self._file(self._state(), 'Add dark mode')
+        self.assertIsNone(first['duplicateOf'])
+
+    def test_other_titles_and_teams_and_closed_originals_are_clean(self):
+        state, first = self._file(self._state(), 'Add dark mode')
+        _, rename = self._file(state, 'Add light mode')
+        self.assertIsNone(rename['duplicateOf'])
+        _, cross = self._file(state, 'Add dark mode', team='t2')
+        self.assertIsNone(cross['duplicateOf'])
+        sim.set_issue_status(state, first['key'], 'closed')
+        _, refill = self._file(state, 'Add dark mode')
+        self.assertIsNone(refill['duplicateOf'])
+
+
 if __name__ == '__main__':
     unittest.main()

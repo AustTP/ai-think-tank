@@ -8202,6 +8202,14 @@ ISSUE_TYPES = ('story', 'spike', 'bug', 'task', 'meeting')
 # tracks the work lifecycle (open/in_progress/done/closed).
 ISSUE_STATUSES = ('open', 'in_progress', 'done', 'closed')
 
+
+def _norm_issue_title(text):
+    """Case- and whitespace-insensitive title key for the file_issue same-title
+    guard. Exact match only, on purpose: two agents describing the same gap in
+    different words stay two cards -- only literal re-filings of the same
+    headline ever get the duplicate link."""
+    return ' '.join((text or '').split()).casefold()
+
 # Canonical Jira description blocks. A description, when supplied, must follow
 # one of the two templates the think tank understands:
 #   userStory          "As a <role>, I want to <action>, so that <value>"
@@ -8414,6 +8422,10 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
     convenes the meeting and writes the minutes. Both survive
     file_issue -> refinement -> queue -> task (queue_work whitelists
     them), so the meeting executor can name the participants.
+    Duplicate stamp: an exact-title (case- and whitespace-insensitive) match
+    against an OPEN issue in the same team sets `duplicateOf` on the new card;
+    filing still succeeds -- rejection is the scrum master's call, not the
+    filing API's.
     Pure: mutates state['issues'], state['issueCounters'], and appends a
     backlogRequests record (tagged issueKey + teamId) so the owning scrum
     master can groom the card into a sprint -- the think tank does the work."""
@@ -8432,6 +8444,21 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
     key = next_issue_key(state, team_id)
     story, criteria, never = _normalize_description(description)
     title = (title or '').strip() or summary
+    # Same-title guard: an exact title match against an OPEN card in the same
+    # team is stamped as a duplicate rather than rejected, so a second agent
+    # re-reporting the same gap never silently vanishes -- the record stays,
+    # the scrum master sees why, and a decline can name the real key instead
+    # of judging from scratch. Cross-team same-title cards are different
+    # queues and stay unlinked; closed originals do not suppress new cards.
+    duplicate_of = None
+    req_title = _norm_issue_title(title)
+    for existing in (state.get('issues') or {}).values():
+        if (existing.get('teamId') != team_id
+                or (existing.get('status') or 'open') not in ('open', 'in_progress')):
+            continue
+        if _norm_issue_title(existing.get('title') or existing.get('summary')) == req_title:
+            duplicate_of = existing.get('key')
+            break
     issue = {
         'key': key,
         'teamId': team_id,
@@ -8450,6 +8477,7 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         'blocked': False,  # SM-committed boolean field -- see _file_block_change
         'blockedAt': None,
         'blockedBy': None,
+        'duplicateOf': duplicate_of,  # same-title open card in this team, or None
         'assignedTo': assigned_to or None,  # 'player' = the human does this one
         'lane': normalize_lane(lane),       # attention lane (build/reading/open/parking-lot)
         # MEETING provenance: the attendee spec (roster ids or a

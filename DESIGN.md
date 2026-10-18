@@ -64,9 +64,9 @@ background loops:
 | `_peer_review_loop` | 90s | A random peer observes the action log and files a note on an out-of-line worker (probabilistic) |
 | `_director_approval_loop` | 30s | Resolve pending escalations via delegated JEV approvals |
 | `_telegram_poll_loop` | 25s | Poll Telegram for player messages, route into think tank |
-| `_backup_loop` | 5min | Snapshot think_tank.db (keeps newest 24) |
+| `_backup_loop` | 1h | Snapshot think_tank.db (keeps newest 1) |
 | `_log_prune_loop` | 6h | Delete decision_tape/action_log rows older than retention (7d) |
-| `_model_tier_refresh_loop` | daily | Re-pick each band's best-value model from live catalog + prices |
+| `_model_tier_refresh_loop` | 2h | Re-pick each band's best-value model from live catalog + prices |
 
 Each loop runs as an independent asyncio task; the sim loop runs movement
 on a 2s tick and the task cycle on a 6s tick, both off-thread to avoid
@@ -254,18 +254,21 @@ human-only pool. Fixes the prior 204,000-request escalation storm.
 | Coding | SWE-bench | qwen3-coder | $1.30 | Deterministic: any code/review/qa task uses this tier, no JEV |
 | Vision | MMMU | qwen3-vl | $0.75 | Deterministic capability axis: screenshot/image reading |
 
-### Daily refresh
+### Tier refresh (every 2 hours)
 
 `refresh_model_tiers()` re-picks every band's best-value model from the live
-OpenRouter catalog once a day. Selection within each band:
+OpenRouter catalog every 2 hours (with a 30-minute price watch that fires early
+on a reprive/delisted pick or a better-value qualifier). Selection within each band:
 1. Keep only models with a cited benchmark score in `model_benchmark_scores`
 2. Keep models within `BENCHMARK_QUALITY_FLOOR_GAP` (6 points) of the best score
-3. Pick the cheapest qualifying model
+3. Pick cheapest-first among qualifiers; within 15% of the cheapest qualifier's
+   price, observed median latency decides instead (the BP-63 speed tie-break)
 4. Verify the model works with a real test call before writing to `model_tiers`
 
-The high tier additionally enforces `HIGH_TIER_MAX_PRICE_USD` (default $5/M) —
+The high tier additionally enforces `HIGH_TIER_MAX_PRICE_USD` (default 0, the
+ceiling is off until you set it) —
 no model over the ceiling is even offered to the pool, regardless of its score.
-And `HIGH_TIER_MONTHLY_BUDGET_USD` (default $5/mo) — once the month's high-tier
+And `HIGH_TIER_MONTHLY_BUDGET_USD` (default 0, disabled) — once the month's high-tier
 spend hits the cap, the JEV gate fails closed to mid. The sublow tier enforces
 `SUBLOW_TIER_MAX_PRICE_USD` (default $0.09/M, hard-on) — that ceiling is the
 band's definition, so a sublow pick can never drift up-market.
@@ -415,14 +418,14 @@ request. Tracked monthly; when the month's allowance is spent, both browsing
 and search are refused with a clear message. Set `PAGE_REQUEST_MONTHLY_BUDGET`
 in `.env`.
 
-### Dollar spend cap ($5 default)
+### Dollar spend cap ($50 default)
 
 `SPEND_CAP_USD` is a hard ceiling on total new model spend from the moment
 it's set. Once hit every real model call (JEV, chat, decide) fails closed.
 Baseline is stored in the spend ledger itself so pre-existing spend never
 counts.
 
-### High-tier monthly budget ($5/month)
+### High-tier monthly budget ($0 default, disabled)
 
 `HIGH_TIER_MONTHLY_BUDGET_USD` caps total high-tier model spend per calendar
 month. The JEV gate checks this before returning the high slug — once spent,
@@ -527,7 +530,7 @@ session OR a valid agent key (so server-to-server loopback works).
 3. **Failed closed, not open** — every JEV gate, budget cap, and circuit
    breaker defaults to the safe/conservative/cheap side. An outage never
    causes spend-up or unauthorized access.
-4. **Price-dominant model selection** — models are re-picked daily from the
+4. **Price-dominant model selection** — models are re-picked every 2 hours from the
    live OpenRouter catalog against cited benchmark scores, cheapest within
    a quality floor.
 5. **Single read-modify-write pass** — `_task_cycle` does all completion,
@@ -538,10 +541,10 @@ session OR a valid agent key (so server-to-server loopback works).
    classifier with quorum sampling.
 7. **Idle is free** — `think_tank_has_work()` gates spend before any ceremony
    fires. An idle think tank spends nothing.
-8. **High tier is bounded twice** — per-model price ceiling ($5/M) keeps the
-   daily refresh from picking a $200/M monster; monthly spend cap ($5/mo)
-   keeps the gate from escalating into the expensive tier more than a few
-   times per month.
+8. **High tier is bounded twice** — per-model price ceiling (off by default)
+   keeps the 2-hour refresh from picking a $200/M monster; the high-tier
+   monthly budget (0 by default, disabled) leaves escalation ungated until
+   the operator sets one.
 9. **Teams are derived, not stored** — membership comes from walking the
    `director` graph, so restructuring a team is repointing a pointer. No
    membership list to drift.

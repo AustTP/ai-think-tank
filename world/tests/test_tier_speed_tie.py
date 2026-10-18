@@ -41,6 +41,14 @@ def _clear():
         conn.execute('DELETE FROM model_latency_samples')
 
 
+def _refresh_clear():
+    _clear()
+    with serve._db() as conn:
+        for table in ('model_catalog', 'model_benchmark_scores', 'model_tiers',
+                      'tier_daily_log', 'catalog_price_daily'):
+            conn.execute(f'DELETE FROM {table}')
+
+
 def _seed(model, duration_ms, n=serve.MODEL_LATENCY_MIN_SAMPLES, base_ts=None):
     base = base_ts if base_ts is not None else serve.time.time() - 60
     with serve._db() as conn:
@@ -295,6 +303,60 @@ class WatchMirror(_TierWatchFixture):
         self._select('low', 'low/pricey', 0.30)
         moves = self._watch([self._model('low/pricey', 0.30), self._model('low/cheap', 0.10)])
         self.assertEqual(moves, {'low'})  # plain cheapest-first behavior preserved
+
+
+class RefreshLatencyAudit(unittest.TestCase):
+    """tier_daily_log audit columns: when the refreshed pick is latency-decided
+    (a pricier qualifier inside the parity band won on observed speed), the
+    day's row carries the median ms and the sample count that grounded it plus
+    speed_picked=1; a cheapest-first pick or classifier fallback writes
+    latency NULLs and speed_picked=0, so absence stays honest."""
+
+    def setUp(self):
+        _refresh_clear()
+
+    def _model(self, id_, prompt, completion, input_mods=('text',), output_mods=('text',)):
+        return {
+            'id': id_, 'name': id_,
+            'pricing': {'prompt': prompt, 'completion': completion},
+            'architecture': {
+                'input_modalities': list(input_mods),
+                'output_modalities': list(output_mods),
+            },
+        }
+
+    def _run_refresh(self, models):
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog', return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            return asyncio.run(serve.refresh_model_tiers())
+
+    def _row(self, band='low'):
+        with serve._db() as conn:
+            return conn.execute(
+                'SELECT slug, median_latency_ms, latency_samples, speed_picked '
+                'FROM tier_daily_log WHERE band = ?', (band,)).fetchone()
+
+    def test_speed_pick_row_records_latency_grounds(self):
+        models = [self._model('low/cheap', '0.00000005', '0.00000005'),
+                  self._model('low/fast', '0.000000055', '0.000000055')]
+        serve.set_model_benchmark_score('low/cheap', 'intelligence_index', 70.0, 'u')
+        serve.set_model_benchmark_score('low/fast', 'intelligence_index', 69.0, 'u')
+        _seed('low/cheap', 900.0)
+        _seed('low/fast', 100.0)
+        chosen = self._run_refresh(models)
+        self.assertEqual(chosen['low']['id'], 'low/fast')
+        self.assertEqual(self._row(), ('low/fast', 100.0, 5, 1))
+
+    def test_cheapest_pick_row_stays_null(self):
+        models = [self._model('low/cheap', '0.00000005', '0.00000005')]
+        serve.set_model_benchmark_score('low/cheap', 'intelligence_index', 70.0, 'u')
+        chosen = self._run_refresh(models)
+        self.assertEqual(chosen['low']['id'], 'low/cheap')
+        self.assertEqual(self._row(), ('low/cheap', None, None, 0))
 
 
 if __name__ == '__main__':

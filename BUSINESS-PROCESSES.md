@@ -18,7 +18,7 @@ Scope: the operating processes of the AI think tank as implemented in this repos
 - 7. Knowledge and evidence (BP-34 to BP-41)
 - 8. Money and resources (BP-42 to BP-46)
 - 9. Security, risk, and human oversight (BP-47 to BP-56)
-- 10. Communication and lifecycle (BP-57 to BP-60)
+- 10. Communication and lifecycle (BP-57 to BP-63)
 - 11. Player and operator processes
 - 12. Control framework
 - 13. State and record model
@@ -250,6 +250,9 @@ Owner request
 | BP-58 | Peer help signals | Peer help-signal pass | 90s | Serve, director | Help signal to a director |
 | BP-59 | Dormancy and wake | Idle with the flag armed | 30s poll | Serve | Dormant flag, wake on request |
 | BP-60 | Code self-edits and dormancy windows | Armed edit or agent window request | Per edit or window | JEV, player | Armed edit, applied module, scheduled window |
+| BP-61 | Governed policy knob edits | Agent calls the governed `policy_edit` tool | Per edit | JEV quorum, owner revert | Applied policy key + answer |
+| BP-62 | Cross-team card responses | Owning team changes a filed card | Per transition | Owning team | Mail to the reporter |
+| BP-63 | Speed tie-break in tier picks | Tier re-pick or price watch | 2h refresh, 30m watch | Serve | Updated tier pick, latency samples |
 
 ## 4. Core delivery processes
 
@@ -313,7 +316,10 @@ sprint.
 **Steps.**
 
 1. The agent supplies a title, a room, and a reason.
-2. `file_work_request` appends a pending request to the team's queue.
+2. `file_work_request` appends a pending request to the team's queue. The
+   ticket path (`file_issue`) stamps an exact-title match against an open
+   card in the same team with `duplicateOf` -- filing still succeeds, the
+   scrum master sees the link, and a decline can name the real key.
 3. The request waits for the team's refinement ceremony.
 4. Refinement accepts or rejects it. Acceptance turns it into a queued story.
 5. A linked issue, if any, is mirrored as the request moves.
@@ -2076,7 +2082,10 @@ one-off stalls.
 
 **Records.** `model_latency_samples` rows are the raw measurement; the
 existing `tier_daily_log` stays the auditable record of what each band
-picked and at what price.
+picked and at what price. When a pick was latency-decided (strictly pricier
+than the cheapest in-floor qualifier), the row also carries
+`median_latency_ms` and `latency_samples`; `speed_picked` is 1 only for
+those picks, so absence stays honest.
 
 ## 11. Player and operator processes
 
@@ -2227,6 +2236,7 @@ status.
 | Backup | 1h | Wall | Keep newest 1 |
 | Log prune | 6h | Wall | 7-day retention, 50k rows per run |
 | Model tier refresh | 2h | Wall | Governance task |
+| Tier price watch | 30m | Wall | Mirrors the pick order (BP-63) |
 | Refinement | Weekly plus kick | Cadence stamp | Per-team slot |
 | Social | Weekly | Cadence stamp | Knowledge sharing |
 | Roadmap | Weekly | Cadence stamp | Silent |
@@ -2494,6 +2504,9 @@ rather than gate-integrity questions.
 | BP-58 | `serve._peer_review_pass`, `_peer_review_tick` |
 | BP-59 | `serve._idle_shutdown_loop`, `no_store` wake, `_NON_WAKING_READS`, `_NON_WAKING_WRITES` |
 | BP-60 | `world/selfedit.py` (propose, apply_pass, request_window), `serve._dormancy_window_loop`, selfedit endpoints |
+| BP-61 | `config` operator policy loaders (`bind_policy`, `AGENT_EDITABLE_POLICY_KEYS`), `serve` policy_edit tool case in the tool loop |
+| BP-62 | `sim._mail_card_update`, `sim.set_issue_status`, groom-loop mail hooks |
+| BP-63 | `serve._record_model_latency`, `serve._model_median_latency_ms`, `serve._speed_tie_order`, `serve._best_value_pick` |
 
 ## 20. Appendix D: review checklist
 

@@ -938,8 +938,22 @@ def init_db():
             benchmark TEXT,
             score REAL,
             logged_at REAL NOT NULL,
+            median_latency_ms REAL,
+            latency_samples INTEGER,
+            speed_picked INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (log_date, band)
         )''')
+        # BP-63 audit columns: when a band's pick was latency-decided (a
+        # pricier qualifier inside the price parity band won on observed
+        # speed), the daily row records the median ms and the sample count
+        # that grounded it, plus an explicit speed_picked flag. NULL latency
+        # fields mean the pick was NOT latency-decided (cheapest-first,
+        # unsampled, or a classifier fallback), so absence stays honest.
+        # Column-added migration keeps existing databases working.
+        _tier_log_cols = {r[1] for r in conn.execute('PRAGMA table_info(tier_daily_log)')}
+        for _col_type in ('median_latency_ms REAL', 'latency_samples INTEGER', 'speed_picked INTEGER NOT NULL DEFAULT 0'):
+            if _col_type.split()[0] not in _tier_log_cols:
+                conn.execute(f'ALTER TABLE tier_daily_log ADD COLUMN {_col_type}')
         # Full-catalog daily price snapshot: one row per (date, model) with
         # the blended price. model_catalog overwrites prices in place on
         # every sync, so without this a model's price history is lost the
@@ -12437,6 +12451,42 @@ def _model_median_latency_ms(model_id, now=None):
     return statistics.median(float(r[0]) for r in rows)
 
 
+def _model_latency_sample_count(model_id, now=None):
+    """How many successful samples this model has inside the recency window
+    (0 on any DB problem -- a count is only audit color, never a gate)."""
+    if not model_id:
+        return 0
+    try:
+        now = time.time() if now is None else now
+        with _db() as conn:
+            row = conn.execute(
+                'SELECT COUNT(*) FROM model_latency_samples WHERE model = ? AND ts >= ?',
+                (model_id, now - MODEL_LATENCY_WINDOW_S)).fetchone()
+    except Exception:  # noqa: BLE001 -- audit color must never break a pick
+        return 0
+    return int(row[0]) if row else 0
+
+
+def _attach_latency_audit(picked, cheapest_qual):
+    """BP-63 audit payload for tier_daily_log: when a pick was latency-decided
+    (the pick is a pricier qualifier inside the parity band than the cheapest
+    qualifier on file), the daily row must carry the observed median and the
+    sample count that grounded it -- otherwise a later review cannot tell a
+    deliberate speed choice from a mistake. Stamped as ('_latencyAudit',
+    (median_ms, sample_count, speed_picked)) on the picked dict; (None, None,
+    False) when the pick had no usable latency data or matches cheapest-first.
+    The extra key rides the in-memory pick only; model_tiers writes ignore it."""
+    audit = (None, None, False)
+    median = _model_median_latency_ms(picked['id'])
+    if median is not None:
+        speed = bool(cheapest_qual is not None
+                     and cheapest_qual['id'] != picked['id']
+                     and cheapest_qual['price'] < picked['price'] - 1e-9)
+        audit = (round(median, 1), _model_latency_sample_count(picked['id']), speed)
+    picked['_latencyAudit'] = audit
+    return picked
+
+
 def _speed_tie_order(qualifiers):
     """BP-63 reorder of price-sorted qualifiers: among models within
     TIER_SPEED_TIE_PARITY of the cheapest qualifier, models with a usable
@@ -13167,10 +13217,17 @@ async def refresh_model_tiers():
         # nothing is. Keeps each pick inside one evaluator's scale -- a
         # fallback-only model is never ranked against a primary-scored one.
         picked = None
+        cheapest_qual = None
         for benchmark in BAND_BENCHMARK[band]:
             scores = {r['model_id']: r['score'] for r in all_benchmark_rows if r['benchmark'] == benchmark}
             picked = await _best_value_pick(candidate_pool, scores, BAND_QUALITY_FLOOR_GAP.get(band))
             if picked is not None:
+                # Cheapest in-floor qualifier under the winning benchmark's
+                # scores: the baseline the BP-63 audit compares this pick
+                # against (a strictly pricier pick inside the parity band is
+                # a latency-decided decision; see _attach_latency_audit).
+                quals = _best_value_qualifiers_sync(candidate_pool, scores, BAND_QUALITY_FLOOR_GAP.get(band))
+                cheapest_qual = quals[0] if quals else None
                 break
 
         if picked is None and not pool:
@@ -13204,6 +13261,8 @@ async def refresh_model_tiers():
         if picked is None:
             print(f'[model-tiers] no working candidate found for {band} band after 3 attempts')
             continue
+        if picked is not None:
+            _attach_latency_audit(picked, cheapest_qual)
         chosen[band] = picked
 
     # Vision is a separate axis entirely, not part of the low/mid/high cost
@@ -13244,6 +13303,8 @@ async def refresh_model_tiers():
                 vision_pick = candidate
                 break
     if vision_pick:
+        _vquals = _best_value_qualifiers_sync(vision_pool, vision_scores)
+        _attach_latency_audit(vision_pick, _vquals[0] if _vquals else None)
         chosen['vision'] = vision_pick
     else:
         print('[model-tiers] no working vision-capable candidate found after fallback')
@@ -13271,14 +13332,23 @@ async def refresh_model_tiers():
                         break
                 if _score is not None:
                     break
+            # BP-63 audit columns ride the pick's own audit stamp: latency
+            # median + sample count only when a usable median exists, and
+            # speed_picked only when the pick is strictly pricier than the
+            # cheapest in-floor qualifier (i.e. speed decided the order).
+            _lat_ms, _lat_n, _speed = m.get('_latencyAudit') or (None, None, False)
             conn.execute(
-                'INSERT INTO tier_daily_log (log_date, band, slug, name, price_per_m, benchmark, score, logged_at) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?) '
+                'INSERT INTO tier_daily_log (log_date, band, slug, name, price_per_m, benchmark, score, logged_at, '
+                'median_latency_ms, latency_samples, speed_picked) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
                 'ON CONFLICT(log_date, band) DO UPDATE SET slug=excluded.slug, name=excluded.name, '
                 'price_per_m=excluded.price_per_m, benchmark=excluded.benchmark, score=excluded.score, '
+                'median_latency_ms=excluded.median_latency_ms, latency_samples=excluded.latency_samples, '
+                'speed_picked=excluded.speed_picked, '
                 'logged_at=CASE WHEN tier_daily_log.slug = excluded.slug '
                 'THEN tier_daily_log.logged_at ELSE excluded.logged_at END',
-                (time.strftime('%Y-%m-%d', time.gmtime()), band, m['id'], m['name'], m['price'], _bench, _score, time.time()),
+                (time.strftime('%Y-%m-%d', time.gmtime()), band, m['id'], m['name'], m['price'], _bench, _score, time.time(),
+                 _lat_ms, _lat_n, int(bool(_speed))),
             )
     log_action(None, 'model_tiers_refreshed', {band: m['id'] for band, m in chosen.items()})
     return chosen
