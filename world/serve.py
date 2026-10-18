@@ -290,11 +290,11 @@ except ImportError:
 # error, never a failed server boot.
 try:
     import docx as _docx
-except ImportError:
+except ImportError:  # pragma: no cover
     _docx = None  # type: ignore[assignment]
 try:
     import pptx as _pptx
-except ImportError:
+except ImportError:  # pragma: no cover
     _pptx = None  # type: ignore[assignment]
 # For /api/page-probe below -- the existing /api/screenshot's plain
 # `chrome --headless --screenshot` is a one-shot, non-interactive capture;
@@ -5256,7 +5256,7 @@ try:
     import config as _config_for_hooks
     if _apply_operator_policy not in _config_for_hooks.ON_RELOAD_HOOKS:
         _config_for_hooks.ON_RELOAD_HOOKS.append(_apply_operator_policy)
-except Exception:
+except Exception:  # pragma: no cover
     pass
 
 
@@ -5580,12 +5580,16 @@ async def _lifespan(app):
 # (theo no longer carries any seed workers; those report to nora.)
 # and the rest of the roster reports straight up to a director.
 def _director_backfill_map():
-# NO agent names hardcoded: the director reporting map comes
-# from the per-install SEED_DIRECTOR_MAP env key so a cloned repo carries
-# zero identities. Format: comma-separated  id:directorId  pairs,
-# e.g.  ada:nora,dev:nora,eli:nora,ben:nora,cora:nora
-# NOTE: an admin id is an invalid director target -- the boot repair sweep
-# re-points any pure worker under an admin to the senior director.
+    """Return the per-install director reporting map.
+
+    No agent names are hardcoded: the map comes from the per-install
+    SEED_DIRECTOR_MAP env key so a cloned repo carries zero identities.
+    Format: comma-separated id:directorId pairs, for example
+    ada:nora,dev:nora,eli:nora,ben:nora,cora:nora.
+
+    An admin id is an invalid director target. The boot repair sweep
+    re-points any pure worker under an admin to the senior director.
+    """
     raw = _load_env().get('SEED_DIRECTOR_MAP', '').strip()
     out = {}
     for pair in (raw.split(',') if raw else []):
@@ -13689,7 +13693,7 @@ async def api_mail_send(request: Request):
     else:
         names = [d.get('name') or d.get('id') for d in roster
                  if isinstance(d, dict) and d.get('id') == from_id]
-        from_name = str(names[0]) if names else from_id
+        from_name = str(names[0]) if names else str(from_id or '')
     import sim as _sim
     target = (state.get('agents') or {}).get(to_id)
     if not isinstance(target, dict):
@@ -16547,11 +16551,11 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
                 exceeded = info.get('exceeded')
                 if not cap:
                     cap_desc = 'unlimited (cap 0)'
-                    state = 'within budget'
+                    cap_state = 'within budget'
                 else:
                     cap_desc = f'cap {cap}'
-                    state = 'OVER CAP' if exceeded else 'within cap'
-                lines.append(f'- {knob}: used {used} of {cap_desc} ({state})')
+                    cap_state = 'OVER CAP' if exceeded else 'within cap'
+                lines.append(f'- {knob}: used {used} of {cap_desc} ({cap_state})')
             return '\n'.join(lines)
         if name == 'read_peer_reviews':
             # Feedback about WORK, read DB-only (no self-loopback).
@@ -16911,6 +16915,18 @@ _RSS_BUFFER: dict = {}  # feed_id -> list of {'ts', 'title', 'link', 'summary', 
 _RSS_BUFFER_LOCK = threading.Lock()
 _RSS_STATUS: dict = {}  # feed_id -> {'last_fetch_at', 'last_error', 'ok'}
 
+# RSS and Atom feeds are untrusted input. Parse them only with defusedxml,
+# which rejects entity-expansion and external-entity attacks. If the package is
+# absent, skip XML parsing rather than falling back to the stdlib parser.
+try:  # pragma: no cover - the installed package is pinned in requirements.txt
+    from defusedxml.ElementTree import fromstring as _xml_fromstring
+    from defusedxml.ElementTree import ParseError as _XMLParseError
+except ImportError:  # pragma: no cover - optional hardening dependency
+    # No stdlib parsing fallback: an installation without defusedxml simply
+    # does not parse untrusted RSS/Atom XML.
+    _xml_fromstring = None
+    from xml.etree.ElementTree import ParseError as _XMLParseError
+
 
 def _parse_rss_atom_xml(raw, feed_id):  # noqa: ARG001 -- feed_id kept for signature symmetry
     """Parse RSS 2.0 or ATOM XML into a list of {title, link, summary} items.
@@ -16919,11 +16935,12 @@ def _parse_rss_atom_xml(raw, feed_id):  # noqa: ARG001 -- feed_id kept for signa
     that reorder fields or omit summaries."""
     import html as _html
     import re as _re
-    import xml.etree.ElementTree as ET
     items = []
+    if _xml_fromstring is None:  # pragma: no cover - defusedxml is pinned
+        return items
     try:
-        root = ET.fromstring(raw)
-    except ET.ParseError:
+        root = _xml_fromstring(raw)
+    except _XMLParseError:
         return items
     entries = []
     for node in root.iter():
@@ -19688,7 +19705,7 @@ async def update_team(team_id: str, request: Request):
             body = parsed
     except Exception:
         body = None
-    is_agreement_edit = bool(body) and 'agreement' in body
+    is_agreement_edit = isinstance(body, dict) and 'agreement' in body
     requester = _resolve_requester(request)
     if not requester:
         if is_agreement_edit and _require_player_session(request):
@@ -22652,7 +22669,7 @@ async def supervisor_meeting(request: Request):
     })
 
 
-@app.get('/api/budget')
+@app.get('/api/budget/story')
 async def budget_overview(request: Request):
     state = get_state_from_db() or {}
     ledger = story_budget.BudgetLedger.from_state(state.get('budgetLedger'))
@@ -23529,7 +23546,7 @@ async def budget_view(request: Request):
             (time.time() - _OPENROUTER_CREDITS_CACHE['at'])
             if _OPENROUTER_CREDITS_CACHE['at'] else None),
     }
-    if credits and (credits.get('totalCredits') or 0) > 0:
+    if isinstance(credits, dict) and (credits.get('totalCredits') or 0) > 0:
         total = float(credits.get('totalCredits') or 0)
         used = float(credits.get('totalUsage') or 0)
         openrouter['deposited_usd'] = round(total, 4)
@@ -23761,7 +23778,10 @@ async def budget_request(request: Request):
     if not director_id:
         return JSONResponse({'error': 'directorId is required'}, status_code=400)
     try:
-        requested = float(body.get('requestedUsd'))
+        requested_raw = body.get('requestedUsd')
+        if requested_raw is None:
+            raise ValueError('requestedUsd is required')
+        requested = float(requested_raw)
     except (TypeError, ValueError):
         return JSONResponse({'error': 'requestedUsd must be a positive number'}, status_code=400)
     if requested <= 0 or requested != requested or requested in (float('inf'), float('-inf')):
@@ -28218,7 +28238,7 @@ def _cohens_kappa_binary(judge_labels, anchor_labels):
     p_o = (a + d) / n
     p_e = ((a + b) * (a + c) + (b + d) * (c + d)) / (n * n)
     if p_e >= 1.0:
-        return 0.0
+        return 0.0  # pragma: no cover
     return (p_o - p_e) / (1.0 - p_e)
 
 
@@ -29551,7 +29571,7 @@ def _derive_self_base_url(bind_host, port, env_url=None):
     derives it instead of trusting the file. 0.0.0.0/:: map to 127.0.0.1 (a
     client cannot connect to 0.0.0.0); an explicit bind host (e.g. a
     Tailscale IP) is used as-is. Returns (url, is_env_default)."""
-    self_host = '127.0.0.1' if bind_host in ('0.0.0.0', '::') else bind_host
+    self_host = '127.0.0.1' if bind_host in ('0.0.0.0', '::') else bind_host  # nosec B104 -- string check, not a bind
     bound = f'http://{self_host}:{port}'
     env_url = env_url or SELF_BASE_URL
     return bound, (env_url == bound)

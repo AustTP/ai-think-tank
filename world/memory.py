@@ -297,7 +297,7 @@ def _enforce_limits(session_id):
                         break
                 prune = max(prune, cnt)
             if prune <= 0:
-                return
+                return  # pragma: no cover
             pruned = rows[:prune]
             pruned_tokens = sum(r[4] for r in pruned)
             recap = _rule_based_summary(
@@ -326,7 +326,7 @@ def _rule_based_summary(text):
     Guaranteed to return something, so context is never lost to a failing LLM."""
     lines = (text or '').strip().split('\n')
     if not lines:
-        return 'Context continues from earlier in this conversation.'
+        return 'Context continues from earlier in this conversation.'  # pragma: no cover
     first_user = None
     last_assistant = None
     decision_parts = []

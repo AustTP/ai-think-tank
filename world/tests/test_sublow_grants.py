@@ -10,6 +10,7 @@ hermetic temp DB -- never the live think_tank.db -- and mocks the OpenRouter
 call so nothing here makes a network request.
 """
 import hashlib
+import importlib
 import json
 import os
 import shutil
@@ -20,6 +21,8 @@ import unittest.mock
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import config
 
 import serve
 import sublow
@@ -206,6 +209,66 @@ class SublowGrants(SublowGrantCase):
         self.assertIsNone(bare['agentCapUsd'])
         self.assertIsNone(bare['agentRemainingUsd'])
         self.assertIsNone(bare['tankMonthUsd'])
+
+
+class SublowGrantFailures(SublowGrantCase):
+    """Accounting-failure and guard paths: a ledger or DB failure
+    never breaks the call that just succeeded, the revoke guards fail
+    closed, the quote worksheet degrades when the tiers read fails,
+    and the reload-hook registration is best-effort."""
+
+    def test_agent_month_spend_guards_and_survives_ledger_failure(self):
+        self.assertEqual(sublow._agent_month_spend(''), 0.0)
+        with unittest.mock.patch.object(serve, '_spend_ledger_read',
+                                         side_effect=RuntimeError):
+            self.assertEqual(sublow._agent_month_spend('agent-a'), 0.0)
+
+    def test_accrue_survives_a_db_failure(self):
+        with unittest.mock.patch.object(serve, '_db',
+                                         side_effect=RuntimeError):
+            self.assertIsNone(sublow.accrue_sublow_grant('sg-x', 0.01))
+
+    def test_revoke_guards_fail_closed(self):
+        self.assertFalse(sublow.revoke_sublow_grant(None))
+        self.assertFalse(sublow.revoke_sublow_grant(123))
+        self.assertEqual(sublow.revoke_agent_sublow_grants(''), 0)
+
+    def test_quote_clamps_unparseable_call_counts(self):
+        quote = serve.quote_sublow_grant('agent-a', estimated_calls='abc')
+        self.assertEqual(quote['estimatedCalls'], 1)
+
+    def test_quote_degrades_when_the_tiers_read_fails(self):
+        # The sublow lane has NO fallback price (it must never price
+        # sublow work at another band's rate), so a failed tiers read
+        # leaves the price fields unset rather than guessing.
+        with unittest.mock.patch.object(serve, '_sublow_tier_slug',
+                                         return_value='test-org/test-sublow'), \
+             unittest.mock.patch.object(serve, '_db',
+                                        side_effect=RuntimeError):
+            quote = serve.quote_sublow_grant('agent-a')
+        self.assertIsNone(quote['pricePerM'])
+        self.assertIsNone(quote['perCallUsd'])
+        self.assertIsNone(quote['totalUsd'])
+
+    def test_reload_hook_registration_survives_a_broken_hooks_list(self):
+        # Registration on config.ON_RELOAD_HOOKS is best-effort: a
+        # broken hooks container must not break (re)importing the
+        # module -- the same registration path an operator reload runs.
+        saved = (sublow.GRANT_TTL_S_DEFAULT, sublow.GRANT_TTL_S_MAX,
+                 sublow.GRANT_TOKENS_DEFAULT, sublow.GRANT_TOKENS_MAX)
+
+        class _BrokenHooks:
+            def __contains__(self, item):
+                raise RuntimeError('hooks list is broken')
+
+        try:
+            with unittest.mock.patch.object(config, 'ON_RELOAD_HOOKS',
+                                             _BrokenHooks()):
+                importlib.reload(sublow)
+        finally:
+            importlib.reload(sublow)
+            (sublow.GRANT_TTL_S_DEFAULT, sublow.GRANT_TTL_S_MAX,
+             sublow.GRANT_TOKENS_DEFAULT, sublow.GRANT_TOKENS_MAX) = saved
 
 
 class SublowEndpoints(SublowGrantCase):

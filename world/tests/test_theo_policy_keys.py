@@ -301,5 +301,125 @@ class EvaluateKey(unittest.TestCase):
         self.assertTrue(entry.allowed)
 
 
+class DecisionShape(unittest.TestCase):
+    def test_as_dict_carries_every_field(self):
+        decision = theo_policy.Decision(
+            True, theo_policy.ROLE_WORKER, 'send_message',
+            agent_id='cora', approval_id='apr-1',
+            reason='approved by owner')
+        self.assertEqual(decision.as_dict(), {
+            'allowed': True,
+            'agentId': 'cora',
+            'role': theo_policy.ROLE_WORKER,
+            'action': 'send_message',
+            'requiresApproval': False,
+            'approvalId': 'apr-1',
+            'reason': 'approved by owner',
+        })
+
+
+class RateLimitOverride(unittest.TestCase):
+    def test_none_clears_the_override(self):
+        policy = theo_policy.TheoPolicy(rate_limit=5)
+        policy.usage.set_rate_limit('cora', 2)
+        self.assertEqual(policy.usage._limit_for('cora'), 2)
+        policy.usage.set_rate_limit('cora', None)
+        self.assertEqual(policy.usage._limit_for('cora'), 5)
+
+    def test_key_without_a_limit_uses_the_default(self):
+        # A key granted with no per-key limit carries
+        # None; using it clears the override instead of
+        # setting one, so the policy-wide default rules.
+        registry = theo_policy.KeyRegistry(clock=_Clock())
+        policy = theo_policy.TheoPolicy(
+            rate_limit=5, registry=registry,
+            clock=_Clock())
+        raw, _ = registry.grant_key(
+            theo_policy.ROLE_OWNER, 'cora',
+            theo_policy.ROLE_WORKER, rate_limit=None)
+        decision = policy.evaluate_key(
+            theo_policy.ActionRequest('converse'), raw)
+        self.assertTrue(decision.allowed)
+        self.assertEqual(
+            policy.usage._limit_for(
+                registry.verify(raw).key_id), 5)
+
+
+class ApprovalThroughKey(unittest.TestCase):
+    def setUp(self):
+        self.state = _state()
+        self.clock = _Clock()
+        self.registry = theo_policy.KeyRegistry(
+            clock=self.clock)
+        self.policy = theo_policy.TheoPolicy(
+            registry=self.registry, clock=self.clock)
+
+    def _grant(self, agent_id='cora',
+               role=theo_policy.ROLE_WORKER, **kwargs):
+        return self.registry.grant_key(
+            theo_policy.ROLE_OWNER, agent_id, role,
+            **kwargs)
+
+    def test_approved_grant_lets_the_gated_ask_through(self):
+        raw, _ = self._grant(agent_id='cora')
+        # The first gated ask opens a pending approval.
+        first = self.policy.evaluate_key(
+            theo_policy.ActionRequest(
+                'spend', {'amountUsd': 5.0}), raw)
+        self.assertTrue(first.requires_approval)
+        approval_id = first.approval_id
+        # The owner (the player session) approves it.
+        self.assertTrue(self.policy.approve(
+            self.state, None, approval_id))
+        # The next gated ask rides that approval.
+        second = self.policy.evaluate_key(
+            theo_policy.ActionRequest(
+                'spend', {'amountUsd': 5.0}), raw)
+        self.assertTrue(second.allowed)
+        self.assertFalse(second.requires_approval)
+        self.assertEqual(second.approval_id, approval_id)
+        self.assertEqual(second.reason,
+                         'approved by owner')
+
+    def test_deny_is_owner_only(self):
+        raw, _ = self._grant(agent_id='cora')
+        first = self.policy.evaluate_key(
+            theo_policy.ActionRequest(
+                'spend', {'amountUsd': 5.0}), raw)
+        # A worker cannot deny her own pending approval.
+        self.assertFalse(self.policy.deny_approval(
+            self.state, 'cora', first.approval_id))
+        # The owner (the player session) can.
+        self.assertTrue(self.policy.deny_approval(
+            self.state, None, first.approval_id))
+
+    def test_deny_refuses_missing_and_decided_approvals(self):
+        # A nonexistent approval id is a no-op for the owner.
+        self.assertFalse(self.policy.deny_approval(
+            self.state, None, 'apr-nope'))
+        # So is one that was already approved.
+        raw, _ = self._grant(agent_id='cora')
+        first = self.policy.evaluate_key(
+            theo_policy.ActionRequest(
+                'spend', {'amountUsd': 5.0}), raw)
+        self.policy.approve(
+            self.state, None, first.approval_id)
+        self.assertFalse(self.policy.deny_approval(
+            self.state, None, first.approval_id))
+
+    def test_match_skips_stale_approved_set_entries(self):
+        # The approved set and the approval map must agree;
+        # a stale entry whose approval is no longer approved
+        # is skipped, never treated as a grant.
+        stale = theo_policy.PendingApproval(
+            'apr-stale', 'cora', theo_policy.ROLE_WORKER,
+            'spend', {}, self.clock())
+        stale.status = 'denied'
+        self.policy._approvals['apr-stale'] = stale
+        self.policy._approved.add('apr-stale')
+        self.assertIsNone(
+            self.policy._match_approval('cora', 'spend'))
+
+
 if __name__ == '__main__':
     unittest.main()

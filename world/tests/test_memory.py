@@ -407,5 +407,489 @@ class Consolidation(unittest.TestCase):
             self.assertFalse(memory.ltm_consolidate_due(self.SESSION))
 
 
+class EnsureTablesMigrations(unittest.TestCase):
+    def setUp(self):
+        _clear_memory()
+
+    def _columns(self, table):
+        with serve._db() as conn:
+            return {r[1] for r in conn.execute(f'PRAGMA table_info({table})')}
+
+    def test_stm_sessions_migration_adds_consolidate_turn(self):
+        with serve._db() as conn:
+            conn.execute('DROP TABLE IF EXISTS stm_sessions')
+            conn.execute('''CREATE TABLE stm_sessions (
+                session_id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL DEFAULT '',
+                turn_count INTEGER NOT NULL DEFAULT 0,
+                token_count INTEGER NOT NULL DEFAULT 0,
+                last_extract_turn INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )''')
+        memory._ensure_tables()
+        self.assertIn('last_consolidate_turn', self._columns('stm_sessions'))
+
+    def test_ltm_memories_migration_adds_trust_columns(self):
+        with serve._db() as conn:
+            conn.execute('DROP TABLE IF EXISTS ltm_memories')
+            conn.execute('''CREATE TABLE ltm_memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                mem_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            )''')
+        memory._ensure_tables()
+        cols = self._columns('ltm_memories')
+        for col in ('confidence', 'source_type', 'fact_checked'):
+            self.assertIn(col, cols)
+
+    def test_ensure_tables_swallows_db_errors(self):
+        with unittest.mock.patch.object(serve, '_db',
+                                        side_effect=RuntimeError('boom')):
+            memory._ensure_tables()
+
+
+class StmFailureEdges(unittest.TestCase):
+    SESSION = '111'
+
+    def setUp(self):
+        _clear_memory()
+
+    def test_history_fails_closed_to_empty(self):
+        with unittest.mock.patch.object(serve, '_db',
+                                        side_effect=RuntimeError('boom')):
+            self.assertEqual(memory.stm_history(self.SESSION), ('', []))
+
+    def test_append_fails_closed_to_none(self):
+        with unittest.mock.patch.object(serve, '_db',
+                                        side_effect=RuntimeError('boom')):
+            self.assertIsNone(memory.stm_append(self.SESSION, 'user', 'hi'))
+
+
+class EnforceLimitsEdges(unittest.TestCase):
+    SESSION = '111'
+
+    def setUp(self):
+        _clear_memory()
+
+    def test_turn_budget_with_no_messages_is_a_noop(self):
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT OR IGNORE INTO stm_sessions (session_id, summary, '
+                'turn_count, token_count, last_extract_turn, created_at, '
+                'updated_at) VALUES (?, ?, 5, 0, 0, ?, ?)',
+                (self.SESSION, '', time.time(), time.time()))
+        with unittest.mock.patch.object(serve, 'STM_MAX_TURNS', 2):
+            memory._enforce_limits(self.SESSION)
+        self.assertEqual(memory.stm_history(self.SESSION), ('', []))
+
+    def test_token_budget_prunes_oldest_turn(self):
+        with unittest.mock.patch.object(serve, 'STM_MAX_TOKENS', 4):
+            memory.stm_append(self.SESSION, 'user', 'first message here')
+            memory.stm_append(self.SESSION, 'assistant', 'second message here')
+        summary, history = memory.stm_history(self.SESSION)
+        self.assertEqual([h['content'] for h in history], ['second message here'])
+        self.assertIn('first message here', summary)
+
+    def test_summary_is_capped(self):
+        with unittest.mock.patch.object(serve, 'STM_MAX_TURNS', 1):
+            for i in range(8):
+                memory.stm_append(
+                    self.SESSION, 'user', f'we decided {"x" * 189} turn {i}')
+        summary, _ = memory.stm_history(self.SESSION)
+        self.assertEqual(len(summary), memory._SUMMARY_CAP_CHARS)
+
+    def test_enforce_limits_fails_closed(self):
+        with unittest.mock.patch.object(serve, '_db',
+                                        side_effect=RuntimeError('boom')):
+            memory._enforce_limits(self.SESSION)
+
+
+class SummaryUpgradeEdges(unittest.TestCase):
+    SESSION = '111'
+
+    def setUp(self):
+        _clear_memory()
+
+    def _set_summary(self, value):
+        memory.stm_append(self.SESSION, 'user', 'hello')
+        with serve._db() as conn:
+            conn.execute('UPDATE stm_sessions SET summary = ? WHERE session_id = ?',
+                         (value, self.SESSION))
+
+    def test_rule_based_summary_of_empty_text(self):
+        self.assertEqual(
+            memory._rule_based_summary(''),
+            'Context continues from earlier in this conversation.')
+
+    def test_spawn_upgrade_swallows_thread_errors(self):
+        with unittest.mock.patch.object(serve, 'STM_MAX_TURNS', 1), \
+             unittest.mock.patch.object(memory.threading, 'Thread',
+                                        side_effect=RuntimeError('boom')):
+            memory.stm_append(self.SESSION, 'user', 'one')
+            memory.stm_append(self.SESSION, 'user', 'two')
+
+    def test_upgrade_worker_missing_session(self):
+        memory._summary_upgrade_worker('no-such-session')
+
+    def test_upgrade_worker_replaces_recap(self):
+        self._set_summary('old recap worth condensing')
+        with unittest.mock.patch.object(memory, '_chat_call',
+                                        return_value='new recap'):
+            memory._summary_upgrade_worker(self.SESSION)
+        self.assertEqual(memory.stm_history(self.SESSION)[0], 'new recap')
+
+    def test_upgrade_worker_fails_closed(self):
+        self._set_summary('old recap worth condensing')
+        with unittest.mock.patch.object(memory, '_chat_call',
+                                        side_effect=RuntimeError('boom')):
+            memory._summary_upgrade_worker(self.SESSION)
+        self.assertEqual(memory.stm_history(self.SESSION)[0],
+                         'old recap worth condensing')
+
+
+class LtmRecallEdges(unittest.TestCase):
+    def setUp(self):
+        _clear_memory()
+
+    def test_empty_question_is_none(self):
+        self.assertIsNone(memory.ltm_recall(''))
+
+    def test_zero_limit_is_none(self):
+        self.assertIsNone(memory.ltm_recall('vault door', limit=0))
+
+    def test_recall_fails_closed_on_db_error(self):
+        with unittest.mock.patch.object(serve, '_db',
+                                        side_effect=RuntimeError('boom')):
+            self.assertIsNone(memory.ltm_recall('vault door'))
+
+
+class LtmExtractLaunch(unittest.TestCase):
+    SESSION = '111'
+
+    def setUp(self):
+        _clear_memory()
+
+    def test_null_session_is_none(self):
+        self.assertIsNone(memory.ltm_maybe_extract(None))
+
+    def test_extract_cadence_disabled(self):
+        with unittest.mock.patch.object(serve, 'LTM_EXTRACT_EVERY_TURNS', 0):
+            self.assertIsNone(memory.ltm_maybe_extract(self.SESSION))
+
+    def test_launch_spawns_workers(self):
+        memory.stm_append(self.SESSION, 'user', 'hello')
+        with serve._db() as conn:
+            conn.execute(
+                'UPDATE stm_sessions SET turn_count = 20, '
+                'last_extract_turn = 0, last_consolidate_turn = 0 '
+                'WHERE session_id = ?', (self.SESSION,))
+        with unittest.mock.patch.object(memory, '_ltm_extract_worker'), \
+             unittest.mock.patch.object(memory, '_ltm_consolidate_worker'):
+            self.assertIsNone(memory.ltm_maybe_extract(self.SESSION))
+
+    def test_launch_fails_closed(self):
+        with unittest.mock.patch.object(memory, '_session_row',
+                                        side_effect=RuntimeError('boom')):
+            self.assertIsNone(memory.ltm_maybe_extract(self.SESSION))
+
+
+class LtmExtractWorker(unittest.TestCase):
+    SESSION = '111'
+
+    def setUp(self):
+        _clear_memory()
+
+    def _turns(self):
+        with serve._db() as conn:
+            return conn.execute('SELECT turn_count, last_extract_turn '
+                                  'FROM stm_sessions WHERE session_id = ?',
+                                  (self.SESSION,)).fetchone()
+
+    def test_fresh_session_has_nothing_to_extract(self):
+        memory._ltm_extract_worker(self.SESSION)
+        self.assertEqual(self._turns(), (0, 0))
+
+    def test_worker_with_no_new_messages_marks_turn(self):
+        memory.stm_append(self.SESSION, 'user', 'hello')
+        with serve._db() as conn:
+            conn.execute('UPDATE stm_sessions SET turn_count = 5 '
+                         'WHERE session_id = ?', (self.SESSION,))
+            conn.execute('DELETE FROM stm_messages')
+        memory._ltm_extract_worker(self.SESSION)
+        self.assertEqual(self._turns(), (5, 5))
+
+    def test_worker_distills_new_turns_into_ltm(self):
+        memory.stm_append(self.SESSION, 'user', 'the vault code is 4518')
+        memory.stm_append(self.SESSION, 'assistant', 'noted')
+        with serve._db() as conn:
+            conn.execute('UPDATE stm_sessions SET turn_count = 5 '
+                         'WHERE session_id = ?', (self.SESSION,))
+        reply = '{"memories": [{"type": "fact", "content": "the vault code is 4518"}]}'
+        with unittest.mock.patch.object(memory, '_chat_call',
+                                        return_value=reply):
+            memory._ltm_extract_worker(self.SESSION)
+        self.assertIn('4518', memory.ltm_recall('vault code'))
+        self.assertEqual(self._turns(), (5, 5))
+
+    def test_worker_fails_closed_on_chat_error(self):
+        memory.stm_append(self.SESSION, 'user', 'hello')
+        with serve._db() as conn:
+            conn.execute('UPDATE stm_sessions SET turn_count = 5 '
+                         'WHERE session_id = ?', (self.SESSION,))
+        with unittest.mock.patch.object(memory, '_chat_call',
+                                        side_effect=RuntimeError('boom')):
+            memory._ltm_extract_worker(self.SESSION)
+        self.assertEqual(self._turns(), (5, 0))
+
+
+class ParseMemoriesEdges(unittest.TestCase):
+    def test_parse_plain_list(self):
+        self.assertEqual(
+            memory._parse_memories('[{"type": "fact", "content": "x"}]'),
+            [('fact', 'x', 0.6, 'agent_inferred')])
+
+    def test_parse_scalar_json_is_empty(self):
+        self.assertEqual(memory._parse_memories('"just a string"'), [])
+
+    def test_parse_skips_non_dict_items(self):
+        self.assertEqual(
+            memory._parse_memories('{"memories": ["not-a-dict"]}'), [])
+
+    def test_parse_skips_empty_content(self):
+        self.assertEqual(
+            memory._parse_memories('{"memories": [{"type": "fact", "content": ""}]}'),
+            [])
+
+
+class InsertMemoriesEdges(unittest.TestCase):
+    SESSION = '111'
+
+    def setUp(self):
+        _clear_memory()
+
+    def test_per_session_cap_deactivates_oldest(self):
+        with unittest.mock.patch.object(serve, 'LTM_MAX_PER_SESSION', 2):
+            memory._insert_memories(self.SESSION, [
+                ('fact', 'alpha one', 0.9, 'user_stated'),
+                ('fact', 'beta two', 0.9, 'user_stated'),
+                ('fact', 'gamma three', 0.9, 'user_stated')])
+        with serve._db() as conn:
+            rows = conn.execute('SELECT active FROM ltm_memories '
+                                  'WHERE session_id = ? ORDER BY id',
+                                  (self.SESSION,)).fetchall()
+        self.assertEqual([r[0] for r in rows], [0, 1, 1])
+
+    def test_insert_fails_closed_on_db_error(self):
+        with unittest.mock.patch.object(serve, '_db',
+                                        side_effect=RuntimeError('boom')):
+            memory._insert_memories(self.SESSION, [
+                ('fact', 'alpha one', 0.9, 'user_stated')])
+
+
+class ConsolidationClusterEdges(unittest.TestCase):
+    def test_cluster_skips_consumed_members(self):
+        mems = [
+            (1, 'fact', 'The player works at the observatory north building'),
+            (2, 'preference', 'Prefers short emails in the morning'),
+            (3, 'fact', 'The player is employed at the observatory north building'),
+        ]
+        clusters = memory._find_consolidation_clusters(mems, max_clusters=4)
+        self.assertEqual(len(clusters), 1)
+        self.assertEqual([m[0] for m in clusters[0]], [1, 3])
+
+    def test_cluster_skips_empty_word_sets(self):
+        mems = [(1, 'fact', 'the a an'), (2, 'fact', 'the a an')]
+        self.assertEqual(memory._find_consolidation_clusters(mems), [])
+
+    def test_cluster_count_is_capped(self):
+        mems = [
+            (1, 'fact', 'observatory north building work research'),
+            (2, 'fact', 'observatory north building study research'),
+            (3, 'fact', 'greenhouse south garden plant water'),
+            (4, 'fact', 'greenhouse south garden soil water'),
+            (5, 'fact', 'library east shelf book read'),
+            (6, 'fact', 'library east shelf book page'),
+        ]
+        clusters = memory._find_consolidation_clusters(mems, max_clusters=2)
+        self.assertEqual(len(clusters), 2)
+
+
+class ConsolidateDueEdges(unittest.TestCase):
+    SESSION = '111'
+
+    def setUp(self):
+        _clear_memory()
+
+    def test_null_session_is_not_due(self):
+        self.assertFalse(memory.ltm_consolidate_due(None))
+
+    def test_cadence_disabled_is_not_due(self):
+        with unittest.mock.patch.object(serve, 'LTM_CONSOLIDATE_EVERY_TURNS', 0):
+            self.assertFalse(memory.ltm_consolidate_due(self.SESSION))
+
+    def test_session_below_cadence_is_not_due(self):
+        memory.stm_append(self.SESSION, 'user', 'hello')
+        self.assertFalse(memory.ltm_consolidate_due(self.SESSION))
+
+    def test_due_check_fails_closed(self):
+        with unittest.mock.patch.object(serve, '_db',
+                                        side_effect=RuntimeError('boom')):
+            self.assertFalse(memory.ltm_consolidate_due(self.SESSION))
+
+
+class ConsolidateWorkerEdges(unittest.TestCase):
+    def test_worker_on_missing_session_is_noop(self):
+        memory._ltm_consolidate_worker('no-such-session')
+
+    def test_worker_fails_closed(self):
+        with unittest.mock.patch.object(memory, 'ltm_consolidate',
+                                        side_effect=RuntimeError('boom')):
+            memory._ltm_consolidate_worker('111')
+
+
+class ConsolidateEdges(unittest.TestCase):
+    SESSION = '111'
+
+    def setUp(self):
+        _clear_memory()
+        memory.stm_append(self.SESSION, 'user', 'hello')
+
+    def _bump_turns(self, n):
+        with serve._db() as conn:
+            conn.execute('UPDATE stm_sessions SET turn_count = ? WHERE session_id = ?',
+                         (n, self.SESSION))
+
+    def _insert_near_duplicates(self):
+        memory._insert_memories(self.SESSION, [
+            ('fact', 'The player works at the observatory north building', 0.9, 'user_stated'),
+            ('fact', 'The player is employed at the observatory north building', 0.9, 'user_stated')])
+        self._bump_turns(20)
+
+    def test_null_session_merges_nothing(self):
+        self.assertEqual(memory.ltm_consolidate(None), 0)
+
+    def test_cadence_disabled_merges_nothing(self):
+        with unittest.mock.patch.object(serve, 'LTM_CONSOLIDATE_EVERY_TURNS', 0):
+            self.assertEqual(memory.ltm_consolidate(self.SESSION), 0)
+
+    def test_missing_session_merges_nothing(self):
+        self.assertEqual(memory.ltm_consolidate('no-such-session'), 0)
+
+    def test_scan_fails_closed(self):
+        with unittest.mock.patch.object(serve, '_db',
+                                        side_effect=RuntimeError('boom')):
+            self.assertEqual(memory.ltm_consolidate(self.SESSION), 0)
+
+    def test_merge_skipped_when_model_replies_none(self):
+        self._insert_near_duplicates()
+        with unittest.mock.patch.object(memory, '_chat_call', return_value=None):
+            self.assertEqual(memory.ltm_consolidate(self.SESSION), 0)
+
+    def test_merge_skipped_when_merged_is_not_a_dict(self):
+        self._insert_near_duplicates()
+        with unittest.mock.patch.object(
+                memory, '_chat_call', return_value='{"merged": "not-a-dict"}'):
+            self.assertEqual(memory.ltm_consolidate(self.SESSION), 0)
+
+    def test_merge_with_unknown_type_defaults_to_fact(self):
+        self._insert_near_duplicates()
+        reply = '{"merged": {"type": "bogus", "content": "merged content here"}}'
+        with unittest.mock.patch.object(memory, '_chat_call', return_value=reply):
+            self.assertEqual(memory.ltm_consolidate(self.SESSION), 1)
+        self.assertIn('[fact]', memory.ltm_recall('merged content'))
+
+    def test_merge_skipped_when_content_is_empty(self):
+        self._insert_near_duplicates()
+        reply = '{"merged": {"type": "fact", "content": ""}}'
+        with unittest.mock.patch.object(memory, '_chat_call', return_value=reply):
+            self.assertEqual(memory.ltm_consolidate(self.SESSION), 0)
+
+    def test_merge_with_bogus_confidence_uses_system_weight(self):
+        self._insert_near_duplicates()
+        reply = ('{"merged": {"type": "fact", "content": "merged content", '
+                 '"confidence": "bogus"}}')
+        with unittest.mock.patch.object(memory, '_chat_call', return_value=reply):
+            self.assertEqual(memory.ltm_consolidate(self.SESSION), 1)
+        with serve._db() as conn:
+            row = conn.execute('SELECT confidence, source_type FROM ltm_memories '
+                                 'WHERE session_id = ? AND content = ?',
+                                 (self.SESSION, 'merged content')).fetchone()
+        self.assertEqual(row, (0.8, 'system_generated'))
+
+    def test_merge_fails_closed_on_chat_error(self):
+        self._insert_near_duplicates()
+        with unittest.mock.patch.object(memory, '_chat_call',
+                                        side_effect=RuntimeError('boom')):
+            self.assertEqual(memory.ltm_consolidate(self.SESSION), 0)
+
+
+class CleanupEdges(unittest.TestCase):
+    SESSION = '111'
+
+    def setUp(self):
+        _clear_memory()
+
+    def test_disabled_memory_cleans_nothing(self):
+        with unittest.mock.patch.object(serve, 'MEMORY_ENABLED', False):
+            self.assertEqual(memory.cleanup_expired_sessions(), 0)
+
+    def test_negative_ttl_cleans_nothing(self):
+        with unittest.mock.patch.object(serve, 'STM_TTL_HOURS', -1):
+            self.assertEqual(memory.cleanup_expired_sessions(), 0)
+
+    def test_cleanup_fails_closed(self):
+        with unittest.mock.patch.object(serve, '_db',
+                                        side_effect=RuntimeError('boom')):
+            self.assertEqual(memory.cleanup_expired_sessions(), 0)
+
+
+class ChatCallEdges(unittest.TestCase):
+    def test_missing_api_key_returns_none(self):
+        with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', None):
+            self.assertIsNone(memory._chat_call('system', 'user'))
+
+    def test_missing_state_returns_none(self):
+        with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
+             unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=None):
+            self.assertIsNone(memory._chat_call('system', 'user'))
+
+    def test_missing_model_returns_none(self):
+        with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
+             unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=_state()), \
+             unittest.mock.patch.object(serve, '_admin_agent_id',
+                                        return_value='maya'), \
+             unittest.mock.patch.object(serve, 'get_or_create_agent_key',
+                                        return_value='k'), \
+             unittest.mock.patch.object(serve, '_resolve_model_tier',
+                                        return_value=None):
+            self.assertIsNone(memory._chat_call('system', 'user'))
+
+    def test_successful_call_returns_reply(self):
+        with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
+             unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=_state()), \
+             unittest.mock.patch.object(serve, '_admin_agent_id',
+                                        return_value='maya'), \
+             unittest.mock.patch.object(serve, 'get_or_create_agent_key',
+                                        return_value='k'), \
+             unittest.mock.patch.object(serve, '_resolve_model_tier',
+                                        return_value='test-model'), \
+             unittest.mock.patch.object(serve, '_http_json',
+                                        return_value={'reply': 'condensed'}):
+            self.assertEqual(memory._chat_call('system', 'user'), 'condensed')
+
+    def test_chat_call_fails_closed(self):
+        with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
+             unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        side_effect=RuntimeError('boom')):
+            self.assertIsNone(memory._chat_call('system', 'user'))
+
+
 if __name__ == '__main__':
     unittest.main()

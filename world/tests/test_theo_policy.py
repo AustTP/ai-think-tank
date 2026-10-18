@@ -70,6 +70,18 @@ class RoleResolution(unittest.TestCase):
         self.assertEqual(theo_policy.role_for_requester(_state(), 'ghost'),
                          theo_policy.ROLE_WORKER)
 
+    def test_non_dict_roster_entry_is_skipped(self):
+        # A malformed roster entry must be skipped, not
+        # crash role resolution: the real entry still
+        # resolves after it.
+        state = {'agentRoster': [
+            'not-a-dict',
+            {'id': 'theo', 'isAdmin': True},
+        ]}
+        self.assertEqual(
+            theo_policy.role_for_requester(state, 'theo'),
+            theo_policy.ROLE_DIRECTOR)
+
 
 class CapabilityGating(unittest.TestCase):
     def setUp(self):

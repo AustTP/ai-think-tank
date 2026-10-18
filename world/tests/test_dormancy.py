@@ -57,10 +57,13 @@ class DormancyGatesSim(unittest.TestCase):
 
     @mock.patch.object(serve, 'get_state_from_db', return_value={'sim': {'owner': 'server'}})
     @mock.patch.object(serve, 'save_state_to_db')
-    @mock.patch.object(sim._engine, 'tick', return_value={'sim': {}})
-    def test_waking_resumes_normal_tick(self, mock_tick, mock_save, mock_get):
+    def test_waking_resumes_normal_tick(self, mock_save, mock_get):
         serve._set_dormant(False)  # woken by a request
-        sim._sim_loop_pass()
+        # Patch the CURRENT engine. sim may have been reloaded by an earlier
+        # test, so a decorator bound to the module-level _engine at import time
+        # would patch a stale object.
+        with mock.patch.object(sim._engine, 'tick', return_value={'sim': {}}) as mock_tick:
+            sim._sim_loop_pass()
         mock_tick.assert_called_once()
         mock_save.assert_called_once()
 

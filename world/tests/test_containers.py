@@ -8,6 +8,8 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 
+import containers  # noqa: E402
+import egress  # noqa: E402
 from containers import ContainerBroker  # noqa: E402
 
 
@@ -163,3 +165,111 @@ class TestContainerBroker(unittest.TestCase):
         )
         self.assertFalse(result.ok)
         self.assertEqual(result.reason, "unknown egress profile")
+
+
+class _ScriptedDriver(containers.ContainerDriver):
+    """A driver with canned results, so the broker's
+    runtime-failure paths run without docker."""
+
+    def __init__(self, create=None, stop=True,
+                 start=True):
+        self._create = create
+        self._stop = stop
+        self._start = start
+        self._n = 0
+
+    def create(self, agent_id, image, egress_route):
+        if self._create is not None:
+            return self._create
+        self._n += 1
+        return "ctr-scripted-%d" % self._n, None
+
+    def stop(self, container_id):
+        return self._stop
+
+    def start(self, container_id):
+        return self._start
+
+
+class _FakePlanner(object):
+    """An egress planner that records every route ask."""
+
+    def __init__(self):
+        self.calls = 0
+        self.route = egress.EgressRoute(
+            egress.DIRECT, reason=egress.FALLBACK_REASON)
+
+    def route_for(self):
+        self.calls += 1
+        return self.route
+
+
+class TestContainerDriverBase(unittest.TestCase):
+    def test_abstract_driver_methods_raise(self):
+        driver = containers.ContainerDriver()
+        with self.assertRaises(NotImplementedError):
+            driver.create("ada", "python:3.12-slim", None)
+        with self.assertRaises(NotImplementedError):
+            driver.stop("ctr-1")
+        with self.assertRaises(NotImplementedError):
+            driver.start("ctr-1")
+
+
+class TestBrokerRuntimeFailures(unittest.TestCase):
+    def test_provision_driver_create_failure(self):
+        broker = ContainerBroker(
+            max_containers=3,
+            approved_images=["python:3.12-slim"],
+            driver=_ScriptedDriver(
+                create=(None, "runtime offline")))
+        result = broker.provision(
+            "agent-1", "python:3.12-slim")
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "runtime offline")
+        self.assertEqual(broker.running(), 0)
+
+    def test_shutdown_driver_stop_failure(self):
+        broker = ContainerBroker(
+            max_containers=3,
+            approved_images=["python:3.12-slim"],
+            driver=_ScriptedDriver(stop=False))
+        first = broker.provision(
+            "agent-1", "python:3.12-slim")
+        self.assertTrue(first.ok)
+        self.assertFalse(
+            broker.shutdown("agent-1", first.container_id))
+        # The stop never happened, so it still runs.
+        self.assertEqual(broker.running(), 1)
+
+    def test_restart_driver_start_failure(self):
+        broker = ContainerBroker(
+            max_containers=3,
+            approved_images=["python:3.12-slim"],
+            driver=_ScriptedDriver(start=False))
+        first = broker.provision(
+            "agent-1", "python:3.12-slim")
+        broker.shutdown("agent-1", first.container_id)
+        result = broker.restart(
+            "agent-1", first.container_id)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason,
+                         "driver start failed")
+        self.assertEqual(broker.running(), 0)
+
+    def test_planner_routes_every_provision(self):
+        planner = _FakePlanner()
+        broker = ContainerBroker(
+            max_containers=3,
+            approved_images=["python:3.12-slim"],
+            egress_planner=planner,
+            driver=_ScriptedDriver())
+        result = broker.provision(
+            "agent-1", "python:3.12-slim")
+        self.assertTrue(result.ok)
+        self.assertEqual(planner.calls, 1)
+        container = broker._containers[result.container_id]
+        self.assertIs(container.egress_route, planner.route)
+
+
+if __name__ == '__main__':
+    unittest.main()

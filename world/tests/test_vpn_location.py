@@ -115,6 +115,12 @@ class GeolocateIp(unittest.TestCase):
         with self._urlopen(b'not json'):
             self.assertIsNone(vpn_location.geolocate_ip('203.0.113.7'))
 
+    def test_non_http_scheme_is_rejected(self):
+        with unittest.mock.patch.object(
+                vpn_location, 'GEOLOCATION_URL',
+                'ftp://ip-api.com/json/{ip}?fields=status'):
+            self.assertIsNone(vpn_location.geolocate_ip('203.0.113.7'))
+
     def test_network_error_returns_none(self):
         with unittest.mock.patch.object(
                 urllib.request, 'urlopen',

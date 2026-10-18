@@ -202,7 +202,7 @@ def run(action):
                 if op == 'screenshot':
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action),
                             **_page_state(page, 0)}
-                return {'ok': False, 'op': op, 'error': f'unhandled op {op!r}'}
+                return {'ok': False, 'op': op, 'error': f'unhandled op {op!r}'}  # pragma: no cover
             finally:
                 try:
                     ctx.close()

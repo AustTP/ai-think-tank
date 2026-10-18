@@ -11,6 +11,46 @@ sys.path.insert(
 from roster import OFF_DUTY, ON_DUTY, Roster  # noqa: E402
 
 
+class TestRecordsAndLookups(unittest.TestCase):
+    def setUp(self):
+        self.roster = Roster()
+        self.roster.add_team("alpha")
+        self.roster.add_agent("a1", "alpha", "worker")
+
+    def test_add_team_record_exposes_focus(self):
+        self.assertFalse(self.roster.add_team("t").focused)
+        self.assertTrue(
+            self.roster.add_team("f", focused_task="signals").focused)
+
+    def test_team_lookup(self):
+        self.assertEqual(self.roster.team("alpha").name, "alpha")
+        self.assertIsNone(self.roster.team("nope"))
+
+    def test_agent_lookup(self):
+        record = self.roster.agent("a1")
+        self.assertEqual(record.team, "alpha")
+        self.assertEqual(record.role, "worker")
+        self.assertIsNone(self.roster.agent("nope"))
+
+    def test_add_agent_creates_missing_team(self):
+        self.roster.add_agent("x1", "newteam")
+        self.assertIsNotNone(self.roster.team("newteam"))
+
+    def test_team_mutators_refuse_unknown_team(self):
+        self.assertFalse(self.roster.set_focus("nope", "signals"))
+        self.assertFalse(self.roster.release_team("nope"))
+        self.assertFalse(self.roster.set_do_not_disturb("nope", True))
+
+    def test_status_mutators_refuse_unknown_agent(self):
+        self.assertFalse(self.roster.set_status("ghost", OFF_DUTY))
+        self.assertFalse(self.roster.mark_sprint_complete("ghost"))
+
+    def test_wakeable_without_team_record(self):
+        self.roster.set_status("a1", OFF_DUTY)
+        del self.roster._teams["alpha"]
+        self.assertTrue(self.roster.wakeable("a1", None))
+
+
 class TestRoster(unittest.TestCase):
     def setUp(self):
         self.roster = Roster()
@@ -130,3 +170,7 @@ class TestRoster(unittest.TestCase):
     def test_focused_team_has_no_meeting_capacity(self):
         self.roster.set_focus("beta", "signals")
         self.assertEqual(len(self.roster.team_available("beta")), 0)
+
+
+if __name__ == '__main__':
+    unittest.main()

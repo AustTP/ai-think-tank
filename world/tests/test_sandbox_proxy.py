@@ -7,11 +7,15 @@ SANDBOX_EGRESS_EXTRA_HOSTS, so tests that need to control it reload the
 module under a patched environment rather than mutating the set in place.
 """
 import importlib
+import json
 import os
 import runpy
+import shutil
 import socket
 import sys
+import tempfile
 import threading
+import time
 import unittest
 import unittest.mock
 
@@ -92,6 +96,58 @@ class RateLimit(unittest.TestCase):
         later = now + sandbox_proxy.RATE_LIMIT_WINDOW_S + 1
         with unittest.mock.patch.object(sandbox_proxy.time, 'time', return_value=later):
             self.assertFalse(sandbox_proxy.rate_limited('pypi.org'))
+
+
+class RuntimeGrants(unittest.TestCase):
+    """The Jev-approval grants file: short-lived host -> expiry
+    grants, cached by mtime, re-read on the allowlist path."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='sandbox-proxy-grants-')
+        self.grants_path = os.path.join(self.tmp, 'grants.json')
+        self._saved_path = sandbox_proxy.GRANTS_PATH
+        sandbox_proxy._grants_cache = {'mtime': None, 'hosts': set()}
+
+    def tearDown(self):
+        sandbox_proxy.GRANTS_PATH = self._saved_path
+        sandbox_proxy._grants_cache = {'mtime': None, 'hosts': set()}
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_empty_grants_path_means_no_runtime_hosts(self):
+        sandbox_proxy.GRANTS_PATH = ''
+        self.assertEqual(sandbox_proxy._runtime_grants(), set())
+
+    def test_missing_grants_file_means_no_runtime_hosts(self):
+        sandbox_proxy.GRANTS_PATH = os.path.join(self.tmp, 'absent.json')
+        self.assertEqual(sandbox_proxy._runtime_grants(), set())
+
+    def test_unexpired_grants_are_returned_and_cached(self):
+        now = time.time()
+        with open(self.grants_path, 'w') as f:
+            json.dump({
+                'good.example.com': now + 3600,
+                'stale.example.com': now - 3600,
+                'not-a-time.example.com': 'soon',
+            }, f)
+        sandbox_proxy.GRANTS_PATH = self.grants_path
+        self.assertEqual(sandbox_proxy._runtime_grants(),
+                         {'good.example.com'})
+        # A second read with an unchanged mtime serves the cache.
+        self.assertIs(sandbox_proxy._runtime_grants(),
+                      sandbox_proxy._grants_cache['hosts'])
+
+    def test_unparseable_grants_file_means_no_runtime_hosts(self):
+        with open(self.grants_path, 'w') as f:
+            f.write('not json')
+        sandbox_proxy.GRANTS_PATH = self.grants_path
+        self.assertEqual(sandbox_proxy._runtime_grants(), set())
+
+    def test_granted_hosts_are_allowed(self):
+        with open(self.grants_path, 'w') as f:
+            json.dump({'jev.example.com': time.time() + 3600}, f)
+        sandbox_proxy.GRANTS_PATH = self.grants_path
+        self.assertTrue(sandbox_proxy.is_allowed('jev.example.com'))
+        self.assertFalse(sandbox_proxy.is_allowed('other.example.com'))
 
 
 class _ConnPair:

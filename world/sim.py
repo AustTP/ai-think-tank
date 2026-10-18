@@ -10183,34 +10183,34 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                 depends_on = linked_issue['dependsOnTask']
             if not meeting_card:
                 queue_work(state, [{
-                'title': req['title'], 'room': req['room'], 'goal': req.get('title'),
-                'instructions': instructions,
-                'teamId': req.get('teamId'),
-                'userStory': story,
-                'acceptanceCriteria': criteria,
-                'never': never,
-                'dependsOn': depends_on,
-                'issueKey': req.get('issueKey') or None,
-                # Human-in-the-loop: a card the filer marked for the PLAYER
-                # (assignedTo 'player') stays the player's -- _assign_due_item
-                # hands it to the player instead of an agent. Any other value is
-                # dropped (agents are picked, not named, on the refinement path).
-                'assignedTo': req.get('assignedTo') if req.get('assignedTo') == 'player' else None,
-                # The card's attention lane survives grooming onto the queue
-                # (queue_work normalizes), so a build/reading/parking-lot card
-                # keeps its lane through refinement.
-                'lane': req.get('lane'),
-                # Item 4: the groomer-judged spend ceiling + band ride the queue
-                # item (whitelisted) so the ASSIGNED task carries them.
-                'budgetUsd': req.get('budgetUsd'),
-                'budgetBand': req.get('budgetBand'),
-                # Player-authored provenance: a backlog request the PLAYER filed
-                # (filedBy 'player' -- the player chat lane, or a player-filed
-                # JIRA issue) is player-vetted; every agent-filed request is
-                # not. Threaded so the JEV gate's work-context bypass trusts
-                # only these tasks.
-                'playerAuthored': bool(filed_by == 'player'),
-            }])
+                    'title': req['title'], 'room': req['room'], 'goal': req.get('title'),
+                    'instructions': instructions,
+                    'teamId': req.get('teamId'),
+                    'userStory': story,
+                    'acceptanceCriteria': criteria,
+                    'never': never,
+                    'dependsOn': depends_on,
+                    'issueKey': req.get('issueKey') or None,
+                    # Human-in-the-loop: a card the filer marked for the PLAYER
+                    # (assignedTo 'player') stays the player's -- _assign_due_item
+                    # hands it to the player instead of an agent. Any other value is
+                    # dropped (agents are picked, not named, on the refinement path).
+                    'assignedTo': req.get('assignedTo') if req.get('assignedTo') == 'player' else None,
+                    # The card's attention lane survives grooming onto the queue
+                    # (queue_work normalizes), so a build/reading/parking-lot card
+                    # keeps its lane through refinement.
+                    'lane': req.get('lane'),
+                    # Item 4: the groomer-judged spend ceiling + band ride the queue
+                    # item (whitelisted) so the ASSIGNED task carries them.
+                    'budgetUsd': req.get('budgetUsd'),
+                    'budgetBand': req.get('budgetBand'),
+                    # Player-authored provenance: a backlog request the PLAYER filed
+                    # (filedBy 'player' -- the player chat lane, or a player-filed
+                    # JIRA issue) is player-vetted; every agent-filed request is
+                    # not. Threaded so the JEV gate's work-context bypass trusts
+                    # only these tasks.
+                    'playerAuthored': bool(filed_by == 'player'),
+                }])
             accepted.append(req)
         else:
             req['status'] = 'rejected'
@@ -11395,7 +11395,7 @@ def _charter_alignment(state, room):
         return None
     text = ' '.join([ch.get('goal') or '', ' '.join(ch.get('interests') or [])]).lower()
     if not text:
-        return False
+        return False  # pragma: no cover -- join always leaves a space
     return any(k in text for k in (_ROOM_KEYWORDS.get(room) or []))
 
 

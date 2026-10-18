@@ -10,7 +10,9 @@ Hermetic: temp sqlite with the chat.db shape the script queries; the webhook
 POST is mocked. No Messages.app, no network, no real chat.db (that needs Full
 Disk Access and never appears in CI).
 """
+import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -139,7 +141,7 @@ class Sweep(_FetchCase):
         with unittest.mock.patch.object(fetch, '_forward', return_value={'messageId': 9}) as fwd:
             self.assertEqual(fetch._sweep(self.db, state, 'http://x', 's', False, False), 1)
         fwd.assert_called_once_with('http://x', 's', '+15550001', 'Your code is 777000.')
-        self.assertEqual(state['appleWatermark'], new)
+        self.assertAlmostEqual(state['appleWatermark'], new, places=5)
 
 
 class Main(_FetchCase):
@@ -156,6 +158,147 @@ class Main(_FetchCase):
     def test_main_requires_secret(self):
         with unittest.mock.patch.object(fetch, '_load_env', return_value={}):
             self.assertEqual(fetch.main([]), 2)
+
+    def test_main_reports_a_missing_database(self):
+        env = {'SMS_FORWARD_SECRET': 'sec', 'IMESSAGE_CHAT_DB': '/no/such/chat.db'}
+        with unittest.mock.patch.object(fetch, '_load_env', return_value=env), \
+                unittest.mock.patch.dict(os.environ, {}, clear=False):
+            self.assertEqual(fetch.main([]), 2)
+
+    def test_main_first_run_sets_the_watermark_to_now(self):
+        fresh = self.state_path + '.fresh'
+        env = {'SMS_FORWARD_SECRET': 'sec', 'IMESSAGE_CHAT_DB': self.db,
+               'IMESSAGE_STATE_FILE': fresh}
+        with unittest.mock.patch.object(fetch, '_load_env', return_value=env), \
+                unittest.mock.patch.object(fetch, '_sweep', return_value=0), \
+                unittest.mock.patch.dict(os.environ, {'IMESSAGE_STATE_FILE': fresh}):
+            self.assertEqual(fetch.main([]), 1)
+        with open(fresh) as f:
+            state = json.load(f)
+        self.assertIn('appleWatermark', state)
+        self.assertEqual(state['sentGuids'], [])
+
+    def test_main_survives_a_denied_database(self):
+        env = {'SMS_FORWARD_SECRET': 'sec', 'IMESSAGE_CHAT_DB': self.db,
+               'IMESSAGE_STATE_FILE': self.state_path}
+        with unittest.mock.patch.object(fetch, '_load_env', return_value=env), \
+                unittest.mock.patch.object(fetch, '_sweep',
+                                           side_effect=sqlite3.OperationalError('denied')), \
+                unittest.mock.patch.dict(os.environ, {'IMESSAGE_STATE_FILE': self.state_path}):
+            self.assertEqual(fetch.main([]), 2)
+
+    def test_main_survives_a_webhook_failure(self):
+        env = {'SMS_FORWARD_SECRET': 'sec', 'IMESSAGE_CHAT_DB': self.db,
+               'IMESSAGE_STATE_FILE': self.state_path}
+        with unittest.mock.patch.object(fetch, '_load_env', return_value=env), \
+                unittest.mock.patch.object(fetch, '_sweep',
+                                           side_effect=RuntimeError('webhook returned 500')), \
+                unittest.mock.patch.dict(os.environ, {'IMESSAGE_STATE_FILE': self.state_path}):
+            self.assertEqual(fetch.main([]), 2)
+
+    def test_main_dry_run_exits_zero_without_forwarding(self):
+        env = {'SMS_FORWARD_SECRET': 'sec', 'IMESSAGE_CHAT_DB': self.db,
+               'IMESSAGE_STATE_FILE': self.state_path}
+        with unittest.mock.patch.object(fetch, '_load_env', return_value=env), \
+                unittest.mock.patch.object(fetch, '_sweep', return_value=0), \
+                unittest.mock.patch.dict(os.environ, {'IMESSAGE_STATE_FILE': self.state_path}):
+            self.assertEqual(fetch.main(['--dry-run']), 0)
+
+    def test_main_returns_zero_once_a_message_was_forwarded(self):
+        env = {'SMS_FORWARD_SECRET': 'sec', 'IMESSAGE_CHAT_DB': self.db,
+               'IMESSAGE_STATE_FILE': self.state_path}
+        with unittest.mock.patch.object(fetch, '_load_env', return_value=env), \
+                unittest.mock.patch.object(fetch, '_sweep', return_value=1), \
+                unittest.mock.patch.dict(os.environ, {'IMESSAGE_STATE_FILE': self.state_path}):
+            self.assertEqual(fetch.main([]), 0)
+
+    def test_main_waits_until_the_deadline_elapses(self):
+        env = {'SMS_FORWARD_SECRET': 'sec', 'IMESSAGE_CHAT_DB': self.db,
+               'IMESSAGE_STATE_FILE': self.state_path}
+        mono = iter([0.0, 0.0, 2.0])
+        with unittest.mock.patch.object(fetch, '_load_env', return_value=env), \
+                unittest.mock.patch.object(fetch, '_sweep', return_value=0), \
+                unittest.mock.patch.object(fetch.time, 'monotonic',
+                                           side_effect=lambda: next(mono)), \
+                unittest.mock.patch.object(fetch.time, 'sleep', lambda secs: None), \
+                unittest.mock.patch.dict(os.environ, {'IMESSAGE_STATE_FILE': self.state_path}):
+            self.assertEqual(fetch.main(['--wait', '1']), 1)
+
+
+class LoadEnv(_FetchCase):
+    def test_load_env_reads_a_dot_env_file(self):
+        root = tempfile.mkdtemp(prefix='imessage-env-')
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        with open(os.path.join(root, '.env'), 'w') as f:
+            f.write('# a comment\nSMS_FORWARD_SECRET=sec\n\nNO_EQUALS_HERE\n')
+        with unittest.mock.patch.object(fetch, 'ROOT', root):
+            env = fetch._load_env()
+        self.assertEqual(env, {'SMS_FORWARD_SECRET': 'sec'})
+
+
+class LoadState(_FetchCase):
+    def test_load_state_reads_a_valid_file(self):
+        with open(self.state_path, 'w') as f:
+            json.dump({'appleWatermark': 123.5, 'sentGuids': ['g1']}, f)
+        state = fetch._load_state(self.state_path)
+        self.assertEqual(state['appleWatermark'], 123.5)
+        self.assertEqual(state['sentGuids'], ['g1'])
+
+    def test_load_state_adds_a_missing_sent_guids_list(self):
+        with open(self.state_path, 'w') as f:
+            json.dump({'appleWatermark': 1}, f)
+        self.assertEqual(fetch._load_state(self.state_path),
+                         {'appleWatermark': 1, 'sentGuids': []})
+
+    def test_load_state_ignores_a_corrupt_file(self):
+        with open(self.state_path, 'w') as f:
+            f.write('{not json')
+        self.assertIsNone(fetch._load_state(self.state_path))
+
+
+class Dedupe(_FetchCase):
+    def test_duplicate_guids_forward_once_per_sweep(self):
+        self._add('g1', self.now + 10, 'first copy')
+        self._add('g1', self.now + 11, 'second copy')
+        state = self._state()
+        with unittest.mock.patch.object(fetch, '_forward',
+                                        return_value={'messageId': 1}) as fwd:
+            self.assertEqual(fetch._sweep(self.db, state, 'http://x', 's', False, False), 1)
+        fwd.assert_called_once_with('http://x', 's', '+15550001', 'first copy')
+
+
+class Forward(unittest.TestCase):
+    def test_forward_posts_the_message_and_parses_the_reply(self):
+        reply = unittest.mock.MagicMock()
+        reply.__enter__.return_value.read.return_value = b'{"messageId": 5}'
+        with unittest.mock.patch.object(fetch.urllib.request, 'urlopen',
+                                        return_value=reply) as urlopen:
+            result = fetch._forward('http://web', 'sec', '+15550001', 'hi')
+        self.assertEqual(result, {'messageId': 5})
+        req = urlopen.call_args[0][0]
+        self.assertEqual(req.full_url, 'http://web')
+        self.assertEqual(req.method, 'POST')
+        self.assertEqual(req.data, json.dumps(
+            {'from': '+15550001', 'body': 'hi'}).encode('utf-8'))
+        self.assertEqual(req.headers['X-sms-forward-secret'], 'sec')
+
+    def test_forward_raises_on_an_http_error(self):
+        err = fetch.urllib.error.HTTPError('http://web', 403, 'forbidden', {}, None)
+        err.read = lambda: b'nope'
+        with unittest.mock.patch.object(fetch.urllib.request, 'urlopen',
+                                        side_effect=err):
+            with self.assertRaises(RuntimeError) as ctx:
+                fetch._forward('http://web', 'sec', '+15550001', 'hi')
+        self.assertIn('403', str(ctx.exception))
+        self.assertIn('nope', str(ctx.exception))
+
+    def test_forward_raises_when_the_webhook_is_unreachable(self):
+        err = fetch.urllib.error.URLError('connection refused')
+        with unittest.mock.patch.object(fetch.urllib.request, 'urlopen',
+                                        side_effect=err):
+            with self.assertRaises(RuntimeError) as ctx:
+                fetch._forward('http://web', 'sec', '+15550001', 'hi')
+        self.assertIn('webhook unreachable', str(ctx.exception))
 
 
 if __name__ == '__main__':

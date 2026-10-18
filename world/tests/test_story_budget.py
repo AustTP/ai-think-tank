@@ -74,6 +74,75 @@ class TestBudgetLedger(unittest.TestCase):
     def test_overrun_factor_empty(self):
         self.assertEqual(self.ledger.overrun_factor(), 0.0)
 
+    def test_remaining_and_exceeded_track_the_burn(self):
+        line = self.ledger.line(1)
+        self.assertEqual(line.remaining, 60.0)
+        self.assertFalse(line.exceeded)
+        self.ledger.record_spend(1, 70.0, 3)
+        self.assertEqual(line.remaining, -10.0)
+        self.assertTrue(line.exceeded)
+
+    def test_lines_and_reviews_expose_every_record(self):
+        self.ledger.record_spend(1, 61.0, 3)
+        self.ledger.review(1, "grew", "grant", 30.0)
+        self.assertEqual(len(self.ledger.lines()), 1)
+        self.assertEqual(self.ledger.lines()[0].story_id, 1)
+        self.assertEqual(len(self.ledger.reviews()), 1)
+        self.assertEqual(self.ledger.reviews()[0].decision, "grant")
+
+    def test_overrun_factor_skips_zero_budget_lines(self):
+        # A reviewed line with no budget contributes no ratio (not a
+        # division by zero): the mean is over the budgeted lines only.
+        self.ledger.open_line(1, 0.0, 1)
+        self.ledger.review(1, "no budget", "stop")
+        self.assertEqual(self.ledger.overrun_factor(), 0.0)
+
+    def test_to_state_round_trips_through_from_state(self):
+        self.ledger.record_spend(1, 30.0, 2)
+        self.ledger.review(1, "on track", "grant", 30.0)
+        rebuilt = BudgetLedger.from_state(self.ledger.to_state())
+        line = rebuilt.line(1)
+        self.assertEqual(line.budget_minutes, 90.0)
+        self.assertEqual(line.spent_minutes, 30.0)
+        self.assertEqual(line.completed_items, 2)
+        self.assertEqual(len(rebuilt.alerts()), 0)
+        self.assertEqual(len(rebuilt.reviews()), 1)
+        self.assertEqual(rebuilt.reviews()[0].reason, "on track")
+
+    def test_from_state_skips_malformed_records(self):
+        # Unreadable records are skipped, not fatal: a durable ledger
+        # must never take the meeting down.
+        snapshot = {
+            "lines": [
+                {"story_id": 1, "budget_minutes": 60.0, "total_items": 4,
+                 "spent_minutes": 30.0, "completed_items": 2},
+                {"story_id": 2, "bogus": "field"},
+            ],
+            "alerts": [
+                {"story_id": 1, "spent_minutes": 61.0, "budget_minutes": 60.0,
+                 "completed_items": 3, "total_items": 4},
+                {"story_id": 2, "bogus": "field"},
+            ],
+            "reviews": [
+                {"story_id": 1, "reason": "grew", "decision": "grant",
+                 "completed_items": 3, "total_items": 4,
+                 "spent_minutes": 61.0, "budget_minutes": 60.0,
+                 "additional_minutes": 30.0},
+                {"story_id": 2, "bogus": "field"},
+            ],
+        }
+        rebuilt = BudgetLedger.from_state(snapshot)
+        self.assertIsNotNone(rebuilt)
+        self.assertEqual(rebuilt.line(1).budget_minutes, 60.0)
+        self.assertIsNone(rebuilt.line(2))
+        self.assertEqual(len(rebuilt.alerts()), 1)
+        self.assertEqual(len(rebuilt.reviews()), 1)
+        self.assertEqual(rebuilt.overrun_factor(), 61.0 / 60.0)
+
+    def test_from_state_rejects_non_snapshots(self):
+        self.assertIsNone(BudgetLedger.from_state(None))
+        self.assertIsNone(BudgetLedger.from_state("nope"))
+
 
 class TestMeetingBudgets(unittest.TestCase):
     def setUp(self):
@@ -119,3 +188,7 @@ class TestMeetingBudgets(unittest.TestCase):
         self.meeting.assign(stories)
         line = self.ledger.line(stories[0].story_id)
         self.assertEqual(line.budget_minutes, 150.0)
+
+
+if __name__ == '__main__':
+    unittest.main()

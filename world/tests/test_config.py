@@ -327,5 +327,231 @@ class OperatorPolicySimServeBind(unittest.TestCase):
         self.assertIn(serve._apply_operator_policy, config.ON_RELOAD_HOOKS)
 
 
+class LoaderBranches(unittest.TestCase):
+    """The fail-closed shapes the reload path itself never produces:
+    a present-but-wrong-type container, non-dict entries, a URL that
+    makes urlparse itself raise, and the optional watchlist fields."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='think tank-config-loaders-')
+        self.addCleanup(shutil.rmtree, self._tmp, True)
+
+    def _path(self, name):
+        return os.path.join(self._tmp, name)
+
+    def _write(self, name, data):
+        with open(self._path(name), 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+
+    def test_load_list_non_list_value_falls_back(self):
+        self._write('plain.json', {'banned': 'not-a-list'})
+        out = config._load_list(self._path('plain.json'), ['dflt'],
+                                key='banned')
+        self.assertEqual(out, ['dflt'])
+
+    def test_load_research_desk_non_list_passes(self):
+        self._write('desk.json', {'passes': 'nope'})
+        out = config._load_research_desk(self._path('desk.json'))
+        self.assertEqual(out,
+                         [dict(p) for p in config.RESEARCH_DESK_PASSES_DEFAULT])
+
+    def test_load_watchlist_non_list_topics(self):
+        self._write('watch.json', {'topics': 'nope'})
+        self.assertEqual(config._load_watchlist(self._path('watch.json')), [])
+
+    def test_load_watchlist_skips_non_dict_entries(self):
+        self._write('watch.json', {'topics': ['not-a-dict',
+            {'topic': 'good', 'startUrl': 'https://example.com'}]})
+        out = config._load_watchlist(self._path('watch.json'))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]['topic'], 'good')
+
+    def test_load_watchlist_skips_urlparse_failures(self):
+        # An invalid IPv6 literal makes urlparse itself raise.
+        self._write('watch.json', {'topics': [
+            {'topic': 'bad', 'startUrl': 'http://[::1'},
+            {'topic': 'good', 'startUrl': 'https://example.com'}]})
+        out = config._load_watchlist(self._path('watch.json'))
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]['topic'], 'good')
+
+    def test_load_watchlist_keeps_cadence_and_keywords(self):
+        self._write('watch.json', {'topics': [
+            {'topic': 't', 'startUrl': 'https://example.com',
+             'cadenceMs': 60000, 'linkKeyword': ' docs ',
+             'pageKeyword': ' guide '}]})
+        out = config._load_watchlist(self._path('watch.json'))
+        self.assertEqual(out[0]['cadenceMs'], 60000)
+        self.assertEqual(out[0]['linkKeyword'], 'docs')
+        self.assertEqual(out[0]['pageKeyword'], 'guide')
+
+
+class GrantsLoaderBranches(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='think tank-grants-')
+        self.addCleanup(shutil.rmtree, self._tmp, True)
+
+    def _path(self):
+        return os.path.join(self._tmp, 'grants.json')
+
+    def _write(self, data):
+        with open(self._path(), 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+
+    def test_corrupt_file_grants_nothing(self):
+        with open(self._path(), 'w', encoding='utf-8') as f:
+            f.write('{not json')
+        self.assertEqual(config._load_grants(self._path()),
+                         {'appGrants': [], 'fileGrants': []})
+
+    def test_malformed_entries_are_dropped(self):
+        self._write({'appGrants': ['nope',
+                                    {'bundleId': 'not a valid bundle id'},
+                                    {'id': 'notes', 'bundleId': 'com.apple.Notes'}],
+                     'fileGrants': ['nope', {'scope': '   '},
+                                    {'id': 'f1', 'scope': '~/notes.txt'}]})
+        out = config._load_grants(self._path())
+        self.assertEqual(out['appGrants'],
+                         [{'id': 'notes', 'bundleId': 'com.apple.Notes',
+                           'label': 'com.apple.Notes',
+                           'caps': {'use': True}}])
+        self.assertEqual(out['fileGrants'],
+                         [{'id': 'f1', 'scope': os.path.expanduser('~/notes.txt'),
+                           'label': '~/notes.txt',
+                           'caps': {'read': True, 'write': False,
+                                    'delete': False}}])
+
+
+class CoerceOperatorValue(unittest.TestCase):
+    def test_unknown_key_and_bool_for_int_kind_rejected(self):
+        self.assertIsNone(config._coerce_operator_value('notARealKey', 1))
+        self.assertIsNone(config._coerce_operator_value('maxTeamMembers', True))
+
+
+class OperatorPolicyRawShape(_TempOperatorPolicy):
+    def test_non_dict_operator_file_keeps_defaults(self):
+        with open(self._path, 'w', encoding='utf-8') as f:
+            json.dump([1, 2, 3], f)
+        self.assertEqual(config._load_operator_policy(self._path),
+                         config.OPERATOR_POLICY_DEFAULT)
+
+
+class LiveReloadMissingFile(unittest.TestCase):
+    """A policy file deleted between boots: the mtime probe fails
+    closed to the shipped defaults, never a raised OSError."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='think tank-missing-')
+        self.addCleanup(shutil.rmtree, self._tmp, True)
+        config._OPERATOR_CACHE['mtime'] = None
+        config._GRANTS_CACHE['mtime'] = None
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        config._OPERATOR_CACHE['mtime'] = None
+        config._GRANTS_CACHE['mtime'] = None
+        config.reload_policy_config()
+
+    def test_get_operator_policy_defaults_when_file_absent(self):
+        missing = os.path.join(self._tmp, 'no', 'such', 'operator_policy.json')
+        with unittest.mock.patch.object(config, 'OPERATOR_POLICY_PATH', missing):
+            self.assertEqual(config.get_operator_policy(),
+                             config.OPERATOR_POLICY_DEFAULT)
+
+    def test_get_grants_config_defaults_when_file_absent(self):
+        missing = os.path.join(self._tmp, 'no', 'such', 'grants.json')
+        with unittest.mock.patch.object(config, 'GRANTS_PATH', missing):
+            self.assertEqual(config.get_grants_config(),
+                             {'appGrants': [], 'fileGrants': []})
+
+
+class ResearchWatchlistReload(unittest.TestCase):
+    """get_research_watchlist: the live-reload read that reports
+    (topics, ok) so a sync can refuse to wipe the standing schedule
+    on a transient bad read."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='think tank-watchlist-')
+        self._path = os.path.join(self._tmp, 'watchlist.json')
+        self._patch = unittest.mock.patch.object(
+            config, 'WATCHLIST_PATH', self._path)
+        self._patch.start()
+        config._WATCHLIST_CACHE['mtime'] = None
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        self._patch.stop()
+        config._WATCHLIST_CACHE['mtime'] = None
+        config.reload_policy_config()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_missing_file_reports_not_ok(self):
+        topics, ok = config.get_research_watchlist()
+        self.assertFalse(ok)
+        self.assertEqual(topics, [])
+
+    def test_valid_file_reports_ok_and_refreshes_module_list(self):
+        with open(self._path, 'w', encoding='utf-8') as f:
+            json.dump({'topics': [
+                {'topic': 'follow widgets',
+                 'startUrl': 'https://example.com'}]}, f)
+        topics, ok = config.get_research_watchlist()
+        self.assertTrue(ok)
+        self.assertEqual(len(topics), 1)
+        self.assertEqual(config.RESEARCH_WATCHLIST[0]['topic'],
+                         'follow widgets')
+
+    def test_corrupt_file_reports_not_ok(self):
+        with open(self._path, 'w', encoding='utf-8') as f:
+            f.write('{not json')
+        topics, ok = config.get_research_watchlist()
+        self.assertFalse(ok)
+
+
+class ReloadHookFailure(unittest.TestCase):
+    def test_raising_hook_does_not_abort_reload(self):
+        def boom():
+            raise RuntimeError('hook failed')
+        config.ON_RELOAD_HOOKS.append(boom)
+        self.addCleanup(config.ON_RELOAD_HOOKS.remove, boom)
+        result = config.reload_policy_config()  # must not raise
+        self.assertIn('operator', result)
+
+
+class WatchlistWritebackEdges(_TempPolicy):
+    def test_writeback_starts_fresh_when_topics_not_a_list(self):
+        self._write('watchlist.json', {'topics': 'not-a-list'})
+        config.reload_policy_config()
+        config.ALLOW_WATCHLIST_WRITE = True
+        self.addCleanup(setattr, config, 'ALLOW_WATCHLIST_WRITE', False)
+        rec = {'topic': 'follow widgets', 'startUrl': 'https://example.com'}
+        self.assertTrue(config.note_watchlist_topic(rec))
+        with open(config.WATCHLIST_PATH, encoding='utf-8') as f:
+            topics = json.load(f)['topics']
+        self.assertEqual(len(topics), 1)
+        self.assertEqual(topics[0]['topic'], 'follow widgets')
+
+    def test_writeback_keeps_keywords(self):
+        self._write('watchlist.json', {'topics': []})
+        config.reload_policy_config()
+        config.ALLOW_WATCHLIST_WRITE = True
+        self.addCleanup(setattr, config, 'ALLOW_WATCHLIST_WRITE', False)
+        rec = {'topic': 't', 'startUrl': 'https://example.com',
+               'linkKeyword': 'docs', 'pageKeyword': 'guide'}
+        self.assertTrue(config.note_watchlist_topic(rec))
+        with open(config.WATCHLIST_PATH, encoding='utf-8') as f:
+            entry = json.load(f)['topics'][0]
+        self.assertEqual(entry['linkKeyword'], 'docs')
+        self.assertEqual(entry['pageKeyword'], 'guide')
+
+    def test_writeback_silent_when_file_unreadable(self):
+        config.ALLOW_WATCHLIST_WRITE = True
+        self.addCleanup(setattr, config, 'ALLOW_WATCHLIST_WRITE', False)
+        missing = os.path.join(self._tmp, 'no', 'such', 'watchlist.json')
+        with unittest.mock.patch.object(config, 'WATCHLIST_PATH', missing):
+            self.assertFalse(config.note_watchlist_topic(
+                {'topic': 't', 'startUrl': 'https://example.com'}))
+
+
 if __name__ == '__main__':
     unittest.main()

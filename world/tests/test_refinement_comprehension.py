@@ -182,3 +182,7 @@ class ComprehensionWiring(SimIsolation):
         sim._resolve_refinement(state, pending, 1_000_000,
                                 decider=self._decider())
         self.assertEqual(list(pending['comprehensions']), ['r1'])
+
+
+if __name__ == '__main__':
+    unittest.main()

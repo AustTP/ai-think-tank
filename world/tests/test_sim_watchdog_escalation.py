@@ -148,18 +148,19 @@ class SimLoopPassConsumesEvent(unittest.TestCase):
     @mock.patch.object(serve, '_peer_review_tick')
     @mock.patch.object(serve, '_apply_pending_ask_results')
     @mock.patch.object(serve, 'save_state_to_db')
-    @mock.patch.object(sim._engine, 'tick')
     @mock.patch.object(serve, 'get_state_from_db')
     @mock.patch.object(serve, 'expire_jev_grants')
     @mock.patch.object(serve, 'expire_sublow_grants')
     @mock.patch.object(serve, '_expire_handles')
     def test_event_consumed_once_and_delivered(self, _h, _s, _j, mock_get,
-                                               mock_tick, mock_save, _a, _p, _v):
+                                               mock_save, _a, _p, _v):
         st = _state()
         mock_get.return_value = st
-        mock_tick.return_value = st
         sim._SIM_WATCHDOG_EVENT = _evt(restarts=1)
-        result = sim._sim_loop_pass()
+        # Patch the CURRENT engine: an earlier test may have reloaded sim.
+        with mock.patch.object(sim._engine, 'tick', return_value=st) as mock_tick:
+            result = sim._sim_loop_pass()
+        mock_tick.assert_called_once()
         self.assertIsNotNone(result)
         self.assertIsNone(sim._SIM_WATCHDOG_EVENT, 'clear-on-read: consumed')
         self.assertEqual(len(st['agents']['nora']['mailbox']), 1)

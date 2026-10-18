@@ -5,7 +5,7 @@ their own. These tests cover the WIRING in serve: the
 operator-gated POST /api/supervisor/meeting endpoint that runs
 a SupervisorMeeting over the roster view of the sim state and
 persists the budget lines it opens plus a meeting audit record,
-the GET /api/budget overview, and the operator-gated
+the GET /api/budget/story overview, and the operator-gated
 POST /api/budget/review endpoint that records a director's
 grant-or-stop decision on an over-budget story.
 
@@ -188,10 +188,10 @@ class SupervisorMeetingEndpoint(unittest.TestCase):
         self.assertEqual(response.json()['assignments'], [])
 
 
-class BudgetOverviewEndpoint(unittest.TestCase):
+class BudgetStoryOverviewEndpoint(unittest.TestCase):
     def test_overview_is_empty_without_a_ledger(self):
         _seed({})
-        response = _client().get('/api/budget')
+        response = _client().get('/api/budget/story')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(),
                          {'alerts': [], 'reviews': [],
@@ -200,7 +200,7 @@ class BudgetOverviewEndpoint(unittest.TestCase):
     def test_overview_reads_the_persisted_ledger(self):
         _seed(_roster_state())
         self._meeting_seed()
-        response = _client().get('/api/budget')
+        response = _client().get('/api/budget/story')
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(len(body['lines']), 1)

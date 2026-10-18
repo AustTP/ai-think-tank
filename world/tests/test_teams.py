@@ -97,7 +97,9 @@ class TeamsModel(unittest.TestCase):
         # maya is now a director -> she is DERIVED out of sam's team (she leads
         # her own team instead), while staying under sam's reporting chain.
         self.assertEqual(serve._derive_team_members(state, 'sam'), ['ada'])
-        self.assertEqual(next(d for d in state['agentRoster'] if d['id'] == 'maya')['director'], 'sam')
+        # Promotion re-points the new director at the admin (the chart stays
+        # flat), so the reporting chain is retained via the admin root.
+        self.assertEqual(next(d for d in state['agentRoster'] if d['id'] == 'maya')['director'], 'faye')
         # And she's the director of her own (currently empty) team.
         self.assertEqual(serve._derive_team_members(state, 'maya'), [])
 

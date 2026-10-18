@@ -121,3 +121,7 @@ class TestSignalWaker(unittest.TestCase):
             "BTC", "price<60000 positions>0"
         )
         self.assertEqual(len(events), 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

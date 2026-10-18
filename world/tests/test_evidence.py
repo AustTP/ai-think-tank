@@ -335,5 +335,228 @@ class AuditWiring(unittest.TestCase):
         self.assertEqual(aud.call_args[0][1], 'coverage_failed')
 
 
+class LedgerReadFailures(unittest.TestCase):
+    """The two ledger readers must degrade to empty dicts when the DB
+    seam itself breaks -- a dead DB is an empty ledger, never a crash."""
+
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_evidence_read_returns_empty_when_db_breaks(self):
+        import serve
+        with unittest.mock.patch.object(serve, '_db',
+                                        side_effect=RuntimeError('db down')):
+            self.assertEqual(evidence._evidence_read(), {})
+
+    def test_coverage_read_returns_empty_when_db_breaks(self):
+        import serve
+        with unittest.mock.patch.object(serve, '_db',
+                                        side_effect=RuntimeError('db down')):
+            self.assertEqual(evidence._coverage_read(), {})
+
+
+class AuditEdges(unittest.TestCase):
+    """Unknown actions are ignored and a broken audit table is silent:
+    the audit is a trail, never a gate on the ledger write."""
+
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_unknown_action_is_ignored(self):
+        self.assertIsNone(evidence.append_audit('cora', 'not-an-action'))
+        self.assertEqual(evidence.count_actor_action('cora', 'not-an-action', 0), 0)
+
+    def test_broken_audit_table_is_silent(self):
+        with unittest.mock.patch.object(evidence, '_audit_ensure',
+                                        side_effect=RuntimeError('db down')):
+            self.assertIsNone(
+                evidence.append_audit('cora', 'claim_recorded', claim_id='ev-1'))
+            self.assertEqual(
+                evidence.count_actor_action('cora', 'claim_recorded', 0), 0)
+            self.assertEqual(evidence.list_audit(), [])
+
+
+class NormalizeUrlEdges(unittest.TestCase):
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_empty_url_normalizes_to_empty(self):
+        self.assertEqual(evidence._normalize_url(''), '')
+
+    def test_malformed_ipv6_url_normalizes_to_empty(self):
+        self.assertEqual(evidence._normalize_url('http://[::1'), '')
+
+    def test_url_without_host_normalizes_to_empty(self):
+        self.assertEqual(evidence._normalize_url('not-a-url'), '')
+
+    def test_default_ports_are_dropped(self):
+        self.assertEqual(evidence._normalize_url('https://example.com:443/x'),
+                         'https://example.com/x')
+        self.assertEqual(evidence._normalize_url('http://example.com:80/x'),
+                         'http://example.com/x')
+
+
+class HostAndUniqueIdEdges(unittest.TestCase):
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_host_of_empty_and_malformed_urls(self):
+        self.assertIsNone(evidence._host(''))
+        self.assertIsNone(evidence._host('http://[::1'))
+
+    def test_unique_claim_id_is_free_when_unused(self):
+        self.assertEqual(evidence._unique_claim_id({}, 'ev-x'), 'ev-x')
+
+    def test_unique_claim_id_suffixes_past_collisions(self):
+        claims = {'ev-x': 1, 'ev-x-2': 1}
+        self.assertEqual(evidence._unique_claim_id(claims, 'ev-x'), 'ev-x-3')
+
+
+class SourceIdentityResolvedEdges(unittest.TestCase):
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_unparseable_resolved_url_falls_back_to_source(self):
+        identity, meta = evidence.source_identity(
+            'https://example.com/a', 'http://[::1')
+        self.assertEqual(identity, 'https://example.com/a')
+        self.assertTrue(meta['resolved_ok'])
+
+
+class ValidateClaimRecordEdges(unittest.TestCase):
+    """Rejected input never reaches the ledger: _validate_claim_record
+    raises and record_source_claim converts it to an invalid result."""
+
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_non_dict_record_is_invalid(self):
+        r = evidence.record_source_claim('not-a-dict')
+        self.assertFalse(r['recorded'])
+        self.assertEqual(r['reason'], 'invalid')
+
+    def test_unknown_claim_type_is_invalid(self):
+        r = evidence.record_source_claim(_claim(claim_type='nope'))
+        self.assertFalse(r['recorded'])
+        self.assertEqual(r['reason'], 'invalid')
+
+    def test_non_dict_observed_is_invalid(self):
+        r = evidence.record_source_claim(_claim(observed='not-a-dict'))
+        self.assertEqual(r['reason'], 'invalid')
+
+    def test_non_list_observations_is_invalid(self):
+        r = evidence.record_source_claim(_claim(observations='not-a-list'))
+        self.assertEqual(r['reason'], 'invalid')
+
+
+class ListClaimsStatus(unittest.TestCase):
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_list_claims_filters_by_status(self):
+        _patch_ledgers()
+        evidence.record_source_claim(_claim(
+            source_url='https://example.com/1',
+            resolved_url='https://example.com/1'))
+        evidence.record_source_claim(_claim(
+            source_url='https://example.com/2',
+            resolved_url='https://example.com/2'))
+        first = evidence.list_claims()[0]['id']
+        evidence.update_claim(first, status='cleared')
+        self.assertEqual(len(evidence.list_claims(status='cleared')), 1)
+        self.assertEqual(len(evidence.list_claims()), 2)
+
+
+class UpdateClaimEdges(unittest.TestCase):
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_unknown_claim_returns_none(self):
+        _patch_ledgers()
+        self.assertIsNone(evidence.update_claim('ev-nope', status='needs_review'))
+
+    def test_bad_status_raises(self):
+        _patch_ledgers()
+        res = evidence.record_source_claim(_claim())
+        with self.assertRaises(ValueError):
+            evidence.update_claim(res['id'], status='nope')
+
+    def test_bad_decision_raises(self):
+        _patch_ledgers()
+        res = evidence.record_source_claim(_claim())
+        with self.assertRaises(ValueError):
+            evidence.update_claim(res['id'], decision='nope')
+
+    def test_optional_fields_are_applied(self):
+        _patch_ledgers()
+        res = evidence.record_source_claim(_claim())
+        rec = evidence.update_claim(res['id'], open_questions=['q1'],
+                                    claim='new claim text',
+                                    scope='research-desk')
+        self.assertEqual(rec['open_questions'], ['q1'])
+        self.assertEqual(rec['claim'], 'new claim text')
+        self.assertEqual(rec['scope'], 'research-desk')
+
+
+class MarkReviewedEdges(unittest.TestCase):
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_bad_decision_raises(self):
+        _patch_ledgers()
+        with self.assertRaises(ValueError):
+            evidence.mark_reviewed('ev-x', 'nope')
+
+    def test_unknown_claim_returns_none(self):
+        _patch_ledgers()
+        self.assertIsNone(evidence.mark_reviewed('ev-nope', 'usable_as_written'))
+
+
+class CoverageStatusAndMarkCoveredEdges(unittest.TestCase):
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_coverage_status_of_unknown_identity(self):
+        _patch_ledgers()
+        self.assertIsNone(evidence.coverage_status('https://example.com/1'))
+
+    def test_mark_covered_without_identity_returns_none(self):
+        _patch_ledgers()
+        self.assertIsNone(evidence.mark_covered(''))
+
+    def test_mark_covered_stores_optional_fields(self):
+        store = _patch_ledgers()
+        url = 'https://example.com/post/1'
+        evidence.mark_covered(url, event_id='evt-1',
+                              material_update_ms=12345, run_id='run-9')
+        rec = store['coverage'][url]
+        self.assertEqual(rec['event_id'], 'evt-1')
+        self.assertEqual(rec['material_update_ms'], 12345)
+        self.assertEqual(rec['last_run_id'], 'run-9')
+
+
+class RecordRunFailureEdges(unittest.TestCase):
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_empty_identity_returns_none(self):
+        _patch_ledgers()
+        self.assertIsNone(evidence.record_run_failure('', 'boom'))
+
+    def test_run_failure_stores_optional_fields(self):
+        store = _patch_ledgers()
+        url = 'https://example.com/post/1'
+        rec = evidence.record_run_failure(
+            url, 'boom', artifact='a.md', event_id='evt-1',
+            source_url='https://example.com/post/1',
+            resolved_url='https://example.com/post/1')
+        self.assertEqual(rec['status'], 'failed')
+        self.assertEqual(rec['artifact'], 'a.md')
+        self.assertEqual(rec['event_id'], 'evt-1')
+        self.assertEqual(rec['source_url'], 'https://example.com/post/1')
+        self.assertEqual(rec['resolved_url'], 'https://example.com/post/1')
+        self.assertEqual(len(rec['failures']), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

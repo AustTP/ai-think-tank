@@ -49,6 +49,13 @@ class TestComprehend(unittest.TestCase):
                              comprehension.SUMMARY_MAX_CHARS)
         self.assertTrue(comp.summary.endswith('...'))
 
+    def test_summary_cuts_at_the_first_sentence(self):
+        req = dict(READY_REQ, reason='First sentence. Second sentence.')
+        comp = comprehension.comprehend(req)
+        self.assertEqual(comp.summary,
+                         'Add CSV export to the research desk: '
+                         'First sentence.')
+
     def test_missing_title_needs_clarification(self):
         req = dict(READY_REQ, title='')
         comp = comprehension.comprehend(req)

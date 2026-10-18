@@ -246,5 +246,53 @@ class PhoneMarkAllRead(unittest.TestCase):
             ['read'])
 
 
+class PhoneGateDenials(unittest.TestCase):
+    def setUp(self):
+        self.state = _state()
+        self.clock = _Clock()
+        # One action per window: the first send spends
+        # the sender's own allowance, so her next read
+        # is refused by the policy itself.
+        self.policy = theo_policy.TheoPolicy(
+            rate_limit=1, clock=self.clock)
+        self.phone = phone.Phone(self.policy)
+
+    def test_inbox_refused_when_policy_denies_read(self):
+        self.phone.send(self.state, 'bee', 'ada', 'hi')
+        box = self.phone.inbox(self.state, 'bee')
+        self.assertFalse(box.allowed)
+        self.assertEqual(box.reason, 'rate limit exceeded')
+
+    def test_mark_all_read_refused_when_policy_denies(self):
+        self.phone.send(self.state, 'bee', 'ada', 'hi')
+        box = self.phone.mark_all_read(self.state, 'bee')
+        self.assertFalse(box.allowed)
+        self.assertEqual(box.reason, 'rate limit exceeded')
+
+
+class PhoneMissingAgentRecord(unittest.TestCase):
+    def setUp(self):
+        self.state = _state()
+        # The roster still resolves bee as a worker (so
+        # the read gate passes), but her agent record is
+        # not a dict: the phone lane must deny, not crash.
+        self.state['agents']['bee'] = None
+        self.policy = theo_policy.TheoPolicy()
+        self.phone = phone.Phone(self.policy)
+
+    def test_read_of_a_missing_agent_record_denied(self):
+        box = self.phone.read(self.state, 'bee',
+                              'm-00000000')
+        self.assertFalse(box.allowed)
+        self.assertEqual(box.reason, 'unknown agent')
+        self.assertEqual(box.agent_id, 'bee')
+
+    def test_mark_all_read_of_a_missing_agent_record_denied(self):
+        box = self.phone.mark_all_read(self.state, 'bee')
+        self.assertFalse(box.allowed)
+        self.assertEqual(box.reason, 'unknown agent')
+        self.assertEqual(box.agent_id, 'bee')
+
+
 if __name__ == '__main__':
     unittest.main()

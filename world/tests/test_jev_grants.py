@@ -218,6 +218,40 @@ class JevGrants(JevGrantCase):
         self.assertEqual(quote['modelName'], 'Test Jev')
 
 
+class JevGrantFailures(JevGrantCase):
+    """Accounting-failure and guard paths: a DB failure never breaks
+    the call that just succeeded, the revoke guards fail closed, and
+    the quote worksheet degrades to the conservative fallback basis."""
+
+    def test_accrue_survives_a_db_failure(self):
+        # Best-effort accounting: an accounting failure never breaks
+        # the call that just succeeded.
+        with unittest.mock.patch.object(serve, '_db',
+                                         side_effect=RuntimeError):
+            self.assertIsNone(serve.accrue_jev_grant('jg-x', 0.01))
+
+    def test_revoke_guards_fail_closed(self):
+        self.assertFalse(serve.revoke_jev_grant(None))
+        self.assertFalse(serve.revoke_jev_grant(123))
+        self.assertEqual(serve.revoke_agent_jev_grants(''), 0)
+
+    def test_quote_clamps_unparseable_call_counts(self):
+        quote = serve.quote_jev_grant('agent-a', estimated_calls='abc')
+        self.assertEqual(quote['estimatedCalls'], 1)
+
+    def test_quote_falls_back_when_the_tiers_read_fails(self):
+        # A DB failure inside the worksheet's price lookup must not
+        # break the quote: it degrades to the conservative fallback
+        # basis and says so via priceSource.
+        with unittest.mock.patch.object(serve, '_jev_openrouter_slug',
+                                         return_value=TEST_JEV_SLUG), \
+             unittest.mock.patch.object(serve, '_db',
+                                        side_effect=RuntimeError):
+            quote = serve.quote_jev_grant('agent-a')
+        self.assertEqual(quote['pricePerM'], jev_grants.JEV_FALLBACK_PRICE_PER_M)
+        self.assertEqual(quote['priceSource'], 'fallback')
+
+
 class JevEndpoints(JevGrantCase):
     """HTTP-level coverage of the four endpoints: operator gate on
     mint/quote/revoke, grant-token auth on inference, and the hard estimate /

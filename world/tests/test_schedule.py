@@ -486,5 +486,51 @@ class TestSchedulerFlow(unittest.TestCase):
         self.assertFalse(self.scheduler.abort(task))
 
 
+class TestEdgeCases(unittest.TestCase):
+    def setUp(self):
+        self.scheduler = StandingScheduler()
+
+    def state(self, task):
+        return self.scheduler._state(task)
+
+    def test_unknown_mode_is_never_active(self):
+        task = monday_task()
+        task.mode = "bogus"
+        self.assertFalse(
+            self.scheduler.is_active(
+                task, self.state(task), MONDAY_1.replace(hour=9)
+            )
+        )
+
+    def test_running_without_start_time_uses_now(self):
+        task = monday_task()
+        state = self.state(task)
+        state.running = True
+        result = self.scheduler.tick(task, MONDAY_1.replace(hour=9))
+        self.assertEqual(result.action, "continue")
+        self.assertAlmostEqual(state.consecutive_hours, 0.0)
+
+    def test_occurrence_cap_checked_at_tick(self):
+        task = monday_task(max_occurrences=1)
+        self.state(task).occurrences = 1
+        result = self.scheduler.tick(task, MONDAY_1.replace(hour=8))
+        self.assertEqual(result.action, "idle")
+        self.assertIn("finished", result.reason)
+        state = self.scheduler.states["sweep"]
+        self.assertTrue(state.finished)
+        self.assertEqual(state.finish_reason, "occurrence cap reached")
+
+    def test_end_period_without_start_time(self):
+        task = monday_task()
+        state = self.state(task)
+        state.running = True
+        self.scheduler._end_period(
+            task, state, MONDAY_1.replace(hour=9))
+        self.assertEqual(state.occurrences, 1)
+        self.assertAlmostEqual(state.total_hours, 0.0)
+        self.assertAlmostEqual(state.consecutive_hours, 0.0)
+        self.assertFalse(state.running)
+
+
 if __name__ == "__main__":
     unittest.main()

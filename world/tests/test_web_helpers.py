@@ -6,12 +6,14 @@ socket.getaddrinfo, which is patched per-test to control which addresses a
 hostname "resolves" to without touching the network.
 """
 import email.utils
+import http.client
 import ipaddress
 import os
 import sys
 import unittest
 import unittest.mock
 import urllib.error
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -241,6 +243,239 @@ class ResolveFinalUrl(unittest.TestCase):
     def test_empty_url_returns_unchanged(self):
         final, hops = web_helpers._resolve_final_url('')
         self.assertEqual(final, '')
+        self.assertEqual(hops, 0)
+
+
+class ResolvePublicIp(unittest.TestCase):
+    """_resolve_public_ip: the SSRF resolution primitive's own
+    branches (distinct from _is_safe_public_host's copy)."""
+
+    def _resolve_to(self, addrs):
+        def fake_getaddrinfo(host, *a, **k):
+            return [(None, None, None, None, (addr, 0)) for addr in addrs]
+        return unittest.mock.patch.object(web_helpers.socket, 'getaddrinfo', fake_getaddrinfo)
+
+    def test_rejects_localhost_wildcard_and_empty(self):
+        self.assertIsNone(web_helpers._resolve_public_ip(''))
+        self.assertIsNone(web_helpers._resolve_public_ip('localhost'))
+        self.assertIsNone(web_helpers._resolve_public_ip('0.0.0.0'))
+
+    def test_unresolvable_host_returns_none(self):
+        with unittest.mock.patch.object(
+                web_helpers.socket, 'getaddrinfo',
+                unittest.mock.Mock(side_effect=web_helpers.socket.gaierror)):
+            self.assertIsNone(web_helpers._resolve_public_ip('nope.invalid'))
+
+    def test_non_ip_address_is_skipped(self):
+        with self._resolve_to(['not-an-ip']):
+            self.assertIsNone(web_helpers._resolve_public_ip('host.test'))
+
+    def test_only_private_addresses_returns_none(self):
+        with self._resolve_to(['127.0.0.1', '10.0.0.1']):
+            self.assertIsNone(web_helpers._resolve_public_ip('host.test'))
+
+    def test_returns_the_first_public_address(self):
+        with self._resolve_to(['127.0.0.1', '93.184.216.34']):
+            self.assertEqual(web_helpers._resolve_public_ip('host.test'),
+                             '93.184.216.34')
+
+
+class PinnedHTTPConnect(unittest.TestCase):
+    """_PinnedHTTPConnection: the pinned-IP connect and the
+    proxy-tunnel branch."""
+
+    def test_connect_uses_the_pinned_ip(self):
+        conn = web_helpers._PinnedHTTPConnection('example.com',
+                                                 pinned_ip='93.184.216.34')
+        sock = unittest.mock.Mock()
+        with unittest.mock.patch.object(web_helpers.socket, 'create_connection',
+                                        return_value=sock) as create:
+            conn.connect()
+        self.assertIs(conn.sock, sock)
+        create.assert_called_once_with(('93.184.216.34', conn.port),
+                                       conn.timeout, conn.source_address)
+
+    def test_connect_runs_the_proxy_tunnel(self):
+        conn = web_helpers._PinnedHTTPConnection('example.com',
+                                                 pinned_ip='93.184.216.34')
+        conn._tunnel_host = 'proxy.example:8080'
+        with unittest.mock.patch.object(web_helpers.socket, 'create_connection',
+                                        return_value=unittest.mock.Mock()), \
+             unittest.mock.patch.object(conn, '_tunnel') as tunnel:
+            conn.connect()
+        tunnel.assert_called_once_with()
+
+
+class PinnedHTTPSConnect(unittest.TestCase):
+    def test_connect_tunnels_then_wraps_for_the_origin(self):
+        conn = web_helpers._PinnedHTTPSConnection('example.com',
+                                                  pinned_ip='93.184.216.34')
+        sock = unittest.mock.Mock()
+        wrapped = unittest.mock.Mock()
+        ctx = unittest.mock.Mock()
+        ctx.wrap_socket.return_value = wrapped
+        conn._context = ctx
+        conn._tunnel_host = 'origin.example'
+        with unittest.mock.patch.object(web_helpers.socket, 'create_connection',
+                                        return_value=sock), \
+             unittest.mock.patch.object(conn, '_tunnel') as tunnel:
+            conn.connect()
+        tunnel.assert_called_once_with()
+        self.assertIs(conn.sock, wrapped)
+        ctx.wrap_socket.assert_called_once_with(sock, server_hostname='origin.example')
+
+
+class ResolveProxyIp(unittest.TestCase):
+    """_resolve_proxy_ip: the operator-configured proxy resolver
+    (accepts loopback/private, unlike the origin resolver)."""
+
+    def _resolve_to(self, addrs):
+        def fake_getaddrinfo(host, *a, **k):
+            return [(None, None, None, None, (addr, 0)) for addr in addrs]
+        return unittest.mock.patch.object(web_helpers.socket, 'getaddrinfo', fake_getaddrinfo)
+
+    def test_empty_hostport_returns_none(self):
+        self.assertIsNone(web_helpers._resolve_proxy_ip(''))
+        self.assertIsNone(web_helpers._resolve_proxy_ip(None))
+
+    def test_bracketed_ipv6_literal_is_kept(self):
+        with self._resolve_to(['::1']):
+            self.assertEqual(web_helpers._resolve_proxy_ip('[::1]:8080'), '::1')
+
+    def test_hostport_strips_the_port(self):
+        with self._resolve_to(['127.0.0.1']):
+            self.assertEqual(web_helpers._resolve_proxy_ip('proxy.example:8080'),
+                             '127.0.0.1')
+
+    def test_unresolvable_proxy_returns_none(self):
+        with unittest.mock.patch.object(
+                web_helpers.socket, 'getaddrinfo',
+                unittest.mock.Mock(side_effect=web_helpers.socket.gaierror)):
+            self.assertIsNone(web_helpers._resolve_proxy_ip('proxy.invalid:8080'))
+
+    def test_no_addresses_returns_none(self):
+        with unittest.mock.patch.object(web_helpers.socket, 'getaddrinfo',
+                                        return_value=[]):
+            self.assertIsNone(web_helpers._resolve_proxy_ip('proxy.example:8080'))
+
+
+class PinnedIpFor(unittest.TestCase):
+    def test_tunneled_request_pins_the_proxy(self):
+        req = urllib.request.Request('https://example.com/x')
+        req._tunnel_host = 'proxy.example:8080'
+        with unittest.mock.patch.object(
+                web_helpers, '_resolve_proxy_ip',
+                return_value='127.0.0.1') as resolve:
+            self.assertEqual(web_helpers._pinned_ip_for(req), '127.0.0.1')
+        resolve.assert_called_once_with('example.com')
+
+
+class PinnedIPHandlerDoOpen(unittest.TestCase):
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_refuses_a_private_host(self):
+        handler = web_helpers._PinnedIPHandler()
+        req = urllib.request.Request('http://localhost/x')
+        with self.assertRaises(urllib.error.URLError):
+            handler.do_open(http.client.HTTPConnection, req)
+
+    def test_pins_and_swaps_to_the_pinned_class(self):
+        handler = web_helpers._PinnedIPHandler()
+        req = urllib.request.Request('http://example.com/x')
+        resp = unittest.mock.Mock()
+        with unittest.mock.patch.object(web_helpers, '_resolve_public_ip',
+                                        return_value='93.184.216.34'), \
+             unittest.mock.patch.object(urllib.request.AbstractHTTPHandler,
+                                        'do_open', return_value=resp) as do_open:
+            result = handler.do_open(http.client.HTTPConnection, req)
+        self.assertIs(result, resp)
+        self.assertIs(do_open.call_args[0][0], web_helpers._PinnedHTTPConnection)
+        self.assertEqual(do_open.call_args[1]['pinned_ip'], '93.184.216.34')
+
+
+class PinnedHTTPSHandlerDoOpen(unittest.TestCase):
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_refuses_a_private_host(self):
+        handler = web_helpers._PinnedHTTPSHandler()
+        req = urllib.request.Request('https://localhost/x')
+        with self.assertRaises(urllib.error.URLError):
+            handler.do_open(http.client.HTTPSConnection, req)
+
+    def test_pins_and_swaps_to_the_pinned_class(self):
+        handler = web_helpers._PinnedHTTPSHandler()
+        req = urllib.request.Request('https://example.com/x')
+        resp = unittest.mock.Mock()
+        with unittest.mock.patch.object(web_helpers, '_resolve_public_ip',
+                                        return_value='93.184.216.34'), \
+             unittest.mock.patch.object(urllib.request.AbstractHTTPHandler,
+                                        'do_open', return_value=resp) as do_open:
+            result = handler.do_open(http.client.HTTPSConnection, req)
+        self.assertIs(result, resp)
+        self.assertIs(do_open.call_args[0][0],
+                      web_helpers._PinnedHTTPSConnection)
+        self.assertEqual(do_open.call_args[1]['pinned_ip'], '93.184.216.34')
+
+
+class SafeUrlOpen(unittest.TestCase):
+    """_safe_urlopen: the string-URL wrapper and the proxy-handler
+    branch, both fully hermetic (the pinned handlers' do_open is
+    mocked, so nothing touches the network)."""
+
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def _resp(self):
+        resp = unittest.mock.Mock()
+        resp.code = 200
+        return resp
+
+    def test_string_url_is_wrapped_and_opened(self):
+        resp = self._resp()
+        with unittest.mock.patch.object(web_helpers._PinnedIPHandler, 'do_open',
+                                        return_value=resp), \
+             unittest.mock.patch.object(web_helpers._PinnedHTTPSHandler, 'do_open',
+                                        return_value=resp):
+            self.assertIs(web_helpers._safe_urlopen('http://example.com/x'), resp)
+
+    def test_proxy_url_adds_the_proxy_handler(self):
+        resp = self._resp()
+        with unittest.mock.patch.object(web_helpers._PinnedIPHandler, 'do_open',
+                                        return_value=resp), \
+             unittest.mock.patch.object(web_helpers._PinnedHTTPSHandler, 'do_open',
+                                        return_value=resp):
+            self.assertIs(
+                web_helpers._safe_urlopen('http://example.com/x',
+                                          proxy='http://127.0.0.1:18801'),
+                resp)
+
+
+class IsShortLinkEdges(unittest.TestCase):
+    def test_unparseable_url_returns_false(self):
+        self.assertFalse(web_helpers._is_short_link('http://[::1'))
+
+
+class CountingRedirect(unittest.TestCase):
+    def test_redirect_request_counts_a_hop(self):
+        handler = web_helpers._CountingRedirectHandler()
+        req = urllib.request.Request('http://example.com/a')
+        out = handler.redirect_request(req, None, 301, 'Moved Permanently',
+                                       {}, 'http://example.com/b')
+        self.assertEqual(handler.hops, 1)
+        self.assertIsNotNone(out)
+
+
+class ResolveFinalUrlEmptyFinal(unittest.TestCase):
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_empty_final_url_returns_the_original(self):
+        unittest.mock.patch.object(web_helpers, '_safe_urlopen',
+                                   return_value=_FakeResp('')).start()
+        final, hops = web_helpers._resolve_final_url('https://t.co/abc')
+        self.assertEqual(final, 'https://t.co/abc')
         self.assertEqual(hops, 0)
 
 

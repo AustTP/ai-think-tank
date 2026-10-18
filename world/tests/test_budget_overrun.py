@@ -198,6 +198,28 @@ class OverrunFactor(unittest.TestCase):
             1.5)
 
 
+class OverrunFactorScoping(unittest.TestCase):
+    def test_product_scope_scales_similar_work(self):
+        state = _state()
+        state['budgetOverruns'] = [{
+            'room': 'observatory', 'productId': 'prod-1',
+            'taskType': 'code', 'overrunRatio': 1.5, 'reason': 'scope'}]
+        self.assertAlmostEqual(
+            budget.overrun_factor(state, room='pressoffice',
+                                  product_id='prod-1'), 1.5)
+
+    def test_non_numeric_ratio_counts_as_one(self):
+        state = _state()
+        state['budgetOverruns'] = [
+            {'room': 'pressoffice', 'taskType': 'code',
+             'overrunRatio': 'heavy', 'reason': 'scope'},
+            {'room': 'pressoffice', 'taskType': 'code',
+             'overrunRatio': 2.0, 'reason': 'scope'}]
+        self.assertAlmostEqual(
+            budget.overrun_factor(state, room='pressoffice',
+                                  task_type='code'), 1.5)
+
+
 class BudgetUsdForTask(unittest.TestCase):
     def test_explicit_budget_ignores_the_factor(self):
         self.assertEqual(

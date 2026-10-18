@@ -214,6 +214,42 @@ echo
 echo "== Python: village isolation -- library/sandbox/agent-file scoping =="
 python3 tests/test_village_isolation.py
 
+echo "== Python: container broker -- caps, egress profiles, shutdown/restart/switch =="
+python3 tests/test_containers.py
+
+echo "== Python: supervisor meeting planner -- brief, refine batches, assign =="
+python3 tests/test_planner.py
+
+echo "== Python: pre-refinement comprehension wiring (read-back before the decider) =="
+python3 tests/test_refinement_comprehension.py
+
+echo "== Python: team and agent roster -- one-off routing, confirmations, focus =="
+python3 tests/test_roster.py
+
+echo "== Python: signal registry -- wake plans, scenarios, rearm, active_when =="
+python3 tests/test_signals.py
+
+echo "== Python: story budget ledger -- overrun alerts, review grants, meeting budgets =="
+python3 tests/test_story_budget.py
+
+echo "== Python: training interaction recorder -- local, credential-redacted =="
+python3 tests/test_training_capture.py
+
+echo "== Python: one-shot cleanup -- pending escalations, wedged cora item, wrq-8 =="
+python3 tests/test_cleanup_open_items.py
+
+echo "== Python: one-shot wrq-8 gate thaw -- peer review, stuck-loop escalations =="
+python3 tests/test_reset_wrq8_gates.py
+
+echo "== Python: iMessage capture -- local chat.db forwarder =="
+python3 tests/test_imessage_fetch.py
+
+echo "== Python: training interaction export -- review + dataset export =="
+python3 tests/test_export_training_interactions.py
+
+echo "== Python: sandbox browser_act driver (fake playwright) =="
+python3 tests/test_browser_driver.py
+
 # NOTE: test_visual_regression.py is NOT run here. Every test above is a pure-
 # function test with no live server/DB/browser (hermetic, per test_bank.py's
 # own docstring). The visual regression check needs a REAL running server and

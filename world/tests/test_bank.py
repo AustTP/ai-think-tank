@@ -720,5 +720,112 @@ class Dispatcher(unittest.TestCase):
         self.assertEqual(seen, {})  # no dispatcher branch for library -> placeholder
 
 
+class BestEffortGuards(unittest.TestCase):
+    """Every bank reader is best-effort: a DB or ledger failure, a
+    malformed bucket, or an empty id must never become a false block
+    (or a raised exception) at a money-spending chokepoint."""
+
+    def test_agent_cap_check_refuses_empty_agent_id(self):
+        with unittest.mock.patch.object(serve, 'AGENT_SPEND_CAP_USD', 100.0):
+            self.assertFalse(bank._agent_spend_cap_exceeded(''))
+
+    def test_agent_cap_check_survives_ledger_failure(self):
+        with unittest.mock.patch.object(serve, 'AGENT_SPEND_CAP_USD', 100.0), \
+             unittest.mock.patch.object(serve, '_spend_ledger_read',
+                                        side_effect=RuntimeError('db down')):
+            self.assertFalse(bank._agent_spend_cap_exceeded('ada'))
+
+    def test_director_budget_map_survives_state_failure(self):
+        with unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        side_effect=RuntimeError('db down')):
+            self.assertEqual(bank._director_budget_map(), {})
+
+    def test_director_of_agent_survives_state_failure(self):
+        with unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        side_effect=RuntimeError('db down')):
+            self.assertIsNone(bank._director_of_agent('ada'))
+
+    def test_director_spend_status_survives_state_failure(self):
+        with unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        side_effect=RuntimeError('db down')):
+            self.assertIsNone(bank._director_spend_status('ada'))
+
+    def _director_state(self, budgets):
+        return {
+            'agentRoster': [{'id': 'ada', 'name': 'Ada', 'role': 'Studio',
+                             'director': 'd1'}],
+            'directorBudgets': budgets,
+        }
+
+    def test_director_spend_status_rejects_non_numeric_cap(self):
+        state = self._director_state({'d1': 'not-a-number'})
+        with unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=state):
+            self.assertIsNone(bank._director_spend_status('ada'))
+
+    def test_director_spend_status_ignores_non_positive_cap(self):
+        state = self._director_state({'d1': 0})
+        with unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=state):
+            self.assertIsNone(bank._director_spend_status('ada'))
+
+    def test_director_spend_status_survives_ledger_failure(self):
+        state = self._director_state({'d1': 50.0})
+        with unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=state), \
+             unittest.mock.patch.object(serve, '_spend_ledger_read',
+                                        side_effect=RuntimeError('db down')):
+            self.assertIsNone(bank._director_spend_status('ada'))
+
+    def test_director_spend_status_ignores_non_dict_bucket(self):
+        state = self._director_state({'d1': 50.0})
+        ledger = {bank._director_spend_key('d1'): 'not-a-dict'}
+        with unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=state), \
+             unittest.mock.patch.object(serve, '_spend_ledger_read',
+                                        return_value=ledger):
+            self.assertIsNone(bank._director_spend_status('ada'))
+
+    def test_village_view_survives_ledger_failure(self):
+        with unittest.mock.patch.object(serve, '_spend_ledger_read',
+                                        side_effect=RuntimeError('db down')):
+            self.assertEqual(bank._village_spend_view(), {})
+
+    def test_task_spent_survives_ledger_failure(self):
+        with unittest.mock.patch.object(serve, '_spend_ledger_read',
+                                        side_effect=RuntimeError('db down')):
+            self.assertEqual(bank._task_budget_spent('t1'), (0.0, 0))
+
+    def test_accrue_task_spend_survives_ledger_failure(self):
+        with unittest.mock.patch.object(serve, '_spend_ledger_read',
+                                        side_effect=RuntimeError('db down')):
+            bank._accrue_task_spend('t1', 1.5)  # must not raise
+
+
+class MonthView(unittest.TestCase):
+    def test_month_view_reports_zero_usage_without_baseline(self):
+        # A fresh empty ledger per read: the cap check rolls the
+        # baseline into the ledger it reads, and the month view's
+        # own read must see no baseline record at all.
+        with unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 100.0), \
+             unittest.mock.patch.object(serve, '_spend_ledger_read',
+                                        side_effect=lambda: {}), \
+             unittest.mock.patch.object(serve, '_spend_ledger_write'):
+            view = bank._spend_cap_month_view()
+        self.assertEqual(view, {'usage': 0.0, 'cap': 100.0, 'exceeded': False})
+
+    def test_month_view_reports_none_usage_when_ledger_fails(self):
+        # First read (inside the cap check) succeeds and rolls the
+        # baseline; the month view's own read then fails, so usage is
+        # unknowable -- reported as None, never a wrong number.
+        reads = [{}, RuntimeError('db down')]
+        with unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 100.0), \
+             unittest.mock.patch.object(serve, '_spend_ledger_read',
+                                        side_effect=reads), \
+             unittest.mock.patch.object(serve, '_spend_ledger_write'):
+            view = bank._spend_cap_month_view()
+        self.assertEqual(view, {'usage': None, 'cap': 100.0, 'exceeded': False})
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

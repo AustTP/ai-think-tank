@@ -82,6 +82,22 @@ class SprintProductIds(unittest.TestCase):
         self.assertEqual(sim_helpers.next_product_id({'products': {'prd-abc': {}, 'prd-9': {}}}), 'prd-10')
 
 
+class VillageIds(unittest.TestCase):
+    def test_malformed_village_id_suffix_is_skipped(self):
+        # 'vlg-broken' passes the str + prefix check but blows up on
+        # int(); that ValueError is swallowed and the id is not counted.
+        self.assertEqual(
+            sim_helpers.next_village_id(
+                {'villages': [{'id': 'vlg-broken'}, {'id': 'vlg-9'}]}),
+            'vlg-10')
+
+    def test_blank_name_is_rejected(self):
+        state = {}
+        self.assertIsNone(sim_helpers.create_village(state, ''))
+        self.assertIsNone(sim_helpers.create_village(state, '   '))
+        self.assertEqual(state, {})
+
+
 class ScalarHelpers(unittest.TestCase):
     def test_days_since(self):
         self.assertEqual(sim_helpers.days_since(None, 1000), 0)

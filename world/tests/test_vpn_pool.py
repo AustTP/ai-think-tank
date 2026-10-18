@@ -40,6 +40,26 @@ class FakeDocker:
         return not self.fail_rm
 
 
+class DockerCommands(unittest.TestCase):
+    def test_run_returns_stripped_stdout(self):
+        self.assertEqual(vpn_pool._docker_run(['true']), '')
+
+    def test_run_failure_returns_none(self):
+        self.assertIsNone(vpn_pool._docker_run(['false']))
+
+    def test_run_missing_binary_returns_none(self):
+        self.assertIsNone(vpn_pool._docker_run(['no-such-binary-xyz']))
+
+    def test_rm_success_returns_true(self):
+        self.assertTrue(vpn_pool._docker_rm(['true']))
+
+    def test_rm_failure_returns_false(self):
+        self.assertFalse(vpn_pool._docker_rm(['false']))
+
+    def test_rm_missing_binary_returns_false(self):
+        self.assertFalse(vpn_pool._docker_rm(['no-such-binary-xyz']))
+
+
 class TestVpnExitPool(unittest.TestCase):
 
     def pool(self, **kwargs):
@@ -187,6 +207,13 @@ class TestVpnExitPool(unittest.TestCase):
         pool.start('b-wg-001')
         self.assertEqual(pool.stop_all(), 2)
         self.assertEqual(pool.running(), 0)
+
+    def test_get_returns_running_record(self):
+        pool, _ = self.pool()
+        self.assertIsNone(pool.get('nope'))
+        record, error = pool.start('us-nyc-wg-001')
+        self.assertIsNone(error)
+        self.assertEqual(pool.get('us-nyc-wg-001').name, 'us-nyc-wg-001')
 
     def test_exits_registry_shape_matches_static_exits(self):
         pool, _ = self.pool()

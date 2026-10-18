@@ -470,5 +470,212 @@ class AppGrantApiTests(unittest.TestCase):
         self.assertEqual(self.state['appGrants'], [])
 
 
+class TrashRuleEdge(unittest.TestCase):
+    """The trash rule (fs.py:66-68) only fires when the trash dir is
+    INSIDE the granted scope: ../Trash escapes containment first, so
+    a trash dir nested in the scope is what reaches the rule."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fs-trash-')
+        self.scope = os.path.join(self.tmp, 'Desktop')
+        os.makedirs(self.scope)
+        self.trash = os.path.join(self.scope, '.Trash')
+        os.makedirs(self.trash)
+        self._env = unittest.mock.patch.dict(os.environ, {'TRASH_DIR': self.trash})
+        self._env.start()
+        self.state = {'fileGrants': [_grant(self.scope)]}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._gs.start()
+
+    def tearDown(self):
+        self._gs.stop()
+        self._env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_trash_inside_scope_is_refused_by_the_trash_rule(self):
+        with open(os.path.join(self.trash, 'x.txt'), 'w') as f:
+            f.write('x')
+        with self.assertRaises(PermissionError):
+            fs.read_file(self.scope, '.Trash/x.txt')
+
+
+class NoGrantEdges(unittest.TestCase):
+    """The per-tool 'no grant for this scope' refusals and the
+    not-found errors for read_file/delete_to_trash."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fs-nogrant-')
+        self.scope = os.path.join(self.tmp, 'Desktop')
+        os.makedirs(self.scope)
+        self.trash = os.path.join(self.tmp, 'Trash')
+        os.makedirs(self.trash)
+        self._env = unittest.mock.patch.dict(os.environ, {'TRASH_DIR': self.trash})
+        self._env.start()
+        self.state = {'fileGrants': []}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._gs.start()
+
+    def tearDown(self):
+        self._gs.stop()
+        self._env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_read_write_move_delete_refuse_a_missing_grant(self):
+        for fn, args in ((fs.read_file, (self.scope, 'a.txt')),
+                         (fs.write_file, (self.scope, 'a.txt', 'x')),
+                         (fs.move_file, (self.scope, 'a.txt', 'b.txt')),
+                         (fs.delete_to_trash, (self.scope, 'a.txt'))):
+            with self.subTest(fn=fn.__name__):
+                with self.assertRaises(PermissionError):
+                    fn(*args)
+
+    def test_read_file_of_a_missing_file(self):
+        self.state['fileGrants'] = [_grant(self.scope)]
+        with self.assertRaises(FileNotFoundError):
+            fs.read_file(self.scope, 'nope.txt')
+
+    def test_delete_of_a_missing_file(self):
+        self.state['fileGrants'] = [_grant(self.scope)]
+        with self.assertRaises(FileNotFoundError):
+            fs.delete_to_trash(self.scope, 'nope.txt')
+
+
+class OsascriptDirect(unittest.TestCase):
+    """_osascript itself: exit-code handling and the subprocess
+    failure path (the public API always mocks it away)."""
+
+    def test_success_returns_the_stripped_stdout(self):
+        proc = unittest.mock.Mock(returncode=0, stdout='  3 notes \n', stderr='')
+        with unittest.mock.patch.object(fs.subprocess, 'run', return_value=proc):
+            out, err = fs._osascript('return 3')
+        self.assertEqual(out, '3 notes')
+        self.assertIsNone(err)
+
+    def test_nonzero_exit_returns_the_stderr(self):
+        proc = unittest.mock.Mock(returncode=1, stdout='', stderr='not authorized')
+        with unittest.mock.patch.object(fs.subprocess, 'run', return_value=proc):
+            out, err = fs._osascript('return 3')
+        self.assertIsNone(out)
+        self.assertEqual(err, 'not authorized')
+
+    def test_subprocess_failure_returns_the_exception_text(self):
+        with unittest.mock.patch.object(fs.subprocess, 'run',
+                                        side_effect=OSError('no osascript')):
+            out, err = fs._osascript('return 3')
+        self.assertIsNone(out)
+        self.assertIn('no osascript', err)
+
+
+class DecodeProtoEdges(unittest.TestCase):
+    """decode_proto's wire-type branches and truncation paths, driven
+    with hand-built protobuf fragments."""
+
+    def test_empty_or_too_deep_buffer_returns_nothing(self):
+        self.assertEqual(fs.decode_proto(b''), [])
+        self.assertEqual(fs.decode_proto(b'\x0a\x01a', depth=41), [])
+
+    def test_truncated_tag_varint_returns(self):
+        self.assertEqual(fs.decode_proto(b'\x08'), [])
+
+    def test_varint_value_field_is_consumed(self):
+        self.assertEqual(fs.decode_proto(b'\x08\x05'), [])
+
+    def test_truncated_varint_value_returns(self):
+        self.assertEqual(fs.decode_proto(b'\x08\x80'), [])
+
+    def test_fixed64_field_is_skipped(self):
+        self.assertEqual(fs.decode_proto(b'\x09' + b'12345678'), [])
+
+    def test_truncated_length_delimited_returns(self):
+        self.assertEqual(fs.decode_proto(b'\x12\x80'), [])
+
+    def test_non_utf8_payload_recurses(self):
+        self.assertEqual(fs.decode_proto(b'\x12\x03\xff\xfe\xfd'), [])
+
+    def test_non_printable_payload_recurses(self):
+        self.assertEqual(fs.decode_proto(b'\x12\x04\x00\x00\x00\x00'), [])
+
+    def test_fixed32_field_is_skipped(self):
+        self.assertEqual(fs.decode_proto(b'\x0d' + b'abcd'), [])
+
+    def test_unknown_wire_type_stops(self):
+        self.assertEqual(fs.decode_proto(b'\x1b'), [])
+
+
+class CoreToDt(unittest.TestCase):
+    def test_epoch_zero_is_the_core_data_epoch(self):
+        import datetime
+        self.assertEqual(fs.core_to_dt(0), datetime.datetime(2001, 1, 1))
+
+    def test_non_numeric_timestamps_fall_back_to_the_epoch(self):
+        import datetime
+        self.assertEqual(fs.core_to_dt(None), datetime.datetime(2001, 1, 1))
+        self.assertEqual(fs.core_to_dt('not-a-number'),
+                         datetime.datetime(2001, 1, 1))
+
+
+class ReadStoreEdges(unittest.TestCase):
+    """read_store's missing-file refusal, the gzip/proto decode
+    failure paths, and the output-size bound."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fs-store-edge-')
+        self.scope = os.path.join(self.tmp, 'Data')
+        os.makedirs(self.scope)
+        self.state = {'fileGrants': [{'id': 'g-1', 'scope': self.scope,
+                                      'label': 'Data', 'caps': {'read': True}}]}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._gs.start()
+        self._cg = unittest.mock.patch.object(
+            serve, 'get_grants_config', return_value={'appGrants': [], 'fileGrants': []})
+        self._cg.start()
+        self._env = unittest.mock.patch.dict(os.environ,
+                                             {'TRASH_DIR': os.path.join(self.tmp, 'Trash')})
+        self._env.start()
+        import sqlite3 as _s
+        import gzip as _g
+        self.db = os.path.join(self.scope, 'store.sqlite')
+        conn = _s.connect(self.db)
+        conn.execute('CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, payload BLOB)')
+        conn.execute('INSERT INTO items (name, payload) VALUES (?, ?)',
+                     ('good', _g.compress(b'hello world')))
+        conn.execute('INSERT INTO items (name, payload) VALUES (?, ?)',
+                     ('bad', b'this-is-not-gzip'))
+        conn.execute('INSERT INTO items (name, payload) VALUES (?, ?)',
+                     ('big', 'x' * 210000))
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self._gs.stop()
+        self._cg.stop()
+        self._env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_missing_db_file_is_refused(self):
+        with self.assertRaises(FileNotFoundError):
+            fs.read_store(self.scope, 'nope.sqlite', 'SELECT 1')
+
+    def test_undecodable_gzip_stays_raw(self):
+        rows = fs.read_store(self.scope, 'store.sqlite',
+                             "SELECT name, payload FROM items WHERE name = 'bad'",
+                             gzip_columns=['payload'])
+        self.assertEqual(rows[0]['name'], 'bad')
+
+    def test_proto_decode_failure_falls_back_to_lossy_text(self):
+        with unittest.mock.patch.object(fs, 'decode_proto',
+                                        side_effect=ValueError('boom')):
+            rows = fs.read_store(self.scope, 'store.sqlite',
+                                 "SELECT name, payload FROM items WHERE name = 'good'",
+                                 proto_columns=['payload'])
+        self.assertEqual(rows[0]['name'], 'good')
+        self.assertIsInstance(rows[0]['payload'], str)
+
+    def test_output_bound_stops_after_the_budget(self):
+        rows = fs.read_store(self.scope, 'store.sqlite',
+                             "SELECT name, payload FROM items WHERE name = 'big'")
+        self.assertEqual(len(rows), 1)
+
+
 if __name__ == '__main__':
     unittest.main()

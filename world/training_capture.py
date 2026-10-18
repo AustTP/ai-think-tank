@@ -39,7 +39,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CURRENT = contextvars.ContextVar('training_interaction', default=None)
 _LOCK = threading.RLock()
 _TRACKED = {}
-_OUTCOMES = {}
+_OUTCOMES: dict = {}
 _SECRET = re.compile(r'(?<![\w])(?:github_pat_[\w]+|gh[pousr_][A-Za-z0-9]{20,}|sk-(?:proj-|or-v1-|unsloth-)?[\w-]{16,})|(?i:Bearer\s+)[\w.~-]{12,}')
 _ASSIGNMENT = re.compile(r'(?im)(?:api[_-]?key|access[_-]?token|password|client[_-]?secret)[\"\']?\s*[=:]\s*[\"\']?[^\s\"\',;]{8,}')
 _PRIVATE_KEY = re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----')
@@ -49,6 +49,14 @@ _SENSITIVE_KEY = re.compile(r'(?i)^(?:authorization|cookie|set-cookie|api[_-]?ke
 # nearest review/investigation/recovery ancestor. Resolved inline (no
 # separate story-tracking module) so this module stays dependency-free.
 _LINKS = ('reviewOf', 'investigationOf', 'recoveryOf')
+
+# Task fields copied into the outcome row when they are present. Kept as a
+# module constant so the sync query stays readable and flake8-clean.
+_OUTCOME_FIELDS = (
+    'id', 'status', 'rootStoryId', 'requestId', 'reviewOf', 'recoveryOf',
+    'pipelineOk', 'deliveryState', 'peerReviews', '_peerGate', 'failNote',
+    'reviewFailureKind', 'playerAcceptance', 'libraryPath', 'completedAt',
+)
 
 
 class ClosingConnection(sqlite3.Connection):
@@ -255,7 +263,8 @@ def sync_outcomes(state):
                 task = (state.get('tasks') or {}).get(task_id)
                 if not task:
                     continue
-                fields = {k: task.get(k) for k in ('id','status','rootStoryId','requestId','reviewOf','recoveryOf','pipelineOk','deliveryState','peerReviews','_peerGate','failNote','reviewFailureKind','playerAcceptance','libraryPath','completedAt') if task.get(k) is not None}
+                fields = {k: task.get(k) for k in _OUTCOME_FIELDS
+                          if task.get(k) is not None}
                 clean, flags = sanitize(fields)
                 text = json.dumps({'data': clean, 'flags': flags}, sort_keys=True)
                 if _OUTCOMES.get((path, task_id)) == text:

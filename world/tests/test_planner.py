@@ -134,3 +134,7 @@ class TestSupervisorMeeting(unittest.TestCase):
         _, stories = self.meeting.breakdown(submission)
         assignments = self.meeting.assign(stories)
         self.assertEqual(assignments, [])
+
+
+if __name__ == '__main__':
+    unittest.main()
