@@ -229,6 +229,12 @@ ESCALATION_KIND_RISK = {
     # the director gives up (ask cap / judge-drift circuit) -- same fallback
     # as every other delegable kind.
     'allowlist request': {'floor': JEV_SAFETY_CONFIDENCE},
+    # Agent-scheduled dormant apply window (self-modification change
+    # request, 2026-10-18): pausing the whole tank to land code edits is
+    # a consequential operational decision -- the supervisor's JEV
+    # judgment happens upstream of the escalation, and this floor makes
+    # the PLAYER's email/telegram link the final, mandatory signature.
+    'dormancy window request': {'floor': 1.0},
 }
 ESCALATION_DEFAULT_FLOOR = JEV_SAFETY_CONFIDENCE  # unknown kinds keep the old bar
 ESCALATION_ERROR_PENALTY_STEP = 0.10               # composite hit per consecutive Jev error

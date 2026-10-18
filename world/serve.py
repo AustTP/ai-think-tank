@@ -249,6 +249,14 @@ from jev import (  # noqa: E402,F401
     _jev_quorum_choice_sync,
     _jev_quorum_decision,
 )
+
+# Self-edit pipeline (Phase 1): the modifiable-surface contract lives in
+# selfedit.py (a leaf module -- it reaches serve lazily at call time, exactly
+# like jev does). propose/revert/status are served through dedicated gated
+# endpoints below; apply_pass is wired into _idle_shutdown_loop and acts only
+# while DORMANT, per the operator decisions locked 2026-10-18.
+import selfedit as _selfedit  # noqa: E402
+
 # Conversation memory for the player's Telegram chat (see DESIGN.md "Memory
 # Architecture" and world/memory.py). Extracted into its own module exactly
 # like bank.py/evidence.py: STM stores each ask turn per chat session and
@@ -1738,6 +1746,37 @@ async def _idle_shutdown_loop(poll_s=30):
             # poll). The process stays up and port-bound; only the sim pauses.
             _set_dormant(True)
             print(f'[idle] no request for {int(idle_s)}s (>= {_MAX_IDLE_MINUTES}m) -- think tank dormant; waking on next request', flush=True)
+
+
+async def _dormancy_window_loop(poll_s=30):
+    # The ALWAYS-RUNNING owner of two self-edit contracts:
+    #   1. Firing approved one-shot dormancy windows (the change-request
+    #      process: conflict scan -> supervisor JEV judgment -> player link).
+    #      Where the idle watcher only sleeps the tank AFTER inactivity, a
+    #      window sleeps it AT an approved wall-clock slot.
+    #   2. apply_pass for armed self-edits, DORMANT ONLY (selfedit docstring
+    #      contract). This loop must not depend on --max-idle-minutes: the
+    #      idle loop is only armed when that flag is passed, but an armed
+    #      edit must always land at its dormancy path.
+    # A request arriving mid-window flips the tank awake (no_store
+    # middleware); apply_pass re-checks _dormant() so nothing applies awake,
+    # and the next poll re-forces dormancy while the slot is still open.
+    while True:
+        await asyncio.sleep(poll_s)
+        try:
+            fired = await asyncio.to_thread(_selfedit.window_tick)
+            if fired:
+                print(f'[selfedit] dormancy window(s) fired: {", ".join(fired)}', flush=True)
+        except Exception as exc:
+            print(f'[selfedit] window_tick failed: {exc}', flush=True)
+            continue
+        if _dormant():
+            try:
+                applied = await asyncio.to_thread(_selfedit.apply_pass)
+                if applied:
+                    print(f'[selfedit] applied {applied} armed edit(s) while dormant', flush=True)
+            except Exception as exc:
+                print(f'[selfedit] apply_pass failed: {exc}', flush=True)
 
 
 def get_state_from_db():
@@ -10209,7 +10248,87 @@ AGENT_ASK_TOOLS = [
             },
         },
     },
-] + [_API_CALL_TOOL, _PROPOSE_API_SERVICE_TOOL, _LIST_SERVICES_TOOL]
+] + [_API_CALL_TOOL, _PROPOSE_API_SERVICE_TOOL, _LIST_SERVICES_TOOL] + [
+    {
+        'type': 'function',
+        'function': {
+            'name': 'self_edit',
+            'description': 'Propose a precise find/replace edit to the think tank\'s OWN '
+                           'code (a file under world/). Every edit is gated: the find '
+                           'text must appear exactly once, the result must compile, a '
+                           'quorum of independent reviewer decisions must APPROVE the '
+                           'stated purpose, and a sandboxed validation run must pass '
+                           'before the edit is armed. Armed edits only apply while the '
+                           'tank is dormant, never mid-task. serve.py and '
+                           'BUSINESS-PROCESSES.md are permanently protected. Use this '
+                           'to genuinely improve the tank -- fix a real bug, remove '
+                           'real duplication -- with a summary that says WHAT and WHY.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'path': {'type': 'string', 'description': 'Target file: "sim.py", '
+                              '"world/sim.py", or an absolute path inside this repo.'},
+                    'find': {'type': 'string', 'description': 'The EXACT current text to '
+                              'replace, copied from the file including indentation -- '
+                              'it must appear exactly once.'},
+                    'replace': {'type': 'string', 'description': 'The replacement text '
+                                 '(empty string deletes the find text).'},
+                    'summary': {'type': 'string', 'description': 'WHY this edit improves '
+                                 'the tank; the reviewer rejects vague summaries.'},
+                },
+                'required': ['path', 'find', 'replace', 'summary'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'self_edit_status',
+            'description': 'Read the self-edit ledger: every proposed edit, its review '
+                           'outcome, validator result, and whether it is '
+                           'armed/applied/reverted/failed. Check this after self_edit '
+                           'to see what happened, and before re-proposing to learn '
+                           'what the reviewer refused.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'limit': {'type': 'integer', 'description': 'Max rows, 1-50 (default 15).'},
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'schedule_dormant_apply',
+            'description': 'File a change request to schedule a one-shot window during '
+                           'which the whole think tank goes DORMANT (simulation paused) '
+                           'so armed code self-edits can apply and reload. Two '
+                           'approvals are required: your supervisor judges the request '
+                           'first (Jev quorum), then the player must approve an '
+                           'emailed link. The slot is REFUSED with the conflicting '
+                           'items listed if standing-task schedule entries or other '
+                           'dormancy windows already occupy that time. Every armed '
+                           'edit present when the window fires applies during it. Use '
+                           'sparingly -- an emergency fix or a risky reload is a '
+                           'reason; pausing oversight is not.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'date': {'type': 'string', 'description': 'YYYY-MM-DD, tank local time.'},
+                    'start': {'type': 'string', 'description': 'HH:MM 24h, tank local '
+                              'time; must be at least 5 minutes in the future.'},
+                    'durationMin': {'type': 'integer', 'description': 'Sleep length in '
+                                     'minutes, 5-240 (default 15).'},
+                    'reason': {'type': 'string', 'description': 'WHY the tank should '
+                                'sleep then (which edits are landing and why a '
+                                'dedicated quiet slot is safer).'},
+                },
+                'required': ['date', 'start', 'reason'],
+            },
+        },
+    },
+]
 
 # Additional tools offered to /api/intent/ask ONLY when the dispatched agent's
 # role is Red Team Auditor -- real calls through the SAME gated
@@ -16096,6 +16215,112 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 return (f"Could not list registered services: {result['error']} "
                         "[this is a read-only listing -- you may retry once if it looks transient]")
             return 'Could not list registered services (unexpected response).'
+        if name == 'self_edit':
+            # Code self-modification, gate #1 of the chain: the ENDPOINT owns
+            # every real check (key, rate limit, anchor uniqueness, protected
+            # paths, importer scan, JEV quorum, quarantine validator); the
+            # executor only forwards this agent's identity and key -- same
+            # shape as send_mail/request_allowlist above. The propose chain
+            # BLOCKS on the quorum's sequential judge calls, hence the long
+            # client timeout.
+            path = ((args or {}).get('path') or '').strip()
+            find_text = (args or {}).get('find')
+            replace_text = (args or {}).get('replace')
+            summary = ((args or {}).get('summary') or '').strip()
+            if (not path or not isinstance(find_text, str) or not find_text
+                    or not isinstance(replace_text, str)):
+                return ('self_edit requires path, find (non-empty exact anchor) '
+                        'and replace, plus a summary that says WHY.')
+            result = _http_json('POST', SELF_BASE_URL, '/api/selfedit/propose', {
+                'agentId': agent_id,
+                'path': path,
+                'find': find_text,
+                'replace': replace_text,
+                'summary': summary,
+            }, agent_key, timeout=300)
+            if isinstance(result, dict) and result.get('error'):
+                return (f'self_edit not filed: {result["error"]} '
+                        f'[do not keep re-proposing the same splice -- check '
+                        f'self_edit_status for the recorded outcome]')
+            if isinstance(result, dict) and result.get('status'):
+                return (f'{result.get("message", "edit filed.")} '
+                        f'[edit {result.get("id", "?")} status: {result.get("status")}]')
+            return 'self_edit returned an unexpected response (nothing changed).'
+        if name == 'self_edit_status':
+            limit = (args or {}).get('limit')
+            try:
+                limit = max(1, min(int(limit or 15), 50))
+            except (TypeError, ValueError):
+                limit = 15
+            result = _http_json('POST', SELF_BASE_URL, '/api/selfedit/status', {
+                'agentId': agent_id, 'limit': limit,
+            }, agent_key, timeout=30)
+            if isinstance(result, dict) and isinstance(result.get('edits'), list):
+                edits = result['edits']
+                if not edits:
+                    return ('No self-edits have been proposed yet: nothing armed, '
+                            'nothing pending, nothing applied.')
+                lines = ['SELF-EDIT LEDGER (newest first; armed edits apply the '
+                         'next time the tank is dormant):', '']
+                for e in edits:
+                    conf = (f' jev {e.get("jevConfidence")}'
+                            if e.get('jevConfidence') is not None else '')
+                    lines.append(f"- {e.get('id')} {(e.get('status') or '').upper()} "
+                                 f"{e.get('path')} by {e.get('agent')}{conf}")
+                    lines.append(f"    summary: {(e.get('summary') or '')[:160]}")
+                    if e.get('validator'):
+                        lines.append(f"    validator: {e.get('validator')[:160]}")
+                    if e.get('note'):
+                        lines.append(f"    note: {e.get('note')[:160]}")
+                windows = result.get('windows') or []
+                if windows:
+                    lines.append('')
+                    lines.append(f'DORMANCY WINDOWS ({len(windows)} newest, '
+                                 'one-shot sleep slots for applying edits):')
+                    for w in windows:
+                        lines.append(
+                            f"- {w.get('id')} {(w.get('status') or '').upper()} "
+                            f"{w.get('date')} {w.get('start')} "
+                            f"+{w.get('durationMin')}m by {w.get('agent')}")
+                        lines.append(f"    reason: {(w.get('reason') or '')[:160]}")
+                        if w.get('note'):
+                            lines.append(f"    note: {w.get('note')[:160]}")
+                return '\n'.join(lines)
+            if isinstance(result, dict) and result.get('error'):
+                return f'Could not read the self-edit ledger: {result["error"]}'
+            return 'Could not read the self-edit ledger (unexpected response).'
+        if name == 'schedule_dormant_apply':
+            # Change request #1 of the dormancy-window chain: like self_edit
+            # above, the executor only forwards identity and key; the
+            # ENDPOINT runs the conflict scan, the supervisor JEV judgment,
+            # and the player-link escalation.
+            date = ((args or {}).get('date') or '').strip()
+            start = ((args or {}).get('start') or '').strip()
+            reason = ((args or {}).get('reason') or '').strip()
+            if not date or not start or not reason:
+                return ('schedule_dormant_apply requires date (YYYY-MM-DD), '
+                        'start (HH:MM) and a reason naming the edits that are '
+                        'landing.')
+            body = {'agentId': agent_id, 'date': date, 'start': start,
+                    'reason': reason}
+            try:
+                body['durationMin'] = int((args or {}).get('durationMin'))
+            except (TypeError, ValueError):
+                pass
+            result = _http_json('POST', SELF_BASE_URL,
+                                '/api/selfedit/schedule', body, agent_key,
+                                timeout=300)
+            if isinstance(result, dict) and result.get('error'):
+                lines = [f'schedule_dormant_apply refused: {result["error"]}']
+                for c in (result.get('conflicts') or [])[:8]:
+                    lines.append(f"- {c.get('kind')}: {c.get('name')}")
+                return '\n'.join(lines)
+            if isinstance(result, dict) and result.get('id'):
+                return (f'{result.get("message", "window requested.")} '
+                        f'[window {result.get("id")} status: '
+                        f'{result.get("status")}]')
+            return ('schedule_dormant_apply returned an unexpected response '
+                    '(nothing scheduled).')
         raise ValueError(f'unknown tool: {name}')
     return execute_tool
 
@@ -23765,6 +23990,174 @@ async def allowlist_request(request: Request):
                                     f'Jev gate. Check progress with allowlist_status.'})
 
 
+@app.post('/api/selfedit/propose')
+async def selfedit_propose(request: Request):
+    """Agent-facing gate for the self-edit pipeline (see selfedit.py).
+
+    Binds the proposer server-side: agentId + X-Agent-Key verified here and
+    rate-limited, then the FULL chain runs off the event loop (propose blocks
+    on the JEV quorum's sequential judge calls, so it must not sit on the
+    request loop). ok=False means nothing was armed and the file tree was
+    never touched; every outcome lands in the self_edit_log table."""
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'unknown')
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'selfedit_propose'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    path = (body.get('path') or '').strip()
+    find_text = body.get('find') if isinstance(body.get('find'), str) else None
+    replace_text = body.get('replace') if isinstance(body.get('replace'), str) else None
+    summary = (body.get('summary') or '').strip()
+    if not path or not find_text or replace_text is None:
+        return JSONResponse({'error': 'path, find and replace are required '
+                                      '(replace may be an empty string to delete '
+                                      'the anchor) and a summary is required'}, status_code=400)
+    try:
+        ok, payload = await asyncio.to_thread(
+            _selfedit.propose, agent_id, path, find_text, replace_text, summary)
+    except Exception as exc:
+        print(f'[selfedit] propose crashed for {agent_id}: {exc}', flush=True)
+        log_action(agent_id, 'selfedit_crashed', {'error': str(exc)[:300]},
+                   authorized=authorized)
+        return JSONResponse({'error': f'the self-edit harness failed: {exc}'}, status_code=500)
+    log_action(agent_id, 'selfedit_propose',
+               {'path': path, 'ok': ok, 'id': (payload or {}).get('id'),
+                'status': (payload or {}).get('status') or 'n/a',
+                'note': (((payload or {}).get('error') or '') or
+                         ((payload or {}).get('message') or ''))[:160]},
+               authorized=authorized)
+    return JSONResponse(payload, status_code=200 if ok else 400)
+
+
+@app.post('/api/selfedit/status')
+async def selfedit_status(request: Request):
+    """Read-only bounded view of the self-edit ledger (newest first)."""
+
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'unknown')
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'selfedit_status'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    try:
+        limit = max(1, min(int(body.get('limit') or 15), 50))
+    except (TypeError, ValueError):
+        limit = 15
+    edits = await asyncio.to_thread(_selfedit.status_snapshot, limit)
+    windows = await asyncio.to_thread(_selfedit.windows_snapshot, limit)
+    log_action(agent_id, 'selfedit_status',
+               {'limit': limit, 'windows': len(windows)},
+               authorized=authorized)
+    return JSONResponse({'edits': edits, 'windows': windows})
+
+
+@app.post('/api/selfedit/revert')
+async def selfedit_revert(request: Request):
+    """Operator-gated undo for an APPLIED self-edit (selfedit.revert).
+
+    Two legitimate callers: the player (session cookie) or the admin agent
+    (agentId + key + _is_admin). Everyone else is refused; restores the
+    pre-edit bytes, reloads the module, and marks the row reverted."""
+    body = await request.json()
+    edit_id = (body.get('editId') or '').strip()
+    if not edit_id:
+        return JSONResponse({'error': 'editId is required'}, status_code=400)
+    agent_id = (body.get('agentId') or '').strip()
+    session = verify_session(request.cookies.get(SESSION_COOKIE_NAME))
+    admin_agent = None
+    if agent_id and verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) \
+            and _is_admin(get_state_from_db() or {}, agent_id):
+        admin_agent = agent_id
+    if not session and not admin_agent:
+        return JSONResponse({'error': 'only the player session or the admin '
+                                      'agent may revert a self-edit'}, status_code=403)
+    try:
+        ok, payload = await asyncio.to_thread(
+            _selfedit.revert, edit_id, 'player' if session else admin_agent)
+    except Exception as exc:
+        print(f'[selfedit] revert crashed for {edit_id}: {exc}', flush=True)
+        return JSONResponse({'error': f'revert failed: {exc}'}, status_code=500)
+    log_action('player' if session else admin_agent, 'selfedit_revert',
+               {'editId': edit_id, 'ok': ok,
+                'note': ((payload or {}).get('error') or '')[:160]}, authorized=True)
+    return JSONResponse(payload, status_code=200 if ok else 400)
+
+
+@app.post('/api/selfedit/schedule')
+async def selfedit_schedule(request: Request):
+    """Agent-facing change request for a one-shot DORMANCY WINDOW.
+
+    Runs the full chain in selfedit.request_window OFF the event loop
+    (it blocks on the supervisor review's sequential judge calls):
+    conflict scan (standing tasks + other windows) -> supervisor JEV
+    judgment -> floor-1.0 escalation whose email link is the player's
+    final, mandatory signature. ok=False refusals carry the colliding
+    items so the agent can pick a different slot."""
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'unknown')
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'selfedit_schedule'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    date = (body.get('date') or '').strip()
+    start = (body.get('start') or '').strip()
+    reason = (body.get('reason') or '').strip()
+    if not date or not start or not reason:
+        return JSONResponse({'error': 'date (YYYY-MM-DD), start (HH:MM) and '
+                                      'reason are required'}, status_code=400)
+    try:
+        ok, payload = await asyncio.to_thread(
+            _selfedit.request_window, agent_id, date, start,
+            body.get('durationMin'), reason)
+    except Exception as exc:
+        print(f'[selfedit] schedule crashed for {agent_id}: {exc}', flush=True)
+        log_action(agent_id, 'selfedit_crashed', {'error': str(exc)[:300]},
+                   authorized=authorized)
+        return JSONResponse({'error': f'the window request harness failed: {exc}'}, status_code=500)
+    log_action(agent_id, 'selfedit_schedule',
+               {'date': date, 'start': start,
+                'durationMin': (payload or {}).get('durationMin'),
+                'ok': ok, 'id': (payload or {}).get('id'),
+                'note': (((payload or {}).get('error') or '') or
+                         ((payload or {}).get('message') or ''))[:160]},
+               authorized=authorized)
+    return JSONResponse(payload, status_code=200 if ok else 400)
+
+
+@app.post('/api/selfedit/window/cancel')
+async def selfedit_window_cancel(request: Request):
+    """Operator-gated cancel for a PENDING or APPROVED dormancy window.
+
+    Same two legitimate callers as the revert endpoint: the player session
+    or the admin agent (agentId + key + _is_admin). Cancelled windows never
+    fire. Rebooking the same slot afterwards is a NEW request."""
+    body = await request.json()
+    window_id = (body.get('windowId') or '').strip()
+    if not window_id:
+        return JSONResponse({'error': 'windowId is required'}, status_code=400)
+    agent_id = (body.get('agentId') or '').strip()
+    session = verify_session(request.cookies.get(SESSION_COOKIE_NAME))
+    admin_agent = None
+    if agent_id and verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) \
+            and _is_admin(get_state_from_db() or {}, agent_id):
+        admin_agent = agent_id
+    if not session and not admin_agent:
+        return JSONResponse({'error': 'only the player session or the admin '
+                                      'agent may cancel a dormancy window'}, status_code=403)
+    try:
+        ok, payload = await asyncio.to_thread(
+            _selfedit.cancel_window, window_id,
+            'player' if session else admin_agent)
+    except Exception as exc:
+        print(f'[selfedit] window cancel crashed for {window_id}: {exc}', flush=True)
+        return JSONResponse({'error': f'cancel failed: {exc}'}, status_code=500)
+    log_action('player' if session else admin_agent, 'selfedit_window_cancel',
+               {'windowId': window_id, 'ok': ok,
+                'note': ((payload or {}).get('error') or '')[:160]}, authorized=True)
+    return JSONResponse(payload, status_code=200 if ok else 400)
+
+
 def _normalize_allowlist_target(target):
     """Normalize a host-or-URL string down to its bare lowercase hostname.
     Returns (host, error). Mirrors the /api/allowlist/request normalization
@@ -27710,6 +28103,22 @@ async def resolve_escalation(id: str, token: str, decision: str):
         _ok, _msg = _approve_api_service_proposal(esc)
         return HTMLResponse(f"<p>Recorded: <b>approved</b> for {esc['kind']}.</p>"
                             f"<p>{html.escape(esc['question'])}</p><p>{html.escape(_msg)}</p>")
+    # Side effect (approve OR deny): the player's link decision lands on the
+    # requested dormancy-window row. Approve = the slot is scheduled and the
+    # firing loop will sleep the tank at that time so armed code self-edits
+    # apply. Deny = nothing is scheduled. The supervisor's pre-clearance
+    # already passed; this link is the operator decision the kind's floor
+    # 1.0 makes mandatory.
+    if esc.get('kind') == 'dormancy window request':
+        resolved = _selfedit.resolve_window_escalation(id, decision == 'approve')
+        if resolved:
+            verdict = ('The window is scheduled: the think tank will go '
+                       'dormant at the requested time so armed code '
+                       'self-edits can apply.'
+                       if decision == 'approve' else
+                       'Nothing was scheduled.')
+            return HTMLResponse(f"<p>Recorded: <b>{esc['status']}</b> for the dormancy window.</p>"
+                                f"<p>{html.escape(esc['question'])}</p><p>{verdict}</p>")
     return HTMLResponse(f"<p>Recorded: <b>{esc['status']}</b> for {esc['kind']}.</p><p>{html.escape(esc['question'])}</p>")
 
 
@@ -30035,6 +30444,10 @@ if __name__ == '__main__':
             if _LAST_REQUEST_TIME is None:
                 _LAST_REQUEST_TIME = time.time()
             asyncio.create_task(_idle_shutdown_loop())
+        # The dormancy window loop runs whether or not idle-watching is
+        # armed: it owns dormancy-window firing AND the dormant-only
+        # apply_pass for armed self-edits.
+        asyncio.create_task(_dormancy_window_loop())
         await server.serve()
 
     try:
