@@ -908,6 +908,28 @@ class WorkroomAndProductBuildContent(_ExecutorTestCase):
         self.assertTrue(seen['ctx'].startswith('# Room knowledge block'))
         self.assertIn('Current files', seen['ctx'])
 
+    def test_product_build_design_context_outermost(self):
+        # The folded design taste doc wins the outermost slot: it sits ABOVE
+        # wiki and sandbox context, so the build reads taste first.
+        seen = _store()
+        _base_mocks()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        sandbox = os.path.join(tmp, 'prod-sb')
+        os.makedirs(sandbox)
+        snapshot = _snapshot(products={'prod': {'name': 'P', 'sandboxId': 'prod-sb', 'spec': 's'}})
+        with mock.patch.object(serve, 'SANDBOXES_DIR', tmp), \
+             mock.patch.object(serve, '_http_json', return_value={'allowed': True,
+                                                                   'stdout': 'index.html'}), \
+             mock.patch.object(content, '_run_coding_content',
+                               side_effect=lambda *a, **k: seen.setdefault('ctx', k.get('base_ctx'))), \
+             mock.patch.object(content, '_wiki_context_for_task', return_value=''), \
+             mock.patch.object(content, '_design_context_for_task',
+                               return_value='# Taste doc'):
+            content._run_product_build_content(snapshot, 'cora', {'id': 'w14', 'productId': 'prod'})
+        self.assertTrue(seen['ctx'].startswith('# Taste doc'))
+        self.assertIn('Current files', seen['ctx'])
+
     def test_product_build_coding_failure_skips_release(self):
         # A failed coding run must NOT release a frozen revision -- the
         # release is gated on ok=True only.

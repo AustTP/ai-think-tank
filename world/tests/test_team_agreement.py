@@ -135,7 +135,7 @@ class EmptyAgreementIsToday(unittest.TestCase):
     def test_full_map_covers_every_policy_key(self):
         resolved = sim.team_policy(_state({}), 'd1')
         self.assertEqual(set(resolved), set(config.OPERATOR_POLICY_DEFAULT))
-        self.assertEqual(len(resolved), 82)
+        self.assertEqual(len(resolved), len(config.OPERATOR_POLICY_DEFAULT))
 
     def test_non_dict_stored_agreement_ignored(self):
         with _operator(scrumMasterMinTeamSize=5):

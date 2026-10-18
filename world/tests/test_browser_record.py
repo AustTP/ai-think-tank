@@ -531,5 +531,368 @@ class WaitForDevtools(unittest.TestCase):
             asyncio.run(rec._wait_for_devtools(_Err(), 0.2))
 
 
+class ModuleOddments(unittest.TestCase):
+    def test_session_id_format(self):
+        sid = rec.session_id()
+        self.assertTrue(sid.startswith('rec-') and len(sid) > 10)
+
+    def test_submit_like_click_ignores_non_click(self):
+        self.assertFalse(rec._submit_like_click('fill', {}))
+
+    def test_redact_url_passes_malformed_urls_through(self):
+        self.assertEqual(rec.redact_url('http://['), 'http://[')
+        with unittest.mock.patch.object(rec, 'urlencode',
+                                        side_effect=ValueError('bad query')):
+            self.assertEqual(
+                rec.redact_url('https://site.test/p?x=1&token=abc'),
+                'https://site.test/p?x=1&token=abc')
+
+    def test_click_href_is_redacted_into_the_step(self):
+        steps = rec.aggregate_steps([_ev(
+            'click', selector='#go',
+            element=_el(tag='a', href='https://site.test/out?token=abc'),
+            href='https://site.test/out?token=abc')])
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]['href'],
+                         'https://site.test/out?token=%5Bredacted%5D')
+
+    def test_render_step_click_bits(self):
+        line = rec._render_step(3, {
+            'kind': 'click', 'selector': '#go',
+            'element': _el(tag='a', id='go', text='Go'),
+            'value': 'Go', 'href': 'https://site.test/x',
+            'network': [{'requestId': 'r1'}]})
+        self.assertIn('a#go', line)
+        self.assertIn('label="Go"', line)
+        self.assertIn('-> https://site.test/x', line)
+        self.assertIn('1 net rows', line)
+
+
+class FindBrowserSources(unittest.TestCase):
+    def _fake(self):
+        d = tempfile.mkdtemp()
+        fake = os.path.join(d, 'fake-browser')
+        open(fake, 'w').close()
+        return fake
+
+    def test_env_variable_browser_wins(self):
+        fake = self._fake()
+        with unittest.mock.patch.dict(os.environ,
+                                      {'BROWSER_RECORD_BIN': fake}):
+            self.assertEqual(rec.find_browser(), fake)
+
+    def test_candidate_list_is_scanned(self):
+        fake = self._fake()
+        with unittest.mock.patch.object(rec, 'BROWSER_CANDIDATES',
+                                        ('/nonexistent/a', fake)):
+            self.assertEqual(rec.find_browser(), fake)
+
+
+class WaitForDevtoolsEof(unittest.TestCase):
+    def test_stderr_eof_times_out(self):
+        class _Err:
+            async def readline(self):
+                return b''
+
+        with self.assertRaises(TimeoutError):
+            asyncio.run(rec._wait_for_devtools(_Err(), 0.05))
+
+
+class WriteSessionCleanup(unittest.TestCase):
+    def test_write_session_leaves_no_temp_dir_on_crash(self):
+        out_root = tempfile.mkdtemp()
+        session = {'meta': {'label': 't', 'session_id': 'rec-x',
+                            'redactions_applied': 0, 'artifacts': {}},
+                   'steps': [], 'network_pending': []}
+        with unittest.mock.patch.object(rec, 'render_txt',
+                                        side_effect=RuntimeError('boom')):
+            self.assertRaises(RuntimeError, rec.write_session,
+                              session, out_root)
+        self.assertEqual(os.listdir(out_root), [])
+
+
+class _SlowWs:
+    """A WebSocket that stalls in its first read: the pump's 1s queue poll
+    times out once, then the deadline check ends the pump."""
+
+    def __init__(self):
+        self.sent = []
+        self._read = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._read:
+            self._read = True
+            await asyncio.sleep(1.2)
+        raise StopAsyncIteration
+
+    async def send(self, raw):
+        self.sent.append(json.loads(raw))
+
+
+class PumpDeadline(unittest.TestCase):
+    def test_poll_timeout_then_deadline_return(self):
+        session = {'meta': {'label': 't', 'session_id': 'rec-x',
+                            'started_ts': 0, '_max_minutes': 0.005},
+                   'steps': [], 'network_pending': []}
+        asyncio.run(rec._pump(session, _SlowWs()))
+        self.assertEqual(session['steps'], [])
+
+
+class HandleOne(unittest.TestCase):
+    def test_reply_resolves_the_waiting_future(self):
+        async def go():
+            fut = asyncio.get_running_loop().create_future()
+            session = {'meta': {'label': 't'}, 'steps': [],
+                       'network_pending': []}
+            wire = rec._CdpWire(_FakeWs([]))
+            wire.waiters[5] = fut
+            await rec._handle_one(session, wire, asyncio.Queue(), {},
+                                  {'id': 5, 'result': {'ok': 1}})
+            return fut
+
+        fut = asyncio.run(go())
+        self.assertTrue(fut.done() and fut.result()['result'] == {'ok': 1})
+
+    def test_event_without_session_id_is_dropped(self):
+        async def go():
+            session = {'meta': {'label': 't'}, 'steps': [],
+                       'network_pending': []}
+            wire = rec._CdpWire(_FakeWs([]))
+            await rec._handle_one(session, wire, asyncio.Queue(), {},
+                                  {'method': 'Runtime.enable', 'params': {}})
+            return session
+
+        self.assertEqual(asyncio.run(go())['steps'], [])
+
+
+class NetRow(unittest.TestCase):
+    def _session(self):
+        return {'meta': {'label': 't'}, 'steps': [], 'network_pending': []}
+
+    def test_response_event_updates_the_matching_request(self):
+        session = self._session()
+        rec._net_row(session, {'requestId': 'r7',
+                               'request': {'method': 'GET',
+                                           'url': 'https://site.test/a'}},
+                     'Network.requestWillBeSent')
+        rec._net_row(session, {'requestId': 'r7',
+                               'response': {'url': 'https://site.test/a',
+                                            'status': 200},
+                               'type': 'Fetch'},
+                     'Network.responseReceived')
+        rows = session['network_pending']
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['status'], 200)
+        self.assertEqual(rows[0]['method'], 'GET')
+
+    def test_buffer_is_capped(self):
+        session = self._session()
+        for i in range(rec.MAX_NET_ROWS + 5):
+            rec._net_row(session, {'requestId': 'r%d' % i,
+                                   'request': {'method': 'GET',
+                                               'url': 'https://site.test/%d' % i}},
+                         'Network.requestWillBeSent')
+        self.assertEqual(len(session['network_pending']), rec.MAX_NET_ROWS)
+
+
+class Sink(unittest.TestCase):
+    def _session(self):
+        session = {'meta': {'label': 't'}, 'steps': [], 'network_pending': []}
+        session['steps'].append({'kind': 'fill'})
+        return session
+
+    def test_bad_payload_is_dropped(self):
+        session = self._session()
+        asyncio.run(rec._on_sink(session, None, rec._CdpWire(_FakeWs([])),
+                                 'S', 'not-json'))
+        self.assertEqual(len(session['steps']), 1)
+
+    def test_cooldown_suppresses_screenshots(self):
+        session = self._session()
+        state = rec._SessionState('T')
+        state.last_shot_ts = rec.time.time()
+        asyncio.run(rec._on_sink(session, state, rec._CdpWire(_FakeWs([])),
+                                 'S', json.dumps(_ev('fill', value='v'))))
+        self.assertEqual(session['steps'][-1]['kind'], 'fill')
+
+    def test_screenshot_send_failure_keeps_the_step(self):
+        class _Broken(_FakeWs):
+            async def send(self, raw):
+                raise RuntimeError('send broke')
+
+        session = self._session()
+        asyncio.run(rec._on_sink(session, None, rec._CdpWire(_Broken([])),
+                                 'S', json.dumps(_ev('fill', value='v'))))
+        self.assertEqual(session['steps'][-1]['kind'], 'fill')
+
+
+class RunCaptureAsync(unittest.TestCase):
+    """_run_capture_async against fake browser executables and a stubbed
+    CDP transport: the subprocess lifecycle (terminate, kill-after-grace)
+    is what needs proving, not a real Chromium."""
+
+    def _browser_script(self, body):
+        d = tempfile.mkdtemp()
+        script = os.path.join(d, 'fake-browser')
+        with open(script, 'w') as f:
+            f.write('#!/bin/sh\n'
+                    'echo "DevTools listening on ws://127.0.0.1:59999/'
+                    'devtools/browser/abc" >&2\n' + body)
+        os.chmod(script, 0o755)
+        return script
+
+    def _run(self, script, start_url=None):
+        import websockets
+        session = {'meta': {'label': 't', 'session_id': 'rec-x',
+                            '_max_minutes': 0},
+                   'steps': [], 'network_pending': []}
+        pumps = []
+
+        async def fake_pump(s, ws):
+            pumps.append(ws)
+
+        class _FakeConnect:
+            def __init__(self, url, **kw):
+                self.url = url
+
+            async def __aenter__(self):
+                return _FakeWs([])
+
+            async def __aexit__(self, *exc):
+                return False
+
+        with unittest.mock.patch.object(rec, '_wait_for_devtools',
+                                        return_value='ws://fake'), \
+                unittest.mock.patch.object(rec, '_pump', fake_pump), \
+                unittest.mock.patch.object(websockets, 'connect',
+                                           _FakeConnect):
+            asyncio.run(rec._run_capture_async(
+                session, script, start_url, 0, 0))
+        return session, pumps
+
+    def test_live_browser_is_terminated_and_profile_removed(self):
+        script = self._browser_script('sleep 2\n')
+        session, pumps = self._run(script, start_url='https://site.test/')
+        self.assertEqual(len(pumps), 1)
+        self.assertEqual(session['steps'], [])
+
+    def test_grace_expires_and_the_browser_is_killed(self):
+        script = self._browser_script('trap \'\' TERM\nsleep 6\n')
+        session, _pumps = self._run(script)
+        self.assertEqual(session['steps'], [])
+
+
+class PumpBrokenJson(unittest.TestCase):
+    def test_unparseable_frame_is_skipped(self):
+        class _BadJsonWs:
+            def __init__(self):
+                self.sent = []
+                self._n = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.sleep(0)
+                if not self._n:
+                    self._n = True
+                    return 'not-json{'
+                raise StopAsyncIteration
+
+            async def send(self, raw):
+                self.sent.append(json.loads(raw))
+
+        session = {'meta': {'label': 't', 'session_id': 'rec-x',
+                            '_max_minutes': 0},
+                   'steps': [], 'network_pending': []}
+        asyncio.run(rec._pump(session, _BadJsonWs()))
+        self.assertEqual(session['steps'], [])
+
+    def test_connection_closed_ends_the_reader(self):
+        import websockets.exceptions
+
+        class _ClosedWs:
+            def __init__(self):
+                self.sent = []
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise websockets.exceptions.ConnectionClosed(None, None)
+
+            async def send(self, raw):
+                self.sent.append(json.loads(raw))
+
+        session = {'meta': {'label': 't', 'session_id': 'rec-x',
+                            '_max_minutes': 0},
+                   'steps': [], 'network_pending': []}
+        asyncio.run(rec._pump(session, _ClosedWs()))
+        self.assertEqual(session['steps'], [])
+
+
+class _HideWebsockets:
+    """A meta-path finder that makes `import websockets` fail, so main()'s
+    dependency check can be exercised even with websockets installed."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name == 'websockets':
+            raise ImportError('hidden for test')
+        return None
+
+
+class Main(unittest.TestCase):
+    def test_reports_missing_websockets(self):
+        hidden = _HideWebsockets()
+        with unittest.mock.patch.dict(sys.modules, {'websockets': None}):
+            sys.meta_path.insert(0, hidden)
+            sys.modules.pop('websockets', None)
+            try:
+                rc = rec.main(['--label', 't', '--out', tempfile.mkdtemp()])
+            finally:
+                sys.meta_path.remove(hidden)
+        self.assertEqual(rc, 2)
+
+    def test_main_reports_missing_browser(self):
+        rc = rec.main(['--label', 't', '--out', tempfile.mkdtemp(),
+                       '--browser', '/nonexistent/browser-bin'])
+        self.assertEqual(rc, 2)
+
+    def test_main_handles_sigint_like_a_finish(self):
+        out_root = tempfile.mkdtemp()
+        with unittest.mock.patch.object(rec, 'run_capture',
+                                        side_effect=KeyboardInterrupt):
+            rc = rec.main(['--label', 't', '--out', out_root,
+                           '--browser', os.__file__.replace('.pyc', '.py')])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(os.listdir(out_root)), 1)
+
+    def test_main_runs_and_writes_partial_artifacts(self):
+        d = tempfile.mkdtemp()
+        fake = os.path.join(d, 'fake-browser')
+        with open(fake, 'w') as f:
+            f.write('#!/bin/sh\n'
+                    'echo "DevTools listening on ws://127.0.0.1:59999/'
+                    'devtools/browser/abc" >&2\n'
+                    'sleep 0.5\n')
+        os.chmod(fake, 0o755)
+        out_root = tempfile.mkdtemp()
+        rc = rec.main(['--label', 't', '--out', out_root,
+                       '--browser', fake, '--max-minutes', '0.02'])
+        self.assertEqual(rc, 0)
+        written = os.listdir(out_root)
+        self.assertEqual(len(written), 1)
+        rec_dir = os.path.join(out_root, written[0])
+        for name in ('session.txt', 'session.json',
+                     'browser_act_actions.json'):
+            self.assertTrue(os.path.isfile(os.path.join(rec_dir, name)))
+        self.assertIn('aborted',
+                      json.load(open(os.path.join(rec_dir, 'session.json')))
+                      ['meta'])
+
+
 if __name__ == '__main__':
     unittest.main()

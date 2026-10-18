@@ -682,6 +682,38 @@ class SimResidualTest(_Base):
                 reader=lambda r: None)
         self.assertEqual(req['status'], 'rejected')
 
+    def test_resolve_refinement_appeal_rides_instructions(self):
+        req = {'id': 'r1', 'status': 'pending', 'filedBy': 'cora',
+               'room': 'pressoffice', 'title': 'Do X', 'reason': 'why',
+               'appeal': 'it also breaks on Safari'}
+        state = {'agents': {'sm': {'name': 'SM'},
+                            'cora': {'name': 'Cora', 'role': 'worker'}},
+                 'agentRoster': [{'id': 'sm', 'name': 'SM'}],
+                 'backlogRequests': [req], 'tasks': {}, 'workQueue': []}
+        pending = {'scrumMasterId': 'sm', 'reqIds': ['r1'], 'teamId': 't1'}
+        seen = {}
+        with unittest.mock.patch.object(sim.comprehension,
+                                        'comprehend_batch',
+                                        return_value={}), \
+             unittest.mock.patch.object(sim, '_overrun_factor_for',
+                                        return_value=1.0), \
+             unittest.mock.patch.object(sim, 'budget_usd_for_task',
+                                        return_value=1.0), \
+             unittest.mock.patch.object(sim, '_refinement_context_for_room',
+                                        return_value=''), \
+             unittest.mock.patch.object(sim, '_reassign_rolled_over_cards'), \
+             unittest.mock.patch.object(sim, '_restore_refinement_agent'), \
+             unittest.mock.patch('serve.log_action'), \
+             unittest.mock.patch('serve.log_refinement_digest'):
+            sim._resolve_refinement(
+                state, pending, 1000,
+                decider=lambda instructions, criteria: seen.setdefault(
+                    'instructions', instructions) or 'reject',
+                reader=lambda r: None)
+        self.assertIn('APPEAL', seen['instructions'])
+        self.assertIn('Safari', seen['instructions'])
+        self.assertEqual(req['status'], 'rejected')
+
     def test_resolve_breakdown_never_text(self):
         req = {'id': 'r1', 'status': 'pending', 'filedBy': 'cora',
                'goal': 'G', 'title': 'T', 'room': 'pressoffice'}
@@ -729,6 +761,20 @@ class ContentBudgetTest(_Base):
             out = content._record_source_evidence(
                 'http://x', 'k', 'cora', 'u', 'ru', 'text', 0, 'tp', 't1')
         self.assertTrue(out.get('recorded'))
+
+    def test_note_research_coverage_failure_swallowed(self):
+        with unittest.mock.patch('serve._http_json',
+                                 side_effect=RuntimeError('boom')):
+            content._note_research_coverage('http://x', 'k', 'cora', 'ident',
+                                            'artifact')
+            content._note_research_failure('http://x', 'k', 'cora', 'ident',
+                                           'why')
+
+    def test_note_research_failure_records_when_server_responds(self):
+        with unittest.mock.patch('serve._http_json',
+                                 return_value={'ok': True}):
+            content._note_research_failure('http://x', 'k', 'cora', 'ident',
+                                           'why')
 
     def test_research_chat_budget(self):
         task = {'id': 't1', 'research': {'topicId': 'rt1', 'since': 0}}
@@ -920,6 +966,11 @@ class ContentHelperTest(_Base):
             out = ex('publish_skill', args)
         self.assertIn('failed', out)
 
+    def test_skill_publisher_unknown_tool_raises(self):
+        ex = content._make_skill_publisher('cora', 'k')
+        with self.assertRaises(ValueError):
+            ex('some_other_tool', {})
+
     def test_google_tools(self):
         ex = content._make_google_tools_executor()
         with unittest.mock.patch('serve.wrap_external_content',
@@ -1069,6 +1120,13 @@ class CodingAndReviewTest(_Base):
         self.assertEqual(result['peerChecks'], ['c'])
         self.assertEqual(result['peerRisks'], ['r'])
         self.assertIn('queued a fix', result['note'])
+
+    def test_review_chat_budget_stores_budget_result(self):
+        with unittest.mock.patch('sim._store_content_result') as store:
+            self._review([{'budgetExhausted': True, 'taskSpendUsd': 1.0,
+                           'taskSpendAttempts': 2}])
+        self.assertTrue(store.called)
+        self.assertTrue(store.call_args[0][1].get('budgetExhausted'))
 
     def test_review_visual_budget(self):
         with unittest.mock.patch('sim._store_content_result') as store:

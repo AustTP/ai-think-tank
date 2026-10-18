@@ -326,6 +326,10 @@ class OperatorPolicySimServeBind(unittest.TestCase):
         self.assertIn('sim', config.POLICY_BINDINGS)
         self.assertIn('serve', config.POLICY_BINDINGS)
 
+    def test_apply_bindings_skips_unimported_module(self):
+        self.assertEqual(config.apply_policy_bindings('no_such_module_here'), [])
+        self.assertEqual(config.apply_policy_bindings('serve'), ['serve'])
+
 
 class LoaderBranches(unittest.TestCase):
     """The fail-closed shapes the reload path itself never produces:

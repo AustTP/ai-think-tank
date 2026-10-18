@@ -15,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import serve  # noqa: E402
+import sim  # noqa: E402
 import content  # noqa: E402
 
 
@@ -170,6 +171,17 @@ class SandboxContextHelpers(unittest.TestCase):
                                                                   'stdout': 'file contents'}):
             self.assertEqual(content._get_sandbox_context('b', 'k', 'a', 'sb'), 'file contents')
 
+    def test_review_sandbox_id_shared_fallback_for_non_code_lane(self):
+        self.assertEqual(content._review_sandbox_id({'tasks': {}},
+                                                    {'id': 'k1', 'room': 'observatory'},
+                                                    'cora'),
+                         content.WORKROOM_SANDBOX_ID)
+        # A code-class task that somehow carries no id falls back too.
+        self.assertEqual(content._review_sandbox_id({'tasks': {}},
+                                                    {'room': 'pressoffice'},
+                                                    'cora'),
+                         content.WORKROOM_SANDBOX_ID)
+
     def test_search_library_files_variants(self):
         with mock.patch.object(serve, '_http_json', return_value={'matches': [{'path': 'p'}]}):
             self.assertEqual(content._search_library_files('b', 'k', 'a', 'q'), [{'path': 'p'}])
@@ -270,6 +282,11 @@ class ReviewVerdictParsing(unittest.TestCase):
         self.assertEqual(checks, ['ok'])
         self.assertEqual(risks, ['r'])
 
+    def test_parse_review_verdict_malformed_json_falls_back(self):
+        v, summary, checks, risks = content._parse_review_verdict('{not json at all}')
+        self.assertIsNone(v)
+        self.assertEqual((summary, checks, risks), ('', [], []))
+
 
 class JsFileIntegrity(unittest.TestCase):
     def test_extract_written_js_files(self):
@@ -300,6 +317,20 @@ class JsFileIntegrity(unittest.TestCase):
         with mock.patch.object(serve, '_http_json', return_value=None):
             self.assertEqual(content._guess_link_target_html('b', 'k', 'a', 'sb', 'settings.js'),
                              'index.html')
+
+    def test_auto_link_js_files_budget_exhausted(self):
+        def side_effect(method, base, path, body=None, header=None, timeout=30):
+            if path == '/api/execute':
+                return {'allowed': False}
+            if path == '/api/chat':
+                return {'budgetExhausted': True, 'taskSpendUsd': 1.0,
+                        'taskSpendAttempts': 2}
+            return {}
+        with mock.patch.object(serve, '_http_json', side_effect=side_effect):
+            res = content._auto_link_js_files('b', 'k', 'a', 'sb', ['a.js'], [],
+                                              'tier', task_id='c9')
+        self.assertTrue(res.get('budgetExhausted'))
+        self.assertEqual(res.get('taskSpendUsd'), 1.0)
 
     def test_auto_link_js_files_success_and_failure_paths(self):
         calls = {'n': 0}
@@ -462,6 +493,14 @@ class CodingContentBranches(unittest.TestCase):
         self.assertFalse(result)
         self.assertIn('model call failed', note['note'])
         self.assertTrue(note.get('infra'), 'final model-call failure must be tagged infra')
+
+    def test_model_call_budget_exhausted(self):
+        result, note, _ = self._run(
+            [{'budgetExhausted': True, 'taskSpendUsd': 1.0,
+              'taskSpendAttempts': 3}])
+        self.assertFalse(result)
+        self.assertTrue(note.get('budgetExhausted'))
+        self.assertEqual(note.get('tier'), 'tier')
 
     def test_model_call_retry_succeeds(self):
         # First call fails (infra retry), second succeeds -- the task proceeds.
@@ -752,6 +791,23 @@ class ReviewChecklistBranches(unittest.TestCase):
                                                      grades, 'full review')
         self.assertEqual(n, 0)
 
+    def test_record_review_process_trace_get_failure_swallowed(self):
+        grades = [{'id': 'g1', 'verdict': content.GRADE_FAILS, 'section': 's',
+                   'question': 'q', 'type': 'code', 'confidence': 0.9}]
+        calls = {'post': 0}
+        def side_effect(method, base, path, body=None, header=None, timeout=30):
+            if path.startswith('/api/library/file?'):
+                raise RuntimeError('read failed')
+            if path == '/api/library/file':
+                calls['post'] += 1
+                return {'ok': True}
+            return {'ok': True}
+        with mock.patch.object(serve, '_http_json', side_effect=side_effect):
+            n = content._record_review_process_trace('b', 'k', 'ada', 'P', 'T', 'review', 'Ada',
+                                                     grades, 'full review')
+        self.assertEqual(n, 1)
+        self.assertEqual(calls['post'], 1)
+
 
 class PlainCompletionAndReflection(unittest.TestCase):
     def test_plain_completion_success_accrues_cost(self):
@@ -778,6 +834,21 @@ class PlainCompletionAndReflection(unittest.TestCase):
         with mock.patch.object(serve, '_call_openrouter_sync', return_value=None):
             self.assertEqual(content._plain_completion('m', [], 100), '')
 
+    def test_plain_completion_task_budget_gate(self):
+        with mock.patch.object(serve, '_task_budget_exhausted', return_value=True):
+            self.assertEqual(content._plain_completion('m', [], 100, task_id='t9'), '')
+
+    def test_plain_completion_task_id_accrues_task_spend(self):
+        with mock.patch.object(serve, '_call_openrouter_sync',
+                               return_value={'choices': [{'message': {'content': 'a'}}],
+                                             'usage': {'cost': 0.25}}), \
+             mock.patch.object(serve, '_task_budget_exhausted', return_value=False), \
+             mock.patch.object(serve, '_accrue_spend') as accrue, \
+             mock.patch.object(serve, '_accrue_task_spend') as task_accrue:
+            self.assertEqual(content._plain_completion('m', [], 100, task_id='t9'), 'a')
+            accrue.assert_called_once()
+            task_accrue.assert_called_once_with('t9', 0.25)
+
     def test_parse_reflection_variants(self):
         self.assertEqual(content._parse_reflection('{"confidence": 0.8, "note": "ok"}'), (0.8, 'ok'))
         self.assertEqual(content._parse_reflection('prose {"confidence": 0.7, "note": "n"} prose'),
@@ -790,6 +861,21 @@ class PlainCompletionAndReflection(unittest.TestCase):
 
 
 class SpikeExecutorBranches(unittest.TestCase):
+    def test_spike_heartbeat_swallows_frozen_task(self):
+        class _Frozen(dict):
+            def __setitem__(self, k, v):
+                raise RuntimeError('frozen')
+
+        task = _Frozen({'id': 'sp1', 'title': 'T'})
+        with mock.patch.object(serve, '_task_budget_exhausted', return_value=True), \
+             mock.patch.object(serve, '_task_budget_spent', return_value=(1.0, 2)), \
+             mock.patch('sim._store_content_result') as store:
+            content._run_spike_content(
+                {'agentRoster': [{'id': 'cora', 'name': 'Cora'}],
+                 'agents': {'cora': {'name': 'Cora'}}},
+                'cora', task)
+        self.assertTrue(store.call_args[0][1].get('budgetExhausted'))
+
     def test_spike_wants_detectors(self):
         self.assertTrue(content._spike_wants_internal_review("review another team's approach", None))
         self.assertFalse(content._spike_wants_internal_review('browse the web', None))
@@ -1361,6 +1447,20 @@ class DesignContextForTask(unittest.TestCase):
             ctx = content._design_context_for_task({'a': 1}, {'productId': 'product-1'})
         self.assertEqual(ctx, 'PALETTE: #111')
         dc.assert_called_once_with('product-1')
+
+
+class SimVillageOfAgent(unittest.TestCase):
+    def test_resolves_through_sim_helper(self):
+        with mock.patch.object(sim, 'village_of_agent', return_value='north'):
+            self.assertEqual(content._sim_village_of_agent({}, 'bri'), 'north')
+
+    def test_defaults_to_main_without_agent(self):
+        self.assertEqual(content._sim_village_of_agent({}, ''), 'main')
+
+    def test_defaults_to_main_when_helper_raises(self):
+        with mock.patch.object(sim, 'village_of_agent',
+                               side_effect=RuntimeError('boom')):
+            self.assertEqual(content._sim_village_of_agent({}, 'bri'), 'main')
 
 
 class BuildWorkContext(unittest.TestCase):

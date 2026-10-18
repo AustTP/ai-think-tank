@@ -2394,6 +2394,8 @@ class ApplyOperatorPolicyTest(unittest.TestCase):
                                return_value=policy), \
              mock.patch.object(serve, '_SimWatchdogIntervalSEnv', '1.5'), \
              mock.patch.object(serve, '_SimWatchdogStaleSEnv', ''):
+            for key, default in config.OPERATOR_POLICY_DEFAULT.items():
+                policy.setdefault(key, default)
             config.apply_policy_bindings('serve')
         self.assertEqual(serve.CHAT_MAX_TOKENS_CAP, 7)
         self.assertEqual(serve._SIM_WATCHDOG_INTERVAL_S, 1.5)

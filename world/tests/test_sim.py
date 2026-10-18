@@ -1972,6 +1972,20 @@ class CardAppealMailReply(unittest.TestCase):
         state = self._state()
         self.assertFalse(sim._register_card_appeal(state, 'rep', 'T1-99', 'hi'))
 
+    def test_player_and_empty_reporters_and_empty_key_are_refused(self):
+        state = self._state()
+        self.assertFalse(sim._register_card_appeal(state, 'player', 'T1-1', 'me'))
+        self.assertFalse(sim._register_card_appeal(state, '', 'T1-1', 'me'))
+        self.assertFalse(sim._register_card_appeal(state, 'rep', '  ', 'me'))
+
+    def test_missing_issue_and_missing_sm_agent_are_refused(self):
+        no_issue = self._state()
+        del no_issue['issues']['T1-1']
+        self.assertFalse(sim._register_card_appeal(no_issue, 'rep', 'T1-1', 'x'))
+        no_sm = self._state()
+        del no_sm['agents']['ada']
+        self.assertFalse(sim._register_card_appeal(no_sm, 'rep', 'T1-1', 'x'))
+
     def test_serve_replies_find_the_named_card_key(self):
         state = self._state()
         serve._maybe_register_card_appeal(
@@ -2050,6 +2064,26 @@ class IncidentRestoreProbe(unittest.TestCase):
         # Evidence check still runs (recorded), but there is no owning team to
         # escalate to -- and no escalation must be filed for a bare claim.
         self.assertFalse(orphan['restoreVerified'])
+        self.assertIsNone(state.get('_pendingEscalation'))
+
+    def test_already_probed_task_never_reprobes(self):
+        state = self._state()
+        task = self._bug()
+        task['restoreCheck'] = {'ok': True, 'ts': 1, 'evidence': 'app.py'}
+        task['restoreVerified'] = True
+        sim._apply_content_result(state, task, {'ok': True, 'note': 'again'}, 1000)
+        self.assertEqual(task['restoreCheck'], {'ok': True, 'ts': 1, 'evidence': 'app.py'})
+        self.assertTrue(task['restoreVerified'])
+        self.assertIsNone(state.get('_pendingEscalation'))
+
+    def test_unknown_product_skips_escalation_quietly(self):
+        state = self._state()
+        task = self._bug(product='p-ghost')
+        sim._apply_content_result(state, task, {'ok': True, 'note': 'tweaked it'}, 1000)
+        self.assertFalse(task['restoreVerified'])
+        feedback = ' '.join(f.get('text', '')
+                            for f in (state.get('_feedback') or {}).get('rep', []))
+        self.assertIn('restore evidence', feedback)
         self.assertIsNone(state.get('_pendingEscalation'))
 
     def test_runbook_records_the_probe_verdict(self):
