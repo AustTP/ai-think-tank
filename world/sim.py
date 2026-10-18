@@ -6322,7 +6322,8 @@ def _sim_notify_author_failed(state, task, cycle=None, is_infra=False):
     `cycle` (when given) stamps "rejection N of MAX_REVIEW_CYCLES" on the
     notice so the agent can tell a first rejection from a fifth without
     counting copies. `is_infra` switches the wording: an infrastructure
-    failure is not the agent's quality, and the notice must say so."""
+    failure is not the agent's quality, and the notice must say so -- pass
+    cycle=None for infra send-backs, whose retries are not quality rejections."""
     author = task.get('assignedTo')
     if not author:
         return
@@ -6368,7 +6369,10 @@ def _log_quality_gate_reject(state, task, note, escalated):
     _log_governance(state, task.get('assignedTo'), 'quality_gate_reject', details)
 
 
-def _send_back_after_failure(state, task, fail_note=None):
+INFRA_SEND_BACKS = 3  # same-work retries an infra-tagged failure gets before the gate freezes
+
+
+def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
     """Fail-closed quality-gate send-back. A deliverable (or a fix of one) whose
     content result failed the pipeline is marked `failed` -- deliberately NOT
     'needs_review', because _sweep_stuck_gates only processes needs_review and
@@ -6382,20 +6386,52 @@ def _send_back_after_failure(state, task, fail_note=None):
     prior gate (if any) is kept so _maybe_escalate_stuck_gate's shared cap and
     _enter_peer_review's carry-over both see it.
 
-    Infra failures (`task['_infraFailure']`, a model-call/API fault, not the
-    agent's quality) get different treatment: no coaching note (there is
-    nothing the agent could have done differently), different mailbox wording,
-    and the failure note says infrastructure, not quality pipeline."""
+    Infra failures (a model-call/API/sandbox fault -- `result['infra']`, not
+    the agent's quality) never enter that fix-cycle machinery: no coaching
+    note (there is nothing the agent could have done differently), no
+    review-cycle bump (a flaky outage must never auto-close a healthy story),
+    and no 'Fix:' card. The SAME work is re-queued to the original author
+    unchanged (reviewOf keeps the pin + the green-result re-arm path), at most
+    INFRA_SEND_BACKS times; after that the gate is marked `escalated` (frozen)
+    and the story stops ticking, so a persistent outage can neither ship an
+    unverified story nor loop. `is_infra` overrides the task tag: a fix
+    subtask's infra result lands on the fix, but the PARENT is the card being
+    resent, and the parent tag alone misreads the cause."""
     author = task.get('assignedTo')
     note = (fail_note or task.get('note') or 'the pipeline did not pass').strip()
-    is_infra = bool(task.get('_infraFailure'))
-    # Cycle counter for the mailbox notice: "rejection N of MAX" so the agent
-    # can tell a first rejection from a fifth without counting copies.
+    if is_infra is None:
+        is_infra = bool(task.get('_infraFailure'))
     if not task.get('_peerGate'):
         task['_peerGate'] = {'approvals': 0, 'approvers': [],
                              'reviewerIds': [], 'enteredMs': 0}
     gate = task['_peerGate']
-    _sim_notify_author_failed(state, task, cycle=gate.get('cycleCount', 0) + 1,
+    if is_infra and gate.get('infraRetries', 0) >= INFRA_SEND_BACKS:
+        # Infra cap reached: freeze for manual attention. Deliberately NOT
+        # _close_gated_story -- the pipeline never passed clean, so "ship what
+        # exists" would be exactly the red-pipeline escape the gate exists to
+        # prevent.
+        task['status'] = 'failed'
+        task['failedAt'] = int(time.time() * 1000)
+        task['failNote'] = (f'frozen after {INFRA_SEND_BACKS} infrastructure-failure '
+                            f'retries: {note}')[:300]
+        gate['escalated'] = True
+        _append_mailbox((state.get('agents') or {}).get(author, {}), {
+            'kind': 'infrastructure_failure_frozen',
+            'title': task.get('title'),
+            'text': (f'Your work on "{task.get("title")}" kept hitting '
+                     f'infrastructure failures across {INFRA_SEND_BACKS} automatic '
+                     f'retries. The story is frozen pending a manual look -- no '
+                     f'action is needed from you.')})
+        _log_governance(state, author, 'infra_send_back',
+                        {'taskId': task.get('id'), 'title': (task.get('title') or '')[:120],
+                         'frozen': True, 'retries': gate.get('infraRetries', 0),
+                         'note': note[:120]})
+        return
+    # Cycle counter for the mailbox notice: "rejection N of MAX" so the agent
+    # can tell a first rejection from a fifth without counting copies. Infra
+    # retries are NOT quality rejections -- no cycle stamp on their wording.
+    _sim_notify_author_failed(state, task,
+                              cycle=None if is_infra else gate.get('cycleCount', 0) + 1,
                               is_infra=is_infra)
     # Feedback injection (brunnfeld): a concrete failure reason must change the
     # author's NEXT execution, not just land as a mailbox message. Same W6
@@ -6414,12 +6450,6 @@ def _send_back_after_failure(state, task, fail_note=None):
     task['status'] = 'failed'
     task['failedAt'] = int(time.time() * 1000)
     task['failNote'] = note[:300]
-    escalated = _maybe_escalate_stuck_gate(state, task, gate,
-                                           'infrastructure failure keeps happening' if is_infra
-                                           else 'quality pipeline keeps failing')
-    _log_quality_gate_reject(state, task, note, escalated=escalated)
-    if escalated:
-        return  # auto-closed after cycle cap -- no further fix cycling
     if is_infra:
         instructions = (f"Your work on '{task.get('title')}' hit an infrastructure "
                         f"failure (not your code): {note}. The same task is being "
@@ -6433,6 +6463,38 @@ def _send_back_after_failure(state, task, fail_note=None):
         instructions += f"\n\nAcceptance criteria:\n{task['acceptanceCriteria']}"
     if task.get('never'):
         instructions += f"\n\nNEVER:\n{task['never']}"
+    if is_infra:
+        # Bounded same-work retry: count separately from the review cycle, log
+        # with its own governance kind (the red-pipeline telemetry stays about
+        # quality), and requeue the identical work. No _maybe_escalate_stuck_gate
+        # here -- the cycle cap must stay a QUALITY verdict.
+        gate['infraRetries'] = gate.get('infraRetries', 0) + 1
+        _log_governance(state, author, 'infra_send_back',
+                        {'taskId': task.get('id'), 'title': (task.get('title') or '')[:120],
+                         'retry': gate['infraRetries'], 'limit': INFRA_SEND_BACKS,
+                         'note': note[:120]})
+        queue_work(state, [{
+            'title': task.get('title'),
+            'room': task.get('room'),
+            'instructions': instructions,
+            'goal': task.get('projectLabel') or task.get('goal'),
+            'projectLabel': task.get('projectLabel') or task.get('title'),
+            'taskType': 'code',
+            'reviewOf': task.get('id'),
+            'reviewAuthorId': author,
+            'assignedTo': author,
+            'productId': task.get('productId'),
+            'userStory': task.get('userStory'),
+            'acceptanceCriteria': task.get('acceptanceCriteria'),
+            'never': task.get('never') or None,
+            'priority': WORK_PRIORITY['high'],
+        }])
+        return
+    escalated = _maybe_escalate_stuck_gate(state, task, gate,
+                                           'quality pipeline keeps failing')
+    _log_quality_gate_reject(state, task, note, escalated=escalated)
+    if escalated:
+        return  # auto-closed after cycle cap -- no further fix cycling
     queue_work(state, [{
         'title': f'Fix: {task.get("title")}',
         'room': task.get('room'),
@@ -13002,9 +13064,13 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                         # Fail-closed: the FIX itself failed the pipeline. Do NOT
                         # re-arm the gate; the story stays 'failed' and another
                         # fix is queued back to the author (or it escalates once
-                        # the shared cycle cap is hit).
+                        # the shared cycle cap is hit). The infra cause rides on
+                        # the FIX task (where _apply_content_result stamped it),
+                        # NOT the parent -- pass it explicitly or the resend
+                        # words itself around a stale parent tag.
                         _release_agent_after_failure(state, aid, task)
-                        _send_back_after_failure(state, parent, fail_note=task.get('note'))
+                        _send_back_after_failure(state, parent, fail_note=task.get('note'),
+                                                 is_infra=bool(task.get('_infraFailure')))
                         send_agent_off_duty(state, aid, doors, grid)
                         continue
                     elif parent is not None:

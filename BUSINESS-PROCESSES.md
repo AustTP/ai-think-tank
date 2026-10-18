@@ -560,11 +560,17 @@ Confirm this matches the intended quality bar.
    low-confidence call falls back to `style`.
 4. Append the classified failure to the bounded failure ledger.
 5. Send the work back with a note. The note enters the author's feedback buffer.
-6. Re-queue the fix. Re-arm the gate.
-7. Repeated cycles escalate rather than loop forever.
+6. A model-call, API, or sandbox fault (tagged infra) is not the author's
+   quality, so it takes a different lane: no fix card, no review-cycle burn,
+   no coaching. The same work is requeued unchanged, assigned back to the
+   author, at most 3 times; after that the gate freezes for manual attention
+   and never auto-closes, because the pipeline never passed clean.
+7. Re-queue the fix. Re-arm the gate.
+8. Repeated cycles escalate rather than loop forever.
 
 **Controls.** Four-bucket taxonomy, deterministic-first classification,
-fail-closed label, bounded ledger, review cycle cap, escalation.
+fail-closed label, bounded ledger, review cycle cap, infra-retry lane
+(separate counter + freeze at cap), escalation.
 
 **Records.** `failures.json`, feedback buffer, fix task, decision tape.
 

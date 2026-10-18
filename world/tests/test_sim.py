@@ -1109,6 +1109,71 @@ class SimAgentPerception(unittest.TestCase):
         pipeline_fb = [f for f in fb if f.get('source') == 'pipeline']
         self.assertEqual(len(pipeline_fb), 0)
 
+    def test_send_back_infra_failure_retries_same_work_no_cycle_bump(self):
+        # An infra-tagged failure says nothing about the code: no 'Fix:' card,
+        # no review-cycle burn -- the SAME work is re-queued unchanged and the
+        # retries count separately on the gate (an outage must never auto-close
+        # a healthy story at the cycle cap).
+        state = self._state()
+        task = {'id': 'task-1', 'title': 'Build thing', 'assignedTo': 'ada',
+                'room': 'pressoffice', 'status': 'working',
+                '_infraFailure': True,
+                'note': 'the model call failed or returned nothing (infrastructure error)'}
+        sim._send_back_after_failure(state, task)
+        queue = state['workQueue']
+        self.assertEqual(len(queue), 1)
+        item = queue[0]
+        self.assertEqual(item['title'], 'Build thing')  # no 'Fix: ' prefix
+        self.assertEqual(item['reviewOf'], 'task-1')    # pin + green re-arm path
+        self.assertEqual(item['assignedTo'], 'ada')
+        self.assertIn('infrastructure', item['instructions'])
+        gate = task['_peerGate']
+        self.assertEqual(gate.get('cycleCount', 0), 0)  # no quality cycle burned
+        self.assertEqual(gate.get('infraRetries'), 1)
+        self.assertEqual(task['status'], 'failed')
+        # Infra retries are not quality rejections: no "rejection N of MAX" stamp.
+        self.assertNotIn('rejection', state['agents']['ada']['mailbox'][0]['text'])
+
+    def test_send_back_infra_failure_caps_then_freezes_gate(self):
+        # After INFRA_SEND_BACKS same-work retries the story freezes for manual
+        # attention instead of looping forever -- and never auto-closes, since
+        # the pipeline never passed clean ("ship what exists" would be a
+        # red-pipeline escape).
+        state = self._state()
+        task = {'id': 'task-1', 'title': 'Build thing', 'assignedTo': 'ada',
+                'room': 'pressoffice', 'status': 'working',
+                '_infraFailure': True,
+                'note': 'the sandbox pipeline timed out (infrastructure)'}
+        for _ in range(sim.INFRA_SEND_BACKS + 1):
+            sim._send_back_after_failure(state, task)
+        self.assertEqual(len(state['workQueue']), sim.INFRA_SEND_BACKS)
+        gate = task['_peerGate']
+        self.assertEqual(gate.get('infraRetries'), sim.INFRA_SEND_BACKS)
+        self.assertTrue(gate.get('escalated'))
+        self.assertEqual(gate.get('cycleCount', 0), 0)
+        self.assertNotIn('closed', gate)  # not _close_gated_story'd
+        self.assertEqual(task['status'], 'failed')
+        self.assertIn('frozen', task['failNote'])
+        kinds = [m.get('kind') for m in state['agents']['ada']['mailbox']]
+        self.assertIn('infrastructure_failure_frozen', kinds)
+
+    def test_send_back_explicit_is_infra_beats_missing_task_tag(self):
+        # A FIX subtask that fails on infra carries the tag, but the PARENT is
+        # the card being resent -- the parent's (absent) tag alone must not
+        # downgrade the resend to quality wording.
+        state = self._state()
+        parent = {'id': 'task-1', 'title': 'Build thing', 'assignedTo': 'ada',
+                  'room': 'pressoffice', 'status': 'failed'}
+        sim._send_back_after_failure(state, parent,
+                                     fail_note='the sandbox pipeline timed out',
+                                     is_infra=True)
+        mailbox = state['agents']['ada']['mailbox']
+        self.assertIn('infrastructure', mailbox[0]['text'].lower())
+        self.assertNotIn('quality pipeline', mailbox[0]['text'])
+        self.assertEqual(parent['_peerGate']['infraRetries'], 1)
+        self.assertEqual(len(state['workQueue']), 1)
+        self.assertEqual(state['workQueue'][0]['title'], 'Build thing')
+
     def test_team_overview_tool_is_offered(self):
         # Theo's round-3 request: a combined status+digest+allowlist view.
         tool_names = {t['function']['name'] for t in serve.AGENT_ASK_TOOLS}
