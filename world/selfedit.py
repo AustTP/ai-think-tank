@@ -293,6 +293,10 @@ def _ensure_table(conn):
         conn.execute('ALTER TABLE self_edit_log ADD COLUMN signature_esc TEXT')
     except sqlite3.OperationalError:
         pass  # column already exists
+    try:  # two-agent change requests: armed edits reserved for one window
+        conn.execute('ALTER TABLE self_edit_log ADD COLUMN reserve_window TEXT')
+    except sqlite3.OperationalError:
+        pass  # column already exists
     conn.execute('CREATE INDEX IF NOT EXISTS idx_self_edit_status '
                  'ON self_edit_log (status, created)')
 
@@ -628,14 +632,26 @@ def apply_pass():
     serve = _s()
     if not serve._dormant():
         return 0
+    window_id = _active_window_id()
     with serve._db() as conn:
         _ensure_table(conn)
-        rows = conn.execute(
-            "SELECT id, path, sha_before FROM self_edit_log "
-            "WHERE status = 'armed' ORDER BY created").fetchall()
+        if window_id:
+            # inside a change window, ONLY the window's reserved edits apply
+            # (two-agent contract: the validator reviews exactly this
+            # change request's bytes, not bystander edits)
+            rows = conn.execute(
+                "SELECT id, path, sha_before FROM self_edit_log "
+                "WHERE status = 'armed' AND reserve_window = ? "
+                'ORDER BY created', (window_id,)).fetchall()
+        else:
+            # the idle path applies unreserved armed edits; it runs the same
+            # post-apply tests but never pushes (no change request owns it)
+            rows = conn.execute(
+                "SELECT id, path, sha_before FROM self_edit_log "
+                "WHERE status = 'armed' AND reserve_window IS NULL "
+                'ORDER BY created').fetchall()
     if not rows:
         return 0
-    window_id = _active_window_id()
     applied = 0
     landed = []
     for row_id, display, sha_before in rows:
@@ -647,6 +663,18 @@ def apply_pass():
             _update(row_id, status='failed', note=str(e)[:200])
             serve.log_action(row_id, 'self_edit_apply_failed',
                              {'error': str(e)[:200]}, authorized=False)
+    if window_id and not landed:
+        # every reserved edit conflicted or failed at apply time: the change
+        # request produced nothing to validate or push
+        note = 'no reserved edits applied (all conflicted or failed at apply time)'
+        _update_window(window_id, push_status='failed',
+                       push_category='unsuccessful', push_note=note)
+        _unreserve_window_edits(window_id)
+        serve.log_action(window_id, 'repo_push',
+                         {'category': 'unsuccessful', 'reason': note},
+                         authorized=True)
+        _telegram_change_request(window_id, 'unsuccessful', note)
+        return 0
     if not landed:
         return 0
     ok, tail = _run_post_apply_tests()
@@ -655,6 +683,8 @@ def apply_pass():
                       'edits': applied, 'window': window_id,
                       'tail': tail[:POST_APPLY_TAIL_LEN]}, authorized=True)
     if ok:
+        if window_id:
+            _hold_for_validator(window_id, remediation_used=False, tail=tail)
         return applied
     if window_id:
         _mark_remediation(window_id, landed, tail)
@@ -850,7 +880,11 @@ def run_remediation_checks(agent_id):
                 _notify_agent(meta['agent'], (
                     f'Change window {window_id} checks PASS after the '
                     f'in-window fixes. Your edit is back to applied and '
-                    f'clean; nothing else to do.'), about=f'selfedit:{row_id}')
+                    f'clean; the validator now reviews the result before '
+                    f'any push.'), about=f'selfedit:{row_id}')
+        _update_window(window_id, remediation_used=1)
+        _hold_for_validator(window_id, remediation_used=True,
+                            tail='tests pass after in-window fixes')
         serve.log_action(window_id, 'selfedit_remediation_cleared', {},
                          authorized=True)
         return True, {'ok': True, 'tests': 'pass',
@@ -1099,6 +1133,17 @@ POST_APPLY_TEST_CMD = ['bash', 'tests/run_all.sh']
 POST_APPLY_TEST_TIMEOUT_S = 900
 POST_APPLY_TAIL_LEN = 2000
 
+# Push contract (operator decision, 2026-10-18). A windowed change request
+# ends in a push to origin main ONLY after the repo gate passed on the live
+# tree AND a second agent (the validator, never one of the proposers)
+# approved the result. Outcomes are categorized; successful_with_issues
+# cannot land without a note. Git failures and protocol failures roll the
+# window back exactly like a failed gate, so local main never sits ahead of
+# origin with unpushed validated bytes.
+PUSH_CATEGORIES = ('successful', 'successful_with_issues', 'unsuccessful')
+MAX_PUSH_NOTE_LEN = 800
+GIT_STEP_TIMEOUT_S = 120
+
 _WINDOW_JEV_KIND = 'dormancy window request'
 
 _WINDOW_INSTRUCTIONS = (
@@ -1133,6 +1178,27 @@ def _ensure_windows_table(conn):
         'escalation_id TEXT, fired_at REAL)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_dormancy_windows_status '
                  'ON dormancy_windows (status, start_ts)')
+    # Push contract (operator decision, 2026-10-18): a change request is
+    # completed by TWO agents -- the implementer requests the window, a
+    # DIFFERENT agent validates the applied result, and only then may the
+    # validated bytes be pushed to origin main. Every push outcome carries a
+    # category (successful / successful_with_issues / unsuccessful); a
+    # successful_with_issues push REQUIRES a non-empty note.
+    for col, decl in (
+            ('validator', 'TEXT'),
+            ('validator_status', 'TEXT'),
+            ('validator_note', 'TEXT'),
+            ('validated_at', 'REAL'),
+            ('remediation_used', 'INTEGER'),
+            ('push_status', 'TEXT'),
+            ('push_category', 'TEXT'),
+            ('push_note', 'TEXT'),
+            ('push_sha', 'TEXT'),
+            ('pushed_at', 'REAL')):
+        try:
+            conn.execute(f'ALTER TABLE dormancy_windows ADD COLUMN {col} {decl}')
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
 
 def _notify_agent(agent_id, text, about=''):
@@ -1278,12 +1344,19 @@ def _parse_window_target(date_text, start_text, now):
     return start_ts, day_end, None
 
 
-def request_window(agent_id, date, start, duration_min, reason):
+def request_window(agent_id, date, start, duration_min, reason, validator=None):
     """Run the change-request chain for one dormancy slot.
 
     Returns (ok, payload); ok=False carries the refusal (with 'conflicts'
     when the slot was blocked by the schedule). ok=True means the supervisor
-    judgment passed and the player-only escalation link is out."""
+    judgment passed and the player-only escalation link is out.
+
+    Two-agent contract (operator decision, 2026-10-18): the requester is the
+    IMPLEMENTER and must name a DIFFERENT agent as validator; the validator
+    reviews the applied result before anything is pushed to main. The
+    implementer's currently armed edits are RESERVED for this window -- they
+    apply inside the slot and nowhere else, so the validator reviews exactly
+    the change request's bytes."""
     serve = _s()
     agent_id = (agent_id or '').strip() or 'unknown'
     reason = (reason or '').strip()[:MAX_WINDOW_REASON_LEN]
@@ -1291,6 +1364,7 @@ def request_window(agent_id, date, start, duration_min, reason):
         return False, {'error': 'a reason is required -- say WHY the tank '
                                 'should sleep then (emergency fix, risky '
                                 'reload, quiet hours maintenance)'}
+    validator = (validator or '').strip()
     try:
         duration_min = int(duration_min or WINDOW_DEFAULT_DURATION_MIN)
     except (TypeError, ValueError):
@@ -1321,6 +1395,33 @@ def request_window(agent_id, date, start, duration_min, reason):
         return False, {'error': 'the requested slot collides with already '
                                 'scheduled items -- pick another time: '
                                 f'{listed}', 'conflicts': conflicts}
+    # two-agent change requests (operator decision, 2026-10-18): the
+    # implementer names a DIFFERENT validator, and the request only proceeds
+    # if the implementer actually has armed edits to reserve for the slot
+    if not validator:
+        return False, {'error': 'a validator is required: name a DIFFERENT '
+                                'agent who will review the applied result '
+                                'before it is pushed to GitHub'}
+    if validator == agent_id:
+        return False, {'error': 'the validator must be a different agent than '
+                                'the implementer -- change requests complete '
+                                'with two agents (implementer + validator)'}
+    state = serve.get_state_from_db() or {}
+    roster = state.get('agents') or {}
+    names = (set(roster.keys()) if isinstance(roster, dict)
+             else {a.get('id') for a in roster if isinstance(a, dict)})
+    if names and validator not in names:
+        return False, {'error': f'{validator} is not a known agent -- name a '
+                                'real validator from the tank roster'}
+    with serve._db() as conn:
+        _ensure_table(conn)
+        armed_ids = [r[0] for r in conn.execute(
+            "SELECT id FROM self_edit_log WHERE status = 'armed' AND "
+            'agent = ? ORDER BY created', (agent_id,)).fetchall()]
+    if not armed_ids:
+        return False, {'error': 'you have no armed edits to schedule a window '
+                                'for -- propose and arm your changes first '
+                                '(self_edit), then schedule the window'}
     question = (f'Agent {agent_id} requests a dormancy window to apply '
                 f'reviewed code self-edits:\n'
                 f'Date: {date}  Start: {start} (tank local time)  '
@@ -1344,18 +1445,29 @@ def request_window(agent_id, date, start, duration_min, reason):
                                      on_approve_note=window_id)
     _window_record(window_id, now, agent_id, date, start, start_ts, end_ts,
                    duration_min, reason, 'pending')
-    _update_window(window_id, escalation_id=esc_id)
+    _update_window(window_id, escalation_id=esc_id, validator=validator,
+                   validator_status='pending')
+    with serve._db() as conn:
+        _ensure_table(conn)
+        for row_id in armed_ids:
+            conn.execute('UPDATE self_edit_log SET reserve_window = ? '
+                         'WHERE id = ?', (window_id, row_id))
     serve.log_action(window_id, 'dormancy_window_requested',
                      {'agent': agent_id, 'date': date, 'start': start,
                       'durationMin': duration_min, 'escalationId': esc_id,
-                      'supervisorDecision': 'approved'},
+                      'supervisorDecision': 'approved', 'validator': validator,
+                      'reservedEdits': armed_ids},
                      authorized=True)
     return True, {'id': window_id, 'status': 'pending', 'escalationId': esc_id,
-                  'durationMin': duration_min,
-                  'message': 'window requested -- the supervisor review '
-                             'approved it; it now waits on the player '
-                             'approval link and then applies on schedule. '
-                             'Check dormancy_window_status.'}
+                  'durationMin': duration_min, 'validator': validator,
+                  'reservedEdits': armed_ids,
+                  'message': f'window requested -- the supervisor review '
+                             f'approved it; {len(armed_ids)} armed edit(s) '
+                             f'are reserved for this window and {validator} '
+                             f'will validate the applied result before any '
+                             f'push. It now waits on the player approval '
+                             f'link and then applies on schedule. Check '
+                             f'dormancy_window_status.'}
 
 
 def resolve_window_escalation(esc_id, approved):
@@ -1372,8 +1484,14 @@ def resolve_window_escalation(esc_id, approved):
     window_id, status = row[0], row[1]
     if status != 'pending':
         return False
-    _update_window(window_id, status='approved' if approved else 'refused',
-                   note=f'player {"approved" if approved else "denied"}')
+    if approved:
+        _update_window(window_id, status='approved', note='player approved')
+    else:
+        # denied change requests release their reserved edits back to the
+        # idle pool -- they were never applied and stay armed
+        _unreserve_window_edits(window_id)
+        _update_window(window_id, status='refused',
+                       note='player denied')
     serve.log_action(window_id, 'dormancy_window_resolved',
                      {'by': 'player', 'approved': approved},
                      authorized=True)
@@ -1394,6 +1512,7 @@ def window_tick():
     for (row_id,) in missed:
         _update_window(row_id, status='missed',
                        note='window passed without firing')
+        _unreserve_window_edits(row_id)
         serve.log_action(row_id, 'dormancy_window_missed', {},
                          authorized=False)
     with serve._db() as conn:
@@ -1418,13 +1537,53 @@ def window_tick():
                            row_id)
             _update_window(row_id, status='rolled_back',
                            note='ended with unresolved test failures; '
-                                'candidates saved and edits reverted')
+                                'candidates saved and edits reverted',
+                           push_status='failed',
+                           push_category='unsuccessful',
+                           push_note='repo tests still failing at the end '
+                                     'of the slot')
             serve.log_action(row_id, 'dormancy_window_rolled_back',
                              {'edits': failing}, authorized=True)
+            _telegram_change_request(row_id, 'unsuccessful',
+                                     'repo tests still failing at the end '
+                                     'of the slot')
         else:
-            _update_window(row_id, status='done')
-            serve.log_action(row_id, 'dormancy_window_done', {},
-                             authorized=True)
+            push_status = _window_field(row_id, 'push_status')
+            if push_status == 'pushed':
+                _update_window(row_id, status='done')
+                serve.log_action(row_id, 'dormancy_window_done', {},
+                                 authorized=True)
+            elif push_status == 'awaiting_validator':
+                applied_rows = _window_participants(row_id, 'applied')
+                _rollback_rows(applied_rows,
+                               f'change window {row_id} ended before the '
+                               'validator approved the push', row_id)
+                _update_window(row_id, status='rolled_back',
+                               note='ended awaiting validation; edits '
+                                    'reverted, candidates saved',
+                               push_status='failed',
+                               push_category='unsuccessful',
+                               push_note='window ended before the validator '
+                                         'approved the push')
+                serve.log_action(row_id, 'dormancy_window_rolled_back',
+                                 {'edits': applied_rows,
+                                  'reason': 'awaiting validator at slot end'},
+                                 authorized=True)
+                _telegram_change_request(
+                    row_id, 'unsuccessful',
+                    'window ended before the validator approved the push')
+            else:
+                _update_window(row_id, status='unsuccessful',
+                               push_status='failed',
+                               push_category='unsuccessful',
+                               push_note='window ended without a validated, '
+                                         'pushed result')
+                serve.log_action(row_id, 'dormancy_window_unsuccessful', {},
+                                 authorized=True)
+                _telegram_change_request(row_id, 'unsuccessful',
+                                         'window ended without a validated, '
+                                         'pushed result')
+        _unreserve_window_edits(row_id)
     fired = []
     for (row_id,) in due:
         _update_window(row_id, status='fired', fired_at=now)
@@ -1456,6 +1615,7 @@ def cancel_window(window_id, by='player'):
         return False, {'error': f'window is {status!r}, nothing to cancel'}
     _update_window(window_id, status='cancelled',
                    note=f'cancelled by {by}')
+    _unreserve_window_edits(window_id)
     serve.log_action(window_id, 'dormancy_window_cancelled',
                      {'by': by}, authorized=True)
     return True, {'ok': True, 'status': 'cancelled'}
@@ -1467,9 +1627,335 @@ def windows_snapshot(limit=25):
         _ensure_windows_table(conn)
         rows = conn.execute(
             'SELECT id, created, agent, date, start, duration_min, reason, '
-            'status, note, escalation_id, fired_at FROM dormancy_windows '
+            'status, note, escalation_id, fired_at, validator, '
+            'validator_status, validator_note, push_status, push_category, '
+            'push_note, push_sha, pushed_at FROM dormancy_windows '
             'ORDER BY created DESC LIMIT ?', (int(limit),)).fetchall()
     return [{'id': r[0], 'created': r[1], 'agent': r[2], 'date': r[3],
              'start': r[4], 'durationMin': r[5], 'reason': r[6],
              'status': r[7], 'note': r[8], 'escalationId': r[9],
-             'firedAt': r[10]} for r in rows]
+             'firedAt': r[10], 'validator': r[11],
+             'validatorStatus': r[12], 'validatorNote': r[13],
+             'pushStatus': r[14], 'pushCategory': r[15], 'pushNote': r[16],
+             'pushSha': r[17], 'pushedAt': r[18]} for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Two-agent change requests -> push to origin main (operator decision,
+# 2026-10-18). The implementer requests the window and names a validator (a
+# DIFFERENT agent). The window reserves the implementer's armed edits, applies
+# exactly those inside the slot, and runs the repo gate on the live tree. Gate
+# green holds the window for the validator's explicit approval; only an
+# approved result is committed and pushed. Every final outcome is categorized
+# (successful / successful_with_issues / unsuccessful), logged as repo_push,
+# and pushed to the player's Telegram. Failures roll back like a failed gate:
+# local main never sits ahead of origin with unpushed validated bytes.
+# ---------------------------------------------------------------------------
+
+
+def _git_run(args):
+    """One git command against the repo root. Returns (rc, stdout, stderr);
+    every failure is a plain return code -- the caller fails closed."""
+    try:
+        done = subprocess.run(['git', '-C', _repo_root(), *args],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=GIT_STEP_TIMEOUT_S)
+        return (done.returncode,
+                (done.stdout or b'').decode('utf-8', errors='replace'),
+                (done.stderr or b'').decode('utf-8', errors='replace'))
+    except subprocess.TimeoutExpired:
+        return 124, '', f'git {args[0]} timed out after {GIT_STEP_TIMEOUT_S}s'
+    except Exception as exc:
+        return 1, '', f'git {args[0]} could not start: {exc}'
+
+
+def _notify_player_telegram(subject, body):
+    """Best-effort player Telegram push for change-request outcomes; never
+    raises (an unreachable Telegram must not break a finished push)."""
+    try:
+        from notify import send_player_telegram_sync
+        return send_player_telegram_sync(subject, body)
+    except Exception as exc:
+        try:
+            _s().log_action('selfedit', 'selfedit_telegram_failed',
+                            {'error': str(exc)[:200]}, authorized=False)
+        except Exception:
+            pass
+        return False
+
+
+def _window_row(window_id):
+    with _s()._db() as conn:
+        conn.row_factory = sqlite3.Row
+        _ensure_windows_table(conn)
+        row = conn.execute(
+            'SELECT * FROM dormancy_windows WHERE id = ?',
+            (window_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def _window_field(window_id, col):
+    with _s()._db() as conn:
+        _ensure_windows_table(conn)
+        row = conn.execute(
+            f'SELECT {col} FROM dormancy_windows WHERE id = ?',
+            (window_id,)).fetchone()
+    return row[0] if row else None
+
+
+def _unreserve_window_edits(window_id):
+    """Release every edit still reserved for a window back to the idle pool
+    (reservation only pays off if the window actually fires)."""
+    with _s()._db() as conn:
+        _ensure_table(conn)
+        conn.execute(
+            'UPDATE self_edit_log SET reserve_window = NULL '
+            'WHERE reserve_window = ?', (window_id,))
+
+
+def _window_applied_paths(window_id):
+    with _s()._db() as conn:
+        _ensure_table(conn)
+        return [r[0] for r in conn.execute(
+            "SELECT DISTINCT path FROM self_edit_log WHERE window_id = ? "
+            "AND status = 'applied'", (window_id,)).fetchall()]
+
+
+def _window_edit_summaries(window_id):
+    with _s()._db() as conn:
+        _ensure_table(conn)
+        rows = conn.execute(
+            "SELECT id, agent, path, summary FROM self_edit_log "
+            "WHERE window_id = ? AND status = 'applied' ORDER BY created",
+            (window_id,)).fetchall()
+    return [{'id': r[0], 'agent': r[1], 'path': r[2], 'summary': r[3]}
+            for r in rows]
+
+
+def _window_unlanded(window_id):
+    """Reserved edits of this window that did NOT end applied (conflicts,
+    apply failures). Each one is a change-request issue the validator must
+    see -- and the note requirement exists for exactly this."""
+    with _s()._db() as conn:
+        _ensure_table(conn)
+        rows = conn.execute(
+            "SELECT id, status FROM self_edit_log WHERE reserve_window = ? "
+            "AND status != 'applied'", (window_id,)).fetchall()
+    return [{'id': r[0], 'status': r[1]} for r in rows]
+
+
+def validation_window():
+    """The fired window currently holding for its validator's push decision
+    (still inside its slot). Drives serve's wake exemption so validator
+    traffic reaches the server without waking the tank mid-window."""
+    import math
+    now = time.time()
+    with _s()._db() as conn:
+        _ensure_windows_table(conn)
+        row = conn.execute(
+            "SELECT id FROM dormancy_windows WHERE status = 'fired' "
+            "AND push_status = 'awaiting_validator' AND end_ts >= ? "
+            'ORDER BY start_ts DESC LIMIT 1', (math.floor(now),)).fetchone()
+    return row[0] if row else None
+
+
+def window_validator(window_id):
+    return _window_field(window_id, 'validator')
+
+
+def _telegram_change_request(window_id, category, note, sha=None, n_edits=None):
+    """One player Telegram message per final change-request outcome."""
+    row = _window_row(window_id) or {}
+    validator = row.get('validator') or '?'
+    if category == 'successful':
+        head = (f'Change request {window_id}: SUCCESSFUL -- {n_edits or "?"} '
+                f'edit(s) passed the repo gate and validator {validator}, '
+                'pushed to main' + (f' ({sha})' if sha else ''))
+    elif category == 'successful_with_issues':
+        head = (f'Change request {window_id}: SUCCESSFUL WITH ISSUES -- '
+                f'pushed to main' + (f' ({sha})' if sha else '')
+                + f' (validated by {validator})')
+    else:
+        head = (f'Change request {window_id}: UNSUCCESSFUL -- nothing was '
+                'pushed to main')
+    body = head
+    if note:
+        body += f'\n\nNote: {note}'
+    return _notify_player_telegram('[AI Think Tank] Change request', body)
+
+
+def _hold_for_validator(window_id, remediation_used, tail):
+    """Gate-green handoff: the change request waits for the validator's
+    explicit approval before anything is pushed. Idempotent per window."""
+    serve = _s()
+    row = _window_row(window_id)
+    if not row or row['status'] != 'fired' or row.get('push_status'):
+        return
+    _update_window(window_id, push_status='awaiting_validator',
+                   remediation_used=1 if remediation_used else 0)
+    edits = _window_edit_summaries(window_id)
+    serve.log_action(window_id, 'selfedit_validation_requested',
+                     {'edits': [e['id'] for e in edits],
+                      'remediationUsed': bool(remediation_used)},
+                     authorized=True)
+    validator = row.get('validator')
+    if not validator:
+        return
+    lines = [
+        f'Change window {window_id} applied {len(edits)} edit(s) and the repo '
+        'test gate PASSED on the live tree. You are the validator for this '
+        'change request: review the applied result, then approve or deny the '
+        'push with the selfedit_validate tool.',
+        'Edits in this change request:',
+    ]
+    for e in edits:
+        lines.append(f"- {e['path']} ({e['agent']}): {(e['summary'] or '')[:200]}")
+    if remediation_used:
+        lines.append('NOTE: in-window remediation fixes were needed before '
+                     'the gate passed -- approving WITHOUT a note is refused; '
+                     'your note becomes the change-request record.')
+    lines.append('Approving pushes straight to main (a note is required when '
+                 'there are issues). Denying rolls the window back like a '
+                 'failed gate -- nothing is pushed.')
+    deadline = time.strftime('%H:%M', time.localtime(row['end_ts']))
+    lines.append(f'Window deadline: {deadline} tank time. If the slot ends '
+                 'before you decide, the window rolls back automatically.')
+    lines.append('Gate tail:\n' + (tail or '')[-POST_APPLY_TAIL_LEN:])
+    _notify_agent(validator, '\n'.join(lines), about=f'selfedit:{window_id}')
+
+
+def _fail_window_push(window_id, reason, by=None):
+    """Roll the window back like a failed gate and record an unsuccessful
+    outcome: candidates saved under .selfedit_failed/<window>/, tree restored,
+    Telegram + action log tell the player."""
+    serve = _s()
+    applied = _window_participants(window_id, 'applied')
+    _rollback_rows(applied, reason, window_id)
+    _update_window(window_id, push_status='failed',
+                   push_category='unsuccessful',
+                   push_note=reason[:MAX_PUSH_NOTE_LEN])
+    serve.log_action(window_id, 'repo_push',
+                     {'category': 'unsuccessful', 'reason': reason[:300],
+                      'by': by or 'system', 'edits': applied},
+                     authorized=True)
+    _telegram_change_request(window_id, 'unsuccessful', reason)
+    return True, {'ok': True, 'status': 'unsuccessful',
+                  'message': f'{reason} -- the window rolled back; nothing '
+                             'was pushed'}
+
+
+def _commit_message(window_id, row, edits):
+    lines = [f'selfedit: change window {window_id}', '',
+             (row.get('reason') or '').strip() or '(no reason recorded)', '',
+             f'Implemented by {row.get("agent")}; validated by '
+             f'{row.get("validator") or "?"}.', '']
+    for e in edits[:20]:
+        lines.append(f"- {e['path']}: {(e['summary'] or '')[:160]}")
+    return '\n'.join(lines)
+
+
+def _push_window(window_id, category, note):
+    """Commit exactly this window's applied files and push origin main.
+    The gate already ran on these exact bytes while the tank was dormant;
+    the status check guards against unrelated tracked changes sneaking in."""
+    serve = _s()
+    row = _window_row(window_id)
+    paths = _window_applied_paths(window_id)
+    if not row or not paths:
+        return _fail_window_push(window_id,
+                                 'no applied edits to push (unexpected state)')
+    rc, out, err = _git_run(['status', '--porcelain'])
+    if rc != 0:
+        return _fail_window_push(window_id,
+                                 f'git status failed: {(err or out)[-300:]}')
+    expected = set(paths)
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        st, path = line[:2], line[3:].strip()
+        if st.strip() in ('??', '!!'):
+            continue  # untracked/ignored noise is not part of the push
+        if ' -> ' in path:
+            path = path.split(' -> ', 1)[1]
+        if path not in expected:
+            return _fail_window_push(
+                window_id,
+                f'unexpected tracked change in the tree ({path}) -- only '
+                "this change request's files may land")
+    edits = _window_edit_summaries(window_id)
+    message = _commit_message(window_id, row, edits)
+    for args in (['add', *paths], ['commit', '-m', message],
+                 ['push', 'origin', 'main']):
+        rc, out, err = _git_run(args)
+        if rc != 0:
+            return _fail_window_push(
+                window_id, f'git {args[0]} failed: {(err or out)[-300:]}')
+    rc, sha_out, _err = _git_run(['rev-parse', 'HEAD'])
+    sha = sha_out.strip()[:12] if rc == 0 and sha_out.strip() else ''
+    _update_window(window_id, push_status='pushed', push_category=category,
+                   push_note=(note or None), push_sha=sha,
+                   pushed_at=time.time())
+    serve.log_action(window_id, 'repo_push',
+                     {'category': category, 'sha': sha, 'edits': len(edits),
+                      'agent': row.get('agent'),
+                      'validator': row.get('validator'),
+                      'note': (note or '')[:300]},
+                     authorized=True)
+    _telegram_change_request(window_id, category, note, sha=sha,
+                             n_edits=len(edits))
+    _notify_agent(row.get('agent'), (
+        f'Change window {window_id} was validated by {row.get("validator")} '
+        f'and PUSHED to main ({sha or "sha unavailable"}), category '
+        f'{category}.' + (f' Note: {note}' if note else '')),
+        about=f'selfedit:{window_id}')
+    return True, {'ok': True, 'status': category, 'sha': sha,
+                  'edits': len(edits),
+                  'message': f'pushed to origin main ({sha or "sha unavailable"}), '
+                             f'category {category}'}
+
+
+def validate_window(agent_id, window_id, approved, note, issues=False):
+    """The validator's push decision for a held change request. Only the
+    window's validator may call this, only while the slot is open and the
+    window holds. Deny = rollback (nothing pushed). Approve = push, with a
+    REQUIRED note whenever the outcome has issues (remediation was used,
+    reserved edits failed to apply, or the validator flags concerns)."""
+    agent_id = (agent_id or '').strip()
+    note = (note or '').strip()[:MAX_PUSH_NOTE_LEN]
+    row = _window_row(window_id)
+    if not row:
+        return False, {'error': 'unknown window id'}
+    if row.get('validator') != agent_id:
+        return False, {'error': 'only the change request\'s validator may '
+                                'validate it (you are not on record as the '
+                                'validator)'}
+    if row['status'] != 'fired' or row.get('push_status') != 'awaiting_validator':
+        return False, {'error': f"window {window_id} is {row['status']!r} / "
+                                f"push {row.get('push_status')!r} -- nothing "
+                                'is waiting for validation right now'}
+    if row['end_ts'] < time.time():
+        return False, {'error': 'the window slot has ended -- the sweep will '
+                                'roll the edits back; schedule a fresh window'}
+    if not approved:
+        _fail_window_push(window_id,
+                          f'validator {agent_id} denied the push', by=agent_id)
+        return True, {'ok': True, 'status': 'unsuccessful',
+                      'message': 'denial recorded -- the window rolled back '
+                                 'and nothing was pushed'}
+    remediation_used = bool(row.get('remediation_used'))
+    unlanded = _window_unlanded(window_id)
+    has_issues = bool(remediation_used or unlanded or issues)
+    if has_issues and not note:
+        why = []
+        if remediation_used:
+            why.append('in-window remediation was needed')
+        if unlanded:
+            why.append(f'{len(unlanded)} reserved edit(s) did not apply')
+        if issues:
+            why.append('you flagged issues')
+        return False, {'error': 'a note is REQUIRED for a change request '
+                                'with issues (' + '; '.join(why) + ') -- '
+                                'describe them for the record, then approve '
+                                'again'}
+    category = 'successful_with_issues' if has_issues else 'successful'
+    return _push_window(window_id, category, note)

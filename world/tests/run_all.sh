@@ -256,6 +256,9 @@ echo
 echo "== Python: self-edit pipeline (proposal/change windows/remediation) =="
 python3 tests/test_selfedit.py
 echo
+echo "== Python: change-request push contract (two-agent validator -> push to main) =="
+python3 tests/test_selfedit_push.py
+echo
 echo "== Python: governed policy_edit tool (Phase 3 externalized serve knobs) =="
 python3 tests/test_policy_edit.py
 echo
@@ -264,6 +267,9 @@ python3 tests/test_tier_speed_tie.py
 echo
 echo "== Python: sandbox browser_act driver (fake playwright) =="
 python3 tests/test_browser_driver.py
+echo
+echo "== Python: browser session recorder -- CDP capture, redaction, artifacts (fake wire) =="
+python3 tests/test_browser_record.py
 
 # NOTE: test_visual_regression.py is NOT run here. Every test above is a pure-
 # function test with no live server/DB/browser (hermetic, per test_bank.py's

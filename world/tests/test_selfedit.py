@@ -298,15 +298,42 @@ def _patch_player_approval(monkeypatch):
         look_first='', **_kw: 'esc-' + (on_approve_note[:0] or 'x12345'))
 
 
+def _patch_roster(monkeypatch):
+    # Deterministic roster for the two-agent validator check (the seed
+    # roster is env-dependent in the real install).
+    monkeypatch.setattr(serve, 'get_state_from_db',
+                        lambda: {'agents': {'worker': {}, 'reviewer': {}}})
+
+
+def _arm_edit(monkeypatch, world, agent='worker', path='gear.py'):
+    """Arm one reviewed edit for `agent` so a change request has something
+    to reserve."""
+    (world / path).write_text('SPEED = 2\n', encoding='utf-8')
+    _approve(monkeypatch)
+    ok, payload = selfedit.propose(agent, path, 'SPEED = 2', 'SPEED = 3',
+                                   'engine tuning knob')
+    assert ok is True, payload
+    return payload['id']
+
+
 def test_schedule_window_happy_path_pends_escalation(fake_repo, monkeypatch):
     _, world = fake_repo
-    _approve(monkeypatch)
+    edit_id = _arm_edit(monkeypatch, world)
     _patch_player_approval(monkeypatch)
+    _patch_roster(monkeypatch)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'nightly maintenance')
+        'worker', _window_slot(), '03:10', 15, 'nightly maintenance',
+        'reviewer')
     assert ok is True, payload
     assert payload['status'] == 'pending'
     assert payload['escalationId'].startswith('esc-x')
+    assert payload['validator'] == 'reviewer'
+    assert payload['reservedEdits'] == [edit_id]
+    with sqlite3.connect(serve.DB_PATH) as conn:
+        reserved = conn.execute(
+            'SELECT reserve_window FROM self_edit_log WHERE id = ?',
+            (edit_id,)).fetchone()[0]
+    assert reserved == payload['id']
     rows = selfedit.windows_snapshot()
     assert len(rows) == 1
     row = rows[0]
@@ -316,6 +343,7 @@ def test_schedule_window_happy_path_pends_escalation(fake_repo, monkeypatch):
     assert row['durationMin'] == 15
     assert row['status'] == 'pending'
     assert row['escalationId'] == payload['escalationId']
+    assert row['validator'] == 'reviewer'
 
 
 def test_schedule_window_refused_by_conflicts(fake_repo, monkeypatch):
@@ -371,10 +399,13 @@ def test_schedule_window_time_and_range_validation(fake_repo, monkeypatch):
 
 def test_schedule_window_supervisor_refusal(fake_repo, monkeypatch):
     _, world = fake_repo
+    _arm_edit(monkeypatch, world)
     _approve(monkeypatch, decision='reject', confidence=0.7)
     _patch_player_approval(monkeypatch)
+    _patch_roster(monkeypatch)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'vague pause please')
+        'worker', _window_slot(), '03:10', 15, 'vague pause please',
+        'reviewer')
     assert ok is False and payload['status'] == 'refused'
     assert 'supervisor review said' in payload['error']
     assert selfedit.windows_snapshot(limit=10) == []
@@ -382,18 +413,65 @@ def test_schedule_window_supervisor_refusal(fake_repo, monkeypatch):
 
 def test_resolve_and_cancel_lifecycle(fake_repo, monkeypatch):
     _, world = fake_repo
+    edit_id = _arm_edit(monkeypatch, world)
     _approve(monkeypatch)
     _patch_player_approval(monkeypatch)
+    _patch_roster(monkeypatch)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'nightly maintenance')
+        'worker', _window_slot(), '03:10', 15, 'nightly maintenance',
+        'reviewer')
     window_id, esc_id = payload['id'], payload['escalationId']
     assert selfedit.resolve_window_escalation(esc_id, True) is True
     assert selfedit.resolve_window_escalation(esc_id, True) is False
     assert selfedit.windows_snapshot()[0]['status'] == 'approved'
+    # the reservation survives approval (the window still fires later)
+    with sqlite3.connect(serve.DB_PATH) as conn:
+        reserved = conn.execute(
+            'SELECT reserve_window FROM self_edit_log WHERE id = ?',
+            (edit_id,)).fetchone()[0]
+    assert reserved == window_id
     ok, payload = selfedit.cancel_window(window_id, by='player')
     assert ok is True and payload['status'] == 'cancelled'
+    # cancellation releases the reservation back to the idle pool
+    with sqlite3.connect(serve.DB_PATH) as conn:
+        reserved = conn.execute(
+            'SELECT reserve_window FROM self_edit_log WHERE id = ?',
+            (edit_id,)).fetchone()[0]
+    assert reserved is None
     ok, payload = selfedit.cancel_window('win-nope', by='player')
     assert ok is False and 'unknown window id' in payload['error']
+
+
+def test_request_window_two_agent_contract(fake_repo, monkeypatch):
+    _, world = fake_repo
+    _approve(monkeypatch)
+    _patch_player_approval(monkeypatch)
+    _patch_roster(monkeypatch)
+    edit_id = _arm_edit(monkeypatch, world)
+    ok, payload = selfedit.request_window(
+        'worker', _window_slot(), '03:10', 15, 'nightly maintenance')
+    assert ok is False and 'a validator is required' in payload['error']
+    ok, payload = selfedit.request_window(
+        'worker', _window_slot(), '03:10', 15, 'nightly maintenance',
+        'worker')
+    assert ok is False and 'different agent' in payload['error']
+    ok, payload = selfedit.request_window(
+        'worker', _window_slot(), '03:10', 15, 'nightly maintenance',
+        'ghost')
+    assert ok is False and 'not a known agent' in payload['error']
+    # a rostered validator with no armed edits of the implementer's
+    monkeypatch.setattr(serve, 'get_state_from_db',
+                        lambda: {'agents': {'idle': {}, 'reviewer': {}}})
+    ok, payload = selfedit.request_window(
+        'idle', _window_slot(), '03:10', 15, 'nightly maintenance',
+        'reviewer')
+    assert ok is False and 'no armed edits' in payload['error']
+    assert selfedit.windows_snapshot(limit=10) == []
+    with sqlite3.connect(serve.DB_PATH) as conn:
+        reserved = conn.execute(
+            'SELECT reserve_window FROM self_edit_log WHERE id = ?',
+            (edit_id,)).fetchone()[0]
+    assert reserved is None  # refused requests leave the edit unreserved
 
 
 def test_window_tick_fires_forces_dormancy_and_marks_missed(
@@ -446,9 +524,14 @@ def test_dormancy_tools_surface_and_executor_forwarding(monkeypatch):
     out = exec_tool('schedule_dormant_apply', {
         'date': _window_slot(), 'start': '03:10', 'durationMin': 25,
         'reason': 'nightly maintenance'})
+    assert 'requires a validator' in out
+    out = exec_tool('schedule_dormant_apply', {
+        'date': _window_slot(), 'start': '03:10', 'durationMin': 25,
+        'reason': 'nightly maintenance', 'validator': 'reviewer'})
     assert sent[0]['path'] == '/api/selfedit/schedule'
     assert sent[0]['body']['agentId'] == 'worker'
     assert sent[0]['body']['durationMin'] == 25
+    assert sent[0]['body']['validator'] == 'reviewer'
     assert 'win-y' in out and 'pending' in out
     # conflict-shaped refusals render their list
     monkeypatch.setattr(
@@ -460,7 +543,7 @@ def test_dormancy_tools_surface_and_executor_forwarding(monkeypatch):
                               'name': 'Engineering ritual block'}]})
     out = exec_tool('schedule_dormant_apply', {
         'date': _window_slot(), 'start': '03:10',
-        'reason': 'nightly maintenance'})
+        'reason': 'nightly maintenance', 'validator': 'reviewer'})
     assert 'Engineering ritual block' in out
 
 
@@ -536,6 +619,10 @@ def test_window_remediation_fix_recheck_recover(monkeypatch, fake_repo):
                                    'MARKER_VALUE = 2', 'bump the marker')
     assert ok is True, payload
     window_id = _fire_window(now - 60)
+    # two-agent contract: the window applies only its reserved edits
+    with sqlite3.connect(serve.DB_PATH) as conn:
+        conn.execute('UPDATE self_edit_log SET reserve_window = ? '
+                     'WHERE id = ?', (window_id, payload['id']))
     assert dormancy == [True]
     monkeypatch.setattr(serve, '_dormant', lambda: True)
     _fake_test_gate(monkeypatch, [(False, 'boom: marker tests broken')])
@@ -554,6 +641,35 @@ def test_window_remediation_fix_recheck_recover(monkeypatch, fake_repo):
     assert all(r['status'] == 'applied' for r in rows
                if r['path'] == 'world/marker.py')
     assert selfedit.remediation_window() is None
+    # NEW contract: gate green now holds the window for its validator; the
+    # validator must approve (with a note -- remediation was used) before
+    # the push, and only a pushed window closes as done.
+    assert selfedit._window_field(window_id, 'push_status') \
+        == 'awaiting_validator'
+    selfedit._update_window(window_id, validator='reviewer')
+    git_calls = []
+
+    def fake_git(args):
+        git_calls.append(args)
+        if args and args[0] == 'rev-parse':
+            return 0, 'abcdef123456\n', ''
+        return 0, '', ''
+
+    monkeypatch.setattr(selfedit, '_git_run', fake_git)
+    telegrams = []
+    monkeypatch.setattr(selfedit, '_notify_player_telegram',
+                        lambda subject, body: telegrams.append((subject, body)))
+    ok, payload = selfedit.validate_window('reviewer', window_id, True, '', False)
+    assert ok is False and 'note is REQUIRED' in payload['error'], payload
+    assert git_calls == []  # nothing pushed before the note exists
+    ok, payload = selfedit.validate_window(
+        'reviewer', window_id, True,
+        'in-window fixes recovered the failed assert', False)
+    assert ok is True and payload['status'] == 'successful_with_issues', payload
+    assert selfedit._window_field(window_id, 'push_sha') == 'abcdef123456'
+    commit = next(c for c in git_calls if c and c[0] == 'commit')
+    assert 'Implemented by worker; validated by reviewer.' in commit[2]
+    assert any('SUCCESSFUL WITH ISSUES' in body for _s, body in telegrams)
     # a healthy ending: no rollback file trash, window closes as done
     selfedit._update_window(window_id, end_ts=selfedit.time.time() - 10)
     selfedit.window_tick()
@@ -573,6 +689,10 @@ def test_window_end_unresolved_rolls_back(monkeypatch, fake_repo):
     ok, payload = selfedit.propose('worker', 'world/marker.py', 'MARKER_VALUE = 1',
                                    'MARKER_VALUE = 2', 'bump the marker')
     window_id = _fire_window(now - 60)
+    # two-agent contract: the window applies only its reserved edits
+    with sqlite3.connect(serve.DB_PATH) as conn:
+        conn.execute('UPDATE self_edit_log SET reserve_window = ? '
+                     'WHERE id = ?', (window_id, payload['id']))
     _fake_test_gate(monkeypatch, [(False, 'still failing')])
     selfedit.apply_pass()
     # nobody fixes in time: the slot ends

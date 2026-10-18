@@ -442,7 +442,8 @@ class AskEndpoint(unittest.TestCase):
                      'propose_api_service', 'list_services', 'grant_allowlist', 'revoke_allowlist',
                      'send_mail', 'mark_mailbox_read',
                      'self_edit', 'self_edit_status', 'schedule_dormant_apply',
-                     'selfedit_fix', 'selfedit_recheck', 'selfedit_read', 'policy_edit'}
+                     'selfedit_fix', 'selfedit_recheck', 'selfedit_read',
+                     'selfedit_validate', 'policy_edit'}
                     | ({'search_web'} if serve.TAVILY_API_KEY else set())
                     | ({'generate_image', 'generate_video'} if serve._higgsfield_configured() else set()))
         self.assertEqual(tool_names, expected)

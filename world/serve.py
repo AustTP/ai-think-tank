@@ -10383,13 +10383,17 @@ AGENT_ASK_TOOLS = [
             'name': 'schedule_dormant_apply',
             'description': 'File a change request to schedule a one-shot window during '
                            'which the whole think tank goes DORMANT (simulation paused) '
-                           'so armed code self-edits can apply and reload. Two '
-                           'approvals are required: your supervisor judges the request '
-                           'first (Jev quorum), then the player must approve an '
-                           'emailed link. The slot is REFUSED with the conflicting '
-                           'items listed if standing-task schedule entries or other '
-                           'dormancy windows already occupy that time. Every armed '
-                           'edit present when the window fires applies during it. Use '
+                           'so your armed code self-edits can apply and reload. You are '
+                           'the IMPLEMENTER of this change request and must name a '
+                           'DIFFERENT agent as validator -- after your edits apply and '
+                           'the repo test gate passes on the live tree, the validator '
+                           'reviews the result and approves or denies the push to '
+                           'main. Two approvals are required: your supervisor judges '
+                           'the request first (Jev quorum), then the player must '
+                           'approve an emailed link. The slot is REFUSED with the '
+                           'conflicting items listed if standing-task schedule entries '
+                           'or other dormancy windows already occupy that time. Your '
+                           'currently armed edits are reserved for this window. Use '
                            'sparingly -- an emergency fix or a risky reload is a '
                            'reason; pausing oversight is not.',
             'parameters': {
@@ -10398,13 +10402,16 @@ AGENT_ASK_TOOLS = [
                     'date': {'type': 'string', 'description': 'YYYY-MM-DD, tank local time.'},
                     'start': {'type': 'string', 'description': 'HH:MM 24h, tank local '
                               'time; must be at least 5 minutes in the future.'},
+                    'validator': {'type': 'string', 'description': 'Agent id of the '
+                                  'DIFFERENT agent who will validate the applied '
+                                  'result before it is pushed to main. Required.'},
                     'durationMin': {'type': 'integer', 'description': 'Sleep length in '
                                      'minutes, 5-240 (default 15).'},
                     'reason': {'type': 'string', 'description': 'WHY the tank should '
                                 'sleep then (which edits are landing and why a '
                                 'dedicated quiet slot is safer).'},
                 },
-                'required': ['date', 'start', 'reason'],
+                'required': ['date', 'start', 'reason', 'validator'],
             },
         },
     },
@@ -10473,6 +10480,43 @@ AGENT_ASK_TOOLS = [
                                        'path; omit for the listing.',
                     },
                 },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'selfedit_validate',
+            'description': 'Give your push decision as the VALIDATOR of a '
+                           'change request (you will be emailed when the '
+                           'implementer\'s edits have applied and the repo '
+                           'test gate passed on the live tree). Approve to '
+                           'commit and push the window\'s files straight to '
+                           'origin main; deny to roll everything back with '
+                           'nothing pushed. When the change request has '
+                           'issues (in-window remediation was needed, '
+                           'reserved edits failed to apply, or you have '
+                           'concerns), approving REQUIRES a non-empty note '
+                           'describing them. Denials and end-of-slot '
+                           'no-decisions roll back automatically.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'windowId': {'type': 'string', 'description': 'The '
+                                 'change window id from your validation '
+                                 'email.'},
+                    'approved': {'type': 'boolean', 'description': 'true '
+                                 'commits and pushes the validated bytes to '
+                                 'main; false rolls the window back.'},
+                    'note': {'type': 'string', 'description': 'REQUIRED when '
+                             'the change request has issues: what they were '
+                             'and why the result is still acceptable.'},
+                    'issues': {'type': 'boolean', 'description': 'Set true '
+                               'when you have concerns beyond the automatic '
+                               'ones -- this forces the successful_with_'
+                               'issues category and the note.'},
+                },
+                'required': ['windowId', 'approved'],
             },
         },
     },
@@ -13571,6 +13615,46 @@ def _selfedit_fix_headers(agent_id):
     return {'X-Dormancy-Window': active, 'X-Dormancy-Agent': agent_id or ''}
 
 
+def _selfedit_validation_exempt(request):
+    """True when this request is change-request VALIDATION traffic: a fired
+    window holds for its validator's push decision, and the validator MUST be
+    able to reach the selfedit endpoints without waking the tank (a wake
+    would not undo the applied edits, but it disturbs the quiet slot the
+    player approved). Narrow on purpose: /api/selfedit/* paths only, only
+    while a window actually awaits validation, only the window's own
+    validator, with a verified agent key."""
+    if not request.url.path.startswith('/api/selfedit/'):
+        return False
+    try:
+        active = _selfedit.validation_window()
+    except Exception:
+        return False
+    if not active or request.headers.get('X-Dormancy-Window') != active:
+        return False
+    agent_id = request.headers.get('X-Dormancy-Agent') or ''
+    if not agent_id or not verify_agent_key(
+            agent_id, request.headers.get('X-Agent-Key')):
+        return False
+    if agent_id != _selfedit.window_validator(active):
+        return False
+    log_action(agent_id, 'selfedit_validation_traffic',
+               {'window': active, 'path': request.url.path}, authorized=True)
+    return True
+
+
+def _selfedit_validate_headers(agent_id):
+    """Slot headers for validator traffic while a fired window holds for
+    validation; _selfedit_validation_exempt validates the same pair. Without
+    a holding window these calls work normally (and wake the tank)."""
+    try:
+        active = _selfedit.validation_window()
+    except Exception:
+        active = None
+    if not active:
+        return None
+    return {'X-Dormancy-Window': active, 'X-Dormancy-Agent': agent_id or ''}
+
+
 @app.middleware('http')
 async def no_store(request: Request, call_next):
     # Local dev server for actively-edited files -- a cached stale
@@ -13586,12 +13670,17 @@ async def no_store(request: Request, call_next):
     # server. Read-only board/status GETs and pure telemetry do NOT wake
     # (see _NON_WAKING_READS) -- an open tab must not defeat dormancy.
     if _dormant() and _should_wake(request):
-        if _selfedit_remediation_exempt(request):
+        if (_selfedit_remediation_exempt(request)
+                or _selfedit_validation_exempt(request)):
             # An open change-window remediation session: the responsible
             # agents MUST be able to reach the fix endpoints (and read their
             # mail) without waking the tank, since a wake exits the quiet
             # window their fixes are happening inside. Narrow by path,
             # remediation state, and verified agent identity.
+            # Same for a fired window that HOLDS for its validator's push
+            # decision (two-agent change requests): the validator must
+            # review and approve/deny without disturbing the quiet slot
+            # the player approved.
             pass
         else:
             _set_dormant(False)
@@ -16711,6 +16800,17 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                             f"- {w.get('id')} {(w.get('status') or '').upper()} "
                             f"{w.get('date')} {w.get('start')} "
                             f"+{w.get('durationMin')}m by {w.get('agent')}")
+                        if w.get('validator'):
+                            lines.append(f"    validator: {w.get('validator')} "
+                                         f"(status: {w.get('validatorStatus') or '-'})")
+                        if w.get('pushStatus'):
+                            push_extra = ''
+                            if w.get('pushCategory'):
+                                push_extra += f" / {w.get('pushCategory')}"
+                            if w.get('pushSha'):
+                                push_extra += f" {w.get('pushSha')}"
+                            lines.append(f"    push: {w.get('pushStatus')}"
+                                         f"{push_extra}")
                         lines.append(f"    reason: {(w.get('reason') or '')[:160]}")
                         if w.get('note'):
                             lines.append(f"    note: {w.get('note')[:160]}")
@@ -16726,12 +16826,17 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             date = ((args or {}).get('date') or '').strip()
             start = ((args or {}).get('start') or '').strip()
             reason = ((args or {}).get('reason') or '').strip()
+            validator = ((args or {}).get('validator') or '').strip()
             if not date or not start or not reason:
                 return ('schedule_dormant_apply requires date (YYYY-MM-DD), '
                         'start (HH:MM) and a reason naming the edits that are '
                         'landing.')
+            if not validator:
+                return ('schedule_dormant_apply requires a validator: name a '
+                        'DIFFERENT agent who will validate the applied result '
+                        'before it is pushed to main.')
             body = {'agentId': agent_id, 'date': date, 'start': start,
-                    'reason': reason}
+                    'reason': reason, 'validator': validator}
             try:
                 body['durationMin'] = int((args or {}).get('durationMin'))
             except (TypeError, ValueError):
@@ -16812,6 +16917,29 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                         + ']')
                 return f'{result.get("path")} {note}\n{(result.get("text") or "")}'
             return 'selfedit_read returned an unexpected response.'
+        if name == 'selfedit_validate':
+            window_id = ((args or {}).get('windowId') or '').strip()
+            if not window_id or 'approved' not in (args or {}):
+                return ('selfedit_validate requires windowId and approved '
+                        '(true pushes the validated bytes to main, false '
+                        'rolls the window back).')
+            body = {'agentId': agent_id, 'windowId': window_id,
+                    'approved': bool(args.get('approved')),
+                    'note': (args.get('note') or '')[:800],
+                    'issues': bool(args.get('issues'))}
+            result = _http_json('POST', SELF_BASE_URL,
+                                '/api/selfedit/validate', body, agent_key,
+                                timeout=120,
+                                extra_headers=_selfedit_validate_headers(agent_id))
+            if isinstance(result, dict) and result.get('error'):
+                return (f'selfedit_validate refused: {result["error"]} '
+                        f'[only the change request\'s validator may decide, '
+                        f'and only while the window holds]')
+            if isinstance(result, dict) and result.get('status'):
+                detail = result.get('sha') and f' ({result.get("sha")})' or ''
+                return (f'Change request {window_id}: {result.get("status")}'
+                        f'{detail} -- {result.get("message", "")}')
+            return 'selfedit_validate returned an unexpected response.'
         if name == 'policy_edit':
             key = ((args or {}).get('key') or '').strip()
             value = (args or {}).get('value')
@@ -24617,13 +24745,14 @@ async def selfedit_schedule(request: Request):
     date = (body.get('date') or '').strip()
     start = (body.get('start') or '').strip()
     reason = (body.get('reason') or '').strip()
+    validator = (body.get('validator') or '').strip()
     if not date or not start or not reason:
         return JSONResponse({'error': 'date (YYYY-MM-DD), start (HH:MM) and '
                                       'reason are required'}, status_code=400)
     try:
         ok, payload = await asyncio.to_thread(
             _selfedit.request_window, agent_id, date, start,
-            body.get('durationMin'), reason)
+            body.get('durationMin'), reason, validator)
     except Exception as exc:
         print(f'[selfedit] schedule crashed for {agent_id}: {exc}', flush=True)
         log_action(agent_id, 'selfedit_crashed', {'error': str(exc)[:300]},
@@ -24716,6 +24845,40 @@ async def selfedit_fix_checks(request: Request):
         return JSONResponse({'error': f'the recheck harness failed: {exc}'}, status_code=500)
     log_action(agent_id, 'selfedit_recheck',
                {'ok': ok, 'tests': (payload or {}).get('tests')},
+               authorized=authorized)
+    return JSONResponse(payload, status_code=200 if ok else 400)
+
+
+@app.post('/api/selfedit/validate')
+async def selfedit_validate(request: Request):
+    """Agent-facing push decision for a change request that is HOLDING for
+    its validator (two-agent contract, 2026-10-18): the repo gate already
+    passed on the live tree; only the named validator may approve the push
+    to main, deny it (rollback), or attach the required issues note. Agent-key
+    gated; identity is checked inside selfedit.validate_window against the
+    window's validator field."""
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'unknown')
+    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    try:
+        ok, payload = await asyncio.to_thread(
+            _selfedit.validate_window, agent_id,
+            (body.get('windowId') or '').strip(),
+            bool(body.get('approved')),
+            body.get('note') if isinstance(body.get('note'), str) else '',
+            bool(body.get('issues')))
+    except Exception as exc:
+        print(f'[selfedit] validate crashed for {agent_id}: {exc}', flush=True)
+        log_action(agent_id, 'selfedit_validate_crashed',
+                   {'error': str(exc)[:300]}, authorized=authorized)
+        return JSONResponse({'error': f'the validate harness failed: {exc}'},
+                            status_code=500)
+    log_action(agent_id, 'selfedit_validate',
+               {'ok': ok, 'windowId': (body.get('windowId') or '').strip(),
+                'approved': bool(body.get('approved')),
+                'status': (payload or {}).get('status'),
+                'note': (((payload or {}).get('error') or '') or
+                         ((payload or {}).get('message') or ''))[:160]},
                authorized=authorized)
     return JSONResponse(payload, status_code=200 if ok else 400)
 

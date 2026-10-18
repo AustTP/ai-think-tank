@@ -1895,11 +1895,14 @@ duration of 5-240 minutes (default 15). The chain is strict:
    request' kind, which the director loop is barred from; the player's
    email or telegram link is the final, mandatory signature. Approve
    schedules the window; deny schedules nothing.
-4. When a window fires, the loop forces the tank dormant so EVERY armed
-   edit present applies inside it (each edit already passed its own review
-   and validator), and keeps it dormant to the end of the slot. A window
-   missed while the server was down is recorded `missed`. The player or
-   admin agent can cancel a window before it fires.
+4. When a window fires, the loop forces the tank dormant and applies ONLY
+   the edits the implementer RESERVED for it: at request time the
+   implementer's armed edits are stamped with the window id
+   (`reserve_window`), and bystanders' armed edits stay armed for the
+   idle path. A request with nothing armed is refused. The loop keeps the
+   tank dormant to the end of the slot. A window missed while the server
+   was down is recorded `missed`. The player or admin agent can cancel a
+   window before it fires.
 
 **Change windows test what they land (operator decision, 2026-10-18).**
 
@@ -1927,8 +1930,39 @@ LIVE tree. The outcome splits the window in two:
    window. Nothing else about the tank is disturbed, and a fresh window
    means a fresh conflict scan and fresh approvals.
 4. Applies that land OUTSIDE any window (the idle path) get the same
-    post-apply tests. With no window to remediate in, a failure there rolls
-    back immediately and mails the agents.
+     post-apply tests. With no window to remediate in, a failure there rolls
+     back immediately and mails the agents. The idle path never pushes.
+
+**Change windows PUSH (two-agent validator contract, operator decision,
+2026-10-18).** A change window's purpose is to ship its landed edits to
+the shared GitHub repository (`origin main`) under a two-agent contract:
+
+1. The implementer may not bless its own push: `schedule_dormant_apply`
+   REQUIRES a `validator`, a DIFFERENT live roster agent. Requests are
+   refused for a missing, self-named, or unknown validator, and for zero
+   armed edits.
+2. Gate green does NOT push. The window enters `awaiting_validator` and
+   the VALIDATOR is mailed the edit list, the gate's tail, and the
+   deadline. `selfedit_validate(windowId, approved, note?, issues?)` is
+   the single decision point, and only the window's named validator may
+   decide it -- the dormancy wake exemption covers `/api/selfedit/validate`
+   for them while the slot is open.
+3. Every final outcome is recorded in one of three categories on the
+   window row: `successful`, `successful_with_issues`, or `unsuccessful`
+   (denial, git failure, or nothing landed). A successful_with_issues
+   verdict REQUIRES a non-empty note; issues exist when in-window
+   remediation was used, any reserved edit did not land, or the validator
+   flags them. The player's Telegram receives one message per final
+   outcome, and the push is logged as a `repo_push` action.
+4. Clean approval: the window's applied files are added, committed as
+   `selfedit: change window <id> ... Implemented by <agent>; validated by
+   <validator>.` and pushed to `origin main`; the recorded commit sha
+   closes the window `done`. Fail-closed throughout: unexpected
+   tracked-tree dirt aborts BEFORE any add/commit/push, a failed git step
+   rolls the edits back and saves the candidates under
+   `world/.selfedit_failed/<window>/`, and a validator denial or a slot
+   that ends without a decision never touches git -- every unsuccessful
+   outcome restores the pre-window bytes.
 
 **Surface audit (operator decision, 2026-10-18).** Three tiers now bound
 what agents may edit and read, layered on the constant protected names
