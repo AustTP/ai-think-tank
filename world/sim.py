@@ -35,6 +35,11 @@ import time
 import urllib.parse
 from collections import deque
 
+# Operator-policy binding helpers (world/operator_policy.json): shared with
+# serve/content/sublow -- one declarative mechanism instead of per-module
+# rebind functions.
+from config import apply_policy_bindings, bind_policy
+
 # Pure, self-contained helpers extracted to their own module to
 # shrink the sim.py monolith. See sim_helpers.py.
 from sim_helpers import (  # noqa: E402, F401
@@ -1781,111 +1786,6 @@ MORALE_NEGLECT_CAP = 30
 MORALE_DROPPED_DECAY_DAYS = 14  # morale.js:33
 
 
-# ---------------------------------------------------------------------------
-# Operator policy rebind: world/operator_policy.json is the DATA; the scalar
-# constants above are the code mirror. This function re-reads the live policy
-# and rebinds every sim-owned knob in place, so an operator edit + reload
-# (import time + POST /api/policy/reload) takes effect without a restart.
-# Registered on config.ON_RELOAD_HOOKS; also called once here because
-# config.reload_policy_config() ran before this module was imported (hooks
-# registered after that call do not re-run until the next reload).
-# ---------------------------------------------------------------------------
-def _apply_operator_policy():
-    """Rebind sim.py module constants from config.OPERATOR_POLICY (in-place
-    dict, refreshed by get_operator_policy / reload_policy_config)."""
-    global MAX_TEAM_MEMBERS, SCRUM_MASTER_MIN_TEAM_SIZE
-    global MAX_ACTIVE_AGENTS, MAX_TOTAL_AGENTS
-    global DELIVERABLE_GRADE_FLOOR, SUCCESS_GRADE_FLOOR
-    global HIRE_COOLDOWN_MS, FIRING_COOLDOWN_MS
-    global SKILL_REVIEW_CADENCE_MS, DISTILL_CADENCE_MS
-    global REFINEMENT_CADENCE_MS, ROADMAP_CADENCE_MS
-    global WORK_ITEM_MAX_ATTEMPTS
-    global STALE_WORK_TIMEOUT_MS, STALE_WORK_BUDGET_GRACE_S
-    global MAX_BACKLOG_ITEMS, BACKLOG_PULLS_PER_CLOSE
-    global ESCALATION_MAX_OPEN
-    global MORALE_APPROVED_WEIGHT, MORALE_APPROVED_CAP
-    global MORALE_DROPPED_WEIGHT, MORALE_NEGLECT_WEIGHT, MORALE_NEGLECT_CAP
-    # -- this batch: hardcoded sim/content constants promoted to policy --
-    global HIRE_DURATION_MS, FIRING_REVIEW_DURATION_MS
-    global REPORT_STRIKE_WINDOW_MS
-    global ONBOARD_MEET_DURATION_MS, ONBOARD_READINESS_TIMEOUT_MS
-    global SOCIAL_CADENCE_MS, SOCIAL_MEET_MS, SOCIAL_ADOPT_CONFIDENCE
-    global FAILURE_COOLDOWN_HALF_LIFE_S, FAILURE_COOLDOWN_THRESHOLD
-    global FREE_SPIKE_ALLOWANCE_PER_WEEK, FREE_SPIKE_GLOBAL_CAP_PER_WEEK
-    global FREE_SPIKE_BUDGET_MS, FREE_SPIKE_DEFER_MS
-    global WORKER_HELP_AFTER_FAILS, COACHING_MAX_ROUNDS
-    global TEAM_VELOCITY_MAX, WORK_ITEM_STALL_CEILING
-    global TIER_THROTTLE_RATIO
-    global TASK_WORK_DURATION_S, TASK_CONTENT_TIMEOUT_S
-    global TASK_CONTENT_TIMEOUT_MAX_S, TASK_CYCLE_S, MAX_REVIEW_CYCLES
-    global PLACEMENT_MIN_DIST, RULE_MINE_CADENCE_MS
-    global RUNBOOK_MAX_ENTRIES_PER_PRODUCT, STALE_WORK_MAX_REPLANS
-    global REFINEMENT_MAX_REQUESTS, BREAKDOWN_MAX_REQUESTS
-    global TASK_CONTENT_GRACE_MAX_S, _FEEDBACK_MAX
-    global MIN_RESEARCH_CADENCE_MS, MIN_PIPELINE_CADENCE_MS
-    global _DEVICE_CHECKIN_HISTORY_MAX
-    from config import get_operator_policy
-    _p = get_operator_policy()
-    MAX_TEAM_MEMBERS = _p['maxTeamMembers']
-    SCRUM_MASTER_MIN_TEAM_SIZE = _p['scrumMasterMinTeamSize']
-    MAX_ACTIVE_AGENTS = _p['maxActiveAgents']
-    MAX_TOTAL_AGENTS = _p['maxTotalAgents']
-    DELIVERABLE_GRADE_FLOOR = _p['deliverableGradeFloor']
-    SUCCESS_GRADE_FLOOR = _p['successGradeFloor']
-    HIRE_COOLDOWN_MS = _p['hireCooldownMs']
-    FIRING_COOLDOWN_MS = _p['firingCooldownMs']
-    SKILL_REVIEW_CADENCE_MS = _p['skillReviewCadenceMs']
-    DISTILL_CADENCE_MS = _p['distillCadenceMs']
-    REFINEMENT_CADENCE_MS = _p['refinementCadenceMs']
-    ROADMAP_CADENCE_MS = _p['roadmapCadenceMs']
-    WORK_ITEM_MAX_ATTEMPTS = _p['workItemMaxAttempts']
-    STALE_WORK_TIMEOUT_MS = _p['staleWorkTimeoutMs']
-    STALE_WORK_BUDGET_GRACE_S = _p['staleWorkBudgetGraceS']
-    MAX_BACKLOG_ITEMS = _p['maxBacklogItems']
-    BACKLOG_PULLS_PER_CLOSE = _p['backlogPullsPerClose']
-    ESCALATION_MAX_OPEN = _p['escalationMaxOpen']
-    MORALE_APPROVED_WEIGHT = _p['moraleApprovedWeight']
-    MORALE_APPROVED_CAP = _p['moraleApprovedCap']
-    MORALE_DROPPED_WEIGHT = _p['moraleDroppedWeight']
-    MORALE_NEGLECT_WEIGHT = _p['moraleNeglectWeight']
-    MORALE_NEGLECT_CAP = _p['moraleNeglectCap']
-    HIRE_DURATION_MS = _p['hireDurationMs']
-    FIRING_REVIEW_DURATION_MS = _p['firingReviewDurationMs']
-    REPORT_STRIKE_WINDOW_MS = _p['reportStrikeWindowMs']
-    ONBOARD_MEET_DURATION_MS = _p['onboardMeetDurationMs']
-    ONBOARD_READINESS_TIMEOUT_MS = _p['onboardReadinessTimeoutMs']
-    SOCIAL_CADENCE_MS = _p['socialCadenceMs']
-    SOCIAL_MEET_MS = _p['socialMeetMs']
-    SOCIAL_ADOPT_CONFIDENCE = _p['socialAdoptConfidence']
-    FAILURE_COOLDOWN_HALF_LIFE_S = _p['failureCooldownHalfLifeS']
-    FAILURE_COOLDOWN_THRESHOLD = _p['failureCooldownThreshold']
-    FREE_SPIKE_ALLOWANCE_PER_WEEK = _p['freeSpikeAllowancePerWeek']
-    FREE_SPIKE_GLOBAL_CAP_PER_WEEK = _p['freeSpikeGlobalCapPerWeek']
-    FREE_SPIKE_BUDGET_MS = _p['freeSpikeBudgetMs']
-    FREE_SPIKE_DEFER_MS = _p['freeSpikeDeferMs']
-    WORKER_HELP_AFTER_FAILS = _p['workerHelpAfterFails']
-    COACHING_MAX_ROUNDS = _p['coachingMaxRounds']
-    TEAM_VELOCITY_MAX = _p['teamVelocityMax']
-    WORK_ITEM_STALL_CEILING = _p['workItemStallCeiling']
-    TIER_THROTTLE_RATIO = _p['tierThrottleRatio']
-    TASK_WORK_DURATION_S = _p['taskWorkDurationS']
-    TASK_CONTENT_TIMEOUT_S = _p['taskContentTimeoutS']
-    TASK_CONTENT_TIMEOUT_MAX_S = _p['taskContentTimeoutMaxS']
-    TASK_CYCLE_S = _p['taskCycleS']
-    MAX_REVIEW_CYCLES = _p['maxReviewCycles']
-    PLACEMENT_MIN_DIST = _p['placementMinDist']
-    RULE_MINE_CADENCE_MS = _p['ruleMineCadenceMs']
-    RUNBOOK_MAX_ENTRIES_PER_PRODUCT = _p['runbookMaxEntriesPerProduct']
-    STALE_WORK_MAX_REPLANS = _p['staleWorkMaxReplans']
-    REFINEMENT_MAX_REQUESTS = _p['refinementMaxRequests']
-    BREAKDOWN_MAX_REQUESTS = _p['breakdownMaxRequests']
-    TASK_CONTENT_GRACE_MAX_S = _p['taskContentGraceMaxS']
-    _FEEDBACK_MAX = _p['feedbackMax']
-    MIN_RESEARCH_CADENCE_MS = _p['minResearchCadenceMs']
-    MIN_PIPELINE_CADENCE_MS = _p['minPipelineCadenceMs']
-    _DEVICE_CHECKIN_HISTORY_MAX = _p['deviceCheckinHistoryMax']
-
-
 # How long an arriving agent "works" before completing, when the server owns
 # the lifecycle but the real per-room executor hasn't been ported yet (the
 # accepted short-circuit of this slice). Room content execution is next.
@@ -1898,6 +1798,12 @@ def _apply_operator_policy():
 # marked working with a _content_epoch runs up to this budget before the
 # completion loop gives up on the content and finalizes the fallback.
 # Bound via operator policy 'taskContentTimeoutS' (default 120.0).
+
+# Policy-first knobs: operator_policy.json holds the value and bind_policy
+# rebinds the module scalar. A code default still exists so the module has a
+# defined value before that first rebind and static analysis sees the binding.
+TASK_WORK_DURATION_S = 8.0
+TASK_CONTENT_TIMEOUT_S = 120.0
 
 # A content task may carry its OWN work budget (queue_spike's budgetMs is
 # documented as "a hard budgetMs for the work cycle"), but _dispatch_content_work
@@ -3530,12 +3436,74 @@ def sprint_progress(state, sprint_id):
 # Capped so the digest stays a rolling window, not a whole-of-history ledger.
 TEAM_VELOCITY_MAX = 20
 
-# Second import-time rebind: several rebound targets (TASK_WORK_DURATION_S,
-# TASK_CONTENT_TIMEOUT_S/_MAX_S, TASK_CYCLE_S, MAX_REVIEW_CYCLES, and this
-# TEAM_VELOCITY_MAX) are defined AFTER the first call above, so their module
-# level assignments would otherwise clobber the policy values. Hooks still
-# re-run the whole function on every reload, so this is import-order only.
-_apply_operator_policy()
+# Declarative operator-policy bindings: world/operator_policy.json is the
+# DATA; the scalar constants above are the code mirror. bind_policy registers
+# (attribute, policy key) pairs and applies them now; every later
+# config.reload_policy_config() re-applies them via apply_policy_bindings.
+# The rebind runs here, not at the first constant site, because several
+# rebound targets (TASK_WORK_DURATION_S, TASK_CONTENT_TIMEOUT_S/_MAX_S,
+# TASK_CYCLE_S, MAX_REVIEW_CYCLES, and TEAM_VELOCITY_MAX) are defined above
+# this point -- import order must not let their defaults clobber the values.
+bind_policy(__name__, [
+    ('MAX_TEAM_MEMBERS', 'maxTeamMembers'),
+    ('SCRUM_MASTER_MIN_TEAM_SIZE', 'scrumMasterMinTeamSize'),
+    ('MAX_ACTIVE_AGENTS', 'maxActiveAgents'),
+    ('MAX_TOTAL_AGENTS', 'maxTotalAgents'),
+    ('DELIVERABLE_GRADE_FLOOR', 'deliverableGradeFloor'),
+    ('SUCCESS_GRADE_FLOOR', 'successGradeFloor'),
+    ('HIRE_COOLDOWN_MS', 'hireCooldownMs'),
+    ('FIRING_COOLDOWN_MS', 'firingCooldownMs'),
+    ('SKILL_REVIEW_CADENCE_MS', 'skillReviewCadenceMs'),
+    ('DISTILL_CADENCE_MS', 'distillCadenceMs'),
+    ('REFINEMENT_CADENCE_MS', 'refinementCadenceMs'),
+    ('ROADMAP_CADENCE_MS', 'roadmapCadenceMs'),
+    ('WORK_ITEM_MAX_ATTEMPTS', 'workItemMaxAttempts'),
+    ('STALE_WORK_TIMEOUT_MS', 'staleWorkTimeoutMs'),
+    ('STALE_WORK_BUDGET_GRACE_S', 'staleWorkBudgetGraceS'),
+    ('MAX_BACKLOG_ITEMS', 'maxBacklogItems'),
+    ('BACKLOG_PULLS_PER_CLOSE', 'backlogPullsPerClose'),
+    ('ESCALATION_MAX_OPEN', 'escalationMaxOpen'),
+    ('MORALE_APPROVED_WEIGHT', 'moraleApprovedWeight'),
+    ('MORALE_APPROVED_CAP', 'moraleApprovedCap'),
+    ('MORALE_DROPPED_WEIGHT', 'moraleDroppedWeight'),
+    ('MORALE_NEGLECT_WEIGHT', 'moraleNeglectWeight'),
+    ('MORALE_NEGLECT_CAP', 'moraleNeglectCap'),
+    ('HIRE_DURATION_MS', 'hireDurationMs'),
+    ('FIRING_REVIEW_DURATION_MS', 'firingReviewDurationMs'),
+    ('REPORT_STRIKE_WINDOW_MS', 'reportStrikeWindowMs'),
+    ('ONBOARD_MEET_DURATION_MS', 'onboardMeetDurationMs'),
+    ('ONBOARD_READINESS_TIMEOUT_MS', 'onboardReadinessTimeoutMs'),
+    ('SOCIAL_CADENCE_MS', 'socialCadenceMs'),
+    ('SOCIAL_MEET_MS', 'socialMeetMs'),
+    ('SOCIAL_ADOPT_CONFIDENCE', 'socialAdoptConfidence'),
+    ('FAILURE_COOLDOWN_HALF_LIFE_S', 'failureCooldownHalfLifeS'),
+    ('FAILURE_COOLDOWN_THRESHOLD', 'failureCooldownThreshold'),
+    ('FREE_SPIKE_ALLOWANCE_PER_WEEK', 'freeSpikeAllowancePerWeek'),
+    ('FREE_SPIKE_GLOBAL_CAP_PER_WEEK', 'freeSpikeGlobalCapPerWeek'),
+    ('FREE_SPIKE_BUDGET_MS', 'freeSpikeBudgetMs'),
+    ('FREE_SPIKE_DEFER_MS', 'freeSpikeDeferMs'),
+    ('WORKER_HELP_AFTER_FAILS', 'workerHelpAfterFails'),
+    ('COACHING_MAX_ROUNDS', 'coachingMaxRounds'),
+    ('TEAM_VELOCITY_MAX', 'teamVelocityMax'),
+    ('WORK_ITEM_STALL_CEILING', 'workItemStallCeiling'),
+    ('TIER_THROTTLE_RATIO', 'tierThrottleRatio'),
+    ('TASK_WORK_DURATION_S', 'taskWorkDurationS'),
+    ('TASK_CONTENT_TIMEOUT_S', 'taskContentTimeoutS'),
+    ('TASK_CONTENT_TIMEOUT_MAX_S', 'taskContentTimeoutMaxS'),
+    ('TASK_CYCLE_S', 'taskCycleS'),
+    ('MAX_REVIEW_CYCLES', 'maxReviewCycles'),
+    ('PLACEMENT_MIN_DIST', 'placementMinDist'),
+    ('RULE_MINE_CADENCE_MS', 'ruleMineCadenceMs'),
+    ('RUNBOOK_MAX_ENTRIES_PER_PRODUCT', 'runbookMaxEntriesPerProduct'),
+    ('STALE_WORK_MAX_REPLANS', 'staleWorkMaxReplans'),
+    ('REFINEMENT_MAX_REQUESTS', 'refinementMaxRequests'),
+    ('BREAKDOWN_MAX_REQUESTS', 'breakdownMaxRequests'),
+    ('TASK_CONTENT_GRACE_MAX_S', 'taskContentGraceMaxS'),
+    ('_FEEDBACK_MAX', 'feedbackMax'),
+    ('MIN_RESEARCH_CADENCE_MS', 'minResearchCadenceMs'),
+    ('MIN_PIPELINE_CADENCE_MS', 'minPipelineCadenceMs'),
+    ('_DEVICE_CHECKIN_HISTORY_MAX', 'deviceCheckinHistoryMax'),
+])
 
 
 def close_sprint(state, sprint_id, now_ms=None):
@@ -13713,15 +13681,9 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
 # Operator-policy binding runs LAST: every policy-backed literal above is
 # defined by this point, so the rebind sees the module's own defaults and
 # then overrides them from config.OPERATOR_POLICY (in-place dict, refreshed
-# by get_operator_policy / reload_policy_config). Registered on
-# config.ON_RELOAD_HOOKS; also called once here because
-# config.reload_policy_config() ran before this module was imported (hooks
-# registered after that call do not re-run until the next reload).
+# by get_operator_policy / reload_policy_config). bind_policy registered the
+# declarative pairs above; this end-of-import rebind catches any policy-backed
+# constant re-defaulted between that point and module end, and every
+# config.reload_policy_config() run re-applies the whole registered set.
 # ---------------------------------------------------------------------------
-_apply_operator_policy()
-try:
-    import config as _config_for_hooks
-    if _apply_operator_policy not in _config_for_hooks.ON_RELOAD_HOOKS:
-        _config_for_hooks.ON_RELOAD_HOOKS.append(_apply_operator_policy)
-except Exception:
-    pass
+apply_policy_bindings('sim')

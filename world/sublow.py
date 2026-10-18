@@ -24,6 +24,8 @@ import hashlib
 import secrets
 import time
 
+from config import bind_policy
+
 # Grant defaults, all hard-clamped by the caps beside them: an operator can
 # ask for a shorter TTL or a bigger per-call token budget, never a longer or
 # larger one than these. The TTL is deliberately short -- a grant is a
@@ -80,24 +82,6 @@ def _clamp_tokens(max_tokens_per_call):
     except (TypeError, ValueError):
         return GRANT_TOKENS_DEFAULT
     return max(1, min(tokens, GRANT_TOKENS_MAX))
-
-
-# ---------------------------------------------------------------------------
-# Registered on config.ON_RELOAD_HOOKS; also called once here because
-# config.reload_policy_config() ran before this module was imported
-# (hooks registered after that call do not re-run until the next
-# reload). Rebinds the grant default/cap constants so an operator
-# tightens or loosens grant bounds via operator_policy.json.
-# ---------------------------------------------------------------------------
-def _apply_operator_policy():
-    global GRANT_TTL_S_DEFAULT, GRANT_TTL_S_MAX
-    global GRANT_TOKENS_DEFAULT, GRANT_TOKENS_MAX
-    from config import get_operator_policy
-    _p = get_operator_policy()
-    GRANT_TTL_S_DEFAULT = _p['grantTtlDefaultS']
-    GRANT_TTL_S_MAX = _p['grantTtlMaxS']
-    GRANT_TOKENS_DEFAULT = _p['grantTokensDefault']
-    GRANT_TOKENS_MAX = _p['grantTokensMax']
 
 
 def _agent_month_spend(agent_id):
@@ -301,10 +285,13 @@ def quote_sublow_grant(agent_id, estimated_calls=1, max_tokens_per_call=None):
     }
 
 
-_apply_operator_policy()
-try:
-    import config as _config_for_hooks
-    if _apply_operator_policy not in _config_for_hooks.ON_RELOAD_HOOKS:
-        _config_for_hooks.ON_RELOAD_HOOKS.append(_apply_operator_policy)
-except Exception:
-    pass
+# Declarative operator-policy bindings: rebinds the grant default/cap
+# constants so an operator can tighten or loosen grant bounds via
+# operator_policy.json; every config.reload_policy_config() run re-applies
+# them via apply_policy_bindings.
+bind_policy(__name__, [
+    ('GRANT_TTL_S_DEFAULT', 'grantTtlDefaultS'),
+    ('GRANT_TTL_S_MAX', 'grantTtlMaxS'),
+    ('GRANT_TOKENS_DEFAULT', 'grantTokensDefault'),
+    ('GRANT_TOKENS_MAX', 'grantTokensMax'),
+])

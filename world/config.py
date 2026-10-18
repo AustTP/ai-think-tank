@@ -38,6 +38,7 @@ Load discipline, matching world/api_services.json:
 import json
 import os
 import re
+import sys
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -482,14 +483,61 @@ OPERATOR_POLICY: dict = dict(OPERATOR_POLICY_DEFAULT)
 
 _OPERATOR_CACHE = {'mtime': None, 'data': None}
 
-# Consumer refresh hooks. sim.py and serve.py define module-level scalar
-# constants (MAX_TEAM_MEMBERS, PEER_REVIEW_INTERVAL_S, ...); a rebind of
-# config.OPERATOR_POLICY cannot rebind those copies, so each module registers
-# a zero-arg callback here that re-reads OPERATOR_POLICY and rebinds its own
-# globals. Run at the end of reload_policy_config (import time + the
-# player-session POST /api/policy/reload endpoint). Exceptions are swallowed
-# per-hook: one bad consumer refresh must not abort the others' reload.
+# Consumer refresh hooks. Operator-policy scalars now bind declaratively via
+# bind_policy()/POLICY_BINDINGS below, so sim/serve/content/sublow no longer
+# register refresh callbacks here. This list stays for ad-hoc zero-arg
+# callbacks (tests, future consumers): run at the end of reload_policy_config
+# (import time + the player-session POST /api/policy/reload endpoint).
+# Exceptions are swallowed per-hook: one bad consumer refresh must not abort
+# the others' reload.
 ON_RELOAD_HOOKS: list = []
+
+# Declarative operator-policy bindings: module name -> {'pairs':
+# ((module_attribute, policy_key), ...), 'overrides': {attr: fn(policy)}}.
+# Modules register once at import via bind_policy(); every
+# reload_policy_config() run re-applies every registered binding, so operator
+# edits take effect without a restart and each module owns exactly one
+# binding declaration instead of its own rebind function.
+POLICY_BINDINGS: dict = {}
+
+
+def _apply_binding(module_name):
+    module = sys.modules.get(module_name)
+    if module is None:
+        return False
+    entry = POLICY_BINDINGS[module_name]
+    policy = get_operator_policy()
+    overrides = entry['overrides']
+    for attr, key in entry['pairs']:
+        override = overrides.get(attr)
+        setattr(module, attr, override(policy) if override else policy[key])
+    return True
+
+
+def apply_policy_bindings(module_name=None):
+    """(Re)apply registered operator-policy bindings. module_name=None
+    re-applies every registered module. Returns the module names that were
+    bound. Used by reload_policy_config, by modules that need a second
+    import-time rebind after later constants are defined, and by tests that
+    patch get_operator_policy for a deterministic rebind."""
+    names = [module_name] if module_name else list(POLICY_BINDINGS)
+    return [name for name in names if _apply_binding(name)]
+
+
+def bind_policy(module_name, pairs, overrides=None):
+    """Register one module's operator-policy bindings and apply them now.
+
+    pairs: iterable of (module_attribute, policy_key). overrides: optional
+    mapping of module_attribute -> callable(policy_dict) for keys derived
+    from env at import time (the callable re-reads the module's live globals
+    each time it runs, so patching/env reloads stay honored). Registration
+    must run at module import so a later reload_policy_config() re-applies
+    the bindings without a restart."""
+    POLICY_BINDINGS[module_name] = {
+        'pairs': tuple((attr, key) for attr, key in pairs),
+        'overrides': dict(overrides or {}),
+    }
+    _apply_binding(module_name)
 
 
 def _coerce_operator_value(key, value):
@@ -653,6 +701,7 @@ def reload_policy_config():
     # explicit reload must always re-derive from the current file.
     _OPERATOR_CACHE['mtime'] = None
     _op_data = get_operator_policy()
+    apply_policy_bindings()
     for _hook in list(ON_RELOAD_HOOKS):
         try:
             _hook()

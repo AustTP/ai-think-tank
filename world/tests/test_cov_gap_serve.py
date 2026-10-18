@@ -17,6 +17,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import config  # noqa: E402
 import serve  # noqa: E402
 
 
@@ -2385,11 +2386,15 @@ class ApplyOperatorPolicyTest(unittest.TestCase):
             'decideMinIntervalS': 13, 'healthCheckIntervalS': 14,
             'healthAlertDedupWindowS': 15, 'healthDigestIntervalS': 16,
         }
-        with mock.patch.object(serve, 'get_operator_policy',
+        # The declarative bindings read config.get_operator_policy at bind
+        # time; patch it there and force a serve-only rebind. The watchdog
+        # overrides re-read serve's live env capture, so patching those
+        # attributes takes effect at rebind time.
+        with mock.patch.object(config, 'get_operator_policy',
                                return_value=policy), \
              mock.patch.object(serve, '_SimWatchdogIntervalSEnv', '1.5'), \
              mock.patch.object(serve, '_SimWatchdogStaleSEnv', ''):
-            serve._apply_operator_policy()
+            config.apply_policy_bindings('serve')
         self.assertEqual(serve.CHAT_MAX_TOKENS_CAP, 7)
         self.assertEqual(serve._SIM_WATCHDOG_INTERVAL_S, 1.5)
         self.assertEqual(serve._SIM_WATCHDOG_STALE_S, 6.0)

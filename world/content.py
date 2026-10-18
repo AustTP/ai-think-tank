@@ -31,7 +31,7 @@ import urllib.parse
 import serve as _serve
 import training_capture
 
-from config import RESEARCH_DESK_PASSES
+from config import RESEARCH_DESK_PASSES, bind_policy
 
 
 def _chat_error_result(r, fallback_note):
@@ -946,28 +946,15 @@ _REVIEW_MAX_TOKENS = 32000                    # runReviewTask /api/chat
 _VISION_MAX_TOKENS = 500                     # reviewScreenshot /api/chat
 
 
-# Rebind the code-lane constants above from config.OPERATOR_POLICY. Registered
-# on config.ON_RELOAD_HOOKS and called once here (config.reload_policy_config
-# ran before this module was imported, so late hooks don't re-run until an
-# explicit reload) -- same pattern as sim/serve _apply_operator_policy.
-def _apply_operator_policy():
-    global CODE_CONTINUATION_ATTEMPTS, MAX_CODE_PROBE_ROUNDS
-    global MAX_CODE_COLAB_ROUNDS, MAX_REVIEW_PROBE_ROUNDS
-    from config import get_operator_policy
-    _p = get_operator_policy()
-    CODE_CONTINUATION_ATTEMPTS = _p['codeContinuationAttempts']
-    MAX_CODE_PROBE_ROUNDS = _p['maxCodeProbeRounds']
-    MAX_CODE_COLAB_ROUNDS = _p['maxCodeColabRounds']
-    MAX_REVIEW_PROBE_ROUNDS = _p['maxReviewProbeRounds']
-
-
-_apply_operator_policy()
-try:
-    import config as _config_for_hooks
-    if _apply_operator_policy not in _config_for_hooks.ON_RELOAD_HOOKS:
-        _config_for_hooks.ON_RELOAD_HOOKS.append(_apply_operator_policy)
-except Exception:
-    pass
+# Rebind the code-lane constants above from config.OPERATOR_POLICY.
+# bind_policy registers declarative bindings, applies them at import, and
+# every config.reload_policy_config() run re-applies them.
+bind_policy(__name__, [
+    ('CODE_CONTINUATION_ATTEMPTS', 'codeContinuationAttempts'),
+    ('MAX_CODE_PROBE_ROUNDS', 'maxCodeProbeRounds'),
+    ('MAX_CODE_COLAB_ROUNDS', 'maxCodeColabRounds'),
+    ('MAX_REVIEW_PROBE_ROUNDS', 'maxReviewProbeRounds'),
+])
 
 
 def _resolve_story_root(snapshot, task):

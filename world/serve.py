@@ -224,6 +224,8 @@ from config import (  # noqa: E402,F401
     BROWSE_BLOCK_CATEGORIES,
     PLAIN_WRITING_BAN_LIST,
     RESEARCH_WATCHLIST,
+    ROOT,
+    bind_policy,
     get_grants_config,
     get_operator_policy,
     note_watchlist_topic,
@@ -317,7 +319,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Red
 from fastapi.staticfiles import StaticFiles
 from typing import Optional
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+# ROOT (world/) comes from config.py: one path definition for the codebase.
 THINK_TANK_DIR = os.path.dirname(ROOT)
 
 
@@ -656,7 +658,7 @@ DECIDE_BURST_ALLOW = 6          # how many calls an agent may issue in one burst
 DECIDE_BURST_WINDOW_S = 5.0     # the burst is measured over these many seconds
 DECIDE_MIN_INTERVAL_S = 0.4     # hard floor between any two calls from one agent
 # Chat/ask per-request token cap and OTP SMS TTL bounds. Literals are
-# the operator-policy seeds; _apply_operator_policy rebinds them from
+# the operator-policy seeds; bind_policy declared bindings rebind them from
 # operator_policy.json (chatMaxTokensCap / smsTtl*).
 CHAT_MAX_TOKENS_CAP = 4000
 SMS_TTL_DEFAULT_S = 300
@@ -4309,7 +4311,7 @@ def resolve_capability_handle(agent_id, handle, method, url):
 # was that nothing got noticed until a human looked or a browser-side bug
 # surfaced visibly. All three health cadences are operator-policy knobs
 # (operator_policy.json healthCheckIntervalS / healthAlertDedupWindowS /
-# healthDigestIntervalS), rebound by _apply_operator_policy on
+# healthDigestIntervalS), rebound by the bind_policy declarations on
 # POST /api/policy/reload; these literals are the shipped defaults.
 HEALTH_CHECK_INTERVAL_S = 300
 # Admin gap 1: how often the periodic health DIGEST (a readable markdown
@@ -5218,46 +5220,43 @@ _SIM_WATCHDOG_STALE_S = float(_SimWatchdogStaleSEnv) if _SimWatchdogStaleSEnv el
 
 
 # Operator policy rebind (world/operator_policy.json -> serve-owned scalars).
-# Called once here (config.reload_policy_config ran before this module was
-# imported, so late hooks don't re-run until an explicit reload) and on every
-# subsequent reload via config.ON_RELOAD_HOOKS.
-def _apply_operator_policy():
-    global SUCCESS_GRADE_FLOOR
-    global PEER_REVIEW_INTERVAL_S, PEER_REVIEW_FILE_PROBABILITY
-    global DIRECTOR_ESCALATION_REASK_COOLDOWN_S, DIRECTOR_ESCALATION_MAX_ASKS
-    global _SIM_WATCHDOG_INTERVAL_S, _SIM_WATCHDOG_STALE_S
-    global CHAT_MAX_TOKENS_CAP
-    global SMS_TTL_DEFAULT_S, SMS_TTL_MIN_S, SMS_TTL_MAX_S
-    global DECIDE_BURST_ALLOW, DECIDE_BURST_WINDOW_S, DECIDE_MIN_INTERVAL_S
-    global HEALTH_CHECK_INTERVAL_S, HEALTH_ALERT_DEDUP_WINDOW_S
-    global HEALTH_DIGEST_INTERVAL_S
-    _p = get_operator_policy()
-    SUCCESS_GRADE_FLOOR = _p['successGradeFloor']
-    PEER_REVIEW_INTERVAL_S = _p['peerReviewIntervalS']
-    PEER_REVIEW_FILE_PROBABILITY = _p['peerReviewFileProbability']
-    DIRECTOR_ESCALATION_REASK_COOLDOWN_S = _p['directorEscalationReaskCooldownS']
-    DIRECTOR_ESCALATION_MAX_ASKS = _p['directorEscalationMaxAsks']
-    _SIM_WATCHDOG_INTERVAL_S = float(_SimWatchdogIntervalSEnv) if _SimWatchdogIntervalSEnv else float(_p['simWatchdogIntervalS'])
-    _SIM_WATCHDOG_STALE_S = float(_SimWatchdogStaleSEnv) if _SimWatchdogStaleSEnv else float(_p['simWatchdogStaleS'])
-    CHAT_MAX_TOKENS_CAP = _p['chatMaxTokensCap']
-    SMS_TTL_DEFAULT_S = _p['smsTtlDefaultS']
-    SMS_TTL_MIN_S = _p['smsTtlMinS']
-    SMS_TTL_MAX_S = _p['smsTtlMaxS']
-    DECIDE_BURST_ALLOW = _p['decideBurstAllow']
-    DECIDE_BURST_WINDOW_S = _p['decideBurstWindowS']
-    DECIDE_MIN_INTERVAL_S = _p['decideMinIntervalS']
-    HEALTH_CHECK_INTERVAL_S = _p['healthCheckIntervalS']
-    HEALTH_ALERT_DEDUP_WINDOW_S = _p['healthAlertDedupWindowS']
-    HEALTH_DIGEST_INTERVAL_S = _p['healthDigestIntervalS']
+# Declared once here via config.bind_policy; applied at import and re-applied
+# on every config.reload_policy_config() run. The two watchdog knobs keep
+# their env fallbacks through overrides, which re-read serve's live globals
+# so a patched/env-derived capture stays honored at each rebind.
+def _watchdog_interval_s(policy):
+    env = globals().get('_SimWatchdogIntervalSEnv')
+    return float(env) if env else float(policy['simWatchdogIntervalS'])
 
 
-_apply_operator_policy()
-try:
-    import config as _config_for_hooks
-    if _apply_operator_policy not in _config_for_hooks.ON_RELOAD_HOOKS:
-        _config_for_hooks.ON_RELOAD_HOOKS.append(_apply_operator_policy)
-except Exception:  # pragma: no cover
-    pass
+def _watchdog_stale_s(policy):
+    env = globals().get('_SimWatchdogStaleSEnv')
+    return float(env) if env else float(policy['simWatchdogStaleS'])
+
+
+bind_policy(__name__, [
+    ('SUCCESS_GRADE_FLOOR', 'successGradeFloor'),
+    ('PEER_REVIEW_INTERVAL_S', 'peerReviewIntervalS'),
+    ('PEER_REVIEW_FILE_PROBABILITY', 'peerReviewFileProbability'),
+    ('DIRECTOR_ESCALATION_REASK_COOLDOWN_S',
+     'directorEscalationReaskCooldownS'),
+    ('DIRECTOR_ESCALATION_MAX_ASKS', 'directorEscalationMaxAsks'),
+    ('_SIM_WATCHDOG_INTERVAL_S', 'simWatchdogIntervalS'),
+    ('_SIM_WATCHDOG_STALE_S', 'simWatchdogStaleS'),
+    ('CHAT_MAX_TOKENS_CAP', 'chatMaxTokensCap'),
+    ('SMS_TTL_DEFAULT_S', 'smsTtlDefaultS'),
+    ('SMS_TTL_MIN_S', 'smsTtlMinS'),
+    ('SMS_TTL_MAX_S', 'smsTtlMaxS'),
+    ('DECIDE_BURST_ALLOW', 'decideBurstAllow'),
+    ('DECIDE_BURST_WINDOW_S', 'decideBurstWindowS'),
+    ('DECIDE_MIN_INTERVAL_S', 'decideMinIntervalS'),
+    ('HEALTH_CHECK_INTERVAL_S', 'healthCheckIntervalS'),
+    ('HEALTH_ALERT_DEDUP_WINDOW_S', 'healthAlertDedupWindowS'),
+    ('HEALTH_DIGEST_INTERVAL_S', 'healthDigestIntervalS'),
+], overrides={
+    '_SIM_WATCHDOG_INTERVAL_S': _watchdog_interval_s,
+    '_SIM_WATCHDOG_STALE_S': _watchdog_stale_s,
+})
 
 
 # Sim-loop failure escalation ladder (R6). Counts consecutive watchdog failure

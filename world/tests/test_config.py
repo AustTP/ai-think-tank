@@ -320,11 +320,11 @@ class OperatorPolicySimServeBind(unittest.TestCase):
             config.reload_policy_config()
             self.assertEqual(serve._SIM_WATCHDOG_INTERVAL_S, 11.0)
 
-    def test_hooks_are_registered(self):
-        import serve  # noqa: F401  (ensures serve hook is registered)
-        import sim    # noqa: F401  (ensures sim hook is registered)
-        self.assertIn(sim._apply_operator_policy, config.ON_RELOAD_HOOKS)
-        self.assertIn(serve._apply_operator_policy, config.ON_RELOAD_HOOKS)
+    def test_policy_bindings_are_registered(self):
+        import serve  # noqa: F401  (ensures serve bindings are registered)
+        import sim    # noqa: F401  (ensures sim bindings are registered)
+        self.assertIn('sim', config.POLICY_BINDINGS)
+        self.assertIn('serve', config.POLICY_BINDINGS)
 
 
 class LoaderBranches(unittest.TestCase):
