@@ -216,6 +216,37 @@ class RefinementResolve(unittest.TestCase):
         self.assertEqual(req['status'], 'rejected')
         self.assertEqual(state['workQueue'], [])
 
+    # BP-62: the requester hears the triage outcome through quiet mail.
+
+    def test_accept_mails_reporter_carded(self):
+        state, _req = self._convened()
+        _step(state, None, sim.REFINEMENT_MEET_MS + 2_000_000,
+              decider=_stub_decider('accept'))
+        mail = state['agents']['ben'].get('mailbox') or []
+        self.assertEqual(len(mail), 1)
+        self.assertEqual(mail[0]['kind'], 'request_carded')
+        self.assertIn('Add a ledger export', mail[0]['text'])
+        self.assertIn('groomed into the sprint', mail[0]['text'])
+        self.assertIn("Dev's Crew", mail[0]['text'])
+        self.assertFalse(mail[0].get('read'))  # unread, like send_mail
+
+    def test_reject_mails_reporter_declined(self):
+        state, _req = self._convened()
+        _step(state, None, sim.REFINEMENT_MEET_MS + 2_000_000,
+              decider=_stub_decider('reject'))
+        mail = state['agents']['ben'].get('mailbox') or []
+        self.assertEqual(len(mail), 1)
+        self.assertEqual(mail[0]['kind'], 'request_declined')
+        self.assertIn('groomed out', mail[0]['text'])
+
+    def test_grooming_stays_quiet_for_the_scrum_master_self(self):
+        # The SM grooming their own request hears nothing -- self-mail is noise.
+        state, req = self._convened()
+        req['filedBy'] = 'ada'  # ada is the SM of "Dev's Crew"
+        _step(state, None, sim.REFINEMENT_MEET_MS + 2_000_000,
+              decider=_stub_decider('accept'))
+        self.assertEqual(state['agents']['ada'].get('mailbox') or [], [])
+
     def test_decider_instructions_carry_medium_difficulty_guidance(self):
         # Absolute Zero: the grooming prompt itself steers toward MEDIUM-
         # difficulty cards and gives the reject criterion the trivial/filler

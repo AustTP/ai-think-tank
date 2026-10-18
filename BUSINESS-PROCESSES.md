@@ -1997,6 +1997,42 @@ window.
 modules mid-tick. A policy value is a number the next loop iteration reads;
 the tick boundary is irrelevant and the change is one JSON write.
 
+### BP-62 Cross-team card responses
+
+**Purpose.** Close the loop for tickets. An agent who reports a bug or asks
+another team's tool for a feature hears the outcome from the owning team
+instead of polling the board.
+
+**Trigger.** The owning team changes a card the reporter filed: the
+refinement ceremony grooms it in or out, work starts, or the card
+finishes.
+
+**Steps.**
+
+1. Intake is unchanged. `file_issue` keeps the reporter and the owning
+   team as separate fields, so a requester can file into another team's
+   backlog, and spike workers file findings the same way.
+2. Triage answer. When the owning scrum master's grooming decides, the
+   reporter is mailed the verdict: carded into the sprint, or declined
+   with the reason class the reviewer gave (duplicate, trivial, out of
+   scope, already covered).
+3. Progress answer. When the card moves to in progress, the reporter is
+   mailed that an owner team picked it up.
+4. Close-out answer. When the card reaches done or closed, the reporter
+   is mailed the terminal state and can reply in mail.
+5. Delivery shape. Every note is one mailbox append under the same
+   no-wake rule as `send_mail`: the reporter reads it on their next duty
+   cycle. Same-status transitions mail nothing. Self-filed cards stay
+   quiet for the scrum master, and player reporters are skipped -- the
+   player-facing surfaces carry the same information.
+
+**Controls.** Fail-closed delivery (an unknown reporter id is a no-op),
+no wake, quiet self-mail, retention by the shared mailbox trim.
+
+**Records.** Mailbox kinds `request_carded`, `request_declined`,
+`issue_started`, `issue_done`, `issue_closed`; issues and backlogRequests
+status fields stay the queryable source of truth.
+
 ## 11. Player and operator processes
 
 | Process | Surface | What the owner does |

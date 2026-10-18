@@ -1747,5 +1747,61 @@ class WorkerSpikeIssueFiling(unittest.TestCase):
         self.assertFalse(state.get('issues'), 'no wish -> no filing')
 
 
+class IssueReporterMail(unittest.TestCase):
+    """BP-62: the owning side closes the loop with the reporter through quiet
+    mailbox notes. set_issue_status mails the reporter on started/done/closed
+    transitions; cross-team works because reporter and owning team are
+    independent fields; the player is skipped; same-status no-ops stay quiet."""
+
+    def _state(self):
+        return {
+            'agentRoster': [{'id': 'rep', 'name': 'Repa', 'role': 'Research'},
+                            {'id': 'xi', 'name': 'Xi', 'role': 'Banking'}],
+            'agents': {
+                'rep': {'id': 'rep', 'inRoom': 'pressoffice', 'offDuty': False},
+                'xi': {'id': 'xi', 'inRoom': 'observatory', 'offDuty': False},
+            },
+            'teams': [{'id': 't1', 'name': 'Fixers', 'directorId': 'faye',
+                       'scrumMasterId': 'ada'}],
+            'issues': {},
+            'issueCounters': {},
+            'backlogRequests': [],
+        }
+
+    def _issue(self, reporter='rep', team='t1'):
+        state = self._state()
+        issue = sim.file_issue(state, team, 'story', 'Add dark mode',
+                               'Sh Theme', reporter)
+        return state, issue
+
+    def test_started_done_and_closed_mail_the_reporter(self):
+        state, issue = self._issue()
+        sim.set_issue_status(state, issue['key'], 'in_progress')
+        sim.set_issue_status(state, issue['key'], 'done')
+        sim.set_issue_status(state, issue['key'], 'closed')
+        mail = state['agents']['rep'].get('mailbox') or []
+        kinds = [m['kind'] for m in mail]
+        self.assertEqual(kinds, ['issue_started', 'issue_done', 'issue_closed'])
+        for m in mail:
+            self.assertIn(issue['key'], m['text'])
+            self.assertIn('Add dark mode', m['text'])
+        self.assertIn('Fixers', mail[0]['text'])
+        self.assertFalse(mail[0].get('read'))
+
+    def test_same_status_transition_mails_nothing(self):
+        state, issue = self._issue()
+        sim.set_issue_status(state, issue['key'], 'in_progress')
+        sim.set_issue_status(state, issue['key'], 'in_progress')
+        self.assertEqual(len(state['agents']['rep']['mailbox']), 1)
+
+    def test_player_and_unknown_reporters_are_skipped(self):
+        state, issue = self._issue(reporter='player')
+        sim.set_issue_status(state, issue['key'], 'done')
+        self.assertFalse(state['agents']['rep'].get('mailbox'))
+        state2, issue2 = self._issue(reporter='ghost')
+        sim.set_issue_status(state2, issue2['key'], 'done')  # must not crash
+        self.assertTrue(state2['issues'][issue2['key']]['status'] == 'done')
+
+
 if __name__ == '__main__':
     unittest.main()

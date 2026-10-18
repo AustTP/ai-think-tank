@@ -8537,6 +8537,7 @@ def set_issue_status(state, key, status):
     issue = (state.get('issues') or {}).get(key)
     if not issue:
         return None
+    previous = issue.get('status')
     issue['status'] = status
     # A terminal status supersedes a pending request to PLAYER input: the agent
     # was waiting on you, but the card is now finished/closed -- stop waiting and
@@ -8554,6 +8555,13 @@ def set_issue_status(state, key, status):
                 r['status'] = 'resolved'
             elif status == 'in_progress':
                 r['status'] = 'accepted'
+    # BP-62: the owner side changed the card's state -- the reporter learns it
+    # through one quiet, no-wake mailbox note (skip no-change transitions).
+    mail_kind = _CARD_STATUS_MAIL_KINDS.get(status)
+    if mail_kind and previous != status:
+        team_name = (_team_row(state, issue.get('teamId')) or {}).get('name')
+        _mail_card_update(state, issue.get('reporterId'), mail_kind, key,
+                          issue.get('title'), team_name)
     return issue
 
 
@@ -8991,6 +8999,54 @@ def _append_mailbox(agent, entry):
     mailbox.append(entry)
     if len(mailbox) > MAILBOX_KEEP_COUNT:
         agent['mailbox'] = mailbox[-MAILBOX_KEEP_COUNT:]
+
+
+# BP-62: close-out + triage mail. A cross-team card's reporter learns what the
+# OWNER did with their card the way the tank talks about everything else -- a
+# quiet mailbox note. Mail never wakes the recipient (the send_mail rule): the
+# reporter reads it on their next duty cycle. The player is skipped -- the
+# player-facing UI and digest surfaces carry the same information -- and
+# unknown or missing roster ids fail silently to a no-op.
+_CARD_STATUS_MAIL_KINDS = {
+    'in_progress': 'issue_started',
+    'done': 'issue_done',
+    'closed': 'issue_closed',
+}
+
+
+def _mail_card_update(state, to_id, kind, key, title, team_name, extra=''):
+    """One no-wake mailbox note from the owning side of a card to its
+    reporter. kind: request_carded | request_declined | issue_started |
+    issue_done | issue_closed. Returns True when a note landed. Pure."""
+    if not isinstance(to_id, str) or not to_id or to_id == 'player':
+        return False
+    agent = (state.get('agents') or {}).get(to_id)
+    if not isinstance(agent, dict) or not agent:
+        return False
+    label = f'{key} ' if key else ''
+    title_bit = (title or '')[:120]
+    if kind == 'request_carded':
+        text = (f'Your card {label}"{title_bit}" was groomed into the '
+                f'sprint by {team_name or "the team"} -- it is queued and '
+                'starts when a worker picks it up.')
+    elif kind == 'request_declined':
+        text = (f'Your card {label}"{title_bit}" was groomed out during '
+                f'backlog refinement by {team_name or "the team"}'
+                + (f': {extra}' if extra else '.')
+                + ' File a follow-up with sharper scope if it still matters.')
+    elif kind == 'issue_started':
+        text = (f'{team_name or "The team"} picked up your card {label}'
+                f'"{title_bit}" -- work is in progress.')
+    elif kind == 'issue_done':
+        text = (f'Your card {label}"{title_bit}" is marked done'
+                f'{f" by {team_name}" if team_name else ""}. Reply in mail '
+                'if anything looks off.')
+    else:  # issue_closed
+        text = (f'Your card {label}"{title_bit}" is closed'
+                f'{f" by {team_name}" if team_name else ""}.')
+    _append_mailbox(agent, {'kind': kind, 'about': key or None,
+                            'title': title_bit, 'text': text})
+    return True
 
 
 def _upsert_rejection_mailbox(agent, entry):
@@ -10180,8 +10236,24 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                     'playerAuthored': bool(filed_by == 'player'),
                 }])
             accepted.append(req)
+            # BP-62: triage mail -- the reporter learns their card entered a
+            # sprint. Self-filed cards (the SM grooming their own request)
+            # stay quiet.
+            if filed_by != scrum_master_id:
+                _mail_card_update(
+                    state, filed_by, 'request_carded', req.get('issueKey'),
+                    req.get('title'),
+                    (_team_row(state, pending.get('teamId')) or {}).get('name'))
         else:
             req['status'] = 'rejected'
+            # BP-62: the decline is also the response the requester asked for.
+            if filed_by != scrum_master_id:
+                _mail_card_update(
+                    state, filed_by, 'request_declined', req.get('issueKey'),
+                    req.get('title'),
+                    (_team_row(state, pending.get('teamId')) or {}).get('name'),
+                    extra='judged duplicate, trivial, out of scope, or '
+                          'already covered by the roadmap')
         details = {'request': req['id'], 'choice': choice, 'filedBy': filed_by,
                    'room': req['room'], 'title': req['title'][:120]}
         if choice == 'reject':
