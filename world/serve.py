@@ -455,6 +455,7 @@ from fs import (  # noqa: E402,F401
 import training_capture  # noqa: E402
 import vpn_location  # noqa: E402
 import theo_policy  # noqa: E402
+import tank_accounts  # noqa: E402
 import vpn_pool  # noqa: E402
 import containers  # noqa: E402
 import egress  # noqa: E402
@@ -1423,6 +1424,7 @@ def init_db():
             updated_by TEXT,
             updated_at REAL
         )''')
+        tank_accounts.ensure_schema(conn)
 
     _seed_api_services_if_empty()
     _seed_rss_feeds_if_empty()
@@ -27237,6 +27239,161 @@ async def sms_revoke(request: Request):
         conn.execute('DELETE FROM sms_read_grants WHERE grant_id = ?', (grant_id,))
     log_action(actor, 'sms_revoke', {'grant': grant_id[:8]})
     return JSONResponse({'ok': True})
+
+
+# --- Tank-owned account identities (TOTP) -----------------------------------
+# The tank creates its own accounts, so it captures the TOTP secret at signup
+# instead of importing a phone authenticator. The secret lives in the Fernet
+# credential vault. Agents redeem a single-use owner grant for one code; the
+# secret never leaves the server and the code is never logged.
+
+@app.post('/api/tank-accounts')
+async def tank_account_create(request: Request):
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a player, director, or admin may create a tank account'}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({'error': 'body must be an object'}, status_code=400)
+    try:
+        rec = tank_accounts.create(
+            service=body.get('service') or '',
+            account=body.get('account') or '',
+            username=body.get('username') or '',
+            password=body.get('password') or '',
+            totp_secret=body.get('totpSecret') or body.get('otpauthUri') or '',
+            recovery_codes=body.get('recoveryCodes'),
+            owner=actor,
+            status=body.get('status') or 'active',
+        )
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    except RuntimeError as e:
+        return JSONResponse({'error': str(e)}, status_code=503)
+    return JSONResponse(rec)
+
+
+@app.get('/api/tank-accounts')
+async def tank_account_list(request: Request):
+    authorized, _actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a player, director, or admin may list tank accounts'}, status_code=403)
+    return JSONResponse({'accounts': tank_accounts.list_accounts()})
+
+
+@app.get('/api/tank-accounts/{account_id}')
+async def tank_account_get(account_id: str, request: Request):
+    authorized, _actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a player, director, or admin may read a tank account'}, status_code=403)
+    rec = tank_accounts.get(account_id)
+    if rec is None:
+        return JSONResponse({'error': 'account not found'}, status_code=404)
+    return JSONResponse(rec)
+
+
+@app.post('/api/tank-accounts/{account_id}/code')
+async def tank_account_code(account_id: str, request: Request):
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a player, director, or admin may request a code'}, status_code=403)
+    try:
+        result = tank_accounts.code(account_id, actor=actor)
+    except KeyError:
+        return JSONResponse({'error': 'account not found'}, status_code=404)
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    return JSONResponse(result)
+
+
+@app.post('/api/tank-accounts/{account_id}/grant')
+async def tank_account_grant(account_id: str, request: Request):
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a player, director, or admin may grant a code read'}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({'error': 'body must be an object'}, status_code=400)
+    try:
+        result = tank_accounts.mint_grant(
+            account_id,
+            (body.get('agentId') or '').strip(),
+            granted_by=actor,
+            ttl_s=body.get('ttlSec') or tank_accounts.DEFAULT_GRANT_S,
+        )
+    except KeyError:
+        return JSONResponse({'error': 'account not found'}, status_code=404)
+    except (ValueError, TypeError) as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    return JSONResponse(result)
+
+
+@app.post('/api/tank-accounts/{account_id}/agent-code')
+async def tank_account_agent_code(account_id: str, request: Request):
+    agent_id = _agent_id_for_key(request.headers.get('X-Agent-Key'))
+    if not agent_id:
+        return JSONResponse({'error': 'a valid agent key is required'}, status_code=401)
+    if not check_rate_limit(agent_id):
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({'error': 'body must be an object'}, status_code=400)
+    grant = (body.get('grant') or '').strip()
+    if not grant:
+        return JSONResponse({'error': 'grant is required'}, status_code=400)
+    if not tank_accounts.consume_grant(grant, agent_id, account_id):
+        return JSONResponse({'error': 'invalid, expired, or already-used grant'}, status_code=403)
+    try:
+        result = tank_accounts.code(account_id, actor=agent_id, agent_id=agent_id)
+    except KeyError:
+        return JSONResponse({'error': 'account not found'}, status_code=404)
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    return JSONResponse(result)
+
+
+@app.post('/api/tank-accounts/{account_id}/rotate')
+async def tank_account_rotate(account_id: str, request: Request):
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a player, director, or admin may rotate a TOTP secret'}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    try:
+        result = tank_accounts.rotate(
+            account_id, actor=actor, new_secret=body.get('totpSecret') or '')
+    except KeyError:
+        return JSONResponse({'error': 'account not found'}, status_code=404)
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    except RuntimeError as e:
+        return JSONResponse({'error': str(e)}, status_code=503)
+    return JSONResponse(result)
+
+
+@app.delete('/api/tank-accounts/{account_id}')
+async def tank_account_delete(account_id: str, request: Request):
+    authorized, actor = _operator_gate(request)
+    if not authorized:
+        return JSONResponse({'error': 'only a player, director, or admin may delete a tank account'}, status_code=403)
+    try:
+        result = tank_accounts.delete(account_id, actor=actor)
+    except KeyError:
+        return JSONResponse({'error': 'account not found'}, status_code=404)
+    return JSONResponse(result)
 
 
 @app.post('/api/keys/handles')
