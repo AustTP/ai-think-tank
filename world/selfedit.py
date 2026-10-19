@@ -128,16 +128,36 @@ READ_TEXT_CAP = 48000
 #             importlib.reload re-executes, and serve's import block is
 #             refreshed explicitly; apply re-applies every registered
 #             policy binding through config.apply_policy_bindings().
+#   extracted modules (rss, ws, webhooks, apis, auth, bank) -> serve's
+#             `from <mod> import (...)` names are rebound by the generic
+#             ast-driven refresh, and the modules with DB-backed registries
+#             re-run their loader after the reload (POST_RELOAD_LOADERS).
+#             Long-running loops keep running: they resolve module globals
+#             per iteration, and the module dict is updated in place.
 # Everything else tolerates ZERO outside importers in v1.
 TOLERATED_IMPORTERS = {
     'jev': {'serve.py'},
     'env_reload': {'serve.py'},
+    'rss': {'serve.py'},
+    'ws': {'serve.py'},
+    'webhooks': {'serve.py'},
+    'apis': {'serve.py'},
+    'auth': {'serve.py'},
+    'bank': {'serve.py'},
     'sublow': {'jev_grants.py'},
     'config': {'content.py', 'sim.py', 'sublow.py', 'serve.py'},
 }
 # Reload chain, extras refreshed after the target module itself, in order.
 # The order matters only for readability here: importers of importers are
 # refreshed through their own module-dict attribute lookups, not reloads.
+# Modules that hold a DB-backed in-memory registry: reloading the module
+# re-executes its body and empties that registry, so the loader must run again
+# before the next request. Read off serve by name at apply time.
+POST_RELOAD_LOADERS = {
+    'apis': ('_load_api_services',),
+    'rss': ('_load_rss_feeds',),
+    'ws': ('_load_ws_feeds',),
+}
 RELOAD_IMPORTERS_AFTER = {
     'sublow': ('jev_grants',),
     'config': ('sublow', 'content', 'sim'),
@@ -1046,6 +1066,15 @@ def _reload(target):
         _refresh_serve_config_exports()
     if modname == 'env_reload':
         _refresh_serve_env_reload_exports()
+    _refresh_serve_imports(modname)
+    serve = _s()
+    for loader_name in POST_RELOAD_LOADERS.get(modname, ()):
+        loader = getattr(serve, loader_name, None)
+        if callable(loader):
+            try:
+                loader()
+            except Exception:
+                pass  # a loader failure leaves the registry empty, never a boot failure
     for extra in RELOAD_IMPORTERS_AFTER.get(modname, ()):
         extra_mod = sys.modules.get(extra)
         if extra_mod:
@@ -1064,6 +1093,44 @@ def _refresh_serve_jev_exports():
                  'ESCALATION_ERROR_PENALTY_CAP', '_jev_choice',
                  '_jev_quorum_choice_sync', '_jev_quorum_decision'):
         setattr(serve, name, getattr(jev, name))
+
+
+_SERVE_IMPORT_NAMES: dict = {}
+
+
+def _refresh_serve_imports(modname):
+    """Rebind every name serve.py imports from modname after a reload.
+
+    The name list is read from serve.py's own `from <mod> import (...)`
+    statements with ast, so adding an export later needs no second edit here
+    and cannot drift. Function-local imports are irrelevant (call-time
+    resolution). A name the reloaded module no longer defines is skipped
+    rather than left pointing at the pre-edit object by accident."""
+    import ast
+    import importlib
+    mod = sys.modules.get(modname)
+    if mod is None:
+        return []
+    if modname not in _SERVE_IMPORT_NAMES:
+        names = []
+        try:
+            with open(_s().__file__, 'r', encoding='utf-8') as fh:
+                tree = ast.parse(fh.read())
+        except (OSError, SyntaxError):
+            tree = None
+        if tree is not None:
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module == modname:
+                    for alias in node.names:
+                        names.append((alias.asname or alias.name, alias.name))
+        _SERVE_IMPORT_NAMES[modname] = tuple(names)
+    serve = _s()
+    rebound = []
+    for attr, source_name in _SERVE_IMPORT_NAMES[modname]:
+        if hasattr(mod, source_name):
+            setattr(serve, attr, getattr(mod, source_name))
+            rebound.append(attr)
+    return rebound
 
 
 def _refresh_serve_env_reload_exports():
