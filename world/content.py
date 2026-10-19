@@ -3307,7 +3307,7 @@ def _make_captcha_solve_executor(agent_id, agent_key):
     return execute_tool
 
 
-def _make_browser_act_executor(agent_id, agent_key, sandbox_id, struck_tools=None, work_context='', work_context_trusted=False):
+def _make_browser_act_executor(agent_id, agent_key, sandbox_id, struck_tools=None, work_context='', work_context_trusted=False, task_id=None):
     """Posts each op to the Jev-gated /api/browser-act endpoint and formats the
     driver's page-state result for the model. One-strike on a policy denial,
     same as the web/sandbox executors. Page content is UNTRUSTED external data,
@@ -3343,6 +3343,7 @@ def _make_browser_act_executor(agent_id, agent_key, sandbox_id, struck_tools=Non
             'fields': (args or {}).get('fields') or [],
             'submitSelector': (args or {}).get('submitSelector') or '',
             'workContext': work_context,
+            'taskId': task_id or '',
             # Server-minted proof of player-authored provenance; the endpoint
             # redeems it and ignores the legacy boolean entirely.
             'workTrustNonce': work_trust_nonce,
@@ -5257,7 +5258,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     web_tool = _serve._make_web_tools_executor(agent_id, key, default_query=backlog, struck_tools=struck_tools, work_context=work_context, work_context_trusted=work_context_trusted, task_id=task.get('id'))
     sandbox_id = f"spike-{task.get('id') or 'adhoc'}"
     sandbox_tool = _make_spike_sandbox_executor(agent_id, key, sandbox_id, struck_tools=struck_tools)
-    browser_act_tool = _make_browser_act_executor(agent_id, key, sandbox_id, struck_tools=struck_tools, work_context=work_context, work_context_trusted=work_context_trusted)
+    browser_act_tool = _make_browser_act_executor(agent_id, key, sandbox_id, struck_tools=struck_tools, work_context=work_context, work_context_trusted=work_context_trusted, task_id=task.get('id'))
     captcha_solve_tool = _make_captcha_solve_executor(agent_id, key)
     list_handles_tool = _make_list_handles_executor(agent_id, key)
     library_tool = _make_library_tools_executor(agent_id, struck_tools=struck_tools)

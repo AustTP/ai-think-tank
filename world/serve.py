@@ -27819,6 +27819,8 @@ async def request_credential_access(request: Request):
                                       'service; request access only for work that '
                                       'actually needs it'}, status_code=403)
     credential = spec.get('credential') or service
+    purpose_tag = f'task:{task_id} '
+    handle = None
     with _db() as conn:
         row = conn.execute(
             "SELECT kind FROM external_credentials WHERE name = ? AND status = 'active'",
@@ -27826,16 +27828,32 @@ async def request_credential_access(request: Request):
         if not row or row[0] != 'login':
             return JSONResponse({'error': 'credential is not an active login'},
                                 status_code=404)
-        # One live handle per agent per credential: a new need replaces the old.
-        conn.execute('DELETE FROM capability_handles WHERE agent_id = ? '
-                     'AND credential_name = ?', (agent_id, credential))
-    handle, refusal = mint_capability_handle(
-        agent_id, credential, purpose, list(spec.get('hosts') or []),
-        list(spec.get('methods') or ['POST']), 'need-based-read-only',
-        int(spec.get('ttlSec') or 900))
+        # Idempotent per task: repeated requests for the SAME active task
+        # return the same live handle instead of revoking and minting a new
+        # one. Live miss 2026-10-19: a spike asked three times, each call
+        # rotated the handle, and the model kept submitting an earlier one.
+        existing = conn.execute(
+            'SELECT handle FROM capability_handles WHERE agent_id = ? '
+            'AND credential_name = ? AND purpose LIKE ? AND expires_at > ? '
+            'ORDER BY created_at DESC LIMIT 1',
+            (agent_id, credential, purpose_tag + '%', time.time())).fetchone()
+        if existing:
+            handle = existing[0]
+        else:
+            # One live handle per agent per credential: a new need replaces
+            # the prior task's handle.
+            conn.execute('DELETE FROM capability_handles WHERE agent_id = ? '
+                         'AND credential_name = ?', (agent_id, credential))
+    refusal = None
     if handle is None:
-        return JSONResponse({'error': refusal or 'could not mint a handle'},
-                            status_code=403)
+        handle, refusal = mint_capability_handle(
+            agent_id, credential, purpose_tag + purpose,
+            list(spec.get('hosts') or []),
+            list(spec.get('methods') or ['POST']), 'need-based-read-only',
+            int(spec.get('ttlSec') or 900))
+        if handle is None:
+            return JSONResponse({'error': refusal or 'could not mint a handle'},
+                                status_code=403)
     log_action(agent_id, 'credential_access_granted', {
         'service': service, 'credential': credential, 'taskId': task_id,
         'hosts': spec.get('hosts'), 'methods': spec.get('methods'),
@@ -28465,6 +28483,36 @@ def _is_social_login_url(url):
                ('/login', '/accounts/login', '/checkpoint', '/challenge'))
 
 
+def _active_task_handle(agent_id, task_id, method, url):
+    """Return a live handle minted for THIS agent and THIS task whose scope
+    covers the page host and method, or None. Used only for social login:
+    it lets the browser re-use the handle the agent already requested instead
+    of failing because the model copied an older/truncated token."""
+    if not agent_id or not task_id:
+        return None
+    host = (urllib.parse.urlparse(url or '').hostname or '').lower()
+    if not host:
+        return None
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                'SELECT handle, allowed_hosts, allowed_methods, expires_at '
+                'FROM capability_handles WHERE agent_id = ? AND purpose LIKE ? '
+                'AND expires_at > ? ORDER BY created_at DESC',
+                (agent_id, f'task:{task_id} %', time.time())).fetchall()
+    except Exception:
+        return None
+    for handle, hosts_raw, methods_raw, _expires in rows:
+        try:
+            hosts = json.loads(hosts_raw) if isinstance(hosts_raw, str) else hosts_raw
+            methods = json.loads(methods_raw) if isinstance(methods_raw, str) else methods_raw
+        except Exception:
+            continue
+        if host in (hosts or []) and method in (methods or []):
+            return handle
+    return None
+
+
 def _social_readonly_guard(op, url, page_url, fields):
     """Hard read-only policy for the configured social hosts. Returns an error
     string, or None when the action is allowed. The ONLY write-shaped op is a
@@ -28550,6 +28598,20 @@ async def browser_act(request: Request):
         return JSONResponse({'error': 'fields is required for op=login'}, status_code=400)
     if op == 'click' and not selector:
         return JSONResponse({'error': 'selector is required for op=click'}, status_code=400)
+    # Fill missing social-login handles from the live task handle BEFORE the
+    # read-only guard runs. The executor sends taskId, so a model that already
+    # requested access but omitted the opaque handle still logs in instead of
+    # bouncing on a copy error.
+    _early_fields = body.get('fields') or []
+    _early_task = (body.get('taskId') or '').strip()
+    _early_url = (url or body.get('pageUrl') or '').strip()
+    if (op in ('login', 'fill_many') and _early_fields and _early_task and
+            _is_readonly_social_host(urllib.parse.urlparse(_early_url).hostname or '')):
+        _fallback = _active_task_handle(agent_id, _early_task, 'POST', _early_url)
+        if _fallback:
+            for _f in _early_fields:
+                if isinstance(_f, dict) and not (_f.get('credentialHandle') or '').strip():
+                    _f['credentialHandle'] = _fallback
     social_error = _social_readonly_guard(
         op, url, (body.get('pageUrl') or '').strip(), body.get('fields') or [])
     if social_error:
@@ -28604,6 +28666,9 @@ async def browser_act(request: Request):
     supplied_fields = body.get('fields') or []
     scope_is_social = _is_readonly_social_host(
         (urllib.parse.urlparse(scope_url).hostname or '') if scope_url else '')
+    task_id = (body.get('taskId') or '').strip()
+    fallback_handle = None
+    used_fallback = False
     if op in ('login', 'fill_many') and supplied_fields:
         ok_fields = []
         for field in supplied_fields:
@@ -28612,16 +28677,26 @@ async def browser_act(request: Request):
                 break
             fh = (field.get('credentialHandle') or '').strip()
             ff = (field.get('credentialField') or '').strip().lower()
-            if not fh:
-                ok_fields = None
-                break
-            fscope = verify_capability_handle_scope(agent_id, fh, 'POST', scope_url)
-            if fscope is None or fscope.get('kind') != 'login' or ff not in ('username', 'password'):
+            fscope = verify_capability_handle_scope(agent_id, fh, 'POST', scope_url) if fh else None
+            if fscope is None and scope_is_social and task_id:
+                if fallback_handle is None:
+                    fallback_handle = _active_task_handle(agent_id, task_id, 'POST', scope_url)
+                if fallback_handle:
+                    field['credentialHandle'] = fallback_handle
+                    fh = fallback_handle
+                    fscope = verify_capability_handle_scope(agent_id, fh, 'POST', scope_url)
+                    used_fallback = True
+            if fscope is None or ff not in ('username', 'password'):
                 ok_fields = None
                 break
             ok_fields.append(fscope)
         if ok_fields is not None:
             fields_scope = ok_fields[0]
+            if used_fallback:
+                log_action(agent_id, 'browser_act_handle_fallback', {
+                    'sandboxId': sandbox_id, 'op': op, 'url': scope_url,
+                    'taskId': task_id, 'reason': 'used the live task handle',
+                }, authorized=authorized)
         elif scope_is_social:
             # A social login WITHOUT a live, host-scoped handle is not a
             # policy judgment -- the agent simply has not been granted access

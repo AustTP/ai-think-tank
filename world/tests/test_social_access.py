@@ -100,13 +100,25 @@ class RequestEndpointTests(_SocialCase):
         self.assertEqual(rows[0][1], 'facebook')
         self.assertIn('facebook.com', rows[0][2])
 
-    def test_new_need_replaces_the_old_handle(self):
+    def test_same_task_reuses_the_handle(self):
         task = _task()
         self._save(task)
         first = self._request({'agentId': 'cora', 'service': 'facebook',
                                'taskId': task['id'], 'purpose': 'read group posts'}).json()['handle']
         second = self._request({'agentId': 'cora', 'service': 'facebook',
                                 'taskId': task['id'], 'purpose': 'read group posts'}).json()['handle']
+        self.assertEqual(first, second)
+        self.assertEqual(len(self._handles()), 1)
+
+    def test_a_new_task_replaces_the_old_handle(self):
+        first_task = _task()
+        self._save(first_task)
+        first = self._request({'agentId': 'cora', 'service': 'facebook',
+                               'taskId': first_task['id'], 'purpose': 'read group posts'}).json()['handle']
+        second_task = dict(first_task, id='task-social-2')
+        self._save(second_task)
+        second = self._request({'agentId': 'cora', 'service': 'facebook',
+                                'taskId': second_task['id'], 'purpose': 'read group posts'}).json()['handle']
         self.assertNotEqual(first, second)
         self.assertEqual(len(self._handles()), 1)
 
@@ -151,6 +163,33 @@ class RequestEndpointTests(_SocialCase):
         self.assertFalse(body.get('allowed'))
         self.assertTrue(body.get('credentialHandleError'))
         classify.assert_not_called()
+
+
+    def test_login_uses_the_live_task_handle_when_the_copied_one_is_stale(self):
+        task = _task()
+        self._save(task)
+        handle = self._request({'agentId': 'cora', 'service': 'facebook',
+                                'taskId': task['id'], 'purpose': 'read group posts'}).json()['handle']
+        fields = [
+            {'selector': '#email', 'credentialHandle': 'old-token', 'credentialField': 'username'},
+            {'selector': '#pass', 'credentialHandle': 'old-token', 'credentialField': 'password'},
+        ]
+        with unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True), \
+             unittest.mock.patch.object(serve, 'check_rate_limit', return_value=True), \
+             unittest.mock.patch.object(serve, 'EXECUTION_ENABLED', True), \
+             unittest.mock.patch.object(serve, 'BROWSING_ENABLED', True), \
+             unittest.mock.patch.object(serve, '_classify_browser_action',
+                                        new=unittest.mock.AsyncMock(return_value=(True, 'allow'))), \
+             unittest.mock.patch.object(serve, '_run_browser_act_sync',
+                                        return_value=({'ok': True, 'url': 'https://www.facebook.com/login',
+                                                       'title': 'Log in', 'fields': [], 'links': []}, None)):
+            r = self.client.post('/api/browser-act', json={
+                'agentId': 'cora', 'sandboxId': 'spike-test', 'op': 'login',
+                'url': 'https://www.facebook.com/login', 'taskId': task['id'],
+                'purpose': 'read public group posts', 'fields': fields,
+            })
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json().get('ok'), r.text)
 
     def test_unknown_service_is_refused(self):
         self._save(_task())
