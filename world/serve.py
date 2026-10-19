@@ -28618,10 +28618,12 @@ async def browser_act(request: Request):
         # Missing/invalid login fields are a provisioning mistake, not a
         # policy denial: the agent must request a fresh handle and retry.
         # Mark it so the tool loop does not spend its one browser strike.
-        retryable = (op == 'login' and
-                     ('credential handle' in social_error or
-                      'needs username' in social_error or
-                      'username or password' in social_error))
+        retryable = ((op == 'login' and
+                      ('credential handle' in social_error or
+                       'needs username' in social_error or
+                       'username or password' in social_error)) or
+                     (op in ('read', 'screenshot') and
+                      'pass the current' in social_error))
         log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op,
                                               'url': url or body.get('pageUrl'),
                                               'decision': 'blocked',

@@ -3143,7 +3143,9 @@ _BROWSER_ACT_TOOL = {
             'request_credential_access (your own active grants for kind=login credentials); '
             'credentialField is username or password. For Facebook/Instagram, call '
             'request_credential_access FIRST, then use the returned handle; a social login without '
-            'a fresh host-scoped handle is refused before any policy review. ' 'You still need the css selector for the field, so '
+            'a fresh host-scoped handle is refused before any policy review. For Facebook prefer '
+            'https://mbasic.facebook.com/login or https://m.facebook.com/login, then op=read to find '
+            'the real selectors. You still need the css selector for the field, so '
             'goto+read the login page first to find it. Pass pageUrl (the page you are filling on) so the '
             'handle can be scope-checked against the right host. For a multi-field login, use op=login '
             'with fields (each with its own selector + credentialHandle + credentialField) and '
@@ -3325,17 +3327,24 @@ def _make_browser_act_executor(agent_id, agent_key, sandbox_id, struck_tools=Non
     # Minted here -- at factory time, from the real task's flag -- never read
     # back out of an agent-controlled request body.
     work_trust_nonce = _serve._mint_work_trust_nonce() if work_context_trusted else ''
+    last_url = {'url': ''}
     def execute_tool(name, args):
         if struck_tools is not None and name in struck_tools:
             return ('browser_act was already blocked once this investigation (one-strike) -- '
                     'do not call it again, use a different tool or approach instead.')
         op = (args or {}).get('op') or ''
         purpose = (args or {}).get('purpose') or 'spike investigation'
+        req_url = (args or {}).get('url') or (args or {}).get('pageUrl') or ''
+        # A read/screenshot after a goto often omits url. Reuse the last page
+        # we actually opened so the social read-only guard can see the host
+        # instead of blocking an otherwise valid read as url-less.
+        if not req_url and op in ('read', 'screenshot') and last_url['url']:
+            req_url = last_url['url']
         body = {
             'agentId': agent_id,
             'sandboxId': sandbox_id,
             'op': op,
-            'url': (args or {}).get('url') or '',
+            'url': req_url,
             'selector': (args or {}).get('selector') or '',
             'value': (args or {}).get('value') or '',
             'purpose': purpose,
@@ -3356,6 +3365,8 @@ def _make_browser_act_executor(agent_id, agent_key, sandbox_id, struck_tools=Non
         result = _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/browser-act', body, agent_key, timeout=90)
         if not isinstance(result, dict):
             return 'Could not run that browser action (unexpected response).'
+        if result.get('url'):
+            last_url['url'] = result['url']
         if result.get('allowed') is False:
             if result.get('credentialHandleError'):
                 return (f"Browser action needs a fresh credential handle: {result.get('reason', 'not granted')} "
@@ -5186,7 +5197,10 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         'browse_page on those hosts and do NOT file an allowlist request for them: use '
         'request_credential_access(service="facebook" or "instagram", purpose=...) while working '
         'this task, then browser_act op=login on the service login page with the returned handle. '
-        'After login use only browser_act goto/read/screenshot on public pages. Social hosts are '
+        'For Facebook, prefer https://mbasic.facebook.com/login or https://m.facebook.com/login; '
+        'the www page often hides the form behind a consent/landing screen. After goto, use '
+        'browser_act op=read to find the real input selectors before logging in. After login use '
+        'only browser_act goto/read/screenshot on public pages. Social hosts are '
         'hard read-only: fill, click, and submit are refused outside that login. Many sites load '
         'their real content via JavaScript/AJAX -- if a plain browse_page '
         'fetch comes back as an empty shell or just navigation/boilerplate with no real content, '
