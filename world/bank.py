@@ -21,9 +21,25 @@ and friends stay the stable public surface the call sites and tests use.
 """
 
 import datetime
+import functools
 import json
+import threading
 import time
 import urllib.request
+
+# Every accrual is a whole-ledger read/modify/write. Two concurrent model
+# calls cannot both add their cost and keep both results, so the last writer
+# silently loses the other's spend. Serialize the mutators. RLock because
+# some accrual paths call another accrual helper.
+_LEDGER_WRITE_LOCK = threading.RLock()
+
+
+def _serialized_ledger(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _LEDGER_WRITE_LOCK:
+            return fn(*args, **kwargs)
+    return wrapper
 
 # The default per-service budget when no product record pins a cap.
 DEFAULT_BUDGET_CAP_USD = 50.0
@@ -70,6 +86,7 @@ def _budget_cap_usd(service, products=None):
     return DEFAULT_BUDGET_CAP_USD
 
 
+@_serialized_ledger
 def _accrue_spend(service, cost, village_id=None, agent_id=None):
     """Accrue a single model call's cost to a service's ledger bucket. The whole
     point is that accrual happens exactly once per model call, at the choke
@@ -366,6 +383,7 @@ def _task_budget_spent(task_id):
         return 0.0, 0
 
 
+@_serialized_ledger
 def _accrue_task_spend(task_id, cost):
     """Accrue one real model call's cost against a task's own ledger bucket.
     Best-effort exactly like _accrue_spend: an accounting failure must never
@@ -798,6 +816,7 @@ def _page_budget_exhausted():
     return _serve._page_budget_used() >= _serve.PAGE_REQUEST_MONTHLY_BUDGET
 
 
+@_serialized_ledger
 def _accrue_page_request():
     """Record ONE external page request (browse fetch or search_web call) against
     this month's budget. Best-effort like _accrue_spend: a ledger failure must
@@ -859,6 +878,7 @@ def _high_tier_budget_exceeded():
     return _serve._high_tier_spend_this_month() >= _serve.HIGH_TIER_MONTHLY_BUDGET_USD
 
 
+@_serialized_ledger
 def _accrue_high_tier_spend(cost):
     """Accrue a high-tier model call's cost against the monthly high-tier
     budget. Best-effort like _accrue_spend: an accounting failure must never
@@ -917,6 +937,7 @@ def _apify_budget_exceeded():
     return _serve._apify_spend_this_month() >= _serve.APIFY_MONTHLY_BUDGET_USD
 
 
+@_serialized_ledger
 def _accrue_apify_spend(cost):
     """Accrue an Apify actor run's real cost against the monthly budget.
     Best-effort like _accrue_spend: an accounting failure must never break the
@@ -992,6 +1013,7 @@ def _colab_budget_exceeded():
     return False
 
 
+@_serialized_ledger
 def _accrue_colab_units(units):
     """Accrue a run's compute units against the monthly budget. Best-effort
     like _accrue_spend: an accounting failure must never break the real run.
