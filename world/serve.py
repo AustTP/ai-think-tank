@@ -1002,6 +1002,21 @@ def init_db():
             price_per_m REAL NOT NULL,
             chosen_at REAL NOT NULL
         )''')
+        # Ordered alternates for each tier: when a band's selected model stops
+        # answering (delisted / no endpoints), a real call retries down this
+        # list immediately instead of waiting for the minute-scale re-pick
+        # loop. Filled from the same candidate pool as the pick; not verified
+        # up front, because an alternate is only tried after a real failure
+        # and a successful answer is its proof.
+        conn.execute('''CREATE TABLE IF NOT EXISTS model_tier_fallbacks (
+            band TEXT NOT NULL,
+            rank INTEGER NOT NULL,
+            slug TEXT NOT NULL,
+            name TEXT NOT NULL,
+            price_per_m REAL NOT NULL,
+            chosen_at REAL NOT NULL,
+            PRIMARY KEY (band, rank)
+        )''')
         # Daily tier price/score log: one row per (date, band) recording
         # which model the tier picked, its blended price, and the benchmark
         # score the pick was grounded on. model_tiers keeps only the CURRENT
@@ -1643,6 +1658,25 @@ async def _tier_refresh_logged(reason):
             print(f'[model-tiers] tier refresh changed picks, no admin/director to attribute to: {after}', flush=True)
     await _auto_failover_jev_if_gone(fresh, actor)
     return fresh, changed
+
+
+async def _model_tier_boot_backfill():
+    """One-shot, shortly after boot: if the fallback table is empty (first
+    boot after the feature shipped, or a DB restored from before it), run the
+    normal tier refresh so a band has alternates before its first availability
+    failure. No-op once populated; the scheduled loop owns later refreshes."""
+    await asyncio.sleep(5)
+    try:
+        with _db() as conn:
+            _ensure_tier_fallbacks_table(conn)
+            have = conn.execute(
+                'SELECT COUNT(*) FROM model_tier_fallbacks').fetchone()[0]
+        if not have:
+            print('[model-tiers] no tier fallbacks stored; refreshing once to '
+                  'backfill them', flush=True)
+            await _tier_refresh_logged('boot backfill: tier fallbacks missing')
+    except Exception as e:
+        print(f'[model-tiers] fallback backfill skipped: {e}', flush=True)
 
 
 async def _model_tier_refresh_loop():
@@ -4672,6 +4706,52 @@ def _model_tier_slug(band):
     return row[0] if row else None
 
 
+def _tier_fallback_slugs(model, limit=3):
+    """Alternates for whichever band currently selects `model`, in rank
+    order, deduped and excluding the model itself. Empty when the slug is not
+    a tier pick -- a spike's one-off model must never silently swap."""
+    if not model:
+        return []
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                'SELECT f.slug FROM model_tier_fallbacks f '
+                'JOIN model_tiers t ON t.band = f.band '
+                'WHERE t.slug = ? ORDER BY f.rank, f.slug', (model,)).fetchall()
+    except Exception:
+        return []
+    out = []
+    for (slug,) in rows:
+        if slug and slug != model and slug not in out:
+            out.append(slug)
+        if len(out) >= limit:
+            break
+    return out
+
+
+TIER_FALLBACK_MAX_DEPTH = 2
+
+
+def _try_tier_fallbacks(model, depth, call):
+    """Try each configured alternate for `model` in order. `call(slug)` does
+    the same request with a different model. Returns the first successful
+    result, or None so the original error still surfaces."""
+    for slug in _tier_fallback_slugs(model):
+        if is_model_circuit_broken(slug):
+            continue
+        try:
+            result = call(slug)
+        except Exception:
+            continue
+        print(f'[model-tiers] {model} unavailable; served the call with '
+              f'fallback {slug}', flush=True)
+        log_action(None, 'tier_model_fallback',
+                   {'from': model, 'to': slug, 'depth': depth},
+                   authorized=False)
+        return result
+    return None
+
+
 def _mid_tier_slug():
     # Pulled out as its own function specifically so a test can mock the
     # return value instead of writing into the real, shared model_tiers
@@ -5717,6 +5797,7 @@ async def _lifespan(app):
     backup_task = asyncio.create_task(_backup_loop())
     prune_task = asyncio.create_task(_log_prune_loop())
     tier_refresh_task = asyncio.create_task(_model_tier_refresh_loop())
+    tier_boot_backfill_task = asyncio.create_task(_model_tier_boot_backfill())
     tier_price_watch_task = asyncio.create_task(_tier_price_watch_loop())
     tier_failure_recheck_task = asyncio.create_task(_tier_failure_recheck_loop())
     calibration_task = asyncio.create_task(_calibration_loop())
@@ -5770,6 +5851,7 @@ async def _lifespan(app):
         colab_compute_task.cancel()
     prune_task.cancel()
     tier_refresh_task.cancel()
+    tier_boot_backfill_task.cancel()
     tier_price_watch_task.cancel()
     tier_failure_recheck_task.cancel()
     if telegram_task is not None:
@@ -8939,6 +9021,8 @@ def _openrouter_chat_post(body):
             # re-pick (see _queue_tier_recheck_if_availability); transient
             # errors are ignored there and owned by retry/circuit-breaker.
             _queue_tier_recheck_if_availability(body.get('model'), e.code, detail)
+            if any(marker in detail for marker in _AVAILABILITY_ERROR_MARKERS):
+                e.availability_failure = True
             raise
         body = dict(body)
         body['reasoning'] = {'max_tokens': max(1, (body.get('max_tokens') or 2048) // 2)}
@@ -8951,10 +9035,12 @@ def _openrouter_chat_post(body):
             except Exception:
                 pass
             _queue_tier_recheck_if_availability(body.get('model'), e2.code, detail2)
+            if any(marker in detail2 for marker in _AVAILABILITY_ERROR_MARKERS):
+                e2.availability_failure = True
             raise
 
 
-def _call_openrouter_once_sync(model, messages, max_tokens):
+def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0):
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if _api_key_is_broken('openrouter'):
@@ -8985,6 +9071,15 @@ def _call_openrouter_once_sync(model, messages, max_tokens):
         record_model_result(model, success=False)
         if e.code in (401, 403):
             _note_api_key_failure('openrouter', e.code)
+        if (getattr(e, 'availability_failure', False)
+                and _fallback_depth < TIER_FALLBACK_MAX_DEPTH):
+            fallback = _try_tier_fallbacks(
+                model, _fallback_depth,
+                lambda slug: _call_openrouter_once_sync(
+                    slug, messages, max_tokens,
+                    _fallback_depth=_fallback_depth + 1))
+            if fallback is not None:
+                return fallback
         raise
     except Exception:
         record_model_result(model, success=False)
@@ -9084,7 +9179,8 @@ def _call_openrouter_sync(model, messages, max_tokens, best_of=1):
     return samples
 
 
-def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choice=None):
+def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choice=None,
+                         _fallback_depth=0):
     """Lowest-level OpenRouter chat-completions POST, shared by the plain
     `_call_openrouter_sync` and the /api/intent/ask tool loop. `tools`,
     `max_tokens`, and `tool_choice` are optional; bodies only include what
@@ -9131,6 +9227,15 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
         record_model_result(model, success=False)
         if e.code in (401, 403):
             _note_api_key_failure('openrouter', e.code)
+        if (getattr(e, 'availability_failure', False)
+                and _fallback_depth < TIER_FALLBACK_MAX_DEPTH):
+            fallback = _try_tier_fallbacks(
+                model, _fallback_depth,
+                lambda slug: _post_openrouter_raw(
+                    slug, messages, tools, max_tokens, tool_choice,
+                    _fallback_depth=_fallback_depth + 1))
+            if fallback is not None:
+                return fallback
         raise
     except Exception:
         record_model_result(model, success=False)
@@ -10686,7 +10791,11 @@ def _decision_model_chain():
     multi-slug value makes _call_openrouter_decision_sync fall through to the
     next candidate when the active one fails or its circuit breaker is open.
     Never auto-updated -- adding a decision model is deliberate, exactly like
-    the model switch itself."""
+    the model switch itself. The per-band model_tier_fallbacks table does NOT
+    apply here: JEV is a decision engine with a choice protocol, and the
+    catalog holds no comparable decision model at its price point (2026-10-18);
+    the generic OpenRouter routers at the same sentinel price are not
+    substitutes."""
     chain = None
     saved = (_get_setting('jev_model') or '').strip()
     if saved:
@@ -12639,6 +12748,55 @@ def _sync_model_catalog(models):
     return len(gone)
 
 
+def _ensure_tier_fallbacks_table(conn):
+    """init_db() only runs in the __main__ path, not under uvicorn, so a
+    table added after the DB was first created must be ensured where it is
+    used."""
+    conn.execute('''CREATE TABLE IF NOT EXISTS model_tier_fallbacks (
+        band TEXT NOT NULL,
+        rank INTEGER NOT NULL,
+        slug TEXT NOT NULL,
+        name TEXT NOT NULL,
+        price_per_m REAL NOT NULL,
+        chosen_at REAL NOT NULL,
+        PRIMARY KEY (band, rank)
+    )''')
+
+
+def _tier_fallback_candidates(band, pool, scores, picked, limit=3):
+    """The next-best alternates for a band after `picked`: in-floor
+    qualifiers under the winning benchmark first (cheapest first), then the
+    cheapest remaining pool members. Excludes the pick; not live-verified."""
+    if not picked:
+        return []
+    seen = {picked['id']}
+    out = []
+    for m in _best_value_qualifiers_sync(pool, scores or {},
+                                         BAND_QUALITY_FLOOR_GAP.get(band)):
+        if m['id'] not in seen:
+            out.append(m)
+            seen.add(m['id'])
+        if len(out) >= limit:
+            break
+    if len(out) < limit:
+        # Quality-first fill for the capability bands: an unavailable planning
+        # or coding model must not degrade to the cheapest small model just
+        # because it was next by price. Cost bands keep price order, which is
+        # their whole purpose.
+        if scores and band in ('coding', 'high'):
+            rest = sorted(pool, key=lambda x: (-scores.get(x['id'], -1e9),
+                                               x['price'], x['id']))
+        else:
+            rest = sorted(pool, key=lambda x: (x['price'], x['id']))
+        for m in rest:
+            if m['id'] not in seen:
+                out.append(m)
+                seen.add(m['id'])
+            if len(out) >= limit:
+                break
+    return out
+
+
 async def refresh_model_tiers():
     models = await asyncio.to_thread(_fetch_openrouter_catalog_sync)
     _sync_model_catalog(models)
@@ -12646,6 +12804,7 @@ async def refresh_model_tiers():
     all_benchmark_rows = get_model_benchmark_scores()
     pools = _band_candidate_pools(models)
     chosen = {}
+    fallbacks = {}
     for band, purpose in MODEL_BAND_PURPOSE.items():
         pool = buckets.get(band, [])
 
@@ -12671,6 +12830,7 @@ async def refresh_model_tiers():
         # fallback-only model is never ranked against a primary-scored one.
         picked = None
         cheapest_qual = None
+        scores = {}
         for benchmark in BAND_BENCHMARK[band]:
             scores = {r['model_id']: r['score'] for r in all_benchmark_rows if r['benchmark'] == benchmark}
             picked = await _best_value_pick(candidate_pool, scores, BAND_QUALITY_FLOOR_GAP.get(band), band=band)
@@ -12717,6 +12877,8 @@ async def refresh_model_tiers():
         if picked is not None:
             _attach_latency_audit(picked, cheapest_qual)
         chosen[band] = picked
+        fallbacks[band] = _tier_fallback_candidates(
+            band, candidate_pool, scores if picked else {}, picked)
 
     # Vision is a separate axis entirely, not part of the low/mid/high cost
     # ladder -- it's gated on a real, catalog-verifiable capability
@@ -12763,12 +12925,20 @@ async def refresh_model_tiers():
         print('[model-tiers] no working vision-capable candidate found after fallback')
 
     with _db() as conn:
+        _ensure_tier_fallbacks_table(conn)
         for band, m in chosen.items():
             conn.execute(
                 'INSERT INTO model_tiers (band, slug, name, price_per_m, chosen_at) VALUES (?, ?, ?, ?, ?) '
                 'ON CONFLICT(band) DO UPDATE SET slug=excluded.slug, name=excluded.name, price_per_m=excluded.price_per_m, chosen_at=excluded.chosen_at',
                 (band, m['id'], m['name'], m['price'], time.time()),
             )
+            conn.execute('DELETE FROM model_tier_fallbacks WHERE band = ?', (band,))
+            for _rank, _fb in enumerate(fallbacks.get(band, []), 1):
+                conn.execute(
+                    'INSERT INTO model_tier_fallbacks (band, rank, slug, name, price_per_m, chosen_at) '
+                    'VALUES (?, ?, ?, ?, ?, ?)',
+                    (band, _rank, _fb['id'], _fb['name'], _fb['price'], time.time()),
+                )
             # Daily price/score log: look up the benchmark score the pick was
             # grounded on (first metric in the band's chain that has a score
             # for this model) and write today's row. Same-day re-runs update
