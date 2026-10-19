@@ -12,7 +12,10 @@ def cards(state):
     for task in (state.get('tasks') or {}).values():
         if task.get('boardClearedAt') or task.get('status') in ('done', 'cancelled', 'abandoned', 'walking', 'working'):
             continue
-        if not task.get('manualAttention') and not (task.get('_peerGate') or {}).get('escalated'):
+        if __import__('code_director').validation_progress(state, task):
+            continue
+        if not (task.get('manualAttention') or (task.get('_peerGate') or {}).get('escalated')
+                or task.get('status') == 'blocked' or task.get('blocked') or task.get('blockedReason')):
             continue
         evidence = ((task.get('reviewDiagnosis') or {}).get('failure') or task.get('failNote')
                     or task.get('note') or 'No detailed failure was recorded.')
@@ -62,15 +65,29 @@ def cards(state):
                        'Complete the repair stories and submit the corrected artifact for review.')
         result.append({'taskId': task['id'], 'title': task.get('title'), 'owner': task.get('assignedTo'),
             'category': category, 'evidence': evidence[:4000], 'findings': checks,
-            'recoveryOwner': recovery_owner, 'nextAction': next_action, 'needsHumanInput': True,
+            'recoveryOwner': recovery_owner,
+            'nextAction': (task.get('blockerRecommendation') or {}).get('reason') or next_action,
+            'needsHumanInput': (task.get('blockerRecommendation') or {}).get('action') in (None, 'wait_for_inputs'),
             'diagnosticsTaskId':task.get('lastReviewDiagnosticsTask'),
             'repairs':[{'id':r['id'],'owner':r.get('assignedTo'),'status':r.get('status'),'criteria':r.get('acceptanceCriteria')} for r in repairs[-6:]],
-            'recommendedAction': action, 'acceptanceCriteria': task.get('acceptanceCriteria'),
-            'actions': (['retry_review'] if failure_kind in ('invalid_response','service_unavailable') or task.get('blockedReason') == 'review_model_response' else []) + ['provide_inputs', 'clarify_scope', 'assign_repair', 'retry_infrastructure', 'cancel']})
+            'recommendedAction': (task.get('blockerRecommendation') or {}).get('action') or action,
+            'modelRecommendation': task.get('blockerRecommendation'), 'automation': task.get('blockerAutomation'),
+            'acceptanceCriteria': task.get('acceptanceCriteria'),
+            'actions': (['retry_review'] if failure_kind in ('invalid_response','service_unavailable') or task.get('blockedReason') == 'review_model_response' else []) + ['provide_inputs', 'clarify_scope', 'assign_repair', 'retry_infrastructure', 'investigate', 'wait_for_inputs', 'cancel']})
     return result
 
 
 def reconcile_notices(state):
+    import code_director
+    # Refresh this cheap progress label on every sim pass, even while the
+    # longer task-assignment loop is waiting for another operation.
+    for task in (state.get('tasks') or {}).values():
+        progress = code_director.validation_progress(state, task)
+        if progress:
+            task['deliveryState'], task['nextAction'] = progress
+        elif (task.get('status') == 'blocked' and task.get('blockedReason') == 'code_director_check'
+              and task.get('deliveryState') in ('validation_queued', 'validation_running')):
+            task.update(deliveryState='blocked', nextAction='Inspect the failed or missing code director check.')
     open_cards = {c['taskId']: c for c in cards(state)}
     inbox = state.setdefault('playerInbox', [])
     for message in inbox:
@@ -96,7 +113,7 @@ def apply_action(serve, tid, body):
     if not isinstance(body, dict):
         raise ValueError('Expected a JSON object.')
     action = body.get('action')
-    if action not in ('retry_review', 'provide_inputs', 'clarify_scope', 'assign_repair', 'retry_infrastructure', 'cancel'):
+    if action not in ('retry_review', 'provide_inputs', 'clarify_scope', 'assign_repair', 'retry_infrastructure', 'investigate', 'wait_for_inputs', 'cancel'):
         raise ValueError('Choose a supported decision.')
     guidance = body.get('guidance') or ''
     criteria = body.get('acceptanceCriteria') or ''
@@ -119,12 +136,38 @@ def apply_action(serve, tid, body):
         task = (state.get('tasks') or {}).get(tid)
         if not task or tid not in {c['taskId'] for c in cards(state)}:
             raise ValueError('This task is no longer awaiting a decision.')
+        if body.get('decisionSource') == 'model-automation':
+            import approval_automation
+            card = next(c for c in cards(state) if c['taskId'] == tid)
+            if not approval_automation.settings(serve)['autoResolveBlockers']:
+                raise ValueError('Automatic blocker decisions are disabled.')
+            if approval_automation.fingerprint(card) != body.get('expectedFingerprint'):
+                raise ValueError('Blocker evidence changed while the model was deciding; request a new recommendation.')
+            approval_automation.validate_recommendation(body.get('recommendation'), card)
+            if body['recommendation']['action'] != action:
+                raise ValueError('Decision must match the reviewed recommendation.')
+            if (body['recommendation'].get('review') or {}).get('approved') is not True:
+                raise ValueError('The recommendation has not passed review.')
+            task['blockerRecommendation'] = body['recommendation']
+            task['blockerAutomation'].update(status='waiting_for_inputs' if action == 'wait_for_inputs' else 'applied')
         old_gate = dict(task.get('_peerGate') or {})
         task.setdefault('decisionHistory', []).append({'action': action, 'at': int(time.time()*1000),
-            'guidance': guidance, 'previousGate': old_gate})
+            'guidance': guidance, 'previousGate': old_gate,
+            'source': body.get('decisionSource') or 'player', 'recommendation': body.get('recommendation')})
         state['workQueue'] = [q for q in state.get('workQueue') or [] if q.get('reviewOf') != tid
                              and not (task.get('tradingStage') and q.get('tradingStage') == task['tradingStage'])]
-        if action == 'retry_review':
+        if action == 'wait_for_inputs':
+            if __import__('approval_automation').settings(serve)['preset'] == 'always' and task.get('failureCategory') != 'budget':
+                task['missingInputs'] = (body.get('recommendation') or {}).get('missingInputs', [])
+                review_guidance.apply_guidance(state, tid, {'action': 'research', 'guidance':
+                    guidance + '\nContinue investigating lawful sources for the missing inputs and work that can proceed '
+                    'within the original contract and remaining budget. Never invent credentials, permissions, '
+                    'data or successful results. Record unavailable inputs precisely and recheck availability.'})
+            else:
+                task.update(manualAttention=True, note=guidance or task.get('note'))
+        elif action == 'investigate':
+            review_guidance.apply_guidance(state, tid, {'action': 'research', 'guidance': guidance})
+        elif action == 'retry_review':
             if task.get('reviewFailureKind') not in ('invalid_response','service_unavailable') and task.get('blockedReason') != 'review_model_response':
                 raise ValueError('Retry review is only for a failed review request or invalid response; repair deliverable failures first.')
             gate = task.get('_peerGate') or {}
@@ -165,6 +208,10 @@ def apply_action(serve, tid, body):
                 'action': 'edit_scope' if action == 'clarify_scope' else 'provide_inputs' if action == 'provide_inputs' else 'retry',
                 'guidance': guidance or task.get('failNote') or 'Address the recorded reviewer findings.',
                 'acceptanceCriteria': criteria, 'taskType': body.get('taskType') or task.get('taskType') or 'research'})
+        if action != 'wait_for_inputs':
+            task['blocked'] = False
+            if not (task.get('_codeDirectorPending') and task.get('blockedReason') == 'code_director_check'):
+                task['blockedReason'] = None
         reconcile_notices(state)
         serve.save_state_to_db(state)
         if hasattr(serve, '_load_escalations'):
@@ -172,9 +219,10 @@ def apply_action(serve, tid, body):
             for escalation in escalations.values():
                 if escalation.get('kind') == 'stuck review loop' and escalation.get('status') == 'pending' \
                         and review_guidance.escalation_task_id(escalation, state) == tid:
-                    escalation.update(status='guided', resolvedBy='player', guidanceAction=action, resolvedAt=time.time())
+                    escalation.update(status='guided', resolvedBy=body.get('decisionSource') or 'player', guidanceAction=action, resolvedAt=time.time())
             serve._save_escalations(escalations)
-        serve.log_action('player', 'blocker_decision', {'taskId': tid, 'action': action}, authorized=True)
+        serve.log_action('player', 'blocker_decision', {'taskId': tid, 'action': action,
+            'source': body.get('decisionSource') or 'player'}, authorized=True)
         return {'ok': True, 'taskId': tid, 'action': action}
 
 
@@ -219,47 +267,9 @@ def router_for(serve):
 
 
 def complete_with_exceptions(serve, task_id, reason):
-    import copy
-    import story_tracking
-    import sim
-    if not isinstance(reason, str) or not reason.strip() or len(reason) > 4000:
-        raise ValueError('Explain which failed requirements you accept (maximum 4000 characters).')
-    with serve._STATE_UPDATE_LOCK:
-        state = serve.get_state_from_db() or {}
-        task = (state.get('tasks') or {}).get(task_id)
-        if not task or any(task.get(k) for k in story_tracking.LINKS):
-            raise ValueError('Choose an original story, rather than its subtask or review.')
-        if task.get('status') == 'done' and task.get('playerAcceptance'):
-            return {'ok': True, 'taskId': task_id, 'alreadyAccepted': True}
-        if task.get('status') not in ('blocked', 'failed', 'needs_review', 'repairing') or not (task.get('manualAttention') or (task.get('_peerGate') or {}).get('escalated') or task.get('status') in ('blocked','failed')):
-            raise ValueError('Only blocked or failed stories can be completed with exceptions.')
-        now = int(time.time()*1000)
-        task['playerAcceptance'] = {'at':now, 'by':'player', 'reason':reason.strip(),
-            'failedFindings':copy.deepcopy(task.get('peerReviews') or []),
-            'diagnosis':copy.deepcopy(task.get('reviewDiagnosis')),
-            'previousGate':copy.deepcopy(task.get('_peerGate')), 'failure':task.get('failNote'),
-            'qualityStatus':'accepted_with_exceptions', 'tradingAuthorized':False}
-        children = [t for t in state.get('tasks', {}).values() if t['id'] != task_id and story_tracking.root(state,t).get('id') == task_id]
-        ids = {t['id'] for t in children} | {task_id}
-        state['workQueue'] = [q for q in state.get('workQueue',[]) if not any(q.get(k) in ids for k in story_tracking.LINKS)]
-        for child in children:
-            if child.get('status') not in ('done','cancelled','abandoned'):
-                child.update(status='cancelled', cancelledAt=now, note='Parent story accepted by player with recorded exceptions.')
-            agent = state.get('agents',{}).get(child.get('assignedTo'))
-            if agent and agent.get('task') == child['id']:
-                if child.get('pairWith'):
-                    sim._release_pair_navigator(state, child['pairWith'], child['id'])
-                agent.update(task=None, busy=False, inRoom=None, path=None, offDuty=True, visible=False)
-        task.update(status='done', completedAt=now, manualAttention=False,
-                    blockedReason=None, deliveryState='accepted_with_exceptions',
-                    nextAction='Completed by the player with recorded exceptions.')
-        task.pop('_peerRepairPending', None)
-        task['_peerGate'] = dict(task.get('_peerGate') or {})
-        task['_peerGate']['escalated'] = True
-        reconcile_notices(state)
-        serve.save_state_to_db(state)
-        serve.log_action('player','story_accepted_with_exceptions', {'taskId':task_id,'reason':reason.strip()}, authorized=True)
-        return {'ok':True,'taskId':task_id,'status':'done','qualityStatus':'accepted_with_exceptions','tradingAuthorized':False}
+    """Compatibility endpoint: known failures cannot be accepted as complete."""
+    raise ValueError('Completion with exceptions is disabled. Meet every acceptance criterion, '
+                     'pass quality checks, and obtain independent review before completing this story.')
 
 
 def submit_artifact(serve, task_id, library_path):

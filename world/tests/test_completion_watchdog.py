@@ -21,6 +21,51 @@ def seed(status='recovery_planned'):
 
 
 class CompletionWatchdog(unittest.TestCase):
+    def test_failed_parent_with_running_repair_has_current_repairing_status(self):
+        state = seed('failed')
+        parent = state['tasks']['p']
+        parent.update(_peerRepairPending=True, failNote='Original reviewer found missing report.')
+        state['tasks']['fix'] = {'id': 'fix', 'reviewOf': 'p', 'taskType': 'code', 'status': 'working'}
+        watchdog.step(state, 100000)
+        self.assertEqual(parent['status'], 'repairing')
+        self.assertEqual(parent['deliveryState'], 'actively_working')
+        self.assertEqual(parent['failNote'], 'Original reviewer found missing report.')
+        self.assertNotEqual(parent['status'], 'done')
+
+    def test_active_repair_does_not_hide_manual_or_budget_stop(self):
+        for flag in ('manualAttention', 'budgetExhausted'):
+            state = seed('failed')
+            state['tasks']['p'].update(_peerRepairPending=True, **{flag: True})
+            state['tasks']['fix'] = {'id': 'fix', 'reviewOf': 'p', 'taskType': 'code', 'status': 'working'}
+            watchdog.step(state, 100000)
+            self.assertNotEqual(state['tasks']['p']['status'], 'repairing')
+
+    def test_other_presets_ignore_stale_budget_only_flag(self):
+        for preset in ('moderation', 'strict'):
+            state = seed('repairing')
+            state['completionControl'] = {'budgetOnlyStops': True, 'approvalPreset': preset}
+            state['tasks']['p']['completionRecovery'] = {'attempts': 10}
+            watchdog.step(state, 100000)
+            self.assertEqual(state['tasks']['p']['status'], 'blocked')
+            self.assertFalse(state['workQueue'])
+
+    def test_budget_only_mode_continues_past_recovery_count_with_bounded_backoff(self):
+        state = seed('repairing')
+        state['completionControl'] = {'budgetOnlyStops': True, 'approvalPreset': 'always'}
+        state['tasks']['p']['completionRecovery'] = {'attempts': 10000}
+        watchdog.step(state, 100000)
+        self.assertTrue(state['workQueue'])
+        self.assertEqual(state['tasks']['p']['status'], 'repairing')
+        self.assertLessEqual(state['tasks']['p']['completionRecovery']['nextAttemptAt'], 100000 + 900000)
+
+    def test_budget_only_mode_still_stops_at_budget_limit(self):
+        state = seed('repairing')
+        state['completionControl'] = {'budgetOnlyStops': True, 'approvalPreset': 'always'}
+        state['tasks']['p']['budgetExhausted'] = True
+        watchdog.step(state, 100000)
+        self.assertEqual(state['tasks']['p']['status'], 'blocked')
+        self.assertFalse(state['workQueue'])
+
     def test_completed_investigation_repair_closes_only_investigation(self):
         state = seed('needs_review')
         state['tasks'].update({

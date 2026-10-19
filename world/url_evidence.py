@@ -1,5 +1,4 @@
 """Track discovered URLs without allowing models to invent citation paths."""
-import json
 import re
 from urllib.parse import urlsplit
 
@@ -10,9 +9,26 @@ class DiscoveredURLs:
         self.observe(initial)
 
     def observe(self, value):
-        text = value if isinstance(value, str) else json.dumps(value)
+        if isinstance(value, dict):
+            for item in value.values():
+                self.observe(item)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                self.observe(item)
+            return
+        if not isinstance(value, str):
+            return
+        text = value
         for url in re.findall(r'https?://[^\s<>"\x60]+', text):
-            url = url.rstrip(').,;\'')
+            # Search output renders "Title (URL): snippet". The punctuation
+            # belongs to the citation, not the URL. Preserve balanced path
+            # parentheses, e.g. an article named Function_(mathematics).
+            if url.endswith('):'):
+                url = url[:-1]
+            url = url.rstrip('.,;\'')
+            while url.endswith(')') and url.count(')') > url.count('('):
+                url = url[:-1]
             if self.valid(url):
                 self.urls.add(url.rstrip('/'))
 

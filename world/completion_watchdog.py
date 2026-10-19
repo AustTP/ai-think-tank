@@ -5,6 +5,10 @@ ACTIVE = ('walking', 'working', 'needs_review')
 TERMINAL = ('done', 'cancelled', 'abandoned')
 
 
+def budget_only_stops(control):
+    return control.get('approvalPreset') == 'always' and control.get('budgetOnlyStops') is True
+
+
 def related(state, task):
     tid = task['id']
     children = [t for t in (state.get('tasks') or {}).values()
@@ -38,6 +42,13 @@ def step(state, now_ms=None):
             continue
         children, queued = related(state, task)
         active = [t for t in children if t.get('status') in ACTIVE]
+        repair_running = any(t.get('taskType') not in ('review', 'qa')
+                             and t.get('status') in ('walking', 'working') for t in children)
+        repair_queued = any(q.get('taskType') not in ('review', 'qa') for q in queued)
+        if (status == 'failed' and task.get('_peerRepairPending') and (repair_running or repair_queued)
+                and not task.get('manualAttention') and not task.get('budgetExhausted')
+                and not (task.get('_peerGate') or {}).get('escalated')):
+            task['status'] = status = 'repairing'
         if task.get('investigationOf') and status in ('repairing', 'investigating') and not active and not queued:
             completed_repairs = [t for t in children if (t.get('reviewOf') == task['id'] or t.get('investigationOf') == task['id'])
                                  and t.get('status') == 'done' and t.get('libraryPath')
@@ -62,6 +73,10 @@ def step(state, now_ms=None):
         stamp = repr(signature)
         if task.get('_completionSignature') != stamp:
             task.update(_completionSignature=stamp, lastProgressAt=now)
+        validation = __import__('code_director').validation_progress(state, task)
+        if validation:
+            task['deliveryState'], task['nextAction'] = validation
+            continue
         frozen = task.get('manualAttention') or (task.get('_peerGate') or {}).get('escalated') or status == 'blocked'
         task['deliveryState'] = ('blocked' if frozen else 'awaiting_review' if status == 'needs_review'
                                  else 'actively_working' if status in ('walking','working') or active
@@ -81,7 +96,7 @@ def step(state, now_ms=None):
         if task.get('budgetExhausted') or any(t.get('budgetExhausted') for t in children):
             block(task, 'Recovery needs a budget decision; automatic retries cannot increase the task budget.')
             continue
-        if record['attempts'] >= control['maxRecoveryAttempts']:
+        if record['attempts'] >= control['maxRecoveryAttempts'] and not budget_only_stops(control):
             block(task, 'Automatic recovery made no completion after the retry limit. Inspect evidence, supply inputs, change owner or split the story.')
             continue
         if record.get('nextAttemptAt', 0) > now or recovered >= control['maxRecoveriesPerTick']:
@@ -89,7 +104,7 @@ def step(state, now_ms=None):
             continue
         kind = task.get('reviewFailureKind')
         failure = str(task.get('failNote') or '').lower()
-        if kind == 'missing_inputs' or any(w in failure for w in ('credentials', 'not configured', 'missing human decision')):
+        if (kind == 'missing_inputs' or any(w in failure for w in ('credentials', 'not configured', 'missing human decision'))) and not budget_only_stops(control):
             block(task, 'Supply the missing inputs before this story can continue. ' + str(task.get('failNote') or ''))
             continue
         if status == 'investigating':
@@ -103,7 +118,7 @@ def step(state, now_ms=None):
                 recovery_staffing.step(state)
                 if not related(state, task)[1]:
                     block(task, 'Assign an available recovery owner and worker to investigate this story.')
-                record.update(attempts=record['attempts'] + 1, nextAttemptAt=now + control['retryBaseMs'] * 2 ** record['attempts'])
+                record.update(attempts=record['attempts'] + 1, nextAttemptAt=now + min(900000, control['retryBaseMs'] * 2 ** min(record['attempts'], 6)))
                 recovered += 1
                 continue
         owner = task.get('originalAssignedTo') or task.get('assignedTo')
@@ -115,7 +130,7 @@ def step(state, now_ms=None):
             task['_peerGate'] = {'escalated': False}
         if kind in ('invalid_response', 'service_unavailable') or 'review validation failed' in failure:
             gate = task.setdefault('_peerGate', {})
-            if gate.get('formatFailures', 0) >= 3:
+            if gate.get('formatFailures', 0) >= 3 and not budget_only_stops(control):
                 block(task, 'Review response formatting failed three times. Fix the review service and explicitly retry review; another investigation is not new validation evidence.')
                 continue
             gate.update(formatFailures=0, serviceFailures=0, inputFailures=0)
@@ -128,7 +143,7 @@ def step(state, now_ms=None):
             sim._queue_peer_repair(state, task, rationale)
             task['status'] = 'repairing'
         children, queued = related(state, task)
-        delay = control['retryBaseMs'] * 2 ** record['attempts']
+        delay = min(900000, control['retryBaseMs'] * 2 ** min(record['attempts'], 6))
         for item in queued:
             item['notBefore'] = max(item.get('notBefore') or 0, now + delay)
             item['taskMasterWork'] = True
@@ -143,6 +158,17 @@ def step(state, now_ms=None):
 
 def can_start(state, item):
     """Recovery/review can finish admitted stories even when the WIP cap is full."""
+    parent = __import__('story_tracking').root(state, item)
+    cap = parent.get('budgetUsd')
+    if parent.get('budgetExhausted') or (isinstance(cap, (int, float)) and cap > 0
+            and float(parent.get('storySpendUsd') or 0) >= cap):
+        return False
+    request_id = parent.get('requestId') or parent.get('workOrderId')
+    request = next((r for r in state.get('backlogRequests', []) if r.get('id') == request_id), {})
+    request_cap = request.get('requestBudgetUsd')
+    used = (state.get('storyCostTracking') or {}).get('requests', {}).get(request_id, {}).get('used', 0)
+    if request_cap is not None and used >= request_cap:
+        return False
     if item.get('reviewOf') or item.get('investigationOf'):
         return True
     if not (state.get('completionControl') or {}).get('enabled'):

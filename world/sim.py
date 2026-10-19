@@ -1263,6 +1263,13 @@ def _drain_emails_from_db():
                     for sid, record in (state.get('sprints') or {}).items():
                         if sid in (fresh.get('sprints') or {}) and record.get('resultsEmail'):
                             fresh['sprints'][sid]['resultsEmail'] = record['resultsEmail']
+                    for entry in original_outbox:
+                        tid = entry.get('completionTaskId')
+                        receipt = ((state.get('tasks') or {}).get(tid) or {}).get('completionWriteup') or {}
+                        target = (fresh.get('tasks') or {}).get(tid)
+                        if target is not None and receipt:
+                            target.setdefault('completionWriteup', {}).update({
+                                key: receipt[key] for key in ('emailStatus', 'attempts', 'sentAt') if key in receipt})
                     serve.save_state_to_db(fresh)
         except Exception as e:  # pragma: no cover
             print(f'[sim] email drain save failed: {e}')
@@ -1651,6 +1658,14 @@ _content_results_lock = threading.Lock()
 
 
 def _store_content_result(task_id, result):
+    research = getattr(threading.current_thread(), 'researchArchiveTask', None)
+    if research and research.get('id') == task_id:
+        try:
+            result = __import__('content').archive_research_result(
+                research, research.get('assignedTo'), result)
+        except Exception as error:
+            result = {**result, 'ok': False, 'reviewFailureKind': 'service_unavailable',
+                      'note': str(result.get('note') or '') + ' Research archive failed: ' + str(error)}
     __import__('training_capture').event('content_result', task_id, result)
     with _content_results_lock:
         worker = _content_workers.get(task_id)
@@ -1871,9 +1886,11 @@ def _apply_content_result(state, task, result, now_ms=None):
         if parent_contract_task is not None and not parent_contract_task.get('reviewContract'):
             parent_contract_task['reviewContract'] = result['reviewContract']
     note = result.get('note')
-    for field in ('reviewDiagnostics', 'reviewFailureKind', 'reviewContract'):
+    for field in ('reviewDiagnostics', 'reviewFailureKind', 'reviewContract', 'stagedWorkspace', 'previousWorkspace', 'resumedFromWorkspace'):
         if result.get(field) is not None:
             task[field] = result[field]
+    if result.get('stagedWorkspace') and result.get('ok') is False:
+        __import__('story_tracking').root(state, task)['lastFailedWorkspace'] = result['stagedWorkspace']
     task['contentFinishedAt'] = now_ms
     if result.get('tradingAcceptance') is not None:
         task['tradingAcceptance'] = result['tradingAcceptance']
@@ -1961,7 +1978,9 @@ def _apply_content_result(state, task, result, now_ms=None):
     # _queue_player_email directly; this runs inside the tick's real
     # read-modify-write, where state is actually the live, mutable object.
     notify = result.get('notifyPlayer')
-    if notify and notify.get('kind') and notify.get('subject') and notify.get('body'):
+    if (notify and notify.get('kind') and notify.get('subject') and notify.get('body')
+            and not (notify.get('kind') in ('spike_done', 'story_done')
+                     and __import__('completion_reporting').is_repair_task(task))):
         _queue_player_email(state, notify['kind'], notify['subject'], notify['body'])
     # Peer-approval gate (Phase E addendum): when the completing task is a
     # review subtask carrying a `reviewOf` pointer, fold its Jev verdict into
@@ -1977,6 +1996,25 @@ def _apply_content_result(state, task, result, now_ms=None):
             verdict = result.get('peerVerdict')
             reviewer = task.get('assignedTo')
             gate = parent['_peerGate']
+            if (task.get('taskType') in ('review', 'qa') and task.get('createdAt')
+                    and task['createdAt'] < (gate.get('enteredMs') or 0)):
+                return  # An older artifact's result cannot change this gate.
+            if verdict == 'clean' and gate.get('approvals', 0) and gate.get('acceptanceVerified') is not True:
+                gate.update(approvals=0, approvers=[])
+            if verdict == 'clean':
+                approval_errors = __import__('review_quality').clean_vote_errors(result)
+                if approval_errors:
+                    gate['approvals'] = 0
+                    gate['approvers'] = []
+                    gate['acceptanceVerified'] = False
+                    if __import__('review_quality').known_failure(result):
+                        verdict = 'actionable'
+                        result = {**result, 'peerVerdict': verdict,
+                                  'note': 'Approval refused: ' + '; '.join(approval_errors)}
+                    else:
+                        result = {**result, 'reviewFormatError': True, 'reviewFailureKind': 'invalid_response',
+                                  'note': 'Approval refused: ' + '; '.join(approval_errors)}
+                        verdict = None
             if result.get('reviewFormatError'):
                 kind = result.get('reviewFailureKind') or 'invalid_response'
                 parent['reviewFailureKind'] = kind
@@ -2009,9 +2047,6 @@ def _apply_content_result(state, task, result, now_ms=None):
             if verdict in ('clean', 'actionable'):
                 parent.pop('reviewFailureKind', None)
                 gate.update(formatFailures=0, serviceFailures=0, inputFailures=0)
-            if (task.get('taskType') in ('review', 'qa') and task.get('createdAt')
-                    and task['createdAt'] < (gate.get('enteredMs') or 0)):
-                return  # vote belongs to the previous artifact, before its repair
             # Item 6: fold the reviewer's structured verdict onto the parent so
             # the author and player see WHY the vote went the way it did, not
             # just the binary -- the summary, the checks actually verified, and
@@ -2025,6 +2060,7 @@ def _apply_content_result(state, task, result, now_ms=None):
                     'checks': list(result.get('peerChecks') or []),
                     'risks': list(result.get('peerRisks') or []),
                     'repairStories': list(result.get('peerRepairStories') or []),
+                    'acceptanceAssessment': result.get('acceptanceAssessment'),
                     'atMs': now_ms,
                 })
             if verdict == 'actionable':
@@ -2067,6 +2103,7 @@ def _apply_content_result(state, task, result, now_ms=None):
                         gate['approvers'] = []
                         _sim_notify_author(state, parent, reviewer, rationale=task.get('note'))
                 elif reviewer and reviewer not in gate['approvers']:
+                    gate['acceptanceVerified'] = True
                     gate['approvers'].append(reviewer)
                     gate['approvals'] += 1
 
@@ -2225,19 +2262,26 @@ def _recover_content_after_restart(state):
     global _restart_recovery_done
     if _restart_recovery_done or not _content_executor:
         return []
-    _restart_recovery_done = True
     resumed = []
+    pending = False
     for task in (state.get('tasks') or {}).values():
         agent_id = task.get('assignedTo')
         agent = (state.get('agents') or {}).get(agent_id) or {}
         if task.get('status') != 'working' or not task.get('_contentInFlight'):
             continue
+        with _content_results_lock:
+            if task.get('id') in _content_workers or task.get('id') in _content_results:
+                continue
         if agent.get('task') != task.get('id') or not agent.get('busy'):
+            pending = True
             continue
         task['resumedAt'] = int(time.time()*1000)
         task['resumeCount'] = task.get('resumeCount',0) + 1
         if _dispatch_content_work(_content_executor,state,agent_id,task,time.time()):
             resumed.append(task['id'])
+        else:
+            pending = True
+    _restart_recovery_done = not pending
     return resumed
 
 
@@ -2302,11 +2346,15 @@ def _dispatch_content_work(executor, state, agent_id, task, now):
 
         finally:
             with _content_results_lock:
-                if not getattr(worker, 'resultProduced', False) and task_id not in _content_results:
-                    _content_results[task_id] = {'ok': False, 'note': 'Worker exited without a completion result.'}
+                missing_result = not getattr(worker, 'resultProduced', False) and task_id not in _content_results
+            if missing_result:
+                _store_content_result(task_id, {'ok': False, 'note': 'Worker exited without a completion result.'})
+            with _content_results_lock:
                 _content_workers.pop(task_id, None)
 
     worker = threading.Thread(target=_run, daemon=True)
+    if task.get('taskType') in ('research', 'spike') or task.get('research'):
+        worker.researchArchiveTask = dict(task, assignedTo=agent_id)
     with _content_results_lock:
         _content_workers[task_id] = worker
     worker.start()
@@ -2392,6 +2440,7 @@ def queue_work(state, items):
             'workOrderStoryId': item.get('workOrderStoryId'),
             'investigationOf': item.get('investigationOf'),
             'reviewContract': item.get('reviewContract'),
+            'sourceEvidencePaths': item.get('sourceEvidencePaths'),
             'pair': bool(item.get('pair')),
             'notBefore': item.get('notBefore') or None,
             'priority': normalize_priority(item.get('priority')),
@@ -4028,7 +4077,8 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'workOrderId': (extra or {}).get('workOrderId'),
         'workOrderStoryId': (extra or {}).get('workOrderStoryId'),
         'investigationOf': (extra or {}).get('investigationOf'),
-        'codeWorkspaceVersion': 1,
+        'sourceEvidencePaths': (extra or {}).get('sourceEvidencePaths'),
+        'codeWorkspaceVersion': 2,
         'taskMasterWork': bool((extra or {}).get('taskMasterWork')),
         'pipelineStep': (extra or {}).get('pipelineStep'),
         # Bot Ops / shadow mode: a dry-run task (see queue_work). Stamped so the
@@ -4277,6 +4327,7 @@ def finish_task(state, agent_id, grid=None):
     if task:
         task['status'] = 'done'
         task['completedAt'] = int(time.time() * 1000)
+        __import__('completion_reporting').queue(state, task)
         # A landed task satisfies any dependency-block keyed on it: queue the
         # SM's auto-unblock so the cards that were waiting on this work free up.
         _auto_clear_dependency_blocks(state, task.get('id'),
@@ -5475,7 +5526,7 @@ def _sim_notify_author(state, parent, reviewer_id, rationale=None):
             'review_denial', int(time.time() * 1000),
             f"Peer review of '{parent.get('title')}' was sent back for a fix. "
             f"What the reviewer said: {(rationale or '')[:400]}. Address this on "
-            f"your next pass.", repeat=True)
+            f"your next pass.", repeat=True, source_task_id=parent.get('id'))
     # Item 2: the rejection itself lands in the author's feedback buffer, so the
     # NEXT dispatch's perception block shows what came back at them (same W6
     # intent -- coaching that changes the next execution -- but visible in the
@@ -5545,6 +5596,7 @@ def _queue_peer_repair(state, parent, rationale=None):
         'productId': parent.get('productId'), 'userStory': parent.get('userStory'),
         'acceptanceCriteria': parent.get('acceptanceCriteria'), 'teamId': parent.get('teamId'),
         'reviewContract':stable_contract,
+        'sourceEvidencePaths': parent.get('sourceEvidencePaths'),
         'budgetUsd': parent.get('budgetUsd'), 'priority': 'high',
     }])
 
@@ -5615,7 +5667,7 @@ def _send_back_after_failure(state, task, fail_note=None):
             'pipeline_feedback', int(time.time() * 1000),
             f"Your deliverable '{task.get('title')}' failed the quality pipeline. "
             f"What failed: {(note or '')[:400]}. Address this on your next pass.",
-            repeat=True)
+            repeat=True, source_task_id=task.get('id'))
     if not task.get('_peerGate'):
         # Seed a real (empty) gate: _resolve_review_parent requires a truthy
         # _peerGate to resolve a later fix's completion, and the cycle cap needs
@@ -5645,7 +5697,9 @@ def _send_back_after_failure(state, task, fail_note=None):
         'instructions': instructions,
         'goal': task.get('projectLabel') or task.get('goal'),
         'projectLabel': task.get('projectLabel') or task.get('title'),
-        'taskType': 'code',
+        'taskType': task.get('taskType') or 'code',
+        'sourceEvidencePaths': task.get('sourceEvidencePaths'),
+        'reviewContract': task.get('reviewContract'),
         'reviewOf': task.get('id'),
         'reviewAuthorId': author,
         'assignedTo': author,
@@ -5660,6 +5714,8 @@ def _peer_gate_should_close(gate, now_ms, entered_ms):
     """Close rule: two distinct clean approvals, OR -- after the review-timeout
     window has elapsed -- a single clean approval. Guards against a small think tank
     deadlocking on a second unreachable approver."""
+    if gate.get('acceptanceVerified') is not True or gate.get('escalated'):
+        return False
     if gate['approvals'] >= 2:
         return True
     if gate['approvals'] >= 1 and entered_ms and (now_ms - entered_ms) >= PEER_REVIEW_TIMEOUT_MS:
@@ -5903,6 +5959,9 @@ def _close_gated_story(state, parent):
     direct status flip + log rather than finish_task, which needs a working
     agent. Returns True on close."""
     review_counts = parent.get('_peerGate') or {}
+    if (not _peer_gate_should_close(review_counts, int(time.time() * 1000), review_counts.get('enteredMs'))
+            or parent.get('_peerRepairPending') or parent.get('manualAttention')):
+        return False
     review_counts['closed'] = True
     parent['status'] = 'done'
     parent['completedAt'] = int(time.time() * 1000)
@@ -5922,9 +5981,7 @@ def _close_gated_story(state, parent):
     # player was asking about -- called directly (not via the notifyPlayer
     # indirection content executors need) since this already runs inside the
     # tick's real read-modify-write with live, mutable `state` in hand.
-    title = parent.get('title') or parent.get('projectLabel') or 'a story'
-    _queue_player_email(state, 'story_done', f'[AI Think Tank] Shipped: {title[:80]}',
-                        f'"{title}" just landed after {review_counts.get("approvals", 0)} peer approval(s).')
+    __import__('completion_reporting').queue(state, parent)
     return True
 
 
@@ -5935,9 +5992,15 @@ def _parent_close_from_vote(state, parent, now_ms):
     gate = parent.get('_peerGate')
     if not gate:
         return False
+    if gate.get('escalated') or parent.get('manualAttention') or parent.get('_peerRepairPending'):
+        return False
+    if gate.get('approvals', 0) and gate.get('acceptanceVerified') is not True:
+        gate.update(approvals=0, approvers=[])
+        parent['note'] = 'Previous approvals lack acceptance evidence; independent review requested.'
+        _reenter_gate_review(state, parent, gate.get('reviewerIds') or [])
+        return False
     if _peer_gate_should_close(gate, now_ms, gate.get('enteredMs')):
-        _close_gated_story(state, parent)
-        return True
+        return _close_gated_story(state, parent)
     return False
 
 
@@ -7608,7 +7671,8 @@ def _drain_email_outbox_sync(state):
     reply when the player texted in first). Clears the outbox regardless so
     a permanent SMTP/Telegram failure doesn't wedge the queue. Calls into
     serve lazily (side-effect), returns a list of (kind, emailOk, telegramOk)
-    results. Pure callers never hit the network."""
+    results. Completion write-ups remain queued after email failures, with
+    bounded backoff. Pure callers never hit the network."""
     outbox = state.get('emailOutbox') or []
     if not outbox:
         return []
@@ -7618,9 +7682,13 @@ def _drain_email_outbox_sync(state):
         from serve import send_player_email_sync, send_player_telegram_sync
     except Exception as e:  # pragma: no cover - import failure only
         print(f'[email] drain unavailable: {e}')
-        state['emailOutbox'] = []
         return [('import', False, False)]
     for entry in list(outbox):
+        completion_task = (state.get('tasks') or {}).get(entry.get('completionTaskId'))
+        if __import__('completion_reporting').is_repair_task(completion_task):
+            completion_task.setdefault('completionWriteup', {})['emailStatus'] = 'suppressed'
+            results.append((entry.get('kind'), False, False))
+            continue
         if entry.get('nextAttemptAt', 0) > int(time.time() * 1000):
             retained.append(entry)
             continue
@@ -7636,6 +7704,17 @@ def _drain_email_outbox_sync(state):
             telegram_ok = False
             print(f'[telegram] player push raised: {e}')
         results.append((entry.get('kind'), bool(email_ok), bool(telegram_ok)))
+        completion = (state.get('tasks') or {}).get(entry.get('completionTaskId'))
+        if completion is not None:
+            now_ms = int(time.time()*1000)
+            attempts = int(entry.get('attempts') or 0) + 1
+            writeup = completion.setdefault('completionWriteup', {})
+            writeup.update(emailStatus='sent' if email_ok else 'retrying', attempts=attempts)
+            if email_ok:
+                writeup['sentAt'] = now_ms
+            else:
+                entry.update(attempts=attempts, nextAttemptAt=now_ms + min(900000, 60000 * 2 ** min(attempts-1, 4)))
+                retained.append(entry)
         sid = entry.get('sprintId')
         record = (state.get('sprints') or {}).get(sid)
         if record:
@@ -9694,7 +9773,7 @@ def _runbook_task(state, task, now_ms):
         del rb[:-RUNBOOK_MAX_ENTRIES_PER_PRODUCT]
 
 
-def _write_growth_plan(state, agent_id, room, kind, now_ms, note, repeat=False):
+def _write_growth_plan(state, agent_id, room, kind, now_ms, note, repeat=False, source_task_id=None):
     """Record a coaching note against an agent (dedup by kind so repeated low
     grades don't spam identical plans). The note is APPENDED once to that
     agent's next assigned task by _coaching_note_for. `repeat=True` bypasses the
@@ -9705,10 +9784,13 @@ def _write_growth_plan(state, agent_id, room, kind, now_ms, note, repeat=False):
         for p in plans:
             if p.get('kind') == kind:
                 return  # already coaching on this axis
-    plans.append({'kind': kind, 'ts': now_ms, 'room': room, 'note': note, 'applied': False})
+    plan = {'kind': kind, 'ts': now_ms, 'room': room, 'note': note, 'applied': False}
+    if source_task_id:
+        plan['sourceTaskId'] = source_task_id
+    plans.append(plan)
 
 
-def _coaching_note_for(state, agent_id):
+def _coaching_note_for(state, agent_id, task=None):
     """Pop the oldest un-applied growth plan for an agent and return it as a
     coaching line to append to their next task; marks it applied. Returns None
     if none pending. This is the 'manager feedback changes the next execution'
@@ -9718,6 +9800,15 @@ def _coaching_note_for(state, agent_id):
         return None
     for p in plans:
         if not p.get('applied'):
+            if task is not None and p.get('kind') in ('pipeline_feedback', 'review_denial'):
+                source = (state.get('tasks') or {}).get(p.get('sourceTaskId'))
+                # Legacy failure notes lack provenance; the repair already carries
+                # its own findings. Never attach another story's requirements.
+                if not source:
+                    continue
+                import story_tracking
+                if story_tracking.root(state, source).get('id') != story_tracking.root(state, task).get('id'):
+                    continue
             p['applied'] = True
             return p.get('note')
     return None
@@ -9760,7 +9851,7 @@ def _refocus_note_for(state, product_id):
             f'serves that -- not just what looks like a natural next addition from here.')
 
 
-def _augment_task_instructions(state, agent_id, product_id, instructions, refocus=False):
+def _augment_task_instructions(state, agent_id, product_id, instructions, refocus=False, task=None):
     """Append coaching + runbook knowledge to a task's instructions BEFORE
     assignment. Pure: returns the augmented instructions (or the original).
     A pending growth plan is injected once (marking it applied); a product's
@@ -9775,7 +9866,7 @@ def _augment_task_instructions(state, agent_id, product_id, instructions, refocu
         relay = ''
     if relay:
         pieces.insert(0, relay)
-    note = _coaching_note_for(state, agent_id)
+    note = _coaching_note_for(state, agent_id, task)
     if note:
         pieces.append(note)
     if product_id:
@@ -10497,12 +10588,16 @@ def _director_grant_budget_reopen(state, task_id, new_budget_usd, director_id=No
     task = tasks.get(task_id) if task_id else None
     if not isinstance(task, dict):
         return {'ok': False, 'error': 'unknown task'}
-    if task.get('status') != 'failed' or not task.get('budgetExhausted'):
+    if task.get('status') not in ('failed', 'blocked') or not task.get('budgetExhausted'):
         return {'ok': False, 'error': 'only a budget-exhausted (failed) card can be re-opened with more budget'}
     if not isinstance(new_budget_usd, (int, float)) or new_budget_usd <= 0:
         return {'ok': False, 'error': 'new budget must be a positive USD amount'}
     import serve as _serve_mod
     spent, attempts = _serve_mod._task_budget_spent(task_id)
+    import story_tracking
+    parent = story_tracking.root(state, task)
+    usage = story_tracking.costs(state, _serve_mod._spend_ledger_read() or {})['stories'].get(parent.get('id'), {})
+    spent = max(spent, usage.get('used', 0.0))
     if float(new_budget_usd) <= spent:
         return {'ok': False,
                 'error': f'new budget ${float(new_budget_usd):.4f} does not exceed the ${spent:.4f} already spent on this task -- the gate would refuse the next call anyway'}
@@ -10512,6 +10607,10 @@ def _director_grant_budget_reopen(state, task_id, new_budget_usd, director_id=No
     task['budgetUsd'] = budget
     task['budgetGrantedAt'] = now_ms
     task['budgetGrantedBy'] = director_id
+    parent.update(budgetUsd=budget, budgetUnlimited=False, budgetExhausted=False, manualAttention=False,
+                  status='repairing', blockedReason=None)
+    parent.setdefault('_peerGate', {}).update(escalated=False, approvals=0, approvers=[], acceptanceVerified=False)
+    parent.pop('_budgetExhaustedNotified', None)
     fail_note = (task.get('failNote') or '').strip()
     queue_work(state, [{
         'title': task.get('title') or 'Re-opened task',
@@ -10529,6 +10628,11 @@ def _director_grant_budget_reopen(state, task_id, new_budget_usd, director_id=No
         'budgetBand': task.get('budgetBand') or 'standard',
         'userStory': task.get('userStory'),
         'acceptanceCriteria': task.get('acceptanceCriteria'),
+        'reviewOf': parent.get('id'),
+        'reviewContract': parent.get('reviewContract'),
+        'workOrderId': parent.get('workOrderId'),
+        'workOrderStoryId': parent.get('workOrderStoryId'),
+        'requestId': parent.get('requestId'),
     }])
     _log_governance(state, director_id or task.get('assignedTo'), 'task_budget_granted',
                     {'taskId': task_id, 'title': (task.get('title') or '')[:120],
@@ -10924,7 +11028,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     __import__('story_tracking').refresh(state, __import__('serve')._spend_ledger_read())
 
     for parent in list((state.get('tasks') or {}).values()):
-        if parent.get('status') != 'failed' or not parent.get('_peerRepairPending'):
+        if parent.get('status') not in ('failed', 'repairing') or not parent.get('_peerRepairPending'):
             continue
         if (parent.get('_peerGate') or {}).get('escalated'):
             continue
@@ -11034,6 +11138,13 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 # Content landed -- mirror the JS Promise.race: finalize as soon
                 # as the real work resolves (the min-visual floor is satisfied by
                 # the network round-trips), not when the timeout ceiling hits.
+                if __import__('transport_recovery').queue(state, task, result, now_ms):
+                    task['note'] = result.get('note')
+                    task['_contentInFlight'] = False
+                    _release_agent_after_failure(state, aid, task)
+                    __import__('story_tracking').root(state, task)['status'] = 'repairing'
+                    send_agent_off_duty(state, aid, doors, grid)
+                    continue
                 _apply_content_result(state, task, result, now_ms)
                 # Bot Ops / shadow mode: a dry-run task ships nothing. Capture the
                 # outcome to the shadow ledger and release the agent, skipping the
@@ -11541,13 +11652,16 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     agents = state.get('agents') or {}
     if (pick.get('room') or _resolve_assignment_room(pick)) == 'pressoffice':
         tasks = state.get('tasks') or {}
+        workspace = __import__('code_workspaces').sandbox_for(state, pick)
         # One writer or reviewer at a time; hold unrelated writes while a
         # version is awaiting its peer votes so both reviewers see that version.
         if any(t.get('room') == 'pressoffice' and t.get('status') in ('walking', 'working')
+               and __import__('code_workspaces').sandbox_for(state, t) == workspace
                for t in tasks.values()):
             return None
         awaiting = {t['id'] for t in tasks.values() if t.get('room') == 'pressoffice'
-                    and t.get('status') == 'needs_review' and not (t.get('_peerGate') or {}).get('escalated')}
+                    and t.get('status') == 'needs_review' and not (t.get('_peerGate') or {}).get('escalated')
+                    and __import__('code_workspaces').sandbox_for(state, t) == workspace}
         if awaiting and pick.get('reviewOf') not in awaiting:
             return None
     # A shared-backlog card is queued ROOM-LESS on purpose: the ASSIGNED agent
@@ -11716,6 +11830,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         'workOrderStoryId': pick.get('workOrderStoryId'),
         'investigationOf': pick.get('investigationOf'),
         'reviewContract': pick.get('reviewContract'),
+        'sourceEvidencePaths': pick.get('sourceEvidencePaths'),
         'taskMasterWork': bool(pick.get('taskMasterWork')),
         'sprintId': pick.get('sprintId'),
         'teamId': pick.get('teamId'),
@@ -11776,7 +11891,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     # THIS task's execution.
     instructions = _augment_task_instructions(
         state, chosen_id, pick.get('productId'), pick.get('instructions'),
-        refocus=bool(pick.get('reviewOf') or pick.get('incident')))
+        refocus=bool(pick.get('reviewOf') or pick.get('incident')), task=pick)
     task = assign_task(state, chosen_id, pick.get('title'), pick.get('room'),
                        instructions, pick.get('projectLabel') or pick.get('goal'), extra,
                        grid, doors, now_ms, task_id_holder or _TASK_ID_HOLDER)

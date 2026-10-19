@@ -592,7 +592,7 @@ class StuckGate(SimIsolation):
     def test_close_gated_story_log_raises(self):
         state = {'agents': {}}
         parent = {'id': 'task-1', 'title': 't',
-                  '_peerGate': {'approvals': 1, 'approvers': ['ben']}}
+                  '_peerGate': {'approvals': 2, 'approvers': ['ben', 'ada'], 'acceptanceVerified': True}}
         with unittest.mock.patch('serve.log_action', side_effect=RuntimeError('boom')), \
              unittest.mock.patch.object(sim, '_revoke_task_access'), \
              unittest.mock.patch.object(sim, '_queue_player_email'):

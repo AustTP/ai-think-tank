@@ -2,6 +2,27 @@
 import time
 
 
+def validation_progress(state, parent):
+    """Distinguish scheduled validation from a blocker requiring intervention."""
+    if (parent.get('status') != 'blocked' or parent.get('blockedReason') != 'code_director_check'
+            or parent.get('manualAttention') or (parent.get('_peerGate') or {}).get('escalated')):
+        return None
+    checks = [t for t in (state.get('tasks') or {}).values()
+              if t.get('reviewOf') == parent['id'] and t.get('taskType') == 'code_preflight'
+              and t.get('status') in ('walking', 'working')]
+    if checks:
+        return 'validation_running', 'Code director validation is running before independent peer review.'
+    if any(q.get('reviewOf') == parent['id'] and q.get('taskType') == 'code_preflight'
+           for q in state.get('workQueue') or []):
+        writer = next((t for t in (state.get('tasks') or {}).values()
+                       if t.get('room') == 'pressoffice' and t.get('status') in ('walking', 'working')
+                       and __import__('code_workspaces').sandbox_for(state, t) == __import__('code_workspaces').sandbox_for(state, parent)), None)
+        message = ('Waiting for ' + str(writer.get('title') or writer['id']) + ' to release the code workspace.'
+                   if writer else 'Code director validation is queued before independent peer review.')
+        return 'validation_queued', message
+    return None
+
+
 def create_director(state):
     aid = 'code-director'
     if aid in (state.get('agents') or {}):
@@ -74,6 +95,8 @@ def complete_check(state, task, result, now_ms):
                                      'evidence': result['evidence']}
     if result.get('sourceDigest'):
         parent['lastValidatedSourceDigest'] = result['sourceDigest']
+    if result.get('libraryPath'):
+        parent['libraryPath'] = result['libraryPath']
     parent.pop('_codeDirectorPending', None)
     parent.pop('blockedReason', None)
     sim._enter_peer_review(state, parent, now_ms)

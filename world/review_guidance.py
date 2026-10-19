@@ -133,6 +133,7 @@ def apply_guidance(state, task_id, data):
     __import__('recovery_control').authorize(__import__('story_tracking').root(state, task), guidance)
     if action in ('retry', 'provide_inputs', 'edit_scope', 'reassign', 'research'):
         task.pop('completionRecovery', None)
+        task.pop('repeatWorkStop', None)
         previous = (task.get('interventionHistory') or [])[-2:-1]
         if not previous or previous[0].get('guidance') != guidance:
             task.pop('artifactRecoveryAttempts', None)
@@ -173,9 +174,11 @@ def apply_guidance(state, task_id, data):
             sim.kick_refinement_now(state, tid, now)
     else:
         task.update(assignedTo=owner, status='repairing', manualAttention=False,
-                    note='Repair queued for '+str(owner)+' using your retry instructions.')
+                    deliveryState='queued', nextAction='Dispatch the repair requested by player guidance.',
+                    lastProgressAt=now, note='Repair queued for '+str(owner)+' using your retry instructions.')
         for field in ('blockedReason','boardClearedAt','failNote','reviewFailureKind',
-                      '_codeDirectorPending','_codeDirectorPassed','recoveryStaffed'):
+                      '_codeDirectorPending','_codeDirectorPassed','recoveryStaffed',
+                      'reviewBlocker','_completionSignature'):
             task.pop(field, None)
         if task.get('reviewDiagnosis'):
             task.setdefault('reviewDiagnosisHistory', []).append(task.pop('reviewDiagnosis'))

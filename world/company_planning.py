@@ -22,7 +22,7 @@ def _assess_potential(request, completed):
                     task['artifactExcerpt']=stream.read(1500)
             except OSError:
                 pass
-    payload={'agentId':request['scrumMasterId'], 'taskId':'request/'+request['id'],
+    payload={'agentId':request['scrumMasterId'], 'taskId':'request/'+request['id'], 'modelPurpose':'planning',
              'max_tokens':1000, 'response_format':{'type':'json_object'}, 'deliberate':False,
              'messages':[{'role':'system','content':
                  'As scrum master, activate only potential stories whose activationCondition is demonstrated '
@@ -93,7 +93,7 @@ def north_star_context(state):
 def _plan(request, star, master):
     import serve
     payload = {'agentId':master, 'taskId':'request/' + request['id'], 'max_tokens':2600, 'deliberate':False,
-        'model':serve._mid_tier_slug() or serve._low_tier_slug(),
+        'model':serve._mid_tier_slug() or serve._low_tier_slug(), 'modelPurpose':'planning',
         'messages':[{'role':'system','content':
             'You are the scrum master completing an explicit player request. Never silently reject it. '
             'Break its overarching goal into testable stories, including an implementation milestone for code requests. '

@@ -8,6 +8,12 @@ CALL = re.compile(r'<tool_call>\s*<function=([A-Za-z_][\w.-]*)>(.*?)</function>\
 PARAMETER = re.compile(r'<parameter=([A-Za-z_][\w.-]*)>(.*?)</parameter>', re.S)
 
 
+class ToolCallValidationError(ValueError):
+    def __init__(self, message, raw_text):
+        super().__init__(message)
+        self.raw_text = raw_text
+
+
 def validate(value, schema):
     kind = schema.get('type')
     valid = {'string': isinstance(value, str), 'integer': isinstance(value, int) and not isinstance(value, bool),
@@ -43,22 +49,25 @@ def normalize(result, tools):
             continue
         matches = list(CALL.finditer(text))
         if not matches or len(matches) != text.count('<tool_call>'):
-            raise ValueError('Local model returned an incomplete or malformed textual tool call')
+            raise ToolCallValidationError('Local model returned an incomplete or malformed textual tool call', text)
         calls = []
         for match in matches:
             name, body = match.groups()
             if name not in definitions:
-                raise ValueError('Local model requested a tool that was not supplied')
+                raise ToolCallValidationError('Local model requested a tool that was not supplied: ' + name, text)
             schema = definitions[name].get('parameters', {})
             properties = schema.get('properties', {})
             parameters = list(PARAMETER.finditer(body))
             if PARAMETER.sub('', body).strip():
-                raise ValueError('Local model returned malformed tool parameters')
+                raise ToolCallValidationError('Local model returned malformed tool parameters for ' + name, text)
             arguments = {}
             for parameter in parameters:
                 key, raw = parameter.groups()
                 if key in arguments or key not in properties:
-                    raise ValueError('Local tool request has duplicate or unknown parameters')
+                    reason = 'duplicate' if key in arguments else 'unknown'
+                    raise ToolCallValidationError(
+                        f'Local tool request has {reason} parameter {key!r} for {name}. '
+                        'Allowed parameters: ' + ', '.join(sorted(properties)), text)
                 raw = raw.strip()
                 if properties[key].get('type') == 'string':
                     value = raw
@@ -66,9 +75,13 @@ def normalize(result, tools):
                     try:
                         value = json.loads(raw)
                     except ValueError as error:
-                        raise ValueError('Local tool argument is not valid JSON') from error
+                        raise ToolCallValidationError('Local tool argument is not valid JSON for ' + name + '.' + key, text) from error
                 arguments[key] = value
-            validate(arguments, schema)
+            try:
+                validate(arguments, schema)
+            except ValueError as error:
+                raise ToolCallValidationError(str(error) + ' for ' + name + '. Required parameters: '
+                                              + ', '.join(schema.get('required', [])), text) from error
             calls.append({'id': 'call_' + uuid.uuid4().hex, 'type': 'function',
                           'function': {'name': name, 'arguments': json.dumps(arguments, ensure_ascii=False)}})
         choice['_raw_tool_call_content'] = text

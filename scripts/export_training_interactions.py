@@ -6,10 +6,17 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
+import os
+import subprocess
+import shutil
+import uuid
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'world'))
 import training_capture as capture
+from training_roles import worker_interaction
 
 
 def sha(value):
@@ -22,12 +29,36 @@ def jsonl(path, rows):
             handle.write(json.dumps(row, ensure_ascii=False) + '\n')
 
 
-def export(conn, out, fraction=0.1, max_chars=40000):
+def archive_export(out, label='export'):
+    files = [p for p in out.iterdir() if p.is_file() and p.suffix in ('.json', '.jsonl')]
+    if not files:
+        return None
+    now = datetime.now(ZoneInfo('America/New_York'))
+    snapshot = out / 'history' / f'{now:%Y-%m-%d_%H-%M-%S}_{label}_{uuid.uuid4().hex[:8]}'
+    snapshot.mkdir(parents=True)
+    for path in files:
+        shutil.copy2(path, snapshot / path.name)
+        if path.name in ('train.jsonl', 'eval.jsonl', 'train.studio.jsonl', 'eval.studio.jsonl'):
+            dated_name = f'{path.stem}_{now:%Y-%m-%d_%H-%M-%S}_{snapshot.name.rsplit("_", 1)[-1]}{path.suffix}'
+            shutil.copy2(path, snapshot / dated_name)
+    metadata = {'archived_at': now.isoformat(), 'timezone': 'America/New_York',
+                'label': label, 'files': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files}}
+    (snapshot / 'archive.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+    return str(snapshot.resolve())
+
+
+def export(conn, out, fraction=0.1, max_chars=0, prepare_studio=True, max_tokens=16384):
+    if not isinstance(max_tokens, int) or not 256 <= max_tokens <= 32768:
+        raise ValueError('Token limit must be between 256 and 32768')
     out.mkdir(parents=True, exist_ok=True)
+    archive_export(out, 'previous')
     candidates, accepted, skipped = [], [], collections.Counter()
     outcomes = {r['task_id']: json.loads(r['payload']) for r in conn.execute('SELECT * FROM task_outcomes')}
     for row in conn.execute('SELECT * FROM interactions ORDER BY ts,id'):
         payload = json.loads(row['payload'])
+        if not worker_interaction(payload, row['agent_id']):
+            skipped['non_worker_role'] += 1
+            continue
         flags = json.loads(row['flags'])
         request, response = payload.get('request') or {}, payload.get('response') or {}
         choices = response.get('choices') or []
@@ -60,7 +91,7 @@ def export(conn, out, fraction=0.1, max_chars=40000):
             skipped['redacted_or_omitted'] += 1
         elif row['review_status'] != 'approved':
             skipped['not_approved'] += 1
-        elif len(json.dumps(conversation, ensure_ascii=False)) > max_chars:
+        elif max_chars and len(json.dumps(conversation, ensure_ascii=False)) > max_chars:
             skipped['over_character_limit'] += 1
         elif message.get('refusal') or choices[0].get('finish_reason') in ('length', 'error', 'content_filter'):
             skipped['incomplete_or_refused'] += 1
@@ -99,7 +130,28 @@ def export(conn, out, fraction=0.1, max_chars=40000):
     for split, rows in splits.items():
         jsonl(out / (split + '.jsonl'), rows)
     summary = {'candidates': len(candidates), 'train': len(splits['train']), 'eval': len(splits['eval']),
-               'groups': len(groups), 'skipped': dict(skipped)}
+               'groups': len(groups), 'skipped': dict(skipped),
+               'exported_at': datetime.now(ZoneInfo('America/New_York')).isoformat(),
+               'timezone': 'America/New_York', 'token_limit': max_tokens}
+    if prepare_studio:
+        # Use Studio's Transformers v5 without changing the app's Python environment.
+        studio_python = Path.home() / '.unsloth/studio/unsloth_studio/Scripts/python.exe'
+        python = os.environ.get('TRAINING_TOKENIZER_PYTHON') or (str(studio_python) if studio_python.is_file() else sys.executable)
+        try:
+            result = subprocess.run([python, str(Path(__file__).with_name('prepare_qwen_studio.py')), str(out.resolve()), str(max_tokens)], capture_output=True, text=True, encoding='utf-8', timeout=180)
+            failure = result.stderr[-3000:] if result.returncode else None
+        except (OSError, subprocess.TimeoutExpired) as error:
+            failure = str(error)
+        if failure is not None:
+            for split in ('train', 'eval'):
+                (out / f'{split}.studio.jsonl').write_text('', encoding='utf-8')
+            error = {'status': 'failed', 'reason': 'Qwen tokenizer preparation failed', 'details': failure}
+            (out / 'studio-validation.json').write_text(json.dumps(error, indent=2), encoding='utf-8')
+            summary['studio'] = error
+        else:
+            summary['studio'] = json.loads(result.stdout.strip().splitlines()[-1])
+    (out / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+    summary['dated_path'] = archive_export(out, f'{max_tokens}-tokens')
     (out / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
     return summary
 
@@ -120,7 +172,8 @@ def main():
     output = sub.add_parser('export')
     output.add_argument('--out', type=Path, default=ROOT / 'datasets/local/interactions/export')
     output.add_argument('--eval-fraction', type=float, default=0.1)
-    output.add_argument('--max-chars', type=int, default=40000)
+    output.add_argument('--max-chars', type=int, default=0, help='Optional character cap; 0 disables it. Token lengths are measured for Studio.')
+    output.add_argument('--max-tokens', type=int, default=16384, help='Studio token limit; longer examples are excluded, never truncated')
     args = parser.parse_args()
     if not args.db.is_file():
         parser.error('Recording database does not exist yet. Enable recording and run a model interaction first.')
@@ -155,9 +208,9 @@ def main():
             conn.commit()
             print('Review saved.')
         else:
-            if not 0 < args.eval_fraction < 1 or args.max_chars < 1:
+            if not 0 < args.eval_fraction < 1 or args.max_chars < 0:
                 parser.error('Invalid evaluation fraction or character limit')
-            print(json.dumps(export(conn, args.out, args.eval_fraction, args.max_chars), indent=2))
+            print(json.dumps(export(conn, args.out, args.eval_fraction, args.max_chars, max_tokens=args.max_tokens), indent=2))
     finally:
         conn.close()
 

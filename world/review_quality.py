@@ -7,21 +7,165 @@ import json
 import os
 import re
 
+BLOCKING_FINDING = re.compile(r'\[(?:SOURCE_VERIFICATION|MISSING_ARTIFACT|FUNCTIONAL_DEFECT|TEST_FAILURE|'
+                             r'QUALITY_CHECK|ACCEPTANCE_GAP|MISSING_INPUT|SERVICE_FAILURE)\]')
+
+ACCEPTANCE_PROMPT = (
+    'Approval requires EVERY supplied nonempty criterion to be met with inspected evidence. '
+    'Include acceptanceChecks in the JSON: [{"criterionId":"C1","status":"met|unmet|unverified",'
+    '"evidenceIds":["E1"],"explanation":"what the evidence proves"}]. '
+    'Use one entry per criterion, with exact supplied evidence IDs. '
+    'Also give completionPercent (0-100) per criterion as an evidence-based estimate of implemented work, '
+    'and explain what remains. Use 100 only for met criteria; unverified criteria get 0. '
+    'For an unmet criterion, partial credit requires inspected evidence of working portions. '
+    'This estimate never changes the acceptance decision. '
+    'Any unmet or unverified criterion, known blocking defect, failing test, or missing required artifact '
+    'forbids approve. Return send_back with an evidence-anchored repair for a known defect. '
+    'Never accept a known failure as an optional limitation, exception, future fix, or scope reduction. '
+    'Request approval settings do not waive acceptance criteria or quality checks. '
+)
+
+
+def approval_assessment(text, references):
+    """Resolve criterion evidence server-side; a bare model approval is insufficient."""
+    data = None
+    for match in re.finditer(r'\{', text or ''):
+        try:
+            candidate, _ = json.JSONDecoder().raw_decode(text[match.start():])
+        except ValueError:
+            continue
+        if isinstance(candidate, dict) and candidate.get('verdict') in ('approve', 'send_back'):
+            data = candidate
+            break
+    data = data or {}
+    required = {key: value for key, value in references.get('criteria', {}).items()
+                if isinstance(value, str) and value.strip()}
+    errors, verified = [], []
+    rows = data.get('acceptanceChecks')
+    if not required:
+        errors.append('No acceptance criteria are available to verify.')
+    if not isinstance(rows, list):
+        rows = []
+        errors.append('Review must include acceptanceChecks for every criterion.')
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            errors.append('Invalid acceptance check.')
+            continue
+        cid = row.get('criterionId')
+        if not isinstance(cid, str) or cid not in required or cid in seen:
+            errors.append('Unknown or duplicate criterion in acceptanceChecks.')
+            continue
+        seen.add(cid)
+        ids = row.get('evidenceIds')
+        quotes = [references.get('evidence', {}).get(eid) for eid in ids
+                  if isinstance(eid, str)] if isinstance(ids, list) else []
+        if not quotes or len(quotes) != len(ids) or not all(isinstance(q, str) and q.strip() for q in quotes):
+            errors.append(cid + ' lacks inspected evidence with valid reference IDs.')
+        if row.get('status') != 'met':
+            errors.append(cid + ' is unmet or unverified.')
+        if not isinstance(row.get('explanation'), str) or not row['explanation'].strip():
+            errors.append(cid + ' lacks an explanation of how its evidence satisfies the criterion.')
+        percent = row.get('completionPercent', 0)
+        valid_evidence = bool(quotes) and len(quotes) == len(ids) and all(isinstance(q, str) and q.strip() for q in quotes)
+        if not isinstance(percent, (int, float)) or isinstance(percent, bool) or not 0 <= percent <= 100:
+            percent = 0
+        percent = (100 if row.get('status') == 'met' else min(99, int(percent))) if valid_evidence and row.get('explanation') else 0
+        if row.get('status') not in ('met', 'unmet'):
+            percent = 0
+        verified.append({'criterionId': cid, 'criterion': required[cid], 'status': row.get('status'), 'completionPercent': percent,
+                         'evidence': quotes, 'explanation': row.get('explanation')})
+    for cid in required.keys() - seen:
+        errors.append(cid + ' was not verified.')
+    if data.get('repairStories'):
+        errors.append('Outstanding repair stories prevent approval.')
+    findings = [data.get('summary', '')]
+    for field in ('checks', 'risks'):
+        if isinstance(data.get(field), list):
+            findings.extend(data[field])
+    if any(BLOCKING_FINDING.search(str(finding)) for finding in findings):
+        errors.append('The review records a blocking finding.')
+    return {'verified': not errors, 'checks': verified, 'errors': errors}
+
+
+def clean_vote_errors(result):
+    assessment = result.get('acceptanceAssessment') or {}
+    errors = list(assessment.get('errors') or [])
+    if assessment.get('verified') is not True or not assessment.get('checks'):
+        errors.append('Approval lacks verified acceptance criteria.')
+    if any(not isinstance(check, dict) or check.get('status') != 'met' or not check.get('evidence')
+           for check in assessment.get('checks') or []):
+        errors.append('An acceptance criterion is unmet or unverified.')
+    if result.get('ok') is False:
+        errors.append('The review or execution failed.')
+    if result.get('pipelineOk') is not True:
+        errors.append('Quality pipeline did not pass.')
+    if result.get('peerRepairStories'):
+        errors.append('Required repairs remain unresolved.')
+    if any(BLOCKING_FINDING.search(str(finding)) for field in ('peerChecks', 'peerRisks')
+           for finding in result.get(field) or []):
+        errors.append('The reviewer recorded a blocking finding.')
+    artifact = (result.get('reviewDiagnostics') or {}).get('artifactChecks') or {}
+    if artifact.get('errors') or artifact.get('passed') is False:
+        errors.append('Artifact inspection found failures.')
+    if result.get('checklistEscalated') or any(g.get('verdict') != 'meets_requirement'
+                                              for g in result.get('checklistGrades') or []):
+        errors.append('A checklist requirement failed or remains unverified.')
+    return errors
+
+
+def known_failure(result):
+    artifact = (result.get('reviewDiagnostics') or {}).get('artifactChecks') or {}
+    return (result.get('ok') is False or result.get('pipelineOk') is False
+            or bool(result.get('peerRepairStories')) or bool(artifact.get('errors'))
+            or artifact.get('passed') is False
+            or any(check.get('status') == 'unmet'
+                   for check in (result.get('acceptanceAssessment') or {}).get('checks') or []
+                   if isinstance(check, dict))
+            or any(check.get('verdict') == 'fails_requirement' for check in result.get('checklistGrades') or []))
+
 
 def contract_for(task):
     if isinstance(task.get('reviewContract'), dict):
-        return dict(task['reviewContract'])
-    instructions = str(task.get('instructions') or '')
+        contract = dict(task['reviewContract'])
+    else:
+        contract = {'instructions': str(task.get('instructions') or ''),
+                    'acceptanceCriteria': str(task.get('acceptanceCriteria') or ''), 'version': 1}
+    instructions = contract.get('instructions') or ''
+    # Old coaching was appended before contracts were frozen. A generated
+    # failure notice is feedback, never an additional acceptance requirement.
+    instructions = re.sub(r"\nYour deliverable '[^\n]*failed the quality pipeline\.[\s\S]*?Address this on your next pass\.", '', instructions)
     for marker in ('\nPeer review of ', '\n\nHuman guidance:', '\nHuman guidance:',
                    '\n\nRepair the original deliverable:', '\nPeer-review findings:'):
         instructions = instructions.split(marker, 1)[0]
-    contract = {'instructions': instructions, 'acceptanceCriteria': str(task.get('acceptanceCriteria') or ''),
-                'version': 1}
+    contract['instructions'] = instructions
     return contract
 
 
 def digest(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def artifact_references(document, contract=None):
+    """Required/delivered files, excluding explicit descriptions of absent output.
+
+    A limitation is not a delivery claim. Named contractual outputs remain
+    mandatory even when the report admits they were not produced.
+    """
+    pattern = r'[A-Za-z0-9_./-]+\.(?:csv|ipynb)'
+    contract = contract or {}
+    requirements = str(contract.get('instructions') or '').split('Story:', 1)[-1]
+    requirements += '\n' + str(contract.get('acceptanceCriteria') or '')
+    paths = re.findall(pattern, requirements)
+    absent = re.compile(r'\b(?:unable|could not|not (?:created|saved|produced|generated|available)|'
+                        r'never (?:created|saved|produced)|planned|proposed|intended|would (?:contain|include))\b', re.I)
+    for line in document.splitlines():
+        for path in re.findall(pattern, line):
+            missing = re.search(r'\bmissing(?: artifact| file| document)?\s*:?\s*[`\'"]?' + re.escape(path), line, re.I)
+            missing = missing or re.search(re.escape(path) + r'[`\'"]?(?:\s+(?:is|was|remains))?\s+(?:missing|unavailable)\b', line, re.I)
+            if not absent.search(line.replace(path, '<artifact>')) and not missing:
+                paths.append(path)
+    return list(dict.fromkeys(paths))[:12]
 
 
 def _date(value):
@@ -50,7 +194,7 @@ def artifact_checks(document, contract, resolve, execution=None):
         requirements, re.I))
     needs_data = mentions_history and (not documentation or delivers_dataset)
     needs_notebook = bool(re.search(r'notebook|\.ipynb', requirements, re.I))
-    paths = list(dict.fromkeys(re.findall(r'[A-Za-z0-9_./-]+\.(?:csv|ipynb)', document)))[:12]
+    paths = artifact_references(document, contract)
     checks, errors = [], []
     has_csv = has_notebook = False
     verified_notebook = False

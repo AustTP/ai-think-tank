@@ -137,6 +137,7 @@ def metadata(state, agent_id, task_id=None, purpose=None):
     if not isinstance(task, dict):
         task = {}
     return {'agent_id': agent_id, 'role': agent.get('role'), 'task_id': task_id or task.get('id'),
+            **{key: bool(agent.get(key)) for key in ('isAdmin', 'isDirector', 'isReviewer', 'isDedicatedReviewer', 'isTaskMaster', 'isLibrarian', 'isScrumMaster')},
             'group_id': task.get('requestId') or task.get('rootStoryId') or task_id or task.get('id'),
             'purpose': purpose, 'task_type': task.get('taskType'), 'title': task.get('title'),
             'root_story_id': task.get('rootStoryId'), 'request_id': task.get('requestId'),

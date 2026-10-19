@@ -70,20 +70,21 @@ def save_check(key, result):
 
 
 def compact(task, limit=7000):
-    contract = task.get('reviewContract') or {}
+    import review_quality
+    contract = review_quality.contract_for(task)
     original = contract.get('instructions') or str(task.get('instructions') or '').split('\n\nHuman guidance:', 1)[0].split('\nPeer-review findings:', 1)[0]
     original = original.split('Story:', 1)[-1]
     guidance = str(task.get('instructions') or '').rsplit('\n\nHuman guidance:', 1)
     correction = str(task.get('currentFailure') or task.get('failNote') or '')
     if not correction and '\nPeer-review findings:' in str(task.get('instructions') or ''):
         correction = str(task['instructions']).split('\nPeer-review findings:',1)[1].split('\nExisting Library document:',1)[0]
-    if len(guidance) == 2:
-        correction += '\nLatest human guidance: ' + guidance[-1][-1800:]
     # Keep the contract exact. Compact feedback/history, never required clauses.
     pieces = ['Original contract:\n' + original,
               'Acceptance criteria:\n' + str(contract.get('acceptanceCriteria') or task.get('acceptanceCriteria') or ''),
               'Current correction:\n' + correction[:2500],
               'Saved evidence: ' + str(task.get('libraryPath') or 'none')]
+    if len(guidance) == 2:
+        pieces.append('Latest human guidance:\n' + guidance[-1][-1800:])
     return '\n\n'.join(pieces)
 
 

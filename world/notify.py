@@ -213,6 +213,14 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
         _serve._save_escalations(escalations)
         return esc_id
 
+    import approval_automation
+    if approval_automation.settings(_serve)['alwaysApproveRequests']:
+        # The approval loop handles this request; email uses the chosen interval
+        # automatic actions rather than sending another request for a click.
+        escalations[esc_id].update(notificationChannel='automation', emailSent=False)
+        _serve._save_escalations(escalations)
+        return esc_id
+
     approve_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=approve'
     deny_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=deny'
     body = (f'{question}\n\n'
@@ -234,10 +242,50 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
     return esc_id
 
 
+def reconcile_command_approvals(state, escalations):
+    """Resume the linked policy-blocked story once after a recorded human approval.
+
+    This queues a checked repair; it does not execute the approval text or
+    grant permission to other commands, accounts, or stories.
+    """
+    import review_guidance, story_tracking
+    handled = state.setdefault('commandApprovalRecoveries', {})
+    for eid, record in escalations.items():
+        if (eid in handled or record.get('kind') != 'blocked command' or record.get('status') != 'approved'
+                or record.get('resolvedBy') not in ('admin', 'player-automation')):
+            continue
+        try:
+            metadata = json.loads(record.get('note') or '{}')
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(metadata, dict):
+            continue
+        task = (state.get('tasks') or {}).get(metadata.get('taskId'))
+        if not task or task.get('assignedTo') != metadata.get('agentId'):
+            continue
+        root = story_tracking.root(state, task)
+        if root.get('status') not in ('failed', 'blocked'):
+            continue
+        latest = (root.get('interventionHistory') or [])[-1:]
+        if latest and latest[0].get('at', 0) > record.get('resolvedAt', 0) * 1000:
+            continue
+        if root.get('failureCategory') != 'policy' and 'blocked:' not in str(root.get('failNote') or ''):
+            continue
+        if any(t.get('reviewOf') == root['id'] and t.get('status') in ('walking', 'working')
+               for t in (state.get('tasks') or {}).values()):
+            continue
+        guidance = (f'Player-authorized command approval {eid} was recorded. Resume this original story using its saved workspace. '
+                    'Produce an executable shell command, not tool-call XML. Existing execution policy, budgets, '
+                    'quality checks and independent review still apply. This approval does not complete the story.')
+        review_guidance.apply_guidance(state, root['id'], {'action': 'retry', 'guidance': guidance})
+        handled[eid] = {'taskId': root['id'], 'at': int(time.time() * 1000)}
+
+
 def reconcile_review_escalations(state):
     """Close obsolete review alerts without sending a message or approving work."""
     import serve as _serve
     escalations = _serve._load_escalations()
+    reconcile_command_approvals(state, escalations)
     changed = False
     for record in escalations.values():
         if record.get('kind') != 'stuck review loop' or record.get('status') != 'pending':

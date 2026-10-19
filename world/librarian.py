@@ -26,7 +26,7 @@ def relevant_documents(state, task, serve):
         for directory, dirs, files in os.walk(root):
             dirs[:]=[d for d in dirs if not any(w in d.lower() for w in ('backup','pending_review')) and not d.startswith('.')]
             for name in files:
-                if not name.endswith(('.md','.csv')) or name.startswith('.'): continue
+                if not name.endswith(('.md','.txt','.csv')) or name.startswith('.'): continue
                 path=os.path.join(directory,name)
                 if os.path.islink(path): continue
                 try:
@@ -87,10 +87,14 @@ def create_role(state):
 
 def embedded_csv(document, path):
     """Extract only a table/fence immediately following an explicit CSV filename."""
-    label = re.search(r'(?m)^.*(?<![\w/.-])' + re.escape(path) + r'(?![\w/.-]).*$', document)
-    if not label:
-        return None
-    tail = document[label.end():].lstrip()
+    for label in re.finditer(r'(?m)^.*(?<![\w/.-])' + re.escape(path) + r'(?![\w/.-]).*$', document):
+        contents = _csv_after_label(document[label.end():].lstrip())
+        if contents is not None:
+            return contents
+    return None
+
+
+def _csv_after_label(tail):
     fence = re.match(r'```(?:csv)?[ \t]*\r?\n(.*?)\r?\n```', tail, re.S)
     if fence:
         rows = list(csv.reader(io.StringIO(fence.group(1))))
@@ -111,6 +115,36 @@ def embedded_csv(document, path):
     return output.getvalue()
 
 
+def publish_validated_csv(task, workspace, serve):
+    """Deliver explicitly requested CSVs after the caller's quality gate passes."""
+    request=' '.join(str(task.get(k) or '') for k in ('title','acceptanceCriteria'))
+    if 'library' not in request.lower(): return []
+    names=list(dict.fromkeys(re.findall(r'(?<![\w/.-])[A-Za-z0-9_-]+\.csv\b',request)))
+    saved=[]
+    for name in names:
+        source=os.path.join(workspace,name)
+        if not os.path.isfile(source) or os.path.islink(source): continue
+        with open(source,encoding='utf-8',newline='') as stream: text=stream.read()
+        rows=list(csv.reader(io.StringIO(text)))
+        if len(rows)<2 or not rows[0] or any(len(row)!=len(rows[0]) for row in rows):
+            raise ValueError('Validated CSV artifact has inconsistent rows: '+name)
+        dest=serve._safe_library_path(name)
+        if not dest: raise ValueError('Invalid Library CSV destination')
+        digest=hashlib.sha256(text.encode()).hexdigest()
+        if os.path.isfile(dest):
+            with open(dest,'rb') as stream: previous=stream.read()
+            if previous!=text.encode():
+                backup=serve._safe_library_path('reports/artifact-delivery-backups/'+hashlib.sha256(previous).hexdigest()+'-'+name)
+                os.makedirs(os.path.dirname(backup),exist_ok=True)
+                with open(backup,'wb') as stream: stream.write(previous)
+        os.makedirs(os.path.dirname(dest),exist_ok=True)
+        with open(dest,'w',encoding='utf-8',newline='') as stream: stream.write(text)
+        with open(dest+'.provenance.json','w',encoding='utf-8') as stream:
+            json.dump({'taskId':task.get('id'),'sha256':digest,'method':'Quality-validated sandbox artifact delivery; substantive claims still require independent review.'},stream,indent=2)
+        saved.append(name)
+    return saved
+
+
 def inspect_report(task, serve):
     """Idempotently file supplied CSV tables. Missing content remains an explicit failure."""
     report_path = task.get('libraryPath')
@@ -118,7 +152,8 @@ def inspect_report(task, serve):
     if not target or not os.path.isfile(target): return {'saved':[], 'missing':[]}
     with open(target,encoding='utf-8',errors='replace') as stream:
         document = stream.read(200000)
-    paths = list(dict.fromkeys(re.findall(r'[A-Za-z0-9_./-]+\.(?:csv|ipynb)',document)))[:12]
+    import review_quality
+    paths = review_quality.artifact_references(document, review_quality.contract_for(task))
     saved, missing = [], []
     for path in paths:
         dest = serve._safe_library_path(path)

@@ -18,19 +18,21 @@ async def guard(state, task_id):
     request_id = task.get('requestId') or task.get('workOrderId') if task else (
         task_id[len('request/'):] if task_id.startswith('request/') else None)
     request = next((r for r in state.get('backlogRequests', []) if r.get('id') == request_id), {})
-    if request.get('requestBudgetUsd') is None:
+    parent = story_tracking.root(state, task) if task else {}
+    if request.get('requestBudgetUsd') is None and not parent.get('budgetUsd'):
         yield
         return
     locks = _LOOPS.setdefault(asyncio.get_running_loop(), {})
-    async with locks.setdefault(request_id, asyncio.Lock()):
+    lock_key = request_id if request.get('requestBudgetUsd') is not None else 'story/' + str(parent.get('id'))
+    async with locks.setdefault(lock_key, asyncio.Lock()):
         yield
 
 
 def allowance(state, ledger, task_id, messages, requested_tokens, prices):
     status = story_tracking.budget_status(state, ledger, task_id)
-    if status['scope'] != 'request':
+    if status['scope'] not in ('request', 'story'):
         return requested_tokens
-    if not prices or any(not math.isfinite(p) or p < 0 for p in prices):
+    if not prices or len(prices) != 2 or any(not isinstance(p, (int, float)) or not math.isfinite(p) or p < 0 for p in prices):
         raise ValueError('A budgeted request requires known model token pricing.')
     prompt_rate, completion_rate = prices
     # UTF-8 bytes plus framing is a conservative text-token upper estimate.

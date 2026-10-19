@@ -33,6 +33,9 @@ INSTRUCTIONS = (
 
 EMAIL_INSTRUCTIONS = 'PROJECT EMAIL DELIVERY: ' + INSTRUCTIONS.split('PROJECT EMAIL DELIVERY: ', 1)[1]
 
+from reporting_standard import INSTRUCTIONS as REPORT_INSTRUCTIONS
+INSTRUCTIONS += '\n\n' + REPORT_INSTRUCTIONS
+
 
 def apply(messages):
     result = [dict(message) for message in messages]

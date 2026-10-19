@@ -40,6 +40,43 @@ errors produce a warning and do not stop agent work.
 
 ## Review and export
 
+Every export preserves existing files first, then saves a dated snapshot under
+`export/history/YYYY-MM-DD_HH-MM-SS_<token-limit>-tokens_<unique-id>/`.
+Dates use America/New_York. Each snapshot includes all dataset files, settings,
+validation reports, and `archive.json` with file hashes. The root export files
+remain the latest version; the app displays the dated snapshot path.
+
+Training exports and the app review queue include workers only. Reviewer and
+administrative roles (including directors, scrum/task masters, librarians and
+risk managers) and worker review tasks are excluded even if previously approved.
+Unknown roles are withheld. Existing raw recordings remain available for diagnostics.
+
+Every export also prepares `train.studio.jsonl` and `eval.studio.jsonl` for
+Qwen3.5-4B using its cached tokenizer and chat template. Tool definitions,
+calls and results are materialized as model-native conversation content so
+Studio does not discard nested tool fields. Import these files using `messages`.
+`studio-validation.json` lists per-example token counts and exclusions, and the
+required maximum sequence length. Set Studio's context to at least that value
+and enable Train on completions. Confirm masking in Studio's preview/logs;
+the exporter verifies response boundaries but does not run Studio's trainer.
+No prompt or answer is truncated. Default character limits are disabled.
+Studio files default to a 16,384-token limit. Adjust it in the app or pass
+`export --max-tokens 16384`. Oversized examples are excluded with a reported
+reason, never truncated. Cleanup removes only consecutive exact duplicate
+system instructions. Task instructions, conversation history, evidence, tool
+calls/results and final responses are preserved. Shortened-context proposals
+are no longer generated; older proposals remain in dated archives.
+The exporter uses the local Studio Python; `TRAINING_TOKENIZER_PYTHON` can override
+it. Preparation failures clear Studio output files and report the error instead
+of leaving stale files presented as ready. Original structured exports remain.
+
+In the app, open the board and click **Training review**. Filter recordings by
+review status, select a recording to read its request, response, tool definitions
+and recorded task outcome, then enter a review note and approve, reject or keep
+it pending. **Export approved examples** writes the files described below and
+shows the training/evaluation counts and output folder. The API requires login.
+Restart the server after installing this feature to load its new routes.
+
 From the project root:
 
 ```powershell

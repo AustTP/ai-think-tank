@@ -9,6 +9,19 @@ import librarian
 
 
 class LibrarianTests(unittest.TestCase):
+    def test_validated_requested_csv_is_delivered_with_previous_copy_preserved(self):
+        with tempfile.TemporaryDirectory() as root:
+            workspace=os.path.join(root,'workspace');library=os.path.join(root,'library')
+            os.makedirs(workspace);os.makedirs(library)
+            with open(os.path.join(workspace,'output.csv'),'w') as stream: stream.write('name,value\nactual,1\n')
+            with open(os.path.join(library,'output.csv'),'w') as stream: stream.write('old,contents\nold,0\n')
+            serve=SimpleNamespace(_safe_library_path=lambda path:os.path.join(library,path))
+            task={'id':'t','title':'Create output.csv','acceptanceCriteria':'Save CSV in Library'}
+            self.assertEqual(librarian.publish_validated_csv(task,workspace,serve),['output.csv'])
+            with open(os.path.join(library,'output.csv')) as stream: self.assertIn('actual,1',stream.read())
+            self.assertTrue(os.listdir(os.path.join(library,'reports','artifact-delivery-backups')))
+            self.assertTrue(os.path.exists(os.path.join(library,'output.csv.provenance.json')))
+
     def test_prior_work_handoff_distinguishes_help_from_possible_fulfillment(self):
         with tempfile.TemporaryDirectory() as root:
             for name,text in [('risk.csv','crypto risk management source evidence'),('weather.md','rain and sunshine')]:

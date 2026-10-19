@@ -900,12 +900,17 @@ def get_state_from_db():
 
 
 def save_state_to_db(data):
-    with _db() as conn:
-        conn.execute(
-            'INSERT INTO kv_state (id, blob, updated_at) VALUES (1, ?, ?) '
-            'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
-            (json.dumps(data), time.time()),
-        )
+    import state_updates
+    with _STATE_UPDATE_LOCK:
+        with _db() as conn:
+            row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
+            if row:
+                data = state_updates.preserve_guidance(json.loads(row[0]), data)
+            conn.execute(
+                'INSERT INTO kv_state (id, blob, updated_at) VALUES (1, ?, ?) '
+                'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
+                (json.dumps(data), time.time()),
+            )
     try:
         sync_agent_directories(data)
     except Exception as e:
@@ -1251,6 +1256,8 @@ def _render_agents_md(name, role, profile):
         lines.append(f'- {instr}')
     if not any(evidence_policy.EMAIL_INSTRUCTIONS in str(instr) for instr in profile.get('instructions', [])):
         lines.append('- ' + evidence_policy.EMAIL_INSTRUCTIONS)
+    if not any(evidence_policy.REPORT_INSTRUCTIONS in str(instr) for instr in profile.get('instructions', [])):
+        lines.append('- ' + evidence_policy.REPORT_INSTRUCTIONS)
     agreement = profile.get('workAgreement')
     if isinstance(agreement, dict) and agreement.get('text'):
         lines += ['', '## Work Agreement', '', agreement['text'], '',
@@ -2894,6 +2901,11 @@ def _coding_tier_slug():
     return _model_tier_slug('coding') or _mid_tier_slug()
 
 
+def _review_tier_slug():
+    """Medium by default, with a persistent task-specific model selection."""
+    return __import__('review_model').choose(sys.modules[__name__])
+
+
 def _vision_tier_slug():
     # The MMMU-scored band for reading real screenshots. Falls back to the
     # mid tier so reviewScreenshot still degrades (to a plain text review,
@@ -3008,7 +3020,7 @@ def _reasoning_tier_slug():
 
 # JEV-gated tier escalation: by default
 # EVERYTHING uses the cheap LOW tier; only a real need escalates. Coding is
-# DETERMINISTIC (a code/review/qa task always uses the coding tier -- it's
+# DETERMINISTIC (code uses the coding tier; review/QA use their medium-default policy -- it's
 # easy to tell when code is being written, and correctness there doesn't scale
 # down with apparent size). For everything else, JEV decides:
 #   - MID is LIGHTLY gated -- the criteria ask whether the task needs real
@@ -3049,7 +3061,7 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None)
     """Pick which model tier a call deserves, under the JEV-gated escalation
     policy. Returns a resolved model slug (never None).
 
-    `task_type` 'code'/'review'/'qa' -> deterministic CODING tier (no JEV).
+    `task_type` 'code' -> coding; 'review'/'qa' -> medium-default review policy (no JEV).
     `allow_high` -> JEV may pick HIGH; otherwise the decision is low-or-mid.
     `purpose` -> a one-line description of what the call is for, so JEV's
     judgment is grounded in the actual work rather than a generic "should I
@@ -3057,7 +3069,9 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None)
 
     Fails CLOSED to low: a JEV outage, a non-binary answer, or a low-confidence
     escalation all keep the cheap tier."""
-    if task_type in ('code', 'review', 'qa'):
+    if task_type in ('review', 'qa'):
+        return _review_tier_slug()
+    if task_type == 'code':
         return _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()
     decider = decider or _tier_gate_decider
     try:
@@ -3121,6 +3135,12 @@ def _senior_most_director_id(state):
 
 
 def _resolve_pending_escalations_sync():
+    import approval_automation
+    approval_settings = approval_automation.settings(sys.modules[__name__])
+    if approval_settings['preset'] == 'strict':
+        return 0
+    if approval_settings['alwaysApproveRequests']:
+        return approval_automation.approve_pending(sys.modules[__name__])
     # Runs on the director loop (a thread). No pending escalation, no work.
     escalations = _load_escalations()
     pending = {i: e for i, e in escalations.items() if e.get('status') == 'pending'}
@@ -3245,6 +3265,8 @@ def _resolve_pending_escalations_sync():
                             'decision': decision, 'confidence': confidence, 'judge_confidence': judge_conf},
                            authorized=False)
                 continue
+        if approval_automation.settings(sys.modules[__name__])['preset'] != 'moderation':
+            break  # A preset changed while the model was deciding.
         esc['status'] = 'approved' if decision == 'approve' else 'denied'
         esc['resolvedBy'] = f'{director_name} ({director_id})'
         esc['resolvedAt'] = time.time()
@@ -3257,6 +3279,9 @@ def _resolve_pending_escalations_sync():
                    {'escalationId': esc_id, 'kind': esc_kind, 'question': esc.get('question'),
                     'confidence': confidence, 'composite': round(composite, 3), 'floor': floor,
                     **judge_note}, authorized=False)
+        if bloom:
+            approval_automation.record_event(sys.modules[__name__], 'approval', f'{esc_id}: {esc_kind}',
+                'Model-approved routine request', detail=esc.get('question') or '')
         resolved += 1
     if dirty:
         _save_escalations(escalations)
@@ -3267,7 +3292,10 @@ async def _director_approval_loop():
     while True:
         await asyncio.sleep(DIRECTOR_APPROVAL_INTERVAL_S)
         try:
-            await asyncio.to_thread(_resolve_pending_escalations_sync)
+            import approval_automation
+            if approval_automation.settings(sys.modules[__name__])['preset'] == 'moderation':
+                await asyncio.to_thread(_resolve_pending_escalations_sync)
+            await asyncio.to_thread(approval_automation.tick, sys.modules[__name__])
         except Exception as e:
             print(f'[director] loop error: {e}', flush=True)
 
@@ -4088,10 +4116,14 @@ def _teams_missing_scrum_master(state, team_ids):
 
 
 app = FastAPI(lifespan=_lifespan)
+from training_review import router as training_review_router
+app.include_router(training_review_router)
 import coinbase_spot
 app.include_router(coinbase_spot.router_for(sys.modules[__name__]))
 import blocker_control
 app.include_router(blocker_control.router_for(sys.modules[__name__]))
+import approval_automation
+app.include_router(approval_automation.router_for(sys.modules[__name__]))
 import company_planning
 app.include_router(company_planning.router_for(sys.modules[__name__]))
 
@@ -5187,6 +5219,13 @@ def _run_in_sandbox_sync(sandbox_dir, command, soft_limit=True):
             'timedOut': False,
         }
     # Only reachable network is SANDBOX_NETWORK (internal -- see
+    import story_containers
+    if story_containers.enabled(sandbox_dir):
+        try:
+            return story_containers.execute(sandbox_dir, command, sys.modules[__name__], soft_limit)
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as error:
+            return {'exitCode': None, 'stdout': '', 'stderr': str(error), 'timedOut': False}
+    # Legacy sandboxes retain the one-command container execution path.
     # ensure_sandbox_networking() above); the proxy env vars are what let
     # a well-behaved package manager actually install anything, not a
     # relaxation of the isolation itself. --memory/--cpus/--pids-limit cap
@@ -5546,6 +5585,11 @@ def _read_openrouter_response(req):
 
 
 def _call_openrouter_once_sync(model, messages, max_tokens, response_format=None):
+    import local_work_model
+    config = _load_env()
+    if local_work_model.primary_enabled(config):
+        return local_work_model.complete(local_work_model.selection(config), messages, max_tokens,
+                                         response_format=response_format)
     import evidence_policy
     messages = evidence_policy.apply(messages)
     if _think_tank_spend_cap_exceeded():
@@ -5565,7 +5609,7 @@ def _call_openrouter_once_sync(model, messages, max_tokens, response_format=None
     # reads reasoning output, so turning it off there is free.
     if response_format:
         reasoning = {'enabled': False}
-    elif model in (_coding_tier_slug(), _high_tier_slug(), _mid_tier_slug(), _reasoning_tier_slug()):
+    elif model in (_coding_tier_slug(), _high_tier_slug(), _mid_tier_slug(), _reasoning_tier_slug(), _review_tier_slug()):
         reasoning = {'max_tokens': max_tokens // 2}
     else:
         reasoning = {'enabled': False}
@@ -5623,6 +5667,11 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     resilience + model-result bookkeeping as the plain call -- the tool loop
     is a real model consumer, so it earns the same protections. Returns the
     parsed OpenRouter JSON document."""
+    import local_work_model
+    config = _load_env()
+    if local_work_model.primary_enabled(config):
+        return local_work_model.complete(local_work_model.selection(config), messages, max_tokens,
+                                         tools=tools, tool_choice=tool_choice)
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if is_model_circuit_broken(model):
@@ -5718,7 +5767,7 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
             tool_choice = ({'type': 'function', 'function': {'name': force_first_tool}}
                            if isinstance(force_first_tool, str) else 'required')
         import local_work_model
-        work_state = get_state_from_db() or {} if task_id else {}
+        work_state = get_state_from_db() or {}
         worker_id = agent_id or (work_state.get('tasks', {}).get(task_id) or {}).get('assignedTo')
         local = local_work_model.route(_load_env(), work_state, worker_id, task_id, messages=current_messages)
         if local:
@@ -5726,7 +5775,7 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
             log_action(worker_id, 'chat', {'model': local['model'], 'provider': 'unsloth-local',
                        'seed': local['seed'], 'taskId': task_id, 'cost': 0.0})
         else:
-            data = _post_openrouter_raw(model, current_messages, tools=tools, max_tokens=max_tokens,
+            data = local_work_model.remote_call(_post_openrouter_raw, model, current_messages, tools=tools, max_tokens=max_tokens,
                                         tool_choice=tool_choice)
         _accrue_spend(service, ((data or {}).get('usage') or {}).get('cost', 0.0), village_id=village_id)
         if task_id and isinstance(((data or {}).get('usage') or {}).get('cost'), (int, float)):
@@ -7448,6 +7497,8 @@ def _escalation_judge_drift_summary():
 
 
 def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confidence, cost, authorized, trace_id=None):
+    if approval_automation.approve_request(sys.modules[__name__], agent_id, action, target, purpose):
+        return True
     # Shared low-confidence handling for the Jev safety gates (browse,
     # download, curl/execute, sandbox download/save, temp access). A
     # confident allow passes through; a LOW-confidence allow is "unsure" --
@@ -7496,7 +7547,7 @@ MODEL_BAND_PURPOSE = {
     # different models, and collapsing them meant whichever benchmark won
     # the band silently decided both. Now each is chosen on a benchmark
     # that actually measures its own job.
-    'coding': 'Writing and reviewing real code (Code Reviewer, and any role that writes code). Correctness of generated code is the whole job here.',
+    'coding': 'Writing and repairing real code. Independent review and remediation recommendations use the dedicated medium-default review model policy.',
     'high': 'Breaking a large, vague request into as many concrete, well-scoped subtasks as the work actually requires (never a fixed count -- a small ask may be one card, a sprawling one many) and deciding how work is distributed (assignBigTask). Runs once per real request, and every downstream call depends on this one being right -- a bad decomposition wastes everything after it, so this is the band to spend on.',
 }
 
@@ -7940,7 +7991,13 @@ async def refresh_model_tiers():
 def get_cached_model_tiers():
     with _db() as conn:
         rows = conn.execute('SELECT band, slug, name, price_per_m FROM model_tiers').fetchall()
-    return {band: {'slug': slug, 'name': name, 'price': price} for band, slug, name, price in rows}
+    tiers = {band: {'slug': slug, 'name': name, 'price': price} for band, slug, name, price in rows}
+    review = __import__('review_model').policy(sys.modules[__name__])
+    if review.get('model'):
+        tiers['review'] = {'slug': review['model'], 'name': review.get('name', review['model']),
+                           'price': review.get('price'), 'defaultTier': 'mid',
+                           'purpose': 'Independent review and evidence-based remediation recommendations'}
+    return tiers
 
 
 # Read-only board/status GETs must NOT wake a dormant tank: the browser polls
@@ -8016,6 +8073,7 @@ AUTH_PROTECTED_PREFIXES = ('/save', '/api/state', '/api/log', '/api/decide', '/a
 
 
 AUTH_PROTECTED_PREFIXES += ('/api/trading',)
+AUTH_PROTECTED_PREFIXES += ('/api/training',)
 
 
 def _valid_agent_key_presented(presented_key):
@@ -8194,7 +8252,7 @@ def _merge_server_owned(existing, incoming):
         # The client still sends `workQueue`, but a stale copy must not clobber
         # the server's mid-cycle edits -- the server's queue + task map win
         # when they exist.
-        for k in ('workQueue', 'tasks', 'taskCounter', 'researchTopics', 'reports', 'nextReportId', 'backlogRequests', 'taskMasterControl'):
+        for k in ('workQueue', 'tasks', 'taskCounter', 'researchTopics', 'reports', 'nextReportId', 'backlogRequests', 'taskMasterControl', 'completionControl'):
             if k in existing:
                 merged[k] = existing[k]
         # Phase 4: governance (auto-hire / auto-firing review) is a server
@@ -8430,7 +8488,7 @@ async def post_report(request: Request):
 _DELEGATABLE_ROOMS = ['observatory', 'pressoffice', 'postoffice', 'bank',
                       'weatherstation', 'library', 'media']
 _DEFAULT_ROOM_DEFINITIONS = {
-    'pressoffice': {'label': 'Work Room', 'purpose': 'real sandboxed software development; actually writes and runs code for the SPECIFIC task given (taskType "code"), or reviews/QA-tests an already-built deliverable for real, specific problems (taskType "review" or "qa"). Use this for anything meaning "write/build/fix code" OR "review/test what was built." QUALITY BAR: written code must follow PEP 8 and pass the standard Python toolchain baked into this sandbox -- flake8, mypy, bandit, and pytest with >=90% coverage (the "quality pipeline") -- and work is NOT approved unless that pipeline is green.'},
+    'pressoffice': {'label': 'Press Room', 'purpose': 'Explore a task, sprint or project as a graph of task nodes, prerequisite edges, repair/review links and optional chronological connections. Select a task to inspect current work, prior attempts, acceptance criteria, reviews, saved artifacts and completion write-ups. Agent implementation and validation continue in isolated story Docker workspaces: route code, review and QA work here, preserve the original criteria, and require a passing quality pipeline and independent review.'},
     'observatory': {'label': 'Research Center', 'purpose': 'makes a real model call reasoning about the SPECIFIC subtask given and files a genuine, findable finding. Use for "research/investigate/write up findings on X."'},
     'weatherstation': {'label': 'Weather Station', 'purpose': 'currently only checks a fixed weather reference, not yet aware of a specific subtask\'s content.'},
     'media': {'label': 'Studio', 'purpose': 'digests one of the subscribed feeds (media/feeds.md) into a summary. Use only for "summarize/digest an external source."'},
@@ -10115,7 +10173,16 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             from urllib.parse import urlsplit
             url = (args or {}).get('url') or ''
             if not discovered.allows(url):
-                return '__TOOL_ERROR__: URL is malformed or was not discovered in search, supplied task context, Library evidence, or page links. Search for the exact page first; do not guess its path.'
+                valid_url = discovered.valid(url)
+                log_action(agent_id, 'browse_url_rejected', {'url': url,
+                    'reason': 'not_discovered' if valid_url else 'malformed'}, authorized=False)
+                if not valid_url:
+                    return '__TOOL_ERROR__: URL syntax is invalid. No page fetch was attempted. Copy a complete exact URL from a search result or page link.'
+                host = urlsplit(url).hostname
+                choices = sorted(u for u in discovered.urls if urlsplit(u).hostname == host)[:8]
+                return ('__TOOL_ERROR__: URL has valid syntax but this exact path was not discovered. '
+                        'No page fetch was attempted. Use one of the actual discovered links below or search for the exact page; do not invent paths.\n'
+                        + '\n'.join(choices or sorted(discovered.urls)[:8]))
             parsed = urlsplit(url)
             cacheable = (parsed.scheme == 'https' and parsed.hostname in
                          ('docs.cdp.coinbase.com', 'docs.python.org', 'docs.influxdata.com', 'developers.openai.com')
@@ -13521,6 +13588,12 @@ def _taste_is_expired(taste):
     return review < datetime.date.today()
 
 
+def _budget_model_prices(model):
+    with _db() as conn:
+        row = conn.execute('SELECT prompt_price, completion_price FROM model_catalog WHERE model_id=?', (model,)).fetchone()
+    return tuple(row) if row else None
+
+
 @app.post('/api/chat')
 async def chat(request: Request):
     import request_budget
@@ -13559,6 +13632,11 @@ async def _chat_request(request: Request):
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
     if not model or not messages:
         return JSONResponse({'error': 'model and messages are required'}, status_code=400)
+    import local_work_model
+    try:
+        local_work_model.validate_messages(messages)
+    except ValueError as error:
+        return JSONResponse({'error': str(error)}, status_code=400)
     # Input pattern guard: fast, deterministic injection-vector
     # check BEFORE the call reaches the model. Scans the concatenated message
     # text for known prompt-injection patterns (ignore previous instructions,
@@ -13660,12 +13738,10 @@ async def _chat_request(request: Request):
         import request_budget
         state = get_state_from_db() or {}
         info = story_tracking.budget_status(state, _spend_ledger_read() or {}, task_id)
-        if info['scope'] == 'request':
-            with _db() as conn:
-                row = conn.execute('SELECT prompt_price, completion_price FROM model_catalog WHERE model_id=?', (model,)).fetchone()
+        if info['scope'] in ('request', 'story'):
             try:
                 max_tokens = request_budget.allowance(state, _spend_ledger_read() or {}, task_id,
-                    messages, max_tokens, tuple(row) if row else None)
+                    messages, max_tokens, _budget_model_prices(model))
             except ValueError as error:
                 return JSONResponse({'error': str(error), 'budgetExhausted': True,
                     'budgetScope': info, 'taskSpendUsd': info['used']}, status_code=429)
@@ -13692,7 +13768,7 @@ async def _chat_request(request: Request):
             data = await asyncio.to_thread(local_work_model.complete, local, messages, max_tokens,
                                           **({'response_format': response_format} if response_format else {}))
         else:
-            data = await asyncio.to_thread(_call_openrouter_sync, model, messages, max_tokens, best_of=best_n,
+            data = await asyncio.to_thread(local_work_model.remote_call, _call_openrouter_sync, model, messages, max_tokens, best_of=best_n,
                                           **({'response_format': response_format} if response_format else {}))
         if best_n > 1:
             # Sampling path: every sample is a real completion. Fold the set
@@ -14309,6 +14385,8 @@ async def sandbox_download(request: Request):
         return JSONResponse({'allowed': False, 'reason': 'Downloading into a sandbox only works from inside the Work Room or the Observatory, or with a real temporary grant from your supervisor (see /api/access/request).'})
     if not url or not filename or not sandbox_id:
         return JSONResponse({'error': 'url, filename, and sandboxId are required'}, status_code=400)
+    if not _private_story_access(request, agent_id, sandbox_id):
+        return JSONResponse({'error': 'This story workspace belongs to another task.'}, status_code=403)
 
     safe_name = _sanitize_download_filename(filename)
     if not safe_name:
@@ -14408,6 +14486,8 @@ async def sandbox_save_page(request: Request):
         return JSONResponse({'allowed': False, 'reason': 'Saving a page into a sandbox only works from inside the Work Room or the Observatory, or with a real temporary grant from your supervisor (see /api/access/request).'})
     if not url or not filename or not sandbox_id or not content:
         return JSONResponse({'error': 'url, filename, sandboxId, and content are required'}, status_code=400)
+    if not _private_story_access(request, agent_id, sandbox_id):
+        return JSONResponse({'error': 'This story workspace belongs to another task.'}, status_code=403)
 
     safe_name = _sanitize_download_filename(filename)
     if not safe_name:
@@ -14519,6 +14599,8 @@ async def access_request(request: Request):
 
 
 async def _classify_command(command, purpose, agent_id='unknown'):
+    if approval_automation.approve_request(sys.modules[__name__], agent_id, 'execute_classify', command, purpose):
+        return True, 'Player enabled always approve requests'
     # Fails closed, same direction as browsing and for the same reason:
     # an unreachable classifier is not consent to run something unvetted.
     if not OPENROUTER_API_KEY:
@@ -14726,6 +14808,31 @@ async def delete_handle(handle: str, request: Request):
     return JSONResponse({'ok': True})
 
 
+def _private_story_access(request, agent_id, sandbox_id):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', sandbox_id or ''):
+        return False
+    metadata = os.path.join(SANDBOXES_DIR, sandbox_id + '.runtime.json')
+    if not sandbox_id.startswith('story-') and not os.path.isfile(metadata):
+        return True
+    if verify_session((getattr(request, 'cookies', {}) or {}).get(SESSION_COOKIE_NAME)):
+        return True
+    if verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
+        return False
+    state = get_state_from_db() or {}
+    agent = (state.get('agents') or {}).get(agent_id) or {}
+    task = (state.get('tasks') or {}).get(agent.get('task'))
+    if not task:
+        return False
+    expected = __import__('code_workspaces').sandbox_for(state, task)
+    if sandbox_id == expected:
+        return True
+    try:
+        with open(metadata, encoding='utf-8') as stream:
+            return json.load(stream).get('workspace') == expected
+    except (OSError, ValueError):
+        return False
+
+
 def _validate_execution_body(body, pipeline=False):
     if not isinstance(body, dict):
         raise ValueError('Execution request must be a JSON object.')
@@ -14772,6 +14879,8 @@ async def execute(request: Request):
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
     if not command:
         return JSONResponse({'error': 'command is required'}, status_code=400)
+    if not _private_story_access(request, agent_id, sandbox_id):
+        return JSONResponse({'error': 'This story workspace belongs to another task.'}, status_code=403)
 
     allowed, reason = await _classify_command(command, purpose, agent_id)
     if not allowed:
@@ -14783,6 +14892,8 @@ async def execute(request: Request):
         esc_id = create_escalation(
             'blocked command',
             f'Agent {agent_id} wants to run this command in the Work Room, but it was blocked ({reason}):\n\n{command}\n\nPurpose given: {purpose or "none given"}',
+            on_approve_note=json.dumps({'agentId': agent_id, 'sandboxId': sandbox_id,
+                'taskId': ((get_state_from_db() or {}).get('agents', {}).get(agent_id) or {}).get('task')}),
         )
         log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'purpose': purpose, 'decision': 'blocked', 'reason': reason, 'escalationId': esc_id}, authorized=authorized)
         return JSONResponse({'allowed': False, 'reason': reason, 'escalationId': esc_id})
@@ -14869,6 +14980,8 @@ async def _pipeline_execute(request: Request):
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
     if not steps:
         return JSONResponse({'error': 'steps is required'}, status_code=400)
+    if not _private_story_access(request, agent_id, sandbox_id):
+        return JSONResponse({'error': 'This story workspace belongs to another task.'}, status_code=403)
 
     sandbox_dir = _sandbox_dir_for(sandbox_id)
     results = []

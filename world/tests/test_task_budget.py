@@ -149,6 +149,7 @@ class ChatGate(unittest.TestCase):
              unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
              unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True), \
              unittest.mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             unittest.mock.patch.object(serve, '_budget_model_prices', return_value=(0.0, 0.0)), \
              unittest.mock.patch.object(serve, 'log_action'):
             return c.post('/api/chat', json=body)
 

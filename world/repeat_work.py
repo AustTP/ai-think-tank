@@ -43,11 +43,15 @@ def record(state, task, result, now):
         return False
     records.append({'signature':signature, 'attempt':attempt, 'at':now, 'taskId':task.get('id'), 'failure':failure[:2000]})
     parent['repeatWorkFailures'] = records[-30:]
-    matches = sum(r['signature'] == signature for r in records)
+    # An explicit player retry authorizes a fresh attempt even when the words
+    # are unchanged (for example, the model service was restored).
+    authorizations = (parent.get('recoveryLedger') or {}).get('authorizations') or []
+    authorized_at = max((a.get('at') or 0 for a in authorizations), default=0)
+    matches = sum(r['signature'] == signature and r.get('at', 0) >= authorized_at for r in records)
     if matches < 2:
         return False
     parent.update(status='blocked', manualAttention=True, blockedReason='unchanged_failure',
-                  failNote='The same failure recurred with unchanged evidence and repair plan. Supply a new input, change the plan, or accept the known failure. Latest: ' + failure[:1800])
+                  failNote='The same failure recurred with unchanged evidence and repair plan. Investigate the cause, supply a new input, or change the repair plan. Latest: ' + failure[:1800])
     parent['_peerGate'] = dict(parent.get('_peerGate') or {})
     parent['_peerGate']['escalated'] = True
     parent['repeatWorkStop'] = {'signature':signature, 'at':now, 'attempts':matches}

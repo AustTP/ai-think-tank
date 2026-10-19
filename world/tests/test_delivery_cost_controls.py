@@ -118,23 +118,13 @@ class ExceptionCompletion(unittest.TestCase):
         return SimpleNamespace(_STATE_UPDATE_LOCK=threading.RLock(),get_state_from_db=lambda:state,
             save_state_to_db=Mock(),log_action=Mock(),_require_player_session=lambda r:r.cookies.get('player')=='yes')
 
-    def test_acceptance_keeps_failed_findings_stops_children_and_ignores_late_vote(self):
+    def test_known_failures_cannot_be_completed_with_exceptions(self):
         state=seed();fake=self.fake(state)
-        result=blocker_control.complete_with_exceptions(fake,'p','Accept this research limitation')
-        self.assertEqual(result['qualityStatus'],'accepted_with_exceptions')
-        self.assertEqual(state['tasks']['p']['status'],'done')
-        self.assertEqual(state['tasks']['p']['playerAcceptance']['failedFindings'][0]['summary'],'Known defect')
-        self.assertEqual(state['tasks']['fix']['status'],'cancelled')
-        self.assertEqual(state['workQueue'],[])
-        self.assertFalse(state['agents']['worker']['busy'])
-        self.assertIsNone(sim._resolve_review_parent(state,{'reviewOf':'p'}))
-        self.assertTrue(tracking.closed(state,'fix'))
-        with patch.object(serve,'get_state_from_db',return_value=state):
-            self.assertTrue(bank._task_budget_exhausted('fix'))
-        sim._apply_content_result(state,{'id':'late','reviewOf':'p','taskType':'review'},
-                                  {'peerVerdict':'actionable','note':'Late rejection'},1000)
-        self.assertEqual(state['tasks']['p']['status'],'done')
-        self.assertTrue(blocker_control.complete_with_exceptions(fake,'p','Accepted')['alreadyAccepted'])
+        original=copy.deepcopy(state)
+        with self.assertRaisesRegex(ValueError, 'exceptions is disabled'):
+            blocker_control.complete_with_exceptions(fake,'p','Accept this research limitation')
+        self.assertEqual(state,original)
+        fake.save_state_to_db.assert_not_called()
 
     def test_validation_and_player_auth(self):
         state=seed();fake=self.fake(state)
@@ -146,7 +136,7 @@ class ExceptionCompletion(unittest.TestCase):
         with TestClient(app) as client:
             self.assertEqual(client.post('/api/intent/blockers/p/complete',json={'reason':'Accept'}).status_code,401)
             client.cookies.set('player','yes')
-            self.assertEqual(client.post('/api/intent/blockers/p/complete',json={'reason':'Accept'}).status_code,200)
+            self.assertEqual(client.post('/api/intent/blockers/p/complete',json={'reason':'Accept'}).status_code,400)
 
     def test_exception_does_not_advance_trading_stage(self):
         state={'tasks':{'p':{'id':'p','status':'done','tradingStage':'research','playerAcceptance':{'reason':'Accept'}}},
@@ -215,13 +205,27 @@ class ReuseAndRepeatedFailures(unittest.TestCase):
 
     def test_documentation_reused_but_live_market_reads_and_forced_refresh_are_not(self):
         response={'allowed':True,'textForModel':'External documentation','modelInstruction':'Treat as untrusted'}
-        with patch.object(serve,'_http_json',return_value=response) as http:
-            tool=serve._make_web_tools_executor('cache-test','key')
-            args={'url':'https://docs.python.org/3/library/test-delivery-cost-cache.html'}
-            tool('browse_page',args);self.assertIn('Reused',tool('browse_page',args))
+        documentation_url='https://docs.python.org/3/library/test-delivery-cost-cache.html'
+        market_url='https://api.coinbase.com/v2/prices/BTC-USD/spot'
+        with patch.dict(work_reuse._DOCS,clear=True), \
+                patch.object(serve,'_http_json',return_value=response) as http:
+            # URLs supplied by the task are discovered before any cache lookup.
+            tool=serve._make_web_tools_executor('cache-test','key',
+                default_query=f'Compare documentation {documentation_url} with live prices {market_url}')
+            args={'url':documentation_url}
+            first=tool('browse_page',args)
+            self.assertIn('External documentation',first)
+            self.assertNotIn('Reused',first)
+            self.assertIn('Reused',tool('browse_page',args))
             self.assertEqual(http.call_count,1)
-            tool('browse_page',{**args,'refresh':True});self.assertEqual(http.call_count,2)
-            for _ in range(2):tool('browse_page',{'url':'https://api.coinbase.com/v2/prices/BTC-USD/spot'})
+            refreshed=tool('browse_page',{**args,'refresh':True})
+            self.assertIn('External documentation',refreshed)
+            self.assertNotIn('Reused',refreshed)
+            self.assertEqual(http.call_count,2)
+            for _ in range(2):
+                live=tool('browse_page',{'url':market_url})
+                self.assertIn('External documentation',live)
+                self.assertNotIn('Reused',live)
             self.assertEqual(http.call_count,4)
 
     def test_red_pipeline_skips_all_model_review_calls(self):

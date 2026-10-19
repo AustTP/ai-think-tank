@@ -59,7 +59,7 @@ const ROOM_COLLISIONS = {
 };
 
 const ROOMS = {
-  pressoffice: { image: 'assets/rooms/room_workstations.png', collision: 'workstations', label: 'Work Room' },
+  pressoffice: { image: 'assets/rooms/room_workstations.png', collision: 'workstations', label: 'Press Room' },
   media: { image: 'assets/rooms/room_workstations.png', collision: 'workstations', label: 'Studio' },
   weatherstation: { image: 'assets/rooms/room_workstations.png', collision: 'workstations', label: 'Weather Station' },
   observatory: { image: 'assets/rooms/room_workstations.png', collision: 'workstations', label: 'Research Center' },

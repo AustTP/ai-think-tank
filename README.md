@@ -8,8 +8,19 @@ consequences. Close the browser and the think tank keeps running; reopen it and
 you see what happened while you were away.
 
 See `DESIGN.md` for the full architecture documentation.
+See [the repository guide](docs/repository-guide.md) for the directory layout,
+development checks, and the boundary between source and local runtime data.
 
 ## Running it
+
+Install the Python dependencies from the repository root:
+
+```sh
+python -m pip install -r requirements.txt
+```
+
+The CI environment uses Python 3.12 and Node.js 20. Docker is required for agent
+execution and quality checks; Node.js runs the JavaScript regression harnesses.
 
 ### Local active-work model
 
@@ -22,12 +33,37 @@ OpenAI-compatible API. Set these server-side values in the git-ignored `.env`:
 
 ```ini
 LOCAL_WORK_MODEL_ENABLED=true
-LOCAL_WORK_MODEL_PATH=C:\Users\Khalil\.unsloth\studio\outputs\unsloth_Qwen3.5-4B_1791825047
+LOCAL_WORK_MODEL_PATH=C:\models\your-adapter
 LOCAL_WORK_MODEL_BASE_URL=http://127.0.0.1:8888/v1
 LOCAL_WORK_MODEL_API_KEY=<Studio API key>
 LOCAL_WORK_MODEL_TIMEOUT=120
 LOCAL_WORK_MODEL_MANAGE_STUDIO=true
 ```
+
+Set `PRIMARY_MODEL_PROVIDER=unsloth` to use this endpoint for all ordinary
+worker completions, general chat, and tool calls. Repairs, planning and reviews
+retain their configured remote models, including scrum-master and director work.
+Local failures surface without falling back to a paid provider. The separate
+JEV policy classifier keeps its configured provider. Omit this setting to retain
+the worker-only routing described below.
+When the desired model is already loaded in Studio, set
+`LOCAL_WORK_MODEL_MANAGE_STUDIO=false` to use it directly without requesting
+another adapter load. Keep the configured model path matched to that model.
+Before a local completion, the client counts the prompt with the adapter's
+tokenizer and chat template, reserving space for the reply. Older exchanges
+that would exceed the budget are replaced by a cached remote-model summary;
+task instructions and recent complete tool exchanges are preserved. Summary
+responses may contain JSON fences or surrounding commentary. Invalid or
+unsupported summaries get up to two corrective retries with costs recorded;
+failure after three attempts stops the call rather than sending oversized history. The original
+transcript remains available to the executor and interaction recording.
+`LOCAL_WORK_MODEL_CONTEXT_LENGTH` defaults to 8192 and
+`LOCAL_WORK_MODEL_MAX_OUTPUT_TOKENS` defaults to 1500; match the context setting
+to Studio's loaded context limit. Summary calls use the configured remote
+mid/low tier and their provider cost is recorded.
+Malformed local textual tool calls also receive up to two corrective retries,
+with the rejected parameter and permitted names supplied to the model. Unknown
+or duplicate parameters are never executed or silently removed.
 
 With `LOCAL_WORK_MODEL_MANAGE_STUDIO=true`, each local call checks the loaded
 model and loads the adapter in 4-bit mode with an 8,192-token context if another
@@ -95,8 +131,30 @@ integrations you actually use.
 Tests:
 
 ```bash
-cd world && python3 -m pytest tests/
+python -m pytest
 ```
+
+Run this from the repository root to discover the Python suites in `world/tests/`
+and `scripts/`. For a focused change, pass the relevant test files explicitly.
+The Bash/Node regression harness remains available as `bash world/tests/run_all.sh`.
+
+Research stories should normally deliver a plain-text `.txt` report. CSVs are
+for actual tabular data, not a default requirement for research, API summaries,
+comparisons, or lists of findings. Explicitly requested data files must be saved
+to the Library and verified before submission. A report explaining that a file
+could not be produced does not claim that file exists; incomplete findings still
+require independent review against the original story requirements.
+Every research attempt is retained in the Library for later reuse, including
+partial findings, source evidence, and failure notes. Saving an incomplete
+attempt does not mark it successful. A failed Library write prevents completion.
+
+Coding repairs continue from an isolated checkpoint of the failed attempt when
+the published workspace has not changed. Missing tests are added against that
+implementation; compiler, type-checker, lint and test errors are returned for
+targeted edits in the same staged workspace. Each execution allows at most two
+correction rounds and retains existing spend limits. Failed checkpoints remain
+unpublished; only passing changes proceed to normal review. Document repairs
+load the previous Library report and revise its missing or incorrect sections.
 
 Unfinished-story recovery runs on each simulation tick. Completed blocker
 investigations queue a repair of the original story; repairs return to its

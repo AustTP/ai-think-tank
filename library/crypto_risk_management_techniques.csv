@@ -1,8 +1,6 @@
-technique_name,description,sources,basis
-Diversification,Spreading investments across multiple coins to reduce risk.,"https://bisonapp.com/en/academy/crypto-risk-management,https://changelly.com/blog/risk-management-in-crypto-trading",verified
-Stop-loss and Take-profit Orders,Automatically selling assets when prices reach certain levels to protect capital and lock in profits.,"https://changelly.com/blog/risk-management-in-crypto-trading,https://algosone.ai/the-science-of-risk-management-in-crypto-trading",verified
-Hedging,Mitigating volatility risks and maintaining a stable portfolio.,"https://uk.investing.com/analysis/risk-management-for-crypto-investors-tools-methods-techniques-200433004,https://changelly.com/blog/risk-management-in-crypto-trading",verified
-Thorough Technical and Fundamental Analysis,Conducting in-depth analysis to make informed investment decisions.,https://changelly.com/blog/risk-management-in-crypto-trading,verified
-Regulated and Secure Trading Platforms,Using reputable platforms to limit security-related risks.,https://bisonapp.com/en/academy/crypto-risk-management,verified
-Position Sizing,Determining how much capital to allocate to a single trade to manage potential losses.,https://changelly.com/blog/risk-management-in-crypto-trading,verified
-Predefined Risk Limits,Setting daily loss caps and leverage restrictions to control exposure to potential losses.,https://changelly.com/blog/risk-management-in-crypto-trading,verified
+technique,description,purpose,implementation_notes,sources,basis
+Stop-Loss,An exit order triggered when the price falls to a specified level.,Limit loss exposure.,Define the exit trigger for the position.,https://algosone.ai/the-science-of-risk-management-in-crypto-trading/,verified
+Take-Profit,An exit order triggered when a specified profit price is reached.,Realize gains at the selected trigger.,Define the profit-taking exit trigger.,https://algosone.ai/the-science-of-risk-management-in-crypto-trading/,verified
+Position Sizing,Determining the capital allocated to a position.,Manage exposure from a single position.,Determine the amount allocated before entering a trade.,https://algosone.ai/the-science-of-risk-management-in-crypto-trading/,verified
+Portfolio Diversification,Spreading holdings across assets.,Reduce concentration in a single asset.,Review how capital is distributed across holdings.,https://algosone.ai/the-science-of-risk-management-in-crypto-trading/,verified
+Scenario Analysis,Evaluating the impact of different risk scenarios.,Understand potential portfolio impacts.,Assess specified risk scenarios and mitigation effectiveness.,https://financialcrimeacademy.org/cryptocurrency-risk-management/,verified

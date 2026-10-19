@@ -51,3 +51,19 @@ def test_typed_arguments_and_multiple_calls():
     calls=qwen.normalize(response(text+text),tools)['choices'][0]['message']['tool_calls']
     assert len(calls)==2 and calls[0]['id']!=calls[1]['id']
     assert json.loads(calls[0]['function']['arguments'])=={'count':3,'options':{'daily':True}}
+
+
+def test_unknown_parameter_error_identifies_exact_schema_and_retains_raw_call():
+    invalid = BEN_REPLY.replace('<parameter=query>', '<parameter=file_path>')
+    with pytest.raises(qwen.ToolCallValidationError) as caught:
+        qwen.normalize(response(invalid), TOOLS)
+    assert 'unknown parameter' in str(caught.value)
+    assert 'file_path' in str(caught.value)
+    assert 'Allowed parameters: query' in str(caught.value)
+    assert caught.value.raw_text == invalid
+
+
+def test_duplicate_parameters_are_rejected_instead_of_silently_overwritten():
+    invalid = BEN_REPLY.replace('</function>', '<parameter=query>second query</parameter></function>')
+    with pytest.raises(qwen.ToolCallValidationError, match='duplicate parameter'):
+        qwen.normalize(response(invalid), TOOLS)

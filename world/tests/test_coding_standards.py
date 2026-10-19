@@ -83,6 +83,11 @@ class ApprovalGate(unittest.TestCase):
         review = {'id': f'rev-{reviewer}', 'reviewOf': parent_id,
                   'assignedTo': reviewer, 'taskType': 'review', 'status': 'working'}
         result = dict(result)
+        if result.get('peerVerdict') == 'clean':
+            # These tests isolate the pipeline gate; criterion validation has
+            # already succeeded at the review-executor boundary.
+            result['acceptanceAssessment'] = {'verified': True, 'errors': [], 'checks': [
+                {'criterionId': 'C2', 'status': 'met', 'evidence': ['Inspected required behavior.']}]}
         result.setdefault('note', 'review filed')
         sim._apply_content_result(state, review, result)
         return state['tasks'][parent_id]

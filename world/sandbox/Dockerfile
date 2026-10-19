@@ -17,5 +17,6 @@ RUN python -m pip install --no-cache-dir \
     pytest-cov==7.1.0
 WORKDIR /workspace
 RUN python -m pip install --no-cache-dir \
-    numpy==2.2.6 pandas==2.2.3 scikit-learn==1.6.1 yfinance==0.2.65
+    numpy==2.2.6 pandas==2.2.3 scikit-learn==1.6.1 yfinance==0.2.65 \
+    coinbase-advanced-py==1.8.4
 ENV OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1

@@ -89,7 +89,7 @@ def test_failed_calls_remain_diagnostic_records(monkeypatch, tmp_path):
 def test_export_requires_approval_and_keeps_request_groups(monkeypatch, tmp_path):
     path = configure_capture(monkeypatch, tmp_path)
     for identifier, group in [('a','request-1'),('b','request-1'),('c','request-2')]:
-        with capture.context({'agent_id':identifier,'task_id':identifier,'group_id':group}):
+        with capture.context({'agent_id':identifier,'role':'Researcher','task_id':identifier,'group_id':group}):
             capture.record('local', {'model':'m','messages':[{'role':'user','content':'question-'+identifier}]},
                 {'choices':[{'message':{'content':'answer-'+identifier},'finish_reason':'stop'}]})
     script = Path(__file__).resolve().parents[2] / 'scripts/export_training_interactions.py'
@@ -98,11 +98,17 @@ def test_export_requires_approval_and_keeps_request_groups(monkeypatch, tmp_path
     spec.loader.exec_module(module)
     with sqlite3.connect(path) as conn:
         conn.row_factory = sqlite3.Row
-        summary = module.export(conn, tmp_path / 'out')
+        summary = module.export(conn, tmp_path / 'out', prepare_studio=False)
         assert summary['train'] == summary['eval'] == 0
         conn.execute("UPDATE interactions SET review_status='approved'")
-        summary = module.export(conn, tmp_path / 'out', 0.5)
+        summary = module.export(conn, tmp_path / 'out', 0.5, prepare_studio=False)
     assert summary['train'] + summary['eval'] == 3
+    snapshots = list((tmp_path / 'out/history').iterdir())
+    assert len(snapshots) == 3  # first export, preserved previous export, second export
+    saved = json.loads((Path(summary['dated_path']) / 'summary.json').read_text())
+    assert saved['train'] + saved['eval'] == 3
+    assert saved['timezone'] == 'America/New_York'
+    assert any((snapshot / 'train.jsonl').read_text() == '' for snapshot in snapshots)
     manifest = [json.loads(x) for x in (tmp_path/'out/manifest.jsonl').read_text().splitlines()]
     groups = {}
     for row in manifest:

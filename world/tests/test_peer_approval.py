@@ -26,6 +26,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import serve
 import sim
 
+def _acceptance_proof():
+    return {'verified': True, 'errors': [], 'checks': [
+        {'criterionId': 'C2', 'status': 'met', 'criterion': 'Required deliverable works.',
+         'evidence': ['Inspected implementation and passing acceptance tests.'],
+         'explanation': 'Acceptance tests exercise the required behavior.'}]}
+
+
 _TMP_DIR = None
 _PATCHER = None
 
@@ -208,6 +215,7 @@ class VerdictFolding(unittest.TestCase):
         result = {'note': 'ok', 'peerVerdict': verdict}
         if verdict == 'clean':
             result['pipelineOk'] = True
+            result['acceptanceAssessment'] = _acceptance_proof()
             result['evidence'] = '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'
         sim._apply_content_result(state, review_task, result)
         return state['tasks'][parent_id]
@@ -254,7 +262,7 @@ class VerdictFolding(unittest.TestCase):
         sim._apply_content_result(state, {'id': 'r0', 'reviewOf': task['id'],
                                           'assignedTo': 'ada', 'taskType': 'review',
                                           'status': 'working'},
-                                  {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True,
+                                  {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True, 'acceptanceAssessment': _acceptance_proof(),
                                    'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         parent = state['tasks'][task['id']]
         self.assertEqual(parent['_peerGate']['approvals'], 1)
@@ -266,7 +274,7 @@ class VerdictFolding(unittest.TestCase):
         sim._apply_content_result(state, {'id': 'r1', 'reviewOf': task['id'],
                                           'assignedTo': 'cora', 'taskType': 'review',
                                           'status': 'working'},
-                                  {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True,
+                                  {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True, 'acceptanceAssessment': _acceptance_proof(),
                                    'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         parent = state['tasks'][task['id']]
         self.assertEqual(parent['_peerGate']['approvals'], 2)
@@ -280,7 +288,7 @@ class VerdictFolding(unittest.TestCase):
             sim._apply_content_result(state, {'id': 'r0', 'reviewOf': task['id'],
                                               'assignedTo': 'ada', 'taskType': 'review',
                                               'status': 'working'},
-                                      {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True,
+                                      {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True, 'acceptanceAssessment': _acceptance_proof(),
                                        'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         parent = state['tasks'][task['id']]
         self.assertEqual(parent['_peerGate']['approvals'], 1,
@@ -378,7 +386,7 @@ class VerdictFolding(unittest.TestCase):
         sim._apply_content_result(state, {'id': 'r0', 'reviewOf': task['id'],
                                           'assignedTo': 'ada', 'taskType': 'review',
                                           'status': 'working'},
-                                  {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True,
+                                  {'note': 'ok', 'peerVerdict': 'clean', 'pipelineOk': True, 'acceptanceAssessment': _acceptance_proof(),
                                    'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         parent = state['tasks'][task['id']]
         now = parent['_peerGate']['enteredMs'] + sim.PEER_REVIEW_TIMEOUT_MS + 1
@@ -509,14 +517,14 @@ class Integration(unittest.TestCase):
         sim._apply_content_result(state,
                                   {'id': 'rev-1', 'reviewOf': story['id'], 'assignedTo': reviewers[0],
                                    'taskType': 'review', 'status': 'working'},
-                                  {'note': 'looks good', 'peerVerdict': 'clean', 'pipelineOk': True,
+                                  {'note': 'looks good', 'peerVerdict': 'clean', 'pipelineOk': True, 'acceptanceAssessment': _acceptance_proof(),
                                    'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         self.assertFalse(sim._parent_close_from_vote(state, story, now_ms=int(now * 1000)),
                          'one clean vote must not close within the timeout')
         sim._apply_content_result(state,
                                   {'id': 'rev-2', 'reviewOf': story['id'], 'assignedTo': reviewers[1],
                                    'taskType': 'review', 'status': 'working'},
-                                  {'note': 'solid', 'peerVerdict': 'clean', 'pipelineOk': True,
+                                  {'note': 'solid', 'peerVerdict': 'clean', 'pipelineOk': True, 'acceptanceAssessment': _acceptance_proof(),
                                    'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         self.assertTrue(sim._parent_close_from_vote(state, story, now_ms=int(now * 1000)),
                         'two distinct clean votes close the story')
@@ -631,6 +639,7 @@ class ReviewDenialCoaching(unittest.TestCase):
         if verdict == 'clean':
             result['pipelineOk'] = pipeline_ok
             if pipeline_ok:
+                result['acceptanceAssessment'] = _acceptance_proof()
                 result['evidence'] = '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'
         sim._apply_content_result(state, review_task, result)
         return state['tasks'][parent_id]

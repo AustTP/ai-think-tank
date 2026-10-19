@@ -25,6 +25,28 @@ def state():
 
 
 class Guidance(unittest.TestCase):
+    def test_repeated_explicit_retry_clears_blocker_and_grants_fresh_failure_window(self):
+        import repeat_work
+        s = state();t = s['tasks']['t']
+        t['interventionHistory'] = [{'guidance': 'Model is working now; retry', 'at': 1}]
+        t['recoveryLedger'] = {'attempts': 2, 'noProgress': 2, 'history': []}
+        failure = {'ok': False, 'note': 'HTTP Error 500'}
+        with patch.object(repeat_work, 'evidence_digest', return_value='same source'):
+            for identifier, now in [('old-a', 1000), ('old-b', 2000)]:
+                child = {'id': identifier, 'reviewOf': 't'}
+                repeat_work.record(s, child, failure, now)
+            t.update(deliveryState='blocked', reviewBlocker='Old service failure')
+            with patch.object(guidance.time, 'time', return_value=3):
+                guidance.apply_guidance(s, 't', {'action': 'retry', 'guidance': 'Model is working now; retry'})
+            self.assertEqual(t['status'], 'repairing')
+            self.assertEqual(t['deliveryState'], 'queued')
+            self.assertFalse(t['manualAttention'])
+            self.assertNotIn('repeatWorkStop', t)
+            self.assertNotIn('reviewBlocker', t)
+            self.assertFalse(repeat_work.record(s, {'id': 'new-a', 'reviewOf': 't'}, failure, 4000))
+            self.assertTrue(repeat_work.record(s, {'id': 'new-b', 'reviewOf': 't'}, failure, 5000))
+            self.assertEqual(len(t['repeatWorkFailures']), 4)
+
     def test_investigation_of_investigation_routes_to_original_once(self):
         s=state()
         s['tasks']['child']={'id':'child','status':'failed','investigationOf':'t'}
@@ -162,15 +184,18 @@ class Guidance(unittest.TestCase):
             guidance.apply_guidance(s, 't', {'action': 'edit_scope'})
         self.assertEqual(s, original)
 
-    def test_repeated_error_stops_after_two_attempts(self):
+    def test_repeated_review_error_retains_diagnosis_for_evidence_based_recovery(self):
         t = state()['tasks']['t']
         gate = t['_peerGate'] = {}
         with patch.object(serve, 'create_escalation') as esc:
             self.assertFalse(sim._maybe_escalate_stuck_gate(t, gate, 'lint', 'a.py:1:1: F821 undefined pd'))
-            self.assertTrue(sim._maybe_escalate_stuck_gate(t, gate, 'lint', 'a.py:9:2: F821 undefined pd'))
+            self.assertFalse(sim._maybe_escalate_stuck_gate(t, gate, 'lint', 'a.py:9:2: F821 undefined pd'))
         self.assertEqual(gate['cycleCount'], 2)
         self.assertEqual(t['reviewDiagnosis']['category'], 'code_defect')
-        self.assertIn('taskId', esc.call_args.kwargs['on_approve_note'])
+        # Actionable reviews may continue; repeat_work enforces unchanged
+        # failures using the persisted evidence and current player decision.
+        self.assertEqual(gate['noProgressCount'], 2)
+        esc.assert_not_called()
 
     def test_shared_workspace_assignment_waits(self):
         s = state()
@@ -204,12 +229,16 @@ class WeatherAndDocumentReview(unittest.TestCase):
             target = os.path.join(root, 'doc.md')
             with open(target, 'w') as f:
                 f.write('Actual sourced document')
-            snapshot = {'tasks': {'parent': {'id': 'parent', 'room': 'observatory', 'libraryPath': 'doc.md'}}}
+            snapshot = {'tasks': {'parent': {'id': 'parent', 'room': 'observatory', 'libraryPath': 'doc.md',
+                'instructions': 'Save sourced findings.', 'acceptanceCriteria': 'A sourced document is saved.'}}}
             with patch.object(serve, '_safe_library_path', return_value=target), \
                     patch.object(serve, 'get_or_create_agent_key', return_value='test'), \
                     patch.object(serve, '_mid_tier_slug', return_value='model'), \
                     patch.object(serve, '_http_json', return_value={'reply': json.dumps({
-                        'verdict': 'approve', 'summary': 'Verified', 'checks': [], 'risks': []})}), \
+                        'verdict': 'approve', 'summary': 'Verified', 'checks': [], 'risks': [],
+                        'acceptanceChecks': [
+                            {'criterionId': 'C1', 'status': 'met', 'evidenceIds': ['E1'], 'explanation': 'Sourced findings are in the saved report.'},
+                            {'criterionId': 'C2', 'status': 'met', 'evidenceIds': ['E1'], 'explanation': 'The report was opened from Library.'}]})}), \
                     patch.object(content, '_run_quality_pipeline') as pipeline, \
                     patch.object(sim, '_store_content_result') as store:
                 content._run_review_content(snapshot, 'ben', {'id': 'review', 'reviewOf': 'parent'})

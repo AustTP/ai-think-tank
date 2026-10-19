@@ -22,6 +22,71 @@ def fixture():
 
 
 class CodeDirector(unittest.TestCase):
+    def test_player_retry_preserves_validation_status_and_clears_attention(self):
+        import blocker_control
+        import threading
+        from types import SimpleNamespace
+        state, parent = fixture()
+        parent.update(status='blocked', manualAttention=True, blockedReason='story_recovery_limit')
+        server = SimpleNamespace(_STATE_UPDATE_LOCK=threading.RLock(),
+            get_state_from_db=lambda: state, save_state_to_db=lambda value: None,
+            log_action=lambda *args, **kwargs: None)
+        blocker_control.apply_action(server, parent['id'], {
+            'action': 'assign_repair', 'guidance': 'Inspect and repair the recorded failure.'})
+        self.assertEqual(parent['blockedReason'], 'code_director_check')
+        self.assertEqual(parent['deliveryState'], 'validation_queued')
+        self.assertNotIn(parent['id'], [c['taskId'] for c in blocker_control.cards(state)])
+
+    def test_queued_validation_is_progress_not_a_human_blocker(self):
+        import blocker_control
+        import completion_watchdog
+        state, parent = fixture()
+        parent['failNote'] = 'blocked: None Existing workspace preserved.'
+        code_director.queue_check(state, parent)
+        state['tasks']['writer'] = {'id': 'writer', 'title': 'Format portfolio data',
+            'room': 'pressoffice', 'status': 'working'}
+        completion_watchdog.step(state, 1000)
+        self.assertEqual(parent['deliveryState'], 'validation_queued')
+        self.assertIn('Format portfolio data', parent['nextAction'])
+        self.assertEqual(parent['status'], 'blocked')
+        self.assertEqual(parent['_peerGate']['approvals'], 0)
+        self.assertEqual(parent['failNote'], 'blocked: None Existing workspace preserved.')
+        self.assertNotIn(parent['id'], [c['taskId'] for c in blocker_control.cards(state)])
+
+    def test_running_validation_reports_running_and_orphan_remains_actionable(self):
+        import blocker_control
+        import completion_watchdog
+        state, parent = fixture()
+        code_director.queue_check(state, parent)
+        state['workQueue'] = []
+        state['tasks']['check'] = {'id': 'check', 'reviewOf': parent['id'],
+            'taskType': 'code_preflight', 'status': 'working'}
+        completion_watchdog.step(state, 1000)
+        self.assertEqual(parent['deliveryState'], 'validation_running')
+        state['tasks']['check']['status'] = 'failed'
+        completion_watchdog.step(state, 2000)
+        self.assertEqual(parent['deliveryState'], 'blocked')
+        self.assertIn(parent['id'], [c['taskId'] for c in blocker_control.cards(state)])
+
+    def test_sim_notice_refresh_updates_validation_without_task_assignment_pass(self):
+        import blocker_control
+        state, parent = fixture()
+        code_director.queue_check(state, parent)
+        blocker_control.reconcile_notices(state)
+        self.assertEqual(parent['deliveryState'], 'validation_queued')
+        state['workQueue'] = []
+        blocker_control.reconcile_notices(state)
+        self.assertEqual(parent['deliveryState'], 'blocked')
+        self.assertIn(parent['id'], [c['taskId'] for c in blocker_control.cards(state)])
+
+    def test_validation_does_not_hide_an_explicit_human_pause(self):
+        import blocker_control
+        state, parent = fixture()
+        code_director.queue_check(state, parent)
+        parent['manualAttention'] = True
+        self.assertIsNone(code_director.validation_progress(state, parent))
+        self.assertIn(parent['id'], [c['taskId'] for c in blocker_control.cards(state)])
+
     def test_director_is_created_once_and_reserved_from_delivery_and_review(self):
         state, _ = fixture()
         original = copy.deepcopy(state)

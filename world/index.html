@@ -410,6 +410,7 @@
   #libraryModal.library-expanded #libraryFileContent { flex: 1; min-height: 0; overflow: auto; font: 15px/1.65 var(--font-mono); }
 </style>
 <link rel="stylesheet" href="board.css?v=20261009-menu-revert">
+<link rel="stylesheet" href="work_graph.css?v=2">
 </head>
 <body>
 <div id="wrap">
@@ -561,6 +562,7 @@
   </div>
 </div>
 
+<div id="workGraphModal" class="modal hidden" role="dialog" aria-modal="true" aria-label="Post Office work graph"><div id="workGraphHost"></div></div>
 <div id="workroomModal" class="modal hidden">
   <div class="modal-box terminal-box">
     <div class="terminal-header">
@@ -740,13 +742,39 @@
     </header>
     <div id="boardMetrics" class="board-metrics" aria-label="Work overview"></div>
     <nav class="board-tabs" aria-label="Board sections">
+      <button type="button" onclick="window.location.assign('/training_review.html')">Training review</button>
       <button type="button" onclick="showBoardPane('recovery',this)" aria-selected="true">Needs attention</button>
       <button type="button" onclick="showBoardPane('activity',this)" aria-selected="false">Work &amp; reviews</button>
       <button type="button" onclick="showBoardPane('requests',this)" aria-selected="false">Requests &amp; direction</button>
       <button type="button" onclick="showBoardPane('roles',this)" aria-selected="false">Team</button>
       <button type="button" onclick="showBoardPane('projects',this)" aria-selected="false">Projects &amp; Library</button>
     </nav>
-    <section id="board-recovery" class="board-pane"><h4>Needs attention</h4><p>Choose a blocked story to see its requirements and send recovery instructions.</p><div id="boardBlockers" class="blocker-grid"></div></section>
+    <section id="board-recovery" class="board-pane">
+      <h4>Needs attention</h4>
+      <form id="approvalAutomationSettings" style="padding:16px;border:1px solid var(--border);border-radius:8px;margin-bottom:16px;text-align:left">
+        <label for="approvalPreset"><strong>Approval setting</strong></label>
+        <select id="approvalPreset" name="preset" aria-describedby="approvalPresetDescription" style="display:block;width:100%;max-width:360px;margin:10px 0;padding:10px">
+          <option value="always">Always approve</option>
+          <option value="moderation">Moderation approve</option>
+          <option value="strict" selected>Strict approval</option>
+        </select>
+        <p id="approvalPresetDescription" style="margin:8px 0">Approval requests and blocker decisions wait for you.</p>
+        <p style="margin:8px 0">Every preset requires verified acceptance criteria and passing quality checks before work is accepted.</p>
+        <label for="approvalReportEvery"><strong>Email report interval</strong></label>
+        <select id="approvalReportEvery" name="reportEvery" style="display:block;width:100%;max-width:360px;margin:10px 0;padding:10px">
+          <option value="5">Every 5 actions</option>
+          <option value="10" selected>Every 10 actions</option>
+          <option value="25">Every 25 actions</option>
+          <option value="50">Every 50 actions</option>
+          <option value="100">Every 100 actions</option>
+        </select>
+        <p style="margin:8px 0">Count automatic approvals and recovery attempts. Each email includes a summary and one line per item, showing what was approved or retried.</p>
+        <button type="submit">Save setting</button>
+        <span id="approvalAutomationStatus" role="status"></span>
+      </form>
+      <p>Choose a blocked story to see its requirements and send recovery instructions.</p>
+      <div id="boardBlockers" class="blocker-grid"></div>
+    </section>
     <section id="board-requests" class="board-pane" hidden>
     <details open style="text-align:left;margin-bottom:12px;">
       <summary>Company North Star</summary>
@@ -810,7 +838,7 @@
 </div>
 
 <script src="world.js?v=29"></script>
-<script src="rooms.js?v=6"></script>
+<script src="rooms.js?v=7"></script>
 <script src="terminals.js?v=3"></script>
 <script src="agents.js?v=28"></script>
 <script src="meetings.js?v=2"></script>
@@ -824,6 +852,7 @@
 <script src="handoffs.js?v=11"></script>
 <script src="templates.js?v=1"></script>
 <script src="sim_bridge.js?v=5"></script>
+<script src="work_graph.js?v=5"></script>
 <script>
 const VIEW_W = 1024, VIEW_H = Math.round(1024 * 384 / 688);
 const canvas = document.getElementById('game');
@@ -914,6 +943,7 @@ function enterRoom(building) {
   state.player.y = 370;
   state.player.dir = 'north';
   state.zoom = ZOOM_ROOM;
+  if (building === 'postoffice') openPostOfficeGraph();
 }
 
 function exitRoom() {
@@ -951,7 +981,7 @@ function openTerminal(item) {
   // Center) keeps the generic stub terminal below. Press Office is
   // labeled "Work Room" (ROOMS.pressoffice) -- real sandboxed execution.
   if (state.location.building === 'weatherstation') { openBrowser(item); return; }
-  if (state.location.building === 'pressoffice') { openWorkroom(item); return; }
+  if (state.location.building === 'pressoffice') { openWorkroomSandbox(item); return; }
   if (state.location.building === 'observatory') { openResearch(item); return; }
   if (state.location.building === 'library') { openLibrary(item); return; }
   if (state.location.building === 'media') { openLibrary(item); return; }
@@ -1125,7 +1155,21 @@ async function handleBrowserCurl() {
 const WORKROOM_SANDBOX_ID = 'workroom-shared';
 let workroomSandboxId = WORKROOM_SANDBOX_ID;
 
-function openWorkroom(item) {
+let workGraphView = null;
+function openPostOfficeGraph(item = {zone:null}) {
+  if (state.location.kind !== 'room' || state.location.building !== 'postoffice') return;
+  if (workGraphView) workGraphView.close();
+  activeInteractZone = item.zone;
+  state.ui = 'workgraph';
+  const modal = document.getElementById('workGraphModal');
+  modal.classList.remove('hidden');
+  workGraphView = WorkGraph.create(document.getElementById('workGraphHost'), {
+    onClose: () => { modal.classList.add('hidden'); state.ui = null; clearInteractZone(); workGraphView = null; },
+  });
+  modal.querySelector('[data-scope]').focus();
+}
+
+function openWorkroomSandbox(item) {
   activeInteractZone = item.zone;
   state.ui = 'workroom';
   document.getElementById('workroomPurposeInput').value = '';
@@ -1865,23 +1909,28 @@ try { setBoardTheme(localStorage.getItem('think-tank-board-theme') || 'dark'); }
 // Keep queued requests beside their form without changing polling targets.
 document.getElementById('board-requests').appendChild(document.getElementById('workOrdersBody'));
 function renderBoard() {
+  loadApprovalAutomationSettings().catch(error => {
+    document.getElementById('approvalAutomationStatus').textContent = `Could not load approval setting: ${error.message}`;
+  });
   const rootStories = Object.values(TASKS).filter(t => !t.reviewOf && !t.investigationOf && !t.recoveryOf);
+  const validating = t => t.status === 'blocked' && t.blockedReason === 'code_director_check'
+    && !t.manualAttention && !t._peerGate?.escalated
+    && ['validation_queued', 'validation_running'].includes(t.deliveryState);
+  const repairing = t => t.status === 'failed' && t._peerRepairPending && !t.manualAttention && !t._peerGate?.escalated && (
+    Object.values(TASKS).some(child => child.reviewOf === t.id && !['review','qa'].includes(child.taskType) && ['walking','working'].includes(child.status)) ||
+    t.deliveryState === 'queued');
   const overview = [
-    ['Working now', rootStories.filter(t => ['walking','working'].includes(t.status)).length, 'active stories'],
-    ['Awaiting review', rootStories.filter(t => t.status === 'needs_review').length, 'decisions pending'],
-    ['Needs attention', rootStories.filter(t => !t.boardClearedAt && !['done','cancelled','abandoned'].includes(t.status) && (t.manualAttention || t.status === 'blocked' || t._peerGate?.escalated)).length, 'stories to unblock'],
+    ['Working now', rootStories.filter(t => ['walking','working'].includes(t.status) || repairing(t)).length, 'active stories'],
+    ['Awaiting review', rootStories.filter(t => t.status === 'needs_review' || validating(t)).length, 'validation & review'],
+    ['Needs attention', rootStories.filter(t => !t.boardClearedAt && !validating(t) && !['done','cancelled','abandoned'].includes(t.status) && (t.manualAttention || t.status === 'blocked' || t._peerGate?.escalated)).length, 'stories to unblock'],
     ['Completed', rootStories.filter(t => t.status === 'done').length, 'stories & investigations']
   ];
   setBoardSectionHtml(document.getElementById('boardMetrics'), overview.map(([label,count,detail]) => `<div class="board-metric"><span>${label}</span><strong>${count}</strong><small>${detail}</small></div>`).join(''));
-  const blockers = Object.values(TASKS).filter(t => !t.boardClearedAt && !t.reviewOf && !['done','cancelled','abandoned'].includes(t.status) && (t.manualAttention || t.status === 'blocked' || t.status === 'failed' || t._peerGate?.escalated));
+  const blockers = Object.values(TASKS).filter(t => !t.boardClearedAt && !t.reviewOf && !validating(t) && !repairing(t) && !['done','cancelled','abandoned'].includes(t.status) && (t.manualAttention || t.status === 'blocked' || t.status === 'failed' || t._peerGate?.escalated));
   const escBoard = value => { const span = document.createElement('span'); span.textContent = value || ''; return span.innerHTML; };
 
   const body = document.getElementById('boardBody');
   const taskNote = (t, actionable = false) => {
-    const isRoot = !t.reviewOf && !t.investigationOf && !t.recoveryOf;
-    const canAccept = isRoot && !['done','cancelled','abandoned','walking','working'].includes(t.status)
-      && (t.manualAttention || t._peerGate?.escalated || ['blocked','failed'].includes(t.status));
-    const accept = actionable && canAccept ? `<button class="hud-btn" onclick="showExceptionCompletion(this, '${encodeURIComponent(t.id).replace(/'/g,'%27')}')">Mark complete with exceptions</button>` : '';
     const guide = actionable && (t.manualAttention || (t._peerGate || {}).escalated || ['blocked','failed'].includes(t.status))
       && !['done', 'cancelled', 'abandoned'].includes(t.status)
       ? `<a class="hud-btn" href="/api/intent/task/${encodeURIComponent(t.id)}/guidance" target="_blank" rel="noopener">Guide review</a>` : '';
@@ -1893,37 +1942,42 @@ function renderBoard() {
       ? `<div>Recovery owner: ${escapeDetails(t.assignedTo || 'Unassigned')}. ${repairs.length ? repairs.map(r => `${escapeDetails(r.id)}: ${escapeDetails(r.status)} / ${escapeDetails(r.assignedTo || '')}`).join('; ') : 'Next: inspect the blocker and choose its recovery action.'}</div>` : '';
     const ownerCost = `<div>Scrum master: ${escapeDetails(AGENTS[t.scrumMasterId]?.name || t.scrumMasterId || 'Unassigned')}. Story total: $${Number(t.storySpendUsd || 0).toFixed(4)}; this task: $${Number(t.ownSpendUsd || 0).toFixed(4)}${t.rootStoryId && t.rootStoryId !== t.id ? `; original story: ${escapeDetails(t.rootStoryId)}` : ''}.</div>`;
     const exception = t.playerAcceptance ? `<div><strong>Completed with exceptions</strong>: ${escapeDetails(t.playerAcceptance.reason)}. Review failures remain recorded.</div>` : '';
-    const progress = ownerCost + exception + accept + (t.deliveryState ? `<div>Delivery: ${escapeDetails(t.deliveryState.replace(/_/g, ' '))}. ${actionable ? `Next: ${escapeDetails(t.nextAction || '')}` : ''}${t.lastProgressAt ? `. Last progress: ${escapeDetails(new Date(t.lastProgressAt).toLocaleString())}` : ''}</div>` : '');
+    const writeup = t.completionWriteup?.body ? `<details><summary>Completion write-up — email ${escapeDetails(t.completionWriteup.emailStatus || 'queued')}</summary><pre style="white-space:pre-wrap;max-height:420px;overflow:auto;">${escapeDetails(t.completionWriteup.body)}</pre></details>` : '';
+    const progress = ownerCost + exception + writeup + (t.deliveryState ? `<div>Delivery: ${escapeDetails(t.deliveryState.replace(/_/g, ' '))}. ${actionable ? `Next: ${escapeDetails(t.nextAction || '')}` : ''}${t.lastProgressAt ? `. Last progress: ${escapeDetails(new Date(t.lastProgressAt).toLocaleString())}` : ''}</div>` : '');
     if (!t.note && !t.failNote) return progress + guide + recovery + diagnostics;
     const el = document.createElement('div');
-    el.textContent = t.failNote || t.note;
+    el.textContent = validating(t) ? t.nextAction : t.failNote || t.note;
     return `<div style="opacity:0.8; margin:3px 0 8px;">${el.innerHTML}</div>${progress}${guide}${recovery}${diagnostics}`;
   };
   const blockerCards = blockers.length ? blockers.map(t => `<article class="blocker-card"><strong>${escBoard(t.title)}</strong><p>Owner: ${escBoard(AGENTS[t.assignedTo]?.name || t.assignedTo || 'Unassigned')} · ${escBoard(t.status)}</p><p>Required: ${escBoard(t.acceptanceCriteria || 'Completion criteria need clarification')}</p><details><summary>Reason work stopped</summary><p>${escBoard((t.failNote || t.note || 'Investigate the recorded blocker.').slice(0,1800))}</p></details>${taskNote(t, true)}</article>`).join('') : '<p>No blocked stories need attention.</p>';
   const boardTasks = Object.values(TASKS).filter(t => !t.boardClearedAt ||
     (t.failedAt || 0) > t.boardClearedAt ||
     !['failed', 'cancelled', 'abandoned'].includes(t.status));
-  const failed = boardTasks.filter(t => t.status === 'failed');
+  const failed = boardTasks.filter(t => t.status === 'failed' && !repairing(t));
   const stopped = boardTasks.filter(t => ['cancelled', 'abandoned'].includes(t.status));
-  const open = boardTasks.filter(t => !['done', 'failed', 'cancelled', 'abandoned'].includes(t.status));
+  const open = boardTasks.filter(t => repairing(t) || !['done', 'failed', 'cancelled', 'abandoned'].includes(t.status));
   const done = Object.values(TASKS).filter(t => t.status === 'done' && !t.promotedRequestId).sort((a, b) => (b.completedAt || b.createdAt || 0) - (a.completedAt || a.createdAt || 0));
   // Peer-approval gate: a deliverable story awaiting two reviewer approvals is
   // neither "in progress" (its author finished) nor done. Show it separately.
-  const needsReview = open.filter(t => t.status === 'needs_review');
-  const inProgress = open.filter(t => ['walking', 'working'].includes(t.status));
-  const waiting = open.filter(t => !['walking', 'working', 'needs_review'].includes(t.status) && !blockers.includes(t));
+  const needsReview = open.filter(t => t.status === 'needs_review' || validating(t));
+  const inProgress = open.filter(t => ['walking', 'working'].includes(t.status) || repairing(t));
+  const waiting = open.filter(t => !['walking', 'working', 'needs_review'].includes(t.status) && !repairing(t) && !validating(t) && !blockers.includes(t));
   const waitingLines = waiting.map(t => `<div>&bull; ${escBoard(t.title)} — ${escBoard(t.deliveryState || t.status)} / ${escBoard(AGENTS[t.assignedTo]?.name || t.assignedTo)}</div>${taskNote(t)}`).join('');
 
   const openLines = inProgress.length
     ? inProgress.map(t => {
         const who = AGENTS[t.assignedTo] ? AGENTS[t.assignedTo].name : t.assignedTo;
         const room = ROOMS[t.room] ? ROOMS[t.room].label : t.room;
-        return `<div>&bull; ${t.title} -- ${who} (${room}, ${t.status})</div>${taskNote(t)}`;
+        return `<div>&bull; ${t.title} -- ${who} (${room}, ${repairing(t) ? 'repairing' : t.status})</div>${taskNote(t)}`;
       }).join('')
     : '<div style="opacity:0.6;">Nothing in progress right now.</div>';
 
   const reviewLines = needsReview.length
     ? needsReview.map(t => {
+        if (validating(t)) {
+          const label = t.deliveryState === 'validation_running' ? 'Validation running' : 'Validation queued';
+          return `<div>&bull; ${escBoard(t.title)} — ${label}</div>${taskNote(t)}`;
+        }
         const g = t._peerGate || {};
         const done = (g.approvals || 0);
         const total = (g.reviewerIds || []).length;
@@ -2092,60 +2146,6 @@ async function submitWorkOrder(event) {
   } catch (e) {
     status.textContent = e.message;
   } finally { btn.disabled = false; }
-}
-
-function showExceptionCompletion(button, encodedId) {
-  if (button.nextElementSibling?.classList.contains('exception-completion-form')) return;
-  const form = document.createElement('form');
-  form.className = 'exception-completion-form';
-  form.dataset.taskId = decodeURIComponent(encodedId);
-  const label = document.createElement('label');
-  label.textContent = 'Which failed requirements are you accepting?';
-  const reason = document.createElement('textarea');
-  reason.required = true;
-  reason.maxLength = 4000;
-  reason.rows = 3;
-  label.appendChild(reason);
-  const explanation = document.createElement('p');
-  explanation.textContent = 'This completes the story with recorded exceptions and stops its remaining work.';
-  const submit = document.createElement('button');
-  submit.type = 'submit';
-  submit.textContent = 'Confirm completion';
-  const cancel = document.createElement('button');
-  cancel.type = 'button';
-  cancel.textContent = 'Cancel';
-  cancel.onclick = () => { form.remove(); button.hidden = false; };
-  const status = document.createElement('p');
-  status.setAttribute('role', 'status');
-  form.append(label, explanation, submit, cancel, status);
-  form.onsubmit = async event => {
-    event.preventDefault();
-    if (!reason.value.trim()) { status.textContent = 'A reason is required.'; return; }
-    submit.disabled = true;
-    cancel.disabled = true;
-    status.textContent = 'Completing story?';
-    try {
-      await acceptBlockedStory(encodedId, reason.value.trim());
-    } catch (error) {
-      status.textContent = error.message;
-    } finally {
-      submit.disabled = false;
-      cancel.disabled = false;
-    }
-  };
-  button.after(form);
-  button.hidden = true;
-  reason.focus();
-}
-
-async function acceptBlockedStory(encodedId, reason) {
-  const id = decodeURIComponent(encodedId);
-  const response = await apiFetch(`/api/intent/blockers/${encodeURIComponent(id)}/complete`, {
-    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({reason})});
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok || !result.ok) throw new Error(result.error || `Could not complete the story (HTTP ${response.status}).`);
-  if (TASKS[id]) Object.assign(TASKS[id], {status:'done', manualAttention:false, playerAcceptance:{reason}, deliveryState:'accepted_with_exceptions'});
-  renderBoard();
 }
 
 async function editRequestBudget(encodedId) {
@@ -2555,6 +2555,7 @@ async function renderBlockerDecisions() {
   const panel = document.getElementById('blockerDecisionPanel');
   if (!panel || panel.contains(document.activeElement)) return;
   try {
+    await loadApprovalAutomationSettings();
     const response = await apiFetch('/api/intent/blockers');
     if (!response.ok) return;
     const data = await response.json();
@@ -2565,7 +2566,8 @@ async function renderBlockerDecisions() {
       panel.appendChild(progress);
     }
     const labels = {retry_review: 'Retry review without rewriting deliverable', provide_inputs: 'Supply missing inputs', clarify_scope: 'Clarify scope',
-      assign_repair: 'Assign repair', retry_infrastructure: 'Retry after infrastructure fix', cancel: 'Cancel task' };
+      assign_repair: 'Assign repair', retry_infrastructure: 'Retry after infrastructure fix',
+      investigate: 'Investigate recorded blocker', wait_for_inputs: 'Wait for missing inputs', cancel: 'Cancel task' };
     for (const blocker of data.blockers || []) {
       const card = document.createElement('section');
       card.className = 'msg';
@@ -2577,6 +2579,18 @@ async function renderBlockerDecisions() {
       details.style.whiteSpace = 'pre-wrap';
       details.textContent = `Reason: ${blocker.category}\nOwner: ${blocker.owner}\nRecovery owner: ${blocker.recoveryOwner || blocker.owner}\nNext: ${blocker.nextAction || blocker.recommendedAction}\nHuman input: ${blocker.needsHumanInput ? "Required" : "Not required"}\n${blocker.evidence}\n${(blocker.findings || []).join('\n')}`;
       card.appendChild(details);
+      if (blocker.modelRecommendation) {
+        const recommendation = document.createElement('pre');
+        recommendation.style.whiteSpace = 'pre-wrap';
+        const plan = blocker.modelRecommendation;
+        recommendation.textContent = `Reviewed recommendation: ${plan.reason}\n${(plan.steps || []).map((step, i) => `${i + 1}. ${step}`).join('\n')}\nVerify: ${plan.verification}`;
+        card.appendChild(recommendation);
+      }
+      if (blocker.automation?.error) {
+        const error = document.createElement('p');
+        error.textContent = `Automatic recovery: ${blocker.automation.error}`;
+        card.appendChild(error);
+      }
       const action = document.createElement('select');
       for (const key of blocker.actions) {
         const option = document.createElement('option');
@@ -2587,6 +2601,10 @@ async function renderBlockerDecisions() {
       action.value = blocker.recommendedAction;
       const guidance = document.createElement('textarea');
       guidance.placeholder = 'Missing inputs, repair instructions, or replacement scope';
+      if (blocker.modelRecommendation) {
+        const plan = blocker.modelRecommendation;
+        guidance.value = `${plan.reason}\n${(plan.steps || []).join('\n')}\nVerify: ${plan.verification}`;
+      }
       const criteria = document.createElement('textarea');
       criteria.placeholder = 'Measurable acceptance criteria (required to clarify scope)';
       criteria.value = blocker.acceptanceCriteria || '';
@@ -2620,6 +2638,56 @@ async function renderBlockerDecisions() {
     if (!panel.hasChildNodes()) panel.textContent = `Could not load decisions: ${error.message}`;
   }
 }
+
+async function loadApprovalAutomationSettings() {
+  const form = document.getElementById('approvalAutomationSettings');
+  if (!form || form.contains(document.activeElement) || form.dataset.dirty === 'true') return;
+  const response = await apiFetch('/api/intent/automation');
+  if (!response.ok) return;
+  const data = await response.json();
+  // Do not overwrite a choice made while this request was in flight.
+  if (form.contains(document.activeElement) || form.dataset.dirty === 'true') return;
+  document.getElementById('approvalPreset').value = data.settings.preset || 'strict';
+  document.getElementById('approvalReportEvery').value = String(data.settings.reportEvery || data.reportEvery || 10);
+  updateApprovalPresetDescription();
+  const latest = (data.reports || []).at(-1);
+  document.getElementById('approvalAutomationStatus').textContent = latest
+    ? `${data.totalActions} automatic actions. Latest email: ${latest.status === 'sent' ? 'sent' : 'pending delivery'}.`
+    : `${data.totalActions} automatic actions; report every ${data.settings.reportEvery || data.reportEvery || 10}.`;
+}
+
+function updateApprovalPresetDescription() {
+  const descriptions = {
+    always: 'Approve requests automatically and keep recovery running until budget limits are reached. Missing inputs are investigated and rechecked; acceptance criteria and independent review still apply.',
+    moderation: 'Use model checks for requests and reviewed recovery decisions for blockers. Higher-risk requests wait for you.',
+    strict: 'Escalated approval requests and blocker decisions wait for you.'
+  };
+  document.getElementById('approvalPresetDescription').textContent = descriptions[document.getElementById('approvalPreset').value];
+}
+
+document.getElementById('approvalAutomationSettings').addEventListener('change', event => {
+  event.currentTarget.dataset.dirty = 'true';
+  updateApprovalPresetDescription();
+});
+document.getElementById('approvalAutomationSettings').addEventListener('submit', async event => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const status = document.getElementById('approvalAutomationStatus');
+  const button = form.querySelector('button');
+  button.disabled = true;
+  try {
+    const response = await apiFetch('/api/intent/automation', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({preset: document.getElementById('approvalPreset').value,
+        reportEvery: Number(document.getElementById('approvalReportEvery').value)})
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'Settings could not be saved.');
+    form.dataset.dirty = 'false';
+    status.textContent = 'Saved. Applies to pending and future requests and blockers.';
+  } catch (error) { status.textContent = error.message; }
+  finally { button.disabled = false; }
+});
 
 function appendInboxMessage(log, m, waiting) {
   const box = document.createElement('div');
@@ -3940,6 +4008,7 @@ async function main() {
     if (e.key === 'Enter') handleTerminalSend();
   });
   document.getElementById('hudCallMeetingBtn').addEventListener('click', openMeetingUI);
+  document.getElementById('playerInboxCloseBtn').addEventListener('click', closePlayerInbox);
   document.getElementById('hudLogoutBtn').addEventListener('click', () => {
     fetch('/logout', { method: 'POST' }).finally(() => { window.location.href = '/'; });
   });

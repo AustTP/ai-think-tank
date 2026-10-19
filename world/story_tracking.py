@@ -48,6 +48,8 @@ def stamp(state, task):
         task['workOrderId'] = request_id
     if parent.get('workOrderStoryId'):
         task['workOrderStoryId'] = parent['workOrderStoryId']
+    if parent.get('budgetUnlimited') is True:
+        task.update(budgetUnlimited=True, budgetUsd=0.0)
     return task
 
 
@@ -86,12 +88,23 @@ def refresh(state, ledger):
     return view
 
 
+def _cap(value):
+    try:
+        return budget(value) if value else None
+    except ValueError:
+        return None
+
+
 def exhausted(state, ledger, task_id):
     task = (state.get('tasks') or {}).get(task_id)
     request_id = task_id[len('request/'):] if task_id.startswith('request/') else None
     if task:
         stamp(state, task)
         request_id = task.get('requestId')
+        parent = root(state, task)
+        story_cap = _cap(parent.get('budgetUsd'))
+        if story_cap is not None and costs(state, ledger)['stories'].get(parent.get('id'), {}).get('used', 0.0) >= story_cap:
+            return True
     request = next((r for r in state.get('backlogRequests') or [] if r.get('id') == request_id), None)
     cap = request.get('requestBudgetUsd') if request else None
     if cap is None:
@@ -106,9 +119,21 @@ def budget_status(state, ledger, task_id):
         stamp(state, task)
         request_id = task.get('requestId')
     request = next((r for r in state.get('backlogRequests') or [] if r['id'] == request_id), {})
+    choices = []
     if request.get('requestBudgetUsd') is not None:
         usage = costs(state, ledger)['requests'].get(request_id, {'used':0.0,'calls':0})
-        return {'scope':'request', 'id':request_id, 'budgetUsd':request['requestBudgetUsd'], **usage}
+        choices.append({'scope':'request', 'id':request_id, 'budgetUsd':request['requestBudgetUsd'], **usage})
+    if task:
+        parent = root(state, task)
+        cap = _cap(parent.get('budgetUsd'))
+        if cap is not None:
+            usage = costs(state, ledger)['stories'].get(parent.get('id'), {'used':0.0,'calls':0})
+            choices.append({'scope':'story', 'id':parent.get('id'), 'budgetUsd':cap, **usage})
+    if choices:
+        return min(choices, key=lambda row:row['budgetUsd']-row['used'])
+    if task and parent.get('budgetUnlimited') is True:
+        usage = costs(state, ledger)['stories'].get(parent.get('id'), {'used':0.0,'calls':0})
+        return {'scope':'unlimited', 'id':parent.get('id'), 'budgetUsd':None, **usage}
     entry = ledger.get('__task__/' + task_id) or {}
     return {'scope':'task', 'id':task_id, 'budgetUsd':(task or {}).get('budgetUsd'),
             'used':float(entry.get('used') or 0), 'calls':int(entry.get('calls') or 0)}
