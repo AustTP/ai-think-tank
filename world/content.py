@@ -3123,7 +3123,9 @@ _BROWSER_ACT_TOOL = {
             'the server injects it from the encrypted vault directly into the browser; you never see or '
             'handle the secret itself. credentialHandle comes from list_capability_handles or '
             'request_credential_access (your own active grants for kind=login credentials); '
-            'credentialField is username or password. You still need the css selector for the field, so '
+            'credentialField is username or password. For Facebook/Instagram, call '
+            'request_credential_access FIRST, then use the returned handle; a social login without '
+            'a fresh host-scoped handle is refused before any policy review. ' 'You still need the css selector for the field, so '
             'goto+read the login page first to find it. Pass pageUrl (the page you are filling on) so the '
             'handle can be scope-checked against the right host. For a multi-field login, use op=login '
             'with fields (each with its own selector + credentialHandle + credentialField) and '
@@ -3336,6 +3338,10 @@ def _make_browser_act_executor(agent_id, agent_key, sandbox_id, struck_tools=Non
         if not isinstance(result, dict):
             return 'Could not run that browser action (unexpected response).'
         if result.get('allowed') is False:
+            if result.get('credentialHandleError'):
+                return (f"Browser action needs a fresh credential handle: {result.get('reason', 'not granted')} "
+                        "[call request_credential_access for this task, then retry browser_act with the "
+                        "returned handle on every field -- this is not a policy block]")
             if struck_tools is not None:
                 struck_tools.add('browser_act')
             return (f"Browser action blocked: {result.get('reason', 'not approved')} "

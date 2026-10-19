@@ -50,6 +50,7 @@ class _SocialCase(unittest.TestCase):
             {'kind': 'login', 'username': 'austtp25', 'password': 'not-in-any-file'},
             status='active', proposed_by='player')
         self.client = TestClient(serve.app)
+        self.client.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
         self.client.headers.update({'X-Agent-Key': 'agent-key'})
 
     def tearDown(self):
@@ -129,6 +130,28 @@ class RequestEndpointTests(_SocialCase):
         self.assertEqual(r.status_code, 403)
         self.assertIn('does not reference', r.text)
 
+    def test_stale_social_login_handle_is_retryable_not_a_policy_block(self):
+        fields = [
+            {'selector': '#email', 'credentialHandle': 'stale-handle', 'credentialField': 'username'},
+            {'selector': '#pass', 'credentialHandle': 'stale-handle', 'credentialField': 'password'},
+        ]
+        with unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True), \
+             unittest.mock.patch.object(serve, 'check_rate_limit', return_value=True), \
+             unittest.mock.patch.object(serve, 'EXECUTION_ENABLED', True), \
+             unittest.mock.patch.object(serve, 'BROWSING_ENABLED', True), \
+             unittest.mock.patch.object(serve, '_classify_browser_action') as classify:
+            r = self.client.post('/api/browser-act', json={
+                'agentId': 'cora', 'sandboxId': 'spike-test', 'op': 'login',
+                'url': 'https://www.facebook.com/login',
+                'purpose': 'read public group posts',
+                'fields': fields,
+            })
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertFalse(body.get('allowed'))
+        self.assertTrue(body.get('credentialHandleError'))
+        classify.assert_not_called()
+
     def test_unknown_service_is_refused(self):
         self._save(_task())
         r = self._request({'agentId': 'cora', 'service': 'notes',
@@ -173,6 +196,24 @@ class SocialReadOnlyPolicyTests(unittest.TestCase):
         self.assertIn('read-only social', reason)
         jev.assert_not_called()
         gate.assert_not_called()
+
+    def test_browser_act_executor_does_not_strike_on_stale_handle(self):
+        import content
+        struck = set()
+        execu = content._make_browser_act_executor('cora', 'key', 'spike-test', struck_tools=struck)
+        with unittest.mock.patch.object(serve, '_http_json', return_value={
+                'allowed': False, 'credentialHandleError': True,
+                'reason': 'call request_credential_access first'}):
+            out = execu('browser_act', {
+                'op': 'login', 'url': 'https://www.facebook.com/login',
+                'purpose': 'read public group posts',
+                'fields': [
+                    {'selector': '#email', 'credentialHandle': 'h', 'credentialField': 'username'},
+                    {'selector': '#pass', 'credentialHandle': 'h', 'credentialField': 'password'},
+                ],
+            })
+        self.assertIn('request_credential_access', out)
+        self.assertNotIn('browser_act', struck)
 
 
 class DriverBackstopTests(unittest.TestCase):

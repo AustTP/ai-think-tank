@@ -28553,12 +28553,20 @@ async def browser_act(request: Request):
     social_error = _social_readonly_guard(
         op, url, (body.get('pageUrl') or '').strip(), body.get('fields') or [])
     if social_error:
+        # Missing/invalid login fields are a provisioning mistake, not a
+        # policy denial: the agent must request a fresh handle and retry.
+        # Mark it so the tool loop does not spend its one browser strike.
+        retryable = (op == 'login' and
+                     ('credential handle' in social_error or
+                      'needs username' in social_error or
+                      'username or password' in social_error))
         log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op,
                                               'url': url or body.get('pageUrl'),
                                               'decision': 'blocked',
                                               'reason': 'read-only social policy'},
                    authorized=authorized)
-        return JSONResponse({'allowed': False, 'reason': social_error}, status_code=200)
+        return JSONResponse({'allowed': False, 'reason': social_error,
+                             'credentialHandleError': retryable}, status_code=200)
     # Confused-deputy fill: an agent can type a vault login field WITHOUT ever
     # holding the secret. It presents a capability handle + which field to
     # inject (username|password). The server resolves the handle against the
@@ -28594,6 +28602,8 @@ async def browser_act(request: Request):
     # the vault.
     fields_scope = None
     supplied_fields = body.get('fields') or []
+    scope_is_social = _is_readonly_social_host(
+        (urllib.parse.urlparse(scope_url).hostname or '') if scope_url else '')
     if op in ('login', 'fill_many') and supplied_fields:
         ok_fields = []
         for field in supplied_fields:
@@ -28612,6 +28622,23 @@ async def browser_act(request: Request):
             ok_fields.append(fscope)
         if ok_fields is not None:
             fields_scope = ok_fields[0]
+        elif scope_is_social:
+            # A social login WITHOUT a live, host-scoped handle is not a
+            # policy judgment -- the agent simply has not been granted access
+            # yet (or used an expired/old handle). Tell it exactly what to do
+            # without burning its one browser strike.
+            log_action(agent_id, 'browser_act', {
+                'sandboxId': sandbox_id, 'op': op, 'url': scope_url,
+                'decision': 'blocked', 'reason': 'missing or stale credential handle',
+            }, authorized=authorized)
+            return JSONResponse({
+                'allowed': False,
+                'credentialHandleError': True,
+                'reason': ('This social login needs a fresh, host-scoped credential '
+                           'handle on every field. Call request_credential_access for '
+                           'this service while working this task, then retry op=login '
+                           'with the returned handle in each field.'),
+            }, status_code=200)
     if url:
         # Same URL guardrails as /api/browse: http(s) only, and the final host
         # must be a safe public host (SSRF/private-network protection). Fires
