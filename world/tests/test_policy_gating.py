@@ -87,3 +87,121 @@ class ExtractedModuleReloadTest(unittest.TestCase):
             with self.subTest(mod=modname):
                 for name in loaders:
                     self.assertTrue(callable(getattr(serve, name, None)))
+
+
+class KernelEditTest(unittest.TestCase):
+    """serve.py is the signed kernel: preflight then restart, with the
+    original bytes restored when anything fails."""
+
+    def setUp(self):
+        import hashlib
+        import tempfile
+        import types
+        from unittest import mock
+        self.tmp = tempfile.mkdtemp(prefix='think tank-kernel-test-')
+        self.addCleanup(__import__('shutil').rmtree, self.tmp, True)
+        self.orig = 'KERNEL = 1\n'
+        self.cand = 'KERNEL = 2\n'
+        self.target = os.path.join(self.tmp, 'serve.py')
+        with open(self.target, 'w', encoding='utf-8') as f:
+            f.write(self.orig)
+        os.makedirs(os.path.join(self.tmp, '.selfedit_staging'))
+        with open(os.path.join(self.tmp, '.selfedit_staging', 'ed-1.cand'),
+                  'w', encoding='utf-8') as f:
+            f.write(self.cand)
+        self.sha = hashlib.sha256(self.orig.encode()).hexdigest()
+        self.updates = []
+        fake = types.SimpleNamespace(log_action=lambda *a, **k: None)
+        self._patches = [
+            mock.patch.object(selfedit, '_world', return_value=self.tmp),
+            mock.patch.object(selfedit, '_s', return_value=fake),
+            mock.patch.object(selfedit, '_update',
+                              side_effect=lambda rid, **kw: self.updates.append(kw)),
+            mock.patch.object(selfedit, '_notify_agent', return_value=True),
+            mock.patch.object(selfedit, '_row_agent', return_value='ben'),
+            mock.patch.object(selfedit, 'KERNEL_RESTART_ENABLED', False),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _content(self):
+        with open(self.target, encoding='utf-8') as f:
+            return f.read()
+
+    def test_kernel_is_signed_readable_and_not_protected(self):
+        path = os.path.join(WORLD, 'serve.py')
+        self.assertTrue(selfedit.is_kernel(path))
+        self.assertTrue(selfedit.is_player_signature(path))
+        self.assertFalse(selfedit.is_unreadable(path))
+        self.assertFalse(selfedit.is_protected(path))
+        self.assertIsNone(selfedit._path_refusal(path, 'world/serve.py'))
+
+    def test_health_url_uses_launch_host_and_port(self):
+        argv = ['/usr/bin/python3', '-m', 'uvicorn', 'serve:app',
+                '--host', '100.96.104.61', '--port', '8937']
+        self.assertEqual(selfedit._kernel_health_url(argv),
+                         'http://100.96.104.61:8937/api/rooms')
+        self.assertEqual(
+            selfedit._kernel_health_url(['x', '--host=0.0.0.0', '--port=9000']),
+            'http://127.0.0.1:9000/api/rooms')
+
+    def test_argv_comes_from_ps(self):
+        from unittest import mock
+        import types
+        done = types.SimpleNamespace(stdout=b'/opt/py -m uvicorn serve:app --port 8937\n')
+        with mock.patch.object(selfedit.subprocess, 'run', return_value=done):
+            self.assertEqual(selfedit._kernel_argv(),
+                             ['/opt/py', '-m', 'uvicorn', 'serve:app', '--port', '8937'])
+
+    def test_successful_preflight_writes_candidate(self):
+        with unittest.mock.patch.object(selfedit, '_run_kernel_preflight',
+                                        return_value=(True, 'ok')):
+            self.assertEqual(selfedit._apply_kernel('ed-1', 'world/serve.py', self.sha), 1)
+        self.assertEqual(self._content(), self.cand)
+        self.assertEqual(self.updates[-1]['status'], 'applied')
+
+    def test_failed_preflight_restores_original(self):
+        with unittest.mock.patch.object(selfedit, '_run_kernel_preflight',
+                                        return_value=(False, '1 failed')):
+            self.assertEqual(selfedit._apply_kernel('ed-1', 'world/serve.py', self.sha), 0)
+        self.assertEqual(self._content(), self.orig)
+        self.assertEqual(self.updates[-1]['status'], 'failed')
+
+    def test_missing_launch_command_restores_original(self):
+        with unittest.mock.patch.object(selfedit, '_run_kernel_preflight',
+                                        return_value=(True, 'ok')), \
+             unittest.mock.patch.object(selfedit, '_kernel_argv', return_value=None):
+            self.assertEqual(selfedit._apply_kernel('ed-1', 'world/serve.py', self.sha), 0)
+        self.assertEqual(self._content(), self.orig)
+        self.assertEqual(self.updates[-1]['status'], 'failed')
+
+    def test_stale_sha_is_a_conflict(self):
+        self.assertEqual(selfedit._apply_kernel('ed-1', 'world/serve.py', '0' * 64), 0)
+        self.assertEqual(self._content(), self.orig)
+        self.assertEqual(self.updates[-1]['status'], 'conflict')
+
+
+class KernelTargetedReadTest(unittest.TestCase):
+    """A 30k-line kernel cannot be read whole, so selfedit_read supports a
+    query window around an exact anchor."""
+
+    def test_query_returns_a_window_with_line_numbers(self):
+        ok, out = selfedit.read_module('serve.py', query='def _should_wake',
+                                       context=2)
+        self.assertTrue(ok)
+        self.assertIn('def _should_wake', out['text'])
+        self.assertGreaterEqual(out['matchLine'], out['startLine'])
+        self.assertLessEqual(out['matchLine'], out['endLine'])
+        self.assertFalse(out['truncated'])
+
+    def test_missing_query_is_a_clear_error(self):
+        ok, out = selfedit.read_module('serve.py', query='no such anchor xyz')
+        self.assertFalse(ok)
+        self.assertIn('not found', out['error'])
+
+    def test_head_read_still_works(self):
+        ok, out = selfedit.read_module('serve.py')
+        self.assertTrue(ok)
+        self.assertTrue(out['text'])
+        self.assertEqual(out['path'], 'world/serve.py')

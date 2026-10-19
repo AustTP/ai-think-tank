@@ -45,6 +45,9 @@ agents/teams/*/shared/
 
 # Transient runtime state
 escalations.json
+# Self-edit staging/backups and the one-shot kernel restart watchdog
+world/.selfedit_*/
+world/.kernel_watchdog.py
 # Inbound webhook events (webhook consumer tail-regenerates its own view)
 webhooks.jsonl
 # Server/test-runner logs and coverage residue

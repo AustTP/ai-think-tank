@@ -89,9 +89,11 @@ def test_propose_refuses_protected_files(fake_repo):
     _, world = fake_repo
     (world / 'serve.py').write_text('# kernel\n', encoding='utf-8')
     (world / 'BUSINESS-PROCESSES.md').write_text('rule\n', encoding='utf-8')
-    ok, payload = selfedit.propose(
-        'worker', 'serve.py', '# kernel', '# x', 'why')
-    assert ok is False and 'PROTECTED' in payload['error']
+    # serve.py is the signed kernel now, not a protected file: it is accepted
+    # as a proposal target and routed through the signature/restart path.
+    assert selfedit.is_kernel(world / 'serve.py')
+    assert selfedit.is_player_signature(world / 'serve.py')
+    assert not selfedit.is_protected(world / 'serve.py')
     ok, payload = selfedit.propose(
         'worker', 'world/BUSINESS-PROCESSES.md', 'rule', 'no', 'why')
     assert ok is False and 'PROTECTED' in payload['error']
@@ -851,7 +853,7 @@ def test_read_module_surface(fake_repo):
     ok, listing = selfedit.read_module('')
     assert ok is True
     paths = [m['path'] for m in listing['modules']]
-    assert paths == ['world/gear.py']
+    assert paths == ['world/gear.py', 'world/serve.py']
     assert listing['modules'][0]['bytes'] == len('SPEED = 2\n')
 
     ok, head = selfedit.read_module('gear.py')
@@ -862,8 +864,11 @@ def test_read_module_surface(fake_repo):
     assert head['totalBytes'] == len('SPEED = 2\n')
     assert head['sha256'] == hashlib.sha256(b'SPEED = 2\n').hexdigest()
 
-    for guarded in (('serve.py', 'outside the readable'),
-                    ('world/BUSINESS-PROCESSES.md', 'outside the readable'),
+    # The kernel is readable (it is signed, not hidden); the gate and the
+    # oversight internals stay closed.
+    ok, kernel = selfedit.read_module('serve.py')
+    assert ok is True and kernel['text'] == '# kernel\n'
+    for guarded in (('world/BUSINESS-PROCESSES.md', 'outside the readable'),
                     ('jev.py', 'outside the readable'),
                     ('conftest.py', 'outside the readable')):
         ok, payload = selfedit.read_module(guarded[0])
@@ -1210,7 +1215,7 @@ def test_submit_fix_guards_and_splices(fake_repo, monkeypatch):
     (world / 'serve.py').write_text('SPEED = 2\n', encoding='utf-8')
     ok, payload = selfedit.submit_remediation_fix('worker', 'serve.py',
                                                   'A', 'B', 'why')
-    assert ok is False and 'PROTECTED' in payload['error']
+    assert ok is False and 'kernel' in payload['error']
     (world / 'bin3.py').write_bytes(b'\x80\x81')
     ok, payload = selfedit.submit_remediation_fix('worker', 'bin3.py',
                                                   'A', 'B', 'why')

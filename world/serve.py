@@ -9883,10 +9883,11 @@ AGENT_ASK_TOOLS = [
                            'Omit `path` to list the readable modules '
                            '(name + size); pass a path to fetch one '
                            "file's head with its sha256 and total "
-                           'size. The read surface is deliberately '
-                           'smaller than the write surface: serve.py, '
-                           'BUSINESS-PROCESSES.md, tests/, and '
-                           'oversight-enforcement files stay closed.',
+                           'size. Pass `query` to get a window of lines '
+                           'around an exact match instead of the head, '
+                           'which is how you inspect a large file such as '
+                           'serve.py. BUSINESS-PROCESSES.md, tests/, and '
+                           'oversight-enforcement data files stay closed.',
             'parameters': {
                 'type': 'object',
                 'properties': {
@@ -9894,6 +9895,16 @@ AGENT_ASK_TOOLS = [
                         'type': 'string',
                         'description': 'World module or repo-root-relative '
                                        'path; omit for the listing.',
+                    },
+                    'query': {
+                        'type': 'string',
+                        'description': 'Optional exact text to jump to; '
+                                       'returns surrounding lines.',
+                    },
+                    'context': {
+                        'type': 'integer',
+                        'description': 'Lines on each side of the query '
+                                       '(default 40, max 200).',
                     },
                 },
             },
@@ -16354,7 +16365,9 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
         if name == 'selfedit_read':
             path = ((args or {}).get('path') or '').strip()
             result = _http_json('POST', SELF_BASE_URL, '/api/selfedit/read',
-                                {'agentId': agent_id, 'path': path},
+                                {'agentId': agent_id, 'path': path,
+                                 'query': (args or {}).get('query') or '',
+                                 'context': (args or {}).get('context') or 40},
                                 agent_key, timeout=60,
                                 extra_headers=_selfedit_fix_headers(agent_id))
             if isinstance(result, dict) and result.get('error'):
@@ -16373,6 +16386,11 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                         f"{result.get('totalBytes')} bytes total"
                         + (', truncated' if result.get('truncated') else '')
                         + ']')
+                if result.get('matchLine'):
+                    note += (f" [lines {result.get('startLine')}-"
+                             f"{result.get('endLine')} of "
+                             f"{result.get('totalLines')}; match at "
+                             f"{result.get('matchLine')}]")
                 return f'{result.get("path")} {note}\n{(result.get("text") or "")}'
             return 'selfedit_read returned an unexpected response.'
         if name == 'selfedit_validate':
@@ -23622,7 +23640,8 @@ async def selfedit_read(request: Request):
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
     try:
         ok, payload = await asyncio.to_thread(
-            _selfedit.read_module, body.get('path') or '')
+            _selfedit.read_module, body.get('path') or '',
+            body.get('query') or '', body.get('context') or 40)
     except Exception as exc:
         print(f'[selfedit] read crashed: {exc}', flush=True)
         log_action(agent_id, 'selfedit_read_crashed',

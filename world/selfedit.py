@@ -76,17 +76,29 @@ The self-modification contract (operator decisions, locked 2026-10-18):
 """
 
 import hashlib
+import json
 import os
 import secrets
+import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
 
-# NEVER self-editable, by operator decision (2026-10-18): the HTTP kernel
-# and the enforcement documents themselves.
-PROTECTED_BASENAMES = ('serve.py', 'BUSINESS-PROCESSES.md')
+# NEVER self-editable, by operator decision (2026-10-18): the enforcement
+# documents themselves. serve.py is NOT here any more: it is a signed kernel
+# edit (KERNEL_BASENAMES) that applies through a preflighted process restart.
+PROTECTED_BASENAMES = ('BUSINESS-PROCESSES.md',)
+
+# The HTTP kernel. It cannot be importlib-reloaded (uvicorn owns `app`), so a
+# kernel edit is staged, preflighted against the full test suite, then applied
+# by an in-place os.execv with a watchdog that restores the previous bytes if
+# the new process never answers /api/health.
+KERNEL_BASENAMES = ('serve.py',)
+KERNEL_RESTART_ENABLED = True          # tests patch this off
+KERNEL_HEALTH_TIMEOUT_S = 120
+KERNEL_WATCHDOG_NAME = '.kernel_watchdog.py'
 
 # Tier A of the 2026-10-18 audit: the post-apply rollback gate must be
 # beyond proposer reach. A broken edit that could rewrite the tests (or the
@@ -99,7 +111,7 @@ GATE_BASENAMES = ('conftest.py',)
 # improve its own judgment, but only through a mandatory PLAYER signature
 # (floor-1.0 escalation kind, like 'dormancy window request'). One quorum
 # review is not enough authority for the files that govern the reviews.
-PLAYER_SIGNATURE_BASENAMES = ('jev.py', 'selfedit.py', 'notify.py',
+PLAYER_SIGNATURE_BASENAMES = ('serve.py', 'jev.py', 'selfedit.py', 'notify.py',
                               'theo_policy.py', 'sublow.py', 'jev_grants.py',
                               'bank.py', 'budget.py',
                               # Policy data that shapes other agents' prompts,
@@ -203,14 +215,10 @@ def _repo_root():
 
 
 def is_protected(resolved_path):
-    """True for the paths self-edits may never touch: serve.py (the actual
-    kernel file) and every BUSINESS-PROCESSES.md enforcement document in
-    the repo."""
-    name = os.path.basename(resolved_path)
-    if name == 'serve.py':
-        return os.path.realpath(resolved_path) == os.path.realpath(
-            os.path.join(_world(), 'serve.py'))
-    return name in PROTECTED_BASENAMES
+    """True for the paths self-edits may never touch: every
+    BUSINESS-PROCESSES.md enforcement document in the repo. serve.py is not
+    protected any more -- it is the signed kernel target (is_kernel)."""
+    return os.path.basename(resolved_path) in PROTECTED_BASENAMES
 
 
 def is_gate_file(resolved_path):
@@ -225,6 +233,12 @@ def is_gate_file(resolved_path):
     return os.path.basename(real) in GATE_BASENAMES
 
 
+def is_kernel(resolved_path):
+    """True for the HTTP kernel: signed, preflighted, applied by restart."""
+    name = os.path.basename(os.path.realpath(resolved_path))
+    return name in KERNEL_BASENAMES
+
+
 def is_player_signature(resolved_path):
     """Tier B: oversight-enforcement files need the player's signature
     before they can arm, and their contents stay unreadable."""
@@ -234,6 +248,10 @@ def is_player_signature(resolved_path):
 
 def is_unreadable(resolved_path):
     name = os.path.basename(os.path.realpath(resolved_path))
+    if name in KERNEL_BASENAMES:
+        # The kernel is signed, not hidden: an agent cannot propose a safe
+        # find/replace against bytes it is not allowed to read.
+        return False
     if name in UNREADABLE_BASENAMES or name in GATE_BASENAMES:
         return True
     if name in PLAYER_SIGNATURE_BASENAMES:
@@ -246,7 +264,7 @@ def _path_refusal(resolved_path, display):
     None when the path is acceptable."""
     if is_protected(resolved_path):
         return (f'{display} is PROTECTED: self-edits may never touch '
-                'serve.py or BUSINESS-PROCESSES.md, even with approval')
+                'BUSINESS-PROCESSES.md, even with approval')
     if is_gate_file(resolved_path):
         return (f'{display} is part of the repo test gate (tests/, '
                 'conftest.py, run scripts): refused. An edit that could '
@@ -419,19 +437,19 @@ def propose(agent_id, path, find, replace, summary):
         return False, {'error': f'candidate does not compile: {syntax_err} -- '
                                 'fix the splice before proposing'}
     modname = os.path.splitext(os.path.basename(resolved))[0]
-    # No config exception here: config.py has top-level importers
-    # (content.py, sublow.py, serve.py) with no tolerated/refresh contract, so
-    # the scan below refuses it NATURALLY in v1 -- exactly the docstring's
-    # contract (Phase 2 topological reload opens it).
-    importers = _importers_of(modname)
-    tolerated = TOLERATED_IMPORTERS.get(modname, set())
-    hostile = [i for i in importers if i not in tolerated]
-    if hostile:
-        return False, {'error': f'{display} is top-level imported by '
-                                f'{", ".join(hostile)}; those bindings '
-                                'would go stale after the post-apply '
-                                'reload. Propose edits to the consumer '
-                                'module instead (v1 binding contract).'}
+    kernel = is_kernel(resolved)
+    if not kernel:
+        # A kernel edit is a process replacement, so every binding is rebuilt
+        # at boot and the importer scan does not apply to it.
+        importers = _importers_of(modname)
+        tolerated = TOLERATED_IMPORTERS.get(modname, set())
+        hostile = [i for i in importers if i not in tolerated]
+        if hostile:
+            return False, {'error': f'{display} is top-level imported by '
+                                    f'{", ".join(hostile)}; those bindings '
+                                    'would go stale after the post-apply '
+                                    'reload. Propose edits to the consumer '
+                                    'module instead (v1 binding contract).'}
     sha_before = hashlib.sha256(original.encode('utf-8')).hexdigest()
     sha_after = hashlib.sha256(candidate.encode('utf-8')).hexdigest()
     edit_id = f'ed-{secrets.token_hex(6)}'
@@ -456,11 +474,16 @@ def propose(agent_id, path, find, replace, summary):
         # validator already passed; the human signs (or refuses) a fully
         # vetted artifact.
         serve = _s()
+        apply_text = ('Approving ARMS this KERNEL edit: on the next dormant '
+                      'window it is preflighted against the full test suite '
+                      'and then applied by restarting the server in place.'
+                      if kernel else
+                      'Approving ARMS this edit to apply the next time the '
+                      'tank goes dormant.')
         question = (f'Signature requested for a player-signature self-edit '
                     f'of {display} by {agent_id}.\n'
                     f'Summary: {summary}\n'
-                    f'Approving ARMS this edit to apply the next time the '
-                    f'tank goes dormant. Denying refuses it.')
+                    f'{apply_text} Denying refuses it.')
         esc_id = serve.create_escalation(
             OVERSIGHT_KIND, question, on_approve_note=edit_id,
             what_checked='JEV quorum review passed; quarantine validation '
@@ -508,14 +531,14 @@ def resolve_oversight_signature(esc_id, approved):
     return True
 
 
-def read_module(path=''):
+def read_module(path='', query='', context=40):
     """Audit Q3: bounded READ access to the editable surface, mirroring the
-    write rule. Empty path lists the readable world modules; a path reads
-    one file's head up to READ_TEXT_CAP with its sha256 so proposals anchor
-    against known bytes. serve.py, BUSINESS-PROCESSES.md, tests/, and the
-    Tier B oversight files are excluded on purpose: smaller read than write
-    surface, because test expectations and gate/oversight internals are
-    what gaming would target first."""
+    write rule. Empty path lists the readable world modules. A path returns
+    the file's head with its sha256 and total size; `query` instead returns a
+    window of `context` lines around the first exact match, so a large file
+    like serve.py can be inspected at the anchor a proposal needs without
+    loading it whole. BUSINESS-PROCESSES.md, tests/, and the Tier B oversight
+    files stay closed; the kernel is readable because it is signed."""
     if not (path or '').strip():
         modules = []
         world = _world()
@@ -537,25 +560,47 @@ def read_module(path=''):
                                 'self-edit surface (oversight internals and '
                                 'the repo test gate stay closed)'}
     try:
-        with open(resolved, 'r', encoding='utf-8') as fh:
-            head = fh.read(READ_TEXT_CAP + 1)
+        with open(resolved, 'rb') as fh:
+            data = fh.read()
+        text = data.decode('utf-8')
     except (OSError, UnicodeDecodeError) as e:
         return False, {'error': f'cannot read target: {e}'}
-    truncated = len(head) > READ_TEXT_CAP
-    if truncated:
-        head = head[:READ_TEXT_CAP]
-    with open(resolved, 'rb') as fh:
-        data = fh.read()
-    return True, {
+    base = {
         'path': display,
         'sha256': hashlib.sha256(data).hexdigest(),
         'totalBytes': len(data),
-        'truncated': truncated,
-        'text': head,
-        'note': 'read-only context for proposing exact anchors; the file '
-                'may change between this read and an apply',
+        'totalLines': text.count('\n') + 1,
     }
-
+    query = (query or '').strip()
+    if query:
+        idx = text.find(query)
+        if idx < 0:
+            return False, {'error': f'the query was not found in {display}; '
+                                    'omit it to read the head, then pick a '
+                                    'shorter exact anchor'}
+        try:
+            context_n = max(1, min(int(context or 40), 200))
+        except (TypeError, ValueError):
+            context_n = 40
+        line_no = text.count('\n', 0, idx) + 1
+        lines = text.splitlines()
+        start = max(1, line_no - context_n)
+        end = min(len(lines), line_no + context_n)
+        return True, {**base,
+                      'text': '\n'.join(lines[start - 1:end]),
+                      'truncated': False,
+                      'matchLine': line_no,
+                      'startLine': start,
+                      'endLine': end,
+                      'note': 'window around the query; an anchor must still '
+                              'appear exactly once in the whole file'}
+    head = text[:READ_TEXT_CAP]
+    return True, {**base,
+                  'text': head,
+                  'truncated': len(text) > READ_TEXT_CAP,
+                  'note': 'read-only context for proposing exact anchors; '
+                          'the file may change between this read and an apply. '
+                          'Pass query=... to jump to a specific anchor.'}
 
 def _review(edit_id, display, find, replace, summary):
     """One quorum-sampled JEV decisions review; every outcome fails closed
@@ -616,15 +661,20 @@ def _validate(edit_id, resolved, candidate):
             errors.append('compileall: ' + (step.stdout or step.stderr)[-400:])
         else:
             checks.append('compileall ok')
-        flake = subprocess.run(
-            [py, '-m', 'flake8',
-             os.path.join(tmp, os.path.basename(resolved)),
-             '--max-line-length=100'],
-            capture_output=True, text=True, timeout=180)
-        if flake.returncode != 0:
-            errors.append('flake8: ' + (flake.stdout or flake.stderr)[-400:])
+        if is_kernel(resolved):
+            # serve.py deliberately imports after config/root setup (E402) and
+            # predates this gate; the full preflight suite is its real bar.
+            checks.append('flake8 skipped for the kernel')
         else:
-            checks.append('flake8 ok')
+            flake = subprocess.run(
+                [py, '-m', 'flake8',
+                 os.path.join(tmp, os.path.basename(resolved)),
+                 '--max-line-length=100'],
+                capture_output=True, text=True, timeout=180)
+            if flake.returncode != 0:
+                errors.append('flake8: ' + (flake.stdout or flake.stderr)[-400:])
+            else:
+                checks.append('flake8 ok')
         modname = os.path.splitext(os.path.basename(resolved))[0]
         smoke_src = (f'import sys; sys.path.insert(0, {tmp!r}); '
                      f'import {modname}')
@@ -686,6 +736,12 @@ def apply_pass():
                 'ORDER BY created').fetchall()
     if not rows:
         return 0
+    kernel_rows = [r for r in rows if is_kernel(_target_from_display(r[1]))]
+    if kernel_rows:
+        # A kernel edit is applied alone: the restart replaces the process, so
+        # mixing it with reload-based edits in one pass has no coherent order.
+        row_id, display, sha_before = kernel_rows[0]
+        return _apply_kernel(row_id, display, sha_before)
     applied = 0
     landed = []
     for row_id, display, sha_before in rows:
@@ -934,6 +990,215 @@ def _target_from_display(display):
     return os.path.join(_world(), os.path.basename(display))
 
 
+
+# ---------------------------------------------------------------------------
+# Kernel apply: serve.py cannot be reloaded, so an edit is written, preflighted
+# against the full repo gate, then applied by an in-place os.execv. A detached
+# watchdog waits for the new process to answer a public endpoint; if it never
+# does, it restores the pre-edit bytes and relaunches the previous kernel.
+# ---------------------------------------------------------------------------
+_KERNEL_WATCHDOG_SOURCE = """import json, os, shutil, subprocess, sys, time, urllib.request
+
+backup, target, url, cwd, argv_json, timeout = sys.argv[1:7]
+argv = json.loads(argv_json)
+deadline = time.time() + float(timeout)
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            if resp.status == 200:
+                sys.exit(0)
+    except Exception:
+        pass
+    time.sleep(2)
+try:
+    shutil.copyfile(backup, target)
+except Exception:
+    pass
+try:
+    subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+except Exception:
+    pass
+"""
+
+
+def _kernel_argv():
+    """The exact command line this process was launched with, read from ps so
+    the restart reproduces it (host, port, flags) with no guessing. None when
+    the command cannot be read -- the caller then refuses to swap the file."""
+    try:
+        done = subprocess.run(['ps', '-o', 'command=', '-p', str(os.getpid())],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=10)
+        command = (done.stdout or b'').decode('utf-8', errors='replace').strip()
+    except Exception:
+        return None
+    if not command:
+        return None
+    argv = shlex.split(command)
+    return argv or None
+
+
+def _kernel_health_url(argv):
+    """Public readiness URL for the relaunched process: the same host/port
+    from the launch command, with wildcard binds mapped to loopback. /api/rooms
+    is used because /api/health is session-gated and the watchdog has no key."""
+    host, port = '127.0.0.1', '8000'
+    for i, arg in enumerate(argv):
+        if arg == '--host' and i + 1 < len(argv):
+            host = argv[i + 1]
+        elif arg.startswith('--host='):
+            host = arg.split('=', 1)[1]
+        elif arg == '--port' and i + 1 < len(argv):
+            port = argv[i + 1]
+        elif arg.startswith('--port='):
+            port = arg.split('=', 1)[1]
+    if host in ('0.0.0.0', '::', ''):
+        host = '127.0.0.1'
+    return f'http://{host}:{port}/api/rooms'
+
+
+def _spawn_kernel_watchdog(argv, backup, target, health_url):
+    path = os.path.join(_world(), KERNEL_WATCHDOG_NAME)
+    try:
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(_KERNEL_WATCHDOG_SOURCE)
+        subprocess.Popen(
+            [sys.executable, path, backup, target, health_url, _world(),
+             json.dumps(argv), str(KERNEL_HEALTH_TIMEOUT_S)],
+            cwd=_world(), stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        return True
+    except Exception:
+        return False
+
+
+def _run_kernel_preflight():
+    """Run the repo gate against the on-disk candidate. The running process
+    still holds the old code, so a failing candidate is restored and nothing
+    restarts."""
+    repo_root = os.path.dirname(os.path.abspath(_world()))
+    try:
+        done = subprocess.run(
+            POST_APPLY_TEST_CMD, cwd=repo_root,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=POST_APPLY_TEST_TIMEOUT_S)
+        raw = (done.stdout or b'').decode('utf-8', errors='replace')
+        return done.returncode == 0, raw.strip()[-POST_APPLY_TAIL_LEN:]
+    except subprocess.TimeoutExpired:
+        return False, 'kernel preflight timed out'
+    except Exception as exc:
+        return False, f'kernel preflight could not start: {exc}'
+
+
+def _apply_kernel(row_id, display, sha_before):
+    """Apply one armed serve.py edit: verify bytes, write, preflight, restart.
+    Returns 1 when the file was applied (restart disabled in tests) and 0 when
+    the edit failed and the original bytes were restored."""
+    serve = _s()
+    target = _target_from_display(display)
+    if not os.path.isfile(target):
+        _update(row_id, status='conflict', note='target missing at apply time')
+        return 0
+    with open(target, 'r', encoding='utf-8') as fh:
+        original = fh.read()
+    if hashlib.sha256(original.encode('utf-8')).hexdigest() != sha_before:
+        _update(row_id, status='conflict',
+                note='target changed after arming -- re-propose against the '
+                     'current bytes')
+        return 0
+    with open(_staging_candidate(row_id), 'r', encoding='utf-8') as fh:
+        candidate = fh.read()
+    backups = os.path.join(_world(), '.selfedit_backups')
+    os.makedirs(backups, exist_ok=True)
+    backup = os.path.join(backups, row_id)
+    with open(backup, 'w', encoding='utf-8') as fh:
+        fh.write(original)
+    with open(target, 'w', encoding='utf-8') as fh:
+        fh.write(candidate)
+
+    ok, tail = _run_kernel_preflight()
+    serve.log_action(row_id, 'self_edit_kernel_preflight',
+                     {'path': display, 'result': 'pass' if ok else 'fail',
+                      'tail': tail[:POST_APPLY_TAIL_LEN]}, authorized=True)
+    argv = _kernel_argv() if ok else None
+    if not ok or not argv:
+        shutil.copyfile(backup, target)
+        note = ('kernel preflight failed' if not ok
+                else 'launch command unavailable; refusing to restart')
+        _update(row_id, status='failed', note=note)
+        serve.log_action(row_id, 'self_edit_kernel_apply_failed',
+                         {'path': display, 'note': note}, authorized=False)
+        _notify_agent(_row_agent(row_id),
+                      f'Your kernel edit to {display} was not applied: {note}. '
+                      f'The previous serve.py bytes were restored.\n'
+                      f'Test tail:\n{tail[-POST_APPLY_TAIL_LEN:]}',
+                      about='selfedit')
+        return 0
+
+    _update(row_id, status='applied', applied_at=time.time(),
+            note='kernel edit: applied by process restart')
+    serve.log_action(row_id, 'self_edit_kernel_applied',
+                     {'path': display, 'restart': bool(KERNEL_RESTART_ENABLED)},
+                     authorized=True)
+    if not KERNEL_RESTART_ENABLED:
+        return 1
+
+    health_url = _kernel_health_url(argv)
+    watchdog = _spawn_kernel_watchdog(argv, backup, target, health_url)
+    if not watchdog:
+        # Without the rollback net, do not swap the process.
+        shutil.copyfile(backup, target)
+        _update(row_id, status='failed', note='watchdog could not start')
+        serve.log_action(row_id, 'self_edit_kernel_apply_failed',
+                         {'path': display, 'note': 'watchdog could not start'},
+                         authorized=False)
+        return 0
+    try:
+        os.chdir(_world())
+        os.execv(argv[0], argv)
+    except Exception as exc:
+        shutil.copyfile(backup, target)
+        _update(row_id, status='failed', note=f'restart failed: {exc}'[:200])
+        serve.log_action(row_id, 'self_edit_kernel_apply_failed',
+                         {'path': display, 'note': f'restart failed: {exc}'[:200]},
+                         authorized=False)
+        return 0
+    return 1
+
+
+def _row_agent(row_id):
+    try:
+        with _s()._db() as conn:
+            _ensure_table(conn)
+            row = conn.execute('SELECT agent FROM self_edit_log WHERE id = ?',
+                               (row_id,)).fetchone()
+        return (row[0] if row else '') or 'unknown'
+    except Exception:
+        return 'unknown'
+
+
+def _schedule_kernel_restart(delay=1.5):
+    """Restart after the current response flushes (used by revert). A daemon
+    thread is enough: exec replaces the process, and the thread dies with it."""
+    import threading
+
+    def _go():
+        time.sleep(delay)
+        argv = _kernel_argv()
+        if not argv:
+            return
+        try:
+            os.chdir(_world())
+            os.execv(argv[0], argv)
+        except Exception:
+            pass
+
+    threading.Thread(target=_go, daemon=True).start()
+
+
 def _apply_one(row_id, display, sha_before, window_id=None):
     serve = _s()
     target = _target_from_display(display)
@@ -998,6 +1263,10 @@ def submit_remediation_fix(agent_id, path, find, replace, summary):
     refusal = _path_refusal(resolved, display)
     if refusal:
         return False, {'error': refusal}
+    if is_kernel(resolved):
+        return False, {'error': 'serve.py is the kernel: an in-window fix '
+                                'cannot reload it. Propose a normal kernel '
+                                'edit (player signature, preflight, restart).'}
     try:
         with open(resolved, 'r', encoding='utf-8') as fh:
             original = fh.read()
@@ -1047,6 +1316,9 @@ def _revert_one_from_backup(row_id):
     if not os.path.isfile(backup):
         return False
     shutil.copyfile(backup, target)
+    if is_kernel(target):
+        _schedule_kernel_restart()
+        return True
     try:
         _reload(target)
     except Exception:
@@ -1178,7 +1450,10 @@ def revert(edit_id, by='operator'):
                                     f'{edit_id}.cand')
     target = _target_from_display(display)
     shutil.copyfile(backup, target)
-    _reload(target)
+    if is_kernel(target):
+        _schedule_kernel_restart()
+    else:
+        _reload(target)
     _update(edit_id, status='reverted', reverted_at=time.time())
     serve.log_action(edit_id, 'self_edit_reverted', {'by': by}, authorized=True)
     return True, {'ok': True, 'status': 'reverted',
