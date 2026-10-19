@@ -363,6 +363,7 @@ from config import (  # noqa: E402,F401
     BAND_BENCHMARK,
     BAND_QUALITY_FLOOR_GAP,
     BROWSE_BLOCK_CATEGORIES,
+    CREDENTIAL_ACCESS_CONFIG,
     MODEL_BAND_PURPOSE,
     MODEL_PRICE_BANDS,
     PLAIN_WRITING_BAN_LIST,
@@ -377,6 +378,7 @@ from config import (  # noqa: E402,F401
     TREG_ENDPOINT_COSTS,
     ON_RELOAD_HOOKS,
     bind_policy,
+    get_credential_access_config,
     get_grants_config,
     get_operator_policy,
     note_watchlist_topic,
@@ -8790,7 +8792,8 @@ def _run_browser_act_sync(sandbox_dir, action):
     # reachable by the browser. Revoked in a finally below -- the grant never
     # outlives this one action run.
     try:
-        grant_host = urllib.parse.urlparse(action.get('url') or '').hostname or ''
+        grant_host = urllib.parse.urlparse(
+            action.get('url') or action.get('pageUrl') or '').hostname or ''
     except Exception:
         grant_host = ''
     if grant_host and not _is_allowlisted_host(grant_host):
@@ -10273,6 +10276,39 @@ AGENT_ASK_TOOLS = [
                     },
                 },
                 'required': ['key', 'value', 'reason'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'request_credential_access',
+            'description': (
+                'Request a short-lived, read-only login handle for ONE service '
+                'while you are working the active task that needs it. This is '
+                'the need-based path: you cannot list the vault, and you never '
+                'see a username or password. Name the service (facebook or '
+                'instagram), the current taskId, and a concrete purpose. The '
+                'server checks that the task is assigned to you, that its text '
+                'references that service, and that the service is enabled for '
+                'read-only access. It returns an opaque handle scoped to that '
+                'service\'s hosts and login submit only. Use it with browser_act '
+                'op=login on the service login page. Social hosts are hard '
+                'read-only: fill/click/submit are refused outside that login. '
+                'The handle expires and replaces any prior handle for the same '
+                'service.'
+            ),
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'service': {'type': 'string',
+                                'description': 'The enabled service, e.g. facebook or instagram.'},
+                    'taskId': {'type': 'string',
+                               'description': 'Optional: the active task assigned to you. The runtime fills the current task automatically.'},
+                    'purpose': {'type': 'string',
+                                'description': 'One concrete sentence: which task need this serves.'},
+                },
+                'required': ['service', 'purpose'],
             },
         },
     },
@@ -16186,7 +16222,7 @@ async def intent_clarify(request: Request):
         'onCallFallback': plan.get('onCallFallback', False)})
 
 
-def _make_web_tools_executor(agent_id, agent_key, default_location=None, default_query=None, struck_tools=None, work_context='', work_context_trusted=False):
+def _make_web_tools_executor(agent_id, agent_key, default_location=None, default_query=None, struck_tools=None, work_context='', work_context_trusted=False, task_id=None):
     """Shared search_web/browse_page tool executor for any
     AGENT_ASK_TOOLS-driven tool-calling loop. Extracted so the
     spike content executor can reuse the exact same gated fetch/wrap logic
@@ -16286,6 +16322,29 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                         f'pending director review]' if result.get('requested')
                         else f'{msg} [no further request needed]')
             return f'Could not file the allowlist request: {result}'
+        if name == 'request_credential_access':
+            service = ((args or {}).get('service') or '').strip().lower()
+            requested_task = ((args or {}).get('taskId') or '').strip() or (task_id or '')
+            purpose = ((args or {}).get('purpose') or '').strip()
+            if not requested_task:
+                return ('request_credential_access needs the active taskId; it is '
+                        'available only while you are working a task.')
+            result = _http_json('POST', SELF_BASE_URL,
+                                '/api/credentials/request-access', {
+                                    'agentId': agent_id,
+                                    'service': service,
+                                    'taskId': requested_task,
+                                    'purpose': purpose,
+                                }, agent_key, timeout=30)
+            if isinstance(result, dict) and result.get('ok'):
+                return (f"Granted read-only {result.get('service')} access for this task. "
+                        f"handle={result.get('handle')} hosts={', '.join(result.get('hosts') or [])} "
+                        f"expiresInSec={result.get('expiresInSec')}. Use it with browser_act "
+                        "op=login on the service login page. Fill/click/submit are refused on "
+                        "social hosts outside that login.")
+            err = (result.get('error') if isinstance(result, dict) else None) or result
+            return (f'Credential access refused: {err} [do not retry unchanged; use a '
+                    'different source or explain the task need]')
         if name in ('grant_allowlist', 'revoke_allowlist'):
             # Director/admin-only allowlist mutation. The ENDPOINT enforces the
             # role gate via _operator_gate (session or a director/admin agent
@@ -26499,6 +26558,14 @@ async def _classify_browser_action(op, url, purpose, agent_id='unknown', work_co
     # for the bypass.
     if op in BROWSER_ACT_READ_OPS and (_is_allowlisted_host(host) or (work_context_trusted and _is_work_context_host(work_context, host))):
         return True, 'allow (allowlisted or explicitly named in the assigned work)'
+    # Player-vetted, need-based social read path: the host is in the operator's
+    # credential_access.json readOnlyHosts, and the browser_act guard has
+    # already refused every write-shaped op. Reads skip Jev exactly like the
+    # allowlist; the login submit is allowed only with a fully scoped handle.
+    if op in BROWSER_ACT_READ_OPS and _is_readonly_social_host(host):
+        return True, 'allow (read-only social host)'
+    if op == 'login' and handle_scoped_host and _is_readonly_social_host(host):
+        return True, 'allow (read-only social login with player-stored handle)'
     # A fill that carries a VALID, player-minted login capability handle scoped to
     # THIS host skips Jev, same as the allowlist bypass. Reasoning: Jev's
     # credential-submission block exists to stop an agent from typing a secret it
@@ -27692,6 +27759,98 @@ async def captcha_solve(request_id: str, request: Request):
                          'page': parsed, 'screenshotBase64': shot})
 
 
+def _task_need_text(task):
+    parts = []
+    for key in ('title', 'instructions', 'userStory', 'acceptanceCriteria',
+                'goal', 'note', 'projectLabel'):
+        value = task.get(key)
+        if isinstance(value, (list, tuple)):
+            parts.extend(str(v) for v in value)
+        elif value:
+            parts.append(str(value))
+    return ' '.join(parts).lower()
+
+
+@app.post('/api/credentials/request-access')
+async def request_credential_access(request: Request):
+    """Need-based access to ONE read-only credential for ONE active task.
+
+    An agent cannot enumerate the vault. It names a service that the operator
+    put in world/credential_access.json, proves it is working a task assigned
+    to it, and the task text must reference that service or one of its hosts.
+    The server then mints a short-lived handle scoped to exactly those hosts
+    and methods. The secret stays in the vault; the response contains only the
+    handle. This is the on-demand path, not a standing key.
+    """
+    body = await request.json()
+    agent_id = (body.get('agentId') or '').strip()
+    service = (body.get('service') or '').strip().lower()
+    purpose = (body.get('purpose') or '').strip()[:300]
+    task_id = (body.get('taskId') or '').strip()
+    if not verify_agent_key(agent_id, request.headers.get('X-Agent-Key')):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    if not check_rate_limit(agent_id):
+        return JSONResponse({'error': 'Rate limit exceeded'}, status_code=429)
+    if not service or not purpose or not task_id:
+        return JSONResponse({'error': 'service, purpose, and taskId are required'},
+                            status_code=400)
+    if len(purpose) < 10:
+        return JSONResponse({'error': 'purpose must say what task need this serves'},
+                            status_code=400)
+    cfg = _credential_access_cfg()
+    spec = (cfg.get('autoGrant') or {}).get(service)
+    if not spec:
+        return JSONResponse({'error': 'that service is not enabled for need-based '
+                                      'read-only access'}, status_code=403)
+    state = get_state_from_db() or {}
+    task = (state.get('tasks') or {}).get(task_id)
+    if not isinstance(task, dict):
+        return JSONResponse({'error': 'task not found'}, status_code=404)
+    if (task.get('assignedTo') or '') != agent_id:
+        return JSONResponse({'error': 'that task is not assigned to you'},
+                            status_code=403)
+    if task.get('status') not in ('walking', 'working'):
+        return JSONResponse({'error': f"task is {task.get('status')!r}, not active"},
+                            status_code=409)
+    text = _task_need_text(task)
+    needles = [service] + [h.lower() for h in (spec.get('hosts') or [])]
+    if not any(n and n in text for n in needles):
+        return JSONResponse({'error': 'the assigned task does not reference this '
+                                      'service; request access only for work that '
+                                      'actually needs it'}, status_code=403)
+    credential = spec.get('credential') or service
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT kind FROM external_credentials WHERE name = ? AND status = 'active'",
+            (credential,)).fetchone()
+        if not row or row[0] != 'login':
+            return JSONResponse({'error': 'credential is not an active login'},
+                                status_code=404)
+        # One live handle per agent per credential: a new need replaces the old.
+        conn.execute('DELETE FROM capability_handles WHERE agent_id = ? '
+                     'AND credential_name = ?', (agent_id, credential))
+    handle, refusal = mint_capability_handle(
+        agent_id, credential, purpose, list(spec.get('hosts') or []),
+        list(spec.get('methods') or ['POST']), 'need-based-read-only',
+        int(spec.get('ttlSec') or 900))
+    if handle is None:
+        return JSONResponse({'error': refusal or 'could not mint a handle'},
+                            status_code=403)
+    log_action(agent_id, 'credential_access_granted', {
+        'service': service, 'credential': credential, 'taskId': task_id,
+        'hosts': spec.get('hosts'), 'methods': spec.get('methods'),
+        'ttlSec': spec.get('ttlSec'), 'scope': 'read-only-social',
+    }, authorized=True)
+    _append_passport_decision('credential_access_granted', agent_id, {
+        'service': service, 'credential': credential, 'taskId': task_id,
+        'hosts': spec.get('hosts'), 'scope': 'read-only-social'})
+    return JSONResponse({'ok': True, 'handle': handle, 'service': service,
+                         'credential': credential, 'hosts': spec.get('hosts'),
+                         'methods': spec.get('methods'),
+                         'expiresInSec': int(spec.get('ttlSec') or 900),
+                         'readOnly': True})
+
+
 @app.post('/api/keys/handles')
 async def add_handle(request: Request):
     # Handle minting is "limited by the ask": every grant is a purpose + host
@@ -28270,6 +28429,82 @@ async def execute(request: Request):
 BROWSER_ACT_OPS = ('goto', 'read', 'fill', 'fill_many', 'login', 'click', 'submit', 'screenshot')
 
 
+def _credential_access_cfg():
+    try:
+        return get_credential_access_config()
+    except Exception:
+        return CREDENTIAL_ACCESS_CONFIG
+
+
+def _host_matches(host, allowed):
+    host = (host or '').strip().lower().rstrip('.')
+    if not host:
+        return False
+    for item in allowed or []:
+        base = str(item or '').strip().lower().rstrip('.')
+        if not base:
+            continue
+        if host == base or host.endswith('.' + base):
+            return True
+    return False
+
+
+def _is_readonly_social_host(host):
+    return _host_matches(host, _credential_access_cfg().get('readOnlyHosts') or [])
+
+
+def _is_social_login_url(url):
+    try:
+        parsed = urllib.parse.urlparse(url or '')
+    except Exception:
+        return False
+    if not _is_readonly_social_host(parsed.hostname or ''):
+        return False
+    path = (parsed.path or '/').lower()
+    return any(marker in path for marker in
+               ('/login', '/accounts/login', '/checkpoint', '/challenge'))
+
+
+def _social_readonly_guard(op, url, page_url, fields):
+    """Hard read-only policy for the configured social hosts. Returns an error
+    string, or None when the action is allowed. The ONLY write-shaped op is a
+    login submit on an auth path, with every field injected from a scoped
+    credential handle (the agent never supplies a literal secret)."""
+    host = ''
+    for candidate in (url, page_url):
+        try:
+            parsed = urllib.parse.urlparse(candidate or '')
+        except Exception:
+            continue
+        if parsed.hostname:
+            host = parsed.hostname
+            if _is_readonly_social_host(host):
+                break
+    if not _is_readonly_social_host(host):
+        return None
+    if op in ('fill', 'fill_many', 'click', 'submit'):
+        return ('read-only social policy: fill, click, and submit are disabled on '
+                f'{host}; use op=login once on a login page, then only goto/read/screenshot')
+    if op == 'login':
+        if not _is_social_login_url(url):
+            return ('read-only social policy: op=login is allowed only on a login '
+                    f'path for {host}')
+        supplied = fields or []
+        if len(supplied) < 2:
+            return 'read-only social policy: op=login needs username and password fields'
+        for field in supplied:
+            if not (field.get('credentialHandle') or '').strip():
+                return ('read-only social policy: every login field must use a '
+                        'scoped credential handle; literal values are refused')
+            if (field.get('credentialField') or '').strip().lower() not in ('username', 'password'):
+                return ('read-only social policy: login fields must be username or password')
+        return None
+    if op in ('read', 'screenshot') and not url:
+        return (f'read-only social policy: pass the current {host} url on read/screenshot '
+                'so the browser opens the real page')
+    return None
+
+
 @app.post('/api/browser-act')
 async def browser_act(request: Request):
     if not EXECUTION_ENABLED:
@@ -28315,6 +28550,15 @@ async def browser_act(request: Request):
         return JSONResponse({'error': 'fields is required for op=login'}, status_code=400)
     if op == 'click' and not selector:
         return JSONResponse({'error': 'selector is required for op=click'}, status_code=400)
+    social_error = _social_readonly_guard(
+        op, url, (body.get('pageUrl') or '').strip(), body.get('fields') or [])
+    if social_error:
+        log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op,
+                                              'url': url or body.get('pageUrl'),
+                                              'decision': 'blocked',
+                                              'reason': 'read-only social policy'},
+                   authorized=authorized)
+        return JSONResponse({'allowed': False, 'reason': social_error}, status_code=200)
     # Confused-deputy fill: an agent can type a vault login field WITHOUT ever
     # holding the secret. It presents a capability handle + which field to
     # inject (username|password). The server resolves the handle against the
@@ -28343,6 +28587,31 @@ async def browser_act(request: Request):
                                                   'purpose': purpose, 'decision': 'blocked',
                                                   'reason': 'credential handle invalid, expired, out of scope, or not a login credential'}, authorized=authorized)
             return JSONResponse({'error': 'That capability handle is not valid for this login fill (expired, wrong agent, out-of-scope host, or not a login credential).'}, status_code=403)
+    # Per-field handles (op=login/fill_many). Resolve every field's handle
+    # BEFORE the policy gate so a fully scoped login can skip Jev's generic
+    # credential-submission block: the player already vetted the credential and
+    # the host. A single invalid/missing handle fails closed without touching
+    # the vault.
+    fields_scope = None
+    supplied_fields = body.get('fields') or []
+    if op in ('login', 'fill_many') and supplied_fields:
+        ok_fields = []
+        for field in supplied_fields:
+            if not isinstance(field, dict):
+                ok_fields = None
+                break
+            fh = (field.get('credentialHandle') or '').strip()
+            ff = (field.get('credentialField') or '').strip().lower()
+            if not fh:
+                ok_fields = None
+                break
+            fscope = verify_capability_handle_scope(agent_id, fh, 'POST', scope_url)
+            if fscope is None or fscope.get('kind') != 'login' or ff not in ('username', 'password'):
+                ok_fields = None
+                break
+            ok_fields.append(fscope)
+        if ok_fields is not None:
+            fields_scope = ok_fields[0]
     if url:
         # Same URL guardrails as /api/browse: http(s) only, and the final host
         # must be a safe public host (SSRF/private-network protection). Fires
@@ -28366,7 +28635,7 @@ async def browser_act(request: Request):
     # persistent profile), classify against the `scope_url` the handle was
     # resolved against so the Jev bypass sees the real host, not an empty one.
     classify_url = url or (scope_url if (op in ('fill', 'fill_many', 'login', 'submit', 'click') and credential_handle) else '')
-    allowed, reason = await _classify_browser_action(op, classify_url, purpose, agent_id, work_context, work_context_trusted, handle_scoped_host=bool(handle_scope))
+    allowed, reason = await _classify_browser_action(op, classify_url, purpose, agent_id, work_context, work_context_trusted, handle_scoped_host=bool(handle_scope or fields_scope))
     if not allowed:
         # Same supervisor-override path as /api/execute: the director (non-Jev
         # model) gets one review before the block is final.
@@ -28390,7 +28659,8 @@ async def browser_act(request: Request):
         value = injected  # only reaches the sandbox action file; never logged or returned
 
     sandbox_dir = _sandbox_dir_for(sandbox_id)
-    action = {'op': op, 'url': url, 'selector': selector, 'value': value if value is not None else '',
+    action = {'op': op, 'url': url, 'pageUrl': scope_url,
+              'selector': selector, 'value': value if value is not None else '',
              'timeoutMs': 30000, 'maxText': max_text}
     if op in ('fill', 'fill_many', 'login'):
         # Per-field credential injection: each field may carry its own

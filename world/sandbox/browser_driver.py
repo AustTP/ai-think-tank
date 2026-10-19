@@ -34,6 +34,49 @@ MAX_TEXT = int(os.environ.get('BROWSER_ACT_MAX_TEXT', '16000'))
 MAX_FIELDS = 40
 MAX_LINKS = 40
 
+# Hard read-only backstop for the player-vetted social hosts. The server
+# already refuses these ops, but the driver is the last place that sees the
+# REAL current page URL (an omitted url must not turn into a bypass).
+READ_ONLY_SOCIAL_HOSTS = (
+    'facebook.com', 'www.facebook.com', 'm.facebook.com', 'mbasic.facebook.com',
+    'instagram.com', 'www.instagram.com',
+)
+
+
+def _is_social_host(host):
+    host = (host or '').strip().lower().rstrip('.')
+    return any(host == h or host.endswith('.' + h) for h in READ_ONLY_SOCIAL_HOSTS)
+
+
+def _social_host(url):
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url or '').hostname or ''
+    except Exception:
+        return ''
+
+
+def _is_login_path(url):
+    try:
+        from urllib.parse import urlparse
+        path = (urlparse(url or '').path or '/').lower()
+    except Exception:
+        return False
+    return any(marker in path for marker in
+               ('/login', '/accounts/login', '/checkpoint', '/challenge'))
+
+
+def _social_write_guard(op, url):
+    if not _is_social_host(_social_host(url)):
+        return None
+    if op in ('fill', 'fill_many', 'click', 'submit'):
+        return ('read-only social policy: fill, click, and submit are disabled on '
+                'this host; use op=login once on a login page, then only '
+                'goto/read/screenshot')
+    if op == 'login' and not _is_login_path(url):
+        return 'read-only social policy: op=login is allowed only on a login path'
+    return None
+
 
 def _settle(page, ms):
     page.wait_for_timeout(ms)
@@ -227,6 +270,11 @@ def run(action):
                 if op != 'goto' and action.get('url'):
                     page.goto(action.get('url'), timeout=timeout_ms, wait_until='domcontentloaded')
                     _settle(page, 2500)
+                social_error = _social_write_guard(op, page.url)
+                if social_error:
+                    return {'ok': False, 'op': op, 'url': page.url,
+                            'error': social_error,
+                            'socialReadOnly': True}
                 if op == 'goto':
                     page.goto(action.get('url'), timeout=timeout_ms, wait_until='domcontentloaded')
                     _settle(page, 2500)

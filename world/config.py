@@ -8,6 +8,7 @@ this module to tune the village without touching Python:
 - research_desk.json    -> RESEARCH_DESK_PASSES         (the desk's multi-pass questions)
 - watchlist.json        -> RESEARCH_WATCHLIST           (standing research topics; the seed)
 - grants.json           -> GRANTS_CONFIG                (operator-granted app/file access)
+- credential_access.json -> CREDENTIAL_ACCESS_CONFIG   (per-service need-based read-only logins)
 - browse_policy.json    -> STANDING_SAFE_DOMAINS        (read-only reference hosts, in the same file)
 - service_costs.json    -> TREG_ENDPOINT_COSTS          (per-endpoint prices for metered APIs)
 - model_bands.json      -> MODEL_PRICE_BANDS, MODEL_BAND_PURPOSE, BAND_BENCHMARK,
@@ -59,6 +60,7 @@ BROWSE_POLICY_PATH = os.path.join(ROOT, 'browse_policy.json')
 RESEARCH_DESK_PATH = os.path.join(ROOT, 'research_desk.json')
 WATCHLIST_PATH = os.path.join(ROOT, 'watchlist.json')
 GRANTS_PATH = os.path.join(ROOT, 'grants.json')
+CREDENTIAL_ACCESS_PATH = os.path.join(ROOT, 'credential_access.json')
 
 # Fail-closed defaults, kept in code so a fresh clone (or a deleted/corrupt
 # JSON file) boots with a working policy. The shipped JSON files carry the
@@ -116,6 +118,38 @@ RESEARCH_WATCHLIST = list(RESEARCH_WATCHLIST_DEFAULT)
 # entries are dropped (fail-closed); an absent or corrupt file grants nothing.
 GRANTS_DEFAULT: dict = {'appGrants': [], 'fileGrants': []}
 GRANTS_CONFIG: dict = {'appGrants': [], 'fileGrants': []}
+
+# Per-service, need-based read-only logins (world/credential_access.json).
+# An agent cannot enumerate the vault. It asks for ONE service by name while it
+# is working an active task, and the server mints a short-lived handle scoped
+# to that service's hosts and POST (the login form) only. `readOnlyHosts` is
+# the hard browser policy: social hosts refuse fill/click/submit; the only
+# write-shaped op is the login submit on an auth path.
+CREDENTIAL_ACCESS_DEFAULT: dict = {
+    'autoGrant': {
+        'facebook': {
+            'credential': 'facebook',
+            'hosts': ['facebook.com', 'www.facebook.com', 'm.facebook.com',
+                      'mbasic.facebook.com'],
+            'methods': ['POST'],
+            'ttlSec': 900,
+        },
+        'instagram': {
+            'credential': 'instagram',
+            'hosts': ['instagram.com', 'www.instagram.com'],
+            'methods': ['POST'],
+            'ttlSec': 900,
+        },
+    },
+    'readOnlyHosts': [
+        'facebook.com', 'www.facebook.com', 'm.facebook.com', 'mbasic.facebook.com',
+        'instagram.com', 'www.instagram.com',
+    ],
+}
+CREDENTIAL_ACCESS_CONFIG: dict = {
+    'autoGrant': {k: dict(v) for k, v in CREDENTIAL_ACCESS_DEFAULT['autoGrant'].items()},
+    'readOnlyHosts': list(CREDENTIAL_ACCESS_DEFAULT['readOnlyHosts']),
+}
 
 SERVICE_COSTS_PATH = os.path.join(ROOT, 'service_costs.json')
 MODEL_BANDS_PATH = os.path.join(ROOT, 'model_bands.json')
@@ -241,6 +275,7 @@ TOOL_DESCRIPTIONS: dict = {}
 
 _BUNDLE_ID_RE = re.compile(r'^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$')
 _GRANTS_CACHE = {'mtime': None, 'data': None}
+_CREDENTIAL_ACCESS_CACHE = {'mtime': None, 'data': None}
 
 _WATCHLIST_CACHE: dict = {'mtime': None, 'data': [], 'ok': False}
 
@@ -1141,6 +1176,75 @@ def get_grants_config():
     return _GRANTS_CACHE['data']
 
 
+def _load_credential_access(path):
+    """Validate the per-service read-only login config. Fail-closed: a bad
+    entry is dropped, and a bad file falls back to the built-in defaults."""
+    out = {'autoGrant': {}, 'readOnlyHosts': []}
+    try:
+        with open(path, encoding='utf-8') as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {'autoGrant': {k: dict(v) for k, v in
+                              CREDENTIAL_ACCESS_DEFAULT['autoGrant'].items()},
+                'readOnlyHosts': list(CREDENTIAL_ACCESS_DEFAULT['readOnlyHosts'])}
+    if not isinstance(data, dict):
+        return out
+    hosts = data.get('readOnlyHosts')
+    if isinstance(hosts, list):
+        out['readOnlyHosts'] = [str(h).strip().lower()
+                                for h in hosts if str(h).strip()]
+    auto = data.get('autoGrant')
+    if isinstance(auto, dict):
+        for service, spec in auto.items():
+            name = str(service).strip().lower()
+            if not name or not isinstance(spec, dict):
+                continue
+            credential = str(spec.get('credential') or name).strip()
+            spec_hosts = spec.get('hosts')
+            if not isinstance(spec_hosts, list):
+                continue
+            clean_hosts = [str(h).strip().lower() for h in spec_hosts
+                           if str(h).strip()]
+            if not credential or not clean_hosts:
+                continue
+            methods = spec.get('methods')
+            clean_methods = ([str(m).strip().upper() for m in methods
+                              if str(m).strip()]
+                             if isinstance(methods, list) else ['POST'])
+            try:
+                ttl = max(60, min(int(spec.get('ttlSec') or 900), 3600))
+            except (TypeError, ValueError):
+                ttl = 900
+            out['autoGrant'][name] = {
+                'credential': credential,
+                'hosts': clean_hosts,
+                'methods': clean_methods or ['POST'],
+                'ttlSec': ttl,
+            }
+    if not out['readOnlyHosts']:
+        out['readOnlyHosts'] = list(CREDENTIAL_ACCESS_DEFAULT['readOnlyHosts'])
+    if not out['autoGrant']:
+        out['autoGrant'] = {k: dict(v) for k, v in
+                            CREDENTIAL_ACCESS_DEFAULT['autoGrant'].items()}
+    return out
+
+
+def get_credential_access_config():
+    """Current credential_access.json, re-read on mtime. This is the operator
+    switchboard for need-based read-only logins: add a service to autoGrant to
+    let that service be requested, remove it to revoke the path. The file holds
+    no secrets -- only credential names, hosts, methods, and TTLs."""
+    try:
+        mtime = os.path.getmtime(CREDENTIAL_ACCESS_PATH)
+    except OSError:
+        mtime = -1
+    if _CREDENTIAL_ACCESS_CACHE['mtime'] != mtime:
+        _CREDENTIAL_ACCESS_CACHE['mtime'] = mtime
+        _CREDENTIAL_ACCESS_CACHE['data'] = _load_credential_access(
+            CREDENTIAL_ACCESS_PATH)
+    return _CREDENTIAL_ACCESS_CACHE['data']
+
+
 def get_research_watchlist():
     """Return the current watchlist.json topics, re-reading the file whenever
     its mtime changes -- the same live-reload pattern as get_grants_config, so
@@ -1215,6 +1319,9 @@ def reload_policy_config():
     _grants = get_grants_config()
     GRANTS_CONFIG['appGrants'] = [dict(g) for g in _grants.get('appGrants') or []]
     GRANTS_CONFIG['fileGrants'] = [dict(g) for g in _grants.get('fileGrants') or []]
+    _CREDENTIAL_ACCESS_CACHE['mtime'] = None
+    CREDENTIAL_ACCESS_CONFIG.clear()
+    CREDENTIAL_ACCESS_CONFIG.update(get_credential_access_config())
     # Operator policy: refresh the in-place dict, then notify consumers so
     # their scalar module constants (sim.MAX_TEAM_MEMBERS and friends) rebind.
     # Force the mtime check to re-run even if nothing changed on disk -- an
