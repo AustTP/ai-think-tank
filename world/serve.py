@@ -13732,6 +13732,11 @@ async def api_mail_send(request: Request):
             _maybe_register_card_appeal(state, from_id, text, to_id)
         except Exception:  # noqa: BLE001 -- mail must land even if appeals misbehave
             pass
+    # Commit the mailbox entry (and any appeal) before routed work runs.
+    # A routing lane may save state itself, which releases the whole-blob
+    # lock; committing first lets the reply write re-read the latest blob
+    # instead of saving a stale snapshot over another writer's changes.
+    save_state_to_db(state)
     # Admin messages surface: the admin never runs content tasks, so a mailbox
     # note alone would sit unread forever (verified against the action log --
     # the admin's only model context is governance ceremonies, which never
@@ -13747,24 +13752,31 @@ async def api_mail_send(request: Request):
             reply = routed.get('reply') or routed.get('error') or ''
             if reply:
                 now_ms = int(time.time() * 1000)
-                state.setdefault('playerInbox', []).append({
-                    'id': f'mail-{now_ms}',
-                    'agentId': routed.get('agent') or to_id,
-                    'question': text[:500],
-                    'answer': reply,
-                    'status': 'answered',
-                    'answeredAt': now_ms,
-                    'createdAt': now_ms,
-                    'queued': False,
-                })
-                _sim._queue_player_email(
-                    state, 'admin_mail_answered',
-                    '[AI Think Tank] Theo replied',
-                    (f'You messaged Theo: {text[:300]}\n\nTheo answered:\n{reply}'))
+                # Drop any hold the early commit (or a mocked commit in tests)
+                # left on this thread before taking a fresh snapshot. Nesting
+                # two _state_begin calls would let one release strand the other
+                # and freeze every later writer.
+                _state_abort()
+                latest = _state_begin()
+                if latest is not None:
+                    latest.setdefault('playerInbox', []).append({
+                        'id': f'mail-{now_ms}',
+                        'agentId': routed.get('agent') or to_id,
+                        'question': text[:500],
+                        'answer': reply,
+                        'status': 'answered',
+                        'answeredAt': now_ms,
+                        'createdAt': now_ms,
+                        'queued': False,
+                    })
+                    _sim._queue_player_email(
+                        latest, 'admin_mail_answered',
+                        '[AI Think Tank] Theo replied',
+                        (f'You messaged Theo: {text[:300]}\n\nTheo answered:\n{reply}'))
+                    save_state_to_db(latest)
                 log_action('player', 'admin_mail_answered',
                            {'agent': to_id, 'queued': False},
                            authorized=True)
-    save_state_to_db(state)
     log_action(from_id if from_id != 'player' else None, 'mail_sent',
                {'to': to_id, 'text': text}, authorized=True)
     return JSONResponse({'ok': True, 'mail': entry})

@@ -61,6 +61,22 @@ def _save_escalations(data):
     import serve as _serve
     with _ESCALATIONS_LOCK:
         path = _serve.ESCALATIONS_PATH
+        # Merge a concurrent writer's decisions before replacing the file.
+        # The director loop and the human approve/deny link each load, change
+        # one row, and save; without this merge the loop's pending copy could
+        # overwrite a decision the human just made.
+        try:
+            with open(path) as f:
+                disk = json.load(f) or {}
+        except (OSError, ValueError):
+            disk = {}
+        for eid, esc in disk.items():
+            current = data.get(eid)
+            if current is None:
+                data[eid] = esc
+            elif (esc.get('status') in ('approved', 'denied')
+                  and current.get('status') == 'pending'):
+                data[eid] = esc
         tmp = f'{path}.tmp'
         try:
             with open(tmp, 'w') as f:
