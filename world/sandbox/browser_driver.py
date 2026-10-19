@@ -39,6 +39,79 @@ def _settle(page, ms):
     page.wait_for_timeout(ms)
 
 
+def _captcha_state(page):
+    """Detect visible CAPTCHA widgets and the text field they guard.
+
+    This never solves anything. It marks candidates with a stable data
+    attribute so the endpoint can hand a selector to the broker without
+    guessing at site-specific markup.
+    """
+    try:
+        return page.evaluate("""() => {
+          const visible = (el) => {
+            try {
+              const r = el.getBoundingClientRect();
+              const s = getComputedStyle(el);
+              return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';
+            } catch (e) { return false; }
+          };
+          const nodes = Array.from(document.querySelectorAll('iframe,div,img,input,textarea'));
+          const out = [];
+          let idx = 0;
+          for (const el of nodes) {
+            const tag = el.tagName.toLowerCase();
+            const src = (el.getAttribute('src') || '').toLowerCase();
+            const id = (el.id || '').toLowerCase();
+            const name = (el.getAttribute('name') || '').toLowerCase();
+            const cls = (el.className || '').toString().toLowerCase();
+            const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+            const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+            const text = [src, id, name, cls, ph, aria].join(' ');
+            let kind = '';
+            if (src.includes('recaptcha') || text.includes('g-recaptcha')) kind = 'recaptcha';
+            else if (src.includes('hcaptcha') || text.includes('h-captcha')) kind = 'hcaptcha';
+            else if (src.includes('turnstile') || text.includes('cf-turnstile')) kind = 'turnstile';
+            else if (src.includes('arkose') || text.includes('funcaptcha')) kind = 'arkose';
+            else if (text.includes('captcha') || text.includes('verify you are human') || text.includes('security check')) {
+              if (tag === 'input' || tag === 'textarea') kind = 'input';
+              else if (tag === 'img') kind = 'image';
+              else kind = 'container';
+            }
+            if (!kind || !visible(el)) continue;
+            const rect = el.getBoundingClientRect();
+            const interactive = ['recaptcha', 'hcaptcha', 'turnstile', 'arkose'].includes(kind);
+            if (interactive && (rect.width < 180 || rect.height < 70)) continue;
+            if (kind === 'recaptcha' && src.includes('/anchor')) continue;
+            const key = 'tt-captcha-' + (idx++);
+            el.setAttribute('data-tt-captcha', key);
+            out.push({
+              kind: kind,
+              tag: tag,
+              selector: '[data-tt-captcha="' + key + '"]',
+              id: id,
+              name: name,
+              src: src.slice(0, 200),
+              text: (el.innerText || '').trim().slice(0, 120),
+            });
+          }
+          for (const rec of out) {
+            if (rec.tag === 'input' || rec.tag === 'textarea') continue;
+            const base = document.querySelector(rec.selector);
+            if (!base) continue;
+            const scope = base.parentElement || document;
+            const inp = scope.querySelector('input:not([type=hidden]):not([type=submit]), textarea');
+            if (inp && visible(inp)) {
+              const key = 'tt-captcha-input-' + (idx++);
+              inp.setAttribute('data-tt-captcha-input', key);
+              rec.inputSelector = '[data-tt-captcha-input="' + key + '"]';
+            }
+          }
+          return out.slice(0, 5);
+        }""") or []
+    except Exception:
+        return []
+
+
 def _page_state(page, max_text):
     """Snapshot of the live page: url/title, visible text, interactive form
     fields, links. Truncated so a huge page can't blow the sandbox stdout cap."""
@@ -79,7 +152,8 @@ def _page_state(page, max_text):
         ) or []
     except Exception:
         links = []
-    return {'url': url, 'title': title[:200], 'text': text, 'fields': fields, 'links': links}
+    return {'url': url, 'title': title[:200], 'text': text, 'fields': fields, 'links': links,
+            'captchas': _captcha_state(page)}
 
 
 def _launch(playwright, action):
@@ -203,6 +277,17 @@ def run(action):
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action),
                             **_page_state(page, 0)}
                 return {'ok': False, 'op': op, 'error': f'unhandled op {op!r}'}  # pragma: no cover
+            except Exception as e:
+                # A selector timeout on a CAPTCHA page must still return the
+                # page state, or the endpoint cannot see the challenge and
+                # relay it to the owner.
+                state = {}
+                try:
+                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
+                except Exception:
+                    pass
+                return {'ok': False, 'op': op, 'error': f'{type(e).__name__}: {e}',
+                        'trace': traceback.format_exc(limit=4)[-1200:], **state}
             finally:
                 try:
                     ctx.close()
