@@ -61,6 +61,23 @@ def _join_table(db):
     raise RuntimeError('could not find the Photos album<->asset join table')
 
 
+def _resolve_title(db, album):
+    """Exact title first, then a trimmed case-insensitive match, so an album
+    typed as 'think tank' still finds 'Think Tank'."""
+    wanted = (album or '').strip()
+    if not wanted:
+        return None
+    titles = [r[0] for r in db.execute(
+        'SELECT ZTITLE FROM ZGENERICALBUM WHERE ZTITLE IS NOT NULL')]
+    if wanted in titles:
+        return wanted
+    low = wanted.lower()
+    for title in titles:
+        if title.strip().lower() == low:
+            return title
+    return None
+
+
 def list_albums():
     with _open() as db:
         return [r[0] for r in db.execute(
@@ -73,6 +90,9 @@ def album_assets(album, limit=None):
     hidden assets are excluded. `local` is False when the original has not
     been downloaded to this Mac (cloud-only)."""
     with _open() as db:
+        title = _resolve_title(db, album)
+        if title is None:
+            return []
         table, album_col, asset_col = _join_table(db)
         rows = db.execute(
             f'SELECT a.Z_PK, ast.ZUUID, ast.ZFILENAME, ast.ZDIRECTORY, '
@@ -81,7 +101,7 @@ def album_assets(album, limit=None):
             f'JOIN ZASSET ast ON ast.Z_PK = j."{asset_col}" '
             f'WHERE a.ZTITLE = ? AND ast.ZKIND = 0 AND ast.ZTRASHEDSTATE = 0 '
             f'AND ast.ZHIDDEN = 0 ORDER BY ast.ZADDEDDATE DESC',
-            (album,)).fetchall()
+            (title,)).fetchall()
     originals = os.path.join(library_root(), 'originals')
     out = []
     for r in rows:

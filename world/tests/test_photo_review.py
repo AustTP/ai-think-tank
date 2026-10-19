@@ -98,6 +98,13 @@ class ApplePhotosLibraryTest(unittest.TestCase):
     def test_list_albums(self):
         self.assertEqual(apple_photos.list_albums(), ['Tagged'])
 
+    def test_album_lookup_is_case_and_space_insensitive(self):
+        self.assertEqual([a['uuid'] for a in apple_photos.album_assets('tagged')],
+                         ['U1', 'U2'])
+        self.assertEqual([a['uuid'] for a in apple_photos.album_assets('  TaGgEd ')],
+                         ['U1', 'U2'])
+        self.assertEqual(apple_photos.album_assets('missing'), [])
+
 
 class PhotoReviewAuthTest(unittest.TestCase):
     def _request(self, key=None):
