@@ -160,6 +160,18 @@ class RequestEndpointTests(_SocialCase):
 
 
 class SocialReadOnlyPolicyTests(unittest.TestCase):
+
+    def test_social_spike_forces_the_handle_before_rss(self):
+        import content
+        q = ('Search Facebook public groups for news about Albemarle, NC '
+             'from the last 14 days')
+        self.assertTrue(content._spike_wants_social_login(q, None))
+        self.assertFalse(content._spike_wants_rss(q, None))
+        self.assertEqual(content._spike_first_tool(q, None),
+                         'request_credential_access')
+        self.assertEqual(content._spike_first_tool('any breaking news?', None),
+                         'read_rss_feed')
+
     def test_write_ops_are_blocked(self):
         for op in ('fill', 'fill_many', 'click', 'submit'):
             err = serve._social_readonly_guard(

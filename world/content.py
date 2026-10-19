@@ -2860,6 +2860,19 @@ def _spike_wants_ais_feed(backlog, instructions):
     return mentions_vessel or mentions_maritime
 
 
+def _spike_wants_social_login(backlog, instructions):
+    """A Facebook/Instagram investigation must start with the need-based
+    credential grant, not with the curated RSS feeds. Live miss 2026-10-19:
+    'Facebook public groups for news about Albemarle' matched the broad 'news'
+    trigger in _spike_wants_rss, so force_first_tool pinned read_rss_feed and
+    the spike spent its first turn on BBC/NASA items, then reported the real
+    browser tools as absent. The social host is the task's declared source;
+    force request_credential_access first so the handle exists before any
+    login attempt."""
+    text = f'{backlog or ""} {instructions or ""}'.lower()
+    return 'facebook' in text or 'instagram' in text
+
+
 def _spike_wants_rss(backlog, instructions):
     """Same forced-tool-choice reasoning as the other _spike_wants_* detectors,
     applied preemptively for the curated RSS aggregator: a question about
@@ -2867,8 +2880,13 @@ def _spike_wants_rss(backlog, instructions):
     for read_rss_feed FIRST (the buffered, polled feeds), not search_web and
     not a training-knowledge guess. Broad 'news' phrasing fires it -- the
     curated feeds are the designated news source -- and it never forces a
-    read when no feed could plausibly cover the topic."""
+    read when no feed could plausibly cover the topic. A task that names
+    Facebook/Instagram is excluded: those feeds cannot cover a social host,
+    and forcing RSS there hid the real browser tools (see
+    _spike_wants_social_login)."""
     text = f'{backlog or ""} {instructions or ""}'.lower()
+    if 'facebook' in text or 'instagram' in text:
+        return False
     general_news = any(w in text for w in ('news', 'headlines', 'breaking', 'latest developments',
                                            'what is happening', "what's happening", 'current events',
                                            'this week', 'today in the world'))
@@ -4965,6 +4983,30 @@ def _run_meeting_content(snapshot, agent_id, task, base_ctx=None):
     })
 
 
+def _spike_first_tool(backlog, instructions):
+    """Pick the one tool a spike must call before it may settle. Kept as a
+    named function so the social path is directly testable: a Facebook or
+    Instagram investigation must mint its read-only handle first, not spend
+    turn one on the curated RSS feeds."""
+    if _spike_wants_social_login(backlog, instructions):
+        return 'request_credential_access'
+    if _spike_wants_internal_review(backlog, instructions):
+        return 'search_library'
+    if _spike_wants_x_trending(backlog, instructions):
+        return 'x_trending_topics'
+    if _spike_wants_linkedin_search(backlog, instructions):
+        return 'search_linkedin_posts'
+    if _spike_wants_github(backlog, instructions):
+        return 'github_get_repo'
+    if _spike_wants_ais_feed(backlog, instructions):
+        return 'read_ais_feed'
+    if _spike_wants_rss(backlog, instructions):
+        return 'read_rss_feed'
+    if _spike_wants_market(backlog, instructions):
+        return 'read_market_feed'
+    return 'search_web' if _serve.TAVILY_API_KEY else True
+
+
 def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     """Phase E2b: a SPIKE is a time-boxed investigation with no committed
     deliverable. Writes a concise findings artifact to the Library and stores
@@ -5353,22 +5395,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # LinkedIn-search question needs its own specific tool forced first for
     # the identical reason -- built preemptively this time, on day one,
     # rather than after a live miss, now that the pattern is proven twice.
-    if _spike_wants_internal_review(backlog, instructions):
-        first_tool = 'search_library'
-    elif _spike_wants_x_trending(backlog, instructions):
-        first_tool = 'x_trending_topics'
-    elif _spike_wants_linkedin_search(backlog, instructions):
-        first_tool = 'search_linkedin_posts'
-    elif _spike_wants_github(backlog, instructions):
-        first_tool = 'github_get_repo'
-    elif _spike_wants_ais_feed(backlog, instructions):
-        first_tool = 'read_ais_feed'
-    elif _spike_wants_rss(backlog, instructions):
-        first_tool = 'read_rss_feed'
-    elif _spike_wants_market(backlog, instructions):
-        first_tool = 'read_market_feed'
-    else:
-        first_tool = 'search_web' if _serve.TAVILY_API_KEY else True
+    first_tool = _spike_first_tool(backlog, instructions)
     # Chunked into rounds of 4 with a reflection self-check between them
     # (see _run_spike_tool_loop_with_reflection) -- same 50-call total
     # budget (raised 18->30->50, just spent with a chance to
