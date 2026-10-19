@@ -5800,6 +5800,7 @@ async def _lifespan(app):
     prune_task = asyncio.create_task(_log_prune_loop())
     tier_refresh_task = asyncio.create_task(_model_tier_refresh_loop())
     tier_boot_backfill_task = asyncio.create_task(_model_tier_boot_backfill())
+    photo_watch_task = asyncio.create_task(_photo_album_watch_loop())
     tier_price_watch_task = asyncio.create_task(_tier_price_watch_loop())
     tier_failure_recheck_task = asyncio.create_task(_tier_failure_recheck_loop())
     calibration_task = asyncio.create_task(_calibration_loop())
@@ -5854,6 +5855,7 @@ async def _lifespan(app):
     prune_task.cancel()
     tier_refresh_task.cancel()
     tier_boot_backfill_task.cancel()
+    photo_watch_task.cancel()
     tier_price_watch_task.cancel()
     tier_failure_recheck_task.cancel()
     if telegram_task is not None:
@@ -21361,6 +21363,197 @@ def _save_photo_manifest(data):
     return True
 
 
+
+PHOTO_WATCH_SETTING = 'photo_album_watch'
+PHOTO_WATCH_INTERVAL_S = 30
+PHOTO_WATCH_BATCH = 3
+PHOTO_REVIEW_MAX_ATTEMPTS = 3
+_PHOTO_REVIEW_LOCK = threading.Lock()
+
+
+def _photo_needs_review(manifest, key):
+    """True only for assets that still need a vision pass. baseline and done
+    entries are final; a failed review retries a bounded number of times; a
+    cloud-only asset is re-checked every tick but costs no model call."""
+    value = manifest.get(key)
+    if value is None:
+        return True
+    if isinstance(value, dict):
+        status = value.get('status')
+        if status in ('baseline', 'done'):
+            return False
+        if status == 'waiting-local':
+            return True
+        if status == 'error':
+            return int(value.get('attempts') or 0) < PHOTO_REVIEW_MAX_ATTEMPTS
+        return True
+    return False
+
+
+def _photo_watch_config():
+    raw = _get_setting(PHOTO_WATCH_SETTING)
+    if not raw:
+        return {'enabled': False}
+    try:
+        cfg = json.loads(raw)
+        return cfg if isinstance(cfg, dict) else {'enabled': False}
+    except Exception:
+        return {'enabled': False}
+
+
+def _photo_save_watch_config(cfg):
+    _set_setting(PHOTO_WATCH_SETTING, json.dumps(cfg, sort_keys=True))
+    return cfg
+
+
+def _photo_baseline_album(album):
+    """Mark every current asset in the album as seen without reviewing it.
+    This is what makes 'only new photos' true for a pre-populated album."""
+    assets = _apple_photos.album_assets(album)
+    manifest = _load_photo_manifest()
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    for asset in assets:
+        manifest[f'{album}::{asset["uuid"]}'] = {'status': 'baseline', 'at': now}
+    _save_photo_manifest(manifest)
+    return len(assets)
+
+
+def _review_album_batch_sync(album, project, mode, context, limit, agent_id,
+                             assets=None):
+    """Review up to `limit` pending assets from one album. Shared by the
+    manual endpoint and the watcher; the lock keeps the two from reviewing the
+    same asset twice. Returns a summary dict, never raises for one bad photo."""
+    if not _PHOTO_REVIEW_LOCK.acquire(blocking=False):
+        return {'ok': False, 'busy': True, 'reviewed': [], 'reviewedCount': 0}
+    try:
+        assets = assets if assets is not None else _apple_photos.album_assets(album)
+        manifest = _load_photo_manifest()
+        pending = [a for a in assets
+                   if _photo_needs_review(manifest, f'{album}::{a["uuid"]}')]
+        if not pending:
+            return {'ok': True, 'total': len(assets), 'pending': 0,
+                    'reviewed': [], 'reviewedCount': 0}
+        rel_dir = _photo_review_rel(project)
+        photo_dir = _safe_library_path(rel_dir)
+        if not photo_dir:
+            return {'ok': False, 'error': 'invalid photo-reviews path',
+                    'reviewed': [], 'reviewedCount': 0}
+        os.makedirs(photo_dir, exist_ok=True)
+        reviewed = []
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        for asset in pending[:limit]:
+            key = f'{album}::{asset["uuid"]}'
+            base_name = f'photo-{asset["uuid"][:8]}-{asset["date"][:10]}'
+            if not asset['local']:
+                manifest[key] = {'status': 'waiting-local', 'at': now}
+                reviewed.append({'name': base_name, 'uuid': asset['uuid'],
+                                 'error': 'not downloaded to this Mac yet (iCloud '
+                                          'Optimize Storage); open it in Photos or '
+                                          'download the original'})
+                continue
+            tmp_dir = None
+            try:
+                jpeg_path, tmp_dir = _apple_photos.normalize_to_jpeg(asset['localPath'])
+                with open(jpeg_path, 'rb') as fh:
+                    image_bytes = fh.read()
+                image_b64 = base64.b64encode(image_bytes).decode('ascii')
+                result = _photo_review_from_image(
+                    image_b64, f'Photos album {album}, {asset["filename"]}',
+                    context=context, mode=mode)
+                if not result.get('ok'):
+                    prior = manifest.get(key)
+                    attempts = (int(prior.get('attempts') or 0)
+                                if isinstance(prior, dict) else 0) + 1
+                    manifest[key] = {'status': 'error', 'attempts': attempts,
+                                     'at': now,
+                                     'note': (result.get('note') or '')[:300]}
+                    reviewed.append({'name': base_name, 'uuid': asset['uuid'],
+                                     'error': result.get('note', 'review failed')})
+                    continue
+                image_rel = os.path.join(rel_dir, f'{base_name}.jpg')
+                brief_rel = os.path.join(rel_dir, f'{base_name}.txt')
+                image_path = _safe_library_path(image_rel)
+                brief_path = _safe_library_path(brief_rel)
+                if not image_path or not brief_path:
+                    reviewed.append({'name': base_name, 'uuid': asset['uuid'],
+                                     'error': 'invalid output path'})
+                    continue
+                header = (f'# Photo review: {base_name}\n\n'
+                          f'- Source: Photos album {album} ({asset["filename"]})\n'
+                          f'- Taken: {asset["date"]}\n'
+                          f'- Directory: {rel_dir}\n'
+                          f'- Mode: {mode}\n'
+                          f'- Reviewed: {now}\n'
+                          f'- Image file: {image_rel}\n\n')
+                with open(image_path, 'wb') as fh:
+                    fh.write(image_bytes)
+                _write_file(brief_path, header + result['brief'] + '\n')
+                manifest[key] = {'status': 'done', 'at': now}
+                reviewed.append({'name': base_name, 'uuid': asset['uuid'],
+                                 'image': image_rel, 'briefPath': brief_rel,
+                                 'text': header + result['brief']})
+                log_action(agent_id, 'photo_review_album',
+                           {'album': album, 'uuid': asset['uuid'],
+                            'brief': brief_rel, 'mode': mode})
+            except Exception as e:
+                prior = manifest.get(key)
+                attempts = (int(prior.get('attempts') or 0)
+                            if isinstance(prior, dict) else 0) + 1
+                manifest[key] = {'status': 'error', 'attempts': attempts,
+                                 'at': now, 'note': str(e)[:300]}
+                reviewed.append({'name': base_name, 'uuid': asset['uuid'],
+                                 'error': str(e)[:300]})
+            finally:
+                if tmp_dir:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+        _save_photo_manifest(manifest)
+        done = sum(1 for r in reviewed if not r.get('error'))
+        remaining = sum(1 for a in assets
+                        if _photo_needs_review(manifest, f'{album}::{a["uuid"]}'))
+        return {'ok': True, 'total': len(assets), 'pending': remaining,
+                'reviewedCount': done, 'reviewed': reviewed}
+    finally:
+        _PHOTO_REVIEW_LOCK.release()
+
+
+def _photo_watch_tick_sync():
+    cfg = _photo_watch_config()
+    if not cfg.get('enabled') or not cfg.get('album'):
+        return None
+    try:
+        summary = _review_album_batch_sync(
+            cfg['album'], cfg.get('project') or 'photos',
+            cfg.get('mode') or 'general', cfg.get('context') or '',
+            int(cfg.get('limit') or PHOTO_WATCH_BATCH), 'player')
+    except Exception as e:
+        cfg['lastError'] = str(e)[:300]
+        cfg['lastCheckAt'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _photo_save_watch_config(cfg)
+        return None
+    cfg['lastCheckAt'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if summary and summary.get('ok'):
+        cfg['pending'] = summary.get('pending', 0)
+        if summary.get('reviewedCount'):
+            cfg['reviewedCount'] = int(cfg.get('reviewedCount') or 0) + summary['reviewedCount']
+            cfg['lastReviewedAt'] = cfg['lastCheckAt']
+            cfg.pop('lastError', None)
+    _photo_save_watch_config(cfg)
+    return summary
+
+
+async def _photo_album_watch_loop():
+    """Poll the dedicated album for photos added since the baseline. Only
+    unreviewed assets are analyzed; a ticking run with nothing new costs one
+    read-only SQLite query. The loop starts after the first interval so a
+    boot does not race the registries."""
+    while True:
+        await asyncio.sleep(PHOTO_WATCH_INTERVAL_S)
+        try:
+            await asyncio.to_thread(_photo_watch_tick_sync)
+        except Exception as e:
+            print(f'[photo-watch] tick failed: {e}', flush=True)
+
+
 @app.get('/api/photo-review/albums')
 async def photo_review_albums(request: Request):
     """Album names available in the Mac Photos library, for the picker."""
@@ -21380,8 +21573,7 @@ async def photo_review_album(request: Request):
     """Review NEW photos from a macOS Photos album, on demand. The iPhone tags
     photos by adding them to an album; iCloud Photos syncs the album to this
     Mac; this reads the synced originals and reviews only assets not already
-    recorded in library/photo-reviews/.reviewed.json. Nothing polls: the run
-    happens only when this endpoint is called."""
+    recorded in library/photo-reviews/.reviewed.json."""
     authed, actor = _photo_review_auth(request)
     if not authed:
         return JSONResponse({'error': 'Unauthorized'}, status_code=401)
@@ -21410,79 +21602,115 @@ async def photo_review_album(request: Request):
         return JSONResponse({'ok': True, 'album': album, 'total': 0,
                              'pending': 0, 'reviewed': [],
                              'message': f'album {album!r} has no photos (or has not synced yet)'})
-    manifest = _load_photo_manifest()
-    pending = [a for a in assets if f'{album}::{a["uuid"]}' not in manifest]
-    if not pending:
-        return JSONResponse({'ok': True, 'album': album, 'total': len(assets),
-                             'pending': 0, 'reviewed': [],
+    summary = await asyncio.to_thread(
+        _review_album_batch_sync, album, body.get('project'), mode,
+        body.get('context'), limit, agent_id, assets)
+    if summary.get('busy'):
+        return JSONResponse({'error': 'a photo review is already running'}, status_code=409)
+    if not summary.get('ok'):
+        return JSONResponse({'error': summary.get('error') or 'review failed'}, status_code=500)
+    if not summary.get('reviewed'):
+        return JSONResponse({'ok': True, 'album': album, 'total': summary['total'],
+                             'pending': summary['pending'], 'reviewed': [],
                              'message': 'nothing new in this album'})
-    rel_dir = _photo_review_rel(body.get('project'))
-    try:
-        photo_dir = _safe_library_path(rel_dir)
-        if not photo_dir:
-            return JSONResponse({'error': 'invalid photo-reviews path'}, status_code=400)
-        os.makedirs(photo_dir, exist_ok=True)
-    except Exception:
-        return JSONResponse({'error': 'could not create the photo-reviews directory'}, status_code=500)
-    reviewed = []
-    for asset in pending[:limit]:
-        base_name = f'photo-{asset["uuid"][:8]}-{asset["date"][:10]}'
-        if not asset['local']:
-            reviewed.append({'name': base_name, 'uuid': asset['uuid'],
-                             'error': 'not downloaded to this Mac yet (iCloud '
-                                      'Optimize Storage); open it in Photos or '
-                                      'download the original'})
-            continue
-        tmp_dir = None
+    return JSONResponse({'ok': True, 'album': album, 'total': summary['total'],
+                         'pending': summary['pending'],
+                         'reviewedCount': summary['reviewedCount'],
+                         'reviewed': summary['reviewed']})
+
+
+@app.get('/api/photo-review/album/watch')
+async def photo_review_watch_status(request: Request):
+    """Current watch config plus how many album assets still need review."""
+    authed, _actor = _photo_review_auth(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    cfg = _photo_watch_config()
+    out = dict(cfg)
+    if cfg.get('enabled') and cfg.get('album'):
         try:
-            jpeg_path, tmp_dir = _apple_photos.normalize_to_jpeg(asset['localPath'])
-            with open(jpeg_path, 'rb') as fh:
-                image_bytes = fh.read()
-            image_b64 = base64.b64encode(image_bytes).decode('ascii')
-            result = _photo_review_from_image(
-                image_b64, f'Photos album {album}, {asset["filename"]}',
-                context=body.get('context'), mode=mode)
-            if not result.get('ok'):
-                reviewed.append({'name': base_name, 'uuid': asset['uuid'],
-                                 'error': result.get('note', 'review failed')})
-                continue
-            image_rel = os.path.join(rel_dir, f'{base_name}.jpg')
-            brief_rel = os.path.join(rel_dir, f'{base_name}.txt')
-            image_path = _safe_library_path(image_rel)
-            brief_path = _safe_library_path(brief_rel)
-            if not image_path or not brief_path:
-                reviewed.append({'name': base_name, 'uuid': asset['uuid'],
-                                 'error': 'invalid output path'})
-                continue
-            header = (f'# Photo review: {base_name}\n\n'
-                      f'- Source: Photos album {album} ({asset["filename"]})\n'
-                      f'- Taken: {asset["date"]}\n'
-                      f'- Directory: {rel_dir}\n'
-                      f'- Mode: {mode}\n'
-                      f'- Reviewed: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n'
-                      f'- Image file: {image_rel}\n\n')
-            with open(image_path, 'wb') as fh:
-                fh.write(image_bytes)
-            _write_file(brief_path, header + result['brief'] + '\n')
-            manifest[f'{album}::{asset["uuid"]}'] = datetime.datetime.now(
-                datetime.timezone.utc).isoformat()
-            reviewed.append({'name': base_name, 'uuid': asset['uuid'],
-                             'image': image_rel, 'briefPath': brief_rel,
-                             'text': header + result['brief']})
-            log_action(agent_id, 'photo_review_album',
-                       {'album': album, 'uuid': asset['uuid'],
-                        'brief': brief_rel, 'mode': mode})
+            assets = _apple_photos.album_assets(cfg['album'])
+            manifest = _load_photo_manifest()
+            out['pending'] = sum(
+                1 for a in assets
+                if _photo_needs_review(manifest, f'{cfg["album"]}::{a["uuid"]}'))
+            out['total'] = len(assets)
         except Exception as e:
-            reviewed.append({'name': base_name, 'uuid': asset['uuid'],
-                             'error': str(e)[:300]})
-        finally:
-            if tmp_dir:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-    _save_photo_manifest(manifest)
-    done = sum(1 for r in reviewed if not r.get('error'))
-    return JSONResponse({'ok': True, 'album': album, 'total': len(assets),
-                         'pending': len(pending) - done,
-                         'reviewedCount': done, 'reviewed': reviewed})
+            out['pendingError'] = str(e)[:300]
+    return JSONResponse(out)
+
+
+@app.post('/api/photo-review/album/watch')
+async def photo_review_watch(request: Request):
+    """Start, stop, or re-baseline the watch on one dedicated album.
+
+    action=start: enable the watcher. The first start marks every photo
+    already in the album as baseline (seen, not reviewed), so only photos
+    added afterwards are processed. action=baseline marks the current album
+    contents seen again; action=stop disables the watcher."""
+    authed, actor = _photo_review_auth(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    body = await request.json()
+    claimed = (body.get('agentId') or '').strip() or None
+    if claimed and claimed != actor:
+        return JSONResponse({'error': 'photo reviews require the operator itself'}, status_code=403)
+    action = (body.get('action') or 'start').strip().lower()
+    cfg = _photo_watch_config()
+    if action == 'stop':
+        cfg['enabled'] = False
+        cfg['stoppedAt'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        _photo_save_watch_config(cfg)
+        return JSONResponse({'ok': True, **cfg})
+    if action not in ('start', 'baseline'):
+        return JSONResponse({'error': "action must be 'start', 'stop' or 'baseline'"}, status_code=400)
+    album = (body.get('album') or cfg.get('album') or '').strip()
+    if not album:
+        return JSONResponse({'error': 'album is required'}, status_code=400)
+    try:
+        albums = _apple_photos.list_albums()
+    except Exception as e:
+        return JSONResponse({'error': f'could not read the Photos library: {e}'}, status_code=502)
+    if album not in albums:
+        return JSONResponse({'error': f'album {album!r} does not exist in the Photos '
+                                      'library yet (create it on the iPhone and let it sync)'},
+                            status_code=400)
+    baselined = 0
+    if action == 'baseline' or not cfg.get('baselineDone'):
+        try:
+            baselined = _photo_baseline_album(album)
+        except Exception as e:
+            return JSONResponse({'error': f'could not baseline the album: {e}'}, status_code=502)
+    if action == 'start':
+        mode = (body.get('mode') or cfg.get('mode') or 'general').strip().lower()
+        if mode not in ('general', 'design'):
+            return JSONResponse({'error': "mode must be 'general' or 'design'"}, status_code=400)
+        try:
+            limit = max(1, min(int(body.get('limit') or cfg.get('limit') or PHOTO_WATCH_BATCH), 10))
+        except (TypeError, ValueError):
+            limit = PHOTO_WATCH_BATCH
+        cfg.update({
+            'enabled': True,
+            'album': album,
+            'project': (body.get('project') or cfg.get('project') or 'photos'),
+            'mode': mode,
+            'context': body.get('context', cfg.get('context') or ''),
+            'limit': limit,
+            'baselineDone': True,
+            'startedAt': cfg.get('startedAt') or datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'pending': 0,
+            'lastCheckAt': None,
+        })
+    else:
+        cfg['album'] = album
+        cfg['baselineDone'] = True
+        cfg.setdefault('enabled', False)
+    cfg['baselinedCount'] = baselined
+    cfg['baselinedAt'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    _photo_save_watch_config(cfg)
+    log_action(actor, 'photo_watch', {'action': action, 'album': album,
+                                      'baselined': baselined})
+    return JSONResponse({'ok': True, **cfg})
 
 
 @app.post('/api/photo-review')

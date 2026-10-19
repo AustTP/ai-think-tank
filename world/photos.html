@@ -23,6 +23,10 @@
   button { width:100%; margin-top:18px; padding:14px; font:inherit; font-weight:600; color:#fff;
            background:var(--accent); border:0; border-radius:12px; }
   button:disabled { opacity:.5; }
+  button.secondary { background:transparent; color:var(--fg); border:1px solid var(--line);
+                     font-weight:500; margin-top:8px; }
+  .row { display:flex; gap:10px; }
+  .row button { flex:1; }
   h2.section { font-size:16px; margin:28px 0 4px; }
   #login { border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:8px; }
   #login h2 { font-size:15px; margin:0 0 4px; }
@@ -82,6 +86,13 @@ the button.</p>
 <button id="albumGo" type="button">Review new in album</button>
 <div id="albumStatus"></div>
 <div id="albumResults"></div>
+
+<button id="watchGo" type="button">Watch this album for new photos</button>
+<div id="watchStatus" class="hint"></div>
+<div class="row">
+  <button id="watchBaseline" class="secondary" type="button">Mark current as seen</button>
+  <button id="watchStop" class="secondary" type="button">Stop watching</button>
+</div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -260,8 +271,61 @@ async function loadAlbums() {
   } catch (e) { /* the picker is optional */ }
 }
 
+
+async function loadWatch() {
+  try {
+    const r = await fetch('/api/photo-review/album/watch', { credentials: 'same-origin' });
+    if (!r.ok) return;
+    const w = await r.json();
+    const status = $('watchStatus');
+    if (w.enabled) {
+      const pending = (typeof w.pending === 'number') ? w.pending : '?';
+      status.textContent = `Watching ${w.album}. ${pending} new photo(s) pending.`
+        + (w.reviewedCount ? ` ${w.reviewedCount} reviewed since you started.` : '')
+        + (w.lastCheckAt ? ` Last checked ${new Date(w.lastCheckAt).toLocaleTimeString()}.` : '');
+    } else {
+      status.textContent = 'Not watching. Add photos to the album, then start watching; existing photos are marked seen first.';
+    }
+    $('watchStop').disabled = !w.enabled;
+    $('watchBaseline').disabled = !w.album;
+  } catch (e) { /* status is optional */ }
+}
+
+async function watchAction(action) {
+  const status = $('watchStatus');
+  const album = $('album').value.trim();
+  if (action !== 'stop' && !album) { status.textContent = 'Enter the album name.'; return; }
+  status.textContent = action === 'stop' ? 'Stopping...' : 'Updating watch...';
+  try {
+    const r = await fetch('/api/photo-review/album/watch', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action, album: album || undefined,
+        project: $('project').value.trim() || 'photos',
+        context: $('context').value.trim(),
+        mode: $('mode').value,
+        limit: Number($('limit').value) || 3,
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    if (action === 'start') {
+      status.textContent = `Watching ${data.album}. ${data.baselinedCount || 0} existing photo(s) marked seen; only new additions will be reviewed.`;
+    }
+    await loadWatch();
+  } catch (e) { status.textContent = `Failed: ${e.message || e}`; }
+}
+
+$('watchGo').addEventListener('click', () => watchAction('start'));
+$('watchStop').addEventListener('click', () => watchAction('stop'));
+$('watchBaseline').addEventListener('click', () => watchAction('baseline'));
+
+setInterval(loadWatch, 30000);
+
 checkSession();
 loadAlbums();
+loadWatch();
 </script>
 </body>
 </html>

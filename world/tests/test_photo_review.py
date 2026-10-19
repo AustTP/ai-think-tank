@@ -126,3 +126,73 @@ class PhotoReviewAuthTest(unittest.TestCase):
         with mock.patch.object(serve, 'LIBRARY_DIR', tmp):
             self.assertTrue(serve._save_photo_manifest({'Tagged::U1': '2026-10-18'}))
             self.assertEqual(serve._load_photo_manifest(), {'Tagged::U1': '2026-10-18'})
+
+
+class PhotoWatchTest(unittest.TestCase):
+    def test_needs_review_semantics(self):
+        needs = serve._photo_needs_review
+        self.assertTrue(needs({}, 'a::1'))
+        self.assertFalse(needs({'a::1': {'status': 'baseline'}}, 'a::1'))
+        self.assertFalse(needs({'a::1': {'status': 'done'}}, 'a::1'))
+        self.assertFalse(needs({'a::1': '2026-10-18T00:00:00Z'}, 'a::1'))
+        self.assertTrue(needs({'a::1': {'status': 'error', 'attempts': 2}}, 'a::1'))
+        self.assertFalse(needs({'a::1': {'status': 'error', 'attempts': 3}}, 'a::1'))
+        self.assertTrue(needs({'a::1': {'status': 'waiting-local'}}, 'a::1'))
+
+    def _asset(self, uuid='ABCDEF12-0000-0000-0000-000000000000'):
+        return {'uuid': uuid, 'filename': 'x.jpg', 'date': '2026-10-18T10:00:00+00:00',
+                'favorite': False, 'local': True, 'localPath': '/tmp/original.jpg'}
+
+    def test_baseline_marks_without_reviewing(self):
+        manifest = {}
+        with mock.patch.object(serve._apple_photos, 'album_assets',
+                               return_value=[self._asset('U1'), self._asset('U2')]), \
+             mock.patch.object(serve, '_load_photo_manifest', side_effect=lambda: dict(manifest)), \
+             mock.patch.object(serve, '_save_photo_manifest',
+                               side_effect=lambda d: manifest.update(d) or True):
+            self.assertEqual(serve._photo_baseline_album('Tagged'), 2)
+        self.assertEqual(manifest['Tagged::U1']['status'], 'baseline')
+        self.assertFalse(serve._photo_needs_review(manifest, 'Tagged::U1'))
+
+    def _run_batch(self, assets, attempts=1,
+                   review=None):
+        import tempfile, os
+        tmp = tempfile.mkdtemp(prefix='tt-photo-batch-')
+        self.addCleanup(__import__('shutil').rmtree, tmp, True)
+        jpeg = os.path.join(tmp, 'photo.jpg')
+        with open(jpeg, 'wb') as fh:
+            fh.write(b'\xff\xd8\xff' + b'x' * 50)
+        manifest = {}
+        patches = [
+            mock.patch.object(serve, 'LIBRARY_DIR', tmp),
+            mock.patch.object(serve, 'log_action'),
+            mock.patch.object(serve, '_photo_review_rel', return_value='photo-reviews/photos'),
+            mock.patch.object(serve._apple_photos, 'normalize_to_jpeg',
+                              return_value=(jpeg, None)),
+            mock.patch.object(serve, '_load_photo_manifest', side_effect=lambda: dict(manifest)),
+            mock.patch.object(serve, '_save_photo_manifest',
+                              side_effect=lambda d: manifest.update(d) or True),
+            mock.patch.object(serve, '_photo_review_from_image',
+                              return_value=review or {'ok': True, 'brief': 'SUBJECT: x'}),
+        ]
+        for p in patches:
+            p.start(); self.addCleanup(p.stop)
+        out = None
+        for _ in range(attempts):
+            out = serve._review_album_batch_sync(
+                'Tagged', 'photos', 'general', '', 3, 'player', assets=assets)
+        return manifest, out
+
+    def test_success_marks_done_and_writes_brief(self):
+        manifest, out = self._run_batch([self._asset()])
+        self.assertEqual(out['reviewedCount'], 1)
+        self.assertEqual(manifest['Tagged::ABCDEF12-0000-0000-0000-000000000000']['status'], 'done')
+        self.assertIn('briefPath', out['reviewed'][0])
+
+    def test_failure_stops_after_three_attempts(self):
+        manifest, out = self._run_batch(
+            [self._asset()], attempts=3, review={'ok': False, 'note': 'boom'})
+        key = 'Tagged::ABCDEF12-0000-0000-0000-000000000000'
+        self.assertEqual(manifest[key]['status'], 'error')
+        self.assertEqual(manifest[key]['attempts'], 3)
+        self.assertFalse(serve._photo_needs_review(manifest, key))
