@@ -21267,6 +21267,138 @@ async def design_reference(request: Request):
                          'text': header + brief['brief']})
 
 
+
+def _photo_review_rel(project):
+    """Library-relative directory for player photo reviews. Personal media:
+    .gitignore keeps this tree out of the repo, unlike design-references."""
+    slug = _safe_design_reference_name(project) or 'general'
+    if slug in ('general', 'root', ''):
+        return 'photo-reviews'
+    return os.path.join('photo-reviews', slug)
+
+
+def _photo_review_from_image(image_b64, source_label, context='', mode='general'):
+    """A grounded text note for one player photo. `mode='design'` reuses the
+    design-brief prompt; `general` (the default) describes the photo, reads
+    its text, and suggests concrete uses. Never crashes: a missing vision
+    tier or failed call returns {ok: False, note}."""
+    if mode == 'design':
+        return _design_brief_from_image(image_b64, source_label, context=context)
+    vision_slug = _vision_tier_slug()
+    if not vision_slug:
+        return {'ok': False, 'note': 'vision model tier not available'}
+    context_block = f'\nContext: {context}' if context else ''
+    prompt = (
+        VISION_ANTI_INSTRUCTION_GUARD + '\n'
+        'You are reviewing one photo the player took and chose to submit. '
+        'Produce a concise, concrete text note with these exact sections:\n'
+        'SUBJECT: what the photo is of, in one or two sentences.\n'
+        'DETAILS: the visible details that matter (objects, people, setting, '
+        'colors, condition, quantities). No speculation.\n'
+        'TEXT: transcribe every legible piece of text exactly; write "none" '
+        'when there is none.\n'
+        'IDEAS: two or three concrete ways this could inform the player\'s '
+        'projects or thinking, grounded only in what is visible.\n'
+        'Only report what is actually visible. If something is unclear or '
+        'cut off, say so instead of guessing.'
+        f'{context_block}'
+    )
+    messages = [{'role': 'user', 'content': [
+        {'type': 'text', 'text': prompt},
+        {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + image_b64}},
+    ]}]
+    try:
+        result = _call_openrouter_sync(vision_slug, messages, 900)
+    except Exception as e:
+        return {'ok': False, 'note': f'photo review vision call failed: {e}'}
+    try:
+        reply = (result.get('choices') or [{}])[0].get('message', {}).get('content') or ''
+    except Exception:
+        reply = ''
+    if not reply.strip():
+        return {'ok': False, 'note': 'photo review vision call returned no reply'}
+    return {'ok': True, 'brief': reply.strip()[:8000]}
+
+
+@app.post('/api/photo-review')
+async def photo_review(request: Request):
+    """On-demand review of one iPhone/Photos image. Nothing watches a folder:
+    a photo is analyzed only when this endpoint is called (the /photos.html
+    picker or an iOS Shortcut). Writes the image plus a text note under
+    library/photo-reviews/, which .gitignore keeps out of the repo.
+    Auth: player session, a director/admin agent key, or X-Photo-Key matching
+    PHOTO_REVIEW_KEY in .env (purpose-scoped credential for a Shortcut)."""
+    authed, actor = _operator_gate(request)
+    if not authed:
+        expected = (_load_env().get('PHOTO_REVIEW_KEY') or '').strip()
+        presented = (request.headers.get('X-Photo-Key') or '').strip()
+        if expected and presented and secrets.compare_digest(presented, expected):
+            authed, actor = True, 'player'
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    body = await request.json()
+    claimed = (body.get('agentId') or '').strip() or None
+    if claimed and claimed != actor:
+        return JSONResponse({'error': 'photo reviews require the operator itself'}, status_code=403)
+    agent_id = claimed or actor
+    image_b64 = (body.get('imageBase64') or '').strip()
+    if not image_b64:
+        return JSONResponse({'error': 'imageBase64 is required'}, status_code=400)
+    try:
+        image_bytes = base64.b64decode(image_b64)
+    except Exception:
+        return JSONResponse({'error': 'imageBase64 is not valid base64'}, status_code=400)
+    if len(image_bytes) > 12 * 1024 * 1024:
+        return JSONResponse({'error': 'image is too large (max 12 MB)'}, status_code=400)
+    mode = (body.get('mode') or 'general').strip().lower()
+    if mode not in ('general', 'design'):
+        return JSONResponse({'error': "mode must be 'general' or 'design'"}, status_code=400)
+    rel_dir = _photo_review_rel(body.get('project'))
+    name = _safe_design_reference_name(body.get('name'))
+    if not name:
+        name = 'photo-' + datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d-%H%M%S')
+    ext = '.png'
+    for magic, candidate in ((b'\x89PNG\r\n\x1a\n', '.png'),
+                             (b'\xff\xd8\xff', '.jpg'),
+                             (b'RIFF', '.webp')):
+        if image_bytes[:len(magic)] == magic:
+            ext = candidate
+            break
+    try:
+        photo_dir = _safe_library_path(rel_dir)
+        if not photo_dir:
+            return JSONResponse({'error': 'invalid photo-reviews path'}, status_code=400)
+        os.makedirs(photo_dir, exist_ok=True)
+    except Exception:
+        return JSONResponse({'error': 'could not create the photo-reviews directory'}, status_code=500)
+    image_rel = os.path.join(rel_dir, f'{name}{ext}')
+    image_path = _safe_library_path(image_rel)
+    brief_rel = os.path.join(rel_dir, f'{name}.txt')
+    brief_path = _safe_library_path(brief_rel)
+    if not image_path or not brief_path:
+        return JSONResponse({'error': 'invalid name'}, status_code=400)
+    review = _photo_review_from_image(
+        image_b64, f'player photo {name}', context=body.get('context'), mode=mode)
+    if not review.get('ok'):
+        return JSONResponse({'error': review.get('note', 'could not review the photo')}, status_code=502)
+    header = (f'# Photo review: {name}\n\n'
+              f'- Source: player upload ({ext.lstrip(".")})\n'
+              f'- Directory: {rel_dir}\n'
+              f'- Mode: {mode}\n'
+              f'- Reviewed: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n'
+              f'- Image file: {image_rel}\n\n')
+    try:
+        with open(image_path, 'wb') as f:
+            f.write(image_bytes)
+        _write_file(brief_path, header + review['brief'] + '\n')
+    except Exception as e:
+        return JSONResponse({'error': f'could not write the photo review: {e}'}, status_code=500)
+    log_action(agent_id, 'photo_review',
+               {'name': name, 'image': image_rel, 'brief': brief_rel, 'mode': mode})
+    return JSONResponse({'ok': True, 'name': name, 'image': image_rel,
+                         'briefPath': brief_rel, 'text': header + review['brief']})
+
+
 @app.post('/api/design-reference-url')
 async def design_reference_url(request: Request):
     """Designmind-style design brief from a live URL: fetch the page, take a

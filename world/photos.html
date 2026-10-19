@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Photo review">
+<title>Photo review</title>
+<style>
+  :root { color-scheme: light dark; --fg:#111; --bg:#f7f7f5; --muted:#666; --line:#d8d8d4; --accent:#0a7; }
+  @media (prefers-color-scheme: dark) { :root { --fg:#eee; --bg:#141414; --muted:#9a9a9a; --line:#333; --accent:#3c9; } }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:16px 16px 48px; font:16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:var(--fg); background:var(--bg); }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.lead { margin:0 0 18px; color:var(--muted); font-size:14px; }
+  label { display:block; font-size:13px; color:var(--muted); margin:14px 0 4px; }
+  input[type=text], input[type=password], textarea, select {
+    width:100%; padding:11px 12px; font:inherit; color:var(--fg); background:transparent;
+    border:1px solid var(--line); border-radius:10px;
+  }
+  textarea { min-height:64px; resize:vertical; }
+  input[type=file] { width:100%; padding:10px 0; font-size:14px; }
+  button { width:100%; margin-top:18px; padding:14px; font:inherit; font-weight:600; color:#fff;
+           background:var(--accent); border:0; border-radius:12px; }
+  button:disabled { opacity:.5; }
+  #login { border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:8px; }
+  #login h2 { font-size:15px; margin:0 0 4px; }
+  #login small { color:var(--muted); }
+  .hint { color:var(--muted); font-size:13px; margin-top:10px; }
+  #status { margin-top:16px; font-size:14px; color:var(--muted); white-space:pre-wrap; }
+  article { margin-top:18px; border:1px solid var(--line); border-radius:12px; padding:14px; }
+  article h2 { font-size:15px; margin:0 0 6px; }
+  article pre { white-space:pre-wrap; word-break:break-word; font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin:8px 0 0; }
+  .path { color:var(--muted); font-size:12px; }
+  .err { color:#c33; }
+</style>
+</head>
+<body>
+<h1>Photo review</h1>
+<p class="lead">Pick photos from your library or camera. Nothing is reviewed until you press the button.</p>
+
+<div id="login" hidden>
+  <h2>Sign in</h2>
+  <small>This page talks to the think tank on your tailnet.</small>
+  <label for="u">Username</label>
+  <input id="u" type="text" autocomplete="username" autocapitalize="none">
+  <label for="p">Password</label>
+  <input id="p" type="password" autocomplete="current-password">
+  <button id="loginBtn" type="button">Sign in</button>
+  <div id="loginStatus" class="hint"></div>
+</div>
+
+<label for="project">Project or album label</label>
+<input id="project" type="text" value="photos" autocapitalize="none">
+
+<label for="mode">Review style</label>
+<select id="mode">
+  <option value="general">General note (what it shows, text, ideas)</option>
+  <option value="design">Design brief (palette, type, layout)</option>
+</select>
+
+<label for="context">Context for the reviewer (optional)</label>
+<textarea id="context" placeholder="e.g. research for the storefront refresh; whiteboard from Tuesday"></textarea>
+
+<label for="files">Photos</label>
+<input id="files" type="file" accept="image/*" multiple>
+
+<button id="go" type="button">Review selected photos</button>
+<div id="status"></div>
+<div id="results"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let signedIn = false;
+
+async function checkSession() {
+  try {
+    const r = await fetch('/api/state', { credentials: 'same-origin' });
+    signedIn = r.ok;
+  } catch (e) { signedIn = false; }
+  $('login').hidden = signedIn;
+  $('go').disabled = !signedIn;
+  if (!signedIn) $('status').textContent = 'Sign in to send photos.';
+}
+
+$('loginBtn').addEventListener('click', async () => {
+  const status = $('loginStatus');
+  status.textContent = 'Signing in...';
+  try {
+    const r = await fetch('/login', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: $('u').value.trim(), password: $('p').value }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) { status.textContent = data.error || 'Sign in failed.'; return; }
+    $('p').value = '';
+    status.textContent = '';
+    await checkSession();
+  } catch (e) { status.textContent = 'Sign in failed.'; }
+});
+
+// iPhone photos are often HEIC and large. Normalize to JPEG on the device so
+// the vision endpoint always receives a supported, bounded image.
+async function toJpegBase64(file, maxDim = 1600, quality = 0.85) {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, maxDim / Math.max(bitmap.width, bitmap.height));
+  const w = Math.max(1, Math.round(bitmap.width * scale));
+  const h = Math.max(1, Math.round(bitmap.height * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
+  if (bitmap.close) bitmap.close();
+  const blob = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', quality));
+  const buf = new Uint8Array(await blob.arrayBuffer());
+  let bin = '';
+  for (let i = 0; i < buf.length; i += 0x8000) {
+    bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+  }
+  return btoa(bin);
+}
+
+function stamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+$('go').addEventListener('click', async () => {
+  const files = Array.from($('files').files || []);
+  const status = $('status');
+  const results = $('results');
+  if (!files.length) { status.textContent = 'Choose at least one photo.'; return; }
+  if (!signedIn) { status.textContent = 'Sign in first.'; return; }
+  $('go').disabled = true;
+  results.innerHTML = '';
+  const project = $('project').value.trim() || 'photos';
+  const mode = $('mode').value;
+  const context = $('context').value.trim();
+  const base = stamp();
+  let done = 0;
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    status.textContent = `Reviewing ${i + 1} of ${files.length}: ${f.name || 'photo'}`;
+    try {
+      const imageBase64 = await toJpegBase64(f);
+      const name = `photo-${base}-${i + 1}`;
+      const r = await fetch('/api/photo-review', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agentId: 'player', name, project, context, mode, imageBase64 }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      done += 1;
+      const article = document.createElement('article');
+      const h = document.createElement('h2');
+      h.textContent = name;
+      const path = document.createElement('div');
+      path.className = 'path';
+      path.textContent = data.briefPath;
+      const pre = document.createElement('pre');
+      pre.textContent = data.text;
+      article.append(h, path, pre);
+      results.appendChild(article);
+    } catch (e) {
+      const article = document.createElement('article');
+      const h = document.createElement('h2');
+      h.textContent = `Failed: ${f.name || 'photo'}`;
+      const err = document.createElement('div');
+      err.className = 'err';
+      err.textContent = e.message || String(e);
+      article.append(h, err);
+      results.appendChild(article);
+    }
+  }
+  status.textContent = `Reviewed ${done} of ${files.length} photo(s).`;
+  $('go').disabled = false;
+  $('files').value = '';
+});
+
+checkSession();
+</script>
+</body>
+</html>

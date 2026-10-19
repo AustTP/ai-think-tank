@@ -121,6 +121,9 @@ library/probe/
 # read by agents via /api/library/file so they can act on the player's behalf,
 # but NEVER tracked: this repo is public on GitHub.
 library/player-profile/
+# Player photos and their text reviews: personal media, never tracked. The
+# /api/photo-review endpoint writes here; keep it out of every push.
+library/photo-reviews/
 tinyprobe_test/
 world/coverage/
 world/coverage.json
