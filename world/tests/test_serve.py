@@ -294,6 +294,22 @@ class BoundaryMarkers(unittest.TestCase):
         _w2, nonce2, _t2, _i2 = serve.wrap_external_content('same content')
         self.assertNotEqual(nonce1, nonce2)
 
+    def test_complete_block_verifies_at_the_model_chokepoint(self):
+        wrapped, _nonce, _tag, instruction = serve.wrap_external_content(
+            'hello world', 'a test page')
+        self.assertTrue(serve.verify_external_boundaries(wrapped))
+        self.assertTrue(serve.verify_external_boundaries(instruction))
+        self.assertTrue(serve._messages_pass_boundary_check(
+            [{'role': 'user', 'content': instruction + '\n\n' + wrapped}]))
+
+    def test_tampered_complete_block_is_refused(self):
+        wrapped, _nonce, _tag, _instruction = serve.wrap_external_content(
+            'hello world', 'a test page')
+        tampered = wrapped.replace('hello world', 'hello WORLD (tampered)')
+        self.assertFalse(serve.verify_external_boundaries(tampered))
+        self.assertFalse(serve._messages_pass_boundary_check(
+            [{'role': 'user', 'content': tampered}]))
+
 
 class BandConfiguration(unittest.TestCase):
     # Guards the band config itself, which is easy to half-update: the

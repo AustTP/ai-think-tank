@@ -136,7 +136,7 @@ Theo's role policy adds a second authority model for conversation:
 
 Actions that spend money, reach outside, change the fleet, or modify the repo
 create a pending approval for the owner. They are not denied outright. The
-owner answers with `approve apr_<id>` or `deny apr_<id>`.
+owner answers with `approve apr-<id>` or `deny apr-<id>`.
 
 ### 2.3 Work hierarchy
 
@@ -267,7 +267,7 @@ of the structured intent endpoints.
 **Steps.**
 
 1. Trim the text. Empty text returns 400.
-2. If the message is `approve apr_<id>` or `deny apr_<id>`, decide the pending
+2. If the message is `approve apr-<id>` or `deny apr-<id>`, decide the pending
    Theo approval before any classification.
 3. If a granted Theo key is presented, verify it. An invalid, revoked, or
    expired key returns 401 before classification.
@@ -2156,7 +2156,7 @@ those picks, so absence stays honest.
 |---|---|---|
 | Login and session | Web UI, `auth.py` | Create the first admin account, log in, hold a session |
 | Ask Theo | Telegram, web chat | Ask questions, give direction |
-| Approve Theo actions | Telegram | `approve apr_<id>` or `deny apr_<id>` |
+| Approve Theo actions | Telegram | `approve apr-<id>` or `deny apr-<id>` |
 | Review escalations | Email link | Approve or deny human-only escalations |
 | Answer agent asks | Player inbox | Answer a blocked agent's question |
 | Rate delivered work | Player inbox | 1 to 5 stars and a comment on a card report |

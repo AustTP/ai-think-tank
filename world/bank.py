@@ -55,6 +55,11 @@ def _budget_cap_usd(service, products=None):
         # otherwise show the $ default cap against a units number. Constants
         # are defined later in serve.py; resolved at call time.
         return float(_serve.COLAB_MONTHLY_UNITS)
+    if service == _serve.HIGH_TIER_LEDGER_KEY:
+        # The high tier has its own monthly dollar cap; showing the generic
+        # $50 default against the rollup bucket made a correctly-budgeted
+        # high tier look over cap.
+        return float(_serve.HIGH_TIER_MONTHLY_BUDGET_USD)
     products = products or []
     for p in products:
         if p.get('id') == service or p.get('name') == service:
@@ -414,6 +419,9 @@ def _spend_cap_period():
     return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
 
 
+_ROLLUP_BUCKET_PREFIXES = ('__village__/', '__agent__/', '__director__/')
+
+
 def _is_tracked_service_bucket(key, value):
     """The membership test for the bucket set the monthly USD cap is
     measured against: every dollar-denominated service bucket and nothing
@@ -422,13 +430,18 @@ def _is_tracked_service_bucket(key, value):
     so counting it here would trip the USD cap on a currency that isn't
     money (a single T4 run accruing ~4 units looked like $4 of spend and
     failed every classifier call closed). Per-task / per-village /
-    per-agent buckets are attribution dimensions, excluded so they never
-    double-count the shared budget."""
+    per-agent / per-director buckets are attribution dimensions, excluded
+    so they never double-count the shared budget. HIGH_TIER_LEDGER_KEY is
+    also a dimension: the same high-tier call already lands in its service
+    bucket, and counting the high-tier rollup again halved the effective
+    cap."""
     import serve as _serve
     return (isinstance(value, dict)
-            and key not in {_serve._SPEND_CAP_BASELINE_KEY, _serve.COLAB_LEDGER_KEY}
+            and key not in {_serve._SPEND_CAP_BASELINE_KEY,
+                            _serve.COLAB_LEDGER_KEY,
+                            _serve.HIGH_TIER_LEDGER_KEY}
             and not _is_task_spend_key(key)
-            and not key.startswith('__village__/') and not key.startswith('__agent__/'))
+            and not any(key.startswith(p) for p in _ROLLUP_BUCKET_PREFIXES))
 
 
 def _spend_cap_tracked_total(ledger):
@@ -576,9 +589,9 @@ def _bank_budget_view(snapshot):
     ledger = _serve._spend_ledger_read() or {}
     for svc, bucket in ledger.items():
         if svc == _serve._SPEND_CAP_BASELINE_KEY or _is_task_spend_key(svc) \
-                or svc.startswith('__village__/') or svc.startswith('__agent__/') \
+                or any(svc.startswith(p) for p in _ROLLUP_BUCKET_PREFIXES) \
                 or not isinstance(bucket, dict):
-            continue  # reserved keys + village/agent rollups are attribution, not service buckets
+            continue  # reserved keys + rollup dimensions are not service buckets
         used = float(bucket.get('used', 0) or 0)
         cap = _serve._budget_cap_usd(svc, products)
         # A zero/unset cap means NO cap (e.g. __colab_compute__ with
@@ -668,7 +681,7 @@ def _forecast(bucket, cap):
     by_day = bucket.get('byDay') or {}
     if not by_day or used <= 0:
         return 0.0, None
-    today = datetime.date.today()
+    today = datetime.datetime.now(datetime.timezone.utc).date()
     window = 0.0
     days_present = 0
     for day_str, amt in by_day.items():

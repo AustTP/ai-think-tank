@@ -25,6 +25,7 @@ import json
 import os
 import secrets
 import smtplib
+import threading
 import time
 
 # One-way SMTP to the player's real address via a Gmail app-password held in
@@ -37,19 +38,42 @@ GMAIL_SMTP_HOST = os.environ.get('AI_THINK_TANK_GMAIL_SMTP_HOST') or 'smtp.gmail
 GMAIL_SMTP_PORT = int(os.environ.get('AI_THINK_TANK_GMAIL_SMTP_PORT', '587'))
 _GMAIL_CRED_NAME = 'gmail_smtp'
 
+# Serialize escalation read/modify/write. The director loop, the human
+# approve/deny link, and the request endpoints all touch the same JSON file;
+# an unlocked write can lose a decision or leave a half-written file.
+_ESCALATIONS_LOCK = threading.Lock()
+
 
 def _load_escalations():
     import serve as _serve
-    if os.path.exists(_serve.ESCALATIONS_PATH):
-        with open(_serve.ESCALATIONS_PATH) as f:
-            return json.load(f)
-    return {}
+    with _ESCALATIONS_LOCK:
+        if os.path.exists(_serve.ESCALATIONS_PATH):
+            try:
+                with open(_serve.ESCALATIONS_PATH) as f:
+                    return json.load(f)
+            except (OSError, ValueError) as e:
+                print(f'[escalation] could not read {_serve.ESCALATIONS_PATH}: {e}')
+                return {}
+        return {}
 
 
 def _save_escalations(data):
     import serve as _serve
-    with open(_serve.ESCALATIONS_PATH, 'w') as f:
-        json.dump(data, f, indent=2)
+    with _ESCALATIONS_LOCK:
+        path = _serve.ESCALATIONS_PATH
+        tmp = f'{path}.tmp'
+        try:
+            with open(tmp, 'w') as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
 
 
 def _send_escalation_email_sync(subject, body_text):

@@ -486,11 +486,18 @@ class TheoPolicy(object):
     """The policy engine. Construct once, injectable clock for
     tests. evaluate() is the roster lane the routing layer
     uses; evaluate_key() is the granted-key lane, which needs
-    a KeyRegistry passed at construction."""
+    a KeyRegistry passed at construction.
+
+    Pending approvals are DURABLE when a storage_path is set: the
+    owner may answer an `apr-...` id hours later, or after a restart,
+    and it must still resolve. Without persistence the pending object
+    lived only in memory and a restart silently dropped it."""
+
+    DECIDED_RETENTION_S = 7 * 24 * 3600
 
     def __init__(self, rate_limit=DEFAULT_RATE_LIMIT,
                  window_seconds=RATE_WINDOW_SECONDS,
-                 clock=time.time, registry=None):
+                 clock=time.time, registry=None, storage_path=None):
         self.clock = clock
         self.usage = UsageTracker(rate_limit=rate_limit,
                                   window_seconds=window_seconds,
@@ -499,6 +506,65 @@ class TheoPolicy(object):
         self.registry = registry
         self._approvals = {}
         self._approved = set()
+        self.storage_path = storage_path
+        if storage_path:
+            self.load_persisted()
+
+    def _persist(self):
+        if not self.storage_path:
+            return
+        now = self.clock()
+        # Decide-and-forget approvals are kept a week for audit, then dropped.
+        for aid, approval in list(self._approvals.items()):
+            if (approval.status != 'pending'
+                    and now - float(approval.created_at or 0) > self.DECIDED_RETENTION_S):
+                self._approvals.pop(aid, None)
+                self._approved.discard(aid)
+        data = {'approvals': [
+            {'approval_id': a.approval_id, 'requester_id': a.requester_id,
+             'role': a.role, 'action': a.action, 'payload': a.payload,
+             'created_at': a.created_at, 'status': a.status,
+             'decided_by': a.decided_by}
+            for a in self._approvals.values()
+        ]}
+        tmp = self.storage_path + '.tmp'
+        try:
+            import os
+            os.makedirs(os.path.dirname(self.storage_path) or '.', exist_ok=True)
+            with open(tmp, 'w') as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.storage_path)
+        except (OSError, ValueError):
+            try:
+                import os
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
+    def load_persisted(self):
+        if not self.storage_path:
+            return
+        try:
+            with open(self.storage_path) as f:
+                data = json.load(f) or {}
+        except (OSError, ValueError):
+            return
+        for row in data.get('approvals') or []:
+            try:
+                approval = PendingApproval(
+                    row['approval_id'], row['requester_id'], row['role'],
+                    row['action'], row.get('payload') or {},
+                    row.get('created_at') or self.clock())
+            except (KeyError, TypeError):
+                continue
+            approval.status = row.get('status') or 'pending'
+            approval.decided_by = row.get('decided_by')
+            self._approvals[approval.approval_id] = approval
+            if approval.status == 'approved':
+                self._approved.add(approval.approval_id)
 
     def evaluate(self, state, requester_id, action, payload=None):
         """Decide whether Theo does `action` for `requester_id`.
@@ -657,6 +723,7 @@ class TheoPolicy(object):
         approval.status = 'approved'
         approval.decided_by = owner_requester_id
         self._approved.add(approval_id)
+        self._persist()
         self.audit.record(AuditEntry(
             self.clock(), owner_requester_id, ROLE_OWNER,
             'approve:%s' % approval_id, True, approval_id=approval_id))
@@ -672,6 +739,7 @@ class TheoPolicy(object):
             return False
         approval.status = 'denied'
         approval.decided_by = owner_requester_id
+        self._persist()
         self.audit.record(AuditEntry(
             self.clock(), owner_requester_id, ROLE_OWNER,
             'deny:%s' % approval_id, False, approval_id=approval_id))
@@ -691,6 +759,7 @@ class TheoPolicy(object):
             'apr-%s' % secrets.token_hex(8),
             requester_id, role, action, payload, self.clock())
         self._approvals[approval.approval_id] = approval
+        self._persist()
         return approval
 
     def _record(self, requester_id, role, action, decision, payload=None):

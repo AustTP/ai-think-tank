@@ -181,12 +181,13 @@ class RunsClosed(unittest.TestCase):
                                 'a review subtask must be queued (or live) for the story')
         self.assertEqual(calls.get('room'), 'observatory',
                          'a deliverable task must dispatch real content work')
-        # The author was released (approvedCount bumped) and is off duty, while
-        # the story waits for review.
+        # The author was released and is off duty, while the story waits for
+        # review. Approval credit is NOT granted yet: the gate may still
+        # reject the work, and only shipped work counts.
         author = story.get('assignedTo')
         author_state = final['agents'].get(author, {})
-        self.assertGreater(author_state.get('approvedCount', 0), 0,
-                           'a gated worker must still bump approvedCount on finishing primary work')
+        self.assertEqual(author_state.get('approvedCount', 0), 0,
+                         'unapproved gated work must not count as approved')
         self.assertIn(author_state.get('task'), (None, story['id']),
                       'the author must not be stranded on a freshly-assigned task')
         self.assertFalse(author_state.get('busy'),

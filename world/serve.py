@@ -9200,6 +9200,8 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
         raise RuntimeError('OpenRouter API key is blocked after repeated auth failures -- swap the key in .env and reload env')
     if is_model_circuit_broken(model):
         raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
+    if not _messages_pass_boundary_check(messages):
+        raise RuntimeError('external data boundary failed verification -- refusing model call')
     body = {'model': model, 'messages': messages}
     if tools is not None:
         body['tools'] = tools
@@ -13662,6 +13664,7 @@ def _merge_server_owned_agent(server_agent, client_agent):
 
 
 @app.post('/api/mail/send')
+@_state_writer
 async def api_mail_send(request: Request):
     # The one sanctioned inter-agent mail path, server-validated and
     # server-authoritative. Previously the browser pushed ``fromName: text``
@@ -13693,7 +13696,7 @@ async def api_mail_send(request: Request):
     if not isinstance(text, str) or not text.strip():
         return JSONResponse({'error': 'text is required'}, status_code=400)
     text = text.strip()[:2000]
-    state = get_state_from_db()
+    state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     roster = state.get('agentRoster') or []
@@ -17752,7 +17755,8 @@ def _save_key_registry():
 _KEY_REGISTRY = _load_key_registry()
 
 _theo_policy = theo_policy.TheoPolicy(
-    registry=_KEY_REGISTRY)
+    registry=_KEY_REGISTRY,
+    storage_path=os.path.join(LIBRARY_DIR, 'theo-approvals.json'))
 
 # The owner adjudicates a pending approval by texting
 # "approve apr_<id>" or "deny apr_<id>" -- checked before lane
@@ -20214,6 +20218,43 @@ def verify_boundary_intact(content, nonce, tag):
     # sight.
     expected = hmac.new(_BOUNDARY_SECRET.encode(), (nonce + content).encode(), hashlib.sha256).hexdigest()[:16]
     return hmac.compare_digest(tag, expected)
+
+
+# A complete wrapped block. The END marker must repeat the opener's nonce;
+# incomplete or mismatched markers are intentionally NOT treated as a block
+# (the wrapper's own instruction text also mentions the marker names, so a
+# lone marker is not proof of tampering).
+_BOUNDARY_BLOCK_RE = re.compile(
+    r'<<<EXTERNAL_DATA nonce=([0-9a-f]+) tag=([0-9a-f]+)>>>\n'
+    r'(.*?)\n<<<END_EXTERNAL_DATA nonce=\1>>>', re.DOTALL)
+
+
+def verify_external_boundaries(text):
+    """Verify every complete EXTERNAL_DATA block in `text` before a model sees
+    it. Returns False when any block's HMAC does not match. Consumers no
+    longer have to remember to call verify_boundary_intact: the model-call
+    chokepoint does it for them."""
+    if not isinstance(text, str) or '<<<EXTERNAL_DATA' not in text:
+        return True
+    for match in _BOUNDARY_BLOCK_RE.finditer(text):
+        nonce, tag, content = match.group(1), match.group(2), match.group(3)
+        if not verify_boundary_intact(content, nonce, tag):
+            return False
+    return True
+
+
+def _messages_pass_boundary_check(messages):
+    for msg in messages or []:
+        content = (msg or {}).get('content')
+        if isinstance(content, str):
+            if not verify_external_boundaries(content):
+                return False
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get('text'), str):
+                    if not verify_external_boundaries(part['text']):
+                        return False
+    return True
 
 
 # Per the tool_governance.py research: /api/execute, /api/browse, and
@@ -28176,6 +28217,9 @@ async def screenshot(request: Request):
     cmd = [
         chrome, '--headless', '--disable-gpu', '--no-sandbox',
         '--host-resolver-rules=MAP * 0.0.0.0', '--disable-background-networking',
+        # The resolver rule only blocks DNS. Route every actual connection
+        # through a dead proxy so an IP literal or localhost cannot bypass it.
+        '--proxy-server=127.0.0.1:9', '--proxy-bypass-list=<-loopback>',
         f'--screenshot={out_path}', f'--window-size={width},{height}',
         '--virtual-time-budget=2000', f'file://{target}',
     ]
@@ -28205,6 +28249,21 @@ PAGE_PROBE_TIMEOUT_S = 20
 PAGE_PROBE_MAX_ACTIONS = 40
 PAGE_PROBE_MAX_PROBES = 20
 PAGE_PROBE_MAX_WAIT_MS = 5000
+PAGE_PROBE_MAX_RESULT_CHARS = 20000
+PAGE_PROBE_MAX_GLOBAL_KEYS = 100
+
+
+def _bounded_probe_result(value, max_chars=PAGE_PROBE_MAX_RESULT_CHARS):
+    """Keep a probe result JSON-transportable and bounded. A page can return a
+    huge object from one evaluate; without this the endpoint serializes it all
+    and can stall the server."""
+    try:
+        text = json.dumps(value, default=str)
+    except Exception:
+        text = repr(value)
+    if len(text) <= max_chars:
+        return value
+    return {'truncated': True, 'chars': len(text), 'preview': text[:max_chars]}
 
 
 def _page_probe_sync(file_path, actions, probes):
@@ -28219,7 +28278,8 @@ def _page_probe_sync(file_path, actions, probes):
         # site, so there's no reason it should ever reach the internet.
         browser = p.chromium.launch(
             headless=True,
-            args=['--host-resolver-rules=MAP * 0.0.0.0', '--disable-background-networking'],
+            args=['--host-resolver-rules=MAP * 0.0.0.0', '--disable-background-networking',
+                  '--proxy-server=127.0.0.1:9', '--proxy-bypass-list=<-loopback>'],
         )
         try:
             # A fresh blank page in the same browser/engine gives the real
@@ -28238,6 +28298,18 @@ def _page_probe_sync(file_path, actions, probes):
             baseline_page.close()
 
             page = browser.new_page()
+
+            def _deny_non_file(route):
+                url = (route.request.url or '').lower()
+                if url.startswith(('file:', 'data:', 'blob:')):
+                    route.continue_()
+                else:
+                    route.abort()
+
+            # Belt and braces with the dead proxy: abort anything that is not
+            # the local sandbox file. This catches http(s), ws(s), and IP
+            # literals that a DNS blackhole alone would let through.
+            page.route('**/*', _deny_non_file)
             page.on('console', lambda msg: console_messages.append(f'[{msg.type}] {msg.text}'))
             page.on('pageerror', lambda exc: page_errors.append(str(exc)))
             page.goto(f'file://{file_path}', timeout=PAGE_PROBE_TIMEOUT_S * 1000)
@@ -28279,7 +28351,7 @@ def _page_probe_sync(file_path, actions, probes):
             # the score element actually say right now."
             for expr in probes[:PAGE_PROBE_MAX_PROBES]:
                 try:
-                    results[expr] = page.evaluate(expr)
+                    results[expr] = _bounded_probe_result(page.evaluate(expr))
                 except Exception as e:
                     results[expr] = f'ERROR: {e}'
 
@@ -28300,7 +28372,7 @@ def _page_probe_sync(file_path, actions, probes):
                         if (Array.isArray(v)) return { name, type: 'array', length: v.length };
                         if (typeof v === 'object' && !(v instanceof Node)) {
                             let keys = [];
-                            try { keys = Object.keys(v); } catch (e) {}
+                            try { keys = Object.keys(v).slice(0, 100); } catch (e) {}
                             return { name, type: 'object', keys };
                         }
                         // A bug found building this tool: a fix

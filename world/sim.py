@@ -1871,6 +1871,9 @@ TASK_CYCLE_S = 6.0
 # player 1:1 thread and pending review requests survive, tight enough that the
 # state blob can't grow without bound.
 MAILBOX_KEEP_COUNT = 200
+# Trimmed entries are not silently destroyed: keep a small recoverable tail so
+# an operator can see a notice that fell out of the live mailbox window.
+MAILBOX_ARCHIVE_KEEP_COUNT = 50
 
 # ---------------------------------------------------------------------------
 # Item 4: per-task model-spend ceiling. A card gets a hard budgetUsd at
@@ -6548,8 +6551,10 @@ def _note_completed_room(state, agent_id, task):
 def _release_agent_gated(state, agent_id, grid):
     """Release an agent whose deliverable work just finished but whose STORY stays
     open in 'needs_review' (as opposed to finish_task, which marks it 'done').
-    Clears the agent's task/busy/inRoom + bumps approvedCount, leaves the task
-    status untouched, and sends the agent off duty (vanishes in place)."""
+    Clears the agent's task/busy/inRoom and sends the agent off duty (vanishes
+    in place). The approval count and the deliverable grade land at GATE CLOSE,
+    not here: work that reviewers may still reject must not count as shipped.
+    """
     agents = state.get('agents') or {}
     a = agents.get(agent_id)
     if not a:
@@ -6559,9 +6564,6 @@ def _release_agent_gated(state, agent_id, grid):
     a['busy'] = False
     a['inRoom'] = None
     a['visible'] = True
-    a['approvedCount'] = (a.get('approvedCount') or 0) + 1
-    a['weekApprovals'] = (a.get('weekApprovals') or 0) + 1
-    _note_completed_room(state, agent_id, completed)
     _maybe_file_followup(state, agent_id, completed, int(time.time() * 1000))
 
 
@@ -6791,6 +6793,17 @@ def _close_gated_story(state, parent):
     direct status flip + log rather than finish_task, which needs a working
     agent. Returns True on close."""
     review_counts = parent.get('_peerGate') or {}
+    # The author's approval and the deliverable grade belong to the gate
+    # closing, not the earlier release. Count them once per close.
+    if not parent.get('_gateCloseRecorded'):
+        parent['_gateCloseRecorded'] = True
+        author_id = parent.get('assignedTo')
+        a = (state.get('agents') or {}).get(author_id)
+        if a:
+            a['approvedCount'] = (a.get('approvedCount') or 0) + 1
+            a['weekApprovals'] = (a.get('weekApprovals') or 0) + 1
+        if author_id:
+            _note_completed_room(state, author_id, parent)
     review_counts['closed'] = True
     parent['status'] = 'done'
     # The gated story shipped: its per-story capability grant dies with it.
@@ -7144,6 +7157,14 @@ def _complete_auto_hire(state, pending, grid, now_ms):
     }
     new_id = name.lower()
     roster = state.setdefault('agentRoster', [])
+    # The start gate may no longer hold by the time the ceremony finishes
+    # (a spawn, a borrowed agent, or another completion can grow the roster).
+    # Re-check the hard total before appending, so a delayed hire cannot push
+    # the tank past MAX_TOTAL_AGENTS.
+    if len(roster) >= MAX_TOTAL_AGENTS:
+        state['_hireBlockedAtCapNote'] = len(roster)
+        state.pop('_pendingHire', None)
+        return None
     # Reentry guard: a fired employee can never come back. Refuse the hire and
     # drop the pending record so the next pass stages a fresh (different) hire
     # instead of retrying the same forbidden one forever.
@@ -9094,6 +9115,10 @@ def _append_mailbox(agent, entry):
     mailbox = agent.setdefault('mailbox', [])
     mailbox.append(entry)
     if len(mailbox) > MAILBOX_KEEP_COUNT:
+        archived = agent.setdefault('mailboxArchive', [])
+        archived.extend(mailbox[:-MAILBOX_KEEP_COUNT])
+        if len(archived) > MAILBOX_ARCHIVE_KEEP_COUNT:
+            agent['mailboxArchive'] = archived[-MAILBOX_ARCHIVE_KEEP_COUNT:]
         agent['mailbox'] = mailbox[-MAILBOX_KEEP_COUNT:]
 
 
@@ -9137,9 +9162,11 @@ def _mail_card_update(state, to_id, kind, key, title, team_name, extra=''):
         text = (f'Your card {label}"{title_bit}" is marked done'
                 f'{f" by {team_name}" if team_name else ""}. Reply in mail '
                 'if anything looks off.')
-    else:  # issue_closed
+    elif kind == 'issue_closed':
         text = (f'Your card {label}"{title_bit}" is closed'
                 f'{f" by {team_name}" if team_name else ""}.')
+    else:
+        return False
     _append_mailbox(agent, {'kind': kind, 'about': key or None,
                             'title': title_bit, 'text': text})
     return True
@@ -11339,9 +11366,12 @@ def _grade_completed_task(state, agent_id, task, now_ms):
     _tref = task.get('teamId') or agent_team_ref(state, agent_id)
     _floor = team_policy(state, _tref, 'deliverableGradeFloor')
     _success = team_policy(state, _tref, 'successGradeFloor')
-    if grade < _floor:
+    # A fabricated fallback is a placeholder, not a personnel signal. It may
+    # be recorded for continuity, but it must not coach, escalate, or feed
+    # success mining as if Jev had judged the work.
+    if grade_is_real and grade < _floor:
         _coach_low_grade(state, agent_id, room, grade, now_ms, title, task=task)
-    elif grade >= _success:
+    elif grade_is_real and grade >= _success:
         # Positive learning loop (ChatDev ECL): a deliverable graded at/above
         # the success floor is the raw material for the weekly success-mining
         # pass -- "what made this good" should propagate, not just "what went
@@ -11366,11 +11396,33 @@ def _coach_low_grade(state, agent_id, room, grade, now_ms, title, task=None):
     When `task` carries acceptance criteria or a user story, the note quotes
     them -- agents reported 0.0-grade coaching that said "meet the spec" but
     never stated what the spec was, leaving nothing to act on."""
-    plans = state.setdefault('growthPlans', {}).setdefault(agent_id, [])
     _tref = agent_team_ref(state, agent_id)
     _maxr = team_policy(state, _tref, 'coachingMaxRounds')
     _floor = team_policy(state, _tref, 'deliverableGradeFloor')
-    rounds = sum(1 for p in plans if p.get('kind') == 'low_grade')
+    # Count low-grade coaching rounds SINCE THE LAST REAL RECOVERY. A lifetime
+    # count punished an agent who recovered months ago: the next single low
+    # close escalated immediately. Rounds are still plan-based so the daily
+    # catch-up sweep (which has no new deliverable) can re-coach or escalate
+    # from the plans that already exist.
+    recovery_ts = 0
+    for d in (state.get('completedDeliverables') or []):
+        if d.get('agentId') != agent_id or not d.get('gradeIsReal', True):
+            continue
+        if isinstance(d.get('grade'), (int, float)) and d.get('grade') >= _floor:
+            recovery_ts = max(recovery_ts, d.get('gradedAt') or 0)
+    plans = state.get('growthPlans', {}).get(agent_id) or []
+    rounds = 0
+    for p in plans:
+        if p.get('kind') != 'low_grade':
+            continue
+        ts = p.get('ts')
+        # Legacy plans carry no timestamp. They count only when there has
+        # been no recovery to order them against.
+        if ts is None:
+            if recovery_ts == 0:
+                rounds += 1
+        elif ts > recovery_ts:
+            rounds += 1
     if rounds >= _maxr:
         _escalate_coaching_loop(state, agent_id, room, grade, now_ms, title)
         return

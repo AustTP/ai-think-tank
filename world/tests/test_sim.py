@@ -643,12 +643,16 @@ class SimTaskLifecycle(unittest.TestCase):
         self.assertGreater(len(offduty), 0,
                            'a worker who completed a task must end up off-duty')
         worker = offduty[0]
-        self.assertGreater(worker.get('approvedCount', 0), 0,
-                           'completing a task bumps approvedCount')
         self.assertFalse(worker.get('path'), 'off-duty worker should have no live path')
         tasks = state.get('tasks') or {}
-        self.assertTrue(any(t.get('status') == 'done' for t in tasks.values()),
-                        'the task must complete')
+        self.assertTrue(any(t.get('status') in ('done', 'needs_review')
+                            for t in tasks.values()),
+                        'the task must complete or enter peer review')
+        self.assertTrue(
+            worker.get('approvedCount', 0) > 0
+            or any(t.get('status') == 'needs_review' for t in tasks.values()),
+            'approvedCount bumps only when the gate closes; a story still in '
+            'review must not count as approved')
         # Spare-time lane (2026-10-06): completing a real deliverable earns one
         # deferred free exploration spike, so the queue is never literally
         # empty after work -- but NO committed work may remain, and the spike

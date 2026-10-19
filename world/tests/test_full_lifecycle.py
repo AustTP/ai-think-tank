@@ -157,13 +157,10 @@ class FullLifecycle(unittest.TestCase):
         self.assertTrue(gate['reviewerIds'], 'gate must assign reviewers')
         self.assertEqual(calls.get('room'), 'pressoffice',
                          'a code deliverable must dispatch real content work')
-        # Grading is fire-and-forget at gate entry: a completed deliverable with
-        # a grade + Last-reviewed date already exists, awaiting (re)review.
+        # Grading lands at GATE CLOSE, not at gate entry: work that reviewers
+        # may still reject is not a shipped deliverable yet.
         dels = state.get('completedDeliverables') or []
-        self.assertEqual(len(dels), 1)
-        self.assertEqual(dels[0]['id'], story['id'])
-        self.assertIsInstance(dels[0].get('grade'), (int, float))
-        self.assertTrue(dels[0].get('lastReviewed'), 'a landed deliverable carries a Last-reviewed date')
+        self.assertEqual(dels, [])
 
         # ---- accept: two distinct clean votes close the gate deterministically ----
         # The vote fold is a hermetic pure path (unit-tested in test_peer_approval);
@@ -179,6 +176,18 @@ class FullLifecycle(unittest.TestCase):
         self.assertTrue(sim._parent_close_from_vote(state, state['tasks'][story['id']], now_ms=2**62),
                         'two distinct clean votes must close the story')
         self.assertEqual(state['tasks'][story['id']]['status'], 'done')
+        # Now that the gate closed, the author is credited and the deliverable
+        # is graded exactly once.
+        dels = state.get('completedDeliverables') or []
+        self.assertEqual(len(dels), 1)
+        self.assertEqual(dels[0]['id'], story['id'])
+        self.assertIsInstance(dels[0].get('grade'), (int, float))
+        self.assertTrue(dels[0].get('lastReviewed'),
+                        'a landed deliverable carries a Last-reviewed date')
+        author = story.get('assignedTo')
+        if author:
+            self.assertGreater(state['agents'][author].get('approvedCount', 0), 0,
+                               'gate close credits the author')
 
         # ---- release: snapshot the sandbox into a frozen v1 with a RELEASE.md ----
         from starlette.testclient import TestClient as StarletteClient

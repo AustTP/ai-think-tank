@@ -469,24 +469,26 @@ class MonthToDate(unittest.TestCase):
                 bank._service_month_to_date({}, 'alpha'), 0.0)
 
     def test_ledger_month_to_date_counts_dollars_not_rollups_or_units(self):
-        # Tracked dollar buckets only: alpha + high-tier + apify +
-        # treg. Task/village/agent rollups, Colab UNITS and the
-        # baseline key are excluded (they would double-count or
-        # trip the USD cap on a currency that isn't money).
+        # Tracked dollar service buckets only: alpha + apify + treg.
+        # High-tier, task, village, agent and director rollups are
+        # dimensions of the same call, so counting them again would
+        # double-count the shared budget. Colab UNITS and the baseline
+        # key are excluded for the same reason.
         with self._patched_period():
             self.assertAlmostEqual(
-                bank._ledger_month_to_date(self._ledger()), 9.0)
+                bank._ledger_month_to_date(self._ledger()), 7.5)
 
     def test_openrouter_month_to_date_excludes_other_vendor_lanes(self):
         # Treg (scraping API) and Apify (its own actor account)
-        # spend real money but NOT through the OpenRouter account,
-        # so the OpenRouter month-to-date is alpha + high-tier only.
+        # spend real money but NOT through the OpenRouter account.
+        # High-tier is a rollup of a service bucket already counted,
+        # so it is excluded here too.
         with self._patched_period():
             ledger = self._ledger()
             self.assertAlmostEqual(
-                bank._openrouter_month_to_date(ledger), 6.5)
+                bank._openrouter_month_to_date(ledger), 5.0)
             self.assertAlmostEqual(
-                bank._ledger_month_to_date(ledger), 9.0)
+                bank._ledger_month_to_date(ledger), 7.5)
 
     def test_bank_view_rows_carry_month_used(self):
         ledger = self._ledger()

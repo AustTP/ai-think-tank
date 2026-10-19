@@ -145,12 +145,17 @@ class ReviewerSelection(unittest.TestCase):
         sim.finish_task(state, 'ben', grid=None)
         self.assertIn('pressoffice', state['agents']['ben'].get('completedRooms', []))
 
-        # The peer-gate release path records the room too (gated story).
+        # The peer-gate release does NOT record the room yet: the story is
+        # still awaiting approval, so it is not shipped work. The room lands
+        # when the gate actually closes.
         state2 = _state()
         t2 = _task(room='observatory', status='working', entryX=None, entryY=None)
         state2['agents']['ben']['task'] = t2['id']
         state2['tasks'][t2['id']] = t2
         sim._release_agent_gated(state2, 'ben', None)
+        self.assertNotIn('observatory', state2['agents']['ben'].get('completedRooms', []))
+        t2['_peerGate'] = {'approvals': 2, 'approvers': ['ada', 'cora']}
+        sim._close_gated_story(state2, t2)
         self.assertIn('observatory', state2['agents']['ben'].get('completedRooms', []))
 
 

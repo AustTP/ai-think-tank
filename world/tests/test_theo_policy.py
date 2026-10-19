@@ -8,7 +8,9 @@ test is hermetic. The clock is injectable for the rate-limit window.
 """
 
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -281,6 +283,37 @@ class AuditTrail(unittest.TestCase):
                      if e.action.startswith('approve:')]
         self.assertEqual(len(approvals), 1)
         self.assertEqual(approvals[0].requester_id, None)
+
+
+class ApprovalPersistence(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='theo-approvals-test-')
+        self.path = os.path.join(self.tmp, 'theo-approvals.json')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_pending_approval_survives_a_restart(self):
+        first_policy = theo_policy.TheoPolicy(storage_path=self.path)
+        first = first_policy.evaluate(_state(), 'cora', 'spend')
+        self.assertTrue(first.requires_approval)
+
+        # A fresh process rebuilds the policy from the same file. The owner
+        # can still answer the approval id that was handed out before.
+        second_policy = theo_policy.TheoPolicy(storage_path=self.path)
+        self.assertTrue(second_policy.approve(_state(), None,
+                                              first.approval_id))
+        allowed = second_policy.evaluate(_state(), 'cora', 'spend')
+        self.assertTrue(allowed.allowed)
+
+    def test_decided_approval_survives_and_stays_one_shot(self):
+        policy = theo_policy.TheoPolicy(storage_path=self.path)
+        first = policy.evaluate(_state(), 'cora', 'spend')
+        policy.approve(_state(), None, first.approval_id)
+        reloaded = theo_policy.TheoPolicy(storage_path=self.path)
+        self.assertFalse(reloaded.approve(_state(), None, first.approval_id))
+        allowed = reloaded.evaluate(_state(), 'cora', 'spend')
+        self.assertTrue(allowed.allowed)
 
 
 class SandboxRule(unittest.TestCase):

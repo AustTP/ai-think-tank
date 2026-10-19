@@ -29,14 +29,30 @@ something true"):
    so recurring runs catch late discoveries.
 """
 
+import functools
 import hashlib
 import json
 import re
 import sqlite3
+import threading
 import time
 import urllib.parse
 
 from web_helpers import _is_short_link
+
+# The claim and coverage ledgers are whole-blob read/modify/write rows. The
+# crawl, the verifier endpoint, and a player review can all mutate them at
+# once; without this lock the last writer silently drops the other's claim or
+# covered flip. RLock because the public mutators call each other.
+_LEDGER_LOCK = threading.RLock()
+
+
+def _serialized(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _LEDGER_LOCK:
+            return fn(*args, **kwargs)
+    return wrapper
 
 # The lifecycle statuses a claim record can take.
 CLAIM_STATUSES = frozenset({'needs_review', 'cleared', 'blocked'})
@@ -353,6 +369,7 @@ def _validate_claim_record(record):
         raise ValueError('observations must be a list')
 
 
+@_serialized
 def record_source_claim(record, actor=None):
     """Record one claim into the evidence ledger, applying the source-identity
     and coverage rules. Returns a result dict:
@@ -455,6 +472,7 @@ def record_source_claim(record, actor=None):
             'resolved_ok': bool(meta['resolved_ok'])}
 
 
+@_serialized
 def record_observation_change(claim_id, field, before, after, *, source_url=None,
                               note=None, actor=None):
     """The article's change-record primitive: a structured before -> after
@@ -532,6 +550,7 @@ def list_claims(status=None, limit=None):
     return claims
 
 
+@_serialized
 def update_claim(claim_id, *, status=None, decision=None, open_questions=None,
                  claim=None, scope=None):
     """Transition one claim's status/decision/scope. The Verifier's move: it
@@ -563,6 +582,7 @@ def update_claim(claim_id, *, status=None, decision=None, open_questions=None,
     return rec
 
 
+@_serialized
 def mark_reviewed(claim_id, decision, artifact=None, actor=None):
     """The article's review step: a claim that survives verification becomes
     cleared (and, when independent, folds its identity into the coverage
@@ -611,6 +631,7 @@ def is_source_covered(identity, material_update_ms=None):
     return True
 
 
+@_serialized
 def mark_covered(identity, *, artifact=None, reviewed=False, event_id=None,
                  source_url=None, resolved_url=None, material_update_ms=None,
                  run_id=None, actor=None):
@@ -658,6 +679,7 @@ def mark_covered(identity, *, artifact=None, reviewed=False, event_id=None,
     return existing
 
 
+@_serialized
 def record_run_failure(identity, reason, *, artifact=None, event_id=None,
                        source_url=None, resolved_url=None, actor=None):
     """Record a failed run against a source identity. A failure NEVER marks an
