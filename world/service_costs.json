@@ -1,0 +1,7 @@
+{
+  "comment": "Per-endpoint USD prices for metered APIs (TREG_ENDPOINT_COSTS). Operator-edited: add a price before calling a new endpoint on a metered service, or the chokepoint has no cost to accrue.",
+  "treg_endpoint_costs": {
+    "x.x.get-trends-by-woeid": 0.01,
+    "scrapecreators.x.v1-linkedin-search-posts": 0.00188
+  }
+}

@@ -59,10 +59,14 @@ The self-modification contract (operator decisions, locked 2026-10-18):
         scripts -- is refused outright for edits and in-window fixes. An
         edit that could rewrite its own acceptance bar proves nothing.
       Tier B: oversight-enforcement files (jev, selfedit, notify,
-        theo_policy, sublow, jev_grants, bank, budget) stay editable but
-        need the PLAYER's emailed signature (OVERSIGHT_KIND, floor 1.0, the
-        same human-in-the-loop as dormancy windows). The row waits as
-        pending_signature and arms only after resolve_oversight_signature.
+        theo_policy, sublow, jev_grants, bank, budget) AND the operator
+        policy data that steers other agents or weakens a safety net
+        (tool_descriptions, redaction, actions, model_bands, service_costs,
+        browse_policy, rooms, seed_profiles, endpoint_policy -- the world/
+        *.json files) stay editable but need the PLAYER's emailed signature
+        (OVERSIGHT_KIND, floor 1.0, the same human-in-the-loop as dormancy
+        windows). The row waits as pending_signature and arms only after
+        resolve_oversight_signature.
       READS mirror the write rule minus a smaller deliberate core
         (read_module): test expectations, gate internals, and oversight
         files are also UNREADABLE, since those are exactly what gaming
@@ -97,7 +101,16 @@ GATE_BASENAMES = ('conftest.py',)
 # review is not enough authority for the files that govern the reviews.
 PLAYER_SIGNATURE_BASENAMES = ('jev.py', 'selfedit.py', 'notify.py',
                               'theo_policy.py', 'sublow.py', 'jev_grants.py',
-                              'bank.py', 'budget.py')
+                              'bank.py', 'budget.py',
+                              # Policy data that shapes other agents' prompts,
+                              # spend/routing facts, dormancy telemetry, or the
+                              # log redaction net. Same tier as the code that
+                              # consumes it: editable, player-signed.
+                              'tool_descriptions.json', 'redaction.json',
+                              'actions.json', 'model_bands.json',
+                              'service_costs.json', 'browse_policy.json',
+                              'rooms.json', 'seed_profiles.json',
+                              'endpoint_policy.json')
 OVERSIGHT_KIND = 'oversight self-edit'
 
 # Read access mirrors the write rule: an agent may read exactly what it may
@@ -118,6 +131,7 @@ READ_TEXT_CAP = 48000
 # Everything else tolerates ZERO outside importers in v1.
 TOLERATED_IMPORTERS = {
     'jev': {'serve.py'},
+    'env_reload': {'serve.py'},
     'sublow': {'jev_grants.py'},
     'config': {'content.py', 'sim.py', 'sublow.py', 'serve.py'},
 }
@@ -1030,6 +1044,8 @@ def _reload(target):
         _refresh_serve_jev_exports()
     if modname == 'config':
         _refresh_serve_config_exports()
+    if modname == 'env_reload':
+        _refresh_serve_env_reload_exports()
     for extra in RELOAD_IMPORTERS_AFTER.get(modname, ()):
         extra_mod = sys.modules.get(extra)
         if extra_mod:
@@ -1048,6 +1064,16 @@ def _refresh_serve_jev_exports():
                  'ESCALATION_ERROR_PENALTY_CAP', '_jev_choice',
                  '_jev_quorum_choice_sync', '_jev_quorum_decision'):
         setattr(serve, name, getattr(jev, name))
+
+
+def _refresh_serve_env_reload_exports():
+    """serve.py binds the .env reload table and its flag helper by name, so
+    a self-edit to env_reload.py must rebind both or the pre-edit table keeps
+    running until a restart."""
+    import env_reload
+    serve = _s()
+    serve._ENV_RELOAD_FIELDS = env_reload.ENV_RELOAD_FIELDS
+    serve._env_flag = env_reload._env_flag
 
 
 def _refresh_serve_config_exports():

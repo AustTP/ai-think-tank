@@ -559,3 +559,349 @@ class WatchlistWritebackEdges(_TempPolicy):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ExtractedPolicyFilesTest(unittest.TestCase):
+    """The three policy files moved out of serve.py: service costs, model
+    bands, and redaction patterns. Each must load from the shipped file,
+    fall back per section on garbage, and mutate in place so serve.py's
+    imported names stay live."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='think tank-policy-test-')
+        self._patch = unittest.mock.patch.multiple(
+            config,
+            BROWSE_POLICY_PATH=os.path.join(self._tmp, 'browse_policy.json'),
+            SERVICE_COSTS_PATH=os.path.join(self._tmp, 'service_costs.json'),
+            MODEL_BANDS_PATH=os.path.join(self._tmp, 'model_bands.json'),
+            REDACTION_PATH=os.path.join(self._tmp, 'redaction.json'),
+        )
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        config.reload_policy_config()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _write(self, name, data):
+        with open(os.path.join(self._tmp, name), 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+
+    def test_shipped_files_parse_and_match_defaults(self):
+        config.reload_policy_config()
+        self.assertEqual(config.TREG_ENDPOINT_COSTS,
+                         dict(config.TREG_ENDPOINT_COSTS_DEFAULT))
+        self.assertEqual(config.MODEL_PRICE_BANDS,
+                         dict(config.MODEL_PRICE_BANDS_DEFAULT))
+        self.assertEqual(config.BAND_BENCHMARK,
+                         dict(config.BAND_BENCHMARK_DEFAULT))
+        self.assertEqual(config.STANDING_SAFE_DOMAINS,
+                         set(config.STANDING_SAFE_DOMAINS_DEFAULT))
+        self.assertEqual([p.pattern for p in config.SECRET_PATTERNS],
+                         list(config.SECRET_PATTERN_DEFAULTS))
+
+    def test_missing_files_fall_back_to_defaults(self):
+        config.reload_policy_config()
+        self.assertEqual(config.TREG_ENDPOINT_COSTS,
+                         dict(config.TREG_ENDPOINT_COSTS_DEFAULT))
+        self.assertEqual(config.MODEL_BAND_PURPOSE,
+                         dict(config.MODEL_BAND_PURPOSE_DEFAULT))
+        self.assertEqual([p.pattern for p in config.SECRET_PATTERNS],
+                         list(config.SECRET_PATTERN_DEFAULTS))
+
+    def test_edited_cost_table_is_validated_and_applied(self):
+        self._write('service_costs.json', {'treg_endpoint_costs': {
+            'new.endpoint': 0.5, 'bad': 'free', 'negative': -1, '': 2}})
+        config.reload_policy_config()
+        self.assertEqual(config.TREG_ENDPOINT_COSTS, {'new.endpoint': 0.5})
+
+    def test_malformed_section_does_not_blank_the_others(self):
+        self._write('model_bands.json', {
+            'price_bands': 'nope',
+            'band_purpose': {'coding': 'Write code.'},
+            'band_benchmark': {'coding': ['coding_index']},
+            'quality_floor_gap': {'high': 3},
+            'tier_gate_criteria': {'high': 'Plan carefully.'},
+        })
+        config.reload_policy_config()
+        self.assertEqual(config.MODEL_PRICE_BANDS,
+                         dict(config.MODEL_PRICE_BANDS_DEFAULT))
+        self.assertEqual(config.MODEL_BAND_PURPOSE, {'coding': 'Write code.'})
+        self.assertEqual(config.BAND_BENCHMARK, {'coding': ('coding_index',)})
+        self.assertEqual(config.BAND_QUALITY_FLOOR_GAP, {'high': 3})
+        self.assertEqual(config.TIER_GATE_CRITERIA, {'high': 'Plan carefully.'})
+
+    def test_invalid_price_band_is_dropped(self):
+        self._write('model_bands.json', {'price_bands': {
+            'low': [0, 0.5], 'backwards': [5, 1], 'negative': [-1, 2],
+            'notpair': [1], 'mid': [0.5, 5], 'high': [5, 50]}})
+        config.reload_policy_config()
+        self.assertEqual(set(config.MODEL_PRICE_BANDS), {'low', 'mid', 'high'})
+
+    def test_standing_domains_reject_schemes_and_paths(self):
+        self._write('browse_policy.json', {'standing_safe_domains': [
+            'example.org', '.Example.ORG', 'https://bad.example', 'bad.example/path',
+            'gov', '']})
+        config.reload_policy_config()
+        self.assertEqual(config.STANDING_SAFE_DOMAINS, {'example.org', 'gov'})
+
+    def test_bad_regex_is_dropped_but_redaction_stays_on(self):
+        self._write('redaction.json', {'secret_patterns': ['sk-[a-z]+', '(', '']})
+        config.reload_policy_config()
+        self.assertEqual([p.pattern for p in config.SECRET_PATTERNS], ['sk-[a-z]+'])
+
+    def test_reload_mutates_in_place_so_imported_names_stay_live(self):
+        bands_ref = config.MODEL_PRICE_BANDS
+        costs_ref = config.TREG_ENDPOINT_COSTS
+        domains_ref = config.STANDING_SAFE_DOMAINS
+        patterns_ref = config.SECRET_PATTERNS
+        self._write('service_costs.json', {'treg_endpoint_costs': {'only': 1}})
+        config.reload_policy_config()
+        self.assertIs(config.MODEL_PRICE_BANDS, bands_ref)
+        self.assertIs(config.TREG_ENDPOINT_COSTS, costs_ref)
+        self.assertIs(config.STANDING_SAFE_DOMAINS, domains_ref)
+        self.assertIs(config.SECRET_PATTERNS, patterns_ref)
+        self.assertEqual(config.TREG_ENDPOINT_COSTS, {'only': 1})
+
+    def test_serve_reexports_the_live_objects(self):
+        import serve
+        self.assertIs(serve.MODEL_PRICE_BANDS, config.MODEL_PRICE_BANDS)
+        self.assertIs(serve.STANDING_SAFE_DOMAINS, config.STANDING_SAFE_DOMAINS)
+        self.assertIs(serve.TREG_ENDPOINT_COSTS, config.TREG_ENDPOINT_COSTS)
+        self.assertIs(serve._SECRET_PATTERNS, config.SECRET_PATTERNS)
+        self.assertIs(serve._TIER_GATE_CRITERIA, config.TIER_GATE_CRITERIA)
+
+
+class ToolDescriptionOverridesTest(unittest.TestCase):
+    """world/tool_descriptions.json is an override layer over the inline tool
+    text in serve.py: editing a description needs no code change, and removing
+    an entry restores the shipped text."""
+
+    NAMES = ('browse_page', 'search_web', 'api_call', 'policy_edit')
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='think tank-tools-test-')
+        self._path = os.path.join(self._tmp, 'tool_descriptions.json')
+        self._patch = unittest.mock.patch.object(
+            config, 'TOOL_DESCRIPTIONS_PATH', self._path)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        config.reload_policy_config()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _write(self, descriptions):
+        with open(self._path, 'w', encoding='utf-8') as f:
+            json.dump({'descriptions': descriptions}, f)
+
+    def _served(self, name):
+        import serve
+        return next(t['function']['description'] for t in serve.AGENT_ASK_TOOLS
+                    if t['function']['name'] == name)
+
+    def test_shipped_file_covers_the_offered_tools(self):
+        import serve
+        shipped = os.path.join(os.path.dirname(config.__file__), 'tool_descriptions.json')
+        with open(shipped, encoding='utf-8') as f:
+            descriptions = json.load(f)['descriptions']
+        offered = {t['function']['name'] for t in serve.AGENT_ASK_TOOLS}
+        self.assertLessEqual(offered, set(descriptions))
+
+    def test_override_reaches_the_served_tool_and_removal_restores_it(self):
+        import serve
+        original = self._served('browse_page')
+        self._write({'browse_page': 'Use this to read one exact page.'})
+        config.reload_policy_config()
+        self.assertEqual(self._served('browse_page'), 'Use this to read one exact page.')
+
+        self._write({})
+        config.reload_policy_config()
+        self.assertEqual(self._served('browse_page'), original)
+
+    def test_malformed_entries_are_dropped(self):
+        self._write({'browse_page': '', 'search_web': 7, 'api_call': '   '})
+        config.reload_policy_config()
+        self.assertEqual(config.TOOL_DESCRIPTIONS, {})
+
+    def test_unknown_names_are_harmless(self):
+        # Kept in the map (a tool may be added later) but never applied to
+        # anything that is offered today.
+        import serve
+        self._write({'no_such_tool': 'x'})
+        config.reload_policy_config()
+        self.assertEqual(config.TOOL_DESCRIPTIONS, {'no_such_tool': 'x'})
+        self.assertTrue(all(t['function']['name'] != 'no_such_tool'
+                            for t in serve.AGENT_ASK_TOOLS))
+
+    def test_missing_file_leaves_inline_text_untouched(self):
+        import serve
+        original = self._served('browse_page')
+        config.reload_policy_config()
+        self.assertEqual(self._served('browse_page'), original)
+
+    def test_reload_mutates_the_live_dict_in_place(self):
+        ref = config.TOOL_DESCRIPTIONS
+        self._write({'browse_page': 'Edited.'})
+        config.reload_policy_config()
+        self.assertIs(config.TOOL_DESCRIPTIONS, ref)
+        self.assertEqual(ref, {'browse_page': 'Edited.'})
+
+
+class ActionTaxonomyTest(unittest.TestCase):
+    """world/actions.json feeds ceremony/progress/rework accounting and the
+    /api/log filter. The passport hash-chain list stays in serve.py."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='think tank-actions-test-')
+        self._path = os.path.join(self._tmp, 'actions.json')
+        self._patch = unittest.mock.patch.object(config, 'ACTIONS_PATH', self._path)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        config.reload_policy_config()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _write(self, data):
+        with open(self._path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+
+    def test_shipped_file_matches_defaults(self):
+        config.reload_policy_config()
+        self.assertEqual(config.CEREMONY_ACTIONS, list(config.CEREMONY_ACTIONS_DEFAULT))
+        self.assertEqual(config.PROGRESS_ACTIONS, list(config.PROGRESS_ACTIONS_DEFAULT))
+        self.assertEqual(config.REWORK_ACTIONS, list(config.REWORK_ACTIONS_DEFAULT))
+        self.assertEqual(config.API_LOG_ALLOWED_ACTIONS,
+                         set(config.API_LOG_ALLOWED_ACTIONS_DEFAULT))
+
+    def test_edit_applies_live_to_serve_without_rebinding(self):
+        import serve
+        ceremony_ref = config.CEREMONY_ACTIONS
+        api_log_ref = config.API_LOG_ALLOWED_ACTIONS
+        self._write({'ceremony_actions': ['new_ceremony'],
+                     'progress_actions': ['new_progress'],
+                     'rework_actions': ['new_rework'],
+                     'api_log_allowed_actions': ['new_log']})
+        config.reload_policy_config()
+        self.assertIs(config.CEREMONY_ACTIONS, ceremony_ref)
+        self.assertIs(config.API_LOG_ALLOWED_ACTIONS, api_log_ref)
+        self.assertEqual(serve._CEREMONY_ACTIONS, ['new_ceremony'])
+        self.assertEqual(serve._PROGRESS_ACTIONS, ['new_progress'])
+        self.assertEqual(serve._REWORK_ACTIONS, ['new_rework'])
+        self.assertEqual(serve._API_LOG_ALLOWED_ACTIONS, {'new_log'})
+
+    def test_empty_section_keeps_its_default(self):
+        self._write({'ceremony_actions': [], 'api_log_allowed_actions': ['']})
+        config.reload_policy_config()
+        self.assertEqual(config.CEREMONY_ACTIONS, list(config.CEREMONY_ACTIONS_DEFAULT))
+        self.assertEqual(config.API_LOG_ALLOWED_ACTIONS,
+                         set(config.API_LOG_ALLOWED_ACTIONS_DEFAULT))
+
+    def test_hashed_actions_stay_in_the_kernel(self):
+        import serve
+        config.reload_policy_config()
+        self.assertTrue(serve._HASHED_ACTIONS)
+        self.assertFalse(hasattr(config, 'HASHED_ACTIONS'))
+
+
+class VillagePolicyOverlaysTest(unittest.TestCase):
+    """endpoint_policy.json, rooms.json and seed_profiles.json are overlay
+    files: they extend or override the kernel defaults and can never shrink
+    the kernel's dormancy safety set."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp(prefix='think tank-village-test-')
+        self._patch = unittest.mock.patch.multiple(
+            config,
+            ENDPOINT_POLICY_PATH=os.path.join(self._tmp, 'endpoint_policy.json'),
+            ROOMS_PATH=os.path.join(self._tmp, 'rooms.json'),
+            SEED_PROFILES_PATH=os.path.join(self._tmp, 'seed_profiles.json'),
+        )
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        config.reload_policy_config()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _write(self, name, data):
+        with open(os.path.join(self._tmp, name), 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+
+    def test_endpoint_extras_are_additive(self):
+        import serve
+        kernel_reads = set(serve._NON_WAKING_READS_BASE)
+        self._write('endpoint_policy.json', {
+            'extra_non_waking_reads': ['/api/new-board', 'not-a-path', ''],
+            'extra_non_waking_writes': ['/api/new-ping']})
+        config.reload_policy_config()
+        self.assertLessEqual(kernel_reads, serve._NON_WAKING_READS)
+        self.assertIn('/api/new-board', serve._NON_WAKING_READS)
+        self.assertNotIn('not-a-path', serve._NON_WAKING_READS)
+        self.assertEqual(serve._NON_WAKING_WRITES,
+                         {'/api/device/checkin', '/api/new-ping'})
+
+    def test_room_override_merges_and_delegatable_replaces(self):
+        import serve
+        base = dict(serve._ROOM_DEFINITION_DEFAULTS['observatory'])
+        self._write('rooms.json', {
+            'definitions': {'observatory': {'purpose': 'Edited purpose.'}},
+            'delegatable': ['observatory']})
+        config.reload_policy_config()
+        self.assertEqual(serve._DEFAULT_ROOM_DEFINITIONS['observatory'],
+                         {'label': base['label'], 'purpose': 'Edited purpose.'})
+        self.assertEqual(serve._DELEGATABLE_ROOMS, ['observatory'])
+
+    def test_empty_room_file_keeps_kernel_rooms(self):
+        import serve
+        config.reload_policy_config()
+        self.assertEqual(serve._DEFAULT_ROOM_DEFINITIONS,
+                         serve._ROOM_DEFINITION_DEFAULTS)
+        self.assertEqual(serve._DELEGATABLE_ROOMS, serve._DELEGATABLE_ROOMS_DEFAULTS)
+
+    def test_seed_profile_override_and_default(self):
+        import serve
+        self._write('seed_profiles.json', {
+            'profiles': {'Research': {'mission': 'Edited mission.',
+                                      'instructions': ['Do the edited thing.']}},
+            'default': {'mission': 'Edited fallback.'}})
+        config.reload_policy_config()
+        self.assertEqual(serve._SEED_PROFILES['Research'],
+                         {'mission': 'Edited mission.',
+                          'instructions': ['Do the edited thing.'], 'notes': []})
+        self.assertEqual(serve._DEFAULT_PROFILE['mission'], 'Edited fallback.')
+        # Untouched roles keep their kernel profile.
+        self.assertEqual(serve._SEED_PROFILES['Banking']['mission'],
+                         serve._SEED_PROFILE_DEFAULTS['Banking']['mission'])
+
+    def test_empty_seed_file_restores_kernel_profiles(self):
+        import serve
+        config.reload_policy_config()
+        self.assertEqual(serve._SEED_PROFILES, serve._SEED_PROFILE_DEFAULTS)
+        self.assertEqual(serve._DEFAULT_PROFILE, serve._DEFAULT_PROFILE_BASE)
+
+    def test_invalid_profile_entries_are_dropped(self):
+        self._write('seed_profiles.json', {
+            'profiles': {'Research': {'mission': ''}, 'Bad': 'nope'}})
+        config.reload_policy_config()
+        self.assertEqual(config.SEED_PROFILE_OVERRIDES, {})
+
+
+class EnvReloadTableTest(unittest.TestCase):
+    """The .env reload table lives in env_reload.py; serve imports it and the
+    reload loop still honors a patched serve._ENV_RELOAD_FIELDS."""
+
+    def test_table_covers_the_budget_and_memory_keys(self):
+        import env_reload
+        for key in ('SPEND_CAP_USD', 'OPENROUTER_API_KEY', 'MEMORY_ENABLED',
+                    'BROWSE_ALLOWLIST_DOMAINS', 'TTC_BEST_OF'):
+            self.assertIn(key, env_reload.ENV_RELOAD_FIELDS)
+
+    def test_patched_table_is_still_honored_by_serve(self):
+        import serve
+        with unittest.mock.patch.object(serve, '_ENV_RELOAD_FIELDS',
+                                        {'SPEND_CAP_USD': lambda e: 123.0}):
+            out = serve._reload_env_config()
+        self.assertIn('SPEND_CAP_USD', out['changed'])
+        self.assertEqual(serve.SPEND_CAP_USD, 123.0)

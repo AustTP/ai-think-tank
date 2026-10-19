@@ -1,5 +1,5 @@
 {
-  "comment": "Categories that ALWAYS block a browse/execute/save regardless of the agent's stated purpose (BROWSE_BLOCK_CATEGORIES). Operator-edited: relevance to assigned work never overrides a blocked category.",
+  "comment": "Categories that ALWAYS block a browse/execute/save regardless of the agent's stated purpose (BROWSE_BLOCK_CATEGORIES), plus the curated READ-ONLY reference hosts that skip the Jev classify round trip (STANDING_SAFE_DOMAINS). Operator-edited: relevance never overrides a blocked category, and a standing host is reachable to read, never as standing write surface.",
   "block_categories": [
     "child sexual abuse material or content sexualizing minors in any way",
     "illegal drug or weapons marketplaces, or instructions for making weapons/explosives",
@@ -9,5 +9,29 @@
     "fraud, scams, or phishing",
     "terrorism or violent extremist content",
     "pirated copyrighted media distribution"
+  ],
+  "standing_safe_domains": [
+    "wikipedia.org",
+    "wikimedia.org",
+    "wiktionary.org",
+    "wikidata.org",
+    "arxiv.org",
+    "biorxiv.org",
+    "medrxiv.org",
+    "plos.org",
+    "developer.mozilla.org",
+    "docs.python.org",
+    "docs.rs",
+    "learn.microsoft.com",
+    "developer.apple.com",
+    "go.dev",
+    "bbc.com",
+    "bbc.co.uk",
+    "reuters.com",
+    "apnews.com",
+    "npr.org",
+    "theguardian.com",
+    "gov",
+    "edu"
   ]
 }

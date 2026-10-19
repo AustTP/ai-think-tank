@@ -45,6 +45,8 @@ agents/teams/*/shared/
 
 # Transient runtime state
 escalations.json
+# Inbound webhook events (webhook consumer tail-regenerates its own view)
+webhooks.jsonl
 # Server/test-runner logs and coverage residue
 *.log
 *.log.*

@@ -1,0 +1,8 @@
+{
+  "comment": "Credential shapes scrubbed from anything written to the action log, wiki, or reports (SECRET_PATTERNS). Each entry is a Python regular expression. A missing shape means a leaked key lands in the log verbatim.",
+  "secret_patterns": [
+    "sk-[a-zA-Z0-9_-]{16,}",
+    "(?i)(api[_-]?key|secret|password|token)\\s*[:=]\\s*\\S+",
+    "AKIA[0-9A-Z]{16}"
+  ]
+}

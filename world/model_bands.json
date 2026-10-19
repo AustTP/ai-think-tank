@@ -1,0 +1,55 @@
+{
+  "comment": "Model tier facts (MODEL_PRICE_BANDS / MODEL_BAND_PURPOSE / BAND_BENCHMARK / BAND_QUALITY_FLOOR_GAP / TIER_GATE_CRITERIA). Operator-edited: prices and benchmark names drift, so re-tune here instead of editing serve.py. Price bands are USD per million blended tokens; benchmark entries are ordered fallback chains.",
+  "price_bands": {
+    "low": [
+      0,
+      0.5
+    ],
+    "mid": [
+      0.5,
+      5
+    ],
+    "high": [
+      5,
+      50
+    ]
+  },
+  "band_purpose": {
+    "low": "Routine, high-volume work: short in-character replies, simple task narration. Needs to be cheap above all else, but still coherent -- not a model too weak to follow basic instructions.",
+    "sublow": "Short, bounded test scenarios run at scale (hundreds of reenactment/testing agents): brief in-character replies, throwaway probes, simple narration. The cheapest model that is still coherent -- hard per-model price ceiling, coherence is the bar, not depth. Never for real deliverables or long-running narrative work, where the coherence loss shows.",
+    "mid": "Judgment calls: classifying report severity, generating a new hire's onboarding file, deciding what belongs in an agent's own notes. Needs real reasoning, moderate cost is fine.",
+    "coding": "Writing and reviewing real code (Code Reviewer, and any role that writes code). Correctness of generated code is the whole job here.",
+    "high": "Breaking a large, vague request into as many concrete, well-scoped subtasks as the work actually requires (never a fixed count -- a small ask may be one card, a sprawling one many) and deciding how work is distributed (assignBigTask). Runs once per real request, and every downstream call depends on this one being right -- a bad decomposition wastes everything after it, so this is the band to spend on."
+  },
+  "band_benchmark": {
+    "low": [
+      "intelligence_index",
+      "MMLU-Pro"
+    ],
+    "sublow": [
+      "intelligence_index",
+      "MMLU-Pro"
+    ],
+    "mid": [
+      "intelligence_index",
+      "MMLU-Pro"
+    ],
+    "high": [
+      "agentic_index"
+    ],
+    "coding": [
+      "coding_index"
+    ],
+    "vision": [
+      "MMMU"
+    ]
+  },
+  "quality_floor_gap": {
+    "high": 2
+  },
+  "tier_gate_criteria": {
+    "high": "High-stakes, one-shot planning or decomposition where getting it wrong wastes every downstream step (e.g. breaking one large vague request into the subtasks everything else depends on).",
+    "mid": "Needs real multi-step reasoning or judgment: synthesis, classification, summarization of gathered material, a considered in-character reply. Routine but non-trivial thinking.",
+    "low": "Routine, cheap work: a short reply, simple extraction, or a one-line note where the cheap tier is plenty."
+  }
+}

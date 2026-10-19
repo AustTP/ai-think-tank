@@ -1,0 +1,40 @@
+{
+  "comment": "Action-name taxonomies used for accounting, health, and the /api/log filter (CEREMONY_ACTIONS, PROGRESS_ACTIONS, REWORK_ACTIONS, API_LOG_ALLOWED_ACTIONS). Operator/village-edited: a new action name added in code must be listed here or the accounting silently ignores it. The passport hash chain list (_HASHED_ACTIONS) is deliberately NOT here: it is tamper-evidence enforcement and stays in serve.py.",
+  "ceremony_actions": [
+    "task_peer_widened",
+    "task_review_requeued",
+    "review_escalate",
+    "story_vetoed",
+    "escalation_unsure",
+    "escalation_approve",
+    "escalation_deny",
+    "access_request"
+  ],
+  "progress_actions": [
+    "task_completed",
+    "product_released",
+    "sprint_closed",
+    "artifact_published",
+    "spike_promoted",
+    "library_promote"
+  ],
+  "rework_actions": [
+    "task_review_requeued",
+    "story_vetoed",
+    "review_escalate",
+    "task_peer_widened"
+  ],
+  "api_log_allowed_actions": [
+    "big_task_delegated",
+    "firing_review",
+    "handoff",
+    "hire",
+    "hire_blocked_at_cap",
+    "mail_sent",
+    "media_digest_filed",
+    "pair_programming",
+    "task_assigned",
+    "task_completed",
+    "work_item_abandoned"
+  ]
+}

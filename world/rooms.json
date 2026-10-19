@@ -1,0 +1,5 @@
+{
+  "comment": "Room seed overrides (label/purpose) merged over the kernel definitions per room, and an optional delegatable room list. Edit one room without touching serve.py; the kernel text remains the fallback for every room not listed here.",
+  "definitions": {},
+  "delegatable": []
+}

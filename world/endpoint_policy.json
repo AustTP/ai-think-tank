@@ -1,0 +1,5 @@
+{
+  "comment": "Endpoints that stay silent while the tank is dormant, ADDED to the kernel's safe set (never replacing it): a new read endpoint listed here does not wake the tank, and a new telemetry POST listed here lands while asleep. Operator/village-edited.",
+  "extra_non_waking_reads": [],
+  "extra_non_waking_writes": []
+}

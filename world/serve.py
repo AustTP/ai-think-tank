@@ -130,6 +130,134 @@ from bank import (  # noqa: E402,F401
     _think_tank_spend_cap_exceeded,
     _village_spend_view,
 )
+# The curated RSS/ATOM aggregator (see DESIGN.md "Current events"). Extracted
+# into rss.py the same way: the poll loop, tolerant parser, ring buffer, and
+# operator-managed feed registry are re-exported here so the routes, the
+# read_rss_feed tool, and the lifespan wiring keep calling `serve._rss_*`.
+from rss import (  # noqa: E402,F401
+    _RSS_BUFFER,
+    _RSS_BUFFER_LOCK,
+    _RSS_BUFFER_MAX_PER_FEED,
+    _RSS_FEED_SEED,
+    _RSS_FEEDS,
+    _RSS_FEEDS_LOAD_ERROR,
+    _RSS_FETCH_TIMEOUT_S,
+    _RSS_HTTP_HEADERS,
+    _RSS_STATUS,
+    _RSS_WINDOW_S,
+    _fetch_feed_sync,
+    _load_rss_feeds,
+    _parse_rss_atom_xml,
+    _probe_rss_url,
+    _rss_feed_row_to_spec,
+    _rss_feed_spec_to_row,
+    _rss_feed_upsert,
+    _rss_ingest,
+    _rss_match_topics,
+    _rss_poll_loop,
+    _rss_recent,
+    _seed_rss_feeds_if_empty,
+    _validate_rss_feed_spec,
+)
+# The generic WebSocket feed collector (see DESIGN.md "WebSocket feeds").
+# Kraken and AISStream are registered data, not code; the descriptor language
+# and the supervisor live in ws.py and are re-exported here so /api/ws/*, the
+# read_ais_feed tool, and the lifespan wiring keep using `serve._ws_*`.
+from ws import (  # noqa: E402,F401
+    _WS_BUFFERS,
+    _WS_FEED_SEED,
+    _WS_FEEDS,
+    _WS_FEEDS_LOAD_ERROR,
+    _WS_LOCK,
+    _WS_TASKS,
+    _kraken_normalize_pair,
+    _load_ws_feeds,
+    _seed_ws_feeds_if_empty,
+    _validate_ws_feed_spec,
+    _ws_collector_loop,
+    _ws_extract_frame,
+    _ws_feed_row_to_spec,
+    _ws_feed_spec_to_row,
+    _ws_feed_upsert,
+    _ws_ingest,
+    _ws_latest,
+    _ws_recent,
+    _ws_resolve_path,
+    _ws_status,
+    _ws_substitute,
+    _ws_subscribe_payload,
+    _ws_supervisor_loop,
+)
+# Inbound webhook intake (see DESIGN.md "Inbound loom requests"). The channel
+# registry, goal formatter, self-activity gate, and consumer loop live in
+# webhooks.py; the endpoint in this file stays a pure sink.
+from webhooks import (  # noqa: E402,F401
+    CHANNELS as WEBHOOK_CHANNEL_SPECS,
+    WEBHOOK_CHANNELS,
+    _WEBHOOK_POLL_INTERVAL_S,
+    _WEBHOOK_SEEN,
+    _webhook_channel_enabled,
+    _webhook_channel_spec,
+    _webhook_goal_text,
+    _webhook_handle_entry,
+    _webhook_poll_loop,
+    _webhook_read_new,
+    _webhook_seed_seen,
+    _webhook_seen_key,
+    _webhook_self_mention,
+    active_webhook_channels,
+)
+# Live-reloadable .env field table (see env_reload.py). The reload loop below
+# reads serve._ENV_RELOAD_FIELDS, so tests that patch that name still work.
+from env_reload import ENV_RELOAD_FIELDS as _ENV_RELOAD_FIELDS, _env_flag  # noqa: E402,F401
+
+# The api_call service registry, channel routing, credential injection, and
+# per-service daily call budget (see DESIGN.md "Generic api_call"). The gates
+# and the execution path stay here; the config half lives in apis.py.
+from apis import (  # noqa: E402,F401
+    MULLVAD_TOKEN_REFRESH_MARGIN_S,
+    OAUTH2_REFRESH_MARGIN_S,
+    _API_CHANNELS,
+    _API_CHANNELS_LOAD_ERROR,
+    _API_SERVICE_COLUMNS,
+    _API_SERVICE_JSON_COLUMNS,
+    _API_SERVICES,
+    _API_SERVICES_FINGERPRINT,
+    _API_SERVICES_FRESH_CHECK,
+    _API_SERVICES_LOAD_ERROR,
+    _API_SERVICES_REFRESH_TTL_S,
+    _MULLVAD_TOKEN_CACHE,
+    _MULLVAD_TOKEN_LOCK,
+    _OAUTH2_TOKEN_CACHE,
+    _OAUTH2_TOKEN_LOCK,
+    _api_accrue_daily_call,
+    _api_apply_auth,
+    _api_backend_url,
+    _api_base_url,
+    _api_channel_for_host,
+    _api_credential_value,
+    _api_daily_calls_day,
+    _api_daily_calls_exceeded,
+    _api_daily_calls_ledger_read,
+    _api_daily_calls_ledger_write,
+    _api_daily_calls_used,
+    _api_service_for_host,
+    _api_service_path_allowed,
+    _api_service_row_to_spec,
+    _api_service_spec_to_row,
+    _api_service_upsert,
+    _approve_api_service_proposal,
+    _ensure_api_services_fresh,
+    _index_api_service,
+    _load_api_channels,
+    _load_api_services,
+    _mullvad_access_token,
+    _mullvad_token_request_sync,
+    _oauth2_access_token,
+    _oauth2_token_request_sync,
+    _seed_api_services_if_empty,
+    _validate_api_service_spec,
+)
 from notify import (  # noqa: E402,F401
     GMAIL_SMTP,
     GMAIL_SMTP_HOST,
@@ -222,16 +350,48 @@ from jev_grants import (  # noqa: E402,F401
 # etc. (see world/config.py for load discipline).
 from config import (  # noqa: E402,F401
     ALLOW_WATCHLIST_WRITE,
+    API_LOG_ALLOWED_ACTIONS,
+    NON_WAKING_READS_EXTRA,
+    NON_WAKING_WRITES_EXTRA,
+    ROOM_DELEGATABLE_OVERRIDES,
+    ROOM_DEFINITION_OVERRIDES,
+    SEED_DEFAULT_PROFILE_OVERRIDE,
+    SEED_PROFILE_OVERRIDES,
+    CEREMONY_ACTIONS,
+    BAND_BENCHMARK,
+    BAND_QUALITY_FLOOR_GAP,
     BROWSE_BLOCK_CATEGORIES,
+    MODEL_BAND_PURPOSE,
+    MODEL_PRICE_BANDS,
     PLAIN_WRITING_BAN_LIST,
+    PROGRESS_ACTIONS,
     RESEARCH_WATCHLIST,
+    REWORK_ACTIONS,
     ROOT,
+    SECRET_PATTERNS,
+    STANDING_SAFE_DOMAINS,
+    TIER_GATE_CRITERIA,
+    TOOL_DESCRIPTIONS,
+    TREG_ENDPOINT_COSTS,
+    ON_RELOAD_HOOKS,
     bind_policy,
     get_grants_config,
     get_operator_policy,
     note_watchlist_topic,
     reload_policy_config,
 )
+
+# Original private names kept so existing call sites and the redaction tests
+# stay byte-identical; the objects themselves are the config module's live
+# containers, so an operator reload updates them in place.
+_SECRET_PATTERNS = SECRET_PATTERNS
+_TIER_GATE_CRITERIA = TIER_GATE_CRITERIA
+# Accounting taxonomies are operator data in world/actions.json; these aliases
+# are the same live containers, so a policy reload updates them in place.
+_CEREMONY_ACTIONS = CEREMONY_ACTIONS
+_PROGRESS_ACTIONS = PROGRESS_ACTIONS
+_REWORK_ACTIONS = REWORK_ACTIONS
+_API_LOG_ALLOWED_ACTIONS = API_LOG_ALLOWED_ACTIONS
 
 # JEV decision engine (Phase 0c self-modification split): the modifiable
 # engine lives in jev.py; these re-exports keep every serve.X call site and
@@ -367,96 +527,6 @@ def _load_env():
     return env
 
 
-def _env_flag(value, default='true'):
-    return str(value or default).strip().lower() != 'false'
-
-
-# The env settings that can be rebound live without a restart. Each entry is a
-# loader (env -> value) matching the SAME formula the import-time globals used,
-# so a reload applies a new .env exactly as a reboot would for these names.
-# Consumers read the module globals at call time (e.g. _call_openrouter_sync
-# reads serve.OPENROUTER_API_KEY), so rebinding takes effect immediately. A
-# per-name loader means one malformed value fails only that name. Still
-# restart-only: TELEGRAM_* (the bridge holds its own membership set built at
-# import), SEED_* (roster seeds are boot-only), and the GOOGLE_*_RATE_PER_MIN
-# values (rebuilt in place below via _reload_google_rate_limits).
-_ENV_RELOAD_FIELDS = {
-    'OPENROUTER_API_KEY': lambda e: e.get('OPENROUTER_API_KEY'),
-    'TAVILY_API_KEY': lambda e: e.get('TAVILY_API_KEY'),
-    'GITHUB_TOKEN': lambda e: e.get('GITHUB_TOKEN'),
-    'APIFY_API_KEY': lambda e: e.get('APIFY_API_KEY'),
-    'HIGGSFIELD_API_KEY_ID': lambda e: e.get('HIGGSFIELD_API_KEY_ID'),
-    'HIGGSFIELD_API_KEY_SECRET': lambda e: e.get('HIGGSFIELD_API_KEY_SECRET'),
-    'OPEN_SKY_CLIENT_ID': lambda e: e.get('OPEN_SKY_CLIENT_ID'),
-    'OPEN_SKY_CLIENT_SECRET': lambda e: e.get('OPEN_SKY_CLIENT_SECRET'),
-    'AISSTREAM_API_KEY': lambda e: e.get('AISSTREAM_API_KEY'),
-    'HF_TOKEN': lambda e: e.get('HF_TOKEN'),
-    'SPEND_CAP_USD': lambda e: float(e.get('SPEND_CAP_USD', '50') or 0),
-    'AGENT_SPEND_CAP_USD': lambda e: float(e.get('AGENT_SPEND_CAP_USD', '0') or 0),
-    'OPENROUTER_MONTHLY_BUDGET_USD': lambda e: float(e.get('OPENROUTER_MONTHLY_BUDGET_USD', '0') or 0),
-    'PAGE_REQUEST_MONTHLY_BUDGET': lambda e: int(e.get('PAGE_REQUEST_MONTHLY_BUDGET', '1000') or 1000),
-    'HIGH_TIER_MONTHLY_BUDGET_USD': lambda e: float(e.get('HIGH_TIER_MONTHLY_BUDGET_USD', '0') or 0),
-    'HIGH_TIER_MAX_PRICE_USD': lambda e: float(e.get('HIGH_TIER_MAX_PRICE_USD', '0') or 0),
-    'CODING_TIER_MAX_PRICE_USD': lambda e: float(e.get('CODING_TIER_MAX_PRICE_USD', '0') or 0),
-    'VISION_TIER_MAX_PRICE_USD': lambda e: float(e.get('VISION_TIER_MAX_PRICE_USD', '0') or 0),
-    'SUBLOW_TIER_MAX_PRICE_USD': lambda e: float(e.get('SUBLOW_TIER_MAX_PRICE_USD', '0.09') or 0),
-    'APIFY_MONTHLY_BUDGET_USD': lambda e: float(e.get('APIFY_MONTHLY_BUDGET_USD', '5') or 0),
-    'COLAB_MONTHLY_UNITS': lambda e: float(e.get('COLAB_MONTHLY_UNITS', '0') or 0),
-    'DECISION_CACHE_TTL_S': lambda e: float(e.get('DECISION_CACHE_TTL_S', '3600') or 0),
-    'DECISION_KEY_WINDOW_S': lambda e: float(e.get('DECISION_KEY_WINDOW_S', str(7 * 24 * 3600)) or (7 * 24 * 3600)),
-    'JEV_MODEL': lambda e: e.get('JEV_MODEL', 'typesafe/jev-1.13'),
-    'JEV_JUDGE_MODEL': lambda e: (e.get('JEV_JUDGE_MODEL') or '').strip() or None,
-    'API_CALL_ENABLED': lambda e: _env_flag(e.get('API_CALL_ENABLED', 'true')),
-    'BROWSING_ENABLED': lambda e: _env_flag(e.get('AGENT_BROWSING_ENABLED', 'true')),
-    'EXECUTION_ENABLED': lambda e: _env_flag(e.get('AGENT_EXECUTION_ENABLED', 'true')),
-    'PLAYER_EMAIL_ENABLED': lambda e: _env_flag(e.get('PLAYER_EMAIL_ENABLED', 'true')),
-    # Sandbox execution mode + the sandbox egress allowlist. Rebinding the
-    # allowlist also refreshes the egress proxy (see _reload_env_config).
-    'SANDBOX_EXECUTION': lambda e: e.get('SANDBOX_EXECUTION', 'local').strip().lower(),
-    'BROWSE_ALLOWLIST_DOMAINS': lambda e: {d.strip().lower() for d in
-                                           (e.get('BROWSE_ALLOWLIST_DOMAINS', '') or '').split(',') if d.strip()},
-    # Player notifications (read via _serve.* from notify.py).
-    'MULLVAD_ACCOUNT_NUMBER': lambda e: e.get('MULLVAD_ACCOUNT_NUMBER'),
-    'SMTP_HOST': lambda e: e.get('SMTP_HOST'),
-    'SMTP_PORT': lambda e: int(e.get('SMTP_PORT', '587') or 587),
-    'SMTP_USER': lambda e: e.get('SMTP_USER'),
-    'SMTP_PASSWORD': lambda e: e.get('SMTP_PASSWORD'),
-    'ESCALATION_EMAIL_TO': lambda e: e.get('ESCALATION_EMAIL_TO'),
-    # Default follows SELF_BASE_URL's boot value, not a hardcoded port --
-    # resolve links in escalation messages must hit THIS process, and the
-    # old localhost:8010 default silently produced dead Approve/Deny URLs
-    # whenever the real server ran elsewhere (e.g. :8937).
-    'ESCALATION_BASE_URL': lambda e: e.get('ESCALATION_BASE_URL') or e.get('SELF_BASE_URL', 'http://localhost:8010'),
-    # Publishing target (PUBLISH_REMOTE_URL is recomputed after the rebind).
-    'PUBLISH_REPO': lambda e: (e.get('AI_THINK_TANK_PUBLISH_REPO') or '').strip(),
-    # Caches + sync cadence (read at call time).
-    'AGENT_DIR_SYNC_INTERVAL_S': lambda e: float(e.get('AGENT_DIR_SYNC_INTERVAL_S', '15') or 15),
-    'DIGITALOCEAN_BALANCE_CACHE_TTL_S': lambda e: float(e.get('BALANCE_CACHE_TTL_S', '300') or 300),
-    'TREG_BALANCE_CACHE_TTL_S': lambda e: float(e.get('BALANCE_CACHE_TTL_S', '300') or 300),
-    'PIXELLAB_BALANCE_CACHE_TTL_S': lambda e: float(e.get('BALANCE_CACHE_TTL_S', '300') or 300),
-    'GOOGLE_ACCESS_TOKEN_TTL_S': lambda e: float(e.get('GOOGLE_ACCESS_TOKEN_TTL_S', '3000') or 3000),
-    'COLAB_ENABLED': lambda e: str(e.get('COLAB_ENABLED', '1') or '1').lower() not in ('0', 'false', 'no'),
-    'COLAB_STANDBY_ENABLED': lambda e: str(e.get('COLAB_STANDBY_ENABLED', '') or '').lower() in ('1', 'true', 'yes'),
-    'COLAB_FREE_TIER': lambda e: str(e.get('COLAB_FREE_TIER', '') or '').lower() in ('1', 'true', 'yes'),
-    # TTC cap: the clamp depends on both names, so TTC_BEST_OF is loaded here
-    # and TTC_MAX_BEST_OF is recomputed in _reload_env_config after it.
-    'TTC_BEST_OF': lambda e: max(2, min(int(e.get('TTC_BEST_OF', '2') or 2), int(e.get('TTC_MAX_BEST_OF', '3') or 3))),
-    # Conversation memory (read via serve.* from memory.py at call time).
-    'MEMORY_ENABLED': lambda e: _env_flag(e.get('MEMORY_ENABLED', 'true')),
-    'STM_MAX_TURNS': lambda e: int(e.get('STM_MAX_TURNS', '40') or 40),
-    'STM_MAX_TOKENS': lambda e: int(e.get('STM_MAX_TOKENS', '8000') or 8000),
-    'STM_TTL_HOURS': lambda e: int(e.get('STM_TTL_HOURS', '168') or 168),
-    'LTM_MAX_RECALL': lambda e: int(e.get('LTM_MAX_RECALL', '5') or 5),
-    'LTM_MAX_PER_SESSION': lambda e: int(e.get('LTM_MAX_PER_SESSION', '200') or 200),
-    'LTM_EXTRACT_EVERY_TURNS': lambda e: int(e.get('LTM_EXTRACT_EVERY_TURNS', '6') or 6),
-    'LTM_MIN_CONFIDENCE': lambda e: float(e.get('LTM_MIN_CONFIDENCE', '0.3') or 0.3),
-    'LTM_MAX_AGE_DAYS': lambda e: int(e.get('LTM_MAX_AGE_DAYS', '180') or 180),
-    'LTM_CONSOLIDATE_ENABLED': lambda e: e.get('LTM_CONSOLIDATE_ENABLED', 'true') not in ('0', 'false', 'False'),
-    'LTM_CONSOLIDATE_EVERY_TURNS': lambda e: int(e.get('LTM_CONSOLIDATE_EVERY_TURNS', '12') or 12),
-    'LTM_CONSOLIDATE_MAX_CLUSTERS': lambda e: int(e.get('LTM_CONSOLIDATE_MAX_CLUSTERS', '4') or 4),
-}
-
-
 def _reload_google_rate_limits(env):
     """Rebuild the Google per-minute rate ceilings IN PLACE from .env. The
     dict is read at call time by the limiter, so mutating it takes effect
@@ -539,6 +609,17 @@ def _reload_env_config():
 # exactly the kind of thing that must never be publicly fetchable.
 SANDBOXES_DIR = os.path.join(THINK_TANK_DIR, 'sandboxes')
 ESCALATIONS_PATH = os.path.join(THINK_TANK_DIR, 'escalations.json')
+# Inbound loom requests (/api/webhook/{channel} below): one JSON line per
+# relayed event, each tagged with the channel that produced it (x-mention is
+# the Gmail-watcher channel for X notification emails; future watchers -- a
+# phone-forwarder, a GitHub bot -- just pick a new channel name, no server
+# changes). Kept outside world/ for the same reason as sandboxes/ -- the
+# agent-facing evidence of what a human asked for must never be statically
+# servable.
+WEBHOOKS_PATH = os.path.join(THINK_TANK_DIR, 'webhooks.jsonl')
+# The channels a webhook can write to live with their goal formatter and
+# self-activity gate in webhooks.py (CHANNELS); adding an integration is adding
+# one descriptor there, not a change here.
 # Draft-failure ledger + rule proposals: the human-in-the-loop rule book (see
 # DESIGN.md "Failure taxonomy and rule mining"). `failures.json` is the sorted
 # raw material -- one classified failure per review/QA send-back. The weekly
@@ -2074,7 +2155,7 @@ def _default_roster_definitions():
 # definition stays readable and additive. Fallback stays the generic line
 # for any role without a bespoke entry, so adding a roster role can never
 # crash the seed.
-_SEED_PROFILES = {
+_SEED_PROFILE_DEFAULTS = {
     'Research': {
         'mission': 'Investigate assigned topics from primary sources and file grounded research briefs the think tank can act on.',
         'instructions': [
@@ -2141,11 +2222,43 @@ _SEED_PROFILES = {
     },
 }
 
-_DEFAULT_PROFILE = {
+_DEFAULT_PROFILE_BASE = {
     'mission': 'Support the think tank in this role.',
     'instructions': ["Check in with an admin if you're unsure what to prioritize."],
     'notes': [],
 }
+
+_SEED_PROFILES = {}
+_DEFAULT_PROFILE = {}
+
+
+def _merge_profile(base, override):
+    """Launch profile with an optional seed_profiles.json override merged in.
+    An override replaces the mission and, when supplied, the instruction list;
+    notes are always the override's (empty by default)."""
+    out = {'mission': base['mission'],
+           'instructions': list(base.get('instructions') or []),
+           'notes': list(base.get('notes') or [])}
+    if override:
+        out['mission'] = override['mission']
+        if 'instructions' in override:
+            out['instructions'] = list(override['instructions'])
+        out['notes'] = list(override.get('notes') or [])
+    return out
+
+
+def _rebuild_seed_profiles():
+    """Rebuild the live profiles from the kernel defaults + JSON overrides.
+    Mutates in place so `from serve import _SEED_PROFILES` consumers stay live."""
+    _SEED_PROFILES.clear()
+    for role, base in _SEED_PROFILE_DEFAULTS.items():
+        _SEED_PROFILES[role] = _merge_profile(base, SEED_PROFILE_OVERRIDES.get(role))
+    _DEFAULT_PROFILE.clear()
+    _DEFAULT_PROFILE.update(
+        _merge_profile(_DEFAULT_PROFILE_BASE, SEED_DEFAULT_PROFILE_OVERRIDE or None))
+
+
+_rebuild_seed_profiles()
 
 
 # ---------------------------------------------------------------------------
@@ -3254,10 +3367,7 @@ def _treg_account_balance():
 # the catalog's own stated price exactly. Prices can still drift over time
 # without this constant being updated -- re-verify before relying on it long
 # after.
-TREG_ENDPOINT_COSTS = {
-    'x.x.get-trends-by-woeid': 0.01,
-    'scrapecreators.x.v1-linkedin-search-posts': 0.00188,
-}
+# Metered endpoint prices live in world/service_costs.json (config.py).
 
 
 def _treg_call(endpoint_id, body=None, method='POST', timeout=30, query=None):
@@ -4426,18 +4536,12 @@ HEALTH_DIGEST_INTERVAL_S = 6 * 3600
 # actions that are ABOUT the work (review, escalation, veto, re-queue), not
 # actions that ARE the work. Every name below is a real action_log value
 # grepped from the call sites, not a guess at what might get logged.
-_CEREMONY_ACTIONS = ('task_peer_widened', 'task_review_requeued', 'review_escalate',
-                     'story_vetoed', 'escalation_unsure', 'escalation_approve',
-                     'escalation_deny', 'access_request')
-_PROGRESS_ACTIONS = ('task_completed', 'product_released', 'sprint_closed',
-                     'artifact_published', 'spike_promoted', 'library_promote')
 
 # Rework actions: finished work that went BACK instead of straight through --
 # the "61% of requests looped back" shape. A strict subset of ceremony: requeue,
 # veto, escalate, widen. NOT the escalation resolutions or access requests,
-# which close loops rather than open them.
-_REWORK_ACTIONS = ('task_review_requeued', 'story_vetoed', 'review_escalate',
-                   'task_peer_widened')
+# which close loops rather than open them. The name list itself lives in
+# world/actions.json (see _REWORK_ACTIONS above).
 
 
 async def _health_check_loop():
@@ -4747,11 +4851,7 @@ def _reasoning_tier_slug():
 #     everything downstream (the assign-big-task case). High is a RARE upgrade.
 # Fails CLOSED to low: on any JEV outage/error the call stays on the cheap
 # tier rather than spending up on a guess. Returns a resolved model slug.
-_TIER_GATE_CRITERIA = {
-    'high': 'High-stakes, one-shot planning or decomposition where getting it wrong wastes every downstream step (e.g. breaking one large vague request into the subtasks everything else depends on).',
-    'mid': 'Needs real multi-step reasoning or judgment: synthesis, classification, summarization of gathered material, a considered in-character reply. Routine but non-trivial thinking.',
-    'low': 'Routine, cheap work: a short reply, simple extraction, or a one-line note where the cheap tier is plenty.',
-}
+# Tier-gate criteria text lives in world/model_bands.json (config.py).
 # A genuinely low JEV confidence should not trigger a spend-up -- require the
 # chosen escalation to carry at least this confidence (mirrors JEV_SAFETY_CONFIDENCE's
 # own "don't act on weak signal" bar).
@@ -5628,6 +5728,11 @@ async def _lifespan(app):
     if TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS:
         telegram_task = asyncio.create_task(_telegram_poll_loop())
         print(f'[telegram] bridge active for {len(TELEGRAM_ALLOWED_CHAT_IDS)} allowlisted chat(s)', flush=True)
+    webhook_task = None
+    _webhook_active = active_webhook_channels()
+    if _webhook_active:
+        webhook_task = asyncio.create_task(_webhook_poll_loop())
+        print(f'[webhook] consumer active for {", ".join(_webhook_active)}', flush=True)
     ask_drain_task = asyncio.create_task(_pending_ask_drain_loop())
     avatar_task = asyncio.create_task(_avatar_loop())
     rss_task = asyncio.create_task(_rss_poll_loop())
@@ -5669,6 +5774,8 @@ async def _lifespan(app):
     tier_failure_recheck_task.cancel()
     if telegram_task is not None:
         telegram_task.cancel()
+    if webhook_task is not None:
+        webhook_task.cancel()
     ask_drain_task.cancel()
     if avatar_task is not None:
         avatar_task.cancel()
@@ -6678,6 +6785,33 @@ ADMIN_USERNAME, ADMIN_PASSWORD_SALT, ADMIN_PASSWORD_HASH, _GENERATED_PASSWORD = 
 
 DEVICE_API_KEY, _GENERATED_DEVICE_KEY = _get_or_create_device_key()
 
+# The inbound webhook key (see /api/webhook/{channel} below): external
+# watchers -- the Google Apps Script that watches the Gmail inbox for X
+# notification emails being the first -- present this bearer key on every
+# POST, the same shape as X-Device-Key above. Same "auto-generate, persist
+# to .env, surface once" convention -- the only time the plaintext is
+# printed is the first boot that generates it. One key for every channel:
+# the channel name in the URL scopes the data, not the credential.
+def _get_or_create_webhook_key():
+    env = _load_env()
+    key = env.get('WEBHOOK_API_KEY')
+    if key:
+        return key, None
+    key = secrets.token_urlsafe(24)
+    with open(os.path.join(THINK_TANK_DIR, '.env'), 'a', encoding='utf-8') as f:
+        f.write(f'\nWEBHOOK_API_KEY={key}\n')
+    return key, key  # second value set only when freshly generated
+
+WEBHOOK_API_KEY, _GENERATED_WEBHOOK_KEY = _get_or_create_webhook_key()
+
+# Our own X handle (no @, from .env): the x-mention webhook consumer (loop
+# below /api/webhook/{channel}) only files a large request when the relayed
+# notification is someone ELSE mentioning us -- the Gmail watcher relays
+# every X notification email, including our own activity, which must never
+# wake the tank. Unset = consumer disabled (loop never started), the same
+# all-or-nothing gate as the Telegram bridge.
+X_HANDLE = (_load_env().get('X_HANDLE') or '').strip().lstrip('@')
+
 
 
 # Kill switch for agent internet access -- this needs to be
@@ -7093,22 +7227,8 @@ def _effective_allowlist_domains():
 # NOT part of _effective_allowlist_domains(): the sandbox egress proxy, Colab
 # URL gate, and _is_allowlisted_host's full read+write semantics stay untouched.
 # A standing domain is reachable to READ, never as standing write surface.
-STANDING_SAFE_DOMAINS = {
-    # Reference / knowledge
-    'wikipedia.org', 'wikimedia.org', 'wiktionary.org', 'wikidata.org',
-    # Papers / science
-    'arxiv.org', 'biorxiv.org', 'medrxiv.org', 'plos.org',
-    # Docs (vendor developer documentation)
-    'developer.mozilla.org', 'docs.python.org', 'docs.rs', 'learn.microsoft.com',
-    'developer.apple.com', 'go.dev',
-    # Major public news
-    'bbc.com', 'bbc.co.uk', 'reuters.com', 'apnews.com', 'npr.org', 'theguardian.com',
-    # Public-institution suffixes: bare 'gov'/'edu' in the set means any
-    # *.gov / *.gov host subdomain matches via the endswith('.' + d) rule
-    # (nih.gov, www.energy.gov); a host must actually END in .gov/.edu to
-    # match, so attacker.gov.example.com does not.
-    'gov', 'edu',
-}
+# The list itself is operator data in world/browse_policy.json
+# (`standing_safe_domains`), loaded live by config.py.
 
 
 def _is_standing_safe_host(hostname):
@@ -7289,722 +7409,18 @@ def _work_context_clause(work_context):
 # ---- Generic api_call service registry (config, not code) ------------------
 # A new external service is added via the proposal/approval flow
 # (/api/api-service/request -> player approval -> a row in the api_services
-# table), or by seeding the table from world/api_services.json. Each entry
-# declares the base URL, where the credential lives (an .env key or the
-# vault), how auth is injected (bearer header, key-pair header, a field
-# merged into the JSON body, or the OAuth2 client-credentials flow with a
-# short-lived minted access token), the allowed paths/methods, how spend is
-# accrued (page budget, Apify USD, or a per-service daily call cap), and (for
-# the multi-step generation services) a workflow spec. The gates around these
-# entries -- SSRF, Jev classification, rate limit, one-strike, page/spend
-# accrual -- live in serve.py and are never delegated to a config row. This
-# is the DB-backed replacement for the original world/api_services.json seed
-# file: the file still seeds a fresh DB, but the runtime source of truth is
-# the table.
+# table), or by seeding the table from world/api_services.json. The registry,
+# host/path rules, credential injection and the per-service daily call budget
+# live in apis.py; the gates around them -- SSRF, Jev classification, rate
+# limit, one-strike, page/spend accrual -- stay in this file and are never
+# delegated to a config row. The JSON file still seeds a fresh DB, but the
+# runtime source of truth is the table.
 API_SERVICES_PATH = os.path.join(ROOT, 'api_services.json')
-_API_SERVICES = {}
-_API_SERVICES_LOAD_ERROR = None
-# Registry freshness: the api_services table is the operator-editable config,
-# so _ensure_api_services_fresh() re-loads _API_SERVICES when the table's
-# active-row fingerprint changes. The TTL bounds the cost to one aggregate
-# query at most every _API_SERVICES_REFRESH_TTL_S per process; a config edit
-# therefore goes live within that window, with no code change and no restart.
-_API_SERVICES_REFRESH_TTL_S = 5.0
-_API_SERVICES_FINGERPRINT = None
-_API_SERVICES_FRESH_CHECK = 0.0
-# Read-only CHANNELS: named capabilities (Reddit, Twitter/X, LinkedIn ...) that
-# map hostnames to an ORDERED backend chain. Each backend is a registered
-# service plus a url_template that rewrites the agent's requested URL ({url})
-# into that backend's fetch URL (e.g. Jina Reader's https://r.jina.ai/{url}).
-# The first backend that answers wins; the chain falls through on failure,
-# mirroring agent-reach's per-platform ordered backends. Channels are pure
-# config (JSON-only, not DB-backed): they grant no new credential on their own
-# -- every backend must be a registered service, and the requested host is
-# still SSRF-gated and Jev-judged exactly like any other unregistered GET/HEAD.
-_API_CHANNELS = {}
-_API_CHANNELS_LOAD_ERROR = None
-
-# Registry column names that hold JSON (lists/dicts) and need load-time
-# parsing; everything else is scalar.
-_API_SERVICE_JSON_COLUMNS = ('default_headers', 'methods', 'path_rules', 'workflow')
-
-_API_SERVICE_COLUMNS = (
-    'id', 'name', 'base_url', 'credential_type', 'credential_key', 'credential_key2',
-    'credential_name', 'auth_type', 'auth_value_format', 'auth_field', 'auth_token_url',
-    'auth_header_name',
-    'default_headers', 'methods', 'path_rules', 'spend_kind', 'spend_note', 'spend_cap',
-    'workflow', 'status', 'proposed_by', 'created_at', 'updated_at',
-)
 
 
-def _api_service_spec_to_row(sid, spec, status='active', proposed_by=None):
-    """Flatten a registry spec dict into a DB row dict. The spec uses the
-    same shape as the original JSON seed (see world/api_services.json), which
-    is exactly what the approval flow stores on an approved proposal."""
-    cred = (spec or {}).get('credential') or {}
-    auth = (spec or {}).get('auth') or {}
-    spend = (spec or {}).get('spend') or {}
-    now = time.time()
-    return {
-        'id': sid,
-        'name': (spec or {}).get('name') or sid,
-        'base_url': (spec or {}).get('base_url') or '',
-        'credential_type': cred.get('type') or 'env',
-        'credential_key': cred.get('key'),
-        'credential_key2': cred.get('key2'),
-        'credential_name': cred.get('name'),
-        'auth_type': auth.get('type') or 'header_bearer',
-        'auth_value_format': auth.get('value_format'),
-        'auth_field': auth.get('field'),
-        'auth_token_url': auth.get('token_url'),
-        'auth_header_name': auth.get('header_name'),
-        'default_headers': json.dumps((spec or {}).get('default_headers') or {}),
-        'methods': json.dumps((spec or {}).get('methods') or []),
-        'path_rules': json.dumps((spec or {}).get('path_rules') or []),
-        'spend_kind': spend.get('kind') or 'none',
-        'spend_note': spend.get('note'),
-        'spend_cap': spend.get('cap'),
-        'workflow': json.dumps((spec or {}).get('workflow') or None),
-        'status': status,
-        'proposed_by': proposed_by,
-        'created_at': now,
-        'updated_at': now,
-    }
-
-
-def _api_service_row_to_spec(row):
-    """Inflate a DB row back into the registry spec dict shape the runtime
-    helpers (auth injection, path rules, spend, workflow) consume."""
-    def _jget(key, default):
-        raw = row.get(key)
-        if raw in (None, ''):
-            return default
-        try:
-            return json.loads(raw)
-        except (TypeError, ValueError):
-            return default
-    return {
-        'id': row.get('id'),
-        'name': row.get('name') or row.get('id'),
-        'base_url': row.get('base_url') or '',
-        'credential': {
-            'type': row.get('credential_type') or 'env',
-            'key': row.get('credential_key'),
-            'key2': row.get('credential_key2'),
-            'name': row.get('credential_name'),
-        },
-        'auth': {
-            'type': row.get('auth_type') or 'header_bearer',
-            'value_format': row.get('auth_value_format'),
-            'field': row.get('auth_field'),
-            'token_url': row.get('auth_token_url'),
-            'header_name': row.get('auth_header_name'),
-        },
-        'default_headers': _jget('default_headers', {}),
-        'methods': _jget('methods', []),
-        'path_rules': _jget('path_rules', []),
-        'spend': {'kind': row.get('spend_kind') or 'none', 'note': row.get('spend_note'),
-                  'cap': row.get('spend_cap')},
-        'workflow': _jget('workflow', None),
-        'status': row.get('status') or 'active',
-    }
-
-
-def _seed_api_services_if_empty():
-    """First-run seed: when the api_services table has no rows, load the
-    canonical built-ins from world/api_services.json into it as 'active'."""
-    try:
-        with _db() as conn:
-            count = conn.execute('SELECT COUNT(*) FROM api_services').fetchone()[0]
-            if count:
-                return
-            if not os.path.exists(API_SERVICES_PATH):
-                return
-            with open(API_SERVICES_PATH, encoding='utf-8') as f:
-                data = json.load(f)
-            for sid, spec in (data.get('services') or {}).items():
-                row = _api_service_spec_to_row(sid, spec, status='active')
-                conn.execute(
-                    'INSERT OR IGNORE INTO api_services (' + ','.join(_API_SERVICE_COLUMNS) + ') '
-                    'VALUES (' + ','.join('?' * len(_API_SERVICE_COLUMNS)) + ')',  # nosec B608 -- column set is a fixed constant tuple, never user input
-                    [row.get(c) for c in _API_SERVICE_COLUMNS])
-    except Exception as e:
-        # A seed failure is harmless: _load_api_services() runs right after and
-        # records its own error if the table can't be read. Fall through to the
-        # JSON seed in that case.
-        print(f'[api-services] seed failed: {e}', flush=True)
-
-
-def _load_api_services():
-    """Load the active api_services rows into _API_SERVICES, keyed by service
-    id AND by the base URL's hostname (so a URL lookup by host works). Reads
-    the DB table; falls back to the JSON seed file only if the DB is not yet
-    available (module import happens before init_db). On any failure, leaves
-    the registry empty and records the error -- fail closed: an empty
-    registry means api_call only serves read-only unregistered GET/HEAD,
-    never a credentialed write."""
-    global _API_SERVICES, _API_SERVICES_LOAD_ERROR
-    _API_SERVICES = {}
-    _API_SERVICES_LOAD_ERROR = None
-    rows = None
-    try:
-        with _db() as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT " + ','.join(_API_SERVICE_COLUMNS) + " FROM api_services WHERE status = 'active'"  # nosec B608 -- column set is a fixed constant tuple
-            ).fetchall()
-    except Exception as e:
-        _API_SERVICES_LOAD_ERROR = f'db unavailable at load: {e}'
-        rows = None
-    if rows is None:
-        # DB not ready yet (import-time): fall back to the JSON seed so the
-        # runtime has a working registry before init_db runs.
-        try:
-            with open(API_SERVICES_PATH, encoding='utf-8') as f:
-                data = json.load(f)
-            for sid, spec in (data.get('services') or {}).items():
-                spec = dict(spec)
-                spec['id'] = sid
-                _index_api_service(spec)
-        except Exception as e:
-            _API_SERVICES_LOAD_ERROR = f'json seed unavailable: {e}'
-        _load_api_channels()
-        return
-    for row in rows:
-        _index_api_service(_api_service_row_to_spec(dict(row)))
-    _load_api_channels()
-
-
-def _ensure_api_services_fresh():
-    """Reload the registry from the DB when the active-row fingerprint changes,
-    so an operator's api_services row edit (add / revoke / tweak) goes live
-    without a restart. Called at the api_call chokepoint and the registry list
-    endpoint; TTL-guarded so the cost is one aggregate query per window, and
-    _load_api_services() only runs when something actually changed. On any DB
-    error, keeps the current registry -- fail closed, never a raised call."""
-    global _API_SERVICES_FINGERPRINT, _API_SERVICES_FRESH_CHECK
-    now = time.time()
-    if now - _API_SERVICES_FRESH_CHECK < _API_SERVICES_REFRESH_TTL_S:
-        return
-    _API_SERVICES_FRESH_CHECK = now
-    try:
-        with _db() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*), MAX(updated_at) FROM api_services WHERE status = 'active'"  # nosec B608 -- aggregate over a fixed table, never user input
-            ).fetchone()
-    except Exception:
-        return  # DB not ready or busy: keep the registry as-is
-    fingerprint = (row[0], row[1])
-    if fingerprint != _API_SERVICES_FINGERPRINT:
-        _API_SERVICES_FINGERPRINT = fingerprint
-        _load_api_services()
-
-
-def _load_api_channels():
-    """Load the CHANNELS (ordered read-only backend chains) from the JSON seed.
-    Channels are config-only -- never DB rows, since they grant no credential on
-    their own: every backend must be a registered service, and channel hosts are
-    still SSRF-gated and Jev-judged as unregistered GET/HEAD. Keyed by channel
-    hostname (exact + subdomain match). Fail closed: on any error, no channel
-    routes (unregistered hosts just fall back to a plain GET/HEAD)."""
-    global _API_CHANNELS, _API_CHANNELS_LOAD_ERROR
-    _API_CHANNELS = {}
-    _API_CHANNELS_LOAD_ERROR = None
-    try:
-        if not os.path.exists(API_SERVICES_PATH):
-            return
-        with open(API_SERVICES_PATH, encoding='utf-8') as f:
-            data = json.load(f)
-        for chost, chan in (data.get('channels') or {}).items():
-            if chost == 'comment' or not isinstance(chan, dict):
-                continue
-            hosts = chan.get('hosts') or []
-            backends = chan.get('backends') or []
-            if not hosts or not backends:
-                _API_CHANNELS_LOAD_ERROR = f'channel {chost} missing hosts or backends'
-                return
-            for host in hosts:
-                host = (host or '').lower().lstrip('.')
-                if not host or '.' not in host:
-                    _API_CHANNELS_LOAD_ERROR = f'channel {chost} has invalid host {host!r}'
-                    return
-                spec = dict(chan)
-                spec['id'] = chost
-                _API_CHANNELS[host] = spec
-    except Exception as e:
-        _API_CHANNELS_LOAD_ERROR = str(e)
-
-
-def _api_channel_for_host(hostname):
-    """Channel spec for a hostname (exact or subdomain of a channel host), or
-    None if no channel owns that host. Mirrors _api_service_for_host."""
-    host = (hostname or '').lower()
-    if not host:
-        return None
-    for chost, spec in _API_CHANNELS.items():
-        if host == chost or host.endswith('.' + chost):
-            return spec
-    return None
-
-
-def _api_backend_url(backend, url):
-    """Expand a channel backend's url_template against the requested URL. The
-    template is trusted config; {url} is substituted with the original URL."""
-    template = (backend or {}).get('url_template') or '{url}'
-    return template.replace('{url}', url)
-
-
-def _index_api_service(spec):
-    """Register one spec (already inflated) into the in-memory _API_SERVICES
-    map, by service id and by base hostname."""
-    base = (spec.get('base_url') or '').rstrip('/')
-    if not base:
-        return
-    sid = spec.get('id')
-    host = urllib.parse.urlparse(base).hostname
-    if host:
-        _API_SERVICES[host.lower()] = spec
-    if sid:
-        _API_SERVICES[sid] = spec
-
-
-def _api_service_upsert(spec, status='active', proposed_by=None):
-    """Persist a service spec as a row and refresh the in-memory registry.
-    Used by the approval flow when a proposal is approved (status='active')
-    and by the revoke flow (status='denied')."""
-    sid = spec.get('id')
-    row = _api_service_spec_to_row(sid, spec, status=status, proposed_by=proposed_by)
-    with _db() as conn:
-        conn.execute(
-            'INSERT INTO api_services (' + ','.join(_API_SERVICE_COLUMNS) + ') '  # nosec B608 -- column set is a fixed constant tuple, never user input
-            'VALUES (' + ','.join('?' * len(_API_SERVICE_COLUMNS)) + ') '
-            'ON CONFLICT(id) DO UPDATE SET '
-            + ','.join(f'{c}=excluded.{c}' for c in _API_SERVICE_COLUMNS if c != 'id'),
-            [row.get(c) for c in _API_SERVICE_COLUMNS])
-    _load_api_services()
-
-
-def _validate_api_service_spec(spec):
-    """Validate a proposed service spec (the shape in world/api_services.json).
-    Returns (service_id, normalized_spec, error) -- error is None when valid.
-    Security-sensitive constraints live here and are enforced again at approval
-    time, so a forged/edited proposal can never grant more than this allows:
-    public https base URL only, a known auth type, a known credential source,
-    non-empty methods + path rules, and a known spend kind."""
-    spec = spec or {}
-    sid = str(spec.get('id') or '').strip().lower()
-    if not sid or not sid.replace('_', '').replace('-', '').isalnum():
-        return None, None, 'service id must be a simple alphanumeric slug'
-    base = str(spec.get('base_url') or '').strip().rstrip('/')
-    parsed = urllib.parse.urlparse(base)
-    if parsed.scheme != 'https' or not parsed.hostname or not _is_safe_public_host(parsed.hostname):
-        return None, None, 'base_url must be a public https URL'
-    cred = spec.get('credential') or {}
-    if cred.get('type') not in ('none', 'env', 'vault'):
-        return None, None, 'credential.type must be "none", "env", or "vault"'
-    auth = spec.get('auth') or {}
-    auth_type = auth.get('type')
-    if auth_type not in ('none', 'header_bearer', 'header_key', 'body_field', 'mullvad', 'oauth2_client_credentials'):
-        return None, None, 'auth.type must be none, header_bearer, header_key, body_field, mullvad, or oauth2_client_credentials'
-    if auth_type == 'mullvad':
-        # Mullvad mints a bearer from the account number via its JSON token
-        # endpoint -- requires a public https auth.token_url and a single-part
-        # env credential (the account number; there is no client secret).
-        token_url = str(auth.get('token_url') or '').strip().rstrip('/')
-        parsed_tok = urllib.parse.urlparse(token_url)
-        if parsed_tok.scheme != 'https' or not parsed_tok.hostname or not _is_safe_public_host(parsed_tok.hostname):
-            return None, None, 'mullvad requires a public https auth.token_url'
-        if cred.get('type') != 'env' or not cred.get('key') or cred.get('key2'):
-            return None, None, 'mullvad requires a single-part env credential (the account number)'
-        auth = dict(auth)
-        auth['token_url'] = token_url
-    if auth_type == 'oauth2_client_credentials':
-        # The token endpoint the OAuth2 client-credentials flow POSTs the
-        # client id/secret pair to. It must be a public https URL (SSRF-safe,
-        # same rule as base_url) and the credential must be the two-part env
-        # pair -- a minted access token is never stored in the registry.
-        token_url = str(auth.get('token_url') or '').strip().rstrip('/')
-        parsed_tok = urllib.parse.urlparse(token_url)
-        if parsed_tok.scheme != 'https' or not parsed_tok.hostname or not _is_safe_public_host(parsed_tok.hostname):
-            return None, None, 'oauth2_client_credentials requires a public https auth.token_url'
-        if cred.get('type') != 'env' or not cred.get('key') or not cred.get('key2'):
-            return None, None, 'oauth2_client_credentials requires a two-part env credential (key = client id, key2 = client secret)'
-        auth = dict(auth)
-        auth['token_url'] = token_url
-    methods = spec.get('methods') or []
-    if not methods or not all(m in CURL_METHODS for m in methods):
-        return None, None, 'methods must be a non-empty subset of GET/POST/PUT/PATCH/DELETE/HEAD'
-    path_rules = spec.get('path_rules') or []
-    if not path_rules or not all(isinstance(r, dict) and r.get('prefix') for r in path_rules):
-        return None, None, 'path_rules must be a non-empty list of {prefix, methods} rules'
-    spend_kind = ((spec.get('spend') or {}).get('kind')) or 'none'
-    if spend_kind not in ('none', 'page_request', 'apify', 'daily_calls'):
-        return None, None, 'spend.kind must be none, page_request, apify, or daily_calls'
-    if spend_kind == 'daily_calls':
-        cap = (spec.get('spend') or {}).get('cap')
-        if not isinstance(cap, (int, float)) or cap <= 0:
-            return None, None, 'spend.kind daily_calls requires a positive numeric spend.cap'
-    normalized = dict(spec)
-    normalized['id'] = sid
-    normalized['name'] = str(spec.get('name') or sid)
-    normalized['base_url'] = base
-    normalized['auth'] = auth
-    return sid, normalized, None
-
-
-def _approve_api_service_proposal(esc):
-    """Approval side-effect for an 'api service proposal' escalation. Parses
-    the validated spec out of the escalation note, re-validates it (a forged
-    or edited note cannot grant more than the validator allows), and writes it
-    to the api_services registry as active -- the only path that registers a
-    service. Returns (ok, message)."""
-    try:
-        spec = json.loads(esc.get('note') or '{}')
-    except ValueError:
-        return False, 'the proposal note could not be read; no service was registered.'
-    sid, norm, error = _validate_api_service_spec(spec)
-    if error:
-        return False, f'the proposal is no longer valid: {error}. No service registered.'
-    _api_service_upsert(norm, status='active', proposed_by=esc.get('resolvedBy') or 'player')
-    return True, f'Service {sid} is now registered and reachable by agents.'
-
-
+# Import-time registry load so the service map exists before init_db runs;
+# apis.py falls back to the JSON seed when the DB is not ready yet.
 _load_api_services()
-
-
-def _api_base_url(host):
-    """Registry base_url for a host, or a plain https://host fallback (used by
-    the curated tool executors so the base URL comes from the registry, not a
-    hardcoded literal)."""
-    spec = _api_service_for_host(host)
-    return (spec or {}).get('base_url') or ('https://' + host)
-
-
-def _api_service_for_host(hostname):
-    """Registry spec for a hostname (exact or subdomain of a registered base
-    host), or None if unregistered."""
-    host = (hostname or '').lower()
-    if not host:
-        return None
-    for registered_host, spec in _API_SERVICES.items():
-        if '.' not in registered_host:  # a service-id key, not a host
-            continue
-        if host == registered_host or host.endswith('.' + registered_host):
-            return spec
-    return None
-
-
-def _api_service_path_allowed(spec, method, path):
-    """True when (method, path) is inside a registered service's path_rules.
-    path_rules prefixes are matched against the URL path with the base_url's
-    own path stripped first -- so an Apify base_url of https://api.apify.com/v2
-    and a rule prefix of '/actors/' both accept '/v2/actors/...' and reject
-    '/v2/users/me' unless a '/users/me' rule exists."""
-    base_path = urllib.parse.urlparse((spec or {}).get('base_url') or '').path
-    rel_path = path or '/'
-    if base_path and rel_path.startswith(base_path):
-        rel_path = rel_path[len(base_path):] or '/'
-    for rule in (spec or {}).get('path_rules') or []:
-        prefix = rule.get('prefix', '/')
-        if rel_path.startswith(prefix) and method in rule.get('methods', []):
-            return True
-    return False
-
-
-def _api_credential_value(spec):
-    """Resolve a registry entry's credential to (token, token2, error). token2
-    is the second half of a two-part key credential (Higgsfield). Resolved
-    through module globals for .env keys so tests can patch them normally,
-    and through the vault for vault-held credentials. Never returns a secret
-    the caller did not already own the right to use -- this function is the
-    single chokepoint, same as _treg_call/_pixellab_call."""
-    cred = (spec or {}).get('credential') or {}
-    ctype = cred.get('type')
-    if ctype == 'none':
-        # A keyless/free public API (Open-Meteo, ...) -- no credential to
-        # resolve, no auth to inject, and never an "unconfigured credential"
-        # block. This is the config-not-code path for free integrations.
-        return None, None, None
-    if ctype == 'env':
-        key = cred.get('key') or ''
-        # Module globals first (tests patch them and hot env reload rebinds
-        # them); a key with no module global falls back to the live .env so a
-        # brand-new service needs ZERO code changes -- just a row + a .env key.
-        token = globals().get(key)
-        if not token:
-            token = _load_env().get(key) or ''
-        key2 = cred.get('key2') or ''
-        token2 = globals().get(key2) if key2 else None
-        if key2 and not token2:
-            token2 = _load_env().get(key2) or ''
-        if not token:
-            return None, None, f'env key {key} is not set'
-        return token, token2, None
-    if ctype == 'vault':
-        name = cred.get('name') or ''
-        token = _open_secret(_credential_token(name) or '')
-        if not token:
-            return None, None, f'credential {name} is not in the vault'
-        return token, None, None
-    return None, None, 'registry entry has no credential configured'
-
-
-def _api_apply_auth(spec, token, token2, method, url, headers, body):
-    """Inject a registry credential into a request. Auth comes from the
-    registry spec, never from anything the agent supplied. Returns the
-    (url, headers, body) triple with the credential applied."""
-    auth = (spec or {}).get('auth') or {}
-    atype = auth.get('type')
-    if atype == 'header_bearer':
-        headers['Authorization'] = f'Bearer {token}'
-    elif atype == 'header_key':
-        fmt = auth.get('value_format') or 'Key {key}'
-        headers[auth.get('header_name') or 'Authorization'] = fmt.format(key=token, key2=token2)
-    elif atype == 'body_field':
-        field = auth.get('field') or 'api_key'
-        body = dict(body or {})
-        body[field] = token
-    elif atype == 'mullvad':
-        # Mullvad account API: mint a short-lived bearer from the account
-        # number via the JSON token endpoint, inject as Bearer. The minted
-        # bearer is the ONLY credential that ever rides on the actual request.
-        token_url = (auth.get('token_url') or '').strip()
-        if not token_url:
-            raise ValueError('mullvad auth requires auth.token_url')
-        bearer = _mullvad_access_token(token_url, token)
-        headers['Authorization'] = f'Bearer {bearer}'
-    elif atype == 'oauth2_client_credentials':
-        # OAuth2 client-credentials: the registry stores the CLIENT ID/SECRET
-        # pair (token = client_id, token2 = client_secret) plus the token
-        # endpoint. A short-lived access token is minted and cached in-process
-        # (never persisted, never returned to the agent), then injected as a
-        # Bearer header. The minted bearer is the ONLY credential that ever
-        # rides on the actual API request.
-        token_url = (auth.get('token_url') or '').strip()
-        if not token_url:
-            raise ValueError('oauth2_client_credentials requires auth.token_url')
-        bearer = _oauth2_access_token(token_url, token, token2)
-        headers['Authorization'] = f'Bearer {bearer}'
-    return url, headers, body
-
-
-# ---------------------------------------------------------------------------
-# OAuth2 client-credentials mint + cache. OpenSky (and other OAuth2-protected
-# APIs) take a client id/secret pair and exchange it for a SHORT-LIVED access
-# token (OpenSky: 30 minutes) -- the registry can't inject a static bearer, it
-# has to mint one. The minted token lives in a module-level cache keyed by
-# (token_url, client_id) so a long-lived think tank polls the same service all
-# day without one mint per request; it is refreshed proactively before expiry
-# and never logged, persisted, or returned to an agent. The token endpoint is
-# SSRF-gated the same way the registry base_urls are: public https only.
-# ---------------------------------------------------------------------------
-_OAUTH2_TOKEN_CACHE: dict[tuple[str, str], dict[str, object]] = {}
-_OAUTH2_TOKEN_LOCK = threading.Lock()
-OAUTH2_REFRESH_MARGIN_S = 30
-
-
-def _oauth2_token_request_sync(token_url, client_id, client_secret):
-    """POST the client-credentials grant to the token endpoint and return the
-    raw response body. Form-encoded body (OAuth2's content type), SSRF-pinned
-    like every other outbound call, redirect-final-host re-checked. Raises on
-    a non-2xx response or a redirect to a disallowed host."""
-    if not client_id or not client_secret:
-        raise ValueError('oauth2 client id/secret are not set')
-    body = urllib.parse.urlencode({
-        'grant_type': 'client_credentials',
-        'client_id': client_id,
-        'client_secret': client_secret,
-    }).encode()
-    headers = {'Content-Type': 'application/x-www-form-urlencoded',
-               'Accept': 'application/json', 'User-Agent': 'AIThinkTankAgent/1.0'}
-    req = urllib.request.Request(token_url, data=body, headers=headers, method='POST')
-    with _safe_urlopen(req, timeout=API_CALL_TIMEOUT_S) as resp:  # token URL is public-https validated at registration; _safe_urlopen pins each resolved IP so DNS cannot rebind to an internal address
-        final_url = resp.geturl()
-        final_host = urllib.parse.urlparse(final_url).hostname
-        if not _is_safe_public_host(final_host):
-            raise ValueError('oauth2 token endpoint redirected to a disallowed host')
-        raw = resp.read(API_CALL_MAX_BODY_BYTES + 1)
-    if resp.status >= 400:
-        raise ValueError(f'oauth2 token endpoint returned HTTP {resp.status}')
-    return raw.decode(errors='replace')[:API_CALL_MAX_BODY_BYTES]
-
-
-def _oauth2_access_token(token_url, client_id, client_secret):
-    """Return a valid access token for (token_url, client_id), minting and
-    caching one when the cache is empty or near expiry. Raises when the mint
-    fails so the caller (the auth-injection path) fails the request cleanly."""
-    parsed = urllib.parse.urlparse(token_url)
-    if parsed.scheme != 'https' or not parsed.hostname or not _is_safe_public_host(parsed.hostname):
-        raise ValueError('oauth2 token_url must be a public https URL')
-    cache_key = (token_url, client_id)
-    with _OAUTH2_TOKEN_LOCK:
-        cached = _OAUTH2_TOKEN_CACHE.get(cache_key)
-        if cached and time.time() + OAUTH2_REFRESH_MARGIN_S < cached['expires_at']:
-            return cached['token']
-        raw = _oauth2_token_request_sync(token_url, client_id, client_secret)
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            raise ValueError('oauth2 token endpoint returned non-JSON')
-        token = (data or {}).get('access_token')
-        if not token:
-            raise ValueError('oauth2 token endpoint returned no access_token')
-        try:
-            expires_in = float(data.get('expires_in') or 3600)
-        except (ValueError, TypeError):
-            expires_in = 3600.0
-        _OAUTH2_TOKEN_CACHE[cache_key] = {'token': token, 'expires_at': time.time() + expires_in}
-        return token
-
-
-# ---------------------------------------------------------------------------
-# Mullvad account-token mint + cache. Mullvad's account API is OAuth2-ish but
-# NOT the standard client-credentials form grant: the token endpoint is POST
-# api.mullvad.net/auth/v1/token with a JSON body {"account_number": "..."}
-# (no client secret -- the account number IS the credential), and the response
-# carries an ISO-8601 `expiry` instead of `expires_in` (confirmed live: the
-# stock form-encoded grant is 415'd, and a JSON body with "client_id" is 400'd
-# with 'Either account_number or authorization_code is required'). The minted
-# bearer is cached keyed by (token_url, account_number), refreshed proactively
-# before expiry, and never logged or returned to an agent.
-# ---------------------------------------------------------------------------
-_MULLVAD_TOKEN_CACHE: dict[tuple[str, str], dict[str, object]] = {}
-_MULLVAD_TOKEN_LOCK = threading.Lock()
-MULLVAD_TOKEN_REFRESH_MARGIN_S = 60
-
-
-def _mullvad_token_request_sync(token_url, account_number):
-    """POST the JSON {account_number} grant to Mullvad's token endpoint and
-    return the raw response body. SSRF-pinned like every other outbound call,
-    redirect-final-host re-checked, raises on a non-2xx response."""
-    if not account_number:
-        raise ValueError('mullvad account number is not set')
-    body = json.dumps({'account_number': account_number}).encode()
-    headers = {'Content-Type': 'application/json', 'Accept': 'application/json',
-               'User-Agent': 'AIThinkTankAgent/1.0'}
-    req = urllib.request.Request(token_url, data=body, headers=headers, method='POST')
-    with _safe_urlopen(req, timeout=API_CALL_TIMEOUT_S) as resp:
-        final_url = resp.geturl()
-        final_host = urllib.parse.urlparse(final_url).hostname
-        if not _is_safe_public_host(final_host):
-            raise ValueError('mullvad token endpoint redirected to a disallowed host')
-        raw = resp.read(API_CALL_MAX_BODY_BYTES + 1)
-    if resp.status >= 400:
-        raise ValueError(f'mullvad token endpoint returned HTTP {resp.status}')
-    return raw.decode(errors='replace')[:API_CALL_MAX_BODY_BYTES]
-
-
-def _mullvad_access_token(token_url, account_number):
-    """Return a valid Mullvad access token for the account number, minting and
-    caching one when the cache is empty or near expiry. Raises when the mint
-    fails so the auth-injection path fails the request cleanly."""
-    parsed = urllib.parse.urlparse(token_url)
-    if parsed.scheme != 'https' or not parsed.hostname or not _is_safe_public_host(parsed.hostname):
-        raise ValueError('mullvad token_url must be a public https URL')
-    cache_key = (token_url, account_number)
-    with _MULLVAD_TOKEN_LOCK:
-        cached = _MULLVAD_TOKEN_CACHE.get(cache_key)
-        if cached and time.time() + MULLVAD_TOKEN_REFRESH_MARGIN_S < cached['expires_at']:
-            return cached['token']
-        raw = _mullvad_token_request_sync(token_url, account_number)
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            raise ValueError('mullvad token endpoint returned non-JSON')
-        token = (data or {}).get('access_token')
-        if not token:
-            raise ValueError('mullvad token endpoint returned no access_token')
-        expires_at = time.time() + 3600.0
-        expiry = (data or {}).get('expiry')
-        if expiry:
-            try:
-                expires_at = datetime.datetime.fromisoformat(str(expiry).replace('Z', '+00:00')).timestamp()
-            except ValueError:
-                pass
-        _MULLVAD_TOKEN_CACHE[cache_key] = {'token': token, 'expires_at': expires_at}
-        return token
-
-
-# ---------------------------------------------------------------------------
-# Daily per-service call budget (spend.kind = 'daily_calls'). Some registered
-# services run on a DAILY quota rather than dollars or a monthly count --
-# OpenSky's per-account credit buckets refill every day (4,000/day per endpoint
-# family for a standard account), so the correct rollover key is a UTC date,
-# not a month. A registry entry declares a conservative spend.cap (a call count
-# well under the real credit allowance) and the chokepoint blocks before the
-# quota could be exhausted, mirroring the Apify monthly gate. Counts live in
-# their own kv_apicalls row so the accounting never touches the sim-state blob.
-# ---------------------------------------------------------------------------
-
-
-def _api_daily_calls_ledger_read():
-    try:
-        with _db() as conn:
-            conn.execute('''CREATE TABLE IF NOT EXISTS kv_apicalls (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                blob TEXT NOT NULL,
-                updated_at REAL NOT NULL
-            )''')
-            row = conn.execute('SELECT blob FROM kv_apicalls WHERE id = 1').fetchone()
-            return json.loads(row[0]) if row else {}
-    except Exception:
-        return {}
-
-
-def _api_daily_calls_ledger_write(ledger):
-    try:
-        with _db() as conn:
-            conn.execute(
-                'INSERT INTO kv_apicalls (id, blob, updated_at) VALUES (1, ?, ?) '
-                'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
-                (json.dumps(ledger), time.time()),
-            )
-    except Exception:
-        pass
-
-
-def _api_daily_calls_day(now=None):
-    """The current UTC date (2026-10-08) -- the daily rollover key: a fresh
-    date starts a new allowance for every service."""
-    return datetime.datetime.fromtimestamp(now or time.time(), datetime.timezone.utc).strftime('%Y-%m-%d')
-
-
-def _api_daily_calls_used(service):
-    """How many api_call requests this service has consumed today."""
-    sid = (service or {}).get('id')
-    if not sid:
-        return 0
-    ledger = _api_daily_calls_ledger_read()
-    bucket = ledger.get(_api_daily_calls_day()) or {}
-    return int(bucket.get(sid, 0) or 0)
-
-
-def _api_daily_calls_exceeded(service):
-    """True when a registered service with spend.kind=daily_calls has consumed
-    its configured daily cap. Never true when no cap is configured."""
-    spend = ((service or {}).get('spend') or {})
-    if spend.get('kind') != 'daily_calls':
-        return False
-    cap = spend.get('cap')
-    if not isinstance(cap, (int, float)) or cap <= 0:
-        return False
-    return _api_daily_calls_used(service) >= cap
-
-
-def _api_accrue_daily_call(service):
-    """Record ONE api_call against the service's daily budget. Best-effort like
-    the other ledgers: an accounting failure must never break the real request."""
-    sid = (service or {}).get('id')
-    if not sid:
-        return
-    try:
-        ledger = _api_daily_calls_ledger_read()
-        day = _api_daily_calls_day()
-        bucket = ledger.setdefault(day, {})
-        bucket[sid] = int(bucket.get(sid, 0) or 0) + 1
-        _api_daily_calls_ledger_write(ledger)
-    except Exception:
-        pass
 
 
 # Master switch for the generic api_call path -- fail closed like
@@ -10559,6 +9975,36 @@ AGENT_ASK_TOOLS = [
     },
 ]
 
+# Operator/village-editable tool descriptions: world/tool_descriptions.json is
+# an override layer over the inline text above (config.TOOL_DESCRIPTIONS). The
+# inline text stays as the fail-closed default, so deleting an override -- or
+# the whole file -- restores what shipped. Applied at import and on every
+# policy reload, in place, so every consumer of AGENT_ASK_TOOLS sees the edit.
+_TOOL_DESCRIPTION_DEFAULTS = {
+    tool['function']['name']: tool['function'].get('description', '')
+    for tool in AGENT_ASK_TOOLS
+    if isinstance(tool.get('function'), dict) and tool['function'].get('name')
+}
+
+
+def _apply_tool_descriptions(tools):
+    for tool in tools:
+        fn = tool.get('function')
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get('name')
+        override = TOOL_DESCRIPTIONS.get(name)
+        if override:
+            fn['description'] = override
+        elif name in _TOOL_DESCRIPTION_DEFAULTS:
+            fn['description'] = _TOOL_DESCRIPTION_DEFAULTS[name]
+    return tools
+
+
+_apply_tool_descriptions(AGENT_ASK_TOOLS)
+ON_RELOAD_HOOKS.append(lambda: _apply_tool_descriptions(AGENT_ASK_TOOLS))
+
+
 # Additional tools offered to /api/intent/ask ONLY when the dispatched agent's
 # role is Red Team Auditor -- real calls through the SAME gated
 # endpoints any agent goes through (/api/curl, /api/keys/handles), never a
@@ -12312,84 +11758,13 @@ async def _jev_re_gate_redirect_final(agent_id, action, noun, approved_url, fina
     return True, None
 
 
-# Model tiers shouldn't be three slugs frozen in code --
-# Jev should pick them from OpenRouter's real, current catalog. Jev is a
-# classifier over a short candidate list, not something that should sift
-# 447 raw models with pricing math itself, so the actual price
-# comparison/bucketing happens here in plain arithmetic first; Jev only
-# ever chooses between an already-sane, pre-filtered shortlist per band.
-MODEL_PRICE_BANDS = {
-    # ($/M tokens, blended prompt+completion) -- absolute bands, not a
-    # statistical split of the catalog, since a handful of extreme
-    # outliers (o1-pro at $750/M) would otherwise dominate a percentile
-    # split and say nothing about what "affordable" actually means.
-    'low': (0, 0.5),
-    'mid': (0.5, 5),
-    'high': (5, 50),
-}
-MODEL_BAND_PURPOSE = {
-    'low': 'Routine, high-volume work: short in-character replies, simple task narration. Needs to be cheap above all else, but still coherent -- not a model too weak to follow basic instructions.',
-    'sublow': 'Short, bounded test scenarios run at scale (hundreds of reenactment/testing agents): brief in-character replies, throwaway probes, simple narration. The cheapest model that is still coherent -- hard per-model price ceiling, coherence is the bar, not depth. Never for real deliverables or long-running narrative work, where the coherence loss shows.',
-    'mid': 'Judgment calls: classifying report severity, generating a new hire\'s onboarding file, deciding what belongs in an agent\'s own notes. Needs real reasoning, moderate cost is fine.',
-    # Split out of what used to be one overloaded 'high' band:
-    # writing code and planning work are different jobs that reward
-    # different models, and collapsing them meant whichever benchmark won
-    # the band silently decided both. Now each is chosen on a benchmark
-    # that actually measures its own job.
-    'coding': 'Writing and reviewing real code (Code Reviewer, and any role that writes code). Correctness of generated code is the whole job here.',
-    'high': 'Breaking a large, vague request into as many concrete, well-scoped subtasks as the work actually requires (never a fixed count -- a small ask may be one card, a sprawling one many) and deciding how work is distributed (assignBigTask). Runs once per real request, and every downstream call depends on this one being right -- a bad decomposition wastes everything after it, so this is the band to spend on.',
-}
-
-# EVERY band's pick has to be grounded in a real,
-# published benchmark score across the WHOLE catalog, not a hardcoded
-# shortlist of familiar names (a first version of the 'high'/coding band
-# used a fixed 3-model list that, on inspection, was entirely Anthropic --
-# exactly the brand-recognition bias this is supposed to replace) and not
-# Jev's own generic classifier either, which has no benchmark data in its
-# decision context, just each candidate's name and price -- a live run of
-# this exact system on confirmed that's unreliable: it picked
-# GPT-4 Turbo ($40/M) over several cheaper, real-benchmark-stronger
-# candidates sitting in the very same shortlist.
-#
-# Different bands need different benchmarks, since they do genuinely
-# different jobs (MODEL_BAND_PURPOSE above): 'coding' actually writes/
-# reviews code, so a coding capability index is the direct match. 'low' is
-# high-volume in-character chat/narration ("still coherent, not too weak to
-# follow basic instructions") and 'mid' is judgment calls ("needs real
-# reasoning") -- both draw on the OpenRouter catalog's own Artificial
-# Analysis intelligence_index, the general reasoning blend those jobs
-# actually need. 'high' is genuinely hard, high-stakes planning work and
-# scores on agentic_index, the catalog's agentic-work benchmark -- the
-# closest available proxy for goal decomposition, and deliberately a
-# DIFFERENT metric from low/mid so the bands stay distinct through both
-# price pool and score signal. The catalog's ONLY other benchmark block
-# (design_arena) is visual-GENERATION elo, which no band consumes, so it is
-# not ingested.
-#
-# Each band's entry is an ordered metric CHAIN, not a single benchmark. The
-# picker uses the FIRST metric that any candidate in the band's pool is scored
-# on; a later metric only matters when no candidate has any earlier one. That
-# gives a fallback a chance to make a model visible (the HF Open LLM
-# Leaderboard's MMLU-Pro for open-weights models the AA index never measured,
-# evaluator 'huggingface_open_llm') WITHOUT ever ranking a fallback-only model
-# against a primary-scored one on a different scale -- within one metric the
-# scores are comparable, across metrics they are not.
-BAND_BENCHMARK = {
-    'low': ('intelligence_index', 'MMLU-Pro'),
-    # Sublow ranks on the SAME intelligence chain as low -- it is the same
-    # job (coherent short replies/narration) done by an even cheaper model,
-    # so a different metric would make the two bands' picks incomparable.
-    # The $0.09 ceiling, not a different benchmark, is what separates it.
-    'sublow': ('intelligence_index', 'MMLU-Pro'),
-    'mid': ('intelligence_index', 'MMLU-Pro'),
-    'high': ('agentic_index',),
-    'coding': ('coding_index',),
-    # 'vision' stays on MMMU (player-entered, cited research -- the catalog
-    # carries no image-COMPREHENSION metric to back it). Listed here so one
-    # place answers "what benchmark backs this pick" for every real model
-    # choice this system makes.
-    'vision': ('MMMU',),
-}
+# Model tiers are chosen by Jev from OpenRouter's real, current catalog: this
+# file does the price bucketing in plain arithmetic and hands Jev a pre-filtered
+# shortlist per band. The bands themselves -- price ranges, the job each band
+# does, the benchmark chain backing each pick, and the tier-gate criteria -- are
+# operator data in world/model_bands.json (config.py), so prices and benchmark
+# names can be re-tuned without editing this kernel. The benchmark metric
+# catalog below is a fixed code contract with the ingested data.
 # The Artificial Analysis capability indices the OpenRouter catalog carries in
 # each model's `benchmarks.artificial_analysis` block, ingested automatically.
 # Source citation for auto-ingested rows is the model's own OpenRouter page.
@@ -12431,7 +11806,6 @@ BENCHMARK_QUALITY_FLOOR_GAP = 6
 # price": the pick still has to justify itself on score, but far less
 # compromise is accepted before cost breaks the tie, because every
 # downstream call in a request depends on this one decomposition.
-BAND_QUALITY_FLOOR_GAP = {'high': 2}
 
 
 # BP-63: observed-latency speed tie-break. OpenRouter's own speed numbers
@@ -13541,7 +12915,7 @@ def get_tier_value_windows():
 # (the player approving a pending escalation must wake the tank so the grant
 # actually lands and the egress proxy refreshes). The one exception: pure
 # telemetry writes (device check-in) are exempted separately, below.
-_NON_WAKING_READS = {
+_NON_WAKING_READS_BASE = {
     '/api/state', '/api/health', '/api/health/alerts', '/api/sim/status',
     '/api/sim/agents', '/api/activity', '/api/activity/summary', '/api/decisions',
     '/api/reviews', '/api/backlog', '/api/rooms', '/api/teams', '/api/library',
@@ -13553,12 +12927,15 @@ _NON_WAKING_READS = {
     '/api/pipelines', '/api/keys/credentials', '/api/sandbox-backups',
     '/api/shadow', '/', '/index.html',
 }
+# Kernel-safe set plus any operator additions from endpoint_policy.json.
+_NON_WAKING_READS = set(_NON_WAKING_READS_BASE) | NON_WAKING_READS_EXTRA
 # Pure telemetry that may WRITE while dormant WITHOUT waking the tank. Kept
 # separate from the GET-only _NON_WAKING_READS and checked by _should_wake
 # BEFORE the method test: the device check-in is a POST, but a phone Shortcut
 # must never keep the think tank awake. Check-ins still land while asleep
 # (the endpoint itself is not gated on _dormant()).
-_NON_WAKING_WRITES = {'/api/device/checkin'}
+_NON_WAKING_WRITES_BASE = {'/api/device/checkin'}
+_NON_WAKING_WRITES = set(_NON_WAKING_WRITES_BASE) | NON_WAKING_WRITES_EXTRA
 
 
 def _should_wake(request):
@@ -13732,6 +13109,7 @@ AUTH_PUBLIC_PATHS = (
     '/api/mail', '/api/reports', '/api/download',
     '/api/file-grants', '/api/app-grants',
     '/api/device/checkin',                              # X-Device-Key
+    '/api/webhook/',                                    # X-Webhook-Key (external watchers, any channel)
     '/api/task-budget', '/api/budget', '/api/env/reload',
     '/api/ais', '/api/market', '/api/rss', '/api/ws',
     '/api/data-sources', '/api/credentials',
@@ -14096,11 +13474,6 @@ def _merge_server_owned_agent(server_agent, client_agent):
 # free-text channel: an arbitrary "action" from any authenticated caller was a
 # memory-poisoning vector (hostile text planted in action_log.details would
 # surface verbatim in the agent's long-term memory on the next render).
-_API_LOG_ALLOWED_ACTIONS = {
-    'firing_review', 'mail_sent', 'work_item_abandoned', 'task_assigned',
-    'big_task_delegated', 'pair_programming', 'media_digest_filed',
-    'task_completed', 'handoff', 'hire_blocked_at_cap', 'hire',
-}
 
 
 @app.post('/api/mail/send')
@@ -14561,9 +13934,10 @@ async def post_report(request: Request):
 # (state.roomDefinitions) and are director/admin-editable via
 # POST /api/rooms/{room}/purpose -- the label is locked there, only the
 # description that agents reason about may change.
-_DELEGATABLE_ROOMS = ['observatory', 'pressoffice', 'postoffice', 'bank',
-                      'weatherstation', 'library', 'media']
-_DEFAULT_ROOM_DEFINITIONS = {
+_DELEGATABLE_ROOMS_DEFAULTS = ['observatory', 'pressoffice', 'postoffice', 'bank',
+                             'weatherstation', 'library', 'media']
+_DELEGATABLE_ROOMS = list(_DELEGATABLE_ROOMS_DEFAULTS)
+_ROOM_DEFINITION_DEFAULTS = {
     'pressoffice': {'label': 'Work Room', 'purpose': 'real sandboxed software development; actually writes and runs code for the SPECIFIC task given (taskType "code"), or reviews/QA-tests an already-built deliverable for real, specific problems (taskType "review" or "qa"). Use this for anything meaning "write/build/fix code" OR "review/test what was built." QUALITY BAR: written code must follow PEP 8 and pass the standard Python toolchain baked into this sandbox -- flake8, mypy, bandit, and pytest with >=90% coverage (the "quality pipeline") -- and work is NOT approved unless that pipeline is green.'},
     'observatory': {'label': 'Research Center', 'purpose': 'makes a real model call reasoning about the SPECIFIC subtask given and files a genuine, findable finding. Use for "research/investigate/write up findings on X."'},
     'weatherstation': {'label': 'Weather Station', 'purpose': 'an open-ended research room with internet access; may investigate or analyze any topic on request. The name is cosmetic and does not limit the topic. Use for "research/investigate/analyze X" on any subject.'},
@@ -14573,6 +13947,31 @@ _DEFAULT_ROOM_DEFINITIONS = {
     'bank': {'label': 'Bank', 'purpose': 'no automated work happens here at all; never assign a subtask here that needs a real deliverable.'},
     'hangout': {'label': 'Hangout', 'purpose': 'an empty social room behind the Town Hall door; agents idle and mingle here. NEVER assign a subtask here -- this is not a work room.'},
 }
+_DEFAULT_ROOM_DEFINITIONS = {}
+
+
+def _rebuild_room_definitions():
+    """Kernel room seeds with rooms.json overrides merged per room. Mutates
+    in place so the durable-state backfill and every reader see an edit."""
+    _DEFAULT_ROOM_DEFINITIONS.clear()
+    for room, base in _ROOM_DEFINITION_DEFAULTS.items():
+        entry = dict(base)
+        entry.update(ROOM_DEFINITION_OVERRIDES.get(room) or {})
+        _DEFAULT_ROOM_DEFINITIONS[room] = entry
+    _DELEGATABLE_ROOMS[:] = list(ROOM_DELEGATABLE_OVERRIDES or _DELEGATABLE_ROOMS_DEFAULTS)
+
+
+def _rebuild_village_policy():
+    _rebuild_seed_profiles()
+    _rebuild_room_definitions()
+    _NON_WAKING_READS.clear()
+    _NON_WAKING_READS.update(_NON_WAKING_READS_BASE | NON_WAKING_READS_EXTRA)
+    _NON_WAKING_WRITES.clear()
+    _NON_WAKING_WRITES.update(_NON_WAKING_WRITES_BASE | NON_WAKING_WRITES_EXTRA)
+
+
+ON_RELOAD_HOOKS.append(_rebuild_village_policy)
+_rebuild_room_definitions()
 _big_task_max_tokens = 4000  # tasks.js: the decomposition runs once per request; every downstream call depends on it.
 
 
@@ -14800,6 +14199,82 @@ def _breakdown_into_shared_backlog(state, goal, admin_id, constraints=None):
     return {'feature': feature, 'items': out}
 
 
+async def _dispatch_big_task(state, goal, actor, constraints=None):
+    """Core routing for a large request, shared by /api/intent/assign-big-task
+    and the x-mention webhook consumer loop: when EVERY existing team is
+    committed to an active sprint, the ask is broken down into stories/spikes
+    filed in the SHARED backlog under a feature -- any team pulls from it
+    (first-come) when a sprint closes, so the work is captured without
+    spawning an unbounded number of teams. If the breakdown fails (model
+    outage), fall back to spawning a new director + team to take the ask
+    (with an employee; the director stands in as scrum master while the team
+    is small) and kick its refinement to run on the very next pass.
+    Otherwise a free authority (waking a merely-resting one if needed) staffs
+    a team from the ask alone and the ask is filed as a pending
+    large-request breakdown for that team's breakdown ceremony. No sprint
+    record is created and no subtasks are predicted up front: the receiving
+    team plans its own work, like a real org.
+    Returns (outcome, data), outcome one of 'backlogged', 'new_team',
+    'no_authority', 'no_team', 'failed', 'staffed'."""
+    import sim as _sim
+    if _all_teams_busy_in_sprint(state):
+        admin_id_for_new = next((d.get('id') for d in (state.get('agentRoster') or [])
+                                 if d.get('isAdmin')), None)
+        backlogged = await asyncio.to_thread(_breakdown_into_shared_backlog,
+                                             state, goal, admin_id_for_new,
+                                             constraints=constraints)
+        if backlogged:
+            save_state_to_db(state)
+            log_action(actor, 'big_task_backlogged',
+                       {'goal': goal[:200],
+                        'feature': backlogged['feature'].get('id'),
+                        'items': [b.get('id') for b in backlogged['items']]},
+                       authorized=True)
+            return 'backlogged', backlogged
+        # Fallback: the model couldn't break it down -- spawn a fresh team.
+        new_team = _sim.spawn_new_team_for_request(state, goal, admin_id=admin_id_for_new,
+                                                   constraints=constraints)
+        if new_team:
+            save_state_to_db(state)
+            log_action(actor, 'big_task_new_team',
+                       {'goal': goal[:200], 'team': new_team.get('id'),
+                        'members': new_team.get('members')}, authorized=True)
+            return 'new_team', new_team
+    authority = _free_authority(state)
+    if not authority:
+        # tasks.js: "a new request from you wakes the admin." Honor that --
+        # if everyone is merely RESTING (offDuty, not busy), wake one so the
+        # think tank isn't permanently un-delegable the moment it goes idle.
+        authority = _wake_authority_on_request(state)
+        if authority:
+            save_state_to_db(state)
+    if not authority:
+        return 'no_authority', {}
+    admin_id = authority['id']
+    # Sprint staffing: the free authority picks the receiving team from the
+    # ask alone -- her OWN team when it's free, else the first free team --
+    # and the ask is filed as a pending large-request breakdown for that
+    # team's breakdown ceremony (scrum master + workers) to card into
+    # stories/spikes on the next pass.
+    team = _staffing_team_for_authority(state, admin_id)
+    if not team:
+        return 'no_team', {}
+    team_id = team.get('id') or team.get('directorId')
+    now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+    req = _sim.file_large_request(state, admin_id, goal, team_id, now_ms,
+                                  constraints=constraints)
+    if not req:
+        return 'failed', {}
+    save_state_to_db(state)
+    log_action(actor, 'big_task_staffed',
+               {'admin': admin_id, 'goal': goal[:200], 'team': team_id,
+                'request': req['id'],
+                'pinned': sorted((req.get('playerConstraints') or {}).keys())}, authorized=True)
+    return 'staffed', {'admin': admin_id, 'adminName': authority.get('name'),
+                       'team': team_id, 'teamName': team.get('name') or team_id,
+                       'request': req['id']}
+
+
 @app.post('/api/intent/assign-big-task')
 @_state_writer
 async def intent_assign_big_task(request: Request):
@@ -14834,88 +14309,34 @@ async def intent_assign_big_task(request: Request):
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
 
-    # Large-request routing: backlog refinement should start the
-    # moment a large request is sent, and when EVERY existing team is already
-    # committed to an active sprint, the ask is broken down into stories/spikes
-    # filed in the SHARED backlog under a feature -- any team pulls from it
-    # (first-come) when a sprint closes, so the work is captured without
-    # spawning an unbounded number of teams. If the breakdown fails (model
-    # outage), we fall back to the original behavior: spawn a new director +
-    # team to take the ask (with an employee; the director stands in as scrum
-    # master while the team is small), and kick its refinement to run on the
-    # very next pass so it starts grooming immediately.
-    import sim as _sim
-    if _all_teams_busy_in_sprint(state):
-        admin_id_for_new = next((d.get('id') for d in (state.get('agentRoster') or [])
-                                 if d.get('isAdmin')), None)
-        backlogged = await asyncio.to_thread(_breakdown_into_shared_backlog,
-                                             state, goal, admin_id_for_new,
+    # Large-request routing is shared with the webhook consumer loop: see
+    # _dispatch_big_task (backlog breakdown / new-team / staffing).
+    outcome, data = await _dispatch_big_task(state, goal, player_id,
                                              constraints=constraints)
-        if backlogged:
-            save_state_to_db(state)
-            log_action(player_id, 'big_task_backlogged',
-                       {'goal': goal[:200],
-                        'feature': backlogged['feature'].get('id'),
-                        'items': [b.get('id') for b in backlogged['items']]},
-                       authorized=True)
-            return JSONResponse({'ok': True, 'backlogged': True,
-                                 'feature': backlogged['feature'].get('id'),
-                                 'featureName': backlogged['feature'].get('name'),
-                                 'items': len(backlogged['items']),
-                                 'note': 'Every existing team was busy in a sprint, so this request was broken down and filed in the shared backlog under a feature. A team pulls from it (first-come) when a sprint closes.'})
-        # Fallback: the model couldn't break it down -- spawn a fresh team.
-        new_team = _sim.spawn_new_team_for_request(state, goal, admin_id=admin_id_for_new,
-                                                   constraints=constraints)
-        if new_team:
-            save_state_to_db(state)
-            log_action(player_id, 'big_task_new_team',
-                       {'goal': goal[:200], 'team': new_team.get('id'),
-                        'members': new_team.get('members')}, authorized=True)
-            return JSONResponse({'ok': True, 'newTeam': True,
-                                 'team': new_team.get('id'),
-                                 'teamName': new_team.get('name'),
-                                 'members': new_team.get('members'),
-                                 'note': 'Every existing team was busy in a sprint, so a new director + team was created to take this request. It will start a backlog refinement immediately.'})
-
-    authority = _free_authority(state)
-    if not authority:
-        # tasks.js: "a new request from you wakes the admin." Honor that --
-        # if everyone is merely RESTING (offDuty, not busy), wake one so the
-        # think tank isn't permanently un-delegable the moment it goes idle.
-        authority = _wake_authority_on_request(state)
-        if authority:
-            save_state_to_db(state)
-    if not authority:
+    if outcome == 'backlogged':
+        return JSONResponse({'ok': True, 'backlogged': True,
+                             'feature': data['feature'].get('id'),
+                             'featureName': data['feature'].get('name'),
+                             'items': len(data['items']),
+                             'note': 'Every existing team was busy in a sprint, so this request was broken down and filed in the shared backlog under a feature. A team pulls from it (first-come) when a sprint closes.'})
+    if outcome == 'new_team':
+        return JSONResponse({'ok': True, 'newTeam': True,
+                             'team': data.get('id'),
+                             'teamName': data.get('name'),
+                             'members': data.get('members'),
+                             'note': 'Every existing team was busy in a sprint, so a new director + team was created to take this request. It will start a backlog refinement immediately.'})
+    if outcome == 'no_authority':
         return JSONResponse({'error': 'No admin or director is free right now -- try again shortly.'})
-    admin_id = authority['id']
-
-    # Sprint staffing: the free authority picks the receiving team from the ask
-    # alone -- her OWN team when it's free, else the first free team -- and the
-    # ask is filed as a pending large-request breakdown for that team's
-    # breakdown ceremony (scrum master + workers) to card into stories/spikes on
-    # the next pass. No sprint record is created and no subtasks are predicted
-    # up front: the receiving team plans its own work, like a real org.
-    team = _staffing_team_for_authority(state, admin_id)
-    if not team:
+    if outcome == 'no_team':
         return JSONResponse({'error': 'No free team is available to take this request right now -- try again shortly.'})
-    team_id = team.get('id') or team.get('directorId')
-    now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
-    req = _sim.file_large_request(state, admin_id, goal, team_id, now_ms,
-                                  constraints=constraints)
-    if not req:
+    if outcome == 'failed':
         return JSONResponse({'error': "Couldn't file the request -- try again shortly."}, status_code=500)
-    save_state_to_db(state)
-    log_action(player_id, 'big_task_staffed',
-               {'admin': admin_id, 'goal': goal[:200], 'team': team_id,
-                'request': req['id'],
-                'pinned': sorted((req.get('playerConstraints') or {}).keys())}, authorized=True)
-    team_name = team.get('name') or team_id
     return JSONResponse({'ok': True, 'staffed': True,
-                         'admin': admin_id,
-                         'team': team_id,
-                         'teamName': team_name,
-                         'request': req['id'],
-                         'note': f'{authority.get("name")} filed this with the {team_name} team. Its scrum master and workers will break it into concrete stories at their next planning session.'})
+                         'admin': data['admin'],
+                         'team': data['team'],
+                         'teamName': data['teamName'],
+                         'request': data['request'],
+                         'note': f'{data["adminName"]} filed this with the {data["teamName"]} team. Its scrum master and workers will break it into concrete stories at their next planning session.'})
 
 
 @app.post('/api/intent/story/{task_id}/reject')
@@ -16131,6 +15552,43 @@ async def device_checkin(request: Request):
     log_action('player', 'device_checkin', {'trigger': body.get('trigger'),
               'hasLocation': loc is not None}, authorized=True)
     return JSONResponse({'ok': True, 'storedAt': entry['receivedAt']})
+
+
+@app.post('/api/webhook/{channel}')
+async def webhook_channel(channel: str, request: Request):
+    """Accept an inbound event for any external watcher and store it for
+    processing. Self-guarded like /api/device-checkin -- listed in
+    AUTH_PUBLIC_PATHS because the deny-by-default middleware only
+    recognizes a player session or an agent key, neither of which a
+    Google Apps Script watcher can hold, so it checks its own bearer
+    credential instead. One shared WEBHOOK_API_KEY covers every channel;
+    the channel in the path is the scoping, not the credential. No LLM/Jev
+    call involved (pure data storage), so unlike task-driving endpoints
+    this is NOT gated by _dormant() -- a loom request should land even
+    while the think tank is asleep."""
+    if channel not in WEBHOOK_CHANNELS:
+        return JSONResponse({'error': 'unknown channel'}, status_code=404)
+    presented = request.headers.get('X-Webhook-Key')
+    if not presented or not secrets.compare_digest(presented, WEBHOOK_API_KEY):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    if not body:
+        return JSONResponse({'error': 'empty body'}, status_code=400)
+    entry = {
+        'channel': channel,
+        'receivedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'payload': body,
+    }
+    with open(WEBHOOKS_PATH, 'a') as f:
+        f.write(json.dumps(entry) + '\n')
+    log_action('external', 'webhook_channel', {'channel': channel,
+                'id': body.get('id')}, authorized=True)
+    return JSONResponse({'ok': True})
+
+
 
 
 @app.post('/api/teams/{team_id}/prefix')
@@ -17575,733 +17033,6 @@ def _apply_pending_ask_results(state):
 # ---------------------------------------------------------------------------
 
 
-# ---------------------------------------------------------------------------
-# Curated RSS/ATOM aggregator. Same architecture as the AISStream collector,
-# applied to feeds agents keep asking about (current events, space, hazards,
-# research): a standing poll loop fetches each feed on its own cadence, a
-# tolerant parser handles both RSS 2.0 (<item>) and ATOM (<entry>) XML, and the
-# most recent items per feed live in an in-process ring buffer served by the
-# read_rss_feed tool / /api/rss/recent. Items are tagged at ingest with any
-# watchlist research topics whose words appear in the title, so the Research
-# Desk's standing topics surface straight out of the feed read.
-#
-# The feed LIST is operator-managed at runtime: the rss_feeds DB table is the
-# registry, seeded from _RSS_FEED_SEED on first boot, and /api/rss/{propose,
-# approve, remove} let directors/admins add or drop feeds without a restart
-# (the poll loop re-reads the live _RSS_FEEDS dict every cycle).
-# ---------------------------------------------------------------------------
-_RSS_FEED_SEED = {
-    'bbc_world': {
-        'name': 'BBC World',
-        'url': 'https://feeds.bbci.co.uk/news/world/rss.xml',
-        'interval_s': 600,
-    },
-    'nasa_breaking': {
-        'name': 'NASA Breaking News',
-        'url': 'https://www.nasa.gov/rss/breaking_news.rss',
-        'interval_s': 1800,
-    },
-    'usgs_quakes': {
-        'name': 'USGS Earthquakes (M2.5+)',
-        'url': 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.atom',
-        'interval_s': 600,
-    },
-    'arxiv_cs_lg': {
-        'name': 'arXiv cs.LG',
-        'url': 'https://rss.arxiv.org/rss/cs.LG',
-        'interval_s': 1800,
-    },
-    'arxiv_cs_cl': {
-        'name': 'arXiv cs.CL',
-        'url': 'https://rss.arxiv.org/rss/cs.CL',
-        'interval_s': 1800,
-    },
-}
-_RSS_FEEDS = {}  # live registry: feed_id -> {'name', 'url', 'interval_s'} (DB-backed)
-_RSS_FEEDS_LOAD_ERROR = None
-_RSS_BUFFER_MAX_PER_FEED = 50
-_RSS_WINDOW_S = 3 * 86400
-_RSS_FETCH_TIMEOUT_S = 20
-_RSS_HTTP_HEADERS = {'User-Agent': 'AIThinkTankAgent/1.0 (think-tank current-events aggregator)'}
-
-_RSS_BUFFER: dict = {}  # feed_id -> list of {'ts', 'title', 'link', 'summary', 'matchedTopics'}
-_RSS_BUFFER_LOCK = threading.Lock()
-_RSS_STATUS: dict = {}  # feed_id -> {'last_fetch_at', 'last_error', 'ok'}
-
-# RSS and Atom feeds are untrusted input. Parse them only with defusedxml,
-# which rejects entity-expansion and external-entity attacks. If the package is
-# absent, skip XML parsing rather than falling back to the stdlib parser.
-try:  # pragma: no cover - the installed package is pinned in requirements.txt
-    from defusedxml.ElementTree import fromstring as _xml_fromstring
-    from defusedxml.ElementTree import ParseError as _XMLParseError
-except ImportError:  # pragma: no cover - optional hardening dependency
-    # No stdlib parsing fallback: an installation without defusedxml simply
-    # does not parse untrusted RSS/Atom XML.
-    _xml_fromstring = None
-    from xml.etree.ElementTree import ParseError as _XMLParseError
-
-
-def _parse_rss_atom_xml(raw, feed_id):  # noqa: ARG001 -- feed_id kept for signature symmetry
-    """Parse RSS 2.0 or ATOM XML into a list of {title, link, summary} items.
-    Namespace-tolerant (strips '{...}' from tags), handles <item>/<entry> even
-    when nested inside a <channel> container, and degrades gracefully on feeds
-    that reorder fields or omit summaries."""
-    import html as _html
-    import re as _re
-    items = []
-    if _xml_fromstring is None:  # pragma: no cover - defusedxml is pinned
-        return items
-    try:
-        root = _xml_fromstring(raw)
-    except _XMLParseError:
-        return items
-    entries = []
-    for node in root.iter():
-        tag = _re.sub(r'\{.*?\}', '', node.tag).lower()
-        if tag in ('item', 'entry'):
-            entries.append(node)
-    for entry in entries:
-        fields = {}
-        for child in entry:
-            tag = _re.sub(r'\{.*?\}', '', child.tag).lower()
-            if tag in ('title', 'link', 'guid', 'id', 'description', 'summary', 'content'):
-                text = (child.text or '').strip()
-                if tag == 'link' and not text:
-                    text = child.get('href') or ''
-                if tag in ('description', 'summary', 'content'):
-                    text = _re.sub(r'<[^>]+>', ' ', text)
-                    text = _html.unescape(text)
-                    text = _re.sub(r'\s+', ' ', text).strip()
-                if tag in ('title', 'link', 'guid', 'id'):
-                    fields.setdefault(tag, text)
-                elif tag in ('description', 'summary', 'content') and not fields.get('summary'):
-                    fields['summary'] = text[:500]
-        title = fields.get('title') or ''
-        link = fields.get('link') or fields.get('guid') or fields.get('id') or ''
-        if title or link:
-            items.append({'title': title, 'link': link,
-                          'summary': fields.get('summary') or ''})
-    return items
-
-
-def _rss_match_topics(title):
-    """Tag a title with any current watchlist research topics it mentions
-    (word-boundary match on topic words, not the full topic string)."""
-    try:
-        state = get_state_from_db()
-    except Exception:  # noqa: BLE001 -- never let topic tagging break the poller
-        state = None
-    topics = [(t.get('topic') or '') for t in ((state or {}).get('researchTopics') or [])]
-    title_l = f' {title.lower()} '
-    matched = []
-    for topic in topics:
-        if not topic:
-            continue
-        words = [w for w in topic.lower().split() if len(w) > 2]
-        if words and all(f' {w} ' in title_l for w in words):
-            matched.append(topic)
-    return matched
-
-
-def _rss_ingest(feed_id, items):
-    now = int(time.time() * 1000)
-    with _RSS_BUFFER_LOCK:
-        seen = {it.get('link') for it in _RSS_BUFFER.get(feed_id, [])}
-        fresh = []
-        for it in items:
-            link = it.get('link') or ''
-            if link and link in seen:
-                continue
-            seen.add(link)
-            fresh.append({'ts': now, 'title': it.get('title') or '',
-                          'link': link, 'summary': it.get('summary') or '',
-                          'matchedTopics': _rss_match_topics(it.get('title') or '')})
-        buf = _RSS_BUFFER.setdefault(feed_id, [])
-        buf.extend(fresh)
-        if len(buf) > _RSS_BUFFER_MAX_PER_FEED:
-            del buf[:len(buf) - _RSS_BUFFER_MAX_PER_FEED]
-    return len(fresh)
-
-
-def _rss_recent(feed_id, max_items=10):
-    cutoff = int(time.time() * 1000) - _RSS_WINDOW_S * 1000
-    with _RSS_BUFFER_LOCK:
-        items = [dict(it) for it in _RSS_BUFFER.get(feed_id, []) if it['ts'] >= cutoff]
-    return items[-max_items:]
-
-
-def _rss_feed_spec_to_row(spec, status='active', proposed_by=None):
-    now = time.time()
-    return {
-        'id': spec.get('id'),
-        'name': spec.get('name') or spec.get('id'),
-        'url': spec.get('url') or '',
-        'interval_s': int(spec.get('interval_s') or 600),
-        'status': status,
-        'proposed_by': proposed_by,
-        'created_at': now,
-        'updated_at': now,
-    }
-
-
-def _rss_feed_row_to_spec(row):
-    return {'id': row['id'], 'name': row['name'], 'url': row['url'],
-            'interval_s': int(row['interval_s'] or 600), 'status': row['status'],
-            'proposed_by': row.get('proposed_by')}
-
-
-def _load_rss_feeds():
-    """Load the active rss_feeds rows into the live _RSS_FEEDS dict. Fail
-    closed like _load_api_services: on any DB error the registry stays empty
-    (the poll loop then has nothing to fetch, never a crash)."""
-    global _RSS_FEEDS, _RSS_FEEDS_LOAD_ERROR
-    _RSS_FEEDS = {}
-    _RSS_FEEDS_LOAD_ERROR = None
-    try:
-        with _db() as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT id, name, url, interval_s, status, proposed_by FROM rss_feeds WHERE status = 'active'"  # nosec B608 -- fixed internal columns
-            ).fetchall()
-    except Exception as e:
-        _RSS_FEEDS_LOAD_ERROR = f'db unavailable: {e}'
-        return
-    for row in rows:
-        spec = _rss_feed_row_to_spec(dict(row))
-        _RSS_FEEDS[spec['id']] = spec
-
-
-def _seed_rss_feeds_if_empty():
-    """Seed the rss_feeds table from _RSS_FEED_SEED the first time it comes up
-    empty, mirroring _seed_api_services_if_empty. New DBs get the five curated
-    feeds for free; an existing registry is left untouched."""
-    try:
-        with _db() as conn:
-            count = conn.execute('SELECT COUNT(*) FROM rss_feeds').fetchone()[0]
-            if count:
-                return
-            for sid, feed in _RSS_FEED_SEED.items():
-                spec = {'id': sid, 'name': feed.get('name'), 'url': feed.get('url'),
-                        'interval_s': feed.get('interval_s') or 600}
-                row = _rss_feed_spec_to_row(spec, status='active', proposed_by='seed')
-                conn.execute(
-                    'INSERT INTO rss_feeds (id, name, url, interval_s, status, proposed_by, created_at, updated_at) '
-                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                    [row[c] for c in ('id', 'name', 'url', 'interval_s', 'status', 'proposed_by', 'created_at', 'updated_at')])
-    except Exception as e:
-        print(f'[rss] seed failed: {e}', flush=True)
-
-
-def _rss_feed_upsert(spec, status='active', proposed_by=None):
-    """Persist a feed spec as a row and refresh the live registry. Used by the
-    propose flow (status='proposed'), the approval flow (status='active' or
-    'denied'), and the remove flow (status='removed')."""
-    row = _rss_feed_spec_to_row(spec, status=status, proposed_by=proposed_by)
-    with _db() as conn:
-        conn.execute(
-            'INSERT INTO rss_feeds (id, name, url, interval_s, status, proposed_by, created_at, updated_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?) '
-            'ON CONFLICT(id) DO UPDATE SET name=excluded.name, url=excluded.url, '
-            'interval_s=excluded.interval_s, status=excluded.status, '
-            'proposed_by=excluded.proposed_by, updated_at=excluded.updated_at',
-            [row[c] for c in ('id', 'name', 'url', 'interval_s', 'status', 'proposed_by', 'created_at', 'updated_at')])
-    _load_rss_feeds()
-
-
-def _validate_rss_feed_spec(spec):
-    """Validate a proposed feed spec. Returns (feed_id, normalized, error) --
-    error is None when valid. Security constraints mirror _validate_api_service_spec:
-    a public https URL only (the poll loop fetches it, so an internal address
-    would be an SSRF hole), a simple alphanumeric slug id, and a sane interval."""
-    spec = spec or {}
-    fid = str(spec.get('id') or '').strip().lower()
-    if not fid or not fid.replace('_', '').replace('-', '').isalnum():
-        return None, None, 'feed id must be a simple alphanumeric slug'
-    url = str(spec.get('url') or '').strip()
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != 'https' or not parsed.hostname or not _is_safe_public_host(parsed.hostname):
-        return None, None, 'url must be a public https URL'
-    interval_s = max(60, min(int(spec.get('interval_s') or 600), 86400))
-    name = str(spec.get('name') or '').strip() or fid
-    return fid, {'id': fid, 'name': name[:120], 'url': url, 'interval_s': interval_s}, None
-
-
-def _probe_rss_url(url):
-    """Fetch + parse a feed URL ONCE, at propose time, so a garbage or dead URL
-    is caught before it is ever approved. Returns {'ok', 'itemCount',
-    'sampleTitle', 'error'} -- never raises."""
-    try:
-        items = _fetch_feed_sync('_probe', url)
-        return {'ok': True, 'itemCount': len(items),
-                'sampleTitle': (items[0].get('title') if items else '')[:120], 'error': ''}
-    except Exception as e:  # noqa: BLE001 -- a failed probe is a result, not a crash
-        return {'ok': False, 'itemCount': 0, 'sampleTitle': '', 'error': str(e)[:200]}
-
-
-def _fetch_feed_sync(feed_id, url):
-    """Synchronous feed fetch (poll loop runs in a thread). Returns the parsed
-    items or raises -- the loop owns retry/backoff and status tracking."""
-    req = urllib.request.Request(url, headers=_RSS_HTTP_HEADERS)
-    with _safe_urlopen(req, timeout=_RSS_FETCH_TIMEOUT_S) as resp:
-        raw = resp.read(2 ** 20 + 1)
-    return _parse_rss_atom_xml(raw, feed_id)
-
-
-async def _rss_poll_loop():
-    """Standing loop (created in _lifespan): fetch each curated feed whose
-    interval has elapsed, ingest new items into the ring buffer, and surface
-    per-feed health in _RSS_STATUS. Polls are serialized through a thread so one
-    slow feed can't stall the rest of the event loop. The feed list is re-read
-    each cycle (a snapshot of the live _RSS_FEEDS registry), so a director/admin
-    adding or removing a feed via /api/rss/* goes live with no restart -- and
-    the sleep is capped at 30s so a newly-approved feed is fetched promptly
-    instead of waiting for the next scheduled pass."""
-    import asyncio
-    while True:
-        feeds = dict(_RSS_FEEDS)
-        now = time.time()
-        for feed_id, feed in feeds.items():
-            last = _RSS_STATUS.get(feed_id, {}).get('last_fetch_at', 0)
-            if now - last < (feed.get('interval_s') or 600):
-                continue
-            url = feed.get('url') or ''
-            try:
-                items = await asyncio.to_thread(_fetch_feed_sync, feed_id, url)
-                n = _rss_ingest(feed_id, items)
-                _RSS_STATUS[feed_id] = {'ok': True, 'last_fetch_at': time.time(),
-                                        'last_error': '', 'new': n}
-            except Exception as e:  # noqa: BLE001 -- a bad feed/network hiccup must never kill the loop
-                _RSS_STATUS[feed_id] = {'ok': False, 'last_fetch_at': time.time(),
-                                        'last_error': str(e)[:200], 'new': 0}
-                print(f'[rss] {feed_id} fetch failed: {e}', flush=True)
-            await asyncio.sleep(0.02)
-        # Sleep until the soonest next poll across all feeds, capped so a
-        # newly-added feed is picked up within ~30s.
-        now = time.time()
-        due = min((now + (feed.get('interval_s') or 600) - _RSS_STATUS.get(feed_id, {}).get('last_fetch_at', 0)
-                   for feed_id, feed in feeds.items()), default=600)
-        await asyncio.sleep(max(1.0, min(due, 30)))
-
-
-# ---------------------------------------------------------------------------
-# Generic WebSocket feed collector. One loop interprets a declarative
-# ws_spec descriptor (url, subscribe template with credential/variable
-# substitution, frame filter, field paths, buffer kind) for ANY
-# "subscribe then stream JSON" feed -- Kraken and AISStream are just two
-# registered instances (ws_feeds DB table, seeded on first boot). A supervisor
-# reconciles running collector tasks with the live registry every few seconds,
-# so a director/admin adding, editing, or removing a feed via /api/ws/*
-# takes effect with no restart. HTTP's universal contract is what makes
-# api_call generic; WebSocket has no such contract, so the descriptor language
-# IS the abstraction. Hard boundary: binary frames, protobuf, and multi-round
-# handshake protocols cannot be described and stay as code.
-# ---------------------------------------------------------------------------
-_WS_FEED_SEED = {
-    'kraken': {
-        'name': 'Kraken public crypto ticker',
-        'credential': {'type': 'none'},
-        'ws': {
-            'url': 'wss://ws.kraken.com',
-            'subscribe': {'event': 'subscribe', 'pair': ['$PAIRS'],
-                          'subscription': {'name': 'ticker'}},
-            'vars': {'$PAIRS': ['XBT/USD', 'ETH/USD', 'XRP/USD', 'SOL/USD', 'XDG/USD']},
-            'open_timeout_s': 15,
-            'stall_timeout_s': 90,
-            'reconnect_backoff_s': 15,
-            'frame_filter': {
-                'data_kind': 'list',
-                'data_index': 1,
-                # Ticker frames are [channelID, data, channelName, pair].
-                'topic_path': '[3]',
-                'fields': {'price': 'c[0]', 'bid': 'b[0]', 'ask': 'a[0]', 'volume': 'v[0]'},
-            },
-            'buffer': {'kind': 'latest_per_topic', 'max_topics': 100, 'history': 200},
-        },
-    },
-    'aisstream': {
-        'name': 'AISStream live maritime positions',
-        'credential': {'type': 'env', 'key': 'AISSTREAM_API_KEY'},
-        'ws': {
-            'url': 'wss://stream.aisstream.io/v0/stream',
-            'subscribe': {'APIKey': '$CRED',
-                          'BoundingBoxes': [[[36.9, -76.3], [33.3, -74.8]]],
-                          'FilterMessageTypes': ['PositionReport']},
-            'vars': {},
-            'open_timeout_s': 20,
-            'stall_timeout_s': 120,
-            'reconnect_backoff_s': 15,
-            'frame_filter': {
-                'data_kind': 'dict',
-                'topic_path': 'MetaData.ShipName',
-                'skip_on_key': 'MessageType',
-                'skip_values': ['SubscriptionConfirmation'],
-                'fields': {'lat': 'MetaData.latitude', 'lon': 'MetaData.longitude',
-                           'time': 'MetaData.time_utc', 'mmsi': 'MetaData.MMSI_String'},
-            },
-            'buffer': {'kind': 'ring', 'history': 300},
-        },
-    },
-}
-_WS_FEEDS = {}  # live registry: sid -> {'name', 'credential', 'ws': descriptor} (DB-backed)
-_WS_FEEDS_LOAD_ERROR = None
-_WS_BUFFERS: dict = {}  # sid -> {'latest': {topic: rec}, 'history': [...], 'status': {...}}
-_WS_LOCK = threading.Lock()
-_WS_TASKS: dict = {}  # sid -> (spec_fingerprint, asyncio.Task)
-
-
-def _ws_feed_spec_to_row(spec, status='active', proposed_by=None):
-    now = time.time()
-    cred = spec.get('credential') or {}
-    return {
-        'id': spec.get('id'),
-        'name': spec.get('name') or spec.get('id'),
-        'credential_type': cred.get('type') or 'none',
-        'credential_key': cred.get('key') if cred.get('type') in ('env', 'vault') else None,
-        'credential_key2': cred.get('key2'),
-        'ws_spec': json.dumps(spec.get('ws') or {}, sort_keys=True),
-        'status': status,
-        'proposed_by': proposed_by,
-        'created_at': now,
-        'updated_at': now,
-    }
-
-
-def _ws_feed_row_to_spec(row):
-    try:
-        ws = json.loads(row.get('ws_spec') or '{}')
-    except ValueError:
-        ws = {}
-    return {'id': row['id'], 'name': row['name'],
-            'credential': {'type': row.get('credential_type') or 'none',
-                           'key': row.get('credential_key'),
-                           'key2': row.get('credential_key2')},
-            'ws': ws, 'status': row['status'], 'proposed_by': row.get('proposed_by')}
-
-
-def _load_ws_feeds():
-    """Load the active ws_feeds rows into the live _WS_FEEDS registry. Fail
-    closed: on DB error the registry stays empty (no collectors start)."""
-    global _WS_FEEDS, _WS_FEEDS_LOAD_ERROR
-    _WS_FEEDS = {}
-    _WS_FEEDS_LOAD_ERROR = None
-    try:
-        with _db() as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT id, name, credential_type, credential_key, credential_key2, ws_spec, status, proposed_by "
-                "FROM ws_feeds WHERE status = 'active'"  # nosec B608 -- fixed internal columns
-            ).fetchall()
-    except Exception as e:
-        _WS_FEEDS_LOAD_ERROR = f'db unavailable: {e}'
-        return
-    for row in rows:
-        spec = _ws_feed_row_to_spec(dict(row))
-        _WS_FEEDS[spec['id']] = spec
-
-
-def _seed_ws_feeds_if_empty():
-    """Seed the ws_feeds table from _WS_FEED_SEED the first time it comes up
-    empty, mirroring _seed_api_services_if_empty."""
-    try:
-        with _db() as conn:
-            count = conn.execute('SELECT COUNT(*) FROM ws_feeds').fetchone()[0]
-            if count:
-                return
-            for sid, feed in _WS_FEED_SEED.items():
-                spec = {'id': sid, 'name': feed.get('name'),
-                        'credential': feed.get('credential') or {},
-                        'ws': feed.get('ws') or {}}
-                row = _ws_feed_spec_to_row(spec, status='active', proposed_by='seed')
-                conn.execute(
-                    'INSERT INTO ws_feeds (id, name, credential_type, credential_key, '
-                    'credential_key2, ws_spec, status, proposed_by, created_at, updated_at) '
-                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                    [row[c] for c in ('id', 'name', 'credential_type', 'credential_key',
-                                      'credential_key2', 'ws_spec', 'status', 'proposed_by',
-                                      'created_at', 'updated_at')])
-    except Exception as e:
-        print(f'[ws] seed failed: {e}', flush=True)
-
-
-def _ws_feed_upsert(spec, status='active', proposed_by=None):
-    """Persist a feed spec as a row and refresh the live registry. Used by the
-    propose flow (status='proposed'), approval flow ('active'/'denied'), and
-    remove flow ('removed')."""
-    row = _ws_feed_spec_to_row(spec, status=status, proposed_by=proposed_by)
-    with _db() as conn:
-        conn.execute(
-            'INSERT INTO ws_feeds (id, name, credential_type, credential_key, '
-            'credential_key2, ws_spec, status, proposed_by, created_at, updated_at) '
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
-            'ON CONFLICT(id) DO UPDATE SET name=excluded.name, '
-            'credential_type=excluded.credential_type, credential_key=excluded.credential_key, '
-            'credential_key2=excluded.credential_key2, ws_spec=excluded.ws_spec, '
-            'status=excluded.status, proposed_by=excluded.proposed_by, updated_at=excluded.updated_at',
-            [row[c] for c in ('id', 'name', 'credential_type', 'credential_key',
-                              'credential_key2', 'ws_spec', 'status', 'proposed_by',
-                              'created_at', 'updated_at')])
-    _load_ws_feeds()
-
-
-def _validate_ws_feed_spec(spec):
-    """Validate a proposed websocket feed descriptor. Returns (sid, normalized,
-    error) -- error is None when valid. Security constraints mirror the other
-    registry validators: a public wss:// URL only (the collector connects to
-    it), a known credential source, a describable frame filter, and non-empty
-    field paths. Re-validated at approval time so a forged proposal cannot
-    grant more than this allows."""
-    spec = spec or {}
-    sid = str(spec.get('id') or '').strip().lower()
-    if not sid or not sid.replace('_', '').replace('-', '').isalnum():
-        return None, None, 'feed id must be a simple alphanumeric slug'
-    ws = spec.get('ws') or {}
-    url = str(ws.get('url') or '').strip()
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme != 'wss' or not parsed.hostname or not _is_safe_public_host(parsed.hostname):
-        return None, None, 'ws.url must be a public wss:// URL'
-    if not isinstance(ws.get('subscribe'), dict):
-        return None, None, 'ws.subscribe must be a JSON object (the subscription template)'
-    cred = spec.get('credential') or {}
-    if cred.get('type') not in ('none', 'env', 'vault'):
-        return None, None, 'credential.type must be "none", "env", or "vault"'
-    if cred.get('type') in ('env', 'vault') and not (cred.get('key') or '').strip():
-        return None, None, 'credential.key is required for env/vault credentials'
-    ff = ws.get('frame_filter') or {}
-    if ff.get('data_kind') not in ('list', 'dict'):
-        return None, None, 'frame_filter.data_kind must be "list" or "dict"'
-    fields = ff.get('fields') or {}
-    if not isinstance(fields, dict) or not fields:
-        return None, None, 'frame_filter.fields must be a non-empty mapping of name -> path'
-    buf = ws.get('buffer') or {}
-    if buf.get('kind') not in ('latest_per_topic', 'ring'):
-        return None, None, 'buffer.kind must be "latest_per_topic" or "ring"'
-    # Clamp every numeric knob so a bad proposal cannot DoS the collector.
-    ws['open_timeout_s'] = max(5, min(int(ws.get('open_timeout_s') or 15), 60))
-    ws['stall_timeout_s'] = max(15, min(int(ws.get('stall_timeout_s') or 90), 600))
-    ws['reconnect_backoff_s'] = max(5, min(int(ws.get('reconnect_backoff_s') or 15), 300))
-    return sid, {'id': sid, 'name': str(spec.get('name') or sid)[:120],
-                 'credential': {'type': cred.get('type') or 'none',
-                                'key': cred.get('key') if cred.get('type') in ('env', 'vault') else None,
-                                'key2': cred.get('key2')},
-                 'ws': ws}, None
-
-
-def _ws_resolve_path(obj, path):
-    """Resolve a tiny path language against a parsed frame: bare segments are
-    dict keys, bracketed numbers are list indices. 'MetaData.ShipName',
-    'c[0]', '[3]'. Returns None when any step is missing or the wrong type."""
-    tokens = re.findall(r'[^.\[\]]+|\[\d+\]', path or '')
-    cur = obj
-    for tok in tokens:
-        if tok.startswith('[') and tok.endswith(']'):
-            idx = int(tok[1:-1])
-            if not isinstance(cur, (list, tuple)) or idx >= len(cur):
-                return None
-            cur = cur[idx]
-        else:
-            if not isinstance(cur, dict) or tok not in cur:
-                return None
-            cur = cur[tok]
-    return cur
-
-
-def _ws_extract_frame(ws_cfg, data):
-    """Extract (topic, fields, raw) from one frame per the feed's frame_filter.
-    Returns (None, None, None) for control frames (heartbeats, subscription
-    confirmations, malformed shapes)."""
-    ff = ws_cfg.get('frame_filter') or {}
-    kind = ff.get('data_kind', 'dict')
-    if kind == 'list':
-        # List-framed feeds: data frames are [..., {data}, ...]; any dict is a
-        # control frame and any list without a dict payload is skipped.
-        if not isinstance(data, list):
-            return None, None, None
-        idx = int(ff.get('data_index') or 1)
-        if len(data) <= idx or not isinstance(data[idx], dict):
-            return None, None, None
-        payload = data[idx]
-        topic = _ws_resolve_path(data, ff.get('topic_path'))
-    else:
-        if not isinstance(data, dict):
-            return None, None, None
-        skip_key = ff.get('skip_on_key')
-        skip_vals = ff.get('skip_values') or []
-        if skip_key and data.get(skip_key) in skip_vals:
-            return None, None, None
-        payload = data
-        topic = _ws_resolve_path(data, ff.get('topic_path'))
-    if not topic:
-        return None, None, None
-    fields = {}
-    for fname, path in (ff.get('fields') or {}).items():
-        try:
-            val = _ws_resolve_path(payload, path)
-        except Exception:  # noqa: BLE001 -- a missing field is skipped, never a dropped frame
-            val = None
-        if val is not None:
-            fields[fname] = val
-    return topic, fields, data
-
-
-def _ws_substitute(node, token, var_map):
-    """Recursively substitute $CRED (the resolved credential) and $VARS entries
-    into a subscription template. A var whose value is a LIST splices into an
-    enclosing list (Kraken's 'pair': ['$PAIRS'] must become a flat pair array,
-    not a nested one)."""
-    if isinstance(node, dict):
-        return {k: _ws_substitute(v, token, var_map) for k, v in node.items()}
-    if isinstance(node, list):
-        out = []
-        for v in node:
-            if isinstance(v, str) and v in var_map and isinstance(var_map[v], list):
-                out.extend(var_map[v])
-            else:
-                out.append(_ws_substitute(v, token, var_map))
-        return out
-    if isinstance(node, str):
-        if node == '$CRED' and token is not None:
-            return token
-        if node in var_map:
-            return var_map[node]
-        return node
-    return node
-
-
-def _ws_subscribe_payload(ws_cfg, token):
-    return _ws_substitute(ws_cfg.get('subscribe') or {}, token, ws_cfg.get('vars') or {})
-
-
-def _ws_ingest(sid, topic, fields, raw):
-    buf = _WS_BUFFERS.setdefault(sid, {'latest': {}, 'history': [],
-                                       'status': {'connected': False, 'last_error': '',
-                                                  'connected_at': 0, 'last_tick_at': 0}})
-    spec = _WS_FEEDS.get(sid) or {}
-    cfg = (spec.get('ws') or {}).get('buffer') or {}
-    now = int(time.time() * 1000)
-    rec = {'ts': now, 'topic': topic, **fields, 'raw': raw}
-    kind = cfg.get('kind', 'latest_per_topic')
-    with _WS_LOCK:
-        buf['status']['last_tick_at'] = time.time()
-        if kind == 'ring':
-            buf['history'].append(rec)
-            cap = int(cfg.get('history') or 300)
-            if len(buf['history']) > cap:
-                del buf['history'][:len(buf['history']) - cap]
-        else:
-            buf['latest'][topic] = rec
-            max_topics = int(cfg.get('max_topics') or 100)
-            if len(buf['latest']) > max_topics:
-                oldest = min(buf['latest'], key=lambda t: buf['latest'][t]['ts'])
-                del buf['latest'][oldest]
-            buf['history'].append(rec)
-            cap = int(cfg.get('history') or 200)
-            if len(buf['history']) > cap:
-                del buf['history'][:len(buf['history']) - cap]
-
-
-def _ws_status(sid):
-    return dict((_WS_BUFFERS.get(sid) or {}).get('status') or {})
-
-
-def _ws_latest(sid, topics=None):
-    buf = _WS_BUFFERS.get(sid) or {}
-    with _WS_LOCK:
-        latest = buf.get('latest') or {}
-        wanted = topics or list(latest)
-        return {t: dict(latest[t]) for t in wanted if t in latest}
-
-
-def _ws_recent(sid, max_items=20, window_s=1800, topic=None):
-    buf = _WS_BUFFERS.get(sid) or {}
-    cutoff = time.time() - window_s
-    with _WS_LOCK:
-        items = [dict(r) for r in (buf.get('history') or [])
-                 if r['ts'] / 1000 >= cutoff and (topic is None or r.get('topic') == topic)]
-    return items[-max_items:]
-
-
-def _kraken_normalize_pair(pair):
-    """Normalize a user-supplied pair to Kraken's canonical symbol set:
-    uppercase, '-'/'_' -> '/', and the common aliases BTC->XBT and DOGE->XDG
-    (Kraken's ticker symbols for bitcoin and dogecoin)."""
-    p = (pair or '').strip().upper().replace('-', '/').replace('_', '/')
-    p = p.replace('BTC', 'XBT').replace('DOGE', 'XDG')
-    return p
-
-
-async def _ws_collector_loop(sid):
-    """One generic collector per registered feed. Reads the spec fresh from the
-    live registry on every reconnect, resolves the credential (if any),
-    subscribes, and ingests extracted frames into the service buffer. The stall
-    watchdog forces a reconnect when a subscribed-but-silent connection sits
-    idle (observed live after rapid reconnects throttled the IP)."""
-    import asyncio
-    import websockets
-    while True:
-        spec = _WS_FEEDS.get(sid) or {}
-        ws = spec.get('ws') or {}
-        url = ws.get('url') or ''
-        stall = float(ws.get('stall_timeout_s') or 90)
-        backoff = float(ws.get('reconnect_backoff_s') or 15)
-        open_timeout = float(ws.get('open_timeout_s') or 15)
-        buf = _WS_BUFFERS.setdefault(sid, {'latest': {}, 'history': [],
-                                           'status': {'connected': False, 'last_error': '',
-                                                      'connected_at': 0, 'last_tick_at': 0}})
-        try:
-            token, _t2, err = _api_credential_value(spec)
-            if err:
-                buf['status'].update(connected=False, last_error=err)
-                print(f'[ws:{sid}] credential error: {err}', flush=True)
-                await asyncio.sleep(backoff)
-                continue
-            payload = _ws_subscribe_payload(ws, token)
-            async with websockets.connect(
-                    url, max_size=2 ** 20,
-                    open_timeout=open_timeout, ping_interval=20, ping_timeout=20) as conn:
-                await conn.send(json.dumps(payload))
-                buf['status'].update(connected=True, last_error='', connected_at=time.time())
-                print(f'[ws:{sid}] connected', flush=True)
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(conn.recv(), timeout=stall)
-                    except asyncio.TimeoutError:
-                        print(f'[ws:{sid}] no data for {stall}s; reconnecting', flush=True)
-                        break
-                    except Exception:  # noqa: BLE001 -- ConnectionClosed et al: reconnect
-                        break
-                    try:
-                        data = json.loads(raw)
-                    except ValueError:
-                        continue
-                    topic, fields, full = _ws_extract_frame(ws, data)
-                    if topic is None:
-                        continue
-                    _ws_ingest(sid, topic, fields, full)
-        except Exception as e:  # noqa: BLE001 -- a drop/backoff and retry is the whole point
-            buf['status'].update(connected=False, last_error=str(e)[:200])
-            print(f'[ws:{sid}] collector error: {e}', flush=True)
-            await asyncio.sleep(backoff)
-
-
-async def _ws_supervisor_loop():
-    """Reconcile running collector tasks with the live _WS_FEEDS registry every
-    few seconds: spawn collectors for newly-active feeds, cancel collectors for
-    removed/denied feeds, and restart a collector whose spec fingerprint changed
-    (an operator's edit goes live without a restart)."""
-    import asyncio
-    while True:
-        for sid, spec in list(_WS_FEEDS.items()):
-            fp = json.dumps(spec, sort_keys=True)
-            entry = _WS_TASKS.get(sid)
-            if entry is None or entry[0] != fp or entry[1].done():
-                if entry is not None:
-                    entry[1].cancel()
-                _WS_TASKS[sid] = (fp, asyncio.create_task(_ws_collector_loop(sid)))
-        for sid, entry in list(_WS_TASKS.items()):
-            if sid not in _WS_FEEDS:
-                entry[1].cancel()
-                _WS_TASKS.pop(sid, None)
-        await asyncio.sleep(10)
 
 
 def _team_digest_text(max_markdown_chars=1400, tape_window_s=86400):
@@ -21240,11 +19971,8 @@ async def read_library_file(path: str, request: Request):
 # A cheap, real idea worth taking regardless of the memory/cost question:
 # this is a SHARED, agent-writable space now, so a credential accidentally
 # pasted into a note shouldn't just sit there in plain text forever.
-_SECRET_PATTERNS = [
-    re.compile(r'sk-[a-zA-Z0-9_-]{16,}'),           # OpenAI/Anthropic/OpenRouter-style keys
-    re.compile(r'(?i)(api[_-]?key|secret|password|token)\s*[:=]\s*\S+'),
-    re.compile(r'AKIA[0-9A-Z]{16}'),                  # AWS access key id
-]
+# Credential shapes scrubbed from logged text live in world/redaction.json
+# (config.SECRET_PATTERNS); _SECRET_PATTERNS above aliases that live list.
 
 
 def _redact_secrets(content):

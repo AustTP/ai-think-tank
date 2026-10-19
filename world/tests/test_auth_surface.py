@@ -41,6 +41,10 @@ EXPECTED_PUBLIC = (
     '/api/sms',
     '/api/experiments',
     '/api/rule-proposals', '/api/success-proposals',
+    # Inbound webhook intake. Not a village route: the handler requires the
+    # X-Webhook-Key header (403 without it) and only appends to the JSONL
+    # queue; a bad or missing key stores nothing.
+    '/api/webhook/',
 )
 
 # Routes that must stay reachable without a session (login page + assets).

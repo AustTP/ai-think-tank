@@ -1,0 +1,5 @@
+{
+  "comment": "Role profile overrides merged over the kernel launch profiles by role: mission, instructions, notes. A role not listed keeps the kernel profile; `default` overrides the fallback profile used for roles that have no seed.",
+  "profiles": {},
+  "default": null
+}
