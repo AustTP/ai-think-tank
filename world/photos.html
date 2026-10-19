@@ -14,7 +14,7 @@
   h1 { font-size:20px; margin:0 0 4px; }
   p.lead { margin:0 0 18px; color:var(--muted); font-size:14px; }
   label { display:block; font-size:13px; color:var(--muted); margin:14px 0 4px; }
-  input[type=text], input[type=password], textarea, select {
+  input[type=text], input[type=password], input[type=number], textarea, select {
     width:100%; padding:11px 12px; font:inherit; color:var(--fg); background:transparent;
     border:1px solid var(--line); border-radius:10px;
   }
@@ -23,6 +23,7 @@
   button { width:100%; margin-top:18px; padding:14px; font:inherit; font-weight:600; color:#fff;
            background:var(--accent); border:0; border-radius:12px; }
   button:disabled { opacity:.5; }
+  h2.section { font-size:16px; margin:28px 0 4px; }
   #login { border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:8px; }
   #login h2 { font-size:15px; margin:0 0 4px; }
   #login small { color:var(--muted); }
@@ -68,6 +69,19 @@
 <button id="go" type="button">Review selected photos</button>
 <div id="status"></div>
 <div id="results"></div>
+
+<h2 class="section">From a Photos album</h2>
+<p class="hint">Add photos to an album on your iPhone. iCloud Photos syncs it to
+this Mac. Only photos not reviewed before are analyzed, and only when you press
+the button.</p>
+<label for="album">Album name</label>
+<input id="album" type="text" value="Think Tank" list="albumList" autocapitalize="words">
+<datalist id="albumList"></datalist>
+<label for="limit">New photos per run (max 10)</label>
+<input id="limit" type="number" min="1" max="10" value="5">
+<button id="albumGo" type="button">Review new in album</button>
+<div id="albumStatus"></div>
+<div id="albumResults"></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -179,7 +193,75 @@ $('go').addEventListener('click', async () => {
   $('files').value = '';
 });
 
+
+$('albumGo').addEventListener('click', async () => {
+  const status = $('albumStatus');
+  const results = $('albumResults');
+  if (!signedIn) { status.textContent = 'Sign in first.'; return; }
+  const album = $('album').value.trim();
+  if (!album) { status.textContent = 'Enter the album name.'; return; }
+  $('albumGo').disabled = true;
+  results.innerHTML = '';
+  status.textContent = 'Reading the album...';
+  try {
+    const r = await fetch('/api/photo-review/album', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agentId: 'player', album,
+        project: $('project').value.trim() || 'photos',
+        context: $('context').value.trim(),
+        mode: $('mode').value,
+        limit: Number($('limit').value) || 5,
+      }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    if (data.message) status.textContent = data.message;
+    else status.textContent = `Reviewed ${data.reviewedCount || 0} of ${data.total} photo(s); ${data.pending} still pending.`;
+    for (const item of (data.reviewed || [])) {
+      const article = document.createElement('article');
+      const h = document.createElement('h2');
+      h.textContent = item.name;
+      article.appendChild(h);
+      if (item.error) {
+        const err = document.createElement('div');
+        err.className = 'err';
+        err.textContent = item.error;
+        article.appendChild(err);
+      } else {
+        const path = document.createElement('div');
+        path.className = 'path';
+        path.textContent = item.briefPath;
+        const pre = document.createElement('pre');
+        pre.textContent = item.text;
+        article.append(path, pre);
+      }
+      results.appendChild(article);
+    }
+  } catch (e) {
+    status.textContent = `Failed: ${e.message || e}`;
+  }
+  $('albumGo').disabled = false;
+});
+
+async function loadAlbums() {
+  try {
+    const r = await fetch('/api/photo-review/albums', { credentials: 'same-origin' });
+    if (!r.ok) return;
+    const data = await r.json();
+    const list = $('albumList');
+    list.innerHTML = '';
+    for (const name of (data.albums || [])) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      list.appendChild(opt);
+    }
+  } catch (e) { /* the picker is optional */ }
+}
+
 checkSession();
+loadAlbums();
 </script>
 </body>
 </html>

@@ -258,6 +258,8 @@ from apis import (  # noqa: E402,F401
     _seed_api_services_if_empty,
     _validate_api_service_spec,
 )
+import apple_photos as _apple_photos  # noqa: E402
+
 from notify import (  # noqa: E402,F401
     GMAIL_SMTP,
     GMAIL_SMTP_HOST,
@@ -21320,6 +21322,169 @@ def _photo_review_from_image(image_b64, source_label, context='', mode='general'
     return {'ok': True, 'brief': reply.strip()[:8000]}
 
 
+
+def _photo_review_auth(request):
+    """Player session, a director/admin agent key, or X-Photo-Key matching
+    PHOTO_REVIEW_KEY in .env (purpose-scoped credential for a Shortcut)."""
+    authed, actor = _operator_gate(request)
+    if authed:
+        return True, actor
+    expected = (_load_env().get('PHOTO_REVIEW_KEY') or '').strip()
+    presented = (request.headers.get('X-Photo-Key') or '').strip()
+    if expected and presented and secrets.compare_digest(presented, expected):
+        return True, 'player'
+    return False, None
+
+
+def _photo_manifest_path():
+    return _safe_library_path('photo-reviews/.reviewed.json')
+
+
+def _load_photo_manifest():
+    path = _photo_manifest_path()
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_photo_manifest(data):
+    path = _photo_manifest_path()
+    if not path:
+        return False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _write_file(path, json.dumps(data, indent=1, sort_keys=True) + '\n')
+    return True
+
+
+@app.get('/api/photo-review/albums')
+async def photo_review_albums(request: Request):
+    """Album names available in the Mac Photos library, for the picker."""
+    authed, _actor = _photo_review_auth(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        return JSONResponse({'albums': _apple_photos.list_albums()})
+    except FileNotFoundError as e:
+        return JSONResponse({'error': str(e)}, status_code=503)
+    except Exception as e:
+        return JSONResponse({'error': f'could not read the Photos library: {e}'}, status_code=502)
+
+
+@app.post('/api/photo-review/album')
+async def photo_review_album(request: Request):
+    """Review NEW photos from a macOS Photos album, on demand. The iPhone tags
+    photos by adding them to an album; iCloud Photos syncs the album to this
+    Mac; this reads the synced originals and reviews only assets not already
+    recorded in library/photo-reviews/.reviewed.json. Nothing polls: the run
+    happens only when this endpoint is called."""
+    authed, actor = _photo_review_auth(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    body = await request.json()
+    claimed = (body.get('agentId') or '').strip() or None
+    if claimed and claimed != actor:
+        return JSONResponse({'error': 'photo reviews require the operator itself'}, status_code=403)
+    agent_id = claimed or actor
+    album = (body.get('album') or '').strip()
+    if not album:
+        return JSONResponse({'error': 'album is required'}, status_code=400)
+    mode = (body.get('mode') or 'general').strip().lower()
+    if mode not in ('general', 'design'):
+        return JSONResponse({'error': "mode must be 'general' or 'design'"}, status_code=400)
+    try:
+        limit = max(1, min(int(body.get('limit') or 5), 10))
+    except (TypeError, ValueError):
+        limit = 5
+    try:
+        assets = _apple_photos.album_assets(album)
+    except FileNotFoundError as e:
+        return JSONResponse({'error': str(e)}, status_code=503)
+    except Exception as e:
+        return JSONResponse({'error': f'could not read the Photos library: {e}'}, status_code=502)
+    if not assets:
+        return JSONResponse({'ok': True, 'album': album, 'total': 0,
+                             'pending': 0, 'reviewed': [],
+                             'message': f'album {album!r} has no photos (or has not synced yet)'})
+    manifest = _load_photo_manifest()
+    pending = [a for a in assets if f'{album}::{a["uuid"]}' not in manifest]
+    if not pending:
+        return JSONResponse({'ok': True, 'album': album, 'total': len(assets),
+                             'pending': 0, 'reviewed': [],
+                             'message': 'nothing new in this album'})
+    rel_dir = _photo_review_rel(body.get('project'))
+    try:
+        photo_dir = _safe_library_path(rel_dir)
+        if not photo_dir:
+            return JSONResponse({'error': 'invalid photo-reviews path'}, status_code=400)
+        os.makedirs(photo_dir, exist_ok=True)
+    except Exception:
+        return JSONResponse({'error': 'could not create the photo-reviews directory'}, status_code=500)
+    reviewed = []
+    for asset in pending[:limit]:
+        base_name = f'photo-{asset["uuid"][:8]}-{asset["date"][:10]}'
+        if not asset['local']:
+            reviewed.append({'name': base_name, 'uuid': asset['uuid'],
+                             'error': 'not downloaded to this Mac yet (iCloud '
+                                      'Optimize Storage); open it in Photos or '
+                                      'download the original'})
+            continue
+        tmp_dir = None
+        try:
+            jpeg_path, tmp_dir = _apple_photos.normalize_to_jpeg(asset['localPath'])
+            with open(jpeg_path, 'rb') as fh:
+                image_bytes = fh.read()
+            image_b64 = base64.b64encode(image_bytes).decode('ascii')
+            result = _photo_review_from_image(
+                image_b64, f'Photos album {album}, {asset["filename"]}',
+                context=body.get('context'), mode=mode)
+            if not result.get('ok'):
+                reviewed.append({'name': base_name, 'uuid': asset['uuid'],
+                                 'error': result.get('note', 'review failed')})
+                continue
+            image_rel = os.path.join(rel_dir, f'{base_name}.jpg')
+            brief_rel = os.path.join(rel_dir, f'{base_name}.txt')
+            image_path = _safe_library_path(image_rel)
+            brief_path = _safe_library_path(brief_rel)
+            if not image_path or not brief_path:
+                reviewed.append({'name': base_name, 'uuid': asset['uuid'],
+                                 'error': 'invalid output path'})
+                continue
+            header = (f'# Photo review: {base_name}\n\n'
+                      f'- Source: Photos album {album} ({asset["filename"]})\n'
+                      f'- Taken: {asset["date"]}\n'
+                      f'- Directory: {rel_dir}\n'
+                      f'- Mode: {mode}\n'
+                      f'- Reviewed: {datetime.datetime.now(datetime.timezone.utc).isoformat()}\n'
+                      f'- Image file: {image_rel}\n\n')
+            with open(image_path, 'wb') as fh:
+                fh.write(image_bytes)
+            _write_file(brief_path, header + result['brief'] + '\n')
+            manifest[f'{album}::{asset["uuid"]}'] = datetime.datetime.now(
+                datetime.timezone.utc).isoformat()
+            reviewed.append({'name': base_name, 'uuid': asset['uuid'],
+                             'image': image_rel, 'briefPath': brief_rel,
+                             'text': header + result['brief']})
+            log_action(agent_id, 'photo_review_album',
+                       {'album': album, 'uuid': asset['uuid'],
+                        'brief': brief_rel, 'mode': mode})
+        except Exception as e:
+            reviewed.append({'name': base_name, 'uuid': asset['uuid'],
+                             'error': str(e)[:300]})
+        finally:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+    _save_photo_manifest(manifest)
+    done = sum(1 for r in reviewed if not r.get('error'))
+    return JSONResponse({'ok': True, 'album': album, 'total': len(assets),
+                         'pending': len(pending) - done,
+                         'reviewedCount': done, 'reviewed': reviewed})
+
+
 @app.post('/api/photo-review')
 async def photo_review(request: Request):
     """On-demand review of one iPhone/Photos image. Nothing watches a folder:
@@ -21328,12 +21493,7 @@ async def photo_review(request: Request):
     library/photo-reviews/, which .gitignore keeps out of the repo.
     Auth: player session, a director/admin agent key, or X-Photo-Key matching
     PHOTO_REVIEW_KEY in .env (purpose-scoped credential for a Shortcut)."""
-    authed, actor = _operator_gate(request)
-    if not authed:
-        expected = (_load_env().get('PHOTO_REVIEW_KEY') or '').strip()
-        presented = (request.headers.get('X-Photo-Key') or '').strip()
-        if expected and presented and secrets.compare_digest(presented, expected):
-            authed, actor = True, 'player'
+    authed, actor = _photo_review_auth(request)
     if not authed:
         return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     body = await request.json()

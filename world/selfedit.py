@@ -156,6 +156,7 @@ TOLERATED_IMPORTERS = {
     'apis': {'serve.py'},
     'auth': {'serve.py'},
     'bank': {'serve.py'},
+    'apple_photos': {'serve.py'},
     'sublow': {'jev_grants.py'},
     'config': {'content.py', 'sim.py', 'sublow.py', 'serve.py'},
 }
