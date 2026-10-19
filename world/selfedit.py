@@ -40,6 +40,14 @@ The self-modification contract (operator decisions, locked 2026-10-18):
     applies whatever armed edits exist when it fires (each edit already
     passed its own quorum + validator), then consumes itself; the tank
     normally re-awakes on the next request, exactly like the idle path.
+  * VALIDATOR TURN (operator decision, 2026-10-19): the sim tick is paused
+    while a window holds for validation, so the validator cannot be reached
+    through the normal mailbox -> task path. serve._dormancy_window_loop runs
+    ONE narrow decision turn for the window's named validator only. The turn
+    reviews the applied diff plus the gate tail and still records its verdict
+    through validate_window(); no other agent runs and the village stays
+    dormant. A transport failure retries with backoff up to a hard attempt
+    cap, then fails closed so the slot rollback still applies.
   * CHANGE WINDOW semantics (operator decision, 2026-10-18): edits landed in
     a window are TESTED after they apply (the repo's own gate script runs
     inside the window). If tests fail, an in-window remediation session
@@ -75,6 +83,7 @@ The self-modification contract (operator decisions, locked 2026-10-18):
     unverifiable proposal never touches the file tree.
 """
 
+import difflib
 import hashlib
 import json
 import os
@@ -84,6 +93,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 
 # NEVER self-editable, by operator decision (2026-10-18): the enforcement
@@ -1490,6 +1500,19 @@ WINDOW_MAX_DURATION_MIN = 240
 WINDOW_DEFAULT_DURATION_MIN = 15
 WINDOW_MIN_LEAD_S = 5 * 60
 WINDOW_MAX_LEAD_S = 30 * 24 * 60 * 60
+
+# Validator turn (operator decision, 2026-10-19). The tank is dormant while a
+# change window holds for validation, so the sim tick cannot run and the
+# validator cannot be reached through the normal mailbox -> task path. The
+# dormancy loop therefore runs ONE narrow decision turn for the named
+# validator only. It is the same two-agent contract, not a new approver: the
+# decision still goes through validate_window(), and only the window's own
+# validator identity may record it.
+VALIDATOR_TURN_MAX_ATTEMPTS = 3
+VALIDATOR_TURN_RETRY_S = 60
+VALIDATOR_TURN_MAX_DIFF_CHARS = 16000
+VALIDATOR_TURN_MAX_TAIL_CHARS = 6000
+_VALIDATION_LOCK = threading.Lock()
 MAX_WINDOW_REASON_LEN = 500
 
 # The post-apply gate: the change window tests the LIVE tree after edits
@@ -1559,6 +1582,9 @@ def _ensure_windows_table(conn):
             ('validator_note', 'TEXT'),
             ('validated_at', 'REAL'),
             ('remediation_used', 'INTEGER'),
+            ('gate_tail', 'TEXT'),
+            ('validator_attempt_at', 'REAL'),
+            ('validator_attempts', 'INTEGER'),
             ('push_status', 'TEXT'),
             ('push_category', 'TEXT'),
             ('push_note', 'TEXT'),
@@ -2161,7 +2187,8 @@ def _hold_for_validator(window_id, remediation_used, tail):
     if not row or row['status'] != 'fired' or row.get('push_status'):
         return
     _update_window(window_id, push_status='awaiting_validator',
-                   remediation_used=1 if remediation_used else 0)
+                   remediation_used=1 if remediation_used else 0,
+                   gate_tail=(tail or '')[-POST_APPLY_TAIL_LEN:])
     edits = _window_edit_summaries(window_id)
     serve.log_action(window_id, 'selfedit_validation_requested',
                      {'edits': [e['id'] for e in edits],
@@ -2191,6 +2218,254 @@ def _hold_for_validator(window_id, remediation_used, tail):
                  'before you decide, the window rolls back automatically.')
     lines.append('Gate tail:\n' + (tail or '')[-POST_APPLY_TAIL_LEN:])
     _notify_agent(validator, '\n'.join(lines), about=f'selfedit:{window_id}')
+
+
+def _window_diff(window_id):
+    """Bounded pre-edit/current diff for the validator turn. The applied rows
+    are exactly the change request's bytes, so a unified diff is the smallest
+    honest review surface; a missing backup degrades to a named limitation."""
+    where = _world()
+    with _s()._db() as conn:
+        _ensure_table(conn)
+        rows = conn.execute(
+            'SELECT id, agent, path FROM self_edit_log WHERE window_id = ? '
+            "AND status = 'applied' ORDER BY created", (window_id,)).fetchall()
+    parts = []
+    for row_id, agent, display in rows:
+        target = _target_from_display(display)
+        backup = os.path.join(where, '.selfedit_backups', row_id)
+        try:
+            with open(backup, 'rb') as fh:
+                before = fh.read().decode('utf-8', errors='replace')
+            with open(target, 'rb') as fh:
+                after = fh.read().decode('utf-8', errors='replace')
+        except OSError as exc:
+            parts.append(f'{display} ({agent}): diff unavailable: {exc}')
+            continue
+        diff = ''.join(difflib.unified_diff(
+            before.splitlines(True), after.splitlines(True),
+            fromfile=f'{display} (before)', tofile=f'{display} (after)',
+            n=3))
+        parts.append(f'{display} ({agent}):\n'
+                     + (diff or '(no line diff; binary or line-ending change)'))
+    text = '\n\n'.join(parts) or '(no applied edits to diff)'
+    if len(text) > VALIDATOR_TURN_MAX_DIFF_CHARS:
+        text = text[:VALIDATOR_TURN_MAX_DIFF_CHARS] + '\n[diff truncated]'
+    return text
+
+
+def _validator_brief(window_id):
+    row = _window_row(window_id) or {}
+    return {
+        'window': row,
+        'edits': _window_edit_summaries(window_id),
+        'unlanded': _window_unlanded(window_id),
+        'diff': _window_diff(window_id),
+        'tail': (row.get('gate_tail') or '')[-VALIDATOR_TURN_MAX_TAIL_CHARS:],
+    }
+
+
+SELFEDIT_VALIDATE_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'selfedit_validate',
+        'description': ('Record the validator decision for one change request. '
+                        'approve=true pushes the applied bytes to origin main; '
+                        'approve=false rolls the window back with nothing '
+                        'pushed. A non-empty note is required when remediation '
+                        'was used, any reserved edit failed to apply, or you '
+                        'flag issues.'),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'windowId': {'type': 'string',
+                             'description': 'The change window id under review.'},
+                'approved': {'type': 'boolean',
+                             'description': 'true to push, false to roll back.'},
+                'note': {'type': 'string',
+                         'description': 'Why, and what issues you found.'},
+                'issues': {'type': 'boolean',
+                           'description': 'true when you have concerns beyond '
+                                          'the automatic issue checks.'},
+            },
+            'required': ['windowId', 'approved'],
+        },
+    },
+}
+
+
+def _default_validator_decider(window_id, validator, brief):
+    """One model turn as the named validator. Forced to the decision tool so a
+    prose answer cannot be mistaken for consent. Evidence is wrapped as
+    external data; the validator identity is the window's own."""
+    serve = _s()
+    row = brief['window']
+    state = serve.get_state_from_db() or {}
+    agents = state.get('agents') or {}
+    agent = agents.get(validator) if isinstance(agents, dict) else {}
+    if not isinstance(agent, dict):
+        agent = {}
+    name = agent.get('name') or validator
+    role = agent.get('role') or 'agent'
+    diff_block, _n, _t, diff_inst = serve.wrap_external_content(
+        brief['diff'], 'the applied change diff')
+    tail_block, _n2, _t2, tail_inst = serve.wrap_external_content(
+        brief['tail'] or '(no gate output recorded)', 'the repo test gate output')
+    edit_lines = [f"- {e['path']} by {e['agent']}: {(e['summary'] or '')[:240]}"
+                  for e in brief['edits']]
+    unlanded = [f"- {u['id']}: {u['status']}" for u in brief['unlanded']]
+    system = (
+        f'You are {name}, a {role} in an AI think tank. You are the named '
+        'validator for one change request. The tank is dormant while you '
+        'decide, and your decision is the only gate before the applied bytes '
+        'are pushed to the shared main branch. Review the diff, the applied '
+        'edit summaries, and the repo test gate output. Approve only when the '
+        'change matches the stated reason, is safe to ship, and the gate '
+        'output actually supports it. Deny when the change is unrelated, '
+        'incomplete, unsafe, or the evidence is insufficient. If in-window '
+        'remediation was used, any reserved edit did not land, or you have '
+        'any concern, set issues=true and write a non-empty note. Return '
+        'exactly one selfedit_validate tool call. Do not return prose.'
+    )
+    user = ('## Change request\n'
+            f"Window: {window_id}\n"
+            f"Implementer: {row.get('agent') or '?'}\n"
+            f"Reason: {row.get('reason') or '(none)'}\n"
+            f"Remediation used: {'yes' if row.get('remediation_used') else 'no'}\n\n"
+            '## Applied edits\n' + ('\n'.join(edit_lines) or '(none)') + '\n\n'
+            '## Reserved edits that did not land\n'
+            + ('\n'.join(unlanded) or '(none)') + '\n\n'
+            '## Diff instruction\n' + diff_inst + '\n' + diff_block + '\n\n'
+            '## Gate instruction\n' + tail_inst + '\n' + tail_block)
+    model = serve._resolve_model_tier(
+        f'Review applied self-edits for change request {window_id}',
+        task_type='review')
+    data = serve._post_openrouter_raw(
+        model, [{'role': 'system', 'content': system},
+                {'role': 'user', 'content': user}],
+        tools=[SELFEDIT_VALIDATE_TOOL], max_tokens=800,
+        tool_choice={'type': 'function',
+                     'function': {'name': 'selfedit_validate'}})
+    usage = (data or {}).get('usage') or {}
+    cost = usage.get('cost') or 0
+    if cost:
+        serve._accrue_spend('selfedit_validation', cost, agent_id=validator)
+    message = (((data or {}).get('choices') or [{}])[0].get('message') or {})
+    calls = message.get('tool_calls') or []
+    if not calls:
+        raise RuntimeError('validator returned no selfedit_validate tool call')
+    raw = ((calls[0].get('function') or {}).get('arguments')) or '{}'
+    try:
+        args = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f'validator tool arguments were not JSON: {exc}')
+    if (args.get('windowId') or '').strip() != window_id:
+        raise RuntimeError('validator tool call named a different window')
+    if 'approved' not in args:
+        raise RuntimeError('validator tool call omitted approved')
+    return {'approved': bool(args.get('approved')),
+            'note': (args.get('note') or '').strip(),
+            'issues': bool(args.get('issues')),
+            'model': model, 'cost': cost}
+
+
+def pending_validator_windows(now=None, limit=5):
+    """Fired windows that still need a validator turn. `validator_status`
+    gates retries: a failed transport wait VALIDATOR_TURN_RETRY_S, and a turn
+    that has run out of attempts stops consuming model budget."""
+    now = time.time() if now is None else now
+    with _s()._db() as conn:
+        _ensure_windows_table(conn)
+        rows = conn.execute(
+            "SELECT id FROM dormancy_windows WHERE status = 'fired' "
+            "AND push_status = 'awaiting_validator' AND end_ts >= ? "
+            "AND COALESCE(validator_attempts, 0) < ? "
+            "AND (validator_status IS NULL "
+            "     OR ((validator_status = 'pending' "
+            "          OR validator_status = 'deciding') "
+            "         AND COALESCE(validator_attempt_at, 0) <= ?)) "
+            'ORDER BY start_ts LIMIT ?',
+            (now, VALIDATOR_TURN_MAX_ATTEMPTS,
+             now - VALIDATOR_TURN_RETRY_S, limit)).fetchall()
+    return [r[0] for r in rows]
+
+
+def run_validator_review(window_id, decider=None, now=None):
+    """Run ONE narrow validator decision turn while the tank is dormant.
+    Returns (ok, payload). The decision still goes through validate_window(),
+    so only the window's named validator can record it and every push/rollback
+    path is unchanged."""
+    serve = _s()
+    now = time.time() if now is None else now
+    row = _window_row(window_id)
+    if not row:
+        return False, {'error': 'unknown window id'}
+    if row.get('status') != 'fired' or row.get('push_status') != 'awaiting_validator':
+        return False, {'error': 'window is not awaiting validation'}
+    if row['end_ts'] < now:
+        return False, {'error': 'window slot already ended'}
+    validator = (row.get('validator') or '').strip()
+    if not validator:
+        return False, {'error': 'window has no validator'}
+    attempts = int(row.get('validator_attempts') or 0)
+    if attempts >= VALIDATOR_TURN_MAX_ATTEMPTS:
+        _update_window(window_id, validator_status='failed')
+        return False, {'error': 'validator turn already used all attempts'}
+    with serve._db() as conn:
+        _ensure_windows_table(conn)
+        cur = conn.execute(
+            "UPDATE dormancy_windows SET validator_status = 'deciding', "
+            'validator_attempt_at = ?, '
+            'validator_attempts = COALESCE(validator_attempts, 0) + 1 '
+            "WHERE id = ? AND status = 'fired' "
+            "AND push_status = 'awaiting_validator' AND end_ts >= ? "
+            "AND COALESCE(validator_attempts, 0) < ? "
+            "AND (validator_status IS NULL "
+            "     OR ((validator_status = 'pending' "
+            "          OR validator_status = 'deciding') "
+            "         AND COALESCE(validator_attempt_at, 0) <= ?))",
+            (now, window_id, now, VALIDATOR_TURN_MAX_ATTEMPTS,
+             now - VALIDATOR_TURN_RETRY_S))
+    if cur.rowcount != 1:
+        return False, {'error': 'another validator turn owns this window right now'}
+    attempts += 1
+    serve.log_action(window_id, 'selfedit_validator_turn_started',
+                     {'validator': validator, 'attempt': attempts},
+                     authorized=True)
+    try:
+        brief = _validator_brief(window_id)
+        decider = decider or _default_validator_decider
+        verdict = decider(window_id, validator, brief)
+    except Exception as exc:  # transport/shape failure is not consent
+        status = ('failed' if attempts >= VALIDATOR_TURN_MAX_ATTEMPTS
+                  else 'pending')
+        _update_window(window_id, validator_status=status)
+        serve.log_action(window_id, 'selfedit_validator_turn_failed',
+                         {'validator': validator, 'attempt': attempts,
+                          'error': str(exc)[:300]}, authorized=False)
+        return False, {'error': f'validator turn failed: {exc}'}
+    approved = bool((verdict or {}).get('approved'))
+    note = ((verdict or {}).get('note') or '').strip()
+    issues = bool((verdict or {}).get('issues'))
+    ok, payload = validate_window(validator, window_id, approved, note, issues)
+    if ok:
+        _update_window(window_id,
+                       validator_status='approved' if approved else 'denied',
+                       validated_at=time.time())
+        serve.log_action(window_id, 'selfedit_validator_decided',
+                         {'validator': validator, 'approved': approved,
+                          'issues': issues,
+                          'model': (verdict or {}).get('model'),
+                          'attempt': attempts}, authorized=True)
+    else:
+        status = ('failed' if attempts >= VALIDATOR_TURN_MAX_ATTEMPTS
+                  else 'pending')
+        _update_window(window_id, validator_status=status)
+        serve.log_action(window_id, 'selfedit_validator_decision_refused',
+                         {'validator': validator, 'attempt': attempts,
+                          'error': str((payload or {}).get('error'))[:300]},
+                         authorized=False)
+    return ok, payload
 
 
 def _fail_window_push(window_id, reason, by=None):
@@ -2289,6 +2564,13 @@ def validate_window(agent_id, window_id, approved, note, issues=False):
     window holds. Deny = rollback (nothing pushed). Approve = push, with a
     REQUIRED note whenever the outcome has issues (remediation was used,
     reserved edits failed to apply, or the validator flags concerns)."""
+    with _VALIDATION_LOCK:
+        return _validate_window_unlocked(agent_id, window_id, approved, note,
+                                         issues)
+
+
+def _validate_window_unlocked(agent_id, window_id, approved, note,
+                              issues=False):
     agent_id = (agent_id or '').strip()
     note = (note or '').strip()[:MAX_PUSH_NOTE_LEN]
     row = _window_row(window_id)
@@ -2302,12 +2584,20 @@ def validate_window(agent_id, window_id, approved, note, issues=False):
         return False, {'error': f"window {window_id} is {row['status']!r} / "
                                 f"push {row.get('push_status')!r} -- nothing "
                                 'is waiting for validation right now'}
-    if row['end_ts'] < time.time():
+    # A validator turn that started before the slot ended may finish after it:
+    # the alternative is losing a real decision to a slow model call. The
+    # end-of-slot sweep still rolls back an unanswered window on the next tick.
+    grace = bool(row.get('validator_status') == 'deciding'
+                 and row.get('validator_attempt_at')
+                 and float(row['validator_attempt_at']) <= float(row['end_ts']))
+    if row['end_ts'] < time.time() and not grace:
         return False, {'error': 'the window slot has ended -- the sweep will '
                                 'roll the edits back; schedule a fresh window'}
     if not approved:
         _fail_window_push(window_id,
                           f'validator {agent_id} denied the push', by=agent_id)
+        _update_window(window_id, validator_status='denied',
+                       validated_at=time.time())
         return True, {'ok': True, 'status': 'unsuccessful',
                       'message': 'denial recorded -- the window rolled back '
                                  'and nothing was pushed'}
@@ -2326,5 +2616,7 @@ def validate_window(agent_id, window_id, approved, note, issues=False):
                                 'with issues (' + '; '.join(why) + ') -- '
                                 'describe them for the record, then approve '
                                 'again'}
+    _update_window(window_id, validator_status='approved',
+                   validated_at=time.time())
     category = 'successful_with_issues' if has_issues else 'successful'
     return _push_window(window_id, category, note)

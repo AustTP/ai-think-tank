@@ -1937,6 +1937,26 @@ async def _dormancy_window_loop(poll_s=30):
                     print(f'[selfedit] applied {applied} armed edit(s) while dormant', flush=True)
             except Exception as exc:
                 print(f'[selfedit] apply_pass failed: {exc}', flush=True)
+            # The sim tick is paused, so the normal mailbox -> task path cannot
+            # reach the named validator. Run ONE narrow decision turn for each
+            # window holding for validation; the turn calls validate_window()
+            # with the window's own validator identity.
+            try:
+                pending = await asyncio.to_thread(
+                    _selfedit.pending_validator_windows)
+            except Exception as exc:
+                pending = []
+                print(f'[selfedit] validator queue read failed: {exc}', flush=True)
+            for window_id in pending:
+                try:
+                    ok, payload = await asyncio.to_thread(
+                        _selfedit.run_validator_review, window_id)
+                    if ok:
+                        print(f'[selfedit] validator decided {window_id}: '
+                              f'{payload.get("status")}', flush=True)
+                except Exception as exc:
+                    print(f'[selfedit] validator turn failed for '
+                          f'{window_id}: {exc}', flush=True)
 
 
 def get_state_from_db():

@@ -15,6 +15,7 @@ or network is ever touched. The contract under test:
   - denial, push failure, unexpected tree dirt, and slot end without a
     decision all roll the window back like a failed gate (nothing pushed).
 """
+import asyncio
 import sys
 import os
 
@@ -411,3 +412,250 @@ def test_unarmed_request_refused_and_nothing_reserved(fake_repo, monkeypatch):
 
 if __name__ == '__main__':
     raise SystemExit(pytest.main([__file__, '-q']))
+
+
+def test_validator_turn_pushes_while_dormant(fake_repo, monkeypatch):
+    _, world = fake_repo
+    window_id, _edit_id, _other = _book_window(monkeypatch, fake_repo)
+    monkeypatch.setattr(serve, '_set_dormant', lambda v: None)
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    _fake_test_gate(monkeypatch, [(True, 'ALL GREEN')])
+    _notify_log(monkeypatch)
+    selfedit.apply_pass()
+    calls = _fake_git(monkeypatch)
+    telegrams = _watch_push_outcome(monkeypatch)
+    seen = {}
+
+    def decider(win, validator, brief):
+        seen.update({'window': win, 'validator': validator, 'brief': brief})
+        return {'approved': True, 'note': '', 'issues': False,
+                'model': 'fake-review-model', 'cost': 0.0}
+
+    ok, payload = selfedit.run_validator_review(window_id, decider=decider)
+    assert ok is True and payload['status'] == 'successful', payload
+    assert seen['validator'] == 'reviewer'
+    assert seen['window'] == window_id
+    assert '-SPEED = 2' in seen['brief']['diff']
+    assert '+SPEED = 3' in seen['brief']['diff']
+    assert 'ALL GREEN' in seen['brief']['tail']
+    assert ['push', 'origin', 'main'] in calls
+    assert selfedit._window_field(window_id, 'validator_status') == 'approved'
+    assert selfedit._window_field(window_id, 'push_category') == 'successful'
+    assert selfedit._window_field(window_id, 'gate_tail') == 'ALL GREEN'
+    assert any('SUCCESSFUL' in body for _s, body in telegrams)
+    ok, payload = selfedit.run_validator_review(
+        window_id, decider=lambda w, v, b: {'approved': True})
+    assert ok is False and 'not awaiting validation' in payload['error']
+
+
+def test_validator_turn_transport_failure_retries(fake_repo, monkeypatch):
+    _, world = fake_repo
+    window_id, _edit_id, _other = _book_window(monkeypatch, fake_repo)
+    monkeypatch.setattr(serve, '_set_dormant', lambda v: None)
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    _fake_test_gate(monkeypatch, [(True, 'ALL GREEN')])
+    _notify_log(monkeypatch)
+    selfedit.apply_pass()
+    _fake_git(monkeypatch)
+    _watch_push_outcome(monkeypatch)
+
+    def broken(win, validator, brief):
+        raise RuntimeError('model transport down')
+
+    ok, payload = selfedit.run_validator_review(window_id, decider=broken)
+    assert ok is False and 'transport down' in payload['error']
+    assert selfedit._window_field(window_id, 'validator_status') == 'pending'
+    assert selfedit._window_field(window_id, 'validator_attempts') == 1
+    now = selfedit.time.time()
+    assert window_id not in selfedit.pending_validator_windows(now=now + 5)
+    assert window_id in selfedit.pending_validator_windows(
+        now=now + selfedit.VALIDATOR_TURN_RETRY_S + 5)
+
+    ok, payload = selfedit.run_validator_review(
+        window_id,
+        decider=lambda w, v, b: {'approved': True, 'note': '', 'issues': False},
+        now=now + selfedit.VALIDATOR_TURN_RETRY_S + 5)
+    assert ok is True and payload['status'] == 'successful', payload
+    assert selfedit._window_field(window_id, 'validator_attempts') == 2
+
+
+def test_validator_turn_requires_note_for_issues(fake_repo, monkeypatch):
+    _, world = fake_repo
+    window_id, _edit_id, _other = _book_window(monkeypatch, fake_repo)
+    monkeypatch.setattr(serve, '_set_dormant', lambda v: None)
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    _fake_test_gate(monkeypatch, [(True, 'ALL GREEN')])
+    _notify_log(monkeypatch)
+    selfedit.apply_pass()
+    calls = _fake_git(monkeypatch)
+    _watch_push_outcome(monkeypatch)
+
+    first = lambda w, v, b: {'approved': True, 'note': '',
+                             'issues': True, 'model': 'fake'}
+    ok, payload = selfedit.run_validator_review(window_id, decider=first)
+    assert ok is False and 'note is REQUIRED' in payload['error']
+    assert calls == []
+    assert selfedit._window_field(window_id, 'validator_status') == 'pending'
+
+    second = lambda w, v, b: {'approved': True,
+                              'note': 'naming is off, behavior is right',
+                              'issues': True, 'model': 'fake'}
+    ok, payload = selfedit.run_validator_review(
+        window_id, decider=second,
+        now=selfedit.time.time() + selfedit.VALIDATOR_TURN_RETRY_S + 5)
+    assert ok is True and payload['status'] == 'successful_with_issues', payload
+    assert selfedit._window_field(window_id, 'push_note') \
+        == 'naming is off, behavior is right'
+
+
+def test_default_validator_decider_forces_decision_tool(fake_repo, monkeypatch):
+    _, world = fake_repo
+    window_id, _edit_id, _other = _book_window(monkeypatch, fake_repo)
+    monkeypatch.setattr(serve, '_set_dormant', lambda v: None)
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    _fake_test_gate(monkeypatch, [(True, 'ALL GREEN')])
+    _notify_log(monkeypatch)
+    selfedit.apply_pass()
+    captured = {}
+
+    def fake_post(model, messages, tools=None, max_tokens=None,
+                  tool_choice=None, _fallback_depth=0):
+        captured.update({'model': model, 'messages': messages,
+                         'tools': tools, 'tool_choice': tool_choice,
+                         'max_tokens': max_tokens})
+        return {'usage': {'cost': 0.0},
+                'choices': [{'message': {'tool_calls': [{
+                    'id': 'call-1',
+                    'type': 'function',
+                    'function': {
+                        'name': 'selfedit_validate',
+                        'arguments': ('{"windowId": "%s", "approved": true, '
+                                      '"note": "", "issues": false}'
+                                      % window_id),
+                    }}]}}]}
+
+    monkeypatch.setattr(serve, '_resolve_model_tier',
+                        lambda purpose, task_type=None, **kw: 'fake-review')
+    monkeypatch.setattr(serve, '_post_openrouter_raw', fake_post)
+    verdict = selfedit._default_validator_decider(
+        window_id, 'reviewer', selfedit._validator_brief(window_id))
+    assert verdict['approved'] is True and verdict['issues'] is False
+    assert verdict['model'] == 'fake-review'
+    assert captured['model'] == 'fake-review'
+    assert captured['tool_choice'] == {
+        'type': 'function', 'function': {'name': 'selfedit_validate'}}
+    assert captured['tools'][0]['function']['name'] == 'selfedit_validate'
+    blob = '\n'.join(m['content'] for m in captured['messages'])
+    assert '<<<EXTERNAL_DATA' in blob  # diff and gate tail are wrapped
+    assert window_id in blob
+
+
+def test_dormancy_loop_runs_validator_turn(monkeypatch):
+    seen = []
+
+    async def fake_sleep(_seconds):
+        if seen:
+            raise asyncio.CancelledError()
+        seen.append('slept')
+
+    monkeypatch.setattr(serve.asyncio, 'sleep', fake_sleep)
+    monkeypatch.setattr(serve._selfedit, 'window_tick', lambda: [])
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    monkeypatch.setattr(serve._selfedit, 'apply_pass', lambda: 0)
+    monkeypatch.setattr(serve._selfedit, 'pending_validator_windows',
+                        lambda: ['win-loop'])
+    reviewed = []
+    monkeypatch.setattr(
+        serve._selfedit, 'run_validator_review',
+        lambda window_id: (reviewed.append(window_id)
+                           or (True, {'status': 'successful'})))
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(serve._dormancy_window_loop(poll_s=0.01))
+    assert reviewed == ['win-loop']
+
+
+def test_window_diff_missing_backup_and_truncation(fake_repo, monkeypatch):
+    _, world = fake_repo
+    window_id, edit_id, _other = _book_window(monkeypatch, fake_repo)
+    monkeypatch.setattr(serve, '_set_dormant', lambda v: None)
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    _fake_test_gate(monkeypatch, [(True, 'ALL GREEN')])
+    _notify_log(monkeypatch)
+    selfedit.apply_pass()
+    (world / '.selfedit_backups' / edit_id).unlink()
+    text = selfedit._window_diff(window_id)
+    assert 'diff unavailable' in text
+    monkeypatch.setattr(selfedit, 'VALIDATOR_TURN_MAX_DIFF_CHARS', 5)
+    # rewrite the pre-edit backup so the diff is non-empty and can truncate
+    (world / '.selfedit_backups' / edit_id).write_text(
+        'SPEED = 2\n' * 10, encoding='utf-8')
+    assert selfedit._window_diff(window_id).endswith('[diff truncated]')
+
+
+def test_validator_turn_bad_states(fake_repo, monkeypatch):
+    _, world = fake_repo
+    window_id, _edit_id, _other = _book_window(monkeypatch, fake_repo)
+    monkeypatch.setattr(serve, '_set_dormant', lambda v: None)
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    _fake_test_gate(monkeypatch, [(True, 'ALL GREEN')])
+    _notify_log(monkeypatch)
+    selfedit.apply_pass()
+
+    ok, payload = selfedit.run_validator_review('win-missing')
+    assert ok is False and 'unknown window' in payload['error']
+
+    now = selfedit.time.time()
+    selfedit._update_window(window_id, end_ts=now - 1)
+    ok, payload = selfedit.run_validator_review(window_id, now=now)
+    assert ok is False and 'already ended' in payload['error']
+
+    selfedit._update_window(window_id, end_ts=now + 600, validator='')
+    ok, payload = selfedit.run_validator_review(window_id, now=now)
+    assert ok is False and 'no validator' in payload['error']
+
+    selfedit._update_window(window_id, validator='reviewer',
+                            validator_attempts=selfedit.VALIDATOR_TURN_MAX_ATTEMPTS)
+    ok, payload = selfedit.run_validator_review(window_id, now=now)
+    assert ok is False and 'all attempts' in payload['error']
+    assert selfedit._window_field(window_id, 'validator_status') == 'failed'
+
+    selfedit._update_window(window_id, validator_status='deciding',
+                            validator_attempt_at=now, validator_attempts=0)
+    ok, payload = selfedit.run_validator_review(window_id, now=now)
+    assert ok is False and 'owns this window' in payload['error']
+
+
+def test_default_validator_decider_failure_modes(fake_repo, monkeypatch):
+    _, world = fake_repo
+    window_id, _edit_id, _other = _book_window(monkeypatch, fake_repo)
+    monkeypatch.setattr(serve, '_set_dormant', lambda v: None)
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    _fake_test_gate(monkeypatch, [(True, 'ALL GREEN')])
+    _notify_log(monkeypatch)
+    selfedit.apply_pass()
+    monkeypatch.setattr(serve, '_resolve_model_tier',
+                        lambda purpose, task_type=None, **kw: 'fake-review')
+    monkeypatch.setattr(serve, 'get_state_from_db',
+                        lambda: {'agents': {'reviewer': 'not-a-dict'}})
+    brief = selfedit._validator_brief(window_id)
+
+    def post_with(call):
+        monkeypatch.setattr(
+            serve, '_post_openrouter_raw',
+            lambda *a, **kw: {'usage': {'cost': 0.02},
+                              'choices': [{'message': call}]})
+        return selfedit._default_validator_decider(
+            window_id, 'reviewer', brief)
+
+    for call, needle in (
+            ({'tool_calls': []}, 'no selfedit_validate tool call'),
+            ({'tool_calls': [{'function': {'arguments': 'not json'}}]},
+             'not JSON'),
+            ({'tool_calls': [{'function': {'arguments':
+                                          '{"windowId": "other", "approved": true}'}}]},
+             'different window'),
+            ({'tool_calls': [{'function': {'arguments':
+                                          '{"windowId": "%s"}' % window_id}}]},
+             'omitted approved')):
+        with pytest.raises(RuntimeError, match=needle):
+            post_with(call)

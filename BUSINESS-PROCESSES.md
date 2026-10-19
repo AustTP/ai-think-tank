@@ -1949,10 +1949,15 @@ the shared GitHub repository (`origin main`) under a two-agent contract:
    armed edits.
 2. Gate green does NOT push. The window enters `awaiting_validator` and
    the VALIDATOR is mailed the edit list, the gate's tail, and the
-   deadline. `selfedit_validate(windowId, approved, note?, issues?)` is
-   the single decision point, and only the window's named validator may
-   decide it -- the dormancy wake exemption covers `/api/selfedit/validate`
-   for them while the slot is open.
+   deadline. Because the sim tick is paused, the dormancy loop also runs
+   ONE narrow decision turn as the window's named validator: it reviews
+   the applied diff and gate tail, then calls `selfedit_validate`. No other
+   agent runs, and the village stays dormant. A failed validator turn
+   retries with backoff up to a hard attempt cap, then fails closed so the
+   normal slot rollback applies. `selfedit_validate(windowId, approved,
+   note?, issues?)` remains the single decision point, and only the
+   window's named validator may decide it -- the dormancy wake exemption
+   covers `/api/selfedit/validate` for them while the slot is open.
 3. Every final outcome is recorded in one of three categories on the
    window row: `successful`, `successful_with_issues`, or `unsuccessful`
    (denial, git failure, or nothing landed). A successful_with_issues
