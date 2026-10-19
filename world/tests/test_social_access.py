@@ -200,14 +200,14 @@ class RequestEndpointTests(_SocialCase):
 
 class SocialReadOnlyPolicyTests(unittest.TestCase):
 
-    def test_social_spike_forces_the_handle_before_rss(self):
+    def test_social_spike_searches_before_rss_and_keeps_the_handle_path(self):
         import content
         q = ('Search Facebook public groups for news about Albemarle, NC '
              'from the last 14 days')
         self.assertTrue(content._spike_wants_social_login(q, None))
         self.assertFalse(content._spike_wants_rss(q, None))
-        self.assertEqual(content._spike_first_tool(q, None),
-                         'request_credential_access')
+        with unittest.mock.patch.object(content._serve, 'TAVILY_API_KEY', 'k'):
+            self.assertEqual(content._spike_first_tool(q, None), 'search_web')
         self.assertEqual(content._spike_first_tool('any breaking news?', None),
                          'read_rss_feed')
 

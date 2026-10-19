@@ -2861,14 +2861,14 @@ def _spike_wants_ais_feed(backlog, instructions):
 
 
 def _spike_wants_social_login(backlog, instructions):
-    """A Facebook/Instagram investigation must start with the need-based
-    credential grant, not with the curated RSS feeds. Live miss 2026-10-19:
-    'Facebook public groups for news about Albemarle' matched the broad 'news'
-    trigger in _spike_wants_rss, so force_first_tool pinned read_rss_feed and
-    the spike spent its first turn on BBC/NASA items, then reported the real
-    browser tools as absent. The social host is the task's declared source;
-    force request_credential_access first so the handle exists before any
-    login attempt."""
+    """Detect a Facebook/Instagram investigation so it does not get pinned to
+    the curated RSS feeds. Live miss 2026-10-19: 'Facebook public groups for
+    news about Albemarle' matched the broad 'news' trigger in
+    _spike_wants_rss, so force_first_tool pinned read_rss_feed and the spike
+    spent its first turn on BBC/NASA items, then reported the real browser
+    tools as absent. Public group pages are often readable logged out; the
+    first tool is search_web so the agent can find real group URLs, and the
+    credential path stays available for pages that are actually gated."""
     text = f'{backlog or ""} {instructions or ""}'.lower()
     return 'facebook' in text or 'instagram' in text
 
@@ -3141,11 +3141,10 @@ _BROWSER_ACT_TOOL = {
             'the server injects it from the encrypted vault directly into the browser; you never see or '
             'handle the secret itself. credentialHandle comes from list_capability_handles or '
             'request_credential_access (your own active grants for kind=login credentials); '
-            'credentialField is username or password. For Facebook/Instagram, call '
-            'request_credential_access FIRST, then use the returned handle; a social login without '
-            'a fresh host-scoped handle is refused before any policy review. For Facebook prefer '
-            'https://mbasic.facebook.com/login or https://m.facebook.com/login, then op=read to find '
-            'the real selectors. You still need the css selector for the field, so '
+            'credentialField is username or password. Public Facebook group/post pages often load '
+            'logged out: try browser_act goto/read on the public URL first, and call '
+            'request_credential_access only if the page is genuinely gated. A social login without '
+            'a fresh host-scoped handle is refused before any policy review. You still need the css selector for the field, so '
             'goto+read the login page first to find it. Pass pageUrl (the page you are filling on) so the '
             'handle can be scope-checked against the right host. For a multi-field login, use op=login '
             'with fields (each with its own selector + credentialHandle + credentialField) and '
@@ -5001,7 +5000,7 @@ def _spike_first_tool(backlog, instructions):
     Instagram investigation must mint its read-only handle first, not spend
     turn one on the curated RSS feeds."""
     if _spike_wants_social_login(backlog, instructions):
-        return 'request_credential_access'
+        return 'search_web' if _serve.TAVILY_API_KEY else True
     if _spike_wants_internal_review(backlog, instructions):
         return 'search_library'
     if _spike_wants_x_trending(backlog, instructions):
@@ -5196,11 +5195,11 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         'guessing. If the question is about Facebook or Instagram public content, do NOT use '
         'browse_page on those hosts and do NOT file an allowlist request for them: use '
         'request_credential_access(service="facebook" or "instagram", purpose=...) while working '
-        'this task, then browser_act op=login on the service login page with the returned handle. '
-        'For Facebook, prefer https://mbasic.facebook.com/login or https://m.facebook.com/login; '
-        'the www page often hides the form behind a consent/landing screen. After goto, use '
-        'browser_act op=read to find the real input selectors before logging in. After login use '
-        'only browser_act goto/read/screenshot on public pages. Social hosts are '
+        'this task only if a page is actually gated, then browser_act op=login with the returned '
+        'handle. Public Facebook group and post permalinks often load logged out: use search_web to '
+        'find the group URL, then browser_act goto/read on https://www.facebook.com/groups/<id> and '
+        'the individual post links. Do not request credentials just because the host is Facebook. '
+        'Social hosts are '
         'hard read-only: fill, click, and submit are refused outside that login. Many sites load '
         'their real content via JavaScript/AJAX -- if a plain browse_page '
         'fetch comes back as an empty shell or just navigation/boilerplate with no real content, '
