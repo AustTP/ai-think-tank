@@ -1,13 +1,6 @@
 {
   "comment": "Operator-edited grants. This is the JSON switchboard for agent access: an entry here is granted; remove an entry to revoke it. Edits apply without restarting the server. The /api/app-grants and /api/file-grants endpoints grant the same things into live state for a player session.",
-  "appGrants": [
-    {
-      "id": "cfg-app-notes",
-      "bundleId": "com.apple.Notes",
-      "label": "Notes",
-      "caps": { "use": true }
-    }
-  ],
+  "appGrants": [],
   "fileGrants": [
     {
       "id": "cfg-file-notes-db",
