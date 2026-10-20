@@ -1,0 +1,13 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known fake values and generated test fixtures"
+regexes = [
+  '''test-device-key-[a-z0-9]+''',
+  '''sk-test-[A-Za-z0-9_-]+''',
+  '''ghp_test_[A-Za-z0-9]+'''
+]
+paths = [
+  '''world/tests/fixtures/.*'''
+]

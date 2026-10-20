@@ -10,18 +10,27 @@ consequences. The server owns all state (`think_tank.db`); the browser is a
 read-view into it.
 
 **Codebase:**
-- `world/serve.py` (~15.7k lines) — FastAPI server, simulation driver,
+- `world/serve.py` (~32k lines) — FastAPI server, simulation driver,
   model-tier management, JEV gates, team/director
   hierarchy, all HTTP endpoints. The Bank ledger/budget gates, player
   auth/sessions, and escalation/email/telegram notifications were extracted
   (2026-10-05) into `bank.py`, `auth.py`, and `notify.py` below; serve.py
   re-exports them at the top so `serve.*` call sites are unchanged.
-- `world/sim.py` (~10.2k lines) — Server-owned state machine: movement,
+- `world/sim.py` (~14k lines) — Server-owned state machine: movement,
   task assignment, ceremonies (refinement, social, governance, escalation),
   peer review gates, sprint lifecycle, agent off-duty/position management.
 - `world/content.py` (~3.7k lines) — Content executors that run when an
   agent arrives at a task room: research, coding, review, distill, weather,
   media, spikes, and the Bank teller.
+- `world/confirmations.py` + `world/confirmations_api.py` — Durable
+  two-phase confirmation proposals for write actions. Proposals bind action,
+  target, arguments, actor, channel, and expiry. Only the player can confirm
+  the exact phrase; execution rechecks the payload hash and actor.
+- `world/migrations.py` + `world/migrations/` — Versioned SQLite migrations
+  with SHA-256 checksums. New schema changes go here instead of another
+  idempotent block in `init_db`.
+- `world/model_config.py` — Validates model bands, price ranges, quality gaps,
+  selected tiers, and fallback ranks without importing `serve.py`.
 - `world/bank.py` — The Bank: spend ledger + per-service budget gates,
   spend-cap enforcement, forecasts (extracted from serve.py; re-exported).
 - `world/auth.py` — Player auth: credential creation, PBKDF2 hashing, login

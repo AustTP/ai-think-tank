@@ -42,6 +42,9 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+from confirmation_gate import gate as _confirmation_gate_or_response
+from confirmation_gate import finish as _finish_confirmation
+
 import runtime_limits
 
 # Pure web/text/path/security helpers extracted to their own module
@@ -1432,6 +1435,8 @@ def init_db():
         )''')
         tank_accounts.ensure_schema(conn)
         captcha.ensure_schema(conn)
+        import migrations as _migrations
+        _migrations.apply(conn)
 
     _seed_api_services_if_empty()
     _seed_rss_feeds_if_empty()
@@ -6021,6 +6026,8 @@ def _ensure_runtime_schemas():
     with _db() as conn:
         tank_accounts.ensure_schema(conn)
         captcha.ensure_schema(conn)
+        import migrations as _migrations
+        _migrations.apply(conn)
 
 
 @asynccontextmanager
@@ -6917,6 +6924,8 @@ def _teams_missing_scrum_master(state, team_ids):
 
 
 app = FastAPI(lifespan=_lifespan)
+from confirmations_api import router as _confirmations_router  # noqa: E402
+app.include_router(_confirmations_router)
 
 
 OPENROUTER_API_KEY = _load_env().get('OPENROUTER_API_KEY')
@@ -28813,6 +28822,11 @@ async def execute(request: Request):
         return JSONResponse({'error': 'a valid agent key for agentId is required'}, status_code=401)
     if not command:
         return JSONResponse({'error': 'command is required'}, status_code=400)
+    confirmation_error, confirmation_id = _confirmation_gate_or_response(
+        body, agent_id, 'execute', {'sandboxId': sandbox_id},
+        {'command': command, 'purpose': purpose})
+    if confirmation_error:
+        return confirmation_error
     allowed, reason = await _classify_command(command, purpose, agent_id)
     if not allowed:
         # Blocked by Jev: the agent's supervisor (a NON-Jev model) gets one
@@ -28836,6 +28850,7 @@ async def execute(request: Request):
     await asyncio.to_thread(_snapshot_sandbox, sandbox_id, sandbox_dir)
     result = await asyncio.to_thread(_run_in_sandbox_sync, sandbox_dir, command)
     log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'purpose': purpose, 'decision': 'allowed', 'exitCode': result['exitCode'], 'timedOut': result['timedOut']}, authorized=authorized)
+    _finish_confirmation(confirmation_id, 'executed')
     sync_prototypes(agent_id, sandbox_dir)
     return JSONResponse({'allowed': True, 'sandboxId': sandbox_id, **result})
 
@@ -29267,6 +29282,14 @@ async def _start_pipeline_job(request: Request, body: dict):
     agent_id = body.get('agentId', 'unknown')
     if not _require_player_session(request) and verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
         return JSONResponse({'error': 'Login or agent key required.'}, status_code=401)
+    steps = body.get('steps') or []
+    pipeline_target = {'sandboxId': body.get('sandboxId') or 'unknown',
+                       'steps': [{'name': s.get('name', 'step'),
+                                  'command': s.get('command', '')} for s in steps]}
+    confirmation_error, _confirmation_id = _confirmation_gate_or_response(
+        body, agent_id, 'pipeline', pipeline_target, {'steps': steps})
+    if confirmation_error:
+        return confirmation_error
     job_id = secrets.token_hex(16)
     body['_jobId'] = job_id
     job = {'id': job_id, 'agentId': agent_id, 'status': 'running',
@@ -29343,6 +29366,14 @@ async def _pipeline_execute_locked(request: Request, body: dict):
     if len(steps) > 64:
         return JSONResponse({'error': 'a pipeline may contain at most 64 steps'}, status_code=400)
 
+    pipeline_target = {'sandboxId': sandbox_id,
+                       'steps': [{'name': s.get('name', 'step'),
+                                  'command': s.get('command', '')} for s in steps]}
+    confirmation_error, confirmation_id = _confirmation_gate_or_response(
+        body, agent_id, 'pipeline', pipeline_target, {'steps': steps})
+    if confirmation_error:
+        return confirmation_error
+
     sandbox_dir = _sandbox_dir_for(sandbox_id)
     # A sandbox with no Python files has nothing for the Python gate to check.
     # mypy exits 2 and pytest exits 1 on the ABSENCE itself ("no .py files" /
@@ -29374,6 +29405,7 @@ async def _pipeline_execute_locked(request: Request, body: dict):
             if not overridden:
                 log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'decision': 'blocked', 'reason': reason, 'supervisorNote': override_note}, authorized=authorized)
                 results.append({'name': name, 'allowed': False, 'reason': reason, 'supervisorNote': override_note})
+                _finish_confirmation(confirmation_id, 'failed', f'blocked step {name}')
                 sync_prototypes(agent_id, sandbox_dir)
                 return JSONResponse({'sandboxId': sandbox_id, 'results': results, 'failedStep': name})
             log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'decision': 'allowed_supervisor_override', 'reason': reason, 'supervisorNote': override_note}, authorized=authorized)
@@ -29385,9 +29417,11 @@ async def _pipeline_execute_locked(request: Request, body: dict):
         if job:
             job['stepsCompleted'] = len(results)
         if result['exitCode'] != 0 or result['timedOut']:
+            _finish_confirmation(confirmation_id, 'failed', f'step {name} failed')
             sync_prototypes(agent_id, sandbox_dir)
             return JSONResponse({'sandboxId': sandbox_id, 'results': results, 'failedStep': name})
 
+    _finish_confirmation(confirmation_id, 'executed')
     sync_prototypes(agent_id, sandbox_dir)
     return JSONResponse({'sandboxId': sandbox_id, 'results': results, 'failedStep': None})
 

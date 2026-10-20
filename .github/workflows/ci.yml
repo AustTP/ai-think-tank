@@ -10,6 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -21,6 +23,21 @@ jobs:
 
       - name: Install Python deps
         run: python -m pip install -r requirements.txt
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Environment template guard
+        working-directory: world
+        run: python -m pytest tests/test_env_template.py -q
+
+      - name: Growth guard
+        run: python scripts/check_file_growth.py
+
+      - name: Model configuration
+        run: python scripts/check_models.py
 
       - name: flake8
         working-directory: world

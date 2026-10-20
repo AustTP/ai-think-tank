@@ -57,6 +57,14 @@ states only what changed in the operating model.
 
 **2026-10-20**
 
+- Durable confirmations are recorded in `confirmation_proposals`. The player
+  confirms an exact phrase; the action endpoint rechecks actor, target, and
+  arguments before running. `/api/execute` and `/api/pipeline` can require this
+  with `REQUIRE_CONFIRMATION_FOR_EXECUTION=1`.
+- SQLite schema changes now use versioned `world/migrations/` files with
+  checksums instead of another inline migration block.
+- CI now runs a secret scan, an env-template guard, a monolith growth guard,
+  and a model-config validator.
 - Player asks now use a FIFO backlog capped at 20. A second issue waits instead
   of replacing the first; overflow is logged as `player_ask_dropped`.
 - The peer gate requires two distinct clean votes. The one-vote timeout is
@@ -2575,6 +2583,37 @@ one-shot key rotation.
 **Records.** Library note and manifest under `photo-reviews/`, watch setting
 `photo_album_watch`, action log, `PHOTO_REVIEW_RETENTION_DAYS` prune log.
 
+### BP-65 Durable confirmations
+
+**Purpose.** Keep a model from turning "a user asked" into a real write without
+a separate, owner-approved step that survives a restart.
+
+**Trigger.** A write action that chooses to use the ledger, currently
+`/api/execute` and `/api/pipeline` when
+`REQUIRE_CONFIRMATION_FOR_EXECUTION=1`.
+
+**Steps.**
+
+1. The caller records a proposal with an action name, target, arguments,
+   channel, and a TTL. The server stores a canonical payload hash, the actor,
+   and an exact phrase. Nothing executes.
+2. The proposal is `pending`. Only the player can confirm it. The phrase is
+   `CONFIRM <id> <first 10 hex of the payload hash>`.
+3. A confirmed proposal is still not a blank cheque. The executing endpoint
+   calls `assert_ready` with the same action, target, and arguments. A changed
+   target, changed command, different actor, or expired proposal is refused.
+4. The action runs at most once. Success marks `executed`; a failed or blocked
+   step marks `failed`. There is no automatic replay after a crash.
+5. The player can cancel a pending or confirmed proposal. An actor can cancel
+   its own proposal. Listing is scoped to the actor, except for the player.
+
+**Controls.** Player-only confirmation, exact phrase, payload hash, actor
+binding, expiry, status transitions, no automatic replay, action log.
+
+**Records.** `confirmation_proposals` table, `schema_migrations` checksum row,
+action log `confirmation_proposed` / `confirmation_confirmed` /
+`confirmation_cancelled` / `confirmation_required`.
+
 ## 11. Player and operator processes
 
 | Process | Surface | What the owner does |
@@ -3001,6 +3040,7 @@ rather than gate-integrity questions.
 | Agent policy edits | `policy_edit` tool | Agents tune the 18 agent-editable keys through a JEV-reviewed key/value change; safety-adjacent keys are player-only; effective immediately, no restart; the player reverts by editing the JSON |
 | `GRANTS_CONFIG` | `world/grants.json` | App and file grants; applies live on file change |
 | `DEVICE_API_KEY` | `.env` | Device check-in bearer; auto-generated on first boot if unset, retrievable and rotatable at `/api/device/key` |
+| `REQUIRE_CONFIRMATION_FOR_EXECUTION` | `.env` | `0` by default; `1` makes `/api/execute` and `/api/pipeline` require a confirmed proposal |
 | `deviceCheckinHistoryMax` | `world/operator_policy.json` | 50, range 1 to 1,000 |
 | `deviceCheckinRetentionDays` | `world/operator_policy.json` | 30 days, range 1 to 365 |
 | `--max-idle-minutes` | launch flag | Dormancy arm; 0 or unset disables |
