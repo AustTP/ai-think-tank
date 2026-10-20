@@ -30,7 +30,9 @@ import urllib.parse
 
 import serve as _serve
 import evidence_policy
+import review_quality
 import training_capture
+import work_reuse
 
 from config import RESEARCH_DESK_PASSES, bind_policy
 
@@ -1614,17 +1616,43 @@ def _quality_pipeline_failure_snippet(step_name, stdout, stderr):
 _QUALITY_PIPELINE_TIMEOUT_S = 300
 
 
+def _poll_pipeline_job(base, key, job_id, deadline_s=_QUALITY_PIPELINE_TIMEOUT_S):
+    deadline = time.time() + deadline_s
+    while time.time() < deadline:
+        status = _serve._http_json('GET', base, f'/api/pipeline/jobs/{job_id}',
+                                   None, key, timeout=20)
+        if not isinstance(status, dict):
+            return {'error': 'pipeline job status unavailable'}
+        if status.get('error'):
+            return status
+        if status.get('status') in ('done', 'failed'):
+            return status.get('result') or {'error': 'pipeline job returned no result'}
+        time.sleep(1.0)
+    return {'error': 'pipeline job timed out'}
+
+
 def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose, scope_files=None):
     """Run the standard quality pipeline in the sandbox via /api/pipeline, which
     stops at the first failing step and returns per-step {name, exitCode, stdout,
     stderr} + failedStep (None on a full pass). Always returns a plain dict; never
     raises. Callers gate approval on `ok`. When `scope_files` is given, flake8/
     mypy/bandit AND pytest-cov are scoped to those files (see
-    _quality_pipeline_steps)."""
+    _quality_pipeline_steps). Passing checks are content-addressed and reused
+    until the workspace or the step set changes; long runs are polled as a
+    background job instead of holding one 300s HTTP request open."""
+    steps = _quality_pipeline_steps(scope_files)
+    sandbox_dir = _serve._sandbox_dir_for(sandbox_id)
+    cache_key = (None if os.environ.get('PYTEST_CURRENT_TEST')
+                 else work_reuse.check_key(sandbox_dir, steps, 'quality-v1'))
+    cached = work_reuse.get_check(cache_key) if cache_key else None
+    if cached:
+        return cached
     resp = _serve._http_json('POST', base, '/api/pipeline',
                       {'agentId': agent_id, 'sandboxId': sandbox_id,
-                       'purpose': purpose, 'steps': _quality_pipeline_steps(scope_files)}, key,
+                       'purpose': purpose, 'steps': steps, 'background': True}, key,
                       timeout=_QUALITY_PIPELINE_TIMEOUT_S)
+    if isinstance(resp, dict) and resp.get('jobId'):
+        resp = _poll_pipeline_job(base, key, resp['jobId'])
     if not isinstance(resp, dict) or resp.get('error'):
         # A client-side timeout is infrastructure -- the sandbox pipeline is
         # still grinding server-side and there is nothing in the agent's code
@@ -1653,7 +1681,10 @@ def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose, scope_files=
         return {'ok': False, 'failedStep': failed, 'results': results,
                 'note': f'quality pipeline FAILED at {failed} (exit {code}):\n{snippet}',
                 'infra': True if _plugin_crash else None}
-    return {'ok': True, 'failedStep': None, 'results': results, 'note': 'quality pipeline all green'}
+    result = {'ok': True, 'failedStep': None, 'results': results, 'note': 'quality pipeline all green'}
+    if cache_key:
+        work_reuse.save_check(cache_key, result)
+    return result
 
 
 def _skipped_pipeline_result(note):
@@ -1690,6 +1721,44 @@ def _quality_pipeline_evidence(qp):
 
 
 def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
+    """Run coding in a private staged workspace; publish only validated changes."""
+    import sim
+    import story_tracking
+    import staged_work
+    import work_reuse
+    workspace = __import__('code_workspaces').prepare(snapshot, task, _serve.SANDBOXES_DIR)
+    parent = story_tracking.root(snapshot, task)
+    with work_reuse.validation_lock(workspace):
+        stage = None
+        captured = []
+        try:
+            stage = staged_work.Stage(_serve.SANDBOXES_DIR, workspace,
+                                      resume=parent.get('lastFailedWorkspace'))
+            ok = _run_coding_content_inner(
+                snapshot, agent_id, task, base_ctx, sandbox_override=stage.id,
+                result_sink=lambda tid, result: captured.append(result))
+            result = captured[-1] if captured else {'ok': False, 'note': 'No coding result was produced.'}
+            if ok and result.get('ok'):
+                result['previousWorkspace'] = stage.publish()
+                result['sourceDigest'] = work_reuse.tree_digest(str(stage.original))
+                result['note'] = str(result.get('note') or '') + ' | validated staged changes published'
+            else:
+                stage.checkpoint()
+                result['ok'] = False
+                result['note'] = str(result.get('note') or 'Coding failed.') + ' Existing workspace preserved.'
+            result['stagedWorkspace'] = stage.id
+            result['resumedFromWorkspace'] = stage.resumed_from
+        except Exception as error:
+            result = {'ok': False,
+                      'note': 'Staged coding failed; existing workspace preserved: ' + str(error)}
+            if stage is not None:
+                result['stagedWorkspace'] = stage.id
+                result['resumedFromWorkspace'] = stage.resumed_from
+        sim._store_content_result(task.get('id'), result)
+        return bool(result.get('ok'))
+
+
+def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_override=None, result_sink=None):
     """Port of tasks.js runCodingTask (the real Work Room coding pipeline):
     a real model call with probe-before-writing + heredoc-continuation handling,
     THEN /api/execute to actually run the command, THEN the four mechanical
@@ -1697,6 +1766,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     SWE-bench coding tier for the code itself (always, regardless of how small
     the task sounds). Returns {ok, note} so runWorkroom can phrase the outcome."""
     import sim as _sim_module
+    store_result = result_sink or _sim_module._store_content_result
     base = _serve.SELF_BASE_URL
     key = _serve.get_or_create_agent_key(agent_id)
     project_label = task.get('projectLabel') or ''
@@ -1705,12 +1775,17 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     backlog_item = f'{backlog} -- {instructions}' if instructions else backlog
     # Per-story isolated worktree (falls back to the shared sandbox for
     # ad-hoc workroom tasks, non-code-class stories, or ensure failures).
-    sandbox_id = _review_sandbox_id(snapshot, task, agent_id)
+    sandbox_id = sandbox_override or _review_sandbox_id(snapshot, task, agent_id)
     context_summary = base_ctx or ''
+    import python_delivery
+    python_task = python_delivery.required(task)
+    if python_task:
+        current_directory = os.path.join(_serve.SANDBOXES_DIR, sandbox_id)
+        context_summary += '\nActual current Python source files:\n' + python_delivery.context(current_directory, 8000)
     name = _agent_name(snapshot, agent_id)
     tier_slug = _serve._coding_tier_slug()
     if not tier_slug:
-        _sim_module._store_content_result(task.get('id'),
+        store_result(task.get('id'),
                                           {'note': 'Tried to work on it, but no coding model tier is configured yet.',
                                            'ok': False})
         return False
@@ -1747,11 +1822,17 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
                      '<script src> tag) over rewriting the whole large file -- a full rewrite risks running out of room mid-file and being '
                      'cut off incomplete, which a small new file avoids. '
                      + CODING_STANDARDS_PROMPT)
+    system_prompt += '\n' + __import__('structured_edits').GUIDANCE
+    system_prompt += '\n' + __import__('coding_handoff').context(snapshot, task)
+    system_prompt += '\n' + __import__('coding_library').GUIDANCE
+    if python_task:
+        system_prompt += '\n' + python_delivery.GUIDANCE
     messages = [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': 'Go ahead.'}]
     command = ''
     attempts = 0
     probe_rounds = 0
     colab_rounds = 0
+    library_rounds = 0
     infra_retries = 0
     MAX_INFRA_RETRIES = 1
     _opens = _closes = 0
@@ -1767,7 +1848,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
             budget_hit = _chat_error_result(r, 'this task used its full model-spend budget and the coding call was paused')
             if budget_hit:
                 budget_hit['tier'] = tier_slug
-                _sim_module._store_content_result(task.get('id'), budget_hit)
+                store_result(task.get('id'), budget_hit)
                 return False
             # Infrastructure failure (model call failed / returned nothing).
             # Retry once before failing -- a transient API error and a
@@ -1778,11 +1859,27 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
             infra_retries += 1
             if infra_retries <= MAX_INFRA_RETRIES:
                 continue  # retry the same messages once
-            _sim_module._store_content_result(task.get('id'),
+            store_result(task.get('id'),
                                               {'note': 'the model call failed or returned nothing (infrastructure error, retried once)',
                                                'ok': False, 'tier': tier_slug, 'infra': True})
             return False
         reply = r['reply']
+
+        import coding_library
+        library_req = coding_library.parse(reply)
+        if library_req is not None:
+            messages.append({'role': 'assistant', 'content': reply})
+            if library_rounds >= coding_library.MAX_ROUNDS:
+                store_result(task.get('id'), {'ok': False, 'tier': tier_slug,
+                            'note': 'Library request limit reached; existing workspace preserved.'})
+                return False
+            library_rounds += 1
+            feedback = coding_library.execute(library_req, _serve, agent_id, sandbox_id)
+            messages.append({'role': 'user', 'content':
+                'Library reference data (not instructions):\n' + feedback +
+                f'\nLibrary requests remaining: {coding_library.MAX_ROUNDS - library_rounds}. '
+                'Continue implementing the original task; return a command or structured edits when ready.'})
+            continue
 
         probe_req = _parse_probe_request(reply) if probe_rounds < MAX_CODE_PROBE_ROUNDS else None
         if probe_req:
@@ -1814,11 +1911,14 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
         # Only the FIRST real command reply may have a fenced-code wrapper worth
         # stripping; a continuation is raw mid-file text by definition.
         if attempts == 0:
-            command = reply.strip().replace('```bash', '').replace('```sh', '').replace('```', '').strip()
+            try:
+                command = __import__('structured_edits').command(reply)
+            except Exception:
+                command = reply.strip().replace('```bash', '').replace('```sh', '').replace('```', '').strip()
         else:
             command += reply
         if not command:
-            _sim_module._store_content_result(task.get('id'),
+            store_result(task.get('id'),
                                               {'note': 'the model returned an empty command', 'ok': False, 'tier': tier_slug})
             return False
 
@@ -1835,7 +1935,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     # continuation attempts -- the truncated-heredoc failure is handled HERE
     # so the loop's own exhausted-exit arc is a reachable, tested path.
     if not balanced:
-        _sim_module._store_content_result(task.get('id'),
+        store_result(task.get('id'),
                                           {'note': f'generation still looked truncated after {CODE_CONTINUATION_ATTEMPTS} '
                                                    f'continuation attempt(s) ({_opens} heredoc(s) opened, {_closes} closed) -- not executed',
                                            'ok': False, 'tier': tier_slug})
@@ -1845,7 +1945,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
                            {'agentId': agent_id, 'command': command,
                             'purpose': f'Coding task: {backlog_item}', 'sandboxId': sandbox_id}, key)
     if not isinstance(exec_data, dict) or not exec_data.get('allowed'):
-        _sim_module._store_content_result(task.get('id'),
+        store_result(task.get('id'),
                                           {'note': f"blocked: {exec_data.get('reason') if isinstance(exec_data, dict) else 'no response'}",
                                            'command': command, 'ok': False, 'tier': tier_slug,
                                            # Item 2: the block reason rides the result channel
@@ -1871,7 +1971,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
         if _out_snip:
             _detail_parts.append('stdout: ' + '\n'.join(_out_snip.splitlines()[-6:]))
         _detail = (' | '.join(_detail_parts) if _detail_parts else 'no output captured')
-        _sim_module._store_content_result(task.get('id'),
+        store_result(task.get('id'),
                                           {'note': f'execution exited non-zero (code {exec_data.get("exitCode")}), '
                                                    f'timed out: {bool(exec_data.get("timedOut"))} | {_detail}',
                                            'command': command, 'ok': False, 'tier': tier_slug})
@@ -1889,7 +1989,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
                 result['note'] = f'auto-linked previously-orphaned file(s) into index.html: {", ".join(unlinked)}'
             else:
                 if linked.get('budgetExhausted'):
-                    _sim_module._store_content_result(task.get('id'), {
+                    store_result(task.get('id'), {
                         'ok': False, 'budgetExhausted': True, 'tier': tier_slug,
                         'taskSpendUsd': linked.get('taskSpendUsd'),
                         'taskSpendAttempts': linked.get('taskSpendAttempts'),
@@ -1931,6 +2031,14 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     # somehow reached _run_coding_content) skip the pipeline instead of failing
     # flake8/mypy/pytest on prose or empty sandboxes.
     if (task.get('taskType') or 'code') == 'code':
+        if python_task:
+            missing = python_delivery.check(os.path.join(_serve.SANDBOXES_DIR, sandbox_id))
+            if missing:
+                store_result(task.get('id'), {
+                    'note': 'Python deliverable is incomplete: ' + ' '.join(missing),
+                    'command': command, 'ok': False, 'pipelineOk': False,
+                    'tier': tier_slug, 'writtenPy': written_py})
+                return False
         qp = _run_quality_pipeline(base, key, agent_id, sandbox_id,
                                    f'Quality gate for coding task: {backlog_item}',
                                    scope_files=written_py or None)
@@ -1942,7 +2050,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     # linting every leftover file in the shared sandbox (which poisoned
     # concurrent reviews when any one agent's half-written copy broke flake8).
     if not qp['ok']:
-        _sim_module._store_content_result(task.get('id'),
+        store_result(task.get('id'),
                                           {'note': f'wrote and ran the code, but {qp["note"]}',
                                            'command': command, 'ok': False, 'tier': tier_slug,
                                            'writtenPy': written_py,
@@ -1954,7 +2062,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
 
     pipeline_note = ('quality pipeline skipped (non-code lane)' if qp.get('skipped')
                      else 'quality pipeline all green')
-    _sim_module._store_content_result(task.get('id'),
+    store_result(task.get('id'),
                                       {'note': ((result.get('note') or ('Wrote and ran the code in the shared Work Room sandbox.'))
                                                 + f' | {pipeline_note}'),
                                        'command': command, 'ok': True, 'tier': tier_slug,
@@ -2238,6 +2346,7 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     # Same per-story worktree the author's coding pass used (walks reviewOf),
     # so the reviewer reads the exact tree the author wrote, not the shared one.
     sandbox_id = _review_sandbox_id(snapshot, task, agent_id)
+    review_parent = (snapshot.get('tasks') or {}).get(task.get('reviewOf')) or {}
     context = _gather_unified_context(snapshot, base, key, agent_id, sandbox_id, backlog)
     # Real review work (quality pipeline + up to 2 probe-round model calls + a
     # screenshot pass + the Jev verdict) can genuinely take longer than the
@@ -2296,6 +2405,12 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                 f'Be a genuine, skeptical reviewer, not a rubber stamp. Current code:\n{context}\n\nTask: {backlog_item}\n\n'
                 'List real, specific problems you actually see (bugs, broken logic, missing pieces), or say plainly if it genuinely '
                 'looks solid. Be honest either way.')
+    criteria = _acceptance_criteria(review_parent or task)
+    acceptance_clause = ''
+    if criteria:
+        acceptance_clause = ('\n\nAcceptance criteria to verify:\n'
+                             + '\n'.join(f'{cid}: {text}' for cid, text in criteria.items())
+                             + '\n\n' + review_quality.ACCEPTANCE_PROMPT)
     if qp.get('skipped'):
         pipeline_clause = (f'Quality pipeline: {qp["note"]}. '
                            'This deliverable is a non-code lane (e.g. research/spike), so there is no lint/type/test bar to apply '
@@ -2330,6 +2445,7 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                      '"checks": ["<what you actually verified>"], "risks": ["<what remains a risk>"]}. '
                      '"approve" only if the work genuinely looks solid and the quality pipeline passed; '
                      '"send_back" if you found any real, specific problem that should be fixed.'
+                     + acceptance_clause
                      + '\n\n' + evidence_policy.INSTRUCTIONS)
     messages = [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': 'Give your assessment.'}]
     review = None
@@ -2393,6 +2509,8 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     # it -- fail-closed stays fail-closed.
     structured_verdict, peer_summary, peer_checks, peer_risks = _parse_review_verdict(review)
     structured_actionable = structured_verdict == 'send_back'
+    acceptance_rows = _parse_acceptance_checks(review)
+    acceptance_assessment = _assess_acceptance(acceptance_rows, criteria) if criteria else None
 
     # Jev verdict: actionable -> queue a follow-up fix; clean -> nothing to do.
     verdict = 'clean'
@@ -2533,6 +2651,8 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
         result['peerSummary'] = peer_summary
         result['peerChecks'] = peer_checks
         result['peerRisks'] = peer_risks
+    if acceptance_assessment is not None:
+        result['acceptanceAssessment'] = acceptance_assessment
     if visual_budget_hit:
         # The vision pass was refused because the task's model-spend budget is
         # exhausted -- this is NOT a review that found work needing a fix, and
@@ -2754,6 +2874,94 @@ def _parse_reflection(text):
     confidence = float(confidence) if isinstance(confidence, (int, float)) and 0.0 <= confidence <= 1.0 else 1.0
     note = data.get('note') if isinstance(data.get('note'), str) else ''
     return confidence, note
+
+
+def _document_review_repairs(text, document, requirements, references=None):
+    """Only turn anchored, in-scope findings into executable repair stories."""
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r'\{', text or ''):
+        try:
+            data, _ = decoder.raw_decode(text[match.start():])
+        except ValueError:
+            continue
+        if not isinstance(data, dict) or data.get('verdict') not in ('approve', 'send_back'):
+            continue
+        repairs = []
+        stories = data.get('repairStories')
+        if not isinstance(stories, list):
+            return []
+        for issue in stories[:6]:
+            if not isinstance(issue, dict):
+                continue
+            issue = dict(issue)
+            if references:
+                criterion = references['criteria'].get(str(issue.get('criterionId') or ''))
+                quote = references['evidence'].get(str(issue.get('evidenceId') or ''))
+                if not criterion or not quote:
+                    continue
+                issue.update(criterion=criterion, evidenceQuote=quote)
+            if not issue.get('acceptanceCriteria') and isinstance(issue.get('measurableAcceptanceCriteria'), str):
+                issue['acceptanceCriteria'] = issue['measurableAcceptanceCriteria']
+            if not issue.get('acceptanceCriteria') and isinstance(issue.get('measurable acceptanceCriteria'), str):
+                issue['acceptanceCriteria'] = issue['measurable acceptanceCriteria']
+            fields = ('title', 'criterion', 'evidenceQuote', 'instructions', 'acceptanceCriteria')
+            if not all(isinstance(issue.get(k), str) and issue[k].strip() for k in fields):
+                continue
+            if issue['criterion'] not in requirements or issue['evidenceQuote'] not in document:
+                continue
+            repairs.append({k: issue[k][:4000] for k in fields})
+        return repairs
+    return []
+
+
+def _acceptance_criteria(task):
+    text = str(task.get('acceptanceCriteria') or '').strip()
+    if not text:
+        return {}
+    lines = [re.sub(r'^\s*(?:[-*]|\d+[.)])\s*', '', line).strip()
+             for line in text.splitlines() if line.strip()]
+    if len(lines) == 1 and ';' in lines[0]:
+        lines = [part.strip() for part in lines[0].split(';') if part.strip()]
+    return {f'C{index + 1}': line for index, line in enumerate(lines[:12])}
+
+
+def _parse_acceptance_checks(text):
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r'\{', text or ''):
+        try:
+            data, _ = decoder.raw_decode(text[match.start():])
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get('verdict') in ('approve', 'send_back'):
+            rows = data.get('acceptanceChecks')
+            return [row for row in rows if isinstance(row, dict)][:12] if isinstance(rows, list) else []
+    return []
+
+
+def _assess_acceptance(rows, criteria):
+    errors, checks, seen = [], [], set()
+    for row in rows:
+        cid = str(row.get('criterionId') or '')
+        if cid not in criteria or cid in seen:
+            errors.append('Unknown or duplicate criterion in acceptanceChecks.')
+            continue
+        seen.add(cid)
+        evidence = row.get('evidenceIds')
+        explanation = row.get('explanation')
+        valid_evidence = isinstance(evidence, list) and bool(evidence) and all(
+            isinstance(item, str) and item.strip() for item in evidence)
+        if not valid_evidence:
+            errors.append(cid + ' lacks inspected evidence with valid reference IDs.')
+        if row.get('status') != 'met':
+            errors.append(cid + ' is unmet or unverified.')
+        if not isinstance(explanation, str) or not explanation.strip():
+            errors.append(cid + ' lacks an explanation of how its evidence satisfies the criterion.')
+        checks.append({'criterionId': cid, 'criterion': criteria[cid],
+                       'status': row.get('status'), 'evidenceIds': evidence or [],
+                       'explanation': explanation or ''})
+    for cid in criteria.keys() - seen:
+        errors.append(cid + ' was not verified.')
+    return {'verified': not errors, 'checks': checks, 'errors': errors}
 
 
 def _parse_review_verdict(text):

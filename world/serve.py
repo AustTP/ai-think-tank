@@ -28884,8 +28884,60 @@ async def browser_act(request: Request):
     return JSONResponse({'allowed': True, **parsed_result, 'screenshotBase64': shot})
 
 
+_PIPELINE_JOBS = {}
+
+
 @app.post('/api/pipeline')
 async def pipeline(request: Request):
+    if not EXECUTION_ENABLED:
+        return JSONResponse({'error': 'Agent execution is disabled (AGENT_EXECUTION_ENABLED=false in .env)'}, status_code=403)
+    body = await request.json()
+    if isinstance(body, dict) and body.get('background'):
+        return await _start_pipeline_job(request, body)
+    return await _pipeline_execute(request, body)
+
+
+async def _start_pipeline_job(request: Request, body: dict):
+    agent_id = body.get('agentId', 'unknown')
+    if not _require_player_session(request) and verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
+        return JSONResponse({'error': 'Login or agent key required.'}, status_code=401)
+    job_id = secrets.token_hex(16)
+    body['_jobId'] = job_id
+    job = {'id': job_id, 'agentId': agent_id, 'status': 'running',
+           'startedAt': time.time(), 'stepsTotal': len(body.get('steps') or []),
+           'stepsCompleted': 0}
+    if len(_PIPELINE_JOBS) >= 128:
+        for old_id, old_job in list(_PIPELINE_JOBS.items()):
+            if old_job.get('status') in ('done', 'failed'):
+                _PIPELINE_JOBS.pop(old_id, None)
+                if len(_PIPELINE_JOBS) < 128:
+                    break
+    _PIPELINE_JOBS[job_id] = job
+
+    async def run():
+        try:
+            response = await _pipeline_execute(request, body)
+            job['result'] = json.loads(response.body)
+            job['status'] = 'done' if response.status_code < 400 else 'failed'
+        except Exception as error:
+            job.update(status='failed', result={'error': str(error)})
+        finally:
+            job['finishedAt'] = time.time()
+    job['worker'] = asyncio.create_task(run())
+    return JSONResponse({'jobId': job_id, 'status': 'running'}, status_code=202)
+
+
+@app.get('/api/pipeline/jobs/{job_id}')
+async def pipeline_job(job_id: str, request: Request):
+    job = _PIPELINE_JOBS.get(job_id)
+    if not job:
+        return JSONResponse({'error': 'Unknown pipeline job.'}, status_code=404)
+    if not _require_player_session(request) and verify_agent_key(job['agentId'], request.headers.get('X-Agent-Key')) is not True:
+        return JSONResponse({'error': 'Login or owning agent key required.'}, status_code=401)
+    return {key: value for key, value in job.items() if key != 'worker'}
+
+
+async def _pipeline_execute(request: Request, body: dict):
     # "They would wait to see where the pipeline succeeds or fails" --
     # your words. A pipeline is just a sequence of the same primitive
     # /api/execute already provides, run in the SAME sandbox directory
@@ -28894,8 +28946,6 @@ async def pipeline(request: Request):
     # command or a real non-zero exit.
     if not EXECUTION_ENABLED:
         return JSONResponse({'error': 'Agent execution is disabled (AGENT_EXECUTION_ENABLED=false in .env)'}, status_code=403)
-
-    body = await request.json()
     agent_id = body.get('agentId', 'unknown')
     steps = body.get('steps') or []
     sandbox_id = body.get('sandboxId') or ('sandbox-' + secrets.token_hex(4))
@@ -28925,8 +28975,11 @@ async def pipeline(request: Request):
     # are present, so no server-side skip is needed for them.
     has_py = _sandbox_has_python_files(sandbox_dir)
     results = []
+    job = _PIPELINE_JOBS.get(body.get('_jobId'))
     for step in steps:
         name = step.get('name', 'step')
+        if job:
+            job['currentStep'] = name
         command = (step.get('command') or '').strip()
         if not has_py and name in ('mypy', 'bandit', 'pytest-cov'):
             results.append({'name': name, 'allowed': True, 'exitCode': 0,
@@ -28949,6 +29002,8 @@ async def pipeline(request: Request):
         result = await asyncio.to_thread(_run_in_sandbox_sync, sandbox_dir, command)
         log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'decision': 'allowed', 'exitCode': result['exitCode']}, authorized=authorized)
         results.append({'name': name, 'allowed': True, **result})
+        if job:
+            job['stepsCompleted'] = len(results)
         if result['exitCode'] != 0 or result['timedOut']:
             sync_prototypes(agent_id, sandbox_dir)
             return JSONResponse({'sandboxId': sandbox_id, 'results': results, 'failedStep': name})

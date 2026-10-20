@@ -94,6 +94,10 @@ def step(state, now_ms=None, observe_only=True):
                               'Recover the missing follow-up for this story.')
         if observe_only:
             continue
+        if not control.get('recoverHistorical'):
+            created = task.get('createdAt') or 0
+            if created and created < control.get('recoverySince', 0):
+                continue
         if not control['enabled'] or frozen or task.get('reviewOf') or task.get('investigationOf') or queued or active:
             continue
         if status not in ('investigating', 'recovery_planned', 'repairing') and not (status == 'failed' and task.get('_peerRepairPending')):

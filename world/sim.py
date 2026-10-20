@@ -1274,17 +1274,26 @@ def _sim_loop_pass():
                 _deliver_watchdog_event(state, _watchdog_evt)
             except Exception as e:
                 print(f'[sim] watchdog event deliver error: {e}', flush=True)
-        # Pass 1 completion recovery: observe-only story lineage and delivery
-        # visibility. No status changes, no repair/investigation queueing, no
-        # blocking, no email. Runs inside the same read-modify-write as the
-        # tick so the fields land in the same save.
+        # Completion recovery: story lineage, delivery visibility, and bounded
+        # automatic repair/investigation. The activation stamp keeps this from
+        # sweeping historical failures on the first tick; only stories created
+        # after activation are recovered unless recoverHistorical is explicitly
+        # enabled.
         try:
             import story_tracking
             import completion_watchdog
+            now_ms = int(time.time() * 1000)
+            control = state.setdefault('completionControl', {})
+            if not control.get('pass3ActivatedAt'):
+                control.update(enabled=True, pass3ActivatedAt=now_ms,
+                               recoverySince=now_ms, recoverHistorical=False,
+                               maxConcurrentStories=5, maxRecoveryAttempts=3,
+                               retryBaseMs=30000, maxRecoveriesPerTick=2,
+                               transportRecoveryAttempts=3)
             story_tracking.refresh(state, serve._spend_ledger_read() or {})
-            completion_watchdog.observe(state)
+            completion_watchdog.step(state, now_ms, observe_only=False)
         except Exception as e:
-            print(f'[sim] completion observe error: {e}', flush=True)
+            print(f'[sim] completion recovery error: {e}', flush=True)
         serve.save_state_to_db(state)
         # Stamp the watchdog heartbeat only after a fully successful pass
         # (tick + save). A pass that dies mid-way leaves the old stamp so the
@@ -2138,6 +2147,15 @@ def _apply_content_result(state, task, result, now_ms=None):
     note = result.get('note')
     if note:
         task['note'] = note
+    # Review diagnostics and workspace handoff survive the result channel.
+    for field in ('reviewDiagnostics', 'reviewFailureKind', 'reviewContract',
+                  'stagedWorkspace', 'previousWorkspace', 'resumedFromWorkspace'):
+        if result.get(field) is not None:
+            task[field] = result[field]
+    if result.get('reviewContract') and task.get('reviewOf'):
+        parent_contract_task = (state.get('tasks') or {}).get(task['reviewOf'])
+        if parent_contract_task is not None and not parent_contract_task.get('reviewContract'):
+            parent_contract_task['reviewContract'] = result['reviewContract']
     # Persist the .py files this content pass wrote (coding executor's
     # `writtenPy`). A gate review recovers the parent story's list from here
     # to scope ITS quality pipeline to the story's own files instead of
@@ -2251,6 +2269,45 @@ def _apply_content_result(state, task, result, now_ms=None):
             verdict = result.get('peerVerdict')
             reviewer = task.get('assignedTo')
             gate = parent['_peerGate']
+            if (task.get('taskType') in ('review', 'qa') and task.get('createdAt')
+                    and task['createdAt'] < (gate.get('enteredMs') or 0)):
+                return  # an older artifact result cannot change this gate
+            if result.get('reviewFormatError'):
+                kind = result.get('reviewFailureKind') or 'invalid_response'
+                parent['reviewFailureKind'] = kind
+                parent['reviewDiagnosis'] = {'category': kind, 'failure': result.get('note')}
+                parent['lastReviewDiagnosticsTask'] = task['id']
+                counter = ('serviceFailures' if kind == 'service_unavailable'
+                           else 'inputFailures' if kind == 'missing_inputs' else 'formatFailures')
+                failures = gate[counter] = gate.get(counter, 0) + 1
+                if failures >= 3 or kind == 'missing_inputs':
+                    gate['escalated'] = True
+                    parent.update(manualAttention=True, blockedReason=kind,
+                                  failNote='Review attempts stopped: ' + str(result.get('note') or 'No usable verdict.')[:500])
+                return
+            if verdict == 'clean' and result.get('acceptanceAssessment') is not None:
+                import review_quality
+                approval_errors = review_quality.clean_vote_errors(result)
+                if approval_errors:
+                    gate['approvals'] = 0
+                    gate['approvers'] = []
+                    gate['acceptanceVerified'] = False
+                    parent.setdefault('peerReviewErrors', []).append(
+                        {'atMs': now_ms, 'reviewer': reviewer, 'errors': approval_errors[:12]})
+                    if review_quality.known_failure(result):
+                        verdict = 'actionable'
+                    else:
+                        kind = 'invalid_response'
+                        parent['reviewFailureKind'] = kind
+                        parent['reviewDiagnosis'] = {'category': kind,
+                                                     'failure': 'Approval refused: ' + '; '.join(approval_errors)[:1000]}
+                        parent['lastReviewDiagnosticsTask'] = task['id']
+                        gate['formatFailures'] = gate.get('formatFailures', 0) + 1
+                        if gate['formatFailures'] >= 3:
+                            gate['escalated'] = True
+                            parent.update(manualAttention=True, blockedReason=kind,
+                                          failNote='Approval refused: ' + '; '.join(approval_errors)[:500])
+                        return
             # Item 6: fold the reviewer's structured verdict onto the parent so
             # the author and player see WHY the vote went the way it did, not
             # just the binary -- the summary, the checks actually verified, and
@@ -2302,6 +2359,9 @@ def _apply_content_result(state, task, result, now_ms=None):
                 elif reviewer and reviewer not in gate['approvers']:
                     gate['approvers'].append(reviewer)
                     gate['approvals'] += 1
+                    if result.get('acceptanceAssessment') is not None:
+                        gate['acceptanceVerified'] = bool(
+                            (result.get('acceptanceAssessment') or {}).get('verified'))
     # BP-31 close probe: an incident card is judged here, inside the tick's
     # single read-modify-write, before the completion flow closes it -- a
     # bare "fixed it" (no landed files, no verification note) closes loud
@@ -6161,6 +6221,59 @@ def roster_order(cid, roster):
         if d.get('id') == cid:
             return i
     return 0
+
+
+def _queue_peer_repair(state, parent, rationale=None):
+    """Queue one author-owned repair for a rejected deliverable."""
+    if (parent.get('_peerGate') or {}).get('escalated'):
+        return None
+    author = parent.get('assignedTo')
+    if not author or author not in (state.get('agents') or {}):
+        return None
+    tid = parent['id']
+    existing = next((q for q in state.get('workQueue') or []
+                     if q.get('reviewOf') == tid and q.get('taskType') not in ('review', 'qa')), None)
+    active = next((t for t in (state.get('tasks') or {}).values()
+                   if t.get('reviewOf') == tid and t.get('taskType') not in ('review', 'qa')
+                   and t.get('status') in ('walking', 'working')), None)
+    if existing or active:
+        parent['status'] = 'repairing'
+        parent['_peerRepairPending'] = True
+        return existing or active
+    findings = '\n'.join(
+        f"{r.get('reviewer')}: {r.get('summary') or ''} "
+        + '; '.join(str(check) for check in r.get('checks') or [])
+        for r in (parent.get('peerReviews') or [])[-2:]
+        if r.get('verdict') == 'actionable')
+    feedback = rationale or 'Address the rejected peer-review findings.'
+    instructions = (feedback + '\n' + findings
+                    + f"\nOriginal deliverable: {parent.get('title')}"
+                    + f"\nExisting Library document: {parent.get('libraryPath') or 'not yet saved'}."
+                    + '\nSave the corrected deliverable and meet the original acceptance criteria before requesting review.')
+    item = {
+        'title': 'Fix: ' + str(parent.get('title') or tid),
+        'room': parent.get('room') or 'pressoffice',
+        'taskType': parent.get('taskType') or 'code',
+        'assignedTo': author,
+        'directRoute': True,
+        'reviewOf': tid,
+        'reviewAuthorId': author,
+        'instructions': instructions,
+        'reviewContract': parent.get('reviewContract'),
+        'acceptanceCriteria': parent.get('acceptanceCriteria'),
+        'workOrderId': parent.get('workOrderId'),
+        'workOrderStoryId': parent.get('workOrderStoryId'),
+        'requestId': parent.get('requestId'),
+        'projectLabel': parent.get('projectLabel'),
+        'budgetUsd': parent.get('budgetUsd'),
+        'priority': 'high',
+    }
+    parent['status'] = 'failed'
+    parent['_peerRepairPending'] = True
+    parent['_peerGate'] = dict(parent.get('_peerGate') or {})
+    parent['_peerGate']['escalated'] = False
+    queue_work(state, [item])
+    return item
 
 
 def _enter_peer_review(state, task, now_ms, preferred=None):

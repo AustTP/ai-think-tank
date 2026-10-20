@@ -104,6 +104,12 @@ sandboxes/sb-*/
 # like spike-task-*, never tracked (both main-village story-<id> and the
 # village-scoped <vid>-story-<id> forms).
 sandboxes/story-*/
+# Staged/previous project workspaces and per-project repos produced by the
+# safe coding workflow are runtime state, not source.
+sandboxes/stage-*/
+sandboxes/stage-*.repair.json
+sandboxes/previous-*/
+sandboxes/project-*/
 sandboxes/*-story-*/
 # browser_act / HF login test sandboxes -- contain persistent browser
 # profiles with live session cookies, never tracked.
