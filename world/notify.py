@@ -57,7 +57,7 @@ def _load_escalations():
         return {}
 
 
-def _save_escalations(data):
+def _save_escalations(data, replace_missing=False):
     import serve as _serve
     with _ESCALATIONS_LOCK:
         path = _serve.ESCALATIONS_PATH
@@ -72,12 +72,12 @@ def _save_escalations(data):
             disk = {}
         for eid, esc in disk.items():
             current = data.get(eid)
-            if current is None:
+            if current is None and not replace_missing:
                 data[eid] = esc
             elif (esc.get('status') in ('approved', 'denied')
                   and current.get('status') == 'pending'):
                 data[eid] = esc
-        tmp = f'{path}.tmp'
+        tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
         try:
             with open(tmp, 'w') as f:
                 json.dump(data, f, indent=2)

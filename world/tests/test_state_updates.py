@@ -64,3 +64,20 @@ def test_real_state_save_cannot_erase_accepted_guidance(tmp_path):
     assert saved['tasks']['parent']['status'] == 'repairing'
     assert saved['workQueue'] == fresh['workQueue']
     assert saved['marker'] == 'concurrent save'
+
+
+def test_terminal_archived_task_is_not_resurrected_by_stale_save(tmp_path):
+    database = tmp_path / 'state.db'
+    with sqlite3.connect(database) as conn:
+        conn.execute('CREATE TABLE kv_state (id INTEGER PRIMARY KEY, blob TEXT, updated_at REAL)')
+    with patch.object(serve, 'DB_PATH', str(database)), \
+         patch.object(serve, 'sync_agent_directories'), \
+         patch.object(serve.training_capture, 'sync_outcomes'):
+        serve.save_state_to_db({'tasks': {'t': {'id': 't', 'status': 'working'}},
+                                'workQueue': [], 'agents': {}})
+        serve.save_state_to_db({'tasks': {'t': {'id': 't', 'status': 'done', 'note': 'finished'}},
+                                'workQueue': [], 'agents': {}})
+        serve.save_state_to_db({'tasks': {'t': {'id': 't', 'status': 'working'}},
+                                'workQueue': [], 'agents': {}})
+        saved = serve.get_state_from_db()
+    assert saved['tasks']['t']['status'] == 'done'

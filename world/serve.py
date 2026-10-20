@@ -17,6 +17,7 @@ scattered per-feature .jsonl log files that came before it.
 import asyncio
 import base64
 import contextlib
+import copy
 import dataclasses
 import datetime
 import hashlib
@@ -1568,7 +1569,7 @@ def _prune_logs():
         if stale:
             for esc_id in stale:
                 del escalations[esc_id]
-            _save_escalations(escalations)
+            _save_escalations(escalations, replace_missing=True)
             pruned_escalations = len(stale)
     except Exception as e:
         print(f'[prune] escalation prune failed: {e}', flush=True)
@@ -2023,7 +2024,7 @@ def _merge_archived_tasks(data):
     # in place; if it mutated the cache's own dicts, _reconcile_task_archive
     # would see cached == task and skip the DB write, silently losing the
     # change on the next restart.
-    merged = {tid: dict(task) for tid, task in archived.items()}
+    merged = {tid: copy.deepcopy(task) for tid, task in archived.items()}
     merged.update(data.get('tasks') or {})
     data['tasks'] = merged
 
@@ -2062,7 +2063,14 @@ def save_state_to_db(data):
     with _db() as conn:
         row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
         if row:
-            data = state_updates.preserve_guidance(json.loads(row[0]), data)
+            current = json.loads(row[0])
+            # Archived done tasks are not in the blob. Include them so a stale
+            # save cannot resurrect a completed task as live work.
+            archived = _archived_tasks()
+            if archived:
+                current = copy.deepcopy(current)
+                current['tasks'] = {**archived, **(current.get('tasks') or {})}
+            data = state_updates.preserve_guidance(current, data)
     # Training capture (opt-in): link task outcomes to recorded
     # interactions whenever the sim state is committed.
     training_capture.sync_outcomes(data)
@@ -14031,6 +14039,11 @@ async def api_mail_send(request: Request):
     # The mailbox entry above stays as the durable record. Parked asks (admin
     # busy) are handled by the standing ask-drain, so nothing is lost.
     if from_id == 'player' and to_id == _admin_agent_id(state):
+        # Re-read after the early commit. A routing lane may save state itself;
+        # passing the pre-commit snapshot lets that lane write stale tasks and
+        # queue over changes the tick made during the classifier call.
+        _state_abort()
+        state = _state_begin()
         routed = await _route_player_request(state, text)
         if not routed.get('queued'):
             reply = routed.get('reply') or routed.get('error') or ''
@@ -28977,6 +28990,9 @@ async def _start_pipeline_job(request: Request, body: dict):
                 _PIPELINE_JOBS.pop(old_id, None)
                 if len(_PIPELINE_JOBS) < 128:
                     break
+    if len(_PIPELINE_JOBS) >= 256:
+        return JSONResponse({'error': 'too many pipeline jobs are running; retry shortly'},
+                            status_code=429)
     _PIPELINE_JOBS[job_id] = job
 
     async def run():
@@ -29036,6 +29052,8 @@ async def _pipeline_execute_locked(request: Request, body: dict):
         return JSONResponse({'error': 'a valid agent key for agentId is required'}, status_code=401)
     if not steps:
         return JSONResponse({'error': 'steps is required'}, status_code=400)
+    if len(steps) > 64:
+        return JSONResponse({'error': 'a pipeline may contain at most 64 steps'}, status_code=400)
 
     sandbox_dir = _sandbox_dir_for(sandbox_id)
     # A sandbox with no Python files has nothing for the Python gate to check.

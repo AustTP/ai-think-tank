@@ -11,8 +11,21 @@ def preserve_guidance(current, incoming):
     if not isinstance(tasks, dict):
         return incoming
     fresh = current.get('tasks') or {}
-    protected = {tid for tid, task in fresh.items() if tid in tasks
-                 and guidance_at(task) > guidance_at(tasks[tid])}
+    terminal = {'done', 'cancelled', 'abandoned'}
+    protected = set()
+    for tid, task in fresh.items():
+        if tid not in tasks:
+            continue
+        incoming_task = tasks[tid]
+        completion_marker = (task.get('completedAt') or task.get('finishedAt')
+                             or task.get('note'))
+        incoming_completion = (incoming_task.get('completedAt') or incoming_task.get('finishedAt')
+                               or incoming_task.get('note'))
+        if (guidance_at(task) > guidance_at(incoming_task)
+                or (task.get('status') in terminal
+                    and incoming_task.get('status') not in terminal
+                    and completion_marker and not incoming_completion)):
+            protected.add(tid)
     if not protected:
         return incoming
     result = copy.deepcopy(incoming)

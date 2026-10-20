@@ -36,7 +36,9 @@ owner approves.
 
 import hashlib
 import json
+import os
 import secrets
+import threading
 import time
 
 ROLE_OWNER = 'owner'
@@ -506,6 +508,7 @@ class TheoPolicy(object):
         self.registry = registry
         self._approvals = {}
         self._approved = set()
+        self._lock = threading.RLock()
         self.storage_path = storage_path
         if storage_path:
             self.load_persisted()
@@ -513,36 +516,35 @@ class TheoPolicy(object):
     def _persist(self):
         if not self.storage_path:
             return
-        now = self.clock()
-        # Decide-and-forget approvals are kept a week for audit, then dropped.
-        for aid, approval in list(self._approvals.items()):
-            if (approval.status != 'pending'
-                    and now - float(approval.created_at or 0) > self.DECIDED_RETENTION_S):
-                self._approvals.pop(aid, None)
-                self._approved.discard(aid)
-        data = {'approvals': [
-            {'approval_id': a.approval_id, 'requester_id': a.requester_id,
-             'role': a.role, 'action': a.action, 'payload': a.payload,
-             'created_at': a.created_at, 'status': a.status,
-             'decided_by': a.decided_by}
-            for a in self._approvals.values()
-        ]}
-        tmp = self.storage_path + '.tmp'
-        try:
-            import os
-            os.makedirs(os.path.dirname(self.storage_path) or '.', exist_ok=True)
-            with open(tmp, 'w') as f:
-                json.dump(data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self.storage_path)
-        except (OSError, ValueError):
+        with self._lock:
+            now = self.clock()
+            # Decide-and-forget approvals are kept a week for audit, then dropped.
+            for aid, approval in list(self._approvals.items()):
+                if (approval.status != 'pending'
+                        and now - float(approval.created_at or 0) > self.DECIDED_RETENTION_S):
+                    self._approvals.pop(aid, None)
+                    self._approved.discard(aid)
+            data = {'approvals': [
+                {'approval_id': a.approval_id, 'requester_id': a.requester_id,
+                 'role': a.role, 'action': a.action, 'payload': a.payload,
+                 'created_at': a.created_at, 'status': a.status,
+                 'decided_by': a.decided_by}
+                for a in list(self._approvals.values())
+            ]}
+            tmp = f'{self.storage_path}.{os.getpid()}.{threading.get_ident()}.tmp'
             try:
-                import os
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
+                os.makedirs(os.path.dirname(self.storage_path) or '.', exist_ok=True)
+                with open(tmp, 'w') as f:
+                    json.dump(data, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.storage_path)
+            except (OSError, ValueError):
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except OSError:
+                    pass
 
     def load_persisted(self):
         if not self.storage_path:
@@ -746,13 +748,19 @@ class TheoPolicy(object):
         return True
 
     def _match_approval(self, requester_id, action):
-        for approval_id in self._approved:
-            approval = self._approvals.get(approval_id)
-            if approval is None or approval.status != 'approved':
-                continue
-            if approval.requester_id == requester_id and approval.action == action:
-                return approval
-        return None
+        with self._lock:
+            for approval_id in list(self._approved):
+                approval = self._approvals.get(approval_id)
+                if approval is None or approval.status != 'approved':
+                    self._approved.discard(approval_id)
+                    continue
+                if approval.requester_id == requester_id and approval.action == action:
+                    # One approval authorizes one execution, not a week of them.
+                    self._approved.discard(approval_id)
+                    approval.status = 'used'
+                    self._persist()
+                    return approval
+            return None
 
     def _create_approval(self, requester_id, role, action, payload):
         approval = PendingApproval(

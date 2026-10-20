@@ -14,7 +14,7 @@ def transport(path, body=None):
     else:
         estimate = 60
     with _LOCK:
-        return max(estimate, _OBSERVED.get(path, 0) * 2 + 30)
+        return min(3600, max(estimate, _OBSERVED.get(path, 0) * 2 + 30))
 
 
 def observe(path, elapsed):

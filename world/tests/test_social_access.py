@@ -81,6 +81,17 @@ class ConfigTests(unittest.TestCase):
         self.assertIn('facebook.com', cfg['readOnlyHosts'])
 
 
+    def test_missing_or_empty_config_revokes_auto_grant(self):
+        self.assertEqual(config._load_credential_access('/no/such/file')['autoGrant'], {})
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as handle:
+            handle.write('{"autoGrant": {}, "readOnlyHosts": []}')
+            path = handle.name
+        try:
+            self.assertEqual(config._load_credential_access(path)['autoGrant'], {})
+        finally:
+            os.unlink(path)
+
+
 class RequestEndpointTests(_SocialCase):
     def test_active_task_gets_one_scoped_handle_and_no_secret(self):
         task = _task()

@@ -1184,9 +1184,9 @@ def _load_credential_access(path):
         with open(path, encoding='utf-8') as fh:
             data = json.load(fh)
     except (OSError, ValueError):
-        return {'autoGrant': {k: dict(v) for k, v in
-                              CREDENTIAL_ACCESS_DEFAULT['autoGrant'].items()},
-                'readOnlyHosts': list(CREDENTIAL_ACCESS_DEFAULT['readOnlyHosts'])}
+        # Fail closed: a missing or corrupt switchboard grants nothing. The
+        # operator must put the services back explicitly.
+        return out
     if not isinstance(data, dict):
         return out
     hosts = data.get('readOnlyHosts')
@@ -1223,9 +1223,8 @@ def _load_credential_access(path):
             }
     if not out['readOnlyHosts']:
         out['readOnlyHosts'] = list(CREDENTIAL_ACCESS_DEFAULT['readOnlyHosts'])
-    if not out['autoGrant']:
-        out['autoGrant'] = {k: dict(v) for k, v in
-                            CREDENTIAL_ACCESS_DEFAULT['autoGrant'].items()}
+    # An empty autoGrant is a deliberate revocation, not a cue to restore the
+    # shipped Facebook/Instagram defaults.
     return out
 
 
