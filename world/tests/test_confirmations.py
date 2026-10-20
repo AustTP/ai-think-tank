@@ -139,3 +139,170 @@ class ConfirmationHttpTest(unittest.TestCase):
                 json={'phrase': proposal['phrase']})
         self.assertEqual(confirmed.status_code, 200)
         self.assertEqual(confirmed.json()['proposal']['status'], 'confirmed')
+
+
+class ConfirmationEdgesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = mock.patch.dict(os.environ, {
+            'CONFIRMATIONS_DB': os.path.join(self.tmp.name, 'state.db')})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_propose_rejects_bad_inputs(self):
+        for args in (('', {}, {}, 'a'), ('x', {}, {}, ''), ('x' * 81, {}, {}, 'a')):
+            with self.assertRaises(c.ConfirmationError):
+                c.propose(*args)
+        circular = {}
+        circular['self'] = circular
+        with self.assertRaises(c.ConfirmationError):
+            c.propose('a', circular, {}, 'a')
+        with self.assertRaises(c.ConfirmationError):
+            c.propose('a', {'x': 'y' * (c.MAX_PAYLOAD_BYTES + 1)}, {}, 'a')
+        item = c.propose('a', None, None, 'a', ttl_s='bad')
+        self.assertEqual(item['target'], {})
+        self.assertEqual(item['args'], {})
+
+    def test_confirm_and_cancel_edges(self):
+        with self.assertRaises(c.ConfirmationError) as missing:
+            c.confirm('nope', 'x')
+        self.assertEqual(missing.exception.code, 'not_found')
+        item = c.propose('a', {}, {}, 'ada')
+        first = c.confirm(item['id'], item['phrase'])
+        self.assertEqual(c.confirm(item['id'], 'wrong')['status'], first['status'])
+        c.finish(item['id'], 'executed')
+        with self.assertRaises(c.ConfirmationError) as done:
+            c.confirm(item['id'], item['phrase'])
+        self.assertEqual(done.exception.code, 'executed')
+        with self.assertRaises(c.ConfirmationError):
+            c.finish('x', 'bogus')
+        with self.assertRaises(c.ConfirmationError):
+            c.cancel('nope', 'player')
+
+    def test_expired_and_cancel_paths(self):
+        item = c.propose('a', {}, {}, 'ada', ttl_s=60)
+        with mock.patch.object(c.time, 'time', return_value=item['expires_at'] + 1):
+            with self.assertRaises(c.ConfirmationError) as expired:
+                c.confirm(item['id'], item['phrase'])
+        self.assertEqual(expired.exception.code, 'expired')
+        other = c.propose('a', {}, {}, 'ada')
+        with self.assertRaises(c.ConfirmationError):
+            c.cancel(other['id'], 'nora')
+        cancelled = c.cancel(other['id'], 'player')
+        self.assertEqual(cancelled['status'], 'cancelled')
+        with self.assertRaises(c.ConfirmationError):
+            c.cancel(other['id'], 'player')
+
+    def test_list_expire_and_bad_row(self):
+        c.propose('a', {}, {}, 'ada')
+        c.propose('b', {}, {}, 'ada')
+        self.assertEqual(len(c.list_for_actor('ada')), 2)
+        self.assertEqual(len(c.list_for_actor('ada', 'pending')), 2)
+        self.assertEqual(len(c.list_for_actor('ada', 'pending', limit=1)), 1)
+        self.assertEqual(c.expire_stale(), 0)
+        with c._connect() as conn:
+            conn.execute("UPDATE confirmation_proposals SET target_json='bad'")
+        self.assertIsNone(c.list_for_actor('ada')[0]['target'])
+
+    def test_gate_finish_ignores_missing_and_errors(self):
+        c.gate_finish(None)
+        with mock.patch.object(c, 'finish', side_effect=RuntimeError('x')):
+            c.gate_finish('id')
+
+
+class ConfirmationHttpEdgesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = mock.patch.dict(os.environ, {
+            'CONFIRMATIONS_DB': os.path.join(self.tmp.name, 'state.db')})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def _client(self, session=True):
+        from starlette.testclient import TestClient
+        import serve
+        self.session = mock.patch.object(serve, 'verify_session', return_value=session)
+        self.session.start()
+        self.addCleanup(self.session.stop)
+        return TestClient(serve.app)
+
+    def test_unauthorized_and_malformed(self):
+        client = self._client(False)
+        self.assertEqual(client.get('/api/confirmations').status_code, 401)
+        self.assertEqual(client.post('/api/confirmations', json={}).status_code, 401)
+        client = self._client(True)
+        self.assertEqual(client.post('/api/confirmations', content=b'x').status_code, 400)
+        self.assertEqual(client.post('/api/confirmations', json=[]).status_code, 400)
+        self.assertEqual(client.post('/api/confirmations', json={}).status_code, 400)
+
+    def test_player_flow_and_not_found(self):
+        client = self._client(True)
+        created = client.post('/api/confirmations', json={
+            'action': 'x', 'target': {}, 'args': {}})
+        pid = created.json()['proposal']['id']
+        self.assertEqual(client.get('/api/confirmations').status_code, 200)
+        self.assertEqual(client.get('/api/confirmations/nope').status_code, 404)
+        self.assertEqual(client.get(f'/api/confirmations/{pid}').status_code, 200)
+        self.assertEqual(client.post('/api/confirmations/nope/cancel').status_code, 409)
+        self.assertEqual(client.post(f'/api/confirmations/{pid}/cancel').status_code, 200)
+        self.assertEqual(client.post(f'/api/confirmations/{pid}/confirm',
+                                     json={'phrase': 'x'}).status_code, 409)
+        created = client.post('/api/confirmations', json={
+            'action': 'x', 'target': {}, 'args': {}}).json()['proposal']
+        self.assertEqual(client.post(f"/api/confirmations/{created['id']}/confirm",
+                                     content=b'x').status_code, 400)
+        self.assertEqual(client.post(f"/api/confirmations/{created['id']}/confirm",
+                                     json={'phrase': created['phrase']}).status_code, 200)
+
+
+class ConfirmationFinalEdgesTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = mock.patch.dict(os.environ, {
+            'CONFIRMATIONS_DB': os.path.join(self.tmp.name, 'state.db')})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_connect_rolls_back(self):
+        with self.assertRaises(RuntimeError):
+            with c._connect() as conn:
+                conn.execute('CREATE TABLE t (x)')
+                raise RuntimeError('boom')
+
+    def test_assert_ready_missing_and_changed_action(self):
+        with self.assertRaises(c.ConfirmationError):
+            c.assert_ready('nope', 'a', {}, {}, 'ada')
+        item = c.propose('a', {}, {}, 'ada')
+        c.confirm(item['id'], item['phrase'])
+        with self.assertRaises(c.ConfirmationError) as changed:
+            c.assert_ready(item['id'], 'b', {}, {}, 'ada')
+        self.assertEqual(changed.exception.code, 'action')
+
+    def test_list_limit_is_clamped(self):
+        c.propose('a', {}, {}, 'ada')
+        self.assertEqual(len(c.list_for_actor('ada', limit=0)), 1)
+
+    def test_api_direct_unauthorized_and_agent_actor(self):
+        import asyncio
+        import confirmations_api as api
+        from starlette.requests import Request
+
+        def req(body=None):
+            r = Request({'type': 'http', 'method': 'POST', 'path': '/',
+                         'headers': [], 'query_string': b''})
+            async def _json():
+                return body
+            r.json = _json
+            return r
+
+        with mock.patch.object(api, '_actor', return_value=None):
+            self.assertEqual(asyncio.run(api.get_confirmation('x', req())).status_code, 401)
+            self.assertEqual(asyncio.run(api.cancel_confirmation('x', req())).status_code, 401)
+        with mock.patch.object(api, '_actor', return_value='ada'), \
+             mock.patch.object(api.confirmations, 'get', return_value={'id': 'x', 'actor': 'bob'}):
+            self.assertEqual(asyncio.run(api.get_confirmation('x', req())).status_code, 404)
+        with mock.patch.object(api, '_actor', return_value='ada'):
+            self.assertEqual(asyncio.run(api.confirm_confirmation('x', req({}))).status_code, 403)
