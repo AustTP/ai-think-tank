@@ -2380,6 +2380,7 @@ class ReloadEnvConfigTest(unittest.TestCase):
 
 class ApplyOperatorPolicyTest(unittest.TestCase):
     def test_sets_all_globals(self):
+        self.addCleanup(lambda: config.apply_policy_bindings('serve'))
         policy = {
             'successGradeFloor': 'B', 'peerReviewIntervalS': 1,
             'peerReviewFileProbability': 2,

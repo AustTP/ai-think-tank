@@ -1,12 +1,25 @@
 """Scrum masters coordinate recovery; researchers execute investigations."""
+EXCLUDED_WORKER_FLAGS = ('isAdmin', 'isDirector', 'dedicatedReviewer',
+                         'tradingSpecialist', 'taskMaster', 'librarian')
+
+
+def workers(state):
+    """Roster ids eligible to execute recovery work."""
+    masters = {t.get('scrumMasterId') for t in state.get('teams') or []}
+    agents = state.get('agents') or {}
+    return [d['id'] for d in state.get('agentRoster') or []
+            if d.get('id') in agents and d['id'] not in masters
+            and not any(d.get(flag) for flag in EXCLUDED_WORKER_FLAGS)]
+
+
 def step(state):
     import sim
     masters = {t.get('scrumMasterId') for t in state.get('teams',[])}
-    workers = __import__('task_master').workers(state)
+    worker_ids = workers(state)
     agents = state.get('agents',{})
     tasks = state.get('tasks',{})
     load = {aid:sum(t.get('assignedTo') == aid and t.get('status') in ('walking','working') for t in tasks.values())
-                 +sum(q.get('assignedTo') == aid for q in state.get('workQueue',[])) for aid in workers}
+                 +sum(q.get('assignedTo') == aid for q in state.get('workQueue',[])) for aid in worker_ids}
     for task in list(tasks.values()):
         if task.get('status') != 'investigating' or task.get('investigationOf') or task.get('reviewOf'):
             continue
@@ -26,8 +39,8 @@ def step(state):
         if queue is None and task.get('recoveryStaffed'):
             continue
         team = next((t for t in state.get('teams',[]) if t.get('scrumMasterId') == master),{})
-        candidates = [aid for aid in workers if aid in team.get('members',[]) and not agents[aid].get('busy')]
-        if not candidates: candidates = [aid for aid in workers if not agents[aid].get('busy')]
+        candidates = [aid for aid in worker_ids if aid in team.get('members',[]) and not agents[aid].get('busy')]
+        if not candidates: candidates = [aid for aid in worker_ids if not agents[aid].get('busy')]
         if not candidates: continue
         worker = min(candidates,key=lambda aid:load[aid])
         if queue is None:

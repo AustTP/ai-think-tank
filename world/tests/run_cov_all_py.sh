@@ -13,7 +13,7 @@ ROOT="$(pwd)"
 # starts: this coverage build collects nothing from modules that
 # only become importable mid-run.
 export PYTHONPATH="$ROOT:$ROOT/world:$ROOT/scripts:$ROOT/world/sandbox:$ROOT/sandboxes/sb-p1${PYTHONPATH:+:$PYTHONPATH}"
-SOURCES="_gapmap,_village_check,audit_reachability,auth,bank,budget,browser_driver,cleanup_open_items,comprehension,config,containers,content,cron_scripts,egress,evidence,export_training_interactions,fs,health,imessage_fetch,jev_grants,memory,notify,phone,planner,probe_model,reset_wrq8_gates,roster,sandbox_proxy,schedule,serve,signals,sim,sim_helpers,sprint,story_budget,sublow,theo_policy,training_capture,vpn_location,vpn_pool,web_helpers,checkout"
+SOURCES="_gapmap,_village_check,audit_reachability,auth,bank,budget,browser_driver,cleanup_open_items,comprehension,config,containers,content,cron_scripts,egress,grant_store,evidence,export_training_interactions,fs,health,imessage_fetch,jev_grants,memory,notify,phone,planner,probe_model,reset_wrq8_gates,roster,sandbox_proxy,schedule,serve,signals,sim,sim_helpers,sprint,story_budget,sublow,theo_policy,training_capture,vpn_location,vpn_pool,web_helpers,checkout"
 FILES=$(ls world/tests/test_*.py | sort)
 for f in $FILES; do
     if [ "$(basename "$f")" = "test_visual_regression.py" ]; then

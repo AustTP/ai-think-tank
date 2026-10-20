@@ -29,8 +29,8 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-from confirmation_gate import gate as _confirmation_gate_or_response
-from confirmation_gate import finish as _finish_confirmation
+from confirmations import gate as _confirmation_gate_or_response
+from confirmations import gate_finish as _finish_confirmation
 
 import runtime_limits
 import governance
@@ -5738,20 +5738,6 @@ def _peer_review_tick(state):
 
 
 
-async def _peer_review_loop():
-    while True:
-        await asyncio.sleep(PEER_REVIEW_INTERVAL_S)
-        try:
-            # Live peer reviews are folded into the sim loop's single
-            # read-modify-write (see _peer_review_tick) so no second thread
-            # races the sim's whole-blob save. This loop is retired from the
-            # lifespan; kept only as a back-compat stub so nothing references
-            # a now-deleted name.
-            await asyncio.sleep(0)
-        except Exception as e:
-            print(f'[peer] loop error: {e}', flush=True)
-
-
 def _seed_watchlist_topics(state):
     """Seed researchTopics from the operator-edited world/watchlist.json on
     boot. Idempotent and additive: a topic already in state (by topic +
@@ -9503,7 +9489,8 @@ def _openrouter_chat_post(body):
             raise
 
 
-def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0):
+def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
+                               reasoning_override=None):
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if _api_key_is_broken('openrouter'):
@@ -9519,7 +9506,9 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0):
     # reads reasoning output, so turning it off there is free -- and a
     # mandatory-reasoning model that rejects that override is recovered by
     # _openrouter_chat_post's capped retry.
-    if model in (_coding_tier_slug(), _high_tier_slug(), _mid_tier_slug(), _reasoning_tier_slug()):
+    if reasoning_override is not None:
+        reasoning = reasoning_override
+    elif model in (_coding_tier_slug(), _high_tier_slug(), _mid_tier_slug(), _reasoning_tier_slug()):
         reasoning = {'max_tokens': max_tokens // 2}
     else:
         reasoning = {'enabled': False}
@@ -9598,31 +9587,10 @@ def _retry_reasoning_starved(body, first):
 
 
 def _call_openrouter_sync_reasoning_off(model, messages, max_tokens):
-    """Same as _call_openrouter_once_sync but forces reasoning off. Used as a
-    one-shot recovery when a reasoning-tier model burns the whole token
-    budget on hidden thinking and returns content:null."""
-    if _think_tank_spend_cap_exceeded():
-        raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
-    if _api_key_is_broken('openrouter'):
-        raise RuntimeError('OpenRouter API key is blocked after repeated auth failures -- swap the key in .env and reload env')
-    if is_model_circuit_broken(model):
-        raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
-    body = {'model': model, 'messages': messages, 'max_tokens': max_tokens,
-            'reasoning': {'enabled': False}}
-    try:
-        result = _openrouter_chat_post(body)
-    except urllib.error.HTTPError as e:
-        record_model_result(model, success=False)
-        if e.code in (401, 403):
-            _note_api_key_failure('openrouter', e.code)
-        raise
-    except Exception:
-        record_model_result(model, success=False)
-        raise
-    record_model_result(model, success=True)
-    _note_api_key_success('openrouter')
-    return result
-
+    """One-shot recovery used when a reasoning-tier model burns the whole
+    token budget on hidden thinking and returns content:null."""
+    return _call_openrouter_once_sync(
+        model, messages, max_tokens, reasoning_override={'enabled': False})
 
 def _call_openrouter_sync(model, messages, max_tokens, best_of=1):
     """The plain OpenRouter chat-completions call. With `best_of=1` (the

@@ -92,6 +92,24 @@ def _save_escalations(data, replace_missing=False):
                 pass
 
 
+def _smtp_send(host, port, user, password, to, subject, body_text, tag):
+    """Best-effort SMTP send shared by escalation and player mail. Never
+    raises; logs a missing config or a failed send under `tag`."""
+    msg = email.mime.text.MIMEText(body_text)
+    msg['Subject'] = subject
+    msg['From'] = user
+    msg['To'] = to
+    try:
+        with smtplib.SMTP(host, port, timeout=15) as server:
+            server.starttls()
+            server.login(user, password)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        print(f'[{tag}] send failed: {e}')
+        return False
+
+
 def _send_escalation_email_sync(subject, body_text):
     import serve as _serve
     # Best-effort -- an admin decision this needs shouldn't hang forever
@@ -101,19 +119,9 @@ def _send_escalation_email_sync(subject, body_text):
     if not (_serve.ESCALATION_EMAIL_TO and _serve.SMTP_HOST and _serve.SMTP_USER and _serve.SMTP_PASSWORD):
         print(f'[escalation] SMTP not configured -- would have sent: {subject}')
         return False
-    msg = email.mime.text.MIMEText(body_text)
-    msg['Subject'] = subject
-    msg['From'] = _serve.SMTP_USER
-    msg['To'] = _serve.ESCALATION_EMAIL_TO
-    try:
-        with smtplib.SMTP(_serve.SMTP_HOST, _serve.SMTP_PORT, timeout=15) as server:
-            server.starttls()
-            server.login(_serve.SMTP_USER, _serve.SMTP_PASSWORD)
-            server.send_message(msg)
-        return True
-    except Exception as e:
-        print(f'[escalation] send failed: {e}')
-        return False
+    return _smtp_send(_serve.SMTP_HOST, _serve.SMTP_PORT, _serve.SMTP_USER,
+                      _serve.SMTP_PASSWORD, _serve.ESCALATION_EMAIL_TO,
+                      subject, body_text, 'escalation')
 
 
 def _credential_token(name):
@@ -145,19 +153,9 @@ def _send_player_email_sync(subject, body_text):
     if not app_password:
         print(f'[email] {_serve._GMAIL_CRED_NAME} credential present but undecryptable -- not sending: {subject}')
         return False
-    msg = email.mime.text.MIMEText((body_text or '').strip() or '(no body)')
-    msg['Subject'] = subject
-    msg['From'] = _serve.GMAIL_SMTP
-    msg['To'] = _serve.GMAIL_SMTP
-    try:
-        with smtplib.SMTP(_serve.GMAIL_SMTP_HOST, _serve.GMAIL_SMTP_PORT, timeout=15) as server:
-            server.starttls()
-            server.login(_serve.GMAIL_SMTP, app_password)
-            server.send_message(msg)
-        return True
-    except Exception as e:
-        print(f'[email] send failed: {e}')
-        return False
+    return _smtp_send(_serve.GMAIL_SMTP_HOST, _serve.GMAIL_SMTP_PORT,
+                      _serve.GMAIL_SMTP, app_password, _serve.GMAIL_SMTP,
+                      subject, (body_text or '').strip() or '(no body)', 'email')
 
 
 def send_player_email_sync(subject, body_text):

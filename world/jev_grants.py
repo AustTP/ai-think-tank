@@ -27,6 +27,7 @@ endpoints and tests use.
 import secrets
 import time
 
+import grant_store
 import sublow as _sublow_policy
 from sublow import (
     _agent_month_spend,
@@ -51,24 +52,8 @@ JEV_FALLBACK_PRICE_PER_M = 0.10
 
 
 def _ensure_table(conn):
-    """Grant table DDL, run lazily on every entry point (the same pattern
-    bank.py uses for kv_spend) so no caller can reach a missing table."""
-    conn.execute('''CREATE TABLE IF NOT EXISTS jev_grants (
-        id TEXT PRIMARY KEY,
-        token_hash TEXT NOT NULL UNIQUE,
-        agent_id TEXT NOT NULL,
-        task_id TEXT NOT NULL DEFAULT '',
-        purpose TEXT NOT NULL,
-        estimate_usd REAL NOT NULL,
-        accrued_usd REAL NOT NULL DEFAULT 0,
-        calls INTEGER NOT NULL DEFAULT 0,
-        max_tokens_per_call INTEGER NOT NULL,
-        granted_by TEXT NOT NULL,
-        created_at REAL NOT NULL,
-        expires_at REAL NOT NULL
-    )''')
-    conn.execute('CREATE INDEX IF NOT EXISTS idx_jev_grants_agent ON jev_grants(agent_id)')
-
+    """Grant table DDL, run lazily on every entry point."""
+    grant_store.ensure_table(conn, 'jev_grants')
 
 def _jev_slug():
     """The OpenRouter slug the JEV experiment-grant proxy serves. Resolved
@@ -116,101 +101,61 @@ def mint_jev_grant(agent_id, purpose, estimate_usd, granted_by,
     now = time.time()
     with _serve._db() as conn:
         _ensure_table(conn)
-        conn.execute(
-            'INSERT INTO jev_grants (id, token_hash, agent_id, task_id, purpose, '
-            'estimate_usd, accrued_usd, calls, max_tokens_per_call, granted_by, '
-            'created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?)',
-            (grant_id, _token_hash(token), agent_id, (task_id or '').strip(), purpose,
-             estimate, _clamp_tokens(max_tokens_per_call), granted_by, now,
-             now + _clamp_ttl(ttl_s)),
-        )
+        grant_store.insert(conn, 'jev_grants', (
+            grant_id, _token_hash(token), agent_id, (task_id or '').strip(), purpose,
+            estimate, 0, 0, _clamp_tokens(max_tokens_per_call), granted_by, now,
+            now + _clamp_ttl(ttl_s)))
     return token, None
 
 
 def validate_jev_grant(token):
-    """Resolve a raw grant token to its row, or None when it is unusable --
-    unknown, expired (and the stale row is swept on the way past, like
-    resolve_capability_handle does for handles), so a presented nonce is
-    either a live grant or nothing. Returns a dict of the row's columns."""
+    """Resolve a raw grant token to its row, or None when unusable. Expired
+    rows are swept on the way past."""
     import serve as _serve
     if not token or not isinstance(token, str):
         return None
-    now = time.time()
     with _serve._db() as conn:
         _ensure_table(conn)
-        row = conn.execute(
-            'SELECT id, agent_id, task_id, purpose, estimate_usd, accrued_usd, calls, '
-            'max_tokens_per_call, granted_by, created_at, expires_at '
-            'FROM jev_grants WHERE token_hash = ?',
-            (_token_hash(token),)).fetchone()
-        if not row:
-            return None
-        if row[10] <= now:
-            conn.execute('DELETE FROM jev_grants WHERE id = ?', (row[0],))
-            return None
-    return dict(zip(
-        ('id', 'agent_id', 'task_id', 'purpose', 'estimate_usd', 'accrued_usd', 'calls',
-         'max_tokens_per_call', 'granted_by', 'created_at', 'expires_at'),
-        row))
-
+        return grant_store.resolve(conn, 'jev_grants', _token_hash(token))
 
 def accrue_jev_grant(grant_id, cost):
-    """Accrue one real call's cost against the grant's burn-down and return
-    the new accrued total (None when nothing was recorded). Best-effort, like
-    every ledger accrual: an accounting failure never breaks the call that
-    just succeeded."""
+    """Accrue one real call's cost against the grant's burn-down."""
     import serve as _serve
     if not grant_id or not isinstance(cost, (int, float)) or cost <= 0:
         return None
     try:
         with _serve._db() as conn:
             _ensure_table(conn)
-            conn.execute('UPDATE jev_grants SET accrued_usd = accrued_usd + ?, '
-                         'calls = calls + 1 WHERE id = ?', (float(cost), grant_id))
-            row = conn.execute('SELECT accrued_usd FROM jev_grants WHERE id = ?',
-                               (grant_id,)).fetchone()
-        return float(row[0]) if row else None
+            return grant_store.accrue(conn, 'jev_grants', grant_id, cost)
     except Exception:
         return None
 
-
 def revoke_jev_grant(grant):
-    """Revoke by grant id OR by raw token (whichever the operator still has
-    on hand). Deletes the row outright, same as _revoke_handle: a revoked
-    grant must not be resolvable. True when a row matched."""
+    """Revoke by grant id OR raw token. True when a row matched."""
     import serve as _serve
     if not grant or not isinstance(grant, str):
         return False
     with _serve._db() as conn:
         _ensure_table(conn)
-        cur = conn.execute('DELETE FROM jev_grants WHERE id = ? OR token_hash = ?',
-                           (grant, _token_hash(grant)))
-        return cur.rowcount > 0
+        return grant_store.revoke(conn, 'jev_grants', grant, _token_hash(grant))
 
 
 def revoke_agent_jev_grants(agent_id):
-    """Drop every grant a (fired) agent held, so nothing survives the fire --
-    the same guarantee revoke_agent_credentials gives its handles."""
+    """Drop every grant a (fired) agent held."""
     import serve as _serve
     if not agent_id:
         return 0
     with _serve._db() as conn:
         _ensure_table(conn)
-        cur = conn.execute('DELETE FROM jev_grants WHERE agent_id = ?', (agent_id,))
-        return cur.rowcount or 0
+        return grant_store.revoke_agent(conn, 'jev_grants', agent_id)
 
 
 def expire_jev_grants(now=None):
-    """Sweep grants whose TTL has passed. Cheap and idempotent; runs beside
-    the capability-handle and sublow-grant sweeps on each sim tick, and
-    validation re-checks expiry on access regardless (belt and braces for a
-    stale row)."""
+    """Sweep grants whose TTL has passed."""
     import serve as _serve
     with _serve._db() as conn:
         _ensure_table(conn)
-        conn.execute('DELETE FROM jev_grants WHERE expires_at <= ?',
-                     (time.time() if now is None else now,))
-
+        grant_store.expire(conn, 'jev_grants', now)
 
 def quote_jev_grant(agent_id, estimated_calls=1, max_tokens_per_call=None):
     """Cost-estimate worksheet for the operator minting a grant: the model the

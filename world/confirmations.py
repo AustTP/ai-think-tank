@@ -224,3 +224,51 @@ def expire_stale() -> int:
             "UPDATE confirmation_proposals SET status='expired' "
             "WHERE status='pending' AND expires_at <= ?", (now,))
         return cur.rowcount
+
+
+def _serve():
+    import serve
+    return serve
+
+
+def required() -> bool:
+    env = _serve()._load_env()
+    return (env.get('REQUIRE_CONFIRMATION_FOR_EXECUTION') or '0').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
+def gate(body, actor, action, target, args):
+    """Bind an execution to a durable confirmation. Returns
+    (response_or_None, confirmation_id_or_None)."""
+    serve = _serve()
+    confirmation_id = str(body.get('confirmationId') or '').strip()
+    try:
+        if confirmation_id:
+            assert_ready(confirmation_id, action, target, args, actor)
+            return None, confirmation_id
+        if not required():
+            return None, None
+        proposal = propose(action, target, args, actor=actor,
+                           channel=str(body.get('channel') or 'api'))
+        serve.log_action(actor, 'confirmation_required',
+                         {'id': proposal['id'], 'action': action},
+                         authorized=True)
+        return serve.JSONResponse({
+            'confirmationRequired': True,
+            'confirmationId': proposal['id'],
+            'phrase': proposal['phrase'],
+            'expiresAt': proposal['expires_at'],
+            'note': 'The player must confirm this exact phrase before the action runs.',
+        }, status_code=428), None
+    except ConfirmationError as error:
+        return serve.JSONResponse({'error': str(error), 'code': error.code},
+                                  status_code=409), None
+
+
+def gate_finish(confirmation_id, status='executed', error=None):
+    if not confirmation_id:
+        return
+    try:
+        finish(confirmation_id, status, error)
+    except Exception:
+        pass

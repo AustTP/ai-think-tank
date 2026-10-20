@@ -65,7 +65,6 @@ ALLOWED_HOSTS |= {h.strip().lower() for h in os.environ.get('SANDBOX_EGRESS_EXTR
 # uncapped data exfil pipe.
 GRANTS_PATH = os.environ.get('SANDBOX_EGRESS_GRANTS_PATH', '')
 
-_grants_lock = threading.Lock()
 _grants_cache: dict = {'mtime': None, 'hosts': set()}
 
 

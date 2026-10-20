@@ -79,6 +79,10 @@ function hasFiringSignal(def) {
   return a.droppedCount > a.approvedCount * 0.3;
 }
 
+function isIdleForReview(candidate) {
+  return !!candidate && !candidate.busy && !candidate.task && !candidate.pairWith && !candidate.handoff;
+}
+
 function whoNeedsReview() {
   let best = null;
   for (const def of AGENT_ROSTER) {
@@ -99,7 +103,7 @@ function whoNeedsReview() {
     // .busy alone isn't enough: a pair navigator never gets .busy set
     // (see arrivePair/runPairProgrammingSession), only .pairWith.
     const candidate = AGENTS[def.id];
-    if (!candidate || candidate.busy || candidate.task || candidate.pairWith || candidate.handoff) continue;
+    if (!isIdleForReview(candidate)) continue;
     if (!hasFiringSignal(def)) continue;
     if (best === null) best = def; // among signaled candidates, first valid (roster order) is fine
   }
@@ -287,7 +291,7 @@ async function finishFiringReview(reviewer1Def, reviewer2Def, candidateDef) {
   // progress is exactly the dangling-reference case that check exists to
   // avoid; bail without recording a verdict so this candidate is looked
   // at fresh next cycle rather than wrongly treated as a real "keep".
-  if (candidate.busy || candidate.task || candidate.pairWith || candidate.handoff) {
+  if (!isIdleForReview(candidate)) {
     logThinkTankAction(reviewer1Def.id, 'firing_review', { about: candidateDef.id, decision: 'deferred', reason: 'candidate became busy mid-review' });
     return;
   }

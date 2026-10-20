@@ -45,11 +45,11 @@ jobs:
 
       - name: mypy
         working-directory: world
-        run: python -m mypy serve.py sim.py content.py web_helpers.py sim_helpers.py bank.py auth.py notify.py sublow.py jev_grants.py cron_scripts.py
+        run: python -m mypy serve.py sim.py content.py web_helpers.py sim_helpers.py bank.py auth.py notify.py sublow.py jev_grants.py cron_scripts.py grant_store.py
 
       - name: bandit
         working-directory: world
-        run: python -m bandit --ini setup.cfg -q serve.py sim.py content.py web_helpers.py sim_helpers.py bank.py auth.py notify.py sublow.py jev_grants.py cron_scripts.py
+        run: python -m bandit --ini setup.cfg -q serve.py sim.py content.py web_helpers.py sim_helpers.py bank.py auth.py notify.py sublow.py jev_grants.py cron_scripts.py grant_store.py
 
       - name: Full test suite (Python unittest files + JS harnesses)
         working-directory: world

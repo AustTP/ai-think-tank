@@ -84,6 +84,7 @@ library/theo-keys.json
 # curated library/skills/ templates are tracked; these regenerate at runtime.
 library/archive/
 library/wiki/
+library/research/
 library/social/
 library/pending_review/
 library/refinement/
