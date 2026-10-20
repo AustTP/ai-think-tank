@@ -685,22 +685,27 @@ class WebToolsExecutorTest(unittest.TestCase):
                                              'textForModel': 'txt',
                                              'links': [{'text': 'T',
                                                         'url': 'U'}]}):
-            out = self._ex(struck=set())(
-                'browse_page', {'url': 'https://a'})
+            ex = self._ex(struck=set())
+            ex.observe_urls('https://a')
+            out = ex('browse_page', {'url': 'https://a'})
         self.assertIn('Real links found', out)
         with mock.patch.object(serve, '_http_json',
                                return_value={'allowed': False,
                                              'reason': 'no'}), \
              mock.patch.object(serve, '_allowlist_wait_estimate',
                                return_value='soon'):
-            self.assertIn('ONE-STRIKE', self._ex(struck=set())(
-                'browse_page', {'url': 'https://a'}))
+            ex = self._ex(struck=set())
+            ex.observe_urls('https://a')
+            self.assertIn('ONE-STRIKE', ex('browse_page', {'url': 'https://a'}))
         with mock.patch.object(serve, '_http_json',
                                return_value={'error': 'boom'}):
-            self.assertIn('transient', self._ex(struck=set())(
-                'browse_page', {'url': 'https://a'}))
+            ex = self._ex(struck=set())
+            ex.observe_urls('https://a')
+            self.assertIn('transient', ex('browse_page', {'url': 'https://a'}))
         with mock.patch.object(serve, '_http_json', return_value='raw'):
-            self.assertIn('unexpected response', self._ex(struck=set())(
+            ex = self._ex(struck=set())
+            ex.observe_urls('https://a')
+            self.assertIn('unexpected response', ex(
                 'browse_page', {'url': 'https://a'}))
 
     def test_unknown_tool(self):

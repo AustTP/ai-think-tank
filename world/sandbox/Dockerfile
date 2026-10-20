@@ -56,6 +56,6 @@ RUN apt-get update && apt-get install -y ca-certificates curl gnupg \
 # the node layer on purpose: this RUN reuses the cached flake8/mypy/bandit/
 # pytest/chromium layers above and only executes this one pip install, instead
 # of invalidating the whole build.
-RUN python -m pip install --no-cache-dir autopep8==2.0.4 pycodestyle==2.10.0
+RUN python -m pip install --no-cache-dir autopep8==2.0.4 pycodestyle==2.10.0 black==24.10.0
 
 WORKDIR /workspace

@@ -243,14 +243,19 @@ class HealthScript(unittest.TestCase):
             sys.modules['sqlite3'] = fake_sqlite
             g = {
                 '__name__': '__main__',
+                '__file__': os.path.join(REPO_ROOT, 'health.py'),
                 'json': json,
                 'time': _time,
                 'collections': collections,
             }
             src = open(os.path.join(REPO_ROOT, 'health.py')).read()
             try:
-                with unittest.mock.patch('sys.stdout', io.StringIO()) as out:
-                    exec(compile(src, os.path.join(REPO_ROOT, 'health.py'), 'exec'), g)
+                with unittest.mock.patch('sys.stdout', io.StringIO()) as out, \
+                     unittest.mock.patch.object(sys, 'argv', ['health.py']):
+                    try:
+                        exec(compile(src, os.path.join(REPO_ROOT, 'health.py'), 'exec'), g)
+                    except SystemExit as exc:
+                        self.assertEqual(exc.code, 0)
                 text = out.getvalue()
             finally:
                 if real_sqlite is not None:

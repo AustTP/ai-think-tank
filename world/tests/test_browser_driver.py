@@ -28,11 +28,25 @@ class _FakeKeyboard:
         self.presses.append(key)
 
 
+class _FakeMouse:
+    def __init__(self):
+        self.moves = []
+        self.wheels = []
+
+    def move(self, x, y):
+        self.moves.append((x, y))
+
+    def wheel(self, dx, dy):
+        self.wheels.append((dx, dy))
+
+
 class _FakeLocator:
-    def __init__(self, selector, clicks, error=None):
+    def __init__(self, selector, clicks, error=None, fills=None):
         self.selector = selector
         self.clicks = clicks
         self._error = error
+        self._fills = fills
+        self._value = ''
         self.first = self
 
     def wait_for(self, state='visible', timeout=None):
@@ -43,6 +57,33 @@ class _FakeLocator:
         if self._error:
             raise self._error
         self.clicks.append(self.selector)
+
+    def is_enabled(self):
+        return True
+
+    def fill(self, value, timeout=None):
+        if self._error:
+            raise self._error
+        self._value = value or ''
+        if self._value and self._fills is not None:
+            self._fills.append((self.selector, self._value))
+
+    def press_sequentially(self, value, delay=None, timeout=None):
+        if self._error:
+            raise self._error
+        self._value += value or ''
+        if self._fills is not None:
+            self._fills.append((self.selector, value or ''))
+
+    def press(self, key, timeout=None):
+        if self._error:
+            raise self._error
+
+    def input_value(self):
+        return self._value
+
+    def bounding_box(self):
+        return {'x': 10, 'y': 20, 'width': 100, 'height': 30}
 
 
 class _FakePage:
@@ -57,6 +98,7 @@ class _FakePage:
         self._locator_error = None
         self._screenshot_error = None
         self.keyboard = _FakeKeyboard()
+        self.mouse = _FakeMouse()
         self.gotos = []
         self.fills = []
         self.clicks = []
@@ -104,7 +146,10 @@ class _FakePage:
 
     def locator(self, selector):
         self.locators.append(selector)
-        return _FakeLocator(selector, self.clicks, self._locator_error)
+        return _FakeLocator(selector, self.clicks, self._locator_error, self.fills)
+
+    def get_by_role(self, role, name=None):
+        raise RuntimeError('no role locator in the fake page')
 
     def screenshot(self, path=None):
         if self._screenshot_error:
@@ -228,7 +273,7 @@ class RunOps(unittest.TestCase):
         profile_dir, kwargs = playwright.launches[0]
         self.assertEqual(kwargs['viewport'], {'width': 1280, 'height': 900})
         self.assertIn('--no-sandbox', kwargs['args'])
-        self.assertFalse(kwargs['headless'] is False)
+        self.assertFalse(kwargs['headless'])
         self.assertEqual(kwargs['accept_downloads'], False)
         self.assertIn('Chrome/', kwargs['user_agent'])
 
@@ -272,13 +317,13 @@ class RunOps(unittest.TestCase):
         result, page, _, _ = self._run(
             {'op': 'login', 'fields': [{'selector': '#u', 'value': 'me'}], 'submitSelector': '#go'})
         self.assertEqual(page.fills, [('#u', 'me')])
-        self.assertEqual(page.clicks, ['#go'])
+        self.assertIn('#go', page.clicks)
         self.assertTrue(result['ok'])
 
     def test_login_default_submit(self):
         result, page, _, _ = self._run(
             {'op': 'login', 'fields': [{'selector': '#u', 'value': 'me'}]})
-        self.assertIn('button[type=submit]', page.locators)
+        self.assertTrue(any('button[type=submit]' in s for s in page.locators))
         self.assertTrue(result['ok'])
 
     def test_click(self):

@@ -41,6 +41,8 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+import runtime_limits
+
 # Pure web/text/path/security helpers extracted to their own module
 # to shrink the serve.py monolith. See web_helpers.py.
 from web_helpers import (  # noqa: E402,F401
@@ -16280,6 +16282,11 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
     records into it) --
     defense in depth so a caller that passes the set but forgets to check
     it itself doesn't silently get a no-op."""
+    # Track every URL the tools actually returned. browse_page may only
+    # follow a path that search_web or a previous page really exposed, so a
+    # model cannot invent a plausible news/post URL and cite it as evidence.
+    from url_evidence import DiscoveredURLs
+    discovered = DiscoveredURLs((default_query or '') + '\n' + (work_context or ''))
     # Server-minted, single-use proof that the work-context host bypass is
     # backed by a stored player-authored task. Minted HERE (server code, at
     # factory time, once per tool set) -- never from an agent's request body.
@@ -16402,6 +16409,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             # spend accrued.
             out = _api_execute(agent_id, agent_key, _api_base_url('api.tavily.com') + '/search',
                                'POST', {'query': query}, {}, 'web search')
+            discovered.observe(out)
             if out.get('ok') is not True:
                 return f'Could not search the web: {out.get("reason") or out.get("error") or "failed"}'
             return f"{out.get('modelInstruction', '')}\n\n{out['textForModel']}"
@@ -16456,6 +16464,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                     rows.append(line)
                 parts.append(f'{head} | {len(items)} recent items\n' + '\n'.join(rows))
             raw = '\n\n'.join(parts)
+            discovered.observe(raw)
             wrapped, _nonce, _tag, instruction = wrap_external_content(
                 raw, 'curated RSS/ATOM feed items polled by the think tank')
             return f'{instruction}\n\n{wrapped}'
@@ -16511,9 +16520,27 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
         if name == 'browse_page':
             country = ((args or {}).get('country') or '').strip().lower()
             exit_name = ((args or {}).get('exit') or '').strip()
+            from urllib.parse import urlsplit
+            url = (args or {}).get('url') or ''
+            if not discovered.allows(url):
+                valid_url = discovered.valid(url)
+                log_action(agent_id, 'browse_url_rejected', {
+                    'url': url,
+                    'reason': 'not_discovered' if valid_url else 'malformed',
+                }, authorized=False)
+                if not valid_url:
+                    return ('__TOOL_ERROR__: URL syntax is invalid. No page fetch was attempted. '
+                            'Copy a complete exact URL from a search result or page link.')
+                host = urlsplit(url).hostname
+                choices = sorted(u for u in discovered.urls
+                                 if urlsplit(u).hostname == host)[:8]
+                return ('__TOOL_ERROR__: URL has valid syntax but this exact path was not discovered. '
+                        'No page fetch was attempted. Use one of the actual discovered links below '
+                        'or search for the exact page; do not invent paths.\n'
+                        + '\n'.join(choices or sorted(discovered.urls)[:8]))
             result = _http_json('POST', SELF_BASE_URL, '/api/browse', {
                 'agentId': agent_id,
-                'url': (args or {}).get('url') or '',
+                'url': url,
                 'purpose': (args or {}).get('purpose') or 'research',
                 'render': bool((args or {}).get('render')),
                 'viaVpnCountry': country,
@@ -16536,6 +16563,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 # {text, url} pairs so multi-page investigation actually
                 # works.
                 links = result.get('links') or []
+                discovered.observe(result)
                 links_block = ''
                 if links:
                     lines = [f"- {(l.get('text') or l.get('url'))[:80]} -> {l.get('url')}"
@@ -16894,6 +16922,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                         'rebind already, no restart needed.')
             return 'policy_edit returned an unexpected response.'
         raise ValueError(f'unknown tool: {name}')
+    execute_tool.observe_urls = discovered.observe
     return execute_tool
 
 
@@ -31240,8 +31269,12 @@ def _http_json(method, base, path, body=None, header=None, timeout=30,
     if extra_headers:
         headers.update(extra_headers)
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    effective_timeout = timeout
+    if path in ('/api/chat', '/api/pipeline'):
+        effective_timeout = max(timeout or 0, runtime_limits.transport(path, body))
+    started = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- fixed SELF_BASE_URL internal calls; only SSRF-gated browse URLs use this path
+        with urllib.request.urlopen(req, timeout=effective_timeout) as resp:  # nosec B310 -- fixed SELF_BASE_URL internal calls; only SSRF-gated browse URLs use this path
             raw = resp.read().decode('utf-8', errors='replace')
             try:
                 return json.loads(raw) if raw else {}
@@ -31255,6 +31288,8 @@ def _http_json(method, base, path, body=None, header=None, timeout=30,
             return {'error': f'HTTP {e.code}: {raw[:200]}'}
     except Exception as e:
         return {'error': f'request failed: {e}'}
+    finally:
+        runtime_limits.observe(path, time.monotonic() - started)
 
 
 @app.get('/api/health')

@@ -200,7 +200,9 @@ class WebToolsExecutorBrowsePage(unittest.TestCase):
     404) instead of picking a real link off the page it just fetched."""
 
     def _executor(self):
-        return serve._make_web_tools_executor('ben', 'key-123')
+        executor = serve._make_web_tools_executor('ben', 'key-123')
+        executor.observe_urls('https://dreyx.com')
+        return executor
 
     def test_real_links_are_surfaced_to_the_model(self):
         browse_result = {

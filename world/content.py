@@ -29,6 +29,7 @@ import time
 import urllib.parse
 
 import serve as _serve
+import evidence_policy
 import training_capture
 
 from config import RESEARCH_DESK_PASSES, bind_policy
@@ -2328,7 +2329,8 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                      '{"verdict": "approve" or "send_back", "summary": "<one short sentence>", '
                      '"checks": ["<what you actually verified>"], "risks": ["<what remains a risk>"]}. '
                      '"approve" only if the work genuinely looks solid and the quality pipeline passed; '
-                     '"send_back" if you found any real, specific problem that should be fixed.')
+                     '"send_back" if you found any real, specific problem that should be fixed.'
+                     + '\n\n' + evidence_policy.INSTRUCTIONS)
     messages = [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': 'Give your assessment.'}]
     review = None
     probe_rounds = 0
@@ -5250,6 +5252,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     )
     if _serve._google_is_configured():
         system += _GOOGLE_QUOTA_AWARENESS_BLOCK
+    system += '\n\n' + evidence_policy.INSTRUCTIONS
     messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': 'Go ahead.'}]
     # One-strike-per-tool: a shared set across BOTH sub-executors, so a policy
     # denial on either browse_page or execute_script is remembered and the

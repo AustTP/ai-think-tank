@@ -1459,7 +1459,10 @@ class IntentClarify(unittest.TestCase):
 
 class MakeWebToolsExecutor(unittest.TestCase):
     def _exec(self, struck_tools=None):
-        return serve._make_web_tools_executor("agent-3", "key", struck_tools=struck_tools)
+        executor = serve._make_web_tools_executor("agent-3", "key", struck_tools=struck_tools)
+        executor.observe_urls("https://example.com")
+        executor.observe_urls("https://x.com")
+        return executor
 
     def test_request_allowlist_requested(self):
         with unittest.mock.patch.object(serve, "_http_json",

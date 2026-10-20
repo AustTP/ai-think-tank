@@ -8,6 +8,11 @@
 fastapi==0.115.11
 uvicorn==0.34.0
 pydantic==2.13.4
+# Credential vault encryption (world/serve.py _fernet) and host-side browser
+# rendering for browse_page(render=true). Pinned to the versions verified on
+# this host.
+cryptography==42.0.2
+playwright==1.60.0
 # Document ingestion (/api/library/ingest) -- optional, degrade with a clear
 # per-file error when absent (serve.py guards each import).
 openpyxl==3.0.10
