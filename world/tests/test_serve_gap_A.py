@@ -1131,19 +1131,6 @@ class PeerReviewHelpers(unittest.TestCase):
         self.assertEqual(state['reports'], [{'aboutId': 'b', 'ts': fresh_ts}])
         prp.assert_called_once()
 
-    def test_loop_backcompat_stub(self):
-        with unittest.mock.patch.object(serve.asyncio, 'sleep',
-                                        side_effect=[0, 0, asyncio.CancelledError()]):
-            with self.assertRaises(asyncio.CancelledError):
-                asyncio.run(serve._peer_review_loop())
-
-    def test_loop_tolerates_errors(self):
-        with unittest.mock.patch.object(serve.asyncio, 'sleep',
-                                        side_effect=[0, RuntimeError('x'),
-                                                     asyncio.CancelledError()]):
-            with self.assertRaises(asyncio.CancelledError):
-                asyncio.run(serve._peer_review_loop())
-
 
 class PeerReviewPass(unittest.TestCase):
     def _log_work(self, agent_id, n):

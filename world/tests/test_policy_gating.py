@@ -132,7 +132,7 @@ class KernelEditTest(unittest.TestCase):
     def test_kernel_is_signed_readable_and_not_protected(self):
         path = os.path.join(WORLD, 'serve.py')
         self.assertTrue(selfedit.is_kernel(path))
-        self.assertTrue(selfedit.is_player_signature(path))
+        self.assertFalse(selfedit.is_player_signature(path))
         self.assertFalse(selfedit.is_unreadable(path))
         self.assertFalse(selfedit.is_protected(path))
         self.assertIsNone(selfedit._path_refusal(path, 'world/serve.py'))

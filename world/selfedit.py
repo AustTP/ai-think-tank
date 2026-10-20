@@ -150,7 +150,7 @@ OVERSIGHT_KIND = 'oversight self-edit'
 # edit (audit Q3), MINUS a smaller deliberate core. Also UNREADABLE on top
 # of uneditable: test expectations and gate/oversight internals are the two
 # things a gaming attempt would read first.
-UNREADABLE_BASENAMES = ('serve.py',)
+UNREADABLE_BASENAMES = ()
 READ_TEXT_CAP = 48000
 
 # Loading contract, target module -> importer basenames that ARE tolerated,

@@ -42,10 +42,17 @@ def validate(config: dict, db_path: Path | None = None) -> tuple[list[str], list
             continue
         if low < 0 or high <= low:
             problems.append(f'{band}: invalid price range {bounds}')
-    ordered = sorted(
-        ((float(v[0]), float(v[1]), k) for k, v in price_bands.items()
-         if isinstance(v, list) and len(v) == 2 and float(v[1]) > float(v[0])),
-        key=lambda row: row[0])
+    valid_ranges = []
+    for k, v in price_bands.items():
+        if not isinstance(v, list) or len(v) != 2:
+            continue
+        try:
+            lo, hi = float(v[0]), float(v[1])
+        except (TypeError, ValueError):
+            continue
+        if hi > lo:
+            valid_ranges.append((lo, hi, k))
+    ordered = sorted(valid_ranges, key=lambda row: row[0])
     for (lo1, hi1, name1), (lo2, hi2, name2) in zip(ordered, ordered[1:]):
         if lo2 < hi1:
             problems.append(f'price bands overlap: {name1} and {name2}')
