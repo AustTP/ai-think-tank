@@ -2019,7 +2019,11 @@ def _merge_archived_tasks(data):
     archived = _archived_tasks()
     if not archived:
         return
-    merged = dict(archived)
+    # Copy the archived task dicts before merging. The tick mutates the state
+    # in place; if it mutated the cache's own dicts, _reconcile_task_archive
+    # would see cached == task and skip the DB write, silently losing the
+    # change on the next restart.
+    merged = {tid: dict(task) for tid, task in archived.items()}
     merged.update(data.get('tasks') or {})
     data['tasks'] = merged
 
@@ -2051,6 +2055,14 @@ def _reconcile_task_archive(done):
 
 
 def save_state_to_db(data):
+    # Pass 1 completion recovery: a stale whole-state save must not erase a
+    # newer player recovery decision. Only tasks with newer intervention
+    # history are protected; ordinary saves pass through unchanged.
+    import state_updates
+    with _db() as conn:
+        row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
+        if row:
+            data = state_updates.preserve_guidance(json.loads(row[0]), data)
     # Training capture (opt-in): link task outcomes to recorded
     # interactions whenever the sim state is committed.
     training_capture.sync_outcomes(data)

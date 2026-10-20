@@ -1274,6 +1274,17 @@ def _sim_loop_pass():
                 _deliver_watchdog_event(state, _watchdog_evt)
             except Exception as e:
                 print(f'[sim] watchdog event deliver error: {e}', flush=True)
+        # Pass 1 completion recovery: observe-only story lineage and delivery
+        # visibility. No status changes, no repair/investigation queueing, no
+        # blocking, no email. Runs inside the same read-modify-write as the
+        # tick so the fields land in the same save.
+        try:
+            import story_tracking
+            import completion_watchdog
+            story_tracking.refresh(state, serve._spend_ledger_read() or {})
+            completion_watchdog.observe(state)
+        except Exception as e:
+            print(f'[sim] completion observe error: {e}', flush=True)
         serve.save_state_to_db(state)
         # Stamp the watchdog heartbeat only after a fully successful pass
         # (tick + save). A pass that dies mid-way leaves the old stamp so the
