@@ -20,11 +20,14 @@ OUT_DIR = os.path.join(ROOT, 'library', 'research', 'bot-law-watch')
 SEEN_PATH = os.path.join(OUT_DIR, 'seen.json')
 LATEST_PATH = os.path.join(OUT_DIR, 'latest.md')
 QUERIES = [
-    'automated decision system regulation',
-    'bot disclosure law',
-    'algorithmic accountability regulation',
-    'robotics liability law',
+    '"bot disclosure"',
+    '"automated decision system"',
+    '"algorithmic accountability"',
+    '"robotics liability"',
 ]
+RELEVANT_SUBJECTS = ('bot', 'automated decision', 'algorithmic', 'robotic', 'robot')
+RELEVANT_LEGAL = ('law', 'rule', 'regulation', 'act', 'enforcement', 'liability',
+                  'disclosure', 'compliance', 'statute', 'court')
 MAX_RESULTS = 8
 TIMEOUT_S = 20
 
@@ -44,6 +47,12 @@ def _save_seen(seen):
     with open(tmp, 'w', encoding='utf-8') as fh:
         json.dump(sorted(seen), fh, indent=2)
     os.replace(tmp, SEEN_PATH)
+
+
+def _relevant(item):
+    text = f"{item.get('title', '')} {item.get('summary', '')}".lower()
+    return (any(word in text for word in RELEVANT_SUBJECTS)
+            and any(word in text for word in RELEVANT_LEGAL))
 
 
 def _get_json(url):
@@ -115,7 +124,7 @@ def main():
     fresh = []
     for item in items:
         url = item.get('url') or ''
-        if not url or url in seen:
+        if not url or url in seen or not _relevant(item):
             continue
         seen.add(url)
         fresh.append(item)
