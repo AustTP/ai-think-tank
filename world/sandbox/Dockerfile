@@ -42,7 +42,7 @@ COPY browser_driver.py /opt/browser_driver.py
 # *.test.mjs suites the agents write with the built-in node:test runner.
 RUN apt-get update && apt-get install -y ca-certificates curl gnupg \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs \
+    && apt-get install -y nodejs xauth \
     && rm -rf /var/lib/apt/lists/*
 
 # autopep8: agents reach for `python -m autopep8 --in-place ...` to auto-fix

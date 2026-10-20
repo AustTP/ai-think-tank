@@ -222,7 +222,9 @@ def _page_state(page, max_text):
 
 
 def _launch(playwright, action):
-    args = ['--no-sandbox', '--disable-gpu']
+    args = ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
+            '--disable-blink-features=AutomationControlled', '--no-first-run',
+            '--no-default-browser-check']
     # The sandbox network is INTERNAL (no route out at all); the ONLY way to
     # the internet is the egress allowlist proxy (see serve.ensure_sandbox_networking
     # + sandbox_proxy.py). Chromium ignores http_proxy/http_proxy env vars by
@@ -253,7 +255,13 @@ def _launch(playwright, action):
         user_agent=('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
                     'AppleWebKit/537.36 (KHTML, like Gecko) '
                     'Chrome/131.0.0.0 Safari/537.36'),
+        locale='en-US', timezone_id='America/New_York',
     )
+    try:
+        ctx.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+    except Exception:
+        pass
     page = ctx.pages[0] if ctx.pages else ctx.new_page()
     return ctx, page
 
@@ -331,7 +339,7 @@ def run(action):
                             loc.press_sequentially(f.get('value') or '', delay=20, timeout=timeout_ms)
                         except Exception:
                             loc.fill(f.get('value') or '', timeout=timeout_ms)
-                    _settle(page, 500)
+                    _settle(page, 1500)
                     before = page.url
                     submit_used = ''
                     # Press Enter in the last filled field (usually password).
