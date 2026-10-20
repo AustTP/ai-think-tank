@@ -208,14 +208,36 @@ list a process reader needs in hand.
 |---|---|---|
 | Owner / player | The human who owns the installation | Full authority. Only the owner may change policy, grant or revoke Theo keys, and approve gated Theo actions. |
 | Theo | The admin agent | Director-level agent. Decomposes big tasks, answers the owner, stands at the top of the agent chain. Never the owner. |
+| Supervisor | A non-director operator proxy with Mac terminal access | Watches active work, stops spirals, files blocker bugs, and fixes infrastructure. Does not author product code. |
 | Senior-most director | A director with no director above them, excluding the admin | Stands in for the owner on routine escalation approvals. |
-| Director | Any agent with direct reports | Owns a team, a product area, or both. Can write team and agent state. |
-| Scrum master | A designated team facilitator | Runs refinement, breakdown, retrospective, and escalation ceremonies. Required at team size 4 or more. |
+| Director | Any agent with direct reports | Owns a team, a product area, or both. Can write team and agent state. Files stories, spikes, and bugs from sprint findings. Does not pick up code, bug, or QA work and cannot self-edit code. |
+| Scrum master | A designated team facilitator | Runs refinement, breakdown, retrospective, and escalation ceremonies. Required at team size 4 or more. May grant file and app entitlements when a director is tied up. |
 | Worker | A non-admin, non-director agent | Does room work, reviews peers, files requests and reports. |
 | Critic reviewer | The first reviewer on a peer gate | Instructed to prove the work wrong, not to rubber-stamp it. |
 | Verifier | The player, or a director/admin agent | Clears or blocks evidence claims and flips coverage. A worker or ordinary key holder cannot verify. Agent verifiers are capped at 12 flips per 6 hours; the player is not capped. |
 | Winter team | A second team created by the adversarial village | Works the same goal as main, independently. |
 | Operator | The human running the deployment | Same person as the owner in normal use. Configures policy JSON, budgets, and integrations. |
+
+### 2.1a Supervision levels
+
+Each director has a supervision level from 0 to 5, set per project or as a
+default. The level controls the supervisor's blocker-bug and monitoring
+intensity, not the safety gates:
+
+| Level | Behavior |
+|---|---|
+| 0 | No supervision. Do not file blocker bugs or wake the area for monitoring. |
+| 1 | Watch only failures with 5 or more dependent cards. |
+| 2 | Watch failures with 3 or more dependent cards. |
+| 3 | Default. Watch any failure that gates at least one dependent card. |
+| 4 | Watch any recent failed or blocked card, even with no dependents. |
+| 5 | Most extensive. Same as 4, with the shortest monitoring patience. |
+
+Directors set their own levels through `GET/PUT /api/supervision`; the player
+and admin may set any director's level. The stored map is
+`state['directorSupervision'][directorId][projectKey]`, with `_default` for
+projects without an override. The UI uses project id, then project label, then
+team id as the project key.
 
 ### 2.2 Authority and reporting
 
@@ -2204,11 +2226,12 @@ with `--max-idle-minutes`.
 
 1. Proposal contract (everything in `world/selfedit.py`, with its docstring
    as the contract). The agent proposes a find/replace splice on one file
-   under `world/`. Every `BUSINESS-PROCESSES.md` in the repo is refused
-   outright. `serve.py` is not refused: it is a signed kernel edit with its
-   own preflight, restart, and watchdog (below). The audit tiers add a hard
-   test-gate refusal plus a player-signature tier. No path escapes the
-   repository, and `config.py` is allowed through the Phase 2 reload chain.
+   under `world/` or the repo-root `BUSINESS-PROCESSES.md`. `CONSTITUTION.md`
+   and `constitution.py` are refused outright. `serve.py` is editable through
+   the signed kernel path with its own preflight, restart, and watchdog
+   (below). The audit tiers add a hard test-gate refusal plus a
+   player-signature tier. No path escapes the repository, and `config.py` is
+   allowed through the Phase 2 reload chain.
 2. Mechanical checks come first: the result must compile, and the find text
    must appear in the file exactly once. A rejected proposal never touches
    the file tree.
@@ -2271,10 +2294,11 @@ duration of 5-240 minutes (default 15). The chain is strict:
    (`_supervisor_of`: roster director, else admin, else the player) and a
    JEV quorum judges the request as the supervisor's call -- vague reasons,
    prime-work-hours slots, or oversized durations are rejected.
-3. Player approval: the request escalates as a floor-1.0 'dormancy window
-   request' kind, which the director loop is barred from; the player's
-   email or telegram link is the final, mandatory signature. Approve
-   schedules the window; deny schedules nothing.
+3. Change-request approval. With `governance.changeRequestAdminApproval`
+   enabled, the supervisor pre-clear is followed by two independent agent
+   approvals: a director validator approves the applied bytes, and the admin
+   approves the push. The player link is not part of this chain. With the
+   flag off, the historical player-signature link remains the final approval.
 4. When a window fires, the loop forces the tank dormant and applies ONLY
    the edits the implementer RESERVED for it: at request time the
    implementer's armed edits are stamped with the window id
@@ -2283,6 +2307,12 @@ duration of 5-240 minutes (default 15). The chain is strict:
    tank dormant to the end of the slot. A window missed while the server
    was down is recorded `missed`. The player or admin agent can cancel a
    window before it fires.
+
+**Blocker bugs preempt their area.** When a failed or blocked task gates other
+work (`dependsOn`), the supervisor tick files a high-priority incident bug
+pinned to the owning team's on-call. The dependent cards keep their dependency
+edge, so the area cannot resume until the blocker bug lands. Directors may file
+these bugs from sprint findings; they do not work them.
 
 **Change windows test what they land (operator decision, 2026-10-18).**
 
@@ -2350,8 +2380,9 @@ the shared GitHub repository (`origin main`) under a two-agent contract:
    outcome restores the pre-window bytes.
 
 **Surface audit (operator decision, 2026-10-18).** Three tiers now bound
-what agents may edit and read, layered on the constant protected names
-(`serve.py`, every `BUSINESS-PROCESSES.md`):
+what agents may edit and read. Only the owner constitution is immutable
+(`CONSTITUTION.md`, `world/constitution.py`). `BUSINESS-PROCESSES.md` and
+`serve.py` are editable; `serve.py` uses the signed kernel path.
 
 1. Tier A -- the test gate (`world/tests/`, `conftest.py`, the run
    scripts): refused outright for edits AND fixes, with no approval path.
@@ -2366,7 +2397,7 @@ what agents may edit and read, layered on the constant protected names
 3. Reads -- `selfedit_read` gives bounded read access mirroring the write
    rule, with a SMALLER surface: the full listing and one-file heads (up
    to 48 KB with sha256) for the editable world modules, but
-   `BUSINESS-PROCESSES.md`, the Tier A test gate, and the Tier B internals
+   `CONSTITUTION.md`, `constitution.py`, the Tier A test gate, and the Tier B internals
    stay closed. Exact anchors make proposals better; reading the gates or
    the enforcement internals is what gaming would target first. `serve.py`
    is inspectable only through the bounded query/context path.

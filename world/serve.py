@@ -1,18 +1,5 @@
-"""World's dev server -- a small FastAPI app now, not a plain
-http.server, since Phase 2 needs a real backend: agent/meeting/report
-state should persist across a refresh (it's all lived in browser memory
-until now) and, eventually, API keys need to live server-side rather than
-in browser-served JS (see DESIGN.md's Open Decisions -- an OpenRouter key
-already exists in ~/ai-think-tank/.env, held there specifically because
-nothing under world/ is a safe place for it until this backend actually
-makes the calls). Same invocation as before: python3 serve.py [port]
-(default 8936).
-
-Still accepts POST /save (editor.html, the collision grid) and POST
-/save-doors (door_editor.html, the door trigger rectangles) exactly as
-before. Agent/meeting/report state and a comprehensive activity log both
-live in ~/ai-think-tank/think_tank.db (SQLite) now, not state.json or the
-scattered per-feature .jsonl log files that came before it.
+"""FastAPI server for the think tank: state, tasks, agents, auth, and the
+operator/agent HTTP surface. Run with `python3 serve.py [port]`.
 """
 import asyncio
 import base64
@@ -46,6 +33,8 @@ from confirmation_gate import gate as _confirmation_gate_or_response
 from confirmation_gate import finish as _finish_confirmation
 
 import runtime_limits
+import governance
+import constitution
 
 # Pure web/text/path/security helpers extracted to their own module
 # to shrink the serve.py monolith. See web_helpers.py.
@@ -2014,8 +2003,12 @@ def _task_archive_load_locked():
 
 
 def _archived_tasks():
+    # Return a snapshot, not the live cache. The tick can rebuild the cache
+    # while a request is merging archived tasks; iterating the live dict then
+    # raises "dictionary changed size during iteration" and 500s /api/execute.
+    # The values still get deep-copied by their callers before mutation.
     with _TASK_ARCHIVE_LOCK:
-        return _task_archive_load_locked()
+        return dict(_task_archive_load_locked())
 
 
 def _merge_archived_tasks(data):
@@ -6925,12 +6918,15 @@ def _teams_missing_scrum_master(state, team_ids):
 
 app = FastAPI(lifespan=_lifespan)
 from confirmations_api import router as _confirmations_router  # noqa: E402
+from supervision_api import router as _supervision_router  # noqa: E402
+from feedback_api import router as _feedback_router  # noqa: E402
 app.include_router(_confirmations_router)
+app.include_router(_supervision_router)
+app.include_router(_feedback_router)
 
 
 OPENROUTER_API_KEY = _load_env().get('OPENROUTER_API_KEY')
-# Tavily search: browse_page alone can only fetch a URL the model
-# already guessed -- real web/search-engine scraping hits a bot-detection
+# Tavily search: real web search, not guessed URLs.
 # CAPTCHA wall on every major engine (confirmed against both Google and
 # DuckDuckGo). Tavily is a real API built for exactly this (AI-agent search),
 # returns clean {title, url, content} results, no scraping/CAPTCHA involved.
@@ -9434,6 +9430,7 @@ def _openrouter_chat_post(body):
     at 64 and 16000 tokens), so on that exact error retry once with
     reasoning capped to half the request budget. Returns the parsed JSON
     document; re-raises every other failure unchanged."""
+    body = constitution.with_rules(body)
     def _post_once(payload):
         req = urllib.request.Request(
             'https://openrouter.ai/api/v1/chat/completions',
@@ -15943,6 +15940,21 @@ def _effective_app_grants(state):
     return _merge_grants(state.get('appGrants') or [], get_grants_config()['appGrants'])
 
 
+def _grant_actor(request):
+    """Player session or a scrum master/director/admin agent key."""
+    if verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return 'player'
+    presented = request.headers.get('X-Agent-Key')
+    if not isinstance(presented, str) or not presented:
+        return None
+    requester = _resolve_requester(request)
+    if requester and verify_agent_key(requester, presented) is True:
+        state = get_state_from_db() or {}
+        if governance.may_grant_entitlements(state, requester):
+            return requester
+    return None
+
+
 @app.get('/api/file-grants')
 async def list_file_grants(request: Request):
     """The player's current file-access grants (scope + capability set),
@@ -15966,8 +15978,9 @@ async def add_file_grant(request: Request):
     {scope: '/Users/you/Desktop', label: 'Desktop', caps: {read, write, delete}}.
     `emptyTrash` is never accepted -- the trash rule is absolute. The scope must
     be an existing absolute directory. PLAYER-only."""
-    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    actor = _grant_actor(request)
+    if not actor:
+        return JSONResponse({'error': 'Unauthorized -- player, scrum master, or director required'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -15999,7 +16012,7 @@ async def add_file_grant(request: Request):
     }
     state.setdefault('fileGrants', []).append(grant)
     save_state_to_db(state)
-    log_action('player', 'file_grant_added',
+    log_action(actor, 'file_grant_added',
                {'grantId': grant['id'], 'scope': root, 'caps': grant['caps']}, authorized=True)
     return JSONResponse({'ok': True, 'grant': grant})
 
@@ -16007,9 +16020,10 @@ async def add_file_grant(request: Request):
 @app.delete('/api/file-grants/{grant_id}')
 @_state_writer
 async def revoke_file_grant(grant_id: str, request: Request):
-    """Revoke a file-access grant. PLAYER-only."""
-    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    """Revoke a file-access grant."""
+    actor = _grant_actor(request)
+    if not actor:
+        return JSONResponse({'error': 'Unauthorized -- player, scrum master, or director required'}, status_code=401)
     state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -16019,7 +16033,7 @@ async def revoke_file_grant(grant_id: str, request: Request):
     if len(state['fileGrants']) == before:
         return JSONResponse({'error': 'unknown grant'}, status_code=404)
     save_state_to_db(state)
-    log_action('player', 'file_grant_revoked', {'grantId': grant_id}, authorized=True)
+    log_action(actor, 'file_grant_revoked', {'grantId': grant_id}, authorized=True)
     return JSONResponse({'ok': True})
 
 
@@ -16042,13 +16056,10 @@ async def list_app_grants(request: Request):
 @app.post('/api/app-grants')
 @_state_writer
 async def add_app_grant(request: Request):
-    """Grant the think tank AppleScript control of ONE macOS app. Body:
-    {bundleId: 'com.apple.Notes', label: 'Notes', caps: {use: true}}. The
-    bundle id must be a plausible macOS bundle id (dotted, no spaces). Every
-    call still runs only inside that app -- no shell, no URLs, no escalation.
-    PLAYER-only."""
-    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    """Grant the think tank AppleScript control of ONE macOS app."""
+    actor = _grant_actor(request)
+    if not actor:
+        return JSONResponse({'error': 'Unauthorized -- player, scrum master, or director required'}, status_code=401)
     try:
         body = await request.json()
     except Exception:
@@ -16073,7 +16084,7 @@ async def add_app_grant(request: Request):
     }
     state.setdefault('appGrants', []).append(grant)
     save_state_to_db(state)
-    log_action('player', 'app_grant_added',
+    log_action(actor, 'app_grant_added',
                {'grantId': grant['id'], 'bundleId': bundle_id, 'caps': grant['caps']}, authorized=True)
     return JSONResponse({'ok': True, 'grant': grant})
 
@@ -16081,9 +16092,10 @@ async def add_app_grant(request: Request):
 @app.delete('/api/app-grants/{grant_id}')
 @_state_writer
 async def revoke_app_grant(grant_id: str, request: Request):
-    """Revoke an app-control grant. PLAYER-only."""
-    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
-        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    """Revoke an app-control grant."""
+    actor = _grant_actor(request)
+    if not actor:
+        return JSONResponse({'error': 'Unauthorized -- player, scrum master, or director required'}, status_code=401)
     state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
@@ -16093,7 +16105,7 @@ async def revoke_app_grant(grant_id: str, request: Request):
     if len(state['appGrants']) == before:
         return JSONResponse({'error': 'unknown grant'}, status_code=404)
     save_state_to_db(state)
-    log_action('player', 'app_grant_revoked', {'grantId': grant_id}, authorized=True)
+    log_action(actor, 'app_grant_revoked', {'grantId': grant_id}, authorized=True)
     return JSONResponse({'ok': True})
 
 
@@ -24984,22 +24996,24 @@ async def selfedit_fix_checks(request: Request):
 
 @app.post('/api/selfedit/validate')
 async def selfedit_validate(request: Request):
-    """Agent-facing push decision for a change request that is HOLDING for
-    its validator (two-agent contract, 2026-10-18): the repo gate already
-    passed on the live tree; only the named validator may approve the push
-    to main, deny it (rollback), or attach the required issues note. Agent-key
-    gated; identity is checked inside selfedit.validate_window against the
-    window's validator field."""
+    """Director validator or admin approval for a holding change request."""
     body = await request.json()
     agent_id = (body.get('agentId') or 'unknown')
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
     try:
-        ok, payload = await asyncio.to_thread(
-            _selfedit.validate_window, agent_id,
-            (body.get('windowId') or '').strip(),
-            bool(body.get('approved')),
-            body.get('note') if isinstance(body.get('note'), str) else '',
-            bool(body.get('issues')))
+        if body.get('adminApproval'):
+            ok, payload = await asyncio.to_thread(
+                _selfedit.admin_approve_window, agent_id,
+                (body.get('windowId') or '').strip(),
+                bool(body.get('approved')),
+                body.get('note') if isinstance(body.get('note'), str) else '')
+        else:
+            ok, payload = await asyncio.to_thread(
+                _selfedit.validate_window, agent_id,
+                (body.get('windowId') or '').strip(),
+                bool(body.get('approved')),
+                body.get('note') if isinstance(body.get('note'), str) else '',
+                bool(body.get('issues')))
     except Exception as exc:
         print(f'[selfedit] validate crashed for {agent_id}: {exc}', flush=True)
         log_action(agent_id, 'selfedit_validate_crashed',

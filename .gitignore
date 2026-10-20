@@ -107,6 +107,7 @@ sandboxes/story-*/
 # Staged/previous project workspaces and per-project repos produced by the
 # safe coding workflow are runtime state, not source.
 sandboxes/stage-*/
+sandboxes/stage-*.runtime.json
 sandboxes/stage-*.repair.json
 sandboxes/previous-*/
 sandboxes/project-*/

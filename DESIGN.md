@@ -131,6 +131,17 @@ direct report becomes a director for free.
   team). Get their own team records automatically.
 - **Workers** — non-admin, non-director agents who do the actual room work.
 
+`world/governance.py` is the shared policy seam: directors and the admin may
+not pick up `code`, `bug`, or `qa` work; they file stories, spikes, and bugs
+instead. Directors and the admin also cannot arm code self-edits. A scrum
+master (or a director/admin) may grant file and app entitlements when a
+director is tied up. A failed or blocked card that gates other work gets a
+high-priority incident bug from `governance.supervisor_tick`, and the
+dependent area waits on that bug. Each director sets a 0-5 supervision level
+per project in `state['directorSupervision']`; 0 suppresses blocker bugs and
+5 watches every recent failure. `supervision_api.py` exposes the settings at
+`/api/supervision`.
+
 ### Teams
 
 Teams are materialized records (`state['teams']`) keyed by the director id.

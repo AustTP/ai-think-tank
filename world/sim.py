@@ -1,28 +1,5 @@
-# Server-side simulation engine -- Phase 1-rest of PLAN-server-side-simulation.md.
-#
-# Today the browser (index.html setInterval timers -> tasks.js) is the sole
-# writer of simulation state; the server is a passive store. Each phase of
-# this plan moves more of that engine server-side so the think tank runs even
-# with no browser open. This module is the foundation:
-#
-#   - `SimEngine.tick()` reads the authoritative kv_state blob and maintains a
-#     server-owned `state['sim']` section: a heartbeat (tick + wall-clock) and
-#     a per-agent snapshot of the spatial/activity truth (x/y/dir/busy/task/
-#     inRoom/offDuty/params). The client gets it through /api/state and must
-#     treat it as read-only -- it's the server's record of "where the sim is",
-#     so a browser that closes and reopens, or two browsers, converge to the
-#     same server truth instead of each racing its own mutations.
-#
-#   - `_sim_loop()` (registered in serve.py lifespan) advances the tick every
-#     SIM_TICK_S regardless of whether any client is connected.
-#
-#   - `/api/sim/status` lets a client or a "runs closed" probe confirm the
-#     loop is alive (tick increasing with no browser attached).
-#
-# The client still OWNS agent movement until Phase 2; this module only
-# *records* the server-observed truth and keeps the heartbeat, so it is safe
-# to run alongside the current browser-driven simulation. Phase 2 flips the
-# writing of x/y/dir/path onto this engine.
+# Server-side simulation engine. The server owns the heartbeat, spatial
+# snapshot, and task cycle; browsers are read-only views of that state.
 import asyncio
 import datetime
 import json
@@ -39,6 +16,7 @@ from collections import deque
 # serve/content/sublow -- one declarative mechanism instead of per-module
 # rebind functions.
 from config import apply_policy_bindings, bind_policy
+import governance
 
 # Pure, self-contained helpers extracted to their own module to
 # shrink the sim.py monolith. See sim_helpers.py.
@@ -1233,6 +1211,10 @@ def _sim_loop_pass():
         if not state:
             return None
         state = _engine.tick(state)
+        try:
+            governance.supervisor_tick(state)
+        except Exception as e:
+            print(f'[sim] supervisor tick error: {e}', flush=True)
         # Deliver any finished drained player-ask answers INSIDE this single
         # read-modify-write (same two-phase discipline as _content_results: the
         # model call ran on its own thread and stashed an in-memory result; this
@@ -14003,6 +13985,12 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     if pick.get('reviewOf') and pick['reviewOf'] in (state.get('agents') or {}):
         pick.pop('reviewOf', None)
     candidates = _eligible_candidates(state, can_wake_off_duty)
+    # Directors and the admin delegate code; they never pick up code/bug/qa
+    # work themselves. They can still file stories and spikes.
+    if (pick.get('taskType') in governance.CODE_TASK_TYPES
+            and not pick.get('reviewOf')):
+        candidates = [cid for cid in candidates
+                      if governance.may_work_code(state, cid)]
     # Sprint staffing: a sprint card is assigned ONLY to the sprint's chosen
     # worker pool (the director's 1-6). This is a HARD restriction, not the
     # soft team preference below -- a lean sprint's cards wait (empty pool ->
@@ -14033,6 +14021,10 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
                 or pick.get('_reassignedTo') or pick.get('facilitatorId'))
     pinned = (pick.get('assignedTo') or pick.get('facilitatorId')
               or pick.get('_reassignedTo')) if pin_kind else None
+    if (pick.get('taskType') in governance.CODE_TASK_TYPES
+            and not pick.get('reviewOf') and pinned
+            and not governance.may_work_code(state, pinned)):
+        pinned = None
     # Sprint staffing: a pin to someone OUTSIDE the sprint's worker pool is
     # dropped -- strict staffing wins over the soft reassignment pin (a card
     # re-planned by refinement pins to the team's least-loaded member, but if

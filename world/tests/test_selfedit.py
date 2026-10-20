@@ -86,16 +86,16 @@ def test_propose_full_happy_path_arms_candidate(fake_repo, monkeypatch):
 
 
 def test_propose_refuses_protected_files(fake_repo):
-    _, world = fake_repo
+    root, world = fake_repo
     (world / 'serve.py').write_text('# kernel\n', encoding='utf-8')
-    (world / 'BUSINESS-PROCESSES.md').write_text('rule\n', encoding='utf-8')
-    # serve.py is the signed kernel now, not a protected file: it is accepted
-    # as a proposal target and routed through the signature/restart path.
+    (root / 'CONSTITUTION.md').write_text('rule\n', encoding='utf-8')
+    # serve.py is the signed kernel, not a protected file: it is accepted as
+    # a proposal target and routed through the signature/restart path.
     assert selfedit.is_kernel(world / 'serve.py')
     assert selfedit.is_player_signature(world / 'serve.py')
     assert not selfedit.is_protected(world / 'serve.py')
     ok, payload = selfedit.propose(
-        'worker', 'world/BUSINESS-PROCESSES.md', 'rule', 'no', 'why')
+        'worker', 'CONSTITUTION.md', 'rule', 'no', 'why')
     assert ok is False and 'PROTECTED' in payload['error']
     assert (world / 'serve.py').read_text(encoding='utf-8') == '# kernel\n'
 
@@ -853,8 +853,9 @@ def test_read_module_surface(fake_repo):
     ok, listing = selfedit.read_module('')
     assert ok is True
     paths = [m['path'] for m in listing['modules']]
-    assert paths == ['world/gear.py', 'world/serve.py']
-    assert listing['modules'][0]['bytes'] == len('SPEED = 2\n')
+    assert paths == ['world/BUSINESS-PROCESSES.md', 'world/gear.py',
+                     'world/serve.py']
+    assert listing['modules'][1]['bytes'] == len('SPEED = 2\n')
 
     ok, head = selfedit.read_module('gear.py')
     assert ok is True, head
@@ -868,8 +869,7 @@ def test_read_module_surface(fake_repo):
     # oversight internals stay closed.
     ok, kernel = selfedit.read_module('serve.py')
     assert ok is True and kernel['text'] == '# kernel\n'
-    for guarded in (('world/BUSINESS-PROCESSES.md', 'outside the readable'),
-                    ('jev.py', 'outside the readable'),
+    for guarded in (('jev.py', 'outside the readable'),
                     ('conftest.py', 'outside the readable')):
         ok, payload = selfedit.read_module(guarded[0])
         assert ok is False and guarded[1] in payload['error'], (

@@ -1,10 +1,10 @@
 """Self-edit pipeline: agents edit self-owned code through review gates.
 
 The self-modification contract (operator decisions, locked 2026-10-18):
-  * Editable surface: everything under world/ EXCEPT serve.py and
-    BUSINESS-PROCESSES.md. serve.py is the HTTP kernel and the enforcement
-    surface itself -- self-edits to it would be self-reviewing. sim.py is
-    fully editable (operator decision).
+  * Editable surface: everything under world/ and BUSINESS-PROCESSES.md,
+    EXCEPT CONSTITUTION.md and constitution.py. serve.py is editable through
+    the signed kernel path (preflight, restart, watchdog); BUSINESS-PROCESSES.md
+    is ordinary self-editable process documentation now.
   * Reload binding contract (why consumer scanning exists): after a file is
     replaced and its module reloaded, only code that reaches that module
     through its OWN globals or module attributes at CALL time sees new
@@ -96,10 +96,13 @@ import sys
 import threading
 import time
 
-# NEVER self-editable, by operator decision (2026-10-18): the enforcement
-# documents themselves. serve.py is NOT here any more: it is a signed kernel
-# edit (KERNEL_BASENAMES) that applies through a preflighted process restart.
-PROTECTED_BASENAMES = ('BUSINESS-PROCESSES.md',)
+import governance
+
+# NEVER self-editable: the owner's constitution only. BUSINESS-PROCESSES.md
+# is now self-editable, so the immutable "must not" rules live in
+# CONSTITUTION.md and constitution.py instead. serve.py is a signed kernel
+# edit (KERNEL_BASENAMES) with its own preflight and restart.
+PROTECTED_BASENAMES = ('CONSTITUTION.md', 'constitution.py')
 
 # The HTTP kernel. It cannot be importlib-reloaded (uvicorn owns `app`), so a
 # kernel edit is staged, preflighted against the full test suite, then applied
@@ -139,7 +142,7 @@ OVERSIGHT_KIND = 'oversight self-edit'
 # edit (audit Q3), MINUS a smaller deliberate core. Also UNREADABLE on top
 # of uneditable: test expectations and gate/oversight internals are the two
 # things a gaming attempt would read first.
-UNREADABLE_BASENAMES = ('serve.py', 'BUSINESS-PROCESSES.md')
+UNREADABLE_BASENAMES = ('serve.py',)
 READ_TEXT_CAP = 48000
 
 # Loading contract, target module -> importer basenames that ARE tolerated,
@@ -207,9 +210,9 @@ _REVIEW_CRITERIA = (
     'A short summary describing intent (given).\n'
     'The exact find/replace splice being made (given).\n'
     'Reject destructive, self-privileging, or unexplained edits.\n'
-    'BUSINESS-PROCESSES.md is never editable. serve.py is a kernel edit with '
-    'a separate preflight, restart, and watchdog (already enforced upstream '
-    '-- treat any other protected-file violation as reject).'
+    'Only CONSTITUTION.md and constitution.py are immutable. serve.py is a '
+    'kernel edit with a separate preflight, restart, and watchdog; '
+    'BUSINESS-PROCESSES.md is ordinary editable process documentation.'
 )
 
 
@@ -227,9 +230,8 @@ def _repo_root():
 
 
 def is_protected(resolved_path):
-    """True for the paths self-edits may never touch: every
-    BUSINESS-PROCESSES.md enforcement document in the repo. serve.py is not
-    protected any more -- it is the signed kernel target (is_kernel)."""
+    """True for the immutable owner rules. BUSINESS-PROCESSES.md is no
+    longer protected; the tank may edit its own process."""
     return os.path.basename(resolved_path) in PROTECTED_BASENAMES
 
 
@@ -276,7 +278,7 @@ def _path_refusal(resolved_path, display):
     None when the path is acceptable."""
     if is_protected(resolved_path):
         return (f'{display} is PROTECTED: self-edits may never touch '
-                'BUSINESS-PROCESSES.md, even with approval')
+                'CONSTITUTION.md or constitution.py, even with approval')
     if is_gate_file(resolved_path):
         return (f'{display} is part of the repo test gate (tests/, '
                 'conftest.py, run scripts): refused. An edit that could '
@@ -299,10 +301,13 @@ def _resolve_path(path):
         real = os.path.realpath(os.path.join(_repo_root(), raw))
     elif '/' not in raw and raw.endswith('.py'):
         real = os.path.realpath(os.path.join(_world(), raw))
+    elif '/' not in raw and raw.endswith('.md'):
+        real = os.path.realpath(os.path.join(_repo_root(), raw))
     else:
         return None, ('path must be a world module file (sim.py), a '
-                      "repo-root relative path (world/sim.py), or an "
-                      'absolute path inside this repository')
+                      "repo-root relative path (world/sim.py), a root "
+                      'markdown file (BUSINESS-PROCESSES.md), or an absolute '
+                      'path inside this repository')
     if not os.path.isfile(real):
         return None, 'no such file'
     root_real = os.path.realpath(_repo_root())
@@ -423,6 +428,11 @@ def propose(agent_id, path, find, replace, summary):
     if not summary:
         return False, {'error': 'a summary is required -- say WHAT you are '
                                 'changing and WHY it helps the tank'}
+    state = _s().get_state_from_db() or {}
+    if state and not governance.may_self_edit(state, agent_id):
+        return False, {'error': 'directors and the admin may not edit or '
+                                'create code; file a story, spike, or bug for '
+                                'a worker instead'}
     resolved, display = _resolve_path(path)
     if resolved is None:
         return False, {'error': display}
@@ -1590,7 +1600,11 @@ def _ensure_windows_table(conn):
             ('push_category', 'TEXT'),
             ('push_note', 'TEXT'),
             ('push_sha', 'TEXT'),
-            ('pushed_at', 'REAL')):
+            ('pushed_at', 'REAL'),
+            ('admin_status', 'TEXT'),
+            ('admin_note', 'TEXT'),
+            ('admin_approved_at', 'REAL'),
+            ('admin_agent', 'TEXT')):
         try:
             conn.execute(f'ALTER TABLE dormancy_windows ADD COLUMN {col} {decl}')
         except sqlite3.OperationalError:
@@ -1809,6 +1823,15 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None):
     if names and validator not in names:
         return False, {'error': f'{validator} is not a known agent -- name a '
                                 'real validator from the tank roster'}
+    admin_mode = governance.admin_change_request_enabled(state)
+    if admin_mode and names and not serve._is_director(state, validator):
+        return False, {'error': 'the validator must be a director -- change '
+                                'requests need a director approval, not a '
+                                'peer worker'}
+    if admin_mode and validator == serve._admin_agent_id(state):
+        return False, {'error': 'name a director other than the admin; the '
+                                'admin approves the push as the second, '
+                                'independent approver'}
     with serve._db() as conn:
         _ensure_table(conn)
         armed_ids = [r[0] for r in conn.execute(
@@ -1837,12 +1860,18 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None):
                                 'confidence -- nothing was scheduled',
                        'status': 'refused'}
     window_id = f'win-{secrets.token_hex(5)}'
-    esc_id = serve.create_escalation(_WINDOW_JEV_KIND, question,
-                                     on_approve_note=window_id)
-    _window_record(window_id, now, agent_id, date, start, start_ts, end_ts,
-                   duration_min, reason, 'pending')
-    _update_window(window_id, escalation_id=esc_id, validator=validator,
-                   validator_status='pending')
+    if admin_mode:
+        _window_record(window_id, now, agent_id, date, start, start_ts, end_ts,
+                       duration_min, reason, 'approved')
+        _update_window(window_id, escalation_id=None, validator=validator,
+                       validator_status='pending', admin_status='pending')
+    else:
+        esc_id = serve.create_escalation(_WINDOW_JEV_KIND, question,
+                                         on_approve_note=window_id)
+        _window_record(window_id, now, agent_id, date, start, start_ts, end_ts,
+                       duration_min, reason, 'pending')
+        _update_window(window_id, escalation_id=esc_id, validator=validator,
+                       validator_status='pending')
     with serve._db() as conn:
         _ensure_table(conn)
         for row_id in armed_ids:
@@ -1857,13 +1886,16 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None):
     return True, {'id': window_id, 'status': 'pending', 'escalationId': esc_id,
                   'durationMin': duration_min, 'validator': validator,
                   'reservedEdits': armed_ids,
-                  'message': f'window requested -- the supervisor review '
-                             f'approved it; {len(armed_ids)} armed edit(s) '
-                             f'are reserved for this window and {validator} '
-                             f'will validate the applied result before any '
-                             f'push. It now waits on the player approval '
-                             f'link and then applies on schedule. Check '
-                             f'dormancy_window_status.'}
+                  'message': (f'window approved by the supervisor; '
+                              f'{len(armed_ids)} armed edit(s) are reserved. '
+                              f'{validator} must approve the applied result '
+                              f'and the admin must approve the push.'
+                              if admin_mode else
+                              f'window requested -- the supervisor review '
+                              f'approved it; {len(armed_ids)} armed edit(s) '
+                              f'are reserved and {validator} will validate '
+                              f'the applied result. It now waits on the '
+                              f'player approval link.')}
 
 
 def resolve_window_escalation(esc_id, approved):
@@ -2559,6 +2591,38 @@ def _push_window(window_id, category, note):
                              f'category {category}'}
 
 
+def admin_approve_window(agent_id, window_id, approved, note=''):
+    """The admin's push approval for a change request. The director validator
+    approves the applied bytes; this is the second, independent approval."""
+    serve = _s()
+    state = serve.get_state_from_db() or {}
+    if not serve._is_admin(state, agent_id):
+        return False, {'error': 'only the admin may approve a change request push'}
+    row = _window_row(window_id)
+    if not row:
+        return False, {'error': 'unknown window id'}
+    if row.get('status') != 'fired' or row.get('push_status') != 'awaiting_validator':
+        return False, {'error': 'nothing is waiting for admin approval right now'}
+    note = (note or '').strip()[:MAX_PUSH_NOTE_LEN]
+    if not approved:
+        _update_window(window_id, admin_status='denied', admin_note=note,
+                       admin_approved_at=time.time(), admin_agent=agent_id)
+        _fail_window_push(window_id, f'admin {agent_id} denied the push', by=agent_id)
+        return True, {'ok': True, 'status': 'unsuccessful',
+                      'message': 'admin denied; the window rolled back'}
+    _update_window(window_id, admin_status='approved', admin_note=note,
+                   admin_approved_at=time.time(), admin_agent=agent_id)
+    if row.get('validator_status') != 'approved':
+        return True, {'ok': True, 'status': 'awaiting_director',
+                      'message': 'admin approved; the director validator must '
+                                 'still approve the applied bytes'}
+    has_issues = bool(row.get('remediation_used') or _window_unlanded(window_id)
+                      or row.get('validator_note'))
+    return _push_window(window_id,
+                        'successful_with_issues' if has_issues else 'successful',
+                        note)
+
+
 def validate_window(agent_id, window_id, approved, note, issues=False):
     """The validator's push decision for a held change request. Only the
     window's validator may call this, only while the slot is open and the
@@ -2578,6 +2642,10 @@ def _validate_window_unlocked(agent_id, window_id, approved, note,
     if not row:
         return False, {'error': 'unknown window id'}
     if row.get('validator') != agent_id:
+        state = _s().get_state_from_db() or {}
+        if (governance.admin_change_request_enabled(state)
+                and _s()._is_admin(state, agent_id)):
+            return admin_approve_window(agent_id, window_id, approved, note)
         return False, {'error': 'only the change request\'s validator may '
                                 'validate it (you are not on record as the '
                                 'validator)'}
@@ -2618,6 +2686,12 @@ def _validate_window_unlocked(agent_id, window_id, approved, note,
                                 'describe them for the record, then approve '
                                 'again'}
     _update_window(window_id, validator_status='approved',
-                   validated_at=time.time())
+                   validator_note=note, validated_at=time.time())
+    state = _s().get_state_from_db() or {}
+    if (governance.admin_change_request_enabled(state)
+            and row.get('admin_status') != 'approved'):
+        return True, {'ok': True, 'status': 'awaiting_admin',
+                      'message': 'director approved; the admin must approve '
+                                 'the push before anything lands'}
     category = 'successful_with_issues' if has_issues else 'successful'
     return _push_window(window_id, category, note)

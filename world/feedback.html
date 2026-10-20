@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Think Tank Workroom</title>
+<style>
+:root{
+  --bg:#07070a; --panel:#0f1015; --panel2:#14151c; --text:#f5f1f7;
+  --muted:#8e8998; --line:#262631; --pink:#ff4d9d; --teal:#39e6c3;
+  --amber:#ffc857; --danger:#ff6b6b; --radius:16px;
+}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--text)}
+body{font:15px/1.45 ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  background:
+    radial-gradient(900px 420px at 12% -10%, rgba(255,77,157,.13), transparent 65%),
+    radial-gradient(800px 420px at 92% 0%, rgba(57,230,195,.09), transparent 60%),
+    var(--bg);
+  -webkit-font-smoothing:antialiased}
+button,input,textarea{font:inherit;color:inherit}
+button{cursor:pointer}
+.topbar{position:sticky;top:0;z-index:20;display:flex;gap:16px;align-items:center;
+  justify-content:space-between;flex-wrap:wrap;padding:14px 22px;
+  border-bottom:1px solid rgba(255,255,255,.07);
+  background:rgba(7,7,10,.82);backdrop-filter:blur(18px)}
+.brand{display:flex;align-items:center;gap:12px;min-width:0}
+.mark{width:34px;height:34px;border-radius:50%;border:1px solid rgba(255,77,157,.55);
+  display:grid;place-items:center;color:var(--pink);font-weight:800;
+  box-shadow:0 0 24px rgba(255,77,157,.18) inset}
+.brand h1{font-size:15px;letter-spacing:.12em;text-transform:uppercase;margin:0}
+.brand p{margin:1px 0 0;color:var(--muted);font-size:12px}
+.status{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+.chip{display:inline-flex;align-items:center;gap:7px;padding:7px 11px;border-radius:999px;
+  border:1px solid var(--line);background:rgba(255,255,255,.025);white-space:nowrap}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--teal);box-shadow:0 0 10px var(--teal)}
+.dot.quiet{background:var(--muted);box-shadow:none}
+.dot.bad{background:var(--danger);box-shadow:0 0 10px var(--danger)}
+.iconbtn{min-height:38px;padding:0 14px;border-radius:10px;border:1px solid var(--line);
+  background:var(--panel2);color:var(--text)}
+.iconbtn:hover{border-color:rgba(255,77,157,.55)}
+.shell{display:grid;grid-template-columns:290px minmax(0,1fr);gap:22px;
+  width:min(1440px,100%);margin:0 auto;padding:22px}
+.rail{position:sticky;top:88px;align-self:start;min-width:0;max-height:calc(100vh - 110px);
+  overflow:auto;border:1px solid var(--line);border-radius:var(--radius);
+  background:linear-gradient(180deg,rgba(20,21,28,.9),rgba(11,11,15,.9))}
+.rail-head{display:flex;justify-content:space-between;align-items:center;
+  padding:15px 16px;border-bottom:1px solid var(--line);font-size:12px;
+  letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.rail-list{display:flex;flex-direction:column;padding:8px;min-width:0;max-width:100%}
+.rail-item{display:grid;grid-template-columns:8px minmax(0,1fr) auto;gap:10px;
+  align-items:center;text-align:left;width:100%;padding:11px 10px;margin:2px 0;
+  border:1px solid transparent;border-radius:11px;background:transparent}
+.rail-item:hover{background:rgba(255,255,255,.035)}
+.rail-item.active{background:rgba(255,77,157,.09);border-color:rgba(255,77,157,.3)}
+.rail-item .bar{width:4px;height:28px;border-radius:99px;background:var(--muted)}
+.rail-item[data-status="working"] .bar,.rail-item[data-status="walking"] .bar{background:var(--teal)}
+.rail-item[data-status="needs_review"] .bar,.rail-item[data-status="repairing"] .bar{background:var(--amber)}
+.rail-item[data-status="blocked"] .bar,.rail-item[data-status="failed"] .bar{background:var(--danger)}
+.rail-item .t{display:block;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rail-item .m{display:block;font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rail-item .s{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.content{min-width:0}
+.tabs{display:flex;gap:8px;overflow-x:auto;padding-bottom:14px;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{flex:0 0 auto;min-height:38px;padding:0 14px;border-radius:999px;
+  border:1px solid var(--line);background:rgba(255,255,255,.02);color:var(--muted)}
+.tab.active{color:#0a0a0d;background:var(--pink);border-color:var(--pink);font-weight:700}
+.hero{display:grid;grid-template-columns:1.4fr .9fr;gap:16px;margin-bottom:16px}
+.hero-card,.panel,.card{border:1px solid var(--line);border-radius:var(--radius);
+  background:linear-gradient(180deg,rgba(20,21,28,.95),rgba(12,12,16,.95))}
+.hero-card{padding:20px}
+.eyebrow{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--pink);margin:0 0 8px}
+.hero h2{font-size:clamp(1.35rem,3vw,2rem);line-height:1.15;margin:0 0 8px}
+.hero p{color:var(--muted);margin:0;max-width:58ch}
+.metrics{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;padding:14px}
+.metric{padding:12px;border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.02)}
+.metric b{display:block;font-size:22px;line-height:1.1}
+.metric span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}
+.card{padding:16px;display:flex;flex-direction:column;gap:10px;min-width:0}
+.card-top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.card h3{font-size:16px;line-height:1.25;margin:0}
+.badge{font-size:10px;letter-spacing:.08em;text-transform:uppercase;padding:5px 8px;
+  border-radius:999px;border:1px solid var(--line);color:var(--muted);white-space:nowrap}
+.badge.working,.badge.walking{color:var(--teal);border-color:rgba(57,230,195,.35)}
+.badge.needs_review,.badge.repairing{color:var(--amber);border-color:rgba(255,200,87,.35)}
+.badge.blocked,.badge.failed{color:var(--danger);border-color:rgba(255,107,107,.4)}
+.card p{color:var(--muted);font-size:13px;margin:0;overflow-wrap:anywhere}
+.meta{display:flex;gap:8px;flex-wrap:wrap;font-size:11px;color:var(--muted)}
+.card .open{margin-top:auto;min-height:38px;border:1px solid var(--line);border-radius:10px;
+  background:transparent;color:var(--text)}
+.card .open:hover{border-color:var(--pink);color:var(--pink)}
+.empty{padding:34px 20px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:var(--radius)}
+.detail-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;
+  padding:20px;margin-bottom:14px}
+.detail-head h2{margin:4px 0 6px;font-size:clamp(1.25rem,2.6vw,1.8rem)}
+.detail-head p{margin:0;color:var(--muted);max-width:70ch}
+.panel{padding:18px;margin-bottom:14px}
+.panel h3{margin:0 0 4px;font-size:15px}
+.panel .hint{color:var(--muted);font-size:12px;margin:0 0 14px}
+.quickrow{display:flex;flex-wrap:wrap;gap:8px}
+.choice{min-height:38px;padding:0 13px;border-radius:999px;border:1px solid var(--line);
+  background:rgba(255,255,255,.02);color:var(--muted)}
+.choice.active{background:rgba(255,77,157,.16);border-color:var(--pink);color:var(--text)}
+.choice.works.active{background:rgba(57,230,195,.14);border-color:var(--teal)}
+.choice.broken.active{background:rgba(255,107,107,.14);border-color:var(--danger)}
+.controls{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 18px;margin-top:14px}
+.control label{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:var(--muted);margin-bottom:6px}
+.control input[type=range]{width:100%;accent-color:var(--pink);min-height:30px}
+.control output{color:var(--text);font-variant-numeric:tabular-nums}
+textarea{width:100%;min-height:104px;resize:vertical;border-radius:12px;border:1px solid var(--line);
+  background:#0a0a0e;padding:12px;color:var(--text)}
+textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,157,.65);outline-offset:2px}
+.submitrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
+.primary{min-height:42px;padding:0 18px;border:0;border-radius:11px;background:var(--pink);color:#09090c;font-weight:800}
+.ghost{min-height:42px;padding:0 16px;border:1px solid var(--line);border-radius:11px;background:transparent;color:var(--text)}
+.note{font-size:12px;color:var(--muted)}
+.note.ok{color:var(--teal)}
+.note.bad{color:var(--danger)}
+.history{margin-top:14px;display:flex;flex-direction:column;gap:8px}
+.history-item{padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:rgba(255,255,255,.02);font-size:12px;color:var(--muted)}
+.taste-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px 22px}
+.taste-row{padding:14px;border:1px solid var(--line);border-radius:12px;background:rgba(255,255,255,.02)}
+.taste-row .ends{display:flex;justify-content:space-between;color:var(--muted);font-size:11px;margin-bottom:8px}
+.taste-row b{font-size:13px}
+.taste-row input{width:100%;accent-color:var(--teal);min-height:32px}
+.profile-pill{display:inline-flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.profile-pill span{font-size:11px;padding:4px 8px;border-radius:999px;background:rgba(57,230,195,.1);color:var(--teal)}
+.toast{position:fixed;left:50%;bottom:20px;transform:translate(-50%,20px);opacity:0;pointer-events:none;
+  background:#191a22;border:1px solid var(--line);padding:10px 14px;border-radius:10px;font-size:13px;
+  transition:.2s;z-index:50;max-width:calc(100vw - 32px)}
+.toast.show{opacity:1;transform:translate(-50%,0)}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+@media(max-width:980px){.hero{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(4,1fr)}}
+@media(max-width:760px){
+  .shell{grid-template-columns:1fr;padding:14px;gap:14px}
+  .rail{position:static;max-height:none;overflow:hidden;min-width:0}
+  .rail-list{flex-direction:row;overflow-x:auto;width:100%;max-width:100%;gap:6px;padding:8px;scrollbar-width:none}
+  .rail-list::-webkit-scrollbar{display:none}
+  .rail-item{min-width:210px;max-width:250px;grid-template-columns:8px minmax(0,1fr)}
+  .rail-item .s{display:none}
+  .rail-head{display:none}
+  .topbar{padding:12px 14px;gap:10px}
+  .status{gap:6px}
+  .chip{padding:6px 9px;font-size:11px}
+  .metrics{grid-template-columns:repeat(2,1fr)}
+  .controls,.taste-grid{grid-template-columns:1fr}
+  .detail-head{flex-direction:column;padding:16px}
+  .panel{padding:14px}
+  .choice,.tab,.iconbtn,.card .open,.primary,.ghost{min-height:44px}
+}
+@media(max-width:400px){.brand p{display:none}.grid{grid-template-columns:1fr}.hero-card{padding:16px}}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="mark">TT</div>
+    <div><h1>Think Tank Workroom</h1><p>Current work, granular feedback, and taste</p></div>
+  </div>
+  <div class="status">
+    <span class="chip"><span id="liveDot" class="dot quiet"></span><span id="liveText">Connecting</span></span>
+    <span class="chip">Updated <span id="lastRefresh">never</span></span>
+    <span class="chip">Next <span id="countdown">60</span>s</span>
+    <button class="iconbtn" id="refreshBtn" type="button">Refresh</button>
+  </div>
+</header>
+
+<main class="shell">
+  <aside class="rail" aria-label="Work list">
+    <div class="rail-head"><span>Work items</span><span id="workCount">0</span></div>
+    <nav class="rail-list" id="railList"></nav>
+  </aside>
+
+  <section class="content">
+    <div class="tabs" id="tabs" role="tablist">
+      <button class="tab active" data-tab="overview" type="button">Overview</button>
+      <button class="tab" data-tab="taste" type="button">Taste</button>
+      <button class="tab" data-tab="item" id="itemTab" type="button" hidden>Work item</button>
+    </div>
+
+    <section id="view-overview">
+      <div class="hero">
+        <div class="hero-card">
+          <p class="eyebrow">Live from the tank</p>
+          <h2>What the think tank is working on right now</h2>
+          <p id="heroCopy">Loading current work. This view refreshes every minute and stays honest when the tank is quiet.</p>
+        </div>
+        <div class="hero-card metrics">
+          <div class="metric"><b id="mActive">0</b><span>Active</span></div>
+          <div class="metric"><b id="mRecent">0</b><span>Recent</span></div>
+          <div class="metric"><b id="mBlocked">0</b><span>Blocked</span></div>
+          <div class="metric"><b id="mDone">0</b><span>Done today</span></div>
+        </div>
+      </div>
+      <div class="grid" id="cards"></div>
+    </section>
+
+    <section id="view-item" hidden>
+      <div class="detail-head panel">
+        <div>
+          <div class="meta"><span class="badge" id="detailStatus">status</span><span id="detailMeta"></span></div>
+          <h2 id="detailTitle">Work item</h2>
+          <p id="detailSummary"></p>
+        </div>
+        <button class="ghost" id="backBtn" type="button">Back to overview</button>
+      </div>
+
+      <div class="panel">
+        <h3>Share feedback</h3>
+        <p class="hint">Every field is optional. The tank reads this before its next pass on this work.</p>
+        <div class="quickrow" id="sentimentRow">
+          <button class="choice" data-sentiment="like" type="button">Like</button>
+          <button class="choice" data-sentiment="dislike" type="button">Dislike</button>
+        </div>
+        <div class="quickrow" style="margin-top:8px" id="worksRow">
+          <button class="choice works" data-works="works" type="button">Works</button>
+          <button class="choice broken" data-works="broken" type="button">Does not work</button>
+        </div>
+        <div class="quickrow" style="margin-top:12px" id="quickRow">
+          <button class="choice" data-quick="more-like-this" type="button">More like this</button>
+          <button class="choice" data-quick="less-like-this" type="button">Less like this</button>
+          <button class="choice" data-quick="keep-going" type="button">Keep going</button>
+          <button class="choice" data-quick="change-direction" type="button">Change direction</button>
+          <button class="choice" data-quick="stop-this-line" type="button">Stop this line</button>
+        </div>
+        <div class="controls" id="ratings"></div>
+        <div class="controls" id="aspects"></div>
+        <div style="margin-top:14px">
+          <label class="note" for="notes">Notes</label>
+          <textarea id="notes" placeholder="What should change? Be specific if you can."></textarea>
+        </div>
+        <div class="submitrow">
+          <button class="primary" id="submitFeedback" type="button">Send feedback</button>
+          <button class="ghost" id="clearFeedback" type="button">Clear</button>
+          <span class="note" id="feedbackStatus" role="status" aria-live="polite"></span>
+        </div>
+        <div class="history" id="feedbackHistory"></div>
+      </div>
+    </section>
+
+    <section id="view-taste" hidden>
+      <div class="panel">
+        <h3>Your taste profile</h3>
+        <p class="hint">These settings are durable and scoped to your player. The tank uses them before design work, alongside the project design references.</p>
+        <div class="taste-grid" id="tasteGrid"></div>
+        <div style="margin-top:14px">
+          <label class="note" for="tasteNotes">Taste notes</label>
+          <textarea id="tasteNotes" placeholder="Examples, references, things to avoid."></textarea>
+        </div>
+        <div class="submitrow">
+          <button class="primary" id="saveTaste" type="button">Save taste</button>
+          <span class="note" id="tasteStatus" role="status" aria-live="polite"></span>
+        </div>
+        <div class="profile-pill" id="tasteSummary"></div>
+      </div>
+    </section>
+  </section>
+</main>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(() => {
+  'use strict';
+  const TASTE_KEYS = [
+    ['bold_calm','Bold','Calm'],
+    ['dense_sparse','Dense','Sparse'],
+    ['playful_serious','Playful','Serious'],
+    ['premium_utilitarian','Premium','Utilitarian'],
+    ['technical_accessible','Technical','Accessible']
+  ];
+  const RATINGS = [
+    ['quality','Quality'],['usefulness','Usefulness'],
+    ['tasteFit','Taste fit'],['confidence','Confidence']
+  ];
+  const ASPECTS = [
+    ['layout','Layout'],['copy','Copy'],['behavior','Behavior'],
+    ['completeness','Completeness'],['taste','Taste']
+  ];
+  let state = {items:[], selected:null, feedback:{}, tab:'overview',
+               refreshedAt:0, countdown:60, taste:{weights:{},notes:''}};
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  };
+  const fmtAge = (mins) => mins < 1 ? 'just now' : mins < 60 ? mins + 'm ago' : Math.floor(mins/60) + 'h ago';
+  const esc = (s) => String(s == null ? '' : s);
+
+  function toast(msg, bad) {
+    const t = $('toast'); t.textContent = msg;
+    t.style.borderColor = bad ? 'var(--danger)' : 'var(--line)';
+    t.classList.add('show');
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => t.classList.remove('show'), 2600);
+  }
+
+  function renderRail() {
+    const list = $('railList'); list.textContent = '';
+    $('workCount').textContent = state.items.length;
+    state.items.forEach(item => {
+      const b = el('button','rail-item');
+      b.type = 'button'; b.dataset.status = item.status;
+      if (state.selected && state.selected.id === item.id) b.classList.add('active');
+      b.appendChild(el('span','bar'));
+      const mid = el('span');
+      mid.appendChild(el('span','t', item.title));
+      mid.appendChild(el('span','m', (item.assignee || 'unassigned') + ' · ' + fmtAge(item.ageMinutes)));
+      b.appendChild(mid);
+      b.appendChild(el('span','s', item.status));
+      b.addEventListener('click', () => openItem(item));
+      list.appendChild(b);
+    });
+  }
+
+  function renderOverview() {
+    const cards = $('cards'); cards.textContent = '';
+    $('mActive').textContent = state.items.filter(i => i.active).length;
+    $('mRecent').textContent = state.items.length;
+    $('mBlocked').textContent = state.items.filter(i => ['blocked','failed'].includes(i.status)).length;
+    $('mDone').textContent = state.items.filter(i => i.status === 'done').length;
+    if (!state.items.length) {
+      const e = el('div','empty','No active or recent work. The tank is quiet right now.');
+      cards.appendChild(e); return;
+    }
+    state.items.forEach(item => {
+      const c = el('article','card');
+      const top = el('div','card-top');
+      top.appendChild(el('h3', null, item.title));
+      top.appendChild(el('span','badge ' + item.status, item.status));
+      c.appendChild(top);
+      if (item.summary) c.appendChild(el('p', null, item.summary));
+      const meta = el('div','meta');
+      [item.assignee || 'unassigned', item.room || 'no room', fmtAge(item.ageMinutes)].forEach(x => meta.appendChild(el('span', null, x)));
+      c.appendChild(meta);
+      const b = el('button','open','Open and give feedback');
+      b.type = 'button'; b.addEventListener('click', () => openItem(item));
+      c.appendChild(b);
+      cards.appendChild(c);
+    });
+  }
+
+  function setTab(tab) {
+    state.tab = tab;
+    document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+    $('view-overview').hidden = tab !== 'overview';
+    $('view-item').hidden = tab !== 'item';
+    $('view-taste').hidden = tab !== 'taste';
+    if (tab === 'taste') loadTaste();
+    window.scrollTo({top:0});
+  }
+
+  function openItem(item) {
+    state.selected = item;
+    $('itemTab').textContent = item.title.length > 34 ? item.title.slice(0, 33) + '…' : item.title;
+    $('itemTab').hidden = false;
+    $('detailStatus').textContent = item.status;
+    $('detailStatus').className = 'badge ' + item.status;
+    $('detailMeta').textContent = [item.assignee || 'unassigned', item.room || 'no room', item.team || 'no team', fmtAge(item.ageMinutes)].join(' · ');
+    $('detailTitle').textContent = item.title;
+    $('detailSummary').textContent = item.summary || 'No summary yet.';
+    renderFeedbackForm();
+    loadFeedback(item.id);
+    setTab('item');
+    renderRail();
+  }
+
+  function renderScale(container, key, label, value) {
+    const wrap = el('div','control');
+    const lab = el('label');
+    lab.appendChild(el('span', null, label));
+    const out = el('output', null, String(value));
+    lab.appendChild(out);
+    const input = document.createElement('input');
+    input.type = 'range'; input.min = '0'; input.max = '10'; input.step = '1';
+    input.value = String(value); input.dataset.key = key;
+    input.addEventListener('input', () => out.textContent = input.value);
+    wrap.appendChild(lab); wrap.appendChild(input); container.appendChild(wrap);
+  }
+
+  function renderFeedbackForm() {
+    const r = $('ratings'); r.textContent = '';
+    RATINGS.forEach(([k,l]) => renderScale(r,k,l,5));
+    const a = $('aspects'); a.textContent = '';
+    ASPECTS.forEach(([k,l]) => renderScale(a,k,l,5));
+    $('notes').value = '';
+    $('feedbackStatus').textContent = '';
+    $('feedbackStatus').className = 'note';
+    document.querySelectorAll('[data-sentiment],[data-works],[data-quick]').forEach(b => b.classList.remove('active'));
+  }
+
+  function collectFeedback() {
+    const ratings = {aspects:{}};
+    document.querySelectorAll('#ratings input[data-key]').forEach(i => ratings[i.dataset.key] = Number(i.value));
+    document.querySelectorAll('#aspects input[data-key]').forEach(i => ratings.aspects[i.dataset.key] = Number(i.value));
+    const sentiment = document.querySelector('[data-sentiment].active');
+    const works = document.querySelector('[data-works].active');
+    return {
+      workItemId: state.selected ? state.selected.id : '',
+      sentiment: sentiment ? sentiment.dataset.sentiment : null,
+      works: works ? works.dataset.works : null,
+      notes: $('notes').value.trim(),
+      ratings,
+      quickActions: Array.from(document.querySelectorAll('[data-quick].active')).map(b => b.dataset.quick)
+    };
+  }
+
+  async function submitFeedback() {
+    if (!state.selected) return;
+    const btn = $('submitFeedback'); btn.disabled = true;
+    try {
+      const res = await fetch('/api/feedback', {
+        method:'POST', credentials:'same-origin',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify(collectFeedback())
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not save feedback');
+      $('feedbackStatus').textContent = 'Feedback saved. The tank will read it.';
+      $('feedbackStatus').className = 'note ok';
+      toast('Feedback saved');
+      loadFeedback(state.selected.id);
+    } catch (err) {
+      $('feedbackStatus').textContent = err.message;
+      $('feedbackStatus').className = 'note bad';
+      toast(err.message, true);
+    } finally { btn.disabled = false; }
+  }
+
+  async function loadFeedback(id) {
+    try {
+      const res = await fetch('/api/feedback?workItemId=' + encodeURIComponent(id) + '&limit=8', {credentials:'same-origin'});
+      if (!res.ok) return;
+      const data = await res.json();
+      const h = $('feedbackHistory'); h.textContent = '';
+      (data.feedback || []).forEach(f => {
+        const bits = [];
+        if (f.sentiment) bits.push(f.sentiment);
+        if (f.works) bits.push(f.works);
+        if (f.notes) bits.push(f.notes);
+        const q = (f.ratings && f.ratings.quality != null) ? 'quality ' + f.ratings.quality : '';
+        if (q) bits.push(q);
+        h.appendChild(el('div','history-item', bits.join(' · ')));
+      });
+    } catch (e) { /* history is optional */ }
+  }
+
+  async function loadWork() {
+    const dot = $('liveDot'), text = $('liveText');
+    try {
+      const res = await fetch('/api/work-items', {credentials:'same-origin', cache:'no-store'});
+      if (!res.ok) throw new Error(res.status === 401 ? 'Sign in required' : 'Server unavailable');
+      const data = await res.json();
+      state.items = data.items || [];
+      state.refreshedAt = data.refreshedAt || Date.now();
+      state.countdown = 60;
+      dot.className = 'dot' + (data.activeCount ? '' : ' quiet');
+      text.textContent = data.activeCount ? data.activeCount + ' active' : 'Quiet';
+      $('lastRefresh').textContent = new Date(state.refreshedAt).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+      $('heroCopy').textContent = data.activeCount
+        ? data.activeCount + ' work item' + (data.activeCount === 1 ? ' is' : 's are') + ' active. Open one to give granular feedback.'
+        : 'No active work right now. The list below shows recent work so you can still review it and shape the next pass.';
+      renderRail();
+      if (state.tab === 'overview') renderOverview();
+      if (state.selected) {
+        const fresh = state.items.find(i => i.id === state.selected.id);
+        if (fresh) state.selected = fresh;
+      }
+    } catch (err) {
+      dot.className = 'dot bad'; text.textContent = 'Offline';
+      $('heroCopy').textContent = err.message + '. The page will keep trying every minute.';
+    }
+  }
+
+  function renderTasteGrid() {
+    const g = $('tasteGrid'); g.textContent = '';
+    TASTE_KEYS.forEach(([key,left,right]) => {
+      const row = el('div','taste-row');
+      const ends = el('div','ends');
+      ends.appendChild(el('b',null,left)); ends.appendChild(el('span',null,right));
+      row.appendChild(ends);
+      const input = document.createElement('input');
+      input.type='range'; input.min='0'; input.max='100'; input.step='1';
+      input.value = String(state.taste.weights[key] ?? 50); input.dataset.taste = key;
+      row.appendChild(input);
+      g.appendChild(row);
+    });
+  }
+
+  async function loadTaste() {
+    try {
+      const res = await fetch('/api/taste', {credentials:'same-origin'});
+      if (!res.ok) return;
+      const data = await res.json();
+      state.taste = data.taste || {weights:{},notes:''};
+      $('tasteNotes').value = state.taste.notes || '';
+      renderTasteGrid();
+      const s = $('tasteSummary'); s.textContent = '';
+      TASTE_KEYS.forEach(([key,left,right]) => {
+        const v = Number(state.taste.weights[key] ?? 50);
+        s.appendChild(el('span',null,left + ' ' + v + '% / ' + right + ' ' + (100-v) + '%'));
+      });
+    } catch (e) { toast('Could not load taste', true); }
+  }
+
+  async function saveTaste() {
+    const weights = {};
+    document.querySelectorAll('[data-taste]').forEach(i => weights[i.dataset.taste] = Number(i.value));
+    try {
+      const res = await fetch('/api/taste', {method:'PUT', credentials:'same-origin',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({weights, notes: $('tasteNotes').value.trim()})});
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not save taste');
+      state.taste = data.taste;
+      $('tasteStatus').textContent = 'Taste saved.';
+      $('tasteStatus').className = 'note ok';
+      renderTasteGrid();
+      toast('Taste saved');
+    } catch (err) {
+      $('tasteStatus').textContent = err.message;
+      $('tasteStatus').className = 'note bad';
+      toast(err.message, true);
+    }
+  }
+
+  document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+    if (t.dataset.tab === 'overview') setTab('overview');
+    else if (t.dataset.tab === 'taste') setTab('taste');
+    else if (t.dataset.tab === 'item' && state.selected) setTab('item');
+  }));
+  $('backBtn').addEventListener('click', () => setTab('overview'));
+  $('refreshBtn').addEventListener('click', () => { loadWork(); loadTaste(); });
+  $('submitFeedback').addEventListener('click', submitFeedback);
+  $('clearFeedback').addEventListener('click', renderFeedbackForm);
+  $('saveTaste').addEventListener('click', saveTaste);
+  $('sentimentRow').addEventListener('click', e => {
+    const b = e.target.closest('[data-sentiment]'); if (!b) return;
+    document.querySelectorAll('[data-sentiment]').forEach(x => x.classList.toggle('active', x === b));
+  });
+  $('worksRow').addEventListener('click', e => {
+    const b = e.target.closest('[data-works]'); if (!b) return;
+    document.querySelectorAll('[data-works]').forEach(x => x.classList.toggle('active', x === b));
+  });
+  $('quickRow').addEventListener('click', e => {
+    const b = e.target.closest('[data-quick]'); if (b) b.classList.toggle('active');
+  });
+
+  setInterval(() => {
+    state.countdown -= 1;
+    if (state.countdown <= 0) { loadWork(); state.countdown = 60; }
+    $('countdown').textContent = String(state.countdown);
+  }, 1000);
+  loadWork();
+})();
+</script>
+</body>
+</html>
