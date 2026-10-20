@@ -2149,13 +2149,19 @@ def _apply_content_result(state, task, result, now_ms=None):
         task['note'] = note
     # Review diagnostics and workspace handoff survive the result channel.
     for field in ('reviewDiagnostics', 'reviewFailureKind', 'reviewContract',
-                  'stagedWorkspace', 'previousWorkspace', 'resumedFromWorkspace'):
+                  'stagedWorkspace', 'previousWorkspace', 'resumedFromWorkspace',
+                  'sourceUrls'):
         if result.get(field) is not None:
             task[field] = result[field]
     if result.get('reviewContract') and task.get('reviewOf'):
         parent_contract_task = (state.get('tasks') or {}).get(task['reviewOf'])
         if parent_contract_task is not None and not parent_contract_task.get('reviewContract'):
             parent_contract_task['reviewContract'] = result['reviewContract']
+    if result.get('sourceUrls') and task.get('reviewOf'):
+        parent_sources = (state.get('tasks') or {}).get(task['reviewOf'])
+        if parent_sources is not None:
+            parent_sources['sourceUrls'] = sorted(set(
+                parent_sources.get('sourceUrls') or []) | set(result['sourceUrls']))
     # Persist the .py files this content pass wrote (coding executor's
     # `writtenPy`). A gate review recovers the parent story's list from here
     # to scope ITS quality pipeline to the story's own files instead of

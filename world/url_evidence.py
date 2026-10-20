@@ -42,3 +42,23 @@ class DiscoveredURLs:
 
     def allows(self, url):
         return self.valid(url) and url.rstrip('/') in self.urls
+
+
+def extract_urls(text):
+    """Every syntactically valid http(s) URL in a report, normalized."""
+    return sorted(DiscoveredURLs(text).urls)
+
+def citation_errors(text, allowed):
+    """Flag report citations that were never discovered by the tools.
+
+    A model may summarize freely; it may not mint a URL path. `allowed` is the
+    task's real tool-discovery ledger. An empty ledger is not proof that any
+    citation is valid, so callers should pass the task's recorded URLs.
+    """
+    allowed_urls = {u.rstrip('/') for u in allowed or []
+                    if isinstance(u, str) and DiscoveredURLs.valid(u)}
+    errors = []
+    for url in extract_urls(text):
+        if url not in allowed_urls:
+            errors.append('Cited URL was not discovered by a tool: ' + url)
+    return errors[:20]

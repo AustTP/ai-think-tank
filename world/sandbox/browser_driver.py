@@ -154,6 +154,7 @@ def _captcha_state(page):
               name: name,
               src: src.slice(0, 200),
               text: (el.innerText || '').trim().slice(0, 120),
+              rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
             });
           }
           for (const rec of out) {

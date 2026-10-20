@@ -4734,6 +4734,22 @@ def _telegram_send_photo_sync(png_bytes, caption):
     return sent
 
 
+def _telegram_send_text_sync(text):
+    """Send one bounded text notice to every allowlisted Telegram chat."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS and text):
+        return 0
+    sent = 0
+    for chat_id in TELEGRAM_ALLOWED_CHAT_IDS:
+        try:
+            if _telegram_api_sync('sendMessage',
+                                  {'chat_id': str(chat_id),
+                                   'text': text[:4000]}) is not None:
+                sent += 1
+        except _TelegramConflictError:
+            break
+    return sent
+
+
 def _captcha_vision_candidate(image_b64):
     """Best-effort read of a simple image CAPTCHA. Returns
     {'text', 'confidence'} or None. The caller decides whether the confidence
@@ -4778,6 +4794,49 @@ def _captcha_vision_candidate(image_b64):
     return {'text': text[:32], 'confidence': max(0.0, min(confidence, 1.0))}
 
 
+def _captcha_crop_b64(shot_b64, captchas):
+    """Crop a page screenshot to the challenge region before it leaves the host.
+
+    The full page can contain the owner's mail, session chrome, or unrelated
+    authenticated content. Relay only when a real element rectangle was
+    reported; an uncroppable screenshot is withheld rather than sent whole.
+    """
+    if not shot_b64:
+        return None
+    boxes = []
+    for item in captchas or []:
+        rect = item.get('rect') if isinstance(item, dict) else None
+        if not isinstance(rect, dict):
+            continue
+        try:
+            x, y = float(rect.get('x')), float(rect.get('y'))
+            width, height = float(rect.get('width')), float(rect.get('height'))
+        except (TypeError, ValueError):
+            continue
+        if width <= 0 or height <= 0:
+            continue
+        boxes.append((x, y, x + width, y + height))
+    if not boxes:
+        return None
+    try:
+        import base64
+        import io
+        from PIL import Image
+        image = Image.open(io.BytesIO(base64.b64decode(shot_b64)))
+        pad = 24
+        left = max(0, int(min(box[0] for box in boxes)) - pad)
+        top = max(0, int(min(box[1] for box in boxes)) - pad)
+        right = min(image.width, int(max(box[2] for box in boxes)) + pad)
+        bottom = min(image.height, int(max(box[3] for box in boxes)) + pad)
+        if right <= left or bottom <= top:
+            return None
+        output = io.BytesIO()
+        image.crop((left, top, right, bottom)).convert('RGB').save(output, 'PNG')
+        return base64.b64encode(output.getvalue()).decode()
+    except Exception:
+        return None
+
+
 def _handle_captcha_detected(agent_id, sandbox_id, page_url, captchas, shot_b64,
                               purpose='', submit_selector=''):
     """Record a detected CAPTCHA, try a policy-approved image read, and push
@@ -4809,24 +4868,32 @@ def _handle_captcha_detected(agent_id, sandbox_id, page_url, captchas, shot_b64,
             purpose=purpose)
     request_id = request['id']
     already_answered = request.get('status') == 'answered'
+    # Crop before the image reaches a vision model or Telegram. No rectangle
+    # means no relay image: a full-page screenshot is not a CAPTCHA.
+    relay_b64 = _captcha_crop_b64(shot_b64, captchas)
     auto = None
-    if is_new and mode == 'attempt' and not interactive and shot_b64:
-        candidate = _captcha_vision_candidate(shot_b64)
+    if is_new and mode == 'attempt' and not interactive and relay_b64:
+        candidate = _captcha_vision_candidate(relay_b64)
         if candidate and candidate['confidence'] >= 0.8:
             captcha.set_answer(request_id, candidate['text'], answered_by='vision')
             auto = candidate
             request = captcha.get(request_id)
     sent = 0
-    if is_new and not already_answered and not auto and shot_b64:
+    notice_sent = 0
+    if is_new and not already_answered and not auto:
+        caption = (
+            f"CAPTCHA request {request_id}\n"
+            f"Host: {host or 'unknown'}\n"
+            f"Reply exactly: captcha {request_id} <answer>\n"
+            f"Expires in {captcha.DEFAULT_TTL_S // 60} minutes."
+        )
         try:
-            png = base64.b64decode(shot_b64)
-            caption = (
-                f"CAPTCHA request {request_id}\n"
-                f"Host: {host or 'unknown'}\n"
-                f"Reply exactly: captcha {request_id} <answer>\n"
-                f"Expires in {captcha.DEFAULT_TTL_S // 60} minutes."
-            )
-            sent = _telegram_send_photo_sync(png, caption)
+            if relay_b64:
+                notice_sent = sent = _telegram_send_photo_sync(
+                    base64.b64decode(relay_b64), caption)
+            else:
+                notice_sent = _telegram_send_text_sync(
+                    caption + f'\nOpen the page to read the challenge: {page_url or host}')
         except Exception as e:
             print(f'[captcha] Telegram relay failed: {e}', flush=True)
     return {
@@ -4839,6 +4906,8 @@ def _handle_captcha_detected(agent_id, sandbox_id, page_url, captchas, shot_b64,
         'autoAttempted': bool(auto),
         'autoConfidence': auto['confidence'] if auto else None,
         'imageSent': bool(sent),
+        'noticeSent': bool(notice_sent),
+        'imageCropped': bool(relay_b64),
         'alreadyAnswered': bool(already_answered),
         'expiresIn': captcha.DEFAULT_TTL_S,
         'replyHint': (
@@ -16976,6 +17045,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             return 'policy_edit returned an unexpected response.'
         raise ValueError(f'unknown tool: {name}')
     execute_tool.observe_urls = discovered.observe
+    execute_tool.discovered = discovered
     return execute_tool
 
 

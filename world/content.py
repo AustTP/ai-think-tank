@@ -32,6 +32,7 @@ import serve as _serve
 import evidence_policy
 import review_quality
 import training_capture
+import url_evidence
 import work_reuse
 
 from config import RESEARCH_DESK_PASSES, bind_policy
@@ -324,8 +325,11 @@ def _run_research_content(snapshot, agent_id, task, base_ctx=None):
     # the frontier's hub pages count too).
     for u in visited:
         seen.add(u)
+    source_urls = sorted({k.get('resolved_url') or k.get('url') for k in kept
+                          if k.get('resolved_url') or k.get('url')} | set(visited))
     _sim_module._store_content_result(task.get('id'),
                                       {'note': note, 'seenUrls': sorted(seen),
+                                       'sourceUrls': source_urls,
                                        'passLog': pass_log})
 
 
@@ -2353,6 +2357,20 @@ def _perception_block(base_ctx):
     return f'\n\nContext from the sim:\n{base_ctx}' if base_ctx else ''
 
 
+def _read_library_document(path):
+    """Read a filed Library document for review-time artifact and citation checks."""
+    if not isinstance(path, str) or not path.strip():
+        return ''
+    try:
+        target = _serve._safe_library_path(path.strip())
+        if not target or not os.path.isfile(target):
+            return ''
+        with open(target, encoding='utf-8-sig', errors='replace') as stream:
+            return stream.read(2_000_000)
+    except (OSError, ValueError, TypeError):
+        return ''
+
+
 def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     """Port of tasks.js runReviewTask: a real review/QA pass -- gatherUnifiedContext,
     a skeptical critique call (probe-driven), a real screenshot visual pass, a Jev
@@ -2381,6 +2399,7 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     # approvals and the stuck-gate watchdog re-queues it forever). Same widening
     # the spike executor applies.
     task['workUntil'] = time.time() + 300
+    review_parent = {}
 
     # Cut 4 -- objective pipeline evidence, run by the sandbox, NOT by reviewer
     # opinion. The approval gate in sim.py refuses to count a clean vote unless
@@ -2597,6 +2616,8 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                                     graded.get('escalate', []), full_review,
                                     moonshot=bool(task.get('moonshot')))
 
+    review_document = _read_library_document((review_parent or {}).get('libraryPath'))
+    review_contract = review_quality.contract_for(review_parent or task)
     queue_fix = None
     suffix = 'nothing actionable found'
     is_gate_review = bool(task.get('reviewOf'))
@@ -2639,6 +2660,16 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
             queue_fix['instructions'] += (
                 f'\n\nVerified failing requirements from the review checklist:\n{reqs_text}\n'
                 'Fix the work so each of these is met.')
+        repairs = _document_review_repairs(
+            review, review_document,
+            str(review_contract.get('instructions') or '') + '\n'
+            + str(review_contract.get('acceptanceCriteria') or '')) if review_document else []
+        if repairs:
+            queue_fix['instructions'] += (
+                '\n\nEvidence-anchored repair stories from the review:\n'
+                + '\n'.join(f'- {item["title"]}: {item["instructions"]} '
+                             f'(acceptance: {item["acceptanceCriteria"]})'
+                             for item in repairs[:4]))
         suffix = 'queued a fix'
     # SWiRL: a review that VERIFIED a checklist requirement failed leaves a
     # process-trace lesson in pending_review/skills/ (bounded + deduped by the
@@ -2661,6 +2692,15 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
               # exercised by the standard gate -- never just "a reviewer said it
               # looked ok". Empty when the pipeline couldn't run.
               'evidence': _quality_pipeline_evidence(qp)}
+    if review_document and not pipeline_is_code_class:
+        artifact = review_quality.artifact_checks(
+            review_document, review_contract, _serve._safe_library_path)
+        diagnostics = result.setdefault('reviewDiagnostics', {})
+        diagnostics['artifactChecks'] = artifact
+        allowed_urls = (review_parent or {}).get('sourceUrls') or []
+        citation_errors = url_evidence.citation_errors(review_document, allowed_urls)
+        if citation_errors:
+            diagnostics['citationErrors'] = citation_errors
     if checklist_grades:
         result['checklistGrades'] = checklist_grades
     if escalated_reqs:
@@ -5511,7 +5551,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     web_tool = _serve._make_web_tools_executor(agent_id, key, default_query=backlog, struck_tools=struck_tools, work_context=work_context, work_context_trusted=work_context_trusted, task_id=task.get('id'))
     sandbox_id = f"spike-{task.get('id') or 'adhoc'}"
     sandbox_tool = _make_spike_sandbox_executor(agent_id, key, sandbox_id, struck_tools=struck_tools)
-    browser_act_tool = _make_browser_act_executor(agent_id, key, sandbox_id, struck_tools=struck_tools, work_context=work_context, work_context_trusted=work_context_trusted, task_id=task.get('id'))
+    browser_act_execute = _make_browser_act_executor(agent_id, key, sandbox_id, struck_tools=struck_tools, work_context=work_context, work_context_trusted=work_context_trusted, task_id=task.get('id'))
     captcha_solve_tool = _make_captcha_solve_executor(agent_id, key)
     list_handles_tool = _make_list_handles_executor(agent_id, key)
     library_tool = _make_library_tools_executor(agent_id, struck_tools=struck_tools)
@@ -5581,6 +5621,14 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                           'list_calendar_events', 'create_calendar_event',
                           'search_gmail_messages', 'read_gmail_message', 'create_gmail_draft',
                           'read_google_doc', 'create_google_doc')
+
+    def browser_act_tool(tool_name, args):
+        output = browser_act_execute(tool_name, args)
+        try:
+            web_tool.discovered.observe(output)
+        except Exception:
+            pass
+        return output
 
     def execute_tool(tool_name, args):
         _hb()  # every tool call is live progress the completion loop can see
@@ -5811,8 +5859,10 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # THIRD, deliberate exception to that same rule -- the player asking to
     # be told what was found is a genuinely different need than the durable
     # task record staying lean, not a regression of the same bug.
+    discovered_urls = sorted(getattr(getattr(web_tool, 'discovered', None), 'urls', set()) or set())
     _sim_module._store_content_result(task.get('id'), {
         'note': f'{name} spiked "{backlog}" -- see the Library entry just filed.', 'ok': True,
+        'sourceUrls': discovered_urls,
         # Gap: /api/intent/spike/{id}/promote
         # (turning a spike into a real followup story) only ever had the
         # short note above to work with -- recording the exact path lets it

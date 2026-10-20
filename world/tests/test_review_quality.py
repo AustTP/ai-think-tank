@@ -87,3 +87,23 @@ class QualityEvidence(unittest.TestCase):
         self.assertEqual(parent['_peerGate']['formatFailures'],1)
         self.assertEqual(parent['_peerGate']['serviceFailures'],1)
         self.assertEqual(parent['lastReviewDiagnosticsTask'],'r')
+
+
+class CitationGating(unittest.TestCase):
+    def test_report_cannot_cite_an_undiscovered_url(self):
+        import url_evidence
+        document = ('Verified at https://example.com/report and invented '
+                    'https://example.com/made-up-path.')
+        errors = url_evidence.citation_errors(
+            document, ['https://example.com/report'])
+        self.assertEqual(len(errors), 1)
+        self.assertIn('made-up-path', errors[0])
+
+    def test_clean_vote_rejects_citation_errors(self):
+        result = {'ok': True, 'pipelineOk': True,
+                  'acceptanceAssessment': {'verified': True,
+                                           'checks': [{'status': 'met',
+                                                       'evidence': ['quote']} ]},
+                  'reviewDiagnostics': {'citationErrors': ['bad URL']}}
+        self.assertTrue(any('never discovered' in e for e in
+                            quality.clean_vote_errors(result)))

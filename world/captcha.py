@@ -170,7 +170,7 @@ def set_answer(request_id, answer, answered_by='player'):
             return None
         status, expires_at = row
         if now > expires_at:
-            conn.execute("UPDATE captcha_requests SET status='expired' WHERE id = ?",
+            conn.execute("UPDATE captcha_requests SET status='expired', answer=NULL WHERE id = ?",
                          (request_id,))
             return None
         if status in ('solved', 'failed', 'expired'):
@@ -189,7 +189,7 @@ def mark_solved(request_id, actor='system'):
     s = _serve()
     now = time.time()
     with s._db() as conn:
-        conn.execute("UPDATE captcha_requests SET status='solved', solved_at=? WHERE id=?",
+        conn.execute("UPDATE captcha_requests SET status='solved', solved_at=?, answer=NULL WHERE id=?",
                      (now, request_id))
     s.log_action(actor, 'captcha_solved', {'requestId': request_id}, authorized=True)
     return get(request_id)
@@ -198,7 +198,7 @@ def mark_solved(request_id, actor='system'):
 def mark_failed(request_id, error='', actor='system'):
     s = _serve()
     with s._db() as conn:
-        conn.execute("UPDATE captcha_requests SET status='failed', last_error=? WHERE id=?",
+        conn.execute("UPDATE captcha_requests SET status='failed', last_error=?, answer=NULL WHERE id=?",
                      (str(error)[:500], request_id))
     s.log_action(actor, 'captcha_failed',
                  {'requestId': request_id, 'error': str(error)[:200]},

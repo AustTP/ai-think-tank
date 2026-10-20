@@ -3,12 +3,16 @@
 Hermetic: temp DB, fake browser run, no Telegram/network.
 """
 import asyncio
+import base64
+import io
 import os
 import shutil
 import sys
 import tempfile
 import unittest
 import unittest.mock
+
+from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -75,6 +79,12 @@ class Lifecycle(_CaptchaCase):
                          (0, rec['id']))
         self.assertIsNone(captcha.set_answer(rec['id'], 'AB12'))
 
+    def test_solved_request_drops_the_plaintext_answer(self):
+        rec = self._request()
+        captcha.set_answer(rec['id'], 'ZX9')
+        captcha.mark_solved(rec['id'])
+        self.assertIsNone(captcha.get(rec['id'])['answer'])
+
     def test_policy_default_and_set(self):
         self.assertEqual(captcha.policy_for_host('example.com'), 'relay')
         captcha.set_policy('example.com', 'attempt', updated_by='player')
@@ -125,18 +135,42 @@ class Broker(_CaptchaCase):
 
 
 class Detection(_CaptchaCase):
-    def test_detection_creates_request_and_relays(self):
-        shot = 'aGVsbG8='
+    def _shot(self, width=320, height=240):
+        buffer = io.BytesIO()
+        Image.new('RGB', (width, height), 'white').save(buffer, 'PNG')
+        return base64.b64encode(buffer.getvalue()).decode()
+
+    def test_detection_creates_request_and_relays_only_the_challenge_crop(self):
         with unittest.mock.patch.object(serve, '_telegram_send_photo_sync',
                                         return_value=1) as send:
             info = serve._handle_captcha_detected(
                 'ben', 'sandbox-test', 'https://example.com/login',
-                [{'kind': 'image', 'selector': '#cap', 'inputSelector': '#cap-input'}],
-                shot, purpose='sign in', submit_selector='button[type=submit]')
+                [{'kind': 'image', 'selector': '#cap', 'inputSelector': '#cap-input',
+                  'rect': {'x': 10, 'y': 10, 'width': 80, 'height': 30}}],
+                self._shot(), purpose='sign in', submit_selector='button[type=submit]')
         self.assertTrue(info['imageSent'])
+        self.assertTrue(info['imageCropped'])
         self.assertEqual(info['kind'], 'image')
+        sent_png = Image.open(io.BytesIO(send.call_args.args[0]))
+        self.assertLess(sent_png.width, 200)
+        self.assertLess(sent_png.height, 120)
         self.assertEqual(captcha.get(info['requestId'])['status'], 'pending')
-        send.assert_called_once()
+
+    def test_uncroppable_screenshot_is_withheld_but_the_owner_is_notified(self):
+        with unittest.mock.patch.object(serve, '_telegram_send_photo_sync',
+                                        return_value=1) as send, \
+             unittest.mock.patch.object(serve, '_telegram_send_text_sync',
+                                        return_value=1) as text_send:
+            info = serve._handle_captcha_detected(
+                'ben', 'sandbox-test', 'https://example.com/login',
+                [{'kind': 'image', 'selector': '#cap', 'inputSelector': '#cap-input'}],
+                self._shot(), purpose='sign in')
+        self.assertFalse(info['imageSent'])
+        self.assertFalse(info['imageCropped'])
+        self.assertTrue(info['noticeSent'])
+        send.assert_not_called()
+        text_send.assert_called_once()
+        self.assertIn('https://example.com/login', text_send.call_args.args[0])
 
 
 if __name__ == '__main__':
