@@ -8749,7 +8749,7 @@ def _run_in_sandbox_sync(sandbox_dir, command):
 # proxy is a page the browser can't load either. The action is written to the
 # sandbox's own scratch dir (mounted at /workspace) so the driver's persistent
 # profile + result/screenshot files survive for the caller to read back.
-BROWSER_ACT_TIMEOUT_S = 60
+BROWSER_ACT_TIMEOUT_S = 180
 BROWSER_ACT_MAX_OUTPUT = 60_000
 
 
@@ -8819,7 +8819,16 @@ def _run_browser_act_sync(sandbox_dir, action):
         '-v', f'{action_dir}:/browser-act:ro',
         '-w', '/workspace',
         SANDBOX_IMAGE,
-        'python3', '/opt/browser_driver.py', f'/browser-act/action-{run_id}.json',
+        # Headful Chromium under a private Xvfb. Do NOT use xvfb-run here:
+        # in this container it hangs before running the child command. Start
+        # Xvfb directly, wait for its socket, then run the driver.
+        'sh', '-c',
+        ('Xvfb :99 -screen 0 1280x900x24 >/tmp/xvfb.log 2>&1 & '
+         'export DISPLAY=:99; '
+         'for i in $(seq 1 25); do [ -S /tmp/.X11-unix/X99 ] && break; sleep 0.2; done; '
+         'python3 /opt/browser_driver.py "$1"; rc=$?; '
+         'kill %1 2>/dev/null; exit $rc'),
+        'sh', f'/browser-act/action-{run_id}.json',
     ]
     try:
         try:

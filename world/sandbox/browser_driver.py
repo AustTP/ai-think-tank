@@ -204,7 +204,9 @@ def _page_state(page, max_text):
             "ariaLabel: el.getAttribute('aria-label') || '',"
             "visible: visible,"
             "disabled: !!el.disabled,"
-            "text: (el.textContent || '').trim().slice(0, 80)"
+            "text: (el.textContent || '').trim().slice(0, 80),"
+            "valueLength: (el.value || '').length,"
+            "outer: (el.outerHTML || '').slice(0, 500)"
             "};})" % MAX_FIELDS
         ) or []
     except Exception:
@@ -251,7 +253,7 @@ def _launch(playwright, action):
     # least that unblocks legitimate logins to player-vetted, allowlisted
     # sites the player explicitly wants agents to reach.
     ctx = playwright.chromium.launch_persistent_context(
-        profile_dir, headless=True, args=args, viewport=vp, accept_downloads=False,
+        profile_dir, headless=(os.environ.get('BROWSER_HEADLESS', '0') == '1'), args=args, viewport=vp, accept_downloads=False,
         user_agent=('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
                     'AppleWebKit/537.36 (KHTML, like Gecko) '
                     'Chrome/131.0.0.0 Safari/537.36'),
@@ -327,6 +329,7 @@ def run(action):
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
                 if op == 'login':
                     fields = action.get('fields', [])
+                    filled_lengths = []
                     for f in fields:
                         loc = page.locator(f['selector']).first
                         loc.wait_for(state='visible', timeout=timeout_ms)
@@ -339,6 +342,10 @@ def run(action):
                             loc.press_sequentially(f.get('value') or '', delay=20, timeout=timeout_ms)
                         except Exception:
                             loc.fill(f.get('value') or '', timeout=timeout_ms)
+                        try:
+                            filled_lengths.append(len(loc.input_value()))
+                        except Exception:
+                            filled_lengths.append(-1)
                     _settle(page, 1500)
                     before = page.url
                     submit_used = ''
@@ -392,6 +399,7 @@ def run(action):
                             pass
                     state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
                     return {'ok': True, 'op': op, 'submitUsed': submit_used,
+                            'filledFieldLengths': filled_lengths,
                             'urlAfterSubmit': page.url,
                             'screenshot': _maybe_shot(ctx, page, action), **state}
                 if op == 'click':

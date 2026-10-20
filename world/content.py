@@ -3361,7 +3361,7 @@ def _make_browser_act_executor(agent_id, agent_key, sandbox_id, struck_tools=Non
             body['credentialHandle'] = cred_handle
             body['credentialField'] = (args or {}).get('credentialField') or ''
             body['pageUrl'] = (args or {}).get('pageUrl') or (args or {}).get('url') or ''
-        result = _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/browser-act', body, agent_key, timeout=90)
+        result = _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/browser-act', body, agent_key, timeout=200)
         if not isinstance(result, dict):
             return 'Could not run that browser action (unexpected response).'
         if result.get('url'):
