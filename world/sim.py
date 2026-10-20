@@ -2171,6 +2171,15 @@ def _apply_content_result(state, task, result, now_ms=None):
     library_path = result.get('libraryPath')
     if library_path:
         task['libraryPath'] = library_path
+    # Pass 2 repeat-failure control: two failures with the same normalized
+    # failure, evidence and repair plan are not a new attempt. Block the story
+    # for a real change in input or plan instead of spending on another copy.
+    if result.get('ok') is False or result.get('peerVerdict') == 'actionable':
+        try:
+            import repeat_work
+            repeat_work.record(state, task, result, now_ms)
+        except Exception as e:
+            print(f'[sim] repeat work record error: {e}', flush=True)
     # Merge grown seenUrls back into the topic (dedup is stored per-topic).
     seen = result.get('seenUrls')
     if seen:
@@ -13023,6 +13032,21 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 # Content landed -- mirror the JS Promise.race: finalize as soon
                 # as the real work resolves (the min-visual floor is satisfied by
                 # the network round-trips), not when the timeout ceiling hits.
+                try:
+                    import transport_recovery
+                    transport_outcome = transport_recovery.queue(state, task, result, now_ms)
+                except Exception as e:
+                    print(f'[sim] transport recovery error: {e}', flush=True)
+                    transport_outcome = False
+                if transport_outcome:
+                    task['note'] = result.get('note')
+                    task['_contentInFlight'] = False
+                    _release_agent_after_failure(state, aid, task)
+                    if transport_outcome == 'queued':
+                        import story_tracking
+                        story_tracking.root(state, task)['status'] = 'repairing'
+                    send_agent_off_duty(state, aid, doors, grid)
+                    continue
                 _apply_content_result(state, task, result, now_ms)
                 # Bot Ops / shadow mode: a dry-run task ships nothing. Capture the
                 # outcome to the shadow ledger and release the agent, skipping the
