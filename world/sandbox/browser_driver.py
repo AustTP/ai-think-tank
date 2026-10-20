@@ -25,6 +25,7 @@ mean the harness itself died, which the endpoint reports as a sandbox failure.
 """
 import json
 import os
+import re
 import sys
 import traceback
 
@@ -76,6 +77,21 @@ def _social_write_guard(op, url):
     if op == 'login' and not _is_login_path(url):
         return 'read-only social policy: op=login is allowed only on a login path'
     return None
+
+
+def _try_click(page, selector, timeout=2500):
+    """Click the first matching element only if it is actually visible and
+    enabled. Facebook renders a hidden/disabled input[type=submit] alongside
+    its real button, so a blind click on the submit selector burns 30s."""
+    try:
+        loc = page.locator(selector).first
+        loc.wait_for(state='visible', timeout=timeout)
+        if not loc.is_enabled():
+            return False
+        loc.click(timeout=timeout)
+        return True
+    except Exception:
+        return False
 
 
 def _settle(page, ms):
@@ -175,15 +191,21 @@ def _page_state(page, max_text):
     fields = []
     try:
         fields = page.evaluate(
-            "Array.from(document.querySelectorAll('input,select,textarea,button')).slice(0, %d).map(el => ({"
+            "Array.from(document.querySelectorAll('input,select,textarea,button,[role=button]')).slice(0, %d).map(el => {"
+            "const r = el.getBoundingClientRect(); const s = getComputedStyle(el);"
+            "const visible = r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none';"
+            "return {"
             "tag: el.tagName.toLowerCase(),"
             "type: el.getAttribute('type') || '',"
+            "role: el.getAttribute('role') || '',"
             "name: el.getAttribute('name') || '',"
             "id: el.id || '',"
             "placeholder: el.getAttribute('placeholder') || '',"
             "ariaLabel: el.getAttribute('aria-label') || '',"
+            "visible: visible,"
+            "disabled: !!el.disabled,"
             "text: (el.textContent || '').trim().slice(0, 80)"
-            "}))" % MAX_FIELDS
+            "};})" % MAX_FIELDS
         ) or []
     except Exception:
         fields = []
@@ -296,14 +318,74 @@ def run(action):
                     state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
                 if op == 'login':
-                    for f in action.get('fields', []):
-                        page.locator(f['selector']).first.wait_for(state='visible', timeout=timeout_ms)
-                        page.fill(f['selector'], f.get('value') or '', timeout=timeout_ms)
+                    fields = action.get('fields', [])
+                    for f in fields:
+                        loc = page.locator(f['selector']).first
+                        loc.wait_for(state='visible', timeout=timeout_ms)
+                        # Type real key events, not just set .value: Facebook's
+                        # login form is React-controlled and its submit control
+                        # stays inert when the synthetic input event is skipped.
+                        try:
+                            loc.click(timeout=timeout_ms)
+                            loc.fill('', timeout=timeout_ms)
+                            loc.press_sequentially(f.get('value') or '', delay=20, timeout=timeout_ms)
+                        except Exception:
+                            loc.fill(f.get('value') or '', timeout=timeout_ms)
                     _settle(page, 500)
-                    page.locator(action.get('submitSelector') or 'button[type=submit]').first.click(timeout=timeout_ms)
+                    before = page.url
+                    submit_used = ''
+                    # Press Enter in the last filled field (usually password).
+                    # This targets the form even when the visible submit button
+                    # is a div/role=button and a hidden input[type=submit] exists.
+                    if fields:
+                        try:
+                            page.locator(fields[-1]['selector']).first.press('Enter', timeout=5000)
+                            submit_used = 'enter'
+                        except Exception:
+                            page.keyboard.press('Enter')
+                            submit_used = 'enter-global'
                     _settle(page, 3000)
+                    if page.url == before:
+                        # Prefer the accessible submit control. Facebook's real
+                        # button is often a div[role=button] named "Log in",
+                        # while input[type=submit] is hidden/disabled.
+                        try:
+                            page.get_by_role('button', name=re.compile('log in', re.I)).first.click(timeout=8000)
+                            submit_used = 'role:button:log-in'
+                            _settle(page, 3000)
+                        except Exception:
+                            candidates = [action.get('submitSelector'),
+                                          'form button[type=submit]', 'form [role=button]',
+                                          'form input[type=submit]',
+                                          'button[type=submit]', 'div[role=button]:has-text("Log in")',
+                                          'input[type=submit]']
+                            for sel in candidates:
+                                if sel and _try_click(page, sel):
+                                    submit_used = sel
+                                    _settle(page, 3000)
+                                    break
+                    if page.url == before:
+                        # Last resort: submit the real form, not a visual
+                        # wrapper. Facebook's visible "Log in" is a
+                        # div[role=button] that may not trigger onSubmit.
+                        try:
+                            submitted = page.evaluate(
+                                """() => {
+                                    const f = document.querySelector('form');
+                                    if (!f) return false;
+                                    if (f.requestSubmit) { f.requestSubmit(); }
+                                    else { f.submit(); }
+                                    return true;
+                                }""")
+                            if submitted:
+                                submit_used = (submit_used + '+form-submit').strip('+')
+                                _settle(page, 4000)
+                        except Exception:
+                            pass
                     state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
-                    return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
+                    return {'ok': True, 'op': op, 'submitUsed': submit_used,
+                            'urlAfterSubmit': page.url,
+                            'screenshot': _maybe_shot(ctx, page, action), **state}
                 if op == 'click':
                     page.click(action.get('selector'), timeout=timeout_ms)
                     _settle(page, 2500)
