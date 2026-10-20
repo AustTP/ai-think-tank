@@ -3,10 +3,10 @@
 Pure state helpers, so sim/selfedit/serve can share one definition without
 import cycles. The policy is intentionally small:
 
-- directors and the admin never write code or arm code self-edits;
+- directors and the chief of staff never write code or arm code self-edits;
 - they may still file stories, spikes, and bugs from sprint findings;
 - a scrum master may grant file/app entitlements when a director is tied up;
-- a code change request needs one director and the admin, not the player.
+- a code change request needs one director and the chief of staff, not the player.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def direct_reports(state, agent_id):
 
 
 def is_director(state, agent_id):
-    """A director is the admin or anyone with at least one direct report."""
+    """A director is the chief of staff or anyone with at least one direct report."""
     if not agent_id:
         return False
     return is_admin(state, agent_id) or bool(direct_reports(state, agent_id))
@@ -53,7 +53,7 @@ def is_scrum_master(state, agent_id):
 
 
 def may_work_code(state, agent_id):
-    """Directors and the admin delegate code; they do not write it."""
+    """Directors and the chief of staff delegate code; they do not write it."""
     return not is_director(state, agent_id)
 
 
@@ -76,8 +76,8 @@ def change_request_approvers(state, implementer):
     """Return (director_id, admin_id) for a change request.
 
     The director is the implementer's own director when one exists; otherwise
-    the first non-admin director. The admin is always the roster admin. They
-    must be different people; if the only director is the admin, the request
+    the first non-chief-of-staff director. The chief of staff is always the roster admin. They
+    must be different people; if the only director is the chief of staff, the request
     is not approvable under the two-person rule.
     """
     admin = admin_id(state)

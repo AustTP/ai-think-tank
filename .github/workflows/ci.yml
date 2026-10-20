@@ -45,16 +45,17 @@ jobs:
 
       - name: mypy
         working-directory: world
-        run: python -m mypy serve.py sim.py content.py web_helpers.py sim_helpers.py bank.py auth.py notify.py sublow.py jev_grants.py
+        run: python -m mypy serve.py sim.py content.py web_helpers.py sim_helpers.py bank.py auth.py notify.py sublow.py jev_grants.py cron_scripts.py
 
       - name: bandit
         working-directory: world
-        run: python -m bandit --ini setup.cfg -q serve.py sim.py content.py web_helpers.py sim_helpers.py bank.py auth.py notify.py sublow.py jev_grants.py
+        run: python -m bandit --ini setup.cfg -q serve.py sim.py content.py web_helpers.py sim_helpers.py bank.py auth.py notify.py sublow.py jev_grants.py cron_scripts.py
 
       - name: Full test suite (Python unittest files + JS harnesses)
         working-directory: world
         run: bash tests/run_all.sh
 
-      - name: pytest (all Python tests, including gap suites)
-        working-directory: world
-        run: python -m pytest tests/ -q
+      - name: Coverage gate (world Python + JavaScript, 90% floor)
+        run: |
+          bash world/tests/run_cov_all_py.sh
+          node world/tests/js_coverage.mjs

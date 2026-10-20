@@ -118,23 +118,23 @@ save — never the source of truth.
 ### Director graph
 
 Authority is derived from the `director` pointer: every agent has a director
-they report up to. Walk the chain and you always reach the admin. This makes
+they report up to. Walk the chain and you always reach the chief of staff. This makes
 team membership derived (any agent whose `director` chain resolves to a given
 director id is on that team), and promotion automatic — an agent with a
 direct report becomes a director for free.
 
-- **Admin** (`isAdmin`) — one agent (Theo). Approves/denies escalations,
+- **Chief of Staff** (`isAdmin`) — one agent (Theo). Approves/denies escalations,
   decomposes big tasks, can write any team or agent state.
 - **Senior-most director** — a director with no `director` of their own who
-  is NOT the admin (Nora). Stands in for the admin on routine approvals.
+  is NOT the chief of staff (Theo), with Nora as senior director. Stands in for the chief of staff on routine approvals.
 - **Mid-directors** — agents with direct reports (e.g., Dev leads a support
   team). Get their own team records automatically.
-- **Workers** — non-admin, non-director agents who do the actual room work.
+- **Workers** — non-chief-of-staff, non-director agents who do the actual room work.
 
-`world/governance.py` is the shared policy seam: directors and the admin may
+`world/governance.py` is the shared policy seam: directors and the chief of staff may
 not pick up `code`, `bug`, or `qa` work; they file stories, spikes, and bugs
-instead. Directors and the admin also cannot arm code self-edits. A scrum
-master (or a director/admin) may grant file and app entitlements when a
+instead. Directors and the chief of staff also cannot arm code self-edits. A scrum
+master (or a director/chief of staff) may grant file and app entitlements when a
 director is tied up. A failed or blocked card that gates other work gets a
 high-priority incident bug from `governance.supervisor_tick`, and the
 dependent area waits on that bug. Each director sets a 0-5 supervision level
@@ -300,7 +300,7 @@ model calls without ever holding the OpenRouter key. `world/sublow.py` solves
 it with rotating server-side grants:
 
 - **Mint** `POST /api/experiments/sublow/grant` (operator gate: player
-  session or proven director/admin, same as handle minting). Requires a
+  session or proven director/chief of staff, same as handle minting). Requires a
   declared `estimateUsd > 0`; refuses when there is no sublow pick, when the
   shared monthly cap is already hit, or when the estimate exceeds the agent's
   remaining monthly headroom. Returns a `secrets.token_urlsafe(32)` token
@@ -338,7 +338,7 @@ side-by-side probe) mints a rotating server-side token and never holds the
 OpenRouter key:
 
 - **Mint** `POST /api/experiments/jev/grant` (operator gate: player session
-  or proven director/admin). Requires a declared `estimateUsd > 0`; refuses
+  or proven director/chief of staff). Requires a declared `estimateUsd > 0`; refuses
   when no JEV slug resolves, when the shared monthly cap is already hit, or
   when the estimate exceeds the agent's remaining monthly headroom. Returns
   a `secrets.token_urlsafe(32)` token exactly once; only its SHA-256 is
@@ -415,7 +415,7 @@ cadence — also triggered immediately on large-request arrival via
 ### Peer review gate
 
 Two reviewers are picked per deliverable, preferring same-team members but
-widening to every non-admin agent if the team can't supply two. Reviewers
+widening to every non-chief-of-staff agent if the team can't supply two. Reviewers
 receive a mailbox notification (`peer_review_request`) and must submit a
 verdict (clean = approval counted, actionable = fix re-queued to the author).
 The gate closes at 2 approvals or 1 + review timeout.
@@ -687,7 +687,7 @@ audited:
   research crawl (agent key) can only record `pending_review` or `failed`, so
   a stolen key cannot suppress re-reporting through that route.
 - `POST /api/evidence/review` accepts the player (session) or a roster
-  director/admin (checked via `_agent_is_verifier`, not just key ownership).
+  director/chief of staff (checked via `_agent_is_verifier`, not just key ownership).
   An ordinary agent gets 403 even with a valid key.
 - Agent verifiers are rate-capped: max `VERIFIER_COVERED_MAX` (12) covered
   flips per `VERIFIER_COVERED_WINDOW_S` (6h). Past the cap, only the player
@@ -734,12 +734,12 @@ force-removed from state (same policy as the long-horizon topic).
 
 The Telegram bridge answered every message with a stateless prompt ("a fresh
 question"), so a follow-up like "and the second one?" had no referent and the
-admin failed to answer. The fix adds conversation memory on the think tank's
+chief of staff failed to answer. The fix adds conversation memory on the think tank's
 own SQLite DB, in `world/memory.py`:
 
 | Tier | What it does | Storage |
 |------|--------------|---------|
-| STM | Stores each (player question, admin reply) per chat session; injects the recent turns + a rolling summary ahead of the next question, so a follow-up is answered in context | `stm_sessions` (rolling summary + counters) + `stm_messages` (per-turn rows) |
+| STM | Stores each (player question, chief of staff reply) per chat session; injects the recent turns + a rolling summary ahead of the next question, so a follow-up is answered in context | `stm_sessions` (rolling summary + counters) + `stm_messages` (per-turn rows) |
 | LTM | Distills typed memories (`preference` / `fact` / `decision` / `unresolved_question`) from the conversation at a bounded cadence; recalls the relevant ones on each ask | `ltm_memories` (global to the player, never pruned by session expiry) |
 
 **Wiring.** `_telegram_process_update` passes the Telegram `chat_id` as
@@ -773,7 +773,7 @@ memory is Telegram-bridge-only.
 - LTM recall is keyword-overlap scored, then ranked by a trust factor: a cheap,
   dependency-free stand-in for vector search + a trust filter.
 - All memory model calls (summary upgrade, LTM extraction) go through the
-  `/api/chat` choke point as the admin with a `__memory__` service label, so
+  `/api/chat` choke point as the chief of staff with a `__memory__` service label, so
   they accrue to the Bank like any other spend and are visible per-service.
 - Expired STM sessions (`STM_TTL_HOURS`) are cleaned by the log-prune loop;
   LTM deliberately survives session expiry.

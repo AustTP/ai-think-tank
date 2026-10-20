@@ -54,6 +54,7 @@ from sim_helpers import (  # noqa: E402, F401
 # nothing from the sim, so the top-level import cannot create
 # a cycle (serve is the one module imported inline below).
 import comprehension  # noqa: E402
+import cron_scripts  # noqa: E402
 import schedule  # noqa: E402
 import signals  # noqa: E402
 import roster  # noqa: E402
@@ -197,6 +198,7 @@ def _cell_fits_agent(gx, gy, cell, grid):
     return not _blocked_at({'x': p['x'], 'y': p['y'], 'w': AGENT_W, 'h': AGENT_H}, grid)
 
 
+# BEGIN MOVEMENT PHYSICS -- owner-protected, see selfedit._physics_refusal
 def find_path(start_x, start_y, target_x, target_y, exclude_agent_id, agents, grid):
     """Python port of tasks.js findPath -- a BFS over the collision grid that
     returns a list of top-left-corner waypoints, or None when no route exists.
@@ -825,6 +827,7 @@ def _repair_stalled_interactions(state):
         if _release_stalled_interaction(state, aid):
             released += 1
     return released
+# END MOVEMENT PHYSICS
 
 
 # Fault-aware routing memory, ported from a real 2026 paper
@@ -5438,6 +5441,10 @@ def _standing_task_sweep(state, now, now_ms):
         if result.action == 'start':
             declaration = next((d for d in (state.get('standingTasks') or [])
                                 if d.get('taskId') == task.task_id), {})
+            if declaration.get('script'):
+                cron_scripts.run_standing(state, declaration, _log_governance,
+                                          queue_work, now_ms)
+                continue
             crew = (result.agent_count
                     if result.agent_count is not None else 0)
             queue_work(state, [{

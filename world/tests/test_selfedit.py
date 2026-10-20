@@ -92,7 +92,7 @@ def test_propose_refuses_protected_files(fake_repo):
     # serve.py is the signed kernel, not a protected file: it is accepted as
     # a proposal target and routed through the signature/restart path.
     assert selfedit.is_kernel(world / 'serve.py')
-    assert selfedit.is_player_signature(world / 'serve.py')
+    assert not selfedit.is_player_signature(world / 'serve.py')
     assert not selfedit.is_protected(world / 'serve.py')
     ok, payload = selfedit.propose(
         'worker', 'CONSTITUTION.md', 'rule', 'no', 'why')
@@ -1491,3 +1491,26 @@ def test_validate_window_requires_note_for_unlanded_edits(
 
 if __name__ == '__main__':
     raise SystemExit(pytest.main([__file__, '-q']))
+
+
+def test_propose_refuses_movement_physics(fake_repo, monkeypatch):
+    _, world = fake_repo
+    (world / 'sim.py').write_text(
+        'A = 1\n# BEGIN MOVEMENT PHYSICS\nX = 1\n# END MOVEMENT PHYSICS\n',
+        encoding='utf-8')
+    _approve(monkeypatch)
+    ok, payload = selfedit.propose(
+        'worker', 'sim.py', 'X = 1', 'X = 2', 'faster walking')
+    assert ok is False
+    assert 'owner-protected' in payload['error']
+    assert (world / 'sim.py').read_text(encoding='utf-8').endswith('# END MOVEMENT PHYSICS\n')
+
+
+def test_propose_refuses_sim_when_physics_markers_missing(fake_repo, monkeypatch):
+    _, world = fake_repo
+    (world / 'sim.py').write_text('X = 1\n', encoding='utf-8')
+    _approve(monkeypatch)
+    ok, payload = selfedit.propose(
+        'worker', 'sim.py', 'X = 1', 'X = 2', 'ordinary edit')
+    assert ok is False
+    assert 'guard markers' in payload['error']

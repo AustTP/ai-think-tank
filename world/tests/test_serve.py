@@ -2314,6 +2314,7 @@ class ServerOwnedSeed(unittest.TestCase):
             THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
+            SANDBOXES_DIR=os.path.join(self.tmp, 'sandboxes'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
         )
         self._cm.start()
@@ -4652,6 +4653,7 @@ class PressOfficeContentExecutors(unittest.TestCase):
             THINK_TANK_DIR=self.tmp,
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
+            SANDBOXES_DIR=os.path.join(self.tmp, 'sandboxes'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
         )
         self._cm.start()

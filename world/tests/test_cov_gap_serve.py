@@ -2665,7 +2665,7 @@ class AskCoreTest(unittest.TestCase):
         self.assertIn('disabled', ex('adversarial_village',
                                      {'action': 'disable'}))
         self.assertIn('Usage', ex('adversarial_village', {'action': 'x'}))
-        self.assertIn('Only the admin',
+        self.assertIn('Only the chief of staff',
                       self._ask(admin=False)[1]['execute_tool'](
                           'adversarial_village', {'action': 'enable'}))
 

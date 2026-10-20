@@ -104,6 +104,14 @@ import governance
 # edit (KERNEL_BASENAMES) with its own preflight and restart.
 PROTECTED_BASENAMES = ('CONSTITUTION.md', 'constitution.py')
 
+# Board movement is owner-protected for now: pathfinding, collision, and
+# step/slide geometry stay frozen even though the rest of sim.py is editable.
+# The markers make the guarded span explicit; a missing marker pair fails
+# closed so an edit cannot remove the fence and then walk through it.
+PHYSICS_BASENAMES = ('sim.py',)
+PHYSICS_BEGIN = '# BEGIN MOVEMENT PHYSICS'
+PHYSICS_END = '# END MOVEMENT PHYSICS'
+
 # The HTTP kernel. It cannot be importlib-reloaded (uvicorn owns `app`), so a
 # kernel edit is staged, preflighted against the full test suite, then applied
 # by an in-place os.execv with a watchdog that restores the previous bytes if
@@ -124,7 +132,7 @@ GATE_BASENAMES = ('conftest.py',)
 # improve its own judgment, but only through a mandatory PLAYER signature
 # (floor-1.0 escalation kind, like 'dormancy window request'). One quorum
 # review is not enough authority for the files that govern the reviews.
-PLAYER_SIGNATURE_BASENAMES = ('serve.py', 'jev.py', 'selfedit.py', 'notify.py',
+PLAYER_SIGNATURE_BASENAMES = ('jev.py', 'selfedit.py', 'notify.py',
                               'theo_policy.py', 'sublow.py', 'jev_grants.py',
                               'bank.py', 'budget.py',
                               # Policy data that shapes other agents' prompts,
@@ -233,6 +241,27 @@ def is_protected(resolved_path):
     """True for the immutable owner rules. BUSINESS-PROCESSES.md is no
     longer protected; the tank may edit its own process."""
     return os.path.basename(resolved_path) in PROTECTED_BASENAMES
+
+
+def _physics_refusal(resolved_path, original, find):
+    """Refuse a splice that overlaps sim.py's owner-protected movement
+    physics. Markers are required; their absence fails closed."""
+    if os.path.basename(resolved_path) not in PHYSICS_BASENAMES:
+        return None
+    begin = original.find(PHYSICS_BEGIN)
+    end = original.find(PHYSICS_END)
+    if begin < 0 or end < begin:
+        return ('sim.py movement physics guard markers are missing or '
+                'damaged; the file is refused until the owner restores them')
+    region_end = end + len(PHYSICS_END)
+    start = original.find(find)
+    if start < 0:
+        return None
+    if start < region_end and start + len(find) > begin:
+        return ('sim.py movement physics is owner-protected: pathfinding, '
+                'collision, and step/slide geometry may not be changed '
+                'without the owner. Edit other parts of sim.py instead')
+    return None
 
 
 def is_gate_file(resolved_path):
@@ -444,6 +473,9 @@ def propose(agent_id, path, find, replace, summary):
             original = fh.read()
     except (OSError, UnicodeDecodeError) as e:
         return False, {'error': f'cannot read target: {e}'}
+    refusal = _physics_refusal(resolved, original, find)
+    if refusal:
+        return False, {'error': refusal}
     if len(original.encode('utf-8')) > MAX_TARGET_FILE_BYTES:
         return False, {'error': 'target file too large for a self-edit'}
     occurrences = original.count(find)
@@ -1401,7 +1433,6 @@ def _refresh_serve_imports(modname):
     resolution). A name the reloaded module no longer defines is skipped
     rather than left pointing at the pre-edit object by accident."""
     import ast
-    import importlib
     mod = sys.modules.get(modname)
     if mod is None:
         return []

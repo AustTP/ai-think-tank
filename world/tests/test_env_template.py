@@ -5,12 +5,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 TEMPLATE = ROOT / '.env.template'
 WORLD = ROOT / 'world'
-IGNORE = {'PYTEST_CURRENT_TEST'}
+IGNORE = {'PYTEST_CURRENT_TEST', 'PYTHONPATH'}
 
 READ_PATTERNS = (
     re.compile(r"(?:_load_env\(\)\.get|os\.environ\.get|os\.getenv)\(\s*['\"]([A-Z][A-Z0-9_]*)['\"]"),
     re.compile(r"\benv\.get\(\s*['\"]([A-Z][A-Z0-9_]*)['\"]"),
-    re.compile(r"os\.environ\[\s*['\"]([A-Z][A-Z0-9_]*)['\"]\s*\]"),
+    re.compile(r"os\.environ\[\s*['\"]([A-Z][A-Z0-9_]*)['\"]\s*\](?!\s*=)"),
 )
 
 

@@ -1,4 +1,4 @@
-"""Theo's role policy: what the think tank admin (Theo) will do for
+"""Theo's role policy: what the think tank chief of staff (Theo) will do for
 the person talking to him.
 
 The owner (the player, the human who owns the think tank), the
@@ -13,7 +13,7 @@ never imports serve.py, so it stays testable and free of the
 request/auth machinery.
 
 Roles are resolved from the roster, never from a self-claim: the
-player's session is the owner, the admin agent is a director (Theo
+player's session is the owner, the chief of staff agent is a director (Theo
 himself, the top of the agent chain), an agent who supervises
 others is a director, and every other agent is a worker. A key is
 per agent already (serve.get_or_create_agent_key), so "a different
@@ -131,7 +131,7 @@ def role_for_requester(state, requester_id):
     """The role of whoever is talking to Theo, resolved from the
     roster rather than from any self-claimed field.
 
-    None is the player's own session -- the owner. The admin agent
+    None is the player's own session -- the owner. The chief of staff agent
     (Theo) is a director: the top of the agent chain, but still an
     agent, never the owner. An agent the roster marks isDirector, or
     one that supervises at least one other agent (some roster entry

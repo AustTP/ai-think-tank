@@ -131,3 +131,11 @@ for (const r of report) {
   console.log(`${String(r.pct).padStart(4)}%  ${r.hit}/${r.hit + r.miss}  ${r.url}`);
   if (r.missing.length) console.log(`       missing: ${r.missing.join(', ')}`);
 }
+const totalHit = report.reduce((n, r) => n + r.hit, 0);
+const totalMiss = report.reduce((n, r) => n + r.miss, 0);
+const totalPct = (100 * totalHit) / Math.max(1, totalHit + totalMiss);
+console.log(`TOTAL ${totalPct.toFixed(1)}%  ${totalHit}/${totalHit + totalMiss}`);
+if (totalPct < 90) {
+  console.error('JS coverage is below the 90% constitution floor');
+  process.exit(1);
+}

@@ -8,7 +8,9 @@ executor's tool-dispatch and failure paths.
 """
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -439,6 +441,23 @@ class JsFileIntegrity(unittest.TestCase):
 
 
 class CodingContentBranches(unittest.TestCase):
+    def setUp(self):
+        # Staging must copy an EMPTY sandbox, not the live workroom tree.
+        self.sandboxes = tempfile.mkdtemp(prefix='think tank-content-')
+        self.addCleanup(shutil.rmtree, self.sandboxes, True)
+        for target, value in (
+                (serve, self.sandboxes),
+                (content._serve, self.sandboxes),
+                ('SELF_BASE_URL', 'http://x')):
+            if isinstance(target, str):
+                continue
+            patcher = mock.patch.object(target, 'SANDBOXES_DIR', value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch('sim._peer_coding_class', return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _snapshot(self):
         return {'agentRoster': [{'id': 'cora', 'name': 'Cora'}],
                 'agents': {'cora': {'name': 'Cora'}}}

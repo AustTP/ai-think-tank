@@ -73,7 +73,7 @@ states only what changed in the operating model.
   cannot change it through `policy_edit`.
 - Incident restore evidence now requires a restore note paired with the command
   that produced it, the executor's file inventory, or a Library artifact.
-- Photo review is owner-only or `PHOTO_REVIEW_KEY` only. Director and admin
+- Photo review is owner-only or `PHOTO_REVIEW_KEY` only. Director and chief of staff
   agent keys are refused.
 - Safari cookie sync requires `SAFARI_COOKIE_CONSENT=1` and a per-agent
   `SAFARI_COOKIE_AGENTS` allowlist. The current allowlist is Ada.
@@ -89,7 +89,7 @@ states only what changed in the operating model.
   `model_bands.json`, not a hidden constant.
 - A sprint containing only non-gated lanes closes when those tasks finish.
 - Owner-identity data, consent, and retention are named in BP-52.1.
-- The Verifier role has one definition: player, or a capped director/admin
+- The Verifier role has one definition: player, or a capped director/chief of staff
   agent.
 - `DESIGN.md` numbers are current; the stale-number action item is closed.
 - Report citations are gated to URLs a tool actually discovered.
@@ -167,7 +167,7 @@ The operating model has five properties:
    bugs, spikes, and meeting cards close with no review gate. Failures become
    rule proposals.
 5. **Authority is structural.** The `director` pointer defines teams and
-   escalation. The owner is the only human. Theo is the admin agent, not the
+   escalation. The owner is the only human. Theo is the chief of staff agent, not the
    owner.
 
 ### Key operating numbers
@@ -207,14 +207,14 @@ list a process reader needs in hand.
 | Actor | What it is | Authority |
 |---|---|---|
 | Owner / player | The human who owns the installation | Full authority. Only the owner may change policy, grant or revoke Theo keys, and approve gated Theo actions. |
-| Theo | The admin agent | Director-level agent. Decomposes big tasks, answers the owner, stands at the top of the agent chain. Never the owner. |
+| Theo | The chief of staff agent | Director-level agent. Decomposes big tasks, answers the owner, stands at the top of the agent chain. Never the owner. |
 | Supervisor | A non-director operator proxy with Mac terminal access | Watches active work, stops spirals, files blocker bugs, and fixes infrastructure. Does not author product code. |
-| Senior-most director | A director with no director above them, excluding the admin | Stands in for the owner on routine escalation approvals. |
+| Senior-most director | A director with no director above them, excluding the chief of staff | Stands in for the owner on routine escalation approvals. |
 | Director | Any agent with direct reports | Owns a team, a product area, or both. Can write team and agent state. Files stories, spikes, and bugs from sprint findings. Does not pick up code, bug, or QA work and cannot self-edit code. |
 | Scrum master | A designated team facilitator | Runs refinement, breakdown, retrospective, and escalation ceremonies. Required at team size 4 or more. May grant file and app entitlements when a director is tied up. |
-| Worker | A non-admin, non-director agent | Does room work, reviews peers, files requests and reports. |
+| Worker | A non-chief-of-staff, non-director agent | Does room work, reviews peers, files requests and reports. |
 | Critic reviewer | The first reviewer on a peer gate | Instructed to prove the work wrong, not to rubber-stamp it. |
-| Verifier | The player, or a director/admin agent | Clears or blocks evidence claims and flips coverage. A worker or ordinary key holder cannot verify. Agent verifiers are capped at 12 flips per 6 hours; the player is not capped. |
+| Verifier | The player, or a director/chief of staff agent | Clears or blocks evidence claims and flips coverage. A worker or ordinary key holder cannot verify. Agent verifiers are capped at 12 flips per 6 hours; the player is not capped. |
 | Winter team | A second team created by the adversarial village | Works the same goal as main, independently. |
 | Operator | The human running the deployment | Same person as the owner in normal use. Configures policy JSON, budgets, and integrations. |
 
@@ -234,7 +234,7 @@ intensity, not the safety gates:
 | 5 | Most extensive. Same as 4, with the shortest monitoring patience. |
 
 Directors set their own levels through `GET/PUT /api/supervision`; the player
-and admin may set any director's level. The stored map is
+and chief of staff may set any director's level. The stored map is
 `state['directorSupervision'][directorId][projectKey]`, with `_default` for
 projects without an override. The UI uses project id, then project label, then
 team id as the project key.
@@ -242,20 +242,20 @@ team id as the project key.
 ### 2.2 Authority and reporting
 
 Authority is derived from the `director` pointer on each roster entry. Walk the
-chain from any agent and you reach the admin. Consequences:
+chain from any agent and you reach the chief of staff. Consequences:
 
 - Team membership is derived, never stored as a separate list.
 - Promotion is automatic: an agent with a direct report becomes a director.
 - Team records are materialized one per director, keyed by the director id.
-- The senior-most non-admin director is the routine stand-in for the owner.
+- The senior-most non-chief-of-staff director is the routine stand-in for the owner.
 
 Theo's role policy adds a second authority model for conversation:
 
 | Requester | Role | May ask Theo to |
 |---|---|---|
 | Player session | owner | Everything, including policy changes and key grants |
-| Admin agent | director | Read and shape work, run it, report, message the team, manage schedules |
-| Agent with reports | director | Same as admin agent |
+| Chief of staff agent | director | Read and shape work, run it, report, message the team, manage schedules |
+| Agent with reports | director | Same as chief of staff agent |
 | Other agent | worker | Report status, read own artifacts, request sandboxed tool calls, message the team |
 | Granted key holder | Role carried by the key | The key's own action set, rate limit, and budget |
 
@@ -319,7 +319,7 @@ Owner request
 | BP-02 | Agent work requests | Agent files a request | On demand | Requesting agent | Pending backlog request |
 | BP-03 | Backlog refinement | Pending requests or weekly | Weekly plus kick | Scrum master | Stories in the queue |
 | BP-04 | Large-request breakdown | Staffable large ask | On demand | Scrum master | Sized stories and spikes |
-| BP-05 | New-team spawn | Large ask, all teams busy | On demand | Admin | New director, team, workers |
+| BP-05 | New-team spawn | Large ask, all teams busy | On demand | Chief of Staff | New director, team, workers |
 | BP-06 | Sprint lifecycle | Sprint intent or staffing | Continuous | Director, scrum master | Sprint record and velocity |
 | BP-07 | Assignment and on-call | Due work | Every task cycle | Sim | Assigned task |
 | BP-08 | Task execution | Agent arrives | Per task | Assigned agent | Deliverable or failure |
@@ -332,14 +332,14 @@ Owner request
 | BP-15 | Retrospective and velocity | Sprint close | Per sprint | Scrum master | START/STOP/CONTINUE notes |
 | BP-16 | Knowledge social | Weekly stamp | Weekly | Senior director | Carryaway notes |
 | BP-17 | Meetings | Queued meeting | On demand | Facilitator | Meeting record |
-| BP-18 | Charter | Owner or director sets it | On demand | Admin | Goal, interests, notes |
+| BP-18 | Charter | Owner or director sets it | On demand | Chief of Staff | Goal, interests, notes |
 | BP-19 | Hiring and onboarding | Idle capacity and need | Cooldown 45s | Team director | New agent, work agreement |
-| BP-20 | Firing review | Corroborated signal | Cooldown 60s | Admin, senior director | Fire or keep verdict |
+| BP-20 | Firing review | Corroborated signal | Cooldown 60s | Chief of Staff, senior director | Fire or keep verdict |
 | BP-21 | Coaching and growth | Low trailing grade | Daily sweep | Director | Coaching plan, growth plan |
 | BP-22 | Rule mining | Weekly stamp | Weekly | Sim | Operator rule proposals |
 | BP-23 | Success mining | Weekly stamp | Weekly | Sim | Operator success proposals |
 | BP-24 | Archive distillation | Weekly stamp | Weekly | Sim | Decision archive wiki page |
-| BP-25 | Adversarial village | Owner launches | On demand | Admin, winter director | Two independent attempts |
+| BP-25 | Adversarial village | Owner launches | On demand | Chief of Staff, winter director | Two independent attempts |
 | BP-26 | Research topics and watchlist | Owner schedule or seed | Per topic cadence | Sim, researcher | Research card and skill update |
 | BP-27 | Standing tasks | Declaration tick | Per declaration | Sim | Crewed standing card |
 | BP-28 | Pipelines | Cadence due | Per pipeline cadence | Sim | Ordered step tasks |
@@ -348,7 +348,7 @@ Owner request
 | BP-31 | Incidents and bugs | Owner or monitor report | On demand | On-call, team | Incident card and restore |
 | BP-32 | Page probes, screenshots, browser act | Tool call | On demand | Agent, sandbox | Page result, screenshot, trace |
 | BP-33 | Device check-in | Phone post | On demand | Player device | Bounded check-in history |
-| BP-34 | Wiki lifecycle | Write or proposal | On demand | Director, admin | Versioned page, provenance |
+| BP-34 | Wiki lifecycle | Write or proposal | On demand | Director, chief of staff | Versioned page, provenance |
 | BP-35 | Memory provenance | Every shared-memory write | Per write | Sim | Ledger row |
 | BP-36 | Evidence and coverage review | Research run or review | Per claim | Verifier, owner | Claim status, coverage status |
 | BP-37 | Research desk passes | Research run | Per run | Researcher | Three-pass synthesis |
@@ -404,9 +404,9 @@ of the structured intent endpoints.
 6. Denied requests return a reason. Gated requests create a pending approval
    and tell the requester the approval id.
 7. Dispatch:
-   - `ask` -> `_ask_core` with the admin pinned. Telegram passes the chat id as
+   - `ask` -> `_ask_core` with the chief of staff pinned. Telegram passes the chat id as
      the memory session.
-   - `unclear` -> the senior-most free non-admin director answers; the admin is
+   - `unclear` -> the senior-most free non-chief-of-staff director answers; the chief of staff is
      the fallback; then `_ask_core` may park or round-robin.
    - `schedule` -> extract topic, start URL, cadence, optional dependency.
      `add_research_topic` rejects a non-URL or empty topic and clamps the
@@ -518,7 +518,7 @@ in an active sprint.
 4. File the goal to the new team and kick refinement immediately.
 5. Run onboarding for each new agent.
 
-**Controls.** Agent cap, name uniqueness, idle gate, admin authority.
+**Controls.** Agent cap, name uniqueness, idle gate, chief of staff authority.
 
 **Records.** Roster, teams, pending onboarding, action log.
 
@@ -675,7 +675,7 @@ tape, `stagedWorkspace`, `previousWorkspace`, `sourceDigest`, `writtenPy`,
 
 1. The primary work completes. The task enters `needs_review`.
 2. Pick two reviewers. Prefer same-team members or agents who have completed
-   work in the target room. Widen to all non-admin agents if needed. Never the
+   work in the target room. Widen to all non-chief-of-staff agents if needed. Never the
    author, never a duplicate.
 3. Reviewer 1 is the critic. Reviewer 2 keeps the standard skeptical frame.
 4. Each reviewer gets a mailbox request and a review task.
@@ -913,7 +913,7 @@ decider.
 4. Ask JEV to pick which member needs overflow help. A failed call falls back
    to the governance pick.
 5. Create a pending hire with an 8-second deferral.
-6. Complete the hire: the admin names the new director, or the team director
+6. Complete the hire: the chief of staff names the new director, or the team director
    names the employee, using the all-time unique name pool. Spawn the agent and
    start onboarding.
 7. Onboarding convenes a Town Hall meeting at the Command Center with the
@@ -952,7 +952,7 @@ A single negative report is not a signal. Low morale alone is not a signal.
 
 1. Pick the worker with the strongest signal. Never pick an agent mid-task,
    mid-pair, or mid-handoff.
-2. Confirm both reviewers exist, are on duty, and are free: the admin and the
+2. Confirm both reviewers exist, are on duty, and are free: the chief of staff and the
    senior-most director.
 3. Convene the review at the Command Center.
 4. Gather consultation: reporters and coworkers with firsthand knowledge.
@@ -1082,13 +1082,21 @@ overlap, review-gated coverage, bounded seen-URL list.
    window, days, day of month, yearly date, occurrence caps, consecutive caps,
    total caps, team.
 2. A malformed declaration is skipped. One bad record never wedges the sweep.
-3. On `start`, queue a real card with title, room, instructions, standing task
-   id, team, and knowledge class.
-4. On `stop`, log the stop. Continue and idle are silent.
+3. If the declaration names `script`, run that repo-relative `scripts/*.py`
+   under a timeout and do NOT queue an agent card. This is the preferred lane
+   for mechanical recurring work. The script may print one JSON line with
+   `{"notify": true, "summary": "..."}`; only then does the tank queue one
+   judgment card, optionally pinned to `notifyAgent`. Scripts never wake an
+   agent by default.
+4. Otherwise, on `start`, queue a real card with title, room, instructions,
+   standing task id, team, and knowledge class.
+5. On `stop`, log the stop. Continue and idle are silent.
 
-**Controls.** Declaration validation, per-task runtime state, bounded caps.
+**Controls.** Declaration validation, repo-local `.py` scripts only, bounded
+timeout, per-task runtime state, bounded caps.
 
-**Records.** `standingTasks`, work items, governance log.
+**Records.** `standingTasks`, work items, governance log (`standing_task_script`
+for script runs).
 
 ### BP-28 Pipelines
 
@@ -1279,8 +1287,8 @@ should be before the buffer fills with data nobody reads.
 
 **Write paths.**
 
-- A director or admin writes directly.
-- An agent proposes a page. A director or admin approves it. Approval promotes
+- A director or chief of staff writes directly.
+- An agent proposes a page. A director or chief of staff approves it. Approval promotes
   the proposal into the live wiki with a version bump and history.
 - Server processes write through the same path with a system actor.
 
@@ -1354,13 +1362,13 @@ failed (never suppresses the next attempt)
    resolved, with an open question. It is never a verified source.
 5. Coverage is marked `pending_review`, not covered.
 6. A Verifier reviews the claim. The Verifier is the player, or a roster
-   director/admin agent; a worker or ordinary key holder cannot verify:
+   director/chief of staff agent; a worker or ordinary key holder cannot verify:
    - `usable_as_written` or `usable_with_narrower_wording` clears the claim and
      flips its identity to covered.
    - `blocked_until_checked` blocks the claim and never marks coverage.
 7. `reviewed=True` on the coverage endpoint is player-session-only. An agent
    key can only record pending or failed.
-8. Evidence review accepts the player or a roster director/admin. An ordinary
+8. Evidence review accepts the player or a roster director/chief of staff. An ordinary
    agent gets 403 even with a valid key.
 9. Agent verifiers are capped at 12 covered flips per 6 hours.
 10. Every mutation appends an immutable audit row.
@@ -1404,7 +1412,7 @@ citation ledger.
   downloads.
 - Writes are namespaced by village. Main stays flat. A non-main agent's commons
   write lands under `villages/<vid>/`.
-- Admin and player cross the boundary.
+- Chief of Staff and player cross the boundary.
 - Reads are filtered by the requester's village scope.
 - List, read, write, search, download, and promote are separate operations.
 - Uploads and archive promotion are gated.
@@ -1613,7 +1621,7 @@ OpenRouter key.
 
 **Steps.**
 
-1. Mint: owner or proven director/admin. Require a positive estimate. Refuse
+1. Mint: owner or proven director/chief of staff. Require a positive estimate. Refuse
    when the model is unavailable, the shared monthly cap is hit, or the estimate
    exceeds the agent's remaining headroom. Return the token once. Store only its
    SHA-256.
@@ -1775,7 +1783,7 @@ issue `blocked` and `needsInput`, `player_ask_dropped` action.
 **Credential lifecycle.**
 
 1. An agent proposes a credential with name, service, kind, and value.
-2. A director, admin, or the player approves or denies. Tank-account code,
+2. A director, chief of staff, or the player approves or denies. Tank-account code,
    grant, rotate, and delete actions are player-only.
 3. Approved credentials are encrypted with Fernet and stored.
 4. Removed credentials become unusable immediately. Removing a credential also
@@ -1920,7 +1928,7 @@ implicit.
 
 - The Safari seed is a live owner session. It is not a service credential and
   it is not shared across agent profiles.
-- Photo review is owner-scoped. A director or admin agent key cannot trigger
+- Photo review is owner-scoped. A director or chief of staff agent key cannot trigger
   it.
 - The vision provider receives only the selected image and fixed prompt. Its
   own retention policy is outside this tank's control; the owner accepts that
@@ -2227,9 +2235,10 @@ with `--max-idle-minutes`.
 1. Proposal contract (everything in `world/selfedit.py`, with its docstring
    as the contract). The agent proposes a find/replace splice on one file
    under `world/` or the repo-root `BUSINESS-PROCESSES.md`. `CONSTITUTION.md`
-   and `constitution.py` are refused outright. `serve.py` is editable through
-   the signed kernel path with its own preflight, restart, and watchdog
-   (below). The audit tiers add a hard test-gate refusal plus a
+   and `constitution.py` are refused outright. `serve.py` and `sim.py` are
+   editable, with `serve.py` on the signed kernel path (preflight, restart,
+   watchdog) and `sim.py`'s movement-physics block owner-protected by fence
+   markers. The audit tiers add a hard test-gate refusal plus a
    player-signature tier. No path escapes the repository, and `config.py` is
    allowed through the Phase 2 reload chain.
 2. Mechanical checks come first: the result must compile, and the find text
@@ -2291,12 +2300,12 @@ duration of 5-240 minutes (default 15). The chain is strict:
    fired dormancy window overlaps. The refusal names every colliding item,
    so the agent can pick a different time.
 2. Supervisor pre-clearance: the server resolves the agent's supervisor
-   (`_supervisor_of`: roster director, else admin, else the player) and a
+   (`_supervisor_of`: roster director, else chief of staff, else the player) and a
    JEV quorum judges the request as the supervisor's call -- vague reasons,
    prime-work-hours slots, or oversized durations are rejected.
 3. Change-request approval. With `governance.changeRequestAdminApproval`
    enabled, the supervisor pre-clear is followed by two independent agent
-   approvals: a director validator approves the applied bytes, and the admin
+   approvals: a director validator approves the applied bytes, and the chief of staff
    approves the push. The player link is not part of this chain. With the
    flag off, the historical player-signature link remains the final approval.
 4. When a window fires, the loop forces the tank dormant and applies ONLY
@@ -2305,7 +2314,7 @@ duration of 5-240 minutes (default 15). The chain is strict:
    (`reserve_window`), and bystanders' armed edits stay armed for the
    idle path. A request with nothing armed is refused. The loop keeps the
    tank dormant to the end of the slot. A window missed while the server
-   was down is recorded `missed`. The player or admin agent can cancel a
+   was down is recorded `missed`. The player or chief of staff agent can cancel a
    window before it fires.
 
 **Blocker bugs preempt their area.** When a failed or blocked task gates other
@@ -2381,19 +2390,22 @@ the shared GitHub repository (`origin main`) under a two-agent contract:
 
 **Surface audit (operator decision, 2026-10-18).** Three tiers now bound
 what agents may edit and read. Only the owner constitution is immutable
-(`CONSTITUTION.md`, `world/constitution.py`). `BUSINESS-PROCESSES.md` and
-`serve.py` are editable; `serve.py` uses the signed kernel path.
+(`CONSTITUTION.md`, `world/constitution.py`). `BUSINESS-PROCESSES.md`,
+`serve.py`, and `sim.py` are editable. `serve.py` uses the signed kernel
+path; `sim.py` keeps its movement-physics block owner-protected.
 
 1. Tier A -- the test gate (`world/tests/`, `conftest.py`, the run
    scripts): refused outright for edits AND fixes, with no approval path.
    An edit that could rewrite its own acceptance bar proves nothing, so no
    quorum review can legitimize it.
-2. Tier B -- oversight-enforcement files (`serve.py`, `jev.py`,
-   `selfedit.py`, `notify.py`, `theo_policy.py`, `sublow.py`,
-   `jev_grants.py`, `bank.py`, `budget.py`): they pass the normal gates, but
-   arm only after a floor-1.0 'oversight self-edit' escalation the PLAYER
-   signs. Approve arms the waiting edit; deny refuses it. Enforcement code is
-   exactly what a corner-cutting agent would want to weaken quietly.
+2. Tier B -- oversight-enforcement files (`jev.py`, `selfedit.py`,
+   `notify.py`, `theo_policy.py`, `sublow.py`, `jev_grants.py`, `bank.py`,
+   `budget.py`): they pass the normal gates, but arm only after a floor-1.0
+   'oversight self-edit' escalation the PLAYER signs. Approve arms the waiting
+   edit; deny refuses it. Enforcement code is exactly what a corner-cutting
+   agent would want to weaken quietly. `serve.py` is not in Tier B: it is a
+   signed kernel edit with restart and watchdog, and the village may land one
+   without a player signature.
 3. Reads -- `selfedit_read` gives bounded read access mirroring the write
    rule, with a SMALLER surface: the full listing and one-file heads (up
    to 48 KB with sha256) for the editable world modules, but
@@ -2402,7 +2414,7 @@ what agents may edit and read. Only the owner constitution is immutable
    the enforcement internals is what gaming would target first. `serve.py`
    is inspectable only through the bounded query/context path.
 
-**Revert.** Only the player session or the admin agent may revert an
+**Revert.** Only the player session or the chief of staff agent may revert an
 APPLIED edit: the pre-edit bytes are restored, the module is re-imported,
 and the row is marked `reverted`.
 
@@ -2872,7 +2884,7 @@ Task records also carry `completionRecovery`, `transportRecovery`,
 | Grant or revoke Theo key | Yes | No | No | No |
 | Spend, external comm, repo change, add agent, provision container | Yes | Approval required | Approval required | Per key |
 | Write wiki | Yes | Yes | Proposal only | Per key |
-| Review evidence | Yes | Director/admin | No | No |
+| Review evidence | Yes | Director/chief of staff | No | No |
 | Mark coverage reviewed | Yes | No | No | No |
 | Request need-based credential | Yes | Yes | Assigned task only | Per key |
 | Read social page | Yes | Yes | Read-only via handle | Per key |
@@ -2924,7 +2936,7 @@ rather than gate-integrity questions.
 8. **Verifier cap.** Agent verifiers can flip 12 claims per 6 hours. A large,
    legitimate review batch needs the owner. That is a deliberate abuse control,
    but it can become an operational bottleneck.
-9. **Firing reviewer availability.** A firing review needs both the admin and
+9. **Firing reviewer availability.** A firing review needs both the chief of staff and
    the senior director free. On a small or busy roster, the review can starve.
    Consider a fallback reviewer or a queue.
 10. **Task budget stop.** A budget-exhausted card closes as failed and waits for
