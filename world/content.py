@@ -3174,6 +3174,7 @@ _BROWSER_ACT_TOOL = {
                     'value': {'type': 'string'},
                 }, 'required': ['selector']}, 'description': 'For op=login/fill_many: one entry per field. Use credentialHandle + credentialField for stored logins, never a literal password.'},
                 'submitSelector': {'type': 'string', 'description': 'For op=login: css selector of the submit button.'},
+                'loginEntryUrl': {'type': 'string', 'description': 'For op=login: optional page to visit first and click its Log in link (e.g. https://www.facebook.com/), so the login request has a normal navigation path and referer.'},
                 'pageUrl': {'type': 'string', 'description': 'The url of the page you are filling on (used with credentialHandle to scope-check the handle against the host). Required if url is not already set.'},
                 'purpose': {'type': 'string', 'description': 'One short sentence: why you are performing this browser action.'},
                 'maxText': {'type': 'integer', 'description': 'Optional cap on the page text returned, default ~16000 chars.'},
@@ -3350,6 +3351,7 @@ def _make_browser_act_executor(agent_id, agent_key, sandbox_id, struck_tools=Non
             'maxText': int((args or {}).get('maxText') or 0) or 0,
             'fields': (args or {}).get('fields') or [],
             'submitSelector': (args or {}).get('submitSelector') or '',
+            'loginEntryUrl': (args or {}).get('loginEntryUrl') or '',
             'workContext': work_context,
             'taskId': task_id or '',
             # Server-minted proof of player-authored provenance; the endpoint

@@ -8117,6 +8117,13 @@ def record_browse_success(hostname):
 # kill-switch convention as browsing.
 EXECUTION_ENABLED = _load_env().get('AGENT_EXECUTION_ENABLED', 'true').strip().lower() != 'false'
 SANDBOX_IMAGE = 'ai-think-tank-work-sandbox'  # world/sandbox/Dockerfile -- has flake8/mypy/bandit/pytest-cov baked in (Cut 4)
+# One shared, host-persistent Chromium profile for browser_act. A fresh profile
+# per task is an obvious automation signal (no history, no cookies, no
+# localStorage), and it forces Facebook to treat every read as a brand-new
+# device. The profile lives outside every agent sandbox and is never committed.
+BROWSER_PROFILE_DIR = os.environ.get(
+    'BROWSER_PROFILE_DIR') or os.path.join(ROOT, '.browser-profiles', 'social')
+_BROWSER_PROFILE_LOCK = threading.Lock()
 SANDBOX_TIMEOUT_S = 30
 SANDBOX_MAX_OUTPUT = 20_000
 # Where agent commands actually run: `local` = the local Docker
@@ -8774,7 +8781,7 @@ def _run_browser_act_sync(sandbox_dir, action):
     result_path = os.path.join(work_dir, f'result-{run_id}.json')
     shot_path = os.path.join(work_dir, f'shot-{run_id}.png')
     action['workDir'] = '/workspace/.browser-act'
-    action['profileDir'] = '/workspace/.browser-act/profile'
+    action['profileDir'] = '/browser-profile'
     action['resultPath'] = f'/workspace/.browser-act/result-{run_id}.json'
     action['screenshotPath'] = f'/workspace/.browser-act/shot-{run_id}.png'
     # Host-side, outside the mount. Deleted in finally -- it is never
@@ -8817,6 +8824,7 @@ def _run_browser_act_sync(sandbox_dir, action):
         # read the (decrypted) action file, and nothing in the mount can be
         # swapped between the Jev classification and the driver reading it.
         '-v', f'{action_dir}:/browser-act:ro',
+        '-v', f'{BROWSER_PROFILE_DIR}:/browser-profile',
         '-w', '/workspace',
         SANDBOX_IMAGE,
         # Headful Chromium under a private Xvfb. Do NOT use xvfb-run here:
@@ -8832,7 +8840,15 @@ def _run_browser_act_sync(sandbox_dir, action):
     ]
     try:
         try:
-            result = _run_docker_sandbox(docker_cmd, BROWSER_ACT_TIMEOUT_S)
+            # One Chromium profile at a time: a persistent user-data dir cannot
+            # be opened by two browsers concurrently.
+            os.makedirs(BROWSER_PROFILE_DIR, mode=0o700, exist_ok=True)
+            try:
+                os.chmod(BROWSER_PROFILE_DIR, 0o700)
+            except OSError:
+                pass
+            with _BROWSER_PROFILE_LOCK:
+                result = _run_docker_sandbox(docker_cmd, BROWSER_ACT_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             return None, 'browser action timed out in sandbox'
         # Prefer the driver's own result file (not truncated by capture caps).
@@ -28801,6 +28817,10 @@ async def browser_act(request: Request):
             fields_out.append(field_out)
         action['fields'] = fields_out
         action['submitSelector'] = (body.get('submitSelector') or '').strip()
+        entry = (body.get('loginEntryUrl') or '').strip()
+        if not entry and 'facebook.com' in (urllib.parse.urlparse(scope_url).hostname or ''):
+            entry = 'https://www.facebook.com/'
+        action['loginEntryUrl'] = entry
     parsed_result, run_error = await asyncio.to_thread(_run_browser_act_sync, sandbox_dir, action)
     if parsed_result is None:
         log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'error', 'reason': run_error}, authorized=authorized)

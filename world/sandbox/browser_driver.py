@@ -25,8 +25,10 @@ mean the harness itself died, which the endpoint reports as a sandbox failure.
 """
 import json
 import os
+import random
 import re
 import sys
+import time
 import traceback
 
 
@@ -299,7 +301,34 @@ def run(action):
                 # so a fill would time out waiting for a selector that was
                 # never on screen. goto is the only op that skips this -- it IS
                 # the navigation.
-                if op != 'goto' and action.get('url'):
+                if op == 'login' and action.get('loginEntryUrl'):
+                    # Arrive the way a person does: open the site root, move
+                    # the pointer, click its Log in link, then fill the form.
+                    # This gives the request a real referer and navigation
+                    # chain instead of a cold direct hit on /login.
+                    page.goto(action['loginEntryUrl'], timeout=timeout_ms,
+                              wait_until='domcontentloaded')
+                    _settle(page, 2500)
+                    page.mouse.move(160 + random.randint(0, 260),
+                                    180 + random.randint(0, 160))
+                    page.wait_for_timeout(250 + random.randint(0, 400))
+                    try:
+                        link = page.get_by_role('link', name=re.compile('log in', re.I)).first
+                        link.wait_for(state='visible', timeout=8000)
+                        box = link.bounding_box()
+                        if box:
+                            page.mouse.move(box['x'] + box['width'] / 2,
+                                            box['y'] + box['height'] / 2)
+                            page.wait_for_timeout(200 + random.randint(0, 300))
+                        link.click(timeout=8000)
+                    except Exception:
+                        pass
+                    _settle(page, 2500)
+                    if not _is_login_path(page.url):
+                        page.goto(action.get('url'), timeout=timeout_ms,
+                                  wait_until='domcontentloaded')
+                        _settle(page, 2500)
+                elif op != 'goto' and action.get('url'):
                     page.goto(action.get('url'), timeout=timeout_ms, wait_until='domcontentloaded')
                     _settle(page, 2500)
                 social_error = _social_write_guard(op, page.url)
@@ -330,6 +359,14 @@ def run(action):
                 if op == 'login':
                     fields = action.get('fields', [])
                     filled_lengths = []
+                    # Small, human-looking pointer and scroll activity before
+                    # touching the form. A cold programmatic fill at 0ms is a
+                    # strong automation signal even in a headful browser.
+                    page.mouse.move(220 + random.randint(0, 240),
+                                    220 + random.randint(0, 180))
+                    page.wait_for_timeout(250 + random.randint(0, 350))
+                    page.mouse.wheel(0, random.randint(70, 180))
+                    page.wait_for_timeout(300 + random.randint(0, 450))
                     for f in fields:
                         loc = page.locator(f['selector']).first
                         loc.wait_for(state='visible', timeout=timeout_ms)
@@ -339,14 +376,22 @@ def run(action):
                         try:
                             loc.click(timeout=timeout_ms)
                             loc.fill('', timeout=timeout_ms)
-                            loc.press_sequentially(f.get('value') or '', delay=20, timeout=timeout_ms)
+                            loc.press_sequentially(f.get('value') or '',
+                                                   delay=35 + random.randint(0, 45),
+                                                   timeout=timeout_ms)
                         except Exception:
                             loc.fill(f.get('value') or '', timeout=timeout_ms)
+                        page.wait_for_timeout(180 + random.randint(0, 320))
                         try:
                             filled_lengths.append(len(loc.input_value()))
                         except Exception:
                             filled_lengths.append(-1)
-                    _settle(page, 1500)
+                    # Blur the password field to fire validation, then pause.
+                    try:
+                        page.keyboard.press('Tab')
+                    except Exception:
+                        pass
+                    _settle(page, 800 + random.randint(0, 700))
                     before = page.url
                     submit_used = ''
                     # Press Enter in the last filled field (usually password).

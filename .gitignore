@@ -127,3 +127,6 @@ library/photo-reviews/
 tinyprobe_test/
 world/coverage/
 world/coverage.json
+
+# Shared persistent browser profile (cookies/session; never commit)
+.browser-profiles/

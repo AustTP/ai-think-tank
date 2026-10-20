@@ -371,7 +371,9 @@ class RunBrowserActSync(unittest.TestCase):
         self.assertEqual(fake_run.cmd[fake_run.cmd.index('--network') + 1], 'test-net')
         self.assertIn('-v', fake_run.cmd)
         self.assertIn('--shm-size', fake_run.cmd)  # chromium needs shared memory
-        self.assertIn('/opt/browser_driver.py', fake_run.cmd)
+        self.assertTrue(any('/opt/browser_driver.py' in c for c in fake_run.cmd))
+        self.assertTrue(any('Xvfb :99' in c for c in fake_run.cmd))
+        self.assertTrue(any('DISPLAY=:99' in c for c in fake_run.cmd))
         self.assertTrue(any(c == 'http_proxy=http://proxy-c:8899' for c in fake_run.cmd))
         # The browser needs the proxy as an explicit --proxy-server (Chromium
         # ignores http_proxy env vars), so the run passes BROWSER_PROXY_URL too.
