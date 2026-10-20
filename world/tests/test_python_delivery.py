@@ -10,6 +10,12 @@ def test_html_only_and_placeholder_do_not_satisfy_python_task(tmp_path):
     assert any('implementation' in e for e in delivery.check(tmp_path))
 
 
+def test_root_level_test_file_satisfies_the_contract(tmp_path):
+    (tmp_path / 'trader.py').write_text('def trade():\n    return 1\n')
+    (tmp_path / 'test_trader.py').write_text('def test_trade():\n    assert True\n')
+    assert delivery.check(tmp_path) == []
+
+
 def test_tests_alone_do_not_replace_implementation(tmp_path):
     (tmp_path / 'tests').mkdir()
     (tmp_path / 'tests/test_trader.py').write_text('def test_trade():\n    assert True\n')

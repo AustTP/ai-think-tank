@@ -29,6 +29,14 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+# `python3 serve.py` executes this file as __main__, while sim/content/etc.
+# import `serve` by name. Without this alias that creates a second module
+# object with its own globals, so in-memory flags such as _DORMANT set by the
+# __main__ idle loop are invisible to the sim. Bind the script identity to the
+# module name before any local import runs.
+if __name__ == '__main__':
+    sys.modules.setdefault('serve', sys.modules[__name__])
+
 from confirmations import gate as _confirmation_gate_or_response
 from confirmations import gate_finish as _finish_confirmation
 

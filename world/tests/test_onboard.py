@@ -210,6 +210,54 @@ class OnboardCeremony(unittest.TestCase):
         self.assertTrue(state.get('_pendingOnboard', {}).get('embarked'),
                         'a freed coworker lets the meeting embark')
 
+    def test_off_duty_coworkers_do_not_deadlock_embark(self):
+        """A large dormant roster must not freeze the Town Hall forever."""
+        state = _idle_with_work(_seed())
+        state['lastHireAt'] = 0
+        grid, _ = sim._load_outdoor_geometry()
+        now = 1000.0
+        # Advance until the hire is pending, then send the team off-duty
+        # before the completion pass that convenes the meeting.
+        for _ in range(20):
+            now += sim.SIM_TICK_S
+            sim._governance_pass(state, now=now, now_ms=int(now * 1000),
+                                 grid=grid, decider=self.decider_ben())
+            if state.get('_pendingHire'):
+                break
+        self.assertIsNotNone(state.get('_pendingHire'), 'a hire was queued')
+        state['agents']['ada']['offDuty'] = True
+        state['agents']['ben']['offDuty'] = True
+        for _ in range(20):
+            now += sim.SIM_TICK_S
+            sim._governance_pass(state, now=now, now_ms=int(now * 1000),
+                                 grid=grid, decider=self.decider_ben())
+            if state.get('_pendingOnboard'):
+                break
+        pending = state.get('_pendingOnboard') or {}
+        self.assertTrue(pending.get('embarked'),
+                        'off-duty coworkers are skipped, not treated as blockers')
+        self.assertTrue(state['agents']['faye'].get('busy'),
+                        'the director still convenes the meeting')
+        self.assertFalse(state['agents']['ada'].get('busy'),
+                         'an off-duty coworker is not dragged into the room')
+
+    def test_pending_onboarding_blocks_another_hire(self):
+        """Never overwrite an open ceremony: that strands the earlier hire."""
+        state = _idle_with_work(_seed())
+        state['lastHireAt'] = 0
+        state['_pendingOnboard'] = {
+            'agentId': 'rowan', 'directorId': 'faye', 'coworkerIds': ['ada'],
+            'stage': 0,
+        }
+        grid, _ = sim._load_outdoor_geometry()
+        started = sim._start_auto_hire(
+            state, int(time.time() * 1000), grid, self.decider_ben())
+        self.assertFalse(started, 'no new hire while a ceremony is open')
+        self.assertIsNone(state.get('_pendingHire'),
+                          'nothing was queued behind the open ceremony')
+        self.assertEqual(state['_pendingOnboard']['agentId'], 'rowan',
+                         'the open ceremony was not overwritten')
+
     def test_staged_agend_md_progresses_and_finalizes_when_hire_claims_a_task(self):
         state = _idle_with_work(_seed())
         state['lastHireAt'] = 0

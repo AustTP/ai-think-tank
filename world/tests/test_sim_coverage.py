@@ -470,6 +470,18 @@ class SmallHelpers(SimIsolation):
         self.assertTrue(state['workQueue'][0]['_mailResume'])
         self.assertFalse(sim._requeue_task_for_agent({'workQueue': None}, 'a', 't', 1))
 
+    def test_requeue_task_for_agent_inherits_a_non_code_parent_lane(self):
+        # A follow-up on a review/research task must not default to the code
+        # lane and run the Python gate.
+        state = {'workQueue': [], 'tasks': {
+            'task-1': {'taskType': 'review', 'room': 'pressoffice',
+                       'projectLabel': 'ben'}}}
+        self.assertTrue(sim._requeue_task_for_agent(state, 'ada', 'task-1', 1234))
+        item = state['workQueue'][0]
+        self.assertEqual(item['taskType'], 'review')
+        self.assertEqual(item['room'], 'pressoffice')
+        self.assertEqual(item['projectLabel'], 'ben')
+
     def test_requeue_task_for_agent_does_not_mark_an_agent_id_as_a_review(self):
         # help_signal mail carries `about: <agent id>`; reviewOf is for a TASK
         # id only, and the item must be queued ROOM-LESS (the old hardcoded

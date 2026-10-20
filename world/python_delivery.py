@@ -45,7 +45,10 @@ def check(directory):
                 and not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)) for node in tree.body)
         except (SyntaxError, UnicodeError):
             continue
-    tests = [p for p in paths if 'tests' in p.relative_to(root).parts and p.name.startswith('test_')]
+    # pytest discovers test_*.py at the workspace root too. Requiring a literal
+    # tests/ directory rejected agents that wrote a valid root-level test file
+    # and sent them back to write the same file again.
+    tests = [p for p in paths if p.name.startswith('test_')]
     errors = []
     if not substantive:
         errors.append('No substantive Python implementation module exists in the project workspace. Write the required .py implementation; HTML or an empty placeholder does not satisfy this task.')

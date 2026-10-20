@@ -509,6 +509,15 @@ class BlockCluster(SimIsolation):
             state, 'ada', 'peer_review_request', {'taskId': 't9'}, 1_000_000))
         self.assertEqual(state['workQueue'][0]['reviewOf'], 't9')
 
+    def test_help_signal_mail_is_advisory_not_a_work_card(self):
+        # "Act on mail (<agent>)" was queued into the code room for every help
+        # signal, ran the Python gate, and looped. The mail is advisory.
+        state = {'workQueue': [], 'agents': {'harold': {'id': 'harold'}}}
+        self.assertTrue(sim._queue_mail_work(
+            state, 'nora', 'help_signal', {'about': 'harold'}, 1_000_000))
+        self.assertEqual(state['workQueue'], [],
+                         'a personnel signal must not create a deliverable card')
+
     def test_queue_mail_work_empty_payload(self):
         # 6585: neither issueKey nor taskId -> nothing queued.
         self.assertFalse(sim._queue_mail_work(state := {'workQueue': []},

@@ -7193,6 +7193,13 @@ def _start_auto_hire(state, now_ms, grid, decider):
     if len(roster) >= MAX_TOTAL_AGENTS:
         state['_hireBlockedAtCapNote'] = len(roster)
         return False
+    # One ceremony at a time. _complete_auto_hire overwrites _pendingOnboard,
+    # so starting a second hire while a Town Hall/readiness hold is still open
+    # strands the earlier hire with profile.onboarding forever. The live tank
+    # hit this: 446 of 457 agents were stuck, 420 at stage 0, and the same
+    # overload kept triggering new hires that could never relieve it.
+    if state.get('_pendingOnboard'):
+        return False
     # Active-ceiling gate: stop spawning at MAX_ACTIVE_AGENTS (25). When a
     # sprint ends and workers go dormant, active_agent_count drops below the
     # ceiling and this gate reopens on its own. `lastHireAt` is deliberately
@@ -7728,19 +7735,21 @@ def _onboard_coworker_defs(state, onboard):
 
 
 def _start_onboard_meeting(state, onboard, now_ms):
-    """Convene the Town Hall: the director + the employees who'll work with the
-    new hire meet at Command Center before the AGENT.md is finalized. Only if the
-    director and every intended coworker are free and on-duty (same guard the
-    firing reviewers use) -- if someone is mid-task/pair/handoff, defer the embark
-    and re-attempt next pass rather than strand a live collaboration reference."""
+    """Convene the Town Hall: the director + the on-duty employees who'll work
+    with the new hire meet at Command Center before the AGENT.md is finalized.
+    Busy on-duty coworkers still defer the embark (never strand a live
+    collaboration reference). Off-duty coworkers are skipped instead of
+    blocking: on a large roster most of the team is dormant, and requiring
+    every one of them to be awake deadlocked the ceremony forever."""
     agents = state.get('agents') or {}
     director = agents.get(onboard.get('directorId'))
     if not director or director.get('busy') or director.get('offDuty'):
         return False
-    coworkers = _onboard_coworker_defs(state, onboard)
+    coworkers = [c for c in _onboard_coworker_defs(state, onboard)
+                 if (agents.get(c['id']) or {}).get('offDuty') is not True]
     for c in coworkers:
         a = agents.get(c['id'])
-        if not a or a.get('busy') or a.get('offDuty'):
+        if not a or a.get('busy'):
             return False
     # Healthy -- embark the meeting. The director + coworkers convene at the
     # same Command Center staging the firing reviewers use (spread roomXY).
@@ -9530,6 +9539,13 @@ def _queue_mail_work(state, agent_id, kind, payload, now_ms):
     Returns True if an item was queued."""
     if kind == 'sim_watchdog':
         return _queue_watchdog_alert(state, agent_id, payload, now_ms)
+    # A help_signal is advisory personnel context for the director: "this agent
+    # has done little real work, check in before assuming." It is not a card.
+    # Queuing it produced "Act on mail (<agent>)" in the code room, which ran
+    # the Python gate, failed for missing tests, and generated the next fix
+    # card forever. Acknowledge the mail and let the director decide.
+    if kind == 'help_signal':
+        return True
     issue_key = (payload or {}).get('issueKey')
     task_id = (payload or {}).get('taskId') or (payload or {}).get('about')
     if issue_key:
@@ -9657,14 +9673,25 @@ def _requeue_task_for_agent(state, agent_id, task_id, now_ms):
     # it when the value names an employee instead.
     agents = state.get('agents') or {}
     real_task_id = None if task_id in agents else task_id
+    # A follow-up on an existing task keeps that task's lane. Without this an
+    # untyped re-arm silently defaulted to the code lane in the content
+    # dispatcher, so a review/research follow-up ran the Python gate and could
+    # never satisfy it. A code parent keeps the existing default (None -> code).
+    parent = ((state.get('tasks') or {}).get(real_task_id) or {}) if real_task_id else {}
+    parent_type = parent.get('taskType')
+    if parent_type in (None, '', 'None', 'code'):
+        parent_type = None
     # No hardcoded room: 'townsquare' has no door, so assign_task failed on it
     # every cycle (the 21k-attempt wedge this item caused). Room-less lets
-    # _assign_due_item resolve a real room at assignment time.
+    # _assign_due_item resolve a real room at assignment time. A parent task's
+    # room wins, so the follow-up lands in the same workspace/lane.
     queue.append({
         'title': f'Act on mail ({task_id})',
-        'room': None,
+        'room': parent.get('room') or None,
         'instructions': f'Follow up on {task_id} now that you have been notified.',
         'goal': task_id,
+        'taskType': parent_type,
+        'projectLabel': parent.get('projectLabel') or None,
         'reviewOf': real_task_id,
         'assignedTo': agent_id,  # wake-on-mail pin: THIS agent acts on the mail
         '_mailResume': True,
