@@ -4872,9 +4872,15 @@ def _handle_captcha_detected(agent_id, sandbox_id, page_url, captchas, shot_b64,
     # means no relay image: a full-page screenshot is not a CAPTCHA.
     relay_b64 = _captcha_crop_b64(shot_b64, captchas)
     auto = None
-    if is_new and mode == 'attempt' and not interactive and relay_b64:
+    env = _load_env()
+    auto_enabled = (env.get('CAPTCHA_AUTO_ATTEMPT') or '0') == '1'
+    try:
+        auto_floor = float(env.get('CAPTCHA_AUTO_CONFIDENCE') or '0.95')
+    except (TypeError, ValueError):
+        auto_floor = 0.95
+    if is_new and auto_enabled and mode == 'attempt' and not interactive and relay_b64:
         candidate = _captcha_vision_candidate(relay_b64)
-        if candidate and candidate['confidence'] >= 0.8:
+        if candidate and candidate['confidence'] >= auto_floor:
             captcha.set_answer(request_id, candidate['text'], answered_by='vision')
             auto = candidate
             request = captcha.get(request_id)
@@ -7278,11 +7284,12 @@ PAGE_REQUEST_BUDGET_START_KEY = '__page_budget_start__'
 # on total high-tier model spend: once the month's allowance is consumed, the
 # JEV tier gate fails CLOSED on high (routing to mid instead), so the expensive
 # tier can never overrun. Set HIGH_TIER_MONTHLY_BUDGET_USD in .env to change it
-# (e.g. 1.00 = at most $1 of high-tier spend per calendar month); 0/unset
-# disables the cap. Accrual happens at the /api/chat choke point (see
+# (e.g. 1.00 = at most $1 of high-tier spend per calendar month); 0
+# explicitly disables the cap. The default is $5, a real cap for a band that
+# is meant to be rare. Accrual happens at the /api/chat choke point (see
 # _accrue_high_tier_spend), the single place every model call's real cost is
 # known.
-HIGH_TIER_MONTHLY_BUDGET_USD = float(_load_env().get('HIGH_TIER_MONTHLY_BUDGET_USD', '0') or 0)
+HIGH_TIER_MONTHLY_BUDGET_USD = float(_load_env().get('HIGH_TIER_MONTHLY_BUDGET_USD', '5') or 0)
 # Highest per-million-token price the HIGH tier will even CONSIDER:
 # the refresh only offers Jev/score-pick candidates priced at or below
 # this, so a $210/M model can never win the high tier no matter its score.
@@ -8232,6 +8239,109 @@ SANDBOX_IMAGE = 'ai-think-tank-work-sandbox'  # world/sandbox/Dockerfile -- has 
 # per task is an obvious automation signal (no history, no cookies, no
 # localStorage), and it forces Facebook to treat every read as a brand-new
 # device. The profile lives outside every agent sandbox and is never committed.
+SAFARI_COOKIES_PATH = os.environ.get(
+    'SAFARI_COOKIES_PATH') or os.path.expanduser('~/Library/Cookies/Cookies.binarycookies')
+_SAFARI_SYNC_DOMAINS = ('facebook.com', 'instagram.com')
+
+
+def _parse_safari_binarycookies(data):
+    """Decode Safari's Cookies.binarycookies into Playwright cookie dicts."""
+    import struct
+    if not data or data[:4] != b'cook':
+        return []
+    pages = struct.unpack('>I', data[4:8])[0]
+    sizes = struct.unpack('>' + 'I' * pages, data[8:8 + 4 * pages])
+    pos = 8 + 4 * pages
+    rows = []
+    for size in sizes:
+        page = data[pos:pos + size]
+        pos += size
+        if page[:4] != b'\x00\x00\x01\x00':
+            continue
+        count = struct.unpack('<I', page[4:8])[0]
+        offsets = struct.unpack('<' + 'I' * count, page[8:8 + 4 * count])
+        for offset in offsets:
+            cookie = page[offset:]
+            try:
+                flags = struct.unpack('<I', cookie[8:12])[0]
+                url_o, name_o, path_o, value_o = struct.unpack('<IIII', cookie[16:32])
+                expiry = struct.unpack('<d', cookie[40:48])[0]
+                def text_at(o):
+                    end = cookie.find(b'\x00', o)
+                    return cookie[o:end].decode('utf-8', 'replace')
+                domain = text_at(url_o)
+                rows.append({
+                    'name': text_at(name_o), 'value': text_at(value_o),
+                    'domain': domain, 'path': text_at(path_o) or '/',
+                    'expires': (expiry + 978307200) if expiry > 0 else -1,
+                    'httpOnly': bool(flags & 4), 'secure': bool(flags & 1),
+                    'sameSite': 'Lax',
+                })
+            except (struct.error, ValueError, IndexError, UnicodeError):
+                continue
+    return rows
+
+
+def _sync_safari_cookies(agent_id, host):
+    """Refresh the browser profile's cookie seed from Safari before each run.
+
+    Only the social domains explicitly handled by the read-only credential
+    policy are copied. The file lives inside the existing 0700 per-agent
+    profile and is re-read by the driver on every launch, so Safari's latest
+    session is what the browser uses.
+    """
+    if not agent_id or not host:
+        return 0
+    env = _load_env()
+    if (env.get('BROWSER_SAFARI_COOKIE_SYNC') or '1') == '0':
+        return 0
+    # Owner consent is explicit and per-agent. No consent, no allowlist, or an
+    # agent outside the allowlist means the owner's live social session is not
+    # copied into that profile.
+    if (env.get('SAFARI_COOKIE_CONSENT') or '0') != '1':
+        return 0
+    allowed = {a.strip().lower() for a in
+               (env.get('SAFARI_COOKIE_AGENTS') or '').split(',') if a.strip()}
+    if agent_id.strip().lower() not in allowed:
+        return 0
+    host = host.strip().lower()
+    matched = tuple(d for d in _SAFARI_SYNC_DOMAINS
+                    if host == d or host.endswith('.' + d))
+    if not matched:
+        return 0
+    try:
+        with open(SAFARI_COOKIES_PATH, 'rb') as stream:
+            rows = _parse_safari_binarycookies(stream.read())
+    except OSError:
+        return 0
+    selected = [row for row in rows
+                if any(row['domain'].lstrip('.').lower() == d
+                       or row['domain'].lstrip('.').lower().endswith('.' + d)
+                       for d in matched)]
+    if not selected:
+        return 0
+    profile = _browser_profile_dir(agent_id)
+    os.makedirs(profile, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(profile, 0o700)
+    except OSError:
+        pass
+    target = os.path.join(profile, 'safari-cookies.json')
+    temp = target + '.tmp'
+    try:
+        with open(temp, 'w') as stream:
+            json.dump(selected, stream)
+        os.chmod(temp, 0o600)
+        os.replace(temp, target)
+    except OSError:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+        return 0
+    return len(selected)
+
+
 BROWSER_PROFILE_DIR = os.environ.get(
     'BROWSER_PROFILE_DIR') or os.path.join(ROOT, '.browser-profiles', 'social')
 _BROWSER_PROFILE_LOCK = threading.Lock()
@@ -8901,6 +9011,15 @@ def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
     action['workDir'] = '/workspace/.browser-act'
     action['profileDir'] = '/browser-profile'
     action['resultPath'] = f'/workspace/.browser-act/result-{run_id}.json'
+    # Refresh the per-agent profile's Safari cookie seed before the container
+    # starts. The driver re-applies it to the persistent context on every run.
+    # A malformed URL is the driver's error to report, not a crash here.
+    try:
+        _act_host = urllib.parse.urlparse(
+            action.get('url') or action.get('pageUrl') or '').hostname or ''
+    except ValueError:
+        _act_host = ''
+    _sync_safari_cookies(agent_id, _act_host)
     action['screenshotPath'] = f'/workspace/.browser-act/shot-{run_id}.png'
     # Host-side, outside the mount. Deleted in finally -- it is never
     # world-readable from any other container and never survives the run.
@@ -12468,7 +12587,8 @@ def _best_value_qualifiers_sync(candidates, scores, floor_gap=None):
     WITHOUT paying for verify probes. Returns [] when nothing in `candidates`
     has a stored score yet."""
     if floor_gap is None:
-        floor_gap = BENCHMARK_QUALITY_FLOOR_GAP
+        floor_gap = BAND_QUALITY_FLOOR_GAP.get('default',
+                                               BENCHMARK_QUALITY_FLOOR_GAP)
     scored = [m for m in candidates if m['id'] in scores]
     if not scored:
         return []
@@ -16076,6 +16196,36 @@ async def test_player_email(request: Request):
         'This is a self-test from your AI Think Tank. Notifications are delivered to this address.')
     log_action('player', 'player_email_test', {'sent': bool(ok)}, authorized=True)
     return JSONResponse({'ok': True, 'sent': bool(ok)})
+
+
+@app.get('/api/device/key')
+async def device_key_get(request: Request):
+    """Player-only retrieval of the phone check-in bearer. The key is
+    auto-generated on first boot; this makes it visible without digging
+    through startup logs."""
+    authed, actor = _operator_gate(request)
+    if not authed or actor != 'player':
+        return JSONResponse({'error': 'device key access is player-only'},
+                            status_code=403)
+    return JSONResponse({'key': DEVICE_API_KEY})
+
+
+@app.post('/api/device/key')
+async def device_key_rotate(request: Request):
+    """Rotate the phone check-in bearer and reload it live."""
+    authed, actor = _operator_gate(request)
+    if not authed or actor != 'player':
+        return JSONResponse({'error': 'device key rotation is player-only'},
+                            status_code=403)
+    key = secrets.token_urlsafe(24)
+    try:
+        _set_env_keys({'DEVICE_API_KEY': key})
+    except Exception as e:
+        return JSONResponse({'error': f'could not write .env: {e}'}, status_code=500)
+    _reload_env_config()
+    log_action(None, 'device_key_rotated', {}, authorized=True)
+    return JSONResponse({'ok': True, 'key': key,
+                         'note': 'shown once; update the Shortcut now'})
 
 
 @app.post('/api/device/checkin')
@@ -21796,10 +21946,10 @@ def _photo_review_from_image(image_b64, source_label, context='', mode='general'
 
 
 def _photo_review_auth(request):
-    """Player session, a director/admin agent key, or X-Photo-Key matching
-    PHOTO_REVIEW_KEY in .env (purpose-scoped credential for a Shortcut)."""
+    """Player session or X-Photo-Key matching PHOTO_REVIEW_KEY in .env. Agent
+    keys are refused: personal photos are owner-scoped, even for a director."""
     authed, actor = _operator_gate(request)
-    if authed:
+    if authed and actor == 'player':
         return True, actor
     expected = (_load_env().get('PHOTO_REVIEW_KEY') or '').strip()
     presented = (request.headers.get('X-Photo-Key') or '').strip()
@@ -21838,6 +21988,7 @@ PHOTO_WATCH_SETTING = 'photo_album_watch'
 PHOTO_WATCH_INTERVAL_S = 30
 PHOTO_WATCH_BATCH = 3
 PHOTO_REVIEW_MAX_ATTEMPTS = 3
+PHOTO_REVIEW_RETENTION_DAYS = int(_load_env().get('PHOTO_REVIEW_RETENTION_DAYS', '30') or 30)
 _PHOTO_REVIEW_LOCK = threading.Lock()
 
 
@@ -21886,6 +22037,36 @@ def _photo_baseline_album(album):
         manifest[f'{album}::{asset["uuid"]}'] = {'status': 'baseline', 'at': now}
     _save_photo_manifest(manifest)
     return len(assets)
+
+
+def _prune_photo_reviews_sync():
+    """Delete reviewed images and notes older than the retention window. The
+    manifest stays as a dedup record; the personal media does not."""
+    root = _safe_library_path('photo-reviews')
+    if not root or not os.path.isdir(root):
+        return 0
+    cutoff = time.time() - max(1, PHOTO_REVIEW_RETENTION_DAYS) * 86400
+    removed = 0
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for name in filenames:
+            if name.startswith('.') or not name.lower().endswith(
+                    ('.jpg', '.jpeg', '.png', '.webp', '.txt')):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    removed += 1
+            except OSError:
+                continue
+    if removed:
+        try:
+            log_action(None, 'photo_review_pruned',
+                       {'removed': removed, 'days': PHOTO_REVIEW_RETENTION_DAYS},
+                       authorized=False)
+        except Exception:
+            pass
+    return removed
 
 
 def _review_album_batch_sync(album, project, mode, context, limit, agent_id,
@@ -21977,6 +22158,7 @@ def _review_album_batch_sync(album, project, mode, context, limit, agent_id,
                 if tmp_dir:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
         _save_photo_manifest(manifest)
+        _prune_photo_reviews_sync()
         done = sum(1 for r in reviewed if not r.get('error'))
         remaining = sum(1 for a in assets
                         if _photo_needs_review(manifest, f'{album}::{a["uuid"]}'))
@@ -22183,6 +22365,41 @@ async def photo_review_watch(request: Request):
     return JSONResponse({'ok': True, **cfg})
 
 
+@app.post('/api/photo-review/key')
+async def photo_review_key_rotate(request: Request):
+    """Rotate the iPhone Shortcut key. Player-only. The new key is returned
+    once and written to .env; the old key stops working immediately."""
+    authed, actor = _operator_gate(request)
+    if not authed or actor != 'player':
+        return JSONResponse({'error': 'photo review key rotation is player-only'},
+                            status_code=403)
+    key = secrets.token_urlsafe(32)
+    try:
+        _set_env_keys({'PHOTO_REVIEW_KEY': key})
+    except Exception as e:
+        return JSONResponse({'error': f'could not write .env: {e}'}, status_code=500)
+    _reload_env_config()
+    log_action(None, 'photo_review_key_rotated', {}, authorized=True)
+    return JSONResponse({'ok': True, 'key': key,
+                         'note': 'shown once; update the Shortcut now'})
+
+
+@app.delete('/api/photo-review/key')
+async def photo_review_key_revoke(request: Request):
+    """Disable the iPhone Shortcut credential entirely."""
+    authed, actor = _operator_gate(request)
+    if not authed or actor != 'player':
+        return JSONResponse({'error': 'photo review key revocation is player-only'},
+                            status_code=403)
+    try:
+        _set_env_keys({'PHOTO_REVIEW_KEY': ''})
+    except Exception as e:
+        return JSONResponse({'error': f'could not write .env: {e}'}, status_code=500)
+    _reload_env_config()
+    log_action(None, 'photo_review_key_revoked', {}, authorized=True)
+    return JSONResponse({'ok': True, 'revoked': True})
+
+
 @app.post('/api/photo-review')
 async def photo_review(request: Request):
     """On-demand review of one iPhone/Photos image. Nothing watches a folder:
@@ -22251,6 +22468,7 @@ async def photo_review(request: Request):
         _write_file(brief_path, header + review['brief'] + '\n')
     except Exception as e:
         return JSONResponse({'error': f'could not write the photo review: {e}'}, status_code=500)
+    _prune_photo_reviews_sync()
     log_action(agent_id, 'photo_review',
                {'name': name, 'image': image_rel, 'brief': brief_rel, 'mode': mode})
     return JSONResponse({'ok': True, 'name': name, 'image': image_rel,

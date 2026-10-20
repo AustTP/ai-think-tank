@@ -207,8 +207,9 @@ _REVIEW_CRITERIA = (
     'A short summary describing intent (given).\n'
     'The exact find/replace splice being made (given).\n'
     'Reject destructive, self-privileging, or unexplained edits.\n'
-    'serve.py and BUSINESS-PROCESSES.md are never editable (already '
-    'enforced upstream -- treat violations as reject).'
+    'BUSINESS-PROCESSES.md is never editable. serve.py is a kernel edit with '
+    'a separate preflight, restart, and watchdog (already enforced upstream '
+    '-- treat any other protected-file violation as reject).'
 )
 
 

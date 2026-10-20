@@ -1,7 +1,7 @@
 # Think Tank Business Processes
 
 Status: review draft
-Date: 2026-10-17
+Date: 2026-10-20
 Owner: operator (the player)
 Scope: the operating processes of the AI think tank as implemented in this repository
 
@@ -9,6 +9,7 @@ Scope: the operating processes of the AI think tank as implemented in this repos
 ## Contents
 
 - 0. How to use this document
+- 0.1 Change log
 - 1. Executive summary
 - 2. Operating model
 - 3. Process inventory
@@ -49,6 +50,92 @@ Three source documents were used:
   and the extracted modules (`bank.py`, `evidence.py`, `memory.py`,
   `theo_policy.py`, `config.py`, `fs.py`, `auth.py`, `notify.py`).
 
+## 0.1 Change log
+
+This is a dated change record. Git history carries commit detail; this section
+states only what changed in the operating model.
+
+**2026-10-20**
+
+- Player asks now use a FIFO backlog capped at 20. A second issue waits instead
+  of replacing the first; overflow is logged as `player_ask_dropped`.
+- The peer gate requires two distinct clean votes. The one-vote timeout is
+  gone; after 15 minutes the gate requests a fresh second reviewer.
+- `tierGateMinConfidence` is player-only. Agents can still escalate it, but
+  cannot change it through `policy_edit`.
+- Incident restore evidence now requires a restore note paired with the command
+  that produced it, the executor's file inventory, or a Library artifact.
+- Photo review is owner-only or `PHOTO_REVIEW_KEY` only. Director and admin
+  agent keys are refused.
+- Safari cookie sync requires `SAFARI_COOKIE_CONSENT=1` and a per-agent
+  `SAFARI_COOKIE_AGENTS` allowlist. The current allowlist is Ada.
+- CAPTCHA vision auto-attempt is off by default. It requires
+  `CAPTCHA_AUTO_ATTEMPT=1`, a host policy of `attempt`, and a 0.95 confidence
+  floor.
+- Photo-review images and notes are pruned after 30 days. The Shortcut key can
+  be rotated or revoked by the player.
+- Device check-ins are capped at 1,000 and pruned after 30 days. The player can
+  read or rotate `DEVICE_API_KEY` without digging through startup logs.
+- The high-tier monthly budget defaults to $5, not a disabled 0.
+- The 6-point tier quality gap is `quality_floor_gap.default` in
+  `model_bands.json`, not a hidden constant.
+- A sprint containing only non-gated lanes closes when those tasks finish.
+- Owner-identity data, consent, and retention are named in BP-52.1.
+- The Verifier role has one definition: player, or a capped director/admin
+  agent.
+- `DESIGN.md` numbers are current; the stale-number action item is closed.
+- Report citations are gated to URLs a tool actually discovered.
+- Review diagnostics now include artifact inspection and citation errors, and
+  either one blocks a clean vote.
+- The review contract is frozen and carried from the parent story into the
+  review task.
+- CAPTCHA relay crops to the challenge rectangle. No rectangle means no image;
+  the owner gets a text notice instead. Stored answers are cleared on solve,
+  failure, and expiry.
+- State saves merge archived tasks and protect terminal task rows from stale
+  overwrites, so a completed task cannot be resurrected as live work.
+- Escalation prune can delete rows without the merge re-adding them.
+- Theo approvals are locked, written atomically, and consumed once.
+- Credential access config fails closed. An empty `autoGrant` is a deliberate
+  revocation, not a cue to restore defaults.
+- Pipeline execution is capped at 64 steps and 256 concurrent jobs, with a
+  per-sandbox lock. Model transport timeouts are capped at 3,600 seconds.
+- Browser profiles are per agent. Facebook and Instagram browser actions seed
+  the profile from Safari's current cookie file before every run.
+- Runtime schema creation runs on the uvicorn lifespan, not only the
+  `__main__` boot path.
+- Social access is need-based and read-only: public pages are tried logged out
+  first, login fields must come from a task-scoped capability handle, and
+  fill/click/submit are disabled on social hosts.
+- The browser driver reads `div[role=article]` text when Facebook leaves
+  `document.body.innerText` empty.
+- TOTP tank accounts use the credential vault and single-use owner code grants.
+- Photo review reads one macOS Photos album read-only, reviews only new
+  additions on a 30-second watch, and writes notes to the Library.
+- Model tiers carry ranked fallback models and fail over immediately on an
+  availability error.
+- `serve.py` is a signed kernel edit with preflight, full test gate, process
+  restart, and a 120-second health watchdog that restores the prior bytes.
+- Spend ledger mutators are serialized; the shared cap excludes attribution
+  rollups; the forecast uses the UTC day.
+- Escalation saves merge concurrent decisions under a lock.
+- Every model call verifies external-data HMAC blocks at the chokepoint.
+- Page probe results are bounded and screenshot/page-probe browsers route all
+  connections through a dead proxy.
+
+**2026-10-19**
+
+- Completion recovery observes unfinished stories, then performs bounded
+  repair or investigation with backoff and a manual-attention stop.
+- Coding uses isolated story workspaces, publishes only validated changes,
+  and reuses a quality result only when the tree and step set are unchanged.
+- Repeated failures with unchanged evidence and repair plan stop instead of
+  minting a fresh retry with a new task id.
+- Transient coding model transport failures retry with the saved workspace and
+  a bounded backoff, without treating the fault as a quality failure.
+- Research and spike runs record `sourceUrls`; review uses that ledger for the
+  citation gate.
+
 ## 1. Executive summary
 
 The think tank is a persistent, server-owned organization of LLM agents. The
@@ -65,23 +152,31 @@ The operating model has five properties:
    consequence-bearing choice. A budget gate sits in front of every model call.
 3. **Idle is free.** If no work is due and no agent is active, the task cycle
    returns without spending.
-4. **Deliverable work is reviewed.** Deliverable work passes a two-reviewer
-   peer gate. Research passes a claim-level evidence review. The gates cover
-   deliverables only: bugs, spikes, and meeting cards close with no review
-   gate. Failures become rule proposals.
+4. **Deliverable work is reviewed against evidence.** Deliverable work passes
+   a two-reviewer peer gate. The review reads the filed document, checks the
+   artifacts it cites, and rejects any URL the tools never discovered. Research
+   passes a claim-level evidence review. The gates cover deliverables only:
+   bugs, spikes, and meeting cards close with no review gate. Failures become
+   rule proposals.
 5. **Authority is structural.** The `director` pointer defines teams and
    escalation. The owner is the only human. Theo is the admin agent, not the
    owner.
 
 ### Key operating numbers
 
+Appendix B is the source of truth for configuration. This table is the short
+list a process reader needs in hand.
+
 | Item | Value | Source |
 |---|---|---|
 | Simulation tick | 1s | `sim.SIM_TICK_S` |
 | Task cycle | 6s | `_task_cycle` cadence |
 | Idle gate | No due work and no active agent -> no spend | `think_tank_has_work` |
-| Peer review gate | 2 approvals, or 1 approval plus 15 min | `sim._peer_gate_should_close` |
+| Peer review gate | 2 distinct approvals | `sim._peer_gate_should_close` |
 | Review cycle cap | 8 cycles, then freeze and escalate | `sim.MAX_REVIEW_CYCLES` |
+| Citation gate | Cited URL must be in the task's discovered-URL ledger | `url_evidence.citation_errors` |
+| Pipeline cap | 64 steps per run, 256 concurrent jobs | `serve._pipeline_execute_locked`, `_PIPELINE_JOBS` |
+| Transport ceiling | 3,600 seconds | `runtime_limits.transport` |
 | Refinement cadence | Weekly, plus immediate kick on a large request | `sim.REFINEMENT_CADENCE_MS` |
 | Social cadence | Weekly | `sim.SOCIAL_CADENCE_MS` |
 | Roadmap and mining | Weekly, silent | `sim.ROADMAP_CADENCE_MS`, `RULE_MINE_CADENCE_MS` |
@@ -95,7 +190,7 @@ The operating model has five properties:
 | Database backup | Hourly, newest 1 kept | `serve.DB_BACKUP_INTERVAL_S`, `DB_BACKUP_KEEP` |
 | Page request budget | 1,000 per month by default | `serve.PAGE_REQUEST_MONTHLY_BUDGET` |
 | Spend cap | $50 by default, 0 disables | `serve.SPEND_CAP_USD` |
-| High-tier monthly budget | 0 by default, disabled | `serve.HIGH_TIER_MONTHLY_BUDGET_USD` |
+| High-tier monthly budget | $5 by default; 0 disables | `serve.HIGH_TIER_MONTHLY_BUDGET_USD` |
 
 ## 2. Operating model
 
@@ -110,7 +205,7 @@ The operating model has five properties:
 | Scrum master | A designated team facilitator | Runs refinement, breakdown, retrospective, and escalation ceremonies. Required at team size 4 or more. |
 | Worker | A non-admin, non-director agent | Does room work, reviews peers, files requests and reports. |
 | Critic reviewer | The first reviewer on a peer gate | Instructed to prove the work wrong, not to rubber-stamp it. |
-| Verifier | A director, admin, or the player acting on evidence claims | Clears or blocks claims and flips coverage. Rate capped when acting as an agent. |
+| Verifier | The player, or a director/admin agent | Clears or blocks evidence claims and flips coverage. A worker or ordinary key holder cannot verify. Agent verifiers are capped at 12 flips per 6 hours; the player is not capped. |
 | Winter team | A second team created by the adversarial village | Works the same goal as main, independently. |
 | Operator | The human running the deployment | Same person as the owner in normal use. Configures policy JSON, budgets, and integrations. |
 
@@ -253,6 +348,7 @@ Owner request
 | BP-61 | Governed policy knob edits | Agent calls the governed `policy_edit` tool | Per edit | JEV quorum, owner revert | Applied policy key + answer |
 | BP-62 | Cross-team card responses | Owning team changes a filed card | Per transition | Owning team | Mail to the reporter |
 | BP-63 | Speed tie-break in tier picks | Tier re-pick or price watch | 2h refresh, 30m watch | Serve | Updated tier pick, latency samples |
+| BP-64 | Photo review | Owner upload or album watch | On demand or 30s watch | Owner, vision tier | Photo note in Library, reviewed manifest |
 
 ## 4. Core delivery processes
 
@@ -416,7 +512,10 @@ in an active sprint.
 **Close.**
 
 - The sprint auto-closes when every item is done and every gated item is
-  peer-approved.
+  peer-approved. A non-gated lane (spike, bug, research, meeting) counts as
+  done when its task status is `done`. A sprint made only of non-gated items
+  therefore closes as soon as those tasks finish; it does not wait for a
+  peer gate that will never exist.
 - `close_sprint` records landed, total, percent, rolled-over count, points
   landed, points total, and elapsed time.
 - The velocity record is appended to a rolling window capped at 20.
@@ -485,10 +584,29 @@ rotation, direct route.
 5. The result is applied:
    - success -> deliverable or review result
    - failure -> send-back, retry, or failed card
+   - unchanged repeat failure -> blocked for manual attention
+   - transient coding transport failure -> retry with the saved workspace
    - budget exhaustion -> failed card plus director notice
    - timeout -> grace, then failure
 6. Completion may file a follow-up, free a spike week, emit signals, update
    morale, and note completed rooms.
+7. Completion recovery observes every unfinished story. It records a delivery
+   state and next action, then, when enabled, makes at most 3 bounded recovery
+   attempts with exponential backoff. A scrum master staffs an investigation
+   spike when the cause is unknown; its report becomes the repair rationale.
+   Missing inputs, a spent story budget, or repeated no-progress attempts block
+   the story for a human decision instead of retrying forever.
+8. Coding runs in an isolated `story-*` workspace. Only validated staged
+   changes are published and committed to the story branch. The quality
+   pipeline runs as a background job when long, and its result is reused only
+   when the workspace digest, step set, and runtime version are unchanged.
+9. A coding model transport failure is not a code defect. It retries up to 3
+   times with the preserved workspace and a bounded backoff, then blocks with
+   `transport_retry_limit`.
+10. Coding turns also carry Python delivery rules, structured-edit guidance,
+    and a bounded read-only Library access loop (12 requests, 10 MiB per copy).
+    A valid repair checkpoint is forked into the new story workspace; the old
+    workspace is not modified.
 
 **Executor families.**
 
@@ -507,10 +625,14 @@ rotation, direct route.
 | Spike | Time-boxed investigation with a tool loop |
 
 **Controls.** Content timeout and grace, work budget, task budget, tier gate,
-sandbox isolation, tool allowlist, JEV command gate.
+sandbox isolation, tool allowlist, JEV command gate, staged-workspace publish,
+quality-result reuse keyed to the tree, completion recovery cap and backoff,
+transport retry cap, unchanged-failure stop.
 
 **Records.** Task result, content run state, action log, spend ledger, decision
-tape.
+tape, `stagedWorkspace`, `previousWorkspace`, `sourceDigest`, `writtenPy`,
+`completionRecovery`, `transportRecovery`, `repeatWorkFailures`,
+`deliveryState`, `nextAction`, `investigationReport`.
 
 ### BP-09 Peer review
 
@@ -527,22 +649,41 @@ tape.
    author, never a duplicate.
 3. Reviewer 1 is the critic. Reviewer 2 keeps the standard skeptical frame.
 4. Each reviewer gets a mailbox request and a review task.
-5. The gate closes at 2 approvals, or 1 approval plus a 15-minute timeout.
+5. The gate closes only at 2 distinct clean approvals. There is no
+   one-vote timeout. After 15 minutes with one vote, the stuck-gate sweep
+   requests a fresh second reviewer instead of lowering the bar.
 6. A rejection sends the work back to the author as a fix task. The prior
    reviewer pair is preferred for the re-review.
 7. The cycle count carries across re-entries. At 8 cycles the gate freezes and
    escalates.
 8. A stuck gate sweep runs every 20 seconds. It re-picks a reachable reviewer
    pair. Re-picks are spaced by a 30-minute rescue cooldown.
+9. The review reads the filed Library document from its `libraryPath`. It does
+   not grade the author's description of a file that may not exist.
+10. For non-code lanes, deterministic artifact checks inspect every cited CSV
+    or notebook for existence, size, shape, duplicates, missing values, date
+    coverage, and the contract's required outputs.
+11. The citation gate compares every URL in the report with the parent task's
+    `sourceUrls` ledger, which is built from tool-discovered URLs. A cited URL
+    that was never discovered is a citation error. An empty ledger is not a
+    blanket allowance; it rejects every cited URL.
+12. Artifact errors and citation errors are written to `reviewDiagnostics`.
+    Either one makes the vote unclean and prevents a gate close. The review
+    contract is frozen and carried on the review task so a later edit to the
+    parent cannot move the acceptance bar.
 
 **Controls.** Reviewer selection rules, critic framing, approval threshold,
-timeout, cycle cap, stuck-gate sweep, reachability checks.
+two-vote threshold, cycle cap, stuck-gate sweep, second-vote rescue,
+reachability checks, filed-document read, artifact inspection, citation gate,
+frozen review contract.
 
-**Records.** `_peerGate`, review tasks, mailbox entries, action log.
+**Records.** `_peerGate`, review tasks, mailbox entries, action log,
+`reviewContract`, `reviewDiagnostics.artifactChecks`,
+`reviewDiagnostics.citationErrors`, `sourceUrls`.
 
-**Review note.** The timeout means one clean vote is enough after 15 minutes.
-On a quiet tank, that may become the normal path rather than the exception.
-Confirm this matches the intended quality bar.
+**Review note.** The one-vote timeout was removed on 2026-10-20. A quiet tank
+now gets a fresh second reviewer, not a lower bar. If no second reviewer can
+be reached, the gate stays open and the cycle cap escalates it.
 
 ### BP-10 Failure handling and send-back
 
@@ -565,14 +706,24 @@ Confirm this matches the intended quality bar.
    no coaching. The same work is requeued unchanged, assigned back to the
    author, at most 3 times; after that the gate freezes for manual attention
    and never auto-closes, because the pipeline never passed clean.
-7. Re-queue the fix. Re-arm the gate.
-8. Repeated cycles escalate rather than loop forever.
+7. A coding model transport failure retries with the saved workspace, not a
+   fresh tree, for at most 3 attempts with backoff. A spent story budget
+   blocks before a retry can be queued.
+8. Two failures with the same normalized message, evidence digest, and repair
+   plan are the same attempt even when a fresh task id was minted. The second
+   one stops at `blockedReason=unchanged_failure` instead of paying for a
+   third identical try.
+9. Re-queue the fix. Re-arm the gate. Fix instructions include the verified
+   failing requirements and up to four evidence-anchored repair stories.
+10. Repeated cycles escalate rather than loop forever.
 
 **Controls.** Four-bucket taxonomy, deterministic-first classification,
 fail-closed label, bounded ledger, review cycle cap, infra-retry lane
-(separate counter + freeze at cap), escalation.
+(separate counter + freeze at cap), transport retry cap, unchanged-failure
+signature stop, evidence-anchored repair instructions, escalation.
 
-**Records.** `failures.json`, feedback buffer, fix task, decision tape.
+**Records.** `failures.json`, feedback buffer, fix task, decision tape,
+`repeatWorkFailures`, `transportRecovery`, `reviewFailureKind`.
 
 ### BP-11 Completion, report, and feedback
 
@@ -978,11 +1129,11 @@ intent endpoint.
 3. The bug is assigned to the on-call.
 4. The team restores service.
 5. Before the card is counted closed, the restore must carry evidence: files
-   the fix landed in (`writtenPy`), an executor-supplied restore check, or a
-   Library artifact. A bare "fixed it" with none of those closes loud --
-   marked unverified, the on-call is told what was missing, and the
-   owning team's scrum master gets the same bounded escalation an abandoned
-   incident rides.
+   the fix landed in (`writtenPy`, the executor's file inventory), a restore
+   check paired with the command that produced it, or a Library artifact. A
+   bare "fixed it" or a restore note with no command closes loud -- marked
+   unverified, the on-call is told what was missing, and the owning team's
+   scrum master gets the same bounded escalation an abandoned incident rides.
 6. An open incident past the restore window escalates to the product team's
    scrum master.
 7. Bugs are not peer-gated. They complete directly.
@@ -995,7 +1146,8 @@ window, escalation, restore-evidence close probe.
 action log.
 
 **Review note.** Incidents skip the peer gate; the close probe (step 5)
-answers the verification gap mechanically at close time.
+answers the verification gap mechanically at close time. A restore note is
+only evidence when the command that produced it is attached.
 
 ### BP-32 Page probes, screenshots, and browser act
 
@@ -1004,17 +1156,51 @@ answers the verification gap mechanically at close time.
 **Steps.**
 
 1. Screenshot: fetch a URL through the SSRF-gated path and capture an image.
+   The headless browser is pinned to a dead proxy, so DNS blocking cannot be
+   bypassed by an IP literal or loopback address.
 2. Page probe: open a page in a controlled browser, apply wait and action
-   options, capture the result.
-3. Browser act: run a scripted browser action inside a sandbox. Inputs and
-   credentials are validated. The result and screenshot stay in the sandbox
-   mount.
-4. External content is wrapped before it reaches a model.
+   options, capture the result. The result is capped at 20,000 characters and
+   100 global keys so one evaluate cannot stall the server.
+3. Browser act: run one scripted action inside a sandbox. The operator is
+   authenticated as the agent, never as a body-supplied `agentId`.
+4. Social pages are tried logged out first. A public group or profile that
+   renders without a session is read without spending a credential.
+5. If a social page is genuinely gated, the agent requests a need-based
+   read-only handle for the task (BP-50). Social hosts refuse `fill`, `click`,
+   and `submit` entirely. `login` is allowed only on a login, checkpoint, or
+   challenge path, and every username and password field must name a scoped
+   credential handle. Literal secrets are refused.
+6. The login entry URL must be on the same site as the target. Facebook and
+   Instagram sibling hosts are allowed; arbitrary redirect targets are not.
+7. Each agent has its own persistent Chromium profile. Before a Facebook or
+   Instagram run, the server reads Safari's current cookie file only when
+   `SAFARI_COOKIE_CONSENT=1` and the agent is named in `SAFARI_COOKIE_AGENTS`.
+   It filters to that social domain, writes a `0600` seed into the agent
+   profile, and the driver applies it on launch. A fresh Safari session is
+   therefore used on the next run without a manual export. Consent is
+   per-agent, not a fleet-wide grant.
+8. If a CAPTCHA is detected, the server crops the screenshot to the union of
+   the reported challenge rectangles plus 24 pixels. No rectangle means no
+   image is sent. Auto-attempt is off by default. It runs only when the
+   operator sets `CAPTCHA_AUTO_ATTEMPT=1`, the host policy is `attempt`, the
+   request is new, and vision confidence is at least
+   `CAPTCHA_AUTO_CONFIDENCE` (default 0.95). Interactive challenges always go
+   to the owner. Without a usable crop, the owner gets a text notice with the
+   page URL.
+9. Stored CAPTCHA answers are cleared when the request is solved, failed, or
+   expires.
+10. External content is wrapped before it reaches a model.
 
 **Controls.** SSRF host check, redirect re-check, allowlist, credential
-validation, sandbox isolation, timeout, prompt-injection wrapper.
+validation, per-agent profile isolation, consent-scoped Safari cookie sync,
+social read-only policy, same-site login entry, task-scoped handle, CAPTCHA
+crop and confidence floor, answer clearing, dead-proxy screenshot isolation,
+bounded probe result, CAPTCHA auto-attempt opt-in, sandbox isolation, timeout,
+prompt-injection wrapper.
 
-**Records.** Result file, screenshot path, action log, decision tape.
+**Records.** Result file, screenshot path, action log, decision tape,
+`safari-cookies.json`, `captcha_requests`, capability handle, cropped relay
+status (`imageCropped`, `noticeSent`).
 
 ### BP-33 Device check-in
 
@@ -1036,8 +1222,10 @@ redesigned.
 3. `record_device_checkin` stores the entry: `None` values are dropped, the
    entry is stamped with `receivedAt`, `last` is replaced, and the entry is
    appended to a bounded history. The cap is `deviceCheckinHistoryMax`
-   (default 50, operator-settable 1 to 10,000) because the bucket lives in
-   the hot state blob and must never grow unbounded.
+   (default 50, operator-settable 1 to 1,000). Entries older than
+   `deviceCheckinRetentionDays` (default 30, range 1 to 365) are pruned on
+   every check-in. The bucket lives in the hot state blob, so both bounds are
+   enforced together.
 4. The endpoint is not gated by dormancy, and it does not wake a dormant
    tank either: it is pure telemetry, in the non-waking write set (BP-59). A
    check-in lands while the tank sleeps and the tank stays asleep.
@@ -1135,7 +1323,8 @@ failed (never suppresses the next attempt)
 4. A short link with no resolved URL becomes `unresolved:<hash>`, marked not
    resolved, with an open question. It is never a verified source.
 5. Coverage is marked `pending_review`, not covered.
-6. A Verifier reviews the claim:
+6. A Verifier reviews the claim. The Verifier is the player, or a roster
+   director/admin agent; a worker or ordinary key holder cannot verify:
    - `usable_as_written` or `usable_with_narrower_wording` clears the claim and
      flips its identity to covered.
    - `blocked_until_checked` blocks the claim and never marks coverage.
@@ -1147,11 +1336,17 @@ failed (never suppresses the next attempt)
 10. Every mutation appends an immutable audit row.
 11. Recurring runs search from the last successful run minus 24 hours, so a
     late discovery is not missed.
+12. Research and spike runs record `sourceUrls`: the resolved URLs and every
+    visited frontier page. The review citation gate compares the report's URLs
+    with this ledger. A URL that no tool discovered is never accepted as
+    supporting evidence, even when it looks plausible.
 
 **Controls.** Resolved identity, repost dedup, review gate, role gate, rate cap,
-immutable audit, overlap window, failure never suppresses.
+immutable audit, overlap window, failure never suppresses, discovered-URL
+citation ledger.
 
-**Records.** `evidence_records`, `coverage_ledger`, `evidence_audit`.
+**Records.** `evidence_records`, `coverage_ledger`, `evidence_audit`,
+`sourceUrls`, `reviewDiagnostics.citationErrors`.
 
 ### BP-37 Research desk passes
 
@@ -1195,6 +1390,9 @@ immutable audit, overlap window, failure never suppresses.
   Emptying the trash is never grantable.
 - Notes: existing notes are read-only. An agent may create a note, or modify
   and delete a note it created. Ownership is tracked per note.
+- Current operator state: the Notes app-control grant is revoked
+  (`appGrants` is empty). A read-only grant remains for the Notes SQLite store.
+  App control needs a fresh owner grant.
 
 **Controls.** Village scope, grant capability, containment, trash rule, Notes
 ownership, player-only grant API.
@@ -1305,11 +1503,20 @@ filter, redaction, consolidation cap, TTL.
 6. A refused call fails closed. There is no bypass from inside the tank.
 7. The spend cap baseline is stored in the ledger, so spend from before the cap
    was set does not count.
+8. Every ledger mutator holds one re-entrant write lock. Two concurrent calls
+   cannot both read the ledger, add their cost, and lose one result to the last
+   writer.
+9. The shared dollar cap counts service buckets only. Village, agent, director,
+   task, Colab-unit, and high-tier rollup buckets are attribution dimensions and
+   never double-count the same call.
+10. The high tier reports its own monthly cap, not the generic service default.
+    The day series uses the UTC date so a local-midnight rollover cannot distort
+    the forecast.
 
-**Controls.** Single accrual point, per-service cap, baseline, fail-closed gates,
-forecast.
+**Controls.** Single accrual point, serialized read-modify-write, per-service
+cap, rollup exclusion, baseline, fail-closed gates, UTC forecast.
 
-**Records.** `kv_spend`, per-day series, task spend.
+**Records.** `kv_spend`, per-day series, task spend, high-tier rollup.
 
 ### BP-43 Model tier selection
 
@@ -1327,10 +1534,12 @@ forecast.
 **Selection logic.**
 
 1. Keep only models with a cited benchmark score.
-2. Keep models within 6 points of the best score.
+2. Keep models within `model_bands.json` `quality_floor_gap.default`
+   (default 6) of the best score. A band-specific gap overrides it.
 3. Pick the cheapest qualifying model.
 4. Verify with a real test call before writing the tier.
-5. The high band also enforces a price ceiling and a monthly budget.
+5. The high band also enforces a price ceiling and a monthly budget. The
+   budget defaults to $5; 0 disables it only by explicit operator choice.
 6. The sub-low band enforces a hard price ceiling.
 
 **Per-call gate.**
@@ -1349,10 +1558,21 @@ availability error on a live call queues an out-of-band re-pick that drains
 within a minute, so the band lands on a working model without waiting for
 either cadence.
 
-**Controls.** Cited scores, quality floor, cheapest pick, test call, price
-ceilings, monthly cap, JEV gate, fail-closed.
+**Fallback chain.** Each refresh stores three ranked alternates per band in
+`model_tier_fallbacks`: in-floor qualifiers first, then a quality-first fill
+for coding and high, and a price-first fill for low, mid, and sub-low. When a
+live call fails with an availability error, the same request retries down that
+band's list immediately, up to two fallback levels. A fallback is only tried
+after a real failure; the first successful answer is its proof. JEV is
+excluded because the catalog has no comparable decision model at its price
+point. A one-shot boot backfill fills the table if it is empty.
 
-**Records.** `model_tiers`, `model_benchmark_scores`, decision tape.
+**Controls.** Cited scores, quality floor, cheapest pick, test call, price
+ceilings, monthly cap, JEV gate, fail-closed, ranked fallback depth, circuit
+breaker.
+
+**Records.** `model_tiers`, `model_tier_fallbacks`,
+`model_benchmark_scores`, decision tape, `tier_model_fallback` action.
 
 ### BP-44 Experiment grants
 
@@ -1498,23 +1718,25 @@ visible.
 **Steps.**
 
 1. The agent files a needs-input request on an issue.
-2. The owning team's director reviews it after a short gate (8 seconds).
-3. Verdict:
+2. The first issue occupies `_pendingPlayerAsk`. Later issues wait in
+   `_pendingPlayerAskBacklog` and are promoted in order when the current ask
+   resolves. Nothing is silently overwritten.
+3. The owning team's director reviews the head ask after a short gate
+   (8 seconds).
+4. Verdict:
    - `resolve_internally`: drop the block, unblock the agent, file `blocked=false`.
    - `ask_player`: deliver a player-inbox message, block the agent, file
      `blocked=true`.
-4. The agent waits. It is not abandoned.
-5. The owner answers. The agent unblocks.
-6. A terminal issue status supersedes the ask and frees the worker.
+5. The agent waits. It is not abandoned.
+6. The owner answers. The agent unblocks, and the next backlog ask becomes
+   current.
+7. A terminal issue status supersedes the ask and frees the worker.
 
-**Controls.** Director gate, one ask per issue, terminal-status supersede.
+**Controls.** Director gate, per-issue dedup, FIFO backlog, 20-ask cap,
+overflow logged as `player_ask_dropped`, terminal-status supersede.
 
-**Records.** `_pendingPlayerAsk`, `playerInbox`, issue `blocked` and
-`needsInput`.
-
-**Review note.** `_pendingPlayerAsk` is a single slot. A second issue's ask
-replaces the first pending ask. Confirm that serialization is intended, or add a
-queue.
+**Records.** `_pendingPlayerAsk`, `_pendingPlayerAskBacklog`, `playerInbox`,
+issue `blocked` and `needsInput`, `player_ask_dropped` action.
 
 ### BP-50 Credential vault and capability handles
 
@@ -1523,24 +1745,65 @@ queue.
 **Credential lifecycle.**
 
 1. An agent proposes a credential with name, service, kind, and value.
-2. A director, admin, or the player approves or denies.
+2. A director, admin, or the player approves or denies. Tank-account code,
+   grant, rotate, and delete actions are player-only.
 3. Approved credentials are encrypted with Fernet and stored.
-4. Removed credentials become unusable immediately.
+4. Removed credentials become unusable immediately. Removing a credential also
+   voids every handle that points at it.
+5. `world/credential_access.json` controls need-based access. It names the
+   auto-grant services, their hosts and methods, and the read-only hosts. A
+   missing or corrupt file grants nothing. An empty `autoGrant` is a
+   deliberate revocation, not a cue to restore shipped defaults.
+
+**Need-based access.**
+
+1. An agent names one service, one purpose, and one task. The task must be
+   active and assigned to that agent.
+2. The task text must reference the service or one of its hosts. An agent
+   cannot enumerate the vault or ask for a credential its work does not
+   mention.
+3. The service must be an active login credential. The server mints a handle
+   scoped to the configured hosts, methods, and TTL. The response contains the
+   handle, never the secret.
+4. Requests for the same active task are idempotent and return the same live
+   handle. One agent holds one live handle per credential; a new need replaces
+   the prior one.
 
 **Handle lifecycle.**
 
 1. A handle is minted for one agent, one credential, one purpose, allowed hosts,
    allowed methods, and an expiry.
-2. The agent presents the handle.
-3. The server resolves it, checks host and method, decrypts the secret in
-   process, and injects it into the outbound request.
+2. The agent presents the handle. The server resolves it, checks agent, host,
+   method, and expiry, decrypts the secret in process, and injects it into the
+   outbound request or login field.
+3. Social login fields must use a handle. The agent supplies the selector and
+   `username` or `password`, never a literal value.
 4. Expired handles are swept. Handles are revoked when the agent is fired or the
    story closes.
 
-**Controls.** Approval gate, encryption, scoped handle, host and method
-allowlist, expiry, revocation.
+**Tank-owned TOTP accounts.**
 
-**Records.** `external_credentials`, `capability_handles`, action log.
+1. The tank creates an account record with service, account, username,
+   password, TOTP secret, and recovery codes. Secrets are sealed in the same
+   Fernet vault under `tank_account:<id>`; the metadata table holds no secret.
+2. TOTP secrets accept a base32 secret or a full `otpauth://` URI. Missing
+   values are generated.
+3. Only the owner may request a code, grant code access, rotate the secret, or
+   delete the account.
+4. The owner mints a single-use grant for one account and one agent, with a
+   60 to 900 second TTL. The agent redeems it for the current code. The grant
+   is consumed once.
+5. Codes are short-lived, never logged, and never returned to an agent outside
+   a live grant.
+
+**Controls.** Approval gate, encryption, fail-closed access config, active-task
+binding, task-text need check, scoped handle, host and method allowlist, one
+live handle per agent and credential, expiry, revocation, handle-only social
+login fields, player-only TOTP actions, single-use code grants.
+
+**Records.** `external_credentials`, `capability_handles`,
+`tank_accounts`, `tank_account_grants`, action log,
+`credential_access.json`, `credential_access_granted` decision.
 
 ### BP-51 API service proposals
 
@@ -1577,7 +1840,24 @@ approval.
 
 - Dual-homed network: one isolated net, one egress net.
 - Egress passes through a proxy restricted to allowlisted hosts.
-- Per-task egress grants are written for the sandbox.
+- Per-task egress grants are written for the sandbox and revoked after the
+  action. A target host named in a player-authored task can skip JEV, but never
+  the SSRF or proxy gate.
+
+**Social browser.**
+
+- Each agent has its own Chromium profile. A shared profile would let one
+  agent read every other agent's authenticated session.
+- Facebook and Instagram runs refresh a `safari-cookies.json` seed from the
+  operator's Safari cookie file before the browser starts. The seed is limited
+  to the target social domain, written `0600` inside the `0700` profile, and
+  only copied when `SAFARI_COOKIE_CONSENT=1` AND the agent is named in
+  `SAFARI_COOKIE_AGENTS`. `BROWSER_SAFARI_COOKIE_SYNC=0` disables it
+  altogether.
+- A social page is read logged out first. A login is a last resort on a gated
+  page, uses a task-scoped handle, and is restricted to an auth path.
+- Social hosts are read-only after login: `fill`, `click`, and `submit` are
+  refused, and `goto`/`read`/`screenshot` must carry the real page URL.
 
 **VPN.**
 
@@ -1586,9 +1866,48 @@ approval.
 - Status polling and exit inventory are operator-visible.
 
 **Controls.** SSRF, redirect re-check, category policy, allowlist, JEV, isolated
-network, egress proxy, VPN conflict check.
+network, egress proxy, temporary egress grants, per-agent browser profile,
+Safari cookie sync, read-only social policy, VPN conflict check.
 
-**Records.** `browse_policy.json`, egress grants, action log, decision tape.
+**Records.** `browse_policy.json`, egress grants, action log, decision tape,
+`safari-cookies.json`, browser profile directory.
+
+### BP-52.1 Owner-identity data and retention
+
+**Purpose.** Name every process that handles the owner's identity or personal
+media, and state the consent basis and retention rule instead of leaving it
+implicit.
+
+| Data | Consent and scope | Retention | Revocation |
+|---|---|---|---|
+| Safari cookie seed | Owner sets `SAFARI_COOKIE_CONSENT=1` and names the agents in `SAFARI_COOKIE_AGENTS`; only `facebook.com` and `instagram.com` cookies are copied | Overwritten on every browser run; no backup | Delete `safari-cookies.json`, remove the agent from the allowlist, or set `BROWSER_SAFARI_COOKIE_SYNC=0` |
+| Photo review image | Owner upload, owner session, or `PHOTO_REVIEW_KEY`; agent keys are refused | Images and notes are pruned after `PHOTO_REVIEW_RETENTION_DAYS` (default 30); the manifest stays as a dedup record | Delete the note and manifest, rotate or remove `PHOTO_REVIEW_KEY` |
+| CAPTCHA crop | Owner receives the challenge crop; the full authenticated page is never sent | No image retained; `captcha_requests` keeps status and relay state | Clear the request row |
+| Device check-in | Owner or a configured device poster; treated as telemetry, not a work request | Stored under the operator-set cap and pruned after `deviceCheckinRetentionDays` (default 30) | Clear the device rows or lower the cap |
+| Tank account secret | Owner creates and grants access; agents receive a single-use code grant, never the secret | Encrypted vault row until deleted | Delete the account or rotate the secret |
+
+**Rules.**
+
+- The Safari seed is a live owner session. It is not a service credential and
+  it is not shared across agent profiles.
+- Photo review is owner-scoped. A director or admin agent key cannot trigger
+  it.
+- The vision provider receives only the selected image and fixed prompt. Its
+  own retention policy is outside this tank's control; the owner accepts that
+  when enabling the lane.
+- Photo-review images and text notes are pruned after
+  `PHOTO_REVIEW_RETENTION_DAYS`. The review manifest is kept so a deleted photo
+  is not reviewed again; it carries IDs and status, not image bytes.
+- `PHOTO_REVIEW_KEY` is rotated by `POST /api/photo-review/key`, which returns
+  the new key once and writes it to `.env`. `DELETE /api/photo-review/key`
+  disables the Shortcut credential.
+
+**Controls.** Owner-only photo auth, host-limited cookie seed, per-agent
+profile, temporary image conversion, no CAPTCHA image persistence, encrypted
+tank secrets, explicit revoke paths.
+
+**Records.** `safari-cookies.json`, `photo-reviews/`, `captcha_requests`,
+device check-ins, `tank_accounts`.
 
 ### BP-53 File and app grants
 
@@ -1642,12 +1961,14 @@ argue its way into a scope; it can only ask the owner for a wider grant.
 
 1. Wrap all external content with a nonce and HMAC boundary marker.
 2. Mark whether the work context is trusted.
-3. Verify the boundary downstream.
+3. The model-call chokepoint verifies every complete wrapped block before the
+   request leaves the process. A mismatch refuses the call instead of relying
+   on each caller to remember the check.
 4. A broken boundary is treated as untrusted input.
 
-**Controls.** Nonce, HMAC, verification, trust flag.
+**Controls.** Nonce, HMAC, chokepoint verification, trust flag.
 
-**Records.** Wrapped content, verification result.
+**Records.** Wrapped content, verification result, refused-call action.
 
 ### BP-55 Audit, retention, and backups
 
@@ -1675,14 +1996,40 @@ argue its way into a scope; it can only ask the owner for a wider grant.
 - Newest 1 kept by default.
 - A failed backup never crashes the loop.
 
+**State integrity.**
+
+- `save_state_to_db` re-reads the current blob and merges archived tasks before
+  writing. A stale in-memory snapshot can no longer resurrect a done task as
+  live work.
+- Archived task rows are deep-copied before merge, so the archive cache and the
+  live blob never share mutable dicts.
+- `preserve_guidance` protects a terminal task row from a stale write that
+  lacks its completion marker.
+- Escalation prune uses replace mode, so a deleted escalation is not merged
+  back from disk.
+- Escalation saves hold one lock, merge a concurrent approved or denied
+  decision over an older pending copy, and write through a unique temp file
+  with fsync.
+- The mail send path takes the state writer and re-reads state after any early
+  commit, so a routing lane cannot write a stale task snapshot over the tick.
+- Theo policy writes use a re-entrant lock and a process-and-thread-unique temp
+  file. An approved action is consumed once, not reused for a week.
+- Pipeline execution holds a per-sandbox lock, caps a run at 64 steps, and caps
+  concurrent jobs at 256.
+- Runtime schema creation runs on the uvicorn lifespan path as well as the
+  `__main__` path.
+
 **Controls.** Retention window, prune cap, hash chain, archive distillation,
-backup prune, session expiry.
+backup prune, session expiry, stale-save merge, terminal-row protection,
+deep-copy archive merge, replace-mode prune, locked atomic escalation and
+policy writes, concurrent-decision merge, one-shot approval, pipeline caps and
+locks, runtime schema ensure.
 
-**Records.** Log tables, archive, backup files.
+**Records.** Log tables, archive, backup files, `kv_state`, `self_edit_log`,
+`dormancy_windows`, `captcha_requests`, `tank_accounts`.
 
-**Review note.** The design document says backups run every 5 minutes and keep
-24. The code runs hourly and keeps 1. Confirm which policy is intended before
-relying on the backup window.
+**Review note.** `DESIGN.md` now matches the code: hourly backups, newest 1
+kept. The retention value remains operator-settable in `operator_policy.json`.
 
 ### BP-56 Health monitoring
 
@@ -1849,10 +2196,11 @@ with `--max-idle-minutes`.
 
 1. Proposal contract (everything in `world/selfedit.py`, with its docstring
    as the contract). The agent proposes a find/replace splice on one file
-   under `world/`. Protected names are refused outright: `serve.py` and
-   every `BUSINESS-PROCESSES.md` in the repo, and the audit tiers below
-   add a hard test-gate refusal plus a player-signature tier. No path
-   escapes the repository, and `config.py` is refused in v1 (see step 3).
+   under `world/`. Every `BUSINESS-PROCESSES.md` in the repo is refused
+   outright. `serve.py` is not refused: it is a signed kernel edit with its
+   own preflight, restart, and watchdog (below). The audit tiers add a hard
+   test-gate refusal plus a player-signature tier. No path escapes the
+   repository, and `config.py` is allowed through the Phase 2 reload chain.
 2. Mechanical checks come first: the result must compile, and the find text
    must appear in the file exactly once. A rejected proposal never touches
    the file tree.
@@ -1865,8 +2213,9 @@ with `--max-idle-minutes`.
    config-import block, so a config.py edit IS allowed, Phase 2,
    2026-10-18).
 4. Review gate: the same three-judge JEV quorum the tank uses for
-   consequential choices decides the proposal from its summary. A reject,
-   or a review transport failure, fails closed.
+   consequential choices decides the proposal from the summary AND the exact
+   find/replace splice. The reviewer does not see only a summary. A reject, or
+   a review transport failure, fails closed.
 5. Validator gate: a subprocess quarantine copies the tree and runs
    compileall, flake8 on the changed file, and an import smoke of the
    changed module. A broken candidate cannot reach this step's copy.
@@ -1884,6 +2233,23 @@ with `--max-idle-minutes`.
 8. The tank sleeps through TWO paths: operator idle (`--max-idle-minutes`,
    BP-59), or an approved one-shot dormancy window (step 9). Both end with
    the same wake rule: the next request flips the tank awake.
+
+**Signed kernel edits (`serve.py`).** The HTTP kernel cannot be
+importlib-reloaded because uvicorn owns `app`, so a kernel edit is a gated
+deploy:
+
+1. The proposal passes the same stage, JEV review, and quarantine validation
+   as any other edit. Flake8 is waived only for the kernel's deliberate
+   import block.
+2. On a dormant window, the candidate is written and the full repo test gate
+   runs against the live tree.
+3. On success, the server `os.execv`s the same launch command. A detached
+   watchdog polls `/api/health`; if the new process does not answer within
+   120 seconds, it restores the pre-edit bytes and relaunches.
+4. A preflight or exec failure restores in place and mails the proposer. A
+   revert also restarts the process rather than reloading it.
+5. `selfedit_read` accepts a query and context so a 30k-line kernel can be
+   inspected at an anchor without loading the whole file.
 
 **Dormancy windows (the change-request process).** An agent requests a
 one-shot slot -- a date, an `HH:MM` start at least 5 minutes ahead, and a
@@ -1983,18 +2349,19 @@ what agents may edit and read, layered on the constant protected names
    scripts): refused outright for edits AND fixes, with no approval path.
    An edit that could rewrite its own acceptance bar proves nothing, so no
    quorum review can legitimize it.
-2. Tier B -- oversight-enforcement files (`jev.py`, `selfedit.py`,
-   `notify.py`, `theo_policy.py`, `sublow.py`, `jev_grants.py`, `bank.py`,
-   `budget.py`): they pass the normal gates, but arm only after a
-   floor-1.0 'oversight self-edit' escalation the PLAYER signs. Approve
-   arms the waiting edit; deny refuses it. Enforcement code is exactly
-   what a corner-cutting agent would want to weaken quietly.
+2. Tier B -- oversight-enforcement files (`serve.py`, `jev.py`,
+   `selfedit.py`, `notify.py`, `theo_policy.py`, `sublow.py`,
+   `jev_grants.py`, `bank.py`, `budget.py`): they pass the normal gates, but
+   arm only after a floor-1.0 'oversight self-edit' escalation the PLAYER
+   signs. Approve arms the waiting edit; deny refuses it. Enforcement code is
+   exactly what a corner-cutting agent would want to weaken quietly.
 3. Reads -- `selfedit_read` gives bounded read access mirroring the write
    rule, with a SMALLER surface: the full listing and one-file heads (up
-   to 48 KB with sha256) for the editable world modules, but `serve.py`,
-   `BUSINESS-PROCESSES.md`, the Tier B files, and the test gate stay
-   closed. Exact anchors make proposals better; reading the gates or the
-   enforcement internals is what gaming would target first.
+   to 48 KB with sha256) for the editable world modules, but
+   `BUSINESS-PROCESSES.md`, the Tier A test gate, and the Tier B internals
+   stay closed. Exact anchors make proposals better; reading the gates or
+   the enforcement internals is what gaming would target first. `serve.py`
+   is inspectable only through the bounded query/context path.
 
 **Revert.** Only the player session or the admin agent may revert an
 APPLIED edit: the pre-edit bytes are restored, the module is re-imported,
@@ -2025,7 +2392,7 @@ dormancy. The superset design lives in the selfedit.py docstring.
 
 ### BP-61 Governed policy knob edits
 
-One of the 107 operator-policy knobs is DATA, not code: the player and the
+One of the 108 operator-policy knobs is DATA, not code: the player and the
 agents share it, and changing it never needs a restart or a dormancy
 window.
 
@@ -2038,12 +2405,14 @@ window.
    (2026-10-18), all 24 former serve.py statics are policy keys, and the
    loops that consume them read the live value every iteration, so a
    rebind lands on the next sleep.
-3. Allowlist. `config.AGENT_EDITABLE_POLICY_KEYS` names the 19 keys an
+3. Allowlist. `config.AGENT_EDITABLE_POLICY_KEYS` names the 18 keys an
    agent may propose (tier/mine/memory/browse/peer-review cadences and
    thresholds). The DB/log hygiene keys stay operator-only to keep the
-   audit trail's retention shape out of agent hands; the allowlist lives
-   in self-editable code, so the tank can widen it through the normal
-   pipeline.
+   audit trail's retention shape out of agent hands. Safety-adjacent keys
+   also stay player-only: `config.PLAYER_ONLY_POLICY_KEYS` currently holds
+   `tierGateMinConfidence`. An agent that wants one of those keys must
+   escalate to the player; the policy lane must not have less authority
+   than a code edit to the same gate.
 4. Review. One `policy_edit` call proposes one key, one value, one reason.
    The same JEV quorum that reviews code splices judges the change
    (approve / reject / escalate). Refuse, unknown key, out-of-range
@@ -2134,8 +2503,12 @@ price-watch cycle reads the latest per-model observed latency.
    plain cheapest-first order. The walk still live-verifies and returns
    the first candidate that answers.
 4. Boundaries. The quality floor and the price rank never move: latency
-   only reorders near-price equals. A band with no latency data anywhere
-   picks exactly as before.
+   only reorders near-price equals. Only the high-frequency bands `low` and
+   `coding` participate; `mid`, `vision`, `high`, and `sublow` keep plain
+   cheapest-first order because their samples go stale inside the 7-day
+   window. A band with no latency data anywhere picks exactly as before. The
+   6-point global gap is `quality_floor_gap.default` in `model_bands.json`, not
+   a hidden constant; `high` keeps its 2-point override.
 5. Mirror. The 30-minute price watch compares the current pick against the
    pick policy's first candidate (the same reorder), so a within-parity
    speed pick is not misread as a perpetually available cheaper qualifier
@@ -2155,6 +2528,53 @@ than the cheapest in-floor qualifier), the row also carries
 `median_latency_ms` and `latency_samples`; `speed_picked` is 1 only for
 those picks, so absence stays honest.
 
+### BP-64 Photo review
+
+**Purpose.** Turn a photo the owner took into a grounded text note, either on
+demand or only for new additions to one iPhone album.
+
+**Trigger.** The owner uploads a photo through `/api/photo-review`, posts from
+an iPhone Shortcut with `X-Photo-Key`, requests an album review, or the album
+watch loop runs.
+
+**On-demand steps.**
+
+1. Accept a bounded JPEG/PNG upload or a Photos album name. Only the owner
+   session or the purpose-scoped `PHOTO_REVIEW_KEY` may call it. Agent keys,
+   including director keys, are refused.
+2. For an album, read the macOS Photos SQLite library read-only. Resolve the
+   album title exactly first, then case-insensitively. Read only non-hidden,
+   non-trashed image assets, newest-added first.
+3. Cloud-only assets are reported as not local and never guessed at. Convert
+   downloaded originals to a bounded JPEG with `sips`.
+4. Send the image to the vision tier with a fixed prompt: subject, visible
+   details, exact legible text, and concrete uses. No speculation.
+5. Write one note under `photo-reviews/<project>/`, append a manifest entry,
+   and log the review. A failed vision call is retried a bounded number of
+   times, then recorded as an error.
+
+**Album watch.**
+
+1. The owner enables one album. The first start marks every current asset as
+   `baseline` (seen, not reviewed), so only later additions are processed.
+2. A 30-second loop reads the album and reviews up to 3 pending assets per
+   tick. A tick with nothing new costs one read-only SQLite query and no model
+   call.
+3. `baseline` and `done` entries are final. `waiting-local` is rechecked each
+   tick without a model call. `error` retries up to 3 attempts.
+4. `action=baseline` re-baselines the current album; `action=stop` disables the
+   watcher. Watch status reports pending count, last check, last review, and
+   last error.
+
+**Controls.** Read-only Photos access, album title normalization, hidden and
+trashed exclusion, cloud-only honesty, bounded image size, vision-only note,
+manifest dedup, baseline semantics, 30-second watch, 3-photo batch, bounded
+retries, owner or `X-Photo-Key` auth, one review lock, 30-day media retention,
+one-shot key rotation.
+
+**Records.** Library note and manifest under `photo-reviews/`, watch setting
+`photo_album_watch`, action log, `PHOTO_REVIEW_RETENTION_DAYS` prune log.
+
 ## 11. Player and operator processes
 
 | Process | Surface | What the owner does |
@@ -2166,7 +2586,7 @@ those picks, so absence stays honest.
 | Answer agent asks | Player inbox | Answer a blocked agent's question |
 | Rate delivered work | Player inbox | 1 to 5 stars and a comment on a card report |
 | Set policy | `world/*.json` | Edit plain writing, browse policy, research desk passes, watchlist |
-| Set operator policy | `world/operator_policy.json`, settings | Tune the 107 policy knobs, including every former serve.py static (cadences, thresholds, caps) |
+| Set operator policy | `world/operator_policy.json`, settings | Tune the 108 policy knobs, including every former serve.py static (cadences, thresholds, caps) |
 | Reload policy | `POST /api/policy/reload` | Reload operator policy without a restart |
 | Set budgets | `.env`, settings | Spend cap, high-tier cap, page budget, agent cap |
 | Switch models | Settings | JEV model and judge model |
@@ -2178,6 +2598,8 @@ those picks, so absence stays honest.
 | Inspect health | Health UI, digest | Read alerts and the periodic digest |
 | Inspect decisions | Decision verify endpoint | Verify the tape chain |
 | Probe pages | Page probe | Inspect a live page before trusting it |
+| Refresh social session | Safari, Ada browser profile | Log into Facebook or Instagram in Safari; the next browser run syncs the cookies |
+| Approve social credential use | `world/credential_access.json`, task text | Keep auto-grant services explicit; the agent must name the service in its active task |
 | Manage experiments | Grant endpoints | Mint, quote, revoke sub-low or JEV grants |
 | Back up and restore | Backup files | Use the newest snapshot |
 
@@ -2193,14 +2615,18 @@ those picks, so absence stays honest.
 | Per-task budget | Runaway task | Ceiling hit -> failed card and director note | Task record |
 | Per-service cap | Service overspend | Cap hit -> service gate refuses | Bank view |
 | Tier gate | Expensive model use | Low confidence -> low tier | Decision tape |
+| Tier fallback | A delisted model stops work | Availability error -> next ranked model | `model_tier_fallbacks` |
 | High-tier monthly cap | Expensive model use | Cap hit -> mid tier | Spend ledger |
 | Peer gate | Deliverable quality | Reject -> fix task and re-review | Peer gate record |
 | Review cycle cap | Infinite review loops | 8 cycles -> freeze and escalate | Gate record |
+| Artifact inspection | Cited files that do not exist or do not meet shape | Error -> unclean vote | `reviewDiagnostics.artifactChecks` |
+| Citation gate | Invented report URLs | URL not in discovered ledger -> unclean vote | `reviewDiagnostics.citationErrors` |
+| Frozen review contract | Moving the acceptance bar after work starts | Contract travels with the review | `reviewContract` |
 | Evidence review | False claims | Unreviewed -> not covered | Evidence and coverage ledgers |
 | Verifier cap | Compromised reviewer | Cap hit -> player must review | Audit table |
 | Claim audit | History tampering | Insert-only rows | Evidence audit |
 | Decision tape chain | Decision tampering | Mismatch or break detected | Verify endpoint |
-| Prompt boundary | Prompt injection | Broken boundary -> untrusted | Wrapper result |
+| Prompt boundary | Prompt injection | Broken boundary -> untrusted; model call refused | Wrapper result, action log |
 | SSRF and redirect gate | Network abuse | Unsafe host -> blocked | Action log |
 | Command gate | Host damage | Unsafe command -> block and escalate | Decision tape |
 | Egress proxy | Sandbox escape | Host not allowlisted -> blocked | Egress grants |
@@ -2209,6 +2635,18 @@ those picks, so absence stays honest.
 | Notes ownership | Data loss | Other owner's note -> refused | Note registry |
 | Credential vault | Secret leakage | Agent never sees the secret | Handle record |
 | Capability scope | Confused deputy | Wrong host or method -> refused | Handle record |
+| Credential access config | Silent default grants | Missing or corrupt file -> no grants | `credential_access.json` |
+| Social read-only | Accidental posting or form submission | Fill, click, submit -> refused | Action log |
+| Browser profile isolation | Cross-agent session reading | Profile per agent | Profile directory |
+| Safari cookie sync | Stale social session | Fresh Safari cookies before each run | `safari-cookies.json` |
+| CAPTCHA crop | Over-sharing authenticated page content | No challenge rect -> no image | `imageCropped`, `noticeSent` |
+| Photo watch baseline | Re-reviewing an existing album | First start marks current assets seen | `photo_album_watch` baseline |
+| Bounded photo review | Runaway vision spend | 3 per tick, 3 retries, cloud-only skipped | Photo manifest |
+| Stale-save merge | Resurrecting completed work | Archived and terminal rows win | `kv_state` merge |
+| One-shot approval | Replaying an old approval | Approved -> used | Theo approval record |
+| Pipeline cap and lock | Resource exhaustion and workspace races | More than 64 steps or 256 jobs -> refused | Pipeline response |
+| Spend ledger lock | Lost concurrent spend | Mutators serialize; rollups excluded | `kv_spend` |
+| Kernel edit watchdog | A broken `serve.py` deploy | No health reply in 120s -> restore and relaunch | Kernel watchdog, `self_edit_log` |
 | Backup | Data loss | Backup failure -> logged, loop continues | Backup files |
 | Retention prune | Unbounded growth | Old rows pruned, tape archived first | Log tables |
 | Health alerts | Silent failure | New alert -> push | Health alerts |
@@ -2236,6 +2674,13 @@ those picks, so absence stays honest.
 | `evidence_audit` | Immutable claim and coverage mutations | Forever |
 | `external_credentials` | Encrypted service credentials | Until removed |
 | `capability_handles` | Scoped handles for credentials | Until expiry or revoke |
+| `captcha_requests` | Challenge, page URL, status, cropped relay state | Until solved, failed, or expired |
+| `tank_accounts` | TOTP account metadata | Until deleted |
+| `tank_account_grants` | Single-use owner grants for one account and agent | Until used or expired |
+| `model_tier_fallbacks` | Ranked alternate models per band | Until next refresh |
+| `self_edit_log` | Self-edit proposals, applies, reverts | Forever |
+| `dormancy_windows` | Requested and applied change windows | Forever |
+| `model_latency_samples` | Observed model call latency | Rolling window |
 | `sms_messages` | Inbound SMS inbox | Until consumed |
 | `health_alerts` | Persisted health alerts | Dedup window |
 | `stm_sessions`, `stm_messages` | Conversation short-term memory | TTL |
@@ -2289,6 +2734,13 @@ status.
 | `enteredMs` | When the gate opened |
 | `cycleCount` | Total review and fix cycles across re-entries |
 | `escalated` | Frozen after the cap |
+| `reviewContract` | Frozen instructions and acceptance criteria |
+| `sourceUrls` | Tool-discovered URL ledger used by the citation gate |
+| `reviewDiagnostics` | Artifact checks and citation errors |
+
+Task records also carry `completionRecovery`, `transportRecovery`,
+`repeatWorkFailures`, `deliveryState`, `nextAction`, `stagedWorkspace`,
+`previousWorkspace`, and `sourceDigest` when those lanes run.
 
 ## 14. Cadence and SLA table
 
@@ -2296,6 +2748,9 @@ status.
 |---|---|---|---|
 | Movement | 1s | Simulation | Walk and arrive |
 | Task cycle | 6s | Simulation | One read-modify-write pass |
+| Completion recovery | 6s | Simulation | Observe, then bounded repair with backoff |
+| Safari cookie sync | Per browser run | Wall | Facebook and Instagram only; fresh Safari seed |
+| Photo album watch | 30s | Wall | One album, 3 pending assets per tick |
 | Peer help signals | 90s | Wall | Signal to the worker's director; no report |
 | Director approvals | 30s | Wall | Delegable escalations |
 | Health snapshot | 300s | Wall | Alerts and digest |
@@ -2323,7 +2778,7 @@ status.
 | Stale work sweep | 20s | Wall | Requeue, then scrum master replan |
 | Stuck gate sweep | 20s | Wall | Re-pick reachable reviewers |
 | Coaching catch-up | Daily | Wall | 3-round cap |
-| Peer review timeout | 15 min after 1 vote | Simulation | Gate closes |
+| Peer review timeout | 15 min after 1 vote | Simulation | Fresh second reviewer requested |
 | Escalation re-ask | 15 min cooldown, 6 asks | Wall | Then human |
 | Verifier coverage cap | 12 flips per 6h | Wall | Agent verifiers |
 
@@ -2349,32 +2804,37 @@ status.
 | Write wiki | Yes | Yes | Proposal only | Per key |
 | Review evidence | Yes | Director/admin | No | No |
 | Mark coverage reviewed | Yes | No | No | No |
+| Request need-based credential | Yes | Yes | Assigned task only | Per key |
+| Read social page | Yes | Yes | Read-only via handle | Per key |
+| Manage tank accounts | Yes | No | No | No |
+| Review photos | Yes | No | No | Photo key only |
 
 ## 16. Improvement candidates
 
 These are observations from reading the implementation. They are not defects.
-Each one is a question for the process review.
+Process-section "Review note" items are consolidated here by number. A note in
+a BP section is a pointer, not a second decision record. Each item is a question
+for the process review.
 
 ### Start here
 
 If the review reads only three items, read these. They decide whether the
 quality gates mean what this document says they mean:
 
-1. Item 5: the one-vote peer-gate timeout.
-2. Item 4: bugs and spikes close with no review.
-3. Item 2: the single-slot player ask.
+1. Item 4: bugs and spikes close with no review.
+2. Item 3: single-slot hiring and firing.
+3. Item 6: human-only escalation aging.
 
 The remaining items are real but lower stakes, or are operator preferences
 rather than gate-integrity questions.
 
-1. **Action item: correct `DESIGN.md`.** The code is the source of truth, so
-   `DESIGN.md` moves, not the code. Fix four numbers: backups are hourly and
-   keep 1 snapshot, not every 5 minutes keeping 24; the model refresh runs
-   every 2 hours, not daily; the high-tier monthly budget defaults to 0
-   (disabled), not $5; the spend cap defaults to $50, not $5.
-2. **Single-slot player asks.** `_pendingPlayerAsk` holds one issue. A second
-   issue's ask replaces the first. If concurrent blockers are possible, this
-   drops a question. Consider a queue keyed by issue.
+1. **`DESIGN.md` numbers (closed 2026-10-20).** `DESIGN.md` now says backups
+   are hourly and keep 1, the model refresh runs every 2 hours, the high-tier
+   monthly budget defaults to $5, and the spend cap defaults to $50. No action
+   remains.
+2. **Player-ask backlog (closed 2026-10-20).** The single slot is now a FIFO
+   backlog capped at 20. A second issue waits instead of replacing the first.
+   Overflow is logged as `player_ask_dropped`.
 3. **Single-slot hiring and firing.** Only one pending hire, one onboarding, and
    one firing review exist at a time. This paces governance, but it also means a
    burst of need waits. Decide whether throughput or pacing is the goal.
@@ -2382,9 +2842,9 @@ rather than gate-integrity questions.
    meeting lanes skip the peer gate. Research has the evidence review instead.
    Bugs and spikes have no review. Confirm whether incident fixes should close
    without a post-fix check.
-5. **One-vote timeout.** After 15 minutes, one clean vote closes the gate. On a
-   quiet tank this may be the normal path. If the quality bar needs two votes,
-   the timeout policy should say so.
+5. **One-vote timeout (closed 2026-10-20).** The code now requires two
+   approvals. After 15 minutes with one vote, the stuck-gate sweep requests a
+   fresh second reviewer. The gate stays open if none is reachable.
 6. **Human-only escalation backlog.** Floor-1.0 kinds wait for the owner with no
    time-based SLA. The queue is visible in the escalation file, but not in a
    dedicated aging report. Add an aging view if these can sit.
@@ -2426,6 +2886,19 @@ rather than gate-integrity questions.
     score on the table in exchange for a 2x to 20x price cut. That trade is
     the owner's call per band, not a global constant. Expose the gap as an
     operator-settable knob, the same way the price ceilings already are.
+16. **Safari cookie sync is macOS-only.** The sync reads a macOS Safari binary
+    cookie file. A Linux or Windows operator has no equivalent seed path, and a
+    Safari session that expires still needs a manual refresh. Decide whether a
+    second browser-session import path is needed.
+17. **Cookie seed is a live session.** The sync writes a `0600` JSON file into a
+    `0700` browser profile. That is the same sensitivity as the browser's own
+    session store. If profiles are ever backed up or copied between hosts,
+    treat the seed as a credential.
+18. **Citation ledger completeness.** The citation gate trusts `sourceUrls`.
+    If a legitimately allowed URL never entered the ledger because a tool
+    returned it indirectly, the report is rejected. The safe failure is a
+    rejection, but the review should check that the tool ledger captures every
+    URL the report is allowed to cite.
 
 ## 17. Appendix A: glossary
 
@@ -2438,7 +2911,10 @@ rather than gate-integrity questions.
 | Breakdown | Ceremony that turns a large ask into sized work |
 | Card | A work-queue item or task, in UI language |
 | Charter | Owner-set goal and interests that steer room priority |
+| Artifact check | Deterministic inspection of a cited Library file |
+| Citation gate | Rejection of report URLs absent from the discovered-URL ledger |
 | Claim | One evidence record with a source and status |
+| Completion recovery | Bounded observation and repair of unfinished stories |
 | Coverage | Whether a source has been reviewed and counted as covered |
 | Critic | First peer reviewer, instructed to find the flaw |
 | Decision tape | Hash-chained record of JEV decisions |
@@ -2451,6 +2927,11 @@ rather than gate-integrity questions.
 | Passport | Story-level provenance chain |
 | Peer gate | Two-reviewer approval gate for deliverables |
 | Player inbox | Owner-facing messages, including card reports and asks |
+| Read-only social | Facebook/Instagram access that permits login and reading but refuses fill, click, and submit |
+| Safari cookie seed | Fresh Facebook or Instagram cookies copied from Safari into an agent browser profile |
+| Transport retry | Bounded retry of a transient model connection, preserving the workspace |
+| Photo review | Vision note for one owner photo or one Photos album |
+| Kernel edit | A signed `serve.py` change that deploys through restart and watchdog |
 | Refinement | Grooming requests into stories |
 | Sprint | Bounded delivery window with measured velocity |
 | Standing task | Declared recurring work with schedule rules |
@@ -2467,7 +2948,7 @@ rather than gate-integrity questions.
 | `OPENROUTER_API_KEY` | `.env` | Required |
 | `SPEND_CAP_USD` | `.env` | 50 |
 | `AGENT_SPEND_CAP_USD` | `.env` | 0, disabled |
-| `HIGH_TIER_MONTHLY_BUDGET_USD` | `.env` | 0, disabled |
+| `HIGH_TIER_MONTHLY_BUDGET_USD` | `.env` | 5; 0 explicitly disables the cap |
 | `HIGH_TIER_MAX_PRICE_USD` | `.env` | Price ceiling |
 | `SUBLOW_TIER_MAX_PRICE_USD` | `.env` | Hard cap |
 | `PAGE_REQUEST_MONTHLY_BUDGET` | `.env` | 1000 |
@@ -2480,7 +2961,7 @@ rather than gate-integrity questions.
 | `SCRUM_MASTER_MIN_TEAM_SIZE` | `world/operator_policy.json` | 4 |
 | `MAX_TOTAL_AGENTS` | `world/sim.py` | 500 |
 | `MAX_REVIEW_CYCLES` | `world/operator_policy.json` | 8 |
-| `PEER_REVIEW_TIMEOUT_MS` | `world/sim.py` | 15 minutes |
+| `PEER_REVIEW_TIMEOUT_MS` | `world/sim.py` | 15 minutes; triggers a second reviewer, never a one-vote close |
 | `REPORT_STRIKE_WINDOW_MS` | `world/operator_policy.json` | 14 days |
 | `HIRE_COOLDOWN_MS` | `world/operator_policy.json` | 45 seconds |
 | `FIRING_COOLDOWN_MS` | `world/operator_policy.json` | 60 seconds |
@@ -2498,15 +2979,34 @@ rather than gate-integrity questions.
 | `STM_MAX_TURNS`, `STM_MAX_TOKENS` | `.env` | Memory budgets |
 | `LTM_MAX_RECALL`, `LTM_MAX_PER_SESSION` | `.env` | Memory caps |
 | `FILE_ACCESS_ENABLED` | `.env` | Local file tool |
+| `BROWSER_PROFILE_DIR` | `.env` | Per-agent Chromium profiles; default `world/.browser-profiles/social` |
+| `BROWSER_SAFARI_COOKIE_SYNC` | `.env` | `1`; `0` disables Facebook and Instagram cookie sync |
+| `SAFARI_COOKIE_CONSENT` | `.env` | Must be `1`; no default consent |
+| `SAFARI_COOKIE_AGENTS` | `.env` | Comma-separated agent ids; empty means no agent |
+| `SAFARI_COOKIES_PATH` | `.env` | Override for `~/Library/Cookies/Cookies.binarycookies` |
+| Credential access switchboard | `world/credential_access.json` | Need-based read-only service access; fail-closed on missing or corrupt file |
+| `APPLE_PHOTOS_LIBRARY` | `.env` | Override for `~/Pictures/Photos Library.photoslibrary` |
+| `CAPTCHA_AUTO_ATTEMPT` | `.env` | `0` by default; `1` opts into vision auto-attempt |
+| `CAPTCHA_AUTO_CONFIDENCE` | `.env` | 0.95 floor when auto-attempt is enabled |
+| `PHOTO_REVIEW_KEY` | `.env` | Purpose-scoped key for an iPhone Shortcut; rotate with `POST /api/photo-review/key` |
+| `PHOTO_REVIEW_RETENTION_DAYS` | `.env` | 30 days for photo-review images and notes |
+| `PHOTO_WATCH_INTERVAL_S` | `world/serve.py` | 30 seconds |
+| `PHOTO_WATCH_BATCH` | `world/serve.py` | 3 assets per tick |
+| `PHOTO_REVIEW_MAX_ATTEMPTS` | `world/serve.py` | 3 vision attempts |
 | `BROWSE_BLOCK_CATEGORIES` | `world/browse_policy.json` | Always-block policy |
 | `PLAIN_WRITING_BAN_LIST` | `world/plain_writing.json` | Anti-slop words |
 | `RESEARCH_DESK_PASSES` | `world/research_desk.json` | Three-pass questions |
 | `RESEARCH_WATCHLIST` | `world/watchlist.json` | Standing topics |
-| Operator policy knobs | `world/operator_policy.json` | 107 knobs: cadences, cooldowns, team rules, memory and device knobs, and every former serve.py static (Phase 3, 2026-10-18) |
-| Agent policy edits | `policy_edit` tool | Agents tune the 19 agent-editable keys through a JEV-reviewed key/value change; effective immediately, no restart; the player reverts by editing the JSON |
+| Operator policy knobs | `world/operator_policy.json` | 108 knobs: cadences, cooldowns, team rules, memory and device knobs, and every former serve.py static (Phase 3, 2026-10-18) |
+| Agent policy edits | `policy_edit` tool | Agents tune the 18 agent-editable keys through a JEV-reviewed key/value change; safety-adjacent keys are player-only; effective immediately, no restart; the player reverts by editing the JSON |
 | `GRANTS_CONFIG` | `world/grants.json` | App and file grants; applies live on file change |
-| `DEVICE_API_KEY` | `.env` | Device check-in bearer; auto-generated on first boot if unset |
+| `DEVICE_API_KEY` | `.env` | Device check-in bearer; auto-generated on first boot if unset, retrievable and rotatable at `/api/device/key` |
+| `deviceCheckinHistoryMax` | `world/operator_policy.json` | 50, range 1 to 1,000 |
+| `deviceCheckinRetentionDays` | `world/operator_policy.json` | 30 days, range 1 to 365 |
 | `--max-idle-minutes` | launch flag | Dormancy arm; 0 or unset disables |
+| Pipeline step cap | `world/serve.py` | 64 steps per run |
+| Pipeline job cap | `world/serve.py` | 256 concurrent jobs |
+| Transport ceiling | `world/runtime_limits.py` | 3,600 seconds |
 
 ## 19. Appendix C: process to code map
 
@@ -2519,9 +3019,9 @@ rather than gate-integrity questions.
 | BP-05 | `sim.spawn_new_team_for_request` |
 | BP-06 | `sim.queue_sprint`, `sprint_progress`, `close_sprint` |
 | BP-07 | `sim.pick_next_due_index`, `_assign_due_item`, `on_call_agent` |
-| BP-08 | `sim._task_cycle`, `content._server_content_dispatcher` |
-| BP-09 | `sim._enter_peer_review`, `_peer_gate_should_close`, `_sweep_stuck_gates` |
-| BP-10 | `serve._classify_failure`, `_record_failure`, `sim._send_back_after_failure` |
+| BP-08 | `sim._task_cycle`, `content._server_content_dispatcher`, `code_workspaces`, `staged_work`, `work_reuse`, `completion_watchdog`, `transport_recovery`, `repeat_work` |
+| BP-09 | `sim._enter_peer_review`, `_peer_gate_should_close`, `_sweep_stuck_gates`, `review_quality.artifact_checks`, `url_evidence.citation_errors` |
+| BP-10 | `serve._classify_failure`, `_record_failure`, `sim._send_back_after_failure`, `repeat_work`, `transport_recovery`, `review_quality.clean_vote_errors` |
 | BP-11 | `sim.finish_task`, `_deliver_card_report`, `serve` feedback endpoint |
 | BP-12 | `sim.create_product`, `product_release_record`, `content._run_product_build_content` |
 | BP-13 | `sim._roadmap_step` |
@@ -2543,11 +3043,11 @@ rather than gate-integrity questions.
 | BP-29 | `sim.queue_once`, `serve.intent_schedule_once` |
 | BP-30 | `sim._check_schedules`, `content._run_skill_review_content`, `_run_distill_content` |
 | BP-31 | `sim.queue_bug`, `on_call_agent`, `_escalation_step` |
-| BP-32 | `serve.page_probe`, `_screenshot_url_sync`, `_run_browser_act_sync` |
+| BP-32 | `serve.page_probe`, `_screenshot_url_sync`, `_run_browser_act_sync`, `_sync_safari_cookies`, `captcha._captcha_crop_b64`, `sandbox/browser_driver.py` |
 | BP-33 | `serve` device check-in endpoint, `sim.record_device_checkin` |
 | BP-34 | `sim.wiki_write_page`, `wiki_read_pages`, `serve.propose_wiki_page`, `approve_wiki_proposal` |
 | BP-35 | `sim.record_memory_provenance` |
-| BP-36 | `evidence.py`, `serve` evidence endpoints |
+| BP-36 | `evidence.py`, `url_evidence.py`, `serve` evidence endpoints, `content._run_research_content` |
 | BP-37 | `content._run_research_content`, `config.research_desk_passes` |
 | BP-38 | `serve` library endpoints, `fs.py` |
 | BP-39 | `content._make_skill_publisher`, `_build_skill_card` |
@@ -2558,15 +3058,15 @@ rather than gate-integrity questions.
 | BP-44 | `sublow.py`, `jev_grants.py` |
 | BP-45 | `bank._task_budget_*`, `sim._notify_task_budget_exhausted`, `_director_grant_budget_reopen` |
 | BP-46 | `serve._page_request_*` |
-| BP-47 | `serve._jev_quorum_choice_sync`, `_jev_choice` |
+| BP-47 | `jev.py`, `serve._jev_quorum_choice_sync`, `_jev_choice` |
 | BP-48 | `serve._resolve_pending_escalations_sync`, `_escalation_floor` |
 | BP-49 | `sim.request_player_input`, `request_player_input_verdict`, `resolve_player_ask` |
-| BP-50 | `serve` credential endpoints, `mint_capability_handle`, `resolve_capability_handle` |
+| BP-50 | `serve` credential endpoints, `mint_capability_handle`, `resolve_capability_handle`, `config._load_credential_access`, `tank_accounts.py`, `totp.py` |
 | BP-51 | `serve._validate_api_service_spec`, `_approve_api_service_proposal` |
-| BP-52 | `serve` browse, curl, execute, egress, VPN code |
+| BP-52 | `serve` browse, curl, execute, egress, VPN code, `_browser_profile_dir`, `_sync_safari_cookies` |
 | BP-53 | `serve` grant endpoints, `config.get_grants_config`, `world/grants.json` |
 | BP-54 | `serve.wrap_external_content`, `verify_boundary_intact` |
-| BP-55 | `serve._prune_logs`, `_backup_loop`, `_verify_decision_tape` |
+| BP-55 | `serve._prune_logs`, `_backup_loop`, `_verify_decision_tape`, `save_state_to_db`, `state_updates.preserve_guidance`, `theo_policy.TheoPolicy` |
 | BP-56 | `serve.compute_health_snapshot`, `_health_check_loop` |
 | BP-57 | `serve` player feedback endpoint, `sim._append_feedback` |
 | BP-58 | `serve._peer_review_pass`, `_peer_review_tick` |
@@ -2575,6 +3075,7 @@ rather than gate-integrity questions.
 | BP-61 | `config` operator policy loaders (`bind_policy`, `AGENT_EDITABLE_POLICY_KEYS`), `serve` policy_edit tool case in the tool loop |
 | BP-62 | `sim._mail_card_update`, `sim.set_issue_status`, groom-loop mail hooks |
 | BP-63 | `serve._record_model_latency`, `serve._model_median_latency_ms`, `serve._speed_tie_order`, `serve._best_value_pick` |
+| BP-64 | `apple_photos.py`, `serve._photo_review_from_image`, `_review_album_batch_sync`, `_photo_album_watch_loop`, photo review endpoints |
 
 ## 20. Appendix D: review checklist
 
@@ -2590,5 +3091,14 @@ Use this list when reviewing the document and the process.
 - [ ] Every single-slot queue is intentional.
 - [ ] Every lane without peer review has another quality control.
 - [ ] Every budget stop has a recovery path.
+- [ ] Every report citation is checked against the discovered-URL ledger.
+- [ ] Every cited artifact is inspected, not trusted from prose.
+- [ ] Every state save protects archived and terminal task rows from stale data.
+- [ ] Every social browser run is read-only and uses a per-agent profile.
+- [ ] Every CAPTCHA relay image is cropped to the challenge rectangle.
+- [ ] Every credential access config failure grants nothing.
+- [ ] Every bounded retry has a stop and a manual-attention path.
+- [ ] Every kernel edit has a preflight, a post-restart health check, and a rollback.
+- [ ] Every photo watch has a baseline, a batch cap, and a retry cap.
 - [ ] Every doc statement matches the code or is marked as intent.
 - [ ] Every process has a measurable outcome.

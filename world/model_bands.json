@@ -45,6 +45,7 @@
     ]
   },
   "quality_floor_gap": {
+    "default": 6,
     "high": 2
   },
   "tier_gate_criteria": {

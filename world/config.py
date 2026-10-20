@@ -206,7 +206,7 @@ BAND_BENCHMARK_DEFAULT = {
     'coding': ('coding_index',),
     'vision': ('MMMU',),
 }
-BAND_QUALITY_FLOOR_GAP_DEFAULT = {'high': 2}
+BAND_QUALITY_FLOOR_GAP_DEFAULT = {'default': 6, 'high': 2}
 TIER_GATE_CRITERIA_DEFAULT = {
     'high': 'High-stakes, one-shot planning or decomposition where getting it wrong wastes every downstream step (e.g. breaking one large vague request into the subtasks everything else depends on).',
     'mid': 'Needs real multi-step reasoning or judgment: synthesis, classification, summarization of gathered material, a considered in-character reply. Routine but non-trivial thinking.',
@@ -792,6 +792,7 @@ OPERATOR_POLICY_DEFAULT: dict = {
     'minResearchCadenceMs': 5 * 60 * 1000,
     'minPipelineCadenceMs': 60 * 60 * 1000,
     'deviceCheckinHistoryMax': 50,
+    'deviceCheckinRetentionDays': 30,
     # Experiment grant caps (sublow.py; shared with jev_grants.py).
     'grantTtlDefaultS': 1800,
     'grantTtlMaxS': 86400,
@@ -914,7 +915,8 @@ _OPERATOR_SCHEMA: dict = {
     'feedbackMax': ('int', 1, 100),
     'minResearchCadenceMs': ('int', 0, 24 * 3600 * 1000),
     'minPipelineCadenceMs': ('int', 0, 7 * 24 * 3600 * 1000),
-    'deviceCheckinHistoryMax': ('int', 1, 10000),
+    'deviceCheckinHistoryMax': ('int', 1, 1000),
+    'deviceCheckinRetentionDays': ('int', 1, 365),
     'grantTtlDefaultS': ('int', 1, 86400),
     'grantTtlMaxS': ('int', 1, 7 * 86400),
     'grantTokensDefault': ('int', 1, 100000),
@@ -991,9 +993,16 @@ TEAM_CEILING_KEYS: frozenset = frozenset({
 # shape). The player keeps final authority either way: the JSON itself and
 # POST /api/policy/reload are untouched, so any agent change can simply be
 # reverted by editing the file.
+# Keys that shape a safety or quality gate stay player-only. An agent may
+# still propose them through an escalation, but not through policy_edit: a
+# reviewed threshold change must not have less authority than a code edit to
+# the same gate.
+PLAYER_ONLY_POLICY_KEYS: frozenset = frozenset({
+    'tierGateMinConfidence',
+})
 AGENT_EDITABLE_POLICY_KEYS: frozenset = frozenset({
     'modelTierRefreshIntervalS', 'tierPriceWatchIntervalS',
-    'tierRecheckCooldownS', 'tierGateMinConfidence',
+    'tierRecheckCooldownS',
     'failureMaxRecords', 'successMaxRecords', 'ruleProposalsMax',
     'successProposalsMax', 'ruleMinRecurrence', 'successMinRecurrence',
     'memoryMaxAgeDays', 'memoryDecayFactor', 'memoryKeepCount',

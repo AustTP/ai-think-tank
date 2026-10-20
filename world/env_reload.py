@@ -31,6 +31,7 @@ ENV_RELOAD_FIELDS = {
     'OPEN_SKY_CLIENT_SECRET': lambda e: e.get('OPEN_SKY_CLIENT_SECRET'),
     'AISSTREAM_API_KEY': lambda e: e.get('AISSTREAM_API_KEY'),
     'HF_TOKEN': lambda e: e.get('HF_TOKEN'),
+    'DEVICE_API_KEY': lambda e: e.get('DEVICE_API_KEY'),
     'SPEND_CAP_USD': lambda e: float(e.get('SPEND_CAP_USD', '50') or 0),
     'AGENT_SPEND_CAP_USD': lambda e: float(e.get('AGENT_SPEND_CAP_USD', '0') or 0),
     'OPENROUTER_MONTHLY_BUDGET_USD': lambda e: float(e.get('OPENROUTER_MONTHLY_BUDGET_USD', '0') or 0),

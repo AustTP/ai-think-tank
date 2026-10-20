@@ -60,7 +60,8 @@ class Phase3Iso(unittest.TestCase):
         self.assertLessEqual(config.AGENT_EDITABLE_POLICY_KEYS,
                              set(config._OPERATOR_SCHEMA))
         self.assertEqual(
-            config.AGENT_EDITABLE_POLICY_KEYS, PHASE3_KEYS - HYGIENE_KEYS)
+            config.AGENT_EDITABLE_POLICY_KEYS,
+            PHASE3_KEYS - HYGIENE_KEYS - config.PLAYER_ONLY_POLICY_KEYS)
 
 
 class _TempPolicyEdit(unittest.TestCase):
@@ -113,11 +114,15 @@ class GovernedFlow(_TempPolicyEdit, unittest.TestCase):
             'ag-x', 'maxTotalAgents', 10, 'because')
         self.assertFalse(ok)
         self.assertIn('operator-only', payload['error'])
+        ok, payload = serve._policy_edit_apply(
+            'ag-x', 'tierGateMinConfidence', 0.9, 'lower the gate')
+        self.assertFalse(ok)
+        self.assertIn('operator-only', payload['error'])
 
     def test_out_of_range_value_fails_closed(self):
         self._review()
         ok, payload = serve._policy_edit_apply(
-            'ag-x', 'tierGateMinConfidence', 2.0, 'looser floor')
+            'ag-x', 'memoryDecayFactor', 2.0, 'looser floor')
         self.assertFalse(ok)
         self.assertIn('must be a float between', payload['error'])
         ok, payload = serve._policy_edit_apply(
@@ -146,7 +151,7 @@ class GovernedFlow(_TempPolicyEdit, unittest.TestCase):
         with open(self._policy, encoding='utf-8') as fh:
             data = json.load(fh)
         self.assertIn('_notes', data)
-        self.assertEqual(len(data), 107)  # 107 shipped keys + none lost
+        self.assertEqual(len(data), 108)  # 108 shipped keys + none lost
         self.assertEqual(payload['value'], 7)
         self.assertEqual(payload['previous'], 20)
         # Every bound module rebinds without a restart.

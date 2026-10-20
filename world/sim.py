@@ -3600,6 +3600,7 @@ bind_policy(__name__, [
     ('MIN_RESEARCH_CADENCE_MS', 'minResearchCadenceMs'),
     ('MIN_PIPELINE_CADENCE_MS', 'minPipelineCadenceMs'),
     ('_DEVICE_CHECKIN_HISTORY_MAX', 'deviceCheckinHistoryMax'),
+    ('_DEVICE_CHECKIN_RETENTION_DAYS', 'deviceCheckinRetentionDays'),
 ])
 
 
@@ -3777,9 +3778,10 @@ def _carry_over_sprint_work(state, record, team_ids):
 def _auto_close_completed_sprints(state, now_ms=None):
     """Close any ACTIVE sprint whose entire body of work is done AND approved.
     'Done and approved' is exactly what sprint_progress counts as `done`: for a
-    peer-gated story that means 2 clean peer approvals (or 1 + timeout) have
-    closed its gate (_close_gated_story flips status to 'done' only on that),
-    and for a non-gated task it means finish_task completed it. So done == total
+    peer-gated story that means 2 clean peer approvals have closed its gate
+    (_close_gated_story flips status to 'done' only on that), and for a
+    non-gated task it means finish_task completed it. A sprint made only of
+    non-gated items closes as soon as those tasks finish. So done == total
     is the "fully completed and approved for the entire sprint" signal, and an
     active sprint at that point is automatically closed instead of waiting for
     the player to tap close. Returns the list of sprint ids closed."""
@@ -5215,6 +5217,7 @@ def add_pipeline(state, name, cadence_ms, steps, now_ms=None, depends_on_task=No
 
 
 _DEVICE_CHECKIN_HISTORY_MAX = 50  # bounded ring buffer -- no consumer yet, but never unbounded growth
+_DEVICE_CHECKIN_RETENTION_DAYS = 30
 
 
 def record_device_checkin(state, fields, now_ms=None):
@@ -5236,6 +5239,9 @@ def record_device_checkin(state, fields, now_ms=None):
     history.append(entry)
     if len(history) > _DEVICE_CHECKIN_HISTORY_MAX:
         del history[:-_DEVICE_CHECKIN_HISTORY_MAX]
+    cutoff = now_ms - max(1, _DEVICE_CHECKIN_RETENTION_DAYS) * 86400 * 1000
+    history[:] = [row for row in history
+                  if int(row.get('receivedAt') or 0) >= cutoff]
     return entry
 
 
@@ -6092,7 +6098,7 @@ def _resolve_meeting_attendees(state, attendees, team_id, facilitator_id=None):
 # 'done' when its primary work finishes -- it moves to 'needs_review' and waits
 # for TWO distinct same-team peers to approve it. Only rooms with real content
 # executors gate; chores complete directly.
-PEER_REVIEW_TIMEOUT_MS = 15 * 60 * 1000  # sim-ms: waiting window after which one clean vote suffices
+PEER_REVIEW_TIMEOUT_MS = 15 * 60 * 1000  # sim-ms: after one vote, request a fresh second reviewer
 # Phase E3.1: stuck-at-review watchdog. A gated story's reviewer pool is locked at
 # entry; the watchdog guarantees that pool stays capable of producing a vote (or
 # widens it), so a story can't deadlock on an unreachable/inert locked pair.
@@ -6658,16 +6664,13 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
 
 
 def _peer_gate_should_close(gate, now_ms, entered_ms):
-    """Close rule: two distinct clean approvals, OR -- after the review-timeout
-    window has elapsed -- a single clean approval. Guards against a small think tank
-    deadlocking on a second unreachable approver."""
+    """Close rule: two distinct clean approvals. The old single-vote timeout is
+    gone. A quiet tank gets a fresh second reviewer from the stuck-gate sweep
+    instead of lowering the bar. A gate with one vote stays open until the
+    second vote lands or the gate escalates."""
     if gate.get('escalated'):
         return False
-    if gate['approvals'] >= 2:
-        return True
-    if gate['approvals'] >= 1 and entered_ms and (now_ms - entered_ms) >= PEER_REVIEW_TIMEOUT_MS:
-        return True
-    return False
+    return gate['approvals'] >= 2
 
 
 def _note_completed_room(state, agent_id, task):
@@ -6820,6 +6823,47 @@ def _sweep_stuck_gates(state, now_ms):
         if now_ms - last < STUCK_GATE_RESCUE_REVIEW_TIMEOUT_MS:
             continue  # already rescued too recently -- bounded, no re-pick storm
         locked = gate.get('reviewerIds') or []
+        pending_reviews = [q for q in (state.get('workQueue') or [])
+                           if q.get('reviewOf') == task.get('id')]
+        # A gate with one clean vote needs a real second vote. If the timeout
+        # window has passed and no review is pending from someone other than
+        # the approver, re-queue one fresh review instead of lowering the bar.
+        approvals = int(gate.get('approvals') or 0)
+        approvers = set(gate.get('approvers') or [])
+        if (approvals == 1 and entered and
+                now_ms - entered >= PEER_REVIEW_TIMEOUT_MS):
+            pending_second = [q for q in pending_reviews
+                              if q.get('assignedTo') not in approvers]
+            if not pending_second:
+                last_second = gate.get('secondVoteRescueTs') or 0
+                if now_ms - last_second >= STUCK_GATE_RESCUE_REVIEW_TIMEOUT_MS:
+                    author = task.get('assignedTo')
+                    fresh = [rid for rid in _pick_reviewer_ids(
+                                 state, author, task_room=task.get('room'))
+                             if rid not in approvers and rid != author]
+                    for d in (state.get('agentRoster') or []):
+                        if fresh:
+                            break
+                        rid = d.get('id')
+                        if (not rid or d.get('isAdmin') or rid == author
+                                or rid in approvers):
+                            continue
+                        if _gate_reviewer_reachable(state, rid, gate, now_ms):
+                            fresh.append(rid)
+                    if fresh:
+                        if _reenter_gate_review(state, task, [fresh[0]]):
+                            gate['secondVoteRescueTs'] = now_ms
+                            try:
+                                from serve import log_action
+                                log_action(None, 'task_second_vote_requested',
+                                           {'taskId': task.get('id'),
+                                            'title': task.get('title'),
+                                            'reviewer': fresh[0],
+                                            'approvers': sorted(approvers)},
+                                           authorized=True)
+                            except Exception:
+                                pass
+            continue  # one-vote gate: never fall through to the widen path
         # Phase E3 recovery: a review that completed WITHOUT folding a vote (e.g.
         # under the old router it ran the research executor, or a content timeout
         # dropped it) leaves the gate with NO pending review to pin. The pair may
@@ -6828,8 +6872,6 @@ def _sweep_stuck_gates(state, now_ms):
         # "still advance" continue and the story sits in needs_review forever
         # with reviewedTaskIds growing and approvals stuck at 0. Detect that
         # exact state: reachable reviewers but NO pending reviewOf work item.
-        pending_reviews = [q for q in (state.get('workQueue') or [])
-                           if q.get('reviewOf') == task.get('id')]
         if not pending_reviews:
             if any(_gate_reviewer_reachable(state, rid, gate, now_ms) for rid in locked):
                 # Reviewers are free but the review work silently vanished
@@ -8857,13 +8899,18 @@ def _issue_director(state, issue_key):
     return t.get('directorId') if t else None
 
 
+PENDING_PLAYER_ASK_BACKLOG_MAX = 20
+
+
 def request_player_input(state, issue_key, agent_id, question, context=None,
                          now_ms=None):
     """Record that an agent wants the player's input on issue_key, but ONLY
-    surface it after the director gate. If no director-gate is already pending
-    for this issue, seeds `state['_pendingPlayerAsk']` (the sweep hands it to
-    the director). Returns the awaited inbox message id once the gate has run,
-    else None (gate still pending / issue unknown / issue already needsInput).
+    surface it after the director gate. The first issue occupies
+    `_pendingPlayerAsk`; later issues wait in `_pendingPlayerAskBacklog` and
+    are promoted in order when the current ask resolves. Nothing is silently
+    overwritten. The backlog is bounded, and an overflow is logged as a
+    dropped ask. Returns the awaited inbox message id once the gate has run,
+    else None (gate pending / issue unknown / issue already needsInput).
     Mutates state only -- the director sweep resolves the pending ask."""
     if _issue_director(state, issue_key) is None:
         return None
@@ -8873,17 +8920,34 @@ def request_player_input(state, issue_key, agent_id, question, context=None,
     if issue.get('needsInput'):
         return None  # already awaiting input -- don't double-ask
     now_ms = time.time() * 1000 if now_ms is None else now_ms
-    pending = state.setdefault('_pendingPlayerAsk', {})
-    if pending.get('issueKey') == issue_key:
-        return None
-    pending.update({
+    ask = {
         'issueKey': issue_key,
         'agentId': agent_id,
         'question': (question or '').strip(),
         'context': (context or ''),
         'at': now_ms,
         'directed': False,
-    })
+    }
+    pending = state.get('_pendingPlayerAsk') or {}
+    if pending.get('issueKey') == issue_key:
+        return None
+    backlog = state.setdefault('_pendingPlayerAskBacklog', [])
+    if any(item.get('issueKey') == issue_key for item in backlog):
+        return None
+    if not pending.get('issueKey'):
+        state['_pendingPlayerAsk'] = ask
+        return None
+    backlog.append(ask)
+    if len(backlog) > PENDING_PLAYER_ASK_BACKLOG_MAX:
+        dropped = backlog.pop(0)
+        try:
+            from serve import log_action
+            log_action(None, 'player_ask_dropped',
+                       {'issueKey': dropped.get('issueKey'),
+                        'agentId': dropped.get('agentId'),
+                        'reason': 'backlog_cap'}, authorized=False)
+        except Exception:
+            pass
     return None
 
 
@@ -8915,6 +8979,10 @@ def request_player_input_verdict(state, issue_key, decider=None):
     decider = decider or _player_ask_decider_default
     verdict = decider(state, issue_key, director_id, question, pend.get('context'))
     del state['_pendingPlayerAsk']
+    backlog = state.get('_pendingPlayerAskBacklog') or []
+    if backlog:
+        state['_pendingPlayerAsk'] = backlog.pop(0)
+        state['_pendingPlayerAskBacklog'] = backlog
     if verdict != 'ask_player':
         _unblock_agent(state, agent_id)
         _log_governance(state, director_id or agent_id, 'player_ask',
@@ -11651,8 +11719,11 @@ def _verify_incident_restore(state, task, result, now_ms):
         return
     files = result.get('writtenPy') or []
     check_note = (result.get('restoreCheck') or '').strip()
+    command = (result.get('command') or '').strip()
     artifact = bool(result.get('libraryPath'))
-    verified = bool(files) or bool(check_note) or artifact
+    # A restore note must be paired with the command that produced it. A bare
+    # note is self-attestation; files and a Library artifact are mechanical.
+    verified = bool(files) or (bool(check_note) and bool(command)) or artifact
     receipt = {
         'ok': verified,
         'ts': now_ms,

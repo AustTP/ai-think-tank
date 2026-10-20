@@ -175,6 +175,20 @@ def _captcha_state(page):
         return []
 
 
+def _apply_safari_cookies(ctx, profile_dir):
+    """Re-apply the host-side Safari cookie seed to this persistent profile."""
+    path = os.path.join(profile_dir, 'safari-cookies.json')
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path) as stream:
+            cookies = json.load(stream)
+        if isinstance(cookies, list) and cookies:
+            ctx.add_cookies(cookies)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
 def _page_state(page, max_text):
     """Snapshot of the live page: url/title, visible text, interactive form
     fields, links. Truncated so a huge page can't blow the sandbox stdout cap."""
@@ -191,6 +205,17 @@ def _page_state(page, max_text):
         text = page.evaluate('document.body ? document.body.innerText : ""') or ''
     except Exception:
         text = ''
+    if not text.strip():
+        # Facebook's app shell keeps the visible feed out of body.innerText on
+        # some builds even though each post is a real div[role=article]. Read
+        # those article nodes instead of falling back to body.textContent,
+        # which would dump megabytes of bootstrap scripts.
+        try:
+            text = page.evaluate(
+                "Array.from(document.querySelectorAll('div[role=article]'))"
+                ".map(a => a.innerText || '').filter(Boolean).join('\\n\\n')") or ''
+        except Exception:
+            text = ''
     text = text[:max_text]
     fields = []
     try:
@@ -263,6 +288,7 @@ def _launch(playwright, action):
                     'Chrome/131.0.0.0 Safari/537.36'),
         locale='en-US', timezone_id='America/New_York',
     )
+    _apply_safari_cookies(ctx, profile_dir)
     try:
         ctx.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")

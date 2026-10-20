@@ -338,7 +338,13 @@ class VerdictFolding(unittest.TestCase):
         self.assertTrue(all(rid != old for old in original for rid in re_gate['reviewerIds']),
                         'former reviewers dropped from the pool must not be re-picked')
 
-    def test_timeout_one_clean_vote_closes(self):
+    def test_should_close_requires_two_approvals_even_after_timeout(self):
+        self.assertFalse(sim._peer_gate_should_close(
+            {'approvals': 1, 'approvers': ['ada']}, 10**12, 1))
+        self.assertTrue(sim._peer_gate_should_close(
+            {'approvals': 2, 'approvers': ['ada', 'cora']}, 10**12, 1))
+
+    def test_timeout_one_clean_vote_stays_open(self):
         state, task = self._gated_state()
         sim._apply_content_result(state, {'id': 'r0', 'reviewOf': task['id'],
                                           'assignedTo': 'ada', 'taskType': 'review',
@@ -347,9 +353,9 @@ class VerdictFolding(unittest.TestCase):
                                    'evidence': '[flake8]\nno issues\n[pytest-cov]\nTOTAL 100%'})
         parent = state['tasks'][task['id']]
         now = parent['_peerGate']['enteredMs'] + sim.PEER_REVIEW_TIMEOUT_MS + 1
-        self.assertTrue(sim._parent_close_from_vote(state, parent, now_ms=now),
-                        'one clean vote + elapsed timeout closes')
-        self.assertEqual(parent['status'], 'done')
+        self.assertFalse(sim._parent_close_from_vote(state, parent, now_ms=now),
+                         'a timeout must not lower the two-vote bar')
+        self.assertNotEqual(parent['status'], 'done')
 
 
 class Integration(unittest.TestCase):

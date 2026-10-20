@@ -5,8 +5,11 @@ records the request, stores the owner's answer, and lets the broker fill that
 answer into the waiting page. It does not bypass an interactive challenge.
 
 Policy is per host and defaults to `relay`. `attempt` only means the server may
-try a vision read of a simple image CAPTCHA before asking the owner. Interactive
-challenges (reCAPTCHA, hCaptcha, Turnstile, Arkose) always go to the owner.
+try a vision read of a simple image CAPTCHA before asking the owner, and only
+when the operator has set `CAPTCHA_AUTO_ATTEMPT=1`. The default is off. The
+operator owns the terms-of-service and consent question for auto-attempting a
+site's challenge. Interactive challenges (reCAPTCHA, hCaptcha, Turnstile,
+Arkose) always go to the owner.
 """
 import secrets
 import time

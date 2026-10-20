@@ -119,5 +119,6 @@
   "youtubeTranscriptMaxSegments": 800,
   "agentDirSyncIntervalS": 15.0,
   "peerReviewMinLookbackS": 3600,
-  "peerReviewSignalStaleS": 21600
+  "peerReviewSignalStaleS": 21600,
+  "deviceCheckinRetentionDays": 30
 }

@@ -378,6 +378,24 @@ class PlayerInput(SimIsolation):
         state['_pendingPlayerAsk'] = {'issueKey': 'ISS-1', 'at': 0}
         self.assertIsNone(sim.request_player_input(state, 'ISS-1', 'ada', 'q'))
 
+    def test_request_player_input_queues_instead_of_overwriting(self):
+        # A second issue waits in the backlog; it is promoted when the first
+        # ask resolves, so no owner-facing question is silently discarded.
+        state = self._issue_state()
+        state['issues']['ISS-2'] = {'key': 'ISS-2', 'title': 'Second', 'summary': 's',
+                                    'teamId': 'team-1', 'type': 'story'}
+        with unittest.mock.patch.object(sim, '_issue_director',
+                                        return_value='dir-1'):
+            sim.request_player_input(state, 'ISS-1', 'ada', 'First?', now_ms=1_000)
+            sim.request_player_input(state, 'ISS-2', 'ada', 'Second?', now_ms=2_000)
+        self.assertEqual(state['_pendingPlayerAsk']['issueKey'], 'ISS-1')
+        self.assertEqual([a['issueKey'] for a in state['_pendingPlayerAskBacklog']],
+                         ['ISS-2'])
+        sim.request_player_input_verdict(state, 'ISS-1',
+                                         decider=lambda *a: 'resolve_internally')
+        self.assertEqual(state['_pendingPlayerAsk']['issueKey'], 'ISS-2')
+        self.assertEqual(state['_pendingPlayerAskBacklog'], [])
+
     def test_director_gate_not_due(self):
         # 6229/6230: no pending ask (issueKey mismatch) or an already-directed
         # ask -> not due.

@@ -120,6 +120,11 @@ class PhotoReviewAuthTest(unittest.TestCase):
             self.assertEqual(serve._photo_review_auth(self._request('wrong')),
                              (False, None))
 
+    def test_agent_director_is_refused_even_with_a_session(self):
+        with mock.patch.object(serve, '_operator_gate', return_value=(True, 'nora')):
+            self.assertEqual(serve._photo_review_auth(self._request()),
+                             (False, None))
+
     def test_missing_env_key_disables_the_shortcut_credential(self):
         with mock.patch.object(serve, '_operator_gate', return_value=(False, None)), \
              mock.patch.object(serve, '_load_env', return_value={}):
@@ -133,6 +138,44 @@ class PhotoReviewAuthTest(unittest.TestCase):
         with mock.patch.object(serve, 'LIBRARY_DIR', tmp):
             self.assertTrue(serve._save_photo_manifest({'Tagged::U1': '2026-10-18'}))
             self.assertEqual(serve._load_photo_manifest(), {'Tagged::U1': '2026-10-18'})
+
+
+class PhotoKeyRotationTest(unittest.TestCase):
+    def test_rotation_is_player_only(self):
+        import asyncio, json as _json
+        with mock.patch.object(serve, '_operator_gate', return_value=(True, 'nora')):
+            self.assertEqual(asyncio.run(serve.photo_review_key_rotate(None)).status_code, 403)
+        with mock.patch.object(serve, '_operator_gate', return_value=(True, 'player')), \
+             mock.patch.object(serve, '_set_env_keys') as set_env, \
+             mock.patch.object(serve, '_reload_env_config'), \
+             mock.patch.object(serve, 'log_action'):
+            r = asyncio.run(serve.photo_review_key_rotate(None))
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(_json.loads(r.body).get('key'))
+        set_env.assert_called_once()
+
+
+class PhotoRetentionTest(unittest.TestCase):
+    def test_prune_removes_only_files_older_than_the_window(self):
+        import os, tempfile, time
+        tmp = tempfile.mkdtemp(prefix='tt-photo-retention-')
+        self.addCleanup(__import__('shutil').rmtree, tmp, True)
+        root = os.path.join(tmp, 'photo-reviews', 'photos')
+        os.makedirs(root)
+        old = os.path.join(root, 'old.jpg')
+        new = os.path.join(root, 'new.txt')
+        manifest = os.path.join(tmp, 'photo-reviews', '.reviewed.json')
+        for path in (old, new, manifest):
+            with open(path, 'w') as f:
+                f.write('x')
+        os.utime(old, (time.time() - 90 * 86400,) * 2)
+        with mock.patch.object(serve, 'LIBRARY_DIR', tmp), \
+             mock.patch.object(serve, 'PHOTO_REVIEW_RETENTION_DAYS', 30), \
+             mock.patch.object(serve, 'log_action'):
+            self.assertEqual(serve._prune_photo_reviews_sync(), 1)
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(new))
+        self.assertTrue(os.path.exists(manifest))
 
 
 class PhotoWatchTest(unittest.TestCase):

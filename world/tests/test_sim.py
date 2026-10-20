@@ -2045,7 +2045,8 @@ class IncidentRestoreProbe(unittest.TestCase):
         state = self._state()
         task = self._bug()
         sim._apply_content_result(state, task,
-                                  {'ok': True, 'restoreCheck': 'reloaded the page, error gone'}, 1000)
+                                  {'ok': True, 'restoreCheck': 'reloaded the page, error gone',
+                                   'command': 'curl -fsS http://localhost/health'}, 1000)
         self.assertTrue(task['restoreVerified'])
         self.assertIn('error gone', task['restoreCheck']['evidence'])
         task2 = self._bug()

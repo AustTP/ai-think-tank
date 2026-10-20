@@ -268,7 +268,7 @@ on a reprive/delisted pick or a better-value qualifier). Selection within each b
 The high tier additionally enforces `HIGH_TIER_MAX_PRICE_USD` (default 0, the
 ceiling is off until you set it) —
 no model over the ceiling is even offered to the pool, regardless of its score.
-And `HIGH_TIER_MONTHLY_BUDGET_USD` (default 0, disabled) — once the month's high-tier
+And `HIGH_TIER_MONTHLY_BUDGET_USD` (default $5) — once the month's high-tier
 spend hits the cap, the JEV gate fails closed to mid. The sublow tier enforces
 `SUBLOW_TIER_MAX_PRICE_USD` (default $0.09/M, hard-on) — that ceiling is the
 band's definition, so a sublow pick can never drift up-market.
@@ -425,10 +425,11 @@ it's set. Once hit every real model call (JEV, chat, decide) fails closed.
 Baseline is stored in the spend ledger itself so pre-existing spend never
 counts.
 
-### High-tier monthly budget ($0 default, disabled)
+### High-tier monthly budget ($5 default)
 
 `HIGH_TIER_MONTHLY_BUDGET_USD` caps total high-tier model spend per calendar
-month. The JEV gate checks this before returning the high slug — once spent,
+month. The default is $5; set it to 0 only to disable the cap deliberately. The
+JEV gate checks this before returning the high slug — once spent,
 high requests are routed to mid. Accrual happens at the `/api/chat` choke
 point.
 

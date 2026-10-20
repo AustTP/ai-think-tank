@@ -56,6 +56,15 @@ class RecordDeviceCheckin(unittest.TestCase):
         self.assertEqual(st['deviceCheckins']['last'], entry)
         self.assertEqual(st['deviceCheckins']['history'], [entry])
 
+    def test_history_is_pruned_by_retention_days(self):
+        st = {}
+        sim.record_device_checkin(st, {'battery': 1}, now_ms=_NOW_MS)
+        sim.record_device_checkin(
+            st, {'battery': 2},
+            now_ms=_NOW_MS + sim._DEVICE_CHECKIN_RETENTION_DAYS * 86400 * 1000 + 1)
+        history = st['deviceCheckins']['history']
+        self.assertEqual([row['battery'] for row in history], [2])
+
     def test_history_capped_at_max(self):
         st = {}
         for i in range(sim._DEVICE_CHECKIN_HISTORY_MAX + 10):
@@ -115,6 +124,28 @@ class DeviceCheckinEndpoint(unittest.TestCase):
             r = c.post('/api/device/checkin', headers={'X-Device-Key': 'test-device-key-abc123'},
                       json={'battery': 50})
         self.assertEqual(r.status_code, 503)
+
+    def test_owner_can_read_the_device_key(self):
+        import asyncio, json as _json
+        with unittest.mock.patch.object(serve, '_operator_gate',
+                                        return_value=(True, 'player')):
+            r = asyncio.run(serve.device_key_get(None))
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(_json.loads(r.body).get('key'))
+
+    def test_key_rotation_is_player_only_and_writes_env(self):
+        import asyncio
+        with unittest.mock.patch.object(serve, '_operator_gate',
+                                        return_value=(True, 'nora')):
+            self.assertEqual(asyncio.run(serve.device_key_rotate(None)).status_code, 403)
+        with unittest.mock.patch.object(serve, '_operator_gate',
+                                        return_value=(True, 'player')), \
+             unittest.mock.patch.object(serve, '_set_env_keys') as set_env, \
+             unittest.mock.patch.object(serve, '_reload_env_config'), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            r = asyncio.run(serve.device_key_rotate(None))
+        self.assertEqual(r.status_code, 200)
+        set_env.assert_called_once()
 
     def test_only_battery_no_location_is_valid(self):
         # Every field is optional -- a Shortcut might only send some of them.
