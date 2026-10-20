@@ -30,6 +30,7 @@ import re
 import sys
 import time
 import traceback
+import urllib.parse
 
 
 OPS = ('goto', 'read', 'fill', 'fill_many', 'login', 'click', 'submit', 'screenshot')
@@ -302,6 +303,24 @@ def run(action):
                 # never on screen. goto is the only op that skips this -- it IS
                 # the navigation.
                 if op == 'login' and action.get('loginEntryUrl'):
+                    entry_url = action['loginEntryUrl']
+                    entry_parsed = urllib.parse.urlparse(entry_url)
+                    target_host = (urllib.parse.urlparse(action.get('url') or '').hostname or '').lower()
+                    entry_host = (entry_parsed.hostname or '').lower()
+                    social_sibling = (
+                        (entry_host == 'facebook.com' or entry_host.endswith('.facebook.com'))
+                        and (target_host == 'facebook.com' or target_host.endswith('.facebook.com'))
+                    ) or (
+                        (entry_host == 'instagram.com' or entry_host.endswith('.instagram.com'))
+                        and (target_host == 'instagram.com' or target_host.endswith('.instagram.com'))
+                    )
+                    same_site = bool(entry_host and target_host and (
+                        entry_host == target_host or entry_host.endswith('.' + target_host)
+                        or target_host.endswith('.' + entry_host) or social_sibling))
+                    if (entry_parsed.scheme not in ('http', 'https') or not same_site
+                            or entry_parsed.username or entry_parsed.password):
+                        return {'ok': False, 'op': op, 'url': action.get('url'),
+                                'error': 'loginEntryUrl must be http(s) on the same site as url'}
                     # Arrive the way a person does: open the site root, move
                     # the pointer, click its Log in link, then fill the form.
                     # This gives the request a real referer and navigation

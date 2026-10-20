@@ -3,7 +3,7 @@ import json
 import story_tracking
 
 
-def context(state, task):
+def context(state, task, workspace_resolver=None):
     parent = story_tracking.root(state, task)
     request = next((r for r in state.get('backlogRequests', []) if r.get('id') == parent.get('workOrderId')), {})
     plan = request.get('plan') or {}
@@ -13,7 +13,8 @@ def context(state, task):
     repairs = [{key: item.get(key) for key in ('id', 'title', 'criterionId', 'instructions', 'acceptanceCriteria')}
                for item in parent.get('repairStories', []) if item.get('status') != 'done']
     prerequisites = [{'taskId':t['id'], 'storyId':t.get('workOrderStoryId'), 'libraryPath':t.get('libraryPath'),
-                      'workspace':__import__('code_workspaces').sandbox_for(state,t)}
+                      'workspace': (workspace_resolver(t) if workspace_resolver
+                                    else __import__('code_workspaces').sandbox_for(state,t))}
                      for t in state.get('tasks', {}).values() if t.get('workOrderId') == request.get('id')
                      and t.get('workOrderStoryId') in story.get('prerequisiteStoryIds', [])
                      and t.get('status') == 'done' and not t.get('reviewOf')]

@@ -88,14 +88,16 @@ def approval_assessment(text, references):
     return {'verified': not errors, 'checks': verified, 'errors': errors}
 
 
-def clean_vote_errors(result):
+def clean_vote_errors(result, require_acceptance=True):
     assessment = result.get('acceptanceAssessment') or {}
     errors = list(assessment.get('errors') or [])
-    if assessment.get('verified') is not True or not assessment.get('checks'):
-        errors.append('Approval lacks verified acceptance criteria.')
-    if any(not isinstance(check, dict) or check.get('status') != 'met' or not check.get('evidence')
-           for check in assessment.get('checks') or []):
-        errors.append('An acceptance criterion is unmet or unverified.')
+    if require_acceptance:
+        if assessment.get('verified') is not True or not assessment.get('checks'):
+            errors.append('Approval lacks verified acceptance criteria.')
+        if any(not isinstance(check, dict) or check.get('status') != 'met'
+               or not (check.get('evidence') or check.get('evidenceIds'))
+               for check in assessment.get('checks') or []):
+            errors.append('An acceptance criterion is unmet or unverified.')
     if result.get('ok') is False:
         errors.append('The review or execution failed.')
     if result.get('pipelineOk') is not True:

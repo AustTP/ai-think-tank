@@ -40,6 +40,39 @@ class _TankAccountCase(unittest.TestCase):
         self._cm.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def test_director_cannot_request_code_or_rotate(self):
+        rec = self._create()
+        with unittest.mock.patch.object(serve, '_operator_gate',
+                                        return_value=(True, 'nora')):
+            code = self.client.post(f"/api/tank-accounts/{rec['id']}/code",
+                                    headers=self.headers)
+            rotate = self.client.post(f"/api/tank-accounts/{rec['id']}/rotate",
+                                      json={}, headers=self.headers)
+        self.assertEqual(code.status_code, 403)
+        self.assertEqual(rotate.status_code, 403)
+
+    def test_rotation_revokes_outstanding_grants(self):
+        rec = self._create()
+        with self._owner():
+            grant = self.client.post(f"/api/tank-accounts/{rec['id']}/grant",
+                                     json={'agentId': 'ben'}, headers=self.headers).json()
+            rotated = self.client.post(f"/api/tank-accounts/{rec['id']}/rotate",
+                                       json={}, headers=self.headers)
+        self.assertEqual(rotated.status_code, 200, rotated.text)
+        from tank_accounts import consume_grant
+        self.assertFalse(consume_grant(grant['grant'], 'ben', rec['id']))
+
+    def test_runtime_schema_creation_without_init_db(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, 'fresh.db')
+            with unittest.mock.patch.object(serve, 'DB_PATH', db_path):
+                serve._ensure_runtime_schemas()
+                with serve._db() as conn:
+                    names = {row[0] for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertIn('tank_accounts', names)
+            self.assertIn('captcha_requests', names)
+
     def _owner(self):
         return unittest.mock.patch.object(serve, '_operator_gate',
                                           return_value=(True, 'player'))

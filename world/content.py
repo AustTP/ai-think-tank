@@ -1641,7 +1641,8 @@ def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose, scope_files=
     until the workspace or the step set changes; long runs are polled as a
     background job instead of holding one 300s HTTP request open."""
     steps = _quality_pipeline_steps(scope_files)
-    sandbox_dir = _serve._sandbox_dir_for(sandbox_id)
+    resolved_sandbox = _serve._village_sandbox_id(agent_id, sandbox_id)
+    sandbox_dir = _serve._sandbox_dir_for(resolved_sandbox)
     cache_key = (None if os.environ.get('PYTEST_CURRENT_TEST')
                  else work_reuse.check_key(sandbox_dir, steps, 'quality-v1'))
     cached = work_reuse.get_check(cache_key) if cache_key else None
@@ -1682,7 +1683,9 @@ def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose, scope_files=
                 'note': f'quality pipeline FAILED at {failed} (exit {code}):\n{snippet}',
                 'infra': True if _plugin_crash else None}
     result = {'ok': True, 'failedStep': None, 'results': results, 'note': 'quality pipeline all green'}
-    if cache_key:
+    post_key = (None if os.environ.get('PYTEST_CURRENT_TEST')
+                else work_reuse.check_key(sandbox_dir, steps, 'quality-v1'))
+    if cache_key and post_key == cache_key:
         work_reuse.save_check(cache_key, result)
     return result
 
@@ -1720,14 +1723,34 @@ def _quality_pipeline_evidence(qp):
     return '\n'.join(lines)[:2000]
 
 
+def _commit_story_workspace(workspace, task_id=None):
+    """Commit published changes on the isolated story branch so the peer gate can
+    merge them. Shared workroom fallbacks stay uncommitted until their normal
+    flow handles them."""
+    if not str(workspace or '').startswith('story-'):
+        return
+    directory = os.path.join(_serve.SANDBOXES_DIR, workspace)
+    if not os.path.exists(os.path.join(directory, '.git')):
+        return
+    try:
+        _serve._run_git_sync(directory, ['add', '-A'])
+        status = _serve._run_git_sync(directory, ['status', '--porcelain'])
+        if (status.stdout or '').strip():
+            _serve._run_git_sync(directory, ['commit', '-q', '-m',
+                f'story changes for {task_id or workspace}'])
+    except Exception as error:
+        print(f'[story-commit] {workspace}: {error}')
+
+
 def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     """Run coding in a private staged workspace; publish only validated changes."""
     import sim
     import story_tracking
     import staged_work
     import work_reuse
-    workspace = __import__('code_workspaces').prepare(snapshot, task, _serve.SANDBOXES_DIR)
+    workspace = _review_sandbox_id(snapshot, task, agent_id)
     parent = story_tracking.root(snapshot, task)
+    staged_work.cleanup(_serve.SANDBOXES_DIR)
     with work_reuse.validation_lock(workspace):
         stage = None
         captured = []
@@ -1740,6 +1763,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
             result = captured[-1] if captured else {'ok': False, 'note': 'No coding result was produced.'}
             if ok and result.get('ok'):
                 result['previousWorkspace'] = stage.publish()
+                _commit_story_workspace(workspace, task.get('id'))
                 result['sourceDigest'] = work_reuse.tree_digest(str(stage.original))
                 result['note'] = str(result.get('note') or '') + ' | validated staged changes published'
             else:
@@ -1823,7 +1847,8 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
                      'cut off incomplete, which a small new file avoids. '
                      + CODING_STANDARDS_PROMPT)
     system_prompt += '\n' + __import__('structured_edits').GUIDANCE
-    system_prompt += '\n' + __import__('coding_handoff').context(snapshot, task)
+    system_prompt += '\n' + __import__('coding_handoff').context(
+        snapshot, task, workspace_resolver=lambda item: _review_sandbox_id(snapshot, item, agent_id))
     system_prompt += '\n' + __import__('coding_library').GUIDANCE
     if python_task:
         system_prompt += '\n' + python_delivery.GUIDANCE
@@ -2643,6 +2668,7 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     if is_gate_review:
         # Relay the vote so _apply_content_result can count it on the parent.
         result['peerVerdict'] = verdict
+        result['reviewContract'] = review_quality.contract_for(review_parent or task)
     # Item 6: carry the reviewer's structured verdict (its own explicit call +
     # the WHY -- summary / verified checks / remaining risks) through the result
     # channel so _apply_content_result can fold them onto the parent task and
@@ -2958,6 +2984,7 @@ def _assess_acceptance(rows, criteria):
             errors.append(cid + ' lacks an explanation of how its evidence satisfies the criterion.')
         checks.append({'criterionId': cid, 'criterion': criteria[cid],
                        'status': row.get('status'), 'evidenceIds': evidence or [],
+                       'evidence': evidence or [],
                        'explanation': explanation or ''})
     for cid in criteria.keys() - seen:
         errors.append(cid + ' was not verified.')

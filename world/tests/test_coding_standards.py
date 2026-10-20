@@ -459,6 +459,7 @@ class CodingExecutorQualityGate(unittest.TestCase):
             AGENTS_DIR=os.path.join(self.tmp, 'agents'),
             LIBRARY_DIR=os.path.join(self.tmp, 'library'),
             PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
+            SANDBOXES_DIR=os.path.join(self.tmp, 'sandboxes'),
         )
         self._cm.start()
         serve.init_db()

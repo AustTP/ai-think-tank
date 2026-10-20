@@ -3003,6 +3003,14 @@ def verify_agent_key(agent_id, presented_key):
     return secrets.compare_digest(presented_key, get_or_create_agent_key(agent_id))
 
 
+def _actor_is_authorized(request, agent_id):
+    """A player session may act as any agent; an agent key may act only as the
+    agent it belongs to. Never trust a body agentId on its own."""
+    if verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is True:
+        return True
+    return _require_player_session(request)
+
+
 # --------------------------------------------------------------------------
 # Phase D: external-credential vault + capability handles (confused-deputy).
 # The agent never holds an external service key -- only an opaque handle to a
@@ -5924,8 +5932,20 @@ async def _sim_watchdog_loop(sim_holder, interval_s=None, stale_s=None):
             print(f'[sim-watchdog] error: {e}', flush=True)
 
 
+def _ensure_runtime_schemas():
+    """Create module-owned tables on every boot path. init_db() only runs under
+    the __main__ path, not `uvicorn serve:app`."""
+    with _db() as conn:
+        tank_accounts.ensure_schema(conn)
+        captcha.ensure_schema(conn)
+
+
 @asynccontextmanager
 async def _lifespan(app):
+    try:
+        _ensure_runtime_schemas()
+    except Exception as e:
+        print(f'[schema] runtime ensure failed: {e}', flush=True)
     # The admin/manager/director information should
     # live in the DATABASE, not be baked into a JS file. It does -- the
     # kv_state blob is authoritative and agents/*.json are only materialized
@@ -8138,6 +8158,13 @@ SANDBOX_IMAGE = 'ai-think-tank-work-sandbox'  # world/sandbox/Dockerfile -- has 
 BROWSER_PROFILE_DIR = os.environ.get(
     'BROWSER_PROFILE_DIR') or os.path.join(ROOT, '.browser-profiles', 'social')
 _BROWSER_PROFILE_LOCK = threading.Lock()
+
+
+def _browser_profile_dir(agent_id=None):
+    """Per-agent profile directory. A single shared profile let any agent read
+    every other agent's authenticated social session."""
+    slug = re.sub(r'[^A-Za-z0-9_.-]', '_', str(agent_id or 'shared'))[:64] or 'shared'
+    return os.path.join(BROWSER_PROFILE_DIR, slug)
 SANDBOX_TIMEOUT_S = 30
 SANDBOX_MAX_OUTPUT = 20_000
 # Where agent commands actually run: `local` = the local Docker
@@ -8774,7 +8801,7 @@ BROWSER_ACT_TIMEOUT_S = 180
 BROWSER_ACT_MAX_OUTPUT = 60_000
 
 
-def _run_browser_act_sync(sandbox_dir, action):
+def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
     """Run ONE already-classified browser_act op in the sandbox and return the
     parsed result dict from the driver's result file (falling back to parsing
     its stdout JSON). Returns None on harness-level failure (docker/IO), never
@@ -8838,7 +8865,7 @@ def _run_browser_act_sync(sandbox_dir, action):
         # read the (decrypted) action file, and nothing in the mount can be
         # swapped between the Jev classification and the driver reading it.
         '-v', f'{action_dir}:/browser-act:ro',
-        '-v', f'{BROWSER_PROFILE_DIR}:/browser-profile',
+        '-v', f'{_browser_profile_dir(agent_id)}:/browser-profile',
         '-w', '/workspace',
         SANDBOX_IMAGE,
         # Headful Chromium under a private Xvfb. Do NOT use xvfb-run here:
@@ -8856,9 +8883,10 @@ def _run_browser_act_sync(sandbox_dir, action):
         try:
             # One Chromium profile at a time: a persistent user-data dir cannot
             # be opened by two browsers concurrently.
-            os.makedirs(BROWSER_PROFILE_DIR, mode=0o700, exist_ok=True)
+            profile_dir = _browser_profile_dir(agent_id)
+            os.makedirs(profile_dir, mode=0o700, exist_ok=True)
             try:
-                os.chmod(BROWSER_PROFILE_DIR, 0o700)
+                os.chmod(profile_dir, 0o700)
             except OSError:
                 pass
             with _BROWSER_PROFILE_LOCK:
@@ -27610,8 +27638,8 @@ async def tank_account_get(account_id: str, request: Request):
 @app.post('/api/tank-accounts/{account_id}/code')
 async def tank_account_code(account_id: str, request: Request):
     authorized, actor = _operator_gate(request)
-    if not authorized:
-        return JSONResponse({'error': 'only a player, director, or admin may request a code'}, status_code=403)
+    if not authorized or actor != 'player':
+        return JSONResponse({'error': 'only the owner/player may request a code'}, status_code=403)
     try:
         result = tank_accounts.code(account_id, actor=actor)
     except KeyError:
@@ -27624,8 +27652,8 @@ async def tank_account_code(account_id: str, request: Request):
 @app.post('/api/tank-accounts/{account_id}/grant')
 async def tank_account_grant(account_id: str, request: Request):
     authorized, actor = _operator_gate(request)
-    if not authorized:
-        return JSONResponse({'error': 'only a player, director, or admin may grant a code read'}, status_code=403)
+    if not authorized or actor != 'player':
+        return JSONResponse({'error': 'only the owner/player may grant a code read'}, status_code=403)
     try:
         body = await request.json()
     except Exception:
@@ -27676,8 +27704,8 @@ async def tank_account_agent_code(account_id: str, request: Request):
 @app.post('/api/tank-accounts/{account_id}/rotate')
 async def tank_account_rotate(account_id: str, request: Request):
     authorized, actor = _operator_gate(request)
-    if not authorized:
-        return JSONResponse({'error': 'only a player, director, or admin may rotate a TOTP secret'}, status_code=403)
+    if not authorized or actor != 'player':
+        return JSONResponse({'error': 'only the owner/player may rotate a TOTP secret'}, status_code=403)
     try:
         body = await request.json()
     except Exception:
@@ -27699,8 +27727,8 @@ async def tank_account_rotate(account_id: str, request: Request):
 @app.delete('/api/tank-accounts/{account_id}')
 async def tank_account_delete(account_id: str, request: Request):
     authorized, actor = _operator_gate(request)
-    if not authorized:
-        return JSONResponse({'error': 'only a player, director, or admin may delete a tank account'}, status_code=403)
+    if not authorized or actor != 'player':
+        return JSONResponse({'error': 'only the owner/player may delete a tank account'}, status_code=403)
     try:
         result = tank_accounts.delete(account_id, actor=actor)
     except KeyError:
@@ -27776,6 +27804,13 @@ async def captcha_solve(request_id: str, request: Request):
         return JSONResponse({'ok': True, 'status': 'solved', 'requestId': request_id})
     if rec['status'] in ('expired', 'failed'):
         return JSONResponse({'error': f"request is {rec['status']}"}, status_code=410)
+    if not EXECUTION_ENABLED or not BROWSING_ENABLED:
+        return JSONResponse({'error': 'browser execution is disabled'}, status_code=403)
+    if not check_rate_limit(agent_id):
+        return JSONResponse({'error': 'Rate limit exceeded.'}, status_code=429)
+    page_host = urllib.parse.urlparse(rec.get('pageUrl') or '').hostname or ''
+    if not page_host or not _is_safe_public_host(page_host):
+        return JSONResponse({'error': 'captcha page URL is not a safe public host'}, status_code=403)
     try:
         body = await request.json()
     except Exception:
@@ -27786,7 +27821,7 @@ async def captcha_solve(request_id: str, request: Request):
         wait_s = max(1, min(int(body.get('waitSec') or 120), 300))
     except (TypeError, ValueError):
         wait_s = 120
-    rec = captcha.wait_for_answer(request_id, wait_s=wait_s, poll_s=1.0)
+    rec = await asyncio.to_thread(captcha.wait_for_answer, request_id, wait_s, 1.0)
     if rec is None:
         return JSONResponse({'error': 'request not found'}, status_code=404)
     if rec['status'] in ('pending',):
@@ -27810,7 +27845,8 @@ async def captcha_solve(request_id: str, request: Request):
         'fields': [{'selector': rec['inputSelector'], 'value': rec['answer']}],
         'submitSelector': rec.get('submitSelector') or '',
     }
-    parsed, run_error = await asyncio.to_thread(_run_browser_act_sync, sandbox_dir, action)
+    parsed, run_error = await asyncio.to_thread(
+        _run_browser_act_sync, sandbox_dir, action, agent_id)
     if parsed is None:
         captcha.mark_failed(request_id, run_error or 'browser run failed', actor=agent_id)
         return JSONResponse({'error': run_error or 'browser run failed'}, status_code=502)
@@ -28471,7 +28507,9 @@ async def execute(request: Request):
     if not check_rate_limit(agent_id):
         log_action(agent_id, 'rate_limited', {'endpoint': 'execute'})
         return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
-    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    authorized = _actor_is_authorized(request, agent_id)
+    if not authorized:
+        return JSONResponse({'error': 'a valid agent key for agentId is required'}, status_code=401)
     if not command:
         return JSONResponse({'error': 'command is required'}, status_code=400)
     allowed, reason = await _classify_command(command, purpose, agent_id)
@@ -28651,7 +28689,9 @@ async def browser_act(request: Request):
     if not check_rate_limit(agent_id):
         log_action(agent_id, 'rate_limited', {'endpoint': 'browser-act'})
         return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
-    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    authorized = _actor_is_authorized(request, agent_id)
+    if not authorized:
+        return JSONResponse({'error': 'a valid agent key for agentId is required'}, status_code=401)
     if op not in BROWSER_ACT_OPS:
         return JSONResponse({'error': f'op must be one of {", ".join(BROWSER_ACT_OPS)}'}, status_code=400)
     if op in ('goto',) and not url:
@@ -28861,8 +28901,26 @@ async def browser_act(request: Request):
         entry = (body.get('loginEntryUrl') or '').strip()
         if not entry and 'facebook.com' in (urllib.parse.urlparse(scope_url).hostname or ''):
             entry = 'https://www.facebook.com/'
+        if entry:
+            parsed_entry = urllib.parse.urlparse(entry)
+            scope_host = (urllib.parse.urlparse(scope_url).hostname or '').lower()
+            entry_host = (parsed_entry.hostname or '').lower()
+            social_sibling = (
+                (entry_host == 'facebook.com' or entry_host.endswith('.facebook.com'))
+                and (scope_host == 'facebook.com' or scope_host.endswith('.facebook.com'))
+            ) or (
+                (entry_host == 'instagram.com' or entry_host.endswith('.instagram.com'))
+                and (scope_host == 'instagram.com' or scope_host.endswith('.instagram.com'))
+            )
+            same_site = bool(entry_host and scope_host and (
+                entry_host == scope_host or entry_host.endswith('.' + scope_host)
+                or scope_host.endswith('.' + entry_host) or social_sibling))
+            if (parsed_entry.scheme not in ('http', 'https') or not same_site
+                    or parsed_entry.username or parsed_entry.password):
+                return JSONResponse({'error': 'loginEntryUrl must be http(s) on the same site as url'}, status_code=400)
         action['loginEntryUrl'] = entry
-    parsed_result, run_error = await asyncio.to_thread(_run_browser_act_sync, sandbox_dir, action)
+    parsed_result, run_error = await asyncio.to_thread(
+        _run_browser_act_sync, sandbox_dir, action, agent_id)
     if parsed_result is None:
         log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'error', 'reason': run_error}, authorized=authorized)
         return JSONResponse({'allowed': True, 'ok': False, 'error': run_error})
@@ -28877,14 +28935,21 @@ async def browser_act(request: Request):
     if not isinstance(captcha_info, list):
         captcha_info = []
     if captcha_info:
-        parsed_result['captchaRequired'] = _handle_captcha_detected(
-            agent_id, sandbox_id, parsed_result.get('url') or url, captcha_info, shot,
-            purpose=purpose, submit_selector=(body.get('submitSelector') or '').strip())
+        parsed_result['captchaRequired'] = await asyncio.to_thread(
+            _handle_captcha_detected, agent_id, sandbox_id,
+            parsed_result.get('url') or url, captcha_info, shot,
+            purpose, (body.get('submitSelector') or '').strip())
     log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'allowed', 'ok': parsed_result.get('ok'), 'credentialInjected': bool(credential_handle)}, authorized=authorized)
     return JSONResponse({'allowed': True, **parsed_result, 'screenshotBase64': shot})
 
 
 _PIPELINE_JOBS = {}
+_PIPELINE_SANDBOX_LOCKS = {}
+
+
+def _pipeline_sandbox_lock(agent_id, sandbox_id):
+    key = _village_sandbox_id(agent_id, sandbox_id)
+    return _PIPELINE_SANDBOX_LOCKS.setdefault(key, asyncio.Lock())
 
 
 @app.post('/api/pipeline')
@@ -28938,6 +29003,13 @@ async def pipeline_job(job_id: str, request: Request):
 
 
 async def _pipeline_execute(request: Request, body: dict):
+    agent_id = body.get('agentId', 'unknown')
+    sandbox_id = body.get('sandboxId') or 'unknown'
+    async with _pipeline_sandbox_lock(agent_id, sandbox_id):
+        return await _pipeline_execute_locked(request, body)
+
+
+async def _pipeline_execute_locked(request: Request, body: dict):
     # "They would wait to see where the pipeline succeeds or fails" --
     # your words. A pipeline is just a sequence of the same primitive
     # /api/execute already provides, run in the SAME sandbox directory
@@ -28959,7 +29031,9 @@ async def _pipeline_execute(request: Request, body: dict):
     if not check_rate_limit(agent_id):
         log_action(agent_id, 'rate_limited', {'endpoint': 'pipeline'})
         return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
-    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    authorized = _actor_is_authorized(request, agent_id)
+    if not authorized:
+        return JSONResponse({'error': 'a valid agent key for agentId is required'}, status_code=401)
     if not steps:
         return JSONResponse({'error': 'steps is required'}, status_code=400)
 
@@ -31964,25 +32038,23 @@ if __name__ == '__main__':
 # serve module is fully populated, and content's `_serve.X` lookups resolve at
 # call time, never at import time -- no cycle.
 # ---------------------------------------------------------------------------
-try:
-    import content as _content
-    _server_content_dispatcher = _content._server_content_dispatcher
-    _run_research_content = _content._run_research_content
-    _run_media_content = _content._run_media_content
-    _run_skill_review_content = _content._run_skill_review_content
-    _run_bank_content = _content._run_bank_content
-    _run_research_project_content = _content._run_research_project_content
-    _run_research_bare_content = _content._run_research_bare_content
-    _run_quality_pipeline = _content._run_quality_pipeline
-    _run_coding_content = _content._run_coding_content
-    _run_review_content = _content._run_review_content
-    _run_product_build_content = _content._run_product_build_content
-    _run_spike_content = _content._run_spike_content
-    _run_workroom_content = _content._run_workroom_content
-    _quality_pipeline_steps = _content._quality_pipeline_steps
-    CODING_STANDARDS_PROMPT = _content.CODING_STANDARDS_PROMPT
-except Exception as _exc:
-    # Best-effort re-export: if content can't load, the classifier/executor
-    # paths that reference these will fail loudly on first use rather than
-    # hiding behind a silently-degraded import.
-    print(f'[content] re-export failed: {_exc}')
+_CONTENT_REEXPORTS = {
+    '_server_content_dispatcher', '_run_research_content', '_run_media_content',
+    '_run_skill_review_content', '_run_bank_content',
+    '_run_research_project_content', '_run_research_bare_content',
+    '_run_quality_pipeline', '_run_coding_content', '_run_review_content',
+    '_run_product_build_content', '_run_spike_content', '_run_workroom_content',
+    '_quality_pipeline_steps', 'CODING_STANDARDS_PROMPT',
+}
+
+
+def __getattr__(name):
+    """Lazy content re-exports. content imports serve at module load, so eager
+    re-exports here fail when a test imports content first. Resolve on first
+    access after that import has completed."""
+    if name in _CONTENT_REEXPORTS:
+        import content as _content
+        value = getattr(_content, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')

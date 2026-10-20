@@ -152,6 +152,10 @@ def step(state, now_ms=None, observe_only=True):
             rationale = str(task.get('failNote') or 'Complete the original acceptance criteria.')
             if task.get('investigationReport'):
                 rationale += '\nRead the recovery diagnosis: ' + task['investigationReport']
+            if not can_start(state, {'reviewOf': task['id'],
+                                     'budgetUsd': task.get('budgetUsd')}):
+                block(task, 'Story spend reached its cap; clear or raise the budget before retrying.')
+                continue
             sim._queue_peer_repair(state, task, rationale)
             task['status'] = 'repairing'
         children, queued = related(state, task)

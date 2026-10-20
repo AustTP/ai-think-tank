@@ -4,6 +4,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import completion_watchdog as watchdog
+import sim
 
 
 def seed(status='recovery_planned'):
@@ -59,3 +60,24 @@ class CompletionRecovery(unittest.TestCase):
         watchdog.step(state, 100000, observe_only=False)
         self.assertEqual(state['tasks']['p']['status'], 'blocked')
         self.assertEqual(state['workQueue'], [])
+
+    def test_release_after_failure_does_not_overwrite_blocked(self):
+        state = seed('blocked')
+        state['agents']['ada'] = {'id': 'ada', 'task': 'p', 'busy': True}
+        sim._release_agent_after_failure(state, 'ada', state['tasks']['p'])
+        self.assertEqual(state['tasks']['p']['status'], 'blocked')
+        self.assertFalse(state['agents']['ada']['busy'])
+
+    def test_blocked_or_escalated_story_cannot_close_on_vote(self):
+        state = seed('blocked')
+        parent = state['tasks']['p']
+        parent['_peerGate'] = {'approvals': 2, 'approvers': ['a', 'b'],
+                               'escalated': False, 'enteredMs': 1}
+        self.assertFalse(sim._parent_close_from_vote(state, parent, 100000))
+        parent['status'] = 'needs_review'
+        parent['_peerGate']['escalated'] = True
+        self.assertFalse(sim._parent_close_from_vote(state, parent, 100000))
+
+    def test_review_timeout_does_not_close_an_escalated_gate(self):
+        gate = {'approvals': 1, 'enteredMs': 1, 'escalated': True}
+        self.assertFalse(sim._peer_gate_should_close(gate, 10**12, 1))

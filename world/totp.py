@@ -116,13 +116,19 @@ def parse_otpauth(uri):
     if not issuer and ':' in label:
         issuer = label.split(':', 1)[0]
     account = label.split(':', 1)[1] if ':' in label else label
+    digits = int((query.get('digits') or [DEFAULT_DIGITS])[0])
+    period = int((query.get('period') or [DEFAULT_PERIOD])[0])
+    if not 6 <= digits <= 10:
+        raise ValueError('otpauth digits must be between 6 and 10')
+    if not 15 <= period <= 120:
+        raise ValueError('otpauth period must be between 15 and 120 seconds')
     return {
         'secret': normalize_secret(secret),
         'issuer': issuer.strip(),
         'account': account.strip(),
         'algorithm': _algorithm((query.get('algorithm') or [DEFAULT_ALGORITHM])[0]),
-        'digits': int((query.get('digits') or [DEFAULT_DIGITS])[0]),
-        'period': int((query.get('period') or [DEFAULT_PERIOD])[0]),
+        'digits': digits,
+        'period': period,
     }
 
 

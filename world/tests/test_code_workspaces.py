@@ -38,3 +38,26 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(sandbox_for({}, {}),'workroom-shared')
         old = {'id':'old','projectLabel':'existing'}
         self.assertEqual(sandbox_for({'tasks':{'old':old}},old),'workroom-shared')
+
+
+class StageCleanupTests(unittest.TestCase):
+    def test_cleanup_removes_old_stages_and_excess_previous(self):
+        import time
+        import staged_work
+        with tempfile.TemporaryDirectory() as root:
+            old = Path(root) / 'stage-old'
+            old.mkdir()
+            old_file = old / 'x'
+            old_file.write_text('x')
+            old_time = time.time() - 8 * 86400
+            import os
+            os.utime(old_file, (old_time, old_time))
+            os.utime(old, (old_time, old_time))
+            previous = []
+            for index in range(3):
+                path = Path(root) / f'previous-{index}'
+                path.mkdir()
+                previous.append(path)
+            staged_work.cleanup(root, keep_previous=1)
+            self.assertFalse(old.exists())
+            self.assertEqual(sum(1 for p in previous if p.exists()), 1)

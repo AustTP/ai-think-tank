@@ -60,6 +60,12 @@ class Otpauth(unittest.TestCase):
         self.assertEqual(parsed['secret'], RFC_SECRET)
         self.assertEqual(parsed['account'], 'alice@example.com')
 
+    def test_otpauth_rejects_unbounded_digits_and_period(self):
+        for query in ('digits=999999999', 'period=0', 'period=999999'):
+            uri = f'otpauth://totp/Example:alice?secret={RFC_SECRET}&{query}'
+            with self.assertRaises(ValueError):
+                totp.parse_otpauth(uri)
+
 
 if __name__ == '__main__':
     unittest.main()

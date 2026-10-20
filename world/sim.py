@@ -2285,9 +2285,11 @@ def _apply_content_result(state, task, result, now_ms=None):
                     parent.update(manualAttention=True, blockedReason=kind,
                                   failNote='Review attempts stopped: ' + str(result.get('note') or 'No usable verdict.')[:500])
                 return
-            if verdict == 'clean' and result.get('acceptanceAssessment') is not None:
+            if verdict == 'clean':
                 import review_quality
-                approval_errors = review_quality.clean_vote_errors(result)
+                approval_errors = review_quality.clean_vote_errors(
+                    result,
+                    require_acceptance=result.get('acceptanceAssessment') is not None)
                 if approval_errors:
                     gate['approvals'] = 0
                     gate['approvers'] = []
@@ -4948,7 +4950,7 @@ def finish_task(state, agent_id, grid=None):
     if not a:
         return
     task = (state.get('tasks') or {}).get(a.get('task'))
-    if task:
+    if task and task.get('status') not in ('blocked', 'failed', 'cancelled', 'abandoned'):
         task['status'] = 'done'
         # A landed task satisfies any dependency-block keyed on it: queue the
         # SM's auto-unblock so the cards that were waiting on this work free up.
@@ -6653,6 +6655,8 @@ def _peer_gate_should_close(gate, now_ms, entered_ms):
     """Close rule: two distinct clean approvals, OR -- after the review-timeout
     window has elapsed -- a single clean approval. Guards against a small think tank
     deadlocking on a second unreachable approver."""
+    if gate.get('escalated'):
+        return False
     if gate['approvals'] >= 2:
         return True
     if gate['approvals'] >= 1 and entered_ms and (now_ms - entered_ms) >= PEER_REVIEW_TIMEOUT_MS:
@@ -6713,7 +6717,7 @@ def _release_agent_after_failure(state, agent_id, task):
     a = agents.get(agent_id)
     if not a:
         return
-    if task:
+    if task and task.get('status') not in ('blocked', 'failed', 'cancelled', 'abandoned'):
         task['status'] = 'done'
     a['task'] = None
     a['busy'] = False
@@ -6987,6 +6991,9 @@ def _parent_close_from_vote(state, parent, now_ms):
     caller's needs: called from _task_cycle when a review/fix subtask completes."""
     gate = parent.get('_peerGate')
     if not gate:
+        return False
+    if (parent.get('status') in ('blocked', 'failed', 'cancelled', 'abandoned')
+            or parent.get('manualAttention') or gate.get('escalated')):
         return False
     if _peer_gate_should_close(gate, now_ms, gate.get('enteredMs')):
         _close_gated_story(state, parent)

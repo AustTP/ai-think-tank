@@ -37,14 +37,17 @@ def tree_digest(path):
                 total += os.path.getsize(target)
                 if total > 100 * 1024 * 1024 or count >= 5000:
                     return None
-                h.update(os.path.relpath(target, path).encode())
+                relative = os.path.relpath(target, path).encode()
+                h.update(str(len(relative)).encode() + b':')
+                h.update(relative)
+                h.update(str(os.path.getsize(target)).encode() + b':')
                 with open(target, 'rb') as stream:
                     for chunk in iter(lambda: stream.read(65536), b''):
                         h.update(chunk)
                 count += 1
             except OSError:
                 return None
-    return h.hexdigest() if count else None
+    return h.hexdigest()
 
 
 def check_key(path, steps, runtime):

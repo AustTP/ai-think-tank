@@ -214,6 +214,7 @@ def rotate(account_id, actor='player', new_secret=''):
     with s._db() as conn:
         conn.execute('UPDATE tank_accounts SET last_rotated_at = ?, updated_at = ? '
                      'WHERE id = ?', (time.time(), time.time(), account_id))
+        conn.execute('DELETE FROM tank_account_grants WHERE account_id = ?', (account_id,))
     s.log_action(actor, 'tank_account_rotate',
                  {'accountId': account_id, 'service': meta['service']},
                  authorized=True)
@@ -282,6 +283,9 @@ def consume_grant(grant_id, agent_id, account_id):
             return False
         if grant_account != account_id or grant_agent != agent_id:
             return False
-        conn.execute('UPDATE tank_account_grants SET used_at = ? WHERE grant_id = ?',
-                     (now, grant_id))
+        updated = conn.execute(
+            'UPDATE tank_account_grants SET used_at = ? '
+            'WHERE grant_id = ? AND used_at IS NULL', (now, grant_id))
+        if updated.rowcount != 1:
+            return False
     return True

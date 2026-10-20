@@ -28,6 +28,8 @@ class Stage:
             if any(Path(directory, name).is_symlink() for name in dirs + files):
                 raise ValueError('Staged work does not follow symbolic links.')
         self.before = work_reuse.tree_digest(str(self.original))
+        if self.before is None:
+            raise ValueError('Workspace cannot be validated (too large, unreadable, or contains a symlink).')
         source = self.original
         self.resumed_from = None
         if resume and re.fullmatch(r'stage-[a-f0-9]{32}', resume):
@@ -63,3 +65,27 @@ class Stage:
             raise
         # Preserve the previous workspace for recovery rather than deleting it.
         return str(self.backup)
+
+
+def cleanup(root, keep_previous=10, max_age_s=86400):
+    """Remove old failed stages and excess previous workspaces. Best effort."""
+    import time
+    root = Path(root)
+    if not root.is_dir():
+        return
+    now = time.time()
+    stages = sorted((p for p in root.glob('stage-*') if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in stages:
+        try:
+            if now - path.stat().st_mtime > max_age_s:
+                shutil.rmtree(path, ignore_errors=True)
+                (root / (path.name + '.repair.json')).unlink(missing_ok=True)
+        except OSError:
+            pass
+    previous = sorted((p for p in root.glob('previous-*') if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True)
+    for index, path in enumerate(previous):
+        try:
+            if index >= keep_previous or now - path.stat().st_mtime > max_age_s:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass

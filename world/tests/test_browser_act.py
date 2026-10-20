@@ -189,6 +189,30 @@ class ClassifyBrowserAction(unittest.TestCase):
 class BrowserActEndpoint(unittest.TestCase):
     """POST /api/browser-act -- the Jev-gated real-browser endpoint."""
 
+    def test_login_entry_url_rejects_file_and_cross_site(self):
+        self._common_mocks()
+        for entry in ('file:///etc/login.defs', 'https://evil.example/login'):
+            r = _client().post('/api/browser-act', json={
+                'agentId': 'cora', 'op': 'login', 'url': 'https://dreyx.com/login',
+                'fields': [{'selector': '#u', 'value': 'x'}],
+                'loginEntryUrl': entry, 'purpose': 'log in'})
+            self.assertEqual(r.status_code, 400, entry)
+
+    def test_browser_profiles_are_per_agent(self):
+        self.assertNotEqual(serve._browser_profile_dir('cora'),
+                            serve._browser_profile_dir('ben'))
+        self.assertTrue(serve._browser_profile_dir('cora').startswith(
+            serve.BROWSER_PROFILE_DIR + os.sep))
+
+    def test_agent_key_cannot_act_as_another_agent(self):
+        key = serve.get_or_create_agent_key('cora')
+        r = TestClient(serve.app).post(
+            '/api/browser-act',
+            json={'agentId': 'ben', 'op': 'goto', 'url': 'https://dreyx.com/',
+                  'purpose': 'look'},
+            headers={'X-Agent-Key': key})
+        self.assertEqual(r.status_code, 401)
+
     def _common_mocks(self, classify=(True, 'allow'), run_result=None, sandbox_dir=None):
         patchers = [
             unittest.mock.patch.object(serve, 'EXECUTION_ENABLED', True),

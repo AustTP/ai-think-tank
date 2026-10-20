@@ -27,3 +27,12 @@ class WorkReuse(unittest.TestCase):
             self.assertNotEqual(new_key, key)
             self.assertIsNone(work_reuse.get_check(new_key))
             self.assertEqual(work_reuse.get_check(key)['note'], 'green')
+
+    def test_tree_digest_separates_paths_from_contents(self):
+        with tempfile.TemporaryDirectory() as left, tempfile.TemporaryDirectory() as right:
+            with open(os.path.join(left, 'a'), 'w') as stream:
+                stream.write('bc')
+            with open(os.path.join(right, 'ab'), 'w') as stream:
+                stream.write('c')
+            self.assertNotEqual(work_reuse.tree_digest(left),
+                                work_reuse.tree_digest(right))
