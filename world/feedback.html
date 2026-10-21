@@ -113,6 +113,9 @@ button{cursor:pointer}
 .fb-fields select,.fb-fields input,.filters select{width:100%;min-height:40px;border-radius:10px;border:1px solid var(--line);background:var(--panel2);color:var(--text);padding:0 10px}
 .review-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px}
 .pill{display:inline-flex;padding:2px 8px;border-radius:999px;border:1px solid var(--line);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.sched-form{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+.sched-form input,.sched-item input{min-height:38px;border-radius:10px;border:1px solid var(--line);background:var(--panel2);color:var(--text);padding:0 10px;min-width:140px}
+.sched-item{margin-top:10px}
 textarea{width:100%;min-height:104px;resize:vertical;border-radius:12px;border:1px solid var(--line);
   background:#0a0a0e;padding:12px;color:var(--text)}
 textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,157,.65);outline-offset:2px}
@@ -182,6 +185,7 @@ textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,15
       <button class="tab active" data-tab="overview" type="button">Overview</button>
       <button class="tab" data-tab="taste" type="button">Taste</button>
       <button class="tab" data-tab="review" type="button">Reviews</button>
+      <button class="tab" data-tab="schedules" type="button">Schedules</button>
       <button class="tab" data-tab="item" id="itemTab" type="button" hidden>Work item</button>
     </div>
 
@@ -301,6 +305,26 @@ textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,15
       </div>
     </section>
 
+    <section id="view-schedules" hidden>
+      <div class="panel">
+        <h3>Recurring schedules</h3>
+        <p class="hint">Watch a page on a cadence. Disable to pause without deleting.</p>
+        <div class="sched-form">
+          <div class="control"><label for="schedTopic"><span>Topic</span></label><input id="schedTopic" placeholder="AI regulation news"></div>
+          <div class="control"><label for="schedUrl"><span>Start URL</span></label><input id="schedUrl" placeholder="https://example.com/news"></div>
+          <div class="control"><label for="schedHours"><span>Every (hours)</span></label><input id="schedHours" type="number" min="0.25" step="0.25" value="24"></div>
+          <button class="choice" id="schedCreate" type="button">Create schedule</button>
+          <span class="note" id="schedNote" role="status" aria-live="polite"></span>
+        </div>
+        <div class="history" id="scheduleTopics"></div>
+      </div>
+      <div class="panel">
+        <h3>One-off schedules</h3>
+        <p class="hint">A single card held until a specific time. Edit the time or cancel it here.</p>
+        <div class="history" id="scheduleOneOffs"></div>
+      </div>
+    </section>
+
     <section id="view-taste" hidden>
       <div class="panel">
         <h3>Your taste profile</h3>
@@ -411,8 +435,10 @@ textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,15
     $('view-item').hidden = tab !== 'item';
     $('view-taste').hidden = tab !== 'taste';
     $('view-review').hidden = tab !== 'review';
+    $('view-schedules').hidden = tab !== 'schedules';
     if (tab === 'taste') loadTaste();
     if (tab === 'review') loadReview();
+    if (tab === 'schedules') loadSchedules();
     window.scrollTo({top:0});
   }
 
@@ -589,6 +615,131 @@ textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,15
     }
   }
 
+  function fmtWhen(ms) {
+    if (!ms) return 'never';
+    return new Date(Number(ms)).toLocaleString();
+  }
+
+  function toLocalInput(ms) {
+    const d = new Date(Number(ms) || Date.now());
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  async function scheduleCall(method, url, body) {
+    const res = await fetch(url, {
+      method, credentials:'same-origin',
+      headers: {'Content-Type':'application/json'},
+      body: body ? JSON.stringify(body) : undefined
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Request failed');
+    return data;
+  }
+
+  function schedNote(text, bad) {
+    const n = $('schedNote');
+    n.textContent = text || '';
+    n.className = 'note' + (bad ? ' bad' : ' ok');
+  }
+
+  async function loadSchedules() {
+    const topics = $('scheduleTopics'), once = $('scheduleOneOffs');
+    topics.textContent = ''; once.textContent = '';
+    try {
+      const data = await scheduleCall('GET', '/api/schedules');
+      if (!data.topics.length) topics.appendChild(el('p','note','No recurring schedules yet.'));
+      data.topics.forEach(t => topics.appendChild(topicRow(t)));
+      if (!data.oneOffs.length) once.appendChild(el('p','note','No one-off schedules pending.'));
+      data.oneOffs.forEach(o => once.appendChild(oneOffRow(o)));
+    } catch (err) {
+      schedNote(err.message, true);
+    }
+  }
+
+  function topicRow(t) {
+    const row = el('div','history-item sched-item');
+    const head = el('div','review-head');
+    head.appendChild(el('strong', null, t.topic));
+    head.appendChild(el('span','pill', t.enabled ? 'active' : 'paused'));
+    head.appendChild(el('span','pill', 'every ' + Math.round((t.cadenceMs||0)/3600000*10)/10 + 'h'));
+    row.appendChild(head);
+    row.appendChild(el('p','note', t.startUrl + ' \u00b7 last run ' + fmtWhen(t.lastRunAt)));
+    const actions = el('div','quickrow');
+    const toggle = el('button','choice', t.enabled ? 'Pause' : 'Enable');
+    toggle.type = 'button';
+    toggle.addEventListener('click', async () => {
+      try { await scheduleCall('PATCH', '/api/schedules/topic/' + encodeURIComponent(t.id), {enabled: !t.enabled}); schedNote('Updated.'); loadSchedules(); }
+      catch (err) { schedNote(err.message, true); }
+    });
+    const edit = el('button','ghost','Edit');
+    edit.type = 'button';
+    edit.addEventListener('click', () => editTopicRow(row, t));
+    const del = el('button','ghost','Delete');
+    del.type = 'button';
+    del.addEventListener('click', async () => {
+      if (!confirm('Delete schedule "' + t.topic + '"?')) return;
+      try { await scheduleCall('DELETE', '/api/schedules/topic/' + encodeURIComponent(t.id)); schedNote('Deleted.'); loadSchedules(); }
+      catch (err) { schedNote(err.message, true); }
+    });
+    actions.append(toggle, edit, del);
+    row.appendChild(actions);
+    return row;
+  }
+
+  function editTopicRow(row, t) {
+    row.textContent = '';
+    const form = el('div','sched-form');
+    const topic = el('input'); topic.value = t.topic;
+    const url = el('input'); url.value = t.startUrl;
+    const hours = el('input'); hours.type = 'number'; hours.min = '0.25'; hours.step = '0.25';
+    hours.value = Math.round((t.cadenceMs||0)/3600000*10)/10;
+    const save = el('button','choice','Save'); save.type = 'button';
+    const cancel = el('button','ghost','Cancel'); cancel.type = 'button';
+    form.append(topic, url, hours, save, cancel);
+    row.appendChild(form);
+    cancel.addEventListener('click', loadSchedules);
+    save.addEventListener('click', async () => {
+      try {
+        await scheduleCall('PATCH', '/api/schedules/topic/' + encodeURIComponent(t.id), {
+          topic: topic.value.trim(), startUrl: url.value.trim(),
+          cadenceMs: Math.max(1, Number(hours.value)||0) * 3600000
+        });
+        schedNote('Saved.'); loadSchedules();
+      } catch (err) { schedNote(err.message, true); }
+    });
+  }
+
+  function oneOffRow(o) {
+    const row = el('div','history-item sched-item');
+    const head = el('div','review-head');
+    head.appendChild(el('strong', null, o.title || o.key));
+    head.appendChild(el('span','pill', o.status || 'queued'));
+    row.appendChild(head);
+    row.appendChild(el('p','note', 'runs ' + fmtWhen(o.at) + (o.room ? ' in ' + o.room : '')));
+    const actions = el('div','quickrow');
+    const when = el('input'); when.type = 'datetime-local'; when.value = toLocalInput(o.at);
+    const save = el('button','choice','Retime'); save.type = 'button';
+    const title = el('input'); title.value = o.title || ''; title.placeholder = 'title';
+    save.addEventListener('click', async () => {
+      try {
+        const at = when.value ? new Date(when.value) : null;
+        await scheduleCall('PATCH', '/api/schedules/once/' + encodeURIComponent(o.key), {
+          at: at ? at.toISOString() : undefined, title: title.value.trim() || undefined
+        });
+        schedNote('Saved.'); loadSchedules();
+      } catch (err) { schedNote(err.message, true); }
+    });
+    const del = el('button','ghost','Cancel'); del.type = 'button';
+    del.addEventListener('click', async () => {
+      try { await scheduleCall('DELETE', '/api/schedules/once/' + encodeURIComponent(o.key)); schedNote('Cancelled.'); loadSchedules(); }
+      catch (err) { schedNote(err.message, true); }
+    });
+    actions.append(title, when, save, del);
+    row.appendChild(actions);
+    return row;
+  }
+
   async function loadWork() {
     const dot = $('liveDot'), text = $('liveText');
     try {
@@ -672,6 +823,7 @@ textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,15
     if (t.dataset.tab === 'overview') setTab('overview');
     else if (t.dataset.tab === 'taste') setTab('taste');
     else if (t.dataset.tab === 'review') setTab('review');
+    else if (t.dataset.tab === 'schedules') setTab('schedules');
     else if (t.dataset.tab === 'item' && state.selected) setTab('item');
   }));
   $('backBtn').addEventListener('click', () => setTab('overview'));
@@ -679,6 +831,17 @@ textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,15
   $('reviewCategory').addEventListener('change', loadReview);
   $('reviewStatus').addEventListener('change', loadReview);
   $('reviewRefresh').addEventListener('click', loadReview);
+  $('schedCreate').addEventListener('click', async () => {
+    const hours = Math.max(0.25, Number($('schedHours').value) || 24);
+    try {
+      await scheduleCall('POST', '/api/intent/schedule', {
+        topic: $('schedTopic').value.trim(), startUrl: $('schedUrl').value.trim(),
+        cadenceMs: Math.round(hours * 3600000)
+      });
+      $('schedTopic').value = ''; $('schedUrl').value = '';
+      schedNote('Created.'); loadSchedules();
+    } catch (err) { schedNote(err.message, true); }
+  });
   $('submitFeedback').addEventListener('click', submitFeedback);
   $('clearFeedback').addEventListener('click', renderFeedbackForm);
   $('saveTaste').addEventListener('click', saveTaste);
