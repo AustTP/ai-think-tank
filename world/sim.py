@@ -11883,6 +11883,16 @@ def _supervisor_brief(state, team_id, now_ms=None):
              "Scope: this team only. Do not inspect, comment on, or reassign another team's work.",
              "Role: facilitate. You watch budget and process failures; the workers do the work.",
              '']
+    try:
+        import serve as _serve
+        missing_avatars = [m for m in members if not _serve._avatar_set_complete(m)]
+    except Exception:
+        missing_avatars = []
+    if missing_avatars:
+        lines.append('Avatar images missing: ' + ', '.join(missing_avatars) + '.')
+        lines.append('  - If PixelLab is available, call generate_agent_avatar for each '
+                     'missing worker. The four images belong in that agent\'s own directory.')
+        lines.append('')
     if sprint:
         lines.append(f"Sprint: {sprint.get('name') or sprint.get('id')} ({sprint.get('id')}) -- "
                      f"{sprint.get('goal') or 'no goal set'}")

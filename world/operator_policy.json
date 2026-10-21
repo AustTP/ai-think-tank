@@ -136,5 +136,9 @@
   "reviewGradeCalibrationHysteresis": 0.05,
   "reviewGradeCalibrationMinSamples": 10,
   "reviewGradeCalibrationStep": 0.05,
-  "calibrationAdjustIntervalS": 1800
+  "calibrationAdjustIntervalS": 1800,
+  "avatarTaskIntervalS": 30,
+  "avatarTaskBatchMax": 3,
+  "avatarTaskRetryCooldownS": 21600,
+  "avatarGenerationMinCreditsUsd": 0.5
 }

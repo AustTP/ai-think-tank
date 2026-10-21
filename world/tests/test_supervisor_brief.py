@@ -61,6 +61,14 @@ def test_brief_is_scoped_to_the_team():
     assert 'Scope: this team only' in text
 
 
+def test_brief_lists_workers_missing_avatar_images(monkeypatch):
+    import serve
+    monkeypatch.setattr(serve, '_avatar_set_complete', lambda aid: False)
+    text = sim._supervisor_brief(_state(), 'nora', 1000)['text']
+    assert 'Avatar images missing: ruth' in text
+    assert 'generate_agent_avatar' in text
+
+
 def test_brief_names_no_sprint_when_none_is_active():
     state = _state()
     state['sprints']['s1']['status'] = 'closed'

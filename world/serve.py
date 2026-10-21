@@ -4180,6 +4180,214 @@ def _ensure_agent_avatar(agent_id, name, role, is_director=False):
 
 
 _AVATAR_LOOP_INTERVAL_S = 30
+# Director-driven avatar generation (the old server-side generator is kept
+# below for its tests, but is no longer started). The coordinator loop only
+# queues a supervisor turn; the director calls generate_agent_avatar, which
+# checks PixelLab availability and the budget before spending.
+AVATAR_TASK_INTERVAL_S = 30
+AVATAR_TASK_BATCH_MAX = 3
+AVATAR_TASK_RETRY_COOLDOWN_S = 6 * 3600
+AVATAR_GENERATION_MIN_CREDITS_USD = 0.50
+
+
+def _pixellab_configured():
+    """Cheap credential-presence check (no network, no balance call)."""
+    try:
+        return bool(_open_secret(_credential_token('pixellab') or ''))
+    except Exception:
+        return False
+
+
+_AVATAR_AVAIL_CACHE = {'at': 0.0, 'ok': False}
+AVATAR_AVAILABILITY_TTL_S = 300
+
+
+def _avatar_generation_available():
+    """Cached balance check for the coordinator: the API is usable only when
+    the account has at least the policy credit floor. A 5-minute TTL keeps the
+    loop from hitting the balance endpoint every 30 seconds."""
+    now = time.time()
+    cache = _AVATAR_AVAIL_CACHE
+    if now - float(cache.get('at') or 0) < AVATAR_AVAILABILITY_TTL_S:
+        return bool(cache.get('ok'))
+    remaining = _pixellab_credits_remaining()
+    cache['at'] = now
+    cache['ok'] = (remaining is not None
+                   and remaining >= AVATAR_GENERATION_MIN_CREDITS_USD)
+    return bool(cache['ok'])
+
+
+def _avatar_files(agent_id):
+    d = _avatar_dir(agent_id)
+    if not os.path.isdir(d):
+        return []
+    return sorted(f for f in os.listdir(d) if f.endswith('.png'))
+
+
+def generate_agent_avatar(actor_id, target_id, force=False):
+    """Director/chief tool: generate one agent's four directional images with
+    PixelLab and write them to that agent's own directory
+    (AGENTS_DIR/<agent_id>/avatars/). Only a director may target their own team
+    (or themselves); the chief may target any non-admin agent. Checks PixelLab
+    credentials and a minimum credit balance before spending, and refuses when
+    the think tank or the actor's spend cap is exhausted. Idempotent unless
+    force=True. Returns a JSON-friendly dict; never raises for a refused call."""
+    state = get_state_from_db() or {}
+    actor = str(actor_id or '').strip()
+    target = str(target_id or '').strip()
+    if not actor or not target:
+        return {'ok': False, 'error': 'agentId is required'}
+    if not _is_director_or_admin(state, actor):
+        return {'ok': False, 'error': 'only a director or the chief of staff may generate agent images'}
+    roster = {d.get('id'): d for d in (state.get('agentRoster') or [])}
+    target_def = roster.get(target)
+    if not target_def:
+        return {'ok': False, 'error': 'unknown agent'}
+    if target_def.get('isAdmin'):
+        return {'ok': False, 'error': 'the chief of staff keeps the default sprite'}
+    if not _is_admin(state, actor):
+        team = supervisor_team_for(state, actor)
+        members = set((team or {}).get('members') or [])
+        if target != actor and target not in members:
+            return {'ok': False, 'error': 'that agent is not on your team'}
+    agent = (state.get('agents') or {}).get(target)
+    if not agent:
+        return {'ok': False, 'error': 'agent state not found'}
+    if _avatar_set_complete(target) and not force:
+        return {'ok': True, 'agentId': target, 'alreadyComplete': True,
+                'dir': _avatar_dir(target), 'files': _avatar_files(target)}
+    if target in _AVATAR_IN_FLIGHT:
+        return {'ok': False, 'error': 'that agent is already generating'}
+    if _think_tank_spend_cap_exceeded():
+        return {'ok': False, 'error': 'the think tank spend cap is exhausted'}
+    if _agent_spend_cap_exceeded(actor):
+        return {'ok': False, 'error': 'your spend cap is exhausted'}
+    if _agent_spend_cap_exceeded(target):
+        return {'ok': False, 'error': 'that agent\'s spend cap is exhausted'}
+    remaining = _pixellab_credits_remaining()
+    if remaining is None:
+        return {'ok': False, 'error': 'PixelLab is not configured or unreachable'}
+    if remaining < AVATAR_GENERATION_MIN_CREDITS_USD:
+        return {'ok': False,
+                'error': (f'PixelLab has ${remaining:.2f} left; the avatar floor is '
+                          f'${AVATAR_GENERATION_MIN_CREDITS_USD:.2f}')}
+    ok = _ensure_agent_avatar(target, agent.get('name') or target_def.get('name') or target,
+                              agent.get('role') or target_def.get('role') or 'worker',
+                              bool(target_def.get('isDirector')))
+    files = _avatar_files(target)
+    log_action(actor, 'generate_agent_avatar', {
+        'agentId': target, 'ok': ok, 'files': files, 'forced': bool(force),
+        'remainingBeforeUsd': remaining,
+    }, authorized=True)
+    if not ok:
+        return {'ok': False, 'error': 'PixelLab generation failed; check the service balance'}
+    return {'ok': True, 'agentId': target, 'dir': _avatar_dir(target), 'files': files}
+
+
+def _avatar_task_open(state, agent_id):
+    marker = f'({agent_id})'
+    for item in (state.get('workQueue') or []):
+        title = str(item.get('title') or '')
+        if title.startswith('[AVATAR]') and marker in title:
+            return True
+    for task in (state.get('tasks') or {}).values():
+        title = str(task.get('title') or '')
+        if (title.startswith('[AVATAR]') and marker in title
+                and task.get('status') not in ('done', 'cancelled', 'abandoned', 'failed')):
+            return True
+    return False
+
+
+def _avatar_task_team_id(state, target, responsible):
+    for team in (state.get('teams') or []):
+        if target in (team.get('members') or []):
+            return team.get('id')
+    for team in (state.get('teams') or []):
+        if team.get('directorId') == target:
+            return team.get('id')
+    for team in (state.get('teams') or []):
+        if team.get('directorId') == responsible:
+            return team.get('id')
+    return responsible
+
+
+def _queue_avatar_tasks():
+    """One coordinator pass: for each non-admin agent with a missing avatar
+    set and PixelLab configured, queue one supervisor turn for the responsible
+    director. Does not call PixelLab and does not spend generation credits.
+    Returns the number of tasks queued."""
+    if not _pixellab_configured() or _think_tank_spend_cap_exceeded():
+        return 0
+    if not _avatar_generation_available():
+        return 0
+    import sim as _sim
+    state = _state_begin()
+    try:
+        if not state:
+            return 0
+        agents = state.get('agents') or {}
+        roster = {d.get('id'): d for d in (state.get('agentRoster') or [])}
+        admin = next((d.get('id') for d in (state.get('agentRoster') or [])
+                      if d.get('isAdmin')), None)
+        now_ms = int(time.time() * 1000)
+        seen = state.setdefault('_avatarTaskAt', {})
+        queued = 0
+        for agent_id, agent in agents.items():
+            if roster.get(agent_id, {}).get('isAdmin'):
+                continue
+            if agent_id in _AVATAR_IN_FLIGHT or _avatar_set_complete(agent_id):
+                continue
+            if _avatar_task_open(state, agent_id):
+                continue
+            last = int(seen.get(agent_id) or 0)
+            if last and now_ms - last < AVATAR_TASK_RETRY_COOLDOWN_S * 1000:
+                continue
+            responsible = (roster.get(agent_id, {}).get('director')
+                           or (agent_id if roster.get(agent_id, {}).get('isDirector')
+                               else admin))
+            if not responsible or responsible not in agents:
+                continue
+            name = agent.get('name') or roster.get(agent_id, {}).get('name') or agent_id
+            team_id = _avatar_task_team_id(state, agent_id, responsible)
+            _sim.queue_work(state, [{
+                'title': f'[AVATAR] Generate four images for {name} ({agent_id})'[:120],
+                'room': 'commandcenter',
+                'taskType': 'supervise',
+                'assignedTo': responsible,
+                'teamId': team_id,
+                'priority': 'normal',
+                'budgetUsd': _sim.SUPERVISOR_CARD_BUDGET_USD,
+                'sizeEstimate': 'S',
+                'instructions': (
+                    f'Generate the four directional character images for {name} '
+                    f'({agent_id}) with the generate_agent_avatar tool. The tool writes '
+                    f'them to that agent\'s own directory: agents/{agent_id}/avatars/. '
+                    'Verify south, north, east, and west all exist. If PixelLab is not '
+                    'configured or the budget floor is not met, report that plainly and '
+                    'do not retry in this turn. Do not do other work unless the supervisor '
+                    'report shows a problem.'
+                ),
+            }])
+            seen[agent_id] = now_ms
+            queued += 1
+            if queued >= AVATAR_TASK_BATCH_MAX:
+                break
+        if queued:
+            save_state_to_db(state)
+        return queued
+    finally:
+        _state_abort()
+
+
+async def _avatar_task_loop():
+    """Director-driven avatar coordination. The server only queues a turn; the
+    director calls PixelLab. This replaces the old server-side generator."""
+    while True:
+        try:
+            await asyncio.to_thread(_queue_avatar_tasks)
+        except Exception:
+            pass
+        await asyncio.sleep(AVATAR_TASK_INTERVAL_S)
 
 
 async def _avatar_loop():
@@ -6644,6 +6852,10 @@ bind_policy(__name__, [
     ('HEALTH_CHECK_INTERVAL_S', 'healthCheckIntervalS'),
     ('HEALTH_ALERT_DEDUP_WINDOW_S', 'healthAlertDedupWindowS'),
     ('HEALTH_DIGEST_INTERVAL_S', 'healthDigestIntervalS'),
+    ('AVATAR_TASK_INTERVAL_S', 'avatarTaskIntervalS'),
+    ('AVATAR_TASK_BATCH_MAX', 'avatarTaskBatchMax'),
+    ('AVATAR_TASK_RETRY_COOLDOWN_S', 'avatarTaskRetryCooldownS'),
+    ('AVATAR_GENERATION_MIN_CREDITS_USD', 'avatarGenerationMinCreditsUsd'),
 ], overrides={
     '_SIM_WATCHDOG_INTERVAL_S': _watchdog_interval_s,
     '_SIM_WATCHDOG_STALE_S': _watchdog_stale_s,
@@ -6913,7 +7125,7 @@ async def _lifespan(app):
         webhook_task = asyncio.create_task(_webhook_poll_loop())
         print(f'[webhook] consumer active for {", ".join(_webhook_active)}', flush=True)
     ask_drain_task = asyncio.create_task(_pending_ask_drain_loop())
-    avatar_task = asyncio.create_task(_avatar_loop())
+    avatar_task = asyncio.create_task(_avatar_task_loop())
     rss_task = asyncio.create_task(_rss_poll_loop())
     ws_supervisor_task = asyncio.create_task(_ws_supervisor_loop())
     # Sim task + watchdog. sim_holder is shared with _sim_watchdog_loop so a

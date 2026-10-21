@@ -191,3 +191,85 @@ def test_state_records_refuses_roster_and_internal_keys(monkeypatch):
         out = serve.supervisor_state_records(
             'theo', {'op': 'set', 'path': path, 'value': True})
         assert 'error' in out, path
+
+
+def test_director_generates_avatars_for_own_team_only(monkeypatch, tmp_path):
+    state = _state()
+    state['agents']['ruth'] = {'name': 'Ruth', 'role': 'Assistant'}
+    state['agents']['cora'] = {'name': 'Cora', 'role': 'Assistant'}
+    _patch_state(monkeypatch, state)
+    avatar_dir = tmp_path / 'avatars'
+    monkeypatch.setattr(serve, '_avatar_dir', lambda aid: str(avatar_dir))
+    monkeypatch.setattr(serve, '_avatar_set_complete', lambda aid: False)
+    monkeypatch.setattr(serve, '_pixellab_credits_remaining', lambda: 5.0)
+    monkeypatch.setattr(serve, '_think_tank_spend_cap_exceeded', lambda: False)
+    monkeypatch.setattr(serve, '_agent_spend_cap_exceeded', lambda aid: False)
+
+    def fake_ensure(aid, name, role, is_director):
+        avatar_dir.mkdir(parents=True, exist_ok=True)
+        for orientation in ('south', 'north', 'east', 'west'):
+            (avatar_dir / f'{orientation}.png').write_bytes(b'png')
+        return True
+
+    monkeypatch.setattr(serve, '_ensure_agent_avatar', fake_ensure)
+    out = serve.generate_agent_avatar('nora', 'ruth')
+    assert out['ok'] is True, out
+    assert sorted(out['files']) == ['east.png', 'north.png', 'south.png', 'west.png']
+    # A director cannot target another team's worker.
+    out = serve.generate_agent_avatar('nora', 'cora')
+    assert out['ok'] is False and 'not on your team' in out['error']
+    # The chief can target any non-admin agent.
+    out = serve.generate_agent_avatar('theo', 'cora')
+    assert out['ok'] is True, out
+    # But not the chief's own default sprite.
+    out = serve.generate_agent_avatar('theo', 'theo')
+    assert out['ok'] is False
+
+
+def test_generate_agent_avatar_respects_the_credit_floor(monkeypatch, tmp_path):
+    state = _state()
+    state['agents']['ruth'] = {'name': 'Ruth'}
+    _patch_state(monkeypatch, state)
+    monkeypatch.setattr(serve, '_avatar_dir', lambda aid: str(tmp_path))
+    monkeypatch.setattr(serve, '_avatar_set_complete', lambda aid: False)
+    monkeypatch.setattr(serve, '_think_tank_spend_cap_exceeded', lambda: False)
+    monkeypatch.setattr(serve, '_agent_spend_cap_exceeded', lambda aid: False)
+    monkeypatch.setattr(serve, '_pixellab_credits_remaining', lambda: 0.10)
+    out = serve.generate_agent_avatar('nora', 'ruth')
+    assert out['ok'] is False and 'floor' in out['error']
+
+
+def test_avatar_queue_assigns_missing_worker_to_its_director(monkeypatch):
+    state = _state()
+    state['agents']['ruth'] = {'name': 'Ruth'}
+    state['agents']['cora'] = {'name': 'Cora'}
+    state['_avatarTaskAt'] = {}
+    _patch_state(monkeypatch, state)
+    monkeypatch.setattr(serve, '_state_begin', lambda: state)
+    monkeypatch.setattr(serve, '_state_abort', lambda: None)
+    monkeypatch.setattr(serve, '_pixellab_configured', lambda: True)
+    monkeypatch.setattr(serve, '_avatar_generation_available', lambda: True)
+    monkeypatch.setattr(serve, '_think_tank_spend_cap_exceeded', lambda: False)
+    monkeypatch.setattr(serve, '_avatar_set_complete', lambda aid: False)
+    monkeypatch.setattr(serve, 'AVATAR_TASK_BATCH_MAX', 10)
+    n = serve._queue_avatar_tasks()
+    assert n > 0
+    queued = [q for q in state['workQueue'] if str(q.get('title', '')).startswith('[AVATAR]')]
+    ruth = next(q for q in queued if 'ruth' in q['title'])
+    assert ruth['assignedTo'] == 'nora' and ruth['teamId'] == 'nora'
+    cora = next(q for q in queued if 'cora' in q['title'])
+    assert cora['assignedTo'] == 'ben'
+    # The per-agent cooldown prevents a duplicate turn on the next pass.
+    assert serve._queue_avatar_tasks() == 0
+
+
+def test_avatar_queue_stays_idle_without_pixellab(monkeypatch):
+    _patch_state(monkeypatch, _state())
+    monkeypatch.setattr(serve, '_pixellab_configured', lambda: False)
+    assert serve._queue_avatar_tasks() == 0
+
+
+def test_avatar_directory_is_the_agent_own_directory():
+    import os
+    expected = os.path.join(serve.AGENTS_DIR, 'ruth', 'avatars')
+    assert serve._avatar_dir('ruth') == expected

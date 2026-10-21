@@ -349,6 +349,20 @@ class OperatorPolicySimServeBind(unittest.TestCase):
         self.assertEqual(serve.REVIEW_GRADE_CALIBRATION_STEP, 0.04)
         self.assertEqual(serve.CALIBRATION_ADJUST_INTERVAL_S, 900)
 
+    def test_reload_rebinds_avatar_generation_scalars(self):
+        import serve
+        self._write({
+            'avatarTaskIntervalS': 45,
+            'avatarTaskBatchMax': 4,
+            'avatarTaskRetryCooldownS': 10800,
+            'avatarGenerationMinCreditsUsd': 1.5,
+        })
+        config.reload_policy_config()
+        self.assertEqual(serve.AVATAR_TASK_INTERVAL_S, 45)
+        self.assertEqual(serve.AVATAR_TASK_BATCH_MAX, 4)
+        self.assertEqual(serve.AVATAR_TASK_RETRY_COOLDOWN_S, 10800)
+        self.assertEqual(serve.AVATAR_GENERATION_MIN_CREDITS_USD, 1.5)
+
     def test_env_watchdog_overrides_operator_config(self):
         # Env key present in .env wins; when absent, operator config wins.
         # Simulate the env-present path by patching the capture variables serve

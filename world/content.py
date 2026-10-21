@@ -722,6 +722,7 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
     backlog_tool = _make_supervisor_backlog_executor(agent_id)
     db_tool = _make_supervisor_db_executor(agent_id)
     state_tool = _make_supervisor_state_executor(agent_id)
+    avatar_tool = _make_generate_agent_avatar_executor(agent_id)
 
     def execute_tool(tool_name, args):
         _hb()
@@ -739,6 +740,8 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             return db_tool(tool_name, args)
         if tool_name == 'state_records':
             return state_tool(tool_name, args)
+        if tool_name == 'generate_agent_avatar':
+            return avatar_tool(tool_name, args)
         if tool_name == 'schedules':
             return schedules_tool(tool_name, args)
         if tool_name == 'runbook':
@@ -749,7 +752,8 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
 
     tools = [_SPIKE_SANDBOX_TOOL, _SUPERVISOR_REPORT_TOOL, _SUPERVISOR_GRANT_TOOL,
              _SUPERVISOR_LIVE_READ_TOOL, _SUPERVISOR_DELEGATE_TOOL,
-             _SUPERVISOR_SCHEDULES_TOOL, _SUPERVISOR_RUNBOOK_TOOL]
+             _SUPERVISOR_SCHEDULES_TOOL, _SUPERVISOR_RUNBOOK_TOOL,
+             _GENERATE_AGENT_AVATAR_TOOL]
     if is_admin:
         tools += [_SUPERVISOR_BACKLOG_TOOL, _SUPERVISOR_DB_TOOL,
                   _SUPERVISOR_STATE_TOOL]
@@ -763,7 +767,8 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             'delegate (queue a scoped check for a worker; name the team), schedules '
             '(list/create/edit/delete any), runbook (standard procedures), '
             'supervisor_grant_budget (any team), direct_backlog (instruct a team to put an '
-            'immediate high-priority task in its backlog), db_records (read or modify '
+            'immediate high-priority task in its backlog), generate_agent_avatar (generate '
+            'the four directional images for any non-admin agent), db_records (read or modify '
             'non-secret SQL tables; every write is audited), state_records (read or '
             'modify live business records in the state blob by path).\n'
             'Look for anything unusual across the tank: a failure, a card stuck in review, '
@@ -772,7 +777,8 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             'direct_backlog (concrete title + reason/acceptance), or delegate a scoped check. '
             'Use db_records (SQL tables) or state_records (live business records by path) only '
             'for a concrete record fix you cannot make through the normal tools; state the '
-            'scope, filter/path, and why. Never do a team\'s work for it.\n'
+            'scope, filter/path, and why. If a team is missing avatar images, generate them '
+            'with generate_agent_avatar. Never do a team\'s work for it.\n'
             'Finish with a short report: what you checked, anything unusual, directives filed, '
             'records changed, and next actions.\n\n'
             'Current cross-team brief (supervisor_report returns a fresh copy):\n' + brief['text']
@@ -787,12 +793,16 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             'Do not edit project files.\n'
             'Your tools: supervisor_report (scoped state), live_read (read-only live project and team '
             'log), delegate (queue a scoped check for a worker with a return contract), schedules '
-            '(list/create/edit/delete), runbook (standard procedures), supervisor_grant_budget.\n'
-            'Act on two things only:\n'
+            '(list/create/edit/delete), runbook (standard procedures), supervisor_grant_budget, '
+            'generate_agent_avatar (generate the four directional images for a team member or '
+            'yourself; checks PixelLab availability and budget).\n'
+            'Act on three things:\n'
             '1. Budget. If a card spent its ceiling before close, say what the spend bought and either '
             'grant a top-up with supervisor_grant_budget (with a clear reason) or recommend stopping.\n'
             '2. Process. If a card failed, is stuck in review, or its deliverable is missing, say so '
             'plainly, delegate the check when it needs evidence, and name the next action.\n'
+            '3. Avatars. If the brief lists workers missing avatar images and PixelLab is available, '
+            'call generate_agent_avatar for each one before you finish.\n'
             'Never inspect or comment on another team, never touch the database, never write code. '
             'Finish with a short report: cards reviewed, budget decisions, process issues, delegations, next actions.\n\n'
             'Current scoped brief (supervisor_report returns a fresh copy):\n' + brief['text']
@@ -3875,6 +3885,44 @@ def _make_supervisor_state_executor(agent_id):
         import json as _json
         import serve as _serve
         return _json.dumps(_serve.supervisor_state_records(agent_id, args), sort_keys=True)
+    return run
+
+
+_GENERATE_AGENT_AVATAR_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'generate_agent_avatar',
+        'description': (
+            'Generate the four directional character images for one agent using '
+            "the real PixelLab API, and write them into that agent's own directory "
+            '(agents/<agentId>/avatars/). A director may generate for their own '
+            'team members or themselves; the chief of staff may generate for any '
+            'non-admin agent. The call checks PixelLab credentials, the minimum '
+            'credit floor, and the spend caps before generating. It is idempotent: '
+            'if the set already exists it returns alreadyComplete. Only use force '
+            'when the existing images are wrong.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'agentId': {'type': 'string',
+                            'description': 'The agent id to generate images for.'},
+                'force': {'type': 'boolean',
+                          'description': 'Regenerate even if a complete set exists.'},
+            },
+            'required': ['agentId'],
+        },
+    },
+}
+
+
+def _make_generate_agent_avatar_executor(agent_id):
+    def run(name, args):
+        import json as _json
+        import serve as _serve
+        return _json.dumps(_serve.generate_agent_avatar(
+            agent_id, (args or {}).get('agentId'),
+            bool((args or {}).get('force'))), sort_keys=True)
     return run
 
 

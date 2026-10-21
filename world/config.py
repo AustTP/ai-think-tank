@@ -859,6 +859,14 @@ OPERATOR_POLICY_DEFAULT: dict = {
     'reviewGradeCalibrationMinSamples': 10,
     'reviewGradeCalibrationStep': 0.05,
     'calibrationAdjustIntervalS': 30 * 60,
+    # Director avatar generation. The server only coordinates: it queues a
+    # supervisor turn for a missing worker avatar set, and a director calls
+    # PixelLab through generate_agent_avatar. The minimum-credit floor keeps a
+    # generation from draining the PixelLab account.
+    'avatarTaskIntervalS': 30,
+    'avatarTaskBatchMax': 3,
+    'avatarTaskRetryCooldownS': 6 * 3600,
+    'avatarGenerationMinCreditsUsd': 0.50,
 }
 
 # Per-key validation: (kind, min, max). A wrong-typed or out-of-range value
@@ -988,6 +996,10 @@ _OPERATOR_SCHEMA: dict = {
     'reviewGradeCalibrationMinSamples': ('int', 1, 1000),
     'reviewGradeCalibrationStep': ('float', 0.001, 1.0),
     'calibrationAdjustIntervalS': ('int', 60, 86400),
+    'avatarTaskIntervalS': ('int', 10, 3600),
+    'avatarTaskBatchMax': ('int', 1, 20),
+    'avatarTaskRetryCooldownS': ('int', 300, 7 * 86400),
+    'avatarGenerationMinCreditsUsd': ('float', 0.0, 100.0),
 }
 
 # --- Teamwork agreements -----------------------------------------------------
