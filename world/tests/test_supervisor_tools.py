@@ -323,3 +323,26 @@ def test_supervise_card_pins_its_director_and_keeps_the_team(monkeypatch):
     assert sim._assign_due_item(state, item2, True, grid, doors, 2000,
                                 task_id_holder={0: 1}) is None
     assert all(t.get('assignedTo') != 'ruth' for t in state['tasks'].values())
+
+
+def test_supervisor_tool_loop_has_a_heartbeat(monkeypatch):
+    import content
+    import sim
+    state = _state()
+    state['agents']['nora'] = {'busy': False, 'mailbox': []}
+    state['tasks'] = {}
+    task = {'id': 'sup-hb', 'title': 'Check the team', 'teamId': 'nora',
+            'instructions': 'Check the team.'}
+    called = {}
+
+    def fake_loop(model, messages, tools, execute_tool, **kwargs):
+        called['report'] = execute_tool('supervisor_report', {})
+        return 'done', []
+
+    monkeypatch.setattr(serve, '_call_agent_tool_loop', fake_loop)
+    monkeypatch.setattr(serve, '_mid_tier_slug', lambda: 'mid')
+    monkeypatch.setattr(serve, 'get_or_create_agent_key', lambda aid: 'k')
+    monkeypatch.setattr(serve, '_avatar_set_complete', lambda aid: True)
+    monkeypatch.setattr(sim, '_store_content_result', lambda *a, **k: None)
+    content._run_supervisor_content(state, 'nora', task)
+    assert 'report' in called

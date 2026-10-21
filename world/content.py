@@ -711,6 +711,14 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
     key = _serve.get_or_create_agent_key(agent_id)
     model = _serve._mid_tier_slug() or _serve._low_tier_slug()
     task['workUntil'] = time.time() + 180
+
+    def _hb():
+        try:
+            task['_contentHeartbeat'] = time.time()
+        except Exception:
+            pass
+
+    _hb()
     sandbox_id = f"supervisor-{task.get('id') or 'adhoc'}"
     sandbox_tool = _make_spike_sandbox_executor(agent_id, key, sandbox_id)
     report_tool = _make_supervisor_report_executor(agent_id)
