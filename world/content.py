@@ -890,11 +890,12 @@ def _run_report_content(snapshot, agent_id, task, base_ctx=None):
         '- If the source has no timestamps, say "timestamps unavailable" and do not invent any.\n'
         '- If a source is missing, say so explicitly and make no claims from it.\n'
         '- Do not mention tools, tool failures, or any content that is not in the sources.\n'
-        '- End with a revised final recommendation line: ADOPT / REJECT / ADOPT (limited), with conditions.\n\n'
+        '- Keep the addendum under 900 words.\n'
+        '- ALWAYS end with a single revised final recommendation line: ADOPT / REJECT / ADOPT (limited), with conditions.\n\n'
         'SOURCES:\n\n' + '\n\n'.join(chunks)
     )
     text = _plain_completion(model, [{'role': 'user', 'content': prompt}],
-                             max_tokens=4000, service='report',
+                             max_tokens=8000, service='report',
                              task_id=task.get('id'))
     if not text:
         _sim_module._store_content_result(task.get('id'), {
