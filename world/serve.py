@@ -6568,10 +6568,11 @@ def _can_write_agent(state, writer_id, target_id):
 # empty director spawns nothing.
 # ---------------------------------------------------------------------------
 def _director_ids(state):
-    """Who counts as a director: anyone with >=1 direct report, plus explicit
-    isDirector / isAdmin flags (a director who's mid-restructure with no live
+    """Who counts as a director: anyone with >=1 direct report, plus an
+    explicit isDirector flag (a director who's mid-restructure with no live
     report yet still leads a team). Used to resolve team membership to the
-    NEAREST director a member reports into."""
+    NEAREST director a member reports into; team LEADERSHIP is a separate
+    question and excludes the admin (see _backfill_teams_in_db)."""
     roster = state.get('agentRoster', []) if state else []
     counts = {}
     for d in roster:
@@ -6625,8 +6626,13 @@ def _backfill_teams_in_db():
     # Explicit isDirector flags also qualify (a very senior director with no
     # live report yet shouldn't lose their team mid-restructure).
     for d in roster:
-        if d.get('isDirector') or d.get('isAdmin'):
+        if d.get('isDirector'):
             director_ids.add(d.get('id'))
+    # The admin is a director for authority and membership purposes, but the
+    # chief of staff coordinates the directors; it does not lead a team. Drop
+    # it from the leadership set so it never gets (or keeps) a phantom team.
+    admin_ids = _admin_ids()
+    director_ids -= set(admin_ids or ())
 
     changed = False
     fresh = []
@@ -18500,7 +18506,14 @@ def _classify_team_default(state, text):
     serve.py _backfill_teams_in_db), picking a team is picking a director; no
     separate director-resolution step is needed. Returns a team/director id,
     or None on outage or no teams exist yet."""
-    teams = [t for t in (state.get('teams') or []) if t.get('id')]
+    # Only staffed teams are candidates: a team with an explicitly empty
+    # roster (a stale admin entry, or a lead whose reports have not landed
+    # yet) cannot take work, and offering it to the classifier turns team
+    # routing into a coin flip. An unknown member list stays a candidate.
+    admin_ids = _admin_ids()
+    teams = [t for t in (state.get('teams') or [])
+             if t.get('id') and t.get('id') not in admin_ids
+             and t.get('members') != []]
     if not teams:
         return None
     candidates = [{'id': t['id'], 'description': t.get('purpose') or f"Team directed by {t.get('name', t['id'])}."}

@@ -8771,7 +8771,10 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         'filedBy': reporter_id,
         'title': f"[{issue_type.upper()}] {summary}",
         'room': 'pressoffice',
-        'reason': f"JIRA issue {key}",
+        # Comprehension reads this as the request's rationale: name the card
+        # and its intent, not just the key, so a well-specified issue is not
+        # read back as 'needs-clarification' for a stub reason.
+        'reason': f"JIRA issue {key}: {summary[:200]}",
         'filedAt': now_ms,
         'status': 'pending',
         'origin': 'jira_issue',
@@ -10272,6 +10275,12 @@ def _ceremony_facilitator(state, team_id):
             continue
         if _free(other):
             return other
+    # Last chair: the chief of staff. The admin role is authority, not a team
+    # (it has no team of its own), so it never appears in the loop above, but
+    # it can still run the ceremony when every team director is unavailable.
+    for d in (state.get('agentRoster') or []):
+        if d.get('isAdmin') and _free(d.get('id')):
+            return d.get('id')
     return None
 
 
