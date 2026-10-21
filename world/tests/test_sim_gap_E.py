@@ -279,6 +279,27 @@ class BreakdownCeremony(SimIsolation):
         self.assertEqual(len(state['workQueue']), 1)
         self.assertNotIn('t1', state['pendingBreakdowns'])
 
+    def test_report_card_uses_research_not_the_code_lane(self):
+        pending = {'scrumMasterId': 'sm1', 'teamId': 't1',
+                   'reqIds': ['r1'], 'people': {}}
+        state = {
+            'agentRoster': [{'id': 'sm1', 'name': 'Sam'}],
+            'agents': {'sm1': {'id': 'sm1'}},
+            'teams': [{'id': 't1', 'directorId': 'd1'}],
+            'backlogRequests': [
+                {'id': 'r1', 'status': 'pending', 'filedBy': 'm1', 'title': 'Y',
+                 'goal': 'Y', 'teamId': 't1'},
+            ],
+            'workQueue': [],
+        }
+        decider = lambda s, instructions, goal: {'items': [
+            {'title': 'Write the recommendation', 'type': 'report'},
+            {'title': 'Change the parser', 'type': 'story'},
+        ]}
+        sim._resolve_breakdown(state, pending, 1_000_000, decider=decider)
+        self.assertEqual([q['taskType'] for q in state['workQueue']],
+                         ['research', 'code'])
+
     def test_breakdown_step_defers_unembarked_without_facilitator(self):
         state = {
             'teams': [{'id': 't1', 'directorId': 'd1'}],

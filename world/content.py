@@ -673,7 +673,13 @@ def _run_observatory_content(snapshot, agent_id, task, base_ctx=None):
     elif task.get('research'):
         _run_research_content(snapshot, agent_id, task, base_ctx)
     elif task.get('projectLabel'):
-        _run_research_project_content(snapshot, agent_id, task, base_ctx)
+        # Project research needs the web tools (browse_page, search_web,
+        # youtube_transcript, GitHub read). The old project branch was a single
+        # model call with no tools, so source-based cards came back as honest
+        # refusals ("I cannot open the URL") and still completed as done. Reuse
+        # the tested spike executor, which plans, gathers with real tools, and
+        # writes a cited report.
+        _run_spike_content(snapshot, agent_id, task, base_ctx)
     else:
         _run_research_bare_content(snapshot, agent_id, task, base_ctx)
 
@@ -786,7 +792,9 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             'Use db_records (SQL tables) or state_records (live business records by path) only '
             'for a concrete record fix you cannot make through the normal tools; state the '
             'scope, filter/path, and why. If a team is missing avatar images, generate them '
-            'with generate_agent_avatar. Never do a team\'s work for it.\n'
+            'with generate_agent_avatar. A research or report card whose note says it could '
+            'not fetch its source is a failure, not a done card; direct the owning team to '
+            're-card it as a spike. Never do a team\'s work for it.\n'
             'Finish with a short report: what you checked, anything unusual, directives filed, '
             'records changed, and next actions.\n\n'
             'Current cross-team brief (supervisor_report returns a fresh copy):\n' + brief['text']
@@ -804,12 +812,15 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             '(list/create/edit/delete), runbook (standard procedures), supervisor_grant_budget, '
             'generate_agent_avatar (generate the four directional images for a team member or '
             'yourself; checks PixelLab availability and budget).\n'
-            'Act on three things:\n'
+            'Act on four things:\n'
             '1. Budget. If a card spent its ceiling before close, say what the spend bought and either '
             'grant a top-up with supervisor_grant_budget (with a clear reason) or recommend stopping.\n'
             '2. Process. If a card failed, is stuck in review, or its deliverable is missing, say so '
             'plainly, delegate the check when it needs evidence, and name the next action.\n'
-            '3. Avatars. If the brief lists workers missing avatar images and PixelLab is available, '
+            '3. Research gaps. If a research or report card is done but its note says the source was '
+            'not fetched or the finding is empty, treat it as unfinished and delegate a spike to do '
+            'the real source read.\n'
+            '4. Avatars. If the brief lists workers missing avatar images and PixelLab is available, '
             'call generate_agent_avatar for each one before you finish.\n'
             'Never inspect or comment on another team, never touch the database, never write code. '
             'Finish with a short report: cards reviewed, budget decisions, process issues, delegations, next actions.\n\n'

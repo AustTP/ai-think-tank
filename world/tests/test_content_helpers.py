@@ -1519,3 +1519,13 @@ class BuildWorkContext(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ResearchRouting(unittest.TestCase):
+    def test_project_research_uses_the_tool_using_spike_executor(self):
+        with mock.patch.object(content, '_run_spike_content') as spike, \
+             mock.patch.object(content, '_run_research_project_content') as bare:
+            content._run_observatory_content({}, 'ruth',
+                                             {'projectLabel': 'PI Durable'})
+        spike.assert_called_once()
+        bare.assert_not_called()

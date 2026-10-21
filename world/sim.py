@@ -11138,14 +11138,17 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             "requires -- at least one, never a fixed count: a small ask may be a single card, a sprawling one may need many. "
             "Do NOT assign a room to a card -- the buildings are shared and the agent who picks the work up figures out "
             "where it needs to happen. Keep every title to ONE short sentence. For each card set \"type\" to "
-            "\"story\" (deliverable work), \"spike\" (an investigation with no committed deliverable), or "
+            "\"story\" (code or repo deliverable work), \"spike\" (an investigation with no committed deliverable), "
             "\"research\" (a fact-gathering/analysis sweep that produces findings, not a shipped deliverable -- "
-            "document studies, competitive teardown, desk research), "
+            "document studies, competitive teardown, desk research), or "
+            "\"report\" (a written deliverable, analysis, or recommendation that does NOT change the repo -- use "
+            "this instead of story for a memo, review write-up, or recommendation), "
             "a one-line \"acceptanceCriteria\" when the story has a clear test of done, a \"never\" list "
             "ONLY when the card has hard prohibitions the worker must never do (omit otherwise), and a "
             "\"sizeEstimate\" of S/M/L. "
+            "Never use story for a prose report or recommendation; use report. "
             "Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: "
-            '{"items":[{"title":"short title","type":"story|spike|research","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L",' + budget_field + '}]}'
+            '{"items":[{"title":"short title","type":"story|spike|research|report","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L",' + budget_field + '}]}'
         )
         data = decider(state, instructions, goal)
         items = []
@@ -11165,7 +11168,16 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             # pipeline (Jev block + flake8/mypy/pytest) on pure prose -- the
             # exact failure class that stranded the StealthX research cards.
             raw_type = (s.get('type') or 'story').strip().lower()
-            task_type = raw_type if raw_type in ('spike', 'research') else 'code'
+            # 'report' is prose/recommendation work, not a repo change. Give it
+            # the research executor (which now uses the tool-using spike lane)
+            # instead of the code pipeline, so a written recommendation cannot
+            # fail on flake8/mypy over the whole repository.
+            if raw_type == 'report':
+                task_type = 'research'
+            elif raw_type in ('spike', 'research'):
+                task_type = raw_type
+            else:
+                task_type = 'code'
             ac = (s.get('acceptanceCriteria') or '').strip()
             never = normalize_never_block(s.get('never'))
             instructions_text = (f"Filed by {req.get('filedBy')} during a large-request breakdown by "
