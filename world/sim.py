@@ -1929,13 +1929,41 @@ TASK_CONTENT_GRACE_STEP_S = 60.0
 TASK_CONTENT_GRACE_MAX_S = 300.0
 TASK_CONTENT_HB_STALE_S = 240.0
 
+# In-process heartbeat fallback. The content thread mutates the task dict it
+# was dispatched with; a concurrent whole-blob save from a stale snapshot can
+# overwrite that field, which used to make a live synthesis look dead and get
+# abandoned empty. The registry is process-local, keyed by task id, and is
+# consulted alongside the task field so a save race cannot erase liveness.
+_CONTENT_HEARTBEATS = {}
+
+
+def _bump_content_heartbeat(task_id):
+    if not task_id:
+        return
+    now = time.time()
+    _CONTENT_HEARTBEATS[str(task_id)] = now
+    if len(_CONTENT_HEARTBEATS) > 500:
+        cutoff = now - 3600
+        for key, ts in list(_CONTENT_HEARTBEATS.items()):
+            if ts < cutoff:
+                _CONTENT_HEARTBEATS.pop(key, None)
+
+
+def _content_heartbeat_at(task):
+    hb = task.get('_contentHeartbeat')
+    task_id = task.get('id')
+    reg = _CONTENT_HEARTBEATS.get(str(task_id)) if task_id else None
+    if isinstance(reg, (int, float)) and (not isinstance(hb, (int, float)) or reg > hb):
+        return reg
+    return hb
+
 
 def _content_run_is_live(task, now):
     """True when a still-in-flight content run has heartbeat evidence it is
     alive and grace remains. A missing heartbeat (executor never opted in)
     is NOT live -- that preserves the pre-existing timeout semantics for
     every other lane."""
-    hb = task.get('_contentHeartbeat')
+    hb = _content_heartbeat_at(task)
     if not isinstance(hb, (int, float)):
         return False
     if (task.get('_contentGraceUsed') or 0) >= TASK_CONTENT_GRACE_MAX_S:
@@ -14203,8 +14231,8 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                         from serve import log_action
                         log_action(aid, 'content_run_abandoned',
                                    {'taskId': task['id'],
-                                    'heartbeatAgeS': (round(now - task['_contentHeartbeat'])
-                                                      if isinstance(task.get('_contentHeartbeat'),
+                                    'heartbeatAgeS': (round(now - _content_heartbeat_at(task))
+                                                      if isinstance(_content_heartbeat_at(task),
                                                                     (int, float)) else None),
                                     'graceUsedS': task.get('_contentGraceUsed')}, authorized=False)
                     except Exception:

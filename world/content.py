@@ -721,6 +721,7 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
     def _hb():
         try:
             task['_contentHeartbeat'] = time.time()
+            _sim_module._bump_content_heartbeat(task.get('id'))
         except Exception:
             pass
 
@@ -6003,6 +6004,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     def _hb():
         try:
             task['_contentHeartbeat'] = time.time()
+            _sim_module._bump_content_heartbeat(task.get('id'))
         except Exception:
             pass
 

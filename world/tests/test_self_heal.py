@@ -550,6 +550,17 @@ class ContentGraceHelpers(unittest.TestCase):
         task = {'_contentHeartbeat': 1000.0 - sim.TASK_CONTENT_HB_STALE_S - 1.0}
         self.assertFalse(sim._content_run_is_live(task, 1000.0))
 
+    def test_process_registry_keeps_a_live_run_alive_after_a_stale_save(self):
+        # A concurrent whole-blob save can overwrite the task's heartbeat
+        # field with an older value; the in-process registry must still prove
+        # the content thread is alive.
+        task = {'id': 'hb-reg', '_contentHeartbeat': 1.0, '_contentGraceUsed': 0.0}
+        sim._CONTENT_HEARTBEATS['hb-reg'] = 995.0
+        try:
+            self.assertTrue(sim._content_run_is_live(task, 1000.0))
+        finally:
+            sim._CONTENT_HEARTBEATS.pop('hb-reg', None)
+
     def test_grant_extends_then_caps(self):
         task = {'workUntil': 500.0, '_contentGraceUsed': 0.0}
         granted = sim._grant_content_grace(task, 500.0)
