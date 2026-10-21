@@ -704,7 +704,8 @@ class TregBalanceAndCall(unittest.TestCase):
 
 class PixelLabBalanceAndCall(unittest.TestCase):
     def test_balance_none_without_token(self):
-        with unittest.mock.patch.object(serve, '_open_secret', return_value=''):
+        with unittest.mock.patch.object(serve, '_open_secret', return_value=''), \
+             unittest.mock.patch.object(serve, '_pixellab_token', return_value=None):
             self.assertIsNone(serve._pixellab_account_balance())
 
     def test_balance_uses_cache_without_force(self):
@@ -742,7 +743,8 @@ class PixelLabBalanceAndCall(unittest.TestCase):
         self.assertEqual(data['id'], 'job-1')
 
     def test_call_no_credential(self):
-        with unittest.mock.patch.object(serve, '_open_secret', return_value=''):
+        with unittest.mock.patch.object(serve, '_open_secret', return_value=''), \
+             unittest.mock.patch.object(serve, '_pixellab_token', return_value=None):
             data, error = serve._pixellab_call('GET', '/x')
         self.assertIsNone(data)
         self.assertIn('not configured', error)

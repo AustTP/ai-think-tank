@@ -2721,7 +2721,8 @@ class PixelLabCreditsTest(unittest.TestCase):
     def test_none_token(self):
         with mock.patch.object(serve, '_credential_token',
                                return_value=None), \
-             mock.patch.object(serve, '_open_secret', return_value=''):
+             mock.patch.object(serve, '_open_secret', return_value=''), \
+             mock.patch.object(serve, '_pixellab_token', return_value=None):
             self.assertIsNone(serve._pixellab_credits_remaining())
 
     def test_success_and_failure(self):

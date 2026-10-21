@@ -71,8 +71,9 @@ class AvatarHelpers(unittest.TestCase):
         self.assertEqual(serve._avatar_orientation_name('bogus key'), 'bogus_key')
 
     def test_avatar_available_false_when_not_configured(self):
-        # No pixellab credential in the test vault -> fails closed.
-        self.assertFalse(serve._pixellab_avatar_available())
+        # No pixellab credential in the test vault or .env -> fails closed.
+        with unittest.mock.patch.object(serve, '_pixellab_token', return_value=None):
+            self.assertFalse(serve._pixellab_avatar_available())
 
 
 class AvatarGeneration(unittest.TestCase):

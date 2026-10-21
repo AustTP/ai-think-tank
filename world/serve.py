@@ -3918,6 +3918,17 @@ def _youtube_transcript_colab(url, lang='en', model_size='small'):
     return text, None
 
 
+def _pixellab_token():
+    """PixelLab bearer token: the vault credential first (the historical
+    path), then the operator's PIXELLAB_API_KEY in .env. Env is the shipped
+    path for fresh installs and the fallback for an existing vault row with no
+    stored secret."""
+    token = _open_secret(_credential_token('pixellab') or '')
+    if token:
+        return token
+    return (_load_env().get('PIXELLAB_API_KEY') or '').strip() or None
+
+
 _PIXELLAB_BALANCE_CACHE = {'at': 0.0, 'data': None}
 PIXELLAB_BALANCE_CACHE_TTL_S = float(_load_env().get('BALANCE_CACHE_TTL_S', '300') or 300)
 
@@ -3939,7 +3950,7 @@ def _pixellab_account_balance(force=False):
     delta as its real cost: two calls inside the same TTL window would
     otherwise both return the same stale cached number and show zero cost
     even after a real, billed generation."""
-    token = _open_secret(_credential_token('pixellab') or '')
+    token = _pixellab_token()
     if not token:
         return None
     now = time.time()
@@ -3972,7 +3983,7 @@ def _pixellab_call(method, path, body=None, timeout=30):
     every other real integration. Same vault pattern as every other
     external credential: the caller never holds the raw key. Returns
     (data, error), same 2-tuple shape as _treg_call."""
-    token = _open_secret(_credential_token('pixellab') or '')
+    token = _pixellab_token()
     if not token:
         return None, 'PixelLab is not configured (no credential in the vault)'
     try:
@@ -4098,7 +4109,7 @@ def _pixellab_credits_remaining():
     """Remaining USD credits on the PixelLab account, or None when not
     configured / unreachable (fails closed so avatar generation never runs on
     an unconfigured or unreachable account)."""
-    token = _open_secret(_credential_token('pixellab') or '')
+    token = _pixellab_token()
     if not token:
         return None
     try:
@@ -4193,7 +4204,7 @@ AVATAR_GENERATION_MIN_CREDITS_USD = 0.50
 def _pixellab_configured():
     """Cheap credential-presence check (no network, no balance call)."""
     try:
-        return bool(_open_secret(_credential_token('pixellab') or ''))
+        return bool(_pixellab_token())
     except Exception:
         return False
 

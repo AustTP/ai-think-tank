@@ -477,6 +477,11 @@ def _api_credential_value(spec):
     if ctype == 'vault':
         name = cred.get('name') or ''
         token = _serve._open_secret(_serve._credential_token(name) or '')
+        if not token and name == 'pixellab':
+            # Existing DBs still carry the historical vault row. PixelLab's
+            # shipped credential is PIXELLAB_API_KEY in .env now, so fall back
+            # to it instead of forcing a row migration just to use the key.
+            token = _serve._pixellab_token()
         if not token:
             return None, None, f'credential {name} is not in the vault'
         return token, None, None

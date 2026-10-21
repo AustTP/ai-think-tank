@@ -171,8 +171,8 @@
       "name": "PixelLab",
       "base_url": "https://api.pixellab.ai/v2",
       "credential": {
-        "type": "vault",
-        "name": "pixellab"
+        "type": "env",
+        "key": "PIXELLAB_API_KEY"
       },
       "auth": {
         "type": "header_bearer"

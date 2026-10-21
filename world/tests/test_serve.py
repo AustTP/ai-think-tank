@@ -3738,6 +3738,7 @@ class PixellabCall(unittest.TestCase):
 
     def test_no_credential_fails_closed_without_a_network_call(self):
         with unittest.mock.patch.object(serve, '_open_secret', return_value=None), \
+             unittest.mock.patch.object(serve, '_pixellab_token', return_value=None), \
              unittest.mock.patch.object(serve.urllib.request, 'urlopen') as net:
             data, error = serve._pixellab_call('POST', '/create-character-with-4-directions', {})
         net.assert_not_called()

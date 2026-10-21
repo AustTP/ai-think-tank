@@ -273,3 +273,10 @@ def test_avatar_directory_is_the_agent_own_directory():
     import os
     expected = os.path.join(serve.AGENTS_DIR, 'ruth', 'avatars')
     assert serve._avatar_dir('ruth') == expected
+
+
+def test_pixellab_token_falls_back_to_the_env_file(monkeypatch):
+    monkeypatch.setattr(serve, '_open_secret', lambda token: None)
+    monkeypatch.setattr(serve, '_credential_token', lambda name: 'vault-token')
+    monkeypatch.setattr(serve, '_load_env', lambda: {'PIXELLAB_API_KEY': 'env-key'})
+    assert serve._pixellab_token() == 'env-key'
