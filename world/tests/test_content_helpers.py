@@ -1529,3 +1529,26 @@ class ResearchRouting(unittest.TestCase):
                                              {'projectLabel': 'PI Durable'})
         spike.assert_called_once()
         bare.assert_not_called()
+
+
+class ReportContent(unittest.TestCase):
+    def test_local_report_preloads_sources_and_skips_tool_choice(self):
+        task = {'id': 'r1', 'title': 'Transcript addendum', 'instructions': 'Summarize it.',
+                'sourcePaths': ['media/transcripts/v.txt'], 'reportPath': 'archive/out.md'}
+        stored = {}
+        posted = {}
+        with mock.patch.object(content, '_read_library_document',
+                               return_value='THE REAL TRANSCRIPT'), \
+             mock.patch.object(content, '_plain_completion',
+                               return_value='REAL SUMMARY') as completion, \
+             mock.patch.object(serve, '_resolve_model_tier', return_value='model'), \
+             mock.patch.object(serve, 'get_or_create_agent_key', return_value='k'), \
+             mock.patch.object(serve, '_http_json',
+                               side_effect=lambda *a, **k: posted.update({'args': a})) as http, \
+             mock.patch.object(sim, '_store_content_result',
+                               side_effect=lambda tid, result: stored.update(result)):
+            content._run_report_content({}, 'ruth', task)
+        self.assertIn('THE REAL TRANSCRIPT', completion.call_args[0][1][0]['content'])
+        self.assertTrue(stored.get('ok'))
+        self.assertEqual(stored.get('reportPath'), 'archive/out.md')
+        self.assertIn('REAL SUMMARY', posted['args'][3]['content'])

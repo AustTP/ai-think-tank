@@ -298,7 +298,7 @@ class BreakdownCeremony(SimIsolation):
         ]}
         sim._resolve_breakdown(state, pending, 1_000_000, decider=decider)
         self.assertEqual([q['taskType'] for q in state['workQueue']],
-                         ['research', 'code'])
+                         ['report', 'code'])
 
     def test_breakdown_step_defers_unembarked_without_facilitator(self):
         state = {

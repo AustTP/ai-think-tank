@@ -2018,6 +2018,7 @@ _TASK_BUDGET_USD = {
     'qa': 0.40,
     'spike': 0.30,
     'research': 0.15,
+    'report': 0.25,
     'media': 0.15,
     'distill': 0.10,
     'skillReview': 0.10,
@@ -11196,12 +11197,12 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             # pipeline (Jev block + flake8/mypy/pytest) on pure prose -- the
             # exact failure class that stranded the StealthX research cards.
             raw_type = (s.get('type') or 'story').strip().lower()
-            # 'report' is prose/recommendation work, not a repo change. Give it
-            # the research executor (which now uses the tool-using spike lane)
-            # instead of the code pipeline, so a written recommendation cannot
-            # fail on flake8/mypy over the whole repository.
+            # 'report' is prose/recommendation work, not a repo change. It goes
+            # to the report lane, which preloads named local sources and falls
+            # back to the tool-using spike lane when it has none, so a written
+            # recommendation cannot fail on flake8/mypy over the whole repo.
             if raw_type == 'report':
-                task_type = 'research'
+                task_type = 'report'
             elif raw_type in ('spike', 'research'):
                 task_type = raw_type
             else:

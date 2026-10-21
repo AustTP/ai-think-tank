@@ -845,6 +845,78 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
         'ok': True, 'note': note, 'supervisorCheck': True, 'teamId': team_id})
 
 
+def _run_report_content(snapshot, agent_id, task, base_ctx=None):
+    """Deterministic local-source report lane.
+
+    A report card that names `sourcePaths` does not need to choose tools: the
+    executor reads those Library files itself, puts the real text in the prompt,
+    and asks the model to write the report from that text. This exists because a
+    live transcript addendum called read_rss_feed and then claimed the Library
+    tool was unavailable, producing a fabricated NASA summary. No tool choice,
+    no fabricated unavailability. A report card without sourcePaths falls back
+    to the ordinary tool-using spike lane.
+    """
+    import sim as _sim_module
+    sources = task.get('sourcePaths') or []
+    if not sources:
+        _run_spike_content(snapshot, agent_id, task, base_ctx)
+        return
+    name = _agent_name(snapshot, agent_id)
+    key = _serve.get_or_create_agent_key(agent_id)
+    chunks = []
+    missing = []
+    for path in sources:
+        text = _read_library_document(path)
+        if text:
+            chunks.append(f'=== SOURCE: {path} ===\n{text}')
+        else:
+            missing.append(path)
+    if not chunks:
+        _sim_module._store_content_result(task.get('id'), {
+            'ok': False,
+            'note': 'Report sources could not be read: ' + ', '.join(missing),
+        })
+        return
+    model = _serve._resolve_model_tier(
+        f'Write a source-grounded report: {(task.get("title") or "")[:200]}',
+        allow_high=True)
+    prompt = (
+        f'You are {name}. Write the report requested by the card below, using ONLY the '
+        'source text supplied here as evidence.\n\n'
+        f'Card: {task.get("title") or ""}\n'
+        f'Instructions: {task.get("instructions") or ""}\n\n'
+        'Hard rules:\n'
+        '- Cite the source path for each claim.\n'
+        '- If the source has no timestamps, say "timestamps unavailable" and do not invent any.\n'
+        '- If a source is missing, say so explicitly and make no claims from it.\n'
+        '- Do not mention tools, tool failures, or any content that is not in the sources.\n'
+        '- End with a revised final recommendation line: ADOPT / REJECT / ADOPT (limited), with conditions.\n\n'
+        'SOURCES:\n\n' + '\n\n'.join(chunks)
+    )
+    text = _plain_completion(model, [{'role': 'user', 'content': prompt}],
+                             max_tokens=4000, service='report',
+                             task_id=task.get('id'))
+    if not text:
+        _sim_module._store_content_result(task.get('id'), {
+            'ok': False, 'note': 'Report synthesis returned nothing.'})
+        return
+    report_path = task.get('reportPath') or f"archive/{int(time.time() * 1000)}-report-{task.get('id') or 'adhoc'}.md"
+    body = (f'# {task.get("title") or "Report"}\n\n'
+            f'By: {name}\n\n{text}\n\n'
+            '---\nRead-only sources: ' + ', '.join(sources) + '\n')
+    try:
+        _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/library/file',
+                          {'agentId': agent_id, 'path': report_path,
+                           'content': body, 'source': 'firsthand'}, key)
+    except Exception as e:
+        _sim_module._store_content_result(task.get('id'), {
+            'ok': False, 'note': f'Report written but the Library save failed: {e}'})
+        return
+    _sim_module._store_content_result(task.get('id'), {
+        'ok': True, 'reportPath': report_path,
+        'note': f'Wrote the source-grounded report to {report_path} in the Library.'})
+
+
 def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
     """The router registered as sim._content_executor. Decides by task.room +
     task flags which real content executor runs, mirroring arriveAtTask's
@@ -883,6 +955,10 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
         # A SUPERVISE card is a director's facilitation turn: scoped to their
         # own team, read-only except for a budget top-up. Room-agnostic.
         'supervise': _run_supervisor_content,
+        # A report is a written deliverable, not a repo change. With explicit
+        # local sources it reads them directly; without them it uses the spike
+        # lane's web tools.
+        'report': _run_report_content,
     }
     room_executors = {
         'observatory': _run_observatory_content,
