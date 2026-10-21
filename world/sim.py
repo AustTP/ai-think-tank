@@ -2791,6 +2791,10 @@ def queue_work(state, items):
             # deliverable -- it completes when the budget elapses, landing a
             # findings artifact instead of a peer-reviewed story.
             'budgetMs': item.get('budgetMs') or None,
+            # Deterministic report lane: the executor reads these local sources
+            # itself instead of asking the model to choose a Library tool.
+            'sourcePaths': item.get('sourcePaths') or None,
+            'reportPath': item.get('reportPath') or None,
             # Phase E addendum: a peer-rejected fix returns to the original author.
             'assignedTo': item.get('assignedTo') or None,
             # Human-in-the-loop: a JIRA issue filed FOR the player (assignedTo
@@ -4617,6 +4621,8 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         # The owning team must survive onto the durable task: supervision,
         # team policy, and per-team budget attribution all read task.teamId.
         'teamId': (extra or {}).get('teamId'),
+        'sourcePaths': (extra or {}).get('sourcePaths'),
+        'reportPath': (extra or {}).get('reportPath'),
         'productId': (extra or {}).get('productId'),
         # Adversarial (winter) village tags (see queue_work / _assign_due_item)
         # -- stamped so serve._adversarial_village_tick can detect a side done.
@@ -15041,6 +15047,8 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         'incident': bool(pick.get('incident')),
         # Keep the owning team on the assigned task (see assign_task).
         'teamId': pick.get('teamId'),
+        'sourcePaths': pick.get('sourcePaths'),
+        'reportPath': pick.get('reportPath'),
         'productId': pick.get('productId'),
         # Adversarial (winter) village tags thread onto the task (see
         # assign_task / queue_work) so completion can be read per side.

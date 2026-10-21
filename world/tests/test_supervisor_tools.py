@@ -310,12 +310,16 @@ def test_supervise_card_pins_its_director_and_keeps_the_team(monkeypatch):
         a['y'] = door['y'] + door['h'] + 4
     item = {'title': '[SUPERVISE] check', 'room': 'pressoffice',
             'taskType': 'supervise', 'assignedTo': 'nora', 'teamId': 'nora',
-            'instructions': 'check the team'}
+            'instructions': 'check the team',
+            'sourcePaths': ['media/transcripts/v.txt'],
+            'reportPath': 'archive/report.md'}
     task = sim._assign_due_item(state, item, True, grid, doors, 1000,
                                 task_id_holder={0: 0})
     assert task is not None
     assert task['assignedTo'] == 'nora'
     assert task['teamId'] == 'nora'
+    assert task['sourcePaths'] == ['media/transcripts/v.txt']
+    assert task['reportPath'] == 'archive/report.md'
     # A busy director makes the supervisor card wait; it must never fall
     # through to a worker who has no supervisor scope.
     state['agents']['nora']['task'] = task['id']
