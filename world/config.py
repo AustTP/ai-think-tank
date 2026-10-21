@@ -837,6 +837,28 @@ OPERATOR_POLICY_DEFAULT: dict = {
     # Peer-review gate depth (serve.py lookback and signal staleness).
     'peerReviewMinLookbackS': 3600,
     'peerReviewSignalStaleS': 21600,
+    # Supervisor and chief-of-staff operating rhythm. Cadences and the
+    # per-monitoring-card price are rhythm/economics, not safety gates.
+    'supervisorBriefIntervalMs': 15 * 60 * 1000,
+    'supervisorCardIntervalMs': 30 * 60 * 1000,
+    'chiefMonitorIntervalMs': 60 * 60 * 1000,
+    'supervisorCardBudgetUsd': 0.05,
+    # Delegation and budget-top-up bounds. Operational spend shape, not the
+    # tank-wide spend ceiling (that stays in .env / POST /api/budget).
+    'delegateMaxOpen': 3,
+    'delegateBudgetCapUsd': 0.50,
+    'supervisorBudgetCapUsd': 5.0,
+    # Calibration loop knobs (targets, dead-bands, sample floors, step size,
+    # timer). The threshold min/max clamps stay in code as safety bounds.
+    'jevCalibrationTargetReliability': 0.9,
+    'jevCalibrationHysteresis': 0.05,
+    'jevCalibrationMinOutcome': 10,
+    'jevCalibrationStep': 0.05,
+    'reviewGradeCalibrationTarget': 0.9,
+    'reviewGradeCalibrationHysteresis': 0.05,
+    'reviewGradeCalibrationMinSamples': 10,
+    'reviewGradeCalibrationStep': 0.05,
+    'calibrationAdjustIntervalS': 30 * 60,
 }
 
 # Per-key validation: (kind, min, max). A wrong-typed or out-of-range value
@@ -950,6 +972,22 @@ _OPERATOR_SCHEMA: dict = {
     'agentDirSyncIntervalS': ('float', 1.0, 3600.0),
     'peerReviewMinLookbackS': ('int', 300, 86400),
     'peerReviewSignalStaleS': ('int', 300, 7 * 86400),
+    'supervisorBriefIntervalMs': ('int', 60000, 7 * 24 * 3600 * 1000),
+    'supervisorCardIntervalMs': ('int', 60000, 7 * 24 * 3600 * 1000),
+    'chiefMonitorIntervalMs': ('int', 60000, 30 * 24 * 3600 * 1000),
+    'supervisorCardBudgetUsd': ('float', 0.0, 5.0),
+    'delegateMaxOpen': ('int', 1, 20),
+    'delegateBudgetCapUsd': ('float', 0.0, 100.0),
+    'supervisorBudgetCapUsd': ('float', 0.0, 1000.0),
+    'jevCalibrationTargetReliability': ('float', 0.0, 1.0),
+    'jevCalibrationHysteresis': ('float', 0.0, 1.0),
+    'jevCalibrationMinOutcome': ('int', 1, 1000),
+    'jevCalibrationStep': ('float', 0.001, 1.0),
+    'reviewGradeCalibrationTarget': ('float', 0.0, 1.0),
+    'reviewGradeCalibrationHysteresis': ('float', 0.0, 1.0),
+    'reviewGradeCalibrationMinSamples': ('int', 1, 1000),
+    'reviewGradeCalibrationStep': ('float', 0.001, 1.0),
+    'calibrationAdjustIntervalS': ('int', 60, 86400),
 }
 
 # --- Teamwork agreements -----------------------------------------------------
@@ -1072,9 +1110,19 @@ def bind_policy(module_name, pairs, overrides=None):
     each time it runs, so patching/env reloads stay honored). Registration
     must run at module import so a later reload_policy_config() re-applies
     the bindings without a restart."""
+    entry = POLICY_BINDINGS.get(module_name) or {'pairs': (), 'overrides': {}}
+    merged_pairs = list(entry['pairs'])
+    known = {attr for attr, _key in merged_pairs}
+    for attr, key in pairs:
+        if attr in known:
+            merged_pairs = [(a, k) for a, k in merged_pairs if a != attr]
+        merged_pairs.append((attr, key))
+        known.add(attr)
+    merged_overrides = dict(entry['overrides'])
+    merged_overrides.update(overrides or {})
     POLICY_BINDINGS[module_name] = {
-        'pairs': tuple((attr, key) for attr, key in pairs),
-        'overrides': dict(overrides or {}),
+        'pairs': tuple(merged_pairs),
+        'overrides': merged_overrides,
     }
     _apply_binding(module_name)
 

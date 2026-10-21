@@ -719,6 +719,9 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
     delegate_tool = _make_supervisor_delegate_executor(agent_id)
     schedules_tool = _make_supervisor_schedules_executor(agent_id)
     runbook_tool = _make_supervisor_runbook_executor()
+    backlog_tool = _make_supervisor_backlog_executor(agent_id)
+    db_tool = _make_supervisor_db_executor(agent_id)
+    state_tool = _make_supervisor_state_executor(agent_id)
 
     def execute_tool(tool_name, args):
         _hb()
@@ -730,6 +733,12 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             return live_read_tool(tool_name, args)
         if tool_name == 'delegate':
             return delegate_tool(tool_name, args)
+        if tool_name == 'direct_backlog':
+            return backlog_tool(tool_name, args)
+        if tool_name == 'db_records':
+            return db_tool(tool_name, args)
+        if tool_name == 'state_records':
+            return state_tool(tool_name, args)
         if tool_name == 'schedules':
             return schedules_tool(tool_name, args)
         if tool_name == 'runbook':
@@ -738,37 +747,62 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             return sandbox_tool(tool_name, args)
         return f'unknown tool {tool_name}'
 
-    scope_name = (f'team "{team.get("name") or team_id}"' if team
-                  else 'cross-team oversight as chief of staff')
-    system = (
-        f'You are {name}, {scope_name}. '
-        'Your job is facilitation, not the work. Your scope is this team only.\n'
-        'Call supervisor_report first. Then use live_read to inspect the LIVE project '
-        '(ls/read/grep/team_log) and execute_script only for the sandbox paths the report names. '
-        'Do not edit project files.\n'
-        'Your tools: supervisor_report (scoped state), live_read (read-only live project and team '
-        'log), delegate (queue a scoped check for a worker with a return contract), schedules '
-        '(list/create/edit/delete), runbook (standard procedures), supervisor_grant_budget.\n'
-        'Act on two things only:\n'
-        '1. Budget. If a card spent its ceiling before close, say what the spend bought and either '
-        'grant a top-up with supervisor_grant_budget (with a clear reason) or recommend stopping.\n'
-        '2. Process. If a card failed, is stuck in review, or its deliverable is missing, say so '
-        'plainly, delegate the check when it needs evidence, and name the next action.\n'
-        'Never inspect or comment on another team, never touch the database, never write code. '
-        'Finish with a short report: cards reviewed, budget decisions, process issues, delegations, next actions.\n\n'
-        'Current scoped brief (supervisor_report returns a fresh copy):\n' + brief['text']
-    )
-    if not team:
-        system += ('\nAs chief of staff you cover every team: pass team=<team id> when you '
-                   'delegate, and route cross-team issues rather than editing either team.')
+    tools = [_SPIKE_SANDBOX_TOOL, _SUPERVISOR_REPORT_TOOL, _SUPERVISOR_GRANT_TOOL,
+             _SUPERVISOR_LIVE_READ_TOOL, _SUPERVISOR_DELEGATE_TOOL,
+             _SUPERVISOR_SCHEDULES_TOOL, _SUPERVISOR_RUNBOOK_TOOL]
+    if is_admin:
+        tools += [_SUPERVISOR_BACKLOG_TOOL, _SUPERVISOR_DB_TOOL,
+                  _SUPERVISOR_STATE_TOOL]
+        system = (
+            f'You are {name}, chief of staff for the whole think tank. '
+            'Your job is cross-team oversight and coordination, not the work itself.\n'
+            'Call supervisor_report first. Then use live_read to inspect the LIVE project '
+            '(ls/read/grep/team_log) and execute_script only for sandbox paths the report names. '
+            'Do not edit project files or write code.\n'
+            'Your tools: supervisor_report (every team), live_read (whole live project), '
+            'delegate (queue a scoped check for a worker; name the team), schedules '
+            '(list/create/edit/delete any), runbook (standard procedures), '
+            'supervisor_grant_budget (any team), direct_backlog (instruct a team to put an '
+            'immediate high-priority task in its backlog), db_records (read or modify '
+            'non-secret SQL tables; every write is audited), state_records (read or '
+            'modify live business records in the state blob by path).\n'
+            'Look for anything unusual across the tank: a failure, a card stuck in review, '
+            'budget pressure, a missing deliverable, a missed schedule, or work that is not '
+            'resolving. If something needs action, instruct the owning team with '
+            'direct_backlog (concrete title + reason/acceptance), or delegate a scoped check. '
+            'Use db_records (SQL tables) or state_records (live business records by path) only '
+            'for a concrete record fix you cannot make through the normal tools; state the '
+            'scope, filter/path, and why. Never do a team\'s work for it.\n'
+            'Finish with a short report: what you checked, anything unusual, directives filed, '
+            'records changed, and next actions.\n\n'
+            'Current cross-team brief (supervisor_report returns a fresh copy):\n' + brief['text']
+        )
+        user_prompt = 'Sweep the whole think tank now.'
+    else:
+        system = (
+            f'You are {name}, team "{team.get("name") or team_id}". '
+            'Your job is facilitation, not the work. Your scope is this team only.\n'
+            'Call supervisor_report first. Then use live_read to inspect the LIVE project '
+            '(ls/read/grep/team_log) and execute_script only for the sandbox paths the report names. '
+            'Do not edit project files.\n'
+            'Your tools: supervisor_report (scoped state), live_read (read-only live project and team '
+            'log), delegate (queue a scoped check for a worker with a return contract), schedules '
+            '(list/create/edit/delete), runbook (standard procedures), supervisor_grant_budget.\n'
+            'Act on two things only:\n'
+            '1. Budget. If a card spent its ceiling before close, say what the spend bought and either '
+            'grant a top-up with supervisor_grant_budget (with a clear reason) or recommend stopping.\n'
+            '2. Process. If a card failed, is stuck in review, or its deliverable is missing, say so '
+            'plainly, delegate the check when it needs evidence, and name the next action.\n'
+            'Never inspect or comment on another team, never touch the database, never write code. '
+            'Finish with a short report: cards reviewed, budget decisions, process issues, delegations, next actions.\n\n'
+            'Current scoped brief (supervisor_report returns a fresh copy):\n' + brief['text']
+        )
+        user_prompt = 'Check your team now.'
     messages = [{'role': 'system', 'content': system},
-                {'role': 'user', 'content': 'Check your team now.'}]
+                {'role': 'user', 'content': user_prompt}]
     try:
         text, _transcript = _serve._call_agent_tool_loop(
-            model, messages,
-            [_SPIKE_SANDBOX_TOOL, _SUPERVISOR_REPORT_TOOL, _SUPERVISOR_GRANT_TOOL,
-             _SUPERVISOR_LIVE_READ_TOOL, _SUPERVISOR_DELEGATE_TOOL,
-             _SUPERVISOR_SCHEDULES_TOOL, _SUPERVISOR_RUNBOOK_TOOL],
+            model, messages, tools,
             execute_tool, max_iterations=10, max_tokens=1600,
             service='supervisor', force_first_tool='supervisor_report',
             return_transcript=True, task_id=task.get('id'))
@@ -3733,6 +3767,134 @@ _SUPERVISOR_GRANT_TOOL = {
         },
     },
 }
+
+
+_SUPERVISOR_BACKLOG_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'direct_backlog',
+        'description': (
+            'CHIEF OF STAFF ONLY: instruct one team to put an immediate task in its '
+            'backlog. Files a high-priority backlog card for that team, kicks its '
+            'refinement so the card is groomed on the next pass, and mails the team '
+            'director with the issue key. Use this when you find something unusual '
+            'that needs real work now. Name the team (or its director), a concrete '
+            'title, and the reason/acceptance you want addressed. The team still '
+            'owns refinement; this is a directive, not a bypass.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'team': {'type': 'string',
+                         'description': 'Team id or its director id, e.g. "nora".'},
+                'title': {'type': 'string',
+                          'description': 'One-line task title (at least 6 chars).'},
+                'reason': {'type': 'string',
+                           'description': 'What is wrong, what to address, and the acceptance you expect (at least 12 chars).'},
+                'taskType': {'type': 'string',
+                             'enum': ['task', 'story', 'spike', 'bug'],
+                             'description': 'Backlog card type (default task).'},
+                'feature': {'type': 'string',
+                            'description': 'Optional Jira project/area label.'},
+            },
+            'required': ['team', 'title', 'reason'],
+        },
+    },
+}
+
+_SUPERVISOR_DB_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'db_records',
+        'description': (
+            'CHIEF OF STAFF ONLY: read or modify records in the think tank SQLite '
+            'database. Controlled CRUD, not arbitrary SQL: table and column names '
+            'are validated, values are parameterized, update/delete require a '
+            'non-empty where filter, reads are row-capped, and secret/identity '
+            'tables are refused. Every write is audit-logged. Ops: tables, '
+            'describe, select, insert, update, delete. Example: '
+            '{"op":"select","table":"health_alerts","where":{"category":"work_queue"},"limit":20}. '
+            'The whole-state blob (kv_state) is excluded; use the normal state '
+            'tools for tasks and backlog records.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'op': {'type': 'string',
+                       'enum': ['tables', 'describe', 'select', 'insert', 'update', 'delete']},
+                'table': {'type': 'string'},
+                'columns': {'type': 'array', 'items': {'type': 'string'}},
+                'where': {'description':
+                          'Equality object ({"col": value}) or a list of '
+                          '{"column","op","value"} filters combined with AND.'},
+                'values': {'type': 'object',
+                           'description': 'Column/value object for insert or update.'},
+                'orderBy': {'type': 'string'},
+                'desc': {'type': 'boolean'},
+                'limit': {'type': 'integer',
+                          'description': 'Max rows for select (1-200, default 50).'},
+            },
+            'required': ['op'],
+        },
+    },
+}
+
+
+_SUPERVISOR_STATE_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'state_records',
+        'description': (
+            'CHIEF OF STAFF ONLY: read or modify live business records in the '
+            'think tank state (tasks, workQueue, backlogRequests, issues, teams, '
+            'sprints, products, features, backlog, researchTopics, retrospectives, '
+            'governance, directorSupervision, completionControl). Path-based: '
+            '{"op":"get","path":"tasks/task-1/status"} or '
+            '{"op":"set","path":"tasks/task-1/status","value":"failed"}. '
+            'collections lists every collection with its count. The roster, agent '
+            'runtime state, settings, and underscore-prefixed internals are '
+            'refused. Every set/delete runs under the state lock and is audited.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'op': {'type': 'string',
+                       'enum': ['collections', 'get', 'set', 'delete']},
+                'path': {'type': 'string',
+                         'description': 'Slash path, e.g. tasks/task-1/status or backlogRequests/0/priority.'},
+                'value': {'description': 'JSON value for set.'},
+            },
+            'required': ['op'],
+        },
+    },
+}
+
+
+def _make_supervisor_state_executor(agent_id):
+    def run(name, args):
+        import json as _json
+        import serve as _serve
+        return _json.dumps(_serve.supervisor_state_records(agent_id, args), sort_keys=True)
+    return run
+
+
+def _make_supervisor_backlog_executor(agent_id):
+    def run(name, args):
+        import json as _json
+        import serve as _serve
+        ok, payload = _serve.supervisor_backlog_directive(
+            agent_id, args.get('team'), args.get('title'), args.get('reason'),
+            args.get('taskType') or 'task', args.get('feature'))
+        return _json.dumps(payload, sort_keys=True)
+    return run
+
+
+def _make_supervisor_db_executor(agent_id):
+    def run(name, args):
+        import json as _json
+        import serve as _serve
+        return _json.dumps(_serve.supervisor_db_records(agent_id, args), sort_keys=True)
+    return run
 
 
 def _make_supervisor_report_executor(agent_id):

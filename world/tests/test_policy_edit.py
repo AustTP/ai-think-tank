@@ -151,7 +151,8 @@ class GovernedFlow(_TempPolicyEdit, unittest.TestCase):
         with open(self._policy, encoding='utf-8') as fh:
             data = json.load(fh)
         self.assertIn('_notes', data)
-        self.assertEqual(len(data), 108)  # 108 shipped keys + none lost
+        # Every shipped key plus _notes survives the read-modify-write.
+        self.assertEqual(len(data), len(config.OPERATOR_POLICY_DEFAULT) + 1)
         self.assertEqual(payload['value'], 7)
         self.assertEqual(payload['previous'], 20)
         # Every bound module rebinds without a restart.

@@ -210,6 +210,12 @@ class RefinementResolve(unittest.TestCase):
         self.assertFalse(state['agents']['ben']['busy'])
         self.assertEqual(state['agents']['ben']['inRoom'], None)
 
+    def test_high_priority_request_grooms_onto_a_high_priority_card(self):
+        state, req = self._convened()
+        req['priority'] = sim.WORK_PRIORITY['high']
+        _step(state, None, sim.REFINEMENT_MEET_MS + 2_000_000, decider=_stub_decider('accept'))
+        self.assertEqual(state['workQueue'][0]['priority'], sim.WORK_PRIORITY['high'])
+
     def test_reject_grooms_out(self):
         state, req = self._convened()
         _step(state, None, sim.REFINEMENT_MEET_MS + 2_000_000, decider=_stub_decider('reject'))

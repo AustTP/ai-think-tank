@@ -166,3 +166,51 @@ def test_brief_step_queues_a_cross_team_card_for_the_admin(monkeypatch):
     cross = [q for q in state['workQueue'] if str(q.get('title')).startswith('[SUPERVISE] Cross-team')]
     assert len(cross) == 1
     assert cross[0]['assignedTo'] == 'theo'
+
+
+def test_admin_direct_backlog_files_a_high_priority_issue_and_mails_the_director(monkeypatch):
+    state = _state()
+    _patch_state(monkeypatch, state)
+    ok, payload = serve.supervisor_backlog_directive(
+        'theo', 'nora', 'Investigate the failing parser',
+        'The parser failed twice on the same input; card the fix and prove it handles empty input.',
+        task_type='task')
+    assert ok is True, payload
+    key = payload['issueKey']
+    assert state['issues'][key]['teamId'] == 'nora'
+    req = next(r for r in state['backlogRequests'] if r.get('issueKey') == key)
+    assert req['origin'] == 'chief_of_staff'
+    assert req['priority'] == 2  # high
+    assert req['directiveBy'] == 'theo'
+    mail = state['agents']['nora'].get('mailbox') or []
+    assert mail and mail[0]['kind'] == 'chief_directive'
+
+
+def test_direct_backlog_is_chief_of_staff_only(monkeypatch):
+    _patch_state(monkeypatch, _state())
+    ok, payload = serve.supervisor_backlog_directive(
+        'nora', 'ben', 'Investigate the parser',
+        'The parser failed twice on the same input and needs a card now.')
+    assert ok is False and 'chief of staff' in payload['error']
+
+
+def test_admin_routine_sweep_runs_without_an_attention_reason(monkeypatch):
+    import sim
+    state = _state()
+    state['sprints'] = {'s1': {'id': 's1', 'status': 'active',
+                               'teamIds': ['nora', 'ben']}}
+    state['tasks'] = {}
+    state['workQueue'] = []
+    state['_supervisorBriefAt'] = {}
+    state['_supervisorCardAt'] = {}
+    sim._supervisor_brief_step(state, 0, 1000)
+    routine = [q for q in state['workQueue']
+               if str(q.get('title')).startswith('[SUPERVISE] Cross-team: routine sweep')]
+    assert len(routine) == 1 and routine[0]['assignedTo'] == 'theo'
+    # Consume the card; the routine cadence still suppresses an immediate repeat.
+    state['workQueue'] = []
+    sim._supervisor_brief_step(state, 0, 1000 + 60_000)
+    assert state['workQueue'] == []
+    # Once the routine interval elapses, the next sweep fires again.
+    sim._supervisor_brief_step(state, 0, 1000 + sim.CHIEF_MONITOR_INTERVAL_MS + 1)
+    assert len(state['workQueue']) == 1

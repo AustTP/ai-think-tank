@@ -306,6 +306,39 @@ class StaleWorkSweep(unittest.TestCase):
         self.assertIn('task-1', state['tasks'])
         self.assertEqual(state['workQueue'], [])
 
+    def test_paused_time_does_not_age_a_walking_card(self):
+        # The tank slept for most of this card's wall age. Dormancy is not
+        # work time, so the sweep must leave it alone.
+        state = _state()
+        opened = _NOW_MS - sim.STALE_WORK_TIMEOUT_MS - 60_000
+        state['_simPauseWindows'] = [[opened + 1000, _NOW_MS - 1000]]
+        n = self._run(state, _NOW_MS, 'task-1', 'walking', opened_at=opened)
+        self.assertEqual(n, 0)
+        self.assertIn('task-1', state['tasks'])
+        self.assertEqual(state['workQueue'], [])
+
+    def test_paused_time_gives_back_working_budget(self):
+        # The deadline is wall-old, but the time since it was dormant time.
+        state = _state()
+        work_until_s = (_NOW_MS / 1000) - sim.STALE_WORK_BUDGET_GRACE_S - 600
+        state['_simPauseWindows'] = [[_NOW_MS - 7_200_000, _NOW_MS - 1_000]]
+        n = self._run(state, _NOW_MS, 'task-1', 'working',
+                      work_until_s=work_until_s)
+        self.assertEqual(n, 0)
+        self.assertIn('task-1', state['tasks'])
+        self.assertEqual(state['workQueue'], [])
+
+    def test_record_tick_gap_ignores_jitter_and_records_real_pauses(self):
+        state = _state()
+        state['sim']['lastTickEpochS'] = (_NOW_MS - 5_000) / 1000
+        sim._record_tick_gap(state, _NOW_MS)
+        self.assertNotIn('_simPauseWindows', state)
+
+        state['sim']['lastTickEpochS'] = (_NOW_MS - 600_000) / 1000
+        sim._record_tick_gap(state, _NOW_MS)
+        self.assertEqual(state['_simPauseWindows'],
+                         [[_NOW_MS - 600_000, _NOW_MS]])
+
     def test_bugs_shadows_and_reviews_are_never_replanned(self):
         now_ms = _NOW_MS
         state = _state()

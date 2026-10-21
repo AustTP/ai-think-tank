@@ -108,3 +108,86 @@ def test_brief_step_queues_one_supervise_card_on_attention(monkeypatch):
     cards = [q for q in state['workQueue']
              if q.get('taskType') == 'supervise' and q.get('teamId') == 'nora']
     assert len(cards) == 1
+
+
+def test_db_records_is_chief_of_staff_only(monkeypatch):
+    _patch_state(monkeypatch, _state())
+    out = serve.supervisor_db_records('nora', {'op': 'tables'})
+    assert 'error' in out and 'chief of staff' in out['error']
+
+
+def test_db_records_crud_is_filtered_and_audited(monkeypatch, tmp_path):
+    import sqlite3
+    db = tmp_path / 'records.db'
+    conn = sqlite3.connect(db)
+    conn.execute('CREATE TABLE records (id INTEGER PRIMARY KEY, name TEXT, n INTEGER)')
+    conn.execute("INSERT INTO records (name, n) VALUES ('a', 1)")
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(serve, 'DB_PATH', str(db))
+    _patch_state(monkeypatch, _state())
+    calls = []
+    monkeypatch.setattr(serve, 'log_action', lambda *a, **k: calls.append(a))
+
+    listed = serve.supervisor_db_records('theo', {'op': 'tables'})
+    assert [t['table'] for t in listed['tables']] == ['records']
+    rows = serve.supervisor_db_records('theo', {'op': 'select', 'table': 'records'})
+    assert rows['rows'] == [{'id': 1, 'name': 'a', 'n': 1}]
+
+    out = serve.supervisor_db_records('theo', {
+        'op': 'insert', 'table': 'records', 'values': {'name': 'b', 'n': 2}})
+    assert out['inserted'] == 1
+    out = serve.supervisor_db_records('theo', {
+        'op': 'update', 'table': 'records',
+        'values': {'n': 9}, 'where': {'name': 'b'}})
+    assert out['updated'] == 1
+    rows = serve.supervisor_db_records('theo', {
+        'op': 'select', 'table': 'records', 'where': {'name': 'b'}})
+    assert rows['rows'][0]['n'] == 9
+    out = serve.supervisor_db_records('theo', {
+        'op': 'delete', 'table': 'records', 'where': {'name': 'b'}})
+    assert out['deleted'] == 1
+    assert serve.supervisor_db_records('theo', {
+        'op': 'select', 'table': 'records'})['rows'] == [{'id': 1, 'name': 'a', 'n': 1}]
+    assert calls, 'every write must be audit-logged'
+
+
+def test_db_records_refuses_secret_tables_and_unfiltered_writes(monkeypatch):
+    monkeypatch.setattr(serve, 'DB_PATH', ':memory:')
+    _patch_state(monkeypatch, _state())
+    out = serve.supervisor_db_records('theo', {'op': 'select', 'table': 'agent_keys'})
+    assert 'error' in out and 'not exposed' in out['error']
+    out = serve.supervisor_db_records('theo', {
+        'op': 'update', 'table': 'records', 'values': {'n': 1}})
+    assert 'error' in out
+
+
+def test_state_records_is_chief_of_staff_only(monkeypatch):
+    _patch_state(monkeypatch, _state())
+    out = serve.supervisor_state_records('nora', {'op': 'collections'})
+    assert 'error' in out and 'chief of staff' in out['error']
+
+
+def test_state_records_reads_and_patches_a_task_record(monkeypatch):
+    state = _state()
+    state['tasks'] = {'t1': {'id': 't1', 'status': 'walking', 'note': 'old'}}
+    _patch_state(monkeypatch, state)
+    got = serve.supervisor_state_records(
+        'theo', {'op': 'get', 'path': 'tasks/t1/status'})
+    assert got['value'] == 'walking'
+    out = serve.supervisor_state_records(
+        'theo', {'op': 'set', 'path': 'tasks/t1/status', 'value': 'failed'})
+    assert out['ok'] is True
+    assert state['tasks']['t1']['status'] == 'failed'
+    out = serve.supervisor_state_records(
+        'theo', {'op': 'delete', 'path': 'tasks/t1/note'})
+    assert out['ok'] is True
+    assert 'note' not in state['tasks']['t1']
+
+
+def test_state_records_refuses_roster_and_internal_keys(monkeypatch):
+    _patch_state(monkeypatch, _state())
+    for path in ('agents/ruth/busy', 'agentRoster/0/name', '_onboard/stage'):
+        out = serve.supervisor_state_records(
+            'theo', {'op': 'set', 'path': path, 'value': True})
+        assert 'error' in out, path

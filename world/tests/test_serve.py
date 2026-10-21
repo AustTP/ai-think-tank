@@ -1494,6 +1494,22 @@ class AgingInFlightWork(unittest.TestCase):
         self.assertEqual(serve._aging_in_flight_work({}, 1_725_000_000_000), 0)
         self.assertEqual(serve._aging_in_flight_work({'tasks': {}}, 1_725_000_000_000), 0)
 
+    def test_paused_time_is_excluded_from_walking_age(self):
+        now_ms = 1_725_000_000_000
+        opened = now_ms - sim.STALE_WORK_TIMEOUT_MS - 60_000
+        task = self._task('walking', opened=opened)
+        data = {'tasks': {'t1': task},
+                '_simPauseWindows': [[opened + 1000, now_ms - 1000]]}
+        self.assertEqual(serve._aging_in_flight_work(data, now_ms), 0)
+
+    def test_paused_time_gives_back_working_budget(self):
+        now_ms = 1_725_000_000_000
+        task = self._task('working', opened=now_ms - 1000,
+                          work_until=now_ms / 1000 - sim.STALE_WORK_BUDGET_GRACE_S - 600)
+        data = {'tasks': {'t1': task},
+                '_simPauseWindows': [[now_ms - 7_200_000, now_ms - 1_000]]}
+        self.assertEqual(serve._aging_in_flight_work(data, now_ms), 0)
+
 
 class HealthDigestMarkdown(unittest.TestCase):
     """Admin gap 1: the periodic health digest is a readable markdown combining

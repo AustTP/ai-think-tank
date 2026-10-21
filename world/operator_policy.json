@@ -120,5 +120,21 @@
   "agentDirSyncIntervalS": 15.0,
   "peerReviewMinLookbackS": 3600,
   "peerReviewSignalStaleS": 21600,
-  "deviceCheckinRetentionDays": 30
+  "deviceCheckinRetentionDays": 30,
+  "supervisorBriefIntervalMs": 900000,
+  "supervisorCardIntervalMs": 1800000,
+  "chiefMonitorIntervalMs": 3600000,
+  "supervisorCardBudgetUsd": 0.05,
+  "delegateMaxOpen": 3,
+  "delegateBudgetCapUsd": 0.5,
+  "supervisorBudgetCapUsd": 5.0,
+  "jevCalibrationTargetReliability": 0.9,
+  "jevCalibrationHysteresis": 0.05,
+  "jevCalibrationMinOutcome": 10,
+  "jevCalibrationStep": 0.05,
+  "reviewGradeCalibrationTarget": 0.9,
+  "reviewGradeCalibrationHysteresis": 0.05,
+  "reviewGradeCalibrationMinSamples": 10,
+  "reviewGradeCalibrationStep": 0.05,
+  "calibrationAdjustIntervalS": 1800
 }

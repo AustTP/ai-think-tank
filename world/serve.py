@@ -2304,6 +2304,7 @@ _SEED_PROFILE_DEFAULTS = {
             'Delegation down the chain should match the walk-the-chain authority, never leap past it.',
             'Check the operating rhythm: confirm scheduled and CRON work ran, and surface missed or noisy automation.',
             'Do not write or self-edit code; route code work through the director chain to a worker.',
+            'Monitor the whole tank on a routine cadence; when something is unusual, instruct the owning director to card it immediately.',
             'A consequential call deserves an audit trail -- record it, don\'t just make it.',
         ],
         'notes': [],
@@ -2346,6 +2347,8 @@ _SEED_PROFILE_DEFAULTS = {
         'instructions': [
             'Directors own their teams; you own the coordination between them.',
             'Route code work through the director chain to a worker; do not self-edit code.',
+            'Monitor the whole tank on a routine cadence; when something is unusual, instruct the owning director to card it immediately.',
+            'For a concrete record fix, you may read or modify non-secret database records; keep every write auditable.',
             'Keep decisions auditable: record who approved what and why.',
         ],
         'notes': [],
@@ -5555,6 +5558,387 @@ def supervisor_delegate(agent_id, title, instructions, task_type='spike',
                   'taskType': task_type, 'budgetUsd': budget}
 
 
+def supervisor_backlog_directive(agent_id, team, title, reason,
+                                 task_type='task', feature=None):
+    """Chief of staff only: instruct one team's director to put an immediate
+    task in that team's backlog. Files a JIRA-style issue (the existing
+    backlogRequests intake), marks the request HIGH priority so the groomed
+    card is picked first, kicks the team's refinement so it is due on the very
+    next pass, and mails the director the issue key. The director/scrum master
+    still owns the accept/reject decision; this is a directive to act now, not
+    a bypass of refinement."""
+    state = _state_begin()
+    try:
+        if not state:
+            return False, {'error': 'state unavailable'}
+        if not _is_admin(state, agent_id):
+            return False, {'error': 'only the chief of staff may direct the backlog'}
+        wanted = str(team or '').strip()
+        team_row = next((t for t in (state.get('teams') or [])
+                         if t.get('id') == wanted or t.get('directorId') == wanted), None)
+        if not team_row:
+            return False, {'error': 'name a real team id or its director'}
+        title = str(title or '').strip()
+        reason = str(reason or '').strip()
+        if len(title) < 6 or len(reason) < 12:
+            return False, {'error': 'a title and a concrete reason are required'}
+        issue_type = str(task_type or 'task').strip().lower()
+        if issue_type not in ('task', 'story', 'spike', 'bug'):
+            return False, {'error': 'taskType must be task, story, spike, or bug'}
+        import sim as _sim
+        team_id = team_row.get('id')
+        issue = _sim.file_issue(
+            state, team_id, issue_type, title,
+            str(feature or 'chief-of-staff directive').strip(),
+            reporter_id=agent_id,
+            description=f'CHIEF OF STAFF DIRECTIVE (address immediately): {reason}',
+            title=title)
+        if not issue:
+            return False, {'error': 'could not file the backlog issue'}
+        req = next((r for r in (state.get('backlogRequests') or [])
+                    if r.get('issueKey') == issue.get('key')), None)
+        if req:
+            req['priority'] = _sim.WORK_PRIORITY['high']
+            req['origin'] = 'chief_of_staff'
+            req['directiveBy'] = agent_id
+            req['reason'] = ('CHIEF OF STAFF DIRECTIVE, address immediately: '
+                             + reason)
+        director_id = team_row.get('directorId') or team_row.get('id')
+        director = (state.get('agents') or {}).get(director_id)
+        if director is not None:
+            _sim._append_mailbox(director, {
+                'kind': 'chief_directive',
+                'about': issue.get('key'),
+                'title': f"Chief of staff directive: {title}",
+                'text': (f'The chief of staff ({agent_id}) filed {issue.get("key")} '
+                         f'for your team and wants it addressed immediately. '
+                         f'Reason: {reason}'),
+                'createdAt': int(time.time() * 1000),
+            })
+        save_state_to_db(state)
+        log_action(agent_id, 'chief_backlog_directive', {
+            'team': team_id, 'director': director_id,
+            'issueKey': issue.get('key'), 'title': title[:120],
+            'taskType': issue_type, 'priority': 'high',
+            'reason': reason[:400],
+        }, authorized=True)
+        return True, {
+            'ok': True, 'issueKey': issue.get('key'), 'team': team_id,
+            'director': director_id, 'taskType': issue_type,
+            'priority': 'high', 'refinementKicked': True,
+        }
+    finally:
+        _state_abort()
+
+
+DB_RECORDS_MAX_ROWS = 200
+DB_RECORDS_MAX_CELL_CHARS = 4000
+DB_RECORDS_DENY_TABLES = frozenset({
+    'agent_keys', 'api_services', 'capability_handles', 'external_credentials',
+    'temp_access_grants', 'jev_grants', 'sublow_grants', 'tank_account_grants',
+    'tank_accounts', 'sessions', 'sms_messages', 'sms_read_grants',
+    'kv_state', 'schema_migrations', 'sqlite_sequence',
+})
+DB_RECORDS_WHERE_OPS = frozenset({'=', '!=', '<', '<=', '>', '>=', 'LIKE'})
+
+
+def _db_records_cell(value):
+    if isinstance(value, str) and len(value) > DB_RECORDS_MAX_CELL_CHARS:
+        return value[:DB_RECORDS_MAX_CELL_CHARS] + '…[truncated]'
+    if isinstance(value, bytes):
+        return f'<{len(value)} bytes>'
+    return value
+
+
+def _db_records_quote(name):
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _db_records_columns(conn, table):
+    rows = conn.execute(f'PRAGMA table_info({_db_records_quote(table)})').fetchall()
+    return [{'name': row[1], 'type': row[2], 'notNull': bool(row[3]),
+             'default': row[4], 'primaryKey': bool(row[5])} for row in rows]
+
+
+def _db_records_table(conn, table):
+    name = str(table or '').strip()
+    if not name:
+        raise ValueError('table is required')
+    if name in DB_RECORDS_DENY_TABLES:
+        raise ValueError('that table is not exposed to agents')
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,)).fetchone()
+    if not row:
+        raise ValueError('unknown table')
+    return row[0]
+
+
+def _db_records_where(conn, table, raw):
+    columns = {c['name'] for c in _db_records_columns(conn, table)}
+    items = []
+    if isinstance(raw, dict):
+        items = [(str(k), '=', v) for k, v in raw.items()]
+    elif isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                raise ValueError('where entries must be objects')
+            items.append((str(entry.get('column') or ''),
+                          str(entry.get('op') or '=').upper(),
+                          entry.get('value')))
+    elif raw:
+        raise ValueError('where must be an object or a list')
+    clauses = []
+    params = []
+    for column, op, value in items:
+        if column not in columns:
+            raise ValueError(f'unknown column {column!r}')
+        if op not in DB_RECORDS_WHERE_OPS:
+            raise ValueError(f'unsupported operator {op!r}')
+        clauses.append(f'{_db_records_quote(column)} {op} ?')
+        params.append(value)
+    return ' AND '.join(clauses), params
+
+
+def supervisor_db_records(agent_id, args):
+    """Chief of staff only: read or modify records in the think tank database.
+
+    A controlled CRUD surface, not arbitrary SQL: table and column names are
+    validated against the live schema, values are parameterized, update/delete
+    require a non-empty filter, and a hard row cap bounds every read. Secret or
+    identity-bearing tables are refused. Every operation is audit-logged. The
+    whole-state blob (kv_state) is intentionally excluded; tasks/backlog records
+    are changed through the normal state tools so the sim's single writer stays
+    authoritative."""
+    state = get_state_from_db() or {}
+    if not _is_admin(state, agent_id):
+        return {'error': 'only the chief of staff may read or modify database records'}
+    op = str((args or {}).get('op') or 'tables').strip().lower()
+    try:
+        with _db() as conn:
+            conn.row_factory = sqlite3.Row
+            if op == 'tables':
+                names = [row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "ORDER BY name").fetchall()]
+                out = []
+                for name in names:
+                    if name in DB_RECORDS_DENY_TABLES:
+                        continue
+                    count = conn.execute(
+                        f'SELECT COUNT(*) FROM {_db_records_quote(name)}').fetchone()[0]
+                    out.append({'table': name, 'rows': count})
+                return {'ok': True, 'tables': out}
+            table = _db_records_table(conn, (args or {}).get('table'))
+            columns = _db_records_columns(conn, table)
+            column_names = {c['name'] for c in columns}
+            if op == 'describe':
+                return {'ok': True, 'table': table, 'columns': columns}
+            if op == 'select':
+                chosen = (args or {}).get('columns') or ['*']
+                if not isinstance(chosen, list) or not chosen:
+                    return {'error': 'columns must be a non-empty list'}
+                for name in chosen:
+                    if name != '*' and name not in column_names:
+                        return {'error': f'unknown column {name!r}'}
+                where_sql, params = _db_records_where(
+                    conn, table, (args or {}).get('where'))
+                order_by = (args or {}).get('orderBy')
+                if order_by and order_by not in column_names:
+                    return {'error': f'unknown orderBy column {order_by!r}'}
+                try:
+                    limit = int((args or {}).get('limit') or 50)
+                except (TypeError, ValueError):
+                    limit = 50
+                limit = max(1, min(limit, DB_RECORDS_MAX_ROWS))
+                sql = ('SELECT ' + ', '.join('*' if name == '*' else _db_records_quote(name)
+                                             for name in chosen)
+                       + f' FROM {_db_records_quote(table)}')
+                if where_sql:
+                    sql += ' WHERE ' + where_sql
+                if order_by:
+                    sql += ' ORDER BY ' + _db_records_quote(order_by)
+                    if (args or {}).get('desc'):
+                        sql += ' DESC'
+                sql += ' LIMIT ?'
+                rows = [{k: _db_records_cell(v) for k, v in dict(row).items()}
+                        for row in conn.execute(sql, (*params, limit)).fetchall()]
+                return {'ok': True, 'table': table, 'rows': rows,
+                        'returned': len(rows), 'limit': limit}
+            if op in ('insert', 'update', 'delete'):
+                values = (args or {}).get('values')
+                where_sql, where_params = _db_records_where(
+                    conn, table, (args or {}).get('where'))
+                if op == 'insert':
+                    if not isinstance(values, dict) or not values:
+                        return {'error': 'insert requires a non-empty values object'}
+                    for name in values:
+                        if name not in column_names:
+                            return {'error': f'unknown column {name!r}'}
+                    cols = list(values)
+                    sql = (f'INSERT INTO {_db_records_quote(table)} ('
+                           + ', '.join(_db_records_quote(c) for c in cols)
+                           + ') VALUES (' + ', '.join('?' for _ in cols) + ')')
+                    cur = conn.execute(sql, [values[c] for c in cols])
+                    result = {'ok': True, 'table': table, 'inserted': cur.rowcount,
+                              'lastRowId': cur.lastrowid}
+                else:
+                    if not where_sql:
+                        return {'error': f'{op} requires a non-empty where filter'}
+                    if op == 'delete':
+                        cur = conn.execute(
+                            f'DELETE FROM {_db_records_quote(table)} WHERE ' + where_sql,
+                            where_params)
+                        result = {'ok': True, 'table': table, 'deleted': cur.rowcount}
+                    else:
+                        if not isinstance(values, dict) or not values:
+                            return {'error': 'update requires a non-empty values object'}
+                        for name in values:
+                            if name not in column_names:
+                                return {'error': f'unknown column {name!r}'}
+                        sets = ', '.join(f'{_db_records_quote(c)} = ?' for c in values)
+                        cur = conn.execute(
+                            f'UPDATE {_db_records_quote(table)} SET {sets} WHERE ' + where_sql,
+                            [*values.values(), *where_params])
+                        result = {'ok': True, 'table': table, 'updated': cur.rowcount}
+                # Release the write lock before the audit row opens its own
+                # connection (a second writer inside the open transaction would
+                # block and then roll the whole change back on the error path).
+                conn.commit()
+                try:
+                    log_action(agent_id, 'db_records_write', {
+                        'op': op, 'table': table,
+                        'columns': sorted((values or {}).keys()),
+                        'rowcount': result.get('updated', result.get('deleted',
+                                                                   result.get('inserted'))),
+                    }, authorized=True)
+                except Exception:
+                    pass  # the write is already committed; audit is best-effort
+                return result
+            return {'error': f'unknown op {op!r}; use tables, describe, select, '
+                             'insert, update, or delete'}
+    except ValueError as exc:
+        return {'error': str(exc)}
+    except Exception as exc:
+        return {'error': f'database records operation failed: {exc}'}
+
+
+STATE_RECORDS_TOP_LEVEL = frozenset({
+    'tasks', 'workQueue', 'backlogRequests', 'issues', 'teams', 'sprints',
+    'products', 'features', 'backlog', 'researchTopics', 'retrospectives',
+    'governance', 'directorSupervision', 'completionControl',
+})
+STATE_RECORDS_MAX_VALUE_CHARS = 200_000
+
+
+def supervisor_state_records(agent_id, args):
+    """Chief of staff only: read or modify live business records in the state
+    blob (tasks, backlog requests, issues, teams, sprints, products, features,
+    backlog, schedules, retrospectives, governance). A path-based set/get/delete
+    under the state lock, so the sim's single writer stays authoritative. The
+    roster, agent runtime state, settings, and every underscore-prefixed
+    internal key are refused; the SQL tables have their own db_records tool."""
+    state = _state_begin()
+    try:
+        if not state:
+            return {'error': 'state unavailable'}
+        if not _is_admin(state, agent_id):
+            return {'error': 'only the chief of staff may read or modify state records'}
+        op = str((args or {}).get('op') or 'collections').strip().lower()
+        if op == 'collections':
+            out = []
+            for key in sorted(STATE_RECORDS_TOP_LEVEL):
+                value = state.get(key)
+                if isinstance(value, dict):
+                    out.append({'collection': key, 'type': 'dict', 'count': len(value)})
+                elif isinstance(value, list):
+                    out.append({'collection': key, 'type': 'list', 'count': len(value)})
+            return {'ok': True, 'collections': out}
+        path = str((args or {}).get('path') or '').strip().strip('/')
+        parts = [p for p in path.split('/') if p]
+        if not parts or parts[0] not in STATE_RECORDS_TOP_LEVEL:
+            return {'error': 'path must start with an allowed collection: '
+                             + ', '.join(sorted(STATE_RECORDS_TOP_LEVEL))}
+        if op in ('get', 'set', 'delete') and len(parts) < 2:
+            return {'error': 'name a record inside the collection, e.g. tasks/task-1/status'}
+        cur = state
+        for part in parts[:-1]:
+            if isinstance(cur, dict):
+                if part not in cur:
+                    return {'error': f'path not found at {part!r}'}
+                cur = cur[part]
+            elif isinstance(cur, list):
+                try:
+                    cur = cur[int(part)]
+                except (ValueError, IndexError):
+                    return {'error': f'list index not found at {part!r}'}
+            else:
+                return {'error': f'cannot traverse into {part!r}'}
+        last = parts[-1]
+        if op == 'get':
+            if isinstance(cur, dict):
+                if last not in cur:
+                    return {'error': 'path not found'}
+                value = cur[last]
+            elif isinstance(cur, list):
+                try:
+                    value = cur[int(last)]
+                except (ValueError, IndexError):
+                    return {'error': 'list index not found'}
+            else:
+                return {'error': 'cannot read into a scalar'}
+            try:
+                encoded = json.dumps(value)
+            except (TypeError, ValueError):
+                encoded = ''
+            if len(encoded) > STATE_RECORDS_MAX_VALUE_CHARS:
+                return {'ok': True, 'path': path, 'value': None, 'truncated': True,
+                        'note': f'value is {len(encoded)} chars; read a deeper path'}
+            return {'ok': True, 'path': path, 'value': value}
+        if op == 'set':
+            if 'value' not in (args or {}):
+                return {'error': 'set requires a value'}
+            value = args.get('value')
+            try:
+                encoded = json.dumps(value)
+            except (TypeError, ValueError):
+                return {'error': 'value must be JSON-serializable'}
+            if len(encoded) > STATE_RECORDS_MAX_VALUE_CHARS:
+                return {'error': 'value is too large'}
+            if isinstance(cur, dict):
+                cur[last] = value
+            elif isinstance(cur, list):
+                try:
+                    cur[int(last)] = value
+                except (ValueError, IndexError):
+                    return {'error': 'list index not found'}
+            else:
+                return {'error': 'cannot write into a scalar'}
+            save_state_to_db(state)
+            log_action(agent_id, 'state_records_set', {
+                'path': path, 'valueType': type(value).__name__}, authorized=True)
+            return {'ok': True, 'path': path, 'value': value}
+        if op == 'delete':
+            if isinstance(cur, dict):
+                if last not in cur:
+                    return {'error': 'path not found'}
+                removed = cur.pop(last)
+            elif isinstance(cur, list):
+                try:
+                    removed = cur.pop(int(last))
+                except (ValueError, IndexError):
+                    return {'error': 'list index not found'}
+            else:
+                return {'error': 'cannot delete from a scalar'}
+            save_state_to_db(state)
+            log_action(agent_id, 'state_records_delete', {
+                'path': path, 'removedType': type(removed).__name__}, authorized=True)
+            return {'ok': True, 'path': path, 'removed': removed}
+        return {'error': f'unknown op {op!r}; use collections, get, set, or delete'}
+    finally:
+        _state_abort()
+
+
 def supervisor_schedules(agent_id, args):
     """Team-agnostic schedule control for a director: list anything, create for
     themselves, and edit/delete only schedules they created (the chief of staff
@@ -6245,6 +6629,9 @@ bind_policy(__name__, [
     ('DIRECTOR_ESCALATION_REASK_COOLDOWN_S',
      'directorEscalationReaskCooldownS'),
     ('DIRECTOR_ESCALATION_MAX_ASKS', 'directorEscalationMaxAsks'),
+    ('DELEGATE_MAX_OPEN', 'delegateMaxOpen'),
+    ('DELEGATE_BUDGET_CAP_USD', 'delegateBudgetCapUsd'),
+    ('SUPERVISOR_BUDGET_CAP_USD', 'supervisorBudgetCapUsd'),
     ('_SIM_WATCHDOG_INTERVAL_S', 'simWatchdogIntervalS'),
     ('_SIM_WATCHDOG_STALE_S', 'simWatchdogStaleS'),
     ('CHAT_MAX_TOKENS_CAP', 'chatMaxTokensCap'),
@@ -31001,6 +31388,20 @@ REVIEW_GRADE_CALIBRATION_HYSTERESIS = 0.05  # dead-band: don't move unless off b
 REVIEW_GRADE_CALIBRATION_MIN_SAMPLES = 10   # need >= this many anchored grades before moving
 REVIEW_GRADE_CALIBRATION_STEP = 0.05        # the bar moves in one fixed step per pass
 
+# These calibration knobs are defined after the main serve bind_policy() call,
+# so register them now; bind_policy merges into the module's existing pairs.
+bind_policy(__name__, [
+    ('JEV_CALIBRATION_TARGET_RELIABILITY', 'jevCalibrationTargetReliability'),
+    ('JEV_CALIBRATION_HYSTERESIS', 'jevCalibrationHysteresis'),
+    ('JEV_CALIBRATION_MIN_OUTCOME', 'jevCalibrationMinOutcome'),
+    ('JEV_CALIBRATION_STEP', 'jevCalibrationStep'),
+    ('REVIEW_GRADE_CALIBRATION_TARGET', 'reviewGradeCalibrationTarget'),
+    ('REVIEW_GRADE_CALIBRATION_HYSTERESIS', 'reviewGradeCalibrationHysteresis'),
+    ('REVIEW_GRADE_CALIBRATION_MIN_SAMPLES', 'reviewGradeCalibrationMinSamples'),
+    ('REVIEW_GRADE_CALIBRATION_STEP', 'reviewGradeCalibrationStep'),
+    ('CALIBRATION_ADJUST_INTERVAL_S', 'calibrationAdjustIntervalS'),
+])
+
 
 def _cohens_kappa_binary(judge_labels, anchor_labels):
     """Cohen's kappa for the two binary raters in review_judge_calibration
@@ -31828,12 +32229,13 @@ def _aging_in_flight_work(data, now_ms):
     re-plan, instead of only the queue-length/abandoned signals. Mirrors the
     sweep's own thresholds: 'walking' older than STALE_WORK_TIMEOUT_MS, or
     'working' still working more than STALE_WORK_BUDGET_GRACE_S past workUntil.
-    Pure read over the state blob -- no DB, no network, testable directly."""
+    Ages exclude recorded pause/dormancy windows, exactly like the sweep, so a
+    sleeping tank is not reported as wedged work. Pure read over the state
+    blob -- no DB, no network, testable directly."""
     import sim as _sim
     tasks = data.get('tasks') or {}
     if not isinstance(tasks, dict):
         return 0
-    now = now_ms / 1000
     n = 0
     for task in tasks.values():
         if not isinstance(task, dict):
@@ -31842,15 +32244,15 @@ def _aging_in_flight_work(data, now_ms):
             continue
         if task.get('taskType') == 'bug' or task.get('incident') or task.get('shadow') or task.get('reviewOf'):
             continue  # bugs own an alarm; shadows/reviews are other watchdogs' domain
-        opened = task.get('openedAt') or task.get('assignedAt') or task.get('createdAt')
-        if opened is None:
-            continue
+        if not (task.get('openedAt') or task.get('assignedAt') or task.get('createdAt')):
+            continue  # no start stamp -> cannot judge age (matches the sweep)
         if task.get('status') == 'walking':
-            if now_ms - opened < _sim.STALE_WORK_TIMEOUT_MS:
+            age_ms = _sim._task_active_age_ms(data, task, now_ms)
+            if age_ms is None or age_ms < _sim.STALE_WORK_TIMEOUT_MS:
                 continue
         else:
-            work_until = task.get('workUntil') or 0
-            if now <= work_until + _sim.STALE_WORK_BUDGET_GRACE_S:
+            grace_ms = _sim.STALE_WORK_BUDGET_GRACE_S * 1000
+            if now_ms <= _sim._effective_work_deadline_ms(data, task, now_ms) + grace_ms:
                 continue
         n += 1
     return n
@@ -32125,8 +32527,10 @@ def compute_health_snapshot():
         # Admin gap 1: aging in-flight work -- a non-bug task wedged past its
         # budget (the stale-work sweep's domain, SM gap 1) is a health signal
         # here too: it means the sweep hasn't re-planned it yet, so the digest
-        # surfaces it instead of waiting for a later pass.
-        aging_in_flight = _aging_in_flight_work(data, now * 1000)
+        # surfaces it instead of waiting for a later pass. While DORMANT the
+        # sim is intentionally paused, so wall age here is not wedged work and
+        # the sweep cannot run; reporting it would be a false alarm.
+        aging_in_flight = 0 if _dormant() else _aging_in_flight_work(data, now * 1000)
         # Open escalations: a pending one, plus products with an unresolved
         # escalation record -- an incident the on-call hasn't put to bed yet.
         open_escalations = (1 if data.get('_pendingEscalation') else 0) + len(

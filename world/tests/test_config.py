@@ -310,6 +310,45 @@ class OperatorPolicySimServeBind(unittest.TestCase):
         self.assertEqual(serve.PEER_REVIEW_INTERVAL_S, 120)
         self.assertEqual(serve._SIM_WATCHDOG_INTERVAL_S, 45.0)
 
+    def test_reload_rebinds_supervisor_and_calibration_scalars(self):
+        import serve
+        import sim
+        self._write({
+            'supervisorBriefIntervalMs': 600000,
+            'supervisorCardIntervalMs': 1200000,
+            'chiefMonitorIntervalMs': 2400000,
+            'supervisorCardBudgetUsd': 0.08,
+            'delegateMaxOpen': 5,
+            'delegateBudgetCapUsd': 1.25,
+            'supervisorBudgetCapUsd': 9.0,
+            'jevCalibrationTargetReliability': 0.85,
+            'jevCalibrationHysteresis': 0.08,
+            'jevCalibrationMinOutcome': 14,
+            'jevCalibrationStep': 0.03,
+            'reviewGradeCalibrationTarget': 0.88,
+            'reviewGradeCalibrationHysteresis': 0.06,
+            'reviewGradeCalibrationMinSamples': 12,
+            'reviewGradeCalibrationStep': 0.04,
+            'calibrationAdjustIntervalS': 900,
+        })
+        config.reload_policy_config()
+        self.assertEqual(sim.SUPERVISOR_BRIEF_INTERVAL_MS, 600000)
+        self.assertEqual(sim.SUPERVISOR_CARD_INTERVAL_MS, 1200000)
+        self.assertEqual(sim.CHIEF_MONITOR_INTERVAL_MS, 2400000)
+        self.assertEqual(sim.SUPERVISOR_CARD_BUDGET_USD, 0.08)
+        self.assertEqual(serve.DELEGATE_MAX_OPEN, 5)
+        self.assertEqual(serve.DELEGATE_BUDGET_CAP_USD, 1.25)
+        self.assertEqual(serve.SUPERVISOR_BUDGET_CAP_USD, 9.0)
+        self.assertEqual(serve.JEV_CALIBRATION_TARGET_RELIABILITY, 0.85)
+        self.assertEqual(serve.JEV_CALIBRATION_HYSTERESIS, 0.08)
+        self.assertEqual(serve.JEV_CALIBRATION_MIN_OUTCOME, 14)
+        self.assertEqual(serve.JEV_CALIBRATION_STEP, 0.03)
+        self.assertEqual(serve.REVIEW_GRADE_CALIBRATION_TARGET, 0.88)
+        self.assertEqual(serve.REVIEW_GRADE_CALIBRATION_HYSTERESIS, 0.06)
+        self.assertEqual(serve.REVIEW_GRADE_CALIBRATION_MIN_SAMPLES, 12)
+        self.assertEqual(serve.REVIEW_GRADE_CALIBRATION_STEP, 0.04)
+        self.assertEqual(serve.CALIBRATION_ADJUST_INTERVAL_S, 900)
+
     def test_env_watchdog_overrides_operator_config(self):
         # Env key present in .env wins; when absent, operator config wins.
         # Simulate the env-present path by patching the capture variables serve

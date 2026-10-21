@@ -1213,6 +1213,9 @@ def _sim_loop_pass():
         state = serve._state_begin()
         if not state:
             return None
+        # Record dormancy/downtime as paused time BEFORE the tick advances
+        # sim.lastTickEpochS, so stale-work aging excludes it.
+        _record_tick_gap(state, int(time.time() * 1000))
         state = _engine.tick(state)
         try:
             governance.supervisor_tick(state)
@@ -1660,6 +1663,92 @@ STALE_WORK_CADENCE_MS = 20_000          # coarse sweep cadence (like STUCK_GATE)
 STALE_WORK_TIMEOUT_MS = 3 * 3600 * 1000  # 'walking' older than this -> never arrived
 STALE_WORK_BUDGET_GRACE_S = 900         # 'working' still working this far past workUntil -> wedged
 STALE_WORK_MAX_REPLANS = 2              # re-queues per (title,room) before the SM re-plan
+# Paused-time accounting. Dormancy (and server downtime) stops the sim, so a
+# task's WALL age keeps growing while no work can happen. Aging on wall time
+# then reports a card as wedged purely because the tank slept. The sim records
+# each tick gap (dormancy, restart, or a long stall) as a pause window, and the
+# age-based checks subtract the paused overlap from a task's life. The windows
+# are persisted with the state so a restart does not lose the accounting.
+SIM_PAUSE_MIN_GAP_MS = 60_000           # tick gaps shorter than this are normal jitter
+SIM_PAUSE_WINDOWS_MAX = 64              # keep the tail bounded (state is whole-blob saved)
+
+
+def _record_tick_gap(state, now_ms):
+    """Persist the gap since the previous tick as a paused window, when it is
+    long enough to be a dormancy/restart/stall rather than normal tick jitter.
+    Called BEFORE the engine tick advances sim.lastTickEpochS, so `prev` is the
+    last tick that actually ran. Pure state mutation."""
+    sim = state.get('sim') if isinstance(state, dict) else None
+    prev = (sim or {}).get('lastTickEpochS')
+    try:
+        prev_ms = int(float(prev) * 1000)
+    except (TypeError, ValueError):
+        return
+    if prev_ms <= 0 or now_ms - prev_ms < SIM_PAUSE_MIN_GAP_MS:
+        return
+    windows = state.get('_simPauseWindows')
+    if not isinstance(windows, list):
+        windows = []
+    windows.append([prev_ms, int(now_ms)])
+    del windows[:-SIM_PAUSE_WINDOWS_MAX]
+    state['_simPauseWindows'] = windows
+
+
+def _paused_overlap_ms(state, start_ms, end_ms):
+    """Total pause time overlapping [start_ms, end_ms]. Windows may overlap
+    (a crash before the tick saves can record the same gap again), so clip,
+    sort, and merge them before summing."""
+    if end_ms <= start_ms or not isinstance(state, dict):
+        return 0
+    spans = []
+    for w in state.get('_simPauseWindows') or []:
+        try:
+            ws, we = int(w[0]), int(w[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        lo = max(int(start_ms), ws)
+        hi = min(int(end_ms), we)
+        if hi > lo:
+            spans.append((lo, hi))
+    if not spans:
+        return 0
+    spans.sort()
+    total = 0
+    cur_lo, cur_hi = spans[0]
+    for lo, hi in spans[1:]:
+        if lo <= cur_hi:
+            cur_hi = max(cur_hi, hi)
+        else:
+            total += cur_hi - cur_lo
+            cur_lo, cur_hi = lo, hi
+    total += cur_hi - cur_lo
+    return min(total, end_ms - start_ms)
+
+
+def _task_active_age_ms(state, task, now_ms):
+    """A task's age excluding paused time, or None when it has no start stamp.
+    Mirrors the sweep/health lookup order for createdAt/openedAt."""
+    opened = task.get('openedAt') or task.get('assignedAt') or task.get('createdAt')
+    if opened is None:
+        return None
+    try:
+        opened = int(opened)
+    except (TypeError, ValueError):
+        return None
+    age = int(now_ms) - opened - _paused_overlap_ms(state, opened, now_ms)
+    return max(0, age)
+
+
+def _effective_work_deadline_ms(state, task, now_ms):
+    """workUntil in epoch ms, extended by any paused time that fell after the
+    deadline. A task paused mid-budget keeps its remaining active time."""
+    try:
+        deadline = int(float(task.get('workUntil') or 0) * 1000)
+    except (TypeError, ValueError):
+        deadline = 0
+    return deadline + _paused_overlap_ms(state, deadline, now_ms)
+
+
 # Worker stuck/help signal (W4): a worker whose content execution keeps FAILING
 # (a content-executor crash, or a red-pipeline ok=False) is genuinely stuck, and
 # today has no signal -- a crash is swallowed into a note. Count CONSECUTIVE
@@ -10680,6 +10769,9 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                     'never': never,
                     'dependsOn': depends_on,
                     'issueKey': req.get('issueKey') or None,
+                    # A chief-of-staff directive marks the request high priority
+                    # so the groomed card is picked before ordinary backlog work.
+                    'priority': req.get('priority'),
                     # Human-in-the-loop: a card the filer marked for the PLAYER
                     # (assignedTo 'player') stays the player's -- _assign_due_item
                     # hands it to the player instead of an agent. Any other value is
@@ -11744,6 +11836,16 @@ def _failure_review_step(state, now, now_ms, decider=None):
 SUPERVISOR_BRIEF_INTERVAL_MS = 15 * 60 * 1000
 SUPERVISOR_CARD_INTERVAL_MS = 30 * 60 * 1000
 SUPERVISOR_CARD_BUDGET_USD = 0.05
+CHIEF_MONITOR_INTERVAL_MS = 60 * 60 * 1000  # routine cross-team sweep, attention still wins
+
+# Defined after the module's main bind_policy() call; bind_policy merges these
+# into the existing sim pairs so an operator reload rebinds them too.
+bind_policy(__name__, [
+    ('SUPERVISOR_BRIEF_INTERVAL_MS', 'supervisorBriefIntervalMs'),
+    ('SUPERVISOR_CARD_INTERVAL_MS', 'supervisorCardIntervalMs'),
+    ('CHIEF_MONITOR_INTERVAL_MS', 'chiefMonitorIntervalMs'),
+    ('SUPERVISOR_CARD_BUDGET_USD', 'supervisorCardBudgetUsd'),
+])
 
 
 def _supervisor_team_tasks(state, team_id):
@@ -11917,26 +12019,45 @@ def _supervisor_brief_step(state, now, now_ms):
         reason = _supervisor_attention_reason(state, tid, now_ms)
         if reason:
             reasons.append(f"{team.get('name') or tid}: {reason}")
-    if not reasons:
-        return
     if _supervisor_admin_card_open(state):
         return
-    last_admin = int((state.get('_supervisorCardAt') or {}).get('__admin__') or 0)
-    if last_admin and now_ms - last_admin < SUPERVISOR_CARD_INTERVAL_MS:
+    routine = not reasons
+    if routine and not (state.get('teams') or []):
         return
+    stamp = '__adminRoutine__' if routine else '__admin__'
+    interval = CHIEF_MONITOR_INTERVAL_MS if routine else SUPERVISOR_CARD_INTERVAL_MS
+    last_admin = int((state.get('_supervisorCardAt') or {}).get(stamp) or 0)
+    if last_admin and now_ms - last_admin < interval:
+        return
+    if routine:
+        title = '[SUPERVISE] Cross-team: routine sweep'
+        instructions = (
+            'Routine cross-team oversight. Read every team report, look for anything '
+            'unusual (failures, stuck reviews, budget pressure, missing deliverables, '
+            'missed schedules), and act. When something needs work, instruct the owning '
+            'director with direct_backlog to put an immediate high-priority task in that '
+            "team's backlog, or delegate a scoped check. Do not do the work or edit code."
+        )
+    else:
+        title = f"[SUPERVISE] Cross-team: {len(reasons)} team(s) need attention"
+        instructions = (
+            'Cross-team oversight. Read the report, inspect the live project and the named '
+            'teams, act on budget or process, and route cross-team issues. If something '
+            'needs work, instruct the owning director with direct_backlog to put an '
+            'immediate high-priority task in that team\'s backlog. Do not do the work or '
+            'edit code. Attention: ' + '; '.join(reasons[:5])
+        )
     queue_work(state, [{
-        'title': f"[SUPERVISE] Cross-team: {len(reasons)} team(s) need attention"[:120],
+        'title': title[:120],
         'room': 'commandcenter',
         'taskType': 'supervise',
         'assignedTo': admin,
         'priority': 'high',
         'budgetUsd': SUPERVISOR_CARD_BUDGET_USD,
         'sizeEstimate': 'S',
-        'instructions': ('Cross-team oversight. Read the report, inspect the live project and the '
-                         'named teams, act on budget or process, and route cross-team issues. '
-                         'Do not do the work or edit code. Attention: ' + '; '.join(reasons[:5])),
+        'instructions': instructions,
     }])
-    state.setdefault('_supervisorCardAt', {})['__admin__'] = now_ms
+    state.setdefault('_supervisorCardAt', {})[stamp] = now_ms
 
 
 def _supervisor_admin_card_open(state):
@@ -13016,11 +13137,10 @@ def _escalation_step(state, now, now_ms, decider=None):
             continue
         if t.get('status') not in ('walking', 'working'):
             continue
-        # openedAt set at creation; fall back to a created/since marker.
-        opened = t.get('openedAt') or t.get('assignedAt') or t.get('createdAt')
-        if opened is None:
-            continue
-        if now_ms - opened < timeout:
+        # Active age (paused/dormant time excluded) so a bug is not escalated
+        # just because the tank slept through its restore window.
+        age_ms = _task_active_age_ms(state, t, now_ms)
+        if age_ms is None or age_ms < timeout:
             continue
         product_id = t.get('productId')
         if not product_id:
@@ -13460,14 +13580,15 @@ def _stale_work_step(state, now, now_ms):
             continue  # parked for a scheduled item -- budget restored on resume
         opened = task.get('openedAt') or task.get('assignedAt') or task.get('createdAt')
         if opened is None:
-            continue
+            continue  # no start stamp -> cannot judge age (pre-existing behavior)
         _sref = task.get('teamId') or agent_team_ref(state, task.get('assignedTo'))
         if task.get('status') == 'walking':
-            if now_ms - opened < team_policy(state, _sref, 'staleWorkTimeoutMs'):
+            age_ms = _task_active_age_ms(state, task, now_ms)
+            if age_ms is None or age_ms < team_policy(state, _sref, 'staleWorkTimeoutMs'):
                 continue
         else:  # 'working'
-            work_until = task.get('workUntil') or 0
-            if now <= work_until + team_policy(state, _sref, 'staleWorkBudgetGraceS'):
+            grace_ms = team_policy(state, _sref, 'staleWorkBudgetGraceS') * 1000
+            if now_ms <= _effective_work_deadline_ms(state, task, now_ms) + grace_ms:
                 continue
         # Genuinely wedged non-bug in-flight card. Release any holder so the
         # worker is never pinned by a task that will no longer resolve.
