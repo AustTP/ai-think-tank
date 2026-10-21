@@ -4170,6 +4170,18 @@ def _ensure_agent_avatar(agent_id, name, role, is_director=False):
         if out.get('ok') is not True:
             return False
         rotation_urls = (out.get('data') or {}).get('rotation_urls') or {}
+        # The job can report completed before /characters/{id} has the final
+        # rotation_urls; a single immediate GET used to lose the whole set.
+        # Poll the character briefly, then download whatever directions exist.
+        char_id = (out.get('ids') or {}).get('character_id')
+        if char_id and len([u for u in rotation_urls.values() if u]) < 4:
+            for _ in range(12):
+                char, _err = _pixellab_call('GET', f'/characters/{char_id}')
+                if isinstance(char, dict):
+                    rotation_urls = char.get('rotation_urls') or rotation_urls
+                if len([u for u in rotation_urls.values() if u]) >= 4:
+                    break
+                time.sleep(3)
         if not rotation_urls:
             return False
         d = _avatar_dir(agent_id)
@@ -4178,11 +4190,18 @@ def _ensure_agent_avatar(agent_id, name, role, is_director=False):
             if not url:
                 continue
             filename = _avatar_orientation_name(direction) + '.png'
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 -- PixelLab-signed asset URL
-                data = resp.read()
-            with open(os.path.join(d, filename), 'wb') as f:
-                f.write(data)
+            for attempt in range(3):
+                try:
+                    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 -- PixelLab-signed asset URL
+                        data = resp.read()
+                    with open(os.path.join(d, filename), 'wb') as f:
+                        f.write(data)
+                    break
+                except Exception:
+                    if attempt == 2:
+                        raise
+                    time.sleep(2)
         return _avatar_set_complete(agent_id)
     except Exception:
         return False
