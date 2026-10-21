@@ -4585,6 +4585,9 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         # executor grades per-requirement from here.
         'checklist': list((extra or {}).get('checklist') or []),
         'incident': bool((extra or {}).get('incident')),
+        # The owning team must survive onto the durable task: supervision,
+        # team policy, and per-team budget attribution all read task.teamId.
+        'teamId': (extra or {}).get('teamId'),
         'productId': (extra or {}).get('productId'),
         # Adversarial (winter) village tags (see queue_work / _assign_due_item)
         # -- stamped so serve._adversarial_village_tick can detect a side done.
@@ -14804,7 +14807,11 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     # off-duty facilitator is woken at the meeting room's door).
     pin_kind = (pick.get('reviewOf') or pick.get('incident')
                 or pick.get('_mailResume') or pick.get('directRoute')
-                or pick.get('_reassignedTo') or pick.get('facilitatorId'))
+                or pick.get('_reassignedTo') or pick.get('facilitatorId')
+                # A supervisor card belongs to the named director. Without this
+                # pin it fell through to think-tank-wide round-robin and could
+                # be handed to a worker, who has no supervisor scope at all.
+                or pick.get('taskType') == 'supervise')
     pinned = (pick.get('assignedTo') or pick.get('facilitatorId')
               or pick.get('_reassignedTo')) if pin_kind else None
     if (pick.get('taskType') in governance.CODE_TASK_TYPES
@@ -14852,6 +14859,10 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
             chosen_id = None
     else:
         chosen_id = None
+    if pick.get('taskType') == 'supervise' and chosen_id is None:
+        # Director-only card: wait for the named supervisor instead of leaking
+        # it to an unrelated worker on the global round-robin.
+        return None
     if chosen_id is None:
         if not candidates:
             return None
@@ -14987,6 +14998,8 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # 'bug' + productId + assignedTo travel so the fix is attributable and
         # the cap can be enforced against the open task set).
         'incident': bool(pick.get('incident')),
+        # Keep the owning team on the assigned task (see assign_task).
+        'teamId': pick.get('teamId'),
         'productId': pick.get('productId'),
         # Adversarial (winter) village tags thread onto the task (see
         # assign_task / queue_work) so completion can be read per side.

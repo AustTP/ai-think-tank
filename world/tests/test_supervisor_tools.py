@@ -280,3 +280,46 @@ def test_pixellab_token_falls_back_to_the_env_file(monkeypatch):
     monkeypatch.setattr(serve, '_credential_token', lambda name: 'vault-token')
     monkeypatch.setattr(serve, '_load_env', lambda: {'PIXELLAB_API_KEY': 'env-key'})
     assert serve._pixellab_token() == 'env-key'
+
+
+def test_supervise_card_pins_its_director_and_keeps_the_team(monkeypatch):
+    import sim
+    monkeypatch.setattr(serve, 'log_action', lambda *a, **k: None)
+    state = {
+        'sim': {'owner': 'server'},
+        'agentRoster': [
+            {'id': 'theo', 'name': 'Theo', 'isAdmin': True, 'isDirector': True},
+            {'id': 'nora', 'name': 'Nora', 'isDirector': True},
+            {'id': 'ruth', 'name': 'Ruth', 'director': 'nora'},
+        ],
+        'agents': {
+            'theo': {'id': 'theo', 'name': 'Theo', 'x': 0, 'y': 0, 'busy': False,
+                     'visible': True, 'offDuty': False, 'inRoom': None},
+            'nora': {'id': 'nora', 'name': 'Nora', 'x': 0, 'y': 0, 'busy': False,
+                     'visible': True, 'offDuty': False, 'inRoom': None},
+            'ruth': {'id': 'ruth', 'name': 'Ruth', 'x': 0, 'y': 0, 'busy': False,
+                     'visible': True, 'offDuty': False, 'inRoom': None},
+        },
+        'teams': [{'id': 'nora', 'directorId': 'nora', 'members': ['ruth']}],
+        'tasks': {}, 'workQueue': [],
+    }
+    grid, doors = sim._load_outdoor_geometry()
+    door = doors['pressoffice']
+    for a in state['agents'].values():
+        a['x'] = door['x'] + door['w'] / 2
+        a['y'] = door['y'] + door['h'] + 4
+    item = {'title': '[SUPERVISE] check', 'room': 'pressoffice',
+            'taskType': 'supervise', 'assignedTo': 'nora', 'teamId': 'nora',
+            'instructions': 'check the team'}
+    task = sim._assign_due_item(state, item, True, grid, doors, 1000,
+                                task_id_holder={0: 0})
+    assert task is not None
+    assert task['assignedTo'] == 'nora'
+    assert task['teamId'] == 'nora'
+    # A busy director makes the supervisor card wait; it must never fall
+    # through to a worker who has no supervisor scope.
+    state['agents']['nora']['task'] = task['id']
+    item2 = dict(item, title='[SUPERVISE] check 2')
+    assert sim._assign_due_item(state, item2, True, grid, doors, 2000,
+                                task_id_holder={0: 1}) is None
+    assert all(t.get('assignedTo') != 'ruth' for t in state['tasks'].values())
