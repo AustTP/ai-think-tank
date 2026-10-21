@@ -16,7 +16,12 @@ CREATE TABLE IF NOT EXISTS player_feedback (
     notes TEXT NOT NULL DEFAULT '',
     ratings TEXT NOT NULL DEFAULT '{}',
     quick_actions TEXT NOT NULL DEFAULT '[]',
-    created_at REAL NOT NULL
+    category TEXT,
+    severity TEXT,
+    target TEXT,
+    status TEXT NOT NULL DEFAULT 'new',
+    created_at REAL NOT NULL,
+    updated_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_player_feedback_item
     ON player_feedback (work_item_id, created_at DESC);
@@ -29,6 +34,28 @@ CREATE TABLE IF NOT EXISTS player_taste (
 """
 
 
+FEEDBACK_CATEGORIES = ('bug', 'idea', 'praise', 'confusion')
+FEEDBACK_SEVERITIES = ('low', 'medium', 'high')
+FEEDBACK_STATUSES = ('new', 'triaged', 'resolved')
+
+_MIGRATED_COLUMNS = {
+    'category': 'TEXT',
+    'severity': 'TEXT',
+    'target': 'TEXT',
+    'status': "TEXT NOT NULL DEFAULT 'new'",
+    'updated_at': 'REAL',
+}
+
+
+def _ensure_columns(conn):
+    """Add the structured-feedback columns to a database created before they
+    existed. SQLite has no ADD COLUMN IF NOT EXISTS, so check first."""
+    have = {row[1] for row in conn.execute('PRAGMA table_info(player_feedback)')}
+    for name, decl in _MIGRATED_COLUMNS.items():
+        if name not in have:
+            conn.execute(f'ALTER TABLE player_feedback ADD COLUMN {name} {decl}')
+
+
 class FeedbackStore:
     def __init__(self, path):
         self.path = path
@@ -39,31 +66,43 @@ class FeedbackStore:
         conn.row_factory = sqlite3.Row
         try:
             conn.executescript(SCHEMA)
+            _ensure_columns(conn)
             yield conn
             conn.commit()
         finally:
             conn.close()
 
     def add(self, work_item_id, player, sentiment=None, works=None,
-            notes='', ratings=None, quick_actions=None):
+            notes='', ratings=None, quick_actions=None, category=None,
+            severity=None, target=None):
         if not work_item_id:
             raise ValueError('workItemId is required')
         if sentiment not in (None, 'like', 'dislike'):
             raise ValueError('sentiment must be like or dislike')
         if works not in (None, 'works', 'broken'):
             raise ValueError('works must be works or broken')
+        category = (category or '').strip().lower() or None
+        severity = (severity or '').strip().lower() or None
+        if category is not None and category not in FEEDBACK_CATEGORIES:
+            raise ValueError('category must be one of: ' + ', '.join(FEEDBACK_CATEGORIES))
+        if severity is not None and severity not in FEEDBACK_SEVERITIES:
+            raise ValueError('severity must be one of: ' + ', '.join(FEEDBACK_SEVERITIES))
         ratings = ratings if isinstance(ratings, dict) else {}
         quick_actions = quick_actions if isinstance(quick_actions, list) else []
+        now = time.time()
         with self._conn() as conn:
             cur = conn.execute(
                 'INSERT INTO player_feedback '
                 '(work_item_id, player, sentiment, works, notes, ratings, '
-                'quick_actions, created_at) VALUES (?,?,?,?,?,?,?,?)',
+                'quick_actions, category, severity, target, status, created_at, '
+                'updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (work_item_id, player, sentiment, works, str(notes or '')[:4000],
-                 json.dumps(ratings), json.dumps(quick_actions), time.time()))
+                 json.dumps(ratings), json.dumps(quick_actions), category,
+                 severity, str(target or '')[:240] or None, 'new', now, now))
             return int(cur.lastrowid)
 
-    def list(self, work_item_id=None, player=None, limit=50):
+    def list(self, work_item_id=None, player=None, limit=50, category=None,
+             status=None):
         sql = 'SELECT * FROM player_feedback'
         clauses, args = [], []
         if work_item_id:
@@ -72,6 +111,12 @@ class FeedbackStore:
         if player:
             clauses.append('player = ?')
             args.append(player)
+        if category:
+            clauses.append('category = ?')
+            args.append(str(category).strip().lower())
+        if status:
+            clauses.append('status = ?')
+            args.append(str(status).strip().lower())
         if clauses:
             sql += ' WHERE ' + ' AND '.join(clauses)
         sql += ' ORDER BY created_at DESC LIMIT ?'
@@ -88,6 +133,29 @@ class FeedbackStore:
                     item[key] = {} if key == 'ratings' else []
             out.append(item)
         return out
+
+    def set_status(self, feedback_id, player, status):
+        status = (status or '').strip().lower()
+        if status not in FEEDBACK_STATUSES:
+            raise ValueError('status must be one of: ' + ', '.join(FEEDBACK_STATUSES))
+        with self._conn() as conn:
+            row = conn.execute(
+                'SELECT id FROM player_feedback WHERE id = ? AND player = ?',
+                (int(feedback_id), player)).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                'UPDATE player_feedback SET status = ?, updated_at = ? WHERE id = ?',
+                (status, time.time(), int(feedback_id)))
+            row = conn.execute('SELECT * FROM player_feedback WHERE id = ?',
+                               (int(feedback_id),)).fetchone()
+        item = dict(row)
+        for key in ('ratings', 'quick_actions'):
+            try:
+                item[key] = json.loads(item.get(key) or ('{}' if key == 'ratings' else '[]'))
+            except (TypeError, ValueError):
+                item[key] = {} if key == 'ratings' else []
+        return item
 
     def get_taste(self, player):
         with self._conn() as conn:

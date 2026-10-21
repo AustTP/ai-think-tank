@@ -95,11 +95,13 @@ async def work_items(request: Request):
 
 @router.get('/api/feedback')
 async def list_feedback(request: Request, workItemId: str | None = None,
-                        limit: int = 50):
+                        limit: int = 50, category: str | None = None,
+                        status: str | None = None):
     if not _player(request):
         return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     return JSONResponse({'ok': True, 'feedback': _store().list(
-        work_item_id=workItemId, player='player', limit=limit)})
+        work_item_id=workItemId, player='player', limit=limit,
+        category=category, status=status)})
 
 
 @router.post('/api/feedback')
@@ -118,10 +120,30 @@ async def add_feedback(request: Request):
             body.get('works'),
             body.get('notes') or '',
             body.get('ratings'),
-            body.get('quickActions'))
+            body.get('quickActions'),
+            body.get('category'),
+            body.get('severity'),
+            body.get('target'))
     except ValueError as exc:
         return JSONResponse({'error': str(exc)}, status_code=400)
     return JSONResponse({'ok': True, 'id': fid})
+
+
+@router.patch('/api/feedback/{feedback_id}')
+async def update_feedback_status(feedback_id: int, request: Request):
+    if not _player(request):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    try:
+        item = _store().set_status(feedback_id, 'player', body.get('status'))
+    except ValueError as exc:
+        return JSONResponse({'error': str(exc)}, status_code=400)
+    if item is None:
+        return JSONResponse({'error': 'feedback not found'}, status_code=404)
+    return JSONResponse({'ok': True, 'feedback': item})
 
 
 @router.get('/api/taste')

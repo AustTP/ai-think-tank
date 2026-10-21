@@ -109,6 +109,10 @@ button{cursor:pointer}
 .control label{display:flex;justify-content:space-between;gap:10px;font-size:12px;color:var(--muted);margin-bottom:6px}
 .control input[type=range]{width:100%;accent-color:var(--pink);min-height:30px}
 .control output{color:var(--text);font-variant-numeric:tabular-nums}
+.fb-fields,.filters{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;align-items:end;margin-top:12px}
+.fb-fields select,.fb-fields input,.filters select{width:100%;min-height:40px;border-radius:10px;border:1px solid var(--line);background:var(--panel2);color:var(--text);padding:0 10px}
+.review-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:4px}
+.pill{display:inline-flex;padding:2px 8px;border-radius:999px;border:1px solid var(--line);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
 textarea{width:100%;min-height:104px;resize:vertical;border-radius:12px;border:1px solid var(--line);
   background:#0a0a0e;padding:12px;color:var(--text)}
 textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,157,.65);outline-offset:2px}
@@ -177,6 +181,7 @@ textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,15
     <div class="tabs" id="tabs" role="tablist">
       <button class="tab active" data-tab="overview" type="button">Overview</button>
       <button class="tab" data-tab="taste" type="button">Taste</button>
+      <button class="tab" data-tab="review" type="button">Reviews</button>
       <button class="tab" data-tab="item" id="itemTab" type="button" hidden>Work item</button>
     </div>
 
@@ -225,6 +230,31 @@ textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,15
           <button class="choice" data-quick="change-direction" type="button">Change direction</button>
           <button class="choice" data-quick="stop-this-line" type="button">Stop this line</button>
         </div>
+        <div class="fb-fields">
+          <div class="control">
+            <label for="fbCategory"><span>Category</span></label>
+            <select id="fbCategory">
+              <option value="">choose one</option>
+              <option value="bug">bug</option>
+              <option value="idea">idea</option>
+              <option value="praise">praise</option>
+              <option value="confusion">confusion</option>
+            </select>
+          </div>
+          <div class="control">
+            <label for="fbSeverity"><span>Severity</span></label>
+            <select id="fbSeverity">
+              <option value="">not set</option>
+              <option value="low">low</option>
+              <option value="medium">medium</option>
+              <option value="high">high</option>
+            </select>
+          </div>
+          <div class="control">
+            <label for="fbTarget"><span>Concerns</span></label>
+            <input id="fbTarget" placeholder="page, feature, or agent">
+          </div>
+        </div>
         <div class="controls" id="ratings"></div>
         <div class="controls" id="aspects"></div>
         <div style="margin-top:14px">
@@ -237,6 +267,37 @@ textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,15
           <span class="note" id="feedbackStatus" role="status" aria-live="polite"></span>
         </div>
         <div class="history" id="feedbackHistory"></div>
+      </div>
+    </section>
+
+    <section id="view-review" hidden>
+      <div class="panel">
+        <h3>Feedback review</h3>
+        <p class="hint">Every submission, newest first. Filter it down, then mark what you have handled.</p>
+        <div class="filters">
+          <div class="control">
+            <label for="reviewCategory"><span>Category</span></label>
+            <select id="reviewCategory">
+              <option value="">all</option>
+              <option value="bug">bug</option>
+              <option value="idea">idea</option>
+              <option value="praise">praise</option>
+              <option value="confusion">confusion</option>
+            </select>
+          </div>
+          <div class="control">
+            <label for="reviewStatus"><span>Status</span></label>
+            <select id="reviewStatus">
+              <option value="">all</option>
+              <option value="new">new</option>
+              <option value="triaged">triaged</option>
+              <option value="resolved">resolved</option>
+            </select>
+          </div>
+          <button class="ghost" id="reviewRefresh" type="button">Refresh</button>
+          <span class="note" id="reviewNote" role="status" aria-live="polite"></span>
+        </div>
+        <div class="history" id="reviewList"></div>
       </div>
     </section>
 
@@ -349,7 +410,9 @@ textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,15
     $('view-overview').hidden = tab !== 'overview';
     $('view-item').hidden = tab !== 'item';
     $('view-taste').hidden = tab !== 'taste';
+    $('view-review').hidden = tab !== 'review';
     if (tab === 'taste') loadTaste();
+    if (tab === 'review') loadReview();
     window.scrollTo({top:0});
   }
 
@@ -387,6 +450,9 @@ textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,15
     const a = $('aspects'); a.textContent = '';
     ASPECTS.forEach(([k,l]) => renderScale(a,k,l,5));
     $('notes').value = '';
+    $('fbCategory').value = '';
+    $('fbSeverity').value = '';
+    $('fbTarget').value = '';
     $('feedbackStatus').textContent = '';
     $('feedbackStatus').className = 'note';
     document.querySelectorAll('[data-sentiment],[data-works],[data-quick]').forEach(b => b.classList.remove('active'));
@@ -402,6 +468,9 @@ textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,15
       workItemId: state.selected ? state.selected.id : '',
       sentiment: sentiment ? sentiment.dataset.sentiment : null,
       works: works ? works.dataset.works : null,
+      category: $('fbCategory').value || null,
+      severity: $('fbSeverity').value || null,
+      target: $('fbTarget').value.trim(),
       notes: $('notes').value.trim(),
       ratings,
       quickActions: Array.from(document.querySelectorAll('[data-quick].active')).map(b => b.dataset.quick)
@@ -438,14 +507,86 @@ textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,15
       const h = $('feedbackHistory'); h.textContent = '';
       (data.feedback || []).forEach(f => {
         const bits = [];
+        if (f.category) bits.push(f.category);
+        if (f.severity) bits.push('severity ' + f.severity);
+        if (f.target) bits.push('re: ' + f.target);
         if (f.sentiment) bits.push(f.sentiment);
         if (f.works) bits.push(f.works);
         if (f.notes) bits.push(f.notes);
+        if (f.status) bits.push('[' + f.status + ']');
         const q = (f.ratings && f.ratings.quality != null) ? 'quality ' + f.ratings.quality : '';
         if (q) bits.push(q);
         h.appendChild(el('div','history-item', bits.join(' · ')));
       });
     } catch (e) { /* history is optional */ }
+  }
+
+  function reviewUrl() {
+    const q = new URLSearchParams({limit:'100'});
+    const c = $('reviewCategory').value;
+    const st = $('reviewStatus').value;
+    if (c) q.set('category', c);
+    if (st) q.set('status', st);
+    return '/api/feedback?' + q.toString();
+  }
+
+  async function loadReview() {
+    const list = $('reviewList'); list.textContent = '';
+    $('reviewNote').textContent = '';
+    try {
+      const res = await fetch(reviewUrl(), {credentials:'same-origin', cache:'no-store'});
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not load feedback');
+      const rows = data.feedback || [];
+      if (!rows.length) { list.appendChild(el('p','note','No feedback matches those filters.')); return; }
+      rows.forEach(f => {
+        const item = el('div','history-item');
+        const head = el('div','review-head');
+        head.appendChild(el('strong', null, '#' + f.id));
+        if (f.category) head.appendChild(el('span','pill', f.category));
+        if (f.severity) head.appendChild(el('span','pill', 'severity ' + f.severity));
+        head.appendChild(el('span','pill', f.status || 'new'));
+        item.appendChild(head);
+        const bits = [];
+        if (f.target) bits.push('re: ' + f.target);
+        if (f.notes) bits.push(f.notes);
+        if (f.sentiment) bits.push(f.sentiment);
+        if (f.works) bits.push(f.works);
+        if (f.work_item_id) bits.push('work item ' + f.work_item_id);
+        item.appendChild(el('p', null, bits.join(' · ') || 'No details.'));
+        const actions = el('div','quickrow');
+        ['triaged','resolved'].forEach(next => {
+          if ((f.status || 'new') === next) return;
+          const b = el('button','choice', next === 'triaged' ? 'Mark triaged' : 'Mark resolved');
+          b.type = 'button';
+          b.addEventListener('click', () => updateReviewStatus(f.id, next));
+          actions.appendChild(b);
+        });
+        item.appendChild(actions);
+        list.appendChild(item);
+      });
+    } catch (err) {
+      $('reviewNote').textContent = err.message;
+      $('reviewNote').className = 'note bad';
+    }
+  }
+
+  async function updateReviewStatus(id, status) {
+    try {
+      const res = await fetch('/api/feedback/' + encodeURIComponent(id), {
+        method:'PATCH', credentials:'same-origin',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({status})
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Could not update');
+      $('reviewNote').textContent = 'Marked #' + id + ' ' + status + '.';
+      $('reviewNote').className = 'note ok';
+      loadReview();
+    } catch (err) {
+      $('reviewNote').textContent = err.message;
+      $('reviewNote').className = 'note bad';
+    }
   }
 
   async function loadWork() {
@@ -530,10 +671,14 @@ textarea:focus,input:focus,button:focus-visible{outline:2px solid rgba(255,77,15
   document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
     if (t.dataset.tab === 'overview') setTab('overview');
     else if (t.dataset.tab === 'taste') setTab('taste');
+    else if (t.dataset.tab === 'review') setTab('review');
     else if (t.dataset.tab === 'item' && state.selected) setTab('item');
   }));
   $('backBtn').addEventListener('click', () => setTab('overview'));
-  $('refreshBtn').addEventListener('click', () => { loadWork(); loadTaste(); });
+  $('refreshBtn').addEventListener('click', () => { loadWork(); loadTaste(); loadReview(); });
+  $('reviewCategory').addEventListener('change', loadReview);
+  $('reviewStatus').addEventListener('change', loadReview);
+  $('reviewRefresh').addEventListener('click', loadReview);
   $('submitFeedback').addEventListener('click', submitFeedback);
   $('clearFeedback').addEventListener('click', renderFeedbackForm);
   $('saveTaste').addEventListener('click', saveTaste);
