@@ -659,3 +659,23 @@ def test_default_validator_decider_failure_modes(fake_repo, monkeypatch):
              'omitted approved')):
         with pytest.raises(RuntimeError, match=needle):
             post_with(call)
+
+
+def test_commit_message_names_every_change_request_role(monkeypatch):
+    monkeypatch.setattr(serve, 'get_state_from_db', lambda: {'agentRoster': [
+        {'id': 'worker', 'name': 'Ben'},
+        {'id': 'reviewer', 'name': 'Ada'},
+        {'id': 'supervisor', 'name': 'Nora'},
+        {'id': 'chief', 'name': 'Theo'},
+    ]})
+    row = {'agent': 'worker', 'validator': 'reviewer',
+           'supervisor': 'supervisor', 'admin_agent': 'chief',
+           'reason': 'ship the tuning change'}
+    message = selfedit._commit_message(
+        'win-abc', row, [{'path': 'world/gear.py', 'summary': 'engine knob'}])
+    assert 'Implemented by Ben; validated by Ada.' in message
+    assert 'Approving supervisor: Nora' in message
+    assert 'Chief of staff: Theo' in message
+    assert 'Implementer: Ben' in message
+    assert 'Validator: Ada' in message
+    assert 'world/gear.py: engine knob' in message

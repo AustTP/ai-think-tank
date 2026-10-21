@@ -1635,7 +1635,8 @@ def _ensure_windows_table(conn):
             ('admin_status', 'TEXT'),
             ('admin_note', 'TEXT'),
             ('admin_approved_at', 'REAL'),
-            ('admin_agent', 'TEXT')):
+            ('admin_agent', 'TEXT'),
+            ('supervisor', 'TEXT')):
         try:
             conn.execute(f'ALTER TABLE dormancy_windows ADD COLUMN {col} {decl}')
         except sqlite3.OperationalError:
@@ -1895,14 +1896,16 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None):
         _window_record(window_id, now, agent_id, date, start, start_ts, end_ts,
                        duration_min, reason, 'approved')
         _update_window(window_id, escalation_id=None, validator=validator,
-                       validator_status='pending', admin_status='pending')
+                       validator_status='pending', admin_status='pending',
+                       supervisor=serve._supervisor_of(state, agent_id))
     else:
         esc_id = serve.create_escalation(_WINDOW_JEV_KIND, question,
                                          on_approve_note=window_id)
         _window_record(window_id, now, agent_id, date, start, start_ts, end_ts,
                        duration_min, reason, 'pending')
         _update_window(window_id, escalation_id=esc_id, validator=validator,
-                       validator_status='pending')
+                       validator_status='pending',
+                       supervisor=serve._supervisor_of(state, agent_id))
     with serve._db() as conn:
         _ensure_table(conn)
         for row_id in armed_ids:
@@ -2552,11 +2555,41 @@ def _fail_window_push(window_id, reason, by=None):
                              'was pushed'}
 
 
+def _agent_display_name(agent_id):
+    """The human-facing name for an agent id, read from the live roster. Falls
+    back to the id when the roster cannot be read, so a push never loses the
+    attribution line (the id is still a correct, stable reference)."""
+    if not agent_id:
+        return '?'
+    if agent_id == 'player':
+        return 'player'
+    try:
+        state = _s().get_state_from_db() or {}
+    except Exception:
+        return str(agent_id)
+    for row in state.get('agentRoster') or []:
+        if isinstance(row, dict) and row.get('id') == agent_id:
+            return row.get('name') or agent_id
+    return str(agent_id)
+
+
 def _commit_message(window_id, row, edits):
+    """Commit text for a validated change request. Attribution is part of the
+    contract: the approving supervisor, the chief of staff, the implementer,
+    and the independent validator are all named, so `git log` answers who
+    approved and who checked the work without reading the tank's database."""
+    implementer = _agent_display_name(row.get('agent'))
+    validator = _agent_display_name(row.get('validator'))
+    supervisor = _agent_display_name(row.get('supervisor'))
+    chief = _agent_display_name(row.get('admin_agent'))
     lines = [f'selfedit: change window {window_id}', '',
              (row.get('reason') or '').strip() or '(no reason recorded)', '',
-             f'Implemented by {row.get("agent")}; validated by '
-             f'{row.get("validator") or "?"}.', '']
+             f'Implemented by {implementer}; validated by {validator}.', '',
+             'Change request:',
+             f'Approving supervisor: {supervisor}',
+             f'Chief of staff: {chief}',
+             f'Implementer: {implementer}',
+             f'Validator: {validator}', '']
     for e in edits[:20]:
         lines.append(f"- {e['path']}: {(e['summary'] or '')[:160]}")
     return '\n'.join(lines)
