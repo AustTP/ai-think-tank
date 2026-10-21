@@ -225,7 +225,7 @@
         "spend": {
           "kind": "balance_delta",
           "service": "pixellab",
-          "balance_path": "/v2/balance"
+          "balance_path": "/balance"
         }
       }
     },

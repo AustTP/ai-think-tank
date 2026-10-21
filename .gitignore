@@ -68,6 +68,7 @@ agents/*/agent.json
 agents/*/AGENTS.md
 agents/*/MEMORY.md
 agents/*/state.json
+agents/*/avatars/
 
 # Runtime state: live browse/search/usage trails and the action
 # passport hash-chain are regenerated from think_tank.db at runtime -- never pushed.

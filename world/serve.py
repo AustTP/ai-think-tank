@@ -26647,6 +26647,11 @@ def _agent_is_in_sandbox_room(agent_id, live_room=None):
 
 API_CALL_MAX_BODY_BYTES = 200_000
 API_CALL_TIMEOUT_S = 20
+# Generation workflows (PixelLab, Higgsfield) submit/poll long jobs. A single
+# request can legitimately outlive the plain api_call timeout, so the workflow
+# interpreter gets its own per-request ceiling; the workflow's own poll
+# timeout still bounds the whole job.
+API_WORKFLOW_REQUEST_TIMEOUT_S = 90
 
 
 def _api_request_sync(method, url, headers, body):
@@ -26740,7 +26745,7 @@ def _api_execute_workflow(service, spend_kind, base_url, method, req_headers, re
     values = dict(workflow_params or {})
     req_headers = dict(req_headers or {})
 
-    def _request(path_template, body, method, timeout=API_CALL_TIMEOUT_S):
+    def _request(path_template, body, method, timeout=API_WORKFLOW_REQUEST_TIMEOUT_S):
         url = _api_workflow_url(base_url, path_template, values)
         result = _api_request_sync(method, url, req_headers, body)
         try:
@@ -26758,9 +26763,15 @@ def _api_execute_workflow(service, spend_kind, base_url, method, req_headers, re
             usd = float((estimate or {}).get(spec['estimate'].get('usd_field', 'usd')) or 0)
         except (ValueError, TypeError):
             usd = 0.0
+    # Registry rows written before the base-url/path split may carry the full
+    # '/v2/balance' against a base_url that already ends in '/v2'. Normalize it
+    # here so an existing DB row keeps working without a manual migration.
+    balance_path = spend.get('balance_path', '/v2/balance')
+    if base_url.rstrip('/').endswith('/v2') and str(balance_path).startswith('/v2/'):
+        balance_path = str(balance_path)[len('/v2'):]
     balance_before = None
     if spend.get('kind') == 'balance_delta':
-        bal = _request(spend.get('balance_path', '/v2/balance'), None, 'GET')
+        bal = _request(balance_path, None, 'GET')
         balance_before = (bal or {}).get('balance')
 
     # Submit.
@@ -26810,7 +26821,7 @@ def _api_execute_workflow(service, spend_kind, base_url, method, req_headers, re
     if charged and spend.get('kind') == 'estimate_first' and usd > 0:
         _accrue_spend(spend_service, usd, agent_id=agent_id)
     elif charged and spend.get('kind') == 'balance_delta':
-        bal = _request(spend.get('balance_path', '/v2/balance'), None, 'GET')
+        bal = _request(balance_path, None, 'GET')
         balance_after = (bal or {}).get('balance')
         if isinstance(balance_before, (int, float)) and isinstance(balance_after, (int, float)):
             real_cost = max(0.0, balance_before - balance_after)
