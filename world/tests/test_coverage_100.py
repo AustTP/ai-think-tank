@@ -230,7 +230,7 @@ class TestSmallHelpers:
     def test_structured_edits_rejects_bad_json(self):
         with pytest.raises(ValueError):
             structured_edits.command('{"edits": []}')
-        with pytest.raises(json.JSONDecodeError):
+        with pytest.raises(ValueError):
             structured_edits.command('not json')
 
     def test_transport_recovery_retries_transient(self):

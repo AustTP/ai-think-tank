@@ -354,6 +354,7 @@ from jev_grants import (  # noqa: E402,F401
 # passes, and the research watchlist by editing the JSON files. Re-exported so
 # the stable surface the endpoints/tests use is `serve.PLAIN_WRITING_BAN_LIST`
 # etc. (see world/config.py for load discipline).
+import config  # noqa: E402
 from config import (  # noqa: E402,F401
     ALLOW_WATCHLIST_WRITE,
     API_LOG_ALLOWED_ACTIONS,
@@ -2313,6 +2314,39 @@ _SEED_PROFILE_DEFAULTS = {
             'Judge people on real evidence of work, never on reputation or hearsay alone.',
             'A firing or a hire must follow the consultation and review steps before being acted on.',
             'Surface the most consequential personnel decisions to the chief of staff for a final call.',
+        ],
+        'notes': [],
+    },
+    'Supervisor': {
+        'mission': ('Facilitate one team through its sprint: watch its budget and its '
+                    'process failures, keep work moving, and leave the actual work to the workers.'),
+        'instructions': [
+            "Scope is your own team. Never inspect, comment on, or reassign another team's work; route cross-team issues to the chief of staff.",
+            'Use the shell: check task status, the team sandbox paths, and the team-scoped DB rows before drawing a conclusion.',
+            'Do not do the work yourself. You are the facilitator, not the implementer.',
+            'Budget: if a card spent its ceiling before close, say what the spend bought and whether more is justified; never silently retry.',
+            'Process: a failure, a stuck review, or a missing deliverable is yours to escalate or file as a failure review.',
+            'Read the supervisor brief first; it names the team, the sprint, the cards, the failures, and where to look.',
+        ],
+        'notes': [],
+    },
+    'Supporting Director': {
+        'mission': ('Support the other directors as a senior peer: share context, cover '
+                    'gaps, and keep the director group coherent without owning their teams.'),
+        'instructions': [
+            'Support the directors; do not reassign or override their teams unilaterally.',
+            'Route org-level and cross-team decisions to the chief of staff.',
+            'Keep your own team supervised to the same standard as every other director.',
+        ],
+        'notes': [],
+    },
+    'Chief of Staff': {
+        'mission': ('Coordinate the directors and hold org-level authority: approvals, '
+                    'cross-team decisions, schedules, and the operating rhythm.'),
+        'instructions': [
+            'Directors own their teams; you own the coordination between them.',
+            'Route code work through the director chain to a worker; do not self-edit code.',
+            'Keep decisions auditable: record who approved what and why.',
         ],
         'notes': [],
     },
@@ -5314,6 +5348,379 @@ DIRECTOR_ESCALATION_REASK_COOLDOWN_S = 15 * 60
 DIRECTOR_ESCALATION_MAX_ASKS = 6
 
 
+SUPERVISOR_BUDGET_CAP_USD = 5.0
+
+
+def supervisor_team_for(state, agent_id):
+    """The team a supervisor leads, or None. Team id and directorId may differ
+    in older records, so match either. The chief of staff leads no team here
+    (he coordinates), which keeps team-scoped reads honest."""
+    if not state or not agent_id:
+        return None
+    for team in (state.get('teams') or []):
+        if team.get('directorId') == agent_id:
+            return team
+    return None
+
+
+LIVE_READ_MAX_FILES = 200
+LIVE_READ_MAX_LINES = 400
+LIVE_READ_MAX_BYTES = 8_000_000
+LIVE_READ_DENY = {'.git', '.secret_keys', 'node_modules', '__pycache__', '.venv', '.pytest_cache'}
+
+
+def _safe_live_path(rel):
+    """Resolve a repo-relative path for a read-only live inspection. Refuses
+    traversal, symlink escapes, secrets, and VCS internals."""
+    rel = (rel or '').strip().lstrip('/').replace('\\', '/')
+    base = os.path.realpath(THINK_TANK_DIR)
+    full = os.path.realpath(os.path.join(base, rel)) if rel else base
+    if full != base and not full.startswith(base + os.sep):
+        raise ValueError('path escapes the project')
+    parts = [p for p in os.path.relpath(full, base).split(os.sep) if p not in ('', '.')]
+    if any(p in LIVE_READ_DENY for p in parts):
+        raise ValueError('that path is not readable')
+    if parts and parts[-1] == '.env':
+        raise ValueError('that path is not readable')
+    return full
+
+
+def supervisor_live_read(agent_id, args):
+    """Read-only live inspection for a director: list, read, grep the project,
+    or read the team's recent action log. Never writes, never leaves an
+    allowlisted project path, and never exposes secrets or .git."""
+    state = get_state_from_db() or {}
+    if not _is_director_or_admin(state, agent_id):
+        return {'error': 'only a director or the chief of staff may read the live project'}
+    op = (args.get('op') or 'ls').strip().lower()
+    if op == 'ls':
+        try:
+            full = _safe_live_path(args.get('path') or '')
+        except ValueError as exc:
+            return {'error': str(exc)}
+        if os.path.isfile(full):
+            entries = [os.path.basename(full)]
+        else:
+            entries = [name for name in sorted(os.listdir(full))
+                       if name not in LIVE_READ_DENY and name != '.env'][:LIVE_READ_MAX_FILES]
+        return {'path': os.path.relpath(full, THINK_TANK_DIR), 'entries': entries}
+    if op == 'read':
+        try:
+            full = _safe_live_path(args.get('path') or '')
+        except ValueError as exc:
+            return {'error': str(exc)}
+        if not os.path.isfile(full):
+            return {'error': 'not a file'}
+        if os.path.getsize(full) > LIVE_READ_MAX_BYTES:
+            return {'error': 'file is too large to read here'}
+        start = max(1, int(args.get('start') or 1))
+        end = min(start + LIVE_READ_MAX_LINES - 1, start + LIVE_READ_MAX_LINES - 1)
+        if args.get('end'):
+            end = min(int(args['end']), start + LIVE_READ_MAX_LINES - 1)
+        with open(full, encoding='utf-8', errors='replace') as stream:
+            lines = stream.readlines()
+        chunk = lines[start - 1:end]
+        return {'path': os.path.relpath(full, THINK_TANK_DIR), 'start': start,
+                'end': start + len(chunk) - 1, 'totalLines': len(lines),
+                'text': ''.join(chunk)}
+    if op == 'grep':
+        pattern = (args.get('pattern') or '').strip()
+        if not pattern or len(pattern) > 120:
+            return {'error': 'a pattern (max 120 chars) is required'}
+        try:
+            root = _safe_live_path(args.get('path') or 'world')
+        except ValueError as exc:
+            return {'error': str(exc)}
+        want = pattern.lower()
+        matches = []
+        files_scanned = 0
+        for base_dir, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in LIVE_READ_DENY]
+            for name in files:
+                path = os.path.join(base_dir, name)
+                if os.path.islink(path) or os.path.getsize(path) > LIVE_READ_MAX_BYTES:
+                    continue
+                files_scanned += 1
+                try:
+                    with open(path, encoding='utf-8', errors='replace') as stream:
+                        for lineno, line in enumerate(stream, 1):
+                            if want in line.lower():
+                                matches.append(f"{os.path.relpath(path, THINK_TANK_DIR)}:{lineno}: {line.strip()[:200]}")
+                                if len(matches) >= 50:
+                                    return {'pattern': pattern, 'filesScanned': files_scanned,
+                                            'matches': matches, 'truncated': True}
+                except OSError:
+                    continue
+        return {'pattern': pattern, 'filesScanned': files_scanned,
+                'matches': matches, 'truncated': False}
+    if op in ('team_log', 'log'):
+        team = supervisor_team_for(state, agent_id)
+        if not team and not _is_admin(state, agent_id):
+            return {'error': 'you do not supervise a team'}
+        director = (team or {}).get('directorId') or agent_id
+        team_ids = set(_direct_reports(state, director)) if team else set()
+        team_ids.add(director)
+        limit = min(int(args.get('limit') or 40), 100)
+        rows = []
+        if team_ids:
+            placeholders = ','.join('?' for _ in team_ids)
+            with _db() as conn:
+                rows = conn.execute(
+                    f'SELECT ts, agent_id, action, details FROM action_log '
+                    f'WHERE agent_id IN ({placeholders}) ORDER BY id DESC LIMIT ?',
+                    (*sorted(team_ids), limit)).fetchall()
+        return {'entries': [
+            {'at': r[0], 'agent': r[1], 'action': r[2], 'details': (r[3] or '')[:400]}
+            for r in rows]}
+    return {'error': f'unknown op {op!r}; use ls, read, grep, or team_log'}
+
+
+DELEGATE_BUDGET_CAP_USD = 0.50
+DELEGATE_MAX_OPEN = 3
+
+
+def supervisor_delegate(agent_id, title, instructions, task_type='spike',
+                        assignee=None, budget_usd=0.10, return_contract='', team=None):
+    """Queue one scoped investigation for a worker on the caller's own team,
+    with a written return contract. The delegation is async (a card): the
+    supervisor reads the result on a later turn. Bounded to three open
+    delegations and a small budget."""
+    state = get_state_from_db() or {}
+    if not _is_director_or_admin(state, agent_id):
+        return False, {'error': 'only a director or the chief of staff may delegate'}
+    is_admin = _is_admin(state, agent_id)
+    wanted = str(team or '').strip()
+    team_row = supervisor_team_for(state, agent_id)
+    if wanted:
+        team_row = next((t for t in (state.get('teams') or [])
+                         if t.get('id') == wanted or t.get('directorId') == wanted), None)
+    if not team_row:
+        if is_admin:
+            return False, {'error': 'the chief of staff must name a team to delegate to'}
+        return False, {'error': 'you do not supervise a team'}
+    title = (str(title or '')).strip()
+    instructions = (str(instructions or '')).strip()
+    if len(title) < 6 or len(instructions) < 12:
+        return False, {'error': 'a title and instructions are required'}
+    task_type = (task_type or 'spike').strip().lower()
+    if task_type not in ('spike', 'research', 'code'):
+        return False, {'error': 'taskType must be spike, research, or code'}
+    team_id = (team_row or {}).get('id')
+    members = list((team_row or {}).get('members') or [])
+    if not assignee:
+        try:
+            import sim as _sim
+            assignee = _sim.on_call_agent(state, team_id, None, int(time.time() * 1000))
+        except Exception:
+            assignee = members[0] if members else None
+    if members and assignee not in members:
+        return False, {'error': 'the assignee must be on your team'}
+    try:
+        budget = float(budget_usd)
+    except (TypeError, ValueError):
+        return False, {'error': 'budgetUsd must be a number'}
+    if not (0 < budget <= DELEGATE_BUDGET_CAP_USD):
+        return False, {'error': f'budgetUsd must be between 0 and {DELEGATE_BUDGET_CAP_USD:.2f}'}
+    open_count = 0
+    for item in (state.get('workQueue') or []):
+        if item.get('teamId') == team_id and str(item.get('title') or '').startswith('[DELEGATE]'):
+            open_count += 1
+    for task in (state.get('tasks') or {}).values():
+        if (task.get('teamId') == team_id and str(task.get('title') or '').startswith('[DELEGATE]')
+                and task.get('status') not in ('done', 'cancelled', 'abandoned')):
+            open_count += 1
+    if open_count >= DELEGATE_MAX_OPEN:
+        return False, {'error': f'you already have {open_count} open delegations; finish or cancel one first'}
+    import sim as _sim
+    contract = (str(return_contract or '')).strip() or (
+        'Return: what you checked, what you found, the evidence, and the one next action.')
+    _sim.queue_work(state, [{
+        'title': f'[DELEGATE] {title}'[:140],
+        'room': 'observatory' if task_type == 'research' else 'pressoffice',
+        'taskType': task_type,
+        'assignedTo': assignee,
+        'teamId': team_id,
+        'delegatedBy': agent_id,
+        'priority': 'high',
+        'budgetUsd': budget,
+        'sizeEstimate': 'S',
+        'instructions': (f'Delegated by your supervisor ({agent_id}). Scope: {instructions} '
+                         f'Return contract: {contract}'),
+    }])
+    save_state_to_db(state)
+    log_action(agent_id, 'supervisor_delegate',
+               {'title': title, 'assignee': assignee, 'taskType': task_type,
+                'budgetUsd': budget, 'returnContract': contract[:300]}, authorized=True)
+    return True, {'ok': True, 'title': title, 'assignee': assignee,
+                  'taskType': task_type, 'budgetUsd': budget}
+
+
+def supervisor_schedules(agent_id, args):
+    """Team-agnostic schedule control for a director: list anything, create for
+    themselves, and edit/delete only schedules they created (the chief of staff
+    may edit any). Mutations take the state lock and mirror the watchlist."""
+    op = (args.get('op') or 'list').strip().lower()
+    if op == 'list':
+        state = get_state_from_db() or {}
+        return {'topics': [{'id': t.get('id'), 'topic': t.get('topic'),
+                            'startUrl': t.get('startUrl'),
+                            'cadenceMs': t.get('cadenceMs'),
+                            'enabled': t.get('enabled', True) is not False,
+                            'createdBy': t.get('createdBy'),
+                            'lastRunAt': t.get('lastRunAt') or 0}
+                           for t in (state.get('researchTopics') or [])]}
+    state = _state_begin()
+    try:
+        if not _is_director_or_admin(state or {}, agent_id):
+            return {'error': 'only a director or the chief of staff may change schedules'}
+        if op == 'create':
+            topic = (args.get('topic') or '').strip()
+            url = (args.get('startUrl') or '').strip()
+            parsed = urllib.parse.urlparse(url)
+            if not topic or parsed.scheme not in ('http', 'https') or not parsed.netloc:
+                return {'error': 'topic and a real absolute startUrl are required'}
+            try:
+                cadence = max(int(args.get('cadenceMs') or 0), 900000)
+            except (TypeError, ValueError):
+                return {'error': 'cadenceMs must be a number'}
+            import sim as _sim
+            record = _sim.add_research_topic(state, topic, url, cadence,
+                                             created_by=agent_id)
+            if not record:
+                return {'error': 'could not create schedule'}
+            config.note_watchlist_topic(record)
+            save_state_to_db(state)
+            log_action(agent_id, 'schedule_created', {'topicId': record['id'],
+                                                      'topic': topic}, authorized=True)
+            return {'ok': True, 'topic': record}
+        topic_id = str(args.get('id') or '').strip()
+        topics = state.get('researchTopics') or []
+        record = next((t for t in topics if t.get('id') == topic_id), None)
+        if not record:
+            return {'error': 'unknown schedule'}
+        if not _is_admin(state, agent_id) and record.get('createdBy') != agent_id:
+            return {'error': 'you can only change schedules you created'}
+        if op == 'delete':
+            state['researchTopics'] = [t for t in topics if t.get('id') != topic_id]
+            config.remove_watchlist_topic(record.get('topic'), record.get('startUrl'))
+            save_state_to_db(state)
+            log_action(agent_id, 'schedule_deleted', {'topicId': topic_id,
+                                                      'topic': record.get('topic')}, authorized=True)
+            return {'ok': True}
+        if op == 'update':
+            old = (record.get('topic'), record.get('startUrl'))
+            if args.get('topic') is not None:
+                record['topic'] = str(args['topic']).strip() or record.get('topic')
+            if args.get('startUrl') is not None:
+                url = str(args['startUrl']).strip()
+                parsed = urllib.parse.urlparse(url)
+                if parsed.scheme not in ('http', 'https') or not parsed.netloc:
+                    return {'error': 'startUrl must be a real absolute URL'}
+                record['startUrl'] = url
+            if args.get('cadenceMs') is not None:
+                try:
+                    record['cadenceMs'] = max(int(args['cadenceMs']), 900000)
+                except (TypeError, ValueError):
+                    return {'error': 'cadenceMs must be a number'}
+            if args.get('enabled') is not None:
+                record['enabled'] = args['enabled'] is not False
+            config.update_watchlist_topic(old[0], old[1], record)
+            save_state_to_db(state)
+            log_action(agent_id, 'schedule_updated', {'topicId': topic_id,
+                                                      'topic': record.get('topic')}, authorized=True)
+            return {'ok': True, 'topic': record}
+        return {'error': f'unknown op {op!r}; use list, create, update, or delete'}
+    finally:
+        _state_abort()
+
+
+def supervisor_grant_budget(agent_id, task_id, budget_usd, reason=''):
+    """The supervisor's ONE write: raise one live card's model-spend ceiling,
+    or re-queue a card that closed on budget exhaustion with the higher ceiling.
+
+    Enforced here, not in the prompt:
+      - only a director/supervisor (not a worker) may call it;
+      - only for a card on the caller's OWN team (the chief of staff may cover
+        any team, matching his coordination role);
+      - the new ceiling must exceed both the current ceiling and the spend so
+        far, and stay under a hard cap;
+      - the reason is required and recorded.
+    Never touches the database tables, code, or another team's cards.
+    """
+    state = get_state_from_db() or {}
+    actor = str(agent_id or '').strip()
+    if not actor:
+        return False, {'error': 'unknown supervisor'}
+    if not _is_director(state, actor):
+        return False, {'error': 'only a supervisor may grant budget'}
+    task = (state.get('tasks') or {}).get(str(task_id or ''))
+    if not task:
+        return False, {'error': 'unknown card id'}
+    team = supervisor_team_for(state, actor)
+    is_admin = _is_admin(state, actor)
+    if not is_admin:
+        if not team:
+            return False, {'error': 'you do not supervise a team'}
+        members = set(team.get('members') or [])
+        if task.get('teamId') != team.get('id') and task.get('assignedTo') not in members:
+            return False, {'error': 'that card belongs to another team'}
+    try:
+        new_budget = float(budget_usd)
+    except (TypeError, ValueError):
+        return False, {'error': 'budgetUsd must be a number'}
+    if not (0 < new_budget <= SUPERVISOR_BUDGET_CAP_USD):
+        return False, {'error': f'budgetUsd must be between 0 and {SUPERVISOR_BUDGET_CAP_USD:.2f}'}
+    note = str(reason or '').strip()
+    if len(note) < 12:
+        return False, {'error': 'a reason is required: say what the spend bought and why more is justified'}
+    current = float(task.get('budgetUsd') or 0)
+    spent = float(task.get('ownSpendUsd') or 0)
+    if new_budget <= current:
+        return False, {'error': f'new ceiling must exceed the current ${current:.2f}'}
+    if new_budget <= spent:
+        return False, {'error': f'new ceiling must exceed the ${spent:.4f} already spent'}
+    status = task.get('status')
+    if status in ('done', 'cancelled', 'abandoned'):
+        return False, {'error': 'the card is already closed; nothing to fund'}
+    grant = {'by': actor, 'at': int(time.time() * 1000),
+             'from': current, 'to': new_budget, 'reason': note[:400]}
+    if status == 'failed':
+        # A card that closed on budget exhaustion is re-opened as a fresh card
+        # with the higher ceiling; silently editing the dead task would never
+        # put anyone back to work.
+        if not (task.get('_budgetExhaustedNotified') or 'budget' in str(task.get('failNote') or '').lower()):
+            return False, {'error': 'the card failed for a reason other than budget; file a new card instead'}
+        import sim as _sim
+        _sim.queue_work(state, [{
+            'title': task.get('title') or f"Retry {task.get('id')}",
+            'room': task.get('room') or 'pressoffice',
+            'taskType': task.get('taskType') or 'code',
+            'assignedTo': task.get('assignedTo'),
+            'teamId': task.get('teamId'),
+            'projectLabel': task.get('projectLabel'),
+            'priority': 'high',
+            'budgetUsd': new_budget,
+            'sizeEstimate': 'S',
+            'userStory': task.get('userStory'),
+            'acceptanceCriteria': task.get('acceptanceCriteria'),
+            'never': task.get('never'),
+            'issueKey': task.get('issueKey'),
+            'instructions': task.get('instructions'),
+        }])
+        task['reopenedAt'] = grant['at']
+        task['reopenedBudgetUsd'] = new_budget
+    task.setdefault('budgetGrants', []).append(grant)
+    task['budgetUsd'] = new_budget
+    task.pop('_budgetExhaustedNotified', None)
+    save_state_to_db(state)
+    log_action(actor, 'supervisor_budget_grant',
+               {'taskId': task.get('id'), 'from': current, 'to': new_budget,
+                'spent': spent, 'reopened': status == 'failed', 'reason': note[:300]},
+               authorized=True)
+    return True, {'ok': True, 'taskId': task.get('id'), 'budgetUsd': new_budget,
+                  'spentUsd': spent, 'reopened': status == 'failed'}
+
+
 def _senior_most_director_id(state):
     # "Senior-most director" = the director who stands in for the ADMIN to
     # approve/deny on the chief of staff's behalf. It is therefore the top of the
@@ -6070,6 +6477,7 @@ async def _lifespan(app):
     # lifespan, so a test or stray import can never mutate operator-owned JSON.
     import config
     config.ALLOW_WATCHLIST_WRITE = True
+    config.ALLOW_WORKSPACE_SYNC = True
     try:
         startup_state = get_state_from_db()
         if startup_state is not None and _seed_watchlist_topics(startup_state):
@@ -6182,6 +6590,7 @@ async def _lifespan(app):
     # leave the operator-owned writeback permanently authorized after it exits.
     import config as _config
     _config.ALLOW_WATCHLIST_WRITE = False
+    _config.ALLOW_WORKSPACE_SYNC = False
 
 
 # Workers report to a DIRECTOR -- never directly to the admin. Kept in sync
@@ -19111,6 +19520,201 @@ async def intent_schedule(request: Request):
     return JSONResponse({'ok': True, 'topic': record})
 
 
+@app.get('/api/schedules')
+async def list_schedules(request: Request):
+    """The player's schedule control panel: every recurring research topic and
+    every pending one-off, in one read. Player-session only."""
+    authed, _actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    state = get_state_from_db() or {}
+    topics = []
+    for t in (state.get('researchTopics') or []):
+        topics.append({
+            'id': t.get('id'),
+            'topic': t.get('topic'),
+            'startUrl': t.get('startUrl'),
+            'cadenceMs': t.get('cadenceMs'),
+            'enabled': t.get('enabled', True) is not False,
+            'lastRunAt': t.get('lastRunAt') or 0,
+            'dependsOnTask': t.get('dependsOnTask'),
+            'longHorizon': bool(t.get('longHorizon')),
+        })
+    one_offs = []
+    for index, item in enumerate(state.get('workQueue') or []):
+        if not item.get('notBefore'):
+            continue
+        one_offs.append({
+            'key': f'q:{index}', 'title': item.get('title'),
+            'at': item.get('notBefore'), 'room': item.get('room'),
+            'assignedTo': item.get('assignedTo'),
+            'dependsOnTask': item.get('dependsOn'),
+            'status': 'queued',
+        })
+    for tid, task in (state.get('tasks') or {}).items():
+        if not task.get('notBefore') or task.get('status') in ('done', 'cancelled', 'abandoned'):
+            continue
+        one_offs.append({
+            'key': f't:{tid}', 'taskId': tid, 'title': task.get('title'),
+            'at': task.get('notBefore'), 'room': task.get('room'),
+            'assignedTo': task.get('assignedTo'),
+            'dependsOnTask': task.get('dependsOn'),
+            'status': task.get('status'),
+        })
+    one_offs.sort(key=lambda x: int(x.get('at') or 0))
+    return JSONResponse({'ok': True, 'topics': topics, 'oneOffs': one_offs})
+
+
+@app.patch('/api/schedules/topic/{topic_id}')
+@_state_writer
+async def update_schedule_topic(topic_id: str, request: Request):
+    """Edit one recurring topic in place. Player-session only; mirrors the edit
+    into world/watchlist.json so the live sync does not undo it."""
+    authed, _actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    topics = state.get('researchTopics') or []
+    record = next((t for t in topics if t.get('id') == topic_id), None)
+    if not record:
+        return JSONResponse({'error': 'unknown schedule'}, status_code=404)
+    old = (record.get('topic'), record.get('startUrl'))
+    topic = (body.get('topic') or record.get('topic') or '').strip()
+    start_url = (body.get('startUrl') or record.get('startUrl') or '').strip()
+    parsed = urllib.parse.urlparse(start_url)
+    if not topic or parsed.scheme not in ('http', 'https') or not parsed.netloc:
+        return JSONResponse({'error': 'topic and a real absolute startUrl are required'},
+                            status_code=400)
+    import sim as _sim
+    try:
+        cadence_ms = int(body.get('cadenceMs') or record.get('cadenceMs') or 0)
+    except (TypeError, ValueError):
+        return JSONResponse({'error': 'cadenceMs must be a number'}, status_code=400)
+    cadence_ms = max(cadence_ms, _sim.MIN_RESEARCH_CADENCE_MS)
+    enabled = body.get('enabled', record.get('enabled', True)) is not False
+    record.update(topic=topic, startUrl=start_url, cadenceMs=cadence_ms,
+                  enabled=enabled)
+    if 'dependsOnTask' in body:
+        record['dependsOnTask'] = (body.get('dependsOnTask') or '').strip() or None
+    config.update_watchlist_topic(old[0], old[1], record)
+    save_state_to_db(state)
+    log_action('player', 'schedule_updated', {'topicId': record.get('id'),
+                                              'topic': topic, 'enabled': enabled},
+               authorized=True)
+    return JSONResponse({'ok': True, 'topic': record})
+
+
+@app.delete('/api/schedules/topic/{topic_id}')
+@_state_writer
+async def delete_schedule_topic(topic_id: str, request: Request):
+    """Delete one recurring topic from state and from the operator watchlist."""
+    authed, _actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    topics = state.get('researchTopics') or []
+    record = next((t for t in topics if t.get('id') == topic_id), None)
+    if not record:
+        return JSONResponse({'error': 'unknown schedule'}, status_code=404)
+    state['researchTopics'] = [t for t in topics if t.get('id') != topic_id]
+    config.remove_watchlist_topic(record.get('topic'), record.get('startUrl'))
+    save_state_to_db(state)
+    log_action('player', 'schedule_deleted', {'topicId': topic_id,
+                                             'topic': record.get('topic')},
+               authorized=True)
+    return JSONResponse({'ok': True})
+
+
+@app.patch('/api/schedules/once/{key}')
+@_state_writer
+async def update_schedule_once(key: str, request: Request):
+    """Edit or retime a pending one-off. `key` is q:<index> while it waits in
+    the queue, t:<taskId> once it has been assigned."""
+    authed, _actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    at_ms = _parse_schedule_once_at(body.get('at')) if body.get('at') else None
+    title = (body.get('title') or '').strip() or None
+    if body.get('at') and not at_ms:
+        return JSONResponse({'error': '`at` must be an ISO 8601 time or epoch ms'},
+                            status_code=400)
+    kind, _, ident = key.partition(':')
+    if kind == 'q':
+        try:
+            item = state['workQueue'][int(ident)]
+        except (KeyError, IndexError, ValueError):
+            return JSONResponse({'error': 'unknown one-off'}, status_code=404)
+        if at_ms:
+            item['notBefore'] = at_ms
+        if title:
+            item['title'] = title
+        save_state_to_db(state)
+        return JSONResponse({'ok': True, 'oneOff': {'key': key, 'title': item.get('title'),
+                                                    'at': item.get('notBefore')}})
+    if kind == 't':
+        task = (state.get('tasks') or {}).get(ident)
+        if not task:
+            return JSONResponse({'error': 'unknown one-off'}, status_code=404)
+        if at_ms:
+            task['notBefore'] = at_ms
+        if title:
+            task['title'] = title
+        save_state_to_db(state)
+        return JSONResponse({'ok': True, 'oneOff': {'key': key, 'title': task.get('title'),
+                                                    'at': task.get('notBefore')}})
+    return JSONResponse({'error': 'key must be q:<index> or t:<taskId>'}, status_code=400)
+
+
+@app.delete('/api/schedules/once/{key}')
+@_state_writer
+async def delete_schedule_once(key: str, request: Request):
+    """Cancel a pending one-off (queue item or assigned task)."""
+    authed, _actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    kind, _, ident = key.partition(':')
+    if kind == 'q':
+        try:
+            item = state['workQueue'][int(ident)]
+        except (KeyError, IndexError, ValueError):
+            return JSONResponse({'error': 'unknown one-off'}, status_code=404)
+        state['workQueue'].pop(int(ident))
+        save_state_to_db(state)
+        log_action('player', 'schedule_deleted', {'oneOff': key, 'title': item.get('title')},
+                   authorized=True)
+        return JSONResponse({'ok': True})
+    if kind == 't':
+        task = (state.get('tasks') or {}).get(ident)
+        if not task:
+            return JSONResponse({'error': 'unknown one-off'}, status_code=404)
+        task['status'] = 'cancelled'
+        task['cancelledAt'] = int(time.time() * 1000)
+        task['notBefore'] = None
+        save_state_to_db(state)
+        log_action('player', 'schedule_deleted', {'oneOff': key, 'title': task.get('title')},
+                   authorized=True)
+        return JSONResponse({'ok': True})
+    return JSONResponse({'error': 'key must be q:<index> or t:<taskId>'}, status_code=400)
+
+
 @app.post('/api/intent/schedule-once')
 @_state_writer
 async def intent_schedule_once(request: Request):
@@ -27361,6 +27965,130 @@ def _worktree_is_linked(worktree_dir, base_dir):
     return os.path.realpath(common) == os.path.join(base_real, '.git')
 
 
+def _live_repo_head():
+    """The live project's committed HEAD (the repo this server runs from)."""
+    done = _run_git_sync(THINK_TANK_DIR, ['rev-parse', 'HEAD'])
+    return (done.stdout or '').strip() if done.returncode == 0 else ''
+
+
+def _prune_broken_story_refs(base_dir):
+    """Delete loose `story/*` refs that point at missing objects. A killed
+    worktree or a half-written branch leaves these behind, and a single bad
+    ref makes every `git fetch` into the base fail ("bad object refs/heads/
+    story/task-...") -- which is what blocked the base sync. Returns the number
+    of refs removed."""
+    removed = 0
+    # Packed refs first: a bad entry there survives deleting the loose file and
+    # keeps breaking every fetch.
+    packed = os.path.join(base_dir, '.git', 'packed-refs')
+    if os.path.isfile(packed):
+        try:
+            with open(packed, encoding='utf-8') as stream:
+                lines = stream.read().splitlines()
+        except OSError:
+            lines = []
+        kept = []
+        for line in lines:
+            if line.startswith('#') or line.startswith('^'):
+                kept.append(line)
+                continue
+            parts = line.split(' ', 1)
+            if len(parts) != 2:
+                kept.append(line)
+                continue
+            sha, ref = parts
+            if ref.startswith('refs/heads/story/') and _run_git_sync(
+                    base_dir, ['cat-file', '-e', sha]).returncode != 0:
+                removed += 1
+                name = ref.rsplit('/', 1)[-1]
+                reflog = os.path.join(base_dir, '.git', 'logs', 'refs', 'heads', 'story', name)
+                if os.path.exists(reflog):
+                    try:
+                        os.remove(reflog)
+                    except OSError:
+                        pass
+                continue
+            kept.append(line)
+        if removed:
+            tmp = packed + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as stream:
+                stream.write('\n'.join(kept) + '\n')
+            os.replace(tmp, packed)
+    refs_dir = os.path.join(base_dir, '.git', 'refs', 'heads', 'story')
+    if not os.path.isdir(refs_dir):
+        return removed
+    for name in os.listdir(refs_dir):
+        path = os.path.join(refs_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding='utf-8') as stream:
+                sha = stream.read().strip()
+        except OSError:
+            continue
+        if not sha:
+            continue
+        if _run_git_sync(base_dir, ['cat-file', '-e', sha]).returncode == 0:
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+        reflog = os.path.join(base_dir, '.git', 'logs', 'refs', 'heads', 'story', name)
+        if os.path.exists(reflog):
+            try:
+                os.remove(reflog)
+            except OSError:
+                pass
+        removed += 1
+    return removed
+
+
+def _sync_base_workroom_to_live(base_dir):
+    """Bring the shared sandbox base repo up to the LIVE project's committed
+    HEAD before a NEW story branch is cut.
+
+    Why: story worktrees branch from this base, and the base was seeded once and
+    then drifted. A story could start from a months-old tree (the live incident:
+    a 67-line page presented as an expansion of a 561-line page) and could carry
+    unrelated junk files from prior tasks. Syncing on new-story creation makes
+    every new story start from the code the project actually has.
+
+    Safe by construction: the base is snapshotted into a tagged commit first, so
+    nothing is lost; an existing story branch is never touched (resume keeps its
+    own tree); and a failure to sync simply leaves the old base in place.
+    Returns True when the base matches the live HEAD afterwards."""
+    if not config.ALLOW_WORKSPACE_SYNC:
+        return False
+    _prune_broken_story_refs(base_dir)
+    live_head = _live_repo_head()
+    if not live_head:
+        return False
+    current = _run_git_sync(base_dir, ['rev-parse', 'HEAD'])
+    if current.returncode == 0 and (current.stdout or '').strip() == live_head:
+        return True
+    # Snapshot whatever the base has now (tracked + untracked) so the old tree
+    # survives in history even after the reset.
+    _run_git_sync(base_dir, ['add', '-A'])
+    _run_git_sync(base_dir, ['commit', '-q', '-m',
+                             'snapshot before syncing base workroom to live HEAD'])
+    _run_git_sync(base_dir, ['tag', '-f', f'pre-sync-{int(time.time())}', 'HEAD'])
+    branch_done = _run_git_sync(THINK_TANK_DIR, ['rev-parse', '--abbrev-ref', 'HEAD'])
+    branch = (branch_done.stdout or '').strip() or 'main'
+    fetch = _run_git_sync(base_dir, ['fetch', THINK_TANK_DIR, branch])
+    if fetch.returncode != 0:
+        return False
+    reset = _run_git_sync(base_dir, ['reset', '--hard', 'FETCH_HEAD'])
+    if reset.returncode != 0:
+        _run_git_sync(base_dir, ['reset', '--hard', 'HEAD'])
+        return False
+    # Drop untracked junk from prior tasks (the old tree is in the snapshot
+    # commit above, so nothing is lost). This is what kept stale `_fix_*.py`
+    # files and old test artifacts in every new story.
+    _run_git_sync(base_dir, ['clean', '-fdx'])
+    return _live_repo_head() == live_head
+
+
 def ensure_story_worktree(sandbox_id, base_sandbox_id=None):
     """Create (idempotently) the story worktree `sandbox_id` as a linked
     worktree of `base_sandbox_id` on branch `story/<task-id>`, branching from
@@ -27389,10 +28117,15 @@ def ensure_story_worktree(sandbox_id, base_sandbox_id=None):
     if os.path.isdir(worktree_dir) and os.listdir(worktree_dir) and not os.path.exists(os.path.join(worktree_dir, '.git')):
         raise ValueError(f'story sandbox dir exists but is not a linked worktree: {worktree_dir}')
     os.makedirs(os.path.dirname(worktree_dir), exist_ok=True)
+    # A NEW story starts from the live project's committed HEAD. An existing
+    # story branch is a resume and keeps its own tree untouched.
+    branch_exists = _run_git_sync(base_dir, ['rev-parse', '--verify', branch]).returncode == 0
+    if not branch_exists:
+        _sync_base_workroom_to_live(base_dir)
     # Branch from the base's current HEAD so the story starts with the shared
     # workroom's existing files (not an empty tree). If the branch already
     # exists (story resumed), attach a new worktree to it instead of -b.
-    if _run_git_sync(base_dir, ['rev-parse', '--verify', branch]).returncode == 0:
+    if branch_exists:
         result = _run_git_sync(base_dir, ['worktree', 'add', worktree_dir, branch], )
     else:
         result = _run_git_sync(base_dir, ['worktree', 'add', '-b', branch, worktree_dir, 'HEAD'])
@@ -30984,14 +31717,33 @@ def _health_alerts_for_signals(signals):
     median_h = signals['task_median_completion_hours']
     if assigned >= METR_MIN_ASSIGNED:
         if fast_rate is not None and fast_rate < METR_FAST_COMPLETION_RATE:
+            retired = signals.get('task_abandoned_last_24h', 0)
+            cancelled = signals.get('task_cancelled_last_24h', 0)
+            failed = signals.get('task_failed_last_24h', 0)
+            in_flight = signals.get('task_in_flight_last_24h', 0)
+            causes = ''
+            if retired:
+                causes += f'; {retired} retired after a pipeline failure'
+            if cancelled:
+                causes += f'; {cancelled} cancelled'
+            if failed:
+                causes += f'; {failed} failed'
+            if in_flight:
+                causes += f'; {in_flight} still in flight'
+            if not causes:
+                causes = '; the rest did not finish'
             alert('throughput', 'warning',
                   f'only {fast_rate * 100:.0f}% of {assigned} task(s) assigned in the last 24h finished within '
                   f'{METR_FAST_HORIZON_S // 3600}h'
-                  + (f' (median completion {median_h:.1f}h)' if median_h is not None else '')
-                  + ' -- colony slow to finish work it starts')
+                  + (f' (median for finished work {median_h * 60:.0f} min)'
+                     if median_h is not None and median_h < 1
+                     else (f' (median for finished work {median_h:.1f}h)'
+                           if median_h is not None else ''))
+                  + causes
+                  + ' -- colony is not finishing work it starts')
         elif median_h is not None and median_h > METR_SLOW_MEDIAN_HOURS:
             alert('throughput', 'info',
-                  f'median task completion {median_h:.1f}h across {assigned} task(s) assigned in the last 24h '
+                  f'median task completion {median_h * 60:.0f} min across {assigned} task(s) assigned in the last 24h '
                   f'-- work taking unusually long to finish')
 
     # Admin gap 1: aging in-flight work. A non-bug card wedged past its budget
@@ -31145,6 +31897,63 @@ def _rework_metrics(now):
             'loop_cost_usd': round(loop_cost, 4)}
 
 
+_FAILURE_NOTE_MARKERS = (
+    'execution exited', 'pipeline', 'incomplete', 'truncated', 'heredoc',
+    'not executed', 'no tests', 'failed',
+)
+
+
+def _unfinished_task_causes(task_ids):
+    """Classify assigned-but-uncompleted tasks by their terminal state.
+
+    The action log is authoritative for NEW auto-closes (task_auto_closed),
+    but the window before that logging existed carries 290 pipeline failures
+    marked done with only a failure note. Reading the task record (live or
+    archived) recovers the real cause instead of calling every one of them
+    "still in flight".
+    """
+    out = {'retired': 0, 'cancelled': 0, 'failed': 0, 'in_flight': 0}
+    if not task_ids:
+        return out
+    live = {}
+    archived = {}
+    with _db() as conn:
+        try:
+            row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
+        except Exception:
+            row = None
+        if row and row[0]:
+            try:
+                live = (json.loads(row[0]).get('tasks') or {})
+            except Exception:
+                live = {}
+        try:
+            rows = conn.execute('SELECT id, blob FROM task_archive').fetchall()
+        except Exception:
+            rows = []
+    for tid, blob in rows:
+        if tid not in task_ids:
+            continue
+        try:
+            archived[tid] = json.loads(blob)
+        except Exception:
+            continue
+    for tid in task_ids:
+        task = live.get(tid) or archived.get(tid) or {}
+        status = task.get('status')
+        note = (task.get('note') or '').lower()
+        if status == 'done' and (task.get('_pipelineFailedAt')
+                                 or any(marker in note for marker in _FAILURE_NOTE_MARKERS)):
+            out['retired'] += 1
+        elif status == 'cancelled':
+            out['cancelled'] += 1
+        elif status == 'failed':
+            out['failed'] += 1
+        else:
+            out['in_flight'] += 1
+    return out
+
+
 def _task_horizon_metrics(now):
     """METR reliability-at-horizon, computed from action_log's
     task_assigned -> task_completed pairs (joined in Python on the taskId the
@@ -31175,6 +31984,10 @@ def _task_horizon_metrics(now):
             "SELECT details, ts FROM action_log WHERE action = 'task_completed' AND ts > ?",
             (now - METR_HORIZON_S,),
         ).fetchall()
+        retired_rows = conn.execute(
+            "SELECT details FROM action_log WHERE action = 'task_auto_closed' AND ts > ?",
+            (now - METR_HORIZON_S,),
+        ).fetchall()
 
     def _tid(details):
         try:
@@ -31197,6 +32010,7 @@ def _task_horizon_metrics(now):
             comps_by[tid] = []
         if tid:
             comps_by[tid].append(ts)
+    retired = {_tid(details) for (details,) in retired_rows} - {None}
 
     durations = []
     fast = full = 0
@@ -31229,9 +32043,18 @@ def _task_horizon_metrics(now):
         median_h = sorted_durs[n // 2] / 3600.0
     else:
         median_h = (sorted_durs[n // 2 - 1] + sorted_durs[n // 2]) / 2 / 3600.0
+    causes = _unfinished_task_causes(set(assigns_by) - set(comps_by))
     return {
         'assigned': len(assigns_by),
         'completed': completed_count,
+        # Assigned in the window AND retired by the pipeline: a distinct
+        # terminal from "still in flight" and from a genuine completion.
+        # The logged auto-closes win; the task record fills the pre-logging
+        # window so a historical failure is not misreported as slow.
+        'abandoned': max(len(retired & set(assigns_by)), causes['retired']),
+        'cancelled': causes['cancelled'],
+        'failed': causes['failed'],
+        'in_flight': causes['in_flight'],
         'median_completion_hours': round(median_h, 2) if median_h is not None else None,
         'fast_completion_rate': round(fast / len(assigns_by), 4) if assigns_by else None,
         'horizon_completion_rate': round(full / len(assigns_by), 4) if assigns_by else None,
@@ -31470,6 +32293,10 @@ def compute_health_snapshot():
         # too few completed tasks to judge (or no assignments at all).
         'task_assigned_last_24h': metr['assigned'],
         'task_completed_last_24h': metr['completed'],
+        'task_abandoned_last_24h': metr.get('abandoned', 0),
+        'task_cancelled_last_24h': metr.get('cancelled', 0),
+        'task_failed_last_24h': metr.get('failed', 0),
+        'task_in_flight_last_24h': metr.get('in_flight', 0),
         'task_median_completion_hours': metr['median_completion_hours'],
         'task_fast_completion_rate': metr['fast_completion_rate'],
         'task_horizon_completion_rate': metr['horizon_completion_rate'],

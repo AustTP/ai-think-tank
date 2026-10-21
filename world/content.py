@@ -678,6 +678,109 @@ def _run_observatory_content(snapshot, agent_id, task, base_ctx=None):
         _run_research_bare_content(snapshot, agent_id, task, base_ctx)
 
 
+def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
+    """A supervisor's monitoring turn: scoped to their own team, read-only
+    except for one budget top-up. Uses supervisor_report for live state,
+    execute_script only to inspect files/sandbox paths, and finishes with a
+    short facilitation report. Never edits code and never touches the DB."""
+    import sim as _sim_module
+    name = _agent_name(snapshot, agent_id)
+    team = next((t for t in (snapshot.get('teams') or [])
+                 if t.get('directorId') == agent_id or t.get('id') == task.get('teamId')), None)
+    is_admin = bool(_serve._is_admin(snapshot, agent_id))
+    if not team and not is_admin:
+        _sim_module._store_content_result(task.get('id'), {
+            'ok': False,
+            'note': 'No team is scoped to this supervisor card; nothing to inspect.'})
+        return
+    if team:
+        team_id = team.get('id')
+        brief = _sim_module._supervisor_brief(snapshot, team_id)
+    else:
+        team_id = None
+        parts = []
+        for row in (snapshot.get('teams') or []):
+            b = _sim_module._supervisor_brief(snapshot, row.get('id'))
+            if b:
+                parts.append(b['text'])
+        brief = {'text': '\n\n'.join(parts)} if parts else None
+    if not brief:
+        _sim_module._store_content_result(task.get('id'), {
+            'ok': False, 'note': 'The scoped supervisor brief could not be built.'})
+        return
+    key = _serve.get_or_create_agent_key(agent_id)
+    model = _serve._mid_tier_slug() or _serve._low_tier_slug()
+    task['workUntil'] = time.time() + 180
+    sandbox_id = f"supervisor-{task.get('id') or 'adhoc'}"
+    sandbox_tool = _make_spike_sandbox_executor(agent_id, key, sandbox_id)
+    report_tool = _make_supervisor_report_executor(agent_id)
+    grant_tool = _make_supervisor_grant_executor(agent_id)
+    live_read_tool = _make_supervisor_live_read_executor(agent_id)
+    delegate_tool = _make_supervisor_delegate_executor(agent_id)
+    schedules_tool = _make_supervisor_schedules_executor(agent_id)
+    runbook_tool = _make_supervisor_runbook_executor()
+
+    def execute_tool(tool_name, args):
+        _hb()
+        if tool_name == 'supervisor_report':
+            return report_tool(tool_name, args)
+        if tool_name == 'supervisor_grant_budget':
+            return grant_tool(tool_name, args)
+        if tool_name == 'live_read':
+            return live_read_tool(tool_name, args)
+        if tool_name == 'delegate':
+            return delegate_tool(tool_name, args)
+        if tool_name == 'schedules':
+            return schedules_tool(tool_name, args)
+        if tool_name == 'runbook':
+            return runbook_tool(tool_name, args)
+        if tool_name == 'execute_script':
+            return sandbox_tool(tool_name, args)
+        return f'unknown tool {tool_name}'
+
+    scope_name = (f'team "{team.get("name") or team_id}"' if team
+                  else 'cross-team oversight as chief of staff')
+    system = (
+        f'You are {name}, {scope_name}. '
+        'Your job is facilitation, not the work. Your scope is this team only.\n'
+        'Call supervisor_report first. Then use live_read to inspect the LIVE project '
+        '(ls/read/grep/team_log) and execute_script only for the sandbox paths the report names. '
+        'Do not edit project files.\n'
+        'Your tools: supervisor_report (scoped state), live_read (read-only live project and team '
+        'log), delegate (queue a scoped check for a worker with a return contract), schedules '
+        '(list/create/edit/delete), runbook (standard procedures), supervisor_grant_budget.\n'
+        'Act on two things only:\n'
+        '1. Budget. If a card spent its ceiling before close, say what the spend bought and either '
+        'grant a top-up with supervisor_grant_budget (with a clear reason) or recommend stopping.\n'
+        '2. Process. If a card failed, is stuck in review, or its deliverable is missing, say so '
+        'plainly, delegate the check when it needs evidence, and name the next action.\n'
+        'Never inspect or comment on another team, never touch the database, never write code. '
+        'Finish with a short report: cards reviewed, budget decisions, process issues, delegations, next actions.\n\n'
+        'Current scoped brief (supervisor_report returns a fresh copy):\n' + brief['text']
+    )
+    if not team:
+        system += ('\nAs chief of staff you cover every team: pass team=<team id> when you '
+                   'delegate, and route cross-team issues rather than editing either team.')
+    messages = [{'role': 'system', 'content': system},
+                {'role': 'user', 'content': 'Check your team now.'}]
+    try:
+        text, _transcript = _serve._call_agent_tool_loop(
+            model, messages,
+            [_SPIKE_SANDBOX_TOOL, _SUPERVISOR_REPORT_TOOL, _SUPERVISOR_GRANT_TOOL,
+             _SUPERVISOR_LIVE_READ_TOOL, _SUPERVISOR_DELEGATE_TOOL,
+             _SUPERVISOR_SCHEDULES_TOOL, _SUPERVISOR_RUNBOOK_TOOL],
+            execute_tool, max_iterations=10, max_tokens=1600,
+            service='supervisor', force_first_tool='supervisor_report',
+            return_transcript=True, task_id=task.get('id'))
+    except Exception as error:
+        _sim_module._store_content_result(task.get('id'), {
+            'ok': False, 'note': f'Supervisor check could not run: {error}'})
+        return
+    note = (text or '').strip() or 'Supervisor check completed with no findings.'
+    _sim_module._store_content_result(task.get('id'), {
+        'ok': True, 'note': note, 'supervisorCheck': True, 'teamId': team_id})
+
+
 def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
     """The router registered as sim._content_executor. Decides by task.room +
     task flags which real content executor runs, mirroring arriveAtTask's
@@ -713,6 +816,9 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
         # story open in 'needs_review' forever (the infinite fork).
         'review': _run_review_content,
         'qa': _run_review_content,
+        # A SUPERVISE card is a director's facilitation turn: scoped to their
+        # own team, read-only except for a budget top-up. Room-agnostic.
+        'supervise': _run_supervisor_content,
     }
     room_executors = {
         'observatory': _run_observatory_content,
@@ -941,6 +1047,7 @@ def _run_research_bare_content(snapshot, agent_id, task, base_ctx=None):
 # phantom script detection) and /api/chat for the code itself.
 WORKROOM_SANDBOX_ID = 'workroom-shared'      # index.html WORKROOM_SANDBOX_ID
 CODE_CONTINUATION_ATTEMPTS = 2               # tasks.js:1536 (mirror; JS side stays at these defaults)
+MAX_CODE_REPAIR_ROUNDS = 2                    # invalid command / shell syntax / missing tests
 MAX_CODE_PROBE_ROUNDS = 3                    # tasks.js:1547 (mirror)
 MAX_CODE_COLAB_ROUNDS = 3                    # code-lane Colab compute rounds (mirrors probe rounds)
 MAX_REVIEW_PROBE_ROUNDS = 2                  # tasks.js (mirror)
@@ -1025,6 +1132,60 @@ def _heredoc_balance(command):
     return opens, closes, bool(opens == 0 or opens == closes)
 
 
+def _json_object(reply):
+    """Parse the one JSON object in a reply, tolerating fences and a short
+    narration around it. Returns None when there is no valid object."""
+    text = (reply or '').strip().replace('```json', '').replace('```', '').strip()
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+    start, end = text.find('{'), text.rfind('}')
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(text[start:end + 1])
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _looks_like_shell(command):
+    """True only when a reply plausibly IS a shell command. The coding prompt
+    asks for one bare command, but models sometimes answer with prose or JSON.
+    Executing that produced the live storm of "Let: command not found" and
+    "syntax error near unexpected token" failures, so a non-command now earns
+    a correction instead of an execution."""
+    text = (command or '').strip()
+    if not text:
+        return False
+    first_line = text.splitlines()[0].strip()
+    if not first_line or first_line[0] in '{}[':
+        return False
+    first = first_line.split()[0]
+    known = {
+        'cat', 'printf', 'echo', 'tee', 'touch', 'mkdir', 'mv', 'cp', 'rm',
+        'ln', 'chmod', 'sed', 'perl', 'python', 'python3', 'pip', 'pip3',
+        'sh', 'bash', 'node', 'npm', 'npx', 'git', 'ls', 'cd', 'pwd',
+        'patch', 'tar', 'unzip', 'install', 'pytest', 'flake8', 'mypy',
+        'bandit', 'coverage', 'true', 'set', 'export', 'if', 'for', 'while',
+    }
+    if first in known or first.startswith('./') or first.startswith('/'):
+        return True
+    if first.endswith(':') and len(first) > 1 and first[0].isupper():
+        return False
+    return ('<<' in text or ' > ' in text or text.startswith('>')) and bool(
+        first_line.split(' ', 1)[0].strip())
+
+
+def _is_command_syntax_error(stderr):
+    text = (stderr or '').lower()
+    return any(marker in text for marker in (
+        'syntax error', 'unexpected eof', 'unexpected token', 'command not found',
+        'not found', 'permission denied'))
+
+
 def _parse_probe_request(reply):
     """Port of tasks.js _parseProbeRequest: a probe request is a JSON object
     whose ONLY recognized key is probeRequest {path, actions, probes}; anything
@@ -1034,10 +1195,7 @@ def _parse_probe_request(reply):
     if not reply:
         return None
     import json as _json
-    try:
-        parsed = _json.loads(reply.strip().replace('```json', '').replace('```', '').strip())
-    except Exception:
-        return None
+    parsed = _json_object(reply)
     req = parsed.get('probeRequest') if isinstance(parsed, dict) else None
     if not isinstance(req, dict):
         return None
@@ -1057,10 +1215,7 @@ def _parse_colab_run_request(reply):
     if not reply:
         return None
     import json as _json
-    try:
-        parsed = _json.loads(reply.strip().replace('```json', '').replace('```', '').strip())
-    except Exception:
-        return None
+    parsed = _json_object(reply)
     req = parsed.get('colabRun') if isinstance(parsed, dict) else None
     if not isinstance(req, dict):
         return None
@@ -1746,6 +1901,44 @@ def _commit_story_workspace(workspace, task_id=None):
         print(f'[story-commit] {workspace}: {error}')
 
 
+def _tree_manifest(path):
+    """Relative path -> sha256 for every regular file in `path`, skipping the
+    same caches the workspace copy skips. Used to prove a coding turn actually
+    produced a deliverable instead of publishing an empty or deletion-only
+    change."""
+    import hashlib
+    import work_reuse
+    manifest = {}
+    for base, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if d not in work_reuse.SKIP]
+        for name in files:
+            full = os.path.join(base, name)
+            if os.path.islink(full):
+                continue
+            try:
+                with open(full, 'rb') as stream:
+                    manifest[os.path.relpath(full, path)] = hashlib.sha256(
+                        stream.read()).hexdigest()
+            except OSError:
+                continue
+    return manifest
+
+
+def _deliverable_problem(before, candidate):
+    """Return a reason the candidate tree is not a deliverable, or None.
+    A story must add or modify at least one file. A deletion-only change is
+    refused: the live incident was an agent deleting its own page and the
+    pipeline reviewing the empty tree."""
+    changed = [p for p, digest in candidate.items() if before.get(p) != digest]
+    deleted = [p for p in before if p not in candidate]
+    if changed:
+        return None
+    if deleted:
+        return ('the candidate change only deletes files (' + ', '.join(sorted(deleted)[:5])
+                + '); nothing was added or modified')
+    return 'the candidate change is empty: no file was added or modified'
+
+
 def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     """Run coding in a private staged workspace; publish only validated changes."""
     import sim
@@ -1766,10 +1959,22 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
                 result_sink=lambda tid, result: captured.append(result))
             result = captured[-1] if captured else {'ok': False, 'note': 'No coding result was produced.'}
             if ok and result.get('ok'):
-                result['previousWorkspace'] = stage.publish()
-                _commit_story_workspace(workspace, task.get('id'))
-                result['sourceDigest'] = work_reuse.tree_digest(str(stage.original))
-                result['note'] = str(result.get('note') or '') + ' | validated staged changes published'
+                # Boot-gated like the base sync: unit tests stub the executor
+                # and write nothing, so they must not be judged on a real tree.
+                problem = None
+                if getattr(_serve.config, 'ALLOW_WORKSPACE_SYNC', False):
+                    problem = _deliverable_problem(_tree_manifest(str(stage.original)),
+                                                   _tree_manifest(str(stage.directory)))
+                if problem:
+                    stage.checkpoint()
+                    result['ok'] = False
+                    result['note'] = ('No deliverable was published: ' + problem
+                                      + '. Existing workspace preserved.')
+                else:
+                    result['previousWorkspace'] = stage.publish()
+                    _commit_story_workspace(workspace, task.get('id'))
+                    result['sourceDigest'] = work_reuse.tree_digest(str(stage.original))
+                    result['note'] = str(result.get('note') or '') + ' | validated staged changes published'
             else:
                 stage.checkpoint()
                 result['ok'] = False
@@ -1859,6 +2064,7 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
     messages = [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': 'Go ahead.'}]
     command = ''
     attempts = 0
+    repair_rounds = 0
     probe_rounds = 0
     colab_rounds = 0
     library_rounds = 0
@@ -1951,6 +2157,23 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
                                               {'note': 'the model returned an empty command', 'ok': False, 'tier': tier_slug})
             return False
 
+        if not _looks_like_shell(command):
+            if repair_rounds < MAX_CODE_REPAIR_ROUNDS:
+                repair_rounds += 1
+                attempts = 0
+                messages.append({'role': 'assistant', 'content': reply})
+                messages.append({'role': 'user', 'content': (
+                    'That reply was not a shell command. Reply with ONLY one bare shell command '
+                    '(a heredoc writing the files, or a structured edit object). No prose, no '
+                    'JSON description of a command, no markdown fences.')})
+                command = ''
+                continue
+            store_result(task.get('id'), {
+                'note': 'the model did not return an executable shell command after '
+                        f'{MAX_CODE_REPAIR_ROUNDS} correction(s); existing workspace preserved.',
+                'command': command, 'ok': False, 'tier': tier_slug})
+            return False
+
         _opens, _closes, balanced = _heredoc_balance(command)
         if balanced:
             break
@@ -2003,7 +2226,8 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
         store_result(task.get('id'),
                                           {'note': f'execution exited non-zero (code {exec_data.get("exitCode")}), '
                                                    f'timed out: {bool(exec_data.get("timedOut"))} | {_detail}',
-                                           'command': command, 'ok': False, 'tier': tier_slug})
+                                           'command': command, 'ok': False, 'tier': tier_slug,
+                                           'syntaxFailure': _is_command_syntax_error(_err_snip)})
         return False
 
     # ---- The four mechanical integrity checks (mirror runCodingTask) ----
@@ -2066,7 +2290,10 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
                 store_result(task.get('id'), {
                     'note': 'Python deliverable is incomplete: ' + ' '.join(missing),
                     'command': command, 'ok': False, 'pipelineOk': False,
-                    'tier': tier_slug, 'writtenPy': written_py})
+                    'tier': tier_slug, 'writtenPy': written_py, 'deliveryFailure': True,
+                    'feedback': ('The Python deliverable is incomplete: ' + ' '.join(missing) +
+                                 ' Create the missing tests/test_*.py files, importing the actual '
+                                 'implementation module by its real path.')})
                 return False
         qp = _run_quality_pipeline(base, key, agent_id, sandbox_id,
                                    f'Quality gate for coding task: {backlog_item}',
@@ -3332,6 +3559,214 @@ _SPIKE_SANDBOX_TOOL = {
         },
     },
 }
+
+
+_SUPERVISOR_LIVE_READ_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'live_read',
+        'description': (
+            'Read-only inspection of the LIVE project (not just the sandbox): list a directory, '
+            'read a file, grep the code, or read your team\'s recent action log. Never writes, '
+            'never exposes .env, secrets, or .git.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'op': {'type': 'string', 'enum': ['ls', 'read', 'grep', 'team_log']},
+                'path': {'type': 'string', 'description': 'Repo-relative path for ls/read/grep.'},
+                'pattern': {'type': 'string', 'description': 'Literal text for grep (max 120 chars).'},
+                'start': {'type': 'integer', 'description': 'First line for read.'},
+                'limit': {'type': 'integer', 'description': 'Max log rows for team_log.'},
+            },
+            'required': ['op'],
+        },
+    },
+}
+
+_SUPERVISOR_DELEGATE_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'delegate',
+        'description': (
+            'Queue one scoped investigation for a worker on YOUR team, with a return contract. '
+            'This is how a supervisor hands off a check instead of doing it. Bounded to three '
+            'open delegations and a small budget.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'title': {'type': 'string'},
+                'instructions': {'type': 'string', 'description': 'Exact scope and what to check.'},
+                'taskType': {'type': 'string', 'enum': ['spike', 'research', 'code']},
+                'assignee': {'type': 'string', 'description': 'A worker on your team; omit for on-call.'},
+                'budgetUsd': {'type': 'number'},
+                'returnContract': {'type': 'string', 'description': 'What the result must contain.'},
+                'team': {'type': 'string', 'description': 'Required for the chief of staff: which team to delegate to.'},
+            },
+            'required': ['title', 'instructions'],
+        },
+    },
+}
+
+_SUPERVISOR_SCHEDULES_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'schedules',
+        'description': (
+            'List recurring research schedules, or create one for yourself, or edit/delete a '
+            'schedule you created. The chief of staff may edit any schedule.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'op': {'type': 'string', 'enum': ['list', 'create', 'update', 'delete']},
+                'id': {'type': 'string'},
+                'topic': {'type': 'string'},
+                'startUrl': {'type': 'string'},
+                'cadenceMs': {'type': 'integer'},
+                'enabled': {'type': 'boolean'},
+            },
+            'required': ['op'],
+        },
+    },
+}
+
+_SUPERVISOR_RUNBOOK_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'runbook',
+        'description': 'Load a named standard procedure, or list the available runbook names.',
+        'parameters': {
+            'type': 'object',
+            'properties': {'name': {'type': 'string'}},
+            'required': [],
+        },
+    },
+}
+
+
+def _make_supervisor_live_read_executor(agent_id):
+    def run(name, args):
+        import json as _json
+        import serve as _serve
+        return _json.dumps(_serve.supervisor_live_read(agent_id, args), sort_keys=True)
+    return run
+
+
+def _make_supervisor_delegate_executor(agent_id):
+    def run(name, args):
+        import json as _json
+        import serve as _serve
+        ok, payload = _serve.supervisor_delegate(
+            agent_id, args.get('title'), args.get('instructions'),
+            args.get('taskType') or 'spike', args.get('assignee'),
+            args.get('budgetUsd') or 0.10, args.get('returnContract'), args.get('team'))
+        return _json.dumps(payload, sort_keys=True)
+    return run
+
+
+def _make_supervisor_schedules_executor(agent_id):
+    def run(name, args):
+        import json as _json
+        import serve as _serve
+        return _json.dumps(_serve.supervisor_schedules(agent_id, args), sort_keys=True)
+    return run
+
+
+def _make_supervisor_runbook_executor():
+    def run(name, args):
+        import json as _json
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'runbooks.json')
+        try:
+            with open(path, encoding='utf-8') as stream:
+                data = _json.load(stream)
+        except (OSError, ValueError):
+            return 'The runbook library is unavailable.'
+        key = (args.get('name') or '').strip()
+        if not key:
+            return 'Available runbooks: ' + ', '.join(sorted(data))
+        entry = data.get(key)
+        if not entry:
+            return 'Unknown runbook. Available: ' + ', '.join(sorted(data))
+        return entry.get('title', key) + '\n' + '\n'.join(
+            f'{i}. {step}' for i, step in enumerate(entry.get('steps') or [], 1))
+    return run
+
+
+_SUPERVISOR_REPORT_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'supervisor_report',
+        'description': (
+            'Read the LIVE, read-only supervisor view for the team you supervise: the active '
+            'sprint, its cards, spend against budget, process failures, stuck reviews, and the '
+            'sandbox paths to inspect. Scoped to your team: it cannot read another team, and it '
+            'cannot write anything.'
+        ),
+        'parameters': {'type': 'object', 'properties': {}, 'required': []},
+    },
+}
+
+_SUPERVISOR_GRANT_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'supervisor_grant_budget',
+        'description': (
+            "Raise the model-spend ceiling on one of YOUR team's live cards after the current "
+            'budget is spent or nearly spent. Requires a reason that states what the spend so far '
+            'bought and why the remaining work justifies the top-up. This is the only write a '
+            'supervisor may make: it changes one card budget, never the database, code, or another '
+            "team's work."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'taskId': {'type': 'string',
+                           'description': 'The card id from the supervisor report.'},
+                'budgetUsd': {'type': 'number',
+                              'description': 'New total ceiling in USD. Must exceed both the current budget and the spend so far.'},
+                'reason': {'type': 'string',
+                           'description': 'What the spend bought and why more is justified.'},
+            },
+            'required': ['taskId', 'budgetUsd', 'reason'],
+        },
+    },
+}
+
+
+def _make_supervisor_report_executor(agent_id):
+    """Read-only, team-scoped live report for a supervisor. Loads the state at
+    call time (so the report is fresh), resolves the agent's own team, and
+    returns the same brief the sprint mail carries. No writes."""
+    def run(name, args):
+        import serve as _serve
+        import sim as _sim
+        state = _serve.get_state_from_db() or {}
+        team = _serve.supervisor_team_for(state, agent_id)
+        if not team:
+            if _serve._is_admin(state, agent_id):
+                parts = []
+                for row in (state.get('teams') or []):
+                    brief = _sim._supervisor_brief(state, row.get('id'))
+                    if brief:
+                        parts.append(brief['text'])
+                return '\n\n'.join(parts) or 'No teams are staffed yet.'
+            return 'You do not supervise a team, so there is no scoped report to read.'
+        brief = _sim._supervisor_brief(state, team.get('id'))
+        return brief['text'] if brief else 'No report could be built for your team.'
+    return run
+
+
+def _make_supervisor_grant_executor(agent_id):
+    """The supervisor's one write: a role-checked, team-checked budget top-up."""
+    def run(name, args):
+        import json as _json
+        import serve as _serve
+        ok, payload = _serve.supervisor_grant_budget(
+            agent_id, args.get('taskId'), args.get('budgetUsd'), args.get('reason'))
+        return _json.dumps(payload, sort_keys=True)
+    return run
 
 
 def _make_spike_sandbox_executor(agent_id, agent_key, sandbox_id, struck_tools=None):

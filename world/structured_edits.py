@@ -12,8 +12,27 @@ GUIDANCE = ('Prefer one JSON object {"edits":[{"path":"module.py","old":"exact u
             'JSON is validated before execution; never emit explanatory prose as commands.')
 
 
+def _load(reply):
+    text = (reply or '').strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Tolerate a fenced or narrated wrapper around the one JSON object the
+    # model was asked for. The old strict parse failed on ```json fences and
+    # the caller fell back to executing the raw reply as a shell command,
+    # which is how prose like "Let me..." became a shell error.
+    start, end = text.find('{'), text.rfind('}')
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except Exception:
+            pass
+    raise ValueError('Reply was not a JSON edit object.')
+
+
 def command(reply):
-    data = json.loads(reply)
+    data = _load(reply)
     edits, commands = data.get('edits'), data.get('commands', [])
     if (not isinstance(edits, list) or not 1 <= len(edits) <= 4 or not isinstance(commands, list)
             or len(commands) > 3 or any(not isinstance(c, str) or len(c) > 2000 for c in commands)):

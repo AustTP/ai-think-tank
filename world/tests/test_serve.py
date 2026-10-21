@@ -1255,6 +1255,19 @@ class HealthChecks(unittest.TestCase):
         self.assertEqual(alerts[0]['severity'], 'warning')
         self.assertIn('20%', alerts[0]['message'])
 
+    def test_metr_warning_names_retired_pipeline_failures(self):
+        # The live incident: fast median for the work that finished, but many
+        # assigned cards were retired after a pipeline failure. The message
+        # must say that instead of calling the colony slow.
+        alerts = serve._health_alerts_for_signals(self._signals(
+            task_assigned_last_24h=10, task_fast_completion_rate=0.2,
+            task_median_completion_hours=0.1, task_completed_last_24h=8,
+            task_abandoned_last_24h=2,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertIn('2 retired after a pipeline failure', alerts[0]['message'])
+        self.assertIn('median for finished work', alerts[0]['message'])
+
     def test_metr_slow_median_with_ok_fast_rate_raises_throughput_info(self):
         # Fast-enough start-to-finish on some, but the median is unusually
         # long: a milder (info) signal -- work is getting done but slowly.

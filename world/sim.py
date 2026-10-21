@@ -3443,6 +3443,10 @@ def queue_sprint(state, sprint_id, name, goal, owner_id, items, valid_rooms,
     # new sprint (re-tag their queue items + fold their ids into this sprint's
     # items) so the un-landed scope explicitly continues.
     _carry_over_sprint_work(state, record, team_ids)
+    # The director starts the sprint with the scoped brief, so monitoring does
+    # not depend on them noticing the sprint opened.
+    for tid in record.get('teamIds') or []:
+        _deliver_supervisor_brief(state, tid, int(now_ms))
     return record
 
 
@@ -3992,6 +3996,14 @@ def _on_sprint_closed(state, record, now_ms):
     retros = state.setdefault('pendingSprintRetros', [])
     if record['id'] not in retros:
         retros.append(record['id'])
+    # Director failure review: every card that failed this sprint is read on a
+    # later pass, root-caused, and turned into a bug card when the cause is a
+    # real defect rather than infrastructure or process noise.
+    state.setdefault('pendingFailureReviews', {})[record['id']] = {
+        'at': now_ms + FAILURE_REVIEW_DELAY_MS,
+        'sprintId': record['id'],
+        'teamIds': team_ids,
+    }
     for tid in team_ids:
         # Cross-team borrowing: loans to this team end at sprint close unless
         # the team still has pending work (the feature-need case keeps them).
@@ -5093,7 +5105,8 @@ def next_topic_id(state):
 
 
 def add_research_topic(state, topic, start_url, cadence_ms, now_ms=None,
-                       link_keyword=None, page_keyword=None, depends_on_task=None):
+                       link_keyword=None, page_keyword=None, depends_on_task=None,
+                       enabled=True, created_by=None):
     """The creator side of the standing research-topic cadence: _check_schedules
     (below) has always been able to FIRE a due topic, but nothing ever appended
     one to state['researchTopics'] -- it was seeded empty at boot and never
@@ -5127,6 +5140,8 @@ def add_research_topic(state, topic, start_url, cadence_ms, now_ms=None,
         'linkKeyword': link_keyword or None,
         'pageKeyword': page_keyword or None,
         'dependsOnTask': depends_on_task or None,
+        'enabled': enabled is not False,
+        'createdBy': created_by or None,
     }
     state.setdefault('researchTopics', []).append(record)
     return record
@@ -5366,7 +5381,9 @@ def _sync_research_watchlist(state):
         record = add_research_topic(state, t.get('topic'), t.get('startUrl'),
                                     t.get('cadenceMs') or 0,
                                     link_keyword=t.get('linkKeyword'),
-                                    page_keyword=t.get('pageKeyword'))
+                                    page_keyword=t.get('pageKeyword'),
+                                    enabled=t.get('enabled', True),
+                                    created_by='watchlist')
         if record is not None:
             by_key.add(key)
             added += 1
@@ -5493,6 +5510,8 @@ def _check_schedules(state, now, now_ms):
     # problem on the table from its first pass.
     _ensure_long_horizon_topic(state, now_ms)
     for topic in (state.get('researchTopics') or []):
+        if topic.get('enabled') is False:
+            continue
         if now_ms - (topic.get('lastRunAt') or 0) < topic.get('cadenceMs', 0):
             continue
         # Composed schedule+dependency: a topic with a `dependsOnTask` waits for
@@ -6109,7 +6128,7 @@ _TAIL_GROWTH_PLANS_APPLIED = 50
 # (see the on-call phase); a MEETING is a deliberate conversation whose
 # minutes land on the card itself (see _run_meeting_content). None ships a
 # peer-reviewed story -- all three land a short artifact instead.
-NON_GATED_LANES = frozenset({'spike', 'bug', 'research', 'meeting'})
+NON_GATED_LANES = frozenset({'spike', 'bug', 'research', 'meeting', 'supervise'})
 
 
 def _peer_gated_lane(task):
@@ -6717,6 +6736,20 @@ def _release_agent_after_failure(state, agent_id, task):
         return
     if task and task.get('status') not in ('blocked', 'failed', 'cancelled', 'abandoned'):
         task['status'] = 'done'
+        # This is NOT a completion. Marking the task done only stops the
+        # orphan sweep from re-issuing it. Log it as an auto-close so
+        # throughput telemetry can tell "never finished because the pipeline
+        # rejected it" from "still in flight" -- without this, 290 failed
+        # attempts read as a slow colony.
+        task['_pipelineFailedAt'] = int(time.time() * 1000)
+        try:
+            from serve import log_action
+            log_action(agent_id, 'task_auto_closed',
+                       {'taskId': task.get('id'), 'title': task.get('title'),
+                        'reason': (task.get('note') or 'quality pipeline failed')[:300],
+                        'stage': 'content_pipeline'}, authorized=True)
+        except Exception:
+            pass
     a['task'] = None
     a['busy'] = False
     a['inRoom'] = None
@@ -7238,6 +7271,11 @@ def _start_auto_hire(state, now_ms, grid, decider):
         members = [m for m in _sim_direct_reports(state, did)
                    if agents.get(m)]
         if not members:
+            continue
+        # A team carries six workers plus its scrum master. Hiring is for
+        # requested work the current workers cannot absorb, never for growth
+        # past that cap (the 455-person roster came from exactly this).
+        if not _team_under_cap(state, did):
             continue
         pool_by_director[did] = _team_member_candidates(state, did, members, now_ms)
 
@@ -11382,6 +11420,570 @@ def _retro_step(state, now, now_ms, decider=None):
 
 
 # ---------------------------------------------------------------------------
+# Sprint failure review. A just-closed sprint usually has cards that FAILED --
+# a red pipeline, a review that never converged, an infra timeout. Nobody reads
+# those after the retro, so the same hole is discovered again next sprint. At
+# close the owning DIRECTOR now reads every failed card, names the cause, and
+# -- when the cause is a bug, not infrastructure or process -- files a bug card
+# and puts it straight on the team's on-call (or any free teammate when the
+# on-call is already carrying work). The review is state-only and never blocks
+# the sprint close: the close queues it and a later pass resolves it.
+# ---------------------------------------------------------------------------
+FAILURE_REVIEW_DELAY_MS = 0
+FAILURE_CAUSES = ('bug', 'infra', 'process', 'unknown')
+
+
+def _sprint_failure_ident(task):
+    return ((task.get('title') or '').strip(), (task.get('room') or '').strip())
+
+
+def _sprint_failures(state, sprint_id):
+    """Every card in `sprint_id` that ended the sprint FAILED, newest failure
+    first. A card is in the sprint when its task carries the sprintId or its
+    (title, room) pair is one of the sprint's stored items. Excludes shadow
+    work and cards already reviewed for this same sprint, so a review can be
+    retried after an outage without double-filing."""
+    record = (state.get('sprints') or {}).get(sprint_id) or {}
+    pairs = {((p[0] or '').strip(), (p[1] or '').strip())
+             for p in (record.get('items') or []) if isinstance(p, (list, tuple)) and len(p) == 2}
+    failures = []
+    for task in (state.get('tasks') or {}).values():
+        if not isinstance(task, dict) or task.get('shadow'):
+            continue
+        if task.get('status') != 'failed':
+            continue
+        if task.get('sprintId') != sprint_id and _sprint_failure_ident(task) not in pairs:
+            continue
+        if task.get('_failureReviewSprint') == sprint_id:
+            continue
+        failures.append({
+            'id': task.get('id'),
+            'title': task.get('title') or task.get('id') or '',
+            'room': task.get('room') or '',
+            'taskType': task.get('taskType') or 'code',
+            'assignedTo': task.get('assignedTo') or '',
+            'failNote': (task.get('failNote') or task.get('note') or '')[:600],
+            'infra': bool(task.get('_infraFailure')),
+            'failedAt': task.get('failedAt') or task.get('updatedAt') or 0,
+        })
+    failures.sort(key=lambda f: f.get('failedAt') or 0)
+    return failures
+
+
+def _normalize_failure_cause(value):
+    """Map a model's free-text cause onto the four causes the review acts on.
+    Infrastructure and process are deliberate non-bugs: they earn a review
+    note, never a code card."""
+    text = str(value or '').strip().lower()
+    if text in FAILURE_CAUSES:
+        return text
+    if any(k in text for k in ('infra', 'environment', 'network', 'provider',
+                               'model call', 'timeout', 'rate limit', 'outage',
+                               'sandbox', 'disk', 'unavailable')):
+        return 'infra'
+    if any(k in text for k in ('bug', 'defect', 'regression', 'code', 'logic',
+                               'exception', 'traceback', 'crash', 'flaky')):
+        return 'bug'
+    if any(k in text for k in ('process', 'spec', 'scope', 'instruction',
+                               'coordination', 'review', 'unclear')):
+        return 'process'
+    return 'unknown'
+
+
+def _failure_review_director(state, team_ids):
+    """The director who owns the review: the first sprint team with a live,
+    non-busy director. Off-duty is allowed -- this is end-of-sprint paperwork,
+    not a meeting. Returns None when every director is mid-task; the review
+    then waits for a later pass rather than pinning a busy director."""
+    teams = {t.get('id'): t for t in (state.get('teams') or [])}
+    agents = state.get('agents') or {}
+    for tid in team_ids or []:
+        did = (teams.get(tid) or {}).get('directorId')
+        a = agents.get(did)
+        if did and a and not a.get('busy'):
+            return did
+    return None
+
+
+def _failure_fix_assignee(state, team_id, sprint_id, now_ms):
+    """Who works the bug card: the team's on-call when she is available. If she
+    is already mid-work, any free on-duty teammate may take it (the sprint has
+    moved on and the bug should not wait on one rotation slot). Falls back to
+    the on-call pin when nobody is free, so the card still names an owner."""
+    oc = on_call_agent(state, team_id, sprint_id, now_ms)
+    agents = state.get('agents') or {}
+
+    def free(aid):
+        a = agents.get(aid)
+        return bool(a) and not a.get('busy') and not a.get('offDuty')
+
+    if oc and free(oc):
+        return oc
+    for aid in _team_oncall_members(state, team_id):
+        if aid != oc and free(aid):
+            return aid
+    return oc
+
+
+def _file_failure_bug(state, sprint_id, team_id, director_id, failure, finding, now_ms):
+    """File the backlog bug for a failure the director judged a real bug and
+    queue it as an incident pinned to the fix assignee. Returns the issue, or
+    None when a live card with the same title already exists (dedupe)."""
+    why = str(finding.get('why') or finding.get('rootCause') or '').strip()[:600]
+    base = (failure.get('title') or failure.get('id') or 'failed card').strip()
+    title = f"Bug: {base}"[:140]
+    norm = lambda text: re.sub(r'\s+', ' ', str(text or '').strip().lower())
+    for issue in (state.get('issues') or {}).values():
+        if (issue.get('teamId') == team_id
+                and issue.get('status') in ('open', 'in_progress')
+                and norm(issue.get('title')) == norm(title)):
+            return None
+    for task in (state.get('tasks') or {}).values():
+        if (task.get('teamId') == team_id
+                and task.get('status') not in ('done', 'cancelled', 'abandoned')
+                and norm(task.get('title')) == norm(title)):
+            return None
+    summary = f"Fix the bug behind {base}"[:200]
+    user_story = (f"As the team, I want to remove the bug behind "
+                  f"'{base[:120]}', so that this failure cannot recur next sprint.")
+    criteria = ("Given the original failure, when the fix lands, then a regression "
+                "test reproduces it and passes, and the original card can be "
+                "retried without the same error.")
+    never = ('Do not close without reproducing the original failure\n'
+             'Do not change unrelated files')
+    issue = file_issue(state, team_id, 'bug', summary, 'Reliability', director_id,
+                       description={'userStory': user_story,
+                                    'acceptanceCriteria': criteria,
+                                    'never': never.split('\n')},
+                       title=title, now_ms=now_ms, story_points=2)
+    if not issue:
+        return None
+    issue['rootCause'] = why or None
+    issue['failureOf'] = failure.get('id')
+    issue['sprintId'] = sprint_id
+    for req in (state.get('backlogRequests') or []):
+        if req.get('issueKey') == issue['key'] and req.get('status') == 'pending':
+            # The director is placing this card directly, so refinement must
+            # not groom it a second time.
+            req['status'] = 'accepted'
+            req['acceptedAt'] = now_ms
+            req['acceptedBy'] = director_id
+            break
+    assignee = _failure_fix_assignee(state, team_id, sprint_id, now_ms)
+    queue_work(state, [{
+        'title': f"[BUG] {base}"[:140],
+        'room': failure.get('room') or 'pressoffice',
+        'taskType': 'bug',
+        'assignedTo': assignee,
+        'directRoute': True,
+        'incident': True,
+        'priority': 'high',
+        'teamId': team_id,
+        'issueKey': issue['key'],
+        'userStory': user_story,
+        'acceptanceCriteria': criteria,
+        'never': never,
+        'sizeEstimate': 'S',
+        'instructions': (
+            f"SPRINT FAILURE REVIEW: {failure.get('title')} failed during sprint "
+            f"{sprint_id}. The director judged the cause a BUG: {why or 'see the failed card'}. "
+            f"Fix the underlying cause with a regression test, then report the "
+            f"exact result. This card is the backstop against the same failure "
+            f"next sprint."),
+    }])
+    issue['fixAssignee'] = assignee
+    return issue
+
+
+def _failure_review_decider_default(state, instructions, sprint_id, failures):
+    """Default resolver for a sprint failure review: a low-tier chat call that
+    classifies each failure. Returns a dict with a `findings` list, or {} on a
+    model outage (the deterministic fallback still reviews every card, using
+    the infra flag and an 'unknown' cause)."""
+    try:
+        import serve
+    except Exception:
+        return {}
+    try:
+        model = serve._low_tier_slug()
+        data = serve._call_openrouter_sync(
+            model,
+            [{'role': 'system', 'content': instructions},
+             {'role': 'user', 'content': f"Review the failures from sprint {sprint_id}."}],
+            max_tokens=900)
+        cost = (data.get('usage') or {}).get('cost', 0.0)
+        if isinstance(cost, (int, float)) and cost:
+            serve._accrue_spend('__failure_reviews__', cost)
+        reply = ((data.get('choices') or [{}])[0].get('message') or {}).get('content') or ''
+        start = reply.find('{')
+        end = reply.rfind('}')
+        if start != -1 and end > start:
+            reply = reply[start:end + 1]
+        parsed = json.loads(reply)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {}
+
+
+# Injectable for tests, like _retro_decider. The review is a ceremony on a
+# later pass, so an outage costs the classification, never the sprint close.
+_failure_review_decider = _failure_review_decider_default
+
+
+def _failure_review_findings(data, failures):
+    """One finding per failure, in the failures' order. Accepts the decider's
+    `findings` list (matched by taskId, else by position) or a bare list. A
+    missing or unknown cause falls back to infra when the card was already
+    flagged as an infra failure, else 'unknown' -- never silently a bug."""
+    raw = data.get('findings') if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        raw = []
+    by_id = {}
+    for entry in raw:
+        if isinstance(entry, dict):
+            tid = entry.get('taskId') or entry.get('id')
+            if tid:
+                by_id[str(tid)] = entry
+    findings = []
+    for i, failure in enumerate(failures):
+        entry = by_id.get(str(failure.get('id'))) or (raw[i] if i < len(raw) and isinstance(raw[i], dict) else {})
+        cause = _normalize_failure_cause(entry.get('cause'))
+        if not entry.get('cause'):
+            cause = 'infra' if failure.get('infra') else 'unknown'
+        findings.append({
+            'taskId': failure.get('id'),
+            'title': failure.get('title'),
+            'cause': cause,
+            'why': str(entry.get('why') or entry.get('rootCause') or '').strip()[:800],
+            'prevention': str(entry.get('prevention') or '').strip()[:400],
+        })
+    return findings
+
+
+def _failure_review_step(state, now, now_ms, decider=None):
+    """One sprint-failure-review pass, called from _task_cycle next to the retro.
+    Each queued review waits for a free owning director, classifies that
+    sprint's failed cards, files a bug card for every real bug, stamps the
+    review onto the failed tasks, and records the whole review in
+    state['failureReviews'][sprint_id]. A sprint with no failures records an
+    empty review (no model call)."""
+    decider = decider or _failure_review_decider
+    pending = state.setdefault('pendingFailureReviews', {})
+    for sid in list(pending.keys()):
+        item = pending.get(sid) or {}
+        if int(item.get('at') or 0) > now_ms:
+            continue
+        record = (state.get('sprints') or {}).get(sid)
+        if not record:
+            pending.pop(sid, None)
+            continue
+        team_ids = [t for t in (item.get('teamIds') or record.get('teamIds') or [])
+                    if _team_row(state, t)]
+        failures = _sprint_failures(state, sid)
+        director = _failure_review_director(state, team_ids)
+        if failures and not director:
+            continue  # every owning director is mid-task; retry next pass
+        findings, filed = [], []
+        if failures:
+            instructions = (
+                "You are the owning director reviewing the failures of the sprint "
+                f"'{record.get('name') or sid}'. For each failed card, name the ROOT "
+                "CAUSE and classify it as exactly one of: bug (a defect in code, "
+                "tests, or the deliverable), infra (provider, network, sandbox, "
+                "timeout, outage), process (unclear spec, scope, instructions, "
+                "review or coordination), unknown. A bug earns a permanent code "
+                "card; infra and process earn a note, never a card. Cards:\n"
+                + '\n'.join(
+                    f"- taskId {f.get('id')} | {f.get('title')} | type {f.get('taskType')} "
+                    f"| owner {f.get('assignedTo')} | infraFlag {f.get('infra')} "
+                    f"| failure: {f.get('failNote') or '(no note)'}"
+                    for f in failures)
+                + "\nRespond with ONLY valid JSON, no markdown fences: "
+                  '{"findings":[{"taskId":"...","cause":"bug","why":"...",'
+                  '"prevention":"..."}]}'
+            )
+            data = decider(state, instructions, sid, failures)
+            findings = _failure_review_findings(data, failures)
+            for failure, finding in zip(failures, findings):
+                stamp = now_ms
+                task = (state.get('tasks') or {}).get(failure.get('id'))
+                if isinstance(task, dict):
+                    task['_failureReviewSprint'] = sid
+                    task['_failureReviewedAt'] = stamp
+                    task['_failureReview'] = {'cause': finding['cause'],
+                                              'why': finding['why'][:300]}
+                if finding['cause'] == 'bug' and director and team_ids:
+                    issue = _file_failure_bug(state, sid, team_ids[0], director,
+                                              failure, finding, now_ms)
+                    if issue:
+                        filed.append(issue['key'])
+        state.setdefault('failureReviews', {})[sid] = {
+            'sprintId': sid,
+            'teamIds': team_ids,
+            'directorId': director,
+            'reviewedAt': now_ms,
+            'failures': findings,
+            'filedBugs': filed,
+        }
+        pending.pop(sid, None)
+        _log_governance(state, director or '', 'sprint_failure_review',
+                        {'sprint': sid, 'failures': len(failures),
+                         'bugs': len(filed)})
+
+
+# ---------------------------------------------------------------------------
+# Supervisor brief. A director's job during a sprint is facilitation, not the
+# work: watch the team's budget burn, watch process failures, and keep the
+# sprint moving. The brief gives each director the scoped facts they need
+# (own team only) and the exact commands to inspect status, files, sandbox
+# paths and the DB. It is mail, not a task: no model spend, no queue slot, and
+# it lands before the director's next turn.
+# ---------------------------------------------------------------------------
+SUPERVISOR_BRIEF_INTERVAL_MS = 15 * 60 * 1000
+SUPERVISOR_CARD_INTERVAL_MS = 30 * 60 * 1000
+SUPERVISOR_CARD_BUDGET_USD = 0.05
+
+
+def _supervisor_team_tasks(state, team_id):
+    """Live tasks belonging to `team_id` (its members or its teamId), newest
+    first. The scope boundary for every supervisor view."""
+    team = _team_row(state, team_id)
+    members = set((team or {}).get('members') or [])
+    members.update(_sim_direct_reports(state, (team or {}).get('directorId')))
+    out = []
+    for task in (state.get('tasks') or {}).values():
+        if not isinstance(task, dict) or task.get('shadow'):
+            continue
+        if task.get('teamId') == team_id or task.get('assignedTo') in members:
+            out.append(task)
+    out.sort(key=lambda t: t.get('updatedAt') or t.get('lastProgressAt') or 0, reverse=True)
+    return out
+
+
+def _supervisor_brief(state, team_id, now_ms=None):
+    """The scoped monitoring brief for one team's director. Returns a dict
+    with `text` (mail body) and `teamId`, or None for an unknown team."""
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    team = _team_row(state, team_id)
+    if not team:
+        return None
+    members = list(team.get('members') or [])
+    tasks = _supervisor_team_tasks(state, team_id)
+    sprint = None
+    for rec in (state.get('sprints') or {}).values():
+        if rec.get('status') == 'active' and team_id in (rec.get('teamIds') or []):
+            sprint = rec
+            break
+    lines = [f"SUPERVISOR BRIEF: {team.get('name') or team_id} ({team_id})", '',
+             f"Your team: {', '.join(members) or '(no workers)'}.",
+             "Scope: this team only. Do not inspect, comment on, or reassign another team's work.",
+             "Role: facilitate. You watch budget and process failures; the workers do the work.",
+             '']
+    if sprint:
+        lines.append(f"Sprint: {sprint.get('name') or sprint.get('id')} ({sprint.get('id')}) -- "
+                     f"{sprint.get('goal') or 'no goal set'}")
+    else:
+        lines.append('Sprint: none active for this team.')
+    lines.append('')
+    lines.append('Cards:')
+    if not tasks:
+        lines.append('  (none live)')
+    for t in tasks[:20]:
+        spend = t.get('ownSpendUsd')
+        budget = t.get('budgetUsd')
+        money = ''
+        if budget or spend:
+            money = f" -- spend ${float(spend or 0):.4f} / budget ${float(budget or 0):.2f}"
+            if budget and float(spend or 0) >= float(budget) * 0.9:
+                money += ' -- AT/OVER BUDGET'
+        lines.append(f"  - {t.get('id')} [{t.get('status')}] {t.get('title') or ''}"
+                     f" -- owner {t.get('assignedTo') or '?'}{money}")
+    failures = [t for t in tasks if t.get('status') in ('failed', 'blocked')]
+    lines.append('')
+    lines.append('Process failures:')
+    if not failures:
+        lines.append('  (none)')
+    for t in failures[:10]:
+        note = (t.get('failNote') or t.get('note') or '')[:200]
+        lines.append(f"  - {t.get('id')} {t.get('status')}: {t.get('title') or ''} -- {note}")
+    stuck = [t for t in tasks if t.get('status') == 'needs_review'
+             and now_ms - int(t.get('updatedAt') or now_ms) > 30 * 60 * 1000]
+    if stuck:
+        lines.append('  stuck in review over 30 min: ' + ', '.join(t.get('id') for t in stuck[:10]))
+    lines.append('')
+    lines.append('Where to look:')
+    lines.append("  - Live status: call the supervisor_report tool first (fresh, read-only, your team only).")
+    lines.append("  - Files/sandbox: use execute_script to ls/cat the paths below. The sandbox has no network and no database.")
+    lines.append(f"  - Repo shell only (tasks live in the state JSON, filtered to your team):")
+    lines.append("    sqlite3 " + os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'think_tank.db'))
+                 + " \"select json_extract(value,'$.id'), json_extract(value,'$.status'), "
+                   "json_extract(value,'$.assignedTo'), json_extract(value,'$.ownSpendUsd'), "
+                   "json_extract(value,'$.budgetUsd') from kv_state, json_each(blob,'$.tasks') "
+                   f"where json_extract(value,'$.teamId')='{team_id}';\"")
+    lines.append("  - Sandbox paths for this team's live cards:")
+    roots = []
+    for t in tasks[:10]:
+        for cand in (os.path.join(os.path.dirname(__file__), '..', 'sandboxes', str(t.get('id'))),):
+            if os.path.isdir(cand):
+                roots.append(cand)
+    lines.append('    ' + (', '.join(roots) if roots else '(no task sandboxes on disk yet)'))
+    lines.append('')
+    lines.append('What to act on:')
+    lines.append('  - Budget: if a card used its full budget before close, say what the spend bought and whether more is justified; do not do the work yourself.')
+    lines.append('  - Process: a failure, a stuck review, or a missing deliverable is yours to escalate or file as a failure review; do not silently retry.')
+    lines.append('  - Other teams: out of scope. Route cross-team issues to the chief of staff.')
+    return {'teamId': team_id, 'text': '\n'.join(lines), 'sprintId': (sprint or {}).get('id')}
+
+
+def _deliver_supervisor_brief(state, team_id, now_ms=None):
+    """Append the brief to the team director's mailbox. Never wakes or blocks."""
+    team = _team_row(state, team_id)
+    director_id = (team or {}).get('directorId')
+    agent = (state.get('agents') or {}).get(director_id)
+    if not director_id or not agent:
+        return False
+    brief = _supervisor_brief(state, team_id, now_ms)
+    if not brief:
+        return False
+    _append_mailbox(agent, {
+        'kind': 'supervisor_brief',
+        'about': team_id,
+        'title': f"Supervisor brief: {team.get('name') or team_id}",
+        'text': brief['text'],
+        'createdAt': int(time.time() * 1000) if now_ms is None else int(now_ms),
+    })
+    return True
+
+
+def _supervisor_brief_step(state, now, now_ms):
+    """One cadence pass: while a team has an active sprint, mail its director a
+    fresh scoped brief every SUPERVISOR_BRIEF_INTERVAL_MS. State-only."""
+    seen = state.setdefault('_supervisorBriefAt', {})
+    for team in (state.get('teams') or []):
+        tid = team.get('id')
+        if not tid:
+            continue
+        if not any(r.get('status') == 'active' and tid in (r.get('teamIds') or [])
+                   for r in (state.get('sprints') or {}).values()):
+            continue
+        last = int(seen.get(tid) or 0)
+        if last and now_ms - last < SUPERVISOR_BRIEF_INTERVAL_MS:
+            continue
+        if _deliver_supervisor_brief(state, tid, now_ms):
+            seen[tid] = now_ms
+        # A brief is context; a SUPERVISE card is a turn where the director can
+        # inspect and act. Queue one only when the team actually needs
+        # attention, and at most every 30 minutes, so monitoring is not a
+        # background spend.
+        reason = _supervisor_attention_reason(state, tid, now_ms)
+        if not reason:
+            continue
+        last_card = int((state.get('_supervisorCardAt') or {}).get(tid) or 0)
+        if last_card and now_ms - last_card < SUPERVISOR_CARD_INTERVAL_MS:
+            continue
+        if _supervisor_card_open(state, tid):
+            continue
+        director = team.get('directorId')
+        if not director or director not in (state.get('agents') or {}):
+            continue
+        queue_work(state, [{
+            'title': f"[SUPERVISE] {team.get('name') or tid}: {reason}"[:120],
+            'room': 'commandcenter',
+            'taskType': 'supervise',
+            'assignedTo': director,
+            'teamId': tid,
+            'priority': 'high',
+            'budgetUsd': SUPERVISOR_CARD_BUDGET_USD,
+            'sizeEstimate': 'S',
+            'instructions': ('Facilitate this team. Read the supervisor report, inspect only this '
+                             "team's files and sandbox, act on budget and process, and report back. "
+                             'Do not do the work or edit code.'),
+        }])
+        state.setdefault('_supervisorCardAt', {})[tid] = now_ms
+    # The chief of staff gets a cross-team card when any team needs attention.
+    # He has no team of his own, so the per-team loop above never reaches him;
+    # without this the admin would be blind to the same failures.
+    admin = next((d.get('id') for d in (state.get('agentRoster') or [])
+                  if d.get('isAdmin')), None)
+    if not admin or admin not in (state.get('agents') or {}):
+        return
+    reasons = []
+    for team in (state.get('teams') or []):
+        tid = team.get('id')
+        if not tid:
+            continue
+        reason = _supervisor_attention_reason(state, tid, now_ms)
+        if reason:
+            reasons.append(f"{team.get('name') or tid}: {reason}")
+    if not reasons:
+        return
+    if _supervisor_admin_card_open(state):
+        return
+    last_admin = int((state.get('_supervisorCardAt') or {}).get('__admin__') or 0)
+    if last_admin and now_ms - last_admin < SUPERVISOR_CARD_INTERVAL_MS:
+        return
+    queue_work(state, [{
+        'title': f"[SUPERVISE] Cross-team: {len(reasons)} team(s) need attention"[:120],
+        'room': 'commandcenter',
+        'taskType': 'supervise',
+        'assignedTo': admin,
+        'priority': 'high',
+        'budgetUsd': SUPERVISOR_CARD_BUDGET_USD,
+        'sizeEstimate': 'S',
+        'instructions': ('Cross-team oversight. Read the report, inspect the live project and the '
+                         'named teams, act on budget or process, and route cross-team issues. '
+                         'Do not do the work or edit code. Attention: ' + '; '.join(reasons[:5])),
+    }])
+    state.setdefault('_supervisorCardAt', {})['__admin__'] = now_ms
+
+
+def _supervisor_admin_card_open(state):
+    prefix = '[SUPERVISE] Cross-team'
+    for item in (state.get('workQueue') or []):
+        if str(item.get('title') or '').startswith(prefix):
+            return True
+    for task in (state.get('tasks') or {}).values():
+        if (str(task.get('title') or '').startswith(prefix)
+                and task.get('status') not in ('done', 'cancelled', 'abandoned')):
+            return True
+    return False
+
+
+def _supervisor_attention_reason(state, team_id, now_ms):
+    """Why this team needs a supervisor turn now, or '' when it does not:
+    a failure, a review stuck over 30 minutes, or a live card at 80%+ of its
+    budget. Cheap and state-only."""
+    for t in _supervisor_team_tasks(state, team_id):
+        status = t.get('status')
+        if status in ('failed', 'blocked'):
+            return f"{t.get('id')} {status}"
+        if status == 'needs_review':
+            age = now_ms - int(t.get('updatedAt') or t.get('lastProgressAt') or now_ms)
+            if age > 30 * 60 * 1000:
+                return f"{t.get('id')} stuck in review"
+        budget = t.get('budgetUsd')
+        spent = t.get('ownSpendUsd')
+        if budget and float(spent or 0) >= float(budget) * 0.8:
+            return f"{t.get('id')} at budget"
+    return ''
+
+
+def _supervisor_card_open(state, team_id):
+    """True when this team already has an open SUPERVISE card, so the cadence
+    never stacks duplicate turns."""
+    for item in (state.get('workQueue') or []):
+        if item.get('taskType') == 'supervise' and item.get('teamId') == team_id:
+            return True
+    for task in (state.get('tasks') or {}).values():
+        if (task.get('taskType') == 'supervise' and task.get('teamId') == team_id
+                and task.get('status') not in ('done', 'cancelled', 'abandoned')):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Cut 2: three missing team processes -- deliverable grading +
 # director roadmap, the coaching loop (growth plan -> next task), and incident
 # runbooks. All follow the established pattern: injectable Jev decision +
@@ -13136,6 +13738,16 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # START / STOP / CONTINUE (director excluded) on a later pass. Runs ungated
     # like the Social / refinement, so a closed sprint never strands its retro.
     _retro_step(state, now, now_ms)
+
+    # Sprint failure review: a just-closed sprint's failed cards are root-caused
+    # by the owning director and a real bug becomes an on-call card. Runs
+    # ungated next to the retro so a quiet tank still closes the loop.
+    _failure_review_step(state, now, now_ms)
+
+    # Supervisor brief: while a sprint runs, each director gets a scoped,
+    # state-only brief every 15 minutes (own team, budget, process failures,
+    # where to look). Mail, not a task: no spend, no queue.
+    _supervisor_brief_step(state, now, now_ms)
 
     # Cut 2 roadmap: weekly silent recompute of per-room priority from trailing
     # deliverable grades + delivery volume. Cheap (state-only, no ceremony, no

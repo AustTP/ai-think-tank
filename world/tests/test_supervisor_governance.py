@@ -149,13 +149,26 @@ def test_level_five_watches_recent_failure_without_dependents(monkeypatch):
     assert st['workQueue'][0]['taskType'] == 'bug'
 
 
-def test_constitution_protected_business_processes_editable():
+def test_constitution_protected_business_processes_editable(monkeypatch):
     import selfedit
+    import serve
+    # The actor must be a pure worker: a director is refused earlier by the
+    # "directors do not write code" rule, which would mask the protected-path
+    # check this test is about. Patch the roster so the test does not depend on
+    # the live org chart (supervisors move).
+    monkeypatch.setattr(serve, 'get_state_from_db', lambda: {
+        'agentRoster': [
+            {'id': 'boss', 'isAdmin': True, 'isDirector': True},
+            {'id': 'lead', 'isDirector': True, 'director': 'boss'},
+            {'id': 'worker', 'director': 'lead'},
+        ],
+        'agents': {'worker': {}},
+    })
     assert selfedit.is_protected('/repo/CONSTITUTION.md')
     assert selfedit.is_protected('/repo/world/constitution.py')
     real, display = selfedit._resolve_path('BUSINESS-PROCESSES.md')
     assert real and display == 'BUSINESS-PROCESSES.md'
-    ok, payload = selfedit.propose('ada', 'CONSTITUTION.md', 'x', 'y', 'test')
+    ok, payload = selfedit.propose('worker', 'CONSTITUTION.md', 'x', 'y', 'test')
     assert ok is False and 'PROTECTED' in payload['error']
 
 

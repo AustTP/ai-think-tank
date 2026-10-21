@@ -105,6 +105,11 @@ RESEARCH_WATCHLIST_DEFAULT: list = []
 # Write-back gate. False by default; serve._lifespan sets it True on real boot.
 ALLOW_WATCHLIST_WRITE = False
 
+# Story worktrees branch from the shared sandbox base repo. Syncing that base
+# to the live project's committed HEAD is a boot-only behavior (tests must
+# never reset their own fixtures). Set by the server's lifespan.
+ALLOW_WORKSPACE_SYNC = False
+
 # Loaded values (module-level, replaced by reload_policy_config).
 PLAIN_WRITING_BAN_LIST = list(PLAIN_WRITING_BAN_LIST_DEFAULT)
 BROWSE_BLOCK_CATEGORIES = list(BROWSE_BLOCK_CATEGORIES_DEFAULT)
@@ -1373,6 +1378,42 @@ def reload_policy_config():
     }
 
 
+def remove_watchlist_topic(topic, start_url=''):
+    """Drop a schedule from world/watchlist.json so the live sync does not add
+    it back. Silent on failure: state removal still stands for this session."""
+    if not ALLOW_WATCHLIST_WRITE:
+        return False
+    topic = (topic or '').strip()
+    if not topic:
+        return False
+    try:
+        with open(WATCHLIST_PATH, encoding='utf-8') as f:
+            data = json.load(f)
+        topics = data.get('topics')
+        if not isinstance(topics, list):
+            return False
+        kept = [t for t in topics
+                if not ((t or {}).get('topic') == topic
+                        and (not start_url or (t or {}).get('startUrl') == start_url))]
+        if len(kept) == len(topics):
+            return False
+        data['topics'] = kept
+        with open(WATCHLIST_PATH, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write('\n')
+        return True
+    except Exception:
+        return False
+
+
+def update_watchlist_topic(old_topic, old_url, record):
+    """Replace one watchlist entry in place after a schedule edit. Removes the
+    old entry and appends the new one, so the live sync sees exactly one."""
+    if not remove_watchlist_topic(old_topic, old_url):
+        pass
+    return note_watchlist_topic(record)
+
+
 def note_watchlist_topic(record):
     """Append a villager-added research topic to world/watchlist.json so the
     operator sees (and can edit) what the village asked the desk to watch.
@@ -1407,6 +1448,8 @@ def note_watchlist_topic(record):
             entry['linkKeyword'] = record['linkKeyword']
         if (record.get('pageKeyword') or '').strip():
             entry['pageKeyword'] = record['pageKeyword']
+        if record.get('enabled') is False:
+            entry['enabled'] = False
         topics.append(entry)
         data['topics'] = topics
         with open(WATCHLIST_PATH, 'w', encoding='utf-8') as f:

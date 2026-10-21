@@ -1,0 +1,43 @@
+{
+  "supervisor-sprint-check": {
+    "title": "Supervisor sprint check",
+    "steps": [
+      "Call supervisor_report. Note the sprint, every live card, and spend against budget.",
+      "For any card at 80% or more of budget, read its failure or progress note before deciding.",
+      "Call live_read op=ls on the task sandbox paths in the report, then live_read op=read on the files that changed.",
+      "Call live_read op=team_log for the last 40 actions and look for repeated failures or loops.",
+      "Act: grant a budget top-up with a reason, delegate a scoped check, or escalate a process failure.",
+      "Finish with cards reviewed, decisions, and one next action per open issue."
+    ]
+  },
+  "failure-review": {
+    "title": "Failure review",
+    "steps": [
+      "Identify the failed card and read its failNote end to end.",
+      "Use live_read op=read on the sandbox files the card produced or touched.",
+      "Classify the cause: bug, infra, process, or unknown. Do not guess.",
+      "A bug earns a regression-test card. Infra or process earns a note and a process change.",
+      "Record what would have caught it earlier, and name the owner."
+    ]
+  },
+  "budget-top-up": {
+    "title": "Budget top-up decision",
+    "steps": [
+      "Call supervisor_report and find the card and its spend.",
+      "State what the spend bought so far, in concrete terms.",
+      "Decide whether the remaining work is worth another ceiling, or the card should stop.",
+      "If yes, call supervisor_grant_budget with a reason that names the remaining work.",
+      "If no, say what gets dropped and who owns the decision."
+    ]
+  },
+  "schedule-change": {
+    "title": "Schedule change",
+    "steps": [
+      "Call schedules op=list and find the schedule by id.",
+      "Confirm the change is yours to make: you may only edit schedules you created.",
+      "For a cadence change, state the old and new interval and why.",
+      "Apply with schedules op=update, or op=delete when the watch should stop.",
+      "Report the change and the next expected run."
+    ]
+  }
+}
