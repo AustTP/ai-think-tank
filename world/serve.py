@@ -18797,6 +18797,19 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
 
     def _execute_tool_raw(name, args):
         # Every tool result is external data -> wrap BEFORE it can reach a model.
+        if name == 'browser_step':
+            tools_used.append(name)
+            from content import _make_browser_step_executor
+            step = _make_browser_step_executor(pick, agent_key, f'sandbox-ask-{pick}')
+            return step(name, args)
+        if name == 'audit_agent_readiness':
+            tools_used.append(name)
+            import content as _content
+            return _content.audit_agent_readiness(_web_tool, args)
+        if name == 'project_board':
+            tools_used.append(name)
+            import content as _content
+            return _content.project_board(args)
         if name in ('search_web', 'browse_page', 'download_file', 'read_ais_feed', 'read_rss_feed', 'read_market_feed', 'read_live_feed'):
             tools_used.append(name)
             return _web_tool(name, args)
@@ -18964,6 +18977,13 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         tools = tools + [_LOCAL_FILE_TOOL, _READ_STORE_TOOL]
     if APP_ACCESS_ENABLED and _effective_app_grants(state):
         tools = tools + [_APP_SCRIPT_TOOL]
+    try:
+        import content as _content
+        tools = tools + [_content._PROJECT_BOARD_TOOL]
+        if BROWSING_ENABLED:
+            tools = tools + [_content._BROWSER_STEP_TOOL, _content._AGENT_READINESS_TOOL]
+    except Exception:
+        pass
     try:
         if model:
             # Self-loopback deadlock (same class fixed in the
