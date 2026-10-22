@@ -1936,10 +1936,11 @@ def _quality_pipeline_failure_snippet(step_name, stdout, stderr):
 
 # Client ceiling for the whole /api/pipeline call. The server runs up to 6
 # steps (flake8/mypy/bandit/pytest-cov/node-syntax/node-tests), each with its
-# own SANDBOX_TIMEOUT_S (serve.py) -- 6 x 30s of legitimate server-side work
-# -- while _http_json's default is 30s for the WHOLE call, so real pipelines
-# died as "request failed: timed out" rejections (329 in one 24h window).
-_QUALITY_PIPELINE_TIMEOUT_S = 300
+# own SANDBOX_TIMEOUT_S (serve.py, currently 120s) -- up to 720s of legitimate
+# server-side work -- while _http_json's default is 30s for the WHOLE call, so
+# real pipelines died as "request failed: timed out" rejections (329 in one
+# 24h window). Keep this above 6 * SANDBOX_TIMEOUT_S with headroom.
+_QUALITY_PIPELINE_TIMEOUT_S = 800
 
 
 def _poll_pipeline_job(base, key, job_id, deadline_s=_QUALITY_PIPELINE_TIMEOUT_S):

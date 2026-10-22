@@ -6377,6 +6377,42 @@ def roster_order(cid, roster):
     return 0
 
 
+def _fix_title_root(title):
+    """Strip repeated 'Fix: ' prefixes and retry suffixes so 'Fix: Fix: Act on
+    mail (retry 2)' and 'Act on mail' compare equal. Mirrors _task_fix_spirals'
+    own reduction."""
+    root = str(title or '').strip()
+    while root.startswith('Fix: '):
+        root = root[len('Fix: '):].strip()
+    while True:
+        reduced = re.sub(r'\s*\(retry\s+\d+\)\s*$', '', root).strip()
+        if reduced == root:
+            break
+        root = reduced
+    return root
+
+
+def _open_fix_exists(state, title):
+    """True when a live 'Fix: <root>' card already covers this title. Prevents
+    the send-back path from minting the same fix over and over for one parent."""
+    root = _fix_title_root(title)
+    if not root:
+        return False
+    for q in state.get('workQueue') or []:
+        if _fix_title_root(q.get('title')) != root:
+            continue
+        if q.get('status') in ('completed', 'failed', 'cancelled'):
+            continue
+        return True
+    for t in (state.get('tasks') or {}).values():
+        if _fix_title_root(t.get('title')) != root:
+            continue
+        if t.get('status') in ('completed', 'failed', 'cancelled'):
+            continue
+        return True
+    return False
+
+
 def _queue_peer_repair(state, parent, rationale=None):
     """Queue one author-owned repair for a rejected deliverable."""
     if (parent.get('_peerGate') or {}).get('escalated'):
@@ -6814,6 +6850,10 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
     _log_quality_gate_reject(state, task, note, escalated=escalated)
     if escalated:
         return  # auto-closed after cycle cap -- no further fix cycling
+    if _open_fix_exists(state, task.get('title')):
+        _log_governance(state, author, 'fix_send_back_deduped',
+                        {'taskId': task.get('id'), 'title': (task.get('title') or '')[:120]})
+        return
     queue_work(state, [{
         'title': f'Fix: {task.get("title")}',
         'room': task.get('room'),
@@ -14049,12 +14089,12 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # agents appear. Runs BEFORE the idle gate so a quiet think tank still re-parking
     # its wanderers converges to zero visible idle sprites (assignment re-wakes
     # on demand, so this cannot deadlock the queue).
-    if not work_queue:
-        _park_idle_wanderers(state)
     if not work_queue and not _any_agent_active(agents):
+        _park_idle_wanderers(state)
         # Nothing queued and nobody's mid-task: idle, don't even scan.
         return state
     if not think_tank_has_work(state, now_ms):
+        _park_idle_wanderers(state)
         return state
 
     # Load geometry once per call for this pass (cheap; the movement tick has
@@ -14410,6 +14450,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                            {'title': pick.get('title'), 'room': pick.get('room'),
                             'attempts': pick['attempts']}, authorized=True)
                 _on_work_item_abandoned(state, pick, now_ms)
+    _park_idle_wanderers(state)
     return state
 
 

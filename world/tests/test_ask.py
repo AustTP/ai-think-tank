@@ -446,6 +446,7 @@ class AskEndpoint(unittest.TestCase):
                      'self_edit', 'self_edit_status', 'schedule_dormant_apply',
                      'selfedit_fix', 'selfedit_recheck', 'selfedit_read',
                      'selfedit_validate', 'policy_edit',
+                     'veto_change_request',
                      'pulse_watch', 'read_pulse', 'project_board'}
                     | ({'browser_step', 'audit_agent_readiness'}
                        if serve.BROWSING_ENABLED else set())

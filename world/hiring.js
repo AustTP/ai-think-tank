@@ -23,6 +23,13 @@ const HIRE_NAME_POOL = ['Marcus', 'Priya', 'Sam', 'Nadia', 'Leo', 'Ines', 'Theo'
 const HIRE_COLOR_POOL = ['#f6b26b', '#76a5af', '#a4c2f4', '#d5a6bd', '#b6d7a8', '#ffe599'];
 const HIRE_COOLDOWN_MS = 45000;
 const HIRE_DURATION_MS = 8000;
+// A single person can stay "the one who most needs help" for a long time --
+// low morale or a quiet stretch does not clear just because an assistant
+// showed up. Without a per-target memory, whoNeedsHelp() keeps picking the
+// same person every 45s and mints an assistant every time. One assistant
+// per person per quarter-hour is plenty; the global cooldown above only
+// spaces hires out, it does not stop this repeat targeting.
+const HIRE_PER_TARGET_COOLDOWN_MS = 15 * 60 * 1000;
 
 // Real budget protection: autonomous hiring with no cap
 // would grow unbounded (and once real model calls exist, so would spend).
@@ -39,6 +46,11 @@ const HIRE_DURATION_MS = 8000;
 // active half of this is actually enforced.
 const MAX_TOTAL_AGENTS = 500;
 const MAX_ACTIVE_AGENTS = 25;
+// Mirrors sim.py's MAX_TEAM_MEMBERS. The server enforces this on its own
+// auto-hire path; the client-side hiring flow has to enforce it too, or a
+// browser tab can stack unlimited assistants under one director while the
+// server-side cap sits idle.
+const MAX_TEAM_MEMBERS = 6;
 
 // How often to actually log/toast "we're at the cap" while blocked --
 // attemptAutoHire() is polled every 5s (index.html), so without a
@@ -105,6 +117,9 @@ const MODEL_TIERS = {
 };
 
 let lastHireAt = 0;
+// helpFor.id -> last time we hired someone specifically for that person.
+// See HIRE_PER_TARGET_COOLDOWN_MS above.
+const lastHireForTargetAt = new Map();
 
 // Bug: this fixed 10-name list was the
 // ONLY name source, and it was already fully exhausted at 17 real
@@ -153,8 +168,19 @@ function pickFallbackHireName() {
 // is the admin/director running attemptAutoHire; it's excluded from the
 // candidate pool but everyone else -- workers, directors, and the other
 // administrator -- is eligible to be hired-for.
+function teamIsFull(def) {
+  const teamDirector = def.director || def.id;
+  const teamSize = AGENT_ROSTER.filter(d =>
+    d.id !== teamDirector && (d.director || d.id) === teamDirector).length;
+  return teamSize >= MAX_TEAM_MEMBERS;
+}
+
 async function whoNeedsHelp(hirerId) {
-  const candidatesList = AGENT_ROSTER.filter(d => d.id !== hirerId);
+  const now = Date.now();
+  const candidatesList = AGENT_ROSTER
+    .filter(d => d.id !== hirerId)
+    .filter(d => now - (lastHireForTargetAt.get(d.id) || 0) >= HIRE_PER_TARGET_COOLDOWN_MS)
+    .filter(d => !teamIsFull(d));
   const candidates = candidatesList.map(d => {
     const a = AGENTS[d.id];
     const morale = moraleFor(d.id);
@@ -333,6 +359,11 @@ async function finishHire(adminDef, helpFor) {
 
   const def = {
     id, name, color, role,
+    // Attach the assistant to the team that owns the person she is helping.
+    // Without this the roster entry is an orphan: _derive_team_members and
+    // the team-cap checks group by `director`, so a hire with no director
+    // belongs to no team and is invisible to those controls.
+    director: helpFor.director || helpFor.id,
     // Every new hire defaults to the small tier -- overflow/assistant work
     // doesn't need a bigger model.
     model: 'small',
@@ -377,6 +408,7 @@ async function finishHire(adminDef, helpFor) {
   }
 
   showToast(`${admin.name} hired ${name} to help ${helpFor.name}.`, 4000);
+  lastHireForTargetAt.set(helpFor.id, Date.now());
   logThinkTankAction(adminDef.id, 'hire', { hired: id, helping: helpFor.id });
 }
 

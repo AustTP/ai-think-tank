@@ -10131,7 +10131,12 @@ def _browser_block_payload(parsed_result, agent_id, op, url, purpose):
         'allowlist access.')
     return parsed_result
 
-SANDBOX_TIMEOUT_S = 30
+# The quality pipeline's flake8 step legitimately takes ~32s on this repo
+# (11MB, 1 CPU in the sandbox); 30s made every run a false failure. 120s
+# leaves headroom for flake8/mypy/pytest without opening the door to a
+# runaway command. The pipeline-level cap (_QUALITY_PIPELINE_TIMEOUT_S) is
+# still 300s, so this per-step ceiling only changes which step is blamed.
+SANDBOX_TIMEOUT_S = 120
 SANDBOX_MAX_OUTPUT = 20_000
 # Where agent commands actually run: `local` = the local Docker
 # sandbox (the default and only tested backend); `digitalocean` = a provisioned
@@ -12177,6 +12182,10 @@ AGENT_ASK_TOOLS = [
                                  '(empty string deletes the find text).'},
                     'summary': {'type': 'string', 'description': 'WHY this edit improves '
                                  'the tank; the reviewer rejects vague summaries.'},
+                    'windowOnly': {'type': 'boolean', 'description': 'High-risk changes '
+                                   'must set this. A window-only edit never applies on '
+                                   'the idle dormancy path; it applies only inside an '
+                                   'approved change-request window. Default false.'},
                 },
                 'required': ['path', 'find', 'replace', 'summary'],
             },
@@ -12210,13 +12219,17 @@ AGENT_ASK_TOOLS = [
                            'DIFFERENT agent as validator -- after your edits apply and '
                            'the repo test gate passes on the live tree, the validator '
                            'reviews the result and approves or denies the push to '
-                           'main. Two approvals are required: your supervisor judges '
-                           'the request first (Jev quorum), then the player must '
-                           'approve an emailed link. The slot is REFUSED with the '
-                           'conflicting items listed if standing-task schedule entries '
-                           'or other dormancy windows already occupy that time. Your '
-                           'currently armed edits are reserved for this window. Use '
-                           'sparingly -- an emergency fix or a risky reload is a '
+                           'main. Two approvals are required after the supervisor '
+                           'pre-clear: the director validator approves the applied '
+                           'bytes, then the chief of staff approves the push. In the '
+                           'legacy mode the player link is the final approval instead. '
+                           'The slot is REFUSED with the conflicting items listed if '
+                           'standing-task schedule entries, another dormancy window, '
+                           'or a declared blackout already occupies that time. It is '
+                           'rechecked again at fire time. High-risk changes must '
+                           'declare the full detail block and use window-only edits. '
+                           'Your currently armed edits are reserved for this window. '
+                           'Use sparingly -- an emergency fix or a risky reload is a '
                            'reason; pausing oversight is not.',
             'parameters': {
                 'type': 'object',
@@ -12228,10 +12241,65 @@ AGENT_ASK_TOOLS = [
                                   'DIFFERENT agent who will validate the applied '
                                   'result before it is pushed to main. Required.'},
                     'durationMin': {'type': 'integer', 'description': 'Sleep length in '
-                                     'minutes, 5-240 (default 15).'},
+                                     'minutes, 5-240 (default 15). Trading mode is '
+                                     'capped at 5; event mode at 15.'},
                     'reason': {'type': 'string', 'description': 'WHY the tank should '
                                 'sleep then (which edits are landing and why a '
                                 'dedicated quiet slot is safer).'},
+                    'title': {'type': 'string', 'description': 'Short change name. '
+                              'Required for high-risk requests.'},
+                    'description': {'type': 'string', 'description': 'What changes and '
+                                    'why now. Required for high-risk requests.'},
+                    'changeType': {'type': 'string', 'enum': ['standard', 'normal',
+                                    'emergency'], 'description': 'Change class. '
+                                    'Default normal.'},
+                    'riskLevel': {'type': 'string', 'enum': ['low', 'medium', 'high',
+                                   'critical'], 'description': 'Risk class. Default low. '
+                                   'High and critical require the full detail block.'},
+                    'serviceMode': {'type': 'string', 'enum': ['idle_ok', 'batch',
+                                     'event_driven', 'always_on_trading'],
+                                     'description': 'Operating mode. Trading and event '
+                                     'modes require window-only edits, safe-state and '
+                                     'restore plans, blackout windows, and run the '
+                                     'repo gate before scheduling.'},
+                    'affectedServices': {'type': 'array', 'items': {'type': 'string'},
+                                          'description': 'Services, teams, products, or '
+                                          'customers touched.'},
+                    'fileManifest': {'type': 'array', 'items': {'type': 'string'},
+                                      'description': 'Every repo path the window will '
+                                      'modify. Must match the reserved edits. Required '
+                                      'for high-risk requests.'},
+                    'rollbackPlan': {'type': 'string', 'description': 'Automatic, manual, '
+                                      'forward-fix, or abort. Include data and external '
+                                      'state, not just bytes. Required for high risk.'},
+                    'rollbackOwner': {'type': 'string', 'description': 'Who can trigger '
+                                      'the rollback. Required for high risk.'},
+                    'successCriteria': {'type': 'string', 'description': 'Measurable '
+                                         'definition of working. Required for high risk.'},
+                    'abortCriteria': {'type': 'string', 'description': 'Conditions that '
+                                       'stop the window before rollback. Required for '
+                                       'high risk.'},
+                    'postApplyChecks': {'type': 'string', 'description': 'Smoke, '
+                                         'integration, reconciliation, and health checks '
+                                         'after apply. Required for high risk.'},
+                    'safeStatePlan': {'type': 'string', 'description': 'How the service '
+                                       'is made safe before dormancy. Required for '
+                                       'trading and event modes.'},
+                    'restorePlan': {'type': 'string', 'description': 'How the service is '
+                                     'restored after the window. Required for trading and '
+                                     'event modes.'},
+                    'onCall': {'type': 'string', 'description': 'Who is paged if the '
+                                'window fails. Required for high risk.'},
+                    'acknowledgements': {'type': 'array', 'items': {'type': 'string'},
+                                          'description': 'Agent ids of the affected team '
+                                          'lead or risk owner who know about the window. '
+                                          'Required for high risk.'},
+                    'blackoutWindows': {'type': 'array', 'items': {'type': 'object'},
+                                         'description': 'Market, event, settlement, or '
+                                         'funding intervals the change must not overlap. '
+                                         'Absolute {start,end,label} or daily {start,end,'
+                                         'days,label}. Required for trading and event '
+                                         'modes.'},
                 },
                 'required': ['date', 'start', 'reason', 'validator'],
             },
@@ -12350,6 +12418,29 @@ AGENT_ASK_TOOLS = [
                                'issues category and the note.'},
                 },
                 'required': ['windowId', 'approved'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'veto_change_request',
+            'description': 'CHIEF OF STAFF ONLY. Veto a change request. '
+                           'Before the slot fires this cancels the window and '
+                           'releases its reservations. After it fired but '
+                           'before the push this rolls back every applied '
+                           'edit and blocks the push. A pushed window cannot '
+                           'be vetoed. A reason is always required. The player '
+                           'can veto directly through the player session.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'windowId': {'type': 'string', 'description': 'The '
+                                 'change request id to veto.'},
+                    'reason': {'type': 'string', 'description': 'Why the '
+                               'change must not land. Required.'},
+                },
+                'required': ['windowId', 'reason'],
             },
         },
     },
@@ -18841,6 +18932,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 'find': find_text,
                 'replace': replace_text,
                 'summary': summary,
+                'windowOnly': bool((args or {}).get('windowOnly')),
             }, agent_key, timeout=300)
             if isinstance(result, dict) and result.get('error'):
                 return (f'self_edit not filed: {result["error"]} '
@@ -18927,9 +19019,27 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 body['durationMin'] = int((args or {}).get('durationMin'))
             except (TypeError, ValueError):
                 pass
+            for arg_name, body_name in (
+                    ('title', 'title'), ('description', 'description'),
+                    ('changeType', 'changeType'), ('riskLevel', 'riskLevel'),
+                    ('serviceMode', 'serviceMode'),
+                    ('affectedServices', 'affectedServices'),
+                    ('fileManifest', 'fileManifest'),
+                    ('rollbackPlan', 'rollbackPlan'),
+                    ('rollbackOwner', 'rollbackOwner'),
+                    ('successCriteria', 'successCriteria'),
+                    ('abortCriteria', 'abortCriteria'),
+                    ('postApplyChecks', 'postApplyChecks'),
+                    ('safeStatePlan', 'safeStatePlan'),
+                    ('restorePlan', 'restorePlan'), ('onCall', 'onCall'),
+                    ('acknowledgements', 'acknowledgements'),
+                    ('blackoutWindows', 'blackoutWindows')):
+                value = (args or {}).get(arg_name)
+                if value is not None:
+                    body[body_name] = value
             result = _http_json('POST', SELF_BASE_URL,
                                 '/api/selfedit/schedule', body, agent_key,
-                                timeout=300)
+                                timeout=1800)
             if isinstance(result, dict) and result.get('error'):
                 lines = [f'schedule_dormant_apply refused: {result["error"]}']
                 for c in (result.get('conflicts') or [])[:8]:
@@ -19033,6 +19143,24 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 return (f'Change request {window_id}: {result.get("status")}'
                         f'{detail} -- {result.get("message", "")}')
             return 'selfedit_validate returned an unexpected response.'
+        if name == 'veto_change_request':
+            window_id = ((args or {}).get('windowId') or '').strip()
+            reason = ((args or {}).get('reason') or '').strip()
+            if not window_id or not reason:
+                return ('veto_change_request requires windowId and a reason.')
+            body = {'agentId': agent_id, 'windowId': window_id,
+                    'reason': reason[:800]}
+            result = _http_json('POST', SELF_BASE_URL,
+                                '/api/selfedit/window/veto', body, agent_key,
+                                timeout=120)
+            if isinstance(result, dict) and result.get('error'):
+                return (f'veto_change_request refused: {result["error"]} '
+                        '[only the player session or the chief of staff may '
+                        'veto]')
+            if isinstance(result, dict) and result.get('status'):
+                return (f'Change request {window_id}: {result.get("status")} '
+                        f'-- {result.get("reason", "")}')
+            return 'veto_change_request returned an unexpected response.'
         if name == 'policy_edit':
             key = ((args or {}).get('key') or '').strip()
             value = (args or {}).get('value')
@@ -26899,13 +27027,15 @@ async def selfedit_propose(request: Request):
     find_text = body.get('find') if isinstance(body.get('find'), str) else None
     replace_text = body.get('replace') if isinstance(body.get('replace'), str) else None
     summary = (body.get('summary') or '').strip()
+    window_only = bool(body.get('windowOnly'))
     if not path or not find_text or replace_text is None:
         return JSONResponse({'error': 'path, find and replace are required '
                                       '(replace may be an empty string to delete '
                                       'the anchor) and a summary is required'}, status_code=400)
     try:
         ok, payload = await asyncio.to_thread(
-            _selfedit.propose, agent_id, path, find_text, replace_text, summary)
+            _selfedit.propose, agent_id, path, find_text, replace_text, summary,
+            window_only=window_only)
     except Exception as exc:
         print(f'[selfedit] propose crashed for {agent_id}: {exc}', flush=True)
         log_action(agent_id, 'selfedit_crashed', {'error': str(exc)[:300]},
@@ -27000,7 +27130,24 @@ async def selfedit_schedule(request: Request):
     try:
         ok, payload = await asyncio.to_thread(
             _selfedit.request_window, agent_id, date, start,
-            body.get('durationMin'), reason, validator)
+            body.get('durationMin'), reason, validator,
+            title=body.get('title'),
+            description=body.get('description'),
+            change_type=body.get('changeType') or 'normal',
+            risk_level=body.get('riskLevel') or 'low',
+            service_mode=body.get('serviceMode') or 'idle_ok',
+            affected_services=body.get('affectedServices'),
+            file_manifest=body.get('fileManifest'),
+            rollback_plan=body.get('rollbackPlan'),
+            rollback_owner=body.get('rollbackOwner'),
+            success_criteria=body.get('successCriteria'),
+            abort_criteria=body.get('abortCriteria'),
+            post_apply_checks=body.get('postApplyChecks'),
+            safe_state_plan=body.get('safeStatePlan'),
+            restore_plan=body.get('restorePlan'),
+            on_call=body.get('onCall'),
+            acknowledgements=body.get('acknowledgements'),
+            blackout_windows=body.get('blackoutWindows'))
     except Exception as exc:
         print(f'[selfedit] schedule crashed for {agent_id}: {exc}', flush=True)
         log_action(agent_id, 'selfedit_crashed', {'error': str(exc)[:300]},
@@ -27046,6 +27193,53 @@ async def selfedit_window_cancel(request: Request):
     log_action('player' if session else admin_agent, 'selfedit_window_cancel',
                {'windowId': window_id, 'ok': ok,
                 'note': ((payload or {}).get('error') or '')[:160]}, authorized=True)
+    return JSONResponse(payload, status_code=200 if ok else 400)
+
+
+@app.post('/api/selfedit/window/veto')
+async def selfedit_window_veto(request: Request):
+    """Player or chief-of-staff veto for a change request.
+
+    Before the slot fires: cancel it and release the reservations. After it
+    fired but before push: roll back every applied edit and block the push.
+    A pushed window cannot be vetoed. A reason is always required.
+    """
+    body = await request.json()
+    window_id = (body.get('windowId') or '').strip()
+    reason = (body.get('reason') or '').strip()
+    if not window_id:
+        return JSONResponse({'error': 'windowId is required'},
+                            status_code=400)
+    if not reason:
+        return JSONResponse({'error': 'a reason is required for a veto'},
+                            status_code=400)
+    session = verify_session(request.cookies.get(SESSION_COOKIE_NAME))
+    agent_id = (body.get('agentId') or '').strip()
+    admin_agent = None
+    if agent_id and verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) \
+            and _is_admin(get_state_from_db() or {}, agent_id):
+        admin_agent = agent_id
+    if not session and not admin_agent:
+        return JSONResponse({'error': 'only the player session or the chief '
+                                      'of staff agent may veto a change '
+                                      'request'}, status_code=403)
+    actor = 'player' if session else admin_agent
+    try:
+        ok, payload = await asyncio.to_thread(
+            _selfedit.veto_window, window_id, actor, reason)
+    except Exception as exc:
+        print(f'[selfedit] veto crashed for {window_id}: {exc}', flush=True)
+        log_action(actor, 'selfedit_veto_crashed',
+                   {'error': str(exc)[:300], 'windowId': window_id},
+                   authorized=True)
+        return JSONResponse({'error': f'the veto harness failed: {exc}'},
+                            status_code=500)
+    log_action(actor, 'selfedit_window_veto',
+               {'windowId': window_id, 'ok': ok,
+                'reason': reason[:200],
+                'note': (((payload or {}).get('error') or '') or
+                         ((payload or {}).get('message') or ''))[:160]},
+               authorized=True)
     return JSONResponse(payload, status_code=200 if ok else 400)
 
 

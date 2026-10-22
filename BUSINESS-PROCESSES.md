@@ -2322,6 +2322,54 @@ duration of 5-240 minutes (default 15). The chain is strict:
    was down is recorded `missed`. The player or chief of staff agent can cancel a
    window before it fires.
 
+**Change-request detail fields (2026-10-22).** The slot is only part of
+the request. Every request carries a title, description, change type
+(`standard`, `normal`, `emergency`), risk level (`low`, `medium`, `high`,
+`critical`), service mode (`idle_ok`, `batch`, `event_driven`,
+`always_on_trading`), affected services, a file manifest, the rollback plan
+and owner, success and abort criteria, post-apply checks, the on-call owner,
+acknowledgements, and declared blackout windows. The file manifest must match
+the reserved edits exactly. Low-risk requests may omit the block and get an
+auto-generated manifest from the reserved paths.
+
+High-risk requests are those with risk `high` or `critical`, or service mode
+`event_driven` or `always_on_trading`. They must declare the full block, at
+least one acknowledgement from the affected team or risk owner, and every
+reserved edit must be `window_only`. A window-only edit never applies on the
+idle dormancy path. Trading and event modes also declare a safe-state plan,
+a restore plan, and blackout windows. They are capped at 5 and 15 minutes.
+High-risk requests run the repo gate against a quarantine copy with the
+candidate edits applied BEFORE the request is scheduled. A failed pre-apply
+gate refuses the request.
+
+**Fire-time revalidation (2026-10-22).** Approval is not a permanent pass.
+When a window becomes due, the server re-runs the conflict scan excluding the
+window itself, rechecks declared blackouts, confirms the validator is still
+on the roster and still a director, confirms the reserved edits are still
+armed, compares the stored manifest to the reserved paths, and rechecks the
+window-only rule. Any failure records `deferred_conflict`, releases the
+reservations, mails the implementer, and notifies the player. The window does
+not fire. A deferred request is rebooked as a new request.
+
+**Veto (2026-10-22).** The player and the chief of staff can veto a change
+request at any point before it is pushed. The veto requires a reason and is
+final. Before the slot fires, a veto cancels the window and releases the
+reserved edits. After the slot fired but before the push, a veto rolls back
+every applied edit and blocks the push. A pushed window cannot be vetoed; it
+needs a fresh change request. The implementer, the validator, and the player
+are notified, and the veto is recorded with who, when, and why.
+
+**Trading and event safety.** Blackout windows accept absolute intervals
+(`YYYY-MM-DDTHH:MM`) or daily recurring intervals (`HH:MM` plus days 0-6,
+Monday is 0). The team declares its market, event, settlement, or funding
+windows. The request is refused if the slot overlaps one, and the check runs
+again at fire time. The safe-state plan says how the service is made safe
+before dormancy, for example cancel resting orders, reduce exposure, set
+broker-side stops, or enter read-only mode. The restore plan says how it is
+returned to normal, including position and order reconciliation. A code
+rollback restores bytes; it does not undo a filled order, so the safe-state
+and reconciliation steps are the real protection.
+
 **Blocker bugs preempt their area.** When a failed or blocked task gates other
 work (`dependsOn`), the supervisor tick files a high-priority incident bug
 pinned to the owning team's on-call. The dependent cards keep their dependency
