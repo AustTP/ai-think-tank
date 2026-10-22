@@ -46,6 +46,7 @@ import governance
 import constitution
 import cron_scripts
 from optimization_advisor import build_optimization_advice
+import policies
 
 # Pure web/text/path/security helpers extracted to their own module
 # to shrink the serve.py monolith. See web_helpers.py.
@@ -5984,6 +5985,16 @@ def _is_latency_sensitive(purpose, task_type=None):
                                            'monitor', 'freshness check'))
 
 
+def _slug_for_band(band):
+    if band == 'coding':
+        return _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()
+    if band == 'high':
+        return _high_tier_slug() or _mid_tier_slug() or _low_tier_slug()
+    if band == 'mid':
+        return _mid_tier_slug() or _low_tier_slug()
+    return _low_tier_slug() or _mid_tier_slug()
+
+
 def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None,
                         best_effort=False):
     """Pick which model tier a call deserves, under the JEV-gated escalation
@@ -5997,6 +6008,18 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None,
 
     Fails CLOSED to low: a JEV outage, a non-binary answer, or a low-confidence
     escalation all keep the cheap tier."""
+    route = policies.choose_route(purpose, task_type, allow_high, best_effort)
+    if policies.apply_enabled():
+        band = route['band']
+        if band == 'high' and _high_tier_budget_exceeded():
+            band = 'mid'
+        slug = _slug_for_band(band)
+        if slug:
+            return slug
+    else:
+        policies.record_shadow('routing', route,
+                               {'purpose': (purpose or '')[:120],
+                                'task_type': task_type})
     if task_type in ('code', 'review', 'qa'):
         return _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()
     if _is_latency_sensitive(purpose, task_type):
@@ -34696,6 +34719,13 @@ async def optimization_advice(request: Request):
         return JSONResponse({'error': 'Unauthorized -- player session required'}, status_code=401)
     snapshot = await asyncio.to_thread(compute_health_snapshot)
     return JSONResponse(build_optimization_advice(snapshot))
+
+
+@app.get('/api/optimization/policies')
+async def optimization_policies(request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- player session required'}, status_code=401)
+    return JSONResponse(policies.snapshot())
 
 
 @app.get('/api/sim/status')

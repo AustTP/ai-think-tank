@@ -17,6 +17,7 @@ from collections import deque
 # rebind functions.
 from config import apply_policy_bindings, bind_policy
 import governance
+import policies
 
 # Pure, self-contained helpers extracted to their own module to
 # shrink the sim.py monolith. See sim_helpers.py.
@@ -6924,6 +6925,32 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
         _log_governance(state, author, 'fix_send_back_deduped',
                         {'taskId': task.get('id'), 'title': (task.get('title') or '')[:120]})
         return
+    alternatives = []
+    agents = state.get('agents') or {}
+    team_id = task.get('teamId')
+    if team_id:
+        for aid in _sim_direct_reports(state, team_id):
+            agent = agents.get(aid)
+            if (aid != author and agent and not agent.get('busy')
+                    and not agent.get('task') and not agent.get('pairWith')
+                    and not agent.get('offDuty')
+                    and governance.may_work_code(state, aid)):
+                alternatives.append(aid)
+    decision = policies.decide_retry(task, gate, note, is_infra=False,
+                                     alternatives=alternatives)
+    assignee = author
+    if (policies.apply_enabled() and decision.get('action') == 'reassign'
+            and decision.get('target') in alternatives):
+        assignee = decision['target']
+    policies.record_shadow('retry', decision, {
+        'taskId': task.get('id'),
+        'title': (task.get('title') or '')[:120],
+        'applied': assignee != author,
+    })
+    if assignee != author:
+        _log_governance(state, author, 'retry_reassigned',
+                        {'taskId': task.get('id'), 'from': author,
+                         'to': assignee, 'cycleCount': gate.get('cycleCount', 0)})
     queue_work(state, [{
         'title': f'Fix: {task.get("title")}',
         'room': task.get('room'),
@@ -6932,8 +6959,8 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
         'projectLabel': task.get('projectLabel') or task.get('title'),
         'taskType': 'code',
         'reviewOf': task.get('id'),
-        'reviewAuthorId': author,
-        'assignedTo': author,
+        'reviewAuthorId': assignee,
+        'assignedTo': assignee,
         'productId': task.get('productId'),
         'userStory': task.get('userStory'),
         'acceptanceCriteria': task.get('acceptanceCriteria'),
@@ -15179,9 +15206,18 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
             best_desc = max((s for _, s in desc), default=0)
             if best_desc > 0:
                 ordered = [cid for cid, s in desc if s == best_desc]
-        idx = pointer % len(ordered)
-        chosen_id = ordered[idx]
+        rr_pick = ordered[pointer % len(ordered)]
         rr['task'] = (pointer + 1) % max(1, len(ordered))
+        ranked = policies.rank_assignees(state, pick, ordered)
+        policy_pick = ranked[0]['agentId'] if ranked else None
+        chosen_id = policy_pick if (policies.apply_enabled() and policy_pick) else rr_pick
+        policies.record_shadow('assignment', {
+            'chosenByPolicy': policy_pick,
+            'roundRobin': rr_pick,
+            'ranked': ranked[:5],
+        }, {'title': (pick.get('title') or '')[:120],
+            'taskType': pick.get('taskType'),
+            'room': pick.get('room')})
     # Sprint staffing invariant: whoever was chosen must be inside the sprint's
     # pool. Candidates were already narrowed above, so this only trips for a
     # path that bypassed the narrowed list (e.g. an incident backup re-derive);
