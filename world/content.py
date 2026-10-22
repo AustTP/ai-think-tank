@@ -37,6 +37,61 @@ import work_reuse
 
 from config import RESEARCH_DESK_PASSES, bind_policy
 
+# Tool safety metadata (the Pi Durable takeaway). Every tool has a replay
+# posture and a trust tier. Read-only tools may be repeated freely; tools with
+# external side effects are unsafe to replay and should take a stable
+# requestId. The trust tiers are the transcript's research / prepare / pay
+# ladder applied to our surface: research reads, prepare stages a reversible
+# artifact, commit moves money, sends, or grants access. Unknown tools default
+# to unsafe/commit so a new tool cannot silently become replayable.
+_READ_ONLY_TOOLS = frozenset({
+    'search_library', 'read_library_file', 'search_web', 'browse_page',
+    'github_get_repo', 'github_search_code', 'read_ais_feed', 'read_market_feed',
+    'read_live_feed', 'read_rss_feed', 'read_weather', 'read_google_sheet',
+    'list_calendar_events', 'search_gmail_messages', 'read_gmail_message',
+    'read_google_doc', 'list_services', 'apify_get_dataset_items',
+    'db_records', 'state_records', 'supervisor_db_records',
+    'supervisor_state_records',
+})
+_PREPARE_TOOLS = frozenset({
+    'create_gmail_draft', 'create_google_doc', 'append_google_sheet_row',
+    'write_spike_report', 'write_report', 'draft_email', 'save_note',
+})
+_COMMIT_TOOLS = frozenset({
+    'apify_run_actor', 'create_calendar_event', 'generate_pixel_character',
+    'generate_agent_avatar', 'generate_image', 'generate_video', 'assign_task',
+    'direct_backlog', 'propose_api_service', 'request_allowlist',
+    'grant_allowlist', 'revoke_allowlist', 'request_capability_handle',
+    'adversarial_village', 'local_file', 'app_script', 'send_email',
+    'send_sms', 'send_telegram', 'supervisor_report',
+})
+
+
+def tool_replay_safety(name):
+    """'safe' when repeating the call cannot create a second side effect."""
+    name = str(name or '')
+    if name in _READ_ONLY_TOOLS:
+        return 'safe'
+    if name.startswith(('read_', 'search_', 'list_', 'get_')):
+        return 'safe'
+    return 'unsafe'
+
+
+def tool_trust_tier(name):
+    """research | prepare | commit. Unknown tools are commit (fail closed)."""
+    name = str(name or '')
+    if name in _COMMIT_TOOLS:
+        return 'commit'
+    if tool_replay_safety(name) == 'safe':
+        return 'research'
+    if name in _PREPARE_TOOLS:
+        return 'prepare'
+    return 'commit'
+
+
+def tool_policy(name):
+    return {'replay': tool_replay_safety(name), 'tier': tool_trust_tier(name)}
+
 
 def _chat_error_result(r, fallback_note):
     """Item 4: when /api/chat refuses a call carrying a taskId because that
@@ -5067,6 +5122,10 @@ _APIFY_RUN_ACTOR_TOOL = {
                 'waitSeconds': {'type': 'integer',
                                 'description': ('How long to wait (seconds) for the run to finish '
                                                 'before returning its current status. Max 60.')},
+                'requestId': {'type': 'string',
+                              'description': ('Optional stable idempotency key (use the task id or a UUID). '
+                                              'A retry with the same requestId returns the original run '
+                                              'instead of starting a duplicate meter-billed run.')},
             },
             'required': ['actorId', 'input'],
         },
@@ -5126,41 +5185,57 @@ def _make_apify_tools_executor(agent_id, key):
             actor_id = (args.get('actorId') or '').strip()
             if not actor_id:
                 return 'actorId is required'
-            if _serve._apify_budget_exceeded():
-                return ('Apify monthly budget is exhausted -- refusing to start this actor run '
-                        '(fail closed). Do not retry; say so in your findings.')
             inp = args.get('input') or {}
             wait = min(int(args.get('waitSeconds') or 30), 60)
-            query = {'timeout': str(max(60, wait + 30))}
-            data, error = _call(f'/actors/{actor_id}/runs', method='POST', body=inp, query=query,
-                                purpose='run an Apify actor')
-            if error:
-                return f'Could not start Apify actor: {error}'
-            run = (data or {}).get('data') or {}
-            run_id = run.get('id')
-            dataset_id = run.get('defaultDatasetId')
-            status = run.get('status') or 'RUNNING'
-            elapsed = 0.0
-            while status in ('READY', 'RUNNING') and elapsed < wait:
-                time.sleep(3)
-                elapsed += 3
-                data, error = _call(f'/actor-runs/{run_id}', purpose='poll an Apify actor run')
+            request_id = (args.get('requestId') or '').strip()
+            if not request_id:
+                request_id = _serve.external_write_key(
+                    actor_id, json.dumps(inp, sort_keys=True, default=str))[:32]
+            cache_key = f'{agent_id}:{actor_id}:{request_id}'
+
+            def _run():
+                if _serve._apify_budget_exceeded():
+                    return None, ('Apify monthly budget is exhausted -- refusing to start this '
+                                  'actor run (fail closed). Do not retry; say so in your findings.')
+                query = {'timeout': str(max(60, wait + 30))}
+                data, error = _call(f'/actors/{actor_id}/runs', method='POST', body=inp,
+                                    query=query, purpose='run an Apify actor')
                 if error:
-                    break
+                    return None, f'Could not start Apify actor: {error}'
                 run = (data or {}).get('data') or {}
+                run_id = run.get('id')
+                dataset_id = run.get('defaultDatasetId')
                 status = run.get('status') or 'RUNNING'
-                dataset_id = run.get('defaultDatasetId') or dataset_id
-            cost = run.get('usageTotalUsd') or 0.0
-            result = {'runId': run_id, 'datasetId': dataset_id, 'status': status,
-                      'usageTotalUsd': cost}
-            if status == 'SUCCEEDED' and dataset_id:
-                items, error = _call(f'/datasets/{dataset_id}/items',
-                                     query={'format': 'json', 'clean': '1', 'limit': '10'},
-                                     purpose='fetch Apify dataset items')
-                if error:
-                    result['itemsError'] = error
-                else:
-                    result['items'] = items
+                elapsed = 0.0
+                while status in ('READY', 'RUNNING') and elapsed < wait:
+                    time.sleep(3)
+                    elapsed += 3
+                    data, error = _call(f'/actor-runs/{run_id}',
+                                        purpose='poll an Apify actor run')
+                    if error:
+                        break
+                    run = (data or {}).get('data') or {}
+                    status = run.get('status') or 'RUNNING'
+                    dataset_id = run.get('defaultDatasetId') or dataset_id
+                cost = run.get('usageTotalUsd') or 0.0
+                result = {'runId': run_id, 'datasetId': dataset_id, 'status': status,
+                          'usageTotalUsd': cost}
+                if status == 'SUCCEEDED' and dataset_id:
+                    items, error = _call(f'/datasets/{dataset_id}/items',
+                                         query={'format': 'json', 'clean': '1', 'limit': '10'},
+                                         purpose='fetch Apify dataset items')
+                    if error:
+                        result['itemsError'] = error
+                    else:
+                        result['items'] = items
+                return result, None
+
+            result, error, replayed = _serve.external_write_once(
+                'apify_run_actor', cache_key, _run, ttl_s=3600)
+            if error:
+                return error
+            if replayed:
+                result['replayed'] = True
             # Injection boundary: scraped web items are untrusted third-party
             # content. Wrap before returning to the model.
             raw = json.dumps(result)[:6000]
@@ -5370,6 +5445,10 @@ _GOOGLE_CALENDAR_CREATE_TOOL = {
                 'start_datetime': {'type': 'string', 'description': 'ISO 8601 start, e.g. "2026-10-01T14:00:00-04:00".'},
                 'end_datetime': {'type': 'string', 'description': 'ISO 8601 end, e.g. "2026-10-01T15:00:00-04:00".'},
                 'description': {'type': 'string', 'description': 'Optional event description.'},
+                'requestId': {'type': 'string',
+                              'description': ('Optional stable idempotency key (use the task id or a UUID). '
+                                              'A retry with the same requestId returns the original event '
+                                              'instead of creating a duplicate.')},
             },
             'required': ['summary', 'start_datetime', 'end_datetime'],
         },
@@ -5494,7 +5573,7 @@ _GOOGLE_DOCS_CREATE_TOOL = {
 }
 
 
-def _make_google_tools_executor():
+def _make_google_tools_executor(agent_id=None):
     def execute_tool(name, args):
         args = args or {}
         if name == 'read_google_sheet':
@@ -5541,14 +5620,43 @@ def _make_google_tools_executor():
             end = (args.get('end_datetime') or '').strip()
             if not summary or not start or not end:
                 return 'summary, start_datetime, and end_datetime are required'
-            body = {'summary': summary, 'start': {'dateTime': start}, 'end': {'dateTime': end}}
+            request_id = (args.get('requestId') or '').strip()
+            if not request_id:
+                request_id = _serve.external_write_key(
+                    summary, start, end, args.get('description') or '')[:32]
+            cache_key = f'{agent_id or "tank"}:{request_id}'
+            # Google Calendar accepts a caller-supplied event id (base32hex,
+            # lowercase a-v/0-9). A deterministic id makes a retry after a
+            # crash hit the same event instead of creating a second one.
+            event_id = 'tt' + _serve.external_write_key(cache_key)[:30]
+            body = {'summary': summary, 'start': {'dateTime': start}, 'end': {'dateTime': end},
+                    'id': event_id}
             if args.get('description'):
                 body['description'] = args['description']
-            data, error = _serve._google_call(
-                'POST', 'https://www.googleapis.com/calendar/v3/calendars/primary/events', body)
+
+            def _create():
+                data, error = _serve._google_call(
+                    'POST', 'https://www.googleapis.com/calendar/v3/calendars/primary/events',
+                    body)
+                if error:
+                    if '409' in str(error) or 'already exists' in str(error).lower():
+                        existing, get_error = _serve._google_call(
+                            'GET', 'https://www.googleapis.com/calendar/v3/calendars/primary/events/'
+                                   + event_id)
+                        if not get_error:
+                            return {'id': existing.get('id') or event_id,
+                                    'htmlLink': existing.get('htmlLink')}, None
+                    return None, f'Could not create the event: {error}'
+                return {'id': data.get('id') or event_id,
+                        'htmlLink': data.get('htmlLink')}, None
+
+            result, error, replayed = _serve.external_write_once(
+                'calendar_event', cache_key, _create, ttl_s=86400 * 30)
             if error:
-                return f'Could not create the event: {error}'
-            return json.dumps({'id': data.get('id'), 'htmlLink': data.get('htmlLink')})
+                return error
+            if replayed:
+                result['replayed'] = True
+            return json.dumps(result)
         if name == 'search_gmail_messages':
             query = (args.get('query') or '').strip()
             if not query:
@@ -6308,7 +6416,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     spike_report_writer = _make_spike_report_writer(agent_id, key, report_path)
     treg_tool = _make_treg_tools_executor()
     pixellab_tool = _make_pixellab_tools_executor(agent_id, key)
-    google_tool = _make_google_tools_executor()
+    google_tool = _make_google_tools_executor(agent_id)
     github_tool = _make_github_tools_executor(agent_id, key)
     apify_tool = _make_apify_tools_executor(agent_id, key)
     youtube_tool = _make_youtube_transcript_executor(agent_id, key)

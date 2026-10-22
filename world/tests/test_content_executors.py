@@ -645,7 +645,7 @@ class ObservatoriesAndDispatcher(_ExecutorTestCase):
             with mock.patch.object(content, '_run_distill_content') as d, \
                  mock.patch.object(content, '_run_skill_review_content') as s, \
                  mock.patch.object(content, '_run_research_content') as r, \
-                 mock.patch.object(content, '_run_research_project_content') as rp, \
+                 mock.patch.object(content, '_run_spike_content') as rp, \
                  mock.patch.object(content, '_run_research_bare_content') as rb:
                 content._run_observatory_content(_snapshot(), 'cora', task)
             if flag == 'distill':

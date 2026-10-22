@@ -814,6 +814,122 @@ def _db():
         conn.close()
 
 
+def external_write_key(*parts):
+    """Stable digest for a logical external write. Callers that have a
+    requestId should pass it directly; this helper is for deriving a key from
+    the operation's own inputs."""
+    h = hashlib.sha256()
+    for part in parts:
+        h.update(str(part).encode('utf-8', errors='replace'))
+        h.update(b'\x00')
+    return h.hexdigest()
+
+
+def external_write_once(kind, key, fn, ttl_s=86400, pending_s=180):
+    """Exactly-once convention for a side-effectful external call.
+
+    Returns (result, error, replayed). `fn` must return (result, error) and
+    result must be JSON serializable. A completed write is reused for ttl_s.
+    A concurrent duplicate sees an in-progress row and is refused rather than
+    starting a second side effect; a stale in-progress row (crashed process)
+    is taken over after pending_s.
+    """
+    now = time.time()
+    try:
+        # The ledger table is created in init_db(), but a copied/older DB may
+        # predate it; make the helper self-sufficient.
+        with _db() as conn:
+            conn.execute('''CREATE TABLE IF NOT EXISTS external_writes (
+                kind TEXT NOT NULL,
+                key TEXT NOT NULL,
+                result TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (kind, key)
+            )''')
+        with _db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute(
+                'SELECT result, created_at FROM external_writes WHERE kind=? AND key=?',
+                (kind, key)).fetchone()
+            if row:
+                result_text, created_at = row
+                if result_text and now - float(created_at or 0) < ttl_s:
+                    return json.loads(result_text), None, True
+                if not result_text and now - float(created_at or 0) < pending_s:
+                    return None, 'duplicate request is already in progress', False
+            conn.execute(
+                'INSERT OR REPLACE INTO external_writes (kind, key, result, created_at) '
+                'VALUES (?, ?, ?, ?)', (kind, key, '', now))
+    except Exception as e:
+        return None, f'idempotency ledger unavailable: {e}', False
+
+    try:
+        result, error = fn()
+    except Exception as e:
+        result, error = None, str(e)
+    if error:
+        try:
+            with _db() as conn:
+                conn.execute(
+                    'DELETE FROM external_writes WHERE kind=? AND key=? AND result=\'\'',
+                    (kind, key))
+        except Exception:
+            pass
+        return None, error, False
+    try:
+        with _db() as conn:
+            conn.execute(
+                'UPDATE external_writes SET result=?, created_at=? WHERE kind=? AND key=?',
+                (json.dumps(result, sort_keys=True), time.time(), kind, key))
+    except Exception as e:
+        return None, f'write completed but the idempotency ledger failed: {e}', False
+    return result, None, False
+
+
+def set_collector_checkpoint(collector, cursor):
+    """Persist the last processed cursor for one live feed. Best effort: a
+    checkpoint failure must never stop ingestion."""
+    if not collector:
+        return False
+    try:
+        with _db() as conn:
+            conn.execute('''CREATE TABLE IF NOT EXISTS collector_checkpoints (
+                collector TEXT PRIMARY KEY,
+                cursor TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )''')
+            conn.execute(
+                'INSERT OR REPLACE INTO collector_checkpoints (collector, cursor, updated_at) '
+                'VALUES (?, ?, ?)',
+                (str(collector), json.dumps(cursor, sort_keys=True), time.time()))
+        return True
+    except Exception:
+        return False
+
+
+def get_collector_checkpoint(collector):
+    if not collector:
+        return None
+    try:
+        with _db() as conn:
+            conn.execute('''CREATE TABLE IF NOT EXISTS collector_checkpoints (
+                collector TEXT PRIMARY KEY,
+                cursor TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )''')
+            row = conn.execute(
+                'SELECT cursor, updated_at FROM collector_checkpoints WHERE collector=?',
+                (str(collector),)).fetchone()
+        if not row:
+            return None
+        data = json.loads(row[0])
+        if isinstance(data, dict):
+            data['checkpoint_at'] = row[1]
+        return data
+    except Exception:
+        return None
+
+
 def init_db():
     # Replaces state.json (whole-think tank state) and the separate
     # browse_log.jsonl/execute_log.jsonl files (scattered, per-feature
@@ -873,6 +989,24 @@ def init_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS task_archive (
             id TEXT PRIMARY KEY,
             blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        # Idempotency ledger for external writes. A retry with the same
+        # requestId returns the original result instead of starting a second
+        # Apify run or creating a second calendar event.
+        conn.execute('''CREATE TABLE IF NOT EXISTS external_writes (
+            kind TEXT NOT NULL,
+            key TEXT NOT NULL,
+            result TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (kind, key)
+        )''')
+        # Durable cursor for a live feed collector. AISStream is live-only, so
+        # this records the last ingested frame and the reconnect coverage gap;
+        # it is a checkpoint, not a replay buffer.
+        conn.execute('''CREATE TABLE IF NOT EXISTS collector_checkpoints (
+            collector TEXT PRIMARY KEY,
+            cursor TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
         # Measurement-only: a hash of every Jev decision REQUEST, so we can

@@ -66,6 +66,52 @@ def tearDownModule():
     shutil.rmtree(_MODULE_TMP_DIR, ignore_errors=True)
 
 
+class ExternalWriteOnce(unittest.TestCase):
+    """The retry ledger must replay a completed write and refuse a concurrent
+    duplicate instead of starting a second side effect."""
+
+    def test_completed_write_replays(self):
+        calls = []
+        key = f'replay-test-{serve.time.time()}'
+
+        def fn():
+            calls.append(1)
+            return {'runId': 'r1'}, None
+
+        first, err, replayed = serve.external_write_once('test', key, fn)
+        self.assertIsNone(err)
+        self.assertFalse(replayed)
+        second, err, replayed = serve.external_write_once('test', key, fn)
+        self.assertIsNone(err)
+        self.assertTrue(replayed)
+        self.assertEqual(second, first)
+        self.assertEqual(len(calls), 1)
+
+    def test_failed_write_releases_the_key(self):
+        key = f'fail-test-{serve.time.time()}'
+        first, err, _ = serve.external_write_once(
+            'test', key, lambda: (None, 'boom'))
+        self.assertEqual(err, 'boom')
+        second, err, replayed = serve.external_write_once(
+            'test', key, lambda: ({'ok': True}, None))
+        self.assertIsNone(err)
+        self.assertFalse(replayed)
+        self.assertEqual(second, {'ok': True})
+
+
+class CollectorCheckpoint(unittest.TestCase):
+    def test_checkpoint_round_trip(self):
+        key = f'cp-test-{serve.time.time()}'
+        self.assertTrue(serve.set_collector_checkpoint(key, {'ts': 123, 'topic': 'x'}))
+        cp = serve.get_collector_checkpoint(key)
+        self.assertEqual(cp.get('ts'), 123)
+        self.assertEqual(cp.get('topic'), 'x')
+        self.assertIn('checkpoint_at', cp)
+
+    def test_missing_checkpoint_is_none(self):
+        self.assertIsNone(serve.get_collector_checkpoint('no-such-collector-xyz'))
+
+
 class RedactSecrets(unittest.TestCase):
     def test_redacts_openrouter_style_key(self):
         out = serve._redact_secrets('here is my key sk-abcdefghijklmnopqrstuvwxyz123456 keep it safe')

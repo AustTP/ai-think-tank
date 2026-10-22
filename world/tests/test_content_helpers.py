@@ -1122,6 +1122,49 @@ class SpikeExecutorBranches(unittest.TestCase):
                                                'end_datetime': 'y', 'description': 'd'})
             self.assertIn('e1', out)
 
+    def test_apify_run_replays_without_starting_a_second_run(self):
+        ex = content._make_apify_tools_executor('ben', 'k')
+        calls = []
+        request_id = f'req-{serve.time.time()}'
+
+        def api_execute(agent_id, key, url, method='GET', req_body=None, req_headers=None,
+                        purpose='', workflow=False, workflow_params=None, trace_id=None):
+            calls.append((method, url))
+            if '/datasets/' in url:
+                return {'ok': True, 'data': [{'item': 1}], 'textForModel': '',
+                        'modelInstruction': ''}
+            return {'ok': True, 'data': {'data': {'id': 'r1', 'defaultDatasetId': 'd1',
+                                                  'status': 'SUCCEEDED', 'usageTotalUsd': 0.05}},
+                    'textForModel': '', 'modelInstruction': ''}
+
+        with mock.patch.object(serve, '_apify_budget_exceeded', return_value=False), \
+             mock.patch.object(serve, '_api_execute', side_effect=api_execute):
+            first = ex('apify_run_actor', {'actorId': 'a', 'input': {'x': 1},
+                                           'waitSeconds': 1, 'requestId': request_id})
+            second = ex('apify_run_actor', {'actorId': 'a', 'input': {'x': 1},
+                                            'waitSeconds': 1, 'requestId': request_id})
+        self.assertIn('"status": "SUCCEEDED"', first)
+        self.assertIn('"replayed": true', second)
+        self.assertEqual(len(calls), 2, 'one POST + one dataset GET; replay must not call again')
+
+    def test_calendar_event_replays_without_creating_a_second_event(self):
+        ex = content._make_google_tools_executor('ben')
+        calls = []
+        request_id = f'cal-{serve.time.time()}'
+
+        def google_call(method, url, body=None):
+            calls.append(method)
+            return ({'id': 'e1', 'htmlLink': 'l'}, None)
+
+        with mock.patch.object(serve, '_google_call', side_effect=google_call):
+            first = ex('create_calendar_event', {'summary': 's', 'start_datetime': 'x',
+                                                 'end_datetime': 'y', 'requestId': request_id})
+            second = ex('create_calendar_event', {'summary': 's', 'start_datetime': 'x',
+                                                  'end_datetime': 'y', 'requestId': request_id})
+        self.assertIn('"id": "e1"', first)
+        self.assertIn('"replayed": true', second)
+        self.assertEqual(calls, ['POST'], 'the replay must not POST again')
+
     def test_make_google_tools_executor_gmail_read_only(self):
         # Gmail is READ + DRAFT ONLY: search/read work, draft create works,
         # and there is no send path at all.
@@ -1552,3 +1595,23 @@ class ReportContent(unittest.TestCase):
         self.assertTrue(stored.get('ok'))
         self.assertEqual(stored.get('reportPath'), 'archive/out.md')
         self.assertIn('REAL SUMMARY', posted['args'][3]['content'])
+
+
+class ToolSafetyPolicy(unittest.TestCase):
+    def test_read_only_tools_are_safe_and_research_tier(self):
+        self.assertEqual(content.tool_replay_safety('read_library_file'), 'safe')
+        self.assertEqual(content.tool_trust_tier('read_library_file'), 'research')
+        self.assertEqual(content.tool_replay_safety('browse_page'), 'safe')
+
+    def test_side_effectful_tools_are_unsafe(self):
+        self.assertEqual(content.tool_replay_safety('apify_run_actor'), 'unsafe')
+        self.assertEqual(content.tool_replay_safety('write_spike_report'), 'unsafe')
+
+    def test_prepare_and_commit_tiers(self):
+        self.assertEqual(content.tool_trust_tier('create_gmail_draft'), 'prepare')
+        self.assertEqual(content.tool_trust_tier('create_calendar_event'), 'commit')
+        self.assertEqual(content.tool_trust_tier('apify_run_actor'), 'commit')
+
+    def test_unknown_tool_defaults_closed(self):
+        self.assertEqual(content.tool_policy('brand_new_tool'),
+                         {'replay': 'unsafe', 'tier': 'commit'})

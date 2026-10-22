@@ -1327,6 +1327,17 @@ class PixellabCharacterTool(unittest.TestCase):
 
 
 class GoogleToolsExecutor(unittest.TestCase):
+    def setUp(self):
+        try:
+            with serve._db() as conn:
+                conn.execute('''CREATE TABLE IF NOT EXISTS external_writes (
+                    kind TEXT NOT NULL, key TEXT NOT NULL, result TEXT NOT NULL,
+                    created_at REAL NOT NULL, PRIMARY KEY (kind, key)''')
+                conn.execute('DELETE FROM external_writes')
+        except Exception:
+            pass
+
+
     """read_google_sheet / append_google_sheet_row / list_calendar_events /
     create_calendar_event -- real OAuth call mechanics confirmed
     against a real refresh token minted through a real
@@ -1390,13 +1401,18 @@ class GoogleToolsExecutor(unittest.TestCase):
                                         return_value=({'id': 'evt-1', 'htmlLink': 'https://cal/evt-1'}, None)) as call:
             out = executor('create_calendar_event', {
                 'summary': 'Sprint review', 'start_datetime': '2026-10-01T14:00:00-04:00',
-                'end_datetime': '2026-10-01T15:00:00-04:00', 'description': 'real ceremony'})
-        call.assert_called_once_with(
-            'POST', 'https://www.googleapis.com/calendar/v3/calendars/primary/events',
-            {'summary': 'Sprint review',
-             'start': {'dateTime': '2026-10-01T14:00:00-04:00'},
-             'end': {'dateTime': '2026-10-01T15:00:00-04:00'},
-             'description': 'real ceremony'})
+                'end_datetime': '2026-10-01T15:00:00-04:00', 'description': 'real ceremony',
+                'requestId': 'calendar-test-1'})
+        call.assert_called_once()
+        args = call.call_args.args
+        self.assertEqual(args[0], 'POST')
+        self.assertEqual(args[1], 'https://www.googleapis.com/calendar/v3/calendars/primary/events')
+        body = args[2]
+        self.assertEqual(body['summary'], 'Sprint review')
+        self.assertEqual(body['start'], {'dateTime': '2026-10-01T14:00:00-04:00'})
+        self.assertEqual(body['end'], {'dateTime': '2026-10-01T15:00:00-04:00'})
+        self.assertEqual(body['description'], 'real ceremony')
+        self.assertTrue(body['id'].startswith('tt'))
         self.assertIn('evt-1', out)
 
     def test_create_calendar_event_requires_summary_and_times(self):
@@ -1596,6 +1612,17 @@ class GitHubToolsExecutor(unittest.TestCase):
 
 
 class ApifyToolsExecutor(unittest.TestCase):
+    def setUp(self):
+        try:
+            with serve._db() as conn:
+                conn.execute('''CREATE TABLE IF NOT EXISTS external_writes (
+                    kind TEXT NOT NULL, key TEXT NOT NULL, result TEXT NOT NULL,
+                    created_at REAL NOT NULL, PRIMARY KEY (kind, key)''')
+                conn.execute('DELETE FROM external_writes')
+        except Exception:
+            pass
+
+
     """_make_apify_tools_executor: real Apify platform mechanics (POST
     /actors/{id}/runs, GET /actor-runs/{id}, GET /datasets/{id}/items) with
     the think tank's own Bearer token held server-side, spend-guarded by the
@@ -1627,7 +1654,7 @@ class ApifyToolsExecutor(unittest.TestCase):
             out = executor('apify_run_actor',
                            {'actorId': 'apify/website-content-crawler',
                             'input': {'startUrls': [{'url': 'https://example.com'}]},
-                            'waitSeconds': 5})
+                            'waitSeconds': 5, 'requestId': 'apify-success-test'})
         gate.assert_called_once()
         urls = [c.args[2] for c in ae.call_args_list]
         self.assertIn('/actors/apify/website-content-crawler/runs', urls[0])
@@ -1642,7 +1669,8 @@ class ApifyToolsExecutor(unittest.TestCase):
         with unittest.mock.patch.object(serve, '_apify_budget_exceeded', return_value=True), \
              unittest.mock.patch.object(serve, '_api_execute') as ae:
             out = executor('apify_run_actor', {'actorId': 'apify/website-content-crawler',
-                                               'input': {'startUrls': []}})
+                                               'input': {'startUrls': []},
+                                               'requestId': 'apify-budget-test'})
         ae.assert_not_called()
         self.assertIn('budget is exhausted', out)
 
@@ -1676,7 +1704,7 @@ class ApifyToolsExecutor(unittest.TestCase):
             out = executor('apify_run_actor',
                            {'actorId': 'apify/website-content-crawler',
                             'input': {'startUrls': [{'url': 'https://example.com'}]},
-                            'waitSeconds': 5})
+                            'waitSeconds': 5, 'requestId': 'apify-poll-error-test'})
         self.assertEqual(calls['n'], 2)  # start + one (errored) poll, then break
         self.assertIn('RUNNING', out)  # never overwritten after the failed poll
         self.assertIn('run-1', out)
@@ -1699,7 +1727,8 @@ class ApifyToolsExecutor(unittest.TestCase):
              unittest.mock.patch('time.sleep'):
             out = executor('apify_run_actor',
                            {'actorId': 'apify/website-content-crawler',
-                            'input': {'startUrls': []}, 'waitSeconds': 5})
+                            'input': {'startUrls': []}, 'waitSeconds': 5,
+                            'requestId': 'apify-items-error-test'})
         self.assertIn('SUCCEEDED', out)
         self.assertIn('itemsError', out)
         self.assertIn('items boom', out)

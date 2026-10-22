@@ -80,6 +80,7 @@ _WS_FEEDS: dict = {}  # live registry: sid -> {'name', 'credential', 'ws': descr
 _WS_FEEDS_LOAD_ERROR = None
 _WS_BUFFERS: dict = {}  # sid -> {'latest': {topic: rec}, 'history': [...], 'status': {...}}
 _WS_LOCK = threading.Lock()
+_WS_CHECKPOINT_AT: dict = {}  # sid -> last durable checkpoint write (monotonic seconds)
 _WS_TASKS: dict = {}  # sid -> (spec_fingerprint, asyncio.Task)
 
 
@@ -338,6 +339,18 @@ def _ws_ingest(sid, topic, fields, raw):
             cap = int(cfg.get('history') or 200)
             if len(buf['history']) > cap:
                 del buf['history'][:len(buf['history']) - cap]
+    # Durable cursor every 30s. AISStream is live-only, so this records the
+    # last frame and the reconnect coverage gap; it is not a replay buffer.
+    try:
+        now_s = time.time()
+        if now_s - _WS_CHECKPOINT_AT.get(sid, 0) >= 30:
+            _WS_CHECKPOINT_AT[sid] = now_s
+            _serve.set_collector_checkpoint(sid, {
+                'ts': rec['ts'], 'topic': topic,
+                'history': len(buf.get('history') or []),
+            })
+    except Exception:
+        pass
 
 
 def _ws_status(sid):
@@ -391,6 +404,17 @@ async def _ws_collector_loop(sid):
         buf = _serve._WS_BUFFERS.setdefault(sid, {'latest': {}, 'history': [],
                                                   'status': {'connected': False, 'last_error': '',
                                                              'connected_at': 0, 'last_tick_at': 0}})
+        try:
+            checkpoint = _serve.get_collector_checkpoint(sid)
+            if checkpoint:
+                cp_ts = checkpoint.get('ts') or 0
+                buf['status'].update({
+                    'checkpoint': checkpoint,
+                    'resumed_gap_s': (round(max(0.0, time.time() - cp_ts / 1000.0), 1)
+                                      if cp_ts else None),
+                })
+        except Exception:
+            pass
         try:
             token, _t2, err = _serve._api_credential_value(spec)
             if err:
