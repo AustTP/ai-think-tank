@@ -550,6 +550,15 @@ def _load_env():
     return env
 
 
+if __name__ == '__main__':
+    try:
+        _policy_mode = (_load_env().get('OPTIMIZATION_POLICY_MODE') or '').strip().lower()
+        if _policy_mode in ('shadow', 'apply'):
+            os.environ['OPTIMIZATION_POLICY_MODE'] = _policy_mode
+    except Exception:
+        pass
+
+
 def _reload_google_rate_limits(env):
     """Rebuild the Google per-minute rate ceilings IN PLACE from .env. The
     dict is read at call time by the limiter, so mutating it takes effect
