@@ -1588,6 +1588,7 @@ class ReportContent(unittest.TestCase):
              mock.patch.object(serve, 'get_or_create_agent_key', return_value='k'), \
              mock.patch.object(serve, '_http_json',
                                side_effect=lambda *a, **k: posted.update({'args': a})) as http, \
+             mock.patch.object(content.os.path, 'isfile', return_value=True), \
              mock.patch.object(sim, '_store_content_result',
                                side_effect=lambda tid, result: stored.update(result)):
             content._run_report_content({}, 'ruth', task)
@@ -1595,6 +1596,23 @@ class ReportContent(unittest.TestCase):
         self.assertTrue(stored.get('ok'))
         self.assertEqual(stored.get('reportPath'), 'archive/out.md')
         self.assertIn('REAL SUMMARY', posted['args'][3]['content'])
+
+    def test_local_report_fails_when_the_library_write_does_not_land(self):
+        task = {'id': 'r2', 'title': 'Transcript addendum', 'instructions': 'Summarize it.',
+                'sourcePaths': ['media/transcripts/v.txt'], 'reportPath': 'archive/out.md'}
+        stored = {}
+        with mock.patch.object(content, '_read_library_document',
+                               return_value='THE REAL TRANSCRIPT'), \
+             mock.patch.object(content, '_plain_completion', return_value='REAL SUMMARY'), \
+             mock.patch.object(serve, '_resolve_model_tier', return_value='model'), \
+             mock.patch.object(serve, 'get_or_create_agent_key', return_value='k'), \
+             mock.patch.object(serve, '_http_json', return_value={'error': 'request failed: timed out'}), \
+             mock.patch.object(content.os.path, 'isfile', return_value=False), \
+             mock.patch.object(sim, '_store_content_result',
+                               side_effect=lambda tid, result: stored.update(result)):
+            content._run_report_content({}, 'ruth', task)
+        self.assertFalse(stored.get('ok'))
+        self.assertIn('did not land', stored.get('note', ''))
 
 
 class ToolSafetyPolicy(unittest.TestCase):
