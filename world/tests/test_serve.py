@@ -99,6 +99,51 @@ class ExternalWriteOnce(unittest.TestCase):
         self.assertEqual(second, {'ok': True})
 
 
+class ToolConversationPolicy(unittest.TestCase):
+    def test_commit_tool_is_refused_without_approval(self):
+        execute = unittest.mock.Mock(return_value='EXECUTED')
+        responses = [
+            {'choices': [{'message': {'tool_calls': [
+                {'id': 'c1', 'function': {'name': 'create_calendar_event', 'arguments': '{}'}}]}}]},
+            {'choices': [{'message': {'content': 'done'}}]},
+        ]
+        with unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=responses), \
+             unittest.mock.patch.object(serve, '_accrue_spend'):
+            text, transcript = serve._call_agent_tool_loop(
+                'm', [{'role': 'user', 'content': 'go'}], [], execute,
+                max_iterations=2, return_transcript=True,
+                conversation_policy=lambda name: name != 'create_calendar_event')
+        self.assertEqual(text, 'done')
+        execute.assert_not_called()
+        tool_messages = [m['content'] for m in transcript if m.get('role') == 'tool']
+        self.assertTrue(any('needs player approval' in m for m in tool_messages))
+
+    def test_research_tool_is_allowed(self):
+        execute = unittest.mock.Mock(return_value='EXECUTED')
+        responses = [
+            {'choices': [{'message': {'tool_calls': [
+                {'id': 'c1', 'function': {'name': 'read_library_file', 'arguments': '{}'}}]}}]},
+            {'choices': [{'message': {'content': 'done'}}]},
+        ]
+        with unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=responses), \
+             unittest.mock.patch.object(serve, '_accrue_spend'):
+            serve._call_agent_tool_loop(
+                'm', [{'role': 'user', 'content': 'go'}], [], execute,
+                max_iterations=2, conversation_policy=lambda name: True)
+        execute.assert_called_once()
+
+
+class TaskCheckpoint(unittest.TestCase):
+    def test_round_trip_and_clear(self):
+        key = f'task-cp-{serve.time.time()}'
+        self.assertTrue(serve.save_task_checkpoint(key, 'planned', {'plan': 'P'}))
+        cp = serve.load_task_checkpoint(key)
+        self.assertEqual(cp.get('phase'), 'planned')
+        self.assertEqual(cp.get('plan'), 'P')
+        self.assertTrue(serve.clear_task_checkpoint(key))
+        self.assertIsNone(serve.load_task_checkpoint(key))
+
+
 class CollectorCheckpoint(unittest.TestCase):
     def test_checkpoint_round_trip(self):
         key = f'cp-test-{serve.time.time()}'

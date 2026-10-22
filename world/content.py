@@ -37,60 +37,8 @@ import work_reuse
 
 from config import RESEARCH_DESK_PASSES, bind_policy
 
-# Tool safety metadata (the Pi Durable takeaway). Every tool has a replay
-# posture and a trust tier. Read-only tools may be repeated freely; tools with
-# external side effects are unsafe to replay and should take a stable
-# requestId. The trust tiers are the transcript's research / prepare / pay
-# ladder applied to our surface: research reads, prepare stages a reversible
-# artifact, commit moves money, sends, or grants access. Unknown tools default
-# to unsafe/commit so a new tool cannot silently become replayable.
-_READ_ONLY_TOOLS = frozenset({
-    'search_library', 'read_library_file', 'search_web', 'browse_page',
-    'github_get_repo', 'github_search_code', 'read_ais_feed', 'read_market_feed',
-    'read_live_feed', 'read_rss_feed', 'read_weather', 'read_google_sheet',
-    'list_calendar_events', 'search_gmail_messages', 'read_gmail_message',
-    'read_google_doc', 'list_services', 'apify_get_dataset_items',
-    'db_records', 'state_records', 'supervisor_db_records',
-    'supervisor_state_records',
-})
-_PREPARE_TOOLS = frozenset({
-    'create_gmail_draft', 'create_google_doc', 'append_google_sheet_row',
-    'write_spike_report', 'write_report', 'draft_email', 'save_note',
-})
-_COMMIT_TOOLS = frozenset({
-    'apify_run_actor', 'create_calendar_event', 'generate_pixel_character',
-    'generate_agent_avatar', 'generate_image', 'generate_video', 'assign_task',
-    'direct_backlog', 'propose_api_service', 'request_allowlist',
-    'grant_allowlist', 'revoke_allowlist', 'request_capability_handle',
-    'adversarial_village', 'local_file', 'app_script', 'send_email',
-    'send_sms', 'send_telegram', 'supervisor_report',
-})
-
-
-def tool_replay_safety(name):
-    """'safe' when repeating the call cannot create a second side effect."""
-    name = str(name or '')
-    if name in _READ_ONLY_TOOLS:
-        return 'safe'
-    if name.startswith(('read_', 'search_', 'list_', 'get_')):
-        return 'safe'
-    return 'unsafe'
-
-
-def tool_trust_tier(name):
-    """research | prepare | commit. Unknown tools are commit (fail closed)."""
-    name = str(name or '')
-    if name in _COMMIT_TOOLS:
-        return 'commit'
-    if tool_replay_safety(name) == 'safe':
-        return 'research'
-    if name in _PREPARE_TOOLS:
-        return 'prepare'
-    return 'commit'
-
-
-def tool_policy(name):
-    return {'replay': tool_replay_safety(name), 'tier': tool_trust_tier(name)}
+from tool_policy import (task_tool_policy, tool_policy, tool_replay_safety,
+                            tool_trust_tier)
 
 
 def _chat_error_result(r, fallback_note):
@@ -890,7 +838,12 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             model, messages, tools,
             execute_tool, max_iterations=10, max_tokens=1600,
             service='supervisor', force_first_tool='supervisor_report',
-            return_transcript=True, task_id=task.get('id'))
+            return_transcript=True, task_id=task.get('id'),
+            conversation_policy=task_tool_policy({
+                **task,
+                'approvedTools': ['delegate', 'schedules', 'supervisor_grant_budget',
+                                  'direct_backlog', 'generate_agent_avatar', 'execute_script'],
+            }))
     except Exception as error:
         _sim_module._store_content_result(task.get('id'), {
             'ok': False, 'note': f'Supervisor check could not run: {error}'})
@@ -3673,7 +3626,7 @@ _REFLECTION_CONFIDENCE_FLOOR = 0.5
 
 def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, tools, execute_tool,
                                          total_iterations, max_tokens, force_first_tool, task_id=None,
-                                         village_id=None):
+                                         village_id=None, conversation_policy=None):
     remaining = total_iterations
     current_messages = list(messages)
     first_round = True
@@ -3685,7 +3638,7 @@ def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, to
             tier_slug, current_messages, tools, execute_tool,
             max_iterations=this_round, max_tokens=max_tokens, service='spike',
             force_first_tool=(force_first_tool if first_round else False), return_transcript=True,
-            task_id=task_id, village_id=village_id)
+            task_id=task_id, village_id=village_id, conversation_policy=conversation_policy)
         remaining -= this_round
         if len(current_messages) == before_len:
             # No progress at all this round (no tool call, no settling text
@@ -6241,69 +6194,83 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # fallback-completion path before this thread finishes.
     task['workUntil'] = time.time() + 300
 
+    # Executor-level checkpoint: reuse the plan from a prior attempt after a
+    # crash/restart instead of paying for the same plan twice. The plan is
+    # cleared on a successful close; a failed run keeps it for the retry.
+    plan_text = ''
+    plan_checkpoint = _serve.load_task_checkpoint(task.get('id'))
+    if (isinstance(plan_checkpoint, dict)
+            and plan_checkpoint.get('phase') == 'planned'
+            and plan_checkpoint.get('title') == backlog):
+        plan_text = str(plan_checkpoint.get('plan') or '')
+
     # PLAN -- a short, concrete checklist of sub-goals, from the stronger
     # reasoning tier. Best-effort: an empty plan just means the execute step
     # falls back to its own generic instructions below, not a failure.
     _hb()
-    plan_text = _plain_completion(reasoning_slug, [
-        {'role': 'system', 'content': (
-            'You are planning a real, tool-driven web investigation. Given the question below, '
-            + PREMISE_QUESTIONING_GUIDANCE + ' '
-            'First pin a short RESEARCH CONTRACT (one line each, in your plan): QUESTION (the exact '
-            'thing to answer), AS OF (today\'s date, and how fresh the answer must be -- a live fact '
-            'like pricing/availability/leadership needs a same-week source, a timeless explanation '
-            'does not), SCOPE (what is in and out of bounds), COMPARE (which alternatives/axes matter, '
-            'if any), STOP WHEN (the concrete evidence that makes the answer good enough -- a '
-            'fixed round budget is not a stop condition, verified evidence is), and PROVE WRONG (the '
-            'single most likely objection to the expected answer and the concrete observation that '
-            'would overturn it -- if you cannot name what would prove it false, the question is not '
-            'yet an answerable claim). A question without a contract is the #1 cause of '
-            'broad-but-wrong research, so this comes first.\n'
-            'Then write a short numbered checklist (3-7 items) of concrete sub-goals needed to answer it '
-            'thoroughly and honestly -- e.g. which pages/categories to visit, what to extract from '
-            'each, and what a real answer must cover. The FIRST item must always be a search_web '
-            'query for what OTHER sites say about the subject -- a subject\'s own pages never '            'disclose everything about it (methodology, reputation, who else covers it), and a '
-            'JS-heavy site may not even be readable by a plain fetch. If the subject has a large '
-            'list of items (a directory, a catalog), include a step to sample a few individual item '
-            'pages, not just the top-level listing.\n\n'
-            'INTERNAL PRIOR ART -- if this question is about reviewing, comparing against, or '
-            'building on work already done inside this think tank (another team\'s finished story, an '
-            'earlier spike, prior research), the FIRST item must instead be a search_library query '
-            '(not search_web) -- read what was actually done internally before looking externally, '
-            'and follow a promising hit with read_library_file for the full content. If '
-            'search_library finds nothing relevant, say so explicitly in the plan rather than '
-            'assuming what the other team probably did.\n\n'
-            'DELIVERABLE DECISION -- make this call explicitly: does answering this question well '
-            'mean listing/comparing multiple items with attributes (sources, tools, options, prices, '
-            'anything enumerable), or computing/transforming something from what gets found? If yes, '
-            'the plan MUST include a MANDATORY step, worded exactly like this shape: "Use '
-            'execute_script to write <filename>.csv with columns: <col1>, <col2>, ... -- one row per '
-            '<item>." -- with REAL column names and a REAL filename you choose for this question, not '
-            'a placeholder, and REAL columns for what the answer needs to be a real answer rather than '
-            'a page description (e.g. a source/feasibility question needs columns like '
-            'source_name, url, retrieval_method, api_or_rss_available -- not just source_name). Make '
-            'this the LAST step, run only after the earlier research steps found real data to put in '
-            'it. Say explicitly that describing the CSV in prose instead of actually building it does '
-            'NOT satisfy this step. If the question is a simple yes/no or single-fact lookup with '
-            'nothing to enumerate, skip this and say so -- do not force a CSV that doesn\'t fit.\n\n'
-            'VERIFICATION HONESTY -- real gap caught live (2026-09-26): a CSV with a per-item judgment '
-            'column (feasibility, difficulty, recommendation, anything requiring assessment, not just a '
-            'fact copied from a page) looks equally authoritative whether each row was actually checked '
-            'or just guessed from general knowledge -- there was no way to tell which from the output. '
-            'If the CSV has a judgment column like this, the plan MUST require: (1) a status column '
-            '(e.g. "basis") on EVERY row stating either "verified" (actually checked via a tool this '
-            'run) or "estimated" (general knowledge, not directly checked this run) -- never leave this '
-            'ambiguous; (2) an explicit step to ACTUALLY VERIFY a small sample (3-5 representative '
-            'rows, or all of them if there are fewer than 6) via search_web/browse_page/execute_script '
-            'before finalizing, so the CSV isn\'t 100% estimated -- pick rows that matter most to the '
-            'question, not arbitrary ones. This does not apply to columns that are plain facts already '
-            'confirmed during research (a name, a URL actually seen) -- only to judgment/assessment '
-            'columns.\n\n'
-            'This is a plan for another agent who will actually browse_page/search_web/execute_script '
-            '-- do not answer the question yourself, do not invent facts, just plan the investigation.')},
-        {'role': 'user', 'content': f'Question: {backlog}'
-                                     f'{(" Method/constraints: " + instructions) if instructions else ""}'},
-    ], max_tokens=500, task_id=task.get('id'))
+    if not plan_text:
+        plan_text = _plain_completion(reasoning_slug, [
+            {'role': 'system', 'content': (
+                'You are planning a real, tool-driven web investigation. Given the question below, '
+                + PREMISE_QUESTIONING_GUIDANCE + ' '
+                'First pin a short RESEARCH CONTRACT (one line each, in your plan): QUESTION (the exact '
+                'thing to answer), AS OF (today\'s date, and how fresh the answer must be -- a live fact '
+                'like pricing/availability/leadership needs a same-week source, a timeless explanation '
+                'does not), SCOPE (what is in and out of bounds), COMPARE (which alternatives/axes matter, '
+                'if any), STOP WHEN (the concrete evidence that makes the answer good enough -- a '
+                'fixed round budget is not a stop condition, verified evidence is), and PROVE WRONG (the '
+                'single most likely objection to the expected answer and the concrete observation that '
+                'would overturn it -- if you cannot name what would prove it false, the question is not '
+                'yet an answerable claim). A question without a contract is the #1 cause of '
+                'broad-but-wrong research, so this comes first.\n'
+                'Then write a short numbered checklist (3-7 items) of concrete sub-goals needed to answer it '
+                'thoroughly and honestly -- e.g. which pages/categories to visit, what to extract from '
+                'each, and what a real answer must cover. The FIRST item must always be a search_web '
+                'query for what OTHER sites say about the subject -- a subject\'s own pages never '            'disclose everything about it (methodology, reputation, who else covers it), and a '
+                'JS-heavy site may not even be readable by a plain fetch. If the subject has a large '
+                'list of items (a directory, a catalog), include a step to sample a few individual item '
+                'pages, not just the top-level listing.\n\n'
+                'INTERNAL PRIOR ART -- if this question is about reviewing, comparing against, or '
+                'building on work already done inside this think tank (another team\'s finished story, an '
+                'earlier spike, prior research), the FIRST item must instead be a search_library query '
+                '(not search_web) -- read what was actually done internally before looking externally, '
+                'and follow a promising hit with read_library_file for the full content. If '
+                'search_library finds nothing relevant, say so explicitly in the plan rather than '
+                'assuming what the other team probably did.\n\n'
+                'DELIVERABLE DECISION -- make this call explicitly: does answering this question well '
+                'mean listing/comparing multiple items with attributes (sources, tools, options, prices, '
+                'anything enumerable), or computing/transforming something from what gets found? If yes, '
+                'the plan MUST include a MANDATORY step, worded exactly like this shape: "Use '
+                'execute_script to write <filename>.csv with columns: <col1>, <col2>, ... -- one row per '
+                '<item>." -- with REAL column names and a REAL filename you choose for this question, not '
+                'a placeholder, and REAL columns for what the answer needs to be a real answer rather than '
+                'a page description (e.g. a source/feasibility question needs columns like '
+                'source_name, url, retrieval_method, api_or_rss_available -- not just source_name). Make '
+                'this the LAST step, run only after the earlier research steps found real data to put in '
+                'it. Say explicitly that describing the CSV in prose instead of actually building it does '
+                'NOT satisfy this step. If the question is a simple yes/no or single-fact lookup with '
+                'nothing to enumerate, skip this and say so -- do not force a CSV that doesn\'t fit.\n\n'
+                'VERIFICATION HONESTY -- real gap caught live (2026-09-26): a CSV with a per-item judgment '
+                'column (feasibility, difficulty, recommendation, anything requiring assessment, not just a '
+                'fact copied from a page) looks equally authoritative whether each row was actually checked '
+                'or just guessed from general knowledge -- there was no way to tell which from the output. '
+                'If the CSV has a judgment column like this, the plan MUST require: (1) a status column '
+                '(e.g. "basis") on EVERY row stating either "verified" (actually checked via a tool this '
+                'run) or "estimated" (general knowledge, not directly checked this run) -- never leave this '
+                'ambiguous; (2) an explicit step to ACTUALLY VERIFY a small sample (3-5 representative '
+                'rows, or all of them if there are fewer than 6) via search_web/browse_page/execute_script '
+                'before finalizing, so the CSV isn\'t 100% estimated -- pick rows that matter most to the '
+                'question, not arbitrary ones. This does not apply to columns that are plain facts already '
+                'confirmed during research (a name, a URL actually seen) -- only to judgment/assessment '
+                'columns.\n\n'
+                'This is a plan for another agent who will actually browse_page/search_web/execute_script '
+                '-- do not answer the question yourself, do not invent facts, just plan the investigation.')},
+            {'role': 'user', 'content': f'Question: {backlog}'
+                                         f'{(" Method/constraints: " + instructions) if instructions else ""}'},
+        ], max_tokens=500, task_id=task.get('id'))
+        if plan_text:
+            _serve.save_task_checkpoint(task.get('id'), 'planned',
+                                        {'title': backlog, 'plan': plan_text})
 
     # EXECUTE -- the existing many-iteration real tool loop (mid tier: cheap
     # enough to spend on up to 18 round trips), now following the plan above
@@ -6559,7 +6526,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             tier_slug, reasoning_slug, messages, spike_tools, execute_tool,
             total_iterations=50, max_tokens=2400, force_first_tool=first_tool,
             task_id=task.get('id'),
-            village_id=_sim_village_of_agent(snapshot, agent_id))
+            village_id=_sim_village_of_agent(snapshot, agent_id),
+            conversation_policy=task_tool_policy(task))
     except Exception as e:
         # A model-call failure (circuit-breaker RuntimeError, a 4xx, a network
         # blip) must never crash the spike executor or leave a half-baked
@@ -6711,6 +6679,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # be told what was found is a genuinely different need than the durable
     # task record staying lean, not a regression of the same bug.
     discovered_urls = sorted(getattr(getattr(web_tool, 'discovered', None), 'urls', set()) or set())
+    _serve.clear_task_checkpoint(task.get('id'))
     _sim_module._store_content_result(task.get('id'), {
         'note': f'{name} spiked "{backlog}" -- see the Library entry just filed.', 'ok': True,
         'sourceUrls': discovered_urls,

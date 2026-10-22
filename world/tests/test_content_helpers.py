@@ -1615,3 +1615,22 @@ class ToolSafetyPolicy(unittest.TestCase):
     def test_unknown_tool_defaults_closed(self):
         self.assertEqual(content.tool_policy('brand_new_tool'),
                          {'replay': 'unsafe', 'tier': 'commit'})
+
+
+class TaskToolPolicy(unittest.TestCase):
+    def test_research_allows_reads_and_prepare_but_denies_commit(self):
+        policy = content.task_tool_policy({'taskType': 'research'})
+        self.assertTrue(policy('read_library_file'))
+        self.assertTrue(policy('execute_script'))
+        self.assertFalse(policy('apify_run_actor'))
+        self.assertFalse(policy('create_calendar_event'))
+
+    def test_approved_commit_tool_is_allowed(self):
+        policy = content.task_tool_policy({'taskType': 'research',
+                                           'approvedTools': ['apify_run_actor']})
+        self.assertTrue(policy('apify_run_actor'))
+        self.assertFalse(policy('create_calendar_event'))
+
+    def test_allow_commit_and_trusted_pipeline(self):
+        self.assertTrue(content.task_tool_policy({'allowCommit': True})('apify_run_actor'))
+        self.assertTrue(content.task_tool_policy({'taskType': 'code'})('local_file'))

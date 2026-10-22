@@ -44,6 +44,19 @@ def _completion(text):
 
 
 class SpikeContent(unittest.TestCase):
+    def setUp(self):
+        # Plan checkpoints are intentionally kept after a failed spike, so a
+        # shared test DB would otherwise let one test's plan leak into the
+        # next test that reuses the same task id.
+        try:
+            with serve._db() as conn:
+                conn.execute('''CREATE TABLE IF NOT EXISTS task_checkpoints (
+                    task_id TEXT PRIMARY KEY, phase TEXT NOT NULL,
+                    payload TEXT NOT NULL, updated_at REAL NOT NULL)''')
+                conn.execute('DELETE FROM task_checkpoints')
+        except Exception:
+            pass
+
     def _store(self):
         seen = {}
         patcher = unittest.mock.patch('sim._store_content_result',
@@ -83,6 +96,24 @@ class SpikeContent(unittest.TestCase):
         ]
         return unittest.mock.patch.object(
             serve, '_call_agent_tool_loop', return_value=(execute_text, transcript))
+
+    def test_spike_reuses_a_saved_plan_checkpoint(self):
+        self._common_mocks()
+        seen = self._store()
+        task = {'id': 'spike-resume-plan', 'title': 'Resume me', 'budgetMs': 60000}
+        serve.save_task_checkpoint('spike-resume-plan', 'planned',
+                                   {'title': 'Resume me', 'plan': 'SAVED PLAN TEXT'})
+        self.addCleanup(serve.clear_task_checkpoint, 'spike-resume-plan')
+        with unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                        side_effect=[_completion('report')]) as model_call, \
+             self._mock_loop('summary') as loop:
+            content._run_spike_content(_snapshot(), 'cora', task)
+        self.assertEqual(model_call.call_count, 1, 'the plan call must be skipped')
+        messages = loop.call_args.args[1]
+        system = next(m['content'] for m in messages if m.get('role') == 'system')
+        self.assertIn('SAVED PLAN TEXT', system)
+        self.assertIn(task['id'], seen)
+        self.assertIsNone(serve.load_task_checkpoint(task['id']))
 
     def test_google_quota_awareness_block_folded_when_google_configured(self):
         """The quota wiring: when a Google credential is in the vault, the

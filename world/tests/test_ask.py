@@ -274,7 +274,7 @@ class AskEndpoint(unittest.TestCase):
 
         async def fake_ask_core(state, question, agent_id_hint=None, location=None,
                                 max_tokens=300, allow_admin_pin=False, allow_park=True,
-                                session_id=None):
+                                session_id=None, approved_tools=None):
             seen.setdefault('session_ids', []).append(session_id)
             return {'reply': 'ok', 'agent': 'ben', 'tools': []}
 
@@ -991,7 +991,8 @@ class AskParking(unittest.TestCase):
         s['agents']['dax']['task'] = None
         seen = {}
         async def fake_ask_core(state, question, agent_id_hint=None, location=None,
-                                max_tokens=300, allow_admin_pin=False, allow_park=True):
+                                max_tokens=300, allow_admin_pin=False, allow_park=True,
+                                approved_tools=None):
             seen['agent'] = agent_id_hint
             seen['allow_park'] = allow_park
             return {'reply': 'Here is your answer.', 'agent': agent_id_hint, 'tools': []}
@@ -1010,7 +1011,8 @@ class AskParking(unittest.TestCase):
         s['agents']['ben']['task'] = None
         seen = {}
         async def fake_ask_core(state, question, agent_id_hint=None, location=None,
-                                max_tokens=300, allow_admin_pin=False, allow_park=True):
+                                max_tokens=300, allow_admin_pin=False, allow_park=True,
+                                approved_tools=None):
             seen['agent'] = agent_id_hint
             return {'reply': 'ok', 'agent': agent_id_hint, 'tools': []}
         with unittest.mock.patch.object(serve, '_ask_core', side_effect=fake_ask_core):
@@ -1102,7 +1104,7 @@ class TelegramBridge(unittest.TestCase):
         s = _state()
         s['agentRoster'][0]['isAdmin'] = True  # maya
         seen = {}
-        async def fake_ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None):
+        async def fake_ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None, approved_tools=None):
             seen['question'] = question
             seen['agent_id_hint'] = agent_id_hint
             seen['allow_admin_pin'] = allow_admin_pin
@@ -1126,7 +1128,7 @@ class TelegramBridge(unittest.TestCase):
         s = _state()
         s['agentRoster'][0]['isAdmin'] = True  # maya
         seen = {}
-        async def fake_ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None):
+        async def fake_ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None, approved_tools=None):
             seen['question'] = question
             seen['agent_id_hint'] = agent_id_hint
             seen['allow_admin_pin'] = allow_admin_pin
@@ -1150,7 +1152,7 @@ class TelegramBridge(unittest.TestCase):
         s = _state()
         s['agentRoster'][0]['isAdmin'] = True  # maya
         seen = {}
-        async def fake_ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None):
+        async def fake_ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None, approved_tools=None):
             seen['question'] = question
             seen['agent_id_hint'] = agent_id_hint
             return {'reply': 'Let me get a director on that.', 'agent': 'maya', 'tools': []}
@@ -1175,7 +1177,7 @@ class TelegramBridge(unittest.TestCase):
                                'offDuty': False, 'busy': False, 'task': None,
                                'pairWith': None, 'profile': {'mission': 'run personnel'}}
         seen = {}
-        async def fake_ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None):
+        async def fake_ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None, approved_tools=None):
             seen['agent_id_hint'] = agent_id_hint
             return {'reply': 'Let me split that up for you.', 'agent': 'nora', 'tools': []}
         with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=s), \
@@ -1195,7 +1197,7 @@ class TelegramBridge(unittest.TestCase):
                                 'offDuty': False, 'busy': True, 'task': None,
                                 'pairWith': None, 'profile': {'mission': 'run personnel'}}
         seen2 = {}
-        async def fake_ask_core2(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None):
+        async def fake_ask_core2(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None, approved_tools=None):
             seen2['agent_id_hint'] = agent_id_hint
             return {'reply': 'On it.', 'agent': 'maya', 'tools': []}
         with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=s2), \

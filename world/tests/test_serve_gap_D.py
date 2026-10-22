@@ -1532,7 +1532,8 @@ class MakeWebToolsExecutor(unittest.TestCase):
 
 def _loop_fake(script=None, reply="final answer", capture=None):
     def fake(model, messages, tools, execute_tool, max_iterations, max_tokens,
-             force_first_tool=None, village_id=None, escalate_model=None):
+             force_first_tool=None, village_id=None, escalate_model=None,
+             conversation_policy=None, **kwargs):
         if capture is not None:
             capture["force_first_tool"] = force_first_tool
             capture["escalate_model"] = escalate_model

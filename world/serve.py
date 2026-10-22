@@ -41,6 +41,7 @@ from confirmations import gate as _confirmation_gate_or_response
 from confirmations import gate_finish as _finish_confirmation
 
 import runtime_limits
+from tool_policy import task_tool_policy
 import governance
 import constitution
 import cron_scripts
@@ -930,6 +931,66 @@ def get_collector_checkpoint(collector):
         return None
 
 
+def save_task_checkpoint(task_id, phase, payload):
+    if not task_id:
+        return False
+    try:
+        with _db() as conn:
+            conn.execute('''CREATE TABLE IF NOT EXISTS task_checkpoints (
+                task_id TEXT PRIMARY KEY,
+                phase TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )''')
+            conn.execute(
+                'INSERT OR REPLACE INTO task_checkpoints (task_id, phase, payload, updated_at) '
+                'VALUES (?, ?, ?, ?)',
+                (str(task_id), str(phase), json.dumps(payload, sort_keys=True), time.time()))
+        return True
+    except Exception:
+        return False
+
+
+def load_task_checkpoint(task_id, max_age_s=86400):
+    if not task_id:
+        return None
+    try:
+        with _db() as conn:
+            conn.execute('''CREATE TABLE IF NOT EXISTS task_checkpoints (
+                task_id TEXT PRIMARY KEY,
+                phase TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )''')
+            row = conn.execute(
+                'SELECT phase, payload, updated_at FROM task_checkpoints WHERE task_id=?',
+                (str(task_id),)).fetchone()
+        if not row:
+            return None
+        phase, payload_text, updated_at = row
+        if max_age_s and time.time() - float(updated_at or 0) > max_age_s:
+            return None
+        data = json.loads(payload_text)
+        if not isinstance(data, dict):
+            return None
+        data['phase'] = phase
+        data['checkpoint_at'] = updated_at
+        return data
+    except Exception:
+        return None
+
+
+def clear_task_checkpoint(task_id):
+    if not task_id:
+        return False
+    try:
+        with _db() as conn:
+            conn.execute('DELETE FROM task_checkpoints WHERE task_id=?', (str(task_id),))
+        return True
+    except Exception:
+        return False
+
+
 def init_db():
     # Replaces state.json (whole-think tank state) and the separate
     # browse_log.jsonl/execute_log.jsonl files (scattered, per-feature
@@ -1007,6 +1068,15 @@ def init_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS collector_checkpoints (
             collector TEXT PRIMARY KEY,
             cursor TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        # Executor-level task checkpoint. The spike executor saves its plan at
+        # the plan/execute boundary; a restart can reuse that plan instead of
+        # paying for it again. Rows are cleared on successful close.
+        conn.execute('''CREATE TABLE IF NOT EXISTS task_checkpoints (
+            task_id TEXT PRIMARY KEY,
+            phase TEXT NOT NULL,
+            payload TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
         # Measurement-only: a hash of every Jev decision REQUEST, so we can
@@ -10866,7 +10936,8 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
 
 def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3, max_tokens=None,
                           service='__player_ask__', force_first_tool=False, return_transcript=False,
-                          task_id=None, village_id=None, escalate_model=None):
+                          task_id=None, village_id=None, escalate_model=None,
+                          conversation_policy=None):
     """Agentic tool-calling loop for /api/intent/ask. Sends `messages` with
     `tools`; while the model replies with tool_calls, executes each via
     `execute_tool(name, args)`, appends the results back as `role:tool`
@@ -10920,6 +10991,27 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
     (see the endpoint). This function itself only plumbers role:tool messages.
     """
     current_messages = list(messages)
+    denied_tools = set()
+    raw_execute_tool = execute_tool
+
+    def execute_tool(name, args):
+        try:
+            allowed = True if conversation_policy is None else bool(conversation_policy(name))
+        except Exception:
+            allowed = False
+        if not allowed or name in denied_tools:
+            denied_tools.add(name)
+            try:
+                log_action('system', 'tool_policy_denied',
+                           {'tool': name, 'taskId': task_id}, authorized=True)
+            except Exception:
+                pass
+            return (f'{name} is a commit-tier tool and this conversation has not approved it. '
+                    'This is a hard policy refusal, not a transient error. Do not retry it. '
+                    'State plainly that the action needs player approval and finish the work '
+                    'you can do without it.')
+        return raw_execute_tool(name, args)
+
     for i in range(max_iterations):
         # Item 4 per-task gate inside the loop too: a spike that is already
         # over its task budget must not keep paying for further tool rounds.
@@ -18380,7 +18472,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
     return execute_tool
 
 
-async def _ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None):
+async def _ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None, approved_tools=None):
     """The real logic behind /api/intent/ask, pulled out so a non-HTTP caller
     (the Telegram bridge) can invoke it directly -- no fake Request object,
     no self-loopback HTTP hop, no auth dance for an already-trusted in-process
@@ -18405,6 +18497,11 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     question = (question or '').strip()
     if not question:
         return {'error': 'a question is required', 'status': 400}
+    if isinstance(approved_tools, str):
+        approved_tools = [approved_tools]
+    elif not isinstance(approved_tools, (list, tuple, set)):
+        approved_tools = []
+    approved_tools = [str(t) for t in approved_tools if t]
 
     # Conversation memory (STM + LTM): when the ask rides a session (the
     # Telegram bridge passes the chat id), the question is answered in the
@@ -18452,7 +18549,8 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         now_ms = int(time.time() * 1000)
         parked = {'id': f'ask-{now_ms}', 'question': question,
                   'location': (location or '').strip() or None,
-                  'agentId': requested_agent or None, 'ts': now_ms}
+                  'agentId': requested_agent or None, 'ts': now_ms,
+                  'approvedTools': list(approved_tools or [])}
         state.setdefault('_pendingAsks', []).append(parked)
         if mctx is not None:
             stm_append(session_id, 'user', question)
@@ -18798,7 +18896,10 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
                 execute_tool, 50, int(max_tokens),
                 force_first_tool=ask_force_first_tool,
                 escalate_model=ask_escalate_chain,
-                village_id=_sim_village_for_agent(pick))
+                village_id=_sim_village_for_agent(pick),
+                conversation_policy=task_tool_policy(
+                    {'approvedTools': approved_tools or [], 'taskType': 'ask',
+                     'allowCommit': is_security_test_role}))
         else:
             reply = None
     except Exception as e:
@@ -18889,7 +18990,8 @@ def _pending_ask_drain_pass(state):
             import serve as _serve
             result = asyncio.run(_serve._ask_core(
                 state, ask.get('question'), pick, ask.get('location'),
-                allow_admin_pin=False, allow_park=False))
+                allow_admin_pin=False, allow_park=False,
+                approved_tools=ask.get('approvedTools')))
             result['askId'] = ask['id']
             result['agentId'] = pick
             _store_pending_ask_result(result)
@@ -19402,7 +19504,9 @@ async def intent_ask(request: Request):
     from /api/intent/clarify (a clarify is a question ABOUT completed work and is
     keyed by productId; this is net-new and keyed by nothing but the ask itself).
 
-    Body: {question, location?, agentId?}. The question is required; `location`
+    Body: {question, location?, agentId?, approvedTools?}. The question is
+    required; `approvedTools` is the per-conversation allowlist for commit-tier
+    tools (for example ["create_calendar_event"]); `location`
     is a hint for location-bearing asks (e.g. dressing advice) though the agent
     can also derive it. A free, non-chief-of-staff agent is dispatched round-robin
     unless `agentId` names a specific eligible candidate to pin instead (so
@@ -19444,7 +19548,8 @@ async def intent_ask(request: Request):
     _ask_target = (body.get('agentId') or '').strip() or 'any'
     result = await _ask_core(state, body.get('question'), body.get('agentId'),
                              body.get('location'), body.get('max_tokens', 300),
-                             session_id=f'player-ask:{_ask_target.lower()}')
+                             session_id=f'player-ask:{_ask_target.lower()}',
+                             approved_tools=body.get('approvedTools'))
     if 'error' in result:
         return JSONResponse({'error': result['error']}, status_code=result.get('status', 500))
     if result.get('queued'):

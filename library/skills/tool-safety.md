@@ -32,11 +32,26 @@ runs and thirty days for calendar events.
 
 ## Current enforcement
 - Metadata: every tool can be labeled with `tool_policy(name)`.
-- Enforced now: request-id replay protection on the two external write tools.
-- Not yet enforced: a per-conversation allowlist that refuses a `commit` tool
-  without an approval. That waits for a per-tool review, as the review
-  recommended. Until then, the tier labels are guidance and audit data, not a
-  hard gate.
+- Enforced now: request-id replay protection on `apify_run_actor` and
+  `create_calendar_event`.
+- Enforced now: a per-conversation allowlist. Research and prepare tools are
+  always allowed. A commit tool is refused unless the conversation approves it
+  with `approvedTools`, sets `allowCommit`, or is a trusted code/review/QA
+  pipeline task. The refusal is a hard policy message, not a retryable error.
+- Supervisor cards are server-authored and approve their own tools
+  (`delegate`, `schedules`, `supervisor_grant_budget`, `direct_backlog`,
+  `generate_agent_avatar`, `execute_script`).
+- Player asks: send `approvedTools` with the ask to approve a commit action,
+  for example `{"question": "Book it", "approvedTools": ["create_calendar_event"]}`.
+- The Red Team Auditor role is trusted with commit tools for its live security
+  self-tests.
+
+## Executor checkpoints
+The spike executor saves its plan at the plan/execute boundary. After a
+crash or restart, a retry reuses the saved plan instead of paying for it again.
+The checkpoint is cleared on a successful close; a failed run keeps it for the
+retry. AIS feed cursors are checkpointed separately in
+`collector_checkpoints`.
 
 ## Rules
 1. Read before you write. Prefer a `research` tool that answers the question.
