@@ -191,10 +191,12 @@ class MovementResidual(SimIsolation):
         self.assertEqual(sim._reconcile_stranded_agents({'agents': {}}, self._free_grid()), 0)
         self.assertEqual(sim._reconcile_stranded_agents({'agents': 'x'}, self._free_grid()), 0)
 
-    def test_reconcile_stranded_skips_missing_coords(self):
+    def test_reconcile_stranded_places_missing_coords(self):
         state = {'agents': {'ada': {'id': 'ada', 'visible': True, 'x': None, 'y': None}}}
         with unittest.mock.patch.object(sim, 'SPAWN', {'x': 100, 'y': 100}):
-            self.assertEqual(sim._reconcile_stranded_agents(state, self._free_grid(8, 8)), 0)
+            self.assertEqual(sim._reconcile_stranded_agents(state, self._free_grid(8, 8)), 1)
+        self.assertIsNotNone(state['agents']['ada']['x'])
+        self.assertIsNotNone(state['agents']['ada']['y'])
 
     def test_reconcile_stranded_moves_unreachable_agent(self):
         grid, _ = sim._load_outdoor_geometry()

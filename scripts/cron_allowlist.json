@@ -1,10 +1,51 @@
 {
-  "comment": "Operator-vetted host-run cron scripts. Only these may be referenced by a standing task's 'script'. Add a script only after reviewing every URL, credential, and side effect it can reach.",
+  "comment": "Operator-vetted host cron scripts. Every entry is SHA-256 pinned. runner=sandbox uses the internal sandbox + egress proxy; runner=host requires a player session AND allowHostExecution:true. Update sha256 whenever you intentionally edit a script.",
   "scripts": [
-    "scripts/bot_law_watch.py",
-    "scripts/check_file_growth.py",
-    "scripts/check_models.py",
-    "scripts/export_training_interactions.py",
-    "scripts/test_health.py"
+    {
+      "path": "scripts/bot_law_watch.py",
+      "sha256": "0befd11659832c1c263bc5b368f7ab18c4de28577c48afa4ed2cb79b8ebf29e5",
+      "runner": "sandbox",
+      "allowedHosts": [
+        "www.federalregister.gov",
+        "api.tavily.com"
+      ],
+      "env": [
+        "TAVILY_API_KEY"
+      ]
+    },
+    {
+      "path": "scripts/check_file_growth.py",
+      "sha256": "6d413c41dd12140f319fd537e1ddf0cd96f5fb08e2e6114ec8989fb5e737510f",
+      "runner": "sandbox",
+      "allowedHosts": [],
+      "env": []
+    },
+    {
+      "path": "scripts/check_models.py",
+      "sha256": "a1b7889f18f75962bebb03cb45b7a6059a4183210aa91a34db24de5303497ef5",
+      "runner": "sandbox",
+      "allowedHosts": [],
+      "env": []
+    },
+    {
+      "path": "scripts/test_health.py",
+      "sha256": "1f4e32772ae05a5d90ce907d14ea9838fc32441a95d1b18b2878ba08be757016",
+      "runner": "sandbox",
+      "allowedHosts": [],
+      "env": []
+    },
+    {
+      "path": "scripts/imessage_fetch.py",
+      "sha256": "4a8c7fd7bff1e7e5ae4a5433dc04d91f95d62d11e893e8993b525a5edc2135b1",
+      "runner": "host",
+      "allowedHosts": [
+        "100.96.104.61"
+      ],
+      "env": [
+        "IMESSAGE_CHAT_DB",
+        "IMESSAGE_STATE_FILE"
+      ],
+      "hostReason": "Reads Messages.app chat.db on the host"
+    }
   ]
 }

@@ -1,4 +1,5 @@
 """CRON script lane for standing tasks."""
+import hashlib
 import os
 import sys
 
@@ -10,11 +11,39 @@ import pytest  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _permissive_allowlist(monkeypatch):
-    # These tests exercise cron behavior with temp scripts; the allowlist
-    # enforcement itself is covered in test_cron_allowlist.py.
-    monkeypatch.setattr(cron_scripts, '_allowed_scripts',
-                        lambda: {'scripts/ok.py', 'scripts/watch.py',
-                                 'scripts/bad.py', 'scripts/slow.py'})
+    # These tests exercise cron behavior with temp scripts; the allowlist,
+    # hash, URL, and host-approval rules are covered in test_cron_allowlist.py.
+    def _entries():
+        root = cron_scripts._repo_root()
+        out = {}
+        for rel in ('scripts/ok.py', 'scripts/watch.py',
+                    'scripts/bad.py', 'scripts/slow.py'):
+            path = os.path.join(root, rel)
+            try:
+                with open(path, 'rb') as f:
+                    data = f.read()
+            except OSError:
+                continue
+            out[rel] = {'path': rel,
+                        'sha256': hashlib.sha256(data).hexdigest(),
+                        'runner': 'sandbox', 'allowedHosts': []}
+        return out
+
+    def _local_sandbox(relpath, timeout_s, env):
+        path = os.path.join(cron_scripts._repo_root(), relpath)
+        try:
+            proc = cron_scripts.subprocess.run(
+                [cron_scripts.sys.executable, path],
+                cwd=cron_scripts._repo_root(), env=env,
+                capture_output=True, text=True, timeout=timeout_s)
+        except cron_scripts.subprocess.TimeoutExpired:
+            return {'exitCode': None, 'stdout': '', 'stderr': '',
+                    'timedOut': True}
+        return {'exitCode': proc.returncode, 'stdout': proc.stdout,
+                'stderr': proc.stderr, 'timedOut': False}
+
+    monkeypatch.setattr(cron_scripts, '_allowed_scripts', _entries)
+    monkeypatch.setattr(cron_scripts, '_run_sandboxed', _local_sandbox)
 
 
 def test_resolve_rejects_escapes_and_non_scripts(tmp_path, monkeypatch):
@@ -122,8 +151,11 @@ def test_declaration_fields_validates_and_keeps_followup(tmp_path, monkeypatch):
         'script': 'scripts/ok.py', 'scriptTimeoutSeconds': '60',
         'notifyAgent': 'theo'})
     assert error is None
-    assert fields == {'script': 'scripts/ok.py', 'scriptTimeoutSeconds': 60,
-                      'notifyAgent': 'theo'}
+    assert fields['script'] == 'scripts/ok.py'
+    assert fields['scriptRunner'] == 'sandbox'
+    assert fields['scriptTimeoutSeconds'] == 60
+    assert fields['notifyAgent'] == 'theo'
+    assert fields['scriptSha256']
     fields, error = cron_scripts.declaration_fields({'script': 'scripts/ok.sh'})
     assert fields is None and 'scripts/' in error
     fields, error = cron_scripts.declaration_fields({

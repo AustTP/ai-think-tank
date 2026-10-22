@@ -165,6 +165,7 @@ class CardReport(unittest.TestCase):
                 'userStory': 'As a shopper, I want to pay once, so that I can skip the queue',
                 'acceptanceCriteria': 'Given a cart, When I pay, Then I am charged once',
                 'never': '- never touch the live payment table',
+                'libraryPath': 'library/pressoffice/checkout.html',
                 'note': 'Shipped the checkout flow to pressoffice/checkout.html.'}
         task.update(over)
         return task

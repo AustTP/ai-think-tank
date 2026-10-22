@@ -10762,6 +10762,57 @@ def _run_in_sandbox_sync(sandbox_dir, command):
         return {'exitCode': None, 'stdout': (e.stdout or '')[:SANDBOX_MAX_OUTPUT], 'stderr': (e.stderr or '')[:SANDBOX_MAX_OUTPUT], 'timedOut': True}
 
 
+def run_cron_script_sandboxed(script_relpath, timeout_s, env):
+    """Run one allowlisted cron script inside the same internal-only sandbox
+    and egress proxy as execute_script. The repo is mounted read-only; only
+    library/ is writable. No host environment is inherited."""
+    if SANDBOX_EXECUTION != 'local':
+        return {'exitCode': None, 'stdout': '',
+                'stderr': ('cron scripts require SANDBOX_EXECUTION=local; '
+                           'no command was run'),
+                'timedOut': False}
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    library = os.path.join(repo_root, 'library')
+    os.makedirs(library, exist_ok=True)
+    proxy_url = f'http://{PROXY_CONTAINER}:{PROXY_PORT}'
+    docker_cmd = [
+        'docker', 'run', '--rm',
+        '--network', SANDBOX_NETWORK,
+        '--cap-drop', 'ALL',
+        '--security-opt', 'no-new-privileges',
+        '-e', f'http_proxy={proxy_url}', '-e', f'https_proxy={proxy_url}',
+        '-e', f'HTTP_PROXY={proxy_url}', '-e', f'HTTPS_PROXY={proxy_url}',
+        '--memory', '512m',
+        '--cpus', '1',
+        '--pids-limit', '128',
+        # Run as the host user so files created under the writable library
+        # mount stay owned by the operator, not root.
+        '--user', f'{os.getuid()}:{os.getgid()}',
+        '-v', f'{repo_root}:/workspace:ro',
+        '-v', f'{library}:/workspace/library:rw',
+        '-w', '/workspace',
+    ]
+    for key, value in (env or {}).items():
+        if key and value is not None:
+            docker_cmd += ['-e', f'{key}={value}']
+    docker_cmd += [SANDBOX_IMAGE, 'python3', script_relpath]
+    try:
+        result = _run_docker_sandbox(docker_cmd, timeout_s)
+        return {
+            'exitCode': result.returncode,
+            'stdout': result.stdout[:SANDBOX_MAX_OUTPUT],
+            'stderr': result.stderr[:SANDBOX_MAX_OUTPUT],
+            'timedOut': False,
+        }
+    except subprocess.TimeoutExpired as e:
+        return {
+            'exitCode': None,
+            'stdout': (e.stdout or '')[:SANDBOX_MAX_OUTPUT],
+            'stderr': (e.stderr or '')[:SANDBOX_MAX_OUTPUT],
+            'timedOut': True,
+        }
+
+
 # browser_act: run the fixed browser driver inside the SAME sandbox container
 # as every other agent command (see browser_driver.py / the sandbox Dockerfile
 # COPY). One op per invocation, driver is a fixed /opt/browser_driver.py, never

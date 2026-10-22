@@ -5108,15 +5108,19 @@ def _completion_has_evidence(state, task):
         return True
     if ttype in ('meeting', 'supervise', 'avatar', 'review', 'qa'):
         return True
+    if ttype == 'research' or task.get('research'):
+        # Scheduled research lands its findings in the task note/topic; it is
+        # not a Library-file lane. Require the note, not a fabricated path.
+        return bool(str(task.get('note') or '').strip())
     if ttype == 'bug':
         evidence = bool(task.get('libraryPath') or task.get('writtenPy')
                         or task.get('restoreCheck'))
         if not evidence:
             return False
-    elif ttype in ('spike', 'research', 'report'):
+    elif ttype in ('spike', 'report'):
         if not task.get('libraryPath') or not str(task.get('note') or '').strip():
             return False
-    elif ttype in _DELIVERABLE_TASK_TYPES or task.get('room') in VALUED_QUEUE_ROOMS:
+    elif ttype in _DELIVERABLE_TASK_TYPES or task.get('_peerGate'):
         if not task.get('libraryPath'):
             return False
     grade = task.get('grade')
@@ -5135,31 +5139,22 @@ def finish_task(state, agent_id, grid=None):
     if not a:
         return
     task = (state.get('tasks') or {}).get(a.get('task'))
+    completion_refused = False
     if task and task.get('status') not in ('blocked', 'failed', 'cancelled', 'abandoned'):
         if not _completion_has_evidence(state, task):
+            completion_refused = True
             task['status'] = 'failed'
             task['failNote'] = 'Completion blocked: no saved deliverable in the Library.'
             task['nextAction'] = 'Save the deliverable and re-run the acceptance checks.'
             task['deliveryState'] = 'blocked'
             task['manualAttention'] = False
             task['_peerRepairPending'] = True
-            a['task'] = None
-            a['busy'] = False
-            a['inRoom'] = None
-            try:
-                from serve import log_action
-                log_action(agent_id, 'task_completion_refused',
-                           {'taskId': task.get('id'),
-                            'title': (task.get('title') or '')[:120],
-                            'reason': 'missing_saved_deliverable'}, authorized=True)
-            except Exception:
-                pass
-            return
-        task['status'] = 'done'
-        # A landed task satisfies any dependency-block keyed on it: queue the
-        # SM's auto-unblock so the cards that were waiting on this work free up.
-        _auto_clear_dependency_blocks(state, task.get('id'),
-                                      now_ms=int(time.time() * 1000))
+        else:
+            task['status'] = 'done'
+            # A landed task satisfies any dependency-block keyed on it: queue
+            # the SM's auto-unblock so the cards waiting on this work free up.
+            _auto_clear_dependency_blocks(state, task.get('id'),
+                                          now_ms=int(time.time() * 1000))
     # W1: a PAIR task's navigator rides along on the driver's task -- when the
     # driver finishes, release her too (pairWith/pairTaskId/busy/inRoom) so she
     # doesn't sit busy at the shared desk forever after the work shipped.
@@ -5169,24 +5164,26 @@ def finish_task(state, agent_id, grid=None):
     a['busy'] = False
     a['inRoom'] = None
     a['visible'] = True
-    a['approvedCount'] = (a.get('approvedCount') or 0) + 1
-    a['weekApprovals'] = (a.get('weekApprovals') or 0) + 1
+    if not completion_refused:
+        a['approvedCount'] = (a.get('approvedCount') or 0) + 1
+        a['weekApprovals'] = (a.get('weekApprovals') or 0) + 1
     # The story shipped: any per-story capability grant dies with it.
     _revoke_task_access(task.get('id') if task else None)
-    _note_completed_room(state, agent_id, task)
-    # Backlog refinement intake: the agent just shipped a real deliverable and
-    # saw whether its room still has work. If the room is thinning, file a
-    # follow-up work-request so the scrum master can turn the observed gap into
-    # a story at the next ceremony.
-    _maybe_file_followup(state, agent_id, task, int(time.time() * 1000))
-    # Signal wake-ups (ask 7): a completed task is an emission
-    # point. The event data describes the landed work; any armed
-    # signal plan whose scenario condition appears in it wakes
-    # its agent (when that agent is fully idle). Best-effort --
-    # emit_signals never raises, so a signal failure can never
-    # break task completion.
-    if task:
-        emit_signals(state, 'task.completed', _task_completed_data(task))
+    if not completion_refused:
+        _note_completed_room(state, agent_id, task)
+        # Backlog refinement intake: the agent just shipped a real deliverable and
+        # saw whether its room still has work. If the room is thinning, file a
+        # follow-up work-request so the scrum master can turn the observed gap into
+        # a story at the next ceremony.
+        _maybe_file_followup(state, agent_id, task, int(time.time() * 1000))
+        # Signal wake-ups (ask 7): a completed task is an emission
+        # point. The event data describes the landed work; any armed
+        # signal plan whose scenario condition appears in it wakes
+        # its agent (when that agent is fully idle). Best-effort --
+        # emit_signals never raises, so a signal failure can never
+        # break task completion.
+        if task:
+            emit_signals(state, 'task.completed', _task_completed_data(task))
     if task and task.get('entryX') is not None:
         ex, ey = task['entryX'], task['entryY']
         for oid, other in agents.items():
@@ -5206,13 +5203,19 @@ def finish_task(state, agent_id, grid=None):
             spot = {'x': SPAWN['x'], 'y': SPAWN['y']}
         a['x'], a['y'] = spot['x'], spot['y']
     from serve import log_action
-    log_action(agent_id, 'task_completed', {'taskId': task['id'] if task else None,
-                                            'title': task['title'] if task else None},
-               authorized=True)
-    # Card close reports no longer reach the player on any
-    # channel -- the sprint retro is the player's close signal.
-    # The call keeps its once-per-card idempotency flag.
-    _deliver_card_report(state, task, 'completed')
+    if completion_refused:
+        log_action(agent_id, 'task_completion_refused',
+                   {'taskId': task['id'] if task else None,
+                    'title': task['title'] if task else None,
+                    'reason': 'missing_saved_deliverable'}, authorized=True)
+    else:
+        log_action(agent_id, 'task_completed', {'taskId': task['id'] if task else None,
+                                                'title': task['title'] if task else None},
+                   authorized=True)
+        # Card close reports no longer reach the player on any
+        # channel -- the sprint retro is the player's close signal.
+        # The call keeps its once-per-card idempotency flag.
+        _deliver_card_report(state, task, 'completed')
 
 
 def send_agent_off_duty(state, agent_id, doors, grid):
@@ -14524,7 +14527,6 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                            {'title': pick.get('title'), 'room': pick.get('room'),
                             'attempts': pick['attempts']}, authorized=True)
                 _on_work_item_abandoned(state, pick, now_ms)
-    _park_idle_wanderers(state)
     return state
 
 

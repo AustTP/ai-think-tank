@@ -1,11 +1,20 @@
 """Operator-owned, allowlisted scripts for CRON-style standing tasks.
 
-These scripts run on the HOST, not inside the sandbox, so they have the host
-environment and full network access. Only scripts explicitly listed in
-`scripts/cron_allowlist.json` may be referenced by a standing task, and only
-the player session may create a script-backed standing task. That keeps an
-agent from writing a URL into a script and scheduling it around the normal
-sandbox egress allowlist.
+These scripts are deliberately narrow. A script must be listed in
+`scripts/cron_allowlist.json` with its SHA-256 and an explicit runner:
+
+  * runner "sandbox" -- executed inside the same internal-only Docker
+    sandbox as execute_script. Network egress goes through the sandbox proxy,
+    so the normal package/browse allowlist applies at runtime.
+  * runner "host" -- executed on the host only for genuinely host-bound work
+    (Messages.app, headful browser, etc.). A host script also requires the
+    standing task to carry `allowHostExecution: true`, which only a player
+    session can set.
+
+Every entry also lists `allowedHosts` for literal URLs in the script. The
+tripwire catches static URLs; the sandbox proxy is the runtime guarantee for
+sandboxed scripts. Dynamic URLs in a host script cannot be caught by the
+tripwire and are why host scripts need explicit operator approval.
 
 A standing task normally queues an agent card. When its declaration names a
 `script`, the due window instead runs that script and does not wake an agent.
@@ -15,15 +24,22 @@ exception, not the normal path.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
+import urllib.parse
 
 SCRIPT_DIR = 'scripts'
+ALLOWLIST_NAME = 'cron_allowlist.json'
 MAX_SCRIPT_BYTES = 2_000_000
 DEFAULT_TIMEOUT_S = 120
 MAX_TIMEOUT_S = 600
+_SAFE_ENV_KEYS = ('PATH', 'HOME', 'LANG', 'LC_ALL', 'TMPDIR', 'USER', 'SHELL')
+_URL_RE = re.compile(r'https?://[^\s\'"<>]+', re.IGNORECASE)
 
 
 def _repo_root():
@@ -31,9 +47,9 @@ def _repo_root():
 
 
 def _allowed_scripts():
-    """Operator-vetted cron scripts. Fail closed when the manifest is missing,
-    unreadable, or malformed: host-run scripts are not sandboxed."""
-    path = os.path.join(_repo_root(), SCRIPT_DIR, 'cron_allowlist.json')
+    """Return {repo-relative script path: allowlist entry}, or None when the
+    manifest is missing, unreadable, or malformed. Fail closed."""
+    path = os.path.join(_repo_root(), SCRIPT_DIR, ALLOWLIST_NAME)
     try:
         with open(path, encoding='utf-8') as f:
             data = json.load(f)
@@ -41,34 +57,81 @@ def _allowed_scripts():
         return None
     if not isinstance(data, dict) or not isinstance(data.get('scripts'), list):
         return None
-    return {str(s).strip().replace('\\', '/')
-            for s in data['scripts'] if str(s).strip()}
+    out = {}
+    for item in data['scripts']:
+        if not isinstance(item, dict):
+            return None
+        rel = str(item.get('path') or '').strip().replace('\\', '/')
+        if not rel:
+            return None
+        out[rel] = item
+    return out
 
 
-def resolve_script(relpath):
-    """Resolve one repo-relative scripts/*.py path. Returns (path, error)."""
+def _validate_script(relpath):
+    """Return (path, entry, source, error) for one allowlisted script.
+
+    Checks path shape, allowlist membership, SHA-256 pin, file size, and the
+    literal-URL host tripwire before anything runs."""
     raw = str(relpath or '').strip().replace('\\', '/')
     if not raw:
-        return None, 'script path is required'
+        return None, None, None, 'script path is required'
     if raw.startswith('/') or '..' in raw.split('/'):
-        return None, 'script must be a repo-relative path under scripts/'
+        return None, None, None, 'script must be a repo-relative path under scripts/'
     if not raw.startswith(SCRIPT_DIR + '/') or not raw.endswith('.py'):
-        return None, 'script must be a .py file under scripts/'
+        return None, None, None, 'script must be a .py file under scripts/'
     allowed = _allowed_scripts()
     if allowed is None:
-        return None, 'cron script allowlist is missing or unreadable'
-    if raw not in allowed:
-        return None, 'script is not on the operator cron allowlist'
+        return None, None, None, 'cron script allowlist is missing or unreadable'
+    entry = allowed.get(raw)
+    if not isinstance(entry, dict):
+        return None, None, None, 'script is not on the operator cron allowlist'
+    runner = str(entry.get('runner') or '').strip().lower()
+    if runner not in ('sandbox', 'host'):
+        return None, None, None, 'cron allowlist entry has an invalid runner'
+    expected = str(entry.get('sha256') or '').strip().lower()
+    if not expected:
+        return None, None, None, 'cron allowlist entry is missing sha256'
     root = os.path.realpath(_repo_root())
     path = os.path.realpath(os.path.join(root, raw))
     scripts = os.path.join(root, SCRIPT_DIR)
     if not path.startswith(scripts + os.sep):
-        return None, 'script resolves outside scripts/'
+        return None, None, None, 'script resolves outside scripts/'
     if not os.path.isfile(path):
-        return None, f'script not found: {raw}'
-    if os.path.getsize(path) > MAX_SCRIPT_BYTES:
-        return None, 'script is too large'
-    return path, None
+        return None, None, None, f'script not found: {raw}'
+    try:
+        with open(path, 'rb') as f:
+            data = f.read(MAX_SCRIPT_BYTES + 1)
+    except OSError as exc:
+        return None, None, None, f'could not read script: {exc}'
+    if len(data) > MAX_SCRIPT_BYTES:
+        return None, None, None, 'script is too large'
+    actual = hashlib.sha256(data).hexdigest()
+    if actual != expected:
+        return None, None, None, 'script hash does not match the allowlist entry'
+    try:
+        source = data.decode('utf-8')
+    except UnicodeDecodeError:
+        source = data.decode('utf-8', errors='replace')
+    allowed_hosts = {
+        str(host).strip().lower().strip('.')
+        for host in (entry.get('allowedHosts') or [])
+    }
+    for url in _URL_RE.findall(source):
+        try:
+            host = (urllib.parse.urlparse(url).hostname or '').lower().strip('.')
+        except ValueError:
+            continue
+        if host and host not in allowed_hosts:
+            return None, None, None, (
+                f'script references a URL host not on its allowlist: {host}')
+    return path, entry, source, None
+
+
+def resolve_script(relpath):
+    """Resolve one repo-relative scripts/*.py path. Returns (path, error)."""
+    path, _entry, _source, error = _validate_script(relpath)
+    return path, error
 
 
 def _timeout(declaration):
@@ -97,40 +160,91 @@ def _parse_output(stdout):
     return notify, summary
 
 
+def _safe_env(entry, sandbox=False):
+    """The exact environment a script gets: a small base plus only the names
+    its allowlist entry declares. Never dict(os.environ).
+
+    Sandbox scripts get container paths and no host PATH/HOME. Host scripts
+    get the host base because they are explicitly approved host-bound work."""
+    if sandbox:
+        env = {
+            'HOME': '/tmp',
+            'TMPDIR': '/tmp',
+            'LANG': 'C.UTF-8',
+            'PYTHONPATH': '/workspace:/workspace/world',
+            'PYTHONDONTWRITEBYTECODE': '1',
+        }
+    else:
+        env = {key: os.environ[key] for key in _SAFE_ENV_KEYS if key in os.environ}
+        env.setdefault('HOME', os.path.expanduser('~') or '/tmp')
+        env.setdefault('TMPDIR', tempfile.gettempdir())
+        root = _repo_root()
+        world = os.path.join(root, 'world')
+        env['PYTHONPATH'] = os.pathsep.join(
+            p for p in (root, world, env.get('PYTHONPATH')) if p)
+        env['PYTHONDONTWRITEBYTECODE'] = '1'
+    for key in (entry.get('env') or []):
+        name = str(key).strip()
+        if name and name in os.environ:
+            env[name] = os.environ[name]
+    return env
+
+
+def _run_sandboxed(relpath, timeout_s, env):
+    import serve as _serve
+    return _serve.run_cron_script_sandboxed(relpath, timeout_s, env)
+
+
 def run(declaration):
     """Run one declaration's script. Never raises for a normal failure."""
-    path, error = resolve_script(declaration.get('script'))
+    rel = declaration.get('script')
+    path, entry, _source, error = _validate_script(rel)
     if error:
-        return {'ok': False, 'error': error, 'notify': False, 'summary': error}
-    root = os.path.realpath(_repo_root())
-    env = dict(os.environ)
-    world = os.path.join(root, 'world')
-    env['PYTHONPATH'] = os.pathsep.join(
-        p for p in (root, world, env.get('PYTHONPATH')) if p)
-    try:
-        # Fixed argv, no shell; the path was validated under scripts/.
-        proc = subprocess.run(  # nosec B603
-            [sys.executable, path],
-            cwd=root,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=_timeout(declaration),
-        )
-    except subprocess.TimeoutExpired:
-        return {'ok': False, 'error': 'script timed out', 'notify': False,
-                'summary': 'script timed out'}
-    except OSError as exc:
-        return {'ok': False, 'error': str(exc), 'notify': False,
-                'summary': str(exc)}
-    notify, summary = _parse_output(proc.stdout)
+        return {'ok': False, 'error': error, 'notify': False,
+                'summary': error, 'script': rel,
+                'runner': (entry or {}).get('runner')}
+    runner = str(entry.get('runner') or '').strip().lower()
+    if runner == 'host' and not declaration.get('allowHostExecution'):
+        message = 'host-only script requires explicit allowHostExecution approval'
+        return {'ok': False, 'error': message, 'notify': False,
+                'summary': message, 'script': rel, 'runner': runner}
+    timeout_s = _timeout(declaration)
+    env = _safe_env(entry, sandbox=(runner == 'sandbox'))
+    if runner == 'sandbox':
+        result = _run_sandboxed(str(rel), timeout_s, env)
+        if result.get('timedOut'):
+            return {'ok': False, 'error': 'script timed out', 'notify': False,
+                    'summary': 'script timed out', 'script': rel,
+                    'runner': runner}
+        returncode = result.get('exitCode')
+        stdout = result.get('stdout') or ''
+        stderr = result.get('stderr') or ''
+    else:
+        try:
+            proc = subprocess.run(  # nosec B603 -- fixed argv, no shell
+                [sys.executable, path],
+                cwd=_repo_root(), env=env, capture_output=True, text=True,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            return {'ok': False, 'error': 'script timed out', 'notify': False,
+                    'summary': 'script timed out', 'script': rel,
+                    'runner': runner}
+        except OSError as exc:
+            return {'ok': False, 'error': str(exc), 'notify': False,
+                    'summary': str(exc), 'script': rel, 'runner': runner}
+        returncode = proc.returncode
+        stdout = proc.stdout
+        stderr = proc.stderr
+    notify, summary = _parse_output(stdout)
     return {
-        'ok': proc.returncode == 0,
-        'returncode': proc.returncode,
-        'error': (proc.stderr or '').strip()[-1500:] if proc.returncode else '',
+        'ok': returncode == 0,
+        'returncode': returncode,
+        'error': (stderr or '').strip()[-1500:] if returncode else '',
         'notify': notify,
         'summary': summary,
-        'script': declaration.get('script'),
+        'script': rel,
+        'runner': runner,
     }
 
 
@@ -140,6 +254,8 @@ def run_standing(state, declaration, log, queue, now_ms=None):
     log(state, 'server', 'standing_task_script', {
         'taskId': declaration.get('taskId'),
         'script': outcome.get('script') or declaration.get('script'),
+        'runner': outcome.get('runner'),
+        'hostExecution': bool(declaration.get('allowHostExecution')),
         'ok': outcome.get('ok'),
         'returncode': outcome.get('returncode'),
         'notify': outcome.get('notify'),
@@ -168,10 +284,17 @@ def declaration_fields(body):
     fields = {}
     script = str(body.get('script') or '').strip()
     if script:
-        _, error = resolve_script(script)
+        _path, entry, _source, error = _validate_script(script)
         if error:
             return None, error
+        runner = str(entry.get('runner') or '').strip().lower()
         fields['script'] = script
+        fields['scriptRunner'] = runner
+        fields['scriptSha256'] = str(entry.get('sha256') or '')
+        if runner == 'host':
+            if body.get('allowHostExecution') is not True:
+                return None, 'host-only script requires allowHostExecution: true'
+            fields['allowHostExecution'] = True
         timeout = body.get('scriptTimeoutSeconds')
         if timeout not in (None, ''):
             try:
