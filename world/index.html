@@ -2014,12 +2014,10 @@ function closeBoard() {
   state.player.y = door.y + door.h + 6;
 }
 
-// Phone Booth -- no physical object for this exists anywhere in World's
-// generated background image (confirmed: no `callbooth` entry in
-// door_triggers.json, unlike the main game's hand-placed sprite building),
-// so this is a HUD-button dialog, same access pattern as Command Center's
-// convenience button. Genuinely distinct from walking up and pressing B:
-// it reaches an agent regardless of where they physically are, including
+// Phone Booth -- the red booth on the outdoor map is a dialog-only
+// trigger (no room behind it), and the HUD button is the second way in,
+// same access pattern as Command Center's convenience button. The booth
+// reaches an agent regardless of where they physically are, including
 // off duty (asleep) or mid-task and invisible inside a room -- neither of
 // which a physical walk-up conversation can ever reach. Reuses the exact
 // same conversation UI/log as an in-person chat (openConversation()) per
@@ -2037,6 +2035,11 @@ function openPhoneBooth() {
 function closePhoneBooth() {
   state.ui = null;
   document.getElementById('phoneModal').classList.add('hidden');
+  // Step clear of the booth's trigger so closing does not reopen it next frame.
+  const door = ROOM_DOOR_TRIGGERS && ROOM_DOOR_TRIGGERS.phonebooth;
+  if (door && state.location.kind === 'outside' && overlaps(state.player, door)) {
+    state.player.y = door.y + door.h + 6;
+  }
 }
 
 function renderPhoneRoster() {
@@ -3450,10 +3453,12 @@ function updateOutside(dt) {
   // separate interact key. Town Hall is now a MULTI-OPTION building:
   // its door opens a menu letting you choose between the physical
   // Hangout room and starting a meeting. House keeps opening the board.
+  // The Phone Booth is a dialog-only trigger.
   for (const building in ROOM_DOOR_TRIGGERS) {
     if (overlaps(p, ROOM_DOOR_TRIGGERS[building])) {
       if (building === 'townhall') openDoorMenu();
       else if (building === 'house') openBoard();
+      else if (building === 'phonebooth') openPhoneBooth();
       else enterRoom(building);
       return;
     }

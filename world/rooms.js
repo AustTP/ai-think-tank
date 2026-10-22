@@ -13,7 +13,7 @@
 //
 // Buildings NOT listed here are dialog-only or not yet built: townhall
 // (meeting chatroom, deferred), house (weekly-board dialog, not built),
-// callbooth (call dialog, not built).
+// phonebooth (dialog-only trigger, no room).
 
 const ROOM_NATIVE_W = 632, ROOM_NATIVE_H = 424;
 
