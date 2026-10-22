@@ -11,6 +11,7 @@ _READ_ONLY_TOOLS = frozenset({
     'search_library', 'read_library_file', 'search_web', 'browse_page',
     'github_get_repo', 'github_search_code', 'read_ais_feed', 'read_market_feed',
     'read_live_feed', 'read_rss_feed', 'read_weather', 'read_google_sheet',
+    'read_live_coverage',
     'list_calendar_events', 'search_gmail_messages', 'read_gmail_message',
     'read_google_doc', 'list_services', 'apify_get_dataset_items',
     'db_records', 'state_records', 'supervisor_db_records',
@@ -36,7 +37,7 @@ _COMMIT_TOOLS = frozenset({
     'adversarial_village', 'local_file', 'app_script', 'send_email',
     'send_sms', 'send_telegram', 'publish_skill', 'send_mail', 'api_call',
     'self_edit', 'schedule_dormant_apply', 'selfedit_fix', 'policy_edit',
-    'request_credential_access',
+    'request_credential_access', 'start_live_coverage', 'stop_live_coverage',
 })
 
 

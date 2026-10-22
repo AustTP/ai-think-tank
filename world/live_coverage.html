@@ -1,0 +1,339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Coverage</title>
+<style>
+  :root {
+    --bg: #12100d;
+    --panel: #1c1914;
+    --line: #3a3327;
+    --text: #efe4cf;
+    --muted: #a99b82;
+    --accent: #e0a33a;
+    --good: #8fbf6a;
+    --bad: #d97757;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+  }
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 18px 22px;
+    border-bottom: 1px solid var(--line);
+  }
+  h1 { margin: 0; font-size: 18px; letter-spacing: 0.08em; }
+  a { color: var(--accent); text-decoration: none; }
+  main {
+    display: grid;
+    grid-template-columns: minmax(320px, 460px) minmax(0, 1fr);
+    gap: 18px;
+    padding: 18px 22px 40px;
+  }
+  @media (max-width: 860px) {
+    main { grid-template-columns: 1fr; }
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  h2 { margin: 0 0 12px; font-size: 13px; letter-spacing: 0.08em; color: var(--muted); }
+  label { display: block; margin: 10px 0 4px; color: var(--muted); font-size: 12px; }
+  input {
+    width: 100%;
+    padding: 8px 10px;
+    background: #0d0b09;
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font: inherit;
+  }
+  .row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .actions { display: flex; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+  button {
+    padding: 8px 12px;
+    background: #2a241b;
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font: inherit;
+    cursor: pointer;
+  }
+  button.primary { background: var(--accent); color: #1a1307; border-color: var(--accent); font-weight: 700; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .status { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px 16px; margin: 12px 0; }
+  .status div span { color: var(--muted); }
+  .status strong { color: var(--text); }
+  .error { color: var(--bad); white-space: pre-wrap; }
+  .run-list { margin: 0; padding-left: 18px; color: var(--muted); }
+  .run-list li { margin: 4px 0; }
+  #observations { list-style: none; margin: 0; padding: 0; }
+  #observations li {
+    border-top: 1px solid var(--line);
+    padding: 12px 0;
+  }
+  #observations li:first-child { border-top: 0; }
+  .obs-head { display: flex; gap: 10px; align-items: baseline; color: var(--muted); font-size: 12px; }
+  .obs-body { margin-top: 4px; }
+  .obs-meta { margin-top: 4px; color: var(--muted); font-size: 12px; }
+  .pill {
+    display: inline-block;
+    padding: 1px 7px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>LIVE COVERAGE</h1>
+  <a href="/">Back to the tank</a>
+</header>
+<main>
+  <section class="panel">
+    <h2>START A RUN</h2>
+    <label for="url">Stream URL</label>
+    <input id="url" placeholder="https://.../live.m3u8 or rtsp://...">
+    <label for="label">Label</label>
+    <input id="label" placeholder="What is being covered?">
+    <div class="row">
+      <div>
+        <label for="interval">Seconds between frames</label>
+        <input id="interval" type="number" min="2" max="120" value="8">
+      </div>
+      <div>
+        <label for="maxSeconds">Max seconds</label>
+        <input id="maxSeconds" type="number" min="1" max="3600" value="180">
+      </div>
+      <div>
+        <label for="maxFrames">Max frames</label>
+        <input id="maxFrames" type="number" min="1" max="120" value="12">
+      </div>
+    </div>
+    <label for="maxUsd">Per-run vision spend cap (USD)</label>
+    <input id="maxUsd" type="number" min="0" max="5" step="0.05" value="0.25">
+    <div class="actions">
+      <button class="primary" id="startBtn">Start coverage</button>
+      <button id="stopBtn" disabled>Stop</button>
+      <button id="testBtn" type="button">Use public test stream</button>
+    </div>
+    <p class="hint">
+      Frames are sampled, sent to the vision tier, and written to the shared
+      Library while the run is active. Other agents can call
+      <code>read_live_coverage</code> to see the running observations.
+    </p>
+  </section>
+
+  <section class="panel">
+    <h2>RUN</h2>
+    <div id="statusLine" class="status"></div>
+    <div id="errorLine" class="error"></div>
+    <h2 style="margin-top:18px;">OBSERVATIONS</h2>
+    <ol id="observations"></ol>
+    <div id="recentWrap" style="margin-top:18px;">
+      <h2>RECENT RUNS</h2>
+      <ul id="recent" class="run-list"></ul>
+    </div>
+  </section>
+</main>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  let currentRunId = null;
+  let pollTimer = null;
+
+  async function api(path, options = {}) {
+    const res = await fetch(path, {
+      headers: { 'Content-Type': 'application/json' },
+      ...options,
+    });
+    let data = {};
+    try { data = await res.json(); } catch (_) { data = {}; }
+    if (!res.ok || data.error) {
+      throw new Error(data.error || ('HTTP ' + res.status));
+    }
+    return data;
+  }
+
+  function addCell(root, label, value) {
+    const div = document.createElement('div');
+    const span = document.createElement('span');
+    span.textContent = label + ' ';
+    const strong = document.createElement('strong');
+    strong.textContent = value;
+    div.appendChild(span);
+    div.appendChild(strong);
+    root.appendChild(div);
+  }
+
+  function renderRun(run) {
+    const status = $('statusLine');
+    status.replaceChildren();
+    if (!run) {
+      addCell(status, 'Status', 'no run yet');
+      $('stopBtn').disabled = true;
+      $('startBtn').disabled = false;
+      return;
+    }
+    addCell(status, 'Status', run.status);
+    addCell(status, 'Label', run.label);
+    addCell(status, 'Frames', String(run.frames) + ' / ' + String(run.maxFrames));
+    addCell(status, 'Spent', '$' + Number(run.spentUsd || 0).toFixed(4));
+    addCell(status, 'Stop reason', run.stopReason || 'none');
+    addCell(status, 'Library file', run.libraryPath || 'pending');
+    if (run.lastError) {
+      $('errorLine').textContent = run.lastError;
+    } else {
+      $('errorLine').textContent = '';
+    }
+    const active = run.status === 'starting' || run.status === 'running' || run.status === 'stopping';
+    $('startBtn').disabled = active;
+    $('stopBtn').disabled = !active;
+
+    const list = $('observations');
+    list.replaceChildren();
+    for (const obs of (run.observations || [])) {
+      const li = document.createElement('li');
+      const head = document.createElement('div');
+      head.className = 'obs-head';
+      const time = document.createElement('span');
+      time.textContent = '+' + Number(obs.offsetS || 0).toFixed(1) + 's';
+      const frame = document.createElement('span');
+      frame.className = 'pill';
+      frame.textContent = 'frame ' + String(obs.frame || 0);
+      const confidence = document.createElement('span');
+      confidence.className = 'pill';
+      confidence.textContent = 'confidence ' + Number(obs.confidence || 0).toFixed(2);
+      head.appendChild(time);
+      head.appendChild(frame);
+      head.appendChild(confidence);
+      const body = document.createElement('div');
+      body.className = 'obs-body';
+      body.textContent = obs.observation || '';
+      li.appendChild(head);
+      li.appendChild(body);
+      if (obs.changes) {
+        const meta = document.createElement('div');
+        meta.className = 'obs-meta';
+        meta.textContent = 'Change: ' + obs.changes;
+        li.appendChild(meta);
+      }
+      if (obs.entities && obs.entities.length) {
+        const meta = document.createElement('div');
+        meta.className = 'obs-meta';
+        meta.textContent = 'Entities: ' + obs.entities.join(', ');
+        li.appendChild(meta);
+      }
+      list.appendChild(li);
+    }
+    if (!list.children.length) {
+      const li = document.createElement('li');
+      li.className = 'hint';
+      li.textContent = 'No observations yet.';
+      list.appendChild(li);
+    }
+  }
+
+  function renderRecent(runs) {
+    const list = $('recent');
+    list.replaceChildren();
+    for (const run of runs || []) {
+      const li = document.createElement('li');
+      const when = new Date((run.startedAt || 0) * 1000).toLocaleString();
+      li.textContent = when + ' | ' + run.label + ' | ' + run.status +
+        ' | ' + run.frames + ' frames | $' + Number(run.spentUsd || 0).toFixed(4);
+      list.appendChild(li);
+    }
+    if (!list.children.length) {
+      const li = document.createElement('li');
+      li.textContent = 'No runs yet.';
+      list.appendChild(li);
+    }
+  }
+
+  async function refresh() {
+    try {
+      const query = currentRunId
+        ? '?run_id=' + encodeURIComponent(currentRunId) + '&limit=100'
+        : '?limit=100';
+      const data = await api('/api/live-coverage/status' + query);
+      if (data.run) {
+        currentRunId = data.run.id;
+        renderRun(data.run);
+      } else {
+        currentRunId = null;
+        renderRun(null);
+      }
+      renderRecent(data.runs);
+    } catch (err) {
+      $('errorLine').textContent = String(err.message || err);
+      if (String(err.message || '').indexOf('unknown run') !== -1) {
+        currentRunId = null;
+      }
+    }
+  }
+
+  async function startRun() {
+    $('errorLine').textContent = '';
+    const payload = {
+      url: $('url').value.trim(),
+      label: $('label').value.trim(),
+      intervalS: Number($('interval').value),
+      maxSeconds: Number($('maxSeconds').value),
+      maxFrames: Number($('maxFrames').value),
+      maxUsd: Number($('maxUsd').value),
+    };
+    try {
+      const data = await api('/api/live-coverage/start', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      currentRunId = data.run.id;
+      renderRun(data.run);
+      await refresh();
+    } catch (err) {
+      $('errorLine').textContent = String(err.message || err);
+    }
+  }
+
+  async function stopRun() {
+    if (!currentRunId) return;
+    $('stopBtn').disabled = true;
+    try {
+      await api('/api/live-coverage/stop', {
+        method: 'POST',
+        body: JSON.stringify({ runId: currentRunId }),
+      });
+      await refresh();
+    } catch (err) {
+      $('errorLine').textContent = String(err.message || err);
+    }
+  }
+
+  $('startBtn').addEventListener('click', startRun);
+  $('stopBtn').addEventListener('click', stopRun);
+  $('testBtn').addEventListener('click', () => {
+    $('url').value = 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8';
+    if (!$('label').value.trim()) $('label').value = 'Public HLS test stream';
+  });
+
+  refresh();
+  pollTimer = setInterval(refresh, 2500);
+  window.addEventListener('beforeunload', () => clearInterval(pollTimer));
+})();
+</script>
+</body>
+</html>

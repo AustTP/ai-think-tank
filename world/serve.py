@@ -8464,9 +8464,11 @@ app = FastAPI(lifespan=_lifespan)
 from confirmations_api import router as _confirmations_router  # noqa: E402
 from supervision_api import router as _supervision_router  # noqa: E402
 from feedback_api import router as _feedback_router  # noqa: E402
+from live_coverage_api import router as _live_coverage_router  # noqa: E402
 app.include_router(_confirmations_router)
 app.include_router(_supervision_router)
 app.include_router(_feedback_router)
+app.include_router(_live_coverage_router)
 
 
 OPENROUTER_API_KEY = _load_env().get('OPENROUTER_API_KEY')
@@ -12245,6 +12247,63 @@ AGENT_ASK_TOOLS = [
                                                                'XBT/USD or a vessel name). Omit for all.'},
                     'max': {'type': 'integer', 'description': 'Max records per service, 1-50 (default 10).'},
                 },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'read_live_coverage',
+            'description': 'Read observations from the think tank\'s live video coverage runs. '
+                           'Use this while a run is active to see what the vision desk has '
+                           'reported so far, or to review a recent run. Returns run status, '
+                           'spend, caps, and the most recent observations. Omit run_id for the '
+                           'active or most recent run.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'run_id': {'type': 'string', 'description': 'Coverage run id. Omit for the active or most recent run.'},
+                    'max': {'type': 'integer', 'description': 'Max observations to return, 1-200 (default 30).'},
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'start_live_coverage',
+            'description': 'Start a bounded live video coverage run. Samples a frame from a public '
+                           'http(s), rtsp, rtmp, or rtmps stream every interval_s, sends each '
+                           'frame to the vision tier, and publishes observations to the shared '
+                           'Library and action log while the run continues. One run at a time. '
+                           'Stops at max_frames, max_seconds, or max_usd, whichever comes first. '
+                           'Director/admin only. YouTube live page URLs are resolved with yt-dlp '
+                           'when it is installed.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'url': {'type': 'string', 'description': 'Public stream URL, e.g. an HLS .m3u8, RTSP, or RTMP URL.'},
+                    'label': {'type': 'string', 'description': 'Short label for what is being covered.'},
+                    'interval_s': {'type': 'number', 'description': 'Seconds between frames, 2-120 (default 8).'},
+                    'max_seconds': {'type': 'number', 'description': 'Maximum run duration, 1-3600 seconds (default 180).'},
+                    'max_frames': {'type': 'integer', 'description': 'Maximum frames, 1-120 (default 12).'},
+                    'max_usd': {'type': 'number', 'description': 'Per-run vision spend ceiling in USD, 0-5 (default 0.25; 0 disables the per-run ceiling).'},
+                },
+                'required': ['url'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'stop_live_coverage',
+            'description': 'Stop an active live video coverage run. Director/admin only.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'run_id': {'type': 'string', 'description': 'Coverage run id to stop.'},
+                },
+                'required': ['run_id'],
             },
         },
     },
@@ -18836,6 +18895,87 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             wrapped, _nonce, _tag, instruction = wrap_external_content(
                 raw, 'live real-time feed records buffered by the think tank')
             return f'{instruction}\n\n{wrapped}'
+        if name == 'read_live_coverage':
+            # The vision desk's running transcript. Any agent may read it;
+            # observations are model output about an external video, so they
+            # cross the same external-content boundary as a fetched page.
+            run_id = str((args or {}).get('run_id') or '').strip()
+            try:
+                max_items = int((args or {}).get('max') or 30)
+            except (TypeError, ValueError):
+                max_items = 30
+            max_items = max(1, min(max_items, 200))
+            query = f'?limit={max_items}'
+            if run_id:
+                query = ('?run_id=' + urllib.parse.quote(run_id) +
+                         f'&limit={max_items}')
+            result = _http_json('GET', SELF_BASE_URL,
+                                '/api/live-coverage/status' + query,
+                                None, agent_key)
+            if not isinstance(result, dict) or result.get('error'):
+                return ('Could not read live coverage: '
+                        + str((result or {}).get('error') or 'no response'))
+            run = result.get('run')
+            if not run:
+                return ('No live coverage runs yet. A director can start one with '
+                        'start_live_coverage using a public stream URL.')
+            lines = [
+                f"run {run.get('id')} [{run.get('status')}] label={run.get('label')}",
+                f"stream={run.get('stream')} frames={run.get('frames')}/{run.get('maxFrames')} "
+                f"spent=${float(run.get('spentUsd') or 0):.4f}",
+                f"stopReason={run.get('stopReason') or 'none'} "
+                f"libraryPath={run.get('libraryPath') or 'pending'}",
+            ]
+            observations = run.get('observations') or []
+            if observations:
+                lines.append('recent observations:')
+                for obs in observations:
+                    line = (f"- +{obs.get('offsetS')}s frame {obs.get('frame')} "
+                            f"(confidence {float(obs.get('confidence') or 0):.2f}): "
+                            f"{obs.get('observation')}")
+                    if obs.get('changes'):
+                        line += f" | change: {obs.get('changes')}"
+                    if obs.get('entities'):
+                        line += f" | entities: {', '.join(obs.get('entities'))}"
+                    lines.append(line)
+            else:
+                lines.append('no observations yet')
+            raw = '\n'.join(lines)
+            wrapped, _nonce, _tag, instruction = wrap_external_content(
+                raw, 'live video coverage observations from the vision desk')
+            return f'{instruction}\n\n{wrapped}'
+        if name == 'start_live_coverage':
+            payload = {
+                'url': (args or {}).get('url') or '',
+                'label': (args or {}).get('label') or '',
+                'intervalS': (args or {}).get('interval_s'),
+                'maxSeconds': (args or {}).get('max_seconds'),
+                'maxFrames': (args or {}).get('max_frames'),
+                'maxUsd': (args or {}).get('max_usd'),
+            }
+            result = _http_json('POST', SELF_BASE_URL,
+                                '/api/live-coverage/start', payload,
+                                agent_key, timeout=30)
+            if isinstance(result, dict) and result.get('ok') and result.get('run'):
+                run = result['run']
+                return (f"Live coverage started: run {run.get('id')} is sampling "
+                        f"every {run.get('intervalS') or '?'}s for up to "
+                        f"{run.get('maxSeconds')}s / {run.get('maxFrames')} frames / "
+                        f"${run.get('maxUsd')}. Other agents can call "
+                        f"read_live_coverage while it runs.")
+            return ('Could not start live coverage: '
+                    + str((result or {}).get('error') or 'no response'))
+        if name == 'stop_live_coverage':
+            run_id = str((args or {}).get('run_id') or '').strip()
+            if not run_id:
+                return 'stop_live_coverage needs a run_id.'
+            result = _http_json('POST', SELF_BASE_URL,
+                                '/api/live-coverage/stop', {'runId': run_id},
+                                agent_key, timeout=30)
+            if isinstance(result, dict) and result.get('ok'):
+                return f'Live coverage {run_id} is stopping.'
+            return ('Could not stop live coverage: '
+                    + str((result or {}).get('error') or 'no response'))
         if name == 'browse_page':
             country = ((args or {}).get('country') or '').strip().lower()
             exit_name = ((args or {}).get('exit') or '').strip()
