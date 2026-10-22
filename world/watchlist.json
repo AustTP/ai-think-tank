@@ -1,13 +1,4 @@
 {
   "comment": "Standing research topics the desk watches (RESEARCH_WATCHLIST). The operator edits this file to add/change sources; on server boot it seeds researchTopics. When a village agent adds a topic through the intent lane, it is appended here so you see their additions in the same file. cadenceMs is how often the crawl fires (floored to 5 minutes); linkKeyword/pageKeyword filter which linked pages are followed/kept.",
-  "topics": [
-    {
-      "id": "bot-protection-law",
-      "topic": "Bot-protection laws and regulations: new statutes, rules, enforcement, and court decisions affecting automated agents, scraping, disclosure, and algorithmic accountability",
-      "startUrl": "https://www.federalregister.gov/documents/search?conditions%5Bterm%5D=automated+decision+system+regulation",
-      "cadenceMs": 2592000000,
-      "linkKeyword": "bot|automated|algorithm|robot|scrap|disclos",
-      "pageKeyword": "law|rule|regulation|act|enforcement|court|compliance"
-    }
-  ]
+  "topics": []
 }

@@ -3562,6 +3562,18 @@ function wireZoom() {
 
 async function main() {
   await loadSceneAssets();
+  const playerSprites = {
+    south: await loadImage('assets/character_south.png'),
+    north: await loadImage('assets/character_north.png'),
+    east: await loadImage('assets/character_east.png'),
+    west: await loadImage('assets/character_west.png'),
+  };
+  const roomImages = {};
+  // Start the world as soon as the scene background and player art are
+  // ready. State, agents, generated sprites, and room art arrive later;
+  // none of them may hold the first frame hostage.
+  let last = performance.now();
+  requestAnimationFrame(frame);
   await loadDoorTriggers();
   await loadMeetingPresets();
   // Real ordering fix: a genuinely fresh start now generates each seed
@@ -3579,35 +3591,37 @@ async function main() {
     pollAdversarialVillage();
     setInterval(pollAdversarialVillage, 3000);
   }
-  const playerSprites = {
-    south: await loadImage('assets/character_south.png'),
-    north: await loadImage('assets/character_north.png'),
-    east: await loadImage('assets/character_east.png'),
-    west: await loadImage('assets/character_west.png'),
-  };
+  // Several buildings share the same room image (see rooms.js) -- load
+  // each distinct path once and key the cache by path, not by building.
+  // (roomImages is declared above with the early render start.)
 
   // Per-agent generated sprites: load each non-admin agent's 4-direction set
   // from /api/avatar/<id>/<orientation>.png. Best-effort -- any orientation
   // that 404s (PixelLab unavailable, no credits, or generation still pending)
   // is null and drawAgentAt falls back to the shared default player sprite.
+  //
+  // This must never gate the first frame. It used to be awaited inline, so
+  // 4 requests per agent ran in series before requestAnimationFrame() was
+  // ever called: 37 agents meant ~148 round trips and a black canvas for
+  // over a minute on a busy server. The world now renders from the scene
+  // background and default player sprites immediately; generated art swaps
+  // in as it arrives.
   agentSprites = {};
-  const adminIds = new Set(AGENT_ROSTER.filter(d => d.isAdmin).map(d => d.id));
-  for (const id in AGENTS) {
-    if (adminIds.has(id)) continue;
-    const set = {};
-    for (const o of ['south', 'north', 'east', 'west']) {
-      set[o] = await loadImage(`/api/avatar/${id}/${o}.png`).catch(() => null);
+  void (async () => {
+    const adminIds = new Set(AGENT_ROSTER.filter(d => d.isAdmin).map(d => d.id));
+    for (const id in AGENTS) {
+      if (adminIds.has(id)) continue;
+      const set = {};
+      for (const o of ['south', 'north', 'east', 'west']) {
+        set[o] = await loadImage(`/api/avatar/${id}/${o}.png`).catch(() => null);
+      }
+      if (['south', 'north', 'east', 'west'].some(o => set[o])) agentSprites[id] = set;
     }
-    if (['south', 'north', 'east', 'west'].some(o => set[o])) agentSprites[id] = set;
-  }
-
-  // Several buildings share the same room image (see rooms.js) -- load
-  // each distinct path once and key the cache by path, not by building.
-  const roomImages = {};
-  for (const building in ROOMS) {
-    const path = ROOMS[building].image;
-    if (!roomImages[path]) roomImages[path] = await loadImage(path).catch(() => null);
-  }
+    for (const building in ROOMS) {
+      const path = ROOMS[building].image;
+      if (!roomImages[path]) roomImages[path] = await loadImage(path).catch(() => null);
+    }
+  })().catch(e => console.warn('agent art preload failed:', e));
 
   window.addEventListener('keydown', e => {
     // Typing in the chat box (or any future text field) shouldn't leak into
@@ -3893,7 +3907,6 @@ async function main() {
     }
   }
 
-  let last = performance.now();
   function frame(now) {
     const dt = Math.min(0.05, (now - last) / 1000);
     last = now;
@@ -3922,7 +3935,6 @@ async function main() {
     }
     requestAnimationFrame(frame);
   }
-  requestAnimationFrame(frame);
 }
 
 main();
