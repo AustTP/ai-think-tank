@@ -226,6 +226,8 @@ def find_path(start_x, start_y, target_x, target_y, exclude_agent_id, agents, gr
             continue
         if other is None or not other.get('visible'):
             continue
+        if other.get('x') is None or other.get('y') is None:
+            continue
         if _overlaps(start_box, {'x': other['x'], 'y': other['y'], 'w': AGENT_W, 'h': AGENT_H}):
             co_located.add(aid)
 
@@ -234,6 +236,8 @@ def find_path(start_x, start_y, target_x, target_y, exclude_agent_id, agents, gr
             if aid == exclude_agent_id or aid in co_located:
                 continue
             if not other or not other.get('visible'):
+                continue
+            if other.get('x') is None or other.get('y') is None:
                 continue
             if _overlaps(box, {'x': other['x'], 'y': other['y'], 'w': AGENT_W, 'h': AGENT_H}):
                 return True
@@ -411,6 +415,8 @@ def agent_blocked_at(box, agents, exclude_id=None, ignore_ids=None, doors=None):
             continue
         if not a or not a.get('visible'):
             continue
+        if a.get('x') is None or a.get('y') is None:
+            continue
         if _is_on_door_tile(a.get('x', 0), a.get('y', 0), doors):
             continue
         if _overlaps(box, {'x': a['x'], 'y': a['y'], 'w': AGENT_W, 'h': AGENT_H}):
@@ -529,6 +535,8 @@ def step_agent_movement(dt, agents, grid, doors=None, walk_speed=TASK_WALK_SPEED
     for aid, a in agents.items():
         if not a.get('path') or not a.get('visible'):
             continue
+        if a.get('x') is None or a.get('y') is None:
+            continue
         path = a['path']
         path_index = a.get('pathIndex', 0)
 
@@ -581,7 +589,11 @@ def step_agent_movement(dt, agents, grid, doors=None, walk_speed=TASK_WALK_SPEED
         for oid, other in agents.items():
             if oid == aid:
                 continue
-            if other and other.get('visible') and _overlaps(a_box, {'x': other['x'], 'y': other['y'], 'w': AGENT_W, 'h': AGENT_H}):
+            if not other or not other.get('visible'):
+                continue
+            if other.get('x') is None or other.get('y') is None:
+                continue
+            if _overlaps(a_box, {'x': other['x'], 'y': other['y'], 'w': AGENT_W, 'h': AGENT_H}):
                 co_located.add(oid)
 
         if not _blocked_at(try_both, grid) and not agent_blocked_at(try_both, agents, aid, co_located, doors):
@@ -648,7 +660,8 @@ def _reconcile_stranded_agents(state, grid):
     mask = compute_reachable_mask(grid, SPAWN)
     moved = 0
     occupied = [{'x': v['x'], 'y': v['y']} for v in agents.values()
-                if isinstance(v, dict) and v.get('visible')]
+                if isinstance(v, dict) and v.get('visible')
+                and v.get('x') is not None and v.get('y') is not None]
     for aid, a in agents.items():
         if not isinstance(a, dict) or not a.get('visible'):
             continue
@@ -657,8 +670,8 @@ def _reconcile_stranded_agents(state, grid):
             continue
         x, y = a.get('x'), a.get('y')
         if x is None or y is None:
-            continue
-        if _blocked_at({'x': x, 'y': y, 'w': AGENT_W, 'h': AGENT_H}, grid):
+            stranded = True
+        elif _blocked_at({'x': x, 'y': y, 'w': AGENT_W, 'h': AGENT_H}, grid):
             stranded = True
         elif not is_reachable(x + AGENT_W / 2, y + AGENT_H / 2, grid, mask):
             stranded = True
