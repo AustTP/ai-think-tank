@@ -19236,6 +19236,18 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     # never assign a task, we only borrow an agent's voice for a reply).
     agents = state.get('agents') or {}
     candidates = [aid for aid in _sim._eligible_candidates(state, include_off_duty=True) if agents.get(aid)]
+    # Prefer workers for routine asks. A director is a fallback voice, not the
+    # default respondent: she should be delegating team work, not answering the
+    # player's one-off questions while a worker is available. Stable sort keeps
+    # the existing round-robin order inside each group.
+    roster_by_id = {d.get('id'): d for d in (state.get('agentRoster') or [])}
+
+    def _ask_is_director(aid):
+        rec = roster_by_id.get(aid) or {}
+        return bool(rec.get('isDirector') or rec.get('isAdmin')
+                    or _sim._sim_direct_reports(state, aid))
+
+    candidates.sort(key=lambda aid: 1 if _ask_is_director(aid) else 0)
     requested_agent = (agent_id_hint or '').strip()
     # A deliberate pin (e.g. the Telegram bridge asking for the chief of staff by id)
     # must be able to name a chief of staff -- _eligible_candidates excludes admins
