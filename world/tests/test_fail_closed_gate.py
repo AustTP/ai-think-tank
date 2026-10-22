@@ -329,8 +329,11 @@ class SendBackAfterFailure(unittest.TestCase):
         # The bound auto-closes the story (no player escalation).
         close.assert_called_once()
         self.assertIn('task_auto_closed', [c.args[1] for c in log.call_args_list])
-        # Exactly cap-1 fixes were ever queued; the cap-crossing call queues none.
-        self.assertEqual(len(state['workQueue']), sim.MAX_REVIEW_CYCLES - 1)
+        # Duplicate fixes for the same root title are deduped, so the first
+        # send-back queues one fix and the rest are refused; the cap-crossing
+        # call queues none.
+        self.assertEqual(len(state['workQueue']), 1)
+        self.assertLessEqual(len(state['workQueue']), sim.MAX_REVIEW_CYCLES - 1)
 
     def test_enter_peer_review_carries_cycle_count_and_escalation(self):
         # A re-armed gate (via _send_back's fix completing, or a reviewer
@@ -684,16 +687,17 @@ class ContentRunGraceTimeout(unittest.TestCase):
 
     def test_stale_heartbeat_falls_back_and_logs_abandonment(self):
         # No heartbeat within TASK_CONTENT_HB_STALE_S = the thread died without
-        # storing a result -> the honest fallback fires (task done, agent
-        # released) and the abandonment is logged for the operator.
+        # storing a result -> the fallback releases the agent and closes the
+        # card as failed (no fabricated completion) while logging the
+        # abandonment for the operator.
         task = self._spike()
         state, now_ms = self._quiet_base(task)
         now = now_ms / 1000.0
         task['workUntil'] = now - 1.0
         task['_contentHeartbeat'] = now - (sim.TASK_CONTENT_HB_STALE_S + 5.0)
         self._cycle(state, now)
-        self.assertEqual(task['status'], 'done',
-                         'a dead run must fall back, not hang forever')
+        self.assertEqual(task['status'], 'failed',
+                         'a dead run must fail closed, not fabricate done')
         self.assertIsNone(state['agents']['ada'].get('task'))
         with serve._db() as conn:
             rows = conn.execute(
@@ -710,19 +714,20 @@ class ContentRunGraceTimeout(unittest.TestCase):
         task['workUntil'] = now - 1.0
         task['_contentHeartbeat'] = now - 1.0
         self._cycle(state, now)
-        self.assertEqual(task['status'], 'done',
-                         'grace exhaustion must fall back to completion')
+        self.assertEqual(task['status'], 'failed',
+                         'grace exhaustion must fail closed, not fabricate done')
 
     def test_no_heartbeat_keeps_preexisting_timeout(self):
         # An executor that never opts into heartbeats (every other content
-        # lane) must behave exactly as before: timeout at workUntil, fallback.
+        # lane) still times out at workUntil, and now fails closed rather than
+        # fabricating a completed deliverable.
         task = self._spike()
         task.pop('_contentHeartbeat', None)
         state, now_ms = self._quiet_base(task)
         now = now_ms / 1000.0
         task['workUntil'] = now - 1.0
         self._cycle(state, now)
-        self.assertEqual(task['status'], 'done')
+        self.assertEqual(task['status'], 'failed')
         self.assertNotIn('_contentGraceUsed', task,
                          'no heartbeat = no grace, pre-existing semantics')
 

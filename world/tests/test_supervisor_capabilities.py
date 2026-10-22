@@ -194,7 +194,7 @@ def test_direct_backlog_is_chief_of_staff_only(monkeypatch):
     assert ok is False and 'chief of staff' in payload['error']
 
 
-def test_admin_routine_sweep_runs_without_an_attention_reason(monkeypatch):
+def test_admin_routine_sweep_does_not_fire_without_an_attention_reason(monkeypatch):
     import sim
     state = _state()
     state['sprints'] = {'s1': {'id': 's1', 'status': 'active',
@@ -204,13 +204,7 @@ def test_admin_routine_sweep_runs_without_an_attention_reason(monkeypatch):
     state['_supervisorBriefAt'] = {}
     state['_supervisorCardAt'] = {}
     sim._supervisor_brief_step(state, 0, 1000)
-    routine = [q for q in state['workQueue']
-               if str(q.get('title')).startswith('[SUPERVISE] Cross-team: routine sweep')]
-    assert len(routine) == 1 and routine[0]['assignedTo'] == 'theo'
-    # Consume the card; the routine cadence still suppresses an immediate repeat.
-    state['workQueue'] = []
-    sim._supervisor_brief_step(state, 0, 1000 + 60_000)
     assert state['workQueue'] == []
-    # Once the routine interval elapses, the next sweep fires again.
+    # Idle is not a reason to mint a card on a later cadence either.
     sim._supervisor_brief_step(state, 0, 1000 + sim.CHIEF_MONITOR_INTERVAL_MS + 1)
-    assert len(state['workQueue']) == 1
+    assert state['workQueue'] == []

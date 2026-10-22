@@ -532,12 +532,19 @@ def _load_env():
     env = {}
     env_path = os.path.join(os.path.dirname(ROOT), '.env')
     if os.path.exists(env_path):
-        with open(env_path, encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    k, v = line.split('=', 1)
-                    env[k] = v
+        try:
+            with open(env_path, encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if isinstance(line, bytes):
+                        line = line.decode('utf-8', 'replace')
+                    if line and not line.startswith('#') and '=' in line:
+                        k, v = line.split('=', 1)
+                        env[k] = v
+        except OSError:
+            # A missing/unreadable .env is not fatal: callers treat absent
+            # configuration as defaults, and tests often mock open().
+            pass
     return env
 
 

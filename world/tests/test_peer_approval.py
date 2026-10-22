@@ -139,7 +139,8 @@ class ReviewerSelection(unittest.TestCase):
         # The per-agent room-contributor signal is bumped by real completion,
         # not just queried -- finish_task and the peer-gate release both record it.
         state = _state()
-        task = _task(room='pressoffice', status='working', entryX=None, entryY=None)
+        task = _task(room='pressoffice', status='working', entryX=None, entryY=None,
+                     libraryPath='library/pressoffice/out.md')
         state['agents']['ben']['task'] = task['id']
         state['tasks'][task['id']] = task
         sim.finish_task(state, 'ben', grid=None)
