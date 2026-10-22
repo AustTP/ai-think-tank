@@ -2,14 +2,16 @@
 
 The browser driver detects a CAPTCHA and returns a stable selector. This module
 records the request, stores the owner's answer, and lets the broker fill that
-answer into the waiting page. It does not bypass an interactive challenge.
+answer into the waiting page.
 
-Policy is per host and defaults to `relay`. `attempt` only means the server may
-try a vision read of a simple image CAPTCHA before asking the owner, and only
-when the operator has set `CAPTCHA_AUTO_ATTEMPT=1`. The default is off. The
+Policy is per host and defaults to `relay`. `attempt` means the server may try
+an automatic read of a simple image CAPTCHA (CAPTCHA_AUTO_ATTEMPT=1, default
+off), a Scrapling-style Cloudflare Turnstile/Interstitial solve
+(CAPTCHA_AUTO_SOLVE=cloudflare), or a vision-driven click plan for an
+interactive widget when a live browser session holds the page
+(CAPTCHA_AUTO_SOLVE=all|agentic). `relay` never attempts any of them. The
 operator owns the terms-of-service and consent question for auto-attempting a
-site's challenge. Interactive challenges (reCAPTCHA, hCaptcha, Turnstile,
-Arkose) always go to the owner.
+site's challenge. Anything automatic that fails falls back to the owner.
 """
 import secrets
 import time
@@ -19,7 +21,8 @@ MIN_TTL_S = 60
 MAX_TTL_S = 1800
 ANSWER_MAX = 64
 MODES = ('relay', 'attempt')
-INTERACTIVE = ('recaptcha', 'hcaptcha', 'turnstile', 'arkose')
+INTERACTIVE = ('recaptcha', 'hcaptcha', 'turnstile', 'arkose',
+               'friendlycaptcha', 'awswaf')
 
 
 def ensure_schema(conn):

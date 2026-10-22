@@ -173,5 +173,85 @@ class Detection(_CaptchaCase):
         self.assertIn('https://example.com/login', text_send.call_args.args[0])
 
 
+class AgenticSolver(_CaptchaCase):
+    def _shot(self, width=200, height=100):
+        buffer = io.BytesIO()
+        Image.new('RGB', (width, height), 'white').save(buffer, 'PNG')
+        return base64.b64encode(buffer.getvalue()).decode()
+
+    def test_crop_meta_returns_the_box_and_a_smaller_image(self):
+        b64, box = serve._captcha_crop_meta(
+            self._shot(), [{'rect': {'x': 50, 'y': 20, 'width': 40, 'height': 30}}])
+        self.assertEqual(box, (26, 0, 114, 74))
+        image = Image.open(io.BytesIO(base64.b64decode(b64)))
+        self.assertEqual(image.size, (88, 74))
+
+    def test_plan_parser_clamps_and_bounds(self):
+        content = ('```json\n{"clicks": [[0.1, 0.2], [2, -1]], "text": "AB",'
+                   ' "submit": true, "confidence": 1.4}\n```')
+        with unittest.mock.patch.object(serve, '_vision_tier_slug', return_value='vision'), \
+             unittest.mock.patch.object(
+                 serve, '_call_openrouter_sync',
+                 return_value={'choices': [{'message': {'content': content}}]}):
+            plan = serve._captcha_agentic_plan('fake-image', 'hcaptcha')
+        self.assertEqual(plan['clicks'], [[0.1, 0.2], [1.0, 0.0]])
+        self.assertEqual(plan['text'], 'AB')
+        self.assertTrue(plan['submit'])
+        self.assertEqual(plan['confidence'], 1.0)
+
+    def test_attempt_refuses_without_a_live_session(self):
+        with unittest.mock.patch.object(
+                serve, '_load_env',
+                return_value={'CAPTCHA_AUTO_SOLVE': 'all'}), \
+             unittest.mock.patch.object(serve.browser_session, 'get',
+                                        return_value=None):
+            result = serve._captcha_agentic_attempt(
+                'ben', 'sandbox-test', 'https://example.com/login',
+                [{'kind': 'hcaptcha', 'rect': {'x': 1, 'y': 1, 'width': 50, 'height': 50}}],
+                self._shot())
+        self.assertFalse(result['solved'])
+        self.assertFalse(result['attempted'])
+        self.assertIn('live browser session', result['reason'])
+
+    def test_detected_interactive_challenge_is_solved_by_agentic_plan(self):
+        captchas = [{'kind': 'hcaptcha', 'selector': '#hcap',
+                     'rect': {'x': 10, 'y': 10, 'width': 100, 'height': 50}}]
+        parsed = {'ok': True, 'url': 'https://example.com/login',
+                  'captchas': [], 'challenge': None, 'blocked': False,
+                  '_shotB64': self._shot()}
+        captcha.set_policy('example.com', 'attempt', updated_by='player')
+        with unittest.mock.patch.object(
+                serve, '_load_env',
+                return_value={'CAPTCHA_AUTO_SOLVE': 'all',
+                              'CAPTCHA_AGENTIC_CONFIDENCE': '0.7'}), \
+             unittest.mock.patch.object(
+                 serve.browser_session, 'get',
+                 return_value={'status': 'running', 'takeover': False}), \
+             unittest.mock.patch.object(
+                 serve, '_captcha_agentic_plan',
+                 return_value={'clicks': [[0.5, 0.5]], 'text': '',
+                               'submit': False, 'confidence': 0.9}), \
+             unittest.mock.patch.object(
+                 serve, '_run_browser_act_sync',
+                 return_value=(parsed, None)) as run_mock, \
+             unittest.mock.patch.object(serve, '_telegram_send_photo_sync',
+                                        return_value=1) as send, \
+             unittest.mock.patch.object(serve, '_telegram_send_text_sync',
+                                        return_value=1) as text_send:
+            info = serve._handle_captcha_detected(
+                'ben', 'sandbox-test', 'https://example.com/login',
+                captchas, self._shot(), purpose='sign in')
+            action = run_mock.call_args.args[1]
+        self.assertTrue(info['agenticSolved'])
+        self.assertTrue(info['agenticAttempted'])
+        self.assertFalse(info['imageSent'])
+        send.assert_not_called()
+        text_send.assert_not_called()
+        self.assertEqual(captcha.get(info['requestId'])['status'], 'solved')
+        self.assertEqual(action['op'], 'captcha_act')
+        self.assertEqual(action['clicks'][0], {'x': 67.0, 'y': 42.0})
+        self.assertEqual(action['autoSolve'], 'off')
+
+
 if __name__ == '__main__':
     unittest.main()

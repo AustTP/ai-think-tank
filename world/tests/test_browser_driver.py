@@ -32,12 +32,19 @@ class _FakeMouse:
     def __init__(self):
         self.moves = []
         self.wheels = []
+        self.clicks = []
+        self.click_callback = None
 
     def move(self, x, y):
         self.moves.append((x, y))
 
     def wheel(self, dx, dy):
         self.wheels.append((dx, dy))
+
+    def click(self, x, y, delay=None, button='left'):
+        self.clicks.append((x, y))
+        if self.click_callback:
+            self.click_callback()
 
 
 class _FakeLocator:
@@ -48,12 +55,13 @@ class _FakeLocator:
         self._fills = fills
         self._value = ''
         self.first = self
+        self.last = self
 
     def wait_for(self, state='visible', timeout=None):
         if self._error:
             raise self._error
 
-    def click(self, timeout=None):
+    def click(self, timeout=None, delay=None):
         if self._error:
             raise self._error
         self.clicks.append(self.selector)
@@ -86,6 +94,37 @@ class _FakeLocator:
         return {'x': 10, 'y': 20, 'width': 100, 'height': 30}
 
 
+class _FakeFrame:
+    def __init__(self, box=None, checkbox_clicks=None, error=None):
+        self.box = box or {'x': 100, 'y': 200, 'width': 300, 'height': 80}
+        self.checkbox_clicks = checkbox_clicks if checkbox_clicks is not None else []
+        self._error = error
+        self.load_states = []
+
+    def locator(self, selector):
+        return _FakeLocator(selector, self.checkbox_clicks, self._error)
+
+    def wait_for_load_state(self, state=None, timeout=None):
+        self.load_states.append(state)
+
+    def frame_element(self):
+        return _FakeFrameElement(self.box, self._error)
+
+
+class _FakeFrameElement:
+    def __init__(self, box, error=None):
+        self.box = box
+        self._error = error
+
+    def is_visible(self):
+        if self._error:
+            raise self._error
+        return True
+
+    def bounding_box(self):
+        return self.box
+
+
 class _FakePage:
     def __init__(self):
         self._url = 'http://sandbox/page'
@@ -99,6 +138,10 @@ class _FakePage:
         self._screenshot_error = None
         self.challenge = None
         self.data_routes = []
+        self.html = ''
+        self.cf_frame = None
+        self.frame_requests = []
+        self.load_states = []
         self.user_agent = 'Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0.7339.0 Safari/537.36'
         self.language = 'en-US'
         self.timezone = 'UTC'
@@ -121,6 +164,16 @@ class _FakePage:
         if self._title_error:
             raise self._title_error
         return 'Fake Title'
+
+    def content(self):
+        return self.html
+
+    def frame(self, url=None):
+        self.frame_requests.append(url)
+        return self.cf_frame
+
+    def wait_for_load_state(self, state=None, timeout=None):
+        self.load_states.append(state)
 
     def wait_for_timeout(self, ms):
         pass
@@ -599,6 +652,88 @@ class CdpAttach(unittest.TestCase):
             with _with_playwright(playwright):
                 browser_driver.run({'op': 'goto', 'url': 'http://sandbox/x'})
         self.assertEqual(page.gotos[0][0], 'http://sandbox/x')
+
+
+class CloudflareSolver(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='think tank-cf-test-'))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _run(self, action, page=None):
+        page = page if page is not None else _FakePage()
+        context = _FakeContext([page])
+        playwright = _FakePlaywright(context)
+        with _with_playwright(playwright):
+            result = browser_driver.run(action)
+        return result, page
+
+    def test_challenge_type_reads_cftype_and_turnstile(self):
+        page = _FakePage()
+        page.html = "<script>cType: 'interactive'</script>"
+        self.assertEqual(browser_driver._cf_challenge_type(page), 'interactive')
+        page.html = '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>'
+        self.assertEqual(browser_driver._cf_challenge_type(page), 'embedded')
+        page.html = '<html>normal</html>'
+        self.assertIsNone(browser_driver._cf_challenge_type(page))
+
+    def test_solver_off_by_default(self):
+        page = _FakePage()
+        page.html = "<script>cType: 'interactive'</script>"
+        page.cf_frame = _FakeFrame()
+        result, page = self._run({'op': 'read'}, page=page)
+        self.assertNotIn('captchaSolver', result)
+        self.assertEqual(page.mouse.clicks, [])
+
+    def test_interactive_challenge_is_clicked_and_cleared(self):
+        page = _FakePage()
+        page.html = "<script>cType: 'interactive'</script>"
+        page.cf_frame = _FakeFrame()
+        page.mouse.click_callback = lambda: setattr(page, 'html', '<html>real</html>')
+        result, page = self._run(
+            {'op': 'read', 'autoSolve': 'cloudflare'}, page=page)
+        self.assertTrue(result['captchaSolver']['solved'])
+        self.assertEqual(result['captchaSolver']['challengeType'], 'interactive')
+        self.assertEqual(len(page.mouse.clicks), 1)
+        self.assertTrue(result['captchaSolved'])
+        self.assertFalse(result['blocked'])
+
+    def test_embedded_turnstile_clicks_checkbox(self):
+        page = _FakePage()
+        page.html = '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script>'
+        frame = _FakeFrame()
+        page.cf_frame = frame
+        result, page = self._run(
+            {'op': 'read', 'autoSolve': 'cloudflare'}, page=page)
+        self.assertTrue(result['captchaSolver']['solved'])
+        self.assertEqual(result['captchaSolver']['challengeType'], 'embedded')
+        self.assertEqual(frame.checkbox_clicks, ['input[type="checkbox"]'])
+
+    def test_captcha_act_clicks_fills_and_submits_without_navigation(self):
+        page = _FakePage()
+        result, page = self._run({
+            'op': 'captcha_act',
+            'url': 'http://sandbox/should-not-navigate',
+            'clicks': [{'x': 10, 'y': 20}, {'x': 30, 'y': 40}],
+            'text': 'AB12',
+            'inputSelector': '#cap-input',
+            'submitSelector': '#go',
+            'submit': True,
+        }, page=page)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['clicksSent'], 2)
+        self.assertEqual(page.gotos, [])
+        self.assertEqual(page.mouse.clicks, [(10, 20), (30, 40)])
+        self.assertEqual(page.fills, [('#cap-input', 'AB12')])
+        self.assertIn('#go', page.clicks)
+
+    def test_captcha_act_rejects_bad_coordinates(self):
+        result, _ = self._run({'op': 'captcha_act',
+                               'clicks': [{'x': 'left', 'y': 2}]})
+        self.assertFalse(result['ok'])
+        self.assertIn('coordinates must be numbers', result['error'])
+        result, _ = self._run({'op': 'captcha_act', 'clicks': [{'x': 1, 'y': 2}] * 13})
+        self.assertFalse(result['ok'])
+        self.assertIn('up to 12', result['error'])
 
 
 if __name__ == '__main__':

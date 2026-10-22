@@ -28,11 +28,13 @@ import os
 import random
 import re
 import sys
+import time
 import traceback
 import urllib.parse
 
 
-OPS = ('goto', 'read', 'fill', 'fill_many', 'login', 'click', 'submit', 'screenshot')
+OPS = ('goto', 'read', 'fill', 'fill_many', 'login', 'click', 'submit',
+       'screenshot', 'captcha_act')
 MAX_TEXT = int(os.environ.get('BROWSER_ACT_MAX_TEXT', '16000'))
 MAX_FIELDS = 40
 MAX_LINKS = 40
@@ -72,7 +74,7 @@ def _is_login_path(url):
 def _social_write_guard(op, url):
     if not _is_social_host(_social_host(url)):
         return None
-    if op in ('fill', 'fill_many', 'click', 'submit'):
+    if op in ('fill', 'fill_many', 'click', 'submit', 'captcha_act'):
         return ('read-only social policy: fill, click, and submit are disabled on '
                 'this host; use op=login once on a login page, then only '
                 'goto/read/screenshot')
@@ -133,6 +135,8 @@ def _captcha_state(page):
             else if (src.includes('hcaptcha') || text.includes('h-captcha')) kind = 'hcaptcha';
             else if (src.includes('turnstile') || text.includes('cf-turnstile')) kind = 'turnstile';
             else if (src.includes('arkose') || text.includes('funcaptcha')) kind = 'arkose';
+            else if (src.includes('friendlycaptcha') || text.includes('frc-captcha') || text.includes('friendly captcha')) kind = 'friendlycaptcha';
+            else if (src.includes('awswaf') || text.includes('aws-waf') || text.includes('aws captcha')) kind = 'awswaf';
             else if (text.includes('captcha') || text.includes('verify you are human') || text.includes('security check')) {
               if (tag === 'input' || tag === 'textarea') kind = 'input';
               else if (tag === 'img') kind = 'image';
@@ -140,7 +144,7 @@ def _captcha_state(page):
             }
             if (!kind || !visible(el)) continue;
             const rect = el.getBoundingClientRect();
-            const interactive = ['recaptcha', 'hcaptcha', 'turnstile', 'arkose'].includes(kind);
+            const interactive = ['recaptcha', 'hcaptcha', 'turnstile', 'arkose', 'friendlycaptcha', 'awswaf'].includes(kind);
             if (interactive && (rect.width < 180 || rect.height < 70)) continue;
             if (kind === 'recaptcha' && src.includes('/anchor')) continue;
             const key = 'tt-captcha-' + (idx++);
@@ -223,6 +227,199 @@ def _challenge_state(page):
     if isinstance(found, dict) and found.get('vendor'):
         return {'vendor': str(found['vendor'])[:40], 'marker': str(found.get('marker') or '')[:80]}
     return None
+
+
+CF_FRAME_URL = re.compile(
+    r'^https?://challenges\.cloudflare\.com/cdn-cgi/challenge-platform/.*')
+CF_MAX_SOLVE_ATTEMPTS = 3
+CF_POLL_DEADLINE_S = 5.0
+CF_CLEAR_TIMEOUT_S = 10.0
+
+
+def _cf_mode(action):
+    """Which automatic CAPTCHA work this run may do. Reads the action first so
+    the server can decide per request; falls back to the container env."""
+    mode = str((action or {}).get('autoSolve')
+               or os.environ.get('CAPTCHA_AUTO_SOLVE') or 'off').strip().lower()
+    return mode if mode in ('cloudflare', 'all') else 'off'
+
+
+def _cf_challenge_type(page):
+    """Return the Cloudflare challenge type the page currently carries.
+
+    Mirrors Scrapling's marker read: the challenge script declares its cType
+    in page HTML. 'embedded' is a Turnstile widget on an otherwise normal
+    page. Returns None when no marker is present."""
+    try:
+        html = page.content() or ''
+    except Exception:
+        return None
+    for ctype in ('non-interactive', 'managed', 'interactive'):
+        if "cType: '%s'" % ctype in html or 'cType: "%s"' % ctype in html:
+            return ctype
+    if re.search(r'challenges\.cloudflare\.com/turnstile/v', html):
+        return 'embedded'
+    return None
+
+
+def _cf_frame(page):
+    try:
+        return page.frame(url=CF_FRAME_URL)
+    except Exception:
+        return None
+
+
+def _cf_cleared(page, challenge_type):
+    if challenge_type == 'embedded':
+        return True
+    return _cf_challenge_type(page) is None
+
+
+def _wait_cf_cleared(page, challenge_type, timeout_s=CF_CLEAR_TIMEOUT_S):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if _cf_cleared(page, challenge_type):
+            return True
+        page.wait_for_timeout(200)
+    return _cf_cleared(page, challenge_type)
+
+
+def _cf_wait_idle(page, timeout_ms=5000):
+    try:
+        page.wait_for_load_state('networkidle', timeout=timeout_ms)
+    except Exception:
+        pass
+
+
+def _element_box(page, selector):
+    """Bounding box of the last matching element, or None. Playwright returns
+    None for a hidden or absent element, which is what the caller wants."""
+    try:
+        return page.locator(selector).last.bounding_box()
+    except Exception:
+        return None
+
+
+def _click_point(page, x, y):
+    try:
+        page.mouse.move(x - random.randint(4, 12), y - random.randint(4, 12))
+        page.wait_for_timeout(random.randint(90, 220))
+        page.mouse.click(x, y, delay=random.randint(90, 200))
+        return True
+    except Exception:
+        return False
+
+
+def _click_cf_box(page, box):
+    if not box:
+        return False
+    return _click_point(page, box['x'] + random.randint(26, 28),
+                        box['y'] + random.randint(25, 27))
+
+
+def _solve_cloudflare(page, action):
+    """Scrapling-style Turnstile/Interstitial solver.
+
+    It never reads or submits a token. It waits for the widget, clicks the
+    checkbox area like a person, waits for the challenge marker to clear, and
+    retries a bounded number of times. Anything unusual is reported back as
+    unsolved so the existing owner relay still gets a chance."""
+    if _cf_mode(action) == 'off':
+        return None
+    challenge_type = None
+    deadline = time.monotonic() + CF_POLL_DEADLINE_S
+    for poll in range(51):
+        if poll % 5 == 0 or time.monotonic() >= deadline:
+            challenge_type = _cf_challenge_type(page)
+        if challenge_type or time.monotonic() >= deadline:
+            break
+        page.wait_for_timeout(100)
+    if not challenge_type:
+        return {'attempted': False, 'solved': False, 'kind': 'turnstile'}
+    attempts = 0
+    solved = False
+    error = ''
+    while attempts < CF_MAX_SOLVE_ATTEMPTS and not solved:
+        attempts += 1
+        try:
+            if challenge_type == 'non-interactive':
+                _cf_wait_idle(page, 10000)
+                solved = _wait_cf_cleared(page, challenge_type)
+            elif challenge_type == 'embedded':
+                frame = _cf_frame(page)
+                clicked = False
+                if frame is not None:
+                    try:
+                        frame.locator('input[type="checkbox"]').first.click(
+                            timeout=10000, delay=random.randint(90, 200))
+                        clicked = True
+                    except Exception:
+                        clicked = False
+                if not clicked:
+                    clicked = _click_cf_box(
+                        page, _element_box(
+                            page, '#cf-turnstile, .cf-turnstile, [data-sitekey]'))
+                _cf_wait_idle(page, 5000)
+                solved = bool(clicked)
+            else:
+                frame = _cf_frame(page)
+                box = None
+                if frame is not None:
+                    try:
+                        frame.wait_for_load_state('load', timeout=5000)
+                    except Exception:
+                        pass
+                    try:
+                        element = frame.frame_element()
+                        if element.is_visible():
+                            box = element.bounding_box()
+                    except Exception:
+                        box = None
+                if not box:
+                    box = _element_box(
+                        page,
+                        '#cf_turnstile div, #cf-turnstile div, .turnstile>div>div, '
+                        '.main-content p+div>div>div')
+                if box:
+                    _click_cf_box(page, box)
+                    _cf_wait_idle(page, 5000)
+                    solved = _wait_cf_cleared(page, challenge_type)
+            if not solved:
+                challenge_type = _cf_challenge_type(page) or challenge_type
+        except Exception as e:
+            error = '%s: %s' % (type(e).__name__, e)
+            break
+    return {'attempted': True, 'solved': bool(solved), 'kind': 'turnstile',
+            'challengeType': challenge_type, 'attempts': attempts,
+            'error': error[:200]}
+
+
+def _autosolve(page, action):
+    if _cf_mode(action) == 'off':
+        return None
+    try:
+        return _solve_cloudflare(page, action)
+    except Exception as e:
+        return {'attempted': True, 'solved': False, 'kind': 'turnstile',
+                'error': '%s: %s' % (type(e).__name__, e)}
+
+
+def _state(page, action, response=None, max_text=None):
+    """Page state plus an optional Cloudflare-solve report. A solved challenge
+    stops the page being reported as a WAF block and drops the stale widget
+    list so the endpoint does not open a relay request for it."""
+    solver = _autosolve(page, action)
+    if max_text is None:
+        max_text = int(action.get('maxText') or MAX_TEXT)
+    state = _page_state(page, int(max_text), response=response)
+    if solver:
+        state['captchaSolver'] = solver
+        if solver.get('solved'):
+            state['blocked'] = False
+            state['challenge'] = None
+            state['captchas'] = []
+            state['captchaSolved'] = True
+    return state
 
 
 def _data_routes(page):
@@ -522,6 +719,25 @@ def run(action):
         return {'ok': False, 'op': op, 'error': 'login requires fields (list of {selector, value})'}
     if op == 'click' and not action.get('selector'):
         return {'ok': False, 'op': op, 'error': 'click requires selector'}
+    if op == 'captcha_act':
+        clicks = action.get('clicks')
+        if clicks is None:
+            clicks = []
+        if not isinstance(clicks, list) or len(clicks) > 12:
+            return {'ok': False, 'op': op,
+                    'error': 'captcha_act requires clicks (a list of up to 12 {x, y})'}
+        for point in clicks:
+            if not isinstance(point, dict):
+                return {'ok': False, 'op': op,
+                        'error': 'each captcha_act click must be an {x, y} object'}
+            try:
+                x, y = float(point.get('x')), float(point.get('y'))
+            except (TypeError, ValueError):
+                return {'ok': False, 'op': op,
+                        'error': 'captcha_act click coordinates must be numbers'}
+            if not (0 <= x <= 20000 and 0 <= y <= 20000):
+                return {'ok': False, 'op': op,
+                        'error': 'captcha_act click coordinates are out of range'}
     timeout_ms = int(action.get('timeoutMs') or 30000)
     try:
         from playwright.sync_api import sync_playwright
@@ -583,7 +799,7 @@ def run(action):
                         nav_response = page.goto(action.get('url'), timeout=timeout_ms,
                                                  wait_until='domcontentloaded')
                         _settle(page, 2500)
-                elif op != 'goto' and action.get('url'):
+                elif op != 'goto' and op != 'captcha_act' and action.get('url'):
                     nav_response = page.goto(action.get('url'), timeout=timeout_ms,
                                              wait_until='domcontentloaded')
                     _settle(page, 2500)
@@ -596,24 +812,22 @@ def run(action):
                     nav_response = page.goto(action.get('url'), timeout=timeout_ms,
                                              wait_until='domcontentloaded')
                     _settle(page, 2500)
-                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT),
-                                        response=nav_response)
+                    state = _state(page, action, response=nav_response)
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
                 if op == 'read':
-                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT),
-                                        response=nav_response)
+                    state = _state(page, action, response=nav_response)
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
                 if op == 'fill':
                     page.fill(action.get('selector'), action.get('value') or '', timeout=timeout_ms)
                     _settle(page, 500)
-                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
+                    state = _state(page, action)
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
                 if op == 'fill_many':
                     for f in action.get('fields', []):
                         page.locator(f['selector']).first.wait_for(state='visible', timeout=timeout_ms)
                         page.fill(f['selector'], f.get('value') or '', timeout=timeout_ms)
                     _settle(page, 500)
-                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
+                    state = _state(page, action)
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
                 if op == 'login':
                     fields = action.get('fields', [])
@@ -701,7 +915,7 @@ def run(action):
                                 _settle(page, 4000)
                         except Exception:
                             pass
-                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
+                    state = _state(page, action)
                     return {'ok': True, 'op': op, 'submitUsed': submit_used,
                             'filledFieldLengths': filled_lengths,
                             'urlAfterSubmit': page.url,
@@ -709,7 +923,7 @@ def run(action):
                 if op == 'click':
                     page.click(action.get('selector'), timeout=timeout_ms)
                     _settle(page, 2500)
-                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
+                    state = _state(page, action)
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
                 if op == 'submit':
                     selector = action.get('selector') or ''
@@ -721,11 +935,33 @@ def run(action):
                     except Exception:
                         page.keyboard.press('Enter')
                     _settle(page, 3000)
-                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
+                    state = _state(page, action)
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
+                if op == 'captcha_act':
+                    clicks = action.get('clicks') or []
+                    for point in clicks:
+                        _click_point(page, float(point['x']), float(point['y']))
+                        page.wait_for_timeout(random.randint(180, 420))
+                    text = str(action.get('text') or '')
+                    input_selector = str(action.get('inputSelector') or '')
+                    if text and input_selector:
+                        page.fill(input_selector, text, timeout=timeout_ms)
+                        _settle(page, 300)
+                    submit_selector = str(action.get('submitSelector') or '')
+                    if submit_selector and action.get('submit', True):
+                        _try_click(page, submit_selector, timeout=5000)
+                    elif text:
+                        try:
+                            page.keyboard.press('Enter')
+                        except Exception:
+                            pass
+                    _settle(page, int(action.get('waitMs') or 1500))
+                    state = _state(page, action, max_text=MAX_TEXT)
+                    return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action),
+                            'clicksSent': len(clicks), **state}
                 if op == 'screenshot':
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action),
-                            **_page_state(page, 0)}
+                            **_state(page, action, max_text=0)}
                 return {'ok': False, 'op': op, 'error': f'unhandled op {op!r}'}  # pragma: no cover
             except Exception as e:
                 # A selector timeout on a CAPTCHA page must still return the
@@ -733,7 +969,7 @@ def run(action):
                 # relay it to the owner.
                 state = {}
                 try:
-                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
+                    state = _state(page, action)
                 except Exception:
                     pass
                 return {'ok': False, 'op': op, 'error': f'{type(e).__name__}: {e}',
