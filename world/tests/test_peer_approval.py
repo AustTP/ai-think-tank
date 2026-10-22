@@ -668,3 +668,80 @@ class ReviewDenialCoaching(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+class LeanSprintApproval(unittest.TestCase):
+    """Operator decision, 2026-10-22: a sprint staffed with at most two
+    workers needs only ONE clean peer approval. Two workers cannot supply two
+    reviewers besides the author without pulling in a third agent."""
+
+    def _lean_state(self, worker_count=2):
+        state = _state()
+        state['teams'] = [{
+            'id': 'team-maya', 'directorId': 'maya',
+            'maxTeamMembers': 5, 'scrumMasterMinTeamSize': 99,
+        }]
+        state['sprints'] = {'spr-1': {
+            'id': 'spr-1', 'status': 'active', 'teamIds': ['team-maya'],
+            'ownerId': 'maya', 'workerCount': worker_count,
+        }}
+        return state
+
+    def test_two_worker_sprint_requires_one(self):
+        state = self._lean_state()
+        self.assertEqual(sim._sprint_worker_pool(state, 'spr-1'), ['ada', 'ben'])
+        self.assertEqual(sim._peer_gate_required(state, {'sprintId': 'spr-1'}), 1)
+
+    def test_larger_sprint_keeps_two(self):
+        state = self._lean_state(worker_count=3)
+        self.assertEqual(sim._peer_gate_required(state, {'sprintId': 'spr-1'}), 2)
+
+    def test_no_sprint_keeps_two(self):
+        self.assertEqual(sim._peer_gate_required(_state(), {}), 2)
+
+    def test_gate_stamps_required_and_queues_one_review(self):
+        state = self._lean_state()
+        task = _task(sprintId='spr-1')
+        state['tasks'][task['id']] = task
+        gate = sim._enter_peer_review(state, task, now_ms=1000)
+        self.assertEqual(gate['requiredApprovals'], 1)
+        self.assertEqual(len(gate['reviewerIds']), 1)
+        self.assertEqual(len(state['workQueue']), 1)
+        self.assertNotIn(task['assignedTo'], gate['reviewerIds'])
+
+    def test_larger_sprint_still_queues_two_reviews(self):
+        state = self._lean_state(worker_count=3)
+        task = _task(sprintId='spr-1')
+        state['tasks'][task['id']] = task
+        gate = sim._enter_peer_review(state, task, now_ms=1000)
+        self.assertEqual(gate['requiredApprovals'], 2)
+        self.assertEqual(len(state['workQueue']), 2)
+
+    def test_close_rule_honors_required(self):
+        self.assertTrue(sim._peer_gate_should_close(
+            {'approvals': 1, 'requiredApprovals': 1}, 10 ** 12, 0))
+        self.assertFalse(sim._peer_gate_should_close(
+            {'approvals': 1}, 10 ** 12, 0))
+        self.assertTrue(sim._peer_gate_should_close(
+            {'approvals': 2}, 10 ** 12, 0))
+
+    def test_one_clean_vote_closes_a_lean_gate(self):
+        state = self._lean_state()
+        parent = _task(sprintId='spr-1', status='needs_review',
+                       _peerGate={'approvals': 1, 'requiredApprovals': 1,
+                                  'approvers': ['ada'], 'enteredMs': 0})
+        with unittest.mock.patch.object(sim, '_close_gated_story',
+                                        return_value=True) as close:
+            closed = sim._parent_close_from_vote(state, parent, 10 ** 12)
+        self.assertTrue(closed)
+        close.assert_called_once()
+
+    def test_one_clean_vote_does_not_close_a_normal_gate(self):
+        state = _state()
+        parent = _task(status='needs_review',
+                       _peerGate={'approvals': 1, 'approvers': ['ada'],
+                                  'enteredMs': 0})
+        with unittest.mock.patch.object(sim, '_close_gated_story',
+                                        return_value=True) as close:
+            closed = sim._parent_close_from_vote(state, parent, 10 ** 12)
+        self.assertFalse(closed)
+        close.assert_not_called()

@@ -40,9 +40,14 @@ COPY browser_driver.py /opt/browser_driver.py
 # principle as the Python tools above: installed HERE, not at agent runtime).
 # node --check parses .mjs/.js (ESM) without executing; node --test runs the
 # *.test.mjs suites the agents write with the built-in node:test runner.
+# x11vnc + noVNC/websockify back the player takeover window (see
+# world/browser_session.py): the session container runs Xvfb, Chromium,
+# x11vnc on localhost, and websockify serving /usr/share/novnc on the one
+# loopback-published port. Without these the image can still run one-shot
+# browser_act ops; only the live takeover view fails.
 RUN apt-get update && apt-get install -y ca-certificates curl gnupg \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y nodejs xauth \
+    && apt-get install -y nodejs xauth x11vnc novnc websockify \
     && rm -rf /var/lib/apt/lists/*
 
 # autopep8: agents reach for `python -m autopep8 --in-place ...` to auto-fix

@@ -83,6 +83,27 @@ class BrowserStep(unittest.TestCase):
         self.assertTrue(result['blocked'])
         self.assertIn('allowlisted', result['reason'])
 
+    def test_challenge_page_is_surfaced_with_vendor(self):
+        self.pages['goto'] = {'allowed': True, 'ok': False,
+                              'blocked': {'vendor': 'cloudflare', 'host': 'example.com',
+                                          'status': 403, 'kind': 'challenge'},
+                              'error': 'blocked by cloudflare challenge',
+                              'hint': 'do not retry', 'url': 'https://example.com'}
+        result, _ = self._run({'op': 'goto', 'url': 'https://example.com'})
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['blocked']['vendor'], 'cloudflare')
+        self.assertIn('do not retry', result['hint'])
+
+    def test_operator_takeover_is_surfaced(self):
+        self.pages['goto'] = {'allowed': True, 'ok': False,
+                              'waitingForOperator': True,
+                              'error': 'operator has taken over',
+                              'hint': 'read again after handback',
+                              'url': 'https://example.com'}
+        result, _ = self._run({'op': 'goto', 'url': 'https://example.com'})
+        self.assertTrue(result['waitingForOperator'])
+        self.assertIn('handback', result['hint'])
+
 
 if __name__ == '__main__':
     unittest.main()

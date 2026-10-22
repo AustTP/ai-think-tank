@@ -68,7 +68,12 @@ states only what changed in the operating model.
 - Player asks now use a FIFO backlog capped at 20. A second issue waits instead
   of replacing the first; overflow is logged as `player_ask_dropped`.
 - The peer gate requires two distinct clean votes. The one-vote timeout is
-  gone; after 15 minutes the gate requests a fresh second reviewer.
+  gone; after 15 minutes the gate requests a fresh second reviewer. A sprint
+  staffed with at most two workers (`_sprint_worker_pool` length <= 2) needs
+  only ONE clean vote: two workers cannot supply two reviewers besides the
+  author without pulling in a third agent. The gate stamps
+  `requiredApprovals` at open time (1 for a lean sprint, else 2) and the close
+  rule, reviewer pick, and stuck-gate sweep all read it.
 - `tierGateMinConfidence` is player-only. Agents can still escalate it, but
   cannot change it through `policy_edit`.
 - Incident restore evidence now requires a restore note paired with the command

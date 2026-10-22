@@ -7,6 +7,7 @@
 # pin the new version, run the full suite, commit.
 fastapi==0.115.11
 uvicorn==0.34.0
+websockets==15.0.1
 pydantic==2.13.4
 # Credential vault encryption (world/serve.py _fernet) and host-side browser
 # rendering for browse_page(render=true). Pinned to the versions verified on

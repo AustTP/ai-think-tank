@@ -4671,6 +4671,15 @@ def _make_browser_step_executor(agent_id, agent_key, sandbox_id, work_context=''
             return json.dumps({'ok': False, 'blocked': True,
                                'reason': result.get('reason') or 'not approved',
                                'op': op, 'url': url}, default=str)
+        if result.get('blocked') or result.get('waitingForOperator'):
+            return json.dumps({
+                'ok': False,
+                'blocked': result.get('blocked'),
+                'waitingForOperator': bool(result.get('waitingForOperator')),
+                'error': result.get('error'),
+                'hint': result.get('hint'),
+                'op': op, 'url': result.get('url') or url,
+            }, default=str)
         if result.get('error') and not result.get('captchaRequired'):
             return json.dumps({'ok': False, 'error': result.get('error'), 'op': op}, default=str)
         if wait_ms:

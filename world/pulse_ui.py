@@ -54,6 +54,16 @@ footer{color:var(--muted);font-size:11px;margin-top:18px}
       <h2>Open cards</h2>
       <div id="board" class="empty">Loading...</div>
     </section>
+    <section>
+      <h2>Browser sessions</h2>
+      <div class="meta" style="margin-bottom:10px">
+        <input id="sessAgent" placeholder="agent id" autocomplete="off"
+               style="flex:1;min-width:120px;background:#0c131b;color:inherit;border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit">
+        <button id="sessStart">Start session</button>
+      </div>
+      <div id="sessions" class="empty">Loading...</div>
+      <div class="meta" style="margin-top:10px">Takeover opens the live browser in a new tab. Hand back before the agent continues.</div>
+    </section>
   </div>
   <footer id="stamp"></footer>
 </main>
@@ -109,6 +119,47 @@ async function getJSON(url) {
   if (!r.ok) throw new Error('Request failed: '+r.status);
   return r.json();
 }
+async function postJSON(url, body) {
+  const r = await fetch(url, {method:'POST', credentials:'same-origin',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  let data = {};
+  try { data = await r.json(); } catch (e) {}
+  if (!r.ok) throw new Error(data.error || ('Request failed: '+r.status));
+  return data;
+}
+function sessRow(s) {
+  const c = el('div','card');
+  const t = el('div','top');
+  t.appendChild(el('div','title', s.agentId));
+  const badge = s.takeover ? 'takeover' : s.status;
+  t.appendChild(el('span','badge '+(s.takeover ? 'bad' : (s.status === 'running' ? 'done' : '')), badge));
+  c.appendChild(t);
+  const age = Math.max(0, Math.round((Date.now()-(s.lastUsed||s.startedAt))/60000));
+  c.appendChild(el('div','meta', 'idle '+age+'m / port '+s.port));
+  const row = el('div','meta');
+  const mk = (label, fn, cls) => { const b = el('button', cls, label); b.onclick = fn; row.appendChild(b); };
+  mk('Take over', async () => {
+    try {
+      await postJSON('/api/browser-session/takeover', {agentId:s.agentId});
+      window.open('/api/browser-session/view?token='+encodeURIComponent(s.token), '_blank');
+      loadSessions();
+    } catch(e) { alert(e.message); }
+  });
+  if (s.takeover) mk('Hand back', async () => { try { await postJSON('/api/browser-session/handback', {agentId:s.agentId}); loadSessions(); } catch(e) { alert(e.message); } });
+  mk('Stop', async () => { try { await postJSON('/api/browser-session/stop', {agentId:s.agentId}); loadSessions(); } catch(e) { alert(e.message); } });
+  c.appendChild(row);
+  return c;
+}
+async function loadSessions() {
+  const box = $('sessions');
+  try {
+    const data = await getJSON('/api/browser-session/list');
+    box.textContent = '';
+    if (!data.sessions || !data.sessions.length) { box.className='empty'; box.textContent='No sessions.'; return; }
+    box.className='';
+    data.sessions.forEach(s => box.appendChild(sessRow(s)));
+  } catch (e) { box.className='empty'; box.textContent = e.message; }
+}
 async function refresh() {
   $('error').textContent='';
   try {
@@ -119,7 +170,16 @@ async function refresh() {
     renderPulse(p); renderBoard(b);
     $('stamp').textContent = 'Updated '+new Date().toLocaleString();
   } catch (e) { $('error').textContent = e.message; }
+  loadSessions();
 }
+$('sessStart').addEventListener('click', async () => {
+  const agentId = ($('sessAgent').value || '').trim();
+  if (!agentId) { $('sessAgent').focus(); return; }
+  try {
+    await postJSON('/api/browser-session/start', {agentId});
+    $('sessAgent').value=''; loadSessions();
+  } catch (e) { alert(e.message); }
+});
 $('refresh').addEventListener('click', refresh);
 refresh();
 setInterval(refresh, 30000);

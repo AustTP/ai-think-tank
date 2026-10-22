@@ -97,6 +97,12 @@ class _FakePage:
         self._click_error = None
         self._locator_error = None
         self._screenshot_error = None
+        self.challenge = None
+        self.data_routes = []
+        self.user_agent = 'Mozilla/5.0 (X11; Linux x86_64) Chrome/140.0.7339.0 Safari/537.36'
+        self.language = 'en-US'
+        self.timezone = 'UTC'
+        self.goto_response = None
         self.keyboard = _FakeKeyboard()
         self.mouse = _FakeMouse()
         self.gotos = []
@@ -122,6 +128,16 @@ class _FakePage:
     def evaluate(self, script):
         if self._eval_error:
             raise self._eval_error
+        if 'cf-challenge' in script:
+            return self.challenge
+        if 'link[rel~="alternate"]' in script:
+            return self.data_routes
+        if script == 'navigator.userAgent':
+            return self.user_agent
+        if script == 'navigator.language':
+            return self.language
+        if 'resolvedOptions().timeZone' in script:
+            return self.timezone
         if 'input,select,textarea,button' in script:
             return [{'tag': 'input', 'type': 'text', 'name': 'q', 'id': 'q',
                      'placeholder': 'search', 'ariaLabel': '', 'text': ''}]
@@ -133,6 +149,7 @@ class _FakePage:
         if self._goto_error:
             raise self._goto_error
         self.gotos.append((url, timeout, wait_until))
+        return self.goto_response
 
     def fill(self, selector, value, timeout=None):
         if self._fill_error:
@@ -175,11 +192,21 @@ class _FakeContext:
         return page
 
 
+class _FakeBrowser:
+    def __init__(self, context):
+        self.contexts = [context]
+        self._context = context
+
+    def new_context(self):
+        return self._context
+
+
 class _FakePlaywright:
     def __init__(self, context):
         self.chromium = self
         self._context = context
         self.launches = []
+        self.cdp_urls = []
 
     def __enter__(self):
         return self
@@ -190,6 +217,10 @@ class _FakePlaywright:
     def launch_persistent_context(self, profile_dir, **kwargs):
         self.launches.append((profile_dir, kwargs))
         return self._context
+
+    def connect_over_cdp(self, url):
+        self.cdp_urls.append(url)
+        return _FakeBrowser(self._context)
 
 
 def _with_playwright(playwright):
@@ -275,7 +306,8 @@ class RunOps(unittest.TestCase):
         self.assertIn('--no-sandbox', kwargs['args'])
         self.assertFalse(kwargs['headless'])
         self.assertEqual(kwargs['accept_downloads'], False)
-        self.assertIn('Chrome/', kwargs['user_agent'])
+        # Identity is no longer pinned: the browser reports its own build.
+        self.assertNotIn('user_agent', kwargs)
 
     def test_read_navigates_first(self):
         result, page, _, _ = self._run({'op': 'read', 'url': 'http://sandbox/start'})
@@ -461,6 +493,112 @@ class Main(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 code = browser_driver.main(['browser_driver.py', str(self.tmp / 'action.json')])
         self.assertEqual(code, 0)
+
+
+class _FakeResponse:
+    def __init__(self, status=200, headers=None):
+        self.status = status
+        self.headers = headers or {}
+
+
+class ChallengeAndIdentity(unittest.TestCase):
+    """The driver must report a WAF page and the real identity, not paper over
+    either. See browser_driver._challenge_state / _real_identity."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix='think tank-browser-test-'))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _run(self, action, page):
+        playwright = _FakePlaywright(_FakeContext([page]))
+        with _with_playwright(playwright):
+            return browser_driver.run(action)
+
+    def test_challenge_page_is_reported_as_blocked(self):
+        page = _FakePage()
+        page.challenge = {'vendor': 'cloudflare', 'marker': 'challenge platform'}
+        result = self._run({'op': 'goto', 'url': 'http://sandbox/x'}, page)
+        self.assertTrue(result['blocked'])
+        self.assertEqual(result['challenge']['vendor'], 'cloudflare')
+
+    def test_clean_page_is_not_blocked(self):
+        result = self._run({'op': 'read'}, _FakePage())
+        self.assertFalse(result['blocked'])
+        self.assertIsNone(result['challenge'])
+
+    def test_status_and_retry_after_are_reported(self):
+        page = _FakePage()
+        page.goto_response = _FakeResponse(429, {'retry-after': '7'})
+        result = self._run({'op': 'goto', 'url': 'http://sandbox/x'}, page)
+        self.assertEqual(result['status'], 429)
+        self.assertEqual(result['retryAfter'], '7')
+
+    def test_data_routes_are_surfaced(self):
+        page = _FakePage()
+        page.data_routes = [{'type': 'application/rss+xml',
+                             'href': 'http://sandbox/feed.xml', 'title': 'Feed'}]
+        result = self._run({'op': 'read'}, page)
+        self.assertEqual(result['dataRoutes'][0]['href'], 'http://sandbox/feed.xml')
+
+    def test_identity_reports_real_user_agent(self):
+        page = _FakePage()
+        result = self._run({'op': 'read'}, page)
+        self.assertIn('Chrome/140', result['identity']['userAgent'])
+        self.assertEqual(result['identity']['language'], 'en-US')
+        self.assertFalse(result['identity']['headless'])
+        self.assertFalse(result['identity']['userAgentOverridden'])
+
+    def test_operator_can_pin_user_agent(self):
+        page = _FakePage()
+        playwright = _FakePlaywright(_FakeContext([page]))
+        with unittest.mock.patch.dict(os.environ, {'BROWSER_USER_AGENT': 'Pinned/1.0'}):
+            with _with_playwright(playwright):
+                browser_driver.run({'op': 'read'})
+        kwargs = playwright.launches[0][1]
+        self.assertEqual(kwargs['user_agent'], 'Pinned/1.0')
+
+    def test_host_locale_from_env(self):
+        with unittest.mock.patch.dict(os.environ, {'LC_ALL': 'de_DE.UTF-8'}):
+            self.assertEqual(browser_driver._host_locale(), 'de-DE')
+
+    def test_host_locale_ignores_c(self):
+        with unittest.mock.patch.dict(os.environ, {'LC_ALL': 'C', 'LANG': 'C'}):
+            self.assertEqual(browser_driver._host_locale(), '')
+
+    def test_host_timezone_from_env(self):
+        with unittest.mock.patch.dict(os.environ, {'TZ': 'Europe/Berlin'}):
+            self.assertEqual(browser_driver._host_timezone(), 'Europe/Berlin')
+
+    def test_host_timezone_rejects_garbage(self):
+        with unittest.mock.patch.dict(os.environ, {'TZ': '../../etc/passwd'}):
+            tz = browser_driver._host_timezone()
+        self.assertNotIn('..', tz)
+
+
+class CdpAttach(unittest.TestCase):
+    """With BROWSER_CDP_URL set, the driver attaches to the session Chromium
+    and never launches (or closes) its own. That is what lets a human and an
+    agent share one page during takeover."""
+
+    def test_attaches_and_does_not_close(self):
+        page = _FakePage()
+        context = _FakeContext([page])
+        playwright = _FakePlaywright(context)
+        with unittest.mock.patch.dict(os.environ, {'BROWSER_CDP_URL': 'http://127.0.0.1:9222'}):
+            with _with_playwright(playwright):
+                result = browser_driver.run({'op': 'read', 'url': 'http://sandbox/x'})
+        self.assertTrue(result['ok'])
+        self.assertEqual(playwright.cdp_urls, ['http://127.0.0.1:9222'])
+        self.assertEqual(playwright.launches, [])
+        self.assertFalse(context.closed)
+
+    def test_cdp_uses_existing_page(self):
+        page = _FakePage()
+        playwright = _FakePlaywright(_FakeContext([page]))
+        with unittest.mock.patch.dict(os.environ, {'BROWSER_CDP_URL': 'http://127.0.0.1:9222'}):
+            with _with_playwright(playwright):
+                browser_driver.run({'op': 'goto', 'url': 'http://sandbox/x'})
+        self.assertEqual(page.gotos[0][0], 'http://sandbox/x')
 
 
 if __name__ == '__main__':

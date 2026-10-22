@@ -464,6 +464,7 @@ import training_capture  # noqa: E402
 import vpn_location  # noqa: E402
 import theo_policy  # noqa: E402
 import tank_accounts  # noqa: E402
+import browser_session  # noqa: E402
 import captcha  # noqa: E402
 import vpn_pool  # noqa: E402
 import containers  # noqa: E402
@@ -516,6 +517,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.websockets import WebSocket, WebSocketDisconnect
 from typing import Optional
 
 # ROOT (world/) comes from config.py: one path definition for the codebase.
@@ -9673,6 +9675,278 @@ def _browser_profile_dir(agent_id=None):
     every other agent's authenticated social session."""
     slug = re.sub(r'[^A-Za-z0-9_.-]', '_', str(agent_id or 'shared'))[:64] or 'shared'
     return os.path.join(BROWSER_PROFILE_DIR, slug)
+
+
+# ---------------------------------------------------------------------------
+# Browse politeness (2026-10-22). The driver reports the HTTP status and any
+# WAF/challenge page for each navigation (see sandbox/browser_driver.py).
+# These helpers act on that: pace requests per host, retry only idempotent
+# reads on transient statuses, record a block with its evidence, and honor
+# robots.txt for crawl-style loops. They do not disguise the browser. They
+# keep it from being a nuisance and give the operator something to act on.
+BROWSE_BLOCK_LOG = os.path.join(ROOT, '.browser-blocks', 'blocks.jsonl')
+BROWSE_BLOCK_LOG_MAX_BYTES = 5 * 1024 * 1024
+_BROWSE_PACE_LOCK = threading.Lock()
+_BROWSE_PACE = {}
+_BROWSE_PACE_MAX_WAIT_S = 30.0
+_ROBOTS_CACHE = {}
+_ROBOTS_TTL_S = 3600
+_ROBOTS_UA = 'AIThinkTankAgent/1.0'
+
+
+def _browse_pace_rate():
+    try:
+        rate = float(_load_env().get('BROWSE_PACE_RATE_PER_MIN') or 12)
+    except (TypeError, ValueError):
+        rate = 12.0
+    return max(1.0, rate)
+
+
+def _browse_pace_burst():
+    try:
+        burst = float(_load_env().get('BROWSE_PACE_BURST') or 3)
+    except (TypeError, ValueError):
+        burst = 3.0
+    return max(1.0, burst)
+
+
+def _browse_pace_wait(host, timeout_s=None):
+    """Block until `host`'s token bucket allows one request. Returns seconds
+    waited. Raises TimeoutError when the wait would exceed the budget.
+
+    Per HOST, not per agent: the host is what gets annoyed. A sliding window
+    per agent (see check_rate_limit) cannot see three agents hitting one site
+    at once, which is the case this exists for."""
+    host = (host or '').strip().lower()
+    if not host:
+        return 0.0
+    timeout_s = _BROWSE_PACE_MAX_WAIT_S if timeout_s is None else max(0.0, timeout_s)
+    rate_per_s = _browse_pace_rate() / 60.0
+    burst = _browse_pace_burst()
+    deadline = time.monotonic() + timeout_s
+    waited = 0.0
+    while True:
+        with _BROWSE_PACE_LOCK:
+            now = time.monotonic()
+            state = _BROWSE_PACE.get(host)
+            tokens = burst if state is None else min(
+                burst, state['tokens'] + (now - state['last']) * rate_per_s)
+            if tokens >= 1.0:
+                _BROWSE_PACE[host] = {'tokens': tokens - 1.0, 'last': now}
+                return waited
+            need = (1.0 - tokens) / rate_per_s
+            _BROWSE_PACE[host] = {'tokens': tokens, 'last': now}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f'{host} is pacing slower than the {timeout_s:.0f}s wait budget')
+        sleep_for = min(need, remaining, 1.0)
+        time.sleep(sleep_for)
+        waited += sleep_for
+
+
+def _record_browser_block(agent_id, host, op, url, challenge, status, note=''):
+    """Append one block record as JSONL. Best effort: a write failure must not
+    fail the browser action or lose the page state the caller already has."""
+    entry = {
+        'ts': time.time(),
+        'agentId': str(agent_id or 'unknown')[:80],
+        'host': str(host or '')[:200],
+        'op': str(op or '')[:20],
+        'url': str(url or '')[:500],
+        'vendor': str((challenge or {}).get('vendor') or '')[:40],
+        'marker': str((challenge or {}).get('marker') or '')[:80],
+        'status': status if isinstance(status, int) else None,
+        'note': str(note or '')[:200],
+    }
+    try:
+        os.makedirs(os.path.dirname(BROWSE_BLOCK_LOG), exist_ok=True)
+        try:
+            if os.path.getsize(BROWSE_BLOCK_LOG) > BROWSE_BLOCK_LOG_MAX_BYTES:
+                os.replace(BROWSE_BLOCK_LOG, BROWSE_BLOCK_LOG + '.1')
+        except OSError:
+            pass
+        with open(BROWSE_BLOCK_LOG, 'a') as f:
+            f.write(json.dumps(entry, sort_keys=True) + '\n')
+    except OSError as e:
+        print(f'[browse-blocks] could not record block: {e}', flush=True)
+
+
+def _robots_match(pattern, path):
+    """Match one robots.txt path pattern. Supports '*' and a trailing '$'."""
+    if not pattern:
+        return False
+    anchored = pattern.endswith('$')
+    body = pattern[:-1] if anchored else pattern
+    regex = ''.join('.*' if ch == '*' else re.escape(ch) for ch in body)
+    try:
+        return re.match('^' + regex + ('$' if anchored else ''), path) is not None
+    except re.error:
+        return path.startswith(body)
+
+
+def _robots_rules(text, ua_token):
+    """Return the (allow, pattern) rules for `ua_token` or '*'. Longest match
+    wins, with Allow winning ties, per RFC 9309 section 2.2.2."""
+    groups = []
+    current = None
+    for raw in (text or '').splitlines():
+        line = raw.split('#', 1)[0].strip()
+        if not line or ':' not in line:
+            continue
+        key, val = line.split(':', 1)
+        key = key.strip().lower()
+        val = val.strip()
+        if key == 'user-agent':
+            if current is None or current['rules']:
+                current = {'agents': [], 'rules': []}
+                groups.append(current)
+            current['agents'].append(val.lower())
+        elif key in ('allow', 'disallow') and current is not None:
+            if val:
+                current['rules'].append((key == 'allow', val))
+    token = (ua_token or '').lower()
+    chosen = [g for g in groups
+              if any(a != '*' and a and a in token for a in g['agents'])]
+    if not chosen:
+        chosen = [g for g in groups if '*' in g['agents']]
+    rules = []
+    for g in chosen:
+        rules.extend(g['rules'])
+    return rules
+
+
+def _robots_path_allowed(rules, path):
+    path = path or '/'
+    best = None
+    for allow, pattern in rules:
+        if not _robots_match(pattern, path):
+            continue
+        weight = len(pattern.replace('*', '').replace('$', ''))
+        if best is None or weight > best[0] or (weight == best[0] and allow):
+            best = (weight, allow)
+    return True if best is None else best[1]
+
+
+def _robots_allows(url, timeout=5.0):
+    """Return (allowed, reason) for `url` under robots.txt.
+
+    Only used for crawl-style loops (body.crawl). An interactive browser
+    visit is not a crawler, and robots.txt does not govern it. Results are
+    cached per host. Network failure is treated as a refusal, per RFC 9309;
+    a missing file (4xx) allows."""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or '').lower()
+    if not host:
+        return True, 'no host'
+    now = time.monotonic()
+    cached = _ROBOTS_CACHE.get(host)
+    if cached and cached['expires'] > now:
+        return cached['allowed'], cached['reason']
+    robots_url = f'{parsed.scheme}://{parsed.netloc}/robots.txt'
+    allowed, reason = True, 'no robots.txt rules for this path'
+    try:
+        req = urllib.request.Request(robots_url, headers={'User-Agent': _ROBOTS_UA})
+        with _safe_urlopen(req, timeout=timeout) as resp:
+            body = resp.read(256 * 1024).decode('utf-8', 'replace')
+        rules = _robots_rules(body, _ROBOTS_UA)
+        allowed = _robots_path_allowed(rules, parsed.path or '/')
+        reason = ('allowed by robots.txt' if allowed
+                  else f'robots.txt disallows {parsed.path or "/"}')
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            allowed, reason = False, f'robots.txt returned {e.code}'
+        elif 500 <= e.code < 600:
+            allowed, reason = False, f'robots.txt unavailable ({e.code})'
+        else:
+            allowed, reason = True, f'no robots.txt ({e.code})'
+    except Exception as e:
+        allowed, reason = False, f'robots.txt unreachable ({type(e).__name__})'
+    _ROBOTS_CACHE[host] = {'expires': now + _ROBOTS_TTL_S,
+                           'allowed': allowed, 'reason': reason}
+    return allowed, reason
+
+
+# Statuses worth one more try on an idempotent read. 4xx other than 408/425/429
+# is a stable answer, so retrying only burns the host's patience.
+_BROWSER_RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
+_BROWSER_MAX_ATTEMPTS = 3
+
+
+def _browser_act_with_pacing(sandbox_dir, action, agent_id=None):
+    """Pace per host, then run one op, retrying only idempotent reads on a
+    transient status and honoring Retry-After. A challenge page is never
+    retried; it comes back as-is for the caller to surface."""
+    op = action.get('op')
+    if agent_id:
+        try:
+            if browser_session.is_waiting_for_operator(agent_id):
+                return {'ok': False, 'op': op, 'waitingForOperator': True,
+                        'error': 'the operator has taken over this browser; '
+                                 'control comes back on handback',
+                        'hint': 'Do not retry. Read again after handback.'}, None
+        except browser_session.BrowserSessionError:
+            pass
+    try:
+        host = urllib.parse.urlparse(
+            action.get('url') or action.get('pageUrl') or '').hostname or ''
+    except ValueError:
+        host = ''
+    for attempt in range(1, _BROWSER_MAX_ATTEMPTS + 1):
+        try:
+            _browse_pace_wait(host)
+        except TimeoutError as e:
+            return None, str(e)
+        parsed, err = _run_browser_act_sync(sandbox_dir, action, agent_id)
+        if parsed is None:
+            return None, err
+        if parsed.get('blocked'):
+            return parsed, None
+        status = parsed.get('status')
+        retryable = (op in ('goto', 'read')
+                     and isinstance(status, int)
+                     and status in _BROWSER_RETRYABLE_STATUS)
+        if not retryable or attempt >= _BROWSER_MAX_ATTEMPTS:
+            if attempt > 1:
+                parsed['retryCount'] = attempt - 1
+            return parsed, None
+        try:
+            retry_after = float(parsed.get('retryAfter') or 0)
+        except (TypeError, ValueError):
+            retry_after = 0.0
+        time.sleep(min(15.0, retry_after) if retry_after > 0
+                   else min(8.0, 0.75 * (2 ** (attempt - 1))))
+
+
+def _browser_block_payload(parsed_result, agent_id, op, url, purpose):
+    """Turn a driver-reported challenge into a stop-and-report response."""
+    challenge = parsed_result.get('challenge') or {}
+    try:
+        host = urllib.parse.urlparse(
+            parsed_result.get('url') or url).hostname or ''
+    except ValueError:
+        host = ''
+    _record_browser_block(agent_id, host, op, parsed_result.get('url') or url,
+                          challenge, parsed_result.get('status'), purpose)
+    vendor = challenge.get('vendor') or 'unknown'
+    parsed_result['ok'] = False
+    parsed_result['error'] = (
+        f'blocked by {vendor} challenge on {host or "the target site"}; '
+        'stopped instead of retrying')
+    parsed_result['blocked'] = {
+        'vendor': vendor,
+        'marker': challenge.get('marker') or '',
+        'host': host,
+        'status': parsed_result.get('status'),
+        'kind': 'challenge',
+        'logPath': BROWSE_BLOCK_LOG,
+    }
+    parsed_result['hint'] = (
+        'This is a site-side block, not a bad selector. Do not retry the same '
+        'URL. Ask the operator to take over the browser, or request API or '
+        'allowlist access.')
+    return parsed_result
+
 SANDBOX_TIMEOUT_S = 30
 SANDBOX_MAX_OUTPUT = 20_000
 # Where agent commands actually run: `local` = the local Docker
@@ -10309,6 +10583,32 @@ BROWSER_ACT_TIMEOUT_S = 180
 BROWSER_ACT_MAX_OUTPUT = 60_000
 
 
+def _read_browser_act_result(result, result_path, shot_path):
+    """Prefer the driver's own result file (not truncated by capture caps),
+    then fall back to stdout JSON. Shared by the one-shot and session paths."""
+    if os.path.isfile(result_path):
+        try:
+            with open(result_path, 'r') as f:
+                parsed = json.load(f)
+            if os.path.isfile(shot_path):
+                with open(shot_path, 'rb') as f:
+                    parsed['_shotB64'] = base64.b64encode(f.read()).decode()
+            return parsed, None
+        except (OSError, ValueError):
+            pass
+    out = (result.stdout or '')[:BROWSER_ACT_MAX_OUTPUT]
+    try:
+        parsed = json.loads(out)
+        if os.path.isfile(shot_path):
+            with open(shot_path, 'rb') as f:
+                parsed['_shotB64'] = base64.b64encode(f.read()).decode()
+        return parsed, None
+    except ValueError:
+        return None, (f'browser driver produced no parseable result '
+                      f'(exit {result.returncode}): '
+                      f'{out[-500:] or (result.stderr or "")[-500:]}')
+
+
 def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
     """Run ONE already-classified browser_act op in the sandbox and return the
     parsed result dict from the driver's result file (falling back to parsing
@@ -10342,6 +10642,42 @@ def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
         _act_host = ''
     _sync_safari_cookies(agent_id, _act_host)
     action['screenshotPath'] = f'/workspace/.browser-act/shot-{run_id}.png'
+    # A live session for this agent owns the browser: run the op against it so
+    # the player can watch and step in. Only this falls through to launching a
+    # new one-shot Chromium.
+    try:
+        session = browser_session.get(agent_id) if agent_id else None
+    except browser_session.BrowserSessionError:
+        session = None
+    if session and session.get('status') == 'stopped':
+        session = None
+    if session:
+        # The session container mounts its OWN sandbox dir at /workspace, so
+        # the result and shot must be read from there, not from this call's
+        # dir. Paths inside the container stay identical.
+        session_dir = browser_session.session_sandbox_dir(agent_id) or sandbox_dir
+        session_work = os.path.join(session_dir, '.browser-act')
+        os.makedirs(session_work, exist_ok=True)
+        result_path = os.path.join(session_work, f'result-{run_id}.json')
+        shot_path = os.path.join(session_work, f'shot-{run_id}.png')
+        try:
+            grant_host = urllib.parse.urlparse(
+                action.get('url') or action.get('pageUrl') or '').hostname or ''
+        except ValueError:
+            grant_host = ''
+        if grant_host and not _is_allowlisted_host(grant_host):
+            _grant_egress_host(grant_host)
+        try:
+            result = browser_session.exec_driver(
+                agent_id, action, timeout_s=BROWSER_ACT_TIMEOUT_S)
+        except browser_session.BrowserSessionError as e:
+            return None, str(e)
+        except subprocess.TimeoutExpired:
+            return None, 'browser action timed out in session'
+        finally:
+            if grant_host and not _is_allowlisted_host(grant_host):
+                _revoke_egress_host(grant_host)
+        return _read_browser_act_result(result, result_path, shot_path)
     # Host-side, outside the mount. Deleted in finally -- it is never
     # world-readable from any other container and never survives the run.
     action_dir = tempfile.mkdtemp(prefix='browser_act_')
@@ -10410,27 +10746,7 @@ def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
                 result = _run_docker_sandbox(docker_cmd, BROWSER_ACT_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             return None, 'browser action timed out in sandbox'
-        # Prefer the driver's own result file (not truncated by capture caps).
-        if os.path.isfile(result_path):
-            try:
-                with open(result_path, 'r') as f:
-                    parsed = json.load(f)
-                if os.path.isfile(shot_path):
-                    with open(shot_path, 'rb') as f:
-                        parsed['_shotB64'] = base64.b64encode(f.read()).decode()
-                return parsed, None
-            except (OSError, ValueError):
-                pass
-        # Fallback: parse stdout JSON (may be truncated, hence the file-first).
-        out = (result.stdout or '')[:BROWSER_ACT_MAX_OUTPUT]
-        try:
-            parsed = json.loads(out)
-            if os.path.isfile(shot_path):
-                with open(shot_path, 'rb') as f:
-                    parsed['_shotB64'] = base64.b64encode(f.read()).decode()
-            return parsed, None
-        except ValueError:
-            return None, f'browser driver produced no parseable result (exit {result.returncode}): {out[-500:] or (result.stderr or "")[-500:]}'
+        return _read_browser_act_result(result, result_path, shot_path)
     finally:
         if grant_host and not _is_allowlisted_host(grant_host):
             _revoke_egress_host(grant_host)
@@ -25359,6 +25675,18 @@ async def browse(request: Request):
         # one) on a domain not already vetted -- see record_browse_success.
         record_browse_success(parsed.hostname)
 
+    # robots.txt is a crawler's contract, not an interactive browser's. Apply
+    # it only when the caller says this page is part of a crawl (crawlAndCollect
+    # in world.js sets `crawl: true`), and refuse the page instead of quietly
+    # walking a site the operator asked not to be walked. Cached per host.
+    robots_info = None
+    if body.get('crawl'):
+        robots_allowed, robots_reason = await asyncio.to_thread(_robots_allows, url)
+        robots_info = {'allowed': robots_allowed, 'reason': robots_reason}
+        if not robots_allowed:
+            log_action(agent_id, 'browse', {'url': url, 'purpose': purpose, 'decision': 'blocked', 'reason': robots_reason, 'crawl': True}, authorized=authorized, trace_id=trace_id)
+            return JSONResponse({'allowed': False, 'reason': f'robots.txt: {robots_reason}', 'robots': robots_info})
+
     # Real fix for a real, confirmed gap: plain urllib (_fetch_page_sync)
     # only ever sees a page's INITIAL HTML. For a site that renders its
     # actual content client-side via JS/AJAX -- Reddit, Twitter/X, and any
@@ -25491,6 +25819,7 @@ async def browse(request: Request):
     _accrue_page_request()
     return JSONResponse({
         'allowed': True, 'url': final_url, 'text': text, 'links': links, 'truncated': truncated,
+        'robots': robots_info,
         'textForModel': wrapped, 'modelInstruction': model_instruction,
         'imageBase64': image_b64,
         # Real, if imperfect, "did this actually change" signal for
@@ -30974,7 +31303,7 @@ async def browser_act(request: Request):
                 return JSONResponse({'error': 'loginEntryUrl must be http(s) on the same site as url'}, status_code=400)
         action['loginEntryUrl'] = entry
     parsed_result, run_error = await asyncio.to_thread(
-        _run_browser_act_sync, sandbox_dir, action, agent_id)
+        _browser_act_with_pacing, sandbox_dir, action, agent_id)
     if parsed_result is None:
         log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'error', 'reason': run_error}, authorized=authorized)
         return JSONResponse({'allowed': True, 'ok': False, 'error': run_error})
@@ -30985,6 +31314,13 @@ async def browser_act(request: Request):
     # secret into action['value']; plain fills are also omitted for symmetry).
     if op == 'fill':
         parsed_result.pop('value', None)
+    # A WAF/challenge page is a site-side refusal, not a selector miss. Stop,
+    # record it with the host and vendor, and hand the agent a clear next
+    # step instead of letting it retry the same URL.
+    if parsed_result.get('blocked') or parsed_result.get('challenge'):
+        blocked = _browser_block_payload(parsed_result, agent_id, op, url, purpose)
+        log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'blocked', 'reason': (blocked.get('blocked') or {}).get('vendor')}, authorized=authorized)
+        return JSONResponse({'allowed': True, **blocked, 'screenshotBase64': shot})
     captcha_info = parsed_result.get('captchas') or []
     if not isinstance(captcha_info, list):
         captcha_info = []
@@ -30993,8 +31329,244 @@ async def browser_act(request: Request):
             _handle_captcha_detected, agent_id, sandbox_id,
             parsed_result.get('url') or url, captcha_info, shot,
             purpose, (body.get('submitSelector') or '').strip())
-    log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'allowed', 'ok': parsed_result.get('ok'), 'credentialInjected': bool(credential_handle)}, authorized=authorized)
+    log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op, 'url': url, 'purpose': purpose, 'decision': 'allowed', 'ok': parsed_result.get('ok'), 'status': parsed_result.get('status'), 'retryCount': parsed_result.get('retryCount'), 'dataRoutes': len(parsed_result.get('dataRoutes') or []), 'credentialInjected': bool(credential_handle)}, authorized=authorized)
     return JSONResponse({'allowed': True, **parsed_result, 'screenshotBase64': shot})
+
+
+# ---------------------------------------------------------------------------
+# Browser sessions: a long-lived, player-viewable Chromium per agent.
+# Start one when an agent needs help (or is about to do something fiddly),
+# watch it, take over for a moment, then hand back. Player session only.
+def _browser_session_sandbox_id(agent_id, sandbox_id):
+    sid = sandbox_id or ('sandbox-' + secrets.token_hex(4))
+    sid = _village_sandbox_id(agent_id, sid)
+    if not _SANDBOX_ID_RE.match(sid or ''):
+        raise ValueError('invalid sandboxId')
+    return sid
+
+
+def _browser_session_proxy_url():
+    return f'http://{PROXY_CONTAINER}:{PROXY_PORT}'
+
+
+@app.get('/api/browser-session/list')
+async def browser_session_list(request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'player session required'}, status_code=401)
+    sessions = await asyncio.to_thread(browser_session.list_sessions)
+    return JSONResponse({'sessions': sessions})
+
+
+@app.post('/api/browser-session/start')
+async def browser_session_start(request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'player session required'}, status_code=401)
+    if not EXECUTION_ENABLED:
+        return JSONResponse({'error': 'Agent execution is disabled (AGENT_EXECUTION_ENABLED=false in .env)'}, status_code=403)
+    body = await request.json()
+    agent_id = str(body.get('agentId') or '').strip()
+    if not agent_id:
+        return JSONResponse({'error': 'agentId is required'}, status_code=400)
+    try:
+        sandbox_id = _browser_session_sandbox_id(agent_id, body.get('sandboxId'))
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    # The session joins the sandbox network, so the network and its egress
+    # proxy must exist first. Same call every other sandbox path makes.
+    try:
+        await asyncio.to_thread(ensure_sandbox_networking)
+    except Exception as e:
+        return JSONResponse({'error': f'sandbox networking unavailable: {e}'}, status_code=500)
+    try:
+        session = await asyncio.to_thread(
+            browser_session.start, agent_id,
+            sandbox_dir=_sandbox_dir_for(sandbox_id),
+            profile_dir=_browser_profile_dir(agent_id),
+            proxy_url=_browser_session_proxy_url())
+    except browser_session.BrowserSessionError as e:
+        return JSONResponse({'error': str(e)}, status_code=500)
+    log_action('player', 'browser_session_start',
+               {'agentId': agent_id, 'sandboxId': sandbox_id}, authorized=True)
+    return JSONResponse({'ok': True, 'session': session})
+
+
+@app.post('/api/browser-session/stop')
+async def browser_session_stop(request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'player session required'}, status_code=401)
+    body = await request.json()
+    agent_id = str(body.get('agentId') or '').strip()
+    if not agent_id:
+        return JSONResponse({'error': 'agentId is required'}, status_code=400)
+    try:
+        stopped = await asyncio.to_thread(browser_session.stop, agent_id)
+    except browser_session.BrowserSessionError as e:
+        return JSONResponse({'error': str(e)}, status_code=500)
+    log_action('player', 'browser_session_stop', {'agentId': agent_id}, authorized=True)
+    return JSONResponse({'ok': True, 'stopped': stopped})
+
+
+@app.post('/api/browser-session/takeover')
+async def browser_session_takeover(request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'player session required'}, status_code=401)
+    body = await request.json()
+    agent_id = str(body.get('agentId') or '').strip()
+    if not agent_id:
+        return JSONResponse({'error': 'agentId is required'}, status_code=400)
+    try:
+        session = await asyncio.to_thread(browser_session.takeover, agent_id)
+    except browser_session.BrowserSessionError as e:
+        return JSONResponse({'error': str(e)}, status_code=404)
+    log_action('player', 'browser_session_takeover', {'agentId': agent_id}, authorized=True)
+    return JSONResponse({'ok': True, 'session': session})
+
+
+@app.post('/api/browser-session/handback')
+async def browser_session_handback(request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'player session required'}, status_code=401)
+    body = await request.json()
+    agent_id = str(body.get('agentId') or '').strip()
+    if not agent_id:
+        return JSONResponse({'error': 'agentId is required'}, status_code=400)
+    try:
+        session = await asyncio.to_thread(browser_session.handback, agent_id)
+    except browser_session.BrowserSessionError as e:
+        return JSONResponse({'error': str(e)}, status_code=404)
+    log_action('player', 'browser_session_handback', {'agentId': agent_id}, authorized=True)
+    return JSONResponse({'ok': True, 'session': session})
+
+
+@app.get('/api/browser-session/view')
+async def browser_session_view(request: Request, token: str = ''):
+    if not _require_player_session(request):
+        return HTMLResponse('<p>Sign in at / first.</p>', status_code=401)
+    match = await asyncio.to_thread(browser_session.session_by_token, token)
+    if not match:
+        return HTMLResponse('<p>Unknown or expired session.</p>', status_code=404)
+    agent = re.sub(r'[^A-Za-z0-9_.-]', '', str(match.get('agentId') or ''))[:64]
+    # Same-origin proxy: noVNC assets and its websocket both ride this app's
+    # origin, so takeover works from any machine that can reach the server
+    # (Tailscale included). The loopback port is never exposed to the player.
+    vnc_base = f'/api/browser-session/vnc/{urllib.parse.quote(token)}'
+    src = (vnc_base + '/vnc.html?autoconnect=1&resize=scale'
+           + '&path=' + urllib.parse.quote(vnc_base + '/websockify', safe='/')
+           + '&password=' + urllib.parse.quote(match.get('password') or ''))
+    handback = "/api/browser-session/handback"
+    page = f'''<!doctype html><html><head><meta charset="utf-8">
+<title>Takeover: {agent}</title>
+<style>
+body{{margin:0;background:#0b0f14;color:#d7e2ef;font:14px ui-monospace,Menlo,monospace}}
+header{{display:flex;gap:12px;align-items:center;padding:10px 14px;border-bottom:1px solid #223042}}
+button{{background:#16222f;color:#d7e2ef;border:1px solid #223042;border-radius:6px;padding:6px 10px;font:inherit;cursor:pointer}}
+iframe{{width:100%;height:calc(100vh - 48px);border:0;display:block}}
+</style></head><body>
+<header><b>Takeover: {agent}</b>
+<button id="hb">Hand back to agent</button>
+<span id="msg"></span></header>
+<iframe src="{src}" allow="clipboard-read; clipboard-write"></iframe>
+<script>
+document.getElementById('hb').onclick = async () => {{
+  const r = await fetch('{handback}', {{method:'POST', credentials:'same-origin',
+    headers:{{'Content-Type':'application/json'}},
+    body: JSON.stringify({{agentId: '{agent}'}})}});
+  document.getElementById('msg').textContent = r.ok ? 'Handed back.' : 'Handback failed.';
+}};
+</script></body></html>'''
+    return HTMLResponse(page)
+
+
+@app.get('/api/browser-session/vnc/{token}/{asset:path}')
+async def browser_session_vnc_asset(request: Request, token: str, asset: str):
+    """Serve one noVNC static asset for a session from its loopback port.
+
+    Token plus player session, and the upstream host/port come from the
+    session registry, never from the request. This is a plain loopback fetch
+    (not _safe_urlopen, which correctly refuses private addresses), so the red
+    line is: the URL is built here from a registry entry the player started."""
+    if not _require_player_session(request):
+        return Response(status_code=401)
+    match = await asyncio.to_thread(browser_session.session_by_token, token)
+    if not match:
+        return Response(status_code=404)
+    asset = asset.lstrip('/') or 'vnc.html'
+    if '..' in asset.split('/'):
+        return Response(status_code=400)
+    upstream = f'http://127.0.0.1:{int(match["port"])}/{asset}'
+    try:
+        req = urllib.request.Request(upstream, headers={'User-Agent': 'tank-novnc-proxy'})
+        with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 -- loopback, registry-derived port
+            body = resp.read(32 * 1024 * 1024)
+            ctype = resp.headers.get('Content-Type') or 'application/octet-stream'
+    except urllib.error.HTTPError as e:
+        return Response(status_code=e.code, content=b'')
+    except Exception:
+        return Response(status_code=502, content=b'')
+    return Response(content=body, media_type=ctype)
+
+
+@app.websocket('/api/browser-session/vnc/{token}/websockify')
+async def browser_session_vnc_ws(websocket: WebSocket, token: str):
+    """Relay noVNC's websocket to the session's loopback websockify.
+
+    Same auth as the page (session cookie plus token). Frames are forwarded
+    verbatim in both directions; nothing is decoded, so the agent and the
+    player still share one browser."""
+    if not verify_session(websocket.cookies.get(SESSION_COOKIE_NAME)):
+        await websocket.close(code=4401)
+        return
+    match = browser_session.session_by_token(token)
+    if not match:
+        await websocket.close(code=4404)
+        return
+    try:
+        import websockets
+    except Exception:
+        await websocket.close(code=1011)
+        return
+    offered = list(websocket.scope.get('subprotocols') or [])
+    try:
+        upstream = await websockets.connect(
+            f'ws://127.0.0.1:{int(match["port"])}/websockify',
+            subprotocols=offered, open_timeout=10,
+            max_size=None, ping_interval=None)
+    except Exception:
+        await websocket.close(code=1011)
+        return
+    await websocket.accept(subprotocol=upstream.subprotocol)
+
+    async def client_to_upstream():
+        try:
+            while True:
+                message = await websocket.receive()
+                if message.get('type') == 'websocket.disconnect':
+                    break
+                data = message.get('bytes')
+                if data is not None:
+                    await upstream.send(data)
+                elif message.get('text') is not None:
+                    await upstream.send(message['text'])
+        except Exception:
+            pass
+
+    async def upstream_to_client():
+        try:
+            async for message in upstream:
+                if isinstance(message, bytes):
+                    await websocket.send_bytes(message)
+                else:
+                    await websocket.send_text(message)
+        except Exception:
+            pass
+
+    try:
+        await asyncio.gather(client_to_upstream(), upstream_to_client())
+    finally:
+        with contextlib.suppress(Exception):
+            await upstream.close()
+        with contextlib.suppress(Exception):
+            await websocket.close()
 
 
 _PIPELINE_JOBS = {}

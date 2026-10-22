@@ -28,7 +28,6 @@ import os
 import random
 import re
 import sys
-import time
 import traceback
 import urllib.parse
 
@@ -175,6 +174,169 @@ def _captcha_state(page):
         return []
 
 
+def _challenge_state(page):
+    """Detect a WAF / bot-challenge interstitial, not just a CAPTCHA widget.
+
+    A Cloudflare "Just a moment", an Akamai "Access Denied" reference block,
+    a PerimeterX hold page, a DataDome verify page, or an Imperva/Incapsula
+    refusal usually carries NO CAPTCHA form, so `_captcha_state` returns
+    empty and the caller would otherwise treat it as a normal short page and
+    keep retrying. This only reports what the page says; it never attempts
+    to pass the challenge. Callers should stop and surface it.
+    """
+    try:
+        found = page.evaluate("""() => {
+          const text = ((document.body && document.body.innerText) || '').toLowerCase();
+          const title = (document.title || '').toLowerCase();
+          const html = (document.documentElement && document.documentElement.innerHTML || '').toLowerCase();
+          const hit = (vendor, marker) => ({vendor: vendor, marker: marker});
+          if (html.includes('cf-challenge') || html.includes('challenge-platform')
+              || title.includes('just a moment') || title.includes('attention required')
+              || text.includes('checking your browser') || text.includes('enable javascript and cookies to continue')
+              || text.includes('verify you are human') && html.includes('cloudflare')) {
+            return hit('cloudflare', 'challenge platform');
+          }
+          if (html.includes('incapsula') || html.includes('_incapsula_resource')
+              || text.includes('request unsuccessful. incapsula')) {
+            return hit('imperva', 'incapsula resource');
+          }
+          if (html.includes('px-captcha') || html.includes('_pxhd') || text.includes('press & hold')) {
+            return hit('perimeterx', 'px-captcha');
+          }
+          if (html.includes('datadome') || html.includes('geo.captcha-delivery')) {
+            return hit('datadome', 'datadome script');
+          }
+          if (html.includes('awswaf') || text.includes('your request was blocked')) {
+            return hit('aws-waf', 'waf token');
+          }
+          if ((title.includes('access denied') || text.includes('access denied'))
+              && (text.includes('reference #') || html.includes('errors.edgesuite.net'))) {
+            return hit('akamai', 'reference block');
+          }
+          if (title.includes('too many requests') || text.includes('too many requests')) {
+            return hit('rate-limit', 'too many requests');
+          }
+          return null;
+        }""")
+    except Exception:
+        return None
+    if isinstance(found, dict) and found.get('vendor'):
+        return {'vendor': str(found['vendor'])[:40], 'marker': str(found.get('marker') or '')[:80]}
+    return None
+
+
+def _data_routes(page):
+    """Public JSON/RSS/Atom alternates the page advertises.
+
+    Discovery aid, not a workaround: when a site already exposes a data route,
+    calling it is both cheaper and less hostile than driving its DOM.
+    """
+    try:
+        found = page.evaluate("""() => {
+          const out = [];
+          const push = (type, href, title) => {
+            if (!href || out.length >= 10) return;
+            if (out.some(r => r.href === href)) return;
+            out.push({type: type || '', href: href, title: (title || '').slice(0, 80)});
+          };
+          for (const l of document.querySelectorAll('link[rel~="alternate"], link[type="application/json"], link[type*="rss"], link[type*="atom"]')) {
+            const t = (l.getAttribute('type') || '').toLowerCase();
+            if (t.includes('json') || t.includes('rss') || t.includes('atom') || t.includes('xml')) {
+              push(t, l.href, l.getAttribute('title'));
+            }
+          }
+          for (const a of document.querySelectorAll('a[href]')) {
+            const href = (a.getAttribute('href') || '').toLowerCase();
+            if (href.endsWith('.json') || href.endsWith('.rss') || href.endsWith('.atom')) {
+              push('', a.href, (a.textContent || '').trim());
+            }
+          }
+          return out;
+        }""")
+    except Exception:
+        return []
+    if not isinstance(found, list):
+        return []
+    return [r for r in found if isinstance(r, dict) and r.get('href')][:10]
+
+
+def _real_identity(page):
+    """Report the browser's actual identity instead of a pinned string.
+
+    The UA is read back from the running browser, so it carries the real
+    Chromium build. Locale and timezone are the launch values, which come
+    from the host (see _launch) rather than a fixed claim.
+    """
+    ua = ''
+    lang = ''
+    tz = ''
+    try:
+        ua = page.evaluate("navigator.userAgent") or ''
+    except Exception:
+        ua = ''
+    try:
+        lang = page.evaluate("navigator.language") or ''
+    except Exception:
+        lang = ''
+    try:
+        tz = page.evaluate(
+            "Intl.DateTimeFormat().resolvedOptions().timeZone") or ''
+    except Exception:
+        tz = ''
+    headless = os.environ.get('BROWSER_HEADLESS', '0') == '1'
+    return {
+        'userAgent': str(ua)[:300] if isinstance(ua, str) else '',
+        'language': str(lang)[:40] if isinstance(lang, str) else '',
+        'timezone': str(tz)[:80] if isinstance(tz, str) else '',
+        'headless': headless,
+        'userAgentOverridden': bool(os.environ.get('BROWSER_USER_AGENT')),
+    }
+
+
+_LOCALE_RE = re.compile(r'^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*$')
+_TZ_RE = re.compile(r'^[A-Za-z0-9_+\-/]{1,64}$')
+
+
+def _host_locale():
+    """The host's locale as a BCP-47 tag, or '' when the host has none.
+
+    Not a spoof: taking the locale from the environment instead of asserting
+    en-US keeps the browser consistent with the machine it runs on.
+    """
+    for key in ('LC_ALL', 'LC_MESSAGES', 'LANG'):
+        raw = (os.environ.get(key) or '').strip()
+        if not raw or raw in ('C', 'POSIX'):
+            continue
+        raw = raw.split('.', 1)[0].split('@', 1)[0]
+        tag = raw.replace('_', '-')
+        if _LOCALE_RE.match(tag):
+            return tag
+    return ''
+
+
+def _host_timezone():
+    """The host's IANA timezone, or '' when it cannot be determined."""
+    tz = (os.environ.get('TZ') or '').strip().lstrip(':')
+    if tz and _TZ_RE.match(tz):
+        return tz
+    try:
+        with open('/etc/timezone', 'r') as f:
+            tz = f.read().strip()
+        if tz and _TZ_RE.match(tz):
+            return tz
+    except OSError:
+        pass
+    try:
+        target = os.path.realpath('/etc/localtime')
+        if 'zoneinfo/' in target:
+            tz = target.split('zoneinfo/', 1)[1]
+            if _TZ_RE.match(tz):
+                return tz
+    except OSError:
+        pass
+    return ''
+
+
 def _apply_safari_cookies(ctx, profile_dir):
     """Re-apply the host-side Safari cookie seed to this persistent profile."""
     path = os.path.join(profile_dir, 'safari-cookies.json')
@@ -189,9 +351,14 @@ def _apply_safari_cookies(ctx, profile_dir):
         pass
 
 
-def _page_state(page, max_text):
+def _page_state(page, max_text, response=None):
     """Snapshot of the live page: url/title, visible text, interactive form
-    fields, links. Truncated so a huge page can't blow the sandbox stdout cap."""
+    fields, links. Truncated so a huge page can't blow the sandbox stdout cap.
+
+    `response` is the Playwright response for the navigation that produced
+    this page (when there was one). Its status and Retry-After are reported so
+    the endpoint can tell a 403/429 block from a rendered page and pace
+    itself instead of re-requesting."""
     try:
         url = page.url
     except Exception:
@@ -248,11 +415,46 @@ def _page_state(page, max_text):
         ) or []
     except Exception:
         links = []
+    status = None
+    retry_after = None
+    if response is not None:
+        try:
+            status = response.status
+        except Exception:
+            status = None
+        try:
+            retry_after = response.headers.get('retry-after')
+        except Exception:
+            retry_after = None
+    challenge = _challenge_state(page)
     return {'url': url, 'title': title[:200], 'text': text, 'fields': fields, 'links': links,
-            'captchas': _captcha_state(page)}
+            'captchas': _captcha_state(page),
+            'challenge': challenge,
+            'blocked': bool(challenge),
+            'status': status,
+            'retryAfter': retry_after,
+            'dataRoutes': _data_routes(page),
+            'identity': _real_identity(page)}
+
+
+def _launch_cdp(playwright, action):
+    """Attach to the already-running session Chromium (BROWSER_CDP_URL).
+
+    Returns (None, page): the endpoint owns the browser, so run() must not
+    close the context. This is what lets the player and the agent share one
+    page during a takeover."""
+    browser = playwright.chromium.connect_over_cdp(
+        os.environ['BROWSER_CDP_URL'].strip())
+    contexts = list(getattr(browser, 'contexts', []) or [])
+    ctx = contexts[0] if contexts else browser.new_context()
+    pages = list(getattr(ctx, 'pages', []) or [])
+    page = pages[0] if pages else ctx.new_page()
+    return None, page
 
 
 def _launch(playwright, action):
+    if (os.environ.get('BROWSER_CDP_URL') or '').strip():
+        return _launch_cdp(playwright, action)
     args = ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
             '--disable-blink-features=AutomationControlled', '--no-first-run',
             '--no-default-browser-check']
@@ -273,21 +475,27 @@ def _launch(playwright, action):
         vp = {'width': int(w), 'height': int(h)}
     except Exception:
         vp = {'width': 1280, 'height': 900}
-    # A real Chrome UA, not Playwright's default HeadlessChrome string. Sites
-    # behind CDN WAFs (CloudFront, Fastly, Akamai) serve a 403 to any client
-    # whose UA says HeadlessChrome regardless of how real the rest of the
-    # fingerprint looks -- the sandbox is egressed through the same IP as the
-    # host (verified: a host curl with a normal UA gets 200 from HF, the
-    # sandbox browser got 403 purely on this string). Masking the UA is the
-    # least that unblocks legitimate logins to player-vetted, allowlisted
-    # sites the player explicitly wants agents to reach.
-    ctx = playwright.chromium.launch_persistent_context(
-        profile_dir, headless=(os.environ.get('BROWSER_HEADLESS', '0') == '1'), args=args, viewport=vp, accept_downloads=False,
-        user_agent=('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/131.0.0.0 Safari/537.36'),
-        locale='en-US', timezone_id='America/New_York',
-    )
+    # Identity is NOT pinned to a made-up string. The browser runs headful
+    # under Xvfb by default, so its own UA already names the real Chromium
+    # build; passing a frozen "Chrome/131" override only creates a mismatch
+    # between the UA and everything else the browser reports. An operator can
+    # still pin a UA deliberately with BROWSER_USER_AGENT, and the result's
+    # `identity.userAgentOverridden` says so. Locale/timezone come from the
+    # host when it has them, otherwise the browser default is used.
+    launch_kwargs = {
+        'headless': os.environ.get('BROWSER_HEADLESS', '0') == '1',
+        'args': args, 'viewport': vp, 'accept_downloads': False,
+    }
+    pinned_ua = (os.environ.get('BROWSER_USER_AGENT') or '').strip()
+    if pinned_ua:
+        launch_kwargs['user_agent'] = pinned_ua
+    host_locale = _host_locale()
+    if host_locale:
+        launch_kwargs['locale'] = host_locale
+    host_tz = _host_timezone()
+    if host_tz:
+        launch_kwargs['timezone_id'] = host_tz
+    ctx = playwright.chromium.launch_persistent_context(profile_dir, **launch_kwargs)
     _apply_safari_cookies(ctx, profile_dir)
     try:
         ctx.add_init_script(
@@ -329,6 +537,7 @@ def run(action):
                 # so a fill would time out waiting for a selector that was
                 # never on screen. goto is the only op that skips this -- it IS
                 # the navigation.
+                nav_response = None
                 if op == 'login' and action.get('loginEntryUrl'):
                     entry_url = action['loginEntryUrl']
                     entry_parsed = urllib.parse.urlparse(entry_url)
@@ -352,8 +561,8 @@ def run(action):
                     # the pointer, click its Log in link, then fill the form.
                     # This gives the request a real referer and navigation
                     # chain instead of a cold direct hit on /login.
-                    page.goto(action['loginEntryUrl'], timeout=timeout_ms,
-                              wait_until='domcontentloaded')
+                    nav_response = page.goto(action['loginEntryUrl'], timeout=timeout_ms,
+                                             wait_until='domcontentloaded')
                     _settle(page, 2500)
                     page.mouse.move(160 + random.randint(0, 260),
                                     180 + random.randint(0, 160))
@@ -371,11 +580,12 @@ def run(action):
                         pass
                     _settle(page, 2500)
                     if not _is_login_path(page.url):
-                        page.goto(action.get('url'), timeout=timeout_ms,
-                                  wait_until='domcontentloaded')
+                        nav_response = page.goto(action.get('url'), timeout=timeout_ms,
+                                                 wait_until='domcontentloaded')
                         _settle(page, 2500)
                 elif op != 'goto' and action.get('url'):
-                    page.goto(action.get('url'), timeout=timeout_ms, wait_until='domcontentloaded')
+                    nav_response = page.goto(action.get('url'), timeout=timeout_ms,
+                                             wait_until='domcontentloaded')
                     _settle(page, 2500)
                 social_error = _social_write_guard(op, page.url)
                 if social_error:
@@ -383,12 +593,15 @@ def run(action):
                             'error': social_error,
                             'socialReadOnly': True}
                 if op == 'goto':
-                    page.goto(action.get('url'), timeout=timeout_ms, wait_until='domcontentloaded')
+                    nav_response = page.goto(action.get('url'), timeout=timeout_ms,
+                                             wait_until='domcontentloaded')
                     _settle(page, 2500)
-                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
+                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT),
+                                        response=nav_response)
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
                 if op == 'read':
-                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT))
+                    state = _page_state(page, int(action.get('maxText') or MAX_TEXT),
+                                        response=nav_response)
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
                 if op == 'fill':
                     page.fill(action.get('selector'), action.get('value') or '', timeout=timeout_ms)

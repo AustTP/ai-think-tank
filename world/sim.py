@@ -6430,6 +6430,32 @@ def _queue_peer_repair(state, parent, rationale=None):
     return item
 
 
+# Peer-review close rule (operator decision, 2026-10-22). A normal story
+# needs two distinct clean approvals (the adversarial split). A sprint staffed
+# with only two workers cannot produce a second reviewer besides the author
+# without pulling a third agent into it, so one clean approval is the bar
+# there. `requiredApprovals` is stamped on the gate at open time and carried
+# across re-entries so the close rule never has to re-derive it.
+PEER_APPROVALS_DEFAULT = 2
+PEER_APPROVALS_LEAN_SPRINT = 1
+LEAN_SPRINT_WORKERS = 2
+
+
+def _peer_gate_required(state, task):
+    """Distinct clean approvals this gate needs: 1 for a sprint staffed with
+    at most two workers, else 2."""
+    sprint_id = (task or {}).get('sprintId')
+    if not sprint_id:
+        return PEER_APPROVALS_DEFAULT
+    try:
+        pool = _sprint_worker_pool(state, sprint_id)
+    except Exception:
+        pool = None
+    if pool is not None and len(pool) <= LEAN_SPRINT_WORKERS:
+        return PEER_APPROVALS_LEAN_SPRINT
+    return PEER_APPROVALS_DEFAULT
+
+
 def _enter_peer_review(state, task, now_ms, preferred=None):
     """Move a deliverable task whose primary content work just finished into the
     peer-approval gate: status -> 'needs_review', pick two reviewers (see
@@ -6453,12 +6479,15 @@ def _enter_peer_review(state, task, now_ms, preferred=None):
     prior = task.get('_peerGate') or {}
     if preferred is None:
         preferred = prior.get('reviewerIds') or None
+    required = _peer_gate_required(state, task)
     reviewers = _pick_reviewer_ids(state, author, task_room=task.get('room'), preferred=preferred)
     if not reviewers:
         return None
+    reviewers = reviewers[:required]
     gate = {
         'room': task.get('room'),
         'approvals': 0,
+        'requiredApprovals': required,
         'approvers': [],
         'reviewerIds': reviewers,
         'enteredMs': now_ms,
@@ -6804,13 +6833,15 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
 
 
 def _peer_gate_should_close(gate, now_ms, entered_ms):
-    """Close rule: two distinct clean approvals. The old single-vote timeout is
-    gone. A quiet tank gets a fresh second reviewer from the stuck-gate sweep
-    instead of lowering the bar. A gate with one vote stays open until the
-    second vote lands or the gate escalates."""
+    """Close rule: the gate's required distinct clean approvals, normally two.
+    A two-worker sprint stamps one (see _peer_gate_required). The old
+    single-vote timeout is gone. A quiet tank gets a fresh second reviewer from
+    the stuck-gate sweep instead of lowering the bar. A gate below its bar
+    stays open until the vote lands or the gate escalates."""
     if gate.get('escalated'):
         return False
-    return gate['approvals'] >= 2
+    required = int(gate.get('requiredApprovals') or PEER_APPROVALS_DEFAULT)
+    return gate['approvals'] >= required
 
 
 def _note_completed_room(state, agent_id, task):
@@ -6984,7 +7015,8 @@ def _sweep_stuck_gates(state, now_ms):
         # the approver, re-queue one fresh review instead of lowering the bar.
         approvals = int(gate.get('approvals') or 0)
         approvers = set(gate.get('approvers') or [])
-        if (approvals == 1 and entered and
+        required = int(gate.get('requiredApprovals') or PEER_APPROVALS_DEFAULT)
+        if (required > 1 and approvals == 1 and entered and
                 now_ms - entered >= PEER_REVIEW_TIMEOUT_MS):
             pending_second = [q for q in pending_reviews
                               if q.get('assignedTo') not in approvers]
@@ -7056,12 +7088,13 @@ def _sweep_stuck_gates(state, now_ms):
         author = task.get('assignedTo')
         fresh = _pick_reviewer_ids(state, author, task_room=task.get('room'))
         fresh = [rid for rid in fresh if rid not in locked and rid != author]
-        # Top up to a full pair from the broader reachable non-admin roster when
-        # the team-widened pool came up short (the locked filter can thin it to
-        # one). The rescue must yield a viable PAIR, not leave the gate one vote
-        # short of the 2-clean rule.
+        needed = int(gate.get('requiredApprovals') or PEER_APPROVALS_DEFAULT)
+        # Top up to the gate's bar from the broader reachable non-admin roster
+        # when the team-widened pool came up short (the locked filter can thin
+        # it). The rescue must yield a viable set, not leave the gate one vote
+        # short of its close rule.
         for d in (state.get('agentRoster') or []):
-            if len(fresh) >= 2:
+            if len(fresh) >= needed:
                 break
             if d.get('isAdmin') or d.get('id') == author or d.get('id') in locked:
                 continue
@@ -7079,7 +7112,7 @@ def _sweep_stuck_gates(state, now_ms):
             if item.get('reviewOf') == task.get('id'):
                 item['assignedTo'] = next(repl, item.get('assignedTo'))
                 replaced += 1
-        gate['reviewerIds'] = fresh[:2]
+        gate['reviewerIds'] = fresh[:needed]
         gate['stuckRescueTs'] = now_ms
         gate['enteredMs'] = now_ms  # restart the timeout window fairly
         if replaced:
@@ -7087,7 +7120,7 @@ def _sweep_stuck_gates(state, now_ms):
                 from serve import log_action
                 log_action(None, 'task_peer_widened',
                            {'taskId': task.get('id'), 'title': task.get('title'),
-                            'from': locked, 'to': fresh[:2]}, authorized=True)
+                            'from': locked, 'to': fresh[:needed]}, authorized=True)
             except Exception:
                 pass
 

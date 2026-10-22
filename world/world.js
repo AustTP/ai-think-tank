@@ -486,7 +486,7 @@ async function crawlAndCollect(agentId, sandboxId, startUrl, purpose, opts = {})
 
     let data;
     try {
-      const res = await agentFetch('/api/browse', agentId, { method: 'POST', body: JSON.stringify({ url, purpose, agentId }) });
+      const res = await agentFetch('/api/browse', agentId, { method: 'POST', body: JSON.stringify({ url, purpose, agentId, crawl: true }) });
       data = await res.json();
     } catch (e) {
       manifest.push({ url, kept: false, reason: 'request failed: ' + e.message });

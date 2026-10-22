@@ -1893,6 +1893,7 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None):
                        'status': 'refused'}
     window_id = f'win-{secrets.token_hex(5)}'
     if admin_mode:
+        esc_id = None  # no player link in the two-agent chain
         _window_record(window_id, now, agent_id, date, start, start_ts, end_ts,
                        duration_min, reason, 'approved')
         _update_window(window_id, escalation_id=None, validator=validator,
@@ -1917,7 +1918,9 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None):
                       'supervisorDecision': 'approved', 'validator': validator,
                       'reservedEdits': armed_ids},
                      authorized=True)
-    return True, {'id': window_id, 'status': 'pending', 'escalationId': esc_id,
+    return True, {'id': window_id,
+                  'status': 'approved' if admin_mode else 'pending',
+                  'escalationId': esc_id,
                   'durationMin': duration_min, 'validator': validator,
                   'reservedEdits': armed_ids,
                   'message': (f'window approved by the supervisor; '
@@ -2091,7 +2094,8 @@ def windows_snapshot(limit=25):
             'SELECT id, created, agent, date, start, duration_min, reason, '
             'status, note, escalation_id, fired_at, validator, '
             'validator_status, validator_note, push_status, push_category, '
-            'push_note, push_sha, pushed_at FROM dormancy_windows '
+            'push_note, push_sha, pushed_at, admin_status, admin_note, '
+            'admin_agent, supervisor FROM dormancy_windows '
             'ORDER BY created DESC LIMIT ?', (int(limit),)).fetchall()
     return [{'id': r[0], 'created': r[1], 'agent': r[2], 'date': r[3],
              'start': r[4], 'durationMin': r[5], 'reason': r[6],
@@ -2099,7 +2103,9 @@ def windows_snapshot(limit=25):
              'firedAt': r[10], 'validator': r[11],
              'validatorStatus': r[12], 'validatorNote': r[13],
              'pushStatus': r[14], 'pushCategory': r[15], 'pushNote': r[16],
-             'pushSha': r[17], 'pushedAt': r[18]} for r in rows]
+             'pushSha': r[17], 'pushedAt': r[18],
+             'adminStatus': r[19], 'adminNote': r[20],
+             'adminAgent': r[21], 'supervisor': r[22]} for r in rows]
 
 
 # ---------------------------------------------------------------------------

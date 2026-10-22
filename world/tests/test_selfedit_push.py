@@ -679,3 +679,66 @@ def test_commit_message_names_every_change_request_role(monkeypatch):
     assert 'Implementer: Ben' in message
     assert 'Validator: Ada' in message
     assert 'world/gear.py: engine knob' in message
+
+
+# --- Admin-mode change requests (governance.changeRequestAdminApproval) ----
+# No player link; the director validator and the admin both sign.
+
+def _admin_state():
+    return {
+        'governance': {'changeRequestAdminApproval': True},
+        'agentRoster': [
+            {'id': 'worker', 'name': 'Ben', 'director': 'reviewer'},
+            {'id': 'reviewer', 'name': 'Ada'},
+            {'id': 'chief', 'name': 'Theo', 'isAdmin': True},
+        ],
+        'agents': {'worker': {}, 'reviewer': {}, 'chief': {}},
+        'sprints': {'spr-1': {'id': 'spr-1', 'status': 'active'}},
+    }
+
+
+def _book_admin_window(monkeypatch, fake_repo):
+    """Admin-mode booking: no player escalation, window lands 'approved'."""
+    _, world = fake_repo
+    _approve(monkeypatch)
+    monkeypatch.setattr(serve, 'get_state_from_db', _admin_state)
+    _arm_edit(monkeypatch, world)
+    ok, payload = selfedit.request_window(
+        'worker', _window_slot(), '03:10', 15, 'ship the tuning change',
+        'reviewer')
+    assert ok is True, payload
+    assert payload['status'] == 'approved', payload
+    assert payload['escalationId'] is None
+    _fire_requested_window(payload['id'])
+    return payload['id']
+
+
+def _ready_for_validation(monkeypatch):
+    monkeypatch.setattr(serve, '_set_dormant', lambda v: None)
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    _fake_test_gate(monkeypatch, [(True, 'ALL GREEN')])
+    _notify_log(monkeypatch)
+    selfedit.apply_pass()
+
+
+def test_admin_mode_request_does_not_crash(fake_repo, monkeypatch):
+    # Regression: admin mode used to leave esc_id unbound and raise on every
+    # request while governance.changeRequestAdminApproval was on.
+    window_id = _book_admin_window(monkeypatch, fake_repo)
+    assert selfedit._window_field(window_id, 'status') == 'fired'
+
+
+def test_admin_mode_still_needs_both_approvals(fake_repo, monkeypatch):
+    window_id = _book_admin_window(monkeypatch, fake_repo)
+    _ready_for_validation(monkeypatch)
+    calls = _fake_git(monkeypatch)
+    _watch_push_outcome(monkeypatch)
+    ok, payload = selfedit.validate_window('reviewer', window_id, True,
+                                           '', False)
+    assert ok is True and payload['status'] == 'awaiting_admin', payload
+    assert calls == []
+    assert selfedit._window_field(window_id, 'push_status') == 'awaiting_validator'
+    # The admin's approval then completes the same window.
+    ok, payload = selfedit.admin_approve_window('chief', window_id, True, 'ok')
+    assert ok is True and payload['status'] == 'successful', payload
+    assert selfedit._window_field(window_id, 'push_status') == 'pushed'
