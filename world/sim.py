@@ -2842,6 +2842,10 @@ def queue_work(state, items):
             # vote on a parent story) or a fix subtask (re-opening one). The
             # parent task id travels in `reviewOf`.
             'reviewOf': item.get('reviewOf') or None,
+            # Pi Durable-style fork provenance: a delegated card is an
+            # independent unit with its own id and checkpoint, linked to the
+            # supervisor card that created it.
+            'parentTaskId': item.get('parentTaskId') or None,
             # Phase E3: the story's original author id (see reviewAuthorId on the
             # review-subtask creation) -- lets an actionable review pin the fix
             # back to the worker who built it.
@@ -6255,7 +6259,7 @@ _TAIL_GROWTH_PLANS_APPLIED = 50
 # (see the on-call phase); a MEETING is a deliberate conversation whose
 # minutes land on the card itself (see _run_meeting_content). None ships a
 # peer-reviewed story -- all three land a short artifact instead.
-NON_GATED_LANES = frozenset({'spike', 'bug', 'research', 'meeting', 'supervise'})
+NON_GATED_LANES = frozenset({'spike', 'bug', 'research', 'meeting', 'supervise', 'report'})
 
 
 def _peer_gated_lane(task):
@@ -14329,6 +14333,12 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 break  # nobody who could take this right now, of any kind
         work_queue.pop(due_index)
         assigned = _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_id_holder)
+        if assigned is _ASSIGN_WAIT:
+            # A card that must wait for its named agent is not a failed
+            # assignment: put it back without incrementing attempts, or the
+            # attempt cap would abandon a perfectly valid direct-route card.
+            work_queue.append(pick)
+            continue
         if not assigned:
             # A preemption that didn't land: put the parked task straight back so
             # an agent is never left floating free with a suspended task hanging.
@@ -14782,6 +14792,9 @@ def _assign_player_task(state, pick, now_ms, task_id_holder=None):
     return task
 
 
+_ASSIGN_WAIT = object()
+
+
 def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_id_holder=None):
     """Deterministic assignment of one due queue item: pick the most-idle
     eligible candidate (round-robin, zero JEV spend), wake her if off-duty,
@@ -14909,7 +14922,14 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     if pick.get('taskType') == 'supervise' and chosen_id is None:
         # Director-only card: wait for the named supervisor instead of leaking
         # it to an unrelated worker on the global round-robin.
-        return None
+        return _ASSIGN_WAIT
+    if (pick.get('taskType') == 'report' and pick.get('directRoute')
+            and chosen_id is None):
+        # A directly-routed report belongs to the named agent, not to whoever
+        # is next in the round-robin. Wait for that agent to free up; a
+        # report about a specific person's takeaway must not be written by a
+        # different person (or an unrelated team's worker).
+        return _ASSIGN_WAIT
     if chosen_id is None:
         if not candidates:
             return None

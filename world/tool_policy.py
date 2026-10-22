@@ -18,12 +18,14 @@ _READ_ONLY_TOOLS = frozenset({
     'read_mailbox', 'read_peer_reviews', 'team_digest', 'team_status',
     'allowlist_status', 'team_overview', 'treasury_status', 'x_trending_topics',
     'search_linkedin_posts', 'self_edit_status', 'selfedit_recheck',
-    'selfedit_read', 'selfedit_validate',
+    'selfedit_read', 'selfedit_validate', 'read_pulse', 'project_board',
+    'audit_agent_readiness',
 })
 _PREPARE_TOOLS = frozenset({
     'create_gmail_draft', 'create_google_doc', 'write_spike_report',
     'write_report', 'draft_email', 'save_note', 'execute_script',
-    'download_file', 'mark_mailbox_read',
+    'download_file', 'mark_mailbox_read', 'pulse_watch', 'browser_step',
+    'browser_act',
 })
 _COMMIT_TOOLS = frozenset({
     'apify_run_actor', 'create_calendar_event', 'append_google_sheet_row',

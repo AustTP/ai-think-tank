@@ -6230,3 +6230,13 @@ class OperationalGuardrails(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class LatencyRouting(unittest.TestCase):
+    def test_pulse_and_triage_skip_jev(self):
+        with unittest.mock.patch.object(serve, '_low_tier_slug', return_value='fast-model'), \
+             unittest.mock.patch.object(serve, '_tier_gate_decider',
+                                        side_effect=AssertionError('JEV must not run')):
+            self.assertEqual(serve._resolve_model_tier('pulse triage', 'spike'), 'fast-model')
+            self.assertEqual(serve._resolve_model_tier('routine report', 'pulse'), 'fast-model')
+            self.assertEqual(serve._resolve_model_tier('live alert check', None), 'fast-model')

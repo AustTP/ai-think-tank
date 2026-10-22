@@ -5777,6 +5777,17 @@ def _tier_gate_decider_default(instructions, criteria):
 _tier_gate_decider = _tier_gate_decider_default
 
 
+def _is_latency_sensitive(purpose, task_type=None):
+    """True for work where freshness beats depth: pulse triage, live alerts,
+    monitoring, and short status checks."""
+    task = str(task_type or '').lower()
+    text = str(purpose or '').lower()
+    if task in ('pulse', 'triage', 'monitor', 'monitoring'):
+        return True
+    return any(token in text for token in ('pulse', 'triage', 'live alert',
+                                           'monitor', 'freshness check'))
+
+
 def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None):
     """Pick which model tier a call deserves, under the JEV-gated escalation
     policy. Returns a resolved model slug (never None).
@@ -5791,6 +5802,10 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None)
     escalation all keep the cheap tier."""
     if task_type in ('code', 'review', 'qa'):
         return _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()
+    if _is_latency_sensitive(purpose, task_type):
+        # Pulse triage and live monitoring are latency work: use the cheap,
+        # fast tier and never wait on a JEV escalation call.
+        return _low_tier_slug() or _mid_tier_slug()
     decider = decider or _tier_gate_decider
     try:
         decision, confidence = decider(
@@ -5968,7 +5983,8 @@ DELEGATE_MAX_OPEN = 3
 
 
 def supervisor_delegate(agent_id, title, instructions, task_type='spike',
-                        assignee=None, budget_usd=0.10, return_contract='', team=None):
+                        assignee=None, budget_usd=0.10, return_contract='', team=None,
+                        parent_task_id=None):
     """Queue one scoped investigation for a worker on the caller's own team,
     with a written return contract. The delegation is async (a card): the
     supervisor reads the result on a later turn. Bounded to three open
@@ -6029,6 +6045,7 @@ def supervisor_delegate(agent_id, title, instructions, task_type='spike',
         'assignedTo': assignee,
         'teamId': team_id,
         'delegatedBy': agent_id,
+        'parentTaskId': parent_task_id or None,
         'priority': 'high',
         'budgetUsd': budget,
         'sizeEstimate': 'S',
@@ -6040,7 +6057,8 @@ def supervisor_delegate(agent_id, title, instructions, task_type='spike',
                {'title': title, 'assignee': assignee, 'taskType': task_type,
                 'budgetUsd': budget, 'returnContract': contract[:300]}, authorized=True)
     return True, {'ok': True, 'title': title, 'assignee': assignee,
-                  'taskType': task_type, 'budgetUsd': budget}
+                  'taskType': task_type, 'budgetUsd': budget,
+                  'parentTaskId': parent_task_id or None}
 
 
 def supervisor_backlog_directive(agent_id, team, title, reason,
@@ -11203,6 +11221,11 @@ _VPN_EXIT_SUFFIX = f' ({_VPN_EXIT_DOCS})' if _VPN_EXIT_DOCS else ''
 # The tools /api/intent/ask exposes to its dispatched agent. Kept as data next
 # to the loop so the schema (what the model is allowed to call) stays a single,
 # reviewable structure, and so tests build the exact shape they mock against.
+try:  # pulse desk tools: watch live feeds and read matches
+    from pulse import PULSE_TOOLS as _PULSE_TOOLS
+except Exception:  # pragma: no cover - optional module during bootstrap
+    _PULSE_TOOLS = []
+
 AGENT_ASK_TOOLS = [
     {
         'type': 'function',
@@ -18777,6 +18800,10 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         if name in ('search_web', 'browse_page', 'download_file', 'read_ais_feed', 'read_rss_feed', 'read_market_feed', 'read_live_feed'):
             tools_used.append(name)
             return _web_tool(name, args)
+        if name in ('pulse_watch', 'read_pulse'):
+            tools_used.append(name)
+            from pulse import execute_pulse_tool
+            return execute_pulse_tool(pick, name, args)
         if name == 'team_digest':
             # Read-only DB digest (weekly review + recent decision count).
             # Not external data, but same wrap discipline for consistency;
@@ -18931,7 +18958,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     def execute_tool(name, args):
         return idempotent_tool_call(pick, None, _execute_tool_raw, name, args)
 
-    tools = (AGENT_ASK_TOOLS + [_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL]
+    tools = (AGENT_ASK_TOOLS + _PULSE_TOOLS + [_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL]
             + (SECURITY_TEST_TOOLS if is_security_test_role else []))
     if FILE_ACCESS_ENABLED and _effective_file_grants(state):
         tools = tools + [_LOCAL_FILE_TOOL, _READ_STORE_TOOL]

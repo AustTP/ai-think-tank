@@ -339,6 +339,13 @@ def _ws_ingest(sid, topic, fields, raw):
             cap = int(cfg.get('history') or 200)
             if len(buf['history']) > cap:
                 del buf['history'][:len(buf['history']) - cap]
+    # Pulse desk: match this frame against every watch. Best effort; a
+    # pulse failure must never break ingestion.
+    try:
+        from pulse import observe as _pulse_observe
+        _pulse_observe(sid, topic, rec, dedupe_key=f"{rec['ts']}|{raw}")
+    except Exception:
+        pass
     # Durable cursor every 30s. AISStream is live-only, so this records the
     # last frame and the reconnect coverage gap; it is not a replay buffer.
     try:

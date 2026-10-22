@@ -38,6 +38,14 @@ runs and thirty days for calendar events.
   `external_writes` ledger. An explicit `requestId` is used when present;
   otherwise the key is derived from the conversation, tool, and arguments.
   Error outputs are not cached, so a transient failure can be retried.
+- Browser actions are prepare-tier at the tool-policy layer, but the real
+  approval is the server-side Jev gate and the player-vetted host allowlist.
+  `browser_step` adds verification and a session checkpoint, not a bypass.
+- Pulse watches are prepare-tier local configuration. `read_pulse` is
+  read-only. The matched feed text is external data and is wrapped before it
+  reaches a model.
+- `audit_agent_readiness` and `project_board` are read-only. The audit is a
+  surface scan, not a checkout test; the board never changes a card.
 - Enforced now: a per-conversation allowlist. Research and prepare tools are
   always allowed. A commit tool is refused unless the conversation approves it
   with `approvedTools`, sets `allowCommit`, or is a trusted code/review/QA
