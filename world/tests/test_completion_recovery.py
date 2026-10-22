@@ -54,11 +54,12 @@ class CompletionRecovery(unittest.TestCase):
         self.assertTrue(state['tasks']['p']['manualAttention'])
         self.assertEqual(state['workQueue'], [])
 
-    def test_retry_limit_blocks(self):
+    def test_retry_limit_terminalizes(self):
         state = seed('recovery_planned')
         state['tasks']['p']['completionRecovery'] = {'attempts': 3, 'nextAttemptAt': 0}
         watchdog.step(state, 100000, observe_only=False)
-        self.assertEqual(state['tasks']['p']['status'], 'blocked')
+        self.assertEqual(state['tasks']['p']['status'], 'cancelled')
+        self.assertEqual(state['tasks']['p']['statusReason'], 'recovery_exhausted')
         self.assertEqual(state['workQueue'], [])
 
     def test_release_after_failure_does_not_overwrite_blocked(self):

@@ -3,6 +3,10 @@ import time
 
 ACTIVE = ('walking', 'working', 'needs_review')
 TERMINAL = ('done', 'cancelled', 'abandoned')
+# A blocked story that never receives human input cannot sit open forever.
+# After this long (or after the retry budget), the watchdog closes it as
+# cancelled so the board converges instead of collecting permanent blockers.
+RECOVERY_BLOCK_TTL_MS = 24 * 60 * 60 * 1000
 
 
 def budget_only_stops(control):
@@ -18,10 +22,22 @@ def related(state, task):
     return children, queued
 
 
-def block(task, reason):
+def block(task, reason, now_ms=None):
     task.update(status='blocked', manualAttention=True, blockedReason='completion_recovery',
-                failNote=reason, nextAction=reason)
+                failNote=reason, nextAction=reason,
+                blockedAt=now_ms or int(time.time() * 1000))
     task.setdefault('_peerGate', {})['escalated'] = True
+
+
+def terminalize(task, reason, now_ms):
+    """Close a story that exhausted automatic recovery. Terminal, not blocked:
+    the board must converge to zero instead of accumulating permanent blockers."""
+    task.update(status='cancelled', closedAt=now_ms,
+                statusReason='recovery_exhausted', manualAttention=False,
+                deliveryState='cancelled', note=reason,
+                nextAction='Closed after recovery attempts were exhausted.')
+    task.pop('_peerRepairPending', None)
+    task.pop('_peerGate', None)
 
 
 def step(state, now_ms=None, observe_only=True):
@@ -40,6 +56,14 @@ def step(state, now_ms=None, observe_only=True):
         status = task.get('status')
         if status in TERMINAL:
             continue
+        if status == 'blocked' and task.get('blockedReason') == 'completion_recovery':
+            record = task.get('completionRecovery') or {}
+            attempts = int(record.get('attempts') or 0)
+            blocked_at = int(task.get('blockedAt') or 0)
+            if (attempts >= int(control.get('maxRecoveryAttempts') or 3)
+                    or (blocked_at and now - blocked_at > RECOVERY_BLOCK_TTL_MS)):
+                terminalize(task, 'Automatic recovery exhausted after the retry limit.', now)
+                continue
         children, queued = related(state, task)
         active = [t for t in children if t.get('status') in ACTIVE]
         repair_running = any(t.get('taskType') not in ('review', 'qa')
@@ -109,7 +133,7 @@ def step(state, now_ms=None, observe_only=True):
             block(task, 'Recovery needs a budget decision; automatic retries cannot increase the task budget.')
             continue
         if record['attempts'] >= control['maxRecoveryAttempts'] and not budget_only_stops(control):
-            block(task, 'Automatic recovery made no completion after the retry limit. Inspect evidence, supply inputs, change owner or split the story.')
+            terminalize(task, 'Automatic recovery made no completion after the retry limit.', now)
             continue
         if record.get('nextAttemptAt', 0) > now or recovered >= control['maxRecoveriesPerTick']:
             task['nextAction'] = 'Retry recovery after the scheduled backoff.'

@@ -2233,7 +2233,7 @@ def get_state_from_db():
 # kv_state and merged back in on read, so state['tasks'] keeps its exact shape
 # for every existing reader while the per-tick serialize shrinks from MBs to
 # the handful of live tasks.
-TASK_ARCHIVE_STATUSES = frozenset({'done'})
+TASK_ARCHIVE_STATUSES = frozenset({'done', 'cancelled'})
 _TASK_ARCHIVE_LOCK = threading.Lock()
 _TASK_ARCHIVE_CACHE: dict[str, object] = {'db': None, 'loaded': False, 'tasks': {}}
 
@@ -4603,6 +4603,8 @@ def _queue_avatar_tasks():
     state = _state_begin()
     try:
         if not state:
+            return 0
+        if _sim.automation_paused(state):
             return 0
         agents = state.get('agents') or {}
         roster = {d.get('id'): d for d in (state.get('agentRoster') or [])}

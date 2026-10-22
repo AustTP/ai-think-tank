@@ -5090,6 +5090,41 @@ def emit_signals(state, subject, data):
         return []
 
 
+_DELIVERABLE_TASK_TYPES = frozenset({'code', 'bug', 'research', 'spike', 'report'})
+
+
+def _completion_has_evidence(state, task):
+    """A primary deliverable card may not close on an empty work channel.
+
+    A code/story card needs a saved Library artifact. A spike/research/report
+    needs both the artifact and its findings note. A bug needs a landed file,
+    a restore check, or a Library artifact. Meetings, supervision, review/QA,
+    avatars, and shadow runs close on their own records. A recorded zero grade
+    is always a refusal."""
+    if not task:
+        return True
+    ttype = str(task.get('taskType') or '')
+    if task.get('shadow') or task.get('reviewOf'):
+        return True
+    if ttype in ('meeting', 'supervise', 'avatar', 'review', 'qa'):
+        return True
+    if ttype == 'bug':
+        evidence = bool(task.get('libraryPath') or task.get('writtenPy')
+                        or task.get('restoreCheck'))
+        if not evidence:
+            return False
+    elif ttype in ('spike', 'research', 'report'):
+        if not task.get('libraryPath') or not str(task.get('note') or '').strip():
+            return False
+    elif ttype in _DELIVERABLE_TASK_TYPES or task.get('room') in VALUED_QUEUE_ROOMS:
+        if not task.get('libraryPath'):
+            return False
+    grade = task.get('grade')
+    if isinstance(grade, (int, float)) and grade <= 0:
+        return False
+    return True
+
+
 def finish_task(state, agent_id, grid=None):
     """Port of tasks.js finishTask: clear task/busy/inRoom, return to entry point
     (with the full-agent-width step-aside deadlock avoidance), bump approvedCount,
@@ -5101,6 +5136,25 @@ def finish_task(state, agent_id, grid=None):
         return
     task = (state.get('tasks') or {}).get(a.get('task'))
     if task and task.get('status') not in ('blocked', 'failed', 'cancelled', 'abandoned'):
+        if not _completion_has_evidence(state, task):
+            task['status'] = 'failed'
+            task['failNote'] = 'Completion blocked: no saved deliverable in the Library.'
+            task['nextAction'] = 'Save the deliverable and re-run the acceptance checks.'
+            task['deliveryState'] = 'blocked'
+            task['manualAttention'] = False
+            task['_peerRepairPending'] = True
+            a['task'] = None
+            a['busy'] = False
+            a['inRoom'] = None
+            try:
+                from serve import log_action
+                log_action(agent_id, 'task_completion_refused',
+                           {'taskId': task.get('id'),
+                            'title': (task.get('title') or '')[:120],
+                            'reason': 'missing_saved_deliverable'}, authorized=True)
+            except Exception:
+                pass
+            return
         task['status'] = 'done'
         # A landed task satisfies any dependency-block keyed on it: queue the
         # SM's auto-unblock so the cards that were waiting on this work free up.
@@ -12113,6 +12167,8 @@ def _deliver_supervisor_brief(state, team_id, now_ms=None):
 def _supervisor_brief_step(state, now, now_ms):
     """One cadence pass: while a team has an active sprint, mail its director a
     fresh scoped brief every SUPERVISOR_BRIEF_INTERVAL_MS. State-only."""
+    if automation_paused(state):
+        return
     seen = state.setdefault('_supervisorBriefAt', {})
     for team in (state.get('teams') or []):
         tid = team.get('id')
@@ -12170,6 +12226,11 @@ def _supervisor_brief_step(state, now, now_ms):
         reason = _supervisor_attention_reason(state, tid, now_ms)
         if reason:
             reasons.append(f"{team.get('name') or tid}: {reason}")
+    # No failure, no stuck review, no budget pressure: that is the normal idle
+    # state, not a reason to spend a supervision turn. Routine cross-team
+    # sweeps used to refill an otherwise-empty board every cadence.
+    if not reasons:
+        return
     if _supervisor_admin_card_open(state):
         return
     routine = not reasons
@@ -14512,6 +14573,13 @@ def _park_idle_wanderers(state):
         a['replanCount'] = 0
         parked += 1
     return parked
+
+
+def automation_paused(state):
+    """True when the operator has put the tank in drain/idle mode. Automatic
+    card factories must not refill an empty board while this is set."""
+    mode = str(((state or {}).get('automation') or {}).get('mode') or '').lower()
+    return mode in ('drain', 'idle', 'paused', 'off', 'manual')
 
 
 def _feature_affinity(state, agent_id, pick):
