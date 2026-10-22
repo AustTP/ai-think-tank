@@ -31,6 +31,34 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import serve  # noqa: E402
 import content  # noqa: E402
 
+_TMP_DIR = None
+_PATCHER = None
+
+
+def setUpModule():
+    # Hermetic DB. These tests use external_write_once with FIXED request ids
+    # (calendar-test-1, apify-success-test, ...), so against a shared live DB
+    # the second run REPLAYS the first run's cached result: _google_call and
+    # _apify_budget_exceeded are never invoked and the assertions fail. A
+    # throwaway DB also stops the suite writing replay rows into production.
+    global _TMP_DIR, _PATCHER
+    _TMP_DIR = tempfile.mkdtemp(prefix='think tank-spike-content-test-')
+    _PATCHER = unittest.mock.patch.multiple(
+        serve,
+        DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
+        THINK_TANK_DIR=_TMP_DIR,
+        AGENTS_DIR=os.path.join(_TMP_DIR, 'agents'),
+        LIBRARY_DIR=os.path.join(_TMP_DIR, 'library'),
+        PASSPORT_PATH=os.path.join(_TMP_DIR, 'library', '.passport.json'),
+    )
+    _PATCHER.start()
+    serve.init_db()
+
+
+def tearDownModule():
+    _PATCHER.stop()
+    shutil.rmtree(_TMP_DIR, ignore_errors=True)
+
 
 def _snapshot():
     return {

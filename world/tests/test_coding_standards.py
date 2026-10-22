@@ -254,6 +254,19 @@ class QualityPipelineSteps(unittest.TestCase):
 
 
 class RunQualityPipeline(unittest.TestCase):
+    def setUp(self):
+        # Green results are cached by workspace + step set (work_reuse). A
+        # direct unittest run (run_all.sh) does not set PYTEST_CURRENT_TEST,
+        # so the cache would hand every red fixture below a prior green run's
+        # result. The tests fabricate pipeline responses, so they must never
+        # read or write that cache.
+        for name, kwargs in (('get_check', {'return_value': None}),
+                             ('save_check', {})):
+            patcher = unittest.mock.patch.object(
+                content.work_reuse, name, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def _run(self, pipeline_response):
         called = {}
 
