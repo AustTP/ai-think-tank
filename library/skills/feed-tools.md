@@ -21,6 +21,10 @@ for the tools this think tank actually has.
 | Multi-page scrape or actor output | `apify_run_actor` then `apify_get_dataset_items` | metered, monthly cap | run time | Last resort. Prefer a feed or one page. Always send a stable `requestId`. |
 | Video transcript | `youtube_transcript` | free | cached | Use the cached transcript when present; do not invent timestamps. |
 
+`read_ais_feed` also returns `status.checkpoint` and `status.resumed_gap_s`.
+AISStream is live-only: the checkpoint records the last ingested frame and the
+gap after a reconnect, not a replay buffer.
+
 ## Rules
 1. Prefer the structured feed for continuous data. Do not scrape a page that
    already has a feed.
