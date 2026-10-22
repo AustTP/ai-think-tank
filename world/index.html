@@ -434,6 +434,7 @@
       <div class="hud-pill"><span class="label">MORALE</span><span class="value" id="hudMorale">0</span></div>
       <div class="hud-gap"></div>
       <button class="hud-btn" id="hudCallMeetingBtn">Call Meeting</button>
+      <button class="hud-btn" id="hudPhoneBtn" title="Call anyone, off duty or out of reach">Phone</button>
       <button class="hud-btn" id="hudCommandCenterBtn" title="Enter Control Room -- also where you can check on anyone using it">Command Center</button>
       <a class="hud-btn" href="/pulse" title="Pulse desk and project board" style="display:inline-flex;align-items:center;text-decoration:none;">Ops</a>
       <button class="hud-btn" id="hudLogoutBtn" title="End your real login session">Log Out</button>
@@ -2023,9 +2024,11 @@ function closeBoard() {
 // which a physical walk-up conversation can ever reach. Reuses the exact
 // same conversation UI/log as an in-person chat (openConversation()) per
 // the "shared dialog styling, not duplicated" precedent (Phase 19)
-// rather than building a second chat interface.
+// rather than building a second chat interface. Works from any location:
+// the modal promises "wherever you are", and a room interior is still a
+// place the player can stand.
 function openPhoneBooth() {
-  if (state.ui || state.location.kind !== 'outside') return;
+  if (state.ui) return;
   state.ui = 'phone';
   renderPhoneRoster();
   document.getElementById('phoneModal').classList.remove('hidden');
@@ -3774,6 +3777,7 @@ async function main() {
     if (e.key === 'Enter') handleTerminalSend();
   });
   document.getElementById('hudCallMeetingBtn').addEventListener('click', openMeetingUI);
+  document.getElementById('hudPhoneBtn').addEventListener('click', openPhoneBooth);
   document.getElementById('hudCommandCenterBtn').addEventListener('click', () => enterRoom('commandcenter'));
   document.getElementById('hudLogoutBtn').addEventListener('click', () => {
     fetch('/logout', { method: 'POST' }).finally(() => { window.location.href = '/'; });
