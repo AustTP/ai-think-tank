@@ -34,6 +34,10 @@ runs and thirty days for calendar events.
 - Metadata: every tool can be labeled with `tool_policy(name)`.
 - Enforced now: request-id replay protection on `apify_run_actor` and
   `create_calendar_event`.
+- Enforced now: every known commit-tier tool is wrapped in the same
+  `external_writes` ledger. An explicit `requestId` is used when present;
+  otherwise the key is derived from the conversation, tool, and arguments.
+  Error outputs are not cached, so a transient failure can be retried.
 - Enforced now: a per-conversation allowlist. Research and prepare tools are
   always allowed. A commit tool is refused unless the conversation approves it
   with `approvedTools`, sets `allowCommit`, or is a trusted code/review/QA
@@ -47,8 +51,17 @@ runs and thirty days for calendar events.
   self-tests.
 
 ## Executor checkpoints
-The spike executor saves its plan at the plan/execute boundary. After a
-crash or restart, a retry reuses the saved plan instead of paying for it again.
+The spike executor saves its plan at the plan/execute boundary and saves the
+tool transcript before and after every tool batch. After a crash or restart, a
+retry resumes from the last completed batch instead of re-running the whole
+investigation.
+
+A call that was in flight when the process died is handled by its replay
+label. A `safe` read-only call is reported to the model as safe to retry; the
+model can re-issue it. An `unsafe` side-effecting call is reported as
+interrupted and is not replayed, so the model must verify the external state
+before trying again. This is the Pi Durable replay rule applied to our tools.
+
 The checkpoint is cleared on a successful close; a failed run keeps it for the
 retry. AIS feed cursors are checkpointed separately in
 `collector_checkpoints`.

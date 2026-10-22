@@ -41,7 +41,7 @@ from confirmations import gate as _confirmation_gate_or_response
 from confirmations import gate_finish as _finish_confirmation
 
 import runtime_limits
-from tool_policy import task_tool_policy
+from tool_policy import is_known_tool, task_tool_policy, tool_trust_tier
 import governance
 import constitution
 import cron_scripts
@@ -885,6 +885,49 @@ def external_write_once(kind, key, fn, ttl_s=86400, pending_s=180):
     except Exception as e:
         return None, f'write completed but the idempotency ledger failed: {e}', False
     return result, None, False
+
+
+def _tool_output_is_error(text):
+    s = str(text or '').strip().lower()
+    return s.startswith(('error', 'could not', 'failed', 'unable', 'invalid',
+                         'policy', '__tool_error__', 'not found', 'requires '))
+
+
+def idempotent_tool_call(agent_id, task_id, raw_execute, name, args, ttl_s=3600):
+    """Exactly-once convention for one commit-tier tool call.
+
+    Read-only and prepare tools pass straight through. A commit tool gets a
+    stable request id: the caller's explicit `requestId` when present, else a
+    digest of the conversation, tool, and arguments. A retry inside the TTL
+    returns the original output instead of repeating the side effect. Error
+    outputs are not cached, so a transient failure can be retried with the same
+    call."""
+    if tool_trust_tier(name) != 'commit' or not is_known_tool(name):
+        # Read-only/prepare tools never need the ledger. An unknown name also
+        # bypasses it so its real error propagates instead of being turned
+        # into a cached tool string.
+        return raw_execute(name, args)
+    args = args or {}
+    request_id = str(args.get('requestId') or '').strip()
+    if not request_id:
+        request_id = external_write_key(
+            task_id or agent_id or 'tank', name,
+            json.dumps(args, sort_keys=True, default=str))[:32]
+    key = f'{task_id or agent_id or "tank"}:{name}:{request_id}'
+
+    def run():
+        output = raw_execute(name, args)
+        if _tool_output_is_error(output):
+            return None, output
+        return output, None
+
+    result, error, replayed = external_write_once(
+        'tool:' + str(name), key, run, ttl_s=ttl_s)
+    if error:
+        return error
+    if replayed:
+        return f'{result}\n\n[replayed from requestId {request_id}; the side effect was not repeated]'
+    return result
 
 
 def set_collector_checkpoint(collector, cursor):
@@ -10937,7 +10980,8 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
 def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3, max_tokens=None,
                           service='__player_ask__', force_first_tool=False, return_transcript=False,
                           task_id=None, village_id=None, escalate_model=None,
-                          conversation_policy=None):
+                          conversation_policy=None, on_before_tools=None,
+                          on_after_tools=None):
     """Agentic tool-calling loop for /api/intent/ask. Sends `messages` with
     `tools`; while the model replies with tool_calls, executes each via
     `execute_tool(name, args)`, appends the results back as `role:tool`
@@ -11062,6 +11106,11 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
             return (content, current_messages) if return_transcript else content
         # Executed results -> role:tool, back into the conversation.
         current_messages.append(message)
+        if on_before_tools:
+            try:
+                on_before_tools(tool_calls, current_messages)
+            except Exception:
+                pass
         for call in tool_calls:
             try:
                 name = (call.get('function') or {}).get('name')
@@ -11074,6 +11123,11 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
             except Exception as e:  # noqa: BLE001 - surface tool failure to the model
                 output = f'__TOOL_ERROR__: {e}'
             current_messages.append({'role': 'tool', 'tool_call_id': call.get('id'), 'content': output})
+        if on_after_tools:
+            try:
+                on_after_tools(current_messages)
+            except Exception:
+                pass
     return (None, current_messages) if return_transcript else None
 
 
@@ -18718,7 +18772,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     if ask_force_first_tool:
         ask_escalate_chain = [s for s in (_mid_tier_slug(), _model_tier_slug('high')) if s]
 
-    def execute_tool(name, args):
+    def _execute_tool_raw(name, args):
         # Every tool result is external data -> wrap BEFORE it can reach a model.
         if name in ('search_web', 'browse_page', 'download_file', 'read_ais_feed', 'read_rss_feed', 'read_market_feed', 'read_live_feed'):
             tools_used.append(name)
@@ -18873,6 +18927,9 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         # side implements still raises, with the same message.
         tools_used.append(name)
         return _web_tool(name, args)
+
+    def execute_tool(name, args):
+        return idempotent_tool_call(pick, None, _execute_tool_raw, name, args)
 
     tools = (AGENT_ASK_TOOLS + [_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL]
             + (SECURITY_TEST_TOOLS if is_security_test_role else []))

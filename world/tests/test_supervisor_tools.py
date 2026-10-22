@@ -325,7 +325,7 @@ def test_supervise_card_pins_its_director_and_keeps_the_team(monkeypatch):
     state['agents']['nora']['task'] = task['id']
     item2 = dict(item, title='[SUPERVISE] check 2')
     assert sim._assign_due_item(state, item2, True, grid, doors, 2000,
-                                task_id_holder={0: 1}) is None
+                                task_id_holder={0: 1}) is sim._ASSIGN_WAIT
     assert all(t.get('assignedTo') != 'ruth' for t in state['tasks'].values())
 
 

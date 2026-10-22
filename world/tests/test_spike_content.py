@@ -115,6 +115,34 @@ class SpikeContent(unittest.TestCase):
         self.assertIn(task['id'], seen)
         self.assertIsNone(serve.load_task_checkpoint(task['id']))
 
+    def test_spike_resumes_an_execute_checkpoint_with_interrupted_tools(self):
+        self._common_mocks()
+        seen = self._store()
+        task = {'id': 'spike-resume-exec', 'title': 'Resume exec', 'budgetMs': 60000}
+        transcript = [
+            {'role': 'system', 'content': 'ORIGINAL SYSTEM'},
+            {'role': 'user', 'content': 'Go ahead.'},
+            {'role': 'assistant', 'content': '', 'tool_calls': [
+                {'id': 'c1', 'function': {'name': 'browse_page', 'arguments': '{}'}},
+                {'id': 'c2', 'function': {'name': 'send_mail', 'arguments': '{}'}}]},
+        ]
+        serve.save_task_checkpoint('spike-resume-exec', 'execute', {
+            'title': 'Resume exec', 'plan': 'SAVED PLAN',
+            'transcript': transcript, 'pending': transcript[-1]['tool_calls']})
+        self.addCleanup(serve.clear_task_checkpoint, 'spike-resume-exec')
+        with unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                        side_effect=[_completion('report')]) as model_call, \
+             self._mock_loop('summary') as loop:
+            content._run_spike_content(_snapshot(), 'cora', task)
+        self.assertEqual(model_call.call_count, 1, 'plan and execute must be skipped')
+        messages = loop.call_args.args[1]
+        self.assertEqual(messages[0]['content'], 'ORIGINAL SYSTEM')
+        notes = [m['content'] for m in messages if m.get('role') == 'tool']
+        self.assertTrue(any('safe to retry' in n for n in notes))
+        self.assertTrue(any('NOT replayed' in n for n in notes))
+        self.assertIn(task['id'], seen)
+        self.assertIsNone(serve.load_task_checkpoint(task['id']))
+
     def test_google_quota_awareness_block_folded_when_google_configured(self):
         """The quota wiring: when a Google credential is in the vault, the
         spike system prompt carries the Google-API quota-awareness block so the

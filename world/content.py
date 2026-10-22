@@ -742,7 +742,7 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
     state_tool = _make_supervisor_state_executor(agent_id)
     avatar_tool = _make_generate_agent_avatar_executor(agent_id)
 
-    def execute_tool(tool_name, args):
+    def _execute_tool_raw(tool_name, args):
         _hb()
         if tool_name == 'supervisor_report':
             return report_tool(tool_name, args)
@@ -767,6 +767,10 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
         if tool_name == 'execute_script':
             return sandbox_tool(tool_name, args)
         return f'unknown tool {tool_name}'
+
+    def execute_tool(tool_name, args):
+        return _serve.idempotent_tool_call(agent_id, task.get('id'), _execute_tool_raw,
+                                           tool_name, args)
 
     tools = [_SPIKE_SANDBOX_TOOL, _SUPERVISOR_REPORT_TOOL, _SUPERVISOR_GRANT_TOOL,
              _SUPERVISOR_LIVE_READ_TOOL, _SUPERVISOR_DELEGATE_TOOL,
@@ -3638,7 +3642,8 @@ _REFLECTION_CONFIDENCE_FLOOR = 0.5
 
 def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, tools, execute_tool,
                                          total_iterations, max_tokens, force_first_tool, task_id=None,
-                                         village_id=None, conversation_policy=None):
+                                         village_id=None, conversation_policy=None,
+                                         on_before_tools=None, on_after_tools=None):
     remaining = total_iterations
     current_messages = list(messages)
     first_round = True
@@ -3650,7 +3655,8 @@ def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, to
             tier_slug, current_messages, tools, execute_tool,
             max_iterations=this_round, max_tokens=max_tokens, service='spike',
             force_first_tool=(force_first_tool if first_round else False), return_transcript=True,
-            task_id=task_id, village_id=village_id, conversation_policy=conversation_policy)
+            task_id=task_id, village_id=village_id, conversation_policy=conversation_policy,
+            on_before_tools=on_before_tools, on_after_tools=on_after_tools)
         remaining -= this_round
         if len(current_messages) == before_len:
             # No progress at all this round (no tool call, no settling text
@@ -6210,11 +6216,22 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # crash/restart instead of paying for the same plan twice. The plan is
     # cleared on a successful close; a failed run keeps it for the retry.
     plan_text = ''
+    resume_transcript = None
+    resume_pending = []
     plan_checkpoint = _serve.load_task_checkpoint(task.get('id'))
     if (isinstance(plan_checkpoint, dict)
-            and plan_checkpoint.get('phase') == 'planned'
             and plan_checkpoint.get('title') == backlog):
-        plan_text = str(plan_checkpoint.get('plan') or '')
+        if plan_checkpoint.get('phase') == 'planned':
+            plan_text = str(plan_checkpoint.get('plan') or '')
+        elif (plan_checkpoint.get('phase') == 'execute'
+              and isinstance(plan_checkpoint.get('transcript'), list)):
+            # A prior process died mid-execute. Resume from the last completed
+            # tool batch instead of re-running the whole investigation. Any
+            # call that was in flight is answered below according to its
+            # replay-safety label.
+            plan_text = str(plan_checkpoint.get('plan') or '')
+            resume_transcript = plan_checkpoint.get('transcript')
+            resume_pending = plan_checkpoint.get('pending') or []
 
     # PLAN -- a short, concrete checklist of sub-goals, from the stronger
     # reasoning tier. Best-effort: an empty plan just means the execute step
@@ -6358,7 +6375,20 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     if _serve._google_is_configured():
         system += _GOOGLE_QUOTA_AWARENESS_BLOCK
     system += '\n\n' + evidence_policy.INSTRUCTIONS
-    messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': 'Go ahead.'}]
+    if resume_transcript is not None:
+        messages = list(resume_transcript)
+        for call in resume_pending:
+            name = ((call.get('function') or {}).get('name') or '').strip()
+            if tool_replay_safety(name) == 'safe':
+                note = ('This read-only call was interrupted by a process restart. It is safe to '
+                        'retry; re-issue the same call if you still need it.')
+            else:
+                note = ('This side-effecting call was interrupted by a process restart and was NOT '
+                        'replayed. Do not assume it happened. Verify the external state before '
+                        'retrying.')
+            messages.append({'role': 'tool', 'tool_call_id': call.get('id'), 'content': note})
+    else:
+        messages = [{'role': 'system', 'content': system}, {'role': 'user', 'content': 'Go ahead.'}]
     # One-strike-per-tool: a shared set across BOTH sub-executors, so a policy
     # denial on either browse_page or execute_script is remembered and the
     # SAME tool is refused (no network call at all) if the model tries it
@@ -6460,7 +6490,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             pass
         return output
 
-    def execute_tool(tool_name, args):
+    def _execute_tool_raw(tool_name, args):
         _hb()  # every tool call is live progress the completion loop can see
         if tool_name in struck_tools:
             return (f'{tool_name} was already blocked once this investigation (one-strike) -- do '
@@ -6501,6 +6531,10 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             return _serve._app_script_tool(agent_id, args)
         return web_tool(tool_name, args)
 
+    def execute_tool(tool_name, args):
+        return _serve.idempotent_tool_call(agent_id, task.get('id'), _execute_tool_raw,
+                                           tool_name, args)
+
     # 18/900 (was 10/600): a "list every X across the whole site" question
     # (real request, "a full list of sources ever used on
     # DreyX") needs many more browse_page round trips than a single-fact
@@ -6527,19 +6561,37 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # LinkedIn-search question needs its own specific tool forced first for
     # the identical reason -- built preemptively this time, on day one,
     # rather than after a live miss, now that the pattern is proven twice.
-    first_tool = _spike_first_tool(backlog, instructions)
+    first_tool = None if resume_transcript is not None else _spike_first_tool(backlog, instructions)
     # Chunked into rounds of 4 with a reflection self-check between them
     # (see _run_spike_tool_loop_with_reflection) -- same 50-call total
     # budget (raised 18->30->50, just spent with a chance to
     # course-correct partway through instead of only finding out it went
     # sideways at the end.
+    def _checkpoint_before(tool_calls, checkpoint_messages):
+        try:
+            _serve.save_task_checkpoint(task.get('id'), 'execute', {
+                'title': backlog, 'plan': plan_text,
+                'transcript': checkpoint_messages, 'pending': tool_calls})
+        except Exception:
+            pass
+
+    def _checkpoint_after(checkpoint_messages):
+        try:
+            _serve.save_task_checkpoint(task.get('id'), 'execute', {
+                'title': backlog, 'plan': plan_text,
+                'transcript': checkpoint_messages, 'pending': []})
+        except Exception:
+            pass
+
     try:
         execute_text, transcript = _run_spike_tool_loop_with_reflection(
             tier_slug, reasoning_slug, messages, spike_tools, execute_tool,
             total_iterations=50, max_tokens=2400, force_first_tool=first_tool,
             task_id=task.get('id'),
             village_id=_sim_village_of_agent(snapshot, agent_id),
-            conversation_policy=task_tool_policy(task))
+            conversation_policy=task_tool_policy(task),
+            on_before_tools=_checkpoint_before,
+            on_after_tools=_checkpoint_after)
     except Exception as e:
         # A model-call failure (circuit-breaker RuntimeError, a 4xx, a network
         # blip) must never crash the spike executor or leave a half-baked

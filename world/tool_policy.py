@@ -64,6 +64,16 @@ def tool_policy(name):
     return {'replay': tool_replay_safety(name), 'tier': tool_trust_tier(name)}
 
 
+def is_known_tool(name):
+    """True when the name is in the declared surface. Unknown names stay
+    unwrapped so their real runtime error reaches the caller instead of being
+    swallowed by the idempotency ledger."""
+    name = str(name or '')
+    return (name in _READ_ONLY_TOOLS or name in _PREPARE_TOOLS
+            or name in _COMMIT_TOOLS
+            or name.startswith(('read_', 'search_', 'list_', 'get_')))
+
+
 def task_tool_policy(task):
     """Build the per-conversation allowlist for a task.
 

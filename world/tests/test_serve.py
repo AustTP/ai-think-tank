@@ -133,6 +133,57 @@ class ToolConversationPolicy(unittest.TestCase):
         execute.assert_called_once()
 
 
+class IdempotentToolCall(unittest.TestCase):
+    def test_commit_tool_replays_and_readonly_bypasses(self):
+        calls = []
+        key = f'idem-{serve.time.time()}'
+
+        def raw(name, args):
+            calls.append(name)
+            return 'ok'
+
+        first = serve.idempotent_tool_call('a', key, raw, 'create_calendar_event', {'x': 1})
+        second = serve.idempotent_tool_call('a', key, raw, 'create_calendar_event', {'x': 1})
+        self.assertEqual(first, 'ok')
+        self.assertIn('replayed from requestId', second)
+        self.assertEqual(calls, ['create_calendar_event'])
+        serve.idempotent_tool_call('a', key, raw, 'read_library_file', {})
+        self.assertEqual(calls, ['create_calendar_event', 'read_library_file'])
+
+    def test_error_output_is_not_cached(self):
+        calls = []
+        key = f'idem-err-{serve.time.time()}'
+
+        def raw(name, args):
+            calls.append(name)
+            return 'Could not create the event: boom'
+
+        serve.idempotent_tool_call('a', key, raw, 'create_calendar_event', {'x': 2})
+        serve.idempotent_tool_call('a', key, raw, 'create_calendar_event', {'x': 2})
+        self.assertEqual(len(calls), 2)
+
+
+class ToolLoopCheckpoints(unittest.TestCase):
+    def test_callbacks_see_pending_then_completed(self):
+        seen = {}
+        tool_calls = [{'id': 'c1', 'function': {'name': 'read_library_file',
+                                                 'arguments': '{}'}}]
+        responses = [
+            {'choices': [{'message': {'tool_calls': tool_calls}}]},
+            {'choices': [{'message': {'content': 'done'}}]},
+        ]
+        with unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=responses), \
+             unittest.mock.patch.object(serve, '_accrue_spend'):
+            serve._call_agent_tool_loop(
+                'm', [{'role': 'user', 'content': 'go'}], [], lambda n, a: 'ok',
+                max_iterations=2,
+                on_before_tools=lambda calls, msgs: seen.update(before=calls, before_msgs=len(msgs)),
+                on_after_tools=lambda msgs: seen.update(after_msgs=len(msgs)))
+        self.assertEqual(seen['before'], tool_calls)
+        self.assertEqual(seen['before_msgs'], 2)
+        self.assertEqual(seen['after_msgs'], 3)
+
+
 class TaskCheckpoint(unittest.TestCase):
     def test_round_trip_and_clear(self):
         key = f'task-cp-{serve.time.time()}'
