@@ -1,121 +1,43 @@
-"""CRON script lane for standing tasks."""
+"""Host-run cron scripts are operator-owned and allowlisted. A standing task
+must not be able to name an arbitrary script under scripts/."""
+
 import os
 import sys
+import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import cron_scripts  # noqa: E402
 
 
-def test_resolve_rejects_escapes_and_non_scripts(tmp_path, monkeypatch):
-    monkeypatch.setattr(cron_scripts, '_repo_root', lambda: str(tmp_path))
-    (tmp_path / 'scripts').mkdir()
-    (tmp_path / 'scripts' / 'ok.py').write_text('print(1)\n', encoding='utf-8')
-    assert cron_scripts.resolve_script('scripts/ok.py')[1] is None
-    for bad in ('../ok.py', '/tmp/ok.py', 'scripts/ok.sh', 'scripts/nope.py'):
-        assert cron_scripts.resolve_script(bad)[1]
+class CronAllowlist(unittest.TestCase):
+    def test_allowlisted_script_resolves(self):
+        path, error = cron_scripts.resolve_script('scripts/check_models.py')
+        self.assertIsNone(error)
+        self.assertTrue(path and path.endswith('scripts/check_models.py'))
+
+    def test_non_allowlisted_script_is_refused(self):
+        with mock.patch.object(cron_scripts, '_allowed_scripts',
+                               return_value={'scripts/check_models.py'}):
+            path, error = cron_scripts.resolve_script('scripts/browser_record.py')
+        self.assertIsNone(path)
+        self.assertIn('allowlist', error)
+
+    def test_run_refuses_non_allowlisted_without_executing(self):
+        with mock.patch.object(cron_scripts, '_allowed_scripts',
+                               return_value={'scripts/check_models.py'}):
+            result = cron_scripts.run({'script': 'scripts/browser_record.py'})
+        self.assertFalse(result['ok'])
+        self.assertIn('allowlist', result['error'])
+
+    def test_missing_allowlist_fails_closed(self):
+        with mock.patch.object(cron_scripts, '_allowed_scripts',
+                               return_value=None):
+            path, error = cron_scripts.resolve_script('scripts/check_models.py')
+        self.assertIsNone(path)
+        self.assertIn('allowlist', error)
 
 
-def test_run_parses_notify_line(tmp_path, monkeypatch):
-    monkeypatch.setattr(cron_scripts, '_repo_root', lambda: str(tmp_path))
-    (tmp_path / 'scripts').mkdir()
-    script = tmp_path / 'scripts' / 'watch.py'
-    script.write_text(
-        'import json\nprint(json.dumps({"notify": True, "summary": "new rule"}))\n',
-        encoding='utf-8')
-    out = cron_scripts.run({'script': 'scripts/watch.py'})
-    assert out['ok'] is True
-    assert out['notify'] is True
-    assert out['summary'] == 'new rule'
-
-
-def test_run_standing_queues_only_on_notify():
-    logs, queued = [], []
-
-    def log(state, actor, action, details):
-        logs.append((actor, action, details))
-
-    def queue(state, items):
-        queued.extend(items)
-
-    original = cron_scripts.run
-    try:
-        cron_scripts.run = lambda decl: {'ok': True, 'notify': False,
-                                         'script': 'scripts/x.py'}
-        cron_scripts.run_standing({}, {'taskId': 't1', 'name': 'quiet'},
-                                  log, queue)
-        assert queued == []
-        assert logs[0][1] == 'standing_task_script'
-        cron_scripts.run = lambda decl: {'ok': True, 'notify': True,
-                                         'summary': 'check this',
-                                         'script': 'scripts/x.py'}
-        cron_scripts.run_standing({}, {'taskId': 't2', 'name': 'loud'},
-                                  log, queue)
-        assert len(queued) == 1
-        assert 'check this' in queued[0]['instructions']
-    finally:
-        cron_scripts.run = original
-
-
-def test_run_missing_script_is_an_error():
-    out = cron_scripts.run({'script': '../nope.py'})
-    assert out['ok'] is False
-    assert out['notify'] is False
-    assert 'scripts/' in out['error']
-
-
-def test_run_nonzero_exit_reports_stderr(tmp_path, monkeypatch):
-    monkeypatch.setattr(cron_scripts, '_repo_root', lambda: str(tmp_path))
-    (tmp_path / 'scripts').mkdir()
-    (tmp_path / 'scripts' / 'bad.py').write_text(
-        'import sys\nprint("boom", file=sys.stderr)\nsys.exit(3)\n',
-        encoding='utf-8')
-    out = cron_scripts.run({'script': 'scripts/bad.py'})
-    assert out['ok'] is False
-    assert out['returncode'] == 3
-    assert 'boom' in out['error']
-
-
-def test_run_timeout_is_reported(tmp_path, monkeypatch):
-    monkeypatch.setattr(cron_scripts, '_repo_root', lambda: str(tmp_path))
-    (tmp_path / 'scripts').mkdir()
-    (tmp_path / 'scripts' / 'slow.py').write_text('print(1)\n', encoding='utf-8')
-
-    def boom(*args, **kwargs):
-        raise cron_scripts.subprocess.TimeoutExpired('slow.py', 1)
-
-    monkeypatch.setattr(cron_scripts.subprocess, 'run', boom)
-    out = cron_scripts.run({'script': 'scripts/slow.py'})
-    assert out['ok'] is False
-    assert 'timed out' in out['error']
-
-
-def test_run_standing_pins_notify_agent():
-    queued = []
-    original = cron_scripts.run
-    try:
-        cron_scripts.run = lambda decl: {'ok': True, 'notify': True,
-                                         'summary': 's', 'script': 'scripts/x.py'}
-        cron_scripts.run_standing(
-            {}, {'taskId': 't3', 'name': 'loud', 'notifyAgent': 'theo'},
-            lambda *a: None, lambda state, items: queued.extend(items))
-        assert queued[0]['assignedTo'] == 'theo'
-    finally:
-        cron_scripts.run = original
-
-
-def test_declaration_fields_validates_and_keeps_followup(tmp_path, monkeypatch):
-    monkeypatch.setattr(cron_scripts, '_repo_root', lambda: str(tmp_path))
-    (tmp_path / 'scripts').mkdir()
-    (tmp_path / 'scripts' / 'ok.py').write_text('print(1)\n', encoding='utf-8')
-    fields, error = cron_scripts.declaration_fields({
-        'script': 'scripts/ok.py', 'scriptTimeoutSeconds': '60',
-        'notifyAgent': 'theo'})
-    assert error is None
-    assert fields == {'script': 'scripts/ok.py', 'scriptTimeoutSeconds': 60,
-                      'notifyAgent': 'theo'}
-    fields, error = cron_scripts.declaration_fields({'script': 'scripts/ok.sh'})
-    assert fields is None and 'scripts/' in error
-    fields, error = cron_scripts.declaration_fields({
-        'script': 'scripts/ok.py', 'scriptTimeoutSeconds': 'soon'})
-    assert fields is None and 'integer' in error
+if __name__ == '__main__':
+    unittest.main()

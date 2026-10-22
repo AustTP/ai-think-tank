@@ -1,0 +1,10 @@
+{
+  "comment": "Operator-vetted host-run cron scripts. Only these may be referenced by a standing task's 'script'. Add a script only after reviewing every URL, credential, and side effect it can reach.",
+  "scripts": [
+    "scripts/bot_law_watch.py",
+    "scripts/check_file_growth.py",
+    "scripts/check_models.py",
+    "scripts/export_training_interactions.py",
+    "scripts/test_health.py"
+  ]
+}

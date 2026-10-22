@@ -25494,6 +25494,13 @@ async def standing_tasks_create(request: Request):
         body = None
     if not isinstance(body, dict):
         return JSONResponse({'error': 'body must be a JSON object'}, status_code=400)
+    # Script-backed standing tasks run on the HOST with the full environment
+    # and network. They are operator-authored by definition: require the real
+    # player session, not just a verified agent key, so no agent can schedule
+    # a script around the sandbox egress allowlist.
+    if (body.get('script') or '').strip() and not _require_player_session(request):
+        return JSONResponse({'error': 'script-backed standing tasks are player/operator only'},
+                            status_code=403)
     task, error = _standing_task_from_body(body)
     if task is None:
         return JSONResponse({'error': error}, status_code=400)

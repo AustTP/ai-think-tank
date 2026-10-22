@@ -1,4 +1,11 @@
-"""Operator-owned scripts for CRON-style standing tasks.
+"""Operator-owned, allowlisted scripts for CRON-style standing tasks.
+
+These scripts run on the HOST, not inside the sandbox, so they have the host
+environment and full network access. Only scripts explicitly listed in
+`scripts/cron_allowlist.json` may be referenced by a standing task, and only
+the player session may create a script-backed standing task. That keeps an
+agent from writing a URL into a script and scheduling it around the normal
+sandbox egress allowlist.
 
 A standing task normally queues an agent card. When its declaration names a
 `script`, the due window instead runs that script and does not wake an agent.
@@ -23,6 +30,21 @@ def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _allowed_scripts():
+    """Operator-vetted cron scripts. Fail closed when the manifest is missing,
+    unreadable, or malformed: host-run scripts are not sandboxed."""
+    path = os.path.join(_repo_root(), SCRIPT_DIR, 'cron_allowlist.json')
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get('scripts'), list):
+        return None
+    return {str(s).strip().replace('\\', '/')
+            for s in data['scripts'] if str(s).strip()}
+
+
 def resolve_script(relpath):
     """Resolve one repo-relative scripts/*.py path. Returns (path, error)."""
     raw = str(relpath or '').strip().replace('\\', '/')
@@ -32,6 +54,11 @@ def resolve_script(relpath):
         return None, 'script must be a repo-relative path under scripts/'
     if not raw.startswith(SCRIPT_DIR + '/') or not raw.endswith('.py'):
         return None, 'script must be a .py file under scripts/'
+    allowed = _allowed_scripts()
+    if allowed is None:
+        return None, 'cron script allowlist is missing or unreadable'
+    if raw not in allowed:
+        return None, 'script is not on the operator cron allowlist'
     root = os.path.realpath(_repo_root())
     path = os.path.realpath(os.path.join(root, raw))
     scripts = os.path.join(root, SCRIPT_DIR)
