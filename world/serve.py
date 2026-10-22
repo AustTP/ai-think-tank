@@ -45,6 +45,7 @@ from tool_policy import is_known_tool, task_tool_policy, tool_trust_tier
 import governance
 import constitution
 import cron_scripts
+from optimization_advisor import build_optimization_advice
 
 # Pure web/text/path/security helpers extracted to their own module
 # to shrink the serve.py monolith. See web_helpers.py.
@@ -34591,6 +34592,12 @@ def _health_digest_markdown(snapshot):
     # Escalations
     esc = snapshot.get('open_escalations', 0)
     lines.append(f'**Open escalations:** {esc}')
+    advice = build_optimization_advice(snapshot)
+    if advice.get('recommendations'):
+        focus = advice['recommendations'][0]
+        lines.append(f"**Optimization focus:** {focus['title']}. {focus['action']}")
+    else:
+        lines.append('**Optimization focus:** no dominant constraint detected.')
     lines.append('')
     lines.append('_Periodic server-side digest; alerts push on new warnings between digests._')
     return '\n'.join(lines) + '\n'
@@ -34681,6 +34688,14 @@ def _http_json(method, base, path, body=None, header=None, timeout=30,
 async def health():
     snapshot = await asyncio.to_thread(compute_health_snapshot)
     return JSONResponse(snapshot)
+
+
+@app.get('/api/optimization/advice')
+async def optimization_advice(request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'Unauthorized -- player session required'}, status_code=401)
+    snapshot = await asyncio.to_thread(compute_health_snapshot)
+    return JSONResponse(build_optimization_advice(snapshot))
 
 
 @app.get('/api/sim/status')
