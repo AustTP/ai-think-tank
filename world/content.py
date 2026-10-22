@@ -4191,6 +4191,7 @@ _BROWSER_STEP_TOOL = {
                 'expect': {'type': 'string', 'description': 'Literal text that should appear after the step; case-insensitive. Sets verified.'},
                 'expectUrl': {'type': 'string', 'description': 'Literal substring that should appear in the resulting URL.'},
                 'expectSelector': {'type': 'string', 'description': 'Selector or field id/name expected on the resulting page.'},
+                'expectVisual': {'type': 'string', 'description': 'Natural-language visual check: capture a screenshot and ask the vision tier whether it shows this. Returns visualVerified and visualEvidence.'},
                 'screenshot': {'type': 'boolean', 'description': 'Capture a screenshot after the step. The image stays in the sandbox; the result carries only its SHA-256.'},
                 'purpose': {'type': 'string', 'description': 'One short sentence: why this step is needed.'},
                 'maxText': {'type': 'integer', 'description': 'Cap on returned page text (default 4000).'},
@@ -4584,6 +4585,37 @@ def _browser_session_save(agent_id, sandbox_id, url, op, verified, expect, scree
             'lastExpect': expect or '', 'updatedAt': time.time(), 'history': history}
 
 
+def _vision_review_base64(agent_id, agent_key, task_id, image_b64, question):
+    """Send one browser screenshot to the vision tier and return its answer.
+
+    Mirrors _review_screenshot, but takes the base64 image the browser endpoint
+    already captured instead of a sandbox file path. Degrades to a note, never a
+    crash, when the vision tier or the model call is unavailable.
+    """
+    if not image_b64:
+        return {'ok': False, 'note': 'no screenshot was captured'}
+    slug = _serve._vision_tier_slug()
+    if not slug:
+        return {'ok': False, 'note': 'vision model tier not available'}
+    guarded = _serve.VISION_ANTI_INSTRUCTION_GUARD + '\n' + (question or '')
+    try:
+        r = _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/chat', {
+            'model': slug,
+            'messages': [{'role': 'user', 'content': [
+                {'type': 'text', 'text': guarded},
+                {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + image_b64}},
+            ]}],
+            'max_tokens': _VISION_MAX_TOKENS,
+            'agentId': agent_id,
+            'taskId': task_id or '',
+        }, agent_key, timeout=120)
+    except Exception as e:
+        return {'ok': False, 'note': f'vision call failed: {e}'}
+    if isinstance(r, dict) and not r.get('error') and r.get('reply'):
+        return {'ok': True, 'reply': str(r['reply']).strip()}
+    return {'ok': False, 'note': 'vision call failed or returned nothing'}
+
+
 def _make_browser_step_executor(agent_id, agent_key, sandbox_id, work_context='',
                                 work_context_trusted=False, task_id=None):
     """One verified browser step with a durable session checkpoint.
@@ -4628,6 +4660,7 @@ def _make_browser_step_executor(agent_id, agent_key, sandbox_id, work_context=''
         expect = (args.get('expect') or '').strip()
         expect_url = (args.get('expectUrl') or '').strip()
         expect_selector = (args.get('expectSelector') or '').strip()
+        expect_visual = (args.get('expectVisual') or '').strip()
         purpose = (args.get('purpose') or 'verified browser step').strip()
         max_text = max(200, min(int(args.get('maxText') or 4000), 12000))
         wait_ms = max(0, min(int(args.get('waitMs') or 0), 10000))
@@ -4660,20 +4693,45 @@ def _make_browser_step_executor(agent_id, agent_key, sandbox_id, work_context=''
             hay = ' '.join([text or ''] + [str(f) for f in (result.get('fields') or [])]
                            + [str(l) for l in (result.get('links') or [])]).lower()
             checks['selector'] = expect_selector.lower() in hay
-        verified = all(checks.values()) if checks else None
         shot_sha = ''
         shot_captured = False
-        if args.get('screenshot') or op == 'screenshot':
-            shot = result if op == 'screenshot' else _call('screenshot', result_url, purpose=purpose)
+        screenshot_note = ''
+        shot_b64 = result.get('screenshotBase64') or ''
+        if args.get('screenshot') or op == 'screenshot' or expect_visual:
+            try:
+                shot = result if op == 'screenshot' else _call('screenshot', result_url, purpose=purpose)
+            except Exception as e:
+                shot = {}
+                screenshot_note = f'screenshot failed: {e}'
             if isinstance(shot, dict):
-                b64 = shot.get('screenshotBase64') or ''
-                if b64:
-                    shot_sha = hashlib.sha256(str(b64).encode('utf-8', 'replace')).hexdigest()
+                shot_b64 = shot.get('screenshotBase64') or shot_b64
+                if shot_b64:
+                    shot_sha = hashlib.sha256(str(shot_b64).encode('utf-8', 'replace')).hexdigest()
                     shot_captured = True
-                elif shot.get('ok') is not False:
+                elif shot.get('ok') is True:
                     shot_captured = True
+        visual_verified = None
+        visual_evidence = ''
+        vision_note = ''
+        if expect_visual:
+            review = _vision_review_base64(
+                agent_id, agent_key, task_id, shot_b64,
+                f'Does this screenshot show: {expect_visual}? '
+                'Answer exactly YES or NO on the first line, then one sentence of visual evidence.')
+            if review.get('ok'):
+                reply = str(review.get('reply') or '')
+                visual_verified = reply.strip().lower().startswith('yes')
+                visual_evidence = reply[:600]
+            else:
+                vision_note = review.get('note') or 'vision check unavailable'
+            if visual_verified is not None:
+                checks['visual'] = visual_verified
+        verified = None
+        if checks and all(v is not None for v in checks.values()):
+            verified = all(checks.values())
         session = _browser_session_save(agent_id, sandbox_id, result_url, op,
-                                        verified, expect or expect_url or expect_selector,
+                                        verified,
+                                        expect or expect_url or expect_selector or expect_visual,
                                         shot_sha)
         text_out = ''
         if text:
@@ -4687,12 +4745,16 @@ def _make_browser_step_executor(agent_id, agent_key, sandbox_id, work_context=''
             'title': result.get('title') or '',
             'verified': verified,
             'checks': checks,
-            'expect': expect or expect_url or expect_selector,
+            'expect': expect or expect_url or expect_selector or expect_visual,
+            'visualVerified': visual_verified,
+            'visualEvidence': visual_evidence,
+            'visionNote': vision_note,
             'text': text_out,
             'fields': (result.get('fields') or [])[:20],
             'links': (result.get('links') or [])[:20],
             'screenshotCaptured': shot_captured,
             'screenshotSha256': shot_sha,
+            'screenshotNote': screenshot_note,
             'session': session,
         }
         if result.get('captchaRequired'):
@@ -6433,14 +6495,17 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # _apply_content_result actually queues it) way any executor asks to be
     # notified on completion, success or failure alike, so silence never
     # reads as "still working" when it already gave up.
-    tier_slug = _serve._resolve_model_tier(f'Run a time-boxed web investigation (spike): {backlog[:200]}')
+    best_effort = bool(task.get('bestEffort'))
+    tier_slug = _serve._resolve_model_tier(
+        f'Run a time-boxed web investigation (spike): {backlog[:200]}',
+        best_effort=best_effort)
     # The plan/synthesize bookends do the genuine reasoning of a spike. No
     # separate reasoning band needed: the JEV tier gate already
     # routes consequential work to mid/high, whose models are reasoning-
     # capable. Gate with allow_high so a hard investigation can spend up.
     reasoning_slug = _serve._resolve_model_tier(
         f'Plan and synthesize a time-boxed investigation, judging own completeness: {backlog[:200]}',
-        allow_high=True)
+        allow_high=True, best_effort=best_effort)
     if not tier_slug:
         _sim_module._store_content_result(task.get('id'), {
             'note': f'Spiked "{backlog}", but no model tier is configured yet.', 'ok': False,

@@ -2846,6 +2846,7 @@ def queue_work(state, items):
             # independent unit with its own id and checkpoint, linked to the
             # supervisor card that created it.
             'parentTaskId': item.get('parentTaskId') or None,
+            'bestEffort': bool(item.get('bestEffort')),
             # Phase E3: the story's original author id (see reviewAuthorId on the
             # review-subtask creation) -- lets an actionable review pin the fix
             # back to the worker who built it.

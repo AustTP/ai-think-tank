@@ -274,7 +274,7 @@ class AskEndpoint(unittest.TestCase):
 
         async def fake_ask_core(state, question, agent_id_hint=None, location=None,
                                 max_tokens=300, allow_admin_pin=False, allow_park=True,
-                                session_id=None, approved_tools=None):
+                                session_id=None, approved_tools=None, best_effort=False):
             seen.setdefault('session_ids', []).append(session_id)
             return {'reply': 'ok', 'agent': 'ben', 'tools': []}
 

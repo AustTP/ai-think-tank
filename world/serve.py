@@ -5788,7 +5788,8 @@ def _is_latency_sensitive(purpose, task_type=None):
                                            'monitor', 'freshness check'))
 
 
-def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None):
+def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None,
+                        best_effort=False):
     """Pick which model tier a call deserves, under the JEV-gated escalation
     policy. Returns a resolved model slug (never None).
 
@@ -5806,6 +5807,12 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None)
         # Pulse triage and live monitoring are latency work: use the cheap,
         # fast tier and never wait on a JEV escalation call.
         return _low_tier_slug() or _mid_tier_slug()
+    if best_effort:
+        # Explicit best-capability lane: use the high band when it is
+        # configured and the monthly high-tier allowance is not spent.
+        if _high_tier_budget_exceeded():
+            return _mid_tier_slug() or _low_tier_slug()
+        return _high_tier_slug() or _mid_tier_slug() or _low_tier_slug()
     decider = decider or _tier_gate_decider
     try:
         decision, confidence = decider(
@@ -18549,7 +18556,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
     return execute_tool
 
 
-async def _ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None, approved_tools=None):
+async def _ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None, approved_tools=None, best_effort=False):
     """The real logic behind /api/intent/ask, pulled out so a non-HTTP caller
     (the Telegram bridge) can invoke it directly -- no fake Request object,
     no self-loopback HTTP hop, no auth dance for an already-trusted in-process
@@ -18711,7 +18718,8 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
 
     # Ask lane: a fresh player question. Not code, so JEV-gated (default low,
     # light mid for a question that needs real reasoning).
-    model = _resolve_model_tier(f'Answer the player\'s question: {question[:200]}')
+    model = _resolve_model_tier(f'Answer the player\'s question: {question[:200]}',
+                                best_effort=bool(best_effort))
     tools_used = []
     agent_key = get_or_create_agent_key(pick)
 
@@ -19653,7 +19661,8 @@ async def intent_ask(request: Request):
     result = await _ask_core(state, body.get('question'), body.get('agentId'),
                              body.get('location'), body.get('max_tokens', 300),
                              session_id=f'player-ask:{_ask_target.lower()}',
-                             approved_tools=body.get('approvedTools'))
+                             approved_tools=body.get('approvedTools'),
+                             best_effort=bool(body.get('bestEffort')))
     if 'error' in result:
         return JSONResponse({'error': result['error']}, status_code=result.get('status', 500))
     if result.get('queued'):
@@ -34054,6 +34063,45 @@ async def serve_index(request: Request):
     with open(os.path.join(ROOT, 'index.html'), encoding='utf-8') as f:
         page = f.read()
     return HTMLResponse(page)
+
+
+@app.get('/pulse', response_class=HTMLResponse)
+async def serve_pulse(request: Request):
+    if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return HTMLResponse(_LOGIN_PAGE.replace('__ERROR_HTML__', ''))
+    from pulse_ui import PULSE_HTML
+    return HTMLResponse(PULSE_HTML)
+
+
+@app.get('/api/pulse/overview')
+async def api_pulse_overview(request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'player session required'}, status_code=401)
+    import pulse
+    return JSONResponse({
+        'brief': pulse.brief(None, 24),
+        'watches': pulse.list_watches(None),
+        'events': pulse.events(agent_id=None, limit=100),
+    })
+
+
+@app.get('/api/project-board')
+async def api_project_board(request: Request):
+    if not _require_player_session(request):
+        return JSONResponse({'error': 'player session required'}, status_code=401)
+    import content as _content
+    q = request.query_params
+    try:
+        limit = int(q.get('limit') or 40)
+    except Exception:
+        limit = 40
+    payload = _content.project_board({
+        'team': q.get('team') or '',
+        'project': q.get('project') or '',
+        'status': q.get('status') or 'open',
+        'limit': limit,
+    })
+    return JSONResponse(json.loads(payload))
 
 
 @app.post('/login')

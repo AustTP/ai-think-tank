@@ -58,6 +58,13 @@ runs and thirty days for calendar events.
 - The Red Team Auditor role is trusted with commit tools for its live security
   self-tests.
 
+## Best-capability lane
+`_resolve_model_tier(..., best_effort=True)` routes an explicit high-stakes
+task to the high band when it is configured and the monthly high-tier
+allowance is not spent. The ask endpoint accepts `bestEffort: true`; spike
+cards accept `bestEffort` in the work item. It falls back to mid when the high
+allowance is exhausted.
+
 ## Executor checkpoints
 The spike executor saves its plan at the plan/execute boundary and saves the
 tool transcript before and after every tool batch. After a crash or restart, a

@@ -6240,3 +6240,18 @@ class LatencyRouting(unittest.TestCase):
             self.assertEqual(serve._resolve_model_tier('pulse triage', 'spike'), 'fast-model')
             self.assertEqual(serve._resolve_model_tier('routine report', 'pulse'), 'fast-model')
             self.assertEqual(serve._resolve_model_tier('live alert check', None), 'fast-model')
+
+
+class BestCapabilityRouting(unittest.TestCase):
+    def test_best_effort_uses_high_when_available(self):
+        with unittest.mock.patch.object(serve, '_high_tier_slug', return_value='best-model'), \
+             unittest.mock.patch.object(serve, '_high_tier_budget_exceeded', return_value=False):
+            self.assertEqual(serve._resolve_model_tier('hard analysis', best_effort=True),
+                             'best-model')
+
+    def test_best_effort_falls_back_when_high_budget_is_spent(self):
+        with unittest.mock.patch.object(serve, '_high_tier_slug', return_value='best-model'), \
+             unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-model'), \
+             unittest.mock.patch.object(serve, '_high_tier_budget_exceeded', return_value=True):
+            self.assertEqual(serve._resolve_model_tier('hard analysis', best_effort=True),
+                             'mid-model')

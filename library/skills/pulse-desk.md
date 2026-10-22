@@ -22,6 +22,10 @@ local, event-driven layer, not a firehose clone.
 - `x_trending_topics` records a `trends` item under `x`.
 - `search_linkedin_posts` records the query under `linkedin`.
 
+## Player view
+Open `/pulse` while logged in. The Ops page shows the pulse brief, watches,
+recent events, and the open project board. It refreshes every 30 seconds.
+
 ## Rules
 - Matching is literal. No regex, no fuzzy relevance.
 - Duplicate payloads are deduplicated. A changed payload is a new event.

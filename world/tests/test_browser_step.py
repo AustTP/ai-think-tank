@@ -86,3 +86,26 @@ class BrowserStep(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BrowserStepVision(BrowserStep):
+    def test_visual_expectation_uses_the_vision_tier(self):
+        with unittest.mock.patch.object(
+                content, '_vision_review_base64',
+                return_value={'ok': True, 'reply': 'YES the page shows Done'}):
+            result, calls = self._run({'op': 'click', 'selector': '#done',
+                                        'expectVisual': 'a Done confirmation'})
+        self.assertTrue(result['visualVerified'])
+        self.assertEqual(result['checks']['visual'], True)
+        self.assertTrue(result['screenshotCaptured'])
+        self.assertIn('YES', result['visualEvidence'])
+        self.assertTrue(any(c.get('op') == 'screenshot' for c in calls))
+
+    def test_visual_failure_is_unknown_not_false_evidence(self):
+        with unittest.mock.patch.object(
+                content, '_vision_review_base64',
+                return_value={'ok': False, 'note': 'vision tier unavailable'}):
+            result, _ = self._run({'op': 'click', 'selector': '#done',
+                                   'expectVisual': 'a Done confirmation'})
+        self.assertIsNone(result['visualVerified'])
+        self.assertIn('vision tier unavailable', result['visionNote'])

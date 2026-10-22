@@ -20,3 +20,8 @@ the parent task id for delegated forks.
 - Use it with `supervisor_report` for team-scoped process health.
 
 The board is read-only. It never assigns, edits, or closes a card.
+
+## Player view
+Open `/pulse` while logged in. The same page renders the open board next to the
+pulse desk. The API endpoints are `GET /api/pulse/overview` and
+`GET /api/project-board`; both require a player session.
