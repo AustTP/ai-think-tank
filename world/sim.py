@@ -4620,8 +4620,15 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
     target_x = door['x'] + door['w'] / 2
     target_y = door['y'] + door['h'] + 4
     path = find_path(a['x'], a['y'], target_x, target_y, agent_id, agents, grid)
-    if not path or len(path) == 0:
-        return None
+    if not path:
+        # A pinned agent woken AT the target door is already standing on the
+        # destination. find_path returns no steps, but that is a valid arrival,
+        # not an assignment failure. A one-node path lets movement emit the
+        # normal 'arrive' event on the next tick.
+        if abs(a.get('x', 0) - target_x) < 1 and abs(a.get('y', 0) - target_y) < 1:
+            path = [{'x': target_x, 'y': target_y}]
+        else:
+            return None
 
     task_id = _next_task_id(state, task_id_holder)
     rest_x = path[-1]['x']

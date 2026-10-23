@@ -343,6 +343,23 @@ def test_directed_card_waits_for_its_named_worker():
     assert len(state['tasks']) == before
 
 
+def test_directed_card_assigns_when_the_worker_is_already_at_the_door():
+    state = _state()
+    grid, doors = sim._load_outdoor_geometry()
+    door = doors['pressoffice']
+    nora = state['agents']['nora']
+    nora.update({'x': door['x'] + door['w'] / 2,
+                 'y': door['y'] + door['h'] + 4,
+                 'offDuty': False, 'busy': False, 'task': None})
+    item = {'title': 'Directed spike', 'room': 'pressoffice',
+            'taskType': 'spike', 'assignedTo': 'nora', 'directedTo': True,
+            'teamId': 'nora', 'instructions': 'Do the directed spike.'}
+    task = sim._assign_due_item(state, item, True, grid, doors, 1000,
+                                task_id_holder={0: 0})
+    assert task is not None
+    assert task['assignedTo'] == 'nora'
+
+
 def test_supervisor_tool_loop_has_a_heartbeat(monkeypatch):
     import content
     import sim
