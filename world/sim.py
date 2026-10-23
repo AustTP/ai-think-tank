@@ -10881,13 +10881,20 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
             pin_bits.append('The player named these tasks as important to cover: '
                             + '; '.join(pc['mustInclude']) + '.')
         pin_text = (' ' + ' '.join(pin_bits)) if pin_bits else ''
+        card_type = (req.get('issueType') or req.get('taskType') or 'story').strip().lower()
         instructions = (f"{sm_name} is the scrum master running backlog refinement for {filed_by}'s "
                         f"({author.get('name') or filed_by} / {author.get('role') or 'worker'}) work request "
-                        f"in the {req.get('room')} room. Requested story: '{req.get('title')}'. Reason: "
-                        f"{req.get('reason')}.{pin_text}")
+                        f"in the {req.get('room')} room. Requested card: '{req.get('title')}'. "
+                        f"Card type: {card_type}. Reason: {req.get('reason')}.{pin_text}")
         ctx = _refinement_context_for_room(state, req.get('room'))
         if ctx:
-            instructions += f" Roadmap context for this room: {ctx}."
+            instructions += f" Roadmap context for this room (prioritization only, not a scope gate): {ctx}."
+        instructions += (" The room is where the work happens, not a scope gate. A spike or research "
+                         "card can run in pressoffice; a low room trailing grade is context for "
+                         "prioritization, never a reason by itself to reject a player-filed investigation.")
+        if filed_by == 'player':
+            instructions += (" The player explicitly asked for this card; default to accept unless it is "
+                             "a duplicate, unsafe, or clearly outside the tank's charter.")
         # A reporter appeal rides the record: the reply text is the exact new
         # information the card came back with, so the ceremony judges it in
         # the open instead of past the requester.
@@ -10904,12 +10911,13 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
         if read_back:
             instructions += (f" Read-back: \"{read_back['summary']}\" "
                              f"(readiness: {read_back['readiness']}).")
-        instructions += (" Turn it into a real story (accept) or groom it back to the "
-                         "requester because it's not ready / not needed / doesn't fit the roadmap (reject). "
+        instructions += (" Turn it into a real card (the card type says story, spike, or research) "
+                         "or groom it back to the requester because it's not ready / not needed / "
+                         "doesn't fit the roadmap (reject). "
                          + ABSOLUTE_ZERO_SCOPING_GUIDANCE)
         criteria = [
-            {'id': 'accept', 'description': f"Create '{req.get('title')}' as a real story in {req.get('room')} -- it's a genuine, well-scoped, MEDIUM-difficulty gap worth a card."},
-            {'id': 'accept_generous', 'description': f"Create '{req.get('title')}' as a real story in {req.get('room')} -- it's a genuine, well-scoped, HIGH-VALUE gap worth a card AND a generous spend budget (a bigger investigation or deliverable than the standard card)."},
+            {'id': 'accept', 'description': f"Create '{req.get('title')}' as a real {card_type} card in {req.get('room')} -- it's a genuine, well-scoped, MEDIUM-difficulty gap worth a card."},
+            {'id': 'accept_generous', 'description': f"Create '{req.get('title')}' as a real {card_type} card in {req.get('room')} -- it's a genuine, well-scoped, HIGH-VALUE gap worth a card AND a generous spend budget (a bigger investigation or deliverable than the standard card)."},
             {'id': 'reject', 'description': "Groom this request out -- it's a duplicate, low-value, trivial/filler, over-ambitious/un-scoped, out-of-scope, or the roadmap already covers it."},
         ]
         choice = decider(instructions, criteria)

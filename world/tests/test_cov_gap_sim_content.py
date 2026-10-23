@@ -714,6 +714,46 @@ class SimResidualTest(_Base):
         self.assertIn('Safari', seen['instructions'])
         self.assertEqual(req['status'], 'rejected')
 
+    def test_resolve_refinement_pressoffice_spike_is_not_a_room_reject(self):
+        req = {'id': 'r1', 'status': 'pending', 'filedBy': 'player',
+               'room': 'pressoffice', 'title': '[SPIKE] Review a video transcript',
+               'issueType': 'spike', 'reason': 'JIRA issue DEV-99'}
+        state = {'agents': {'sm': {'name': 'SM'},
+                            'player': {'name': 'Player', 'role': 'operator'}},
+                 'agentRoster': [{'id': 'sm', 'name': 'SM'}],
+                 'backlogRequests': [req], 'tasks': {}, 'workQueue': []}
+        pending = {'scrumMasterId': 'sm', 'reqIds': ['r1'], 'teamId': 't1'}
+        seen = {}
+
+        def decider(instructions, criteria):
+            seen['instructions'] = instructions
+            seen['criteria'] = criteria
+            return 'accept'
+        with unittest.mock.patch.object(sim.comprehension,
+                                        'comprehend_batch',
+                                        return_value={}), \
+             unittest.mock.patch.object(sim, '_overrun_factor_for',
+                                        return_value=1.0), \
+             unittest.mock.patch.object(sim, 'budget_usd_for_task',
+                                        return_value=1.0), \
+             unittest.mock.patch.object(sim, '_refinement_context_for_room',
+                                        return_value=''), \
+             unittest.mock.patch.object(sim, '_reassign_rolled_over_cards'), \
+             unittest.mock.patch.object(sim, '_restore_refinement_agent'), \
+             unittest.mock.patch.object(sim, '_mail_card_update'), \
+             unittest.mock.patch('serve.log_action'), \
+             unittest.mock.patch('serve.log_refinement_digest'):
+            sim._resolve_refinement(state, pending, 1000, decider=decider,
+                                    reader=lambda r: None)
+        self.assertIn('Card type: spike', seen['instructions'])
+        self.assertIn('room is where the work happens, not a scope gate',
+                      seen['instructions'])
+        self.assertIn('player explicitly asked', seen['instructions'])
+        accept = next(c['description'] for c in seen['criteria'] if c['id'] == 'accept')
+        self.assertIn('spike card', accept)
+        self.assertEqual(req['status'], 'accepted')
+        self.assertEqual(state['workQueue'][-1]['room'], 'pressoffice')
+
     def test_resolve_breakdown_never_text(self):
         req = {'id': 'r1', 'status': 'pending', 'filedBy': 'cora',
                'goal': 'G', 'title': 'T', 'room': 'pressoffice'}
