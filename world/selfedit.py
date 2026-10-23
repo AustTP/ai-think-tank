@@ -682,22 +682,40 @@ def _review(edit_id, display, find, replace, summary):
                 f'Summary: {summary}\n'
                 f'FIND (exact splice anchor):\n{find[:4000]}\n'
                 f'REPLACE WITH:\n{replace[:8000]}')
-    try:
-        decision, confidence, cost = serve._jev_quorum_choice_sync(
-            _REVIEW_INSTRUCTIONS, _REVIEW_CRITERIA + '\n\n' + question)
-    except Exception as e:  # transport/shape failure is not consent
-        decision, confidence, cost = None, 1.0, 0.0
-        serve.log_action(edit_id, 'self_edit_review_failed',
-                         {'error': str(e)[:200]}, authorized=False)
+    decision = confidence = None
+    cost = 0.0
+    for _attempt in range(2):
+        try:
+            decision, confidence, cost = serve._jev_quorum_choice_sync(
+                _REVIEW_INSTRUCTIONS, _REVIEW_CRITERIA + '\n\n' + question)
+        except Exception as e:  # transport/shape failure is not consent
+            decision, confidence, cost = None, 0.0, 0.0
+            serve.log_action(edit_id, 'self_edit_review_failed',
+                             {'error': str(e)[:200]}, authorized=False)
+        if decision in ('approve', 'reject'):
+            break
     _update(edit_id, jev_confidence=round(float(confidence or 0.0), 4),
             jev_cost=round(float(cost or 0.0), 6),
             note=f'jev: {decision!r} @ {round(float(confidence or 0.0), 2)}')
     if decision == 'approve':
         return True, {'review': 'approved', 'confidence': confidence}
-    _update(edit_id, status='rejected' if decision == 'reject' else 'refused')
-    serve.log_action(edit_id,
-                     'self_edit_rejected' if decision == 'reject'
-                     else 'self_edit_refused',
+    if decision not in ('approve', 'reject'):
+        # A missing/invalid reviewer decision is an outage, not a judgment.
+        # Fail closed (nothing is armed) but tell the proposer to retry instead
+        # of reporting a substantive rejection that never happened.
+        _update(edit_id, status='refused', note='reviewer unavailable')
+        serve.log_action(edit_id, 'self_edit_review_unavailable',
+                         {'decision': decision, 'confidence': confidence},
+                         authorized=False)
+        return False, {
+            'error': ('the edits reviewer returned no valid decision '
+                      '(reviewer unavailable, not a rejection) -- nothing was '
+                      'changed; retry the same proposal shortly.'),
+            'status': 'unavailable',
+            'retryable': True,
+        }
+    _update(edit_id, status='rejected')
+    serve.log_action(edit_id, 'self_edit_rejected',
                      {'decision': decision, 'confidence': confidence},
                      authorized=True)
     return False, {
@@ -705,7 +723,7 @@ def _review(edit_id, display, find, replace, summary):
                   f'{round(float(confidence or 0.0), 2)} confidence -- '
                   'nothing was changed. Re-propose with a clearer summary, '
                   'a smaller edit, or a rewritten splice.'),
-        'status': 'rejected' if decision == 'reject' else 'refused'}
+        'status': 'rejected'}
 
 
 def _validate(edit_id, resolved, candidate):

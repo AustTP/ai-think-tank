@@ -160,7 +160,7 @@ def _jev_quorum_choice_sync(instructions, criteria):
     try:
         decision, confidence, cost = sample()
     except Exception:
-        return None, 1.0, 0.0
+        return None, 0.0, 0.0
 
     if confidence >= _serve._effective_safety_confidence():
         return decision, confidence, cost  # already confident -- one sample is enough
