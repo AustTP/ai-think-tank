@@ -2159,6 +2159,10 @@ def _maybe_escalate_stuck_gate(state, parent, gate, reason):
                    authorized=True)
     except Exception:
         pass
+    _notify_card_failure(
+        state, parent,
+        f'closed after {gate["cycleCount"]} review cycles: {reason}',
+        category='auto-closed', now_ms=int(time.time() * 1000))
     _close_gated_story(state, parent)
     return True
 
