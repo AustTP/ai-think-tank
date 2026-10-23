@@ -27673,7 +27673,8 @@ async def selfedit_schedule(request: Request):
             restore_plan=body.get('restorePlan'),
             on_call=body.get('onCall'),
             acknowledgements=body.get('acknowledgements'),
-            blackout_windows=body.get('blackoutWindows'))
+            blackout_windows=body.get('blackoutWindows'),
+            notify_created=True)
     except Exception as exc:
         print(f'[selfedit] schedule crashed for {agent_id}: {exc}', flush=True)
         log_action(agent_id, 'selfedit_crashed', {'error': str(exc)[:300]},
@@ -27767,6 +27768,44 @@ async def selfedit_window_veto(request: Request):
                          ((payload or {}).get('message') or ''))[:160]},
                authorized=True)
     return JSONResponse(payload, status_code=200 if ok else 400)
+
+
+@app.get('/api/selfedit/window/veto-link')
+async def selfedit_window_veto_link(windowId: str = '', token: str = '',
+                                    reason: str = ''):
+    """One-click Telegram veto link for a change request.
+
+    The per-window token is the auth (no player session needed), matching
+    the escalation approve/deny links. It delegates to veto_window, so a
+    pushed window still refuses and a pending/approved window is cancelled
+    with its reserved edits released.
+    """
+    if not windowId or not token:
+        return HTMLResponse('<p>Invalid or expired veto link.</p>',
+                            status_code=404)
+    try:
+        ok, payload = await asyncio.to_thread(
+            _selfedit.veto_window_by_link, windowId, token,
+            (reason or 'Vetoed from Telegram link').strip())
+    except Exception as exc:
+        log_action('player', 'selfedit_window_veto_link_crashed',
+                   {'windowId': windowId, 'error': str(exc)[:300]},
+                   authorized=True)
+        return HTMLResponse(f'<p>Veto failed: {html.escape(str(exc))}</p>',
+                            status_code=500)
+    log_action('player', 'selfedit_window_veto_link',
+               {'windowId': windowId, 'ok': ok,
+                'note': (((payload or {}).get('error') or '') or
+                         ((payload or {}).get('message') or ''))[:200]},
+               authorized=True)
+    if ok:
+        return HTMLResponse(
+            f'<p>Vetoed change request <b>{html.escape(windowId)}</b>. '
+            'Nothing will be pushed.</p>')
+    return HTMLResponse(
+        f'<p>Could not veto: '
+        f'{html.escape(str((payload or {}).get("error") or "unknown error"))}</p>',
+        status_code=400)
 
 
 @app.post('/api/selfedit/fix/edit')

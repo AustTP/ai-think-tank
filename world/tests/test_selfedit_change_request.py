@@ -337,3 +337,49 @@ def test_veto_tool_is_offered_and_forwards(monkeypatch):
     assert sent['body']['windowId'] == 'win-x'
     assert sent['body']['reason'] == 'stop'
     assert 'vetoed' in out
+
+
+def test_creation_telegram_has_details_and_veto_link(fake_repo, monkeypatch):
+    _, world = fake_repo
+    _patch_roster(monkeypatch)
+    _patch_player_approval(monkeypatch)
+    _arm_window_only(monkeypatch, world)
+    monkeypatch.setattr(selfedit, '_notify_agent',
+                        lambda agent, text, about='': None)
+    sent = {}
+    monkeypatch.setattr(selfedit, '_notify_player_telegram',
+                        lambda subject, body: sent.update(subject=subject,
+                                                          body=body))
+    fields = _high_risk_fields()
+    fields['risk_level'] = 'medium'
+    ok, payload = selfedit.request_window(
+        'worker', _window_slot(), '03:10', 15, 'normal change', 'reviewer',
+        notify_created=True, **fields)
+    assert ok is True, payload
+    assert sent['subject'] == '[AI Think Tank] Change request created'
+    assert payload['id'] in sent['body']
+    assert 'Veto this change request' in sent['body']
+    token = selfedit._window_row(payload['id'])['veto_token']
+    assert token in sent['body']
+
+
+def test_veto_link_rejects_bad_token_and_accepts_real_one(fake_repo, monkeypatch):
+    _, world = fake_repo
+    _patch_roster(monkeypatch)
+    _patch_player_approval(monkeypatch)
+    _arm_window_only(monkeypatch, world)
+    monkeypatch.setattr(selfedit, '_notify_agent',
+                        lambda agent, text, about='': None)
+    monkeypatch.setattr(selfedit, '_notify_player_telegram',
+                        lambda subject, body: None)
+    fields = _high_risk_fields()
+    fields['risk_level'] = 'medium'
+    ok, payload = selfedit.request_window(
+        'worker', _window_slot(), '03:10', 15, 'normal change', 'reviewer',
+        **fields)
+    assert ok is True, payload
+    ok, result = selfedit.veto_window_by_link(payload['id'], 'wrong-token')
+    assert ok is False and 'invalid or expired' in result['error']
+    token = selfedit._window_row(payload['id'])['veto_token']
+    ok, result = selfedit.veto_window_by_link(payload['id'], token)
+    assert ok is True and result['status'] == 'vetoed'

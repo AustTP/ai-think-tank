@@ -1993,7 +1993,8 @@ def _ensure_windows_table(conn):
             ('deferred_reason', 'TEXT'),
             ('vetoed_by', 'TEXT'),
             ('vetoed_at', 'REAL'),
-            ('veto_reason', 'TEXT')):
+            ('veto_reason', 'TEXT'),
+            ('veto_token', 'TEXT')):
         try:
             conn.execute(f'ALTER TABLE dormancy_windows ADD COLUMN {col} {decl}')
         except sqlite3.OperationalError:
@@ -2153,7 +2154,8 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
                    success_criteria=None, abort_criteria=None,
                    post_apply_checks=None, safe_state_plan=None,
                    restore_plan=None, on_call=None,
-                   acknowledgements=None, blackout_windows=None):
+                   acknowledgements=None, blackout_windows=None,
+                   notify_created=False):
     """Run the change-request chain for one dormancy slot.
 
     Returns (ok, payload); ok=False carries the refusal (with 'conflicts'
@@ -2376,6 +2378,7 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
                                 'confidence -- nothing was scheduled',
                        'status': 'refused'}
     window_id = f'win-{secrets.token_hex(5)}'
+    veto_token = secrets.token_urlsafe(24)
     if admin_mode:
         esc_id = None  # no player link in the two-agent chain
         _window_record(window_id, now, agent_id, date, start, start_ts, end_ts,
@@ -2405,6 +2408,7 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
         blackout_windows=json.dumps(blackouts or []),
         pre_apply_result=pre_apply_result,
         pre_apply_tail=pre_apply_tail[-POST_APPLY_TAIL_LEN:] or None,
+        veto_token=veto_token,
         **({'admin_status': 'pending'} if admin_mode else {}))
     with serve._db() as conn:
         _ensure_table(conn)
@@ -2427,6 +2431,8 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
                       'files': manifest, 'highRisk': high_risk,
                       'preApply': pre_apply_result},
                      authorized=True)
+    if notify_created:
+        _telegram_change_request_created(window_id)
     return True, {'id': window_id,
                   'status': 'approved' if admin_mode else 'pending',
                   'escalationId': esc_id,
@@ -2969,6 +2975,50 @@ def validation_window():
 
 def window_validator(window_id):
     return _window_field(window_id, 'validator')
+
+
+def _telegram_change_request_created(window_id):
+    """Player Telegram message when a change request is created, with the
+    details needed to judge it and a one-click veto link. The link is
+    token-gated and needs no login. Telegram caps a message at 4096 chars."""
+    row = _window_row(window_id) or {}
+    token = row.get('veto_token') or ''
+    base = _s().ESCALATION_BASE_URL.rstrip('/')
+    veto_url = (f'{base}/api/selfedit/window/veto-link'
+                f'?windowId={window_id}&token={token}')
+    try:
+        files = json.loads(row.get('file_manifest') or '[]')
+    except (TypeError, ValueError):
+        files = []
+    title = row.get('title') or row.get('reason') or '(untitled change)'
+    body = (
+        f'Change request {window_id}: {title}\n'
+        f'Status: {row.get("status") or "?"}\n'
+        f'Implementer: {row.get("agent") or "?"}\n'
+        f'Validator: {row.get("validator") or "?"}\n'
+        f'Window: {row.get("date") or "?"} {row.get("start") or "?"} '
+        f'({row.get("duration_min") or "?"} min)\n'
+        f'Risk: {row.get("risk_level") or "low"}; '
+        f'mode: {row.get("service_mode") or "idle_ok"}\n'
+        f'Files: {", ".join(str(f) for f in files) or "(none)"}\n'
+        f'Reason: {(row.get("reason") or "")[:500]}\n\n'
+        f'Veto this change request: {veto_url}'
+    )
+    return _notify_player_telegram('[AI Think Tank] Change request created',
+                                   body[:4096])
+
+
+def veto_window_by_link(window_id, token, reason='Vetoed from Telegram link'):
+    """Veto a change request from the tokenized Telegram link. The token is
+    the authentication; no player session is needed. Fails closed on a
+    missing/mismatched token and delegates every status rule to veto_window."""
+    row = _window_row(window_id)
+    if not row or not token:
+        return False, {'error': 'invalid or expired veto link'}
+    if not secrets.compare_digest(str(row.get('veto_token') or ''), str(token)):
+        return False, {'error': 'invalid or expired veto link'}
+    return veto_window(window_id, 'player',
+                       (reason or 'Vetoed from Telegram link')[:300])
 
 
 def _telegram_change_request(window_id, category, note, sha=None, n_edits=None):
