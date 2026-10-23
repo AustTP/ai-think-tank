@@ -55,6 +55,18 @@ class TierThrottled(unittest.TestCase):
             {'taskType': 'code', 'priority': sim.WORK_PRIORITY['normal'], 'assignedTo': 'player'},
             {'coding': 0.3}))
 
+    def test_issue_card_bypasses(self):
+        self.assertFalse(sim._tier_throttled(
+            {'taskType': 'spike', 'priority': sim.WORK_PRIORITY['normal'],
+             'issueKey': 'NORA-34'},
+            {'mid': 0.3}))
+
+    def test_directed_card_bypasses(self):
+        self.assertFalse(sim._tier_throttled(
+            {'taskType': 'spike', 'priority': sim.WORK_PRIORITY['normal'],
+             'directedTo': True},
+            {'mid': 0.3}))
+
     def test_neutral_when_no_ratios(self):
         self.assertFalse(sim._tier_throttled(
             {'taskType': 'code', 'priority': sim.WORK_PRIORITY['normal']}, {}))

@@ -3359,6 +3359,10 @@ def _tier_throttled(item, tier_ratios):
         return False
     if (item.get('assignedTo') or '') == 'player':
         return False
+    # Player/JIRA work and an explicit lead pin are commitments, not
+    # price-elastic backlog. Never hold them on a bad tier-value day.
+    if item.get('issueKey') or item.get('directedTo'):
+        return False
     ratio = tier_ratios.get(_band_for_work_item(item), 1.0)
     return ratio < TIER_THROTTLE_RATIO
 
