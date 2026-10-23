@@ -343,6 +343,23 @@ def test_directed_card_waits_for_its_named_worker():
     assert len(state['tasks']) == before
 
 
+def test_assign_task_carries_approved_commit_tools():
+    state = _state()
+    grid, doors = sim._load_outdoor_geometry()
+    door = doors['pressoffice']
+    state['agents']['nora'].update({
+        'x': door['x'] + door['w'] / 2,
+        'y': door['y'] + door['h'] + 4,
+        'offDuty': False, 'busy': False, 'task': None})
+    task = sim.assign_task(
+        state, 'nora', 'Governed edit', 'pressoffice', 'Propose it.', 'x',
+        {'taskType': 'spike', 'approvedTools': ['self_edit',
+                                                'schedule_dormant_apply']},
+        grid, doors, 1000, {0: 0})
+    assert task is not None
+    assert task['approvedTools'] == ['self_edit', 'schedule_dormant_apply']
+
+
 def test_directed_card_assigns_when_the_worker_is_already_at_the_door():
     state = _state()
     grid, doors = sim._load_outdoor_geometry()
