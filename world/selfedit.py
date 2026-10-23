@@ -2379,15 +2379,22 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
                                 'blackout window: ' + '; '.join(blackout_hits)}
     pre_apply_result = None
     pre_apply_tail = ''
-    if high_risk:
+    # Run the repo gate BEFORE the window for every change request, not just
+    # high-risk ones. A low-risk HTML edit still shares the repo with every
+    # other test, and a red baseline used to be discovered only after the tank
+    # went dormant. The post-apply gate remains the final authority. A hermetic
+    # unit-test tree has no serve.py/kernel to initialize, so skip there.
+    if os.path.exists(os.path.join(_world(), 'serve.py')):
         ok_tests, pre_apply_tail = _run_pre_apply_tests(reserved_rows)
-        if not ok_tests:
-            serve.log_action(agent_id, 'dormancy_window_pre_apply_failed',
-                             {'tail': pre_apply_tail[:400]}, authorized=True)
-            return False, {'error': 'the pre-apply repo gate failed against '
-                                    'the candidate tree -- nothing was '
-                                    'scheduled', 'detail': pre_apply_tail[-2000:]}
-        pre_apply_result = 'pass'
+    else:
+        ok_tests, pre_apply_tail = True, 'pre-apply gate skipped: hermetic test tree'
+    if not ok_tests:
+        serve.log_action(agent_id, 'dormancy_window_pre_apply_failed',
+                         {'tail': pre_apply_tail[:400]}, authorized=True)
+        return False, {'error': 'the pre-apply repo gate failed against '
+                                'the candidate tree -- nothing was '
+                                'scheduled', 'detail': pre_apply_tail[-2000:]}
+    pre_apply_result = 'pass'
     affected = (affected_services if isinstance(affected_services, list)
                 else ([affected_services] if affected_services else []))
     affected = [str(a).strip()[:120] for a in affected if str(a).strip()]
