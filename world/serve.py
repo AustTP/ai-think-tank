@@ -13168,12 +13168,37 @@ def _tavily_search_sync(query, max_results=5):
     return '\n'.join(parts)
 
 
+def _normalize_decision_questions(questions):
+    """The decisions API expects `choice.criteria` as a record (id -> text),
+    not the list-of-{id,description} shape most call sites use. Sending the
+    list made every gate a HTTP 400 and silently opened the model circuit,
+    which looked like a reviewer refusal. Normalize once at the wire edge."""
+    if not isinstance(questions, dict):
+        return questions
+    choice = questions.get('choice')
+    if not isinstance(choice, dict):
+        return questions
+    criteria = choice.get('criteria')
+    if isinstance(criteria, list):
+        record = {}
+        for item in criteria:
+            if isinstance(item, dict):
+                key = str(item.get('id') or '').strip()
+                if key:
+                    record[key] = str(item.get('description') or '')
+        out = dict(questions)
+        out['choice'] = {**choice, 'criteria': record}
+        return out
+    return questions
+
+
 def _decision_request(model, state, questions):
     # A '://' chain entry is a Jev-compatible provider reached directly (the
     # Colab/Laya standby), not an OpenRouter slug: literally the URL, the same
     # {state, questions} wire format. No 'model' field -- laya routes
     # internally on the Colab runtime. The standby is LOCALHOST-only (loopback
     # ssh forward), so there is no bearer key to attach and nothing public.
+    questions = _normalize_decision_questions(questions)
     if '://' in model:
         src = json.dumps({'state': state, 'questions': questions}).encode()
         return urllib.request.Request(
