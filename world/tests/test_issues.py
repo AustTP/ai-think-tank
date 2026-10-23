@@ -98,11 +98,11 @@ class IssueValidation(unittest.TestCase):
 
 
 class IssueRoomRouting(unittest.TestCase):
-    def test_spike_issue_routes_to_observatory(self):
+    def test_spike_issue_can_work_from_pressoffice(self):
         state = _state()
         sim.file_issue(state, 'dev', 'spike', 'Investigate pricing',
                        'search', 'player', now_ms=_NOW_MS)
-        self.assertEqual(state['backlogRequests'][0]['room'], 'observatory')
+        self.assertEqual(state['backlogRequests'][0]['room'], 'pressoffice')
 
     def test_story_issue_stays_in_pressoffice(self):
         state = _state()

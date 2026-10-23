@@ -9110,11 +9110,11 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         'id': f"iss-{key}",
         'filedBy': reporter_id,
         'title': f"[{issue_type.upper()}] {summary}",
-        # Investigation-first cards belong in the observatory, not the code
-        # room. A spike/report filed through the plain JIRA endpoint used to be
-        # hardcoded to pressoffice, so the scrum master read a transcript or
-        # research spike as an out-of-scope code card and rejected it.
-        'room': 'observatory' if issue_type in ('spike', 'research') else 'pressoffice',
+        # The room is where the work happens, not a scope gate. JIRA cards
+        # default to pressoffice for every type, including spikes and research;
+        # the refinement prompt now judges the card on readiness and value
+        # instead of treating pressoffice as code-only.
+        'room': 'pressoffice',
         # Comprehension reads this as the request's rationale: name the card
         # and its intent, not just the key, so a well-specified issue is not
         # read back as 'needs-clarification' for a stub reason.
