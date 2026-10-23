@@ -1958,13 +1958,15 @@ _WINDOW_INSTRUCTIONS = (
     'to pause oversight. The player still has to approve the window '
     'afterwards; this judgment is the supervisory pre-clearance.'
 )
-_WINDOW_CRITERIA = (
-    'Date, start time and duration for the sleep window (given).\n'
-    'A stated maintenance reason (given).\n'
-    'Reject vague reasons, suspicious slots (prime working hours without '
-    'justification), and oversized durations.\n'
-    'The player approves or denies the final link separately.'
-)
+_WINDOW_CRITERIA = [
+    {'id': 'approve',
+     'description': ('Approve when the maintenance reason is real, the slot is '
+                     'a reasonable quiet time, and the duration is modest.')},
+    {'id': 'reject',
+     'description': ('Reject vague reasons, suspicious prime-hours slots, or '
+                     'oversized durations. The player still approves or denies '
+                     'the final link separately.')},
+]
 
 
 def _ensure_windows_table(conn):
@@ -2402,7 +2404,8 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
                 f'self-edits apply. The supervisor pre-cleared this request '
                 f'through the JEV quorum.')
     decision, confidence, cost = serve._jev_quorum_choice_sync(
-        _WINDOW_INSTRUCTIONS, _WINDOW_CRITERIA + '\n\n' + question)
+        _WINDOW_INSTRUCTIONS + '\n\n' + question,
+        [dict(c) for c in _WINDOW_CRITERIA])
     if decision != 'approve':
         serve.log_action(agent_id, 'dormancy_window_refused',
                          {'decision': decision, 'confidence': confidence},
