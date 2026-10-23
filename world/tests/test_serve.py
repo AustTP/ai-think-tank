@@ -4130,7 +4130,9 @@ class JevQuorumDecision(unittest.TestCase):
             decision, confidence, cost, _trace = asyncio.run(serve._jev_quorum_decision('i', {}))
         self.assertEqual(mock_call.call_count, 1)
         self.assertIsNone(decision)
-        self.assertEqual(confidence, 1.0)
+        # An unreachable classifier is zero trust, not full trust. The old
+        # 1.0 value let a transport outage look maximally confident.
+        self.assertEqual(confidence, 0.0)
 
     def test_trace_id_is_propagated_from_the_decision_call(self):
         # The decision_tape row's trace_id must reach the caller so it can be
@@ -4410,7 +4412,9 @@ class JevQuorumChoiceSync(unittest.TestCase):
             decision, confidence, cost = serve._jev_quorum_choice_sync('i', {})
         self.assertEqual(mock_call.call_count, 1)
         self.assertIsNone(decision)
-        self.assertEqual(confidence, 1.0)
+        # An unreachable classifier is zero trust, not full trust. The old
+        # 1.0 value let a transport outage look maximally confident.
+        self.assertEqual(confidence, 0.0)
 
 
 class _ClassifyCommandJev(unittest.TestCase):

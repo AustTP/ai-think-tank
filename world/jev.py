@@ -94,7 +94,7 @@ async def _jev_quorum_decision(instructions, criteria):
     try:
         decision, confidence, cost, trace_id = await sample()
     except Exception:
-        return None, 1.0, 0.0, None
+        return None, 0.0, 0.0, None
 
     if decision not in ('allow', 'approve') or confidence >= _serve._effective_safety_confidence():
         return decision, confidence, cost, trace_id  # firm block, or already-confident -- one sample is enough
