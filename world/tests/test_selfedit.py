@@ -1514,3 +1514,16 @@ def test_propose_refuses_sim_when_physics_markers_missing(fake_repo, monkeypatch
         'worker', 'sim.py', 'X = 1', 'X = 2', 'ordinary edit')
     assert ok is False
     assert 'guard markers' in payload['error']
+
+
+def test_non_python_asset_skips_python_compile(fake_repo, monkeypatch):
+    root, world = fake_repo
+    (world / 'panel.html').write_text('<html><body>panel</body></html>\n',
+                                      encoding='utf-8')
+    _approve(monkeypatch)
+    ok, payload = selfedit.propose(
+        'worker', 'world/panel.html', '<html><body>panel</body></html>',
+        '<html><body class="artifact">panel</body></html>',
+        'artifact-style pressoffice shell')
+    assert ok is True, payload
+    assert payload['status'] == 'armed'

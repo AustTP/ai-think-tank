@@ -10822,6 +10822,31 @@ def _queue_refined_meeting(state, req, pending):
     })
 
 
+def _refinement_assigned_worker(state, req, filed_by, pending):
+    """The worker a refining card should stay assigned to, or None.
+
+    'player' is always preserved. An agent id is preserved only when a
+    director or the team's scrum master filed the request and named a real
+    non-director worker. Otherwise the normal round-robin assignment stands.
+    """
+    assigned = (req.get('assignedTo') or '').strip()
+    if assigned == 'player':
+        return 'player'
+    if not assigned:
+        return None
+    roster = {d.get('id'): d for d in (state.get('agentRoster') or [])
+              if isinstance(d, dict)}
+    target = roster.get(assigned)
+    filer = roster.get(filed_by) or {}
+    team = _team_row(state, req.get('teamId') or pending.get('teamId'))
+    is_lead = bool(filer.get('isDirector') or filer.get('isAdmin')
+                   or (team and (team.get('scrumMasterId') == filed_by
+                                 or team.get('directorId') == filed_by)))
+    if target and is_lead and not target.get('isDirector') and not target.get('isAdmin'):
+        return assigned
+    return None
+
+
 def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
     """When the ceremony window elapses, the scrum master grooms every pending
     request: the injectable refinement decider picks accept/reject per request,
@@ -10999,9 +11024,12 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                     'priority': req.get('priority'),
                     # Human-in-the-loop: a card the filer marked for the PLAYER
                     # (assignedTo 'player') stays the player's -- _assign_due_item
-                    # hands it to the player instead of an agent. Any other value is
-                    # dropped (agents are picked, not named, on the refinement path).
-                    'assignedTo': req.get('assignedTo') if req.get('assignedTo') == 'player' else None,
+                    # hands it to the player instead of an agent. A director or
+                    # scrum master may also name a worker; that assignment is
+                    # preserved so the SM creates the card AND staffs it, instead
+                    # of telling the player to find a worker.
+                    'assignedTo': _refinement_assigned_worker(
+                        state, req, filed_by, pending),
                     # The card's attention lane survives grooming onto the queue
                     # (queue_work normalizes), so a build/reading/parking-lot card
                     # keeps its lane through refinement.

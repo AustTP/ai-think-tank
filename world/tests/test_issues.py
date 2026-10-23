@@ -379,3 +379,33 @@ class IssueListing(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class RefinementAssignedWorker(unittest.TestCase):
+    def _state(self):
+        return {
+            'agentRoster': [
+                {'id': 'nora', 'name': 'Nora', 'isDirector': True},
+                {'id': 'leo', 'name': 'Leo'},
+                {'id': 'ben', 'name': 'Ben', 'isDirector': True},
+            ],
+            'teams': [{'id': 'nora', 'directorId': 'nora'}],
+        }
+
+    def test_director_can_pin_a_worker(self):
+        self.assertEqual(sim._refinement_assigned_worker(
+            self._state(), {'teamId': 'nora', 'assignedTo': 'leo'},
+            'nora', {'teamId': 'nora'}), 'leo')
+
+    def test_director_cannot_pin_another_director(self):
+        self.assertIsNone(sim._refinement_assigned_worker(
+            self._state(), {'teamId': 'nora', 'assignedTo': 'ben'},
+            'nora', {'teamId': 'nora'}))
+
+    def test_worker_cannot_pin_a_worker(self):
+        self.assertIsNone(sim._refinement_assigned_worker(
+            self._state(), {'teamId': 'nora', 'assignedTo': 'leo'},
+            'leo', {'teamId': 'nora'}))
+
+    def test_player_pin_survives(self):
+        self.assertEqual(sim._refinement_assigned_worker(
+            self._state(), {'assignedTo': 'player'}, 'player', {}), 'player')

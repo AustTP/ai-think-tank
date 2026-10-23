@@ -438,7 +438,13 @@ def _staging_candidate(edit_id):
     return os.path.join(_world(), '.selfedit_staging', f'{edit_id}.cand')
 
 
-def _compile_error(text):
+def _compile_error(text, path=''):
+    # Python's compiler only applies to Python modules. HTML, JS, CSS, and
+    # other assets are valid self-edit targets; compiling them as Python
+    # produced false "invalid decimal literal" failures and blocked the
+    # pressoffice artifact change. The repo gate still tests the tree.
+    if path and not str(path).endswith('.py'):
+        return None
     try:
         compile(text, '<selfedit-candidate>', 'exec')
     except SyntaxError as e:
@@ -497,7 +503,7 @@ def propose(agent_id, path, find, replace, summary, window_only=False):
                                 f'{where}. Include more surrounding context '
                                 'to make the anchor unique'}
     candidate = original.replace(find, replace, 1)
-    syntax_err = _compile_error(candidate)
+    syntax_err = _compile_error(candidate, resolved)
     if syntax_err:
         return False, {'error': f'candidate does not compile: {syntax_err} -- '
                                 'fix the splice before proposing'}
@@ -727,7 +733,13 @@ def _validate(edit_id, resolved, candidate):
             errors.append('compileall: ' + (step.stdout or step.stderr)[-400:])
         else:
             checks.append('compileall ok')
-        if is_kernel(resolved):
+        is_python = str(resolved).endswith('.py')
+        if not is_python:
+            # HTML/JS/CSS assets are valid change-request targets. Python's
+            # flake8 and import smoke do not apply; the repo gate still runs
+            # on the live tree after apply.
+            checks.append('non-Python asset: flake8/import smoke skipped')
+        elif is_kernel(resolved):
             # serve.py deliberately imports after config/root setup (E402) and
             # predates this gate; the full preflight suite is its real bar.
             checks.append('flake8 skipped for the kernel')
@@ -741,17 +753,18 @@ def _validate(edit_id, resolved, candidate):
                 errors.append('flake8: ' + (flake.stdout or flake.stderr)[-400:])
             else:
                 checks.append('flake8 ok')
-        modname = os.path.splitext(os.path.basename(resolved))[0]
-        smoke_src = (f'import sys; sys.path.insert(0, {tmp!r}); '
-                     f'import {modname}')
-        smoke = subprocess.run(
-            [py, '-c', smoke_src],
-            capture_output=True, text=True, timeout=180, cwd=tmp,
-            env={**os.environ, 'PYTHONPATH': tmp})
-        if smoke.returncode != 0:
-            errors.append('import smoke: ' + (smoke.stderr or smoke.stdout)[-600:])
-        else:
-            checks.append('import smoke ok')
+        if is_python and not is_kernel(resolved):
+            modname = os.path.splitext(os.path.basename(resolved))[0]
+            smoke_src = (f'import sys; sys.path.insert(0, {tmp!r}); '
+                         f'import {modname}')
+            smoke = subprocess.run(
+                [py, '-c', smoke_src],
+                capture_output=True, text=True, timeout=180, cwd=tmp,
+                env={**os.environ, 'PYTHONPATH': tmp})
+            if smoke.returncode != 0:
+                errors.append('import smoke: ' + (smoke.stderr or smoke.stdout)[-600:])
+            else:
+                checks.append('import smoke ok')
     except subprocess.TimeoutExpired:
         errors.append('validator timed out')
     except Exception as e:

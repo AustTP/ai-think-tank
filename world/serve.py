@@ -17830,6 +17830,7 @@ async def create_issue(request: Request):
         description=(body.get('description') or ''),
         title=(body.get('title') or ''),
         story_points=body.get('storyPoints'),
+        assigned_to=body.get('assignedTo'),
         attendees=body.get('attendees'),
         facilitator_id=body.get('facilitatorId'))
     if issue is None:
