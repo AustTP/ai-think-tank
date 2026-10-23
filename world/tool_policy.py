@@ -27,7 +27,7 @@ _READ_ONLY_TOOLS = frozenset({
 _PREPARE_TOOLS = frozenset({
     'create_gmail_draft', 'create_google_doc', 'write_spike_report',
     'write_report', 'draft_email', 'save_note', 'execute_script',
-    'download_file', 'mark_mailbox_read', 'pulse_watch', 'browser_step',
+    'download_file', 'youtube_transcript', 'mark_mailbox_read', 'pulse_watch', 'browser_step',
     'browser_act', 'solve_captcha', 'ack_event_stream', 'read_event_stream',
     'read_object_store',
 })

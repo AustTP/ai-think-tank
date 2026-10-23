@@ -1630,6 +1630,7 @@ class ToolSafetyPolicy(unittest.TestCase):
 
     def test_prepare_and_commit_tiers(self):
         self.assertEqual(content.tool_trust_tier('create_gmail_draft'), 'prepare')
+        self.assertEqual(content.tool_trust_tier('youtube_transcript'), 'prepare')
         self.assertEqual(content.tool_trust_tier('create_calendar_event'), 'commit')
         self.assertEqual(content.tool_trust_tier('apify_run_actor'), 'commit')
 
@@ -1643,6 +1644,7 @@ class TaskToolPolicy(unittest.TestCase):
         policy = content.task_tool_policy({'taskType': 'research'})
         self.assertTrue(policy('read_library_file'))
         self.assertTrue(policy('execute_script'))
+        self.assertTrue(policy('youtube_transcript'))
         self.assertFalse(policy('apify_run_actor'))
         self.assertFalse(policy('create_calendar_event'))
 
