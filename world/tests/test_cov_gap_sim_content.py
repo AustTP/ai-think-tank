@@ -753,6 +753,8 @@ class SimResidualTest(_Base):
         self.assertIn('spike card', accept)
         self.assertEqual(req['status'], 'accepted')
         self.assertEqual(state['workQueue'][-1]['room'], 'pressoffice')
+        self.assertEqual(state['workQueue'][-1]['taskType'], 'spike',
+                         'the issue type must survive into the queue lane')
 
     def test_resolve_breakdown_never_text(self):
         req = {'id': 'r1', 'status': 'pending', 'filedBy': 'cora',

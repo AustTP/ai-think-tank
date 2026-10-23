@@ -11163,9 +11163,16 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                 assigned_worker = _refinement_assigned_worker(
                     state, req, filed_by, pending)
                 directed = bool(assigned_worker and assigned_worker != 'player')
+                # The issue type IS the lane. Without this, a spike/jira card
+                # defaulted to 'code', directors were filtered out, and a
+                # directed pin was silently dropped.
+                queue_task_type = (card_type if card_type in
+                                   ('spike', 'research', 'meeting', 'review', 'qa', 'bug')
+                                   else 'code')
                 queue_work(state, [{
                     'title': req['title'], 'room': req['room'], 'goal': req.get('title'),
                     'instructions': instructions,
+                    'taskType': queue_task_type,
                     'teamId': req.get('teamId'),
                     'userStory': story,
                     'acceptanceCriteria': criteria,
