@@ -3001,6 +3001,125 @@ def sync_prototypes(agent_id, sandbox_dir):
         print(f'[agent-dirs] prototypes sync failed for {agent_id}: {e}')
 
 
+_FAILURE_NOTICE_STATE = {}
+_FAILURE_NOTICE_LOCK = threading.Lock()
+_FAILURE_NOTICE_FIELDS = ('taskId', 'windowId', 'id', 'path', 'service', 'host',
+                          'url', 'title', 'reason', 'error', 'note', 'decision',
+                          'summary', 'cost', 'confidence')
+
+
+def _failure_spec(action, details):
+    """Return (label, severity) for an operational failure, or None.
+
+    The action log is the one place every subsystem already writes its
+    outcome. This maps the failure-shaped actions to a player-facing notice
+    without notifying ordinary successful work. Normal review rejections stay
+    low severity and are throttled; they are still included.
+    """
+    a = str(action or '').lower()
+    d = details if isinstance(details, dict) else {}
+    decision = str(d.get('decision') or '').lower()
+    if a == 'api_key_auth_failure' or 'auth_failure' in a:
+        return 'API key authentication failed', 'critical'
+    if 'rollback_failed' in a or 'kernel_apply_failed' in a:
+        return 'A change request could not roll back or apply safely', 'critical'
+    if 'self_edit_review_unavailable' in a:
+        return 'The self-edit reviewer was unavailable', 'high'
+    if 'post_apply_tests_failed' in a or 'pre_apply_failed' in a:
+        return 'A change request failed the repo test gate', 'high'
+    if 'apply_failed' in a or 'validation' in a and ('failed' in a or 'refused' in a):
+        return 'A change request failed to apply or validate', 'high'
+    if 'content_run_abandoned' in a:
+        return 'A content run was abandoned', 'high'
+    if 'work_item_abandoned' in a:
+        return 'A queued work item was abandoned', 'high'
+    if 'dormancy_window_refused' in a:
+        return 'A change request window was refused', 'high'
+    if 'telegram_failed' in a or 'mail_failed' in a:
+        return 'A notification delivery failed', 'medium'
+    if a == 'quality_gate_reject' or a.endswith('_reject') or 'rejected' in a:
+        return 'A review or gate rejected work', 'low'
+    if a.endswith('_denied') or 'denied' in a:
+        return 'A policy or permission check denied a request', 'medium'
+    if a.endswith('_refused') or 'refused' in a:
+        return 'A request was refused', 'medium'
+    if a.endswith('_failed') or '_failure' in a or a.endswith('_failure'):
+        return 'An operation failed', 'medium'
+    if decision in ('blocked', 'denied', 'allowed_but_fetch_failed',
+                    'allowed_but_failed', 'failed', 'refused', 'rejected'):
+        return 'An operation failed or was blocked', 'medium'
+    return None
+
+
+def _failure_notice_key(action, details):
+    d = details if isinstance(details, dict) else {}
+    for field in ('taskId', 'windowId', 'id', 'path', 'service', 'host',
+                  'url', 'title', 'agentId', 'agent'):
+        value = d.get(field)
+        if value:
+            return f'{action}|{field}|{str(value)[:180]}'
+    return f'{action}|global'
+
+
+def _failure_notice_message(agent_id, action, details, label, severity, count=1):
+    d = details if isinstance(details, dict) else {'detail': details}
+    when = time.strftime('%Y-%m-%d %H:%M:%S %Z')
+    bits = []
+    for field in _FAILURE_NOTICE_FIELDS:
+        value = d.get(field)
+        if value in (None, '', [], {}):
+            continue
+        if field in ('reason', 'error', 'note', 'decision', 'summary'):
+            bits.append(f'{field}: {str(value)[:500]}')
+        else:
+            bits.append(f'{field}: {str(value)[:180]}')
+    detail = '\n'.join(bits) or 'No detail was recorded.'
+    detail = _redact_secrets(detail)[:1800]
+    subject = f'[AI Think Tank] Failure: {label}'
+    body = (
+        f'Agent: {agent_id or "system"}\n'
+        f'When: {when}\n'
+        f'Severity: {severity.upper()}\n'
+        f'Action: {action}\n'
+        f'What happened: {label}\n\n'
+        f'{detail}\n'
+    )
+    if count > 1:
+        body += (f'\nThis failure repeated {count} times since the previous '
+                 'notice; identical failures are grouped for one cooldown '
+                 'window.')
+    return subject, body[:4096]
+
+
+def _send_failure_notice(subject, body):
+    try:
+        send_player_telegram_sync(subject, body)
+    except Exception:
+        pass
+
+
+def _maybe_notify_failure(agent_id, action, details):
+    spec = _failure_spec(action, details)
+    if spec is None:
+        return
+    label, severity = spec
+    cooldown = {'critical': 300, 'high': 300, 'medium': 900, 'low': 3600}.get(
+        severity, 900)
+    now = time.time()
+    key = _failure_notice_key(action, details)
+    with _FAILURE_NOTICE_LOCK:
+        state = _FAILURE_NOTICE_STATE.get(key)
+        if state and now - state['last'] < cooldown:
+            state['suppressed'] = state.get('suppressed', 0) + 1
+            return
+        count = (state.get('suppressed', 0) + 1) if state else 1
+        _FAILURE_NOTICE_STATE[key] = {'last': now, 'suppressed': 0}
+    subject, body = _failure_notice_message(
+        agent_id, action, details, label, severity, count)
+    threading.Thread(target=_send_failure_notice,
+                     args=(subject, body), daemon=True).start()
+
+
 def log_action(agent_id, action, details=None, authorized=None, trace_id=None):
     # The single, comprehensive activity log that records all
     # actions, not just the ones a specific feature happened to write to
@@ -3013,6 +3132,11 @@ def log_action(agent_id, action, details=None, authorized=None, trace_id=None):
             'INSERT INTO action_log (agent_id, action, details, authorized, ts, trace_id) VALUES (?, ?, ?, ?, ?, ?)',
             (agent_id, action, json.dumps(details) if details is not None else None, authorized, time.time(), trace_id),
         )
+    try:
+        _maybe_notify_failure(agent_id, action, details)
+    except Exception:
+        # A notification can never break the action log itself.
+        pass
 
 
 # Heuristic: map each decision prompt's instruction text to a coarse kind label.

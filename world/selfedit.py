@@ -3073,10 +3073,18 @@ def _telegram_change_request(window_id, category, note, sha=None, n_edits=None):
     else:
         head = (f'Change request {window_id}: UNSUCCESSFUL -- nothing was '
                 'pushed to main')
-    body = head
+    labels = {'successful': 'SUCCESSFUL',
+              'successful_with_issues': 'SUCCESSFUL WITH ISSUES',
+              'unsuccessful': 'UNSUCCESSFUL'}
+    label = labels.get(category, str(category).upper())
+    body = f'Outcome: {label}\nEnded: {time.strftime("%Y-%m-%d %H:%M:%S %Z")}\n\n{head}'
     if note:
-        body += f'\n\nNote: {note}'
-    return _notify_player_telegram('[AI Think Tank] Change request', body)
+        body += f'\n\nExplanation: {note}'
+    if category == 'unsuccessful':
+        body += ('\n\nNothing was pushed. The tank remains on the last good '
+                 'main; review the explanation above before retrying.')
+    return _notify_player_telegram(
+        f'[AI Think Tank] Change request ended: {label}', body[:4096])
 
 
 def _hold_for_validator(window_id, remediation_used, tail):
