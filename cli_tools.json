@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "comment": "Operator registry for the CLI transport. Stored at the repo root outside the statically served world/ tree. Each entry is an argv array, never a shell string. Extra model-supplied args are refused unless allow_args is true. read_only entries may run through read_cli; everything else needs run_cli and commit approval. env is non-secret literal config; env_from copies a parent environment variable.",
+  "tools": {
+    "git_status": {
+      "name": "Git status",
+      "description": "Show the repository working tree status.",
+      "enabled": false,
+      "command": ["git", "status", "--short"],
+      "cwd": ".",
+      "timeout_s": 15,
+      "max_output_bytes": 200000,
+      "read_only": true,
+      "allow_args": false
+    },
+    "git_diff_stat": {
+      "name": "Git diff stat",
+      "description": "Show a summary of unstaged changes.",
+      "enabled": false,
+      "command": ["git", "diff", "--stat"],
+      "cwd": ".",
+      "timeout_s": 15,
+      "max_output_bytes": 200000,
+      "read_only": true,
+      "allow_args": false
+    }
+  }
+}

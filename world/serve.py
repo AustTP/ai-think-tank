@@ -11844,6 +11844,24 @@ try:  # generic MCP client: operator-registered servers and tool calls
 except Exception:  # pragma: no cover - optional module during bootstrap
     mcp_client = None
     _MCP_TOOLS = []
+try:  # durable event streams: Redis Streams and SQS
+    import durable_streams
+    _DURABLE_STREAM_TOOLS = durable_streams.DURABLE_STREAM_TOOLS
+except Exception:  # pragma: no cover - optional module during bootstrap
+    durable_streams = None
+    _DURABLE_STREAM_TOOLS = []
+try:  # S3-compatible object storage
+    import object_store
+    _OBJECT_STORE_TOOLS = object_store.OBJECT_STORE_TOOLS
+except Exception:  # pragma: no cover - optional module during bootstrap
+    object_store = None
+    _OBJECT_STORE_TOOLS = []
+try:  # allowlisted CLI transport
+    import cli_tools
+    _CLI_TOOLS = cli_tools.CLI_TOOLS
+except Exception:  # pragma: no cover - optional module during bootstrap
+    cli_tools = None
+    _CLI_TOOLS = []
 
 AGENT_ASK_TOOLS = [
     {
@@ -12672,7 +12690,7 @@ AGENT_ASK_TOOLS = [
             },
         },
     },
-] + _MCP_TOOLS
+] + _MCP_TOOLS + _DURABLE_STREAM_TOOLS + _OBJECT_STORE_TOOLS + _CLI_TOOLS
 
 # Operator/village-editable tool descriptions: world/tool_descriptions.json is
 # an override layer over the inline text above (config.TOOL_DESCRIPTIONS). The
@@ -18690,6 +18708,145 @@ def _mcp_tool_text(name, args, agent_id=None):
     return f'{instruction}\n\n{wrapped}'
 
 
+def _wrap_external_text(raw, source):
+    wrapped, _nonce, _tag, instruction = wrap_external_content(raw, source)
+    return f'{instruction}\n\n{wrapped}'
+
+
+def _durable_tool_text(name, args, agent_id=None):
+    if durable_streams is None:
+        return 'Durable event stream support is not available on this server.'
+    args = args or {}
+    try:
+        if name == 'list_event_streams':
+            raw = durable_streams.streams_text()
+            source = 'operator-registered durable event stream metadata'
+        elif name == 'read_event_stream':
+            stream = str(args.get('stream') or '')
+            out = durable_streams.read_stream(
+                stream, count=args.get('max'),
+                block_ms=args.get('blockMs'), wait_s=args.get('waitS'),
+                max_bytes=args.get('maxBytes'))
+            source = f'durable event stream {stream or "?"}'
+            try:
+                log_action(agent_id or 'unknown', 'event_stream_read', {
+                    'stream': stream,
+                    'count': len(out.get('messages') or []),
+                    'ok': bool(out.get('ok')),
+                }, authorized=bool(out.get('ok')))
+            except Exception:
+                pass
+            if not out.get('ok'):
+                return _wrap_external_text(
+                    'Event stream read failed: ' + (out.get('error') or 'unknown error'),
+                    source)
+            raw = out.get('text') or '(no messages)'
+        elif name == 'ack_event_stream':
+            stream = str(args.get('stream') or '')
+            out = durable_streams.ack_stream(stream, args.get('receipts') or [])
+            source = f'durable event stream {stream or "?"}'
+            try:
+                log_action(agent_id or 'unknown', 'event_stream_ack', {
+                    'stream': stream,
+                    'acked': out.get('acked', out.get('deleted', 0)),
+                    'ok': bool(out.get('ok')),
+                }, authorized=bool(out.get('ok')))
+            except Exception:
+                pass
+            if not out.get('ok'):
+                reason = out.get('error') or out.get('text') or 'unknown error'
+                if out.get('errors'):
+                    reason += ' | ' + '; '.join(str(e) for e in out['errors'])
+                return _wrap_external_text(
+                    'Event stream ack failed: ' + reason, source)
+            raw = out.get('text') or 'acknowledged'
+        else:
+            return 'Unknown durable event stream tool.'
+    except Exception as exc:
+        return _wrap_external_text(
+            f'Event stream call failed: {exc}', 'durable event stream error')
+    return _wrap_external_text(raw, source)
+
+
+def _object_tool_text(name, args, agent_id=None):
+    if object_store is None:
+        return 'Object storage support is not available on this server.'
+    args = args or {}
+    try:
+        if name == 'list_object_stores':
+            raw = object_store.stores_text()
+            source = 'operator-registered object store metadata'
+        else:
+            store = str(args.get('store') or '')
+            action = str(args.get('action') or '')
+            source = f'object store {store or "?"} action {action or "?"}'
+            if name == 'read_object_store':
+                out = object_store.read_store(store, action, args, agent_id)
+                try:
+                    log_action(agent_id or 'unknown', 'object_store_read', {
+                        'store': store,
+                        'action': action,
+                        'key': str(args.get('key') or ''),
+                        'ok': bool(out.get('ok')),
+                    }, authorized=bool(out.get('ok')))
+                except Exception:
+                    pass
+            elif name == 'write_object_store':
+                out = object_store.write_store(store, action, args, agent_id)
+                try:
+                    log_action(agent_id or 'unknown', 'object_store_write', {
+                        'store': store,
+                        'action': action,
+                        'key': str(args.get('key') or ''),
+                        'ok': bool(out.get('ok')),
+                    }, authorized=bool(out.get('ok')))
+                except Exception:
+                    pass
+            else:
+                return 'Unknown object store tool.'
+            if not out.get('ok'):
+                return _wrap_external_text(
+                    'Object store call failed: ' + (out.get('error') or 'unknown error'),
+                    source)
+            raw = out.get('text') or '(empty object store result)'
+    except Exception as exc:
+        return _wrap_external_text(
+            f'Object store call failed: {exc}', 'object store error')
+    return _wrap_external_text(raw, source)
+
+
+def _cli_tool_text(name, args, agent_id=None):
+    if cli_tools is None:
+        return 'CLI transport support is not available on this server.'
+    args = args or {}
+    try:
+        if name == 'list_cli_tools':
+            raw = cli_tools.tools_text()
+            source = 'operator-registered CLI tool metadata'
+        else:
+            tool = str(args.get('tool') or '')
+            source = f'CLI tool {tool or "?"}'
+            out = cli_tools.run_tool(
+                tool, args.get('args') or [],
+                read_only=(name == 'read_cli'), max_bytes=args.get('maxBytes'))
+            try:
+                log_action(agent_id or 'unknown', 'cli_run', {
+                    'tool': tool,
+                    'exitCode': out.get('exitCode'),
+                    'ok': bool(out.get('ok')),
+                    'truncated': bool(out.get('truncated')),
+                }, authorized=bool(out.get('ok')))
+            except Exception:
+                pass
+            if not out.get('ok'):
+                reason = out.get('text') or out.get('error') or 'CLI call failed'
+                return _wrap_external_text('CLI call failed: ' + reason, source)
+            raw = out.get('text') or '(empty CLI output)'
+    except Exception as exc:
+        return _wrap_external_text(f'CLI call failed: {exc}', 'CLI transport error')
+    return _wrap_external_text(raw, source)
+
+
 def _make_web_tools_executor(agent_id, agent_key, default_location=None, default_query=None, struck_tools=None, work_context='', work_context_trusted=False, task_id=None):
     """Shared search_web/browse_page tool executor for any
     AGENT_ASK_TOOLS-driven tool-calling loop. Extracted so the
@@ -18738,6 +18895,25 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                     'call it again, use a different tool or approach instead.')
         if name in ('mcp_list_servers', 'mcp_list_tools', 'mcp_read', 'mcp_call'):
             return _mcp_tool_text(name, args, agent_id=agent_id)
+        if name in ('list_event_streams', 'read_event_stream', 'ack_event_stream'):
+            return _durable_tool_text(name, args, agent_id=agent_id)
+        if name in ('list_object_stores', 'read_object_store', 'write_object_store'):
+            return _object_tool_text(name, args, agent_id=agent_id)
+        if name in ('list_cli_tools', 'read_cli', 'run_cli'):
+            return _cli_tool_text(name, args, agent_id=agent_id)
+        if name == 'browser_act':
+            from content import _make_browser_act_executor
+            return _make_browser_act_executor(
+                agent_id, agent_key, f'sandbox-ask-{agent_id}',
+                struck_tools=struck_tools, work_context=work_context,
+                work_context_trusted=work_context_trusted,
+                task_id=task_id)(name, args)
+        if name == 'solve_captcha':
+            from content import _make_captcha_solve_executor
+            return _make_captcha_solve_executor(agent_id, agent_key)(name, args)
+        if name == 'list_capability_handles':
+            from content import _make_list_handles_executor
+            return _make_list_handles_executor(agent_id, agent_key)(name, args)
         if name == 'team_status':
             # Read-only live queue/assignment view (DB-only, no state change) --
             # offered to spikes too, so a spike can see what the team is doing
@@ -19933,7 +20109,9 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         import content as _content
         tools = tools + [_content._PROJECT_BOARD_TOOL]
         if BROWSING_ENABLED:
-            tools = tools + [_content._BROWSER_STEP_TOOL, _content._AGENT_READINESS_TOOL]
+            tools = tools + [_content._BROWSER_STEP_TOOL, _content._BROWSER_ACT_TOOL,
+                             _content._CAPTCHA_SOLVE_TOOL, _content._LIST_HANDLES_TOOL,
+                             _content._AGENT_READINESS_TOOL]
     except Exception:
         pass
     try:

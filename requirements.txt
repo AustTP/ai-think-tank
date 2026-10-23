@@ -24,6 +24,12 @@ python-pptx==1.0.2
 # the other runtime dependencies; serve.py falls back to the stdlib parser if
 # the package is missing.
 defusedxml==0.7.1
+# Durable event streams (Redis Streams) and S3-compatible object storage.
+# Both imports are lazy in world/durable_streams.py and world/object_store.py,
+# so a deployment without these backends still boots and returns a clear
+# per-tool error. Pinned to the versions verified on this host.
+boto3==1.43.89
+redis==8.1.0
 
 # Quality gates. Pinned to the exact versions baked into the Work Room
 # sandbox (world/sandbox/Dockerfile) and expected by the CI workflow

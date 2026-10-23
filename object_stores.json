@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "comment": "Operator registry for S3-compatible object stores. Stored at the repo root outside the statically served world/ tree. Credentials come from the standard AWS environment or profile, never from this file. Keys are relative to the configured prefix. allow_write is false by default. get_file and put_file are restricted to agents/<id>/downloads/ and uploads/.",
+  "stores": {
+    "s3_objects": {
+      "name": "S3-compatible objects",
+      "description": "Example read-only S3-compatible store. Enable after setting the bucket, region, and AWS credentials.",
+      "backend": "s3",
+      "enabled": false,
+      "bucket": "think-tank",
+      "prefix": "shared/",
+      "region": "us-east-1",
+      "profile": null,
+      "endpoint_url": null,
+      "allow_write": false,
+      "max_read_bytes": 2000000,
+      "max_write_bytes": 20000000
+    }
+  }
+}

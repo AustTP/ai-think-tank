@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "comment": "Operator registry for durable event streams. Stored at the repo root outside the statically served world/ tree. Redis Streams uses a consumer group and XACK; SQS uses visibility timeouts and DeleteMessage. Reads do not acknowledge. Prefer url_env over a literal url when the Redis URL contains a password. Backends are optional: add only the streams you actually operate, and set enabled true after the credentials and target exist.",
+  "streams": {
+    "redis_events": {
+      "name": "Redis Streams events",
+      "description": "Example durable Redis Streams consumer. Enable after setting REDIS_EVENTS_URL and creating the stream.",
+      "backend": "redis_stream",
+      "enabled": false,
+      "url_env": "REDIS_EVENTS_URL",
+      "stream": "think-tank-events",
+      "group": "think-tank",
+      "consumer": "agent",
+      "max_batch": 20,
+      "block_ms": 0,
+      "max_message_bytes": 1000000
+    },
+    "sqs_events": {
+      "name": "AWS SQS events",
+      "description": "Example durable SQS consumer. Enable after setting standard AWS credentials and the queue URL.",
+      "backend": "sqs",
+      "enabled": false,
+      "queue_url": "https://sqs.us-east-1.amazonaws.com/000000000000/think-tank-events",
+      "region": "us-east-1",
+      "profile": null,
+      "endpoint_url": null,
+      "visibility_timeout_s": 60,
+      "wait_time_s": 0,
+      "max_messages": 10,
+      "max_message_bytes": 1000000
+    }
+  }
+}

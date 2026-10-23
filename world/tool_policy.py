@@ -12,6 +12,8 @@ _READ_ONLY_TOOLS = frozenset({
     'github_get_repo', 'github_search_code', 'read_ais_feed', 'read_market_feed',
     'read_live_feed', 'read_rss_feed', 'read_weather', 'read_google_sheet',
     'read_live_coverage', 'mcp_list_servers', 'mcp_list_tools', 'mcp_read',
+    'list_event_streams', 'list_object_stores',
+    'list_cli_tools', 'read_cli', 'list_capability_handles',
     'list_calendar_events', 'search_gmail_messages', 'read_gmail_message',
     'read_google_doc', 'list_services', 'apify_get_dataset_items',
     'db_records', 'state_records', 'supervisor_db_records',
@@ -26,7 +28,8 @@ _PREPARE_TOOLS = frozenset({
     'create_gmail_draft', 'create_google_doc', 'write_spike_report',
     'write_report', 'draft_email', 'save_note', 'execute_script',
     'download_file', 'mark_mailbox_read', 'pulse_watch', 'browser_step',
-    'browser_act',
+    'browser_act', 'solve_captcha', 'ack_event_stream', 'read_event_stream',
+    'read_object_store',
 })
 _COMMIT_TOOLS = frozenset({
     'apify_run_actor', 'create_calendar_event', 'append_google_sheet_row',
@@ -37,7 +40,7 @@ _COMMIT_TOOLS = frozenset({
     'adversarial_village', 'local_file', 'app_script', 'send_email',
     'send_sms', 'send_telegram', 'publish_skill', 'send_mail', 'api_call',
     'self_edit', 'schedule_dormant_apply', 'selfedit_fix', 'policy_edit',
-    'mcp_call',
+    'mcp_call', 'write_object_store', 'run_cli',
     'request_credential_access', 'start_live_coverage', 'stop_live_coverage',
 })
 
@@ -45,6 +48,8 @@ _COMMIT_TOOLS = frozenset({
 def tool_replay_safety(name):
     """'safe' when repeating the call cannot create a second side effect."""
     name = str(name or '')
+    if name in _PREPARE_TOOLS:
+        return 'unsafe'
     if name in _READ_ONLY_TOOLS:
         return 'safe'
     if name.startswith(('read_', 'search_', 'list_', 'get_')):
@@ -57,10 +62,10 @@ def tool_trust_tier(name):
     name = str(name or '')
     if name in _COMMIT_TOOLS:
         return 'commit'
-    if tool_replay_safety(name) == 'safe':
-        return 'research'
     if name in _PREPARE_TOOLS:
         return 'prepare'
+    if tool_replay_safety(name) == 'safe':
+        return 'research'
     return 'commit'
 
 

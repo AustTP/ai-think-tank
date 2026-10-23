@@ -449,8 +449,12 @@ class AskEndpoint(unittest.TestCase):
                      'selfedit_validate', 'policy_edit',
                      'veto_change_request',
                      'mcp_list_servers', 'mcp_list_tools', 'mcp_read', 'mcp_call',
+                     'list_event_streams', 'read_event_stream', 'ack_event_stream',
+                     'list_object_stores', 'read_object_store', 'write_object_store',
+                     'list_cli_tools', 'read_cli', 'run_cli',
                      'pulse_watch', 'read_pulse', 'project_board'}
-                    | ({'browser_step', 'audit_agent_readiness'}
+                    | ({'browser_step', 'browser_act', 'solve_captcha',
+                        'list_capability_handles', 'audit_agent_readiness'}
                        if serve.BROWSING_ENABLED else set())
                     | ({'search_web'} if serve.TAVILY_API_KEY else set())
                     | ({'generate_image', 'generate_video'} if serve._higgsfield_configured() else set()))
