@@ -32,6 +32,7 @@ import urllib.parse
 import serve as _serve
 import evidence_policy
 import review_quality
+import skill_prompts
 import training_capture
 import url_evidence
 import work_reuse
@@ -67,6 +68,25 @@ PREMISE_QUESTIONING_GUIDANCE = (
     'question itself and ask whether it is even the right question to be asking. '
     'Challenge the frame -- the most valuable finding is often that the frame was '
     'wrong. Distinguish what you actually verified from what you are assuming.'
+)
+
+# Deterministic fallbacks keep the two task playbooks usable even if the
+# operator-editable skill files are missing. Normal runs load the instruction
+# sections from library/skills through skill_prompts.load_skill_prompt().
+_REPORT_WRITING_FALLBACK = (
+    'Write the report requested by the card below, using ONLY the source text '
+    'supplied here as evidence. Cite the source path for each claim. If a source '
+    'has no timestamps, write "timestamps unavailable" and do not invent any. If a '
+    'source is missing, say so explicitly and make no claims from it. Do not mention '
+    'tools, tool failures, or any content that is not in the sources. Keep the '
+    'addendum under 900 words. End with one revised final recommendation line: '
+    'ADOPT / REJECT / ADOPT (limited), with conditions.'
+)
+_MEETING_MINUTES_FALLBACK = (
+    'Write plain Markdown with exactly these sections: Topic; Attendees; Discussion '
+    '(2-4 bullets in the participants\' voices); Decisions; Action items. Stay inside '
+    'the agenda. Invent no external facts or decisions the agenda cannot support. '
+    'Respect any NEVER section. Under 200 words.'
 )
 
 
@@ -894,18 +914,13 @@ def _run_report_content(snapshot, agent_id, task, base_ctx=None):
     model = _serve._resolve_model_tier(
         f'Write a source-grounded report: {(task.get("title") or "")[:200]}',
         allow_high=True)
+    report_guide = skill_prompts.load_skill_prompt(
+        'report-writing', fallback=_REPORT_WRITING_FALLBACK)
     prompt = (
-        f'You are {name}. Write the report requested by the card below, using ONLY the '
-        'source text supplied here as evidence.\n\n'
+        f'You are {name}. Write the report requested by the card below, using only '
+        f'the supplied source text. Follow this playbook:\n\n{report_guide}\n\n'
         f'Card: {task.get("title") or ""}\n'
         f'Instructions: {task.get("instructions") or ""}\n\n'
-        'Hard rules:\n'
-        '- Cite the source path for each claim.\n'
-        '- If the source has no timestamps, say "timestamps unavailable" and do not invent any.\n'
-        '- If a source is missing, say so explicitly and make no claims from it.\n'
-        '- Do not mention tools, tool failures, or any content that is not in the sources.\n'
-        '- Keep the addendum under 900 words.\n'
-        '- ALWAYS end with a single revised final recommendation line: ADOPT / REJECT / ADOPT (limited), with conditions.\n\n'
         'SOURCES:\n\n' + '\n\n'.join(chunks)
     )
     text = _plain_completion(model, [{'role': 'user', 'content': prompt}],
@@ -6373,21 +6388,14 @@ def _run_meeting_content(snapshot, agent_id, task, base_ctx=None):
             'ok': False,
         })
         return
+    minutes_guide = skill_prompts.load_skill_prompt(
+        'meeting-minutes', fallback=_MEETING_MINUTES_FALLBACK)
     system = (
         'You are the scribe for a team meeting in an AI think tank. The '
         'meeting has already happened in-world: the facilitator convened the '
         'listed attendees, they discussed the agenda, and you are writing the '
-        'minutes now. Write plain Markdown with exactly these sections:\n'
-        '- **Topic**: the meeting title/goal, one line.\n'
-        '- **Attendees**: the named participants, facilitator first.\n'
-        '- **Discussion**: 2-4 bullets of what was said, in the participants\' '
-        'voices -- grounded in the agenda only; invent no external facts and '
-        'no decisions the agenda cannot support.\n'
-        '- **Decisions**: what the group committed to, or "None yet".\n'
-        '- **Action items**: "owner: concrete next step", one per line, or '
-        '"None".\n'
-        'Stay inside the agenda. If the agenda names hard prohibitions (a '
-        'NEVER section), the minutes must respect them. Under 200 words.'
+        'minutes now. Follow this playbook:\n\n'
+        f'{minutes_guide}'
     )
     user = (f"Meeting: {title}\n\nAgenda:\n{agenda or '(none given)'}\n\n"
             f"Facilitator: {facilitator_name}\n"

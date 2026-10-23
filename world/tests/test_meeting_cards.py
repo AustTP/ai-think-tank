@@ -419,6 +419,9 @@ class MeetingExecutor(unittest.TestCase):
         self.assertEqual(model, 'test-tier')
         self.assertEqual(max_tokens, 1200)
         self.assertEqual([m['role'] for m in messages], ['system', 'user'])
+        system = messages[0]['content']
+        self.assertIn('Follow this playbook', system)
+        self.assertIn('**Action items**', system)
         user = messages[1]['content']
         for token in ('Meeting: Sprint retro', 'Ada', 'Dev', 'Ben',
                       'what shipped, what slowed us down.'):

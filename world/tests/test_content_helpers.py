@@ -1593,6 +1593,9 @@ class ReportContent(unittest.TestCase):
                                side_effect=lambda tid, result: stored.update(result)):
             content._run_report_content({}, 'ruth', task)
         self.assertIn('THE REAL TRANSCRIPT', completion.call_args[0][1][0]['content'])
+        prompt = completion.call_args[0][1][0]['content']
+        self.assertIn('Follow this playbook', prompt)
+        self.assertIn('ADOPT / REJECT', prompt)
         self.assertTrue(stored.get('ok'))
         self.assertEqual(stored.get('reportPath'), 'archive/out.md')
         self.assertIn('REAL SUMMARY', posted['args'][3]['content'])
