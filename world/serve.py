@@ -12724,7 +12724,7 @@ _LOCAL_FILE_TOOL = {
                        'omit it to list the scope root), read (read a file\'s text), write '
                        '(create/overwrite a file), move (move/rename within the folder), delete (move to '
                        'trash). Supply the exact '
-                       '`scope` path the player granted (e.g. /Users/you/Desktop) and a relative '
+                       '`scope` path the player granted and a relative '
                        '`path`/`from`/`to` within it.',
         'parameters': {
             'type': 'object',
@@ -18059,8 +18059,8 @@ async def list_file_grants(request: Request):
 @app.post('/api/file-grants')
 @_state_writer
 async def add_file_grant(request: Request):
-    """Grant the think tank scoped access to a folder. Body:
-    {scope: '/Users/you/Desktop', label: 'Desktop', caps: {read, write, delete}}.
+    """Grant the think tank scoped access to a folder. The body carries the
+    absolute `scope`, an optional `label`, and the `caps` map.
     `emptyTrash` is never accepted -- the trash rule is absolute. The scope must
     be an existing absolute directory. PLAYER-only."""
     actor = _grant_actor(request)

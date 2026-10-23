@@ -163,11 +163,6 @@ spatial reasoning from images (above), rhythm/syllable-structure work
 - Take roughly 100 illustrations and fine-tune / transfer-learn a
   HuggingFace model to generate illustrations in that style.
 
-## Family
-
-- Help provide activities for the operator's three-year-old son Miles, and
-  parenting tips on request.
-
 ## Build list
 
 Websites and applications the operator wants the think tank to build:
