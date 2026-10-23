@@ -10735,6 +10735,27 @@ def _ceremony_facilitator(state, team_id):
     for d in (state.get('agentRoster') or []):
         if d.get('isAdmin') and _free(d.get('id')):
             return d.get('id')
+    # No one is on duty. A pending groom is real work the player already
+    # asked for, so wake the best available facilitator instead of leaving it
+    # queued indefinitely. _start_refinement parks them on duty and restores
+    # their prior state afterwards.
+    def _wakeable(aid):
+        a = agents.get(aid)
+        return bool(a) and not a.get('busy')
+
+    if sm and _wakeable(sm):
+        return sm
+    if did and _wakeable(did):
+        return did
+    for t in (state.get('teams') or []):
+        other = t.get('directorId')
+        if not other or other == did:
+            continue
+        if _wakeable(other):
+            return other
+    for d in (state.get('agentRoster') or []):
+        if d.get('isAdmin') and _wakeable(d.get('id')):
+            return d.get('id')
     return None
 
 

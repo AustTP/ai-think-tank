@@ -657,6 +657,12 @@ class CeremonyBranches(SimIsolation):
         state['agents']['sm']['busy'] = False
         self.assertEqual(sim._ceremony_facilitator(state, 't1'), 'sm')
 
+    def test_ceremony_facilitator_wakes_when_everyone_is_off_duty(self):
+        state = self._team_state()
+        for a in state['agents'].values():
+            a['offDuty'] = True
+        self.assertIn(sim._ceremony_facilitator(state, 't1'), ('sm', 'dir'))
+
     def test_refinement_scrum_master_small_team_director_standin(self):
         state = self._team_state()
         state['teams'][0]['scrumMasterId'] = None
