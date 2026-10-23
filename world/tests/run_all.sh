@@ -256,6 +256,9 @@ echo
 echo "== Python: skill safety scan =="
 python3 tests/test_skill_scan.py
 echo
+echo "== Python: failure notification =="
+python3 tests/test_failure_notify.py
+echo
 echo "== Python: self-edit pipeline (proposal/change windows/remediation) =="
 python3 tests/test_selfedit.py
 echo
