@@ -214,14 +214,16 @@ _REVIEW_INSTRUCTIONS = (
     'summary describes. Approve only when purpose and scope are coherent '
     'and safe. Escalate when you are unsure.'
 )
-_REVIEW_CRITERIA = (
-    'A short summary describing intent (given).\n'
-    'The exact find/replace splice being made (given).\n'
-    'Reject destructive, self-privileging, or unexplained edits.\n'
-    'Only CONSTITUTION.md and constitution.py are immutable. serve.py is a '
-    'kernel edit with a separate preflight, restart, and watchdog; '
-    'BUSINESS-PROCESSES.md is ordinary editable process documentation.'
-)
+_REVIEW_CRITERIA = [
+    {'id': 'approve',
+     'description': ('Approve only when the stated purpose and the exact '
+                     'find/replace splice are coherent, scoped, and safe.')},
+    {'id': 'reject',
+     'description': ('Reject destructive, self-privileging, unexplained, or '
+                     'scope-exceeding edits. Only CONSTITUTION.md and '
+                     'constitution.py are immutable; serve.py needs its own '
+                     'preflight, restart, and watchdog.')},
+]
 
 
 def _s():
@@ -687,7 +689,8 @@ def _review(edit_id, display, find, replace, summary):
     for _attempt in range(2):
         try:
             decision, confidence, cost = serve._jev_quorum_choice_sync(
-                _REVIEW_INSTRUCTIONS, _REVIEW_CRITERIA + '\n\n' + question)
+                _REVIEW_INSTRUCTIONS + '\n\n' + question,
+                [dict(c) for c in _REVIEW_CRITERIA])
         except Exception as e:  # transport/shape failure is not consent
             decision, confidence, cost = None, 0.0, 0.0
             serve.log_action(edit_id, 'self_edit_review_failed',
