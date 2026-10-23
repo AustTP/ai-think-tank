@@ -521,11 +521,11 @@ in an active sprint.
 3. Create the director, team record, and employees. Respect the total agent cap
    (`MAX_TOTAL_AGENTS = 500`).
 4. File the goal to the new team and kick refinement immediately.
-5. Run onboarding for each new agent.
+5. Queue onboarding for the director and every employee.
 
 **Controls.** Agent cap, name uniqueness, idle gate, chief of staff authority.
 
-**Records.** Roster, teams, pending onboarding, action log.
+**Records.** Roster, teams, `_pendingOnboard`, `_onboardQueue`, action log.
 
 ### BP-06 Sprint lifecycle
 
@@ -921,23 +921,27 @@ decider.
 6. Complete the hire: the chief of staff names the new director, or the team director
    names the employee, using the all-time unique name pool. Spawn the agent and
    start onboarding.
-7. Onboarding convenes a Town Hall meeting at the Command Center with the
-   director and intended coworkers. Everyone must be free and on duty. If not,
-   defer and retry.
+7. Onboarding convenes a Town Hall meeting at the Command Center. The
+   onboarding leader is the reporting director, or the admin for a new-team
+   spawn where the new director may still be dormant. Busy on-duty coworkers
+   defer the meeting; off-duty coworkers are skipped.
 8. Stage `AGENTS.md` progressively (stages 1 to 3) after the 10-second meeting.
-9. The new agent signs a work agreement.
+9. The new agent drafts a work agreement and the admin empowers it. Onboarding
+   also mints the agent's stable key and records the provisioning checklist.
 10. Readiness times out after 15 minutes and completes onboarding on the
-    fallback path.
+    fallback path. The completed checklist is kept as `onboardingRecord`.
+11. One week later, a first-week review reminder is mailed to the reporting
+    director so the hire's first task and agreement get a measured follow-up.
 
 **Controls.** Total cap, active ceiling, dormant-wake check, borrowing first,
-director availability, cooldown, idle gate, name pool, JEV decider, onboarding
+leader availability, cooldown, idle gate, name pool, JEV decider, onboarding
 readiness timeout.
 
-**Records.** `_pendingHire`, `_pendingOnboard`, roster, agents, action log.
+**Records.** `_pendingHire`, `_pendingOnboard`, `_onboardQueue`, roster,
+agents, `onboardingRecord`, action log.
 
-**Review note.** Hiring is single-slot. Only one pending hire and one pending
-onboarding exist at a time. That is a deliberate pacing choice, but it also
-means a burst of need is served one agent at a time.
+**Review note.** One onboarding ceremony runs at a time. A multi-agent team
+spawn queues its members behind the live ceremony instead of overwriting it.
 
 ### BP-20 Firing review
 

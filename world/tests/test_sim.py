@@ -1531,6 +1531,21 @@ class ServerOwnedPairingHandoff(unittest.TestCase):
         self.assertEqual(len(out.get('handoffs', [])), 1)
         self.assertEqual(out['handoffs'][0]['title'], 'The report')
 
+    def test_credit_pause_leaves_the_queue_untouched(self):
+        state = self._state()
+        grid, doors = sim._load_outdoor_geometry()
+        item = {'title': 'Paused work', 'room': 'pressoffice',
+                'instructions': 'Go.', 'pair': False, 'notBefore': None,
+                'priority': sim.WORK_PRIORITY['normal'], 'goal': None,
+                'research': None, 'taskType': 'code', 'skillReview': False}
+        state['workQueue'] = [item]
+        with unittest.mock.patch('serve.credits_pause_active', return_value=True):
+            sim._task_cycle(state, now=time.time(), grid=grid, doors=doors,
+                            task_id_holder=[0])
+        self.assertEqual(state['workQueue'], [item],
+                         'a credit pause must not consume the queued card')
+        self.assertNotIn('tasks', state)
+
     def test_pair_card_recruits_a_navigator_server_side(self):
         # A `pair` card assigned server-side must recruit a navigator (walking
         # her over) instead of being assigned solo -- the driver still goes
@@ -1542,8 +1557,9 @@ class ServerOwnedPairingHandoff(unittest.TestCase):
                 'priority': sim.WORK_PRIORITY['normal'], 'goal': None,
                 'research': None, 'taskType': 'code', 'skillReview': False}
         state['workQueue'] = [item]
-        sim._task_cycle(state, now=time.time(), grid=grid, doors=doors,
-                        task_id_holder=[0])
+        with unittest.mock.patch('serve.tier_value_ratios', return_value={}):
+            sim._task_cycle(state, now=time.time(), grid=grid, doors=doors,
+                            task_id_holder=[0])
         tasks = [t for t in state['tasks'].values() if t.get('title') == 'Maintain tooling']
         self.assertEqual(len(tasks), 1)
         task = tasks[0]

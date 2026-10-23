@@ -329,6 +329,20 @@ def test_supervise_card_pins_its_director_and_keeps_the_team(monkeypatch):
     assert all(t.get('assignedTo') != 'ruth' for t in state['tasks'].values())
 
 
+def test_directed_card_waits_for_its_named_worker():
+    state = _state()
+    state['agents']['nora']['busy'] = True
+    state['agents']['nora']['task'] = 'busy-task'
+    grid, doors = sim._load_outdoor_geometry()
+    item = {'title': 'Directed spike', 'room': 'pressoffice',
+            'taskType': 'spike', 'assignedTo': 'nora', 'directedTo': True,
+            'teamId': 'nora', 'instructions': 'Do the directed spike.'}
+    before = len(state['tasks'])
+    assert sim._assign_due_item(state, item, True, grid, doors, 1000,
+                                task_id_holder={0: 0}) is sim._ASSIGN_WAIT
+    assert len(state['tasks']) == before
+
+
 def test_supervisor_tool_loop_has_a_heartbeat(monkeypatch):
     import content
     import sim

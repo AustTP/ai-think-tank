@@ -441,6 +441,80 @@ class WorkAgreementEmpowered(unittest.TestCase):
         self.assertIn('I am the Assistant to Ben.', md)
         self.assertIn('empowered by the admin', md)
 
+    def test_stage3_issues_agent_key_and_records_provisioning(self):
+        state, new_id = self._stage3_hire()
+        provisioning = state['agents'][new_id]['profile']['onboarding']['provisioning']
+        self.assertEqual(provisioning['agentKey'], 'issued',
+                         'onboarding mints the stable agent key before first use')
+        self.assertEqual(provisioning['workAgreement'], 'empowered')
+        self.assertEqual(provisioning['firstTask'], 'pending')
+        self.assertGreater(provisioning['firstWeekReviewAt'], 0)
+        with serve._db() as conn:
+            row = conn.execute('SELECT secret_key FROM agent_keys WHERE agent_id = ?',
+                               (new_id,)).fetchone()
+        self.assertIsNotNone(row, 'the provisioning step persists a real agent key')
+
+    def test_completion_keeps_the_onboarding_record(self):
+        state, new_id = self._stage3_hire()
+        sim._complete_onboarding(state, state['_pendingOnboard'], 'timeout', 12_345)
+        profile = state['agents'][new_id]['profile']
+        self.assertNotIn('onboarding', profile)
+        record = profile['onboardingRecord']
+        self.assertEqual(record['completionReason'], 'timeout')
+        self.assertEqual(record['provisioning']['firstTask'], 'timeout')
+        self.assertEqual(record['completedAt'], 12_345)
+
+    def test_first_week_review_mails_director_once(self):
+        state, new_id = self._stage3_hire()
+        sim._complete_onboarding(state, state['_pendingOnboard'], 'claimed', 1_000)
+        record = state['agents'][new_id]['profile']['onboardingRecord']
+        record['provisioning']['firstWeekReviewAt'] = 5_000
+        director = state['agents'][record['directorId']]
+        before = len(director.get('mailbox') or [])
+        sim._first_week_onboard_review_step(state, 5_000)
+        after = len(director.get('mailbox') or [])
+        self.assertEqual(after, before + 1)
+        self.assertEqual(director['mailbox'][-1]['kind'], 'onboarding_review')
+        self.assertEqual(director['mailbox'][-1]['about'], new_id)
+        sim._first_week_onboard_review_step(state, 6_000)
+        self.assertEqual(len(director.get('mailbox') or []), after,
+                         'the reminder is stamped and sent once')
+
+    def test_new_team_spawn_queues_onboarding_for_every_member(self):
+        state = _seed()
+        state['agentRoster'] = [{'id': 'faye', 'name': 'Faye', 'isAdmin': True}]
+        state['agents'] = {'faye': {'id': 'faye', 'busy': False, 'offDuty': False,
+                                    'visible': True, 'task': None}}
+        state['teams'] = []
+        names = iter(['Elio', 'Nadia', 'Owen'])
+
+        def chooser(_state, _who, _used, _role):
+            return next(names)
+
+        with unittest.mock.patch.object(
+                sim, '_load_outdoor_geometry', return_value=({}, {})), \
+             unittest.mock.patch.object(
+                sim, '_free_outdoor_spot', return_value={'x': 10, 'y': 10}), \
+             unittest.mock.patch.object(sim, 'kick_refinement_now'), \
+             unittest.mock.patch.object(sim, '_log_governance'):
+            team = sim.spawn_new_team_for_request(
+                state, 'Build the new thing', now_ms=1_000, chooser=chooser,
+                employees=2)
+        self.assertIsNotNone(team)
+        self.assertEqual(team['id'], 'elio')
+        live = state['_pendingOnboard']
+        self.assertEqual(live['agentId'], 'elio')
+        self.assertEqual(live['leaderId'], 'faye')
+        self.assertEqual([r['agentId'] for r in state['_onboardQueue']],
+                         ['nadia', 'owen'])
+        for member in ['elio', 'nadia', 'owen']:
+            onboarding = state['agents'][member]['profile']['onboarding']
+            self.assertEqual(onboarding['stage'], 0)
+            self.assertEqual(onboarding['provisioning']['firstTask'], 'pending')
+            self.assertEqual(onboarding['provisioning']['mailbox'], 'welcome_queued')
+        self.assertEqual(state['agents']['nadia']['profile']['onboarding']['directorId'],
+                         'elio')
+
     def test_no_admin_means_agreement_recorded_but_not_empowered(self):
         state, new_id = self._stage3_hire()
         for d in state.get('agentRoster') or []:

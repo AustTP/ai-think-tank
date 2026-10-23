@@ -39,6 +39,7 @@ function getGlobal(name) {
 // isn't about the active cap at all) from throwing a ReferenceError;
 // tests specifically about the cap override this to a small number.
 setGlobal('MAX_ACTIVE_AGENTS', 1000);
+setGlobal('agentMission', (def) => (def && def.profile && def.profile.mission) || 'general think tank work');
 const runTaskCycle = () => vm.runInContext('runTaskCycle', context)();
 const thinkTankHasWork = () => vm.runInContext('thinkTankHasWork', context)();
 const queueWork = (...a) => vm.runInContext('queueWork', context)(...a);

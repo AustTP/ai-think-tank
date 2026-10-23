@@ -2697,6 +2697,16 @@ def _dispatch_content_work(executor, state, agent_id, task, now):
         try:
             executor(snapshot, agent_id, task, base_ctx=perception)
         except Exception as e:  # never let a content failure strand the agent
+            if getattr(e, 'credits_paused', False):
+                # The work did not fail; the account is out of credits. Keep the
+                # card intact and requeue it, and hold the task cycle until the
+                # balance is restored.
+                _store_content_result(task_id, {
+                    'creditsPaused': True,
+                    'note': 'OpenRouter credits are exhausted; the task is paused and will resume automatically.',
+                    'seenUrls': (task.get('research') or {}).get('seenUrls') or [],
+                })
+                return
             # W4: a crashed content run is a FAILURE, not a silent success.
             # Mark ok=False so the fail-closed quality gate treats it like a red
             # pipeline (card sent back / fix re-issued), and the worker-stuck
@@ -2811,6 +2821,9 @@ def queue_work(state, items):
             'reportPath': item.get('reportPath') or None,
             # Phase E addendum: a peer-rejected fix returns to the original author.
             'assignedTo': item.get('assignedTo') or None,
+            # An explicit lead/player pin: the named worker is the owner, so
+            # _assign_due_item wakes them and waits rather than round-robins.
+            'directedTo': bool(item.get('directedTo')),
             # Human-in-the-loop: a JIRA issue filed FOR the player (assignedTo
             # 'player') travels with its issueKey so the player task records its
             # provenance -- same class of whitelist as 'distill'/'checklist'.
@@ -3614,9 +3627,16 @@ def sprint_progress(state, sprint_id):
     # ids have ONLY a shadow representation so the fallback below can skip them.
     shadow_ids = set(_sprint_item_id(it) for it in (state.get('workQueue') or [])
                      if it.get('shadow'))
-    for t in (state.get('tasks') or {}).values():
+    # Index the live tasks once by (title, room). The old inner scan walked
+    # every task for every sprint item, which is O(items * tasks) and showed up
+    # on large sprints. This keeps the same identity and shadow semantics.
+    tasks_by_key = {}
+    for t in open_tasks.values():
+        ident = (t.get('title') or '', t.get('room') or '')
         if t.get('shadow'):
-            shadow_ids.add((t.get('title') or '', t.get('room') or ''))
+            shadow_ids.add(ident)
+            continue
+        tasks_by_key.setdefault(ident, []).append(t)
     done = in_progress = queued = 0
     landed = []
     for pair in items:
@@ -3624,23 +3644,15 @@ def sprint_progress(state, sprint_id):
         # so hashing against the set of (title, room) tuples always works.
         title, room = tuple(pair)
         ident = (title, room)
+        matches = tasks_by_key.get(ident, ())
         if ident in still_queued and not any(
-                t.get('status') == 'done' and t.get('title') == title and t.get('room') == room
-                and not t.get('shadow')
-                for t in open_tasks.values()):
+                t.get('status') == 'done' for t in matches):
             # Still in the queue, not yet assigned: queued.
             queued += 1
             continue
-        matched_done = matched_active = False
-        for t in open_tasks.values():
-            if t.get('title') != title or t.get('room') != room:
-                continue
-            if t.get('shadow'):
-                continue
-            if t.get('status') == 'done':
-                matched_done = True
-            elif t.get('status') in ('walking', 'working'):
-                matched_active = True
+        matched_done = any(t.get('status') == 'done' for t in matches)
+        matched_active = any(t.get('status') in ('walking', 'working')
+                             for t in matches)
         if matched_done:
             done += 1
             landed.append(title)
@@ -7533,7 +7545,7 @@ def _start_auto_hire(state, now_ms, grid, decider):
     # strands the earlier hire with profile.onboarding forever. The live tank
     # hit this: 446 of 457 agents were stuck, 420 at stage 0, and the same
     # overload kept triggering new hires that could never relieve it.
-    if state.get('_pendingOnboard'):
+    if state.get('_pendingOnboard') or state.get('_onboardQueue'):
         return False
     # Active-ceiling gate: stop spawning at MAX_ACTIVE_AGENTS (25). When a
     # sprint ends and workers go dormant, active_agent_count drops below the
@@ -7635,6 +7647,53 @@ def _start_auto_hire(state, now_ms, grid, decider):
     return True
 
 
+def _begin_onboarding(state, agent_id, director_id, director_name,
+                      help_for_id=None, help_for_name=None, coworker_ids=None,
+                      now_ms=None, leader_id=None, leader_name=None):
+    """Attach the onboarding marker and queue one ceremony record.
+
+    `director_id` is who the hire reports to. `leader_id` is who runs the
+    Town Hall; for a brand-new team that is the existing admin, because the
+    new director may still be dormant. The queue keeps a multi-agent team
+    spawn from overwriting a single `_pendingOnboard`.
+    """
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    agents = state.setdefault('agents', {})
+    agent = agents.get(agent_id)
+    if not isinstance(agent, dict):
+        return None
+    profile = agent.setdefault('profile', {})
+    profile['onboarding'] = {
+        'stage': 0,
+        'directorId': director_id,
+        'provisioning': {
+            'agentKey': 'pending',
+            'mailbox': 'welcome_queued' if agent.get('mailbox') else 'missing',
+            'accessGrant': agent.get('accessGrant'),
+            'toolGrants': [],
+            'firstTask': 'pending',
+            'firstWeekReviewAt': now_ms + (7 * 24 * 3600 * 1000),
+        },
+    }
+    record = {
+        'agentId': agent_id,
+        'directorId': director_id,
+        'directorName': director_name,
+        'leaderId': leader_id or director_id,
+        'leaderName': leader_name or director_name,
+        'helpForId': help_for_id,
+        'helpForName': help_for_name or help_for_id,
+        'coworkerIds': list(coworker_ids or []),
+        'stage': 0,
+        'at': now_ms + ONBOARD_MEET_DURATION_MS,
+    }
+    if state.get('_pendingOnboard') is None:
+        state['_pendingOnboard'] = record
+    else:
+        state.setdefault('_onboardQueue', []).append(record)
+    return record
+
+
 def _complete_auto_hire(state, pending, grid, now_ms):
     """hiring.js finishHire: actually add the new agent to the roster + agents
     once HIRE_DURATION_MS has elapsed. Idempotent -- a restart mid-hire just
@@ -7731,18 +7790,14 @@ def _complete_auto_hire(state, pending, grid, now_ms):
     coworkers = [c for c in _sim_direct_reports(state, director_id) if c != new_id]
     if pending.get('helpForId') and pending['helpForId'] not in coworkers:
         coworkers.append(pending['helpForId'])
-    state['_pendingOnboard'] = {
-        'agentId': new_id,
-        'directorId': director_id,
-        'directorName': pending.get('adminName') or director_id,
-        'helpForId': pending.get('helpForId'),
-        'helpForName': pending.get('helpForName') or pending.get('helpForId'),
-        'coworkerIds': coworkers,
-        'stage': 0,
-        'at': now_ms + ONBOARD_MEET_DURATION_MS,
-    }
     agents[new_id]['profile'] = dict(profile)
-    agents[new_id]['profile']['onboarding'] = {'stage': 0, 'directorId': director_id}
+    _begin_onboarding(
+        state, new_id, director_id,
+        pending.get('adminName') or director_id,
+        help_for_id=pending.get('helpForId'),
+        help_for_name=pending.get('helpForName') or pending.get('helpForId'),
+        coworker_ids=coworkers, now_ms=now_ms,
+    )
     return new_id
 
 
@@ -8040,6 +8095,22 @@ def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employee
     kick_refinement_now(state, director_id, now_ms)
     _log_governance(state, director_id, 'new_team_for_request',
                     {'team': director_id, 'members': member_ids, 'request': req['id']})
+    # Every new team member goes through the same onboarding ceremony as an
+    # auto-hire. The existing admin leads, because the new director may still
+    # be dormant under the active-agent ceiling. One record is live and the
+    # rest queue behind it.
+    team_ids = [director_id] + [m for m in member_ids if m]
+    for new_id in team_ids:
+        is_director = new_id == director_id
+        reports_to_id = admin_id if is_director else director_id
+        reports_to_name = admin_name if is_director else director_name
+        _begin_onboarding(
+            state, new_id, reports_to_id, reports_to_name,
+            help_for_id=admin_id if is_director else director_id,
+            help_for_name=admin_name if is_director else director_name,
+            coworker_ids=[x for x in team_ids if x != new_id],
+            now_ms=now_ms, leader_id=admin_id, leader_name=admin_name,
+        )
     return team
 
 
@@ -8075,16 +8146,31 @@ def _onboard_coworker_defs(state, onboard):
 
 
 def _start_onboard_meeting(state, onboard, now_ms):
-    """Convene the Town Hall: the director + the on-duty employees who'll work
-    with the new hire meet at Command Center before the AGENT.md is finalized.
-    Busy on-duty coworkers still defer the embark (never strand a live
-    collaboration reference). Off-duty coworkers are skipped instead of
-    blocking: on a large roster most of the team is dormant, and requiring
-    every one of them to be awake deadlocked the ceremony forever."""
+    """Convene the Town Hall: the onboarding leader + the on-duty employees
+    who'll work with the new hire meet at Command Center before the AGENT.md is
+    finalized. `leaderId` lets a new-team hire be onboarded by the existing
+    admin when the new director is still dormant. Busy on-duty coworkers still
+    defer the embark (never strand a live collaboration reference). Off-duty
+    coworkers are skipped instead of blocking: on a large roster most of the
+    team is dormant, and requiring every one of them to be awake deadlocked
+    the ceremony forever."""
     agents = state.get('agents') or {}
-    director = agents.get(onboard.get('directorId'))
+    leader_id = onboard.get('leaderId') or onboard.get('directorId')
+    director = agents.get(leader_id)
     if not director or director.get('busy') or director.get('offDuty'):
-        return False
+        # Fallback for a new-team hire: if the admin leader is unavailable, the
+        # reporting director can run the meeting. A hire never leads its own.
+        fallback_id = onboard.get('directorId')
+        fallback = agents.get(fallback_id) if fallback_id != leader_id else None
+        if not fallback or fallback.get('busy') or fallback.get('offDuty'):
+            return False
+        leader_id = fallback_id
+        director = fallback
+        onboard['leaderId'] = leader_id
+        onboard['leaderName'] = (
+            next((d.get('name') for d in (state.get('agentRoster') or [])
+                  if d.get('id') == leader_id), None)
+            or fallback.get('name') or leader_id)
     coworkers = [c for c in _onboard_coworker_defs(state, onboard)
                  if (agents.get(c['id']) or {}).get('offDuty') is not True]
     for c in coworkers:
@@ -8148,13 +8234,25 @@ def _onboard_hold_claimed_task(state, onboard):
     return True
 
 
-def _complete_onboarding(state, onboard, reason):
-    """Finalize a hire: drop the `onboarding` marker + the pending record so the
-    next sync_agent_directories writes AGENTS.md. `reason` is logged on the
+def _complete_onboarding(state, onboard, reason, now_ms=None):
+    """Finalize a hire: keep the onboarding record for audit, drop the live
+    `onboarding` marker, and clear the pending record so the next
+    sync_agent_directories writes AGENTS.md. `reason` is logged on the
     governance log ('claimed' when the hire proved readiness with a real task,
     'timeout' when an idle/empty think tank hit the readiness cap)."""
     agents = state.get('agents') or {}
     profile = (agents.get(onboard.get('agentId')) or {}).get('profile') or {}
+    onboarding = profile.get('onboarding')
+    if isinstance(onboarding, dict):
+        record = dict(onboarding)
+        provisioning = dict(record.get('provisioning') or {})
+        provisioning['firstTask'] = reason
+        if now_ms is not None:
+            provisioning['completedAt'] = int(now_ms)
+        record['provisioning'] = provisioning
+        record['completedAt'] = int(now_ms) if now_ms is not None else None
+        record['completionReason'] = reason
+        profile['onboardingRecord'] = record
     profile.pop('onboarding', None)
     _log_governance(state, onboard['directorId'], 'onboard',
                     {'about': onboard['agentId'], 'action': 'done',
@@ -8219,6 +8317,17 @@ def _empower_work_agreement(state, onboard, now_ms):
         'empoweredBy': admin_id,
         'empoweredAt': now_ms,
     }
+    # Provisioning checklist: mint the stable agent key now rather than waiting
+    # for the first tool call, and record that the agreement is empowered.
+    provisioning = profile.setdefault('onboarding', {}).setdefault(
+        'provisioning', {})
+    try:
+        import serve as _serve
+        _serve.get_or_create_agent_key(onboard.get('agentId'))
+        provisioning['agentKey'] = 'issued'
+    except Exception:
+        provisioning['agentKey'] = 'pending'
+    provisioning['workAgreement'] = 'empowered'
     _log_governance(state, onboard.get('agentId'), 'onboard',
                     {'about': onboard['agentId'], 'action': 'agreement_drafted',
                      'directorId': onboard['directorId']})
@@ -8230,14 +8339,15 @@ def _empower_work_agreement(state, onboard, now_ms):
 
 
 def _resolve_onboard_meeting(state, onboard, now_ms):
-    """After the Town-Hall duration elapses, the director stages the new agent's
-    AGENT.md progressively. Everyone returns to duty; the new agent's profile is
-    appended to stage by stage; stage 3 is a readiness hold that waits for the
-    hire to actually claim a real co-work task before the `onboarding` marker is
-    removed and the next sync_agent_directories finalizes AGENTS.md. Idempotent
-    if the hire vanished."""
+    """After the Town-Hall duration elapses, the onboarding leader stages the
+    new agent's AGENT.md progressively. Everyone returns to duty; the new
+    agent's profile is appended to stage by stage; stage 3 is a readiness hold
+    that waits for the hire to actually claim a real co-work task before the
+    `onboarding` marker is removed and the next sync_agent_directories
+    finalizes AGENTS.md. Idempotent if the hire vanished."""
     agents = state.get('agents') or {}
-    director = agents.get(onboard.get('directorId'))
+    leader_id = onboard.get('leaderId') or onboard.get('directorId')
+    director = agents.get(leader_id)
     coworkers = _onboard_coworker_defs(state, onboard)
     for a in [director] + [agents.get(c['id']) for c in coworkers]:
         if a:
@@ -8284,11 +8394,11 @@ def _resolve_onboard_meeting(state, onboard, now_ms):
         held = _onboard_hold_claimed_task(state, onboard)
         elapsed = now_ms - (onboarding.get('holdSince') or now_ms)
         if held:
-            _complete_onboarding(state, onboard, 'claimed')
+            _complete_onboarding(state, onboard, 'claimed', now_ms)
         elif elapsed >= ONBOARD_READINESS_TIMEOUT_MS:
             # No task appeared in time -- idle/empty think tank. Finalize anyway so
             # the hire isn't stranded; they'll take upstream work as it arrives.
-            _complete_onboarding(state, onboard, 'timeout')
+            _complete_onboarding(state, onboard, 'timeout', now_ms)
         else:
             # Still waiting on real work. Do NOT advance `at` to a premature done;
             # leave it so the governance pass re-checks every tick. Log the wait
@@ -10842,8 +10952,23 @@ def _refinement_assigned_worker(state, req, filed_by, pending):
     is_lead = bool(filer.get('isDirector') or filer.get('isAdmin')
                    or (team and (team.get('scrumMasterId') == filed_by
                                  or team.get('directorId') == filed_by)))
-    if target and is_lead and not target.get('isDirector') and not target.get('isAdmin'):
+    # A director may name another director for a direct, non-code ask (spike,
+    # research, report, meeting). The old blanket ban sent those cards back to
+    # team round-robin, and an all-dormant team could then abandon them.
+    card_type = (req.get('issueType') or req.get('taskType') or '').strip().lower()
+    code_like = card_type in governance.CODE_TASK_TYPES or card_type in ('story', '')
+    direct_ok = card_type in ('spike', 'research', 'report', 'meeting', 'supervise')
+    if target and is_lead and (
+            (not target.get('isDirector') and not target.get('isAdmin'))
+            or direct_ok):
         return assigned
+    # A player-filed request is explicit work. Preserve its named worker even
+    # when the player is not a roster "lead". The one exception is a code card
+    # pinned to a director/admin, who cannot work code by policy.
+    if target and filed_by == 'player':
+        if (not (target.get('isDirector') or target.get('isAdmin'))
+                or not code_like):
+            return assigned
     return None
 
 
@@ -11010,6 +11135,9 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
             if linked_issue and linked_issue.get('dependsOnTask'):
                 depends_on = linked_issue['dependsOnTask']
             if not meeting_card:
+                assigned_worker = _refinement_assigned_worker(
+                    state, req, filed_by, pending)
+                directed = bool(assigned_worker and assigned_worker != 'player')
                 queue_work(state, [{
                     'title': req['title'], 'room': req['room'], 'goal': req.get('title'),
                     'instructions': instructions,
@@ -11028,8 +11156,11 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                     # scrum master may also name a worker; that assignment is
                     # preserved so the SM creates the card AND staffs it, instead
                     # of telling the player to find a worker.
-                    'assignedTo': _refinement_assigned_worker(
-                        state, req, filed_by, pending),
+                    'assignedTo': assigned_worker,
+                    # An explicit director/lead pin is not a suggestion. It
+                    # wakes that worker and waits for them instead of falling
+                    # through to round-robin or abandoning the card.
+                    'directedTo': directed,
                     # The card's attention lane survives grooming onto the queue
                     # (queue_work normalizes), so a build/reading/parking-lot card
                     # keeps its lane through refinement.
@@ -12232,6 +12363,42 @@ def _deliver_supervisor_brief(state, team_id, now_ms=None):
         'createdAt': int(time.time() * 1000) if now_ms is None else int(now_ms),
     })
     return True
+
+
+def _first_week_onboard_review_step(state, now_ms):
+    """One-time first-week review reminder for a completed onboarding.
+
+    The onboarding record carries `firstWeekReviewAt`; when it comes due, mail
+    the reporting director so the hire's first task and work agreement get a
+    real check instead of the checklist ending at orientation. State-only and
+    idempotent per hire.
+    """
+    agents = state.get('agents') or {}
+    for aid, a in list(agents.items()):
+        if not isinstance(a, dict):
+            continue
+        profile = a.get('profile') or {}
+        record = profile.get('onboardingRecord') or {}
+        provisioning = record.get('provisioning') or {}
+        due = provisioning.get('firstWeekReviewAt')
+        if not due or now_ms < due or provisioning.get('firstWeekReviewNotifiedAt'):
+            continue
+        director_id = record.get('directorId')
+        director = agents.get(director_id)
+        if isinstance(director, dict):
+            _append_mailbox(director, {
+                'kind': 'onboarding_review',
+                'read': False,
+                'ts': now_ms,
+                'about': aid,
+                'text': (f"First-week review due for {a.get('name') or aid}. "
+                         'Check their first claimed task, work agreement, and any '
+                         'coaching notes, then record whether they are ready for '
+                         'normal work.'),
+            })
+        provisioning['firstWeekReviewNotifiedAt'] = now_ms
+        _log_governance(state, 'admin', 'onboarding_review_due',
+                        {'agent': aid, 'director': director_id})
 
 
 def _supervisor_brief_step(state, now, now_ms):
@@ -13529,8 +13696,18 @@ def _governance_pass(state, now=None, now_ms=None, grid=None, decider=None):
     # --- Phase B onboard ceremony: a fresh hire with a _pendingOnboard has its
     # Town-Hall meeting start (director + coworkers convene at Command Center)
     # if not already underway; once the meet duration elapses, stage the new
-    # agent's AGENT.md progressively until final.
+    # agent's AGENT.md progressively until final. A multi-agent team spawn
+    # queues behind the single live ceremony.
     onboard = state.get('_pendingOnboard')
+    if onboard is None:
+        queued = state.get('_onboardQueue') or []
+        if queued:
+            onboard = queued.pop(0)
+            state['_pendingOnboard'] = onboard
+            if queued:
+                state['_onboardQueue'] = queued
+            else:
+                state.pop('_onboardQueue', None)
     if onboard is not None:
         if not onboard.get('embarked'):
             _start_onboard_meeting(state, onboard, now_ms)
@@ -13892,6 +14069,13 @@ def _stale_work_step(state, now, now_ms):
         return 0
     agents = state.get('agents') or {}
     replan_map = state.setdefault('_staleWorkReplans', {})
+    # One roster index for this sweep. agent_team_ref scans the whole roster
+    # per task; on a large in-flight set that becomes tasks * roster.
+    team_by_agent = {
+        d.get('id'): d.get('director')
+        for d in (state.get('agentRoster') or [])
+        if isinstance(d, dict)
+    }
     replanned = 0
     for tid, task in list(tasks.items()):
         if not isinstance(task, dict):
@@ -13907,7 +14091,7 @@ def _stale_work_step(state, now, now_ms):
         opened = task.get('openedAt') or task.get('assignedAt') or task.get('createdAt')
         if opened is None:
             continue  # no start stamp -> cannot judge age (pre-existing behavior)
-        _sref = task.get('teamId') or agent_team_ref(state, task.get('assignedTo'))
+        _sref = task.get('teamId') or team_by_agent.get(task.get('assignedTo'))
         if task.get('status') == 'walking':
             age_ms = _task_active_age_ms(state, task, now_ms)
             if age_ms is None or age_ms < team_policy(state, _sref, 'staleWorkTimeoutMs'):
@@ -13971,6 +14155,57 @@ def _requeue_stale_work(state, task):
         'backlogItemId': task.get('backlogItemId'),
         'sprintId': task.get('sprintId'),
         'priority': WORK_PRIORITY['high'],
+    }])
+
+
+def _requeue_paused_work(state, task, now_ms):
+    """Put a credit-paused card back on the queue unchanged.
+
+    The work never ran, so it must not be graded, counted, or reworded as a
+    failure. Preserve the original scheduling fields and pin the same agent
+    where the card was already pinned.
+    """
+    room = task.get('room') or _resolve_assignment_room(task)
+    queue_work(state, [{
+        'title': task.get('title'),
+        'room': room,
+        'instructions': task.get('instructions'),
+        'goal': task.get('goal'),
+        'taskType': task.get('taskType') or 'code',
+        'projectLabel': task.get('projectLabel'),
+        'priority': task.get('priority'),
+        'notBefore': now_ms,
+        'sizeEstimate': task.get('sizeEstimate'),
+        'teamId': task.get('teamId'),
+        'productId': task.get('productId'),
+        'featureId': task.get('featureId'),
+        'backlogItemId': task.get('backlogItemId'),
+        'sprintId': task.get('sprintId'),
+        'reviewOf': task.get('reviewOf'),
+        'reviewAuthorId': task.get('reviewAuthorId'),
+        'checklist': task.get('checklist') or [],
+        'incident': task.get('incident'),
+        'dependsOn': task.get('dependsOn'),
+        'distill': task.get('distill'),
+        'kbClass': task.get('kbClass'),
+        'shadow': task.get('shadow'),
+        'budgetMs': task.get('budgetMs'),
+        'budgetBand': task.get('budgetBand'),
+        'budgetUsd': task.get('budgetUsd'),
+        'moonshot': task.get('moonshot'),
+        'lane': task.get('lane'),
+        'playerAuthored': task.get('playerAuthored'),
+        'attendees': task.get('attendees') or [],
+        'facilitatorId': task.get('facilitatorId'),
+        'assignedTo': task.get('assignedTo'),
+        'pipelineStep': task.get('pipelineStep'),
+        'adversarialTaskId': task.get('adversarialTaskId'),
+        'villageId': task.get('villageId'),
+        'userStory': task.get('userStory'),
+        'acceptanceCriteria': task.get('acceptanceCriteria'),
+        'never': task.get('never'),
+        'sourcePaths': task.get('sourcePaths'),
+        'reportPath': task.get('reportPath'),
     }])
 
 
@@ -14123,6 +14358,20 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         return state  # browser still drives; stay inert (revert = set owner back)
 
     agents = state.get('agents') or {}
+    # Credit pause: hold all model-dependent work, keep in-flight tasks alive,
+    # and resume the same queue when the probe sees the balance restored.
+    try:
+        import serve as _serve
+        if _serve.credits_pause_active():
+            for a in agents.values():
+                if not isinstance(a, dict) or not a.get('task'):
+                    continue
+                task = (state.get('tasks') or {}).get(a['task'])
+                if isinstance(task, dict) and task.get('status') == 'working':
+                    task['workUntil'] = max(task.get('workUntil') or 0, now + 300)
+            return state
+    except Exception:
+        pass
     _check_schedules(state, now, now_ms)
     # Phase 4: server-owned governance (auto-hire + auto-firing review) runs in
     # the same single read-modify-write, gated on the server-owner + idle rule
@@ -14195,6 +14444,10 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # state-only brief every 15 minutes (own team, budget, process failures,
     # where to look). Mail, not a task: no spend, no queue.
     _supervisor_brief_step(state, now, now_ms)
+
+    # First-week onboarding review: mail the reporting director once when the
+    # hire's checklist comes due, so orientation has a measured follow-up.
+    _first_week_onboard_review_step(state, now_ms)
 
     # Cut 2 roadmap: weekly silent recompute of per-room priority from trailing
     # deliverable grades + delivery volume. Cheap (state-only, no ceremony, no
@@ -14329,6 +14582,23 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                     send_agent_off_duty(state, aid, doors, grid)
                     continue
                 _apply_content_result(state, task, result, now_ms)
+                if result.get('creditsPaused'):
+                    # No credits, no work. Release the worker and put the card
+                    # back exactly as it was; the pause guard stops the next
+                    # assignment until the balance is restored.
+                    task['_contentInFlight'] = False
+                    _requeue_paused_work(state, task, now_ms)
+                    tid = task.get('id')
+                    if tid in (state.get('tasks') or {}):
+                        del state['tasks'][tid]
+                    a['task'] = None
+                    a['busy'] = False
+                    a['inRoom'] = None
+                    a['visible'] = True
+                    _log_governance(state, 'admin', 'credits_pause_requeue',
+                                    {'task': tid, 'title': (task.get('title') or '')[:120]})
+                    send_agent_off_duty(state, aid, doors, grid)
+                    continue
                 # Bot Ops / shadow mode: a dry-run task ships nothing. Capture the
                 # outcome to the shadow ledger and release the agent, skipping the
                 # peer gate / quality gate / credits entirely.
@@ -14625,12 +14895,13 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
             # _on_work_item_abandoned raises) instead of retrying invisibly --
             # the failure mode that hid a 21k-attempt wedge for 38 hours.
             _is_player_card = (pick.get('assignedTo') or '') == 'player'
+            _is_requested_work = bool(pick.get('issueKey') or pick.get('directedTo'))
             _strictly_staffed = bool(pick.get('reviewOf') or pick.get('sprintId'))
             _pick_ref = pick.get('teamId') or _task_owner_director(state, pick)
             _cap = (team_policy(state, _pick_ref, 'workItemStallCeiling')
                     if _strictly_staffed
                     else team_policy(state, _pick_ref, 'workItemMaxAttempts'))
-            if _is_player_card or pick['attempts'] < _cap:
+            if _is_player_card or _is_requested_work or pick['attempts'] < _cap:
                 work_queue.append(pick)
             else:
                 from serve import log_action
@@ -15136,6 +15407,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     # off-duty facilitator is woken at the meeting room's door).
     pin_kind = (pick.get('reviewOf') or pick.get('incident')
                 or pick.get('_mailResume') or pick.get('directRoute')
+                or pick.get('directedTo')
                 or pick.get('_reassignedTo') or pick.get('facilitatorId')
                 # A supervisor card belongs to the named director. Without this
                 # pin it fell through to think-tank-wide round-robin and could
@@ -15191,6 +15463,14 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     if pick.get('taskType') == 'supervise' and chosen_id is None:
         # Director-only card: wait for the named supervisor instead of leaking
         # it to an unrelated worker on the global round-robin.
+        return _ASSIGN_WAIT
+    if pick.get('directedTo') and chosen_id is None:
+        # The lead named this worker. Wait for them (and wake them when they
+        # are dormant) rather than handing their card to someone else.
+        return _ASSIGN_WAIT
+    if pick.get('issueKey') and chosen_id is None:
+        # Player/JIRA work is never shed for lack of an available agent. It
+        # waits in the backlog until someone can take it.
         return _ASSIGN_WAIT
     if (pick.get('taskType') == 'report' and pick.get('directRoute')
             and chosen_id is None):

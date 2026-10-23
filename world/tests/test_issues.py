@@ -409,3 +409,21 @@ class RefinementAssignedWorker(unittest.TestCase):
     def test_player_pin_survives(self):
         self.assertEqual(sim._refinement_assigned_worker(
             self._state(), {'assignedTo': 'player'}, 'player', {}), 'player')
+
+    def test_director_can_pin_a_director_for_a_spike(self):
+        self.assertEqual(sim._refinement_assigned_worker(
+            self._state(), {'teamId': 'nora', 'assignedTo': 'ben',
+                            'issueType': 'spike'},
+            'nora', {'teamId': 'nora'}), 'ben')
+
+    def test_player_can_pin_a_director_for_a_spike(self):
+        self.assertEqual(sim._refinement_assigned_worker(
+            self._state(), {'teamId': 'nora', 'assignedTo': 'ben',
+                            'issueType': 'spike'},
+            'player', {'teamId': 'nora'}), 'ben')
+
+    def test_player_cannot_pin_a_director_to_code(self):
+        self.assertIsNone(sim._refinement_assigned_worker(
+            self._state(), {'teamId': 'nora', 'assignedTo': 'ben',
+                            'issueType': 'story'},
+            'player', {'teamId': 'nora'}))

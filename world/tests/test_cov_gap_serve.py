@@ -8223,14 +8223,14 @@ if __name__ == "__main__":
 
 
 class CreditsWatchdogTest(unittest.TestCase):
-    def test_low_then_hourly_reminder_then_restored(self):
-        state = {'low': False, 'last_alert_at': 0.0}
+    def test_low_then_restored_without_reminders(self):
+        state = {'low': False}
         low = {'remaining': 0.10, 'totalCredits': 10.0, 'totalUsage': 9.9}
         with mock.patch.object(serve, 'OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD', 0.50):
             self.assertEqual(serve._credits_watchdog_step(low, 100.0, state), 'low')
             self.assertIsNone(serve._credits_watchdog_step(low, 200.0, state))
-            self.assertEqual(serve._credits_watchdog_step(low, 3800.0, state),
-                             'reminder')
+            self.assertIsNone(serve._credits_watchdog_step(low, 3800.0, state),
+                              'the watchdog must not nag hourly')
             self.assertEqual(serve._credits_watchdog_step(
                 {'remaining': 2.0, 'totalCredits': 10.0, 'totalUsage': 8.0},
                 4000.0, state), 'restored')
@@ -8240,3 +8240,35 @@ class CreditsWatchdogTest(unittest.TestCase):
 
     def test_unknown_credits_do_not_alert(self):
         self.assertIsNone(serve._credits_watchdog_step(None, 1.0, {}))
+
+
+class CreditsPauseTest(unittest.TestCase):
+    def setUp(self):
+        self._old = dict(serve._CREDITS_PAUSE)
+        self._old_watch = dict(serve._CREDITS_WATCHDOG_STATE)
+        serve._CREDITS_PAUSE.update(active=False, since=0.0)
+        serve._CREDITS_WATCHDOG_STATE.update(low=False)
+
+    def tearDown(self):
+        serve._CREDITS_PAUSE.update(self._old)
+        serve._CREDITS_WATCHDOG_STATE.update(self._old_watch)
+
+    def test_pause_notifies_once_and_restore_clears_it(self):
+        with mock.patch.object(serve, 'send_player_telegram_sync') as send, \
+             mock.patch.object(serve, 'log_action'):
+            self.assertEqual(serve._set_credits_pause(
+                True, {'remaining': 0.10}, source='test'), 'paused')
+            self.assertTrue(serve.credits_pause_active())
+            self.assertIsNone(serve._set_credits_pause(
+                True, {'remaining': 0.05}, source='test'))
+            self.assertEqual(serve._set_credits_pause(
+                False, {'remaining': 2.0}, source='test'), 'resumed')
+            self.assertFalse(serve.credits_pause_active())
+            self.assertEqual(send.call_count, 2)
+
+    def test_model_call_is_refused_while_paused(self):
+        serve._CREDITS_PAUSE.update(active=True)
+        with self.assertRaises(serve.OpenRouterCreditsPaused):
+            serve._call_openrouter_once_sync('test/model', [], 10)
+        with self.assertRaises(serve.OpenRouterCreditsPaused):
+            serve._post_openrouter_raw('test/model', [])

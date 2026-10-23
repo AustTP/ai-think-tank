@@ -1205,6 +1205,9 @@ def init_db():
         # full b-tree scan + temp-sort, pinning a CPU core.
         conn.execute('CREATE INDEX IF NOT EXISTS idx_action_log_agent_ts ON action_log(agent_id, ts)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_action_log_agent ON action_log(agent_id)')
+        # Action-kind reads (allowlist history, a few audits) filter by action
+        # and time. Without this they full-scan a 67k+ row table.
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_action_log_action_ts ON action_log(action, ts)')
         # Decision tape: a raw, model-facing record of every Jev decision call the
         # chokepoint (_call_openrouter_decision_sync) makes -- prompt, candidates,
         # parsed choice/confidence/cost, and the full response. Complements the
@@ -5236,9 +5239,9 @@ async def _health_check_loop():
 
 
 def _credits_watchdog_step(credits, now, state=None):
-    """Pure decision for the credit watchdog. Returns one of 'low',
-    'reminder', 'restored', or None. The caller sends the message; this
-    function only owns the transition and the hourly reminder throttle."""
+    """Pure transition for the credit watchdog. Returns 'low' once when the
+    balance falls to the floor, 'restored' once when it comes back, and None
+    otherwise. No reminders."""
     state = _CREDITS_WATCHDOG_STATE if state is None else state
     if not isinstance(credits, dict):
         return None
@@ -5246,41 +5249,16 @@ def _credits_watchdog_step(credits, now, state=None):
         remaining = float(credits.get('remaining') or 0)
     except (TypeError, ValueError):
         return None
-    floor = OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD
-    is_low = remaining <= floor
+    is_low = remaining <= OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD
     if is_low:
         if not state.get('low'):
             state['low'] = True
-            state['last_alert_at'] = now
             return 'low'
-        if now - float(state.get('last_alert_at') or 0) >= OPENROUTER_CREDITS_WATCHDOG_REMINDER_S:
-            state['last_alert_at'] = now
-            return 'reminder'
         return None
     if state.get('low'):
         state['low'] = False
-        state['last_alert_at'] = 0.0
         return 'restored'
     return None
-
-
-def _credits_watchdog_message(action, credits):
-    """Subject/body for one watchdog transition. Plain text so both Telegram
-    and email read cleanly; no dollar sign is used in the subject."""
-    remaining = float((credits or {}).get('remaining') or 0)
-    total = float((credits or {}).get('totalCredits') or 0)
-    used = float((credits or {}).get('totalUsage') or 0)
-    floor = OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD
-    if action == 'restored':
-        return ('[AI Think Tank] OpenRouter credits restored',
-                f'Credits are back above the ${floor:.2f} watchdog floor. '
-                f'Remaining ${remaining:.2f}. Work resumes automatically on the next call.')
-    label = 'low' if action == 'low' else 'still low'
-    return (f'[AI Think Tank] OpenRouter credits {label}',
-            f'Remaining ${remaining:.2f} of ${total:.2f} purchased (${used:.2f} used). '
-            f'The watchdog floor is ${floor:.2f}. Top up OpenRouter when you can; '
-            'the tank cannot buy credits itself. Work resumes automatically after top-up. '
-            'This reminder repeats at most hourly until the balance is restored.')
 
 
 async def _openrouter_credits_probe_loop():
@@ -5293,13 +5271,10 @@ async def _openrouter_credits_probe_loop():
         try:
             credits = await asyncio.to_thread(_openrouter_account_credits)
             action = _credits_watchdog_step(credits, time.time())
-            if action:
-                subject, body = _credits_watchdog_message(action, credits)
-                await asyncio.to_thread(send_player_telegram_sync, subject, body)
-                log_action('system', 'credits_watchdog',
-                           {'action': action,
-                            'remaining': (credits or {}).get('remaining')},
-                           authorized=True)
+            if action == 'low':
+                await asyncio.to_thread(_set_credits_pause, True, credits, 'probe')
+            elif action == 'restored':
+                await asyncio.to_thread(_set_credits_pause, False, credits, 'probe')
         except Exception as e:
             print(f'[credits-probe] loop error: {e}', flush=True)
         await asyncio.sleep(OPENROUTER_CREDITS_CACHE_TTL_S)
@@ -8903,14 +8878,69 @@ OPENROUTER_MONTHLY_BUDGET_USD = float(_load_env().get('OPENROUTER_MONTHLY_BUDGET
 OPENROUTER_CREDITS_WARN_PCT = 0.20   # remaining <= 20% of live funds -> warning push
 OPENROUTER_CREDITS_CRIT_PCT = 0.10   # remaining <= 10% of live funds -> critical push
 # Credit watchdog: when the live OpenRouter balance is at or below this floor,
-# push one Telegram alert immediately and a reminder at most once per hour
-# until the balance is restored. The watchdog never buys or tops up credits;
-# it only tells the player. The 300s probe loop below carries the check, so
-# there is no separate cron to start or stop.
+# pause new model-dependent work, send one notice, and keep probing. When the
+# balance is restored, resume the queued work automatically. No hourly
+# reminders. The watchdog never buys or tops up credits.
 OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD = float(
     _load_env().get('OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD', '0.50') or 0.50)
-OPENROUTER_CREDITS_WATCHDOG_REMINDER_S = 3600
-_CREDITS_WATCHDOG_STATE = {'low': False, 'last_alert_at': 0.0}
+_CREDITS_WATCHDOG_STATE = {'low': False}
+_CREDITS_PAUSE = {'active': False, 'since': 0.0}
+
+
+class OpenRouterCreditsPaused(RuntimeError):
+    """Raised when a model call is refused because the account has no credits."""
+    credits_paused = True
+
+
+def credits_pause_active():
+    return bool(_CREDITS_PAUSE.get('active'))
+
+
+def _reset_model_circuits():
+    """Credits failures are not model failures. On restore, close every model
+    circuit so queued work resumes immediately instead of waiting out a
+    5-minute breaker cooldown."""
+    with _model_circuit_lock:
+        for state in _model_circuit_state.values():
+            state['consecutive_failures'] = 0
+            state['open_until'] = 0
+            state['probing'] = False
+
+
+def _set_credits_pause(active, credits=None, source='probe'):
+    """Toggle the global credit pause and send one message per transition."""
+    active = bool(active)
+    if active == _CREDITS_PAUSE.get('active'):
+        return None
+    _CREDITS_PAUSE['active'] = active
+    _CREDITS_PAUSE['since'] = time.time() if active else 0.0
+    _CREDITS_WATCHDOG_STATE['low'] = active
+    remaining = None
+    if isinstance(credits, dict):
+        try:
+            remaining = float(credits.get('remaining') or 0)
+        except (TypeError, ValueError):
+            remaining = None
+    if active:
+        subject = '[AI Think Tank] OpenRouter credits exhausted'
+        body = (f'Remaining ${remaining:.2f}.' if remaining is not None else 'The account is out of credits.') + \
+               ' New model work is paused. Queued work will resume automatically when credits are added.'
+    else:
+        _reset_model_circuits()
+        subject = '[AI Think Tank] OpenRouter credits restored'
+        body = (f'Remaining ${remaining:.2f}. ' if remaining is not None else '') + \
+               'Work resumed automatically where it stopped.'
+    try:
+        send_player_telegram_sync(subject, body)
+    except Exception:
+        pass
+    try:
+        log_action('system', 'credits_pause',
+                   {'active': active, 'source': source, 'remaining': remaining},
+                   authorized=True)
+    except Exception:
+        pass
+    return 'paused' if active else 'resumed'
 
 # Page-request budget: the think tank has a MONTHLY allowance of
 # EXTERNAL page requests -- each browse_page fetch (/api/browse) and each
@@ -11491,6 +11521,8 @@ def _openrouter_chat_post(body):
             detail = e.read().decode('utf-8', 'ignore').lower()
         except Exception:
             pass
+        if e.code == 402:
+            _set_credits_pause(True, source='openrouter_402')
         if e.code != 400 or 'reasoning is mandatory' not in detail:
             # Availability-class failure of a SELECTED tier model queues a
             # re-pick (see _queue_tier_recheck_if_availability); transient
@@ -11509,6 +11541,8 @@ def _openrouter_chat_post(body):
                 detail2 = e2.read().decode('utf-8', 'ignore').lower()
             except Exception:
                 pass
+            if e2.code == 402:
+                _set_credits_pause(True, source='openrouter_402')
             _queue_tier_recheck_if_availability(body.get('model'), e2.code, detail2)
             if any(marker in detail2 for marker in _AVAILABILITY_ERROR_MARKERS):
                 e2.availability_failure = True
@@ -11517,6 +11551,8 @@ def _openrouter_chat_post(body):
 
 def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
                                reasoning_override=None):
+    if credits_pause_active():
+        raise OpenRouterCreditsPaused('OpenRouter credits are exhausted; work is paused until the balance is restored')
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if _api_key_is_broken('openrouter'):
@@ -11647,6 +11683,8 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     resilience + model-result bookkeeping as the plain call -- the tool loop
     is a real model consumer, so it earns the same protections. Returns the
     parsed OpenRouter JSON document."""
+    if credits_pause_active():
+        raise OpenRouterCreditsPaused('OpenRouter credits are exhausted; work is paused until the balance is restored')
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if _api_key_is_broken('openrouter'):
@@ -25582,6 +25620,11 @@ async def chat(request: Request):
     key_ok = verify_agent_key(body.get('agentId'), request.headers.get('X-Agent-Key')) is True
     if not session_ok and not key_ok:
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    if credits_pause_active():
+        return JSONResponse({
+            'error': 'OpenRouter credits are exhausted. Model work is paused and will resume automatically when credits are added.',
+            'creditsPaused': True,
+        }, status_code=503)
     model = body.get('model')
     messages = body.get('messages')
     agent_id = body.get('agentId')
@@ -25767,7 +25810,14 @@ async def chat(request: Request):
                 _accrue_high_tier_spend(usage_cost)
         log_action(agent_id, 'chat', {'model': model, 'service': service, 'cost': float(usage_cost) if isinstance(usage_cost, (int, float)) else 0.0, 'best_of': best_n}, authorized=authorized)
         return JSONResponse({'reply': reply})
+    except OpenRouterCreditsPaused as e:
+        return JSONResponse({'error': str(e), 'creditsPaused': True}, status_code=503)
     except urllib.error.HTTPError as e:
+        if e.code == 402:
+            return JSONResponse({
+                'error': 'OpenRouter credits are exhausted. Model work is paused and will resume automatically when credits are added.',
+                'creditsPaused': True,
+            }, status_code=503)
         return JSONResponse({'error': e.read().decode()}, status_code=e.code)
     except Exception as e:
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -35234,9 +35284,12 @@ def _http_json(method, base, path, body=None, header=None, timeout=30,
     except urllib.error.HTTPError as e:
         raw = e.read().decode('utf-8', errors='replace')
         try:
-            return json.loads(raw) if raw else {'error': f'HTTP {e.code}'}
+            parsed = json.loads(raw) if raw else {'error': f'HTTP {e.code}'}
         except json.JSONDecodeError:
             return {'error': f'HTTP {e.code}: {raw[:200]}'}
+        if isinstance(parsed, dict) and parsed.get('creditsPaused'):
+            raise OpenRouterCreditsPaused(parsed.get('error') or 'OpenRouter credits are exhausted')
+        return parsed
     except Exception as e:
         return {'error': f'request failed: {e}'}
     finally:
