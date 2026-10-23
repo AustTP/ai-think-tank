@@ -259,6 +259,9 @@ echo
 echo "== Python: failure notification =="
 python3 tests/test_failure_notify.py
 echo
+echo "== Python: notification preferences =="
+python3 tests/test_notify_prefs.py
+echo
 echo "== Python: self-edit pipeline (proposal/change windows/remediation) =="
 python3 tests/test_selfedit.py
 echo

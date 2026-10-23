@@ -183,13 +183,38 @@ def send_player_telegram_sync(subject, body_text):
     text = f"{subject}\n\n{body_text}" if subject else body_text
     ok = False
     for chat_id in _serve.TELEGRAM_ALLOWED_CHAT_IDS:
-        try:
-            result = _serve._telegram_api_sync('sendMessage', {'chat_id': chat_id, 'text': text})
-        except Exception as e:
-            print(f'[telegram] player push failed for {chat_id}: {e}', flush=True)
-            result = None
-        ok = ok or (result is not None)
+        chat_ok = True
+        for chunk in _telegram_chunks(text):
+            try:
+                result = _serve._telegram_api_sync('sendMessage', {'chat_id': chat_id, 'text': chunk})
+            except Exception as e:
+                print(f'[telegram] player push failed for {chat_id}: {e}', flush=True)
+                result = None
+            if result is None:
+                chat_ok = False
+        ok = ok or chat_ok
     return ok
+
+
+def _telegram_chunks(text, limit=4000):
+    """Split a long notification into ordered Telegram-sized chunks.
+
+    Telegram rejects a message over 4096 characters, and the old code sent the
+    whole body in one call. A long sprint retrospective therefore failed as a
+    unit. Split on line boundaries where possible so every START/STOP/CONTINUE
+    item still arrives.
+    """
+    text = text or ''
+    out = []
+    while len(text) > limit:
+        cut = text.rfind('\n', 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        out.append(text[:cut])
+        text = text[cut:]
+    if text:
+        out.append(text)
+    return out or ['']
 
 
 def provision_player_email(app_password):

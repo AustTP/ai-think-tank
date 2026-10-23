@@ -9519,6 +9519,11 @@ def _queue_player_email(state, kind, subject, body_text, now_ms=None,
     delivery (['email'] keeps a chatty kind off Telegram); the default is both
     channels. Returns the outbox entry or None."""
     now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    # Successful spikes already leave a Library report. The player asked not to
+    # get a push for every completed spike; failures, pauses, and budget stops
+    # still use the same kind and still notify.
+    if kind == 'spike_done' and str(subject or '').startswith('[AI Think Tank] Spike done:'):
+        return None
     outbox = state.setdefault('emailOutbox', [])
     last = state.get('_lastEmailAt') or {}
     if now_ms - (last.get(kind) or 0) < _EMAIL_DEDUP_MS:
