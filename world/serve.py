@@ -6999,7 +6999,7 @@ def _resolve_pending_escalations_sync():
             'approve': 'An ordinary, legitimate, in-scope request that should go ahead.',
             'deny': 'Out of scope, unsafe, insufficiently justified, or clearly should not happen.',
         }
-        # _jev_quorum_choice_sync never raises (fails closed to (None, 1.0, 0.0)
+        # _jev_quorum_choice_sync never raises (fails closed to (None, 0.0, 0.0)
         # internally) -- an unreachable/non-binary classifier is caught by the
         # decision-not-in-(approve,deny) check right below, same as before.
         decision, confidence, _cost = _jev_quorum_choice_sync(instr, criteria)
