@@ -30,6 +30,33 @@ class SpikeNotificationTest(unittest.TestCase):
         self.assertEqual(len(state['emailOutbox']), 1)
 
 
+class CardFailureNotificationTest(unittest.TestCase):
+    def test_card_failure_is_telegram_only_and_deduped(self):
+        state = {}
+        task = {'id': 'task-1', 'title': 'Fix the report',
+                'room': 'pressoffice', 'taskType': 'story',
+                'issueKey': 'NORA-1', 'assignedTo': 'leo'}
+        sim._notify_card_failure(
+            state, task, 'the pipeline did not pass', now_ms=1_000_000_000)
+        self.assertEqual(len(state['emailOutbox']), 1)
+        entry = state['emailOutbox'][0]
+        self.assertEqual(entry['channels'], ['telegram'])
+        self.assertIn('Card failed: Fix the report', entry['subject'])
+        self.assertIn('the pipeline did not pass', entry['body'])
+        self.assertIn('Issue: NORA-1', entry['body'])
+        sim._notify_card_failure(
+            state, task, 'the pipeline did not pass', now_ms=1_000_000_100)
+        self.assertEqual(len(state['emailOutbox']), 1,
+                         'the same card is deduped for 30 minutes')
+
+    def test_spike_specific_notice_wins_over_generic_card_failure(self):
+        state = {}
+        task = {'id': 'task-2', 'title': 'Spike X', 'room': 'observatory',
+                'taskType': 'spike', '_notifyQueued': 'spike_done'}
+        sim._notify_card_failure(state, task, 'came up empty', now_ms=1_000_000_000)
+        self.assertFalse(state.get('emailOutbox'))
+
+
 class AdminEscalationTest(unittest.TestCase):
     def test_admin_resolves_after_director_gives_up(self):
         state = {'agentRoster': [

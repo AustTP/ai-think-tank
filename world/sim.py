@@ -2381,6 +2381,7 @@ def _apply_content_result(state, task, result, now_ms=None):
     notify = result.get('notifyPlayer')
     if notify and notify.get('kind') and notify.get('subject') and notify.get('body'):
         _queue_player_email(state, notify['kind'], notify['subject'], notify['body'])
+        task['_notifyQueued'] = notify.get('kind')
     # Peer-approval gate (Phase E addendum): when the completing task is a
     # review subtask carrying a `reviewOf` pointer, fold its Jev verdict into
     # the PARENT task's gate -- clean = +1 approval (distinct reviewers only),
@@ -5234,6 +5235,9 @@ def finish_task(state, agent_id, grid=None):
                    {'taskId': task['id'] if task else None,
                     'title': task['title'] if task else None,
                     'reason': 'missing_saved_deliverable'}, authorized=True)
+        _notify_card_failure(
+            state, task or {}, 'no saved deliverable in the Library',
+            category='refused')
     else:
         log_action(agent_id, 'task_completed', {'taskId': task['id'] if task else None,
                                                 'title': task['title'] if task else None},
@@ -6850,6 +6854,8 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
     resent, and the parent tag alone misreads the cause."""
     author = task.get('assignedTo')
     note = (fail_note or task.get('note') or 'the pipeline did not pass').strip()
+    _notify_card_failure(state, task, note, category='failed',
+                         now_ms=int(time.time() * 1000))
     if is_infra is None:
         is_infra = bool(task.get('_infraFailure'))
     if not task.get('_peerGate'):
@@ -7075,6 +7081,9 @@ def _release_agent_after_failure(state, agent_id, task):
                         'stage': 'content_pipeline'}, authorized=True)
         except Exception:
             pass
+        _notify_card_failure(
+            state, task, task.get('note') or 'quality pipeline failed',
+            category='auto-closed', now_ms=int(time.time() * 1000))
     a['task'] = None
     a['busy'] = False
     a['inRoom'] = None
@@ -9536,6 +9545,61 @@ def _queue_player_email(state, kind, subject, body_text, now_ms=None,
         entry['channels'] = list(channels)
     outbox.append(entry)
     return entry
+
+
+_CARD_FAILURE_DEDUP_MS = 30 * 60 * 1000
+
+
+def _notify_card_failure(state, task, reason, category='failed', now_ms=None):
+    """One Telegram notice per failing card, with the reason and card identity.
+
+    Per-task retries mint new task ids, so the dedup key is the issue key, or
+    the room+title for unkeyed cards. The notice is Telegram-only by request;
+    successful cards never call this path.
+    """
+    if not isinstance(task, dict):
+        return None
+    task_id = task.get('id') or task.get('taskId')
+    title = (task.get('title') or task_id or 'untitled card').strip()
+    issue = (task.get('issueKey') or '').strip()
+    key = issue or f"{task.get('room') or ''}|{title}"
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    seen = state.setdefault('_cardFailureNotified', {})
+    if now_ms - float(seen.get(key) or 0) < _CARD_FAILURE_DEDUP_MS:
+        return None
+    seen[key] = now_ms
+    # A spike that already queued its own specific notice (done/stalled/paused)
+    # owns the message; do not add a second card-failure copy for the same task.
+    if task.get('_notifyQueued'):
+        return None
+    text = str(reason or 'the card did not complete').strip()
+    try:
+        from serve import _redact_secrets
+        text = _redact_secrets(text)
+    except Exception:
+        pass
+    detail = [
+        f'Card: {title}',
+        f'Type: {task.get("taskType") or "task"}',
+        f'Room: {task.get("room") or "unknown"}',
+    ]
+    if issue:
+        detail.append(f'Issue: {issue}')
+    if task.get('assignedTo'):
+        detail.append(f'Assigned: {task["assignedTo"]}')
+    detail.extend([f'Category: {category}', f'Why: {text[:900]}'])
+    if category == 'abandoned':
+        detail.append('The card was removed from the queue after repeated assignment failures.')
+    elif category == 'auto-closed':
+        detail.append('The card was closed without completing because the pipeline kept failing.')
+    elif category == 'refused':
+        detail.append('Completion was refused because the saved deliverable was missing.')
+    else:
+        detail.append('The card was sent back or remains available for another attempt.')
+    return _queue_player_email(
+        state, f'card_failure:{key}',
+        f'[AI Think Tank] Card {category}: {title[:120]}',
+        '\n'.join(detail), now_ms=now_ms, channels=('telegram',))
 
 
 def _deliver_card_report(state, task, close_reason, approvals=0):
@@ -14832,6 +14896,10 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                                                       if isinstance(_content_heartbeat_at(task),
                                                                     (int, float)) else None),
                                     'graceUsedS': task.get('_contentGraceUsed')}, authorized=False)
+                        _notify_card_failure(
+                            state, task,
+                            'the content run stopped heartbeating and never produced a result',
+                            category='abandoned', now_ms=now_ms)
                     except Exception:
                         pass
                 # Bot Ops / shadow mode: capture the dry-run outcome to the shadow
@@ -14962,6 +15030,10 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 log_action(None, 'work_item_abandoned',
                            {'title': pick.get('title'), 'room': pick.get('room'),
                             'attempts': pick['attempts']}, authorized=True)
+                _notify_card_failure(
+                    state, pick,
+                    f'could not be assigned after {pick["attempts"]} attempts',
+                    category='abandoned', now_ms=now_ms)
                 _on_work_item_abandoned(state, pick, now_ms)
     return state
 
