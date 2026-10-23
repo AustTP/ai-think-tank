@@ -58,6 +58,14 @@ function agentFetch(url, agentId, options = {}) {
   return apiFetch(url, Object.assign({}, options, { headers }));
 }
 
+function agentMission(def) {
+  const id = typeof def === 'string' ? def : (def && def.id);
+  const live = id && typeof AGENTS !== 'undefined' ? AGENTS[id] : null;
+  return (live && live.profile && live.profile.mission)
+    || (def && def.profile && def.profile.mission)
+    || 'general think tank work';
+}
+
 // Hiring, firing, task assignment, and handoffs are all decided entirely
 // in the browser (no serve.py route makes the call itself), so without
 // this they'd be invisible to the one activity log.

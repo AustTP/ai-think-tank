@@ -81,6 +81,7 @@ setGlobal('ROOM_DOOR_TRIGGERS', {
 setGlobal('WORKROOM_SANDBOX_ID', 'workroom-shared');
 setGlobal('RESEARCH_SANDBOX_ID', 'research-shared');
 setGlobal('MODEL_TIERS', { small: { slug: 'test/small' }, mid: { slug: 'test/mid' }, planning: { slug: 'test/planning' } });
+setGlobal('agentMission', (def) => (def && def.profile && def.profile.mission) || 'general think tank work');
 setGlobal('SKILL_FILE_FORMAT_GUIDE', 'Format guide.');
 setGlobal('overlaps', () => false);
 setGlobal('blockedAt', () => false);

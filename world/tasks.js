@@ -850,7 +850,7 @@ async function assignTaskViaJev(title, room, instructions, includeOffDuty = fals
     // arrives) into a completely unrelated solo task, corrupting her
     // in-flight path/state.
     .filter(d => { const a = AGENTS[d.id]; return a && !a.busy && !a.task && !a.pairWith && (includeOffDuty || !a.offDuty); })
-    .map(d => ({ id: d.id, description: `${d.name}, ${d.role}. ${d.profile.mission}` }));
+    .map(d => ({ id: d.id, description: `${d.name}, ${d.role}. ${agentMission(d)}` }));
   if (candidates.length === 0) return null;
 
   let chosenId = (await requestJevChoice(instructions, candidates))?.choice;
@@ -1310,7 +1310,7 @@ async function assignPairTask(title, room, instructions, includeOffDuty = false,
   const pool = AGENT_ROSTER
     .filter(d => !d.isAdmin && !DEDICATED_PROJECT_ROLES.has(d.role))
     .filter(d => { const a = AGENTS[d.id]; return a && !a.busy && !a.task && !a.pairWith && (includeOffDuty || !a.offDuty); })
-    .map(d => ({ id: d.id, description: `${d.name}, ${d.role}. ${d.profile.mission}` }));
+    .map(d => ({ id: d.id, description: `${d.name}, ${d.role}. ${agentMission(d)}` }));
   if (pool.length < 2) return null; // pairing needs two free hands, not just one
 
   let driverId = (await requestJevChoice(`${instructions} Pick who should DRIVE -- physically write and run the work.`, pool))?.choice;

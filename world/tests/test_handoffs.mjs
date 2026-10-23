@@ -90,6 +90,7 @@ function reset({ evicted = [], mailFallback = false } = {}) {
   setGlobal('markContacted', () => {});
   setGlobal('agentFetch', async () => ({ ok: true, json: async () => ({ reply: 'nice work' }) }));
   setGlobal('requestJevChoice', async () => ({ choice: 'ben' }));
+  setGlobal('agentMission', (def) => (def && def.profile && def.profile.mission) || 'general think tank work');
   // handoffs.js schedules the recipient's reply speech 2200ms after the
   // handoff line lands -- run it immediately so tests don't stall for 2s.
   setGlobal('setTimeout', (fn) => { fn(); });

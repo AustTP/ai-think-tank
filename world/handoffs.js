@@ -88,7 +88,7 @@ async function attemptHandoff(fromId, finishedRoom, finishedTitle) {
     // until she actually arrives, so without this a handoff could target
     // someone who's about to vanish into a pairing session out from under it.
     .filter(d => { const a = AGENTS[d.id]; return a && a.visible && !a.busy && !a.task && !a.pairWith && !a.offDuty; })
-    .map(d => ({ id: d.id, description: `${d.name}, ${d.role}. ${d.profile.mission}` }));
+    .map(d => ({ id: d.id, description: `${d.name}, ${d.role}. ${agentMission(d)}` }));
 
   // Gap: if everyone eligible happens to be busy right
   // now, this used to just silently give up. Mail
@@ -96,7 +96,7 @@ async function attemptHandoff(fromId, finishedRoom, finishedTitle) {
   // reaches someone wherever they are, without needing them free.
   const anyCandidates = AGENT_ROSTER
     .filter(d => !d.isAdmin && d.id !== fromId && AGENTS[d.id])
-    .map(d => ({ id: d.id, description: `${d.name}, ${d.role}. ${d.profile.mission}` }));
+    .map(d => ({ id: d.id, description: `${d.name}, ${d.role}. ${agentMission(d)}` }));
 
   const candidates = idleCandidates.length > 0 ? idleCandidates : anyCandidates;
   if (candidates.length === 0) return false;
