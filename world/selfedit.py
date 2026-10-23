@@ -742,7 +742,7 @@ def _validate(edit_id, resolved, candidate):
         shutil.copytree(_world(), tmp,
                         ignore=shutil.ignore_patterns(
                             '__pycache__', '.selfedit_staging',
-                            '.selfedit_backups'),
+                            '.selfedit_backups', '.selfedit_failed'),
                         dirs_exist_ok=True)
         with open(os.path.join(tmp, os.path.basename(resolved)), 'w',
                   encoding='utf-8') as fh:
