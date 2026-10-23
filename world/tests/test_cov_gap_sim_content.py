@@ -717,7 +717,8 @@ class SimResidualTest(_Base):
     def test_resolve_refinement_pressoffice_spike_is_not_a_room_reject(self):
         req = {'id': 'r1', 'status': 'pending', 'filedBy': 'player',
                'room': 'pressoffice', 'title': '[SPIKE] Review a video transcript',
-               'issueType': 'spike', 'reason': 'JIRA issue DEV-99'}
+               'issueType': 'spike', 'reason': 'JIRA issue DEV-99',
+               'approvedTools': ['self_edit', 'schedule_dormant_apply']}
         state = {'agents': {'sm': {'name': 'SM'},
                             'player': {'name': 'Player', 'role': 'operator'}},
                  'agentRoster': [{'id': 'sm', 'name': 'SM'}],
@@ -755,6 +756,8 @@ class SimResidualTest(_Base):
         self.assertEqual(state['workQueue'][-1]['room'], 'pressoffice')
         self.assertEqual(state['workQueue'][-1]['taskType'], 'spike',
                          'the issue type must survive into the queue lane')
+        self.assertEqual(state['workQueue'][-1]['approvedTools'],
+                         ['self_edit', 'schedule_dormant_apply'])
 
     def test_resolve_breakdown_never_text(self):
         req = {'id': 'r1', 'status': 'pending', 'filedBy': 'cora',

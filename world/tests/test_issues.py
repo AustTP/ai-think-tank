@@ -200,6 +200,20 @@ class IssueFeedsBacklog(unittest.TestCase):
         self.assertEqual(team['id'], 'dev')
 
 
+class IssueApprovedTools(unittest.TestCase):
+    def test_approved_tools_survive_issue_and_backlog(self):
+        state = _state()
+        issue = sim.file_issue(
+            state, 'dev', 'spike', 'Propose a governed edit', 'checkout',
+            'player', now_ms=_NOW_MS, assigned_to='nadia',
+            approved_tools=['self_edit', 'schedule_dormant_apply'])
+        self.assertEqual(issue['approvedTools'],
+                         ['self_edit', 'schedule_dormant_apply'])
+        req = state['backlogRequests'][-1]
+        self.assertEqual(req['approvedTools'],
+                         ['self_edit', 'schedule_dormant_apply'])
+
+
 class IssuePrefix(unittest.TestCase):
     def test_derived_default_prefix(self):
         state = _state()

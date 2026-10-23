@@ -2806,6 +2806,7 @@ def queue_work(state, items):
             'projectLabel': item.get('projectLabel') or None,
             'research': item.get('research') or None,
             'taskType': item.get('taskType') or 'code',
+            'approvedTools': list(item.get('approvedTools') or []),
             'skillReview': bool(item.get('skillReview')),
             # Hive mind: a distillation content-task that merges recent archive
             # findings into the think tank wiki (see _check_schedules's distill sweep).
@@ -4715,6 +4716,7 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'attendees': list((extra or {}).get('attendees') or []),
         'facilitatorId': (extra or {}).get('facilitatorId') or None,
         'assignedTo': agent_id,
+        'approvedTools': list((extra or {}).get('approvedTools') or []),
         'status': 'walking',
         'createdAt': now_ms,
         'entryX': rest_x,
@@ -9132,7 +9134,7 @@ def _groups_look_like_gwt(text):
 def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
                description='', story_points=None, title=None, now_ms=None,
                assigned_to=None, lane=None, attendees=None,
-               facilitator_id=None):
+               facilitator_id=None, approved_tools=None):
     """File a JIRA-style issue for team_id. Returns the issue record dict, or
     None if a required field is missing (team_id / issue_type / summary /
     feature / reporter_id), the issue type is unknown, or the team is unknown.
@@ -9176,6 +9178,7 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         return None
     if not _team_row(state, team_id):
         return None
+    approved_tools = [str(t) for t in (approved_tools or []) if str(t).strip()]
     now_ms = time.time() * 1000 if now_ms is None else now_ms
     key = next_issue_key(state, team_id)
     story, criteria, never = _normalize_description(description)
@@ -9215,6 +9218,10 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         'blockedBy': None,
         'duplicateOf': duplicate_of,  # same-title open card in this team, or None
         'assignedTo': assigned_to or None,  # 'player' = the human does this one
+        # Explicit per-task commit-tool grants (e.g. self_edit and
+        # schedule_dormant_apply for a governed change request). A spike is not
+        # a trusted code pipeline, so it needs this to use commit tools.
+        'approvedTools': approved_tools,
         'lane': normalize_lane(lane),       # attention lane (build/reading/open/parking-lot)
         # MEETING provenance: the attendee spec (roster ids or a
         # 'team'/'all'/'pair' scope, resolved at grooming) and the
@@ -9250,6 +9257,7 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         # through refinement (assignedTo survives onto the queued item, and
         # _assign_due_item hands it to the player -- see _resolve_refinement).
         'assignedTo': assigned_to or None,
+        'approvedTools': approved_tools,
         # The attention lane the filed card rides -- survives file_issue ->
         # refinement -> queue so a parked or build-lane card keeps its lane
         # (see _resolve_refinement, which forwards req['lane'] onto the queue).
@@ -11180,6 +11188,7 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                     'title': req['title'], 'room': req['room'], 'goal': req.get('title'),
                     'instructions': instructions,
                     'taskType': queue_task_type,
+                    'approvedTools': list(req.get('approvedTools') or []),
                     'teamId': req.get('teamId'),
                     'userStory': story,
                     'acceptanceCriteria': criteria,
@@ -14234,6 +14243,7 @@ def _requeue_paused_work(state, task, now_ms):
         'moonshot': task.get('moonshot'),
         'lane': task.get('lane'),
         'playerAuthored': task.get('playerAuthored'),
+        'approvedTools': list(task.get('approvedTools') or []),
         'attendees': task.get('attendees') or [],
         'facilitatorId': task.get('facilitatorId'),
         'assignedTo': task.get('assignedTo'),
