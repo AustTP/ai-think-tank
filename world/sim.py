@@ -12475,6 +12475,22 @@ def _is_auxiliary_deliverable(task):
     return any(title.startswith(prefix) for prefix in _AUXILIARY_DELIVERABLE_PREFIXES)
 
 
+def retire_room_grade_signal(state, room, reason='', now_ms=None):
+    """Retire a room's trailing-grade signal without deleting the historical
+    grades. Used when the operator decides a 0.0 does not measure anything
+    real: the records stay for audit, but the roadmap, consensus relay, and
+    fallback grading stop treating that room's mean as a live signal."""
+    if not room:
+        return
+    state.setdefault('retiredGradeSignals', {})[room] = {
+        'reason': (reason or 'retired by operator').strip()[:300],
+        'at': now_ms or int(time.time() * 1000),
+    }
+    relay = state.get('consensusRelay') or {}
+    if relay.get('room') == room and 'weak trailing grade' in (relay.get('consensus') or ''):
+        state.pop('consensusRelay', None)
+
+
 def _room_trailing_grade(state, room):
     """Trailing-window mean grade for a room's recent completed deliverables
     (the signal the roadmap recompute keys on, and this room's own fallback
@@ -12490,6 +12506,8 @@ def _room_trailing_grade(state, room):
     average; legacy rows written before this field existed have no key at
     all and are treated as real (`.get(..., True)`) rather than silently
     dropped, since there's no way to know which they were retroactively."""
+    if room in (state.get('retiredGradeSignals') or {}):
+        return None
     grades = [d.get('grade') for d in (state.get('completedDeliverables') or [])
               if d.get('room') == room and isinstance(d.get('grade'), (int, float))
               and d.get('gradeIsReal', True)

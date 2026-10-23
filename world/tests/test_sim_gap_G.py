@@ -79,6 +79,25 @@ class GovernanceEscalationGap(SimIsolation):
         self.assertEqual(sim._room_trailing_grade(state, 'pressoffice'), 8.0)
         self.assertEqual(sim._agent_trailing_grade(state, 'ada'), 8.0)
 
+    def test_retired_room_grade_is_ignored(self):
+        state = {'completedDeliverables': [
+            {'title': 'Ship the checkout fix', 'room': 'pressoffice',
+             'agentId': 'ada', 'grade': 0.0, 'gradeIsReal': True},
+        ]}
+        sim.retire_room_grade_signal(state, 'pressoffice', 'source not documented', 1)
+        self.assertIsNone(sim._room_trailing_grade(state, 'pressoffice'))
+
+    def test_retired_room_grade_keeps_consensus_off_the_zero(self):
+        state = {'roadmap': {'pressoffice': {'priority': 5}},
+                 'completedDeliverables': [
+                     {'title': 'Ship the checkout fix', 'room': 'pressoffice',
+                      'agentId': 'ada', 'grade': 0.0, 'gradeIsReal': True},
+                 ]}
+        sim.retire_room_grade_signal(state, 'pressoffice', 'source not documented', 1)
+        sim._consensus_relay_step(state, 2)
+        consensus = (state.get('consensusRelay') or {}).get('consensus') or ''
+        self.assertNotIn('weak trailing grade', consensus)
+
     # --- _escalate_coaching_loop / _director_for ----------------------------
     def test_escalate_coaching_loop_director_for_missing(self):
         state = {'agentRoster': [], 'teams': [], 'agents': {}}
