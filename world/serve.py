@@ -19552,7 +19552,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 return (f'{result.get("message", "edit filed.")} '
                         f'[edit {result.get("id", "?")} status: {result.get("status")}]')
             return 'self_edit returned an unexpected response (nothing changed).'
-        if name == 'self_edit_status':
+        if name in ('self_edit_status', 'selfedit_status'):
             limit = (args or {}).get('limit')
             try:
                 limit = max(1, min(int(limit or 15), 50))

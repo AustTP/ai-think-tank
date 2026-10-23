@@ -20,7 +20,7 @@ _READ_ONLY_TOOLS = frozenset({
     'supervisor_state_records', 'supervisor_report', 'live_read', 'runbook',
     'read_mailbox', 'read_peer_reviews', 'team_digest', 'team_status',
     'allowlist_status', 'team_overview', 'treasury_status', 'x_trending_topics',
-    'search_linkedin_posts', 'self_edit_status', 'selfedit_recheck',
+    'search_linkedin_posts', 'self_edit_status', 'selfedit_status', 'selfedit_recheck',
     'selfedit_read', 'selfedit_validate', 'read_pulse', 'project_board',
     'audit_agent_readiness',
 })

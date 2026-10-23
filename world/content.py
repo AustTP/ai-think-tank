@@ -6740,6 +6740,20 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     )
     if _serve._google_is_configured():
         system += _GOOGLE_QUOTA_AWARENESS_BLOCK
+    if ('self_edit' in (task.get('approvedTools') or [])
+            or 'self_edit' in (instructions or '').lower()
+            or 'change request' in (backlog + ' ' + (instructions or '')).lower()):
+        system += (
+            '\n\nGOVERNED EDIT TASK: This is not a feasibility study. You have '
+            'explicit approval for self_edit and schedule_dormant_apply. First call '
+            'selfedit_read with path "*listing*" to list the available world files, '
+            'then choose an existing target named in the task (for a pressoffice UI '
+            'report, world/index.html is the default). Call self_edit with one exact '
+            'anchor and a small, real change, then call schedule_dormant_apply with '
+            'the named validator. Do not finish with a report saying the pipeline is '
+            'blocked unless self_edit actually returned an error. A missing target '
+            'path must be named exactly, not guessed as world/pressoffice.py.'
+        )
     system += '\n\n' + evidence_policy.INSTRUCTIONS
     if resume_transcript is not None:
         messages = list(resume_transcript)
