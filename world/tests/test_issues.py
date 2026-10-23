@@ -97,6 +97,20 @@ class IssueValidation(unittest.TestCase):
                                          now_ms=_NOW_MS))
 
 
+class IssueRoomRouting(unittest.TestCase):
+    def test_spike_issue_routes_to_observatory(self):
+        state = _state()
+        sim.file_issue(state, 'dev', 'spike', 'Investigate pricing',
+                       'search', 'player', now_ms=_NOW_MS)
+        self.assertEqual(state['backlogRequests'][0]['room'], 'observatory')
+
+    def test_story_issue_stays_in_pressoffice(self):
+        state = _state()
+        sim.file_issue(state, 'dev', 'story', 'Build checkout',
+                       'checkout', 'player', now_ms=_NOW_MS)
+        self.assertEqual(state['backlogRequests'][0]['room'], 'pressoffice')
+
+
 class IssueSequencing(unittest.TestCase):
     def test_per_team_counters_independent(self):
         state = _state()

@@ -1639,6 +1639,21 @@ class ToolSafetyPolicy(unittest.TestCase):
                          {'replay': 'unsafe', 'tier': 'commit'})
 
 
+class SpikeWorkWindow(unittest.TestCase):
+    def test_transcript_spike_gets_the_colab_window(self):
+        self.assertEqual(content._spike_work_window_s(
+            {'instructions': 'use youtube_transcript on the URL'}), 900)
+
+    def test_explicit_budget_wins_and_is_clamped(self):
+        self.assertEqual(content._spike_work_window_s({'budgetMs': 600_000}), 600)
+        self.assertEqual(content._spike_work_window_s({'budgetMs': 10_000}), 300)
+        self.assertEqual(content._spike_work_window_s({'budgetMs': 9_999_999}), 1800)
+
+    def test_ordinary_spike_keeps_the_default(self):
+        self.assertEqual(content._spike_work_window_s(
+            {'instructions': 'browse the market feed'}), 300)
+
+
 class TaskToolPolicy(unittest.TestCase):
     def test_research_allows_reads_and_prepare_but_denies_commit(self):
         policy = content.task_tool_policy({'taskType': 'research'})

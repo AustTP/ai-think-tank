@@ -6442,6 +6442,25 @@ def _spike_first_tool(backlog, instructions):
     return 'search_web' if _serve.TAVILY_API_KEY else True
 
 
+def _spike_work_window_s(task):
+    """Wall-clock window for one spike attempt, in seconds.
+
+    The generic spike window is 300s. A transcript spike can block inside
+    /api/youtube-transcript for up to 600s (Apify actor + Colab Whisper), so
+    that path gets 900s. An explicit budgetMs always wins and is clamped to
+    5..30 minutes so a malformed value cannot pin a task forever.
+    """
+    budget = (task or {}).get('budgetMs')
+    try:
+        budget_s = float(budget) / 1000.0 if budget else 0.0
+    except (TypeError, ValueError):
+        budget_s = 0.0
+    if budget_s <= 0:
+        instructions = (task or {}).get('instructions') or ''
+        budget_s = 900.0 if 'youtube_transcript' in instructions.lower() else 300.0
+    return max(300.0, min(1800.0, budget_s))
+
+
 def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     """Phase E2b: a SPIKE is a time-boxed investigation with no committed
     deliverable. Writes a concise findings artifact to the Library and stores
@@ -6537,7 +6556,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # generic 120s content ceiling _dispatch_content_work installs -- widen
     # it here so a slow-but-real result isn't dropped by that timeout's
     # fallback-completion path before this thread finishes.
-    task['workUntil'] = time.time() + 300
+    task['workUntil'] = time.time() + _spike_work_window_s(task)
 
     # Executor-level checkpoint: reuse the plan from a prior attempt after a
     # crash/restart instead of paying for the same plan twice. The plan is

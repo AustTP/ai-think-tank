@@ -315,6 +315,24 @@ class ColabDenyExemption(unittest.TestCase):
     Colab runs that use yt-dlp stay refused, torrents stay refused
     unconditionally, and every other deny class still fires."""
 
+    def test_colab_warnings_do_not_contaminate_the_transcript(self):
+        stdout = ('UserWarning: HF_TOKEN missing\n'
+                  '__TRANSCRIPT_BEGIN__\n'
+                  'hello from the video\n'
+                  '__TRANSCRIPT_END__\n'
+                  'WARNING:huggingface_hub.utils._http: slow\n')
+        with unittest.mock.patch.object(serve, 'COLAB_ENABLED', True), \
+             unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+             unittest.mock.patch.object(serve, '_colab_budget_exceeded', return_value=False), \
+             unittest.mock.patch.object(serve, 'APIFY_API_KEY', 'test-key'), \
+             unittest.mock.patch.object(serve, '_colab_gate_urls', return_value=None), \
+             unittest.mock.patch.object(serve, '_colab_compute_run',
+                                        return_value={'stdout': stdout, 'units': 1,
+                                                      'elapsed_s': 30, 'session': 'colab'}):
+            text, err = serve._youtube_transcript_colab('https://youtu.be/abc')
+        self.assertIsNone(err)
+        self.assertEqual(text, 'hello from the video')
+
     def test_transcription_needs_no_skip_label_and_uses_apify(self):
         with unittest.mock.patch.object(serve, 'COLAB_ENABLED', True), \
              unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \

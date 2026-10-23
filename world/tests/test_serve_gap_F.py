@@ -2750,11 +2750,14 @@ class YoutubeTranscriptEndpoint(unittest.TestCase):
     URL = 'https://www.youtube.com/watch?v=abc123def45'
 
     def _post(self, body, captions_return=None, captions_error=None,
-              colab_return=None, colab_error=None, rate=True, file_return=None):
+              colab_return=None, colab_error=None, rate=True, file_return=None,
+              cached_return=None):
         with unittest.mock.patch.object(serve, 'check_rate_limit', return_value=rate), \
              unittest.mock.patch.object(serve, 'verify_agent_key', return_value=None), \
              unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
              unittest.mock.patch.object(serve, 'log_action') as log, \
+             unittest.mock.patch.object(serve, '_cached_youtube_transcript',
+                                        return_value=cached_return) as cached, \
              unittest.mock.patch.object(serve, '_youtube_transcript',
                                         return_value=(captions_return, captions_error)) as caps, \
              unittest.mock.patch.object(serve, '_youtube_transcript_colab',
@@ -2769,6 +2772,20 @@ class YoutubeTranscriptEndpoint(unittest.TestCase):
         r, _log, _caps, _colab, _filed = self._post(
             {'agentId': 'eli', 'url': self.URL}, rate=False)
         self.assertEqual(r.status_code, 429)
+
+    def test_cached_transcript_skips_both_fetches(self):
+        r, log, caps, colab, filed = self._post(
+            {'agentId': 'eli', 'url': self.URL},
+            cached_return=('cached text', 'media/transcripts/abc123def45.txt'))
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body['transcript'], 'cached text')
+        self.assertEqual(body['source'], 'cache')
+        self.assertTrue(body['cached'])
+        caps.assert_not_called()
+        colab.assert_not_called()
+        filed.assert_not_called()
+        self.assertEqual(log.call_args[0][2]['decision'], 'cache')
 
     def test_invalid_url_is_400(self):
         r, _log, _caps, _colab, _filed = self._post(
@@ -2855,6 +2872,12 @@ class YoutubeHelpers(unittest.TestCase):
         self.assertTrue(os.path.isfile(target))
         with open(target) as f:
             self.assertIn('hello', f.read())
+
+    def test_cached_transcript_reads_and_strips_header(self):
+        serve._file_youtube_transcript(self.URL, 'hello cached body', 'captions')
+        body, rel = serve._cached_youtube_transcript(self.URL)
+        self.assertEqual(body, 'hello cached body')
+        self.assertEqual(rel, 'media/transcripts/abc123def45.txt')
 
     def test_file_transcript_unsafe_library_path_returns_none(self):
         with unittest.mock.patch.object(serve, '_safe_library_path',

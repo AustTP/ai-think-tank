@@ -3932,6 +3932,32 @@ def _file_youtube_transcript(url, text, source):
         return None
 
 
+def _cached_youtube_transcript(url):
+    """Return (body, library-relative path) for an already-filed transcript, or
+    None. The cache is the shared media/transcripts/{video_id}.txt file. This
+    is checked before the free yt-dlp route and the metered Colab fallback so
+    a retry, a second reviewer, or a later panel reads the existing transcript
+    instead of paying to transcribe the same video twice."""
+    vid = _youtube_video_id(url)
+    if not vid:
+        return None
+    rel = os.path.join('media', 'transcripts', f'{vid}.txt')
+    target = _safe_library_path(rel)
+    if not target or not os.path.isfile(target):
+        return None
+    try:
+        raw = open(target, encoding='utf-8', errors='replace').read()
+    except OSError:
+        return None
+    if raw.startswith('# YouTube transcript\n\n'):
+        parts = raw.split('\n\n', 2)
+        raw = parts[2] if len(parts) == 3 else raw
+    body = raw.strip()
+    if not body:
+        return None
+    return body, rel
+
+
 def _clean_subtitle_file(path):
     """Strip VTT/SRT timing + markup into deduped plain text. YouTube's
     aligned VTT repeats each caption frame across every cue line, so the
@@ -4146,6 +4172,7 @@ def _youtube_transcript_colab(url, lang='en', model_size='small'):
         "                         compute_type='float16' if os.path.exists('/usr/local/cuda') else 'int8')\n"
         "    segments, _info = model.transcribe(out_path, language=(lang if lang != 'en' else None),\n"
         "                                        beam_size=3)\n"
+        "    print('__TRANSCRIPT_BEGIN__')\n"
         "    for seg in segments:\n"
         "        print(seg.text.strip())\n"
         "    print('__TRANSCRIPT_END__')\n"
@@ -4175,8 +4202,12 @@ def _youtube_transcript_colab(url, lang='en', model_size='small'):
                       + (f': {detail[:200]}' if detail else '.') + '.')
     if '__TRANSCRIPT_END__' not in stdout:
         return None, 'Colab transcription did not complete (no end marker) -- the run died partway.'
-    lines = [l.strip() for l in stdout.splitlines()
-             if l.strip() and l.strip() != '__TRANSCRIPT_END__']
+    if '__TRANSCRIPT_BEGIN__' in stdout:
+        body = stdout.split('__TRANSCRIPT_BEGIN__', 1)[1].split('__TRANSCRIPT_END__', 1)[0]
+    else:
+        body = stdout.rsplit('__TRANSCRIPT_END__', 1)[0]
+    lines = [l.strip() for l in body.splitlines()
+             if l.strip() and l.strip() not in ('__TRANSCRIPT_BEGIN__', '__TRANSCRIPT_END__')]
     if not lines:
         return None, 'Colab transcription returned no text.'
     text = '\n'.join(lines)
@@ -32657,6 +32688,14 @@ async def youtube_transcript(request: Request):
     authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
     if not _is_youtube_url(url):
         return JSONResponse({'error': 'a valid youtube.com or youtu.be URL is required'}, status_code=400)
+    cached = _cached_youtube_transcript(url)
+    if cached:
+        text, filed_path = cached
+        log_action(agent_id, 'youtube_transcript',
+                   {'url': url, 'decision': 'cache', 'chars': len(text), 'source': 'cache'},
+                   authorized=authorized)
+        return JSONResponse({'ok': True, 'url': url, 'transcript': text, 'chars': len(text),
+                             'source': 'cache', 'filed': filed_path, 'cached': True})
     text, captions_error = await asyncio.to_thread(_youtube_transcript, url, lang)
     source = 'yt-dlp-captions'
     if not text:
