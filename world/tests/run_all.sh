@@ -253,6 +253,9 @@ python3 tests/test_export_training_interactions.py
 echo "== Python: operator policy loaders (config.py) =="
 python3 tests/test_config.py
 echo
+echo "== Python: skill safety scan =="
+python3 tests/test_skill_scan.py
+echo
 echo "== Python: self-edit pipeline (proposal/change windows/remediation) =="
 python3 tests/test_selfedit.py
 echo

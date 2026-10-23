@@ -33,6 +33,7 @@ import serve as _serve
 import evidence_policy
 import review_quality
 import skill_prompts
+import skill_scan
 import training_capture
 import url_evidence
 import work_reuse
@@ -5192,6 +5193,19 @@ def _make_skill_publisher(agent_id, key):
                     '## Lessons learned) so it reads as a real reference file.')
         card = _build_skill_card(slug, title, source_task, team, interface, body)
         path = f'pending_review/skills/{slug}.md'
+        report = skill_scan.scan_skill_text(card, name=path)
+        if not report.get('ok'):
+            findings = skill_scan.format_findings(report)
+            _serve.log_action(agent_id, 'skill_scan_blocked',
+                              {'slug': slug, 'path': path,
+                               'score': report.get('score'),
+                               'findings': report.get('findings')[:10]},
+                              authorized=True)
+            return (f'publish_skill blocked by the skill safety scan '
+                    f'(risk {report.get("score")}/100). Nothing was written. '
+                    f'Rewrite the card without instructions or code that '
+                    f'bypass controls, exfiltrate secrets, or run destructive '
+                    f'commands.\n{findings}')
         try:
             _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/library/file',
                               {'agentId': agent_id, 'path': path, 'content': card,

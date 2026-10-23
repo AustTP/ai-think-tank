@@ -1453,14 +1453,17 @@ ownership, player-only grant API.
 **Steps.**
 
 1. Build a skill card: slug, title, source task, team, interface, body.
-2. Write the card to `pending_review/skills/`.
-3. The skill review sweep checks accuracy and value.
-4. A publishable skill is moved into the Library.
-5. The skill becomes available to later tasks.
+2. Run the static skill safety scan: prompt injection, secret exfiltration,
+   destructive commands, privilege escalation, policy bypass, and hidden
+   Unicode. A critical or high finding blocks the write.
+3. Write the card to `pending_review/skills/`.
+4. The skill review sweep checks accuracy and value.
+5. A publishable skill is moved into the Library.
+6. The skill becomes available to later tasks.
 
-**Controls.** Pending review, review sweep, Library scope.
+**Controls.** Static safety scan, pending review, review sweep, Library scope.
 
-**Records.** Skill file, review outcome, action log.
+**Records.** Skill file, scan result, review outcome, action log.
 
 ### BP-40 Conversation memory
 
