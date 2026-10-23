@@ -5235,6 +5235,54 @@ async def _health_check_loop():
         await asyncio.sleep(HEALTH_CHECK_INTERVAL_S)
 
 
+def _credits_watchdog_step(credits, now, state=None):
+    """Pure decision for the credit watchdog. Returns one of 'low',
+    'reminder', 'restored', or None. The caller sends the message; this
+    function only owns the transition and the hourly reminder throttle."""
+    state = _CREDITS_WATCHDOG_STATE if state is None else state
+    if not isinstance(credits, dict):
+        return None
+    try:
+        remaining = float(credits.get('remaining') or 0)
+    except (TypeError, ValueError):
+        return None
+    floor = OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD
+    is_low = remaining <= floor
+    if is_low:
+        if not state.get('low'):
+            state['low'] = True
+            state['last_alert_at'] = now
+            return 'low'
+        if now - float(state.get('last_alert_at') or 0) >= OPENROUTER_CREDITS_WATCHDOG_REMINDER_S:
+            state['last_alert_at'] = now
+            return 'reminder'
+        return None
+    if state.get('low'):
+        state['low'] = False
+        state['last_alert_at'] = 0.0
+        return 'restored'
+    return None
+
+
+def _credits_watchdog_message(action, credits):
+    """Subject/body for one watchdog transition. Plain text so both Telegram
+    and email read cleanly; no dollar sign is used in the subject."""
+    remaining = float((credits or {}).get('remaining') or 0)
+    total = float((credits or {}).get('totalCredits') or 0)
+    used = float((credits or {}).get('totalUsage') or 0)
+    floor = OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD
+    if action == 'restored':
+        return ('[AI Think Tank] OpenRouter credits restored',
+                f'Credits are back above the ${floor:.2f} watchdog floor. '
+                f'Remaining ${remaining:.2f}. Work resumes automatically on the next call.')
+    label = 'low' if action == 'low' else 'still low'
+    return (f'[AI Think Tank] OpenRouter credits {label}',
+            f'Remaining ${remaining:.2f} of ${total:.2f} purchased (${used:.2f} used). '
+            f'The watchdog floor is ${floor:.2f}. Top up OpenRouter when you can; '
+            'the tank cannot buy credits itself. Work resumes automatically after top-up. '
+            'This reminder repeats at most hourly until the balance is restored.')
+
+
 async def _openrouter_credits_probe_loop():
     """Keeps the live OpenRouter account-credits cache warm (bank's
     _openrouter_account_credits, 300s TTL, fails closed to None) so the health
@@ -5243,7 +5291,15 @@ async def _openrouter_credits_probe_loop():
     GET per interval. No key set = a cheap no-op every interval."""
     while True:
         try:
-            await asyncio.to_thread(_openrouter_account_credits)
+            credits = await asyncio.to_thread(_openrouter_account_credits)
+            action = _credits_watchdog_step(credits, time.time())
+            if action:
+                subject, body = _credits_watchdog_message(action, credits)
+                await asyncio.to_thread(send_player_telegram_sync, subject, body)
+                log_action('system', 'credits_watchdog',
+                           {'action': action,
+                            'remaining': (credits or {}).get('remaining')},
+                           authorized=True)
         except Exception as e:
             print(f'[credits-probe] loop error: {e}', flush=True)
         await asyncio.sleep(OPENROUTER_CREDITS_CACHE_TTL_S)
@@ -8846,6 +8902,15 @@ OPENROUTER_MONTHLY_BUDGET_USD = float(_load_env().get('OPENROUTER_MONTHLY_BUDGET
 # thresholds.
 OPENROUTER_CREDITS_WARN_PCT = 0.20   # remaining <= 20% of live funds -> warning push
 OPENROUTER_CREDITS_CRIT_PCT = 0.10   # remaining <= 10% of live funds -> critical push
+# Credit watchdog: when the live OpenRouter balance is at or below this floor,
+# push one Telegram alert immediately and a reminder at most once per hour
+# until the balance is restored. The watchdog never buys or tops up credits;
+# it only tells the player. The 300s probe loop below carries the check, so
+# there is no separate cron to start or stop.
+OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD = float(
+    _load_env().get('OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD', '0.50') or 0.50)
+OPENROUTER_CREDITS_WATCHDOG_REMINDER_S = 3600
+_CREDITS_WATCHDOG_STATE = {'low': False, 'last_alert_at': 0.0}
 
 # Page-request budget: the think tank has a MONTHLY allowance of
 # EXTERNAL page requests -- each browse_page fetch (/api/browse) and each

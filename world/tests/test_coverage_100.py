@@ -56,6 +56,13 @@ class TestConstitution:
         body = {'messages': [{'role': 'system', 'content': constitution.MARKER}]}
         assert constitution.with_rules(body) is body
 
+    def test_new_rules_are_in_the_prompt(self):
+        prompt = constitution.PROMPT.lower()
+        for phrase in ('metered api', 'veto is final', 'content involving minors',
+                       'html/css', 'change requests', 'never fabricate',
+                       'not a scope gate', 'denied or vetoed'):
+            assert phrase in prompt, phrase
+
 
 class TestModelConfig:
     def _base(self):

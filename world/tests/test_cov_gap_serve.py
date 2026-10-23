@@ -8220,3 +8220,23 @@ class DecideCaptureTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CreditsWatchdogTest(unittest.TestCase):
+    def test_low_then_hourly_reminder_then_restored(self):
+        state = {'low': False, 'last_alert_at': 0.0}
+        low = {'remaining': 0.10, 'totalCredits': 10.0, 'totalUsage': 9.9}
+        with mock.patch.object(serve, 'OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD', 0.50):
+            self.assertEqual(serve._credits_watchdog_step(low, 100.0, state), 'low')
+            self.assertIsNone(serve._credits_watchdog_step(low, 200.0, state))
+            self.assertEqual(serve._credits_watchdog_step(low, 3800.0, state),
+                             'reminder')
+            self.assertEqual(serve._credits_watchdog_step(
+                {'remaining': 2.0, 'totalCredits': 10.0, 'totalUsage': 8.0},
+                4000.0, state), 'restored')
+            self.assertIsNone(serve._credits_watchdog_step(
+                {'remaining': 2.0, 'totalCredits': 10.0, 'totalUsage': 8.0},
+                5000.0, state))
+
+    def test_unknown_credits_do_not_alert(self):
+        self.assertIsNone(serve._credits_watchdog_step(None, 1.0, {}))
