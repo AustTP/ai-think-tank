@@ -61,6 +61,24 @@ class GovernanceEscalationGap(SimIsolation):
         sim._grade_completed_task(state, 'theo', task, 1)
         self.assertEqual(state['completedDeliverables'], [])
 
+    def test_grade_completed_task_skips_avatar_and_supervise(self):
+        state = {'agents': {}, 'completedDeliverables': []}
+        sim._grade_completed_task(state, 'ada', {'taskType': 'code', 'room': 'pressoffice',
+                                                 'title': '[AVATAR] Generate four images'}, 1)
+        sim._grade_completed_task(state, 'ada', {'taskType': 'code', 'room': 'pressoffice',
+                                                 'title': '[SUPERVISE] Cross-team sweep'}, 1)
+        self.assertEqual(state['completedDeliverables'], [])
+
+    def test_trailing_grade_ignores_auxiliary_zeroes(self):
+        state = {'completedDeliverables': [
+            {'title': '[AVATAR] Generate four images', 'room': 'pressoffice',
+             'agentId': 'ada', 'grade': 0.0, 'gradeIsReal': True},
+            {'title': 'Ship the checkout fix', 'room': 'pressoffice',
+             'agentId': 'ada', 'grade': 8.0, 'gradeIsReal': True},
+        ]}
+        self.assertEqual(sim._room_trailing_grade(state, 'pressoffice'), 8.0)
+        self.assertEqual(sim._agent_trailing_grade(state, 'ada'), 8.0)
+
     # --- _escalate_coaching_loop / _director_for ----------------------------
     def test_escalate_coaching_loop_director_for_missing(self):
         state = {'agentRoster': [], 'teams': [], 'agents': {}}

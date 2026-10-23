@@ -12448,6 +12448,25 @@ def _runbook_decider_default(state, instructions, product_id, room, title, agent
 _runbook_decider = _runbook_decider_default
 
 
+_AUXILIARY_DELIVERABLE_PREFIXES = (
+    '[AVATAR]', '[SUPERVISE]', '[MEETING]', '[SPIKE]', '[REVIEW]', '[QA]',
+)
+
+
+def _is_auxiliary_deliverable(task):
+    """True for a completed task whose note is not a committed deliverable:
+    meeting minutes, spikes, reviews/QA, avatars, and supervisor sweeps. These
+    used to be graded against the code/report roadmap and recorded as real 0.0
+    scores, which then dragged the room's trailing grade to 0.0 and made the
+    consensus relay tell every worker to focus on that room. The 0.0 was an
+    artifact of the wrong rubric, not a quality signal."""
+    ttype = str((task or {}).get('taskType') or '').lower()
+    if ttype in ('meeting', 'spike', 'bug', 'review', 'qa'):
+        return True
+    title = str((task or {}).get('title') or '').strip().upper()
+    return any(title.startswith(prefix) for prefix in _AUXILIARY_DELIVERABLE_PREFIXES)
+
+
 def _room_trailing_grade(state, room):
     """Trailing-window mean grade for a room's recent completed deliverables
     (the signal the roadmap recompute keys on, and this room's own fallback
@@ -12465,7 +12484,8 @@ def _room_trailing_grade(state, room):
     dropped, since there's no way to know which they were retroactively."""
     grades = [d.get('grade') for d in (state.get('completedDeliverables') or [])
               if d.get('room') == room and isinstance(d.get('grade'), (int, float))
-              and d.get('gradeIsReal', True)]
+              and d.get('gradeIsReal', True)
+              and not _is_auxiliary_deliverable(d)]
     if not grades:
         return None
     return round(sum(grades) / len(grades), 1)
@@ -12487,7 +12507,8 @@ def _agent_trailing_grade(state, agent_id):
     float or None when the agent has no real graded deliverable yet."""
     grades = [d.get('grade') for d in (state.get('completedDeliverables') or [])
               if d.get('agentId') == agent_id and isinstance(d.get('grade'), (int, float))
-              and d.get('gradeIsReal', True)]
+              and d.get('gradeIsReal', True)
+              and not _is_auxiliary_deliverable(d)]
     if not grades:
         return None
     return round(sum(grades) / len(grades), 1)
@@ -12538,11 +12559,11 @@ def _grade_completed_task(state, agent_id, task, now_ms):
     """Fire-and-forget grader for a landed deliverable. Never blocks completion;
     on outage records a deterministic default (room's trailing mean, else mid-
     5.0). Also triggers a growth-plan entry if graded below the floor."""
-    if not task or task.get('taskType') in ('spike', 'bug', 'meeting') or task.get('reviewOf'):
-        # No committed deliverable -> nothing to grade. A meeting's only
-        # artifact is its minutes in the card note; grading it against the
-        # code/report roadmap produced real 0.0 scores and coaching
-        # escalations for perfectly good meetings (task-30).
+    if not task or task.get('reviewOf') or _is_auxiliary_deliverable(task):
+        # No committed deliverable -> nothing to grade. Meetings, spikes,
+        # reviews, avatars, and supervisor sweeps were being graded against the
+        # code/report roadmap, recording real 0.0 scores and coaching
+        # escalations for work that never had a deliverable to grade.
         return
     room = task.get('room')
     if not room or room not in VALUED_QUEUE_ROOMS:
@@ -12562,6 +12583,7 @@ def _grade_completed_task(state, agent_id, task, now_ms):
     state.setdefault('completedDeliverables', []).append({
         'id': task.get('id'), 'room': room, 'title': title,
         'agentId': agent_id, 'grade': grade,
+        'taskType': task.get('taskType') or 'code',
         # Hermes Town lesson: a fabricated fallback grade must be
         # distinguishable from a real Jev judgment, not silently identical --
         # see _room_trailing_grade's own comment for why this also matters
