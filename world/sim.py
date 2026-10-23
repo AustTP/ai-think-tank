@@ -12538,8 +12538,12 @@ def _grade_completed_task(state, agent_id, task, now_ms):
     """Fire-and-forget grader for a landed deliverable. Never blocks completion;
     on outage records a deterministic default (room's trailing mean, else mid-
     5.0). Also triggers a growth-plan entry if graded below the floor."""
-    if not task or task.get('taskType') in ('spike', 'bug') or task.get('reviewOf'):
-        return  # no committed deliverable -> nothing to grade
+    if not task or task.get('taskType') in ('spike', 'bug', 'meeting') or task.get('reviewOf'):
+        # No committed deliverable -> nothing to grade. A meeting's only
+        # artifact is its minutes in the card note; grading it against the
+        # code/report roadmap produced real 0.0 scores and coaching
+        # escalations for perfectly good meetings (task-30).
+        return
     room = task.get('room')
     if not room or room not in VALUED_QUEUE_ROOMS:
         return

@@ -55,6 +55,12 @@ class GovernanceEscalationGap(SimIsolation):
         sim._grade_completed_task({'agents': {}}, 'ada', task, 1)
         self.assertNotIn('completedDeliverables', {})
 
+    def test_grade_completed_task_skips_meeting(self):
+        state = {'agents': {}, 'completedDeliverables': []}
+        task = {'taskType': 'meeting', 'room': 'pressoffice'}
+        sim._grade_completed_task(state, 'theo', task, 1)
+        self.assertEqual(state['completedDeliverables'], [])
+
     # --- _escalate_coaching_loop / _director_for ----------------------------
     def test_escalate_coaching_loop_director_for_missing(self):
         state = {'agentRoster': [], 'teams': [], 'agents': {}}
