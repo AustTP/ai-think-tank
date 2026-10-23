@@ -427,6 +427,32 @@ class MeetingExecutor(unittest.TestCase):
                       'what shipped, what slowed us down.'):
             self.assertIn(token, user)
 
+    def test_full_transcript_mode_writes_the_conversation_not_minutes(self):
+        state = _seed()
+        task = self._task()
+        task['instructions'] = ('[FULL TRANSCRIPT] Agenda: what shipped, what slowed us down.')
+        calls = []
+
+        def fake_call(model, messages, max_tokens):
+            calls.append((model, messages, max_tokens))
+            return _completion('Theo: We should ship it.\nNora: Agreed.')
+
+        with mock.patch.object(content._serve, '_task_budget_exhausted',
+                               return_value=False), \
+             mock.patch.object(content._serve, '_resolve_model_tier',
+                               return_value='test-tier'), \
+             mock.patch.object(content._serve, '_call_openrouter_sync',
+                               side_effect=fake_call), \
+             mock.patch.object(sim, '_store_content_result') as stored:
+            content._run_meeting_content(state, 'ada', task)
+        model, messages, max_tokens = calls[0]
+        self.assertEqual(max_tokens, 3500)
+        self.assertIn('full transcript', messages[0]['content'])
+        self.assertNotIn('Follow this playbook', messages[0]['content'])
+        self.assertNotIn('[FULL TRANSCRIPT]', messages[1]['content'])
+        self.assertEqual(stored.call_args[0][1]['note'],
+                         'Theo: We should ship it.\nNora: Agreed.')
+
     def test_budget_exhausted_meeting_fails_closed_before_any_call(self):
         state = _seed()
         task = self._task()

@@ -6358,6 +6358,9 @@ def _run_meeting_content(snapshot, agent_id, task, base_ctx=None):
     name = _agent_name(snapshot, agent_id)
     title = task.get('title') or ''
     agenda = (task.get('instructions') or '').strip()
+    full_transcript = '[FULL TRANSCRIPT]' in agenda.upper()
+    if full_transcript:
+        agenda = agenda.replace('[FULL TRANSCRIPT]', '').replace('[full transcript]', '').strip()
     facilitator_id = task.get('facilitatorId')
     facilitator_name = _agent_name(snapshot, facilitator_id) if facilitator_id else name
     attendee_names = [_agent_name(snapshot, aid)
@@ -6388,23 +6391,40 @@ def _run_meeting_content(snapshot, agent_id, task, base_ctx=None):
             'ok': False,
         })
         return
-    minutes_guide = skill_prompts.load_skill_prompt(
-        'meeting-minutes', fallback=_MEETING_MINUTES_FALLBACK)
-    system = (
-        'You are the scribe for a team meeting in an AI think tank. The '
-        'meeting has already happened in-world: the facilitator convened the '
-        'listed attendees, they discussed the agenda, and you are writing the '
-        'minutes now. Follow this playbook:\n\n'
-        f'{minutes_guide}'
-    )
-    user = (f"Meeting: {title}\n\nAgenda:\n{agenda or '(none given)'}\n\n"
-            f"Facilitator: {facilitator_name}\n"
-            f"Attendees: {', '.join(attendee_names) or '(none)'}\n\n"
-            'Write the minutes now.')
+    if full_transcript:
+        system = (
+            'You are writing the full transcript of a panel discussion in an '
+            'AI think tank. The meeting has already happened in-world. Write '
+            'the complete conversation turn by turn, with each attendee '
+            'speaking in their own voice. Include real disagreement, evidence '
+            'from the source, and a final decisions/action-items section. Do '
+            'not summarize or compress the discussion into minutes. Do not '
+            'invent facts that are not in the agenda or source.'
+        )
+        user = (f"Panel: {title}\n\nAgenda and source material:\n{agenda or '(none given)'}\n\n"
+                f"Facilitator: {facilitator_name}\n"
+                f"Attendees: {', '.join(attendee_names) or '(none)'}\n\n"
+                'Write the full panel conversation now, with a speaker label on every turn.')
+        max_tokens = 3500
+    else:
+        minutes_guide = skill_prompts.load_skill_prompt(
+            'meeting-minutes', fallback=_MEETING_MINUTES_FALLBACK)
+        system = (
+            'You are the scribe for a team meeting in an AI think tank. The '
+            'meeting has already happened in-world: the facilitator convened the '
+            'listed attendees, they discussed the agenda, and you are writing the '
+            'minutes now. Follow this playbook:\n\n'
+            f'{minutes_guide}'
+        )
+        user = (f"Meeting: {title}\n\nAgenda:\n{agenda or '(none given)'}\n\n"
+                f"Facilitator: {facilitator_name}\n"
+                f"Attendees: {', '.join(attendee_names) or '(none)'}\n\n"
+                'Write the minutes now.')
+        max_tokens = 1200
     minutes = _plain_completion(tier_slug, [
         {'role': 'system', 'content': system},
         {'role': 'user', 'content': user},
-    ], 1200, service='meeting', task_id=task.get('id'))
+    ], max_tokens, service='meeting', task_id=task.get('id'))
     if minutes:
         _sim_module._store_content_result(task.get('id'), {
             'note': minutes, 'ok': True,
