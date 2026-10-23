@@ -446,7 +446,7 @@ class MeetingExecutor(unittest.TestCase):
              mock.patch.object(sim, '_store_content_result') as stored:
             content._run_meeting_content(state, 'ada', task)
         model, messages, max_tokens = calls[0]
-        self.assertEqual(max_tokens, 3500)
+        self.assertEqual(max_tokens, 7000)
         self.assertIn('full transcript', messages[0]['content'])
         self.assertNotIn('Follow this playbook', messages[0]['content'])
         self.assertNotIn('[FULL TRANSCRIPT]', messages[1]['content'])

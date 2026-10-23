@@ -6405,7 +6405,7 @@ def _run_meeting_content(snapshot, agent_id, task, base_ctx=None):
                 f"Facilitator: {facilitator_name}\n"
                 f"Attendees: {', '.join(attendee_names) or '(none)'}\n\n"
                 'Write the full panel conversation now, with a speaker label on every turn.')
-        max_tokens = 3500
+        max_tokens = 7000
     else:
         minutes_guide = skill_prompts.load_skill_prompt(
             'meeting-minutes', fallback=_MEETING_MINUTES_FALLBACK)
