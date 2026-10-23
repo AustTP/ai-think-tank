@@ -11838,6 +11838,12 @@ try:  # pulse desk tools: watch live feeds and read matches
     from pulse import PULSE_TOOLS as _PULSE_TOOLS
 except Exception:  # pragma: no cover - optional module during bootstrap
     _PULSE_TOOLS = []
+try:  # generic MCP client: operator-registered servers and tool calls
+    import mcp_client
+    _MCP_TOOLS = mcp_client.MCP_TOOLS
+except Exception:  # pragma: no cover - optional module during bootstrap
+    mcp_client = None
+    _MCP_TOOLS = []
 
 AGENT_ASK_TOOLS = [
     {
@@ -12666,7 +12672,7 @@ AGENT_ASK_TOOLS = [
             },
         },
     },
-]
+] + _MCP_TOOLS
 
 # Operator/village-editable tool descriptions: world/tool_descriptions.json is
 # an override layer over the inline text above (config.TOOL_DESCRIPTIONS). The
@@ -18627,6 +18633,63 @@ async def intent_clarify(request: Request):
         'onCallFallback': plan.get('onCallFallback', False)})
 
 
+def _mcp_tool_text(name, args, agent_id=None):
+    """Run one MCP tool and wrap its result as external data.
+
+    The MCP layer owns protocol and per-tool policy. This function owns the
+    boundary wrapping, so a tool description or payload can never arrive at a
+    model as trusted instructions.
+    """
+    if mcp_client is None:
+        return 'MCP support is not available on this server.'
+    try:
+        if name == 'mcp_list_servers':
+            raw = mcp_client.servers_text()
+            source = 'operator-registered MCP server metadata'
+        elif name == 'mcp_list_tools':
+            server = str((args or {}).get('server') or '')
+            raw = mcp_client.list_tools_text(
+                server, refresh=bool((args or {}).get('refresh')))
+            source = f'MCP tool catalog for server {server or "?"}'
+        else:
+            server = str((args or {}).get('server') or '')
+            tool = str((args or {}).get('tool') or '')
+            out = mcp_client.run_tool(
+                server, tool, (args or {}).get('arguments') or {},
+                read_only=(name == 'mcp_read'),
+                max_bytes=(args or {}).get('maxBytes'))
+            try:
+                log_action(agent_id or 'unknown', 'mcp_tool', {
+                    'server': server,
+                    'tool': tool,
+                    'tier': out.get('tier'),
+                    'ok': bool(out.get('ok')),
+                    'policyDenied': bool(out.get('policy_denied')),
+                }, authorized=not bool(out.get('policy_denied')))
+            except Exception:
+                pass
+            source = f'MCP server {server} tool {tool}'
+            if not out.get('ok'):
+                reason = out.get('error') or out.get('text') or 'MCP call failed'
+                if out.get('policy_denied'):
+                    return (f'MCP call refused: {reason} '
+                            '[policy denial -- do not retry the same call]')
+                wrapped, _nonce, _tag, instruction = wrap_external_content(
+                    reason, source)
+                retry_note = ('[do not retry the same call]'
+                              if out.get('retryable') is False
+                              else '[this may be transient; retry at most once]')
+                return f'MCP call failed. {instruction}\n\n{wrapped}\n{retry_note}'
+            raw = out.get('text') or '(empty MCP result)'
+    except Exception as exc:
+        wrapped, _nonce, _tag, instruction = wrap_external_content(
+            str(exc), 'MCP server or client error')
+        return (f'MCP call failed. {instruction}\n\n{wrapped}\n'
+                '[do not loop on the same call]')
+    wrapped, _nonce, _tag, instruction = wrap_external_content(raw, source)
+    return f'{instruction}\n\n{wrapped}'
+
+
 def _make_web_tools_executor(agent_id, agent_key, default_location=None, default_query=None, struck_tools=None, work_context='', work_context_trusted=False, task_id=None):
     """Shared search_web/browse_page tool executor for any
     AGENT_ASK_TOOLS-driven tool-calling loop. Extracted so the
@@ -18673,6 +18736,8 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
         if struck_tools is not None and name in struck_tools:
             return (f'{name} was already blocked once this investigation (one-strike) -- do not '
                     'call it again, use a different tool or approach instead.')
+        if name in ('mcp_list_servers', 'mcp_list_tools', 'mcp_read', 'mcp_call'):
+            return _mcp_tool_text(name, args, agent_id=agent_id)
         if name == 'team_status':
             # Read-only live queue/assignment view (DB-only, no state change) --
             # offered to spikes too, so a spike can see what the team is doing

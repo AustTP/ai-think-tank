@@ -448,6 +448,7 @@ class AskEndpoint(unittest.TestCase):
                      'selfedit_fix', 'selfedit_recheck', 'selfedit_read',
                      'selfedit_validate', 'policy_edit',
                      'veto_change_request',
+                     'mcp_list_servers', 'mcp_list_tools', 'mcp_read', 'mcp_call',
                      'pulse_watch', 'read_pulse', 'project_board'}
                     | ({'browser_step', 'audit_agent_readiness'}
                        if serve.BROWSING_ENABLED else set())

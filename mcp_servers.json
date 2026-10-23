@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "comment": "Operator registry for MCP servers, stored at the repo root outside the statically served world/ tree. Add one object per server under servers. stdio servers use an argv command array, never a shell string, and inherit only a minimal environment unless inherit_env is true. http servers use a url and require allow_private true for loopback or private-network hosts. Tool policy: allow/blocked are glob patterns, prepare wins over read_only when both match, and anything unmatched is commit. Credentials are env references, never literal secrets. env holds non-secret literal config; env_from maps a child variable to a parent environment variable. headers are literal and must not contain secrets.",
+  "servers": {
+    "rea": {
+      "name": "REA (Reverse Engineer Anything)",
+      "description": "Local reverse-engineering MCP server for native binaries, managed assemblies, Apple app bundles, archives, firmware, JavaScript bundles, browser pages, Electron targets, Android packages, and recorded crash or process evidence. Start with mcp_read for analysis and inspection; use mcp_call only for commit-tier actions that change state.",
+      "transport": "stdio",
+      "command": [
+        "npx",
+        "-y",
+        "rea-agents@6.4.0",
+        "mcp"
+      ],
+      "cwd": ".",
+      "enabled": true,
+      "inherit_env": false,
+      "env": {},
+      "startup_timeout_s": 120,
+      "request_timeout_s": 180,
+      "max_response_bytes": 4000000,
+      "max_tools": 500,
+      "tools": {
+        "allow": [
+          "*"
+        ],
+        "read_only": [
+          "address_name",
+          "analyze_*",
+          "binary_overview",
+          "build_reconstruction_obligation_ledger",
+          "comment",
+          "compare_*",
+          "correlate_*",
+          "current_*",
+          "demangle_swift",
+          "evaluate_*",
+          "find_*",
+          "get_*",
+          "inline_comment",
+          "inspect_*",
+          "list_*",
+          "procedure_*",
+          "project_*",
+          "read_*",
+          "resolve_*",
+          "search_*",
+          "trace_*",
+          "verify_*",
+          "xrefs"
+        ],
+        "prepare": [
+          "decode_*",
+          "extract_*",
+          "inspect_artifact",
+          "load_binary",
+          "open_binary"
+        ],
+        "blocked": []
+      }
+    }
+  }
+}
