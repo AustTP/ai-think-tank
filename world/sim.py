@@ -5149,7 +5149,11 @@ def _completion_has_evidence(state, task):
         if not evidence:
             return False
     elif ttype in ('spike', 'report'):
-        if not task.get('libraryPath') or not str(task.get('note') or '').strip():
+        # Report-lane tasks record reportPath (the file they wrote), not the
+        # generic libraryPath; refusing that completion made a successful
+        # report look like a missing deliverable and spawned a repair loop.
+        artifact = task.get('libraryPath') or task.get('reportPath')
+        if not artifact or not str(task.get('note') or '').strip():
             return False
     elif ttype in _DELIVERABLE_TASK_TYPES or task.get('_peerGate'):
         if not task.get('libraryPath'):

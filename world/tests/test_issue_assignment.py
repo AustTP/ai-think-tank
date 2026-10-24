@@ -27,3 +27,11 @@ def test_unpinned_issue_card_uses_round_robin(monkeypatch):
     got = sim._assign_due_item(state, pick, True, None,
                                {'pressoffice': {}}, 1_000_000)
     assert got == {'id': 'task-x'}
+
+
+def test_report_path_satisfies_completion_evidence():
+    assert sim._completion_has_evidence({}, {
+        'taskType': 'report', 'reportPath': 'x-articles/REVIEWED.md',
+        'note': 'Wrote the report.'})
+    assert not sim._completion_has_evidence({}, {
+        'taskType': 'report', 'note': 'Wrote the report.'})
