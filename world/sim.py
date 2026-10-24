@@ -15600,9 +15600,11 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # The lead named this worker. Wait for them (and wake them when they
         # are dormant) rather than handing their card to someone else.
         return _ASSIGN_WAIT
-    if pick.get('issueKey') and chosen_id is None:
+    if pick.get('issueKey') and chosen_id is None and not candidates:
         # Player/JIRA work is never shed for lack of an available agent. It
-        # waits in the backlog until someone can take it.
+        # waits in the backlog until someone can take it. When candidates DO
+        # exist, fall through to the round-robin below -- the old unconditional
+        # check stranded every unpinned issue card before assignment.
         return _ASSIGN_WAIT
     if (pick.get('taskType') == 'report' and pick.get('directRoute')
             and chosen_id is None):
@@ -15613,7 +15615,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         return _ASSIGN_WAIT
     if chosen_id is None:
         if not candidates:
-            return None
+            return _ASSIGN_WAIT if pick.get('issueKey') else None
         # Round-robin over eligible ids (deterministic, stable order of roster).
         rr = state.setdefault('sim', {}).setdefault('rr', {})
         pointer = rr.get('task', 0)
@@ -15671,7 +15673,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
             if team_ordered:
                 ordered = team_ordered
         if not ordered:
-            return None
+            return _ASSIGN_WAIT if pick.get('issueKey') else None
         # Fault-aware routing: soft-prefer a candidate with no
         # recent unfaded failure signal over the plain round-robin order --
         # same "soft preference, never a hard lock" shape as the team
