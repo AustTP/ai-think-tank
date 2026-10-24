@@ -10549,6 +10549,24 @@ def _browser_block_payload(parsed_result, agent_id, op, url, purpose):
 # still 300s, so this per-step ceiling only changes which step is blamed.
 SANDBOX_TIMEOUT_S = 120
 SANDBOX_MAX_OUTPUT = 20_000
+COMMAND_CONTEXT_MAX = 12_000
+
+
+def _compact_command_output(text, limit=COMMAND_CONTEXT_MAX):
+    """Keep the head and tail of a command's output; drop the repetitive middle.
+
+    Execute results were capped at 20k characters, which is still a large
+    prompt block for a log that mostly repeats. The head usually has the
+    command/context; the tail usually has the error or summary.
+    """
+    text = text or ''
+    if len(text) <= limit:
+        return text
+    head = max(0, (limit * 2) // 3)
+    tail = max(0, limit - head - 40)
+    omitted = len(text) - head - tail
+    return (text[:head] + f'\n... [{omitted} chars omitted] ...\n'
+            + text[-tail:] if tail else text[:head])
 # Where agent commands actually run: `local` = the local Docker
 # sandbox (the default and only tested backend); `digitalocean` = a provisioned
 # DigitalOcean Droplet. This ALSO serves as the master gate for the DO
@@ -11186,12 +11204,12 @@ def _run_in_sandbox_sync(sandbox_dir, command):
         result = _run_docker_sandbox(docker_cmd, SANDBOX_TIMEOUT_S)
         return {
             'exitCode': result.returncode,
-            'stdout': result.stdout[:SANDBOX_MAX_OUTPUT],
-            'stderr': result.stderr[:SANDBOX_MAX_OUTPUT],
+            'stdout': _compact_command_output(result.stdout),
+            'stderr': _compact_command_output(result.stderr),
             'timedOut': False,
         }
     except subprocess.TimeoutExpired as e:
-        return {'exitCode': None, 'stdout': (e.stdout or '')[:SANDBOX_MAX_OUTPUT], 'stderr': (e.stderr or '')[:SANDBOX_MAX_OUTPUT], 'timedOut': True}
+        return {'exitCode': None, 'stdout': _compact_command_output(e.stdout or ''), 'stderr': _compact_command_output(e.stderr or ''), 'timedOut': True}
 
 
 def run_cron_script_sandboxed(script_relpath, timeout_s, env):
@@ -11232,15 +11250,15 @@ def run_cron_script_sandboxed(script_relpath, timeout_s, env):
         result = _run_docker_sandbox(docker_cmd, timeout_s)
         return {
             'exitCode': result.returncode,
-            'stdout': result.stdout[:SANDBOX_MAX_OUTPUT],
-            'stderr': result.stderr[:SANDBOX_MAX_OUTPUT],
+            'stdout': _compact_command_output(result.stdout),
+            'stderr': _compact_command_output(result.stderr),
             'timedOut': False,
         }
     except subprocess.TimeoutExpired as e:
         return {
             'exitCode': None,
-            'stdout': (e.stdout or '')[:SANDBOX_MAX_OUTPUT],
-            'stderr': (e.stderr or '')[:SANDBOX_MAX_OUTPUT],
+            'stdout': _compact_command_output(e.stdout or ''),
+            'stderr': _compact_command_output(e.stderr or ''),
             'timedOut': True,
         }
 
@@ -11485,26 +11503,110 @@ def _fetch_rendered_page_sync(url, proxy=None):
             browser.close()
 
 
+HTTP_CACHE_DIR = os.path.join(THINK_TANK_DIR, '.http_cache')
+HTTP_CACHE_TTL_S = 6 * 3600
+
+
+def _http_cache_paths(url, proxy=None):
+    key = hashlib.sha256((str(proxy or '') + '\n' + url).encode()).hexdigest()
+    return (os.path.join(HTTP_CACHE_DIR, key + '.json'),
+            os.path.join(HTTP_CACHE_DIR, key + '.body'))
+
+
+def _read_http_cache(url, proxy=None):
+    meta_path, body_path = _http_cache_paths(url, proxy)
+    try:
+        with open(meta_path, encoding='utf-8') as fh:
+            meta = json.load(fh)
+        with open(body_path, 'rb') as fh:
+            body = fh.read().decode('utf-8', errors='replace')
+    except (OSError, ValueError):
+        return None
+    meta['body'] = body
+    return meta
+
+
+def _write_http_cache(url, proxy, final_url, content_type, body, truncated,
+                      etag, last_modified, ttl_s):
+    os.makedirs(HTTP_CACHE_DIR, exist_ok=True)
+    meta_path, body_path = _http_cache_paths(url, proxy)
+    meta = {
+        'url': url, 'final_url': final_url, 'content_type': content_type,
+        'truncated': bool(truncated), 'etag': etag or '',
+        'last_modified': last_modified, 'expires': time.time() + max(0, ttl_s),
+    }
+    tmp_meta, tmp_body = meta_path + '.tmp', body_path + '.tmp'
+    with open(tmp_body, 'w', encoding='utf-8') as fh:
+        fh.write(body)
+    with open(tmp_meta, 'w', encoding='utf-8') as fh:
+        json.dump(meta, fh)
+    os.replace(tmp_body, body_path)
+    os.replace(tmp_meta, meta_path)
+
+
+def _cache_ttl_from_headers(headers):
+    cc = (headers.get('Cache-Control') or '').lower()
+    if 'no-store' in cc:
+        return None
+    if 'no-cache' in cc:
+        return 0
+    m = re.search(r'max-age=(\d+)', cc)
+    if m:
+        return max(1, min(int(m.group(1)), 24 * 3600))
+    return HTTP_CACHE_TTL_S
+
+
 def _fetch_page_sync(url, proxy=None):
-    req = urllib.request.Request(url, headers={'User-Agent': 'AIThinkTankAgent/1.0'}, method='GET')
+    cached = _read_http_cache(url, proxy)
+    now = time.time()
+    if cached and cached.get('expires', 0) > now:
+        return (cached.get('final_url') or url, cached.get('content_type') or '',
+                cached.get('body') or '', bool(cached.get('truncated')),
+                cached.get('last_modified'))
+    headers = {'User-Agent': 'AIThinkTankAgent/1.0'}
+    if cached and cached.get('etag'):
+        headers['If-None-Match'] = cached['etag']
+    req = urllib.request.Request(url, headers=headers, method='GET')
     # proxy routes this one fetch through a sandbox VPN exit's proxy;
     # _safe_urlopen pins the proxy's own address and carries the origin
     # over urllib's standard ProxyHandler semantics (CONNECT for https),
     # so the SSRF pinning discipline is preserved on both hops.
-    with _safe_urlopen(req, timeout=BROWSE_TIMEOUT_S, proxy=proxy) as resp:  # user URLs pre-cleared by _jev_safety_gate's SSRF hostname guard (:2157); _safe_urlopen pins each resolved IP so DNS cannot rebind to an internal address
-        final_url = resp.geturl()
-        # Re-check the FINAL host after redirects -- a redirect chain is
-        # exactly how an allowed-looking URL could still end up pointed at
-        # an internal address.
-        final_host = urllib.parse.urlparse(final_url).hostname
-        if not _is_safe_public_host(final_host):
-            raise ValueError('redirected to a disallowed host')
-        content_type = resp.headers.get('Content-Type', '')
-        last_modified = _parse_http_date_ms(resp.headers.get('Last-Modified'))
-        raw = resp.read(BROWSE_MAX_BYTES + 1)
-        truncated = len(raw) > BROWSE_MAX_BYTES
-        raw = raw[:BROWSE_MAX_BYTES]
-        body = raw.decode(errors='replace')
+    try:
+        with _safe_urlopen(req, timeout=BROWSE_TIMEOUT_S, proxy=proxy) as resp:  # user URLs pre-cleared by _jev_safety_gate's SSRF hostname guard (:2157); _safe_urlopen pins each resolved IP so DNS cannot rebind to an internal address
+            final_url = resp.geturl()
+            # Re-check the FINAL host after redirects -- a redirect chain is
+            # exactly how an allowed-looking URL could still end up pointed at
+            # an internal address.
+            final_host = urllib.parse.urlparse(final_url).hostname
+            if not _is_safe_public_host(final_host):
+                raise ValueError('redirected to a disallowed host')
+            content_type = resp.headers.get('Content-Type', '')
+            last_modified = _parse_http_date_ms(resp.headers.get('Last-Modified'))
+            raw = resp.read(BROWSE_MAX_BYTES + 1)
+            truncated = len(raw) > BROWSE_MAX_BYTES
+            raw = raw[:BROWSE_MAX_BYTES]
+            body = raw.decode(errors='replace')
+            ttl = _cache_ttl_from_headers(resp.headers)
+            if ttl is not None:
+                _write_http_cache(url, proxy, final_url, content_type, body,
+                                  truncated, resp.headers.get('ETag'),
+                                  last_modified, ttl)
+    except urllib.error.HTTPError as e:
+        if e.code == 304 and cached:
+            # Revalidated: refresh the expiry and reuse the stored body.
+            meta_path, _ = _http_cache_paths(url, proxy)
+            try:
+                with open(meta_path, encoding='utf-8') as fh:
+                    meta = json.load(fh)
+                meta['expires'] = now + HTTP_CACHE_TTL_S
+                with open(meta_path, 'w', encoding='utf-8') as fh:
+                    json.dump(meta, fh)
+            except OSError:
+                pass
+            return (cached.get('final_url') or url, cached.get('content_type') or '',
+                    cached.get('body') or '', bool(cached.get('truncated')),
+                    cached.get('last_modified'))
+        raise
     return final_url, content_type, body, truncated, last_modified
 
 

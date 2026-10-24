@@ -22,6 +22,10 @@ echo
 echo "== JS: UI helpers =="
 node tests/test_ui_helpers.mjs
 echo
+echo "== Python: cost optimization helpers =="
+python3 tests/test_cost_opt.py
+echo
+
 echo "== Python: Safari tabs and X ingest =="
 python3 tests/test_safari_tabs.py
 python3 tests/test_x_ingest.py
