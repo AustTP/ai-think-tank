@@ -3,7 +3,7 @@
   "scripts": [
     {
       "path": "scripts/bot_law_watch.py",
-      "sha256": "0befd11659832c1c263bc5b368f7ab18c4de28577c48afa4ed2cb79b8ebf29e5",
+      "sha256": "b7735de1c4b20b3ec881566b08f151fa5341712f2f1b387d7e9bea5f6de953b0",
       "runner": "sandbox",
       "allowedHosts": [
         "www.federalregister.gov",
@@ -15,14 +15,14 @@
     },
     {
       "path": "scripts/check_file_growth.py",
-      "sha256": "6d413c41dd12140f319fd537e1ddf0cd96f5fb08e2e6114ec8989fb5e737510f",
+      "sha256": "3b4f1dfb408217686d28033764142b38e1f23e4398dc617bd7f2daef3a4f3d56",
       "runner": "sandbox",
       "allowedHosts": [],
       "env": []
     },
     {
       "path": "scripts/check_models.py",
-      "sha256": "a1b7889f18f75962bebb03cb45b7a6059a4183210aa91a34db24de5303497ef5",
+      "sha256": "5fdf13e5baaff724162d2c1af289c883856d2a11e7692387d1b926cdacbb8394",
       "runner": "sandbox",
       "allowedHosts": [],
       "env": []
