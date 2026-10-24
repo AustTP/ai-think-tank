@@ -1724,12 +1724,13 @@ creates an escalation with kind, question, and note.
 - Risk floor 1.0: human-only. The director loop skips it. The owner gets an
   email link.
 - Delegable kinds: the senior-most director decides on the 30-second loop.
+  If the director gives up, the admin gets one pass before the owner is asked.
 
 **Delegated decision.**
 
 1. Skip kinds whose judge cross-check has tripped the drift circuit.
 2. Respect the re-ask cooldown: 15 minutes.
-3. Stop after 6 asks and notify the human once.
+3. Stop after 6 asks, then try the admin once, then notify the human once.
 4. Ask JEV for approve or deny.
 5. Compute a composite trust score: confidence minus a per-kind error penalty.
 6. Require the per-kind floor and the effective safety confidence.
@@ -1737,9 +1738,11 @@ creates an escalation with kind, question, and note.
    only the original question and criteria, never the primary answer.
 8. A judge failure, disagreement, or suspected collusion sends the case to the
    human and bumps drift.
-9. On approve, run the kind's side effect. Examples: allowlist grant, API service
-   registration.
-10. Record the decision.
+9. The admin pass repeats the same decision and judge checks. Only after the
+   admin also fails does the owner receive the link.
+10. On approve, run the kind's side effect. Examples: allowlist grant, API service
+    registration.
+11. Record the decision.
 
 **Kinds and floors.**
 

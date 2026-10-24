@@ -7045,6 +7045,75 @@ def _senior_most_director_id(state):
     return None
 
 
+def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster):
+    """One chief-of-staff/admin attempt after the senior director gives up.
+
+    Returns True only when the admin produced a valid, sufficiently confident
+    approve/deny. A failed or malformed admin turn is not a decision: the
+    escalation then falls through to the player exactly as before.
+    """
+    admin_id = _admin_agent_id(state)
+    if not admin_id or admin_id == director_id:
+        return False
+    if esc.get('adminAskedAt'):
+        return False
+    esc['adminAskedAt'] = time.time()
+    admin_name = (roster.get(admin_id) or {}).get('name', admin_id)
+    instr = (
+        f'You are {admin_name}, the chief of staff/admin of the AI think tank. '
+        f'The senior director already tried {esc.get("askCount") or 0} time(s) '
+        f'and could not decide this escalation. This is the admin pass before '
+        f'the owner is asked. Kind: {esc.get("kind")}. '
+        f'Question: {esc.get("question")}. Approve only if clearly legitimate, '
+        'in-scope, and safe. Deny if out of scope, unsafe, or clearly no. '
+        'When genuinely unsure, leave it for the owner.'
+    )
+    criteria = {
+        'approve': 'An ordinary, legitimate, in-scope request that should go ahead.',
+        'deny': 'Out of scope, unsafe, insufficiently justified, or clearly should not happen.',
+    }
+    decision, confidence, _cost = _jev_quorum_choice_sync(instr, criteria)
+    if decision not in ('approve', 'deny'):
+        log_action(admin_id, 'escalation_admin_unsure',
+                   {'escalationId': esc_id, 'kind': esc_kind,
+                    'decision': decision, 'confidence': confidence},
+                   authorized=False)
+        return False
+    composite = _jev_directory_score(esc_kind, confidence)
+    floor = _escalation_floor(esc_kind)
+    if composite < floor or confidence < _effective_safety_confidence():
+        log_action(admin_id, 'escalation_admin_unsure',
+                   {'escalationId': esc_id, 'kind': esc_kind,
+                    'decision': decision, 'confidence': confidence,
+                    'composite': round(composite, 3), 'floor': floor},
+                   authorized=False)
+        return False
+    judge_model = _jev_judge_model()
+    if judge_model:
+        judge_decision, judge_conf, _judge_cost = _escalation_judge_crosscheck(
+            instr, criteria)
+        if judge_decision is None or judge_decision != decision:
+            log_action(admin_id, 'escalation_admin_judge_refused',
+                       {'escalationId': esc_id, 'kind': esc_kind,
+                        'decision': decision, 'judge': judge_model,
+                        'judge_decision': judge_decision,
+                        'confidence': confidence,
+                        'judge_confidence': judge_conf},
+                       authorized=False)
+            return False
+    esc['status'] = 'approved' if decision == 'approve' else 'denied'
+    esc['resolvedBy'] = f'{admin_name} ({admin_id})'
+    esc['resolvedAt'] = time.time()
+    if decision == 'approve' and esc_kind in ('allowlist candidate', 'allowlist request') and esc.get('note'):
+        _grant_allowlist(esc['note'], actor=admin_id, via='admin escalation')
+    log_action(admin_id, 'escalation_admin_' + ('approve' if decision == 'approve' else 'deny'),
+               {'escalationId': esc_id, 'kind': esc_kind,
+                'question': esc.get('question'), 'confidence': confidence,
+                'composite': round(composite, 3), 'floor': floor},
+               authorized=False)
+    return True
+
+
 def _resolve_pending_escalations_sync():
     # Runs on the director loop (a thread). No pending escalation, no work.
     escalations = _load_escalations()
@@ -7080,13 +7149,18 @@ def _resolve_pending_escalations_sync():
         # kinds are silent at creation, so this is when the ping actually
         # means "the director cannot handle this".
         if _escalation_judge_drift(esc_kind) >= ESCALATION_JUDGE_DRIFT_CIRCUIT:
+            if _escalation_admin_attempt(state, esc_id, esc, esc_kind,
+                                         director_id, roster):
+                dirty = True
+                resolved += 1
+                continue
+            dirty = True
             if not esc.get('humanNotified'):
                 esc['humanNotified'] = True
-                dirty = True
                 notify_human_of_escalation(
                     esc_id, esc,
-                    context='The director could not resolve this automatically (judge cross-check '
-                            'has been failing closed for this kind), so it is now yours.')
+                    context='The director and the admin both could not resolve this '
+                            'automatically (judge cross-check kept failing closed), so it is now yours.')
             continue
         # Re-ask backoff: don't hit Jev again until the cooldown has elapsed,
         # and stop asking entirely once this escalation has exceeded the
@@ -7099,13 +7173,18 @@ def _resolve_pending_escalations_sync():
         if now - last_asked < DIRECTOR_ESCALATION_REASK_COOLDOWN_S:
             continue
         if asks >= DIRECTOR_ESCALATION_MAX_ASKS:
+            if _escalation_admin_attempt(state, esc_id, esc, esc_kind,
+                                         director_id, roster):
+                dirty = True
+                resolved += 1
+                continue
+            dirty = True
             if not esc.get('humanNotified'):
                 esc['humanNotified'] = True
-                dirty = True
                 notify_human_of_escalation(
                     esc_id, esc,
-                    context=f'The director tried {asks} times and could not decide this '
-                            f'automatically, so it is now yours.')
+                    context=f'The director tried {asks} times and the admin also could '
+                            f'not decide this automatically, so it is now yours.')
             continue
         esc['lastAskedAt'] = now
         esc['askCount'] = asks + 1
