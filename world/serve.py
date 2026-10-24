@@ -10552,21 +10552,50 @@ SANDBOX_MAX_OUTPUT = 20_000
 COMMAND_CONTEXT_MAX = 12_000
 
 
+_OUTPUT_SIGNAL = re.compile(
+    r'(?i)(error|exception|traceback|failed|failure|fatal|warning|warn|assert|'
+    r'denied|timeout|no such file|not found|diff --git|^@@|^\+\+\+|^---|^\+|^-)')
+
+
 def _compact_command_output(text, limit=COMMAND_CONTEXT_MAX):
-    """Keep the head and tail of a command's output; drop the repetitive middle.
+    """Keep head, tail, error lines, and diff-like lines from a command output.
 
     Execute results were capped at 20k characters, which is still a large
-    prompt block for a log that mostly repeats. The head usually has the
-    command/context; the tail usually has the error or summary.
+    prompt block for a log that mostly repeats. A plain head/tail slice can
+    drop the one traceback or diff hunk in the middle, so signal lines are
+    reserved first, then the remaining budget fills head and tail.
     """
     text = text or ''
     if len(text) <= limit:
         return text
-    head = max(0, (limit * 2) // 3)
-    tail = max(0, limit - head - 40)
-    omitted = len(text) - head - tail
-    return (text[:head] + f'\n... [{omitted} chars omitted] ...\n'
-            + text[-tail:] if tail else text[:head])
+    if '\n' not in text:
+        head = max(0, (limit * 2) // 3)
+        tail = max(0, limit - head - 40)
+        return (text[:head] + f'\n... [{len(text) - head - tail} chars omitted] ...\n'
+                + text[-tail:] if tail else text[:head])
+    lines = text.splitlines()
+    signal = [(i, line) for i, line in enumerate(lines)
+              if _OUTPUT_SIGNAL.search(line)]
+    if len(signal) > 80:
+        signal = signal[:40] + signal[-39:]
+    selected = {i: line for i, line in signal}
+    used = sum(len(line) + 1 for line in selected.values())
+    head_n = max(1, len(lines) // 5)
+    tail_n = max(1, len(lines) // 5)
+    for i in list(range(head_n)) + list(range(max(0, len(lines) - tail_n), len(lines))):
+        if i in selected:
+            continue
+        line = lines[i]
+        if used + len(line) + 1 > limit - 60:
+            continue
+        selected[i] = line
+        used += len(line) + 1
+    out = '\n'.join(selected[i] for i in sorted(selected))
+    if len(out) > limit:
+        out = out[:limit - 40] + '\n... [signal output truncated] ...'
+    omitted = max(0, len(lines) - len(selected))
+    return out + (f'\n... [{omitted} lines omitted] ...' if omitted else '')
+
 # Where agent commands actually run: `local` = the local Docker
 # sandbox (the default and only tested backend); `digitalocean` = a provisioned
 # DigitalOcean Droplet. This ALSO serves as the master gate for the DO
