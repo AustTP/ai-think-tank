@@ -889,9 +889,17 @@ def apply_pass():
 def _run_test_gate(cwd, label, env=None):
     """Run the repo's own gate script in cwd and return (ok, tail)."""
     serve = _s()
+    # Tests must not call the live server. When the tank is dormant during a
+    # change window, an unmocked SELF_BASE_URL call gets 503 and the gate flakes
+    # on tests that are otherwise hermetic. Point the gate at a closed local
+    # port and keep Telegram silent.
+    run_env = dict(os.environ if env is None else env)
+    run_env.setdefault('SELF_BASE_URL', 'http://127.0.0.1:1')
+    run_env.setdefault('TELEGRAM_NOTIFICATIONS_ENABLED', 'false')
+    run_env.setdefault('TELEGRAM_SUPPRESS_DURING_TESTS', 'true')
     try:
         done = subprocess.run(
-            POST_APPLY_TEST_CMD, cwd=cwd, env=env,
+            POST_APPLY_TEST_CMD, cwd=cwd, env=run_env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=POST_APPLY_TEST_TIMEOUT_S)
         raw = (done.stdout or b'').decode('utf-8', errors='replace')
