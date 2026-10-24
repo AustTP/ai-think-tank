@@ -14794,6 +14794,51 @@ def _escalation_judge_drift_summary():
         return {}
 
 
+def _director_second_opinion(agent_id, action, noun, target, purpose,
+                             confidence, trace_id=None):
+    """Ask the senior director to decide a low-confidence JEV allow.
+
+    A low-confidence allow is not a block: it is uncertainty. The director
+    gets the same concrete command/action and purpose and makes the call.
+    Returns True only for a confident approve; every other shape fails closed.
+    """
+    try:
+        state = get_state_from_db() or {}
+    except Exception:
+        state = {}
+    director_id = _senior_most_director_id(state)
+    if not director_id:
+        return False
+    roster = {d.get('id'): d for d in (state.get('agentRoster') or [])}
+    director_name = (roster.get(director_id) or {}).get('name', director_id)
+    threshold = _effective_safety_confidence()
+    instr = (
+        f'You are {director_name}, the senior director of the AI think tank. '
+        f'An agent asked to run this {noun}: {target}\n'
+        f'Stated purpose: {purpose or "not given"}\n'
+        f'JEV returned allow at low confidence ({confidence:.2f}, below '
+        f'the {threshold:.2f} safety threshold). Decide whether the action '
+        'should go ahead. Approve only if it is ordinary, in-scope work and '
+        'the low confidence was caution rather than a real risk. Deny if it '
+        'is unsafe, destructive, exfiltrating, out of scope, or unjustified.'
+    )
+    criteria = {
+        'approve': 'Ordinary, legitimate, in-scope work; the low JEV confidence was caution, not a concrete risk.',
+        'deny': 'Unsafe, destructive, credential/secret access or exfiltration, out of scope, or not justified.',
+    }
+    decision, director_conf, _cost = _jev_quorum_choice_sync(instr, criteria)
+    allowed = (decision == 'approve'
+               and director_conf >= threshold)
+    log_action(director_id,
+               'jev_director_override' if allowed else 'jev_director_refused',
+               {'agent': agent_id, 'action': action, 'target': target,
+                'purpose': purpose, 'jevConfidence': confidence,
+                'directorConfidence': director_conf,
+                'decision': decision, 'traceId': trace_id},
+               authorized=False)
+    return allowed
+
+
 def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confidence, cost, authorized, trace_id=None):
     # Shared low-confidence handling for the Jev safety gates (browse,
     # download, curl/execute, sandbox download/save, temp access). A
@@ -14808,10 +14853,14 @@ def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confiden
         log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'blocked', 'confidence': confidence, 'cost': cost, 'reason': 'jev: ' + (decision or 'classifier unavailable, failed closed')}, authorized=authorized, trace_id=trace_id)
         return False
     if confidence < _effective_safety_confidence():
-        # Low-confidence allow: block and log. No player escalation -- the
-        # agent adapts to the block. Access/API-key needs go through the
-        # dedicated request endpoints which DO escalate.
-        log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'blocked_unsure', 'confidence': confidence, 'cost': cost, 'reason': 'jev allow at low confidence, blocked'}, authorized=authorized, trace_id=trace_id)
+        # Low-confidence allow is uncertainty, not a block. The senior
+        # director gets the decision; if the director also cannot approve
+        # confidently, fail closed exactly as before.
+        if _director_second_opinion(agent_id, action, noun, target, purpose,
+                                    confidence, trace_id):
+            log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'allowed_by_director', 'confidence': confidence, 'cost': cost, 'reason': 'jev low confidence; director approved'}, authorized=authorized, trace_id=trace_id)
+            return True
+        log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'blocked_unsure', 'confidence': confidence, 'cost': cost, 'reason': 'jev low confidence; director did not approve'}, authorized=authorized, trace_id=trace_id)
         return False
     # Confident allow -- passes. Log it so cost/confidence are visible in the
     # activity feed (Phase 2c: "log cost + confidence per decision").
