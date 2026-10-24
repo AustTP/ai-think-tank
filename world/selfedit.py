@@ -913,8 +913,19 @@ def _run_test_gate(cwd, label, env=None):
     tail = raw.strip()[-POST_APPLY_TAIL_LEN:]
     if ok:
         return True, tail
+    log_path = ''
+    try:
+        log_dir = os.path.join(_world(), '.selfedit_failed', 'gate-logs')
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(
+            log_dir, f'{label}-{time.strftime("%Y%m%d-%H%M%S")}.log')
+        with open(log_path, 'w', encoding='utf-8') as fh:
+            fh.write(raw)
+    except OSError:
+        log_path = ''
     serve.log_action('selfedit', f'self_edit_{label}_tests_failed',
-                     {'tail': tail[:POST_APPLY_TAIL_LEN]}, authorized=True)
+                     {'tail': tail[:POST_APPLY_TAIL_LEN],
+                      'log': log_path}, authorized=True)
     return False, tail
 
 
@@ -1008,6 +1019,7 @@ def _run_pre_apply_tests(rows):
     staging_root = os.path.join(_world(), '.selfedit_staging')
     os.makedirs(staging_root, exist_ok=True)
     tmp = os.path.join(staging_root, f'pre-{secrets.token_hex(6)}')
+    ok = False
     try:
         shutil.copytree(repo_root, tmp,
                         ignore=shutil.ignore_patterns(*PRE_APPLY_IGNORE),
@@ -1041,7 +1053,11 @@ def _run_pre_apply_tests(rows):
     except Exception as exc:
         return False, f'pre-apply gate could not run: {exc}'
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        if ok:
+            shutil.rmtree(tmp, ignore_errors=True)
+        else:
+            serve.log_action('selfedit', 'self_edit_preapply_preserved',
+                             {'path': tmp}, authorized=True)
 
 
 def _active_window_id():
