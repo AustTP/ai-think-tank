@@ -961,6 +961,16 @@ def _write_preapply_env(repo_root, tmp):
                 lines.append(f'{key}={value}\n')
     except OSError:
         return
+    # The gate is hermetic: never let the candidate tree call the live server,
+    # and never let a test run push Telegram.
+    lines = [line for line in lines
+             if not line.startswith(('SELF_BASE_URL=', 'TELEGRAM_NOTIFICATIONS_ENABLED=',
+                                     'TELEGRAM_SUPPRESS_DURING_TESTS='))]
+    lines.extend([
+        'SELF_BASE_URL=http://127.0.0.1:1\n',
+        'TELEGRAM_NOTIFICATIONS_ENABLED=false\n',
+        'TELEGRAM_SUPPRESS_DURING_TESTS=true\n',
+    ])
     dest = os.path.join(tmp, '.env')
     with open(dest, 'w', encoding='utf-8') as fh:
         fh.writelines(sorted(lines))
@@ -3525,9 +3535,14 @@ def admin_approve_window(agent_id, window_id, approved, note=''):
         return False, {'error': 'nothing is waiting for admin approval right now'}
     note = (note or '').strip()[:MAX_PUSH_NOTE_LEN]
     if not approved:
+        if not note:
+            return False, {'error': 'a note is REQUIRED for an unsuccessful '
+                                    'change request -- say why the push is '
+                                    'being denied, then deny again'}
         _update_window(window_id, admin_status='denied', admin_note=note,
                        admin_approved_at=time.time(), admin_agent=agent_id)
-        _fail_window_push(window_id, f'admin {agent_id} denied the push', by=agent_id)
+        _fail_window_push(
+            window_id, f'admin {agent_id} denied the push: {note}', by=agent_id)
         return True, {'ok': True, 'status': 'unsuccessful',
                       'message': 'admin denied; the window rolled back'}
     _update_window(window_id, admin_status='approved', admin_note=note,
@@ -3546,9 +3561,10 @@ def admin_approve_window(agent_id, window_id, approved, note=''):
 def validate_window(agent_id, window_id, approved, note, issues=False):
     """The validator's push decision for a held change request. Only the
     window's validator may call this, only while the slot is open and the
-    window holds. Deny = rollback (nothing pushed). Approve = push, with a
-    REQUIRED note whenever the outcome has issues (remediation was used,
-    reserved edits failed to apply, or the validator flags concerns)."""
+    window holds. Deny = rollback (nothing pushed). A note is REQUIRED for
+    every unsuccessful outcome and for successful outcomes with issues
+    (remediation was used, reserved edits failed to apply, or the validator
+    flags concerns)."""
     with _VALIDATION_LOCK:
         return _validate_window_unlocked(agent_id, window_id, approved, note,
                                          issues)
@@ -3583,10 +3599,15 @@ def _validate_window_unlocked(agent_id, window_id, approved, note,
         return False, {'error': 'the window slot has ended -- the sweep will '
                                 'roll the edits back; schedule a fresh window'}
     if not approved:
+        if not note:
+            return False, {'error': 'a note is REQUIRED for an unsuccessful '
+                                    'change request -- say why the push is '
+                                    'being denied, then deny again'}
         _fail_window_push(window_id,
-                          f'validator {agent_id} denied the push', by=agent_id)
+                          f'validator {agent_id} denied the push: {note}',
+                          by=agent_id)
         _update_window(window_id, validator_status='denied',
-                       validated_at=time.time())
+                       validator_note=note, validated_at=time.time())
         return True, {'ok': True, 'status': 'unsuccessful',
                       'message': 'denial recorded -- the window rolled back '
                                  'and nothing was pushed'}

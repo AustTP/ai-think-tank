@@ -245,6 +245,9 @@ def test_validator_denial_rolls_back(fake_repo, monkeypatch):
     telegrams = _watch_push_outcome(monkeypatch)
     ok, payload = selfedit.validate_window('reviewer', window_id, False, '',
                                            False)
+    assert ok is False and 'note is REQUIRED' in payload['error']
+    ok, payload = selfedit.validate_window(
+        'reviewer', window_id, False, 'the applied diff is not safe', False)
     assert ok is True and payload['status'] == 'unsuccessful', payload
     assert calls == []  # a denial never touches git
     assert selfedit._window_field(window_id, 'push_category') \

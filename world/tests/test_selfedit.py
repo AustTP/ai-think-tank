@@ -1474,6 +1474,19 @@ def test_validate_window_after_slot_ended_refuses(fake_repo, monkeypatch):
     assert ok is False and 'slot has ended' in payload['error']
 
 
+def test_validate_window_requires_note_for_denial(fake_repo, monkeypatch):
+    _, world = fake_repo
+    window_id, _edit_id = _book_and_apply(monkeypatch, world)
+    ok, payload = selfedit.validate_window('reviewer', window_id, False, '')
+    assert ok is False and 'note is REQUIRED' in payload['error']
+    ok, payload = selfedit.validate_window(
+        'reviewer', window_id, False, 'the repo gate is red')
+    assert ok is True and payload['status'] == 'unsuccessful', payload
+    assert selfedit._window_field(window_id, 'push_status') == 'failed'
+    assert 'repo gate is red' in (
+        selfedit._window_field(window_id, 'push_note') or '')
+
+
 def test_validate_window_requires_note_for_unlanded_edits(
         fake_repo, monkeypatch):
     _, world = fake_repo

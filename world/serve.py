@@ -35483,7 +35483,8 @@ def _health_digest_markdown(snapshot):
 # agent's real key: auth, rate-limit, Jev, redaction, and the passport all run
 # exactly as they do for browser-driven work. This is the lowest-drift port --
 # not a re-implementation of browse/save/chat internals.
-SELF_BASE_URL = _load_env().get('SELF_BASE_URL', 'http://localhost:8010')
+SELF_BASE_URL = (os.environ.get('SELF_BASE_URL')
+                 or _load_env().get('SELF_BASE_URL', 'http://localhost:8010'))
 
 
 def _derive_self_base_url(bind_host, port, env_url=None):

@@ -2436,8 +2436,9 @@ the shared GitHub repository (`origin main`) under a two-agent contract:
    covers `/api/selfedit/validate` for them while the slot is open.
 3. Every final outcome is recorded in one of three categories on the
    window row: `successful`, `successful_with_issues`, or `unsuccessful`
-   (denial, git failure, or nothing landed). A successful_with_issues
-   verdict REQUIRES a non-empty note; issues exist when in-window
+   (denial, git failure, or nothing landed). A successful_with_issues or
+   unsuccessful verdict REQUIRES a non-empty note from the agent making the
+   decision; a bare denial is refused. Issues exist when in-window
    remediation was used, any reserved edit did not land, or the validator
    flags them. The player's Telegram receives one message per final
    outcome, and the push is logged as a `repo_push` action.
