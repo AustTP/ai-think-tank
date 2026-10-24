@@ -92,6 +92,8 @@ library/refinement/
 # Player-ingested reference material (/api/library/ingest) -- runtime content
 # like the other library dirs above, never tracked.
 library/ingested/
+# X articles copied from the player's Safari tabs -- external runtime content.
+library/x-articles/
 # Endpoint-extracted YouTube transcripts land in the shared media/transcripts/
 # tree at runtime (readable by any agent via /api/library/file) -- generated
 # content, like the other runtime dirs above, never tracked.
