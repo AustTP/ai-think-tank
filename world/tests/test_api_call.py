@@ -843,7 +843,7 @@ class ApiServiceRegistry(unittest.TestCase):
         self.addCleanup(_start.stop)
         captured = {}
         with unittest.mock.patch.object(serve, 'create_escalation',
-                                        side_effect=lambda kind, question, on_approve_note='': (
+                                        side_effect=lambda kind, question, on_approve_note='', **kwargs: (
                                             captured.update(kind=kind, note=on_approve_note) or 'esc-1')):
             from starlette.testclient import TestClient
             c = TestClient(serve.app)

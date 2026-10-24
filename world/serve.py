@@ -11507,14 +11507,14 @@ HTTP_CACHE_DIR = os.path.join(THINK_TANK_DIR, '.http_cache')
 HTTP_CACHE_TTL_S = 6 * 3600
 
 
-def _http_cache_paths(url, proxy=None):
-    key = hashlib.sha256((str(proxy or '') + '\n' + url).encode()).hexdigest()
+def _http_cache_paths(url, proxy=None, namespace=''):
+    key = hashlib.sha256((str(namespace) + '\n' + str(proxy or '') + '\n' + url).encode()).hexdigest()
     return (os.path.join(HTTP_CACHE_DIR, key + '.json'),
             os.path.join(HTTP_CACHE_DIR, key + '.body'))
 
 
-def _read_http_cache(url, proxy=None):
-    meta_path, body_path = _http_cache_paths(url, proxy)
+def _read_http_cache(url, proxy=None, namespace=''):
+    meta_path, body_path = _http_cache_paths(url, proxy, namespace)
     try:
         with open(meta_path, encoding='utf-8') as fh:
             meta = json.load(fh)
@@ -11527,17 +11527,53 @@ def _read_http_cache(url, proxy=None):
 
 
 def _write_http_cache(url, proxy, final_url, content_type, body, truncated,
-                      etag, last_modified, ttl_s):
+                      etag, last_modified, ttl_s, last_modified_header='',
+                      namespace=''):
     os.makedirs(HTTP_CACHE_DIR, exist_ok=True)
     meta_path, body_path = _http_cache_paths(url, proxy)
     meta = {
         'url': url, 'final_url': final_url, 'content_type': content_type,
         'truncated': bool(truncated), 'etag': etag or '',
-        'last_modified': last_modified, 'expires': time.time() + max(0, ttl_s),
+        'last_modified': last_modified,
+        'last_modified_header': last_modified_header or '',
+        'expires': time.time() + max(0, ttl_s),
     }
     tmp_meta, tmp_body = meta_path + '.tmp', body_path + '.tmp'
     with open(tmp_body, 'w', encoding='utf-8') as fh:
         fh.write(body)
+    with open(tmp_meta, 'w', encoding='utf-8') as fh:
+        json.dump(meta, fh)
+    os.replace(tmp_body, body_path)
+    os.replace(tmp_meta, meta_path)
+
+
+def _read_http_cache_bytes(url, proxy=None, namespace=''):
+    meta_path, body_path = _http_cache_paths(url, proxy, namespace)
+    try:
+        with open(meta_path, encoding='utf-8') as fh:
+            meta = json.load(fh)
+        with open(body_path, 'rb') as fh:
+            meta['raw'] = fh.read()
+    except (OSError, ValueError):
+        return None
+    return meta
+
+
+def _write_http_cache_bytes(url, proxy, final_url, content_type, raw, truncated,
+                            etag, last_modified, ttl_s, last_modified_header='',
+                            namespace=''):
+    os.makedirs(HTTP_CACHE_DIR, exist_ok=True)
+    meta_path, body_path = _http_cache_paths(url, proxy, namespace)
+    meta = {
+        'url': url, 'final_url': final_url, 'content_type': content_type,
+        'truncated': bool(truncated), 'etag': etag or '',
+        'last_modified': last_modified,
+        'last_modified_header': last_modified_header or '',
+        'expires': time.time() + max(0, ttl_s),
+    }
+    tmp_meta, tmp_body = meta_path + '.tmp', body_path + '.tmp'
+    with open(tmp_body, 'wb') as fh:
+        fh.write(raw)
     with open(tmp_meta, 'w', encoding='utf-8') as fh:
         json.dump(meta, fh)
     os.replace(tmp_body, body_path)
@@ -11566,6 +11602,8 @@ def _fetch_page_sync(url, proxy=None):
     headers = {'User-Agent': 'AIThinkTankAgent/1.0'}
     if cached and cached.get('etag'):
         headers['If-None-Match'] = cached['etag']
+    elif cached and cached.get('last_modified_header'):
+        headers['If-Modified-Since'] = cached['last_modified_header']
     req = urllib.request.Request(url, headers=headers, method='GET')
     # proxy routes this one fetch through a sandbox VPN exit's proxy;
     # _safe_urlopen pins the proxy's own address and carries the origin
@@ -11590,7 +11628,8 @@ def _fetch_page_sync(url, proxy=None):
             if ttl is not None:
                 _write_http_cache(url, proxy, final_url, content_type, body,
                                   truncated, resp.headers.get('ETag'),
-                                  last_modified, ttl)
+                                  last_modified, ttl,
+                                  resp.headers.get('Last-Modified') or '')
     except urllib.error.HTTPError as e:
         if e.code == 304 and cached:
             # Revalidated: refresh the expiry and reuse the stored body.
@@ -24300,17 +24339,39 @@ DOWNLOAD_MAX_BYTES = 20_000_000  # 20MB -- generous for a real reference documen
 
 
 def _download_file_sync(url, max_bytes):
-    req = urllib.request.Request(url, headers={'User-Agent': 'AIThinkTankAgent/1.0'}, method='GET')
-    with _safe_urlopen(req, timeout=BROWSE_TIMEOUT_S) as resp:  # user URLs pre-cleared by _jev_safety_gate's SSRF hostname guard (:2157); _safe_urlopen pins each resolved IP so DNS cannot rebind to an internal address
-        final_url = resp.geturl()
-        final_host = urllib.parse.urlparse(final_url).hostname
-        if not _is_safe_public_host(final_host):
-            raise ValueError('redirected to a disallowed host')
-        content_type = resp.headers.get('Content-Type', '')
-        raw = resp.read(max_bytes + 1)
-        truncated = len(raw) > max_bytes
-        raw = raw[:max_bytes]
-    return final_url, content_type, raw, truncated
+    cached = _read_http_cache_bytes(url, None, 'download')
+    if cached and cached.get('expires', 0) > time.time():
+        return (cached.get('final_url') or url, cached.get('content_type') or '',
+                cached.get('raw') or b'', bool(cached.get('truncated')))
+    headers = {'User-Agent': 'AIThinkTankAgent/1.0'}
+    if cached and cached.get('etag'):
+        headers['If-None-Match'] = cached['etag']
+    elif cached and cached.get('last_modified_header'):
+        headers['If-Modified-Since'] = cached['last_modified_header']
+    req = urllib.request.Request(url, headers=headers, method='GET')
+    try:
+        with _safe_urlopen(req, timeout=BROWSE_TIMEOUT_S) as resp:  # user URLs pre-cleared by _jev_safety_gate's SSRF hostname guard (:2157); _safe_urlopen pins each resolved IP so DNS cannot rebind to an internal address
+            final_url = resp.geturl()
+            final_host = urllib.parse.urlparse(final_url).hostname
+            if not _is_safe_public_host(final_host):
+                raise ValueError('redirected to a disallowed host')
+            content_type = resp.headers.get('Content-Type', '')
+            raw = resp.read(max_bytes + 1)
+            truncated = len(raw) > max_bytes
+            raw = raw[:max_bytes]
+            ttl = _cache_ttl_from_headers(resp.headers)
+            if ttl is not None:
+                _write_http_cache_bytes(
+                    url, None, final_url, content_type, raw, truncated,
+                    resp.headers.get('ETag'),
+                    _parse_http_date_ms(resp.headers.get('Last-Modified')),
+                    ttl, resp.headers.get('Last-Modified') or '', 'download')
+            return final_url, content_type, raw, truncated
+    except urllib.error.HTTPError as e:
+        if e.code == 304 and cached:
+            return (cached.get('final_url') or url, cached.get('content_type') or '',
+                    cached.get('raw') or b'', bool(cached.get('truncated')))
+        raise
 
 
 @app.post('/api/library/download')
@@ -28905,26 +28966,63 @@ def _api_request_sync(method, url, headers, body):
     """Raw outbound HTTP for /api/api-call, mirroring _curl_request_sync's
     redirect re-check (a redirect is exactly how an allowed-looking URL could
     end up pointed at an internal address) and size cap. Returns
-    {'status', 'finalUrl', 'contentType', 'body', 'truncated'}."""
+    {'status', 'finalUrl', 'contentType', 'body', 'truncated'}.
+
+    GETs without credentials are cached with ETag/Last-Modified revalidation.
+    Authenticated calls and writes are never cached.
+    """
+    method = (method or 'GET').upper()
+    cacheable = (method == 'GET'
+                 and not any(str(k).lower() in ('authorization', 'cookie', 'x-api-key')
+                             for k in (headers or {})))
+    cached = _read_http_cache(url, None, 'api') if cacheable else None
+    if cached and cached.get('expires', 0) > time.time():
+        return {'status': 200, 'finalUrl': cached.get('final_url') or url,
+                'contentType': cached.get('content_type') or '',
+                'body': cached.get('body') or '',
+                'truncated': bool(cached.get('truncated'))}
+    req_headers = dict(headers or {})
+    if cached and cached.get('etag'):
+        req_headers['If-None-Match'] = cached['etag']
+    elif cached and cached.get('last_modified_header'):
+        req_headers['If-Modified-Since'] = cached['last_modified_header']
     data = json.dumps(body).encode() if (body is not None and method not in ('GET', 'HEAD')) else None
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    if 'User-Agent' not in {k.title() for k in headers}:
+    req = urllib.request.Request(url, data=data, headers=req_headers, method=method)
+    if 'User-Agent' not in {k.title() for k in req_headers}:
         req.add_header('User-Agent', 'AIThinkTankAgent/1.0')
-    with _safe_urlopen(req, timeout=API_CALL_TIMEOUT_S) as resp:  # registry/SSRF-gated hosts only; _safe_urlopen pins each resolved IP so DNS cannot rebind to an internal address; re-checked below after redirects
-        final_url = resp.geturl()
-        final_host = urllib.parse.urlparse(final_url).hostname
-        if not _is_safe_public_host(final_host):
-            raise ValueError('redirected to a disallowed host')
-        raw = resp.read(API_CALL_MAX_BODY_BYTES + 1)
-        truncated = len(raw) > API_CALL_MAX_BODY_BYTES
-        raw = raw[:API_CALL_MAX_BODY_BYTES]
-        return {
-            'status': resp.status,
-            'finalUrl': final_url,
-            'contentType': (resp.headers.get('content-type') or ''),
-            'body': raw.decode(errors='replace'),
-            'truncated': truncated,
-        }
+    try:
+        with _safe_urlopen(req, timeout=API_CALL_TIMEOUT_S) as resp:  # registry/SSRF-gated hosts only; _safe_urlopen pins each resolved IP so DNS cannot rebind to an internal address; re-checked below after redirects
+            final_url = resp.geturl()
+            final_host = urllib.parse.urlparse(final_url).hostname
+            if not _is_safe_public_host(final_host):
+                raise ValueError('redirected to a disallowed host')
+            raw = resp.read(API_CALL_MAX_BODY_BYTES + 1)
+            truncated = len(raw) > API_CALL_MAX_BODY_BYTES
+            raw = raw[:API_CALL_MAX_BODY_BYTES]
+            result = {
+                'status': resp.status,
+                'finalUrl': final_url,
+                'contentType': (resp.headers.get('content-type') or ''),
+                'body': raw.decode(errors='replace'),
+                'truncated': truncated,
+            }
+            if cacheable and resp.status == 200:
+                ttl = _cache_ttl_from_headers(resp.headers)
+                if ttl is not None:
+                    _write_http_cache(url, None, final_url,
+                                      result['contentType'], result['body'],
+                                      truncated, resp.headers.get('ETag'),
+                                      _parse_http_date_ms(resp.headers.get('Last-Modified')),
+                                      ttl, resp.headers.get('Last-Modified') or '',
+                                      'api')
+            return result
+    except urllib.error.HTTPError as e:
+        if e.code == 304 and cached:
+            return {'status': 200, 'finalUrl': cached.get('final_url') or url,
+                    'contentType': cached.get('content_type') or '',
+                    'body': cached.get('body') or '',
+                    'truncated': bool(cached.get('truncated'))}
+        raise
 
 
 def _api_build_text(result, service, registered, hostname):

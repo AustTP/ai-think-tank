@@ -32,6 +32,7 @@ import urllib.parse
 import serve as _serve
 import evidence_policy
 import review_quality
+import retrieval
 import skill_prompts
 import skill_scan
 import training_capture
@@ -4976,6 +4977,7 @@ _LIBRARY_READ_TOOL = {
                 'path': {'type': 'string', 'description': 'Exact Library-relative path, e.g. "archive/1234-spike-task-9.md".'},
                 'offset': {'type': 'integer', 'description': 'Byte offset to start reading from (default 0). Pass the last offset you read to continue a long file.'},
                 'limit': {'type': 'integer', 'description': 'Max characters to return (default 20000, max 50000).'},
+                'query': {'type': 'string', 'description': 'Optional: return only the most relevant excerpts for this query instead of a raw byte window.'},
             },
             'required': ['path'],
         },
@@ -5078,11 +5080,23 @@ def _make_library_tools_executor(agent_id, struck_tools=None):
                 _serve.log_action(agent_id, 'read_library_file',
                                   {'path': path, 'found': False}, authorized=True)
                 return f'Not found: {path}'
+            query = (args.get('query') or '').strip()
             try:
                 with open(target, 'r', errors='replace') as f:
-                    if offset:
-                        f.seek(offset)
-                    content_text = f.read(limit)
+                    if query:
+                        # Retrieval mode: read a bounded body, split it, and
+                        # return only matching sections. This is the cheap path
+                        # for long articles and Library reports; the raw window
+                        # remains available when the caller needs exact bytes.
+                        whole = f.read(300_000)
+                        content_text = retrieval.excerpts(
+                            whole, query, top_k=4, max_chars=1200)
+                        if not content_text:
+                            content_text = whole[:limit]
+                    else:
+                        if offset:
+                            f.seek(offset)
+                        content_text = f.read(limit)
             except OSError:
                 return f'Could not read {path}'
             # Trail reinforcement: a real, actual read of this
@@ -5091,7 +5105,8 @@ def _make_library_tools_executor(agent_id, struck_tools=None):
             _serve.record_library_read(path)
             _serve.log_action(agent_id, 'read_library_file',
                               {'path': path, 'found': True, 'offset': offset,
-                               'bytes': len(content_text)}, authorized=True)
+                               'bytes': len(content_text), 'query': query},
+                              authorized=True)
             if offset and not content_text:
                 return f'EOF: no content at offset {offset} in {path}'
             return content_text

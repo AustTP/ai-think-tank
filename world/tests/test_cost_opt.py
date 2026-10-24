@@ -41,6 +41,14 @@ class HttpCacheTest(unittest.TestCase):
         self.assertEqual(got['etag'], '"etag-1"')
         self.assertEqual(got['last_modified'], 123)
 
+    def test_binary_round_trip(self):
+        serve._write_http_cache_bytes('https://example.test/a.bin', None,
+                                      'https://example.test/a.bin', 'application/octet-stream',
+                                      b'\x00\x01abc', False, '"e"', 0, 3600,
+                                      namespace='download')
+        got = serve._read_http_cache_bytes('https://example.test/a.bin', namespace='download')
+        self.assertEqual(got['raw'], b'\x00\x01abc')
+
     def test_no_store_is_not_cached(self):
         self.assertIsNone(serve._cache_ttl_from_headers({'Cache-Control': 'no-store'}))
         self.assertEqual(serve._cache_ttl_from_headers({'Cache-Control': 'no-cache'}), 0)

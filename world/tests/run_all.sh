@@ -22,6 +22,10 @@ echo
 echo "== JS: UI helpers =="
 node tests/test_ui_helpers.mjs
 echo
+echo "== Python: chunk and retrieve =="
+python3 tests/test_retrieval.py
+echo
+
 echo "== Python: cost optimization helpers =="
 python3 tests/test_cost_opt.py
 echo
