@@ -149,5 +149,5 @@ def main():
                           'summary': f'No new bot-protection items on {stamp}.'}))
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover
     main()
