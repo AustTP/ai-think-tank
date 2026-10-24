@@ -86,6 +86,17 @@ class CardFailureNotificationTest(unittest.TestCase):
         self.assertEqual(len(state['emailOutbox']), 1,
                          'the same card is deduped for 30 minutes')
 
+    def test_run_abandoned_does_not_claim_queue_removal(self):
+        state = {}
+        task = {'id': 'task-3', 'title': 'Act on mail', 'room': 'pressoffice',
+                'taskType': 'code'}
+        sim._notify_card_failure(
+            state, task, 'the content run stopped heartbeating', category='run-abandoned',
+            now_ms=1_000_000_000)
+        body = state['emailOutbox'][0]['body']
+        self.assertIn('stopped reporting liveness', body)
+        self.assertNotIn('removed from the queue', body)
+
     def test_spike_specific_notice_wins_over_generic_card_failure(self):
         state = {}
         task = {'id': 'task-2', 'title': 'Spike X', 'room': 'observatory',

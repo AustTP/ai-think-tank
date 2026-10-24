@@ -2185,6 +2185,15 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
     import sim as _sim_module
     store_result = result_sink or _sim_module._store_content_result
     base = _serve.SELF_BASE_URL
+
+    def _hb():
+        try:
+            task['_contentHeartbeat'] = time.time()
+            _sim_module._bump_content_heartbeat(task.get('id'))
+        except Exception:
+            pass
+
+    _hb()
     key = _serve.get_or_create_agent_key(agent_id)
     project_label = task.get('projectLabel') or ''
     backlog = task.get('title') or ''
@@ -2258,6 +2267,7 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
     balanced = False
     while attempts <= CODE_CONTINUATION_ATTEMPTS:
         reply = None
+        _hb()
         r = _serve._http_json('POST', base, '/api/chat',
                        {'model': tier_slug, 'messages': messages,
                         'max_tokens': _CODE_MAX_TOKENS, 'agentId': agent_id,
@@ -2304,6 +2314,7 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
         if probe_req:
             probe_rounds += 1
             messages.append({'role': 'assistant', 'content': reply})
+            _hb()
             probe_data = _serve._http_json('POST', base, '/api/page-probe',
                                     {'agentId': agent_id, 'sandboxId': sandbox_id,
                                      'path': probe_req['path'], 'actions': probe_req['actions'],
@@ -2377,6 +2388,7 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
                                            'ok': False, 'tier': tier_slug})
         return False
 
+    _hb()
     exec_data = _serve._http_json('POST', base, '/api/execute',
                            {'agentId': agent_id, 'command': command,
                             'purpose': f'Coding task: {backlog_item}', 'sandboxId': sandbox_id}, key)

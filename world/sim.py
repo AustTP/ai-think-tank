@@ -9594,6 +9594,8 @@ def _notify_card_failure(state, task, reason, category='failed', now_ms=None):
     detail.extend([f'Category: {category}', f'Why: {text[:900]}'])
     if category == 'abandoned':
         detail.append('The card was removed from the queue after repeated assignment failures.')
+    elif category == 'run-abandoned':
+        detail.append('The content run stopped reporting liveness before it produced a result.')
     elif category == 'auto-closed':
         detail.append('The card was closed without completing because the pipeline kept failing.')
     elif category == 'refused':
@@ -14903,7 +14905,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                         _notify_card_failure(
                             state, task,
                             'the content run stopped heartbeating and never produced a result',
-                            category='abandoned', now_ms=now_ms)
+                            category='run-abandoned', now_ms=now_ms)
                     except Exception:
                         pass
                 # Bot Ops / shadow mode: capture the dry-run outcome to the shadow

@@ -7,6 +7,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import content  # noqa: E402
+import sim  # noqa: E402
 import structured_edits  # noqa: E402
 
 
@@ -82,3 +83,25 @@ def test_prose_replies_are_never_executed(monkeypatch):
     assert len(results) == 1
     assert 'did not return an executable shell command' in results[0]['note']
     assert results[0]['ok'] is False
+
+
+def test_coding_run_bumps_heartbeat_before_model_call(monkeypatch):
+    seen = []
+
+    def fake_bump(task_id):
+        seen.append(task_id)
+
+    def fake_http(method, base, path, payload, key):
+        assert 'task-hb' in seen, 'the coding run must heartbeat before the call'
+        return {'error': 'stop after heartbeat check'}
+
+    monkeypatch.setattr(sim, '_bump_content_heartbeat', fake_bump)
+    monkeypatch.setattr(content._serve, '_http_json', fake_http)
+    monkeypatch.setattr(content._serve, '_coding_tier_slug', lambda: 'model')
+    monkeypatch.setattr(content._serve, 'get_or_create_agent_key', lambda a: 'key')
+    monkeypatch.setattr(content, '_review_sandbox_id', lambda *a: 'sandbox-x')
+    monkeypatch.setattr(content, '_agent_name', lambda *a: 'Ben')
+    content._run_coding_content_inner(
+        {}, 'ben', {'id': 'task-hb', 'title': 'Fix the page', 'taskType': 'code'},
+        result_sink=lambda tid, result: None)
+    assert seen
