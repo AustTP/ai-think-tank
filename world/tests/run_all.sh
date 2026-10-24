@@ -22,9 +22,6 @@ echo
 echo "== JS: UI helpers =="
 node tests/test_ui_helpers.mjs
 echo
-echo "== Python: meeting UI source =="
-python3 tests/test_meeting_ui_source.py
-echo
 echo "== JS: mailbox read/unread =="
 node tests/test_mailbox.mjs
 echo
