@@ -5103,9 +5103,11 @@ def _make_library_tools_executor(agent_id, struck_tools=None):
             # finding by another team's investigation is exactly the signal
             # that should make it rank higher in future search_library calls.
             _serve.record_library_read(path)
-            _serve.log_action(agent_id, 'read_library_file',
-                              {'path': path, 'found': True, 'offset': offset,
-                               'bytes': len(content_text), 'query': query},
+            log_details = {'path': path, 'found': True, 'offset': offset,
+                           'bytes': len(content_text)}
+            if query:
+                log_details['query'] = query
+            _serve.log_action(agent_id, 'read_library_file', log_details,
                               authorized=True)
             if offset and not content_text:
                 return f'EOF: no content at offset {offset} in {path}'

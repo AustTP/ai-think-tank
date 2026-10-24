@@ -7139,6 +7139,8 @@ def _resolve_pending_escalations_sync():
         return 0
     state = get_state_from_db()
     senior_id = _senior_most_director_id(state)
+    if not senior_id:
+        return 0
     roster = {d['id']: d for d in (state.get('agentRoster', []) if state else [])}
 
     resolved = 0
@@ -10143,7 +10145,6 @@ def record_browse_success(hostname):
             'Remember: every allowlist entry is full read+write reachability for sandboxed '
             'scripts too, not just read access.',
             on_approve_note=host,
-            agent_id=agent_id,
         )
     _browse_trail_write(trail)
 

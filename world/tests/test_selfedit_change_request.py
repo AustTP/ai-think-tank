@@ -98,6 +98,7 @@ def test_high_risk_pre_apply_gate_and_stored_fields(fake_repo, monkeypatch):
 
 def test_high_risk_pre_apply_failure_refuses(fake_repo, monkeypatch):
     _, world = fake_repo
+    (world / 'serve.py').write_text('# kernel\n', encoding='utf-8')
     _patch_roster(monkeypatch)
     _patch_player_approval(monkeypatch)
     _arm_window_only(monkeypatch, world)

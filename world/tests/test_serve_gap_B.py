@@ -501,6 +501,13 @@ class SendPlayerEmailSync(unittest.TestCase):
 
 
 class SendPlayerTelegramSync(unittest.TestCase):
+    def setUp(self):
+        self._suppress = serve.TELEGRAM_SUPPRESS_DURING_TESTS
+        serve.TELEGRAM_SUPPRESS_DURING_TESTS = False
+
+    def tearDown(self):
+        serve.TELEGRAM_SUPPRESS_DURING_TESTS = self._suppress
+
     def test_not_configured_returns_false(self):
         with unittest.mock.patch.object(serve, 'TELEGRAM_BOT_TOKEN', ''):
             self.assertIs(serve.send_player_telegram_sync('subj', 'body'), False)
@@ -684,6 +691,17 @@ class FetchRenderedPageSync(unittest.TestCase):
 
 
 class FetchPageSync(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._cache = tempfile.mkdtemp(prefix='fetch-page-cache-')
+        self._old_cache = serve.HTTP_CACHE_DIR
+        serve.HTTP_CACHE_DIR = self._cache
+
+    def tearDown(self):
+        import shutil
+        serve.HTTP_CACHE_DIR = self._old_cache
+        shutil.rmtree(self._cache, ignore_errors=True)
+
     def _resp(self, body=b'<html>hi</html>', final_url='https://example.com/final'):
         resp = unittest.mock.MagicMock()
         resp.__enter__.return_value = resp
