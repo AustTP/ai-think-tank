@@ -36,7 +36,7 @@
     },
     {
       "path": "scripts/imessage_fetch.py",
-      "sha256": "4a8c7fd7bff1e7e5ae4a5433dc04d91f95d62d11e893e8993b525a5edc2135b1",
+      "sha256": "fb832ee6cdcccf8cb4d755c9159a746cd24f14e73f8e0c66dea4a227cc5ce814",
       "runner": "host",
       "allowedHosts": [
         "100.96.104.61"
