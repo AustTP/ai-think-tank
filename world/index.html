@@ -3952,5 +3952,23 @@ async function main() {
 
 main();
 </script>
+<section id="pressoffice-artifact-report" class="artifact-report" aria-label="Press Office artifact report">
+  <h2>Press Office Artifact Report</h2>
+  <p>Prototype dashboard for the Work Room.</p>
+  <div class="artifact-grid">
+    <article><h3>Throughput</h3><p>Deliverables landed this week.</p></article>
+    <article><h3>Quality</h3><p>Trailing review grade.</p></article>
+    <article><h3>Spend</h3><p>Model spend against budget.</p></article>
+  </div>
+</section>
+<style>
+.artifact-report{margin:24px;padding:20px;border:1px solid #3a4a5a;border-radius:12px;background:#121a24;color:#e8eef5;font-family:system-ui,sans-serif}
+.artifact-report h2{margin:0 0 6px;font-size:18px}
+.artifact-report p{margin:0 0 14px;color:#9fb0c3}
+.artifact-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.artifact-grid article{padding:12px;border:1px solid #2a3a4a;border-radius:8px;background:#0e151d}
+.artifact-grid h3{margin:0 0 6px;font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:#7fd1c8}
+.artifact-grid p{margin:0;font-size:12px}
+</style>
 </body>
 </html>
