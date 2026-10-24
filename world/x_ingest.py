@@ -224,5 +224,5 @@ def ingest(device_substr='iPhone'):
     return {'tabs': len(tabs), 'written': len(entries), 'errors': errors}
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover
     print(json.dumps(ingest(), indent=2)[:4000])

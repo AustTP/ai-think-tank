@@ -77,5 +77,5 @@ def main():
               f"{item['taskId']}  {item['title']}")
 
 
-if __name__ == '__main__':
+if __name__ == '__main__':  # pragma: no cover
     main()
