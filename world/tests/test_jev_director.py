@@ -14,11 +14,12 @@ def test_low_confidence_allow_goes_to_director():
          mock.patch.object(serve, '_effective_safety_confidence', return_value=0.55), \
          mock.patch.object(serve, '_jev_quorum_choice_sync',
                            return_value=('approve', 0.91, 0.0)), \
+         mock.patch.object(serve, 'create_escalation') as create, \
          mock.patch.object(serve, 'log_action') as log:
         assert serve._director_second_opinion(
             'clara', 'execute_classify', 'command', 'pytest -q', 'run tests', 0.44)
-    log.assert_called()
-    assert log.call_args[0][1] == 'jev_director_override'
+    create.assert_not_called()
+    assert any(c[0][1] == 'jev_chain_approved' for c in log.call_args_list)
 
 
 def test_director_low_confidence_still_blocks():
@@ -28,7 +29,9 @@ def test_director_low_confidence_still_blocks():
          mock.patch.object(serve, '_effective_safety_confidence', return_value=0.55), \
          mock.patch.object(serve, '_jev_quorum_choice_sync',
                            return_value=('approve', 0.30, 0.0)), \
+         mock.patch.object(serve, 'create_escalation', return_value='esc-1') as create, \
          mock.patch.object(serve, 'log_action') as log:
         assert not serve._director_second_opinion(
             'clara', 'execute_classify', 'command', 'pytest -q', 'run tests', 0.44)
-    assert log.call_args[0][1] == 'jev_director_refused'
+    create.assert_called_once()
+    assert any(c[0][1] == 'jev_chain_owner_escalation' for c in log.call_args_list)

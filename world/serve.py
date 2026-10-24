@@ -14806,37 +14806,78 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
         state = get_state_from_db() or {}
     except Exception:
         state = {}
-    director_id = _senior_most_director_id(state)
-    if not director_id:
-        return False
     roster = {d.get('id'): d for d in (state.get('agentRoster') or [])}
-    director_name = (roster.get(director_id) or {}).get('name', director_id)
+    senior_id = _senior_most_director_id(state)
+    admin_id = _admin_agent_id(state)
+    immediate_id = (roster.get(agent_id) or {}).get('director')
+    chain = []
+    for cid in (immediate_id, senior_id, admin_id):
+        if cid and cid != agent_id and cid not in chain and cid in roster:
+            chain.append(cid)
+    if not chain:
+        return False
     threshold = _effective_safety_confidence()
-    instr = (
-        f'You are {director_name}, the senior director of the AI think tank. '
-        f'An agent asked to run this {noun}: {target}\n'
-        f'Stated purpose: {purpose or "not given"}\n'
-        f'JEV returned allow at low confidence ({confidence:.2f}, below '
-        f'the {threshold:.2f} safety threshold). Decide whether the action '
-        'should go ahead. Approve only if it is ordinary, in-scope work and '
-        'the low confidence was caution rather than a real risk. Deny if it '
-        'is unsafe, destructive, exfiltrating, out of scope, or unjustified.'
-    )
     criteria = {
         'approve': 'Ordinary, legitimate, in-scope work; the low JEV confidence was caution, not a concrete risk.',
         'deny': 'Unsafe, destructive, credential/secret access or exfiltration, out of scope, or not justified.',
     }
-    decision, director_conf, _cost = _jev_quorum_choice_sync(instr, criteria)
-    allowed = (decision == 'approve'
-               and director_conf >= threshold)
-    log_action(director_id,
-               'jev_director_override' if allowed else 'jev_director_refused',
-               {'agent': agent_id, 'action': action, 'target': target,
-                'purpose': purpose, 'jevConfidence': confidence,
-                'directorConfidence': director_conf,
-                'decision': decision, 'traceId': trace_id},
-               authorized=False)
-    return allowed
+    for level, reviewer_id in enumerate(chain):
+        reviewer = roster.get(reviewer_id) or {}
+        name = reviewer.get('name') or reviewer_id
+        role = ('chief of staff' if reviewer_id == admin_id else
+                'senior director' if reviewer_id == senior_id else 'director')
+        instr = (
+            f'You are {name}, the {role} of the AI think tank. '
+            f'An agent asked to run this {noun}: {target}\n'
+            f'Stated purpose: {purpose or "not given"}\n'
+            f'JEV returned allow at low confidence ({confidence:.2f}, below '
+            f'the {threshold:.2f} safety threshold). Decide whether the action '
+            'should go ahead. Approve only if it is ordinary, in-scope work and '
+            'the low confidence was caution rather than a real risk. Deny if it '
+            'is unsafe, destructive, exfiltrating, out of scope, or unjustified.'
+        )
+        decision, reviewer_conf, _cost = _jev_quorum_choice_sync(instr, criteria)
+        if decision == 'deny':
+            log_action(reviewer_id, 'jev_chain_denied',
+                       {'agent': agent_id, 'action': action, 'target': target,
+                        'purpose': purpose, 'jevConfidence': confidence,
+                        'reviewerConfidence': reviewer_conf, 'level': level,
+                        'traceId': trace_id}, authorized=False)
+            return False
+        if decision == 'approve' and reviewer_conf >= threshold:
+            log_action(reviewer_id, 'jev_chain_approved',
+                       {'agent': agent_id, 'action': action, 'target': target,
+                        'purpose': purpose, 'jevConfidence': confidence,
+                        'reviewerConfidence': reviewer_conf, 'level': level,
+                        'traceId': trace_id}, authorized=False)
+            return True
+        log_action(reviewer_id, 'jev_chain_unsure',
+                   {'agent': agent_id, 'action': action, 'target': target,
+                    'purpose': purpose, 'jevConfidence': confidence,
+                    'reviewerConfidence': reviewer_conf,
+                    'decision': decision, 'level': level,
+                    'traceId': trace_id}, authorized=False)
+    # The whole chain could not decide: this is the one case that reaches
+    # the owner, not an automatic block.
+    try:
+        esc_id = create_escalation(
+            'owner safety decision',
+            f'Agent {agent_id} needs a decision on this {noun}: {target}\n'
+            f'Stated purpose: {purpose or "not given"}\n'
+            f'JEV confidence {confidence:.2f} was below the {threshold:.2f} '
+            'safety threshold, and the director, senior director, and chief '
+            'of staff all declined or could not decide.',
+            what_checked='JEV plus the full director -> senior director -> chief of staff chain',
+            look_first=target)
+        log_action('player', 'jev_chain_owner_escalation',
+                   {'escalationId': esc_id, 'agent': agent_id,
+                    'action': action, 'target': target,
+                    'purpose': purpose, 'traceId': trace_id}, authorized=False)
+    except Exception as exc:
+        log_action(agent_id, 'jev_chain_owner_escalation_failed',
+                   {'error': str(exc)[:200], 'traceId': trace_id},
+                   authorized=False)
+    return False
 
 
 def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confidence, cost, authorized, trace_id=None):

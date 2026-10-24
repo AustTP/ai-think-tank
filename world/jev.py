@@ -205,6 +205,10 @@ ESCALATION_KIND_RISK = {
     # classifier already said "not clearly blocked"); raise its floor above a
     # routine approval.
     'unsure safety decision':  {'floor': 0.85},
+    # The full director -> senior director -> chief of staff chain could not
+    # decide a low-confidence JEV safety question. Only the owner may resolve
+    # this kind; the director loop is barred by the 1.0 floor.
+    'owner safety decision':  {'floor': 1.0},
     # A human's explicit "blocked" verdict on a command or pipeline step is the
     # strongest signal the think tank produces that the action is dangerous. A
     # director-LLM re-framing it as benign should NOT override that -- 1.0 =
