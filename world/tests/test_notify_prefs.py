@@ -19,6 +19,22 @@ class TelegramChunkTest(unittest.TestCase):
         self.assertTrue(all(len(c) <= 4000 for c in chunks))
 
 
+class TelegramSuppressionTest(unittest.TestCase):
+    def test_flag_off_suppresses_proactive_push(self):
+        with mock.patch.object(serve, 'TELEGRAM_NOTIFICATIONS_ENABLED', False), \
+             mock.patch.object(serve, 'TELEGRAM_BOT_TOKEN', 'token'), \
+             mock.patch.object(serve, 'TELEGRAM_ALLOWED_CHAT_IDS', {'1'}), \
+             mock.patch.object(serve, '_telegram_api_sync') as api:
+            self.assertFalse(notify.send_player_telegram_sync('subject', 'body'))
+        api.assert_not_called()
+
+    def test_flag_off_suppresses_captcha_text(self):
+        with mock.patch.object(serve, 'TELEGRAM_NOTIFICATIONS_ENABLED', False), \
+             mock.patch.object(serve, 'TELEGRAM_BOT_TOKEN', 'token'), \
+             mock.patch.object(serve, 'TELEGRAM_ALLOWED_CHAT_IDS', {'1'}):
+            self.assertEqual(serve._telegram_send_text_sync('challenge'), 0)
+
+
 class SpikeNotificationTest(unittest.TestCase):
     def test_successful_spike_is_silent_but_failure_is_not(self):
         state = {}

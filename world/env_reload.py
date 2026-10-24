@@ -51,6 +51,10 @@ ENV_RELOAD_FIELDS = {
     'BROWSING_ENABLED': lambda e: _env_flag(e.get('AGENT_BROWSING_ENABLED', 'true')),
     'EXECUTION_ENABLED': lambda e: _env_flag(e.get('AGENT_EXECUTION_ENABLED', 'true')),
     'PLAYER_EMAIL_ENABLED': lambda e: _env_flag(e.get('PLAYER_EMAIL_ENABLED', 'true')),
+    # Proactive Telegram pushes only. The bridge replies to the player still
+    # work when this is false; only the tank's outbound notifications stop.
+    'TELEGRAM_NOTIFICATIONS_ENABLED': lambda e: _env_flag(
+        e.get('TELEGRAM_NOTIFICATIONS_ENABLED', 'true')),
     # Sandbox execution mode + the sandbox egress allowlist. Rebinding the
     # allowlist also refreshes the egress proxy (see _reload_env_config).
     'SANDBOX_EXECUTION': lambda e: e.get('SANDBOX_EXECUTION', 'local').strip().lower(),

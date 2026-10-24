@@ -5442,6 +5442,8 @@ class _TelegramConflictError(Exception):
 
 
 def _telegram_send_photo_sync(png_bytes, caption):
+    if not TELEGRAM_NOTIFICATIONS_ENABLED:
+        return 0
     """Send one PNG to every allowlisted Telegram chat via multipart upload.
     Returns the number of chats that accepted it. Never raises."""
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS and png_bytes):
@@ -5477,6 +5479,8 @@ def _telegram_send_photo_sync(png_bytes, caption):
 
 
 def _telegram_send_text_sync(text):
+    if not TELEGRAM_NOTIFICATIONS_ENABLED:
+        return 0
     """Send one bounded text notice to every allowlisted Telegram chat."""
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS and text):
         return 0
@@ -10578,6 +10582,8 @@ ESCALATION_BASE_URL = _load_env().get('ESCALATION_BASE_URL') or _load_env().get(
 # would answer ANYONE who finds its username, not just the player.
 TELEGRAM_BOT_TOKEN = _load_env().get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_ALLOWED_CHAT_IDS = {c.strip() for c in (_load_env().get('TELEGRAM_ALLOWED_CHAT_IDS') or '').split(',') if c.strip()}
+TELEGRAM_NOTIFICATIONS_ENABLED = _env_flag(
+    _load_env().get('TELEGRAM_NOTIFICATIONS_ENABLED', 'true'))
 TELEGRAM_POLL_TIMEOUT_S = 25
 # Conversation memory for the Telegram bridge (world/memory.py). STM stores
 # each ask turn per chat session and injects the recent turns + a rolling
