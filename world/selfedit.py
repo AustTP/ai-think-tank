@@ -894,6 +894,10 @@ def _run_test_gate(cwd, label, env=None):
     # on tests that are otherwise hermetic. Point the gate at a closed local
     # port and keep Telegram silent.
     run_env = dict(os.environ if env is None else env)
+    # serve.py exports OPTIMIZATION_POLICY_MODE at boot. Inheriting it makes
+    # the Jev tier-gate tests see the live routing policy and fail. Tests must
+    # start from their own default policy, not the server's boot environment.
+    run_env.pop('OPTIMIZATION_POLICY_MODE', None)
     run_env.setdefault('SELF_BASE_URL', 'http://127.0.0.1:1')
     run_env.setdefault('TELEGRAM_NOTIFICATIONS_ENABLED', 'false')
     run_env.setdefault('TELEGRAM_SUPPRESS_DURING_TESTS', 'true')
