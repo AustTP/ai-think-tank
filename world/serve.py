@@ -7118,6 +7118,19 @@ def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster)
     return True
 
 
+def _escalation_requester_director(state, esc):
+    """The agent's own director, the first rung of the escalation chain."""
+    agent_id = (esc or {}).get('agentId')
+    if not agent_id:
+        return None
+    roster = {d.get('id'): d for d in ((state or {}).get('agentRoster') or [])}
+    entry = roster.get(agent_id) or {}
+    director = entry.get('director')
+    if director and director != agent_id:
+        return director
+    return None
+
+
 def _resolve_pending_escalations_sync():
     # Runs on the director loop (a thread). No pending escalation, no work.
     escalations = _load_escalations()
@@ -7125,19 +7138,22 @@ def _resolve_pending_escalations_sync():
     if not pending:
         return 0
     state = get_state_from_db()
-    director_id = _senior_most_director_id(state)
-    if not director_id:
-        return 0
-    # The director's own roster/agent info, for the decision prompt.
+    senior_id = _senior_most_director_id(state)
     roster = {d['id']: d for d in (state.get('agentRoster', []) if state else [])}
-    director_def = roster.get(director_id, {})
-    director_name = director_def.get('name', director_id)
 
     resolved = 0
     now = time.time()
     dirty = False
     for esc_id, esc in pending.items():
         esc_kind = esc.get('kind') or 'unknown'
+        # Chain: the requester's own director, then the senior director, then
+        # the chief of staff. `_immediateTried` is set when the first rung
+        # gives up or cannot decide.
+        immediate_id = _escalation_requester_director(state, esc)
+        director_id = (immediate_id if (immediate_id and not esc.get('_immediateTried'))
+                       else senior_id)
+        director_def = roster.get(director_id, {}) if director_id else {}
+        director_name = director_def.get('name', director_id or 'the director')
         # Escalations with a 1.0 risk floor are "never auto-approve" by design
         # (blocked command / blocked pipeline step) -- the director is not
         # permitted to resolve them, so don't burn a Jev call re-asking. They
@@ -7153,6 +7169,12 @@ def _resolve_pending_escalations_sync():
         # kinds are silent at creation, so this is when the ping actually
         # means "the director cannot handle this".
         if _escalation_judge_drift(esc_kind) >= ESCALATION_JUDGE_DRIFT_CIRCUIT:
+            if immediate_id and not esc.get('_immediateTried'):
+                esc['_immediateTried'] = True
+                esc['askCount'] = 0
+                esc['lastAskedAt'] = 0
+                dirty = True
+                continue
             if _escalation_admin_attempt(state, esc_id, esc, esc_kind,
                                          director_id, roster):
                 dirty = True
@@ -7177,6 +7199,12 @@ def _resolve_pending_escalations_sync():
         if now - last_asked < DIRECTOR_ESCALATION_REASK_COOLDOWN_S:
             continue
         if asks >= DIRECTOR_ESCALATION_MAX_ASKS:
+            if immediate_id and not esc.get('_immediateTried'):
+                esc['_immediateTried'] = True
+                esc['askCount'] = 0
+                esc['lastAskedAt'] = 0
+                dirty = True
+                continue
             if _escalation_admin_attempt(state, esc_id, esc, esc_kind,
                                          director_id, roster):
                 dirty = True
@@ -7235,6 +7263,11 @@ def _resolve_pending_escalations_sync():
                        {'escalationId': esc_id, 'kind': esc_kind, 'question': esc.get('question'),
                         'confidence': confidence, 'composite': round(composite, 3), 'floor': floor,
                         'reason': 'below-kind-floor' if composite < floor else 'low-confidence'}, authorized=False)
+            if immediate_id and not esc.get('_immediateTried'):
+                esc['_immediateTried'] = True
+                esc['askCount'] = 0
+                esc['lastAskedAt'] = 0
+                dirty = True
             continue
         # Heterogeneous-judge cross-check: the director's auto-approval now has
         # to survive a SECOND, different decisions model independently agreeing
@@ -10110,6 +10143,7 @@ def record_browse_success(hostname):
             'Remember: every allowlist entry is full read+write reachability for sandboxed '
             'scripts too, not just read access.',
             on_approve_note=host,
+            agent_id=agent_id,
         )
     _browse_trail_write(trail)
 
@@ -29751,6 +29785,7 @@ async def api_service_request(request: Request):
         f'paths/methods with the credential injected server-side. A director reviews this proposal '
         f'automatically; the player is only emailed if the director cannot decide.',
         on_approve_note=note,
+        agent_id=agent_id,
     )
     log_action(agent_id, 'api_service_request', {'serviceId': sid, 'name': normalized.get('name'),
                                                  'baseUrl': normalized.get('base_url'), 'purpose': purpose[:200],

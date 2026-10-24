@@ -317,7 +317,7 @@ def notify_human_of_escalation(esc_id, esc, context=''):
     _serve.send_player_telegram_sync('', (_tg_head + _tg_tail)[:4096])
 
 
-def create_escalation(kind, question, on_approve_note='', what_checked='', look_first=''):
+def create_escalation(kind, question, on_approve_note='', what_checked='', look_first='', agent_id=''):
     import serve as _serve
     # Escalation-storm guard: a pending escalation with the SAME kind and
     # question is reused instead of spawning a new record. Without this, a
@@ -336,6 +336,8 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
     esc_id = 'esc-' + secrets.token_hex(4)
     token = secrets.token_urlsafe(24)
     escalations[esc_id] = {'kind': kind, 'question': question, 'status': 'pending', 'token': token, 'ts': time.time(), 'note': on_approve_note, 'whatChecked': what_checked, 'lookFirst': look_first}
+    if agent_id:
+        escalations[esc_id]['agentId'] = agent_id
     _serve._save_escalations(escalations)
 
     # Human-only kinds (floor >= 1.0) notify the player immediately -- the
