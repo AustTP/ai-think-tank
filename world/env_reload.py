@@ -55,6 +55,8 @@ ENV_RELOAD_FIELDS = {
     # work when this is false; only the tank's outbound notifications stop.
     'TELEGRAM_NOTIFICATIONS_ENABLED': lambda e: _env_flag(
         e.get('TELEGRAM_NOTIFICATIONS_ENABLED', 'true')),
+    'TELEGRAM_SUPPRESS_DURING_TESTS': lambda e: _env_flag(
+        e.get('TELEGRAM_SUPPRESS_DURING_TESTS', 'true')),
     # Sandbox execution mode + the sandbox egress allowlist. Rebinding the
     # allowlist also refreshes the egress proxy (see _reload_env_config).
     'SANDBOX_EXECUTION': lambda e: e.get('SANDBOX_EXECUTION', 'local').strip().lower(),

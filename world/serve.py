@@ -5442,7 +5442,7 @@ class _TelegramConflictError(Exception):
 
 
 def _telegram_send_photo_sync(png_bytes, caption):
-    if not TELEGRAM_NOTIFICATIONS_ENABLED:
+    if not telegram_push_allowed():
         return 0
     """Send one PNG to every allowlisted Telegram chat via multipart upload.
     Returns the number of chats that accepted it. Never raises."""
@@ -5479,7 +5479,7 @@ def _telegram_send_photo_sync(png_bytes, caption):
 
 
 def _telegram_send_text_sync(text):
-    if not TELEGRAM_NOTIFICATIONS_ENABLED:
+    if not telegram_push_allowed():
         return 0
     """Send one bounded text notice to every allowlisted Telegram chat."""
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS and text):
@@ -10584,7 +10584,28 @@ TELEGRAM_BOT_TOKEN = _load_env().get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_ALLOWED_CHAT_IDS = {c.strip() for c in (_load_env().get('TELEGRAM_ALLOWED_CHAT_IDS') or '').split(',') if c.strip()}
 TELEGRAM_NOTIFICATIONS_ENABLED = _env_flag(
     _load_env().get('TELEGRAM_NOTIFICATIONS_ENABLED', 'true'))
+TELEGRAM_SUPPRESS_DURING_TESTS = _env_flag(
+    _load_env().get('TELEGRAM_SUPPRESS_DURING_TESTS', 'true'))
 TELEGRAM_POLL_TIMEOUT_S = 25
+
+
+def _in_test_process():
+    # True when this interpreter is running a test file, not the server.
+    import os as _os
+    import sys as _sys
+    if _os.environ.get('PYTEST_CURRENT_TEST'):
+        return True
+    argv0 = (_sys.argv[0] or '').replace('\\', '/')
+    base = _os.path.basename(argv0)
+    return '/tests/' in argv0 or base.startswith('test_')
+
+
+def telegram_push_allowed():
+    if not TELEGRAM_NOTIFICATIONS_ENABLED:
+        return False
+    if TELEGRAM_SUPPRESS_DURING_TESTS and _in_test_process():
+        return False
+    return True
 # Conversation memory for the Telegram bridge (world/memory.py). STM stores
 # each ask turn per chat session and injects the recent turns + a rolling
 # summary into the next ask, so a follow-up question is answered in context;

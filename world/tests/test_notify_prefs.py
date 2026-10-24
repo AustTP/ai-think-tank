@@ -34,6 +34,27 @@ class TelegramSuppressionTest(unittest.TestCase):
              mock.patch.object(serve, 'TELEGRAM_ALLOWED_CHAT_IDS', {'1'}):
             self.assertEqual(serve._telegram_send_text_sync('challenge'), 0)
 
+    def test_test_process_suppresses_even_when_global_flag_is_on(self):
+        with mock.patch.object(serve, 'TELEGRAM_NOTIFICATIONS_ENABLED', True), \
+             mock.patch.object(serve, 'TELEGRAM_SUPPRESS_DURING_TESTS', True), \
+             mock.patch.object(serve, '_in_test_process', return_value=True), \
+             mock.patch.object(serve, 'TELEGRAM_BOT_TOKEN', 'token'), \
+             mock.patch.object(serve, 'TELEGRAM_ALLOWED_CHAT_IDS', {'1'}), \
+             mock.patch.object(serve, '_telegram_api_sync') as api:
+            self.assertFalse(notify.send_player_telegram_sync('subject', 'body'))
+        api.assert_not_called()
+
+    def test_test_suppression_can_be_disabled(self):
+        with mock.patch.object(serve, 'TELEGRAM_NOTIFICATIONS_ENABLED', True), \
+             mock.patch.object(serve, 'TELEGRAM_SUPPRESS_DURING_TESTS', False), \
+             mock.patch.object(serve, '_in_test_process', return_value=True), \
+             mock.patch.object(serve, 'TELEGRAM_BOT_TOKEN', 'token'), \
+             mock.patch.object(serve, 'TELEGRAM_ALLOWED_CHAT_IDS', {'1'}), \
+             mock.patch.object(serve, '_telegram_api_sync',
+                               return_value={'ok': True}) as api:
+            self.assertTrue(notify.send_player_telegram_sync('subject', 'body'))
+        api.assert_called_once()
+
 
 class SpikeNotificationTest(unittest.TestCase):
     def test_successful_spike_is_silent_but_failure_is_not(self):

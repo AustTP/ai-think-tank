@@ -178,7 +178,7 @@ def send_player_telegram_sync(subject, body_text):
     in serve.py (AGENT_BROWSING_ENABLED, TAVILY_API_KEY). Telegram has no
     separate subject line, so it's folded into the message text."""
     import serve as _serve
-    if not getattr(_serve, 'TELEGRAM_NOTIFICATIONS_ENABLED', True):
+    if not getattr(_serve, 'telegram_push_allowed', lambda: True)():
         return False
     if not (_serve.TELEGRAM_BOT_TOKEN and _serve.TELEGRAM_ALLOWED_CHAT_IDS):
         return False
