@@ -11,27 +11,13 @@
 // thinkTankHasWork() gate that hiring/firing also use agrees.
 //
 // Run: node tests/test_idle_quiet.mjs
-import vm from 'node:vm';
-import fs from 'node:fs';
-import assert from 'node:assert/strict';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { assert, vm, context, setGlobal, getGlobal, test, summary,
+         installBaselineGlobals, REAL } from './_task_env.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const worldDir = path.join(__dirname, '..');
-
-const context = { console, Math, Date, JSON, Array, Object, Set, Promise, setTimeout, clearTimeout };
-vm.createContext(context);
-vm.runInContext(fs.readFileSync(path.join(worldDir, 'js', 'tasks.js'), 'utf8'), context, { filename: 'tasks.js' });
-
-function setGlobal(name, value) {
-  context['__inject_' + name] = value;
-  vm.runInContext(`${name} = __inject_${name};`, context);
-}
-function getGlobal(name) {
-  vm.runInContext(`__extract_${name} = ${name};`, context);
-  return context['__extract_' + name];
-}
+installBaselineGlobals();
+// This file tests the real off-duty walk, so restore the genuine function
+// the shared baseline stubs for the other suites.
+setGlobal('sendAgentOffDuty', REAL.sendAgentOffDuty);
 
 // canActivateAnother() (tasks.js) references MAX_ACTIVE_AGENTS, a real
 // const defined in hiring.js -- not loaded into this tasks.js-only
@@ -70,14 +56,6 @@ const assignTaskViaJevReal = vm.runInContext('assignTaskViaJev', context);
 // calls the real queueWork (checkResearchSchedule, checkSkillReview-
 // Schedule) after those tests have run needs this real reference back.
 const queueWorkReal = vm.runInContext('queueWork', context);
-
-let passed = 0, failed = 0;
-function test(name, fn) {
-  return Promise.resolve()
-    .then(fn)
-    .then(() => { console.log(`  ok - ${name}`); passed++; })
-    .catch(e => { console.log(`  FAIL - ${name}`); console.log(`         ${e.message}`); failed++; });
-}
 
 // Every outbound call path the cycle could take, counted. If any of these
 // fires while the think tank is idle, the test fails -- which is the whole
@@ -1001,66 +979,4 @@ await test('a genuinely hung dispatch is still cut off by TASK_DISPATCH_TIMEOUT_
   setGlobal('TASK_DISPATCH_TIMEOUT_MS', 180000); // restore the real default for any test that runs after this one
 });
 
-console.log('\ncheckSkillReviewSchedule: idle-cost contract, same shape as checkResearchSchedule');
-
-await test('nothing pending, not due yet -- makes no calls and queues nothing', () => {
-  setGlobal('queueWork', queueWorkReal); // restore -- runReviewTask's own tests above mock this and never restore it
-  setGlobal('lastSkillReviewAt', Date.now());
-  setGlobal('WORK_QUEUE', []);
-  checkSkillReviewSchedule();
-  assert.equal(getGlobal('WORK_QUEUE').length, 0);
-});
-
-await test('due -- queues a real skillReview WORK_QUEUE item and stamps lastSkillReviewAt', () => {
-  setGlobal('queueWork', queueWorkReal);
-  setGlobal('lastSkillReviewAt', 0);
-  setGlobal('WORK_QUEUE', []);
-  checkSkillReviewSchedule();
-  const queue = getGlobal('WORK_QUEUE');
-  assert.equal(queue.length, 1);
-  assert.equal(queue[0].skillReview, true);
-  assert.equal(queue[0].room, 'observatory');
-  assert.ok(getGlobal('lastSkillReviewAt') > 0);
-});
-
-console.log('\nrunSkillReviewTask: keeps or rejects real pending skill files (2026-09-21)');
-
-await test('nothing pending -- says so plainly, makes no judgment calls', async () => {
-  setGlobal('listLibraryFiles', async () => [{ path: 'archive/2026-09-20-task-1.md' }]); // nothing under pending_review/skills/
-  setGlobal('requestJevChoice', async () => { throw new Error('should never be called with nothing pending'); });
-  const note = await runSkillReviewTask('rev');
-  assert.ok(note.includes('nothing waiting'));
-});
-
-await test('a genuinely useful file is promoted, not rejected', async () => {
-  setGlobal('listLibraryFiles', async () => [{ path: 'pending_review/skills/think tank-governance.md' }]);
-  setGlobal('readLibraryFile', async () => '# Skill: Think Tank Governance\n\nReal, specific, accurate content.');
-  setGlobal("requestJevChoice", async () => ({ choice: "keep" }));
-  let promoted = null, rejected = null;
-  setGlobal('promoteLibraryFile', async (agentId, path) => { promoted = path; return true; });
-  setGlobal('rejectLibraryFile', async (agentId, path) => { rejected = path; return true; });
-  setGlobal('writeLibraryFile', async () => { throw new Error('a KEPT file should not be rewritten with rejection reasoning'); });
-  const note = await runSkillReviewTask('rev');
-  assert.equal(promoted, 'pending_review/skills/think tank-governance.md');
-  assert.equal(rejected, null);
-  assert.ok(note.includes('1 promoted, 0 rejected'));
-});
-
-await test('an inaccurate/vague file is rejected with reasoning appended, not silently deleted', async () => {
-  setGlobal('listLibraryFiles', async () => [{ path: 'pending_review/skills/some-junk.md' }]);
-  setGlobal('readLibraryFile', async () => 'vague, generic, not actually useful content');
-  setGlobal("requestJevChoice", async () => ({ choice: "reject" }));
-  let rejectedPath = null, rewrittenContent = null;
-  setGlobal('promoteLibraryFile', async () => { throw new Error('a REJECTED file should never be promoted'); });
-  setGlobal('rejectLibraryFile', async (agentId, path) => { rejectedPath = path; return true; });
-  setGlobal('writeLibraryFile', async (agentId, path, content, source) => { rewrittenContent = { path, content, source }; });
-  const note = await runSkillReviewTask('rev');
-  assert.equal(rejectedPath, 'pending_review/skills/some-junk.md');
-  assert.equal(rewrittenContent.path, 'pending_review/skills/some-junk.md', 'the rejection reasoning must be written to the SAME pending path before it moves, not a new one');
-  assert.equal(rewrittenContent.source, 'firsthand', 'this is the reviewer\'s own judgment, not new external content -- must not get re-quarantined');
-  assert.ok(rewrittenContent.content.includes('Rejected'));
-  assert.ok(note.includes('0 promoted, 1 rejected'));
-});
-
-console.log(`\n${passed} passed, ${failed} failed`);
-if (failed > 0) process.exit(1);
+summary();

@@ -9,8 +9,16 @@ def _read(rel):
         return fh.read()
 
 
+def _ui_source():
+    # UI scripts were extracted from index.html into js modules so no single
+    # script exceeds 1,000 lines; the plan board's JS lives in ui_inbox.js.
+    rels = ('world/index.html', 'world/js/main.js', 'world/js/ui_panels.js',
+            'world/js/ui_inbox.js', 'world/js/ui_agent.js', 'world/js/ui_loop.js')
+    return '\n'.join(_read(rel) for rel in rels)
+
+
 def test_plan_board_uses_the_approval_endpoints():
-    html = _read('world/index.html')
+    html = _ui_source()
     assert 'id="planApprovals"' in html
     assert '/api/intent/plan-big-task' in html
     assert '/api/plans?status=pending' in html
@@ -18,7 +26,7 @@ def test_plan_board_uses_the_approval_endpoints():
 
 
 def test_plan_board_renders_route_and_budget():
-    html = _read('world/index.html')
+    html = _ui_source()
     assert 'renderPlanApprovals' in html
     assert 'estimatedBudgetUsd' in html
     assert 'No plans waiting for approval' in html

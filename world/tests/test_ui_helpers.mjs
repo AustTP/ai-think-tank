@@ -16,7 +16,8 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const worldDir = path.join(__dirname, '..');
-const html = fs.readFileSync(path.join(worldDir, 'index.html'), 'utf8');
+const UI_SOURCES = ['js/main.js', 'js/ui_panels.js', 'js/ui_inbox.js', 'js/ui_agent.js', 'js/ui_loop.js'];
+const html = UI_SOURCES.map((f) => fs.readFileSync(path.join(worldDir, f), 'utf8')).join('\n');
 
 // Brace-matched extraction starting at `function <name>(` -- robust to
 // nested braces inside the function body (both of these have some),

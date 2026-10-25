@@ -6,109 +6,28 @@
 // the full runCodingTask pipeline (heredoc balance/continuation, probe
 // rounds, orphaned/phantom/dangling file checks), the graded review loop,
 // escalation, runWorkroomTask/runResearchTask/runMediaDigestTask dispatch
-// paths, checkWeatherReference, and finishTask's edge branches.
+// paths, and finishTask's edge branches.
 //
 // Run: node tests/test_tasks_flow.mjs
-import vm from 'node:vm';
-import fs from 'node:fs';
-import assert from 'node:assert/strict';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { assert, vm, context, setGlobal, getGlobal, call, test, summary,
+         snapshotFns, restoreFns, installBaselineGlobals } from './_task_env.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const worldDir = path.join(__dirname, '..');
-
-const context = { console, Math, Date, JSON, Array, Object, Set, Promise, setTimeout, clearTimeout };
-vm.createContext(context);
-vm.runInContext(fs.readFileSync(path.join(worldDir, 'js', 'tasks.js'), 'utf8'), context, { filename: 'tasks.js' });
-
-function setGlobal(name, value) {
-  context['__inject_' + name] = value;
-  vm.runInContext(`${name} = __inject_${name};`, context);
-}
-function getGlobal(name) {
-  vm.runInContext(`__extract_${name} = ${name};`, context);
-  return context['__extract_' + name];
-}
-const call = (name, ...a) => vm.runInContext(name, context)(...a);
+installBaselineGlobals();
 
 // setGlobal can overwrite a real module-level function (function
 // declarations are live globals), so snapshot the implementations we
 // intentionally stub in one section and want the real ones back in
 // another.
-const realFns = {};
-for (const name of [
+const realFns = snapshotFns([
   'runPairProgrammingSession', 'requestPairLine', 'runCodingTask',
   'runGradedReviewLoop', '_produceReviewText', 'escalateReviewRequirement',
   '_extractWrittenJsFiles', '_findUnlinkedJsFiles', '_guessLinkTargetHtml',
   '_autoLinkJsFiles', '_findPhantomScriptRefs', '_removePhantomScriptRefs',
   '_findDanglingSelectorRefs',
-]) {
-  realFns[name] = getGlobal(name);
-}
+]);
 function restoreReal(...names) {
-  for (const n of names) setGlobal(n, realFns[n]);
+  restoreFns(realFns, ...names);
 }
-
-let passed = 0, failed = 0;
-async function test(name, fn) {
-  try {
-    await fn();
-    console.log(`  ok - ${name}`);
-    passed++;
-  } catch (e) {
-    console.log(`  FAIL - ${name}`);
-    console.log(`         ${e.message}`);
-    failed++;
-  }
-}
-
-// ---- baseline globals every area needs (overridden per-test as needed) ----
-setGlobal('DEDICATED_PROJECT_ROLES', new Set());
-setGlobal('MAX_ACTIVE_AGENTS', 1000);
-setGlobal('AGENT_W', 20);
-setGlobal('AGENT_H', 16);
-setGlobal('ROOMS', { pressoffice: { collision: 'pressoffice' } });
-setGlobal('ROOM_INTERACTABLES', {});
-setGlobal('ROOM_NATIVE_W', 200);
-setGlobal('ROOM_NATIVE_H', 200);
-setGlobal('ROOM_DOOR_TRIGGERS', {
-  pressoffice: { x: 100, y: 100, w: 16, h: 16 },
-  observatory: { x: 200, y: 200, w: 16, h: 16 },
-  library: { x: 300, y: 300, w: 16, h: 16 },
-  media: { x: 400, y: 400, w: 16, h: 16 },
-});
-setGlobal('WORKROOM_SANDBOX_ID', 'workroom-shared');
-setGlobal('RESEARCH_SANDBOX_ID', 'research-shared');
-setGlobal('MODEL_TIERS', { small: { slug: 'test/small' }, mid: { slug: 'test/mid' }, planning: { slug: 'test/planning' } });
-setGlobal('agentMission', (def) => (def && def.profile && def.profile.mission) || 'general think tank work');
-setGlobal('SKILL_FILE_FORMAT_GUIDE', 'Format guide.');
-setGlobal('overlaps', () => false);
-setGlobal('blockedAt', () => false);
-setGlobal('agentBlockedAt', () => false);
-setGlobal('pickFreeSpot', (occupied) => ({ x: 500, y: 500 }));
-setGlobal('_resolveRoomWithOverflow', (room) => room);
-setGlobal('logThinkTankAction', () => {});
-setGlobal('showToast', () => {});
-setGlobal('writeLibraryFile', async () => {});
-setGlobal('readLibraryFile', async () => null);
-setGlobal('listLibraryFiles', async () => []);
-setGlobal('promoteLibraryFile', async () => true);
-setGlobal('rejectLibraryFile', async () => true);
-setGlobal('writeSkillFile', async () => {});
-setGlobal('attemptHandoff', async () => false);
-setGlobal('sendAgentOffDuty', () => {});
-setGlobal('pickModelTierForAction', async () => ({ slug: 'test/model', label: 'test' }));
-setGlobal('requestPageProbe', async () => ({ ok: true, results: {} }));
-setGlobal('formatPageProbeResult', (data) => 'PROBE: ' + JSON.stringify(data));
-setGlobal('reviewScreenshot', async () => ({ ok: true, review: 'looks fine' }));
-setGlobal('gatherUnifiedContext', async () => 'CURRENT CONTEXT');
-setGlobal('fetchPageSmart', async () => ({ allowed: true, text: 'feed page text' }));
-setGlobal('readWorkingGuide', async () => null);
-setGlobal('GRADE_MEETS', 'meets_requirement');
-setGlobal('GRADE_FAILS', 'fails_requirement');
-setGlobal('GRADE_UNSURE', 'insufficient_evidence');
-setGlobal('MAX_REVISION_ROUNDS', 2);
 
 console.log('loadRoomPurposes (tasks.js)');
 
@@ -1039,155 +958,4 @@ await test('the ambient fallback reports a failed sandbox request', async () => 
   assert.equal(getGlobal('AGENTS').dev.profile.notes[0], 'Tried to work in the Research Center sandbox, but the request failed.');
 });
 
-console.log('checkWeatherReference (tasks.js)');
-
-await test('logs the live reading for the configured location', async () => {
-  setGlobal('AGENTS', { eli: { id: 'eli', profile: { notes: [] } } });
-  setGlobal('agentFetch', async (p, agentId, opts) => ({ ok: true, json: async () => ({ location: 'Springfield', reading: 'Mostly sunny, 22C with a light breeze' }) }));
-  await call('checkWeatherReference', 'eli');
-  assert.ok(getGlobal('AGENTS').eli.profile.notes[0].includes('Logged live weather for Springfield'));
-  assert.ok(getGlobal('AGENTS').eli.profile.notes[0].includes('Mostly sunny, 22C'));
-});
-
-await test('surfaces a server-side error reading', async () => {
-  setGlobal('AGENTS', { eli: { id: 'eli', profile: { notes: [] } } });
-  setGlobal('agentFetch', async () => ({ ok: true, json: async () => ({ error: 'upstream down' }) }));
-  await call('checkWeatherReference', 'eli');
-  assert.ok(getGlobal('AGENTS').eli.profile.notes[0].includes('the server said: upstream down'));
-});
-
-await test('handles an empty reading and a failed request', async () => {
-  setGlobal('AGENTS', { eli: { id: 'eli', profile: { notes: [] } } });
-  setGlobal('agentFetch', async () => ({ ok: true, json: async () => ({}) }));
-  await call('checkWeatherReference', 'eli');
-  assert.ok(getGlobal('AGENTS').eli.profile.notes[0].includes('reading came back empty'));
-  setGlobal('AGENTS', { eli: { id: 'eli', profile: { notes: [] } } });
-  setGlobal('agentFetch', async () => { throw new Error('down'); });
-  await call('checkWeatherReference', 'eli');
-  assert.ok(getGlobal('AGENTS').eli.profile.notes[0].includes('request failed'));
-});
-
-console.log('parseFeedUrls / runMediaDigestTask (tasks.js)');
-
-await test('parseFeedUrls extracts one URL per non-comment line', () => {
-  const urls = call('parseFeedUrls', '# a comment\n\nhttps://a.example/feed -- why it matters\nno url here\nhttp://b.org/rss\n# another comment');
-  assert.deepEqual([...urls], ['https://a.example/feed', 'http://b.org/rss']);
-});
-
-function mediaSetup() {
-  setGlobal('AGENTS', { studio: { id: 'studio', name: 'Studio', model: 'mid', profile: { notes: [] } } });
-  setGlobal('logThinkTankAction', () => {});
-  setGlobal('writeLibraryFile', async () => {});
-  setGlobal('MODEL_TIERS', { small: { slug: 'test/small' }, mid: { slug: 'test/mid' } });
-}
-
-await test('files a real digest on a subscribed feed end to end', async () => {
-  mediaSetup();
-  let digestPath = null, digestContent = null;
-  let logged = null;
-  setGlobal('agentFetch', async (p, agentId, opts) => {
-    if (p.startsWith('/api/library/file')) return { ok: true, json: async () => ({ content: 'https://news.example/rss -- the news\n' }) };
-    if (p === '/api/chat') return { ok: true, json: async () => ({ reply: '  Two sentences of honest summary.  ' }) };
-    return { ok: true, json: async () => ({}) };
-  });
-  setGlobal('fetchPageSmart', async (agentId, url, purpose) => ({ allowed: true, text: 'real page content here' }));
-  setGlobal('writeLibraryFile', async (a, p, c, s) => { digestPath = p; digestContent = c; });
-  setGlobal('logThinkTankAction', (a, k, d) => { logged = { k, d }; });
-  await call('runMediaDigestTask', 'studio');
-  assert.ok(digestPath.startsWith('media/digests/'), digestPath);
-  assert.ok(digestContent.includes('Source: https://news.example/rss'));
-  assert.ok(digestContent.includes('Two sentences of honest summary.'));
-  assert.equal(logged.k, 'media_digest_filed');
-  assert.equal(logged.d.url, 'https://news.example/rss');
-});
-
-await test('waits for feeds to be configured when the file is empty or unreadable', async () => {
-  mediaSetup();
-  setGlobal('agentFetch', async (p, agentId, opts) => {
-    if (p.startsWith('/api/library/file')) return { ok: false, json: async () => ({}) };
-    return { ok: true, json: async () => ({}) };
-  });
-  await call('runMediaDigestTask', 'studio');
-  assert.equal(getGlobal('AGENTS').studio.profile.notes[0], 'No feeds configured yet -- waiting on media/feeds.md in the Library.');
-});
-
-await test('reports a feed fetch that was not approved', async () => {
-  mediaSetup();
-  setGlobal('agentFetch', async (p, agentId, opts) => {
-    if (p.startsWith('/api/library/file')) return { ok: true, json: async () => ({ content: 'https://news.example/rss\n' }) };
-    return { ok: true, json: async () => ({}) };
-  });
-  setGlobal('fetchPageSmart', async () => ({ allowed: false, reason: 'too expensive' }));
-  await call('runMediaDigestTask', 'studio');
-  assert.ok(getGlobal('AGENTS').studio.profile.notes[0].includes("wasn't approved: too expensive"));
-});
-
-await test('reports a feed page that came back empty', async () => {
-  mediaSetup();
-  setGlobal('agentFetch', async (p, agentId, opts) => {
-    if (p.startsWith('/api/library/file')) return { ok: true, json: async () => ({ content: 'https://news.example/rss\n' }) };
-    return { ok: true, json: async () => ({}) };
-  });
-  setGlobal('fetchPageSmart', async () => ({ allowed: true, text: '' }));
-  await call('runMediaDigestTask', 'studio');
-  assert.ok(getGlobal('AGENTS').studio.profile.notes[0].includes('page came back empty'));
-});
-
-await test('reports when the summarizer returns nothing', async () => {
-  mediaSetup();
-  setGlobal('agentFetch', async (p, agentId, opts) => {
-    if (p.startsWith('/api/library/file')) return { ok: true, json: async () => ({ content: 'https://news.example/rss\n' }) };
-    if (p === '/api/chat') return { ok: true, json: async () => ({ reply: '   ' }) };
-    return { ok: true, json: async () => ({}) };
-  });
-  setGlobal('fetchPageSmart', async () => ({ allowed: true, text: 'page' }));
-  await call('runMediaDigestTask', 'studio');
-  assert.ok(getGlobal('AGENTS').studio.profile.notes[0].includes("couldn't summarize it this time"));
-});
-
-await test('reports a request failure gracefully', async () => {
-  mediaSetup();
-  setGlobal('agentFetch', async () => { throw new Error('down'); });
-  await call('runMediaDigestTask', 'studio');
-  assert.equal(getGlobal('AGENTS').studio.profile.notes[0], 'Tried to check a subscribed feed, but the request failed.');
-});
-
-console.log('finishTask edge branches (tasks.js)');
-
-await test('falls back to a free spot when the task has no recorded entry point', () => {
-  setGlobal('TASKS', { 't1': { id: 't1', title: 'Sort mail', room: 'postoffice' } }); // no entryX
-  setGlobal('AGENTS', { worker: { id: 'worker', name: 'Worker', task: 't1', visible: false, busy: true, inRoom: 'postoffice', approvedCount: 0, profile: { notes: [] }, x: 0, y: 0 } });
-  setGlobal('pickFreeSpot', (occupied) => ({ x: 700, y: 700 }));
-  setGlobal('attemptHandoff', async () => false);
-  let offDuty = null;
-  setGlobal('sendAgentOffDuty', (id) => { offDuty = id; });
-  setGlobal('writeLibraryFile', () => {});
-  setGlobal('logThinkTankAction', () => {});
-  setGlobal('lastTaskCompletedAt', {});
-  call('finishTask', 'worker');
-  const a = getGlobal('AGENTS').worker;
-  assert.equal(a.x, 700);
-  assert.equal(a.y, 700);
-  assert.equal(offDuty, null, 'a real task exists -- she goes to handoff/log first');
-});
-
-await test('clocks off straight home when there is no task at all', () => {
-  setGlobal('TASKS', {});
-  setGlobal('AGENTS', { worker: { id: 'worker', name: 'Worker', task: null, visible: false, busy: true, inRoom: null, approvedCount: 0, profile: { notes: [] }, x: 0, y: 0 } });
-  setGlobal('pickFreeSpot', (occupied) => ({ x: 800, y: 810 }));
-  setGlobal('attemptHandoff', async () => { throw new Error('no task -- must not hand off'); });
-  let offDuty = null;
-  setGlobal('sendAgentOffDuty', (id) => { offDuty = id; });
-  setGlobal('writeLibraryFile', () => {});
-  setGlobal('logThinkTankAction', () => {});
-  call('finishTask', 'worker');
-  const a = getGlobal('AGENTS').worker;
-  assert.equal(a.visible, true);
-  assert.equal(a.busy, false);
-  assert.equal(a.x, 800, 'free-spot fallback when there is no entry point');
-  assert.equal(a.y, 810);
-  assert.equal(offDuty, 'worker', 'with no task she is sent home directly');
-});
-
-console.log(`\n${passed} passed, ${failed} failed`);
-if (failed > 0) process.exit(1);
+summary();

@@ -9,7 +9,9 @@ import path from 'node:path';
 
 const base = path.resolve(import.meta.dirname, '..');
 const context = vm.createContext();
-vm.runInContext(fs.readFileSync(path.join(base, 'js', 'tasks.js'), 'utf8'), context, { filename: 'tasks.js' });
+for (const file of ['tasks.js', 'task_movement.js', 'task_coding.js', 'task_delivery.js']) {
+  vm.runInContext(fs.readFileSync(path.join(base, 'js', file), 'utf8'), context, { filename: file });
+}
 
 function setGlobal(name, value) {
   context['__inject_' + name] = value;

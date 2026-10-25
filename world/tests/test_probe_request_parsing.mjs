@@ -20,8 +20,12 @@ const worldDir = path.join(__dirname, '..');
 const context = { console, Math, Date, JSON, Array, Object };
 vm.createContext(context);
 
-const src = fs.readFileSync(path.join(worldDir, 'js', 'tasks.js'), 'utf8');
-vm.runInContext(src, context, { filename: 'tasks.js' });
+let src = '';
+for (const file of ['tasks.js', 'task_movement.js', 'task_coding.js', 'task_delivery.js']) {
+  const chunk = fs.readFileSync(path.join(worldDir, 'js', file), 'utf8');
+  vm.runInContext(chunk, context, { filename: file });
+  src += chunk + '\n';
+}
 
 const parseProbeRequest = (...args) => vm.runInContext('_parseProbeRequest', context)(...args);
 

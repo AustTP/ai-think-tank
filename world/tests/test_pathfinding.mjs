@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const worldDir = path.join(__dirname, '..');
+const jsDir = path.join(worldDir, 'js');
 
 const context = {
   console,
@@ -28,8 +29,8 @@ const context = {
 };
 vm.createContext(context);
 
-for (const file of ['world.js', 'agents.js', 'tasks.js']) {
-  const src = fs.readFileSync(path.join(worldDir, file), 'utf8');
+for (const file of ['world.js', 'agents.js', 'tasks.js', 'task_movement.js', 'task_coding.js', 'task_delivery.js']) {
+  const src = fs.readFileSync(path.join(jsDir, file), 'utf8');
   vm.runInContext(src, context, { filename: file });
 }
 

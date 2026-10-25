@@ -32,6 +32,7 @@ RUN python -m pip install --no-cache-dir \
 RUN python -m pip install --no-cache-dir playwright==1.60.0
 RUN python -m playwright install --with-deps chromium
 COPY browser_driver.py /opt/browser_driver.py
+COPY browser_cf.py /opt/browser_cf.py
 
 # Node.js for the JS half of the quality gate. wrq-8 asked for a vanilla-JS
 # simulation engine; the sandbox had no node, so `node --check`/`node --test`

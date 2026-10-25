@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'sandbox'))
 
 import browser_driver  # noqa: E402
+import browser_cf  # noqa: E402
 
 
 class _Locator:
@@ -234,10 +235,10 @@ def test_cf_helper_failures():
 
 def test_wait_cf_cleared_loops_then_returns_final_state():
     page = _FakePage()
-    with unittest.mock.patch.object(browser_driver, '_cf_cleared',
+    with unittest.mock.patch.object(browser_cf, '_cf_cleared',
                                     return_value=False):
         ticks = iter([0, 0, 2])
-        with unittest.mock.patch.object(browser_driver.time, 'monotonic',
+        with unittest.mock.patch.object(browser_cf.time, 'monotonic',
                                         side_effect=lambda: next(ticks, 2)):
             assert browser_driver._wait_cf_cleared(page, 'managed',
                                                    timeout_s=1) is False
@@ -246,9 +247,9 @@ def test_wait_cf_cleared_loops_then_returns_final_state():
 def test_solve_cloudflare_off_no_marker_and_single_attempts():
     page = _FakePage()
     assert browser_driver._solve_cloudflare(page, {'autoSolve': 'off'}) is None
-    with unittest.mock.patch.object(browser_driver, 'CF_POLL_DEADLINE_S', 100):
+    with unittest.mock.patch.object(browser_cf, 'CF_POLL_DEADLINE_S', 100):
         ticks = iter([0, 0, 1000])
-        with unittest.mock.patch.object(browser_driver.time, 'monotonic',
+        with unittest.mock.patch.object(browser_cf.time, 'monotonic',
                                         side_effect=lambda: next(ticks, 1000)):
             result = browser_driver._solve_cloudflare(
                 page, {'autoSolve': 'cloudflare'})
@@ -263,7 +264,7 @@ def test_solve_cloudflare_off_no_marker_and_single_attempts():
         return page.html if calls['n'] == 1 else ''
 
     page.content = content
-    with unittest.mock.patch.object(browser_driver, 'CF_MAX_SOLVE_ATTEMPTS', 1):
+    with unittest.mock.patch.object(browser_cf, 'CF_MAX_SOLVE_ATTEMPTS', 1):
         result = browser_driver._solve_cloudflare(
             page, {'autoSolve': 'cloudflare'})
     assert result['solved'] is True
@@ -284,7 +285,7 @@ def test_solve_cloudflare_off_no_marker_and_single_attempts():
         return original(selector)
 
     page.locator = locator
-    with unittest.mock.patch.object(browser_driver, 'CF_MAX_SOLVE_ATTEMPTS', 1):
+    with unittest.mock.patch.object(browser_cf, 'CF_MAX_SOLVE_ATTEMPTS', 1):
         result = browser_driver._solve_cloudflare(
             page, {'autoSolve': 'all'})
     assert result['attempted'] is True
@@ -298,8 +299,8 @@ def test_solve_cloudflare_interactive_frame_error_paths():
         RuntimeError('load'))
     frame.frame_element = lambda: (_ for _ in ()).throw(RuntimeError('el'))
     page.frame_obj = frame
-    with unittest.mock.patch.object(browser_driver, 'CF_MAX_SOLVE_ATTEMPTS', 1):
-        with unittest.mock.patch.object(browser_driver, '_cf_challenge_type',
+    with unittest.mock.patch.object(browser_cf, 'CF_MAX_SOLVE_ATTEMPTS', 1):
+        with unittest.mock.patch.object(browser_cf, '_cf_challenge_type',
                                         side_effect=["cType", None]):
             browser_driver._solve_cloudflare(page, {'autoSolve': 'all'})
 
@@ -307,12 +308,12 @@ def test_solve_cloudflare_interactive_frame_error_paths():
 def test_solve_cloudflare_outer_exception_is_reported():
     page = _FakePage()
     page.html = "cType: 'non-interactive'"
-    with unittest.mock.patch.object(browser_driver, '_wait_cf_cleared',
+    with unittest.mock.patch.object(browser_cf, '_wait_cf_cleared',
                                     side_effect=RuntimeError('boom')):
         result = browser_driver._solve_cloudflare(
             page, {'autoSolve': 'cloudflare'})
     assert result['error'].startswith('RuntimeError')
-    with unittest.mock.patch.object(browser_driver, '_solve_cloudflare',
+    with unittest.mock.patch.object(browser_cf, '_solve_cloudflare',
                                     side_effect=RuntimeError('boom')):
         result = browser_driver._autosolve(page, {'autoSolve': 'cloudflare'})
     assert result['solved'] is False

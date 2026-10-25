@@ -22,8 +22,12 @@ vm.createContext(context);
 // tasks.js references several globals from other files at parse time only
 // inside function bodies, never at top level, so loading it alone is safe
 // for testing a single pure function -- same reasoning as test_pathfinding.mjs.
-const src = fs.readFileSync(path.join(worldDir, 'js', 'tasks.js'), 'utf8');
-vm.runInContext(src, context, { filename: 'tasks.js' });
+let src = '';
+for (const file of ['tasks.js', 'task_movement.js', 'task_coding.js', 'task_delivery.js']) {
+  const chunk = fs.readFileSync(path.join(worldDir, 'js', file), 'utf8');
+  vm.runInContext(chunk, context, { filename: file });
+  src += chunk + '\n';
+}
 
 const extractWrittenJsFiles = (...args) => vm.runInContext('_extractWrittenJsFiles', context)(...args);
 
