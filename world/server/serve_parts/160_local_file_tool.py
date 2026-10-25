@@ -49,7 +49,7 @@ def _local_file_tool(agent_id, args):
     """Dispatch a `local_file` tool call to the scoped fs layer. Every failure
     (no grant, cap denied, containment escape, trash rule) is surfaced to the
     model as a denial -- never a bypass."""
-    import fs as _fs
+    import core.fs as _fs
     action = (args or {}).get('action') or ''
     scope = (args or {}).get('scope') or ''
     try:
@@ -117,7 +117,7 @@ _READ_STORE_TOOL = {
 
 def _read_store_tool(agent_id, args):
     """Dispatch a `read_store` tool call to the gated fs layer."""
-    import fs as _fs
+    import core.fs as _fs
     try:
         rows = _fs.read_store(
             (args or {}).get('scope') or '',
@@ -176,7 +176,7 @@ def _app_script_tool(agent_id, args):
     """Dispatch an `app_script` tool call to the gated fs layer. Every failure
     (no grant, denied primitive, TCC/automation refusal, script error) is
     surfaced to the model as a denial -- never a bypass."""
-    import fs as _fs
+    import core.fs as _fs
     bundle_id = (args or {}).get('bundleId') or ''
     script = (args or {}).get('script') or ''
     try:

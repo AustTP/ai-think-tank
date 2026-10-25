@@ -1,10 +1,10 @@
 import sqlite3
 
-import apis
-import migrations
-import model_config
-import structured_edits
-import url_evidence
+import integrations.apis as apis
+import server.migrations as migrations
+import core.model_config as model_config
+import core.structured_edits as structured_edits
+import core.url_evidence as url_evidence
 
 
 def test_migrations_files(tmp_path, monkeypatch):

@@ -38,7 +38,7 @@ import threading
 import time
 import urllib.parse
 
-from web_helpers import _is_short_link
+from integrations.web_helpers import _is_short_link
 
 # The claim and coverage ledgers are whole-blob read/modify/write rows. The
 # crawl, the verifier endpoint, and a player review can all mutate them at

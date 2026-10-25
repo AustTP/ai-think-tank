@@ -14,9 +14,9 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
-from planner import PlannerSubmission, SupervisorMeeting  # noqa: E402
-from roster import Roster  # noqa: E402
-from story_budget import BudgetLedger  # noqa: E402
+from core.planner import PlannerSubmission, SupervisorMeeting  # noqa: E402
+from village.roster import Roster  # noqa: E402
+from agents.story_budget import BudgetLedger  # noqa: E402
 
 
 class TestBudgetLedger(unittest.TestCase):

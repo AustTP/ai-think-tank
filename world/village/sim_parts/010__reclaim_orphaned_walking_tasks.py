@@ -391,8 +391,8 @@ def _sim_loop_pass():
         # after activation are recovered unless recoverHistorical is explicitly
         # enabled.
         try:
-            import story_tracking
-            import completion_watchdog
+            import agents.story_tracking as story_tracking
+            import agents.completion_watchdog as completion_watchdog
             now_ms = int(time.time() * 1000)
             control = state.setdefault('completionControl', {})
             if not control.get('pass3ActivatedAt'):
@@ -627,7 +627,7 @@ def team_policy(state, team_ref, key=None):
     always resolve to the operator value. Reads config.OPERATOR_POLICY
     (refreshed in place by reload) instead of get_operator_policy() so a
     hot sim loop does not stat the policy file on every call."""
-    import config as _cfg
+    import core.config as _cfg
     op_policy = _cfg.OPERATOR_POLICY or _cfg.get_operator_policy()
     defaults = _cfg.OPERATOR_POLICY_DEFAULT
     agr = team_agreement(state, team_ref)

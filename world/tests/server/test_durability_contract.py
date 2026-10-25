@@ -10,7 +10,7 @@ import unittest.mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import serve
 import sim
-import tool_policy
+import core.tool_policy as tool_policy
 
 
 class DurabilityContract(unittest.TestCase):

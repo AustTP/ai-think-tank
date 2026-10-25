@@ -22,7 +22,7 @@ import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import containers  # noqa: E402
+import agents.containers as containers  # noqa: E402
 import serve  # noqa: E402
 
 _TMP_DIR = None

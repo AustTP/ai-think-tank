@@ -43,7 +43,7 @@ _URL_RE = re.compile(r'https?://[^\s\'"<>]+', re.IGNORECASE)
 
 
 def _repo_root():
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _allowed_scripts():

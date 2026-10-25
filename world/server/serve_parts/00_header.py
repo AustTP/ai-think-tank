@@ -37,20 +37,20 @@ import zipfile
 if __name__ == '__main__':
     sys.modules.setdefault('serve', sys.modules[__name__])
 
-from confirmations import gate as _confirmation_gate_or_response
-from confirmations import gate_finish as _finish_confirmation
+from core.confirmations import gate as _confirmation_gate_or_response
+from core.confirmations import gate_finish as _finish_confirmation
 
-import runtime_limits
-from tool_policy import is_known_tool, task_tool_policy, tool_trust_tier
-import governance
-import constitution
-import cron_scripts
-from optimization_advisor import build_optimization_advice
-import policies
+import core.runtime_limits as runtime_limits
+from core.tool_policy import is_known_tool, task_tool_policy, tool_trust_tier
+import core.governance as governance
+import core.constitution as constitution
+import server.cron_scripts as cron_scripts
+from core.optimization_advisor import build_optimization_advice
+import core.policies as policies
 
 # Pure web/text/path/security helpers extracted to their own module
 # to shrink the serve.py monolith. See web_helpers.py.
-from web_helpers import (  # noqa: E402,F401
+from integrations.web_helpers import (  # noqa: E402,F401
     _block_link_value,
     _download_dest_rel_path,
     _extract_links,
@@ -75,7 +75,7 @@ from web_helpers import (  # noqa: E402,F401
 # modules reach serve.py's own state through `_serve.X` at call time (the
 # same lazy pattern sim.py and content.py use), so there is no import-time
 # cycle: by the time these functions RUN, this module is fully populated.
-from auth import (  # noqa: E402,F401
+from core.auth import (  # noqa: E402,F401
     _LOGIN_ATTEMPT_LIMIT,
     _check_login_rate_limit,
     _get_or_create_admin_credentials,
@@ -90,7 +90,7 @@ from auth import (  # noqa: E402,F401
     destroy_session,
     verify_session,
 )
-from bank import (  # noqa: E402,F401
+from integrations.bank import (  # noqa: E402,F401
     DEFAULT_BUDGET_CAP_USD,
     OPENROUTER_CREDITS_CACHE_TTL_S,
     _OPENROUTER_CREDITS_CACHE,
@@ -141,7 +141,7 @@ from bank import (  # noqa: E402,F401
 # into rss.py the same way: the poll loop, tolerant parser, ring buffer, and
 # operator-managed feed registry are re-exported here so the routes, the
 # read_rss_feed tool, and the lifespan wiring keep calling `serve._rss_*`.
-from rss import (  # noqa: E402,F401
+from integrations.rss import (  # noqa: E402,F401
     _RSS_BUFFER,
     _RSS_BUFFER_LOCK,
     _RSS_BUFFER_MAX_PER_FEED,
@@ -170,7 +170,7 @@ from rss import (  # noqa: E402,F401
 # Kraken and AISStream are registered data, not code; the descriptor language
 # and the supervisor live in ws.py and are re-exported here so /api/ws/*, the
 # read_ais_feed tool, and the lifespan wiring keep using `serve._ws_*`.
-from ws import (  # noqa: E402,F401
+from server.ws import (  # noqa: E402,F401
     _WS_BUFFERS,
     _WS_FEED_SEED,
     _WS_FEEDS,
@@ -198,7 +198,7 @@ from ws import (  # noqa: E402,F401
 # Inbound webhook intake (see DESIGN.md "Inbound loom requests"). The channel
 # registry, goal formatter, self-activity gate, and consumer loop live in
 # webhooks.py; the endpoint in this file stays a pure sink.
-from webhooks import (  # noqa: E402,F401
+from server.webhooks import (  # noqa: E402,F401
     CHANNELS as WEBHOOK_CHANNEL_SPECS,
     WEBHOOK_CHANNELS,
     _WEBHOOK_POLL_INTERVAL_S,
@@ -216,12 +216,12 @@ from webhooks import (  # noqa: E402,F401
 )
 # Live-reloadable .env field table (see env_reload.py). The reload loop below
 # reads serve._ENV_RELOAD_FIELDS, so tests that patch that name still work.
-from env_reload import ENV_RELOAD_FIELDS as _ENV_RELOAD_FIELDS, _env_flag  # noqa: E402,F401
+from core.env_reload import ENV_RELOAD_FIELDS as _ENV_RELOAD_FIELDS, _env_flag  # noqa: E402,F401
 
 # The api_call service registry, channel routing, credential injection, and
 # per-service daily call budget (see DESIGN.md "Generic api_call"). The gates
 # and the execution path stay here; the config half lives in apis.py.
-from apis import (  # noqa: E402,F401
+from integrations.apis import (  # noqa: E402,F401
     MULLVAD_TOKEN_REFRESH_MARGIN_S,
     OAUTH2_REFRESH_MARGIN_S,
     _API_CHANNELS,
@@ -265,9 +265,9 @@ from apis import (  # noqa: E402,F401
     _seed_api_services_if_empty,
     _validate_api_service_spec,
 )
-import apple_photos as _apple_photos  # noqa: E402
+import integrations.apple_photos as _apple_photos  # noqa: E402
 
-from notify import (  # noqa: E402,F401
+from integrations.notify import (  # noqa: E402,F401
     GMAIL_SMTP,
     GMAIL_SMTP_HOST,
     GMAIL_SMTP_PORT,
@@ -287,7 +287,7 @@ from notify import (  # noqa: E402,F401
 # ledger (see DESIGN.md "Research Desk" and evidence.py). Extracted into its
 # own module exactly like bank.py: re-exported here so the stable public
 # surface the endpoints and tests use is `serve._evidence_read` etc.
-from evidence import (  # noqa: E402,F401
+from core.evidence import (  # noqa: E402,F401
     CLAIM_DECISIONS,
     CLAIM_STATUSES,
     CLAIM_TYPES,
@@ -321,7 +321,7 @@ from evidence import (  # noqa: E402,F401
 # behind a declared cost estimate, so a Colab experiment can run at scale
 # with NO OpenRouter key in the notebook. Re-exported here so the stable
 # public surface the endpoints/tests use is `serve.mint_sublow_grant` etc.
-from sublow import (  # noqa: E402,F401
+from core.sublow import (  # noqa: E402,F401
     GRANT_TOKENS_DEFAULT,
     GRANT_TOKENS_MAX,
     GRANT_TTL_S_DEFAULT,
@@ -340,7 +340,7 @@ from sublow import (  # noqa: E402,F401
 # JEV decisions model -- same restrictions, different model. Re-exported so
 # the stable public surface the endpoints/tests use is `serve.mint_jev_grant`
 # etc.
-from jev_grants import (  # noqa: E402,F401
+from core.jev_grants import (  # noqa: E402,F401
     JEV_FALLBACK_PRICE_PER_M,
     JEV_LEDGER_SERVICE,
     accrue_jev_grant,
@@ -357,8 +357,8 @@ from jev_grants import (  # noqa: E402,F401
 # passes, and the research watchlist by editing the JSON files. Re-exported so
 # the stable surface the endpoints/tests use is `serve.PLAIN_WRITING_BAN_LIST`
 # etc. (see world/config.py for load discipline).
-import config  # noqa: E402
-from config import (  # noqa: E402,F401
+import core.config as config  # noqa: E402
+from core.config import (  # noqa: E402,F401
     ALLOW_WATCHLIST_WRITE,
     API_LOG_ALLOWED_ACTIONS,
     NON_WAKING_READS_EXTRA,
@@ -410,7 +410,7 @@ _API_LOG_ALLOWED_ACTIONS = API_LOG_ALLOWED_ACTIONS
 # test patch path byte-identical. The apply flow for a self-edit of jev.py
 # must reload jev and refresh these names from the reloaded module while the
 # tank sleeps (serve itself must never be reloaded -- uvicorn owns `app`).
-from jev import (  # noqa: E402,F401
+from core.jev import (  # noqa: E402,F401
     ESCALATION_DEFAULT_FLOOR,
     ESCALATION_ERROR_PENALTY_CAP,
     ESCALATION_ERROR_PENALTY_STEP,
@@ -437,7 +437,7 @@ import selfedit as _selfedit  # noqa: E402
 # failure); LTM distills durable facts/preferences from the conversation and
 # recalls the relevant ones on each ask. Re-exported here so the stable public
 # surface the call sites and tests use is `serve.memory_context` etc.
-from memory import (  # noqa: E402,F401
+from agents.memory import (  # noqa: E402,F401
     LTM_TYPES,
     cleanup_expired_sessions,
     ltm_maybe_extract,
@@ -451,7 +451,7 @@ from memory import (  # noqa: E402,F401
 # and Notes Access" and world/fs.py). Every call is checked for containment,
 # the trash rule (deletes move to trash, never empty it), and Notes ownership.
 # Re-exported here so the stable surface call sites/tests use is `serve.fs_*`.
-from fs import (  # noqa: E402,F401
+from core.fs import (  # noqa: E402,F401
     delete_to_trash as fs_delete_to_trash,
     list_scope as fs_list_scope,
     move_file as fs_move_file,
@@ -462,19 +462,19 @@ from fs import (  # noqa: E402,F401
 # datasets (opt-in via TRAINING_CAPTURE_ENABLED; see
 # datasets/INTERACTION_RECORDING.md). Stdlib-only module, so
 # importing it here cannot create a cycle.
-import training_capture  # noqa: E402
-import vpn_location  # noqa: E402
-import theo_policy  # noqa: E402
-import tank_accounts  # noqa: E402
-import browser_session  # noqa: E402
-import captcha  # noqa: E402
-import vpn_pool  # noqa: E402
-import containers  # noqa: E402
-import egress  # noqa: E402
-import phone  # noqa: E402
-import planner  # noqa: E402
-import story_budget  # noqa: E402
-import schedule  # noqa: E402
+import agents.training_capture as training_capture  # noqa: E402
+import integrations.vpn_location as vpn_location  # noqa: E402
+import core.theo_policy as theo_policy  # noqa: E402
+import integrations.tank_accounts as tank_accounts  # noqa: E402
+import agents.browser_session as browser_session  # noqa: E402
+import agents.captcha as captcha  # noqa: E402
+import integrations.vpn_pool as vpn_pool  # noqa: E402
+import agents.containers as containers  # noqa: E402
+import core.egress as egress  # noqa: E402
+import integrations.phone as phone  # noqa: E402
+import core.planner as planner  # noqa: E402
+import agents.story_budget as story_budget  # noqa: E402
+import village.schedule as schedule  # noqa: E402
 
 # Optional, real dependencies for document ingestion (/api/library/ingest,
 # below) -- openpyxl (Excel) was already installed for something else in

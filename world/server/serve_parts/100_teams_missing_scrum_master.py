@@ -26,10 +26,10 @@ def _teams_missing_scrum_master(state, team_ids):
 
 
 app = FastAPI(lifespan=_lifespan)
-from confirmations_api import router as _confirmations_router  # noqa: E402
-from supervision_api import router as _supervision_router  # noqa: E402
-from feedback_api import router as _feedback_router  # noqa: E402
-from live_coverage_api import router as _live_coverage_router  # noqa: E402
+from server.confirmations_api import router as _confirmations_router  # noqa: E402
+from server.supervision_api import router as _supervision_router  # noqa: E402
+from server.feedback_api import router as _feedback_router  # noqa: E402
+from server.live_coverage_api import router as _live_coverage_router  # noqa: E402
 app.include_router(_confirmations_router)
 app.include_router(_supervision_router)
 app.include_router(_feedback_router)

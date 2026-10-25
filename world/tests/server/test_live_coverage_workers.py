@@ -2,7 +2,7 @@ import json
 import time
 from pathlib import Path
 
-import live_coverage as lc
+import server.live_coverage as lc
 
 
 def test_url_validate_redact():

@@ -12,8 +12,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import vpn_location  # noqa: E402
-import vpn_pool  # noqa: E402
+import integrations.vpn_location as vpn_location  # noqa: E402
+import integrations.vpn_pool as vpn_pool  # noqa: E402
 
 ACCOUNT = '1234567890123456'
 

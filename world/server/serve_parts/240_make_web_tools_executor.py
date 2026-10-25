@@ -36,7 +36,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
     # Track every URL the tools actually returned. browse_page may only
     # follow a path that search_web or a previous page really exposed, so a
     # model cannot invent a plausible news/post URL and cite it as evidence.
-    from url_evidence import DiscoveredURLs
+    from core.url_evidence import DiscoveredURLs
     discovered = DiscoveredURLs((default_query or '') + '\n' + (work_context or ''))
     # Server-minted, single-use proof that the work-context host bypass is
     # backed by a stored player-authored task. Minted HERE (server code, at

@@ -16,7 +16,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-import config  # noqa: E402
+import core.config as config  # noqa: E402
 import serve  # noqa: E402
 from test_cov_gap_serve_helpers import (  # noqa: E402
     _NO_GRANT, _SENTINEL, req_with, decision_cache_report_defaults)
@@ -80,7 +80,7 @@ class SimWatchdogNoteTest(unittest.TestCase):
                  '_SIM_WATCHDOG_PLAYER_ALERTED': False,
                  '_SIM_WATCHDOG_LAST_EVENT_AT': 0,
                  '_SIM_WATCHDOG_PLAYER_ALERT_AFTER': 1}), \
-             mock.patch('notify.send_player_telegram_sync',
+             mock.patch('integrations.notify.send_player_telegram_sync',
                         side_effect=RuntimeError('tg')):
             self.assertEqual(serve._sim_watchdog_note_failure('loop', 'd',
                                                               False), 1)
@@ -833,7 +833,7 @@ class LifespanTest(unittest.TestCase):
              mock.patch.object(serve, 'TELEGRAM_BOT_TOKEN', ''), \
              mock.patch.object(serve, '_WS_TASKS', {}), \
              mock.patch('sim._sim_loop', mock.MagicMock()), \
-             mock.patch('config.ALLOW_WATCHLIST_WRITE', False):
+             mock.patch('core.config.ALLOW_WATCHLIST_WRITE', False):
             def fake_task(coro):
                 if hasattr(coro, 'close'):
                     coro.close()

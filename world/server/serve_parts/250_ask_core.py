@@ -279,7 +279,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
             return _web_tool(name, args)
         if name in ('pulse_watch', 'read_pulse'):
             tools_used.append(name)
-            from pulse import execute_pulse_tool
+            from agents.pulse import execute_pulse_tool
             return execute_pulse_tool(pick, name, args)
         if name == 'team_digest':
             # Read-only DB digest (weekly review + recent decision count).

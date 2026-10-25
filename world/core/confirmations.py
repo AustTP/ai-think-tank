@@ -21,9 +21,9 @@ import sqlite3
 import time
 from pathlib import Path
 
-from migrations import apply as apply_migrations
+from server.migrations import apply as apply_migrations
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[2]
 MAX_PAYLOAD_BYTES = 64 * 1024
 DEFAULT_TTL_S = 900
 MIN_TTL_S = 60

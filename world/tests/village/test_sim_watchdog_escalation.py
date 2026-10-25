@@ -199,7 +199,7 @@ class WatchdogNoteFailure(unittest.TestCase):
          serve._SIM_WATCHDOG_LAST_EVENT_AT) = self._saved
         sim._SIM_WATCHDOG_EVENT = None
 
-    @mock.patch('notify.send_player_telegram_sync', return_value=True)
+    @mock.patch('integrations.notify.send_player_telegram_sync', return_value=True)
     def test_stamps_side_channel_counts_and_no_alert_yet(self, mock_tg):
         n = serve._sim_watchdog_note_failure('dead', 'boom', True)
         self.assertEqual(n, 1)
@@ -209,7 +209,7 @@ class WatchdogNoteFailure(unittest.TestCase):
         self.assertFalse(evt['player_alert'])
         mock_tg.assert_not_called()
 
-    @mock.patch('notify.send_player_telegram_sync', return_value=True)
+    @mock.patch('integrations.notify.send_player_telegram_sync', return_value=True)
     def test_failed_restart_alerts_player_immediately(self, mock_tg):
         n = serve._sim_watchdog_note_failure('dead', 'boom', False)
         self.assertEqual(n, 1)
@@ -219,7 +219,7 @@ class WatchdogNoteFailure(unittest.TestCase):
         mock_tg.assert_called_once()
         self.assertIn('server logs', mock_tg.call_args[0][1])
 
-    @mock.patch('notify.send_player_telegram_sync', return_value=True)
+    @mock.patch('integrations.notify.send_player_telegram_sync', return_value=True)
     def test_threshold_alerts_once_per_streak(self, mock_tg):
         for _ in range(serve._SIM_WATCHDOG_PLAYER_ALERT_AFTER - 1):
             serve._sim_watchdog_note_failure('stale', 'frozen', True)
@@ -229,7 +229,7 @@ class WatchdogNoteFailure(unittest.TestCase):
         serve._sim_watchdog_note_failure('stale', 'frozen', True)
         mock_tg.assert_called_once()  # latch: one alert per streak
 
-    @mock.patch('notify.send_player_telegram_sync', return_value=True)
+    @mock.patch('integrations.notify.send_player_telegram_sync', return_value=True)
     def test_healthy_tick_resets_ladder_and_latch(self, mock_tg):
         for _ in range(serve._SIM_WATCHDOG_PLAYER_ALERT_AFTER):
             serve._sim_watchdog_note_failure('dead', 'boom', True)

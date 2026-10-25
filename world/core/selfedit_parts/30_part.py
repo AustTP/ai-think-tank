@@ -403,7 +403,7 @@ def _notify_player_telegram(subject, body):
     """Best-effort player Telegram push for change-request outcomes; never
     raises (an unreachable Telegram must not break a finished push)."""
     try:
-        from notify import send_player_telegram_sync
+        from integrations.notify import send_player_telegram_sync
         return send_player_telegram_sync(subject, body)
     except Exception as exc:
         try:

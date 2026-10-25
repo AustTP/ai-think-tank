@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-import cli_tools
+import tools.cli_tools as cli_tools
 
 
 @pytest.fixture

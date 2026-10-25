@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import model_config
+import core.model_config as model_config
 
 
 class ModelConfigTest(unittest.TestCase):

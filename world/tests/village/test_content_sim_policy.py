@@ -15,7 +15,7 @@ import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import config  # noqa: E402
+import core.config as config  # noqa: E402
 import content  # noqa: E402
 import serve  # noqa: E402
 import sim  # noqa: E402
@@ -99,7 +99,7 @@ class RosterAndStateTest(_Base):
         self.assertIsNone(sim.normalize_never_block('- \n* \n'))
 
     def test_overrun_factor_guard(self):
-        with unittest.mock.patch('budget.overrun_factor',
+        with unittest.mock.patch('core.budget.overrun_factor',
                                  side_effect=RuntimeError('boom')):
             self.assertEqual(sim._overrun_factor_for({}, 'room', {}), 1.0)
 
@@ -182,7 +182,7 @@ class GuardsTest(_Base):
         task = {'id': 't1', 'title': 'T', 'assignedTo': 'cora'}
         with unittest.mock.patch.object(sim, '_task_owner_director',
                                         return_value='d1'), \
-             unittest.mock.patch('budget.overrun_factor',
+             unittest.mock.patch('core.budget.overrun_factor',
                                  side_effect=RuntimeError('boom')), \
              unittest.mock.patch('serve.log_action'):
             sim._notify_task_budget_exhausted(

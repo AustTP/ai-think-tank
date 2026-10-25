@@ -2,8 +2,8 @@ import asyncio
 import threading
 import types
 
-import governance
-import ws
+import core.governance as governance
+import server.ws as ws
 
 
 def test_ws_ingest_errors(monkeypatch):

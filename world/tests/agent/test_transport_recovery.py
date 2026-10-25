@@ -3,7 +3,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-import transport_recovery
+import agents.transport_recovery as transport_recovery
 
 
 def fixture():

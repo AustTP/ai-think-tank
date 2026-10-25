@@ -864,7 +864,7 @@ class TeamAgreementApi(unittest.TestCase):
             # The resolved surface mirrors the operator-policy
             # schema key for key, so it grows when the JSON
             # policy grows (no hardcoded count).
-            import config as _cfg
+            import core.config as _cfg
             self.assertEqual(len(t1["agreementResolved"]),
                              len(_cfg.OPERATOR_POLICY_DEFAULT))
             self.assertEqual(t1["agreementResolved"]["scrumMasterMinTeamSize"], 6)

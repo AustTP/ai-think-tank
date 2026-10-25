@@ -6,7 +6,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import safari_tabs  # noqa: E402
+import integrations.safari_tabs as safari_tabs  # noqa: E402
 
 
 class SafariTabsTest(unittest.TestCase):

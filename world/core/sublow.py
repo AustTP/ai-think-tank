@@ -24,9 +24,9 @@ import hashlib
 import secrets
 import time
 
-import grant_store
+import core.grant_store as grant_store
 
-from config import bind_policy
+from core.config import bind_policy
 
 # Grant defaults, all hard-clamped by the caps beside them: an operator can
 # ask for a shorter TTL or a bigger per-call token budget, never a longer or

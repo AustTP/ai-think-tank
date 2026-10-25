@@ -1,6 +1,6 @@
 """Carry resolved user decisions and prerequisite artifacts into every repair."""
 import json
-import story_tracking
+import agents.story_tracking as story_tracking
 
 
 def context(state, task, workspace_resolver=None):
@@ -14,7 +14,7 @@ def context(state, task, workspace_resolver=None):
                for item in parent.get('repairStories', []) if item.get('status') != 'done']
     prerequisites = [{'taskId':t['id'], 'storyId':t.get('workOrderStoryId'), 'libraryPath':t.get('libraryPath'),
                       'workspace': (workspace_resolver(t) if workspace_resolver
-                                    else __import__('code_workspaces').sandbox_for(state,t))}
+                                    else __import__('agents.code_workspaces', fromlist=['*']).sandbox_for(state,t))}
                      for t in state.get('tasks', {}).values() if t.get('workOrderId') == request.get('id')
                      and t.get('workOrderStoryId') in story.get('prerequisiteStoryIds', [])
                      and t.get('status') == 'done' and not t.get('reviewOf')]

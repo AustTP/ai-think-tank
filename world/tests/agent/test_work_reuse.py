@@ -4,7 +4,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-import work_reuse
+import agents.work_reuse as work_reuse
 
 
 class WorkReuse(unittest.TestCase):

@@ -8,7 +8,7 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
-from roster import OFF_DUTY, ON_DUTY, Roster  # noqa: E402
+from village.roster import OFF_DUTY, ON_DUTY, Roster  # noqa: E402
 
 
 class TestRecordsAndLookups(unittest.TestCase):

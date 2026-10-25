@@ -3,16 +3,16 @@ import json
 import os
 import time
 
-import migrations
-import policies
-import python_delivery
-import skill_prompts
-import skill_scan
-import state_updates
-import story_tracking
-import structured_edits
-import url_evidence
-import work_reuse
+import server.migrations as migrations
+import core.policies as policies
+import agents.python_delivery as python_delivery
+import agents.skill_prompts as skill_prompts
+import agents.skill_scan as skill_scan
+import server.state_updates as state_updates
+import agents.story_tracking as story_tracking
+import core.structured_edits as structured_edits
+import core.url_evidence as url_evidence
+import agents.work_reuse as work_reuse
 
 
 def test_structured_edits_valid_command():

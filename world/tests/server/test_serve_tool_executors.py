@@ -16,7 +16,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-import config  # noqa: E402
+import core.config as config  # noqa: E402
 import serve  # noqa: E402
 from test_cov_gap_serve_helpers import (  # noqa: E402
     _NO_GRANT, _SENTINEL, req_with, decision_cache_report_defaults)
@@ -26,7 +26,7 @@ class LocalFileToolTest(unittest.TestCase):
     def test_list_with_and_without_sizes(self):
         entries = [{'name': 'a.txt', 'type': 'file', 'size': 3},
                    {'name': 'docs', 'type': 'dir'}]
-        with mock.patch('fs.list_scope', return_value=entries) as ls:
+        with mock.patch('core.fs.list_scope', return_value=entries) as ls:
             out = serve._local_file_tool(
                 'cora', {'action': 'list', 'scope': 's', 'path': 'sub'})
         self.assertIn('a.txt', out)
@@ -35,25 +35,25 @@ class LocalFileToolTest(unittest.TestCase):
         ls.assert_called_once_with('s', 'sub')
 
     def test_list_empty(self):
-        with mock.patch('fs.list_scope', return_value=[]):
+        with mock.patch('core.fs.list_scope', return_value=[]):
             out = serve._local_file_tool(
                 'cora', {'action': 'list', 'scope': 's'})
         self.assertEqual(out, 'Files in s:\n')
 
     def test_read_write_move_delete(self):
-        with mock.patch('fs.read_file', return_value='body'):
+        with mock.patch('core.fs.read_file', return_value='body'):
             self.assertEqual(serve._local_file_tool(
                 'cora', {'action': 'read', 'scope': 's', 'path': 'p'}),
                 'body')
-        with mock.patch('fs.write_file', return_value='p'):
+        with mock.patch('core.fs.write_file', return_value='p'):
             self.assertEqual(serve._local_file_tool(
                 'cora', {'action': 'write', 'scope': 's', 'path': 'p',
                          'content': 'c'}), 'wrote p')
-        with mock.patch('fs.move_file', return_value='q'):
+        with mock.patch('core.fs.move_file', return_value='q'):
             self.assertEqual(serve._local_file_tool(
                 'cora', {'action': 'move', 'scope': 's', 'from': 'a',
                          'to': 'b'}), 'moved to q')
-        with mock.patch('fs.delete_to_trash', return_value='t'):
+        with mock.patch('core.fs.delete_to_trash', return_value='t'):
             self.assertEqual(serve._local_file_tool(
                 'cora', {'action': 'delete', 'scope': 's', 'path': 'p'}),
                 'moved to trash: t')
@@ -61,15 +61,15 @@ class LocalFileToolTest(unittest.TestCase):
     def test_unknown_action_and_errors(self):
         out = serve._local_file_tool('cora', {'action': 'nope'})
         self.assertIn('Unknown local_file action', out)
-        with mock.patch('fs.read_file', side_effect=PermissionError('denied')):
+        with mock.patch('core.fs.read_file', side_effect=PermissionError('denied')):
             self.assertEqual(serve._local_file_tool(
                 'cora', {'action': 'read', 'scope': 's', 'path': 'p'}),
                 'Denied: denied')
-        with mock.patch('fs.read_file', side_effect=FileNotFoundError('gone')):
+        with mock.patch('core.fs.read_file', side_effect=FileNotFoundError('gone')):
             self.assertEqual(serve._local_file_tool(
                 'cora', {'action': 'read', 'scope': 's', 'path': 'p'}),
                 'Not found: gone')
-        with mock.patch('fs.read_file', side_effect=RuntimeError('boom')):
+        with mock.patch('core.fs.read_file', side_effect=RuntimeError('boom')):
             self.assertEqual(serve._local_file_tool(
                 'cora', {'action': 'read', 'scope': 's', 'path': 'p'}),
                 'local_file failed: boom')

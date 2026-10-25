@@ -16,7 +16,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-import config  # noqa: E402
+import core.config as config  # noqa: E402
 import serve  # noqa: E402
 from test_cov_gap_serve_helpers import (  # noqa: E402
     _NO_GRANT, _SENTINEL, req_with, decision_cache_report_defaults)

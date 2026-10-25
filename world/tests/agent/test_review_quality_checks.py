@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-import review_quality as rq
+import agents.review_quality as rq
 
 
 def test_clean_vote_errors_all():

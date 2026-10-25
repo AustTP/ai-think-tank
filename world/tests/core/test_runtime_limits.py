@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-import runtime_limits
+import core.runtime_limits as runtime_limits
 
 
 def test_chat_allowance_scales_with_reply_budget():

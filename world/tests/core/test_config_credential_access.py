@@ -1,6 +1,6 @@
 import json
 
-import config
+import core.config as config
 
 
 def _p(tmp_path, data, name='x.json'):

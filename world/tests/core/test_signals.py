@@ -8,7 +8,7 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
-from signals import Scenario, SignalWaker, WakePlan  # noqa: E402
+from core.signals import Scenario, SignalWaker, WakePlan  # noqa: E402
 
 
 def matches(data, condition):

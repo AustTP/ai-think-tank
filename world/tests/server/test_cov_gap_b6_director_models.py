@@ -19,7 +19,7 @@ import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import serve  # noqa: E402
-import live_coverage as lc  # noqa: E402
+import server.live_coverage as lc  # noqa: E402
 
 _MODULE_TMP_DIR = None
 _MODULE_PATCHER = None

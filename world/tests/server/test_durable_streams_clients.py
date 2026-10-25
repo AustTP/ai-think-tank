@@ -1,7 +1,7 @@
 import json
 import types
 
-import durable_streams as ds
+import server.durable_streams as ds
 
 
 def _redis(**kw):

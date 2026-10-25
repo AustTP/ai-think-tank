@@ -14,7 +14,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import egress  # noqa: E402
+import core.egress as egress  # noqa: E402
 
 
 class _Positions(object):

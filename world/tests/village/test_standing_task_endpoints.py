@@ -22,7 +22,7 @@ import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import schedule  # noqa: E402
+import village.schedule as schedule  # noqa: E402
 import serve  # noqa: E402
 import sim  # noqa: E402
 

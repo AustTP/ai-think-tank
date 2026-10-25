@@ -30,20 +30,20 @@ import time
 import urllib.parse
 
 import serve as _serve
-import evidence_policy
-import review_quality
-import retrieval
-import skill_prompts
-import skill_scan
-import training_capture
-import url_evidence
-import work_reuse
+import core.evidence_policy as evidence_policy
+import agents.review_quality as review_quality
+import core.retrieval as retrieval
+import agents.skill_prompts as skill_prompts
+import agents.skill_scan as skill_scan
+import agents.training_capture as training_capture
+import core.url_evidence as url_evidence
+import agents.work_reuse as work_reuse
 
-from config import RESEARCH_DESK_PASSES, bind_policy
+from core.config import RESEARCH_DESK_PASSES, bind_policy
 
-from tool_policy import (task_tool_policy, tool_policy, tool_replay_safety,
+from core.tool_policy import (task_tool_policy, tool_policy, tool_replay_safety,
                             tool_trust_tier)
-from pulse import execute_pulse_tool
+from agents.pulse import execute_pulse_tool
 
 
 def _chat_error_result(r, fallback_note):

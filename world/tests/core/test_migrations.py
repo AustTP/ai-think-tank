@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import migrations
+import server.migrations as migrations
 
 
 class MigrationRunnerTest(unittest.TestCase):

@@ -369,8 +369,8 @@ def test_task_cycle_credit_pause_and_error(monkeypatch):
 
 def test_task_cycle_transport_and_credits(monkeypatch):
     _task_cycle_patches(monkeypatch)
-    import transport_recovery
-    import story_tracking
+    import agents.transport_recovery as transport_recovery
+    import agents.story_tracking as story_tracking
     monkeypatch.setattr(serve, 'credits_pause_active', lambda: False)
     monkeypatch.setattr(sim, '_apply_content_result', lambda *a: None)
     monkeypatch.setattr(sim, '_take_content_result',
@@ -419,8 +419,8 @@ def test_sim_loop_pass_tick_errors(monkeypatch):
     monkeypatch.setattr(serve, '_apply_pending_ask_results', lambda s: None)
     monkeypatch.setattr(serve, '_peer_review_tick', lambda s: None)
     monkeypatch.setattr(serve, '_adversarial_village_tick', lambda s: None)
-    import story_tracking
-    import completion_watchdog
+    import agents.story_tracking as story_tracking
+    import agents.completion_watchdog as completion_watchdog
     monkeypatch.setattr(story_tracking, 'refresh', lambda *a: None)
     monkeypatch.setattr(completion_watchdog, 'step',
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError('cw')))
@@ -457,7 +457,7 @@ def test_dispatch_content_credits_paused(monkeypatch):
 
 
 def test_apply_content_result_parent_contract_sources_and_repeat(monkeypatch):
-    import repeat_work
+    import agents.repeat_work as repeat_work
     monkeypatch.setattr(repeat_work, 'record',
                         lambda *a: (_ for _ in ()).throw(RuntimeError('x')))
     parent = {'id': 'p', 'sourceUrls': ['a']}
@@ -495,7 +495,7 @@ def test_apply_content_result_review_format_escalates(monkeypatch):
 
 
 def test_apply_content_result_clean_errors_escalate(monkeypatch):
-    import review_quality
+    import agents.review_quality as review_quality
     monkeypatch.setattr(review_quality, 'clean_vote_errors',
                         lambda *a, **k: ['bad'])
     monkeypatch.setattr(review_quality, 'known_failure', lambda r: False)
@@ -510,7 +510,7 @@ def test_apply_content_result_clean_errors_escalate(monkeypatch):
 
 
 def test_apply_content_result_clean_red_pipeline_is_actionable(monkeypatch):
-    import review_quality
+    import agents.review_quality as review_quality
     monkeypatch.setattr(review_quality, 'clean_vote_errors',
                         lambda *a, **k: [])
     state = _gate_state()
@@ -540,8 +540,8 @@ def test_sweep_stuck_gates_second_vote_rescue(monkeypatch):
 
 
 def test_standing_sweep_script_and_check_schedules_disabled(monkeypatch):
-    import schedule
-    import cron_scripts
+    import village.schedule as schedule
+    import server.cron_scripts as cron_scripts
 
     class _Task:
         def __init__(self, **kw):

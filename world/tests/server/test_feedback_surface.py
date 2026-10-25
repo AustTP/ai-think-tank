@@ -1,7 +1,7 @@
 import os
 
-from feedback_store import FeedbackStore
-import feedback_api
+from server.feedback_store import FeedbackStore
+import server.feedback_api as feedback_api
 
 
 def test_feedback_store_round_trip(tmp_path):
@@ -38,7 +38,7 @@ def test_work_items_projection_prefers_active_and_handles_lists():
 
 
 def test_feedback_page_markers():
-    path = os.path.join(os.path.dirname(feedback_api.__file__), 'feedback.html')
+    path = os.path.join(os.path.dirname(os.path.dirname(feedback_api.__file__)), 'feedback.html')
     text = open(path, encoding='utf-8').read()
     assert '/api/work-items' in text
     assert '/api/feedback' in text
@@ -51,7 +51,7 @@ def test_feedback_page_markers():
 
 
 def test_supervision_defaults_to_three(tmp_path):
-    from governance import supervision_level
+    from core.governance import supervision_level
     assert supervision_level({}, 'nora', 'feedback') == 3
 
 
@@ -114,7 +114,7 @@ def test_old_database_gains_structured_columns(tmp_path):
 
 
 def test_feedback_page_has_review_surface():
-    path = os.path.join(os.path.dirname(feedback_api.__file__), 'feedback.html')
+    path = os.path.join(os.path.dirname(os.path.dirname(feedback_api.__file__)), 'feedback.html')
     text = open(path, encoding='utf-8').read()
     for marker in ('data-tab="review"', 'id="fbCategory"', 'id="fbSeverity"',
                    'id="fbTarget"', 'id="reviewList"', 'Mark triaged'):

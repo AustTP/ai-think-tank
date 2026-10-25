@@ -10,7 +10,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'world'))
-import training_capture as capture
+import agents.training_capture as capture
 
 
 def sha(value):

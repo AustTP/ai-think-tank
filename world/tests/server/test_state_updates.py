@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import serve
-import state_updates
+import server.state_updates as state_updates
 
 
 def states():

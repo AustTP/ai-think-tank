@@ -12,7 +12,7 @@ and are never logged.
 import secrets
 import time
 
-import totp
+import core.totp as totp
 
 DEFAULT_GRANT_S = 300
 MIN_GRANT_S = 60

@@ -19,7 +19,7 @@ import unittest.mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import serve  # noqa: E402
-import theo_policy  # noqa: E402
+import core.theo_policy as theo_policy  # noqa: E402
 
 _TMP_DIR = None
 _PATCHER = None

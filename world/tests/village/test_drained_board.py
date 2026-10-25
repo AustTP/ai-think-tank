@@ -9,7 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import completion_watchdog as watchdog  # noqa: E402
+import agents.completion_watchdog as watchdog  # noqa: E402
 import sim  # noqa: E402
 
 

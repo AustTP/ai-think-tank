@@ -2,9 +2,9 @@ import json
 import os
 from pathlib import Path
 
-import code_workspaces
-import cron_scripts
-import work_reuse
+import agents.code_workspaces as code_workspaces
+import server.cron_scripts as cron_scripts
+import agents.work_reuse as work_reuse
 
 
 def test_code_workspaces_helpers(tmp_path):

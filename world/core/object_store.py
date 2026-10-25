@@ -16,7 +16,7 @@ import os
 import re
 import threading
 
-WORLD_DIR = os.path.dirname(os.path.abspath(__file__))
+WORLD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REGISTRY_PATH = os.path.join(os.path.dirname(WORLD_DIR), 'object_stores.json')
 AGENTS_DIR = os.path.join(os.path.dirname(WORLD_DIR), 'agents')
 _AGENT_ID_RE = re.compile(r'^[A-Za-z0-9._-]+$')

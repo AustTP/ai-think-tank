@@ -6,7 +6,7 @@ import uuid
 import json
 from pathlib import Path
 
-import work_reuse
+import agents.work_reuse as work_reuse
 
 
 class Stage:

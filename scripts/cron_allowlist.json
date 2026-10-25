@@ -22,7 +22,7 @@
     },
     {
       "path": "scripts/check_models.py",
-      "sha256": "5fdf13e5baaff724162d2c1af289c883856d2a11e7692387d1b926cdacbb8394",
+      "sha256": "50170b449906038a35b65e2094ee98fd91ac3ac0ff7dcadc672e5dc2ba94bd75",
       "runner": "sandbox",
       "allowedHosts": [],
       "env": []

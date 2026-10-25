@@ -1,4 +1,4 @@
-import completion_watchdog as cw
+import agents.completion_watchdog as cw
 
 
 def test_helpers():

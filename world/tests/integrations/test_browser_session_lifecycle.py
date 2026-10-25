@@ -1,7 +1,7 @@
 import subprocess
 import types
 
-import browser_session as bs
+import agents.browser_session as bs
 
 
 class R:

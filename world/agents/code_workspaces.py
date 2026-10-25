@@ -12,7 +12,7 @@ def has_web_assets(directory):
     if not os.path.isdir(directory):
         return None
     for base, dirs, files in os.walk(directory):
-        dirs[:] = [d for d in dirs if d not in __import__('work_reuse').SKIP and not Path(base, d).is_symlink()]
+        dirs[:] = [d for d in dirs if d not in __import__('agents.work_reuse', fromlist=['*']).SKIP and not Path(base, d).is_symlink()]
         if any(name.endswith(('.html', '.js', '.jsx', '.ts', '.tsx')) for name in files):
             return True
     return False
@@ -30,7 +30,7 @@ def fork_checkpoint(root, old_workspace, workspace, checkpoint):
     if not source.is_dir() or source.is_symlink() or not manifest.is_file() or manifest.is_symlink():
         return None
     metadata = json.loads(manifest.read_text(encoding='utf-8'))
-    digest = __import__('work_reuse').tree_digest(str(base / workspace))
+    digest = __import__('agents.work_reuse', fromlist=['*']).tree_digest(str(base / workspace))
     if metadata.get('workspace') != old_workspace or not digest or metadata.get('baseDigest') != digest:
         return None
     for directory, dirs, files in os.walk(source):
@@ -53,7 +53,7 @@ def ensure_test_directory(root, sandbox):
 
 
 def sandbox_for(state, task):
-    parent = __import__('story_tracking').root(state, task)
+    parent = __import__('agents.story_tracking', fromlist=['*']).root(state, task)
     product = (state.get('products') or {}).get(parent.get('productId')) or {}
     explicit = parent.get('_sandboxId') or parent.get('sandboxId') or product.get('sandboxId')
     if parent.get('codeWorkspaceVersion', 0) >= 2:
@@ -73,7 +73,7 @@ def sandbox_for(state, task):
 
 def prepare(state, task, root):
     sandbox = sandbox_for(state, task)
-    parent = __import__('story_tracking').root(state, task)
+    parent = __import__('agents.story_tracking', fromlist=['*']).root(state, task)
     destination = Path(root).resolve() / sandbox
     if sandbox.startswith('story-') and not destination.exists():
         source = parent.get('_legacySandboxId') or parent.get('_sandboxId') or parent.get('sandboxId')

@@ -150,7 +150,7 @@ def step(state, now_ms=None, observe_only=True):
                 task.update(status='recovery_planned', investigationReport=latest.get('libraryPath'))
             else:
                 task.pop('recoveryStaffed', None)
-                import recovery_staffing
+                import village.recovery_staffing as recovery_staffing
                 recovery_staffing.step(state)
                 if not related(state, task)[1]:
                     block(task, 'Assign an available recovery owner and worker to investigate this story.')
@@ -198,7 +198,7 @@ def step(state, now_ms=None, observe_only=True):
 
 def can_start(state, item):
     """Recovery/review can finish admitted stories even when the WIP cap is full."""
-    parent = __import__('story_tracking').root(state, item)
+    parent = __import__('agents.story_tracking', fromlist=['*']).root(state, item)
     cap = parent.get('budgetUsd')
     if parent.get('budgetExhausted') or (isinstance(cap, (int, float)) and cap > 0
             and float(parent.get('storySpendUsd') or 0) >= cap):

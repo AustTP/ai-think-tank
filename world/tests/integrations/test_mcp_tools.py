@@ -4,7 +4,7 @@ from __future__ import annotations
 from unittest import mock
 
 import serve
-import tool_policy
+import core.tool_policy as tool_policy
 
 
 def _tool_names():

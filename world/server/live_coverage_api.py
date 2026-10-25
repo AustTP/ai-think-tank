@@ -6,10 +6,10 @@ import os
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
-import live_coverage
+import server.live_coverage as live_coverage
 
 router = APIRouter()
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _reader(request):

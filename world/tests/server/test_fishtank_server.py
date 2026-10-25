@@ -3,7 +3,7 @@ import json
 import sqlite3
 import threading
 
-import fishtank_server
+import server.fishtank_server as fishtank_server
 
 
 def _server():

@@ -15,7 +15,7 @@ import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import cleanup_open_items as cleanup  # noqa: E402
+import tools.cleanup_open_items as cleanup  # noqa: E402
 
 
 class _Case(unittest.TestCase):

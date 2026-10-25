@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-import repeat_work
+import agents.repeat_work as repeat_work
 
 
 def fixture():

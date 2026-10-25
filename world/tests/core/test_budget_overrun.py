@@ -15,7 +15,7 @@ import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import budget  # noqa: E402
+import core.budget as budget  # noqa: E402
 import sim  # noqa: E402
 
 

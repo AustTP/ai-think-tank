@@ -4,12 +4,12 @@ import os
 import sqlite3
 from pathlib import Path
 
-import coding_library
-import confirmations_api
-import optimization_advisor
-import recovery_staffing
-import theo_policy
-import transport_recovery
+import agents.coding_library as coding_library
+import server.confirmations_api as confirmations_api
+import core.optimization_advisor as optimization_advisor
+import village.recovery_staffing as recovery_staffing
+import core.theo_policy as theo_policy
+import agents.transport_recovery as transport_recovery
 
 
 def test_coding_library_symlink(tmp_path):

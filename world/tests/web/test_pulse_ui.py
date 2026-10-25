@@ -7,9 +7,9 @@ import unittest
 import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-import pulse
+import agents.pulse as pulse
 import serve
-import pulse_ui
+import agents.pulse_ui as pulse_ui
 from fastapi.testclient import TestClient
 
 

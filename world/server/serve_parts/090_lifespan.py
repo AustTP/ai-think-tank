@@ -45,7 +45,7 @@ async def _lifespan(app):
     # researchTopics on boot. This is the REAL boot path, so it also authorizes
     # write-back of villager-added topics into that file -- tests never run
     # lifespan, so a test or stray import can never mutate operator-owned JSON.
-    import config
+    import core.config as config
     config.ALLOW_WATCHLIST_WRITE = True
     config.ALLOW_WORKSPACE_SYNC = True
     try:
@@ -158,7 +158,7 @@ async def _lifespan(app):
     # config.ALLOW_WATCHLIST_WRITE = True for the server's whole run, and a test
     # that enters this lifespan (`async with serve._lifespan(...)`) must not
     # leave the operator-owned writeback permanently authorized after it exits.
-    import config as _config
+    import core.config as _config
     _config.ALLOW_WATCHLIST_WRITE = False
     _config.ALLOW_WORKSPACE_SYNC = False
 

@@ -20,7 +20,7 @@ import unittest.mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import serve  # noqa: E402
-import bank  # noqa: E402
+import integrations.bank as bank  # noqa: E402
 
 
 def _roster():

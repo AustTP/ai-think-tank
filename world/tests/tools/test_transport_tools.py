@@ -4,12 +4,12 @@ from __future__ import annotations
 import os
 from unittest import mock
 
-import cli_tools
+import tools.cli_tools as cli_tools
 import content
-import durable_streams
-import object_store
+import server.durable_streams as durable_streams
+import core.object_store as object_store
 import serve
-import tool_policy
+import core.tool_policy as tool_policy
 
 
 def _tool_names():

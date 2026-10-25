@@ -342,7 +342,7 @@ def _ws_ingest(sid, topic, fields, raw):
     # Pulse desk: match this frame against every watch. Best effort; a
     # pulse failure must never break ingestion.
     try:
-        from pulse import observe as _pulse_observe
+        from agents.pulse import observe as _pulse_observe
         _pulse_observe(sid, topic, rec, dedupe_key=f"{rec['ts']}|{raw}")
     except Exception:
         pass

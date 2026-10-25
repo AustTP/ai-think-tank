@@ -606,7 +606,7 @@ def save_state_to_db(data):
     # Pass 1 completion recovery: a stale whole-state save must not erase a
     # newer player recovery decision. Only tasks with newer intervention
     # history are protected; ordinary saves pass through unchanged.
-    import state_updates
+    import server.state_updates as state_updates
     with _db() as conn:
         row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
         if row:

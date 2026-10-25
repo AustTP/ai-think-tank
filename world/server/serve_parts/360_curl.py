@@ -661,7 +661,7 @@ def _village_sandbox_id(agent_id, sandbox_id, state=None):
     state = state if state is not None else get_state_from_db()
     if not state or _is_admin(state, agent_id):
         return sandbox_id
-    import sim_helpers as _sh
+    import village.sim_helpers as _sh
     vid = _sh.village_of_agent(state, agent_id)
     if not vid or vid == 'main':
         return sandbox_id

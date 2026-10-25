@@ -16,9 +16,9 @@ import urllib.request
 from datetime import datetime, timezone
 from html import unescape
 
-import safari_tabs
+import integrations.safari_tabs as safari_tabs
 
-LIBRARY = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+LIBRARY = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
                        'library')
 OUT_DIR = os.path.join(LIBRARY, 'x-articles')
 API = 'https://api.fxtwitter.com/status/'

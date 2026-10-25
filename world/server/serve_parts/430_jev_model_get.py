@@ -236,7 +236,7 @@ async def serve_index(request: Request):
 async def serve_pulse(request: Request):
     if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
         return HTMLResponse(_LOGIN_PAGE.replace('__ERROR_HTML__', ''))
-    from pulse_ui import PULSE_HTML
+    from agents.pulse_ui import PULSE_HTML
     return HTMLResponse(PULSE_HTML)
 
 
@@ -244,7 +244,7 @@ async def serve_pulse(request: Request):
 async def api_pulse_overview(request: Request):
     if not _require_player_session(request):
         return JSONResponse({'error': 'player session required'}, status_code=401)
-    import pulse
+    import agents.pulse as pulse
     return JSONResponse({
         'brief': pulse.brief(None, 24),
         'watches': pulse.list_watches(None),

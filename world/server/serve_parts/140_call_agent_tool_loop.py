@@ -227,29 +227,29 @@ _VPN_EXIT_SUFFIX = f' ({_VPN_EXIT_DOCS})' if _VPN_EXIT_DOCS else ''
 # to the loop so the schema (what the model is allowed to call) stays a single,
 # reviewable structure, and so tests build the exact shape they mock against.
 try:  # pulse desk tools: watch live feeds and read matches
-    from pulse import PULSE_TOOLS as _PULSE_TOOLS
+    from agents.pulse import PULSE_TOOLS as _PULSE_TOOLS
 except Exception:  # pragma: no cover - optional module during bootstrap
     _PULSE_TOOLS = []
 try:  # generic MCP client: operator-registered servers and tool calls
-    import mcp_client
+    import integrations.mcp_client as mcp_client
     _MCP_TOOLS = mcp_client.MCP_TOOLS
 except Exception:  # pragma: no cover - optional module during bootstrap
     mcp_client = None
     _MCP_TOOLS = []
 try:  # durable event streams: Redis Streams and SQS
-    import durable_streams
+    import server.durable_streams as durable_streams
     _DURABLE_STREAM_TOOLS = durable_streams.DURABLE_STREAM_TOOLS
 except Exception:  # pragma: no cover - optional module during bootstrap
     durable_streams = None
     _DURABLE_STREAM_TOOLS = []
 try:  # S3-compatible object storage
-    import object_store
+    import core.object_store as object_store
     _OBJECT_STORE_TOOLS = object_store.OBJECT_STORE_TOOLS
 except Exception:  # pragma: no cover - optional module during bootstrap
     object_store = None
     _OBJECT_STORE_TOOLS = []
 try:  # allowlisted CLI transport
-    import cli_tools
+    import tools.cli_tools as cli_tools
     _CLI_TOOLS = cli_tools.CLI_TOOLS
 except Exception:  # pragma: no cover - optional module during bootstrap
     cli_tools = None

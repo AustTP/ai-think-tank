@@ -58,7 +58,7 @@ class HttpCacheTest(unittest.TestCase):
 class CostReportTest(unittest.TestCase):
     def test_per_card_summary(self):
         import sqlite3
-        import cost_report
+        import tools.cost_report as cost_report
         tmp = tempfile.mkdtemp(prefix='cost-report-test-')
         db = os.path.join(tmp, 'think_tank.db')
         con = sqlite3.connect(db)

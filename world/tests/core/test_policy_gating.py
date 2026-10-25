@@ -46,7 +46,8 @@ class ExtractedModuleReloadTest(unittest.TestCase):
     importers are tolerated, serve's `from <mod> import` names are rebound by
     the ast-driven refresh, and DB-backed registries re-run their loader."""
 
-    MODULES = ('rss', 'ws', 'webhooks', 'apis', 'auth', 'bank')
+    MODULES = ('integrations.rss', 'server.ws', 'server.webhooks',
+               'integrations.apis', 'core.auth', 'integrations.bank')
 
     def test_serve_is_the_only_importer_and_is_tolerated(self):
         for modname in self.MODULES:
@@ -55,31 +56,31 @@ class ExtractedModuleReloadTest(unittest.TestCase):
                 self.assertEqual(selfedit.TOLERATED_IMPORTERS[modname], {'serve.py'})
 
     def test_generic_refresh_rebinds_serve_names(self):
-        import apis
+        import integrations.apis as apis
         import serve
         sentinel = lambda *a, **k: 'patched'  # noqa: E731
         old = apis._api_base_url
         apis._api_base_url = sentinel
         try:
-            self.assertIn('_api_base_url', selfedit._refresh_serve_imports('apis'))
+            self.assertIn('_api_base_url', selfedit._refresh_serve_imports('integrations.apis'))
             self.assertIs(serve._api_base_url, sentinel)
         finally:
             apis._api_base_url = old
-        selfedit._refresh_serve_imports('apis')
+        selfedit._refresh_serve_imports('integrations.apis')
         self.assertIs(serve._api_base_url, old)
 
     def test_env_reload_alias_is_rebound(self):
-        import env_reload
+        import core.env_reload as env_reload
         import serve
         old = env_reload.ENV_RELOAD_FIELDS
         env_reload.ENV_RELOAD_FIELDS = {'SENTINEL': lambda e: 1}
         try:
             self.assertIn('_ENV_RELOAD_FIELDS',
-                          selfedit._refresh_serve_imports('env_reload'))
+                          selfedit._refresh_serve_imports('core.env_reload'))
             self.assertIs(serve._ENV_RELOAD_FIELDS, env_reload.ENV_RELOAD_FIELDS)
         finally:
             env_reload.ENV_RELOAD_FIELDS = old
-            selfedit._refresh_serve_imports('env_reload')
+            selfedit._refresh_serve_imports('core.env_reload')
 
     def test_db_backed_modules_reload_their_registry(self):
         import serve

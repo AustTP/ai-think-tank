@@ -27,7 +27,7 @@ async def research_desk_ops(request: Request):
             continue
         by_day = bucket.get('byDay') or {}
         spend_7d += sum(v for d, v in by_day.items() if d >= time.strftime('%Y-%m-%d', time.localtime(now - window_s)))
-    import config as _config
+    import core.config as _config
     return JSONResponse({
         'windowDays': 7,
         'claims': {
@@ -232,7 +232,7 @@ async def policy_view(request: Request):
     # ban list, browse block categories, desk passes, and research watchlist.
     # This is the read surface for the operator UI and for villagers who want
     # to see the standing desk rules.
-    import config as _config
+    import core.config as _config
     return JSONResponse({
         'plain_writing': {'banned': list(_config.PLAIN_WRITING_BAN_LIST)},
         'browse_policy': {'block_categories': list(_config.BROWSE_BLOCK_CATEGORIES)},

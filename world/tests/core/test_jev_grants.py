@@ -23,7 +23,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import serve
-import jev_grants
+import core.jev_grants as jev_grants
 from fastapi.testclient import TestClient
 
 TEST_JEV_SLUG = 'test-org/test-jev'

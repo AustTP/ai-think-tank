@@ -8,9 +8,9 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
-import containers  # noqa: E402
-import egress  # noqa: E402
-from containers import ContainerBroker  # noqa: E402
+import agents.containers as containers  # noqa: E402
+import core.egress as egress  # noqa: E402
+from agents.containers import ContainerBroker  # noqa: E402
 
 
 class TestContainerBroker(unittest.TestCase):

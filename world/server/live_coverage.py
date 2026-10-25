@@ -24,7 +24,7 @@ import time
 import uuid
 from urllib.parse import urlsplit
 
-from web_helpers import _is_safe_public_host
+from integrations.web_helpers import _is_safe_public_host
 
 DEFAULT_INTERVAL_S = 8.0
 MIN_INTERVAL_S = 2.0

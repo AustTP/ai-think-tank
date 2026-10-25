@@ -3,7 +3,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-import story_tracking
+import agents.story_tracking as story_tracking
 
 
 class StoryTracking(unittest.TestCase):

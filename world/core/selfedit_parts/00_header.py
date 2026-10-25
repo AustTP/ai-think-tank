@@ -96,7 +96,7 @@ import sys
 import threading
 import time
 
-import governance
+import core.governance as governance
 
 # NEVER self-editable: the owner's constitution only. BUSINESS-PROCESSES.md
 # is now self-editable, so the immutable "must not" rules live in
@@ -169,6 +169,19 @@ READ_TEXT_CAP = 48000
 #             per iteration, and the module dict is updated in place.
 # Everything else tolerates ZERO outside importers in v1.
 TOLERATED_IMPORTERS = {
+    # Canonical package paths (current layout).
+    'core.jev': {'serve.py'},
+    'core.env_reload': {'serve.py'},
+    'integrations.rss': {'serve.py'},
+    'server.ws': {'serve.py'},
+    'server.webhooks': {'serve.py'},
+    'integrations.apis': {'serve.py'},
+    'core.auth': {'serve.py'},
+    'integrations.bank': {'serve.py'},
+    'integrations.apple_photos': {'serve.py'},
+    'core.sublow': {'serve.py', 'core/jev_grants.py'},
+    'core.config': {'content.py', 'sim.py', 'core/sublow.py', 'serve.py'},
+    # Legacy flat paths (temp-repo fixtures and old checkouts).
     'jev': {'serve.py'},
     'env_reload': {'serve.py'},
     'rss': {'serve.py'},
@@ -178,7 +191,7 @@ TOLERATED_IMPORTERS = {
     'auth': {'serve.py'},
     'bank': {'serve.py'},
     'apple_photos': {'serve.py'},
-    'sublow': {'jev_grants.py'},
+    'sublow': {'serve.py', 'jev_grants.py'},
     'config': {'content.py', 'sim.py', 'sublow.py', 'serve.py'},
 }
 # Reload chain, extras refreshed after the target module itself, in order.
@@ -188,11 +201,16 @@ TOLERATED_IMPORTERS = {
 # re-executes its body and empties that registry, so the loader must run again
 # before the next request. Read off serve by name at apply time.
 POST_RELOAD_LOADERS = {
+    'integrations.apis': ('_load_api_services',),
+    'integrations.rss': ('_load_rss_feeds',),
+    'server.ws': ('_load_ws_feeds',),
     'apis': ('_load_api_services',),
     'rss': ('_load_rss_feeds',),
     'ws': ('_load_ws_feeds',),
 }
 RELOAD_IMPORTERS_AFTER = {
+    'core.sublow': ('core.jev_grants',),
+    'core.config': ('core.sublow', 'content', 'sim'),
     'sublow': ('jev_grants',),
     'config': ('sublow', 'content', 'sim'),
 }
@@ -403,36 +421,59 @@ def _resolve_path(path):
     return real, os.path.relpath(real, root_real)
 
 
+def _module_name_from_path(path):
+    """Canonical dotted module name for a file under world/, or its legacy
+    top-level name when the file sits directly in world/."""
+    rel = os.path.relpath(os.path.realpath(path), os.path.realpath(_world()))
+    if rel.endswith('.py'):
+        rel = rel[:-3]
+    return rel.replace(os.sep, '.')
+
+
 def _importers_of(modname):
-    """World modules whose TOP-LEVEL code does `import <modname>` or
-    `from <modname> import ...` -- bindings that would go stale across a
-    reload. Function-local `import <modname>` does not count (call-time
-    resolution is reload-safe); only column-0 statements are read. Source
-    splits are read as their concatenated logical module."""
+    """World modules whose TOP-LEVEL code imports ``modname``.
+
+    Walks the package tree, stitches ``# parts:`` loaders back into their
+    logical module, and ignores function-local imports. Importer names are
+    world-relative paths (``serve.py``, ``core/sublow.py``)."""
     importers = []
-    for fn in sorted(os.listdir(_world())):
-        if not fn.endswith('.py') or fn == f'{modname}.py':
-            continue
-        full = os.path.join(_world(), fn)
-        real = _facade_redirect(full) or full
-        try:
-            src = _read_source(real)
-        except (OSError, UnicodeDecodeError):
-            continue
-        for line in src.splitlines():
-            if not line or line[0] in (' ', '\t', '#'):
+    short = modname.rsplit('.', 1)[-1]
+    world = _world()
+    for root, dirs, files in os.walk(world):
+        dirs[:] = sorted(
+            d for d in dirs
+            if d not in ('__pycache__', '.selfedit_staging',
+                         '.selfedit_backups', 'tests')
+            and not d.endswith('_parts'))
+        for fn in sorted(files):
+            if not fn.endswith('.py'):
                 continue
-            stripped = line.strip()
-            if stripped.startswith('import '):
-                if stripped.split()[1].split('.')[0] == modname:
-                    importers.append(fn)
-                    break
-            elif stripped.startswith('from '):
-                module = stripped.split()[1].split('.')[0]
-                if module == modname:
-                    importers.append(fn)
+            full = os.path.join(root, fn)
+            if _module_name_from_path(full) == modname:
+                continue
+            try:
+                src = _read_source(full)
+            except (OSError, UnicodeDecodeError):
+                continue
+            display = os.path.relpath(full, world).replace(os.sep, '/')
+            for line in src.splitlines():
+                if not line or line[0] in (' ', '\t', '#'):
+                    continue
+                stripped = line.strip()
+                imported = ''
+                if stripped.startswith('import '):
+                    token = stripped[len('import '):].split(',')[0]
+                    imported = token.split()[0].split(' as ')[0]
+                elif stripped.startswith('from '):
+                    imported = stripped.split()[1]
+                if not imported:
+                    continue
+                if imported == modname or ('.' not in imported and imported == short):
+                    importers.append(display)
                     break
     return importers
+
+
 def _ensure_table(conn):
     conn.execute(
         'CREATE TABLE IF NOT EXISTS self_edit_log ('

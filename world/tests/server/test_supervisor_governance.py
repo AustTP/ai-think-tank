@@ -1,4 +1,4 @@
-import governance
+import core.governance as governance
 
 
 def _state():
@@ -173,7 +173,7 @@ def test_constitution_protected_business_processes_editable(monkeypatch):
 
 
 def test_constitution_rules_are_injected_once():
-    import constitution
+    import core.constitution as constitution
     body = {'model': 'x', 'messages': [{'role': 'user', 'content': 'hi'}]}
     out = constitution.with_rules(body)
     assert out['messages'][0]['role'] == 'system'

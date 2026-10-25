@@ -1,5 +1,5 @@
 """Retry transient model transport failures without treating them as code defects."""
-import story_tracking
+import agents.story_tracking as story_tracking
 
 TRANSIENT_MARKERS = (
     'remote end closed connection', 'connection reset', 'connection refused',

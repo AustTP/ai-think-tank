@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import threading
 
-WORLD_DIR = os.path.dirname(os.path.abspath(__file__))
+WORLD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_DIR = os.path.dirname(WORLD_DIR)
 REGISTRY_PATH = os.path.join(REPO_DIR, 'cli_tools.json')
 MAX_OUTPUT_BYTES = 2_000_000

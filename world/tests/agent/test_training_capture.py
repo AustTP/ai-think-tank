@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import training_capture  # noqa: E402
+import agents.training_capture as training_capture  # noqa: E402
 
 _TMP_DIR = None
 _ROOT_PATCHER = None

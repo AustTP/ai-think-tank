@@ -17,8 +17,8 @@ import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import audit_reachability  # noqa: E402
-import probe_model  # noqa: E402
+import tools.audit_reachability as audit_reachability  # noqa: E402
+import tools.probe_model as probe_model  # noqa: E402
 
 WORLD_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 REPO_ROOT = os.path.dirname(WORLD_DIR)
@@ -181,7 +181,7 @@ class ModuleMain(unittest.TestCase):
         import runpy
         with unittest.mock.patch.object(sys, 'argv', ['audit_reachability.py']), \
              unittest.mock.patch('sys.stdout', io.StringIO()):
-            runpy.run_module('audit_reachability', run_name='__main__')
+            runpy.run_module('tools.audit_reachability', run_name='__main__')
 
     def test_probe_model_main_guard(self):
         import runpy
@@ -201,7 +201,7 @@ class ModuleMain(unittest.TestCase):
                                                           'usage': {'cost': 0.0}}), \
                  unittest.mock.patch('sys.stdout', io.StringIO()):
                 with self.assertRaises(SystemExit) as cm:
-                    runpy.run_module('probe_model', run_name='__main__')
+                    runpy.run_module('tools.probe_model', run_name='__main__')
                 self.assertEqual(cm.exception.code, 0)
         finally:
             os.unlink(path)
@@ -297,7 +297,8 @@ class VillageCheck(unittest.TestCase):
         fake_subprocess = types.SimpleNamespace(
             run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout='12345'))
 
-        src = open(os.path.join(WORLD_DIR, '_village_check.py')).read()
+        village_check_path = os.path.join(WORLD_DIR, 'tools', '_village_check.py')
+        src = open(village_check_path).read()
         g = {
             '__name__': '__main__',
             'time': __import__('time'),
@@ -312,7 +313,7 @@ class VillageCheck(unittest.TestCase):
         sys.modules['serve'] = fake_serve
         try:
             with unittest.mock.patch('sys.stdout', io.StringIO()) as out:
-                exec(compile(src, '_village_check.py', 'exec'), g)
+                exec(compile(src, village_check_path, 'exec'), g)
             text = out.getvalue()
         finally:
             if real_serve is not None:
@@ -345,7 +346,8 @@ class VillageCheck(unittest.TestCase):
                     raise Exception('no such table: health_alerts')
                 return FakeCursor()
 
-        src = open(os.path.join(WORLD_DIR, '_village_check.py')).read()
+        village_check_path = os.path.join(WORLD_DIR, 'tools', '_village_check.py')
+        src = open(village_check_path).read()
         fake_serve = types.ModuleType('serve')
         fake_serve._db = lambda: FakeConn()
         g = {
@@ -360,7 +362,7 @@ class VillageCheck(unittest.TestCase):
         sys.modules['serve'] = fake_serve
         try:
             with unittest.mock.patch('sys.stdout', io.StringIO()) as out:
-                exec(compile(src, '_village_check.py', 'exec'), g)
+                exec(compile(src, village_check_path, 'exec'), g)
             text = out.getvalue()
         finally:
             if real_serve is not None:
@@ -381,12 +383,12 @@ class GapMap(unittest.TestCase):
                 json.dump({'files': cov_files}, f)
             with open(os.path.join(td, 'sim.py'), 'w') as f:
                 f.write(sim_src)
-            src = open(os.path.join(WORLD_DIR, '_gapmap.py')).read()
+            src = open(os.path.join(WORLD_DIR, 'tools', '_gapmap.py')).read()
             old = os.getcwd()
             os.chdir(td)
             try:
                 with unittest.mock.patch('sys.stdout', io.StringIO()) as out:
-                    exec(compile(src, os.path.join(WORLD_DIR, '_gapmap.py'), 'exec'),
+                    exec(compile(src, os.path.join(WORLD_DIR, 'tools', '_gapmap.py'), 'exec'),
                          {'__name__': '__main__', 'ast': ast, 'json': json})
                 return out.getvalue()
             finally:

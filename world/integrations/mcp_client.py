@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 from collections import deque
 
-WORLD_DIR = os.path.dirname(os.path.abspath(__file__))
+WORLD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MCP_SERVERS_PATH = os.path.join(os.path.dirname(WORLD_DIR), 'mcp_servers.json')
 PROTOCOL_VERSION = '2025-06-18'
 CLIENT_INFO = {'name': 'ai-think-tank', 'version': '1.0'}

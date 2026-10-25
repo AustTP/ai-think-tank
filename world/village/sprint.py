@@ -19,7 +19,7 @@ from typing import Callable, Dict, List, Optional
 # Single source of truth: schedule.py's role_for_sprint (driven by its
 # SCRUM_MASTER_MIN_AGENTS constant). Re-exported here because the sprint
 # planner and tests import it from this module.
-from schedule import role_for_sprint  # noqa: F401
+from village.schedule import role_for_sprint  # noqa: F401
 
 DIRECTOR_MAX_AGENTS = 3
 DEFAULT_BATCH_SIZE = 25

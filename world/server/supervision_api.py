@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-import governance
+import core.governance as governance
 
 router = APIRouter()
 

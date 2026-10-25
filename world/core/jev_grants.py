@@ -27,9 +27,9 @@ endpoints and tests use.
 import secrets
 import time
 
-import grant_store
-import sublow as _sublow_policy
-from sublow import (
+import core.grant_store as grant_store
+import core.sublow as _sublow_policy
+from core.sublow import (
     _agent_month_spend,
     _clamp_tokens,
     _clamp_ttl,

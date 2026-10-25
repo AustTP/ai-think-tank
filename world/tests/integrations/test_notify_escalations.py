@@ -2,8 +2,8 @@ import json
 import os
 import time
 
-import notify
-import theo_policy
+import integrations.notify as notify
+import core.theo_policy as theo_policy
 
 
 def test_notify_escalation_file_edges(tmp_path, monkeypatch):

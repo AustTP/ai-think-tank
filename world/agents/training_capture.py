@@ -35,7 +35,7 @@ import threading
 import time
 import uuid
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 CURRENT = contextvars.ContextVar('training_interaction', default=None)
 _LOCK = threading.RLock()
 _TRACKED = {}

@@ -4,7 +4,7 @@ import os
 import sys
 import types
 
-import mcp_client as m
+import integrations.mcp_client as m
 
 
 def _stdio(**kw):

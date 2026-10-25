@@ -14,7 +14,7 @@ import hashlib
 import sqlite3
 from pathlib import Path
 
-MIGRATIONS_DIR = Path(__file__).with_name('migrations')
+MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / 'migrations'
 
 
 def _files():

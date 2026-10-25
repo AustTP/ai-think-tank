@@ -2,8 +2,8 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
-import captcha
-import pulse
+import agents.captcha as captcha
+import agents.pulse as pulse
 
 
 class Fake:

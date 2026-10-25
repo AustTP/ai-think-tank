@@ -289,7 +289,7 @@ def _overrun_factor_for(state, room=None, scope=None):
     carrying teamId/productId/taskType."""
     scope = scope or {}
     try:
-        import budget as _budget
+        import core.budget as _budget
         return _budget.overrun_factor(
             state, room=room,
             team_id=scope.get('teamId'),
@@ -530,7 +530,7 @@ def _apply_content_result(state, task, result, now_ms=None):
     # for a real change in input or plan instead of spending on another copy.
     if result.get('ok') is False or result.get('peerVerdict') == 'actionable':
         try:
-            import repeat_work
+            import agents.repeat_work as repeat_work
             repeat_work.record(state, task, result, now_ms)
         except Exception as e:
             print(f'[sim] repeat work record error: {e}', flush=True)
@@ -623,7 +623,7 @@ def _apply_content_result(state, task, result, now_ms=None):
                                   failNote='Review attempts stopped: ' + str(result.get('note') or 'No usable verdict.')[:500])
                 return
             if verdict == 'clean':
-                import review_quality
+                import agents.review_quality as review_quality
                 approval_errors = review_quality.clean_vote_errors(
                     result,
                     require_acceptance=result.get('acceptanceAssessment') is not None)

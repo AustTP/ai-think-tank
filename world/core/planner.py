@@ -13,8 +13,8 @@ the ledger's overrun history.
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from roster import Roster
-from sprint import (
+from village.roster import Roster
+from village.sprint import (
     DEFAULT_BATCH_SIZE,
     DiscoveryBrief,
     Story,
@@ -22,7 +22,7 @@ from sprint import (
     refine_backlog,
     run_discovery,
 )
-from story_budget import BudgetLedger
+from agents.story_budget import BudgetLedger
 
 
 @dataclass

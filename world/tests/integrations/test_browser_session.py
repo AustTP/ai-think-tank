@@ -14,7 +14,7 @@ import unittest
 import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-import browser_session  # noqa: E402
+import agents.browser_session as browser_session  # noqa: E402
 
 
 class _DockerRecorder:

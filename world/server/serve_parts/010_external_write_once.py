@@ -858,7 +858,7 @@ def init_db():
         )''')
         tank_accounts.ensure_schema(conn)
         captcha.ensure_schema(conn)
-        import migrations as _migrations
+        import server.migrations as _migrations
         _migrations.apply(conn)
 
     _seed_api_services_if_empty()

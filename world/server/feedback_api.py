@@ -7,10 +7,10 @@ import time
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, JSONResponse
 
-from feedback_store import FeedbackStore
+from server.feedback_store import FeedbackStore
 
 router = APIRouter()
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 TASTE_KEYS = ('bold_calm', 'dense_sparse', 'playful_serious',
               'premium_utilitarian', 'technical_accessible')

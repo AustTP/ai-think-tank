@@ -24,7 +24,7 @@ import unittest.mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import serve  # noqa: E402
-import fs  # noqa: E402
+import core.fs as fs  # noqa: E402
 
 
 def _grant(scope, caps=None):
@@ -197,7 +197,7 @@ class ReadStoreTests(unittest.TestCase):
         self.assertNotEqual(by_name['a'], 'hello world')
 
     def test_proto_decode_extracts_strings(self):
-        import fs as _fs
+        import core.fs as _fs
         buf = (b'\x0a\x03abc' + b'\x12\x05hello' + b'\x1a\x06world!')
         out = _fs.decode_proto(buf)
         self.assertIn('abc', out)

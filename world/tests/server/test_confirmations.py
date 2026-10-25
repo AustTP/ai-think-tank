@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-import confirmations as c
+import core.confirmations as c
 
 
 class ConfirmationLedgerTest(unittest.TestCase):
@@ -287,7 +287,7 @@ class ConfirmationFinalEdgesTest(unittest.TestCase):
 
     def test_api_direct_unauthorized_and_agent_actor(self):
         import asyncio
-        import confirmations_api as api
+        import server.confirmations_api as api
         from starlette.requests import Request
 
         def req(body=None):

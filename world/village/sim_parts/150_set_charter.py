@@ -771,7 +771,7 @@ def _notify_task_budget_exhausted(state, task, spent=None, attempts=None,
     else:
         work_line = ''
     try:
-        import budget as _budget
+        import core.budget as _budget
         factor = _budget.overrun_factor(
             state, room=task.get('room'), team_id=task.get('teamId'),
             product_id=task.get('productId'), task_type=task.get('taskType'))

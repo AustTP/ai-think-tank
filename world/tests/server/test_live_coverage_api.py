@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import unittest.mock
 
-import live_coverage
+import server.live_coverage as live_coverage
 import serve
 from starlette.testclient import TestClient
 

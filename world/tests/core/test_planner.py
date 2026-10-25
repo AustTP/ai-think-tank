@@ -8,8 +8,8 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
-from planner import PlannerSubmission, SupervisorMeeting  # noqa: E402
-from roster import OFF_DUTY, Roster  # noqa: E402
+from core.planner import PlannerSubmission, SupervisorMeeting  # noqa: E402
+from village.roster import OFF_DUTY, Roster  # noqa: E402
 
 
 class TestSupervisorMeeting(unittest.TestCase):

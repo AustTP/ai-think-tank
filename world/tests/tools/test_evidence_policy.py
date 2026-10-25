@@ -6,18 +6,18 @@ import time
 
 import pytest
 
-import coding_library
-import constitution
-import evidence_policy
-import migrations
-import model_config
-import runtime_limits
-import state_updates
-import story_tracking
-import structured_edits
-import transport_recovery
-import url_evidence
-import work_reuse
+import agents.coding_library as coding_library
+import core.constitution as constitution
+import core.evidence_policy as evidence_policy
+import server.migrations as migrations
+import core.model_config as model_config
+import core.runtime_limits as runtime_limits
+import server.state_updates as state_updates
+import agents.story_tracking as story_tracking
+import core.structured_edits as structured_edits
+import agents.transport_recovery as transport_recovery
+import core.url_evidence as url_evidence
+import agents.work_reuse as work_reuse
 
 
 class TestEvidencePolicy:

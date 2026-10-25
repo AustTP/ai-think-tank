@@ -12,7 +12,7 @@ import unittest.mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import serve  # noqa: E402
-import totp  # noqa: E402
+import core.totp as totp  # noqa: E402
 
 
 class _TankAccountCase(unittest.TestCase):
@@ -59,7 +59,7 @@ class _TankAccountCase(unittest.TestCase):
             rotated = self.client.post(f"/api/tank-accounts/{rec['id']}/rotate",
                                        json={}, headers=self.headers)
         self.assertEqual(rotated.status_code, 200, rotated.text)
-        from tank_accounts import consume_grant
+        from integrations.tank_accounts import consume_grant
         self.assertFalse(consume_grant(grant['grant'], 'ben', rec['id']))
 
     def test_runtime_schema_creation_without_init_db(self):

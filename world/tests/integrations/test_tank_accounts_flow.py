@@ -1,7 +1,7 @@
 import sqlite3
 from contextlib import contextmanager
 
-import tank_accounts
+import integrations.tank_accounts as tank_accounts
 
 
 class Fake:

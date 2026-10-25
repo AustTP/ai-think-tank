@@ -4,7 +4,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import x_ingest  # noqa: E402
+import integrations.x_ingest as x_ingest  # noqa: E402
 
 
 class XIngestTest(unittest.TestCase):

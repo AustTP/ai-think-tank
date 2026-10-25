@@ -351,7 +351,7 @@ async def update_team(team_id: str, request: Request):
             t['purpose'] = purpose
             changed = True
     if is_agreement_edit:
-        import config as _config
+        import core.config as _config
         raw = body.get('agreement')
         if raw is None:
             if t.get('agreement') is not None:
@@ -679,7 +679,7 @@ def _library_path_village(rel_path, state=None):
         if v not in ('main', 'general', 'root', ''):
             return v
     if state:
-        import sim_helpers as _sh
+        import village.sim_helpers as _sh
         if norm[0] == 'downloads' and len(norm) >= 2:
             return _sh.village_of_agent(state, norm[1]) or 'main'
         if norm[0] == 'pending_review' and len(norm) >= 3 and norm[1] == 'downloads':
@@ -700,7 +700,7 @@ def _requester_villages(requester):
         return None
     if _is_admin(state, requester):
         return None
-    import sim_helpers as _sh
+    import village.sim_helpers as _sh
     return {_sh.village_of_agent(state, requester)}
 
 
@@ -726,7 +726,7 @@ def _library_namespace_write(agent_id, rel_path, state=None):
     state = state if state is not None else get_state_from_db()
     if not state or _is_admin(state, agent_id):
         return rel_path
-    import sim_helpers as _sh
+    import village.sim_helpers as _sh
     vid = _sh.village_of_agent(state, agent_id)
     if not vid or vid == 'main':
         return rel_path
@@ -847,7 +847,7 @@ def _cross_village_agent_denied(state, requester, target_agent_id):
         return False
     if not state or _is_admin(state, requester):
         return False
-    import sim_helpers as _sh
+    import village.sim_helpers as _sh
     rv = _sh.village_of_agent(state, requester)
     tv = _sh.village_of_agent(state, target_agent_id)
     return rv != tv

@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'world'))
 
-import model_config  # noqa: E402
+import core.model_config as model_config  # noqa: E402
 
 
 def main() -> int:

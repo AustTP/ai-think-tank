@@ -16,7 +16,7 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import captcha  # noqa: E402
+import agents.captcha as captcha  # noqa: E402
 import serve  # noqa: E402
 
 

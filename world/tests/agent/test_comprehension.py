@@ -11,7 +11,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import comprehension  # noqa: E402
+import agents.comprehension as comprehension  # noqa: E402
 
 READY_REQ = {
     'id': 'r1',

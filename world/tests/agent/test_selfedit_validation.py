@@ -114,18 +114,19 @@ def test_config_reload_chain_and_serve_refresh(monkeypatch, fake_repo):
         return mod
 
     monkeypatch.setattr('importlib.reload', fake_reload)
-    config_stub = type('StubModule', (), {'__name__': 'config'})()
+    config_stub = type('StubModule', (), {'__name__': 'core.config'})()
     for name in names:
         setattr(config_stub, name, 'sentinel-' + name)
-    for name in ('sublow', 'content', 'sim'):
+    for name in ('core.sublow', 'content', 'sim'):
         monkeypatch.setitem(
             sys.modules, name, type('StubModule', (), {'__name__': name})())
-    monkeypatch.setitem(sys.modules, 'config', config_stub)
+    monkeypatch.setitem(sys.modules, 'core.config', config_stub)
     saved = {name: getattr(serve, name) for name in names}
     try:
-        (world / 'config.py').write_text('X = 1\n', encoding='utf-8')
-        selfedit._reload(str(world / 'config.py'))
-        assert reloaded == ['config', 'sublow', 'content', 'sim']
+        (world / 'core').mkdir(exist_ok=True)
+        (world / 'core' / 'config.py').write_text('X = 1\n', encoding='utf-8')
+        selfedit._reload(str(world / 'core' / 'config.py'))
+        assert reloaded == ['core.config', 'core.sublow', 'content', 'sim']
         for name in names:
             assert getattr(serve, name) == 'sentinel-' + name
     finally:
@@ -514,7 +515,7 @@ def test_notify_agent_survives_state_read_failure(fake_repo, monkeypatch):
 
 def test_telegram_push_survives_sender_failure(fake_repo, monkeypatch):
     fake_repo
-    import notify
+    import integrations.notify as notify
 
     def boom(*args, **kw):
         raise RuntimeError('telegram unreachable')

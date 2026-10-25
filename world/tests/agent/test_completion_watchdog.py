@@ -3,7 +3,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-import completion_watchdog as watchdog
+import agents.completion_watchdog as watchdog
 
 
 def seed(status='working'):

@@ -1,7 +1,7 @@
 import types
 from pathlib import Path
 
-import live_coverage as lc
+import server.live_coverage as lc
 
 
 def test_helpers_url_and_reply():

@@ -4,7 +4,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-import structured_edits
+import core.structured_edits as structured_edits
 
 
 class StructuredEdits(unittest.TestCase):

@@ -1,5 +1,5 @@
 import types
-import governance as g
+import core.governance as g
 
 
 def test_roles_and_approvers():

@@ -3,10 +3,10 @@ import sqlite3
 import time
 from pathlib import Path
 
-import apple_photos
-import live_coverage_api
-import repeat_work
-import staged_work
+import integrations.apple_photos as apple_photos
+import server.live_coverage_api as live_coverage_api
+import agents.repeat_work as repeat_work
+import agents.staged_work as staged_work
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 

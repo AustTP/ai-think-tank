@@ -17,7 +17,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import web_helpers  # noqa: E402
+import integrations.web_helpers as web_helpers  # noqa: E402
 
 
 class StripHtmlToText(unittest.TestCase):

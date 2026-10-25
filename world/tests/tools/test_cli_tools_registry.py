@@ -2,7 +2,7 @@ import json
 import os
 import sys
 
-import cli_tools
+import tools.cli_tools as cli_tools
 
 
 def _registry(tmp_path, monkeypatch, tool=None):

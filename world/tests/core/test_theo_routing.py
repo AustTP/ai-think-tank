@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.abspath(
     os.path.join(os.path.dirname(__file__), '..', '..')))
 
 import serve  # noqa: E402  (import serve before content)
-import theo_policy  # noqa: E402
+import core.theo_policy as theo_policy  # noqa: E402
 
 
 def _state():

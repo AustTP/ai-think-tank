@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-import coding_library
+import agents.coding_library as coding_library
 import content
 
 

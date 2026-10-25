@@ -2,8 +2,8 @@ import asyncio
 import json
 import time
 
-import feedback_api
-import webhooks
+import server.feedback_api as feedback_api
+import server.webhooks as webhooks
 
 
 class Req:

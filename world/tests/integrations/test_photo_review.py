@@ -4,7 +4,7 @@ import unittest
 from unittest import mock
 
 import serve
-import apple_photos
+import integrations.apple_photos as apple_photos
 
 
 class PhotoReviewPathTest(unittest.TestCase):

@@ -23,7 +23,7 @@ _REPO = os.path.dirname(_WORLD)
 sys.path.insert(0, os.path.join(_REPO, 'scripts'))
 sys.path.insert(0, _WORLD)
 
-import training_capture  # noqa: E402
+import agents.training_capture as training_capture  # noqa: E402
 import export_training_interactions as export  # noqa: E402
 
 _TMP_DIR = None

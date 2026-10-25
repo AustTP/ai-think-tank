@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-import mcp_client
+import integrations.mcp_client as mcp_client
 
 
 FAKE_SERVER = r'''

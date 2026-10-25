@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 import serve  # noqa: E402
 import sim  # noqa: E402
-from sim_helpers import is_work_item_due  # noqa: E402
+from village.sim_helpers import is_work_item_due  # noqa: E402
 
 _MODULE_TMP_DIR = tempfile.mkdtemp(prefix="think-tank-schedule-once-ttc-")
 

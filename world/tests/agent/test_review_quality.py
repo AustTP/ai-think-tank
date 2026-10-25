@@ -7,7 +7,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import serve
 import sim
-import review_quality as quality
+import agents.review_quality as quality
 
 class QualityEvidence(unittest.TestCase):
     def test_reference_ids_resolve_exact_quotes_and_reject_invented_ids(self):
@@ -91,7 +91,7 @@ class QualityEvidence(unittest.TestCase):
 
 class CitationGating(unittest.TestCase):
     def test_report_cannot_cite_an_undiscovered_url(self):
-        import url_evidence
+        import core.url_evidence as url_evidence
         document = ('Verified at https://example.com/report and invented '
                     'https://example.com/made-up-path.')
         errors = url_evidence.citation_errors(

@@ -43,7 +43,7 @@ def evidence_digest(state, parent):
 
 
 def record(state, task, result, now):
-    import story_tracking
+    import agents.story_tracking as story_tracking
     parent = story_tracking.root(state, task)
     if not parent.get('id') or parent.get('status') in ('done', 'cancelled', 'abandoned'):
         return False

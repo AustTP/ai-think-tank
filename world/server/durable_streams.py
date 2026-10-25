@@ -16,7 +16,7 @@ import json
 import os
 import threading
 
-WORLD_DIR = os.path.dirname(os.path.abspath(__file__))
+WORLD_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REGISTRY_PATH = os.path.join(os.path.dirname(WORLD_DIR), 'event_streams.json')
 MAX_TOTAL_BYTES = 2_000_000
 

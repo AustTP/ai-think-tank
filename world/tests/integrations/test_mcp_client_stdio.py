@@ -3,7 +3,7 @@ import json
 import threading
 import types
 
-import mcp_client as m
+import integrations.mcp_client as m
 
 
 def _spec(**kw):

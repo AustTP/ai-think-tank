@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 import serve  # noqa: E402
 import sim  # noqa: E402
 import content  # noqa: E402
-import pulse  # noqa: E402
+import agents.pulse as pulse  # noqa: E402
 
 _MODULE_TMP_DIR = None
 _MODULE_PATCHER = None

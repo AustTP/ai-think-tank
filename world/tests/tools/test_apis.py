@@ -2,13 +2,13 @@ import json
 import os
 import sqlite3
 
-import apis
-import coding_library
-import confirmations_api
-import python_delivery
-import skill_scan
-import state_updates
-import work_reuse
+import integrations.apis as apis
+import agents.coding_library as coding_library
+import server.confirmations_api as confirmations_api
+import agents.python_delivery as python_delivery
+import agents.skill_scan as skill_scan
+import server.state_updates as state_updates
+import agents.work_reuse as work_reuse
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 

@@ -3,7 +3,7 @@ import json
 import runpy
 from contextlib import redirect_stdout
 
-import x_ingest
+import integrations.x_ingest as x_ingest
 
 
 def test_helpers():

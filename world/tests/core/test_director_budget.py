@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import serve
 import sim
-import bank
+import integrations.bank as bank
 
 _MODULE_TMP_DIR = tempfile.mkdtemp(prefix="think-tank-director-budget-")
 

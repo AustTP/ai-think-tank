@@ -13,7 +13,7 @@ GUIDANCE = ('For Python implementation tasks, create importable .py implementati
 
 
 def required(task):
-    import review_quality
+    import agents.review_quality as review_quality
     contract = review_quality.contract_for(task)
     text = str(task.get('title') or '') + ' ' + contract['instructions'].split('Story:', 1)[-1] + ' ' + contract['acceptanceCriteria']
     return bool(re.search(r'\bpython\b|\b[\w/-]+\.py\b', text, re.I))

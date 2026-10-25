@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-import live_coverage as lc
+import server.live_coverage as lc
 
 
 @pytest.fixture(autouse=True)

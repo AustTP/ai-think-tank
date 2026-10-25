@@ -1,8 +1,8 @@
 import asyncio
 import types
 
-import governance
-import supervision_api
+import core.governance as governance
+import server.supervision_api as supervision_api
 
 
 class Req:

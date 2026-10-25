@@ -18,7 +18,7 @@ import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import evidence  # noqa: E402
+import core.evidence as evidence  # noqa: E402
 
 
 def _patch_ledgers(evidence_rows=None, coverage_rows=None):
@@ -30,15 +30,15 @@ def _patch_ledgers(evidence_rows=None, coverage_rows=None):
     store = {'evidence': evidence_rows if evidence_rows is not None else {},
              'coverage': coverage_rows if coverage_rows is not None else {}}
     patchers = [
-        unittest.mock.patch('evidence._evidence_read',
+        unittest.mock.patch('core.evidence._evidence_read',
                             lambda: store['evidence']),
-        unittest.mock.patch('evidence._evidence_write',
+        unittest.mock.patch('core.evidence._evidence_write',
                             lambda rows: store.__setitem__('evidence', rows)),
-        unittest.mock.patch('evidence._coverage_read',
+        unittest.mock.patch('core.evidence._coverage_read',
                             lambda: store['coverage']),
-        unittest.mock.patch('evidence._coverage_write',
+        unittest.mock.patch('core.evidence._coverage_write',
                             lambda rows: store.__setitem__('coverage', rows)),
-        unittest.mock.patch('evidence.append_audit', return_value=None),
+        unittest.mock.patch('core.evidence.append_audit', return_value=None),
     ]
     for p in patchers:
         p.start()
@@ -304,7 +304,7 @@ class AuditWiring(unittest.TestCase):
 
     def test_recording_a_claim_appends_claim_recorded(self):
         _patch_ledgers()
-        with unittest.mock.patch('evidence.append_audit') as aud:
+        with unittest.mock.patch('core.evidence.append_audit') as aud:
             evidence.record_source_claim(_claim(), actor='cora')
         aud.assert_called()
         action = aud.call_args[0][1]
@@ -313,7 +313,7 @@ class AuditWiring(unittest.TestCase):
     def test_review_appends_claim_reviewed_and_coverage_covered(self):
         store = _patch_ledgers()
         res = evidence.record_source_claim(_claim(), actor='cora')
-        with unittest.mock.patch('evidence.append_audit') as aud:
+        with unittest.mock.patch('core.evidence.append_audit') as aud:
             evidence.mark_reviewed(res['id'], 'usable_as_written', actor='lex')
         actions = [c.args[1] for c in aud.call_args_list]
         self.assertIn('claim_reviewed', actions)
@@ -323,14 +323,14 @@ class AuditWiring(unittest.TestCase):
     def test_review_by_player_writes_player_as_actor(self):
         _patch_ledgers()
         res = evidence.record_source_claim(_claim(), actor='cora')
-        with unittest.mock.patch('evidence.append_audit') as aud:
+        with unittest.mock.patch('core.evidence.append_audit') as aud:
             evidence.mark_reviewed(res['id'], 'usable_as_written', actor='player')
         for c in aud.call_args_list:
             self.assertEqual(c.args[0], 'player')
 
     def test_failure_appends_coverage_failed(self):
         _patch_ledgers()
-        with unittest.mock.patch('evidence.append_audit') as aud:
+        with unittest.mock.patch('core.evidence.append_audit') as aud:
             evidence.record_run_failure('https://example.com/post/1', 'boom', actor='cora')
         self.assertEqual(aud.call_args[0][1], 'coverage_failed')
 

@@ -2,7 +2,7 @@ import base64
 import json
 from pathlib import Path
 
-import object_store as os_
+import core.object_store as os_
 
 
 def _spec(**kw):

@@ -16,7 +16,7 @@ import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import config  # noqa: E402
+import core.config as config  # noqa: E402
 
 
 class _TempPolicy(unittest.TestCase):
@@ -755,7 +755,7 @@ class ToolDescriptionOverridesTest(unittest.TestCase):
 
     def test_shipped_file_covers_the_offered_tools(self):
         import serve
-        shipped = os.path.join(os.path.dirname(config.__file__), 'tool_descriptions.json')
+        shipped = os.path.join(config.ROOT, 'tool_descriptions.json')
         with open(shipped, encoding='utf-8') as f:
             descriptions = json.load(f)['descriptions']
         offered = {t['function']['name'] for t in serve.AGENT_ASK_TOOLS}
@@ -946,7 +946,7 @@ class EnvReloadTableTest(unittest.TestCase):
     reload loop still honors a patched serve._ENV_RELOAD_FIELDS."""
 
     def test_table_covers_the_budget_and_memory_keys(self):
-        import env_reload
+        import core.env_reload as env_reload
         for key in ('SPEND_CAP_USD', 'OPENROUTER_API_KEY', 'MEMORY_ENABLED',
                     'BROWSE_ALLOWLIST_DOMAINS', 'TTC_BEST_OF'):
             self.assertIn(key, env_reload.ENV_RELOAD_FIELDS)

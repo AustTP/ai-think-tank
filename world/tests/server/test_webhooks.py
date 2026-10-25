@@ -14,7 +14,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import serve
-import webhooks
+import server.webhooks as webhooks
 
 
 class GoalTextTest(unittest.TestCase):

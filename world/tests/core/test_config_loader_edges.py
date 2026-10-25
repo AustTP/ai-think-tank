@@ -3,7 +3,7 @@ band keys, and a missing credential_access.json (mtime OSError path)."""
 import json
 import os
 
-import config
+import core.config as config
 
 
 def _p(tmp_path, data, name='x.json'):

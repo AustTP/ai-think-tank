@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-import object_store
+import core.object_store as object_store
 
 
 class FakeBody(io.BytesIO):

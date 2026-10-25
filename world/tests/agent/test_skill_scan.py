@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import content  # noqa: E402
 import serve  # noqa: E402
-import skill_scan  # noqa: E402
+import agents.skill_scan as skill_scan  # noqa: E402
 
 
 class SkillScanTest(unittest.TestCase):

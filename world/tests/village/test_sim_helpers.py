@@ -10,7 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import sim_helpers  # noqa: E402
+import village.sim_helpers as sim_helpers  # noqa: E402
 
 
 class NormalizePriority(unittest.TestCase):

@@ -1,6 +1,6 @@
 import types
 
-import completion_watchdog as cw
+import agents.completion_watchdog as cw
 
 
 def _control(**kw):
@@ -25,7 +25,7 @@ def test_replacements_and_backoff(monkeypatch):
 
 
 def test_investigating_and_format_and_budget(monkeypatch):
-    import sim, recovery_staffing
+    import sim, village.recovery_staffing as recovery_staffing
     monkeypatch.setattr(sim, '_queue_peer_repair', lambda *a: None)
     monkeypatch.setattr(recovery_staffing, 'step', lambda s: None)
     monkeypatch.setattr(cw, 'related', lambda s, t: ([], []))

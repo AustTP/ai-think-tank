@@ -356,7 +356,7 @@ def _tree_manifest(path):
     produced a deliverable instead of publishing an empty or deletion-only
     change."""
     import hashlib
-    import work_reuse
+    import agents.work_reuse as work_reuse
     manifest = {}
     for base, dirs, files in os.walk(path):
         dirs[:] = [d for d in dirs if d not in work_reuse.SKIP]
@@ -391,9 +391,9 @@ def _deliverable_problem(before, candidate):
 def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     """Run coding in a private staged workspace; publish only validated changes."""
     import sim
-    import story_tracking
-    import staged_work
-    import work_reuse
+    import agents.story_tracking as story_tracking
+    import agents.staged_work as staged_work
+    import agents.work_reuse as work_reuse
     workspace = _review_sandbox_id(snapshot, task, agent_id)
     parent = story_tracking.root(snapshot, task)
     staged_work.cleanup(_serve.SANDBOXES_DIR)
@@ -468,7 +468,7 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
     # ad-hoc workroom tasks, non-code-class stories, or ensure failures).
     sandbox_id = sandbox_override or _review_sandbox_id(snapshot, task, agent_id)
     context_summary = base_ctx or ''
-    import python_delivery
+    import agents.python_delivery as python_delivery
     python_task = python_delivery.required(task)
     if python_task:
         current_directory = os.path.join(_serve.SANDBOXES_DIR, sandbox_id)
@@ -513,10 +513,10 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
                      '<script src> tag) over rewriting the whole large file -- a full rewrite risks running out of room mid-file and being '
                      'cut off incomplete, which a small new file avoids. '
                      + CODING_STANDARDS_PROMPT)
-    system_prompt += '\n' + __import__('structured_edits').GUIDANCE
-    system_prompt += '\n' + __import__('coding_handoff').context(
+    system_prompt += '\n' + __import__('core.structured_edits', fromlist=['*']).GUIDANCE
+    system_prompt += '\n' + __import__('agents.coding_handoff', fromlist=['*']).context(
         snapshot, task, workspace_resolver=lambda item: _review_sandbox_id(snapshot, item, agent_id))
-    system_prompt += '\n' + __import__('coding_library').GUIDANCE
+    system_prompt += '\n' + __import__('agents.coding_library', fromlist=['*']).GUIDANCE
     if python_task:
         system_prompt += '\n' + python_delivery.GUIDANCE
     messages = [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': 'Go ahead.'}]
@@ -559,7 +559,7 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
             return False
         reply = r['reply']
 
-        import coding_library
+        import agents.coding_library as coding_library
         library_req = coding_library.parse(reply)
         if library_req is not None:
             messages.append({'role': 'assistant', 'content': reply})
@@ -607,7 +607,7 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
         # stripping; a continuation is raw mid-file text by definition.
         if attempts == 0:
             try:
-                command = __import__('structured_edits').command(reply)
+                command = __import__('core.structured_edits', fromlist=['*']).command(reply)
             except Exception:
                 command = reply.strip().replace('```bash', '').replace('```sh', '').replace('```', '').strip()
         else:

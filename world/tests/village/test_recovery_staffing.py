@@ -2,7 +2,7 @@ import os
 import sys
 import unittest
 sys.path.insert(0,os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-import recovery_staffing
+import village.recovery_staffing as recovery_staffing
 
 
 class RecoveryStaffing(unittest.TestCase):

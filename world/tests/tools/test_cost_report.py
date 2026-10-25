@@ -5,7 +5,7 @@ import sys
 import time
 from contextlib import redirect_stdout
 
-import cost_report
+import tools.cost_report as cost_report
 
 
 def _db(tmp_path):

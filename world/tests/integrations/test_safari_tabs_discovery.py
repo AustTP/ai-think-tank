@@ -1,6 +1,6 @@
 import sqlite3
 
-import safari_tabs
+import integrations.safari_tabs as safari_tabs
 
 
 def test_no_db(monkeypatch):

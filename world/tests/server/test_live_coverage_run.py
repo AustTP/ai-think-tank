@@ -2,7 +2,7 @@ import base64
 import json
 import time
 
-import live_coverage as lc
+import server.live_coverage as lc
 
 
 def _reset():

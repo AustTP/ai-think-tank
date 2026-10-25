@@ -542,7 +542,7 @@ def test_library_tool_query_and_log(monkeypatch, tmp_path):
 
 
 def test_treg_pulse_observe_failures(monkeypatch):
-    import pulse
+    import agents.pulse as pulse
     monkeypatch.setattr(pulse, 'observe',
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError('x')))
     monkeypatch.setattr(content._serve, '_treg_call',
@@ -578,9 +578,9 @@ def test_audit_and_project_board(monkeypatch, tmp_path):
 
 def test_run_coding_content_guard_and_exception(monkeypatch, tmp_path):
     import sim
-    import staged_work
-    import work_reuse
-    import story_tracking
+    import agents.staged_work as staged_work
+    import agents.work_reuse as work_reuse
+    import agents.story_tracking as story_tracking
     stored = []
     monkeypatch.setattr(sim, '_store_content_result',
                         lambda t, r: stored.append(r))
@@ -774,7 +774,7 @@ def test_supervisor_unknown_tool_branch(monkeypatch):
 
 def test_coding_inner_heartbeat_and_library_limit(monkeypatch):
     import sim
-    import coding_library
+    import agents.coding_library as coding_library
     monkeypatch.setattr(sim, '_store_content_result', lambda t, r: None)
     monkeypatch.setattr(sim, '_bump_content_heartbeat',
                         lambda t: (_ for _ in ()).throw(RuntimeError('hb')))
@@ -787,7 +787,7 @@ def test_coding_inner_heartbeat_and_library_limit(monkeypatch):
     monkeypatch.setattr(content._serve, '_http_json',
                         lambda *a, **k: {'reply': 'library please'})
     monkeypatch.setattr(content, '_review_sandbox_id', lambda *a: 's')
-    import python_delivery
+    import agents.python_delivery as python_delivery
     monkeypatch.setattr(python_delivery, 'required', lambda t: False)
     monkeypatch.setattr(coding_library, 'parse', lambda r: {'ref': 1})
     monkeypatch.setattr(coding_library, 'MAX_ROUNDS', 0)

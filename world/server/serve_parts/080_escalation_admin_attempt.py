@@ -538,7 +538,7 @@ def _seed_watchlist_topics(state):
     the real boot path (lifespan), never in tests. Entries that fail
     add_research_topic's own fail-closed validation (empty topic, non-absolute
     URL) are skipped. Returns the number of topics newly seeded."""
-    import config as _config
+    import core.config as _config
     if not _config.RESEARCH_WATCHLIST:
         return 0
     import sim as _sim
@@ -698,7 +698,7 @@ def _sim_watchdog_note_failure(kind, detail, restarted):
                 f'the think tank can resolve this -- check the server logs.')
         print(f'[sim-watchdog] player alert: {body}', flush=True)
         try:
-            from notify import send_player_telegram_sync
+            from integrations.notify import send_player_telegram_sync
             send_player_telegram_sync('[AI Think Tank] sim loop down', body)
         except Exception as e:
             print(f'[sim-watchdog] player alert send failed: {e}', flush=True)
@@ -810,5 +810,5 @@ def _ensure_runtime_schemas():
     with _db() as conn:
         tank_accounts.ensure_schema(conn)
         captcha.ensure_schema(conn)
-        import migrations as _migrations
+        import server.migrations as _migrations
         _migrations.apply(conn)

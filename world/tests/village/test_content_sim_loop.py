@@ -15,7 +15,7 @@ import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import config  # noqa: E402
+import core.config as config  # noqa: E402
 import content  # noqa: E402
 import serve  # noqa: E402
 import sim  # noqa: E402
@@ -243,10 +243,10 @@ class TaskCycleTest(_Base):
         self._cycle_patches()
         with unittest.mock.patch.object(sim, '_notify_task_budget_exhausted'), \
              unittest.mock.patch.object(sim, 'send_agent_off_duty'), \
-             unittest.mock.patch('budget.analyze_overrun', return_value={}), \
-             unittest.mock.patch('budget.evaluate_completed_work',
+             unittest.mock.patch('core.budget.analyze_overrun', return_value={}), \
+             unittest.mock.patch('core.budget.evaluate_completed_work',
                                  return_value={}), \
-             unittest.mock.patch('budget.record_overrun'), \
+             unittest.mock.patch('core.budget.record_overrun'), \
              unittest.mock.patch('serve.tier_value_ratios',
                                  side_effect=RuntimeError('boom')):
             sim._task_cycle(state, now=now, grid={}, doors={})

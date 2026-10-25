@@ -18,7 +18,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import serve  # noqa: E402
 import sim  # noqa: E402
-import config  # noqa: E402
+import core.config as config  # noqa: E402
 
 _MODULE_TMP_DIR = None
 _MODULE_PATCHER = None

@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import time
 
-import skill_prompts
+import agents.skill_prompts as skill_prompts
 
 
 def test_shipped_report_skill_loads():

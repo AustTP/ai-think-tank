@@ -17,7 +17,7 @@ import os
 import random
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import sim  # noqa: E402
 
 
@@ -37,7 +37,7 @@ def spawn_a_batch(grid, n, rng):
 
 
 def main():
-    root = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     grid = json.load(open(os.path.join(root, "collision_grid.json")))
     doors = json.load(open(os.path.join(root, "door_triggers.json")))
     n = 24  # ~ roster headcount

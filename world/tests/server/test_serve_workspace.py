@@ -16,7 +16,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-import config  # noqa: E402
+import core.config as config  # noqa: E402
 import serve  # noqa: E402
 from test_cov_gap_serve_helpers import (  # noqa: E402
     _NO_GRANT, _SENTINEL, req_with, decision_cache_report_defaults)
@@ -423,7 +423,7 @@ class UpdateTeamTest(unittest.TestCase):
              mock.patch.object(serve, '_require_player_session',
                                return_value=True), \
              mock.patch.object(serve, '_state_begin', return_value=state), \
-             mock.patch('config.validate_team_agreement',
+             mock.patch('core.config.validate_team_agreement',
                         return_value={'new': True}), \
              mock.patch.object(serve, 'save_state_to_db') as save, \
              mock.patch.object(serve, 'log_action') as log:
@@ -604,7 +604,7 @@ class TierRecheckTest(unittest.TestCase):
 class ReadStoreToolTest(unittest.TestCase):
     def test_success(self):
         rows = [{'a': 1}]
-        with mock.patch('fs.read_store', return_value=rows) as rs, \
+        with mock.patch('core.fs.read_store', return_value=rows) as rs, \
              mock.patch.object(serve, 'log_action') as log:
             out = serve._read_store_tool('cora', {
                 'scope': 's', 'path': 'p', 'query': 'SELECT 1',
@@ -616,34 +616,34 @@ class ReadStoreToolTest(unittest.TestCase):
         log.assert_called_once()
 
     def test_errors(self):
-        with mock.patch('fs.read_store',
+        with mock.patch('core.fs.read_store',
                         side_effect=PermissionError('denied')), \
              mock.patch.object(serve, 'log_action') as log:
             self.assertEqual(serve._read_store_tool('c', {}),
                              'Denied: denied')
         log.assert_called_once()
-        with mock.patch('fs.read_store',
+        with mock.patch('core.fs.read_store',
                         side_effect=FileNotFoundError('gone')):
             self.assertEqual(serve._read_store_tool('c', {}),
                              'Not found: gone')
-        with mock.patch('fs.read_store', side_effect=RuntimeError('boom')):
+        with mock.patch('core.fs.read_store', side_effect=RuntimeError('boom')):
             self.assertEqual(serve._read_store_tool('c', {}),
                              'read_store failed: boom')
 
 
 class AppScriptToolTest(unittest.TestCase):
     def test_success_and_errors(self):
-        with mock.patch('fs.app_script', return_value='done'), \
+        with mock.patch('core.fs.app_script', return_value='done'), \
              mock.patch.object(serve, 'log_action') as log:
             self.assertEqual(serve._app_script_tool(
                 'cora', {'bundleId': 'b', 'script': 's'}), 'done')
         log.assert_called_once()
-        with mock.patch('fs.app_script',
+        with mock.patch('core.fs.app_script',
                         side_effect=PermissionError('no')), \
              mock.patch.object(serve, 'log_action') as log:
             self.assertEqual(serve._app_script_tool('c', {}), 'Denied: no')
         log.assert_called_once()
-        with mock.patch('fs.app_script',
+        with mock.patch('core.fs.app_script',
                         side_effect=RuntimeError('boom')), \
              mock.patch.object(serve, 'log_action') as log:
             self.assertEqual(serve._app_script_tool('c', {}),

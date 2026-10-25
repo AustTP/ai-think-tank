@@ -7,7 +7,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import optimization_advisor as oa
+import core.optimization_advisor as oa
 import serve
 
 

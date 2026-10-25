@@ -4,7 +4,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import retrieval  # noqa: E402
+import core.retrieval as retrieval  # noqa: E402
 
 
 class RetrievalTest(unittest.TestCase):

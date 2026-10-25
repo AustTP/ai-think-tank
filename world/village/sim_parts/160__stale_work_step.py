@@ -531,7 +531,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 # as the real work resolves (the min-visual floor is satisfied by
                 # the network round-trips), not when the timeout ceiling hits.
                 try:
-                    import transport_recovery
+                    import agents.transport_recovery as transport_recovery
                     transport_outcome = transport_recovery.queue(state, task, result, now_ms)
                 except Exception as e:
                     print(f'[sim] transport recovery error: {e}', flush=True)
@@ -541,7 +541,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                     task['_contentInFlight'] = False
                     _release_agent_after_failure(state, aid, task)
                     if transport_outcome == 'queued':
-                        import story_tracking
+                        import agents.story_tracking as story_tracking
                         story_tracking.root(state, task)['status'] = 'repairing'
                     send_agent_off_duty(state, aid, doors, grid)
                     continue
@@ -592,7 +592,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                     # durable history that scales future budgets for
                     # similar work (budget.py). Computed once here and
                     # shared with the director notification below.
-                    import budget as _budget
+                    import core.budget as _budget
                     analysis = _budget.analyze_overrun(
                         task, result.get('taskSpendUsd'),
                         result.get('taskSpendAttempts'))

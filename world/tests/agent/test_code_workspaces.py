@@ -2,8 +2,8 @@ import os
 import sys
 import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-from code_workspaces import sandbox_for
-from code_workspaces import ensure_test_directory, prepare
+from agents.code_workspaces import sandbox_for
+from agents.code_workspaces import ensure_test_directory, prepare
 import tempfile
 from pathlib import Path
 
@@ -43,7 +43,7 @@ class WorkspaceTests(unittest.TestCase):
 class StageCleanupTests(unittest.TestCase):
     def test_cleanup_removes_old_stages_and_excess_previous(self):
         import time
-        import staged_work
+        import agents.staged_work as staged_work
         with tempfile.TemporaryDirectory() as root:
             old = Path(root) / 'stage-old'
             old.mkdir()

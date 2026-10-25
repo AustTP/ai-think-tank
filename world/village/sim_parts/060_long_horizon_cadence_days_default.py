@@ -273,7 +273,7 @@ def _sync_research_watchlist(state):
     run lifespan, so the file stays inert there -- exactly the write-back gate
     discipline). Removal is skipped if the file cannot be read, so a transient
     bad parse cannot wipe the schedule. Returns (added, removed)."""
-    import config as _config
+    import core.config as _config
     if not _config.ALLOW_WATCHLIST_WRITE:
         return 0, 0
     watchlist, ok = _config.get_research_watchlist()

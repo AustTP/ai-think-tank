@@ -5,7 +5,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import notify  # noqa: E402
+import integrations.notify as notify  # noqa: E402
 import serve  # noqa: E402
 import sim  # noqa: E402
 

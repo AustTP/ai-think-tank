@@ -32,7 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-WORLD_DIR = Path(__file__).resolve().parent
+WORLD_DIR = Path(__file__).resolve().parent.parent
 ROOT_DIR = WORLD_DIR.parent
 DB_PATH = ROOT_DIR / 'think_tank.db'
 ASSETS_DIR = WORLD_DIR / 'assets'

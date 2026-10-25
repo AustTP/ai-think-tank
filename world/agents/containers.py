@@ -24,7 +24,7 @@ from typing import Dict, List, Optional
 
 import docker
 
-from egress import EgressRoute
+from core.egress import EgressRoute
 
 
 @dataclass

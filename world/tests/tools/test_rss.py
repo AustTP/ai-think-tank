@@ -1,10 +1,10 @@
 import sqlite3
 import sys
 
-import feedback_store
-import optimization_advisor
-import rss
-import totp
+import server.feedback_store as feedback_store
+import core.optimization_advisor as optimization_advisor
+import integrations.rss as rss
+import core.totp as totp
 
 
 def test_totp_branches():

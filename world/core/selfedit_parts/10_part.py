@@ -775,15 +775,15 @@ def _revert_one_from_backup(row_id):
 
 def _reload(target):
     import importlib
-    modname = os.path.splitext(os.path.basename(target))[0]
+    modname = _module_name_from_path(target)
     mod = sys.modules.get(modname)
     if mod:
         importlib.reload(mod)
-    if modname == 'jev':
+    if modname in ('jev', 'core.jev'):
         _refresh_serve_jev_exports()
-    if modname == 'config':
+    if modname in ('config', 'core.config'):
         _refresh_serve_config_exports()
-    if modname == 'env_reload':
+    if modname in ('env_reload', 'core.env_reload'):
         _refresh_serve_env_reload_exports()
     _refresh_serve_imports(modname)
     serve = _s()
@@ -804,7 +804,7 @@ def _refresh_serve_jev_exports():
     """serve.py's `from jev import (...)` names must point at the reloaded
     jev module's objects after a jev self-edit, or every serve-side call
     site would keep running pre-edit functions (the jev.py apply contract)."""
-    import jev
+    import core.jev as jev
     serve = _s()
     for name in ('JEV_SAFETY_CONFIDENCE', 'QUORUM_SAMPLE_SIZE',
                  'QUORUM_MIN_AGREEING', 'ESCALATION_KIND_RISK',
@@ -857,7 +857,7 @@ def _refresh_serve_env_reload_exports():
     """serve.py binds the .env reload table and its flag helper by name, so
     a self-edit to env_reload.py must rebind both or the pre-edit table keeps
     running until a restart."""
-    import env_reload
+    import core.env_reload as env_reload
     serve = _s()
     serve._ENV_RELOAD_FIELDS = env_reload.ENV_RELOAD_FIELDS
     serve._env_flag = env_reload._env_flag
@@ -870,7 +870,7 @@ def _refresh_serve_config_exports():
     `from config import` bindings re-execute against the updated module.
     The reload only ever runs while the tank is dormant, so it lands between
     simulation ticks."""
-    import config
+    import core.config as config
     serve = _s()
     for name in ('ALLOW_WATCHLIST_WRITE', 'BROWSE_BLOCK_CATEGORIES',
                  'PLAIN_WRITING_BAN_LIST', 'RESEARCH_WATCHLIST', 'ROOT',

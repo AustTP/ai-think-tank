@@ -8,7 +8,7 @@ sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 
-from sprint import (  # noqa: E402
+from village.sprint import (  # noqa: E402
     CONFIRM_SCOPE_THRESHOLD,
     DEFAULT_BATCH_SIZE,
     DiscoveryBrief,

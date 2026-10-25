@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 
 import content  # noqa: E402
 import sim  # noqa: E402
-import structured_edits  # noqa: E402
+import core.structured_edits as structured_edits  # noqa: E402
 
 
 def test_shell_command_recognition():

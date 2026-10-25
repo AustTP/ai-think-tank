@@ -15,13 +15,13 @@ from collections import deque
 # Operator-policy binding helpers (world/operator_policy.json): shared with
 # serve/content/sublow -- one declarative mechanism instead of per-module
 # rebind functions.
-from config import apply_policy_bindings, bind_policy
-import governance
-import policies
+from core.config import apply_policy_bindings, bind_policy
+import core.governance as governance
+import core.policies as policies
 
 # Pure, self-contained helpers extracted to their own module to
 # shrink the sim.py monolith. See sim_helpers.py.
-from sim_helpers import (  # noqa: E402, F401
+from village.sim_helpers import (  # noqa: E402, F401
     WORK_PRIORITY,
     _deliverable_room,
     _is_fully_idle,
@@ -54,11 +54,11 @@ from sim_helpers import (  # noqa: E402, F401
 # pre-refinement comprehension -- pure modules that import
 # nothing from the sim, so the top-level import cannot create
 # a cycle (serve is the one module imported inline below).
-import comprehension  # noqa: E402
-import cron_scripts  # noqa: E402
-import schedule  # noqa: E402
-import signals  # noqa: E402
-import roster  # noqa: E402
+import agents.comprehension as comprehension  # noqa: E402
+import server.cron_scripts as cron_scripts  # noqa: E402
+import village.schedule as schedule  # noqa: E402
+import core.signals as signals  # noqa: E402
+import village.roster as roster  # noqa: E402
 
 # The standing-task scheduler (schedule.py) keeps per-task
 # runtime state in-process: the sim owns the clock and supplies

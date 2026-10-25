@@ -15,7 +15,7 @@ import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import reset_wrq8_gates as reset  # noqa: E402
+import tools.reset_wrq8_gates as reset  # noqa: E402
 
 
 class _Case(unittest.TestCase):

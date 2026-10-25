@@ -321,7 +321,7 @@ _POLICY_EDIT_REASONS = (
 def _policy_edit_apply(agent_id, key, raw_value, reason):
     """Synchronous governed policy change. Returns (ok, payload) with the
     applied change or a typed error; every attempt is action-logged."""
-    import config as _cfg
+    import core.config as _cfg
     key = (key or '').strip()
     reason = (reason or '').strip()
     if not key:

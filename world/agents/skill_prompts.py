@@ -15,7 +15,7 @@ _CACHE: dict = {}
 
 _SKILLS_ENV = os.environ.get('THINK_TANK_SKILLS_DIR')
 SKILLS_DIR = (Path(_SKILLS_ENV) if _SKILLS_ENV
-              else Path(__file__).resolve().parent.parent / 'library' / 'skills')
+              else Path(__file__).resolve().parents[2] / 'library' / 'skills')
 
 
 def _safe_slug(name):

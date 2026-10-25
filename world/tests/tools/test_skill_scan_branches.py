@@ -2,13 +2,13 @@ import json
 import os
 import time
 
-import policies
-import python_delivery
-import skill_prompts
-import skill_scan
-import state_updates
-import story_tracking
-import work_reuse
+import core.policies as policies
+import agents.python_delivery as python_delivery
+import agents.skill_prompts as skill_prompts
+import agents.skill_scan as skill_scan
+import server.state_updates as state_updates
+import agents.story_tracking as story_tracking
+import agents.work_reuse as work_reuse
 
 
 def test_story_tracking_stamp_and_bad_cap():

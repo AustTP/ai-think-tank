@@ -300,6 +300,6 @@ def test_cov_refresh_serve_imports_ast_paths(fake_repo, monkeypatch, tmp_path):
 
 def test_cov_refresh_env_reload_exports(fake_repo):
     selfedit._refresh_serve_env_reload_exports()
-    import env_reload
+    import core.env_reload as env_reload
     assert serve._ENV_RELOAD_FIELDS == env_reload.ENV_RELOAD_FIELDS
     assert serve._env_flag == env_reload._env_flag

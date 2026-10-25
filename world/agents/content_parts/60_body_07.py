@@ -58,7 +58,7 @@ def _make_treg_tools_executor():
                 return f'Could not get trending topics: {error}'
             _serve._accrue_spend('treg', _serve.TREG_ENDPOINT_COSTS['x.x.get-trends-by-woeid'])
             try:
-                from pulse import observe as _pulse_observe
+                from agents.pulse import observe as _pulse_observe
                 _pulse_observe('x', 'trends', {'data': data},
                                dedupe_key=json.dumps(data, sort_keys=True, default=str))
             except Exception:
@@ -79,7 +79,7 @@ def _make_treg_tools_executor():
                 return f'Could not search LinkedIn posts: {error}'
             _serve._accrue_spend('treg', _serve.TREG_ENDPOINT_COSTS['scrapecreators.x.v1-linkedin-search-posts'])
             try:
-                from pulse import observe as _pulse_observe
+                from agents.pulse import observe as _pulse_observe
                 _pulse_observe('linkedin', query, {'data': data},
                                dedupe_key=json.dumps(data, sort_keys=True, default=str))
             except Exception:

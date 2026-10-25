@@ -22,7 +22,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import serve  # noqa: E402
-import config  # noqa: E402
+import core.config as config  # noqa: E402
 import test_serve_helpers as _helpers  # noqa: E402
 
 _AUTH_PATCHER = None

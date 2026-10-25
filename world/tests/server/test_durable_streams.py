@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-import durable_streams
+import server.durable_streams as durable_streams
 
 
 class FakeRedis:

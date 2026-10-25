@@ -21,7 +21,7 @@ import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import sandbox_proxy  # noqa: E402
+import tools.sandbox_proxy as sandbox_proxy  # noqa: E402
 
 
 def _reload_with_env(extra_hosts=''):

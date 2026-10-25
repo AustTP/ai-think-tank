@@ -461,7 +461,7 @@ def _standing_task_conflicts(start_ts, end_ts):
     anchors are honored instead of treated as always-on. One sample per
     minute: a 4-hour window is 240 samples of a pure predicate."""
     import datetime as _dt
-    import schedule as _schedule
+    import village.schedule as _schedule
     import sim as _sim
     state = _s().get_state_from_db() or {}
     runtime = {}

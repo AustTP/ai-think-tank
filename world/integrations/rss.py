@@ -164,7 +164,7 @@ def _rss_ingest(feed_id, items):
         if len(buf) > _serve._RSS_BUFFER_MAX_PER_FEED:
             del buf[:len(buf) - _serve._RSS_BUFFER_MAX_PER_FEED]
     try:
-        from pulse import observe as _pulse_observe
+        from agents.pulse import observe as _pulse_observe
         for it in fresh:
             _pulse_observe(f'rss:{feed_id}', it.get('title') or '', it,
                            dedupe_key=it.get('link') or str(it))
