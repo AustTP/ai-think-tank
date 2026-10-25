@@ -252,6 +252,11 @@ class ObservatoriesAndDispatcher(_ExecutorTestCase):
             ({'id': 'x13', 'taskType': 'code', 'room': 'library'}, '_run_coding_content'),
             ({'id': 'x14', 'taskType': 'bug', 'room': 'observatory'}, '_run_coding_content'),
             ({'id': 'x15', 'taskType': 'code', 'room': 'pressoffice'}, '_run_workroom_content'),
+            # A distill/skill-review/research marker is that lane even though
+            # the card is queued with the default taskType 'code'.
+            ({'id': 'x16', 'taskType': 'code', 'distill': True}, '_run_observatory_content'),
+            ({'id': 'x17', 'taskType': 'code', 'skillReview': True}, '_run_observatory_content'),
+            ({'id': 'x18', 'taskType': 'code', 'research': {'topicId': 't'}}, '_run_observatory_content'),
         ]:
             with mock.patch.object(content, '_run_spike_content') as spike, \
                  mock.patch.object(content, '_run_review_content') as review, \

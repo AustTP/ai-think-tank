@@ -282,7 +282,10 @@ class AssignDueItem(SimIsolation):
             task = sim._assign_due_item(state, pick, True, self._grid(),
                                         self._doors(), 1_000_000,
                                         task_id_holder=[0])
-        self.assertIsNone(task)
+        # The busy pin is refused by assign_task, but the card is RETAINED
+        # with a short retry window instead of being shed (2026-10-25).
+        self.assertIs(task, sim._ASSIGN_WAIT)
+        self.assertGreater(pick.get('notBefore') or 0, 1_000_000)
 
 
     def test_all_candidates_vanish(self):

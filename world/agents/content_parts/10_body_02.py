@@ -132,7 +132,16 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
         # library / postoffice / unset -> no entry -> placeholder (unchanged).
     }
     task_type = task.get('taskType')
-    if task_type in ('code', 'bug'):
+    # A card with an explicit observatory-lane marker is that lane, whatever
+    # its taskType says. Distill / skill-review / research cards are queued
+    # with taskType 'code' (the default), so the code-first rule below would
+    # otherwise run the coding executor on them -- a distill card landed in a
+    # bash sandbox and failed on shell errors instead of merging the wiki.
+    lane_marked = bool(task.get('distill') or task.get('skillReview')
+                       or task.get('research') or task_type == 'research')
+    if lane_marked:
+        executor = _run_observatory_content
+    elif task_type in ('code', 'bug'):
         # A CODE card is code wherever it was queued. The room only decides
         # which BUILDING it runs in, not what kind of work it is. Falling
         # through to the room executor made a code/bug card queued into

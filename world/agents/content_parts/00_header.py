@@ -461,7 +461,10 @@ def _run_media_content(snapshot, agent_id, task, base_ctx=None):
     feeds = _parse_feed_urls_after(out.get('content') if isinstance(out, dict) else None)
     if not feeds:
         note = 'No feeds configured yet -- waiting on media/feeds.md in the Library.'
-        _sim_module._store_content_result(task.get('id'), {'note': note})
+        # A legitimate no-op, not a failed deliverable: there is nothing to
+        # digest until feeds.md exists, so this must not loop as a refused
+        # completion.
+        _sim_module._store_content_result(task.get('id'), {'note': note, 'noop': True})
         return
     url = random.choice(feeds)
     purpose = 'Fetching a subscribed feed source to digest for the player.'
@@ -511,7 +514,9 @@ def _run_media_content(snapshot, agent_id, task, base_ctx=None):
                {'agentId': agent_id, 'path': path, 'content': content, 'source': 'firsthand'}, key)
     _serve.log_action(agent_id, 'media_digest_filed', {'url': url, 'path': path}, authorized=True)
     note = f'Filed a digest on {url} for the player.'
-    _sim_module._store_content_result(task.get('id'), {'note': note})
+    # The digest IS the deliverable -- record its real path so completion's
+    # Library-evidence check can see it (it was written but never linked).
+    _sim_module._store_content_result(task.get('id'), {'note': note, 'libraryPath': path})
 
 
 def _run_skill_review_content(snapshot, agent_id, task, base_ctx=None):

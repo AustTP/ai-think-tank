@@ -224,6 +224,8 @@ class MediaContent(_ExecutorTestCase):
         with mock.patch.object(serve, '_http_json', return_value={'content': None}):
             content._run_media_content(_snapshot(), 'cora', {'id': 'm1'})
         self.assertIn('No feeds configured yet', seen['m1']['note'])
+        self.assertIs(seen['m1'].get('noop'), True,
+                      'no feeds is a legitimate no-op, not a refused deliverable')
 
     def test_media_browse_not_approved(self):
         seen = _store()
@@ -257,6 +259,8 @@ class MediaContent(_ExecutorTestCase):
              mock.patch.object(serve, '_resolve_model_tier', return_value='t'):
             content._run_media_content(_snapshot(), 'cora', {'id': 'm3'})
         self.assertIn('Filed a digest on https://news.com/a', seen['m3']['note'])
+        self.assertTrue(str(seen['m3'].get('libraryPath') or '').startswith('media/digests/'),
+                        'the digest file is the deliverable -- its path must be recorded')
         self.assertEqual(calls['n'], 5)  # file GET + 2 browse + chat + file POST
 
     def test_media_long_page_skips_render_retry(self):

@@ -228,18 +228,18 @@ class SimTaskLifecycle(unittest.TestCase):
         self.assertNotIn('Maintain tooling', assigned_titles)
 
     def test_work_item_abandoned_after_max_attempts(self):
-        # An ordinary queue item that genuinely cannot be assigned is retried
-        # up to WORK_ITEM_MAX_ATTEMPTS, then abandoned -- not retried forever.
-        # (2026-10-13: a room with no door is NO LONGER that case -- it now gets
-        # rescued to a real room at assignment time; see the companion test
-        # below. Here the agent simply has no path to any door.)
+        # An ordinary queue item that genuinely has no candidate is retried up
+        # to WORK_ITEM_MAX_ATTEMPTS, then abandoned -- not retried forever.
+        # (A chosen agent who merely cannot walk right now returns ASSIGN_WAIT
+        # and is retained with a retry window instead; see the affinity tests.)
         state = self._base_state(work_queue=[self._item(title='Unassignable')])
-        for a in state['agents'].values():
-            a['x'] = a['y'] = -99999.0
         grid, doors = sim._load_outdoor_geometry()
-        for _ in range(20):  # well past the 3-attempt budget
-            sim._task_cycle(state, now=time.time(), grid=grid, doors=doors,
-                            task_id_holder=[0])
+        # Force the ordinary "no assignment" result; a chosen-but-unreachable
+        # agent returns ASSIGN_WAIT and is retained on purpose.
+        with unittest.mock.patch.object(sim, '_assign_due_item', return_value=None):
+            for _ in range(20):  # well past the 3-attempt budget
+                sim._task_cycle(state, now=time.time(), grid=grid, doors=doors,
+                                task_id_holder=[0])
         self.assertEqual(state['workQueue'], [],
                          'unassignable item must leave the queue (abandoned)')
         self.assertFalse(any(a.get('task') for a in state['agents'].values()))

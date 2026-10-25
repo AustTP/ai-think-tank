@@ -37,6 +37,24 @@ def test_report_path_satisfies_completion_evidence():
         'taskType': 'report', 'note': 'Wrote the report.'})
 
 
+def test_recorded_noop_satisfies_completion_evidence():
+    assert sim._completion_has_evidence({}, {
+        'taskType': 'code', 'noop': True, 'note': 'No feeds configured yet.'})
+    assert not sim._completion_has_evidence({}, {
+        'taskType': 'code', 'note': 'No feeds configured yet.'})
+
+
+def test_distill_and_skill_review_notes_are_completion_evidence():
+    # Distill/skill-review cards are queued as taskType 'code' but their
+    # deliverable is the wiki / the review decision, not a Library file.
+    assert sim._completion_has_evidence({}, {
+        'taskType': 'code', 'distill': True, 'note': 'Merged 4 findings into the wiki.'})
+    assert sim._completion_has_evidence({}, {
+        'taskType': 'code', 'skillReview': True, 'note': '1 promoted, 0 rejected'})
+    assert not sim._completion_has_evidence({}, {
+        'taskType': 'code', 'distill': True, 'note': ''})
+
+
 def test_scoped_issue_card_does_not_get_global_room_focus(monkeypatch):
     state = {
         'agents': {'ada': {'id': 'ada', 'offDuty': True, 'busy': False,

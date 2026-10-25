@@ -339,6 +339,14 @@ def _queue_peer_repair(state, parent, rationale=None):
         'title': 'Fix: ' + str(parent.get('title') or tid),
         'room': parent.get('room') or 'pressoffice',
         'taskType': parent.get('taskType') or 'code',
+        # Lane markers must survive a repair. Distill/skill-review cards are
+        # queued with taskType 'code', so without these a repair ran the
+        # coding executor and could never satisfy the lane's completion rule.
+        'distill': bool(parent.get('distill')),
+        'distillSince': parent.get('distillSince') or 0,
+        'skillReview': bool(parent.get('skillReview')),
+        'kbClass': parent.get('kbClass'),
+        'research': parent.get('research'),
         'assignedTo': author,
         'directRoute': True,
         'reviewOf': tid,
@@ -791,7 +799,13 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
         'instructions': instructions,
         'goal': task.get('projectLabel') or task.get('goal'),
         'projectLabel': task.get('projectLabel') or task.get('title'),
-        'taskType': 'code',
+        'taskType': task.get('taskType') or 'code',
+        # Same lane-marker rule as the peer-repair card above.
+        'distill': bool(task.get('distill')),
+        'distillSince': task.get('distillSince') or 0,
+        'skillReview': bool(task.get('skillReview')),
+        'kbClass': task.get('kbClass'),
+        'research': task.get('research'),
         'reviewOf': task.get('id'),
         'reviewAuthorId': assignee,
         'assignedTo': assignee,

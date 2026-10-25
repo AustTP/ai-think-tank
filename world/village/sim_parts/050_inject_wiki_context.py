@@ -713,6 +713,11 @@ def _completion_has_evidence(state, task):
     ttype = str(task.get('taskType') or '')
     if task.get('shadow'):
         return True
+    if task.get('noop'):
+        # A recorded legitimate no-op (no feeds configured, nothing new to
+        # distill) has no artifact to require -- demanding one looped the same
+        # card forever.
+        return True
     # Peer-review and QA subtasks land their verdict in the note; their
     # evidence is the vote, not a Library file. A REPAIR task also carries
     # reviewOf, but its taskType is the original lane (spike/code/...), so it
@@ -723,9 +728,14 @@ def _completion_has_evidence(state, task):
         return True
     if ttype in ('meeting', 'supervise', 'avatar', 'review', 'qa'):
         return True
-    if ttype == 'research' or task.get('research'):
-        # Scheduled research lands its findings in the task note/topic; it is
-        # not a Library-file lane. Require the note, not a fabricated path.
+    if (ttype == 'research' or task.get('research') or task.get('distill')
+            or task.get('skillReview')):
+        # Scheduled research, distill, and skill-review cards record their
+        # outcome in the task note (a distill writes the wiki, a skill review
+        # promotes/rejects files); none of them files a per-task Library
+        # artifact. Require the note, not a fabricated path. They are queued
+        # as taskType 'code', so the generic code rule below would otherwise
+        # refuse every successful distillation.
         return bool(str(task.get('note') or '').strip())
     if ttype == 'bug':
         evidence = bool(task.get('libraryPath') or task.get('writtenPy')
