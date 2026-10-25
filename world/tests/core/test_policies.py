@@ -23,10 +23,10 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(route['band'], 'low')
         self.assertEqual(route['best_of'], 1)
 
-    def test_best_effort_routes_high(self):
+    def test_best_effort_keeps_samples_but_leaves_band_to_jev(self):
         route = policies.choose_route('hard synthesis', allow_high=True,
                                       best_effort=True)
-        self.assertEqual(route['band'], 'high')
+        self.assertEqual(route['band'], 'mid')
         self.assertEqual(route['best_of'], 3)
 
     def test_routine_routes_low(self):

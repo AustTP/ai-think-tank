@@ -271,15 +271,29 @@ class LatencyRouting(unittest.TestCase):
 
 
 class BestCapabilityRouting(unittest.TestCase):
-    def test_best_effort_uses_high_when_available(self):
+    def test_best_effort_uses_high_when_jev_approves(self):
         with unittest.mock.patch.object(serve, '_high_tier_slug', return_value='best-model'), \
              unittest.mock.patch.object(serve, '_high_tier_budget_exceeded', return_value=False):
-            self.assertEqual(serve._resolve_model_tier('hard analysis', best_effort=True),
-                             'best-model')
+            self.assertEqual(
+                serve._resolve_model_tier(
+                    'hard analysis', best_effort=True,
+                    decider=lambda *a, **k: ('high', 0.99)),
+                'best-model')
 
     def test_best_effort_falls_back_when_high_budget_is_spent(self):
         with unittest.mock.patch.object(serve, '_high_tier_slug', return_value='best-model'), \
              unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='mid-model'), \
              unittest.mock.patch.object(serve, '_high_tier_budget_exceeded', return_value=True):
-            self.assertEqual(serve._resolve_model_tier('hard analysis', best_effort=True),
-                             'mid-model')
+            self.assertEqual(
+                serve._resolve_model_tier(
+                    'hard analysis', best_effort=True,
+                    decider=lambda *a, **k: ('high', 0.99)),
+                'mid-model')
+
+    def test_best_effort_low_jev_decision_stays_cheap(self):
+        with unittest.mock.patch.object(serve, '_low_tier_slug', return_value='low-model'):
+            self.assertEqual(
+                serve._resolve_model_tier(
+                    'hard analysis', best_effort=True,
+                    decider=lambda *a, **k: ('low', 0.99)),
+                'low-model')

@@ -1,0 +1,5 @@
+{
+  "comment": "Operator overrides for model tiers. \"default\" applies to every band without its own entry. Each entry may set base_url (OpenAI-compatible chat-completions URL), model (actual slug sent to the endpoint), api_key_env (env var holding the key), price_per_m (USD per million tokens), and send_reasoning (true only for endpoints that accept the OpenRouter reasoning field). Leave base_url empty to keep OpenRouter as the transport. A positive price_per_m also keeps the global spend cap; a zero price is treated as local/free.",
+  "default": null,
+  "tiers": {}
+}

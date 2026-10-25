@@ -175,8 +175,6 @@ def supervisor_tick(state, now_ms=None):
     """
     import time
     now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
-    state.setdefault('governance', {}).setdefault(
-        'changeRequestAdminApproval', True)
     mode = str(((state or {}).get('automation') or {}).get('mode') or '').lower()
     if mode in ('drain', 'idle', 'paused', 'off', 'manual'):
         return 0

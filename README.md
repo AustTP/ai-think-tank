@@ -40,7 +40,7 @@ python3 -m pytest world/tests -q
 node world/tests/js_coverage.mjs
 ```
 
-`bash world/tests/run_all.sh` runs both plus the package-boundary check. The suite has 7,901 passing Python tests and a 90% JavaScript coverage floor.
+`bash world/tests/run_all.sh` runs both plus the package-boundary check. The suite has 7,921 passing Python tests and a 90% JavaScript coverage floor.
 
 For restart and recovery evidence, run the failure-injection soak harness:
 
@@ -67,7 +67,7 @@ Theo keeps the building honest. He cares about state, gates, and where the money
 - **The executors.** `world/content.py` loads the parts in `world/agents/content_parts/`. It handles research crawls, code writing and review, weather, distillation, media digests, bank reviews, and time-boxed investigations called spikes.
 - **Plan approvals.** A large request is proposed as a durable plan revision before any work is filed. The player can approve, reject with a reason, or revise it. Approval binds the exact plan hash and route; a stale team or authority forces a revision instead of applying an old decision.
 - **The client.** `world/index.html` draws the tank as a pixel-art canvas and lets you interact. It is a viewport. The server owns every position, task, and decision.
-- **The model tiers.** Work starts on the cheap `low` tier. JEV decides which calls earn `mid` or `high`. Coding tasks use the coding tier automatically. The refresh re-picks each band's best-value model from the live OpenRouter catalog.
+- **The model tiers.** Work starts on the cheap `low` tier. JEV decides which calls earn `mid` or `high`. Coding tasks use the coding tier automatically. 3D work aliases to coding until a dedicated model is configured. The refresh re-picks each band's best-value model from the live OpenRouter catalog. `world/model_providers.json` can point any band, or every band, at a custom endpoint or local model.
 - **The budgets.** Page requests are capped at 1,000 per month. The hard spend cap defaults to $50 per month and is set with `SPEND_CAP_USD`. The high tier has its own monthly budget, which defaults to $5. JEV respects both. Every priced model call also writes a durable usage receipt, replayed after an interrupted projection; unpriced usage holds that task's budget by default (`UNPRICED_USAGE_POLICY=block`).
 - **Plain writing.** Prose replies at the model-call boundary carry a "write plainly, no filler" instruction and a word-ban list. The tank spends fewer tokens on the same information. It is on by default. You can opt out per request. JSON prompts are exempt.
 
@@ -98,7 +98,7 @@ Nora keeps the roster, the ceremonies, and the memory. She knows that a think ta
 | `world/integrations/web_helpers.py` | Pure HTML stripping, link extraction, HTTP-date parsing, SSRF host check |
 | `world/village/sim_helpers.py` | Pure priority normalization, room and team derivation, sprint and product ID generation, village and memory-clock helpers |
 | `world/index.html` + `world/js/*.js` | Browser renderer. The client is a viewport and never the state machine. |
-| `world/tests/` | Python and JavaScript test suites (7,901 Python tests plus the JS coverage harness) |
+| `world/tests/` | Python and JavaScript test suites (7,921 Python tests plus the JS coverage harness) |
 
 ## Repo layout
 

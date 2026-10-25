@@ -5,7 +5,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-BANDS = ('low', 'sublow', 'mid', 'coding', 'high', 'vision')
+BANDS = ('low', 'sublow', 'mid', 'coding', 'high', 'vision', '3d')
 
 
 def load_bands(path: Path) -> dict:
@@ -19,6 +19,7 @@ def validate(config: dict, db_path: Path | None = None) -> tuple[list[str], list
     benchmarks = config.get('band_benchmark') or {}
     gaps = config.get('quality_floor_gap') or {}
     criteria = config.get('tier_gate_criteria') or {}
+    aliases = config.get('band_aliases') or {}
 
     for band in ('low', 'mid', 'high'):
         if band not in price_bands:
@@ -27,6 +28,8 @@ def validate(config: dict, db_path: Path | None = None) -> tuple[list[str], list
         if band not in purpose:
             problems.append(f'{band}: missing band_purpose entry')
     for band in BANDS:
+        if aliases.get(band):
+            continue
         if not benchmarks.get(band):
             problems.append(f'{band}: missing band_benchmark entry')
     for band, bounds in price_bands.items():
@@ -56,6 +59,13 @@ def validate(config: dict, db_path: Path | None = None) -> tuple[list[str], list
     for (lo1, hi1, name1), (lo2, hi2, name2) in zip(ordered, ordered[1:]):
         if lo2 < hi1:
             problems.append(f'price bands overlap: {name1} and {name2}')
+    for band, target in aliases.items():
+        if band not in BANDS:
+            problems.append(f'{band}: alias band is unknown')
+        if target not in BANDS:
+            problems.append(f'{band}: alias target {target!r} is unknown')
+        if target == band:
+            problems.append(f'{band}: alias points at itself')
     if not gaps:
         problems.append('quality_floor_gap is empty')
     for band, gap in gaps.items():
@@ -79,6 +89,8 @@ def validate(config: dict, db_path: Path | None = None) -> tuple[list[str], list
                 'SELECT * FROM model_tiers ORDER BY band')]
             seen = {r['band'] for r in rows}
             for band in BANDS:
+                if aliases.get(band):
+                    continue
                 if band not in seen:
                     problems.append(f'{band}: no selected model in model_tiers')
             for row in rows:

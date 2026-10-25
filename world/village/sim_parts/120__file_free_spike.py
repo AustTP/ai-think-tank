@@ -52,6 +52,7 @@ def _file_free_spike(state, agent_id, completed_task, now_ms=None):
     global_map[week] = tank_used + 1
     used_map[agent_id] = (week, used + 1)
     rooms_map.setdefault(week, []).append(room)
+    audit_id = f'free-spike:{week}:{agent_id}:{room}'
     title = f"Free exploration: question an assumption about {room}"
     instructions = (
         f"{FREE_SPIKE_PREMISE_GUIDANCE} You just completed real work in {room} "
@@ -64,9 +65,12 @@ def _file_free_spike(state, agent_id, completed_task, now_ms=None):
     queue_spike(state, title, room, FREE_SPIKE_BUDGET_MS, now_ms=now_ms,
                 instructions=instructions, goal=f"Free exploration in {room}",
                 moonshot=True, notBefore=now_ms + FREE_SPIKE_DEFER_MS)
+    if state.get('workQueue'):
+        state['workQueue'][-1]['auditId'] = audit_id
     _log_governance(state, agent_id, 'free_spike_filed', {
         'room': room, 'week': week, 'agentUsed': used + 1,
         'tankUsed': tank_used + 1, 'after': (completed_task or {}).get('id'),
+        'auditId': audit_id,
     })
     return 1
 

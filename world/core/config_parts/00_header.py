@@ -12,7 +12,8 @@ this module to tune the village without touching Python:
 - browse_policy.json    -> STANDING_SAFE_DOMAINS        (read-only reference hosts, in the same file)
 - service_costs.json    -> TREG_ENDPOINT_COSTS          (per-endpoint prices for metered APIs)
 - model_bands.json      -> MODEL_PRICE_BANDS, MODEL_BAND_PURPOSE, BAND_BENCHMARK,
-                           BAND_QUALITY_FLOOR_GAP, TIER_GATE_CRITERIA
+                           BAND_QUALITY_FLOOR_GAP, TIER_GATE_CRITERIA, MODEL_BAND_ALIASES
+- model_providers.json  -> MODEL_PROVIDER_OVERRIDES     (per-band or global custom endpoints/models)
 - redaction.json        -> SECRET_PATTERNS               (credential shapes scrubbed from logs)
 - tool_descriptions.json -> TOOL_DESCRIPTIONS            (per-tool description overrides)
 - actions.json          -> CEREMONY_ACTIONS, PROGRESS_ACTIONS, REWORK_ACTIONS,
@@ -161,6 +162,7 @@ CREDENTIAL_ACCESS_CONFIG: dict = {
 
 SERVICE_COSTS_PATH = os.path.join(ROOT, 'service_costs.json')
 MODEL_BANDS_PATH = os.path.join(ROOT, 'model_bands.json')
+MODEL_PROVIDERS_PATH = os.path.join(ROOT, 'model_providers.json')
 REDACTION_PATH = os.path.join(ROOT, 'redaction.json')
 TOOL_DESCRIPTIONS_PATH = os.path.join(ROOT, 'tool_descriptions.json')
 ACTIONS_PATH = os.path.join(ROOT, 'actions.json')
@@ -205,6 +207,7 @@ MODEL_BAND_PURPOSE_DEFAULT = {
     'mid': "Judgment calls: classifying report severity, generating a new hire's onboarding file, deciding what belongs in an agent's own notes. Needs real reasoning, moderate cost is fine.",
     'coding': 'Writing and reviewing real code (Code Reviewer, and any role that writes code). Correctness of generated code is the whole job here.',
     'high': 'Breaking a large, vague request into as many concrete, well-scoped subtasks as the work actually requires (never a fixed count -- a small ask may be one card, a sprawling one many) and deciding how work is distributed (assignBigTask). Runs once per real request, and every downstream call depends on this one being right -- a bad decomposition wastes everything after it, so this is the band to spend on.',
+    '3d': '3D modeling work: building, editing, and reviewing three-dimensional scenes or assets. Until a dedicated 3D model is configured, this band routes to coding so the tank can produce the code that builds the scene.',
 }
 BAND_BENCHMARK_DEFAULT = {
     'low': ('intelligence_index', 'MMLU-Pro'),
@@ -213,8 +216,11 @@ BAND_BENCHMARK_DEFAULT = {
     'high': ('agentic_index',),
     'coding': ('coding_index',),
     'vision': ('MMMU',),
+    '3d': ('coding_index',),
 }
 BAND_QUALITY_FLOOR_GAP_DEFAULT = {'default': 6, 'high': 2}
+MODEL_BAND_ALIASES_DEFAULT = {'3d': 'coding'}
+MODEL_PROVIDER_OVERRIDES_DEFAULT = {'default': None, 'tiers': {}}
 TIER_GATE_CRITERIA_DEFAULT = {
     'high': 'High-stakes, one-shot planning or decomposition where getting it wrong wastes every downstream step (e.g. breaking one large vague request into the subtasks everything else depends on).',
     'mid': 'Needs real multi-step reasoning or judgment: synthesis, classification, summarization of gathered material, a considered in-character reply. Routine but non-trivial thinking.',
@@ -226,6 +232,8 @@ MODEL_BAND_PURPOSE: dict = dict(MODEL_BAND_PURPOSE_DEFAULT)
 BAND_BENCHMARK: dict = dict(BAND_BENCHMARK_DEFAULT)
 BAND_QUALITY_FLOOR_GAP: dict = dict(BAND_QUALITY_FLOOR_GAP_DEFAULT)
 TIER_GATE_CRITERIA: dict = dict(TIER_GATE_CRITERIA_DEFAULT)
+MODEL_BAND_ALIASES: dict = dict(MODEL_BAND_ALIASES_DEFAULT)
+MODEL_PROVIDER_OVERRIDES: dict = {'default': None, 'tiers': {}}
 
 # Secret shapes scrubbed from anything written to the action log / wiki /
 # reports (redaction.json). A missed shape is a leaked credential, so this is
@@ -419,13 +427,77 @@ def _load_model_bands(path):
                 out[band.strip()] = int(value) if value.is_integer() else value
         return out or dict(default)
 
+    def _aliases(raw, default):
+        if not isinstance(raw, dict):
+            return dict(default)
+        out = {}
+        for band, target in raw.items():
+            if not isinstance(band, str) or not band.strip():
+                continue
+            if target is None:
+                continue
+            if isinstance(target, str) and target.strip():
+                out[band.strip()] = target.strip()
+        return out or dict(default)
+
     return {
         'price_bands': _bands(data.get('price_bands'), MODEL_PRICE_BANDS_DEFAULT),
         'band_purpose': _prose(data.get('band_purpose'), MODEL_BAND_PURPOSE_DEFAULT),
         'band_benchmark': _chains(data.get('band_benchmark'), BAND_BENCHMARK_DEFAULT),
         'quality_floor_gap': _numbers(data.get('quality_floor_gap'), BAND_QUALITY_FLOOR_GAP_DEFAULT),
         'tier_gate_criteria': _prose(data.get('tier_gate_criteria'), TIER_GATE_CRITERIA_DEFAULT),
+        'band_aliases': _aliases(data.get('band_aliases'), MODEL_BAND_ALIASES_DEFAULT),
     }
+
+
+def _load_model_providers(path):
+    """model_providers.json: operator overrides that point a band (or every
+    band) at a custom OpenAI-compatible chat-completions endpoint, or swap in
+    a different model slug. Empty or malformed entries are dropped so a typo
+    cannot silently redirect production traffic. A missing file means no
+    overrides. `default` applies to every band without its own entry."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            raw = json.load(f)
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def _spec(value):
+        if not isinstance(value, dict):
+            return None
+        base_url = str(value.get('base_url') or '').strip()
+        model = str(value.get('model') or '').strip()
+        if base_url and not base_url.startswith(('http://', 'https://')):
+            return None
+        try:
+            price = float(value.get('price_per_m') or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price < 0:
+            price = 0.0
+        spec = {
+            'provider': str(value.get('provider') or '').strip() or 'custom',
+            'base_url': base_url,
+            'model': model,
+            'api_key_env': str(value.get('api_key_env') or '').strip(),
+            'price_per_m': price,
+            'send_reasoning': bool(value.get('send_reasoning', False)),
+        }
+        if not spec['base_url'] and not spec['model']:
+            return None
+        return spec
+
+    tiers = {}
+    raw_tiers = raw.get('tiers') if isinstance(raw.get('tiers'), dict) else {}
+    for band, value in raw_tiers.items():
+        if not isinstance(band, str) or not band.strip():
+            continue
+        spec = _spec(value)
+        if spec is not None:
+            tiers[band.strip()] = spec
+    return {'default': _spec(raw.get('default')), 'tiers': tiers}
 
 
 def _load_endpoint_policy(path):

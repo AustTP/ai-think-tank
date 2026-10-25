@@ -577,6 +577,64 @@ def _apply_plain_writing(messages):
     return messages
 
 
+OPENROUTER_CHAT_COMPLETIONS_URL = 'https://openrouter.ai/api/v1/chat/completions'
+
+
+def _model_provider_for(model):
+    """Resolve a synthetic @provider:<band> slug to its operator override.
+    Returns None for ordinary OpenRouter slugs. `is_custom` is true only when
+    a base_url is configured, so a model-only override still rides OpenRouter
+    auth, credits, and failover."""
+    cfg = MODEL_PROVIDER_OVERRIDES or {}
+    if not isinstance(model, str) or not model.startswith('@provider:'):
+        return None
+    band = model.split(':', 1)[1]
+    spec = (cfg.get('tiers') or {}).get(band) or cfg.get('default')
+    if not spec:
+        return None
+    actual = spec.get('model') or _raw_model_tier_slug(band)
+    if not actual:
+        return None
+    return {**spec, 'band': band, 'model': actual,
+            'is_custom': bool(spec.get('base_url'))}
+
+
+def _provider_is_billable(provider):
+    """True when a custom endpoint declares a nonzero price. A zero price is
+    treated as local/free and does not trip the global spend cap; a paid
+    endpoint still does, even though OpenRouter credit gates are skipped."""
+    if not provider or not provider.get('is_custom'):
+        return False
+    try:
+        return float(provider.get('price_per_m') or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _apply_provider_cost(result, provider):
+    if not isinstance(result, dict) or not provider or not provider.get('is_custom'):
+        return result
+    usage = result.get('usage')
+    if not isinstance(usage, dict):
+        usage = {}
+        result['usage'] = usage
+    if usage.get('cost') is not None:
+        return result
+    tokens = usage.get('total_tokens')
+    if tokens is None:
+        tokens = (usage.get('prompt_tokens') or 0) + (usage.get('completion_tokens') or 0)
+    try:
+        tokens = float(tokens or 0)
+        price = float(provider.get('price_per_m') or 0)
+    except (TypeError, ValueError):
+        return result
+    if tokens and price:
+        usage['cost'] = tokens * price / 1_000_000
+    else:
+        usage.setdefault('cost', 0.0)
+    return result
+
+
 def _openrouter_chat_post(body):
     """Single POST of a chat-completions body, shared by the two call layers
     (_call_openrouter_once_sync and _post_openrouter_raw), with one recovery
@@ -589,15 +647,31 @@ def _openrouter_chat_post(body):
     at 64 and 16000 tokens), so on that exact error retry once with
     reasoning capped to half the request budget. Returns the parsed JSON
     document; re-raises every other failure unchanged."""
+    provider = _model_provider_for((body or {}).get('model'))
+    is_custom = bool(provider and provider.get('is_custom'))
+    if provider:
+        body = dict(body)
+        body['model'] = provider['model']
+        if not provider.get('send_reasoning'):
+            body.pop('reasoning', None)
     body = constitution.with_rules(body)
+    source = provider.get('provider') if provider and is_custom else 'openrouter'
+    base_url = provider.get('base_url') if is_custom else OPENROUTER_CHAT_COMPLETIONS_URL
+    api_key = None
+    if is_custom:
+        key_env = provider.get('api_key_env') or ''
+        api_key = (_load_env().get(key_env) if key_env else None)
+    else:
+        api_key = OPENROUTER_API_KEY
+
     def _post_once(payload):
+        headers = {'Content-Type': 'application/json'}
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
         req = urllib.request.Request(
-            'https://openrouter.ai/api/v1/chat/completions',
+            base_url,
             data=json.dumps(payload).encode(),
-            headers={
-                'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-                'Content-Type': 'application/json',
-            },
+            headers=headers,
             method='POST',
         )
         return json.loads(_urlopen_with_resilience(req, timeout=30))
@@ -611,11 +685,12 @@ def _openrouter_chat_post(body):
         try:
             result = _post_once(payload)
         except Exception as error:
-            training_capture.record('openrouter', payload, error=error,
+            training_capture.record(source, payload, error=error,
                                     duration_ms=int((time.monotonic() - start) * 1000))
             raise
         duration_ms = int((time.monotonic() - start) * 1000)
-        training_capture.record('openrouter', payload, result,
+        _apply_provider_cost(result, provider)
+        training_capture.record(source, payload, result,
                                 duration_ms=duration_ms)
         # BP-63: the same wall-clock measurement feeds the tier pick's
         # speed tie-break. Only successful POSTs count -- a failed call's
@@ -632,13 +707,14 @@ def _openrouter_chat_post(body):
             detail = e.read().decode('utf-8', 'ignore').lower()
         except Exception:
             pass
-        if e.code == 402:
+        if e.code == 402 and not is_custom:
             _set_credits_pause(True, source='openrouter_402')
         if e.code != 400 or 'reasoning is mandatory' not in detail:
             # Availability-class failure of a SELECTED tier model queues a
             # re-pick (see _queue_tier_recheck_if_availability); transient
             # errors are ignored there and owned by retry/circuit-breaker.
-            _queue_tier_recheck_if_availability(body.get('model'), e.code, detail)
+            if not is_custom:
+                _queue_tier_recheck_if_availability(body.get('model'), e.code, detail)
             if any(marker in detail for marker in _AVAILABILITY_ERROR_MARKERS):
                 e.availability_failure = True
             raise
@@ -652,9 +728,10 @@ def _openrouter_chat_post(body):
                 detail2 = e2.read().decode('utf-8', 'ignore').lower()
             except Exception:
                 pass
-            if e2.code == 402:
+            if e2.code == 402 and not is_custom:
                 _set_credits_pause(True, source='openrouter_402')
-            _queue_tier_recheck_if_availability(body.get('model'), e2.code, detail2)
+            if not is_custom:
+                _queue_tier_recheck_if_availability(body.get('model'), e2.code, detail2)
             if any(marker in detail2 for marker in _AVAILABILITY_ERROR_MARKERS):
                 e2.availability_failure = True
             raise
@@ -662,11 +739,13 @@ def _openrouter_chat_post(body):
 
 def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
                                reasoning_override=None):
-    if credits_pause_active():
+    provider = _model_provider_for(model)
+    is_custom = bool(provider and provider.get('is_custom'))
+    if not is_custom and credits_pause_active():
         raise OpenRouterCreditsPaused('OpenRouter credits are exhausted; work is paused until the balance is restored')
-    if _think_tank_spend_cap_exceeded():
+    if (not is_custom or _provider_is_billable(provider)) and _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
-    if _api_key_is_broken('openrouter'):
+    if not is_custom and _api_key_is_broken('openrouter'):
         raise RuntimeError('OpenRouter API key is blocked after repeated auth failures -- swap the key in .env and reload env')
     if is_model_circuit_broken(model):
         raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
@@ -681,7 +760,8 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
     # _openrouter_chat_post's capped retry.
     if reasoning_override is not None:
         reasoning = reasoning_override
-    elif model in (_coding_tier_slug(), _high_tier_slug(), _mid_tier_slug(), _reasoning_tier_slug()):
+    elif model in (_coding_tier_slug(), _high_tier_slug(), _mid_tier_slug(),
+                   _reasoning_tier_slug(), _3d_tier_slug()):
         reasoning = {'max_tokens': max_tokens // 2}
     else:
         reasoning = {'enabled': False}
@@ -694,7 +774,7 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
                 result = recovered
     except urllib.error.HTTPError as e:
         record_model_result(model, success=False)
-        if e.code in (401, 403):
+        if e.code in (401, 403) and not is_custom:
             _note_api_key_failure('openrouter', e.code)
         if (getattr(e, 'availability_failure', False)
                 and _fallback_depth < TIER_FALLBACK_MAX_DEPTH):
@@ -710,7 +790,8 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
         record_model_result(model, success=False)
         raise
     record_model_result(model, success=True)
-    _note_api_key_success('openrouter')
+    if not is_custom:
+        _note_api_key_success('openrouter')
     return result
 
 
@@ -794,11 +875,13 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     resilience + model-result bookkeeping as the plain call -- the tool loop
     is a real model consumer, so it earns the same protections. Returns the
     parsed OpenRouter JSON document."""
-    if credits_pause_active():
+    provider = _model_provider_for(model)
+    is_custom = bool(provider and provider.get('is_custom'))
+    if not is_custom and credits_pause_active():
         raise OpenRouterCreditsPaused('OpenRouter credits are exhausted; work is paused until the balance is restored')
-    if _think_tank_spend_cap_exceeded():
+    if (not is_custom or _provider_is_billable(provider)) and _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
-    if _api_key_is_broken('openrouter'):
+    if not is_custom and _api_key_is_broken('openrouter'):
         raise RuntimeError('OpenRouter API key is blocked after repeated auth failures -- swap the key in .env and reload env')
     if is_model_circuit_broken(model):
         raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
@@ -821,7 +904,8 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     # A mandatory-reasoning model that rejects the disabled override is
     # recovered by _openrouter_chat_post's capped retry.
     reasoning = {'enabled': False}
-    if model in (_coding_tier_slug(), _high_tier_slug(), _mid_tier_slug(), _reasoning_tier_slug()):
+    if model in (_coding_tier_slug(), _high_tier_slug(), _mid_tier_slug(),
+                 _reasoning_tier_slug(), _3d_tier_slug()):
         if max_tokens is not None:
             reasoning = {'max_tokens': max_tokens // 2}
     body['reasoning'] = reasoning
@@ -833,7 +917,7 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
                 result = recovered
     except urllib.error.HTTPError as e:
         record_model_result(model, success=False)
-        if e.code in (401, 403):
+        if e.code in (401, 403) and not is_custom:
             _note_api_key_failure('openrouter', e.code)
         if (getattr(e, 'availability_failure', False)
                 and _fallback_depth < TIER_FALLBACK_MAX_DEPTH):
@@ -849,5 +933,6 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
         record_model_result(model, success=False)
         raise
     record_model_result(model, success=True)
-    _note_api_key_success('openrouter')
+    if not is_custom:
+        _note_api_key_success('openrouter')
     return result

@@ -22,6 +22,21 @@ class ModelConfigTest(unittest.TestCase):
         problems, _ = model_config.validate(config)
         self.assertTrue(any('quality_floor_gap.default' in p for p in problems))
 
+    def test_alias_band_is_valid_without_a_tier_row(self):
+        config = json.loads(json.dumps(self.config))
+        self.assertEqual(config['band_aliases']['3d'], 'coding')
+        problems, _ = model_config.validate(config)
+        self.assertEqual(problems, [])
+
+    def test_alias_cycle_and_unknown_target_are_reported(self):
+        config = json.loads(json.dumps(self.config))
+        config['band_aliases'] = {'3d': '3d'}
+        problems, _ = model_config.validate(config)
+        self.assertTrue(any('alias points at itself' in p for p in problems))
+        config['band_aliases'] = {'3d': 'nope'}
+        problems, _ = model_config.validate(config)
+        self.assertTrue(any('alias target' in p for p in problems))
+
     def test_overlapping_price_bands_are_reported(self):
         config = json.loads(json.dumps(self.config))
         config['price_bands']['mid'] = [0.4, 5]

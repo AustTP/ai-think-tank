@@ -269,6 +269,19 @@ human-only pool. Fixes the prior 204,000-request escalation storm.
 | High | HLE | deepseek-v4-pro-0813 | ~$4.60 | Heavily gated by JEV + monthly budget. Only for high-stakes planning |
 | Coding | SWE-bench | qwen3-coder | $1.30 | Deterministic: any code/review/qa task uses this tier, no JEV |
 | Vision | MMMU | qwen3-vl | $0.75 | Deterministic capability axis: screenshot/image reading |
+| 3D | Coding alias | coding band | coding price | 3D modeling; aliases to coding until a dedicated model or provider override exists |
+
+### Operator provider overrides
+
+`world/model_providers.json` can replace any band, or every band through
+`default`, with a custom OpenAI-compatible chat-completions endpoint. Each
+entry sets `base_url`, `model`, `api_key_env`, `price_per_m`, and
+`send_reasoning`. A non-empty `base_url` uses that endpoint and key. An empty
+`base_url` keeps OpenRouter transport and only swaps the model slug. Custom
+endpoints skip OpenRouter credit and key gates. A positive `price_per_m` still
+respects the global spend cap; a zero-price local endpoint does not. Cost comes
+from `usage.cost` or `price_per_m`. Band aliases in `model_bands.json`
+(currently `3d` to `coding`) are skipped by refresh and followed at call time.
 
 ### Tier refresh (every 2 hours)
 

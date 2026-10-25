@@ -54,6 +54,7 @@ def test_supervisor_tick(monkeypatch):
     monkeypatch.setitem(__import__('sys').modules, 'sim', fake)
     assert g.supervisor_tick(state, now_ms=100000) == 1
     assert state['tasks']['a']['blockerBugId']
+    assert not g.admin_change_request_enabled(state)
     assert g.supervisor_tick(state, now_ms=100000) == 0
     # mode drain and cooldown
     state['automation']['mode'] = 'drain'

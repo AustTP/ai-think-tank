@@ -236,6 +236,8 @@ MAILBOX_ARCHIVE_KEEP_COUNT = 50
 # because this is a per-card ceiling, not a daily budget.
 _TASK_BUDGET_USD = {
     'code': 0.50,
+    '3d': 0.50,
+    '3d-modeling': 0.50,
     'bug': 0.50,
     'review': 0.40,
     'qa': 0.40,

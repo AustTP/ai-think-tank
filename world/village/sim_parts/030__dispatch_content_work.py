@@ -672,6 +672,8 @@ def _band_for_work_item(item):
     there. Used only by the tier throttle; a wrong guess just means the
     item is held or admitted one band off, never lost."""
     tt = item.get('taskType') or 'code'
+    if tt in ('3d', '3d-modeling'):
+        return '3d'
     if tt in ('code', 'review', 'qa'):
         return 'coding'
     return 'mid'

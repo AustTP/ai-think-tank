@@ -19,7 +19,8 @@
     "sublow": "Short, bounded test scenarios run at scale (hundreds of reenactment/testing agents): brief in-character replies, throwaway probes, simple narration. The cheapest model that is still coherent -- hard per-model price ceiling, coherence is the bar, not depth. Never for real deliverables or long-running narrative work, where the coherence loss shows.",
     "mid": "Judgment calls: classifying report severity, generating a new hire's onboarding file, deciding what belongs in an agent's own notes. Needs real reasoning, moderate cost is fine.",
     "coding": "Writing and reviewing real code (Code Reviewer, and any role that writes code). Correctness of generated code is the whole job here.",
-    "high": "Breaking a large, vague request into as many concrete, well-scoped subtasks as the work actually requires (never a fixed count -- a small ask may be one card, a sprawling one many) and deciding how work is distributed (assignBigTask). Runs once per real request, and every downstream call depends on this one being right -- a bad decomposition wastes everything after it, so this is the band to spend on."
+    "high": "Breaking a large, vague request into as many concrete, well-scoped subtasks as the work actually requires (never a fixed count -- a small ask may be one card, a sprawling one many) and deciding how work is distributed (assignBigTask). Runs once per real request, and every downstream call depends on this one being right -- a bad decomposition wastes everything after it, so this is the band to spend on.",
+    "3d": "3D modeling work: building, editing, and reviewing three-dimensional scenes or assets. Until a dedicated 3D model is configured, this band routes to coding so the tank can produce the code that builds the scene."
   },
   "band_benchmark": {
     "low": [
@@ -42,6 +43,9 @@
     ],
     "vision": [
       "MMMU"
+    ],
+    "3d": [
+      "coding_index"
     ]
   },
   "quality_floor_gap": {
@@ -52,5 +56,8 @@
     "high": "High-stakes, one-shot planning or decomposition where getting it wrong wastes every downstream step (e.g. breaking one large vague request into the subtasks everything else depends on).",
     "mid": "Needs real multi-step reasoning or judgment: synthesis, classification, summarization of gathered material, a considered in-character reply. Routine but non-trivial thinking.",
     "low": "Routine, cheap work: a short reply, simple extraction, or a one-line note where the cheap tier is plenty."
+  },
+  "band_aliases": {
+    "3d": "coding"
   }
 }

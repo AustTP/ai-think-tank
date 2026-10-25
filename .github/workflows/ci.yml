@@ -39,6 +39,9 @@ jobs:
       - name: Module boundaries
         run: python scripts/check_module_boundaries.py
 
+      - name: Business process map
+        run: python scripts/check_business_processes.py
+
       - name: Eval cases
         run: python evals/run_evals.py --dry-run
 

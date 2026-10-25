@@ -37,7 +37,9 @@ This document describes what the think tank does, in what order, who owns each
 step, which control gates each step, and which records each step leaves behind.
 It is written for process review, not for code review. The code remains the
 authoritative source. Where this document and the code disagree, the code wins
-and this document should be corrected.
+and this document should be corrected. A `Last checked` date records the last
+review pass, not a claim that every step was re-read. Section 16 lists the
+points still open.
 
 Each process has an ID (`BP-nn`). Use the IDs when proposing changes so a
 review comment points at one process, not at a whole subsystem.
@@ -419,6 +421,8 @@ Owner request
 
 ### BP-01 Player request intake and routing
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Turn one free-text owner message into one correctly owned piece of
 work.
 
@@ -469,6 +473,8 @@ follow-up keeps context. A caller that passes no session id is still stateless.
 
 ### BP-02 Agent work requests
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Let an agent propose work without letting it write straight into a
 sprint.
 
@@ -492,9 +498,13 @@ Requests are capped per ceremony (`REFINEMENT_MAX_REQUESTS = 20`).
 agent that just finished a real deliverable in a valued room may earn one
 self-filed spike per week. The tank-wide cap is three per week. The spike is
 tagged `moonshot`, skips refinement and the peer gate, and is time-boxed. Both
-caps and the room dedup live in `_file_free_spike`.
+caps and the room dedup live in `_file_free_spike`. The queued spike carries a
+stable `auditId` (`free-spike:<week>:<agent>:<room>`) and the governance record
+repeats it, so the weekly allowance can be traced without trusting the prose.
 
 ### BP-03 Backlog refinement
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Groom raw requests into stories a team can actually execute.
 
@@ -522,6 +532,8 @@ guard, per-team slot.
 decision tape.
 
 ### BP-04 Large-request breakdown
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Turn a large, staffable ask into sized stories and spikes.
 
@@ -551,6 +563,8 @@ status transitions, active-sprint guard, request cap, JEV decider.
 
 ### BP-05 New-team spawn
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Add capacity when a large request cannot be staffed by existing
 teams.
 
@@ -571,6 +585,8 @@ in an active sprint.
 **Records.** Roster, teams, `_pendingOnboard`, `_onboardQueue`, action log.
 
 ### BP-06 Sprint lifecycle
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Give a team a bounded delivery window with measured output.
 
@@ -609,6 +625,8 @@ record.
 
 ### BP-07 Assignment and on-call
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Match due work to a free agent without double-booking or spending
 on gated work.
 
@@ -646,6 +664,8 @@ rotation, direct route.
 **Records.** `workQueue`, `tasks`, agent state, action log.
 
 ### BP-08 Task execution
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Produce the deliverable in the room that owns the work.
 
@@ -714,6 +734,8 @@ tape, `stagedWorkspace`, `previousWorkspace`, `sourceDigest`, `writtenPy`,
 
 ### BP-09 Peer review
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Make a deliverable survive hostile review before it ships.
 
 **Scope.** Deliverable rooms only. Exempt lanes: `spike`, `bug`, `research`,
@@ -765,6 +787,8 @@ be reached, the gate stays open and the cycle cap escalates it.
 
 ### BP-10 Failure handling and send-back
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Turn a rejection into a fix and a reusable rule.
 
 **Steps.**
@@ -805,6 +829,8 @@ signature stop, evidence-anchored repair instructions, escalation.
 
 ### BP-11 Completion, report, and feedback
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Close the card, tell the owner, and feed the result back into the
 next task.
 
@@ -827,6 +853,8 @@ card, bounded feedback buffer.
 **Records.** `task_archive`, `playerInbox`, email outbox, feedback buffer.
 
 ### BP-12 Product build and release
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Turn work into a versioned, releasable product.
 
@@ -852,6 +880,8 @@ after the filesystem write, status transition rules.
 
 ### BP-13 Roadmap recompute
 
+**Last checked:** 2026-10-25
+
 **Trigger.** Weekly stamp.
 
 **Steps.**
@@ -868,6 +898,8 @@ charter alignment.
 
 ### BP-14 Consensus relay
 
+**Last checked:** 2026-10-25
+
 **Trigger.** Weekly stamp, after the roadmap.
 
 **Steps.**
@@ -879,6 +911,8 @@ charter alignment.
 **Output.** `consensusRelay` line.
 
 ### BP-15 Retrospective and velocity
+
+**Last checked:** 2026-10-25
 
 **Trigger.** A sprint closes.
 
@@ -897,6 +931,8 @@ injectable decider.
 
 ### BP-16 Knowledge social
 
+**Last checked:** 2026-10-25
+
 **Trigger.** Weekly stamp.
 
 **Steps.**
@@ -914,6 +950,8 @@ decider.
 
 ### BP-17 Meetings
 
+**Last checked:** 2026-10-25
+
 **Trigger.** A queued meeting.
 
 **Steps.**
@@ -930,6 +968,8 @@ decider.
 
 ### BP-18 Charter
 
+**Last checked:** 2026-10-25
+
 **Trigger.** The owner or a director sets a charter.
 
 **Steps.**
@@ -944,6 +984,8 @@ decider.
 **Output.** `charter`, charter note, roadmap alignment.
 
 ### BP-19 Hiring and onboarding
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Add an agent when the tank has work and a team needs capacity.
 
@@ -988,6 +1030,8 @@ spawn queues its members behind the live ceremony instead of overwriting it.
 
 ### BP-20 Firing review
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Remove an agent only when a corroborated problem exists.
 
 **Trigger.** Governance pass, cooldown 60 seconds, idle gate passed.
@@ -1020,6 +1064,8 @@ two-reviewer gate, consultation, JEV with deterministic fallback.
 
 ### BP-21 Coaching and growth
 
+**Last checked:** 2026-10-25
+
 **Trigger.** A task's trailing grade falls below the floor.
 
 **Steps.**
@@ -1036,6 +1082,8 @@ two-reviewer gate, consultation, JEV with deterministic fallback.
 **Records.** `growthPlans`, coaching notes, action log.
 
 ### BP-22 Rule mining
+
+**Last checked:** 2026-10-25
 
 **Trigger.** Weekly stamp.
 
@@ -1055,6 +1103,8 @@ two-reviewer gate, consultation, JEV with deterministic fallback.
 
 ### BP-23 Success mining
 
+**Last checked:** 2026-10-25
+
 **Trigger.** Weekly stamp.
 
 **Steps.**
@@ -1069,6 +1119,8 @@ two-reviewer gate, consultation, JEV with deterministic fallback.
 
 ### BP-24 Archive distillation
 
+**Last checked:** 2026-10-25
+
 **Trigger.** Weekly stamp.
 
 **Steps.**
@@ -1081,6 +1133,8 @@ two-reviewer gate, consultation, JEV with deterministic fallback.
 **Output.** Wiki page, provenance row.
 
 ### BP-25 Adversarial village
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Run two independent attempts at the same goal and compare.
 
@@ -1105,6 +1159,8 @@ completion check.
 
 ### BP-26 Research topics and watchlist
 
+**Last checked:** 2026-10-25
+
 **Trigger.** Owner schedule lane, watchlist seed, or a long-horizon topic.
 
 **Steps.**
@@ -1126,6 +1182,8 @@ overlap, review-gated coverage, bounded seen-URL list.
 
 ### BP-27 Standing tasks
 
+**Last checked:** 2026-10-25
+
 **Trigger.** A declaration in `state['standingTasks']` becomes due.
 
 **Steps.**
@@ -1135,7 +1193,7 @@ overlap, review-gated coverage, bounded seen-URL list.
    total caps, team.
 2. A malformed declaration is skipped. One bad record never wedges the sweep.
 3. If the declaration names `script`, run that repo-relative `scripts/*.py`
-   under a timeout and do NOT queue an agent card. This is the preferred lane
+   under a timeout and do NOT queue an agent card. This is the default lane
    for mechanical recurring work. The script may print one JSON line with
    `{"notify": true, "summary": "..."}`; only then does the tank queue one
    judgment card, optionally pinned to `notifyAgent`. Scripts never wake an
@@ -1151,6 +1209,8 @@ timeout, per-task runtime state, bounded caps.
 for script runs).
 
 ### BP-28 Pipelines
+
+**Last checked:** 2026-10-25
 
 **Trigger.** Pipeline cadence due.
 
@@ -1171,6 +1231,8 @@ validation.
 
 ### BP-29 One-off schedules
 
+**Last checked:** 2026-10-25
+
 **Trigger.** Owner names a day and time.
 
 **Steps.**
@@ -1190,6 +1252,8 @@ gate, idle gate.
 
 ### BP-30 Skill review and distillation
 
+**Last checked:** 2026-10-25
+
 **Trigger.** 30-minute cadence, content-gated.
 
 **Steps.**
@@ -1208,6 +1272,8 @@ gate, idle gate.
 
 ### BP-31 Incidents and bugs
 
+**Last checked:** 2026-10-25
+
 **Trigger.** The owner reports a live failure through the Telegram lane or the
 intent endpoint.
 
@@ -1224,6 +1290,8 @@ intent endpoint.
    bare "fixed it" or a restore note with no command closes loud -- marked
    unverified, the on-call is told what was missing, and the owning team's
    scrum master gets the same bounded escalation an abandoned incident rides.
+   This close probe is the post-fix review; a peer vote is not required for a
+   bug, because the evidence check is the quality control.
 6. An open incident past the restore window escalates to the product team's
    scrum master.
 7. Bugs are not peer-gated. They complete directly.
@@ -1240,6 +1308,8 @@ answers the verification gap mechanically at close time. A restore note is
 only evidence when the command that produced it is attached.
 
 ### BP-32 Page probes, screenshots, and browser act
+
+**Last checked:** 2026-10-25
 
 **Trigger.** Agent tool call.
 
@@ -1294,6 +1364,8 @@ status (`imageCropped`, `noticeSent`).
 
 ### BP-33 Device check-in
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Give the owner's phone a durable ingestion pipe for ambient
 context, with no fixed schema, so a future signal never needs the endpoint
 redesigned.
@@ -1335,6 +1407,8 @@ should be before the buffer fills with data nobody reads.
 
 ### BP-34 Wiki lifecycle
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Keep shared memory versioned, scoped, and reviewable.
 
 **Write paths.**
@@ -1372,6 +1446,8 @@ provenance, approval gate for proposals.
 
 ### BP-35 Memory provenance
 
+**Last checked:** 2026-10-25
+
 **Trigger.** Every shared-memory write.
 
 **Steps.**
@@ -1384,6 +1460,8 @@ provenance, approval gate for proposals.
 **Output.** `memoryLedger` row.
 
 ### BP-36 Evidence and coverage review
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Separate "we found something" from "we can say it is true."
 
@@ -1440,6 +1518,8 @@ citation ledger.
 
 ### BP-37 Research desk passes
 
+**Last checked:** 2026-10-25
+
 **Trigger.** Every scheduled research run.
 
 **Steps.**
@@ -1457,6 +1537,8 @@ citation ledger.
 **Output.** Synthesis, skill file update, evidence rows, observation rows.
 
 ### BP-38 Library and file access
+
+**Last checked:** 2026-10-25
 
 **Library.**
 
@@ -1491,6 +1573,8 @@ ownership, player-only grant API.
 
 ### BP-39 Skill publishing
 
+**Last checked:** 2026-10-25
+
 **Trigger.** A spike or review produces a reusable method.
 
 **Steps.**
@@ -1509,6 +1593,8 @@ ownership, player-only grant API.
 **Records.** Skill file, scan result, review outcome, action log.
 
 ### BP-40 Conversation memory
+
+**Last checked:** 2026-10-25
 
 **Scope.** The Telegram bridge and the public `/api/intent/ask` lane. The public
 lane keys memory by agent (`player-ask:<agent>`) or by `player-ask:any` when no
@@ -1550,6 +1636,8 @@ filter, redaction, consolidation cap, TTL.
 
 ### BP-41 Decision cache and tape
 
+**Last checked:** 2026-10-25
+
 **Cache.**
 
 - Key: model, configured chain, state, questions.
@@ -1577,6 +1665,8 @@ filter, redaction, consolidation cap, TTL.
 ## 8. Money and resources
 
 ### BP-42 Bank ledger and budget gates
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Attribute every dollar to a service and stop spend at the cap.
 
@@ -1615,6 +1705,8 @@ cap, rollup exclusion, baseline, fail-closed gates, UTC forecast.
 
 ### BP-43 Model tier selection
 
+**Last checked:** 2026-10-25
+
 **Bands.**
 
 | Band | Benchmark | Purpose |
@@ -1625,6 +1717,7 @@ cap, rollup exclusion, baseline, fail-closed gates, UTC forecast.
 | High | HLE | Heavily gated planning, price ceiling and monthly cap |
 | Coding | SWE-bench | Deterministic for code, review, QA |
 | Vision | MMMU | Deterministic for image reading |
+| 3D | Coding alias | 3D modeling; aliases to Coding until a dedicated model or provider override exists |
 
 **Selection logic.**
 
@@ -1636,20 +1729,39 @@ cap, rollup exclusion, baseline, fail-closed gates, UTC forecast.
 5. The high band also enforces a price ceiling and a monthly budget. The
    budget defaults to $5; 0 disables it only by explicit operator choice.
 6. The sub-low band enforces a hard price ceiling.
+7. A band may alias another band. `model_bands.json` `band_aliases` currently
+   maps `3d` to `coding`. Alias bands are skipped by the refresh and resolve to
+   the target band at call time. A per-band provider override replaces the
+   alias.
+
+**Provider overrides.** `model_providers.json` can point any band, or every
+band through `default`, at an OpenAI-compatible chat-completions endpoint.
+Each entry may set `base_url`, the actual `model` slug to send, `api_key_env`,
+`price_per_m`, and `send_reasoning`. A non-empty `base_url` uses that endpoint
+and its own key; an empty `base_url` keeps OpenRouter as the transport and only
+swaps the model slug. Custom endpoints skip OpenRouter credit and key gates.
+A custom endpoint with a positive `price_per_m` still respects the global
+spend cap; a zero-price local endpoint does not. Usage cost comes from the
+response `usage.cost` when present, otherwise from `price_per_m` and token
+usage. Provider overrides take effect on `POST /api/policy/reload` or a
+restart. One file can hold entries for several providers.
 
 **Per-call gate.**
 
 - Coding task type -> coding tier, no JEV.
+- 3D task type -> 3D tier. It aliases to coding until a provider override exists.
 - Vision work -> vision tier.
 - Latency-sensitive work -> low tier, no JEV call.
-- `best_effort=True` -> high tier when the monthly high-tier budget is not
-  spent, no JEV call. This is an explicit caller lane, not the default.
+- `best_effort=True` -> JEV is asked whether the high band is justified. A
+  high pick still needs confidence and budget headroom. This is a request for
+  JEV consideration, not a bypass.
 - Everything else -> JEV chooses low, mid, or high, with confidence floors.
 - High requires both confidence and budget headroom.
 - An outage or low confidence fails closed to low.
 
-The JEV gate is therefore not universal. Code, vision, latency, and explicit
-best-effort calls bypass it by design. The doc and the control table must say
+The JEV gate is therefore not universal. Code, vision, and latency calls
+bypass it by design. Best-effort calls do not bypass it; they set
+`allow_high=True` and let JEV decide. The doc and the control table must say
 which lanes are gated rather than claiming every call is.
 
 **Refresh.** A full re-pick of every band every 2 hours, as a governance task.
@@ -1671,12 +1783,15 @@ point. A one-shot boot backfill fills the table if it is empty.
 
 **Controls.** Cited scores, quality floor, cheapest pick, test call, price
 ceilings, monthly cap, JEV gate, fail-closed, ranked fallback depth, circuit
-breaker.
+breaker, band aliases, provider overrides.
 
 **Records.** `model_tiers`, `model_tier_fallbacks`,
-`model_benchmark_scores`, decision tape, `tier_model_fallback` action.
+`model_benchmark_scores`, decision tape, `tier_model_fallback` action,
+`model_providers.json` operator overrides.
 
 ### BP-44 Experiment grants
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Let a notebook spend on a fixed model without holding the
 OpenRouter key.
@@ -1704,6 +1819,8 @@ actual-cost cutoff, token hash storage, revocation.
 
 ### BP-45 Task budgets and overruns
 
+**Last checked:** 2026-10-25
+
 **Steps.**
 
 1. Every task gets a model-spend ceiling from its type and band.
@@ -1725,6 +1842,8 @@ factor.
 
 ### BP-46 Page request budget
 
+**Last checked:** 2026-10-25
+
 **Steps.**
 
 1. Each browse fetch and each Tavily search counts as one page request.
@@ -1743,6 +1862,8 @@ oversight loops that catch what slips past.
 
 ### BP-47 JEV decision gates
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Put every consequence-bearing choice through one typed classifier.
 
 **Steps.**
@@ -1757,8 +1878,21 @@ oversight loops that catch what slips past.
 actionable, escalation approve/deny, refinement accept/reject, firing
 keep/fire, social carryaway, governance picks, Colab shard gate, request
 routing, failure classification, player-ask gate, and the model tier gate on
-the non-latency, non-best-effort path. Code, vision, latency, and explicit
-best-effort tier picks do not call JEV.
+the non-latency path, including best-effort requests. Code, vision, and
+latency tier picks do not call JEV.
+
+**Deterministic exceptions.** These choices do not call JEV, by design:
+
+- Coding, vision, and latency tier picks. The lane already fixes the band.
+- Free-spike intake and its weekly cap. Filing is mechanical; the refinement
+  ceremony that follows is JEV-gated.
+- Incident restore close. The evidence rule decides, not a model vote.
+- Owner approvals and plan approvals. Human authority is the gate.
+- Budget and spend caps. A spent cap fails closed; no model gets a vote.
+
+Every other consequence-bearing choice in this document is JEV-gated. If a new
+choice cannot be described as one of these deterministic lanes, route it
+through JEV.
 
 **Low-confidence allow chain.** A low-confidence JEV allow is uncertainty,
 not a verdict. `180_director_second_opinion.py` asks the immediate director,
@@ -1772,6 +1906,8 @@ cache.
 **Records.** Decision tape, action log, spend ledger.
 
 ### BP-48 Escalation and delegated approval
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Let a director resolve routine approvals while keeping high-risk
 decisions human-only.
@@ -1826,6 +1962,8 @@ visible.
 
 ### BP-49 Player input asks
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Let an agent ask the owner only when internal recovery has failed.
 
 **Steps.**
@@ -1852,6 +1990,8 @@ overflow logged as `player_ask_dropped`, terminal-status supersede.
 issue `blocked` and `needsInput`, `player_ask_dropped` action.
 
 ### BP-50 Credential vault and capability handles
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Let an agent use a service without ever holding its secret.
 
@@ -1920,6 +2060,8 @@ login fields, player-only TOTP actions, single-use code grants.
 
 ### BP-51 API service proposals
 
+**Last checked:** 2026-10-25
+
 **Steps.**
 
 1. An agent proposes a service spec.
@@ -1935,6 +2077,8 @@ approval.
 **Records.** `api_services.json`, escalation, action log.
 
 ### BP-52 Browse, command, egress, and VPN
+
+**Last checked:** 2026-10-25
 
 **Browse.**
 
@@ -1987,6 +2131,8 @@ Safari cookie sync, read-only social policy, VPN conflict check.
 
 ### BP-52.1 Owner-identity data and retention
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Name every process that handles the owner's identity or personal
 media, and state the consent basis and retention rule instead of leaving it
 implicit.
@@ -2023,6 +2169,8 @@ tank secrets, explicit revoke paths.
 device check-ins, `tank_accounts`.
 
 ### BP-53 File and app grants
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Give the owner a working control surface for what agents may
 touch on the local machine. BP-38 describes enforcement during tool use; this
@@ -2070,6 +2218,8 @@ argue its way into a scope; it can only ask the owner for a wider grant.
 
 ### BP-54 Prompt-injection boundaries
 
+**Last checked:** 2026-10-25
+
 **Steps.**
 
 1. Wrap all external content with a nonce and HMAC boundary marker.
@@ -2084,6 +2234,8 @@ argue its way into a scope; it can only ask the owner for a wider grant.
 **Records.** Wrapped content, verification result, refused-call action.
 
 ### BP-55 Audit, retention, and backups
+
+**Last checked:** 2026-10-25
 
 **Records.**
 
@@ -2146,6 +2298,8 @@ kept. The retention value remains operator-settable in `operator_policy.json`.
 
 ### BP-56 Health monitoring
 
+**Last checked:** 2026-10-25
+
 **Trigger.** Every 300 seconds.
 
 **Steps.**
@@ -2199,6 +2353,8 @@ and the dormancy lifecycle.
 
 ### BP-57 Player feedback
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Let the owner rate delivered work so the rating reaches the exact
 agent that produced it.
 
@@ -2226,6 +2382,8 @@ check, overwrite on resubmit.
 
 ### BP-58 Peer help signals
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Notice a worker whose recent activity is out of line and tell that
 worker's director, without writing a performance report.
 
@@ -2252,6 +2410,8 @@ staleness dedup, no report write, no firing weight.
 that distinction clear if the signal data is ever surfaced in a review.
 
 ### BP-59 Dormancy and wake
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Stop all spend and churn when nobody is around, without giving up
 the port, the wake path, or the security sweeps.
@@ -2298,6 +2458,8 @@ sleeps and does not wake it. That matches the endpoint's contract: pure
 telemetry never produces work (BP-33).
 
 ### BP-60 Code self-edits and dormancy windows
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Give the think tank a governed path to improve its OWN code:
 propose a precise splice, pass independent review and sandboxed validation,
@@ -2395,6 +2557,13 @@ duration of 5-240 minutes (default 15). The chain is strict:
    tank dormant to the end of the slot. A window missed while the server
    was down is recorded `missed`. The player or chief of staff agent can cancel a
    window before it fires.
+
+**Approval scope.** The director+admin chain is opt-in through
+`governance.changeRequestAdminApproval`; it is not a blanket default. The
+supervisor tick does not switch it on. High-risk requests add the window-only
+rule, the manifest match, and the pre-apply repo gate on top of whatever
+approval chain is active. Do not turn the flag on globally just to satisfy a
+single high-risk change.
 
 **Change-request detail fields (2026-10-22).** The slot is only part of
 the request. Every request carries a title, description, change type
@@ -2572,6 +2741,8 @@ dormancy. The superset design lives in the selfedit.py docstring.
 
 ### BP-61 Governed policy knob edits
 
+**Last checked:** 2026-10-25
+
 One of the 108 operator-policy knobs is DATA, not code: the player and the
 agents share it, and changing it never needs a restart or a dormancy
 window.
@@ -2612,6 +2783,8 @@ modules mid-tick. A policy value is a number the next loop iteration reads;
 the tick boundary is irrelevant and the change is one JSON write.
 
 ### BP-62 Cross-team card responses
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Close the loop for tickets. An agent who reports a bug or asks
 another team's tool for a feature hears the outcome from the owning team
@@ -2657,6 +2830,8 @@ backlogRequests status fields stay the queryable source of truth, with the
 appeal stamped on the request record (`appealedAt`, `appeal`).
 
 ### BP-63 Speed tie-break in tier picks
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Stop a cheap-but-slow model from winning a band purely on
 price when an equally scored, slightly pricier model answers far faster.
@@ -2710,6 +2885,8 @@ those picks, so absence stays honest.
 
 ### BP-64 Photo review
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Turn a photo the owner took into a grounded text note, either on
 demand or only for new additions to one iPhone album.
 
@@ -2757,6 +2934,8 @@ one-shot key rotation.
 
 ### BP-65 Durable confirmations
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Keep a model from turning "a user asked" into a real write without
 a separate, owner-approved step that survives a restart.
 
@@ -2787,6 +2966,8 @@ action log `confirmation_proposed` / `confirmation_confirmed` /
 `confirmation_cancelled` / `confirmation_required`.
 
 ### BP-66 Plan approval gate
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Make a large request cheap to revise and hard to apply by accident.
 
@@ -2820,6 +3001,8 @@ apply, status machine, TTL, supersede on revision, audit actor and reason.
 
 ### BP-67 Agent trace visibility
 
+**Last checked:** 2026-10-25
+
 **Purpose.** Let an operator or director reconstruct what one agent actually
 did, without reading the whole database.
 
@@ -2845,6 +3028,8 @@ no secret fields.
 writes no new table.
 
 ### BP-68 Agent writing style
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Keep agent prose plain and free of AI tells in thinking, peer
 messages, player replies, and outside communication.
@@ -2878,6 +3063,8 @@ insertion, final dash sanitizer, no change to facts or code.
 code records. Style checks do not write a new table.
 
 ### BP-69 Read-only live project inspection
+
+**Last checked:** 2026-10-25
 
 **Purpose.** Give directors and the chief of staff bounded evidence from the
 live repository without giving them write access or a shell.
@@ -2947,6 +3134,7 @@ chief-only artifact search, no secret access, audit row.
 | Per-service cap | Service overspend | Cap hit -> service gate refuses | Bank view |
 | Tier gate | Expensive model use | Low confidence -> low tier | Decision tape |
 | Tier fallback | A delisted model stops work | Availability error -> next ranked model | `model_tier_fallbacks` |
+| Tier bypass lanes | Expensive model use outside JEV | Only coding, vision, and latency lanes skip JEV; every other band choice, including best-effort, is JEV-gated | Decision tape |
 | High-tier monthly cap | Expensive model use | Cap hit -> mid tier | Spend ledger |
 | Peer gate | Deliverable quality | Reject -> fix task and re-review | Peer gate record |
 | Review cycle cap | Infinite review loops | Team policy, default 8 cycles -> freeze and escalate | Gate record |
@@ -3277,7 +3465,7 @@ rather than gate-integrity questions.
 | Standing task | Declared recurring work with schedule rules |
 | STM | Short-term conversation memory |
 | Task cycle | The 6-second read-modify-write pass |
-| Tier | Model band: low, sub-low, mid, high, coding, vision |
+| Tier | Model band: low, sub-low, mid, high, coding, vision, 3d |
 | Verifier | Actor who clears or blocks evidence claims |
 | Village | Identity and memory boundary for agents and pages |
 
@@ -3285,7 +3473,8 @@ rather than gate-integrity questions.
 
 | Setting | Where | Default or note |
 |---|---|---|
-| `OPENROUTER_API_KEY` | `.env` | Required |
+| `OPENROUTER_API_KEY` | `.env` | Required for OpenRouter transport |
+| `model_providers.json` | `world/model_providers.json` | Per-band or default custom endpoint/model overrides |
 | `SPEND_CAP_USD` | `.env` | 50 |
 | `AGENT_SPEND_CAP_USD` | `.env` | 0, disabled |
 | `HIGH_TIER_MONTHLY_BUDGET_USD` | `.env` | 5; 0 explicitly disables the cap |
@@ -3437,6 +3626,8 @@ Use this list when reviewing the document and the process.
 - [ ] Every cadence is documented with its actual code value.
 - [ ] Every owner-facing approval has a visible queue.
 - [ ] Every changed BP section states the date it was verified against code.
+- [ ] Every code change that changes a process updates its BP section in the same change request.
+- [ ] Every consequence-bearing choice outside a named deterministic lane goes through JEV.
 - [ ] Every Appendix C path still exists and still contains the named symbol.
 - [ ] Every single-slot queue is intentional.
 - [ ] Every lane without peer review has another quality control.

@@ -83,6 +83,7 @@ class SpareTimeLane(unittest.TestCase):
         self.assertEqual(item['budgetMs'], sim.FREE_SPIKE_BUDGET_MS)
         self.assertTrue(item['moonshot'])
         self.assertEqual(item['room'], 'pressoffice')
+        self.assertTrue(item['auditId'].startswith('free-spike:'))
         # The findings-only framing: question the premise, no committed deliverable.
         self.assertIn(sim.FREE_SPIKE_PREMISE_GUIDANCE, item['instructions'])
         # Spare time is opportunistic: deferred, not due for assignment yet.

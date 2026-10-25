@@ -39,8 +39,11 @@ def choose_route(purpose, task_type=None, allow_high=False, best_effort=False):
         return {'band': 'low', 'best_of': 1,
                 'reason': 'latency-sensitive call', 'confidence': 'high'}
     if best_effort:
-        return {'band': 'high' if allow_high else 'mid', 'best_of': 3,
-                'reason': 'explicit best-effort lane', 'confidence': 'high'}
+        # A best-effort request is not a high-tier grant. Keep the extra
+        # sample budget, but leave the band to the JEV tier gate.
+        return {'band': 'mid', 'best_of': 3,
+                'reason': 'best-effort request; JEV decides the band',
+                'confidence': 'medium'}
     if allow_high and any(word in text for word in
                           ('plan', 'synthesize', 'investigat', 'analy', 'design',
                            'debug', 'reason', 'break down', 'root cause')):

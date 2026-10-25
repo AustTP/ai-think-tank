@@ -3,7 +3,7 @@
 # root health.py, and the sandbox checkout helper) by running the full pytest
 # suite under coverage. The standalone soak harness is excluded: it is an
 # operator-run failure-injection tool, not imported application code. Run from
-the repo root:
+# the repo root:
 #   bash world/tests/run_cov_all_py.sh
 set -e
 cd "$(dirname "$0")/../.." || exit 1

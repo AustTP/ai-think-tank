@@ -6,6 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 python3 scripts/check_module_boundaries.py
+python3 scripts/check_business_processes.py
 python3 evals/run_evals.py --dry-run
 python3 -m pytest world/tests -q -p no:cacheprovider
 node world/tests/js_coverage.mjs

@@ -640,13 +640,31 @@ async def _telegram_poll_loop():
             await asyncio.sleep(5)
 
 
+def _provider_spec_for_band(band):
+    cfg = MODEL_PROVIDER_OVERRIDES or {}
+    tiers = cfg.get('tiers') or {}
+    return tiers.get(band) or cfg.get('default')
+
+
+def _raw_model_tier_slug(band):
+    alias = (MODEL_BAND_ALIASES or {}).get(band)
+    if alias:
+        return _raw_model_tier_slug(alias)
+    with _db() as conn:
+        row = conn.execute('SELECT slug FROM model_tiers WHERE band = ?', (band,)).fetchone()
+    return row[0] if row else None
+
+
 def _model_tier_slug(band):
     # Generalised band lookup used by the per-band pickers below. Exposed
     # separately so the band-specific wrappers stay individually mockable in
     # tests (mirrors why _mid_tier_slug exists as its own unit).
-    with _db() as conn:
-        row = conn.execute('SELECT slug FROM model_tiers WHERE band = ?', (band,)).fetchone()
-    return row[0] if row else None
+    if _provider_spec_for_band(band):
+        return f'@provider:{band}'
+    alias = (MODEL_BAND_ALIASES or {}).get(band)
+    if alias:
+        return _model_tier_slug(alias)
+    return _raw_model_tier_slug(band)
 
 
 def _tier_fallback_slugs(model, limit=3):
@@ -744,6 +762,12 @@ def _vision_tier_slug():
     # mid tier so reviewScreenshot still degrades (to a plain text review,
     # not a failure) on a machine that refreshed tiers before vision existed.
     return _model_tier_slug('vision') or _mid_tier_slug()
+
+
+def _3d_tier_slug():
+    # The 3D modeling band. Until a dedicated model or provider override is
+    # configured, the band aliases to coding so 3D work still produces code.
+    return _model_tier_slug('3d') or _coding_tier_slug()
 
 
 def _safe_design_reference_name(name):

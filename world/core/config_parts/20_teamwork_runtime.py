@@ -363,6 +363,10 @@ def reload_policy_config():
     BAND_BENCHMARK.clear(); BAND_BENCHMARK.update(_model_bands['band_benchmark'])
     BAND_QUALITY_FLOOR_GAP.clear(); BAND_QUALITY_FLOOR_GAP.update(_model_bands['quality_floor_gap'])
     TIER_GATE_CRITERIA.clear(); TIER_GATE_CRITERIA.update(_model_bands['tier_gate_criteria'])
+    MODEL_BAND_ALIASES.clear(); MODEL_BAND_ALIASES.update(_model_bands.get('band_aliases') or {})
+    _providers = _load_model_providers(MODEL_PROVIDERS_PATH)
+    MODEL_PROVIDER_OVERRIDES.clear()
+    MODEL_PROVIDER_OVERRIDES.update(_providers)
     SECRET_PATTERNS[:] = _load_secret_patterns(REDACTION_PATH)
     TOOL_DESCRIPTIONS.clear()
     TOOL_DESCRIPTIONS.update(_load_tool_descriptions(TOOL_DESCRIPTIONS_PATH))
@@ -413,7 +417,10 @@ def reload_policy_config():
                         'band_purpose': dict(MODEL_BAND_PURPOSE),
                         'band_benchmark': dict(BAND_BENCHMARK),
                         'quality_floor_gap': dict(BAND_QUALITY_FLOOR_GAP),
-                        'tier_gate_criteria': dict(TIER_GATE_CRITERIA)},
+                        'tier_gate_criteria': dict(TIER_GATE_CRITERIA),
+                        'band_aliases': dict(MODEL_BAND_ALIASES)},
+        'model_providers': {'default': dict(MODEL_PROVIDER_OVERRIDES.get('default') or {}),
+                            'tiers': {k: dict(v) for k, v in (MODEL_PROVIDER_OVERRIDES.get('tiers') or {}).items()}},
         'secret_patterns': [p.pattern for p in SECRET_PATTERNS],
         'tool_descriptions': dict(TOOL_DESCRIPTIONS),
         'endpoint_policy': {'extra_non_waking_reads': sorted(NON_WAKING_READS_EXTRA),

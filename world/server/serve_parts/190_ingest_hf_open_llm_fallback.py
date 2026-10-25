@@ -224,6 +224,8 @@ async def refresh_model_tiers():
     chosen = {}
     fallbacks = {}
     for band, purpose in MODEL_BAND_PURPOSE.items():
+        if MODEL_BAND_ALIASES.get(band):
+            continue
         pool = buckets.get(band, [])
 
         # 'coding', 'high' (planning) and 'sublow' all search EVERY price

@@ -12,6 +12,8 @@ def _is_latency_sensitive(purpose, task_type=None):
 
 
 def _slug_for_band(band):
+    if band in ('3d', '3d-modeling'):
+        return _3d_tier_slug() or _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()
     if band == 'coding':
         return _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()
     if band == 'high':
@@ -34,30 +36,32 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None,
 
     Fails CLOSED to low: a JEV outage, a non-binary answer, or a low-confidence
     escalation all keep the cheap tier."""
-    route = policies.choose_route(purpose, task_type, allow_high, best_effort)
-    if policies.apply_enabled():
+    # A best-effort call is a request for JEV to consider the high band, not
+    # a bypass around it. The deterministic coding and latency lanes still
+    # win below; every other best-effort band choice is JEV-gated.
+    wants_best = bool(best_effort)
+    if wants_best:
+        allow_high = True
+    route = policies.choose_route(purpose, task_type, allow_high, False)
+    if not wants_best and policies.apply_enabled():
         band = route['band']
         if band == 'high' and _high_tier_budget_exceeded():
             band = 'mid'
         slug = _slug_for_band(band)
         if slug:
             return slug
-    else:
+    elif not wants_best:
         policies.record_shadow('routing', route,
                                {'purpose': (purpose or '')[:120],
                                 'task_type': task_type})
+    if task_type in ('3d', '3d-modeling'):
+        return _3d_tier_slug() or _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()
     if task_type in ('code', 'review', 'qa'):
         return _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()
     if _is_latency_sensitive(purpose, task_type):
         # Pulse triage and live monitoring are latency work: use the cheap,
         # fast tier and never wait on a JEV escalation call.
         return _low_tier_slug() or _mid_tier_slug()
-    if best_effort:
-        # Explicit best-capability lane: use the high band when it is
-        # configured and the monthly high-tier allowance is not spent.
-        if _high_tier_budget_exceeded():
-            return _mid_tier_slug() or _low_tier_slug()
-        return _high_tier_slug() or _mid_tier_slug() or _low_tier_slug()
     decider = decider or _tier_gate_decider
     try:
         decision, confidence = decider(

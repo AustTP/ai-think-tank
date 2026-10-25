@@ -152,9 +152,12 @@ def test_is_latency_sensitive_task_type():
 def test_resolve_model_tier_latency_and_best_effort(monkeypatch):
     _tier_env(monkeypatch, {'band': 'low', 'best_of': 1}, apply=False)
     assert serve._resolve_model_tier('pulse triage') == 'low'
-    assert serve._resolve_model_tier('write a report', best_effort=True) == 'high'
+    high = lambda *a, **k: ('high', 0.99)
+    assert serve._resolve_model_tier('write a report', best_effort=True,
+                                     decider=high) == 'high'
     monkeypatch.setattr(serve, '_high_tier_budget_exceeded', lambda: True)
-    assert serve._resolve_model_tier('write a report', best_effort=True) == 'mid'
+    assert serve._resolve_model_tier('write a report', best_effort=True,
+                                     decider=high) == 'mid'
 
 
 def test_resolve_model_tier_high_decision_without_budget_cap(monkeypatch):
