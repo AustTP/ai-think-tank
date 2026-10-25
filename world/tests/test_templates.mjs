@@ -82,7 +82,7 @@ context.setTimeout = () => {};
 context.escapeHtml = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
 for (const f of ['agents.js', 'templates.js']) {
-  const src = fs.readFileSync(path.join(worldDir, f), 'utf8');
+  const src = fs.readFileSync(path.join(worldDir, 'js', f), 'utf8');
   vm.runInContext(src, context, { filename: f });
 }
 function setGlobal(name, value) {

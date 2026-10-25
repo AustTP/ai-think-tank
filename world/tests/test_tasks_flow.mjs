@@ -20,7 +20,7 @@ const worldDir = path.join(__dirname, '..');
 
 const context = { console, Math, Date, JSON, Array, Object, Set, Promise, setTimeout, clearTimeout };
 vm.createContext(context);
-vm.runInContext(fs.readFileSync(path.join(worldDir, 'tasks.js'), 'utf8'), context, { filename: 'tasks.js' });
+vm.runInContext(fs.readFileSync(path.join(worldDir, 'js', 'tasks.js'), 'utf8'), context, { filename: 'tasks.js' });
 
 function setGlobal(name, value) {
   context['__inject_' + name] = value;

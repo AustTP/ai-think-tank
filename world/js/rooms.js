@@ -64,22 +64,22 @@ const ROOM_COLLISIONS = {
 };
 
 const ROOMS = {
-  pressoffice: { image: 'assets/rooms/room_workstations.png', collision: 'workstations', label: 'Work Room' },
-  media: { image: 'assets/rooms/room_workstations.png', collision: 'workstations', label: 'Studio' },
-  weatherstation: { image: 'assets/rooms/room_workstations.png', collision: 'workstations', label: 'Weather Station' },
-  observatory: { image: 'assets/rooms/room_workstations.png', collision: 'workstations', label: 'Research Center' },
-  library: { image: 'assets/rooms/room_library.png', collision: 'library', label: 'Library' },
-  bank: { image: 'assets/rooms/room_bank.png', collision: 'bank', label: 'Bank' },
-  postoffice: { image: 'assets/rooms/room_postoffice.png', collision: 'postoffice', label: 'Post Office' },
+  pressoffice: { image: '/assets/rooms/room_workstations.png', collision: 'workstations', label: 'Work Room' },
+  media: { image: '/assets/rooms/room_workstations.png', collision: 'workstations', label: 'Studio' },
+  weatherstation: { image: '/assets/rooms/room_workstations.png', collision: 'workstations', label: 'Weather Station' },
+  observatory: { image: '/assets/rooms/room_workstations.png', collision: 'workstations', label: 'Research Center' },
+  library: { image: '/assets/rooms/room_library.png', collision: 'library', label: 'Library' },
+  bank: { image: '/assets/rooms/room_bank.png', collision: 'bank', label: 'Bank' },
+  postoffice: { image: '/assets/rooms/room_postoffice.png', collision: 'postoffice', label: 'Post Office' },
   // Not tied to a building on the outdoor map at all -- reachable only via
   // the HUD's Command Center button (like Call Meeting, callable from
   // anywhere), not by walking anywhere. House is a separate, physical
   // building with its own door trigger and its own purpose (the board).
-  commandcenter: { image: 'assets/rooms/room_workstations.png', collision: 'workstations', label: 'Control Room' },
+  commandcenter: { image: '/assets/rooms/room_workstations.png', collision: 'workstations', label: 'Control Room' },
   // Hangout: the empty gathering room behind the Town Hall's multi-option
   // door. Same open "Outskirts" layout -- shared art with the outdoor
   // clearing look. Non-delegable: agents rest here, never get pushed work.
-  hangout: { image: 'assets/rooms/room_hangout.png', collision: 'hangout', label: 'Hangout' },
+  hangout: { image: '/assets/rooms/room_hangout.png', collision: 'hangout', label: 'Hangout' },
 };
 
 // Door triggers on the OUTDOOR map. Authored in NATIVE image coordinates
@@ -93,8 +93,8 @@ let WINTER_DOOR_TRIGGERS = null;
 
 async function loadDoorTriggers() {
   const [mainRes, winterRes] = await Promise.all([
-    fetch('door_triggers.json?v=' + Date.now()),
-    fetch('door_triggers_winter.json?v=' + Date.now()),
+    fetch('/door_triggers.json?v=' + Date.now()),
+    fetch('/door_triggers_winter.json?v=' + Date.now()),
   ]);
   const native = await mainRes.json();
   MAIN_DOOR_TRIGGERS = {};

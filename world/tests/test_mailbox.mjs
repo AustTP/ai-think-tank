@@ -25,7 +25,7 @@ vm.createContext(context);
 // tests only care about mailbox state, not action-log side effects.
 vm.runInContext('function logThinkTankAction() {}', context);
 
-const src = fs.readFileSync(path.join(worldDir, 'agents.js'), 'utf8');
+const src = fs.readFileSync(path.join(worldDir, 'js', 'agents.js'), 'utf8');
 vm.runInContext(src, context, { filename: 'agents.js' });
 
 function setGlobal(name, value) {

@@ -19,7 +19,7 @@ const worldDir = path.join(__dirname, '..');
 const context = { console, Math, Date, JSON, Array, Object, setTimeout };
 vm.createContext(context);
 
-const src = fs.readFileSync(path.join(worldDir, 'handoffs.js'), 'utf8');
+const src = fs.readFileSync(path.join(worldDir, 'js', 'handoffs.js'), 'utf8');
 vm.runInContext(src, context, { filename: 'handoffs.js' });
 
 function setGlobal(name, value) {

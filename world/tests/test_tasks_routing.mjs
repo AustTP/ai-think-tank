@@ -20,7 +20,7 @@ const worldDir = path.join(__dirname, '..');
 // _pickNextDueIndex reads WORK_QUEUE, which live at module scope in tasks.js.
 const context = { console, Math, Date, JSON, Array, Object, Set };
 vm.createContext(context);
-vm.runInContext(fs.readFileSync(path.join(worldDir, 'tasks.js'), 'utf8'), context, { filename: 'tasks.js' });
+vm.runInContext(fs.readFileSync(path.join(worldDir, 'js', 'tasks.js'), 'utf8'), context, { filename: 'tasks.js' });
 
 function setGlobal(name, value) {
   context['__inject_' + name] = value;

@@ -19,7 +19,7 @@ const context = { console, Math, Date, JSON, Array, Object, Set, String, Promise
 vm.createContext(context);
 
 function load(script) {
-  vm.runInContext(fs.readFileSync(path.join(worldDir, script), 'utf8'), context, { filename: script });
+  vm.runInContext(fs.readFileSync(path.join(worldDir, 'js', script), 'utf8'), context, { filename: script });
 }
 
 // grading.js needs requestJevChoice defined (jev.js). jev.js needs apiFetch.

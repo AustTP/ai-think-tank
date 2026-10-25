@@ -29,7 +29,7 @@ context.CustomEvent = class { constructor(type, opts) { this.type = type; this.d
 
 vm.createContext(context);
 
-const src = fs.readFileSync(path.join(worldDir, 'sim_bridge.js'), 'utf8');
+const src = fs.readFileSync(path.join(worldDir, 'js', 'sim_bridge.js'), 'utf8');
 vm.runInContext(src, context, { filename: 'sim_bridge.js' });
 
 const refreshSimStatus = () => vm.runInContext('refreshSimStatus', context)();

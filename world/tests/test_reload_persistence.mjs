@@ -23,9 +23,9 @@ vm.createContext(context);
 // agents.js references REPORTS/nextReportId (reports.js) and WORK_QUEUE
 // (tasks.js) inside initAgents()'s restore branch -- loaded for real
 // rather than stubbed, so this stays honest about what actually runs.
-vm.runInContext(fs.readFileSync(path.join(worldDir, 'reports.js'), 'utf8'), context, { filename: 'reports.js' });
+vm.runInContext(fs.readFileSync(path.join(worldDir, 'js', 'reports.js'), 'utf8'), context, { filename: 'reports.js' });
 vm.runInContext('const WORK_QUEUE = [];', context);
-vm.runInContext(fs.readFileSync(path.join(worldDir, 'agents.js'), 'utf8'), context, { filename: 'agents.js' });
+vm.runInContext(fs.readFileSync(path.join(worldDir, 'js', 'agents.js'), 'utf8'), context, { filename: 'agents.js' });
 
 function setGlobal(name, value) {
   context['__inject_' + name] = value;

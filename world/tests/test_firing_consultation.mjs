@@ -20,7 +20,7 @@ const context = { console, Math, Date, JSON, Array, Object, Set };
 vm.createContext(context);
 
 for (const f of ['firing.js', 'reports.js']) {
-  const src = fs.readFileSync(path.join(worldDir, f), 'utf8');
+  const src = fs.readFileSync(path.join(worldDir, 'js', f), 'utf8');
   vm.runInContext(src, context, { filename: f });
 }
 function setGlobal(name, value) {

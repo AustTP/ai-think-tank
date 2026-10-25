@@ -171,7 +171,7 @@ class StaticMountLockedDown(unittest.TestCase):
         cls.client = TestClient(serve.app)
 
     def test_asset_extension_is_public(self):
-        r = self.client.get('/world.js')
+        r = self.client.get('/js/world.js')
         # Served by the static mount (200) or not found (404) if the file
         # moved -- but never 401: assets must load before any session exists.
         self.assertIn(r.status_code, (200, 404))

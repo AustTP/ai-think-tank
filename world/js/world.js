@@ -609,15 +609,15 @@ const CONNECTION_BAND = { y0: 26 * 8 * SCALE, y1: 33 * 8 * SCALE };
 
 const SCENES = {
   main: {
-    bgSprite: 'assets/think_tank_background.png',
-    gridSprite: 'collision_grid.json',
-    doorsSprite: 'door_triggers.json',
+    bgSprite: '/assets/think_tank_background.png',
+    gridSprite: '/collision_grid.json',
+    doorsSprite: '/door_triggers.json',
     spawn: { x: 300 * SCALE, y: 170 * SCALE },
   },
   winter: {
-    bgSprite: 'assets/think_tank_winter.png',
-    gridSprite: 'collision_grid_winter.json',
-    doorsSprite: 'door_triggers_winter.json',
+    bgSprite: '/assets/think_tank_winter.png',
+    gridSprite: '/collision_grid_winter.json',
+    doorsSprite: '/door_triggers_winter.json',
     // Mirrored spawn: the connection path's band on the winter (flipped)
     // map is its LEFT edge; drop the player just inside it.
     spawn: { x: 12, y: 29 * 8 * SCALE },

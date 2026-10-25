@@ -1,7 +1,7 @@
 // JS coverage harness: runs every tests/test_*.mjs in a fresh NODE_V8_COVERAGE
 // dir, attributes line coverage per coverage dump (which include files loaded
 // through node:vm) using smallest-range-wins, then ORs the covered line sets
-// across dumps and prints per-file line coverage for the world/*.js sources.
+// across dumps and prints per-file line coverage for the world/js/*.js sources.
 //
 // Attribution is done per dump (per test-file process) rather than by merging
 // all dumps first: V8 emits different range granularities for the same function
@@ -105,7 +105,7 @@ function sourceFor(url) {
   if (url.startsWith('file://')) return path.normalize(decodeURIComponent(new URL(url).pathname));
   if (url.startsWith('/')) return url;
   const base = path.basename(url);
-  if (base.endsWith('.js')) return path.join(worldDir, base);
+  if (base.endsWith('.js')) return path.join(worldDir, 'js', base);
   if (base.endsWith('.mjs')) return path.join(worldDir, 'tests', base);
   if (base.endsWith('.html')) return path.join(worldDir, base);
   return url;

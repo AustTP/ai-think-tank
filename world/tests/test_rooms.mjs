@@ -19,7 +19,7 @@ const context = { console, Math, Date, JSON, Array, Object };
 context.SCALE = 2;
 vm.createContext(context);
 
-const src = fs.readFileSync(path.join(worldDir, 'rooms.js'), 'utf8');
+const src = fs.readFileSync(path.join(worldDir, 'js', 'rooms.js'), 'utf8');
 vm.runInContext(src, context, { filename: 'rooms.js' });
 
 let passed = 0, failed = 0;

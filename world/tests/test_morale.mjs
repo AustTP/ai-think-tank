@@ -21,7 +21,7 @@ const worldDir = path.join(__dirname, '..');
 const context = { console, Math, Date, JSON, Array, Object };
 vm.createContext(context);
 
-const src = fs.readFileSync(path.join(worldDir, 'morale.js'), 'utf8');
+const src = fs.readFileSync(path.join(worldDir, 'js', 'morale.js'), 'utf8');
 vm.runInContext(src, context, { filename: 'morale.js' });
 
 function setGlobal(name, value) {

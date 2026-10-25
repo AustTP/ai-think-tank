@@ -17,7 +17,7 @@ const worldDir = path.join(__dirname, '..');
 const context = { console, Math, Date, JSON, Array, Object, Set };
 vm.createContext(context);
 
-const src = fs.readFileSync(path.join(worldDir, 'firing.js'), 'utf8');
+const src = fs.readFileSync(path.join(worldDir, 'js', 'firing.js'), 'utf8');
 vm.runInContext(src, context, { filename: 'firing.js' });
 
 function setGlobal(name, value) {

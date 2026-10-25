@@ -18,7 +18,7 @@ let nextMeetingId = 1;
 let MEETING_PRESETS = {}; // name -> [agent ids], see meeting_presets.json
 
 async function loadMeetingPresets() {
-  const res = await fetch('meeting_presets.json?v=' + Date.now());
+  const res = await fetch('/meeting_presets.json?v=' + Date.now());
   MEETING_PRESETS = await res.json();
 }
 
