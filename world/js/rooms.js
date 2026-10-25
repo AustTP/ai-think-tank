@@ -93,11 +93,13 @@ let WINTER_DOOR_TRIGGERS = null;
 let SOUTH_DOOR_TRIGGERS = null;
 
 async function loadDoorTriggers() {
-  const [mainRes, winterRes, southRes] = await Promise.all([
+  const [mainRes, winterRes] = await Promise.all([
     fetch('/door_triggers.json?v=' + Date.now()),
     fetch('/door_triggers_winter.json?v=' + Date.now()),
-    fetch('/door_triggers_south.json?v=' + Date.now()),
   ]);
+  // Loaded separately and best-effort: a deployment without the south map must
+  // never lose the main map's doors because one extra fetch failed.
+  const southRes = await fetch('/door_triggers_south.json?v=' + Date.now()).catch(() => null);
   const native = await mainRes.json();
   MAIN_DOOR_TRIGGERS = {};
   for (const building in native) {
@@ -129,6 +131,7 @@ async function loadDoorTriggers() {
   }
   SOUTH_DOOR_TRIGGERS = {};
   try {
+    if (!southRes) throw new Error('south door triggers unavailable');
     const southNative = await southRes.json();
     for (const building in southNative) {
       const d = southNative[building];
