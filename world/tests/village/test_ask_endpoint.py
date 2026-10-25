@@ -10,6 +10,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -115,6 +116,30 @@ class AskEndpoint(unittest.TestCase):
         body = r.json()
         self.assertIn('shorts', body['reply'])
         self.assertIn(body['agent'], ('ben', 'cora', 'dax'))  # non-admin, not maya
+
+    def test_successful_ask_does_not_hold_the_state_lock(self):
+        # Live incident 2026-10-25: /api/intent/ask took the whole-state lock,
+        # answered, then returned without releasing it. Every later sim tick
+        # blocked on _state_begin forever; the watchdog recycled the task but
+        # could not release a lock owned by another thread, so only a process
+        # restart recovered the tank. The ask lane must use a snapshot read.
+        async def fake_ask_core(*args, **kwargs):
+            return {'reply': 'ok', 'agent': 'ben', 'tools': []}
+
+        c = self._client(_state())
+        with unittest.mock.patch.object(serve, '_ask_core', side_effect=fake_ask_core):
+            r = c.post('/api/intent/ask', json={'question': 'hello'})
+        self.assertEqual(r.status_code, 200, r.text)
+        acquired = []
+        def _try_lock():
+            got = serve._STATE_LOCK.acquire(timeout=0.5)
+            acquired.append(got)
+            if got:
+                serve._STATE_LOCK.release()
+        t = threading.Thread(target=_try_lock)
+        t.start()
+        t.join(2.0)
+        self.assertEqual(acquired, [True])
 
     def test_ask_requires_question(self):
         c = self._client(_state())

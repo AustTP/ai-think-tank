@@ -205,7 +205,11 @@ async def intent_ask(request: Request):
         return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     if not check_rate_limit(ASK_LANE_RATE_LIMIT_KEY):
         return JSONResponse({'error': 'Rate limit hit -- too many questions at once. Wait a minute and try again.'}, status_code=429)
-    state = _state_begin()
+    # Read a snapshot without holding the whole-state write lock. The ask lane
+    # can call the model and tools for minutes; holding the lock across that
+    # work starves the sim tick (and a lost release wedges it forever). Only a
+    # parked ask mutates state, and that branch re-reads under the lock below.
+    state = get_state_from_db()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     try:
@@ -221,6 +225,7 @@ async def intent_ask(request: Request):
     # is DB-only; the only model call (LTM extraction) is background and runs
     # every LTM_EXTRACT_EVERY_TURNS, never on the ask's critical path.
     _ask_target = (body.get('agentId') or '').strip() or 'any'
+    pending_before = {a.get('id') for a in (state.get('_pendingAsks') or [])}
     result = await _ask_core(state, body.get('question'), body.get('agentId'),
                              body.get('location'), body.get('max_tokens', 300),
                              session_id=f'player-ask:{_ask_target.lower()}',
@@ -229,7 +234,19 @@ async def intent_ask(request: Request):
     if 'error' in result:
         return JSONResponse({'error': result['error']}, status_code=result.get('status', 500))
     if result.get('queued'):
-        save_state_to_db(state)
+        fresh = [a for a in (state.get('_pendingAsks') or [])
+                 if a.get('id') not in pending_before]
+        latest = _state_begin()
+        if latest is None:
+            _state_abort()
+        else:
+            try:
+                existing = {a.get('id') for a in (latest.get('_pendingAsks') or [])}
+                latest.setdefault('_pendingAsks', []).extend(
+                    a for a in fresh if a.get('id') not in existing)
+                save_state_to_db(latest)
+            finally:
+                _state_abort()
     return JSONResponse(result)
 
 
