@@ -485,10 +485,14 @@ sprint.
 4. Refinement accepts or rejects it. Acceptance turns it into a queued story.
 5. A linked issue, if any, is mirrored as the request moves.
 
-**Controls.** Refinement is the only acceptance path. Requests are capped per
-ceremony (`REFINEMENT_MAX_REQUESTS = 20`).
+**Controls.** Refinement is the only acceptance path for a work request.
+Requests are capped per ceremony (`REFINEMENT_MAX_REQUESTS = 20`).
 
-**Records.** `backlogRequests`, issue link, refinement outcome.
+**Review note.** The spare-time lane is a separate path, not a work request. An
+agent that just finished a real deliverable in a valued room may earn one
+self-filed spike per week. The tank-wide cap is three per week. The spike is
+tagged `moonshot`, skips refinement and the peer gate, and is time-boxed. Both
+caps and the room dedup live in `_file_free_spike`.
 
 ### BP-03 Backlog refinement
 
@@ -2935,6 +2939,8 @@ chief-only artifact search, no secret access, audit row.
 | Idle gate | Model spend | No work -> no spend | Task cycle early return |
 | JEV quorum | Consequence decisions | Outage or low confidence -> safe path | Decision tape |
 | Approval gates | Owner authority | Gated action -> pending approval | Theo approval record |
+| Plan approval gate | Large-request scope and cost | No approved revision -> no apply | `plan_revisions`, plan hash |
+| Free-spike cap | Spare-time spend | Per-agent or tank cap hit -> no spike | `freeSpikeUsed`, `freeSpikeGlobal` |
 | Spend cap | Total budget | Cap hit -> calls fail closed | Spend ledger |
 | Page budget | External fetch cost | Budget spent -> browse and search refused | Page ledger |
 | Per-task budget | Runaway task | Ceiling hit -> failed card and director note | Task record |
@@ -2956,6 +2962,7 @@ chief-only artifact search, no secret access, audit row.
 | Command gate | Host damage | Unsafe command -> block and escalate | Decision tape |
 | Egress proxy | Sandbox escape | Host not allowlisted -> blocked | Egress grants |
 | File containment | Local file abuse | Escape -> refused | Action log |
+| Live-read boundary | Repo and secret exposure | Non-director, secret path, or oversized read -> refused | Role gate, path allowlist, action log |
 | Trash rule | Data loss | Delete -> move to trash, never unlink | Action log |
 | Notes ownership | Data loss | Other owner's note -> refused | Note registry |
 | Credential vault | Secret leakage | Agent never sees the secret | Handle record |
