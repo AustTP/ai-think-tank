@@ -143,13 +143,15 @@ class SyncPrototypes(unittest.TestCase):
 
 class SocialDigest(unittest.TestCase):
     def test_log_social_digest_writes_attendee_lines(self):
+        social_dir = os.path.join(_MODULE_TMP_DIR, 'library', 'social')
+        shutil.rmtree(social_dir, ignore_errors=True)
         serve.log_action('ada', 'task_completed', {'title': 'Weekly Bank Report'}, authorized=False)
         state = {
             'agents': {'ada': {'name': 'Ada', 'weekApprovals': 3}},
             'agentRoster': [{'id': 'ada', 'name': 'Ada'}],
         }
         serve.log_social_digest(state, {'ada': {}}, decisions=[{'agentId': 'ada', 'choice': 'adopt', 'confidence': 0.8}])
-        files = os.listdir(os.path.join(_MODULE_TMP_DIR, 'library', 'social'))
+        files = os.listdir(social_dir)
         self.assertEqual(len(files), 1)
         with open(os.path.join(_MODULE_TMP_DIR, 'library', 'social', files[0])) as f:
             content = f.read()

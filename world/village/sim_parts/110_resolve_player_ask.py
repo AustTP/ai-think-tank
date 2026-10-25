@@ -324,6 +324,7 @@ def _deliver_mail(state, agent_id, kind, payload=None):
         # off-duty rest is the whole point of wake-on-mail.
         appear_from_outskirts(state, agent_id)
         a['_mailAwake'] = {'kind': kind, 'entry': entry, 'at': now_ms}
+        _wake_enqueue(state, agent_id, kind, entry, now_ms)
     return True
 
 
@@ -335,6 +336,8 @@ def _mail_action_step(state, now, now_ms):
     the same tick (fully_idle) -- the marker is what keeps her awake until acted.
     Returns the number of agents routed. Pure state mutation; no Jev."""
     routed = 0
+    _wake_recover_stale(state, now_ms)
+    _wake_restore_markers(state, now_ms)
     agents = state.get('agents') or {}
     for aid, a in list(agents.items()):
         if not isinstance(a, dict) or not a.get('_mailAwake'):
@@ -343,6 +346,8 @@ def _mail_action_step(state, now, now_ms):
         if a.get('busy') or a.get('task') or a.get('handoff') or a.get('pairWith'):
             # She is now acting (or already working); hand off to normal flow.
             a.pop('_mailAwake', None)
+            _wake_complete_for_agent(state, aid, marker.get('kind'),
+                                     marker.get('entry') or {}, 'acting', now_ms)
             routed += 1
             continue
         kind = marker.get('kind') or ''
@@ -352,6 +357,7 @@ def _mail_action_step(state, now, now_ms):
         queued = _queue_mail_work(state, aid, kind, payload, now_ms)
         if queued:
             a.pop('_mailAwake', None)
+            _wake_complete_for_agent(state, aid, kind, payload, 'routed', now_ms)
             routed += 1
         elif not isinstance(payload, dict) or not (
                 payload.get('issueKey') or payload.get('taskId')
@@ -360,6 +366,7 @@ def _mail_action_step(state, now, now_ms):
             # admin's watchdog escalation copy): stop retrying, or the marker
             # holds her awake (and unparkable) forever with nothing to queue.
             a.pop('_mailAwake', None)
+            _wake_complete_for_agent(state, aid, kind, payload, 'unroutable', now_ms)
     return routed
 
 

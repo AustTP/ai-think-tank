@@ -773,6 +773,7 @@
       </div>
     </details>
     <p id="bigTaskStatus" class="meeting-msg"></p>
+    <div id="planApprovals" style="font-size:12px; text-align:left; margin:4px 0;"></div>
     <hr style="opacity:0.3;">
     <h4 style="margin:6px 0 2px;">Sprints <span style="opacity:0.6; font-size:11px;">(director-authored via /api/intent; teams must each have a scrum master)</span></h4>
     <div id="boardSprintsBody" style="max-height:220px; overflow:auto; font-size:12px;">Loading...</div>
@@ -1769,6 +1770,7 @@ function openBoard() {
 // straight off TASKS/AGENTS, the same live objects everything else reads,
 // not a separate summary someone has to remember to update.
 function renderBoard() {
+  loadPlanApprovals();
   const body = document.getElementById('boardBody');
   const open = Object.values(TASKS).filter(t => t.status !== 'done');
   const done = Object.values(TASKS).filter(t => t.status === 'done').sort((a, b) => b.createdAt - a.createdAt).slice(0, 5);
@@ -2518,7 +2520,7 @@ async function handleBigTaskDelegate() {
       // shape the UI below already expects.
       const payload = { goal };
       if (Object.keys(constraints).length) payload.constraints = constraints;
-      const res = await apiFetch('/api/intent/assign-big-task', {
+      const res = await apiFetch('/api/intent/plan-big-task', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -2530,6 +2532,11 @@ async function handleBigTaskDelegate() {
     }
     if (result.error) {
       statusEl.textContent = result.error;
+    } else if (result.plan) {
+      statusEl.textContent = result.note || 'Plan proposed. Approve it before work is filed.';
+      input.value = '';
+      clearBigTaskPins();
+      loadPlanApprovals();
     } else if (result.staffed) {
       // Server-owned sim, sprint staffing: the ask is filed with a free team,
       // whose scrum master + workers break it into concrete stories at their
@@ -2560,6 +2567,110 @@ async function handleBigTaskDelegate() {
     statusEl.textContent = 'Something went wrong delegating that.';
   }
   btn.disabled = false;
+}
+
+let _planRefreshBusy = false;
+async function loadPlanApprovals() {
+  if (_planRefreshBusy) return;
+  _planRefreshBusy = true;
+  try {
+    const res = await apiFetch('/api/plans?status=pending');
+    const data = await res.json();
+    renderPlanApprovals(data.plans || []);
+  } catch (e) {
+    // board is best-effort; a failed read leaves the previous list in place
+  } finally {
+    _planRefreshBusy = false;
+  }
+}
+
+function renderPlanApprovals(plans) {
+  const box = document.getElementById('planApprovals');
+  if (!box) return;
+  box.innerHTML = '';
+  if (!plans.length) {
+    const none = document.createElement('div');
+    none.style.opacity = '0.55';
+    none.textContent = 'No plans waiting for approval.';
+    box.appendChild(none);
+    return;
+  }
+  const title = document.createElement('div');
+  title.style.cssText = 'opacity:0.75; margin:2px 0;';
+  title.textContent = `Plans waiting for approval (${plans.length})`;
+  box.appendChild(title);
+  for (const plan of plans) {
+    const row = document.createElement('div');
+    row.style.cssText = 'border:1px solid rgba(255,255,255,0.18); padding:5px; margin:4px 0; border-radius:3px;';
+    const head = document.createElement('div');
+    const budget = plan.payload && plan.payload.estimatedBudgetUsd;
+    head.textContent = `v${plan.version} [${plan.route}] ${plan.goal}`
+      + (budget ? ` -- budget $${Number(budget).toFixed(2)}` : '');
+    head.style.cssText = 'font-weight:bold; margin-bottom:3px;';
+    row.appendChild(head);
+    const meta = document.createElement('div');
+    meta.style.cssText = 'opacity:0.65; font-size:11px; margin-bottom:4px;';
+    meta.textContent = plan.payload && plan.payload.teamName
+      ? `Team: ${plan.payload.teamName}` : 'Shared backlog route';
+    row.appendChild(meta);
+    const actions = document.createElement('div');
+    const approve = document.createElement('button');
+    approve.textContent = 'Approve';
+    approve.onclick = () => actOnPlan(plan.planId, plan.version, 'approve');
+    const reject = document.createElement('button');
+    reject.textContent = 'Reject';
+    reject.style.marginLeft = '4px';
+    reject.onclick = () => actOnPlan(plan.planId, plan.version, 'reject');
+    const revise = document.createElement('button');
+    revise.textContent = 'Revise';
+    revise.style.marginLeft = '4px';
+    revise.onclick = () => actOnPlan(plan.planId, plan.version, 'revise');
+    actions.append(approve, reject, revise);
+    row.appendChild(actions);
+    box.appendChild(row);
+  }
+}
+
+async function actOnPlan(planId, version, action) {
+  const statusEl = document.getElementById('bigTaskStatus');
+  let body = { version };
+  if (action === 'reject') {
+    const reason = prompt('Why reject this plan? The planner needs a concrete reason.');
+    if (!reason || !reason.trim()) return;
+    body.reason = reason.trim();
+  }
+  if (action === 'revise') {
+    const goal = prompt('Revised goal for this plan:', '');
+    if (!goal || !goal.trim()) return;
+    body.goal = goal.trim();
+    const current = (await apiFetch(`/api/plans/${encodeURIComponent(planId)}`).then(r => r.json())).revisions || [];
+    const latest = current[current.length - 1];
+    body.constraints = (latest && latest.constraints) || {};
+    action = 'revise';
+  }
+  const path = action === 'approve'
+    ? `/api/plans/${encodeURIComponent(planId)}/approve`
+    : action === 'reject'
+      ? `/api/plans/${encodeURIComponent(planId)}/reject`
+      : `/api/plans/${encodeURIComponent(planId)}/revise`;
+  try {
+    const res = await apiFetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      statusEl.textContent = data.error || 'Plan action failed.';
+    } else {
+      statusEl.textContent = action === 'approve'
+        ? (data.note || 'Plan applied.')
+        : action === 'reject' ? 'Plan rejected.' : 'Plan revised; review the new version.';
+    }
+  } catch (e) {
+    statusEl.textContent = 'Plan action failed.';
+  }
+  loadPlanApprovals();
 }
 
 // Player-triggered publish. Freezes the think tank's released work (projects,

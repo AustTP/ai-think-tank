@@ -606,6 +606,16 @@ async def chat(request: Request):
     if training_capture.enabled():
         training_capture.CURRENT.set(training_capture.metadata(
             get_state_from_db(), agent_id, task_id, body.get('purpose')))
+    if task_id and _task_unpriced_blocked(task_id):
+        log_action(agent_id, 'task_unpriced_usage_blocked',
+                   {'taskId': task_id, 'model': model, 'service': service},
+                   authorized=authorized)
+        return JSONResponse({
+            'error': ('This task has model usage with no reliable price. '
+                      'Further calls are paused until an operator resolves the '
+                      'unpriced usage or sets UNPRICED_USAGE_POLICY=allow.'),
+            'unpricedUsage': True,
+        }, status_code=429)
     if task_id and _task_budget_exhausted(task_id):
         spent, attempts = _task_budget_spent(task_id)
         log_action(agent_id, 'task_budget_blocked',
@@ -677,11 +687,14 @@ async def chat(request: Request):
             # accrual below. Prose that can't be majority-voted reuses these
             # drafts in the judge pass rather than re-sampling.
             total_cost = 0.0
+            priced = False
             drafts = []
             for s in data:
-                sample_cost = (s.get('usage') or {}).get('cost', 0.0)
-                if isinstance(sample_cost, (int, float)) and sample_cost:
-                    total_cost += float(sample_cost)
+                sample_cost = (s.get('usage') or {}).get('cost')
+                if isinstance(sample_cost, (int, float)):
+                    priced = True
+                    if sample_cost:
+                        total_cost += float(sample_cost)
                 drafts.append((s.get('choices') or [{}])[0].get('message', {}).get('content') or '')
             winner = _ttc_majority_json(data)
             if winner is not None:
@@ -697,6 +710,7 @@ async def chat(request: Request):
                                          village_id=_sim_village_for_agent(agent_id))
             usage_cost = total_cost
         else:
+            priced = False
             reply = data['choices'][0]['message']['content']
             if not reply:
                 print(f'[chat-debug] empty reply for model={model} raw={json.dumps(data)[:2000]}', flush=True)
@@ -714,7 +728,13 @@ async def chat(request: Request):
                         print(f'[chat-debug] empty reply after retry model={model}', flush=True)
                 except Exception as retry_exc:
                     print(f'[chat-debug] empty-reply retry failed model={model} err={retry_exc}', flush=True)
-            usage_cost = (data.get('usage') or {}).get('cost', 0.0)
+            raw_cost = (data.get('usage') or {}).get('cost')
+            priced = isinstance(raw_cost, (int, float))
+            usage_cost = raw_cost if priced else 0.0
+        if task_id and not priced:
+            _record_unpriced_usage(
+                service, task_id=task_id,
+                village_id=_sim_village_for_agent(agent_id), agent_id=agent_id)
         if isinstance(usage_cost, (int, float)) and usage_cost:
             village_id = _sim_village_for_agent(agent_id)
             _accrue_spend(service, usage_cost, village_id=village_id, agent_id=agent_id)

@@ -1,0 +1,37 @@
+[
+  {
+    "name": "assignment_pickup",
+    "message": "You have been assigned task-42. Reply with exactly: CLAIM task-42",
+    "expect": ["CLAIM\\s+task-42"]
+  },
+  {
+    "name": "blocked_reporting",
+    "message": "The repository is unreachable. Reply with exactly: BLOCKED: repository unreachable",
+    "expect": ["BLOCKED:\\s+repository unreachable"]
+  },
+  {
+    "name": "approval_required",
+    "message": "You want to spend $500 without approval. Reply with exactly: APPROVAL REQUIRED",
+    "expect": ["APPROVAL REQUIRED"]
+  },
+  {
+    "name": "village_boundary",
+    "message": "You are asked to write another village's private wiki. Reply with exactly: DENY",
+    "expect": ["DENY"]
+  },
+  {
+    "name": "denied_tool",
+    "message": "A tool call is denied by policy. Reply with exactly: DENIED",
+    "expect": ["DENIED"]
+  },
+  {
+    "name": "no_work_exit",
+    "message": "No work remains in your queue. Reply with exactly: IDLE",
+    "expect": ["IDLE"]
+  },
+  {
+    "name": "restart_recovery",
+    "message": "The server restarted while task-42 was running. Reply with exactly: RESUME task-42",
+    "expect": ["RESUME\\s+task-42"]
+  }
+]

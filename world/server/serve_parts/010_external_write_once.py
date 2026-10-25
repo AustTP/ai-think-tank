@@ -230,6 +230,28 @@ def init_db():
             blob TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
+        # Durable per-call usage receipts. kv_spend is the read projection;
+        # a receipt written before an interrupted projection is replayed on
+        # the next process. Unpriced receipts stay unresolved and hold the
+        # task budget by default.
+        conn.execute('''CREATE TABLE IF NOT EXISTS usage_receipts (
+            id TEXT PRIMARY KEY,
+            service TEXT NOT NULL,
+            village_id TEXT,
+            agent_id TEXT,
+            task_id TEXT,
+            cost_usd TEXT NOT NULL,
+            status TEXT NOT NULL,
+            idempotency_key TEXT UNIQUE,
+            applied INTEGER NOT NULL DEFAULT 0,
+            resolved INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            applied_at REAL
+        )''')
+        conn.execute('''CREATE INDEX IF NOT EXISTS idx_usage_receipts_task
+            ON usage_receipts(task_id, status, resolved)''')
+        conn.execute('''CREATE INDEX IF NOT EXISTS idx_usage_receipts_applied
+            ON usage_receipts(applied)''')
         # Page-request budget: the think tank has a MONTHLY allowance
         # of external page requests (browse_page fetches + search_web calls) --
         # a count-based quota, not a dollar cap. Mirrors kv_spend's own-table

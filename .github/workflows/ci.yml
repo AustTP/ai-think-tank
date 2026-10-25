@@ -31,10 +31,16 @@ jobs:
 
       - name: Environment template guard
         working-directory: world
-        run: python -m pytest tests/test_env_template.py -q
+        run: python -m pytest tests/core/test_env_template.py -q
 
       - name: Growth guard
         run: python scripts/check_file_growth.py
+
+      - name: Module boundaries
+        run: python scripts/check_module_boundaries.py
+
+      - name: Eval cases
+        run: python evals/run_evals.py --dry-run
 
       - name: Model configuration
         run: python scripts/check_models.py
@@ -45,11 +51,11 @@ jobs:
 
       - name: mypy
         working-directory: world
-        run: python -m mypy serve.py sim.py content.py web_helpers.py sim_helpers.py bank.py auth.py notify.py sublow.py jev_grants.py cron_scripts.py grant_store.py
+        run: python -m mypy serve.py sim.py content.py selfedit.py
 
       - name: bandit
         working-directory: world
-        run: python -m bandit --ini setup.cfg -q serve.py sim.py content.py web_helpers.py sim_helpers.py bank.py auth.py notify.py sublow.py jev_grants.py cron_scripts.py grant_store.py
+        run: python -m bandit --ini setup.cfg -q serve.py sim.py content.py selfedit.py
 
       - name: Full test suite (Python unittest files + JS harnesses)
         working-directory: world

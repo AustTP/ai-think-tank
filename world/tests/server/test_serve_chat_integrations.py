@@ -80,6 +80,26 @@ class ChatEndpointTest(unittest.TestCase):
                                     session=False).status_code, 400)
         self.assertEqual(self._call({'messages': []}).status_code, 400)
 
+    def test_unpriced_usage_blocks_before_a_call(self):
+        body = {'model': 'm', 'messages': [{'role': 'user',
+                                            'content': 'hi'}],
+                'agentId': 'a', 'taskId': 'task-1'}
+        with mock.patch.object(serve, '_task_unpriced_blocked',
+                               return_value=True):
+            r = self._call(body)
+        self.assertEqual(r.status_code, 429)
+        self.assertIn('unpricedUsage', r.body.decode())
+
+    def test_missing_usage_cost_records_unpriced_receipt(self):
+        body = {'model': 'm', 'messages': [{'role': 'user',
+                                            'content': 'hi'}],
+                'agentId': 'a', 'taskId': 'task-1'}
+        with mock.patch.object(serve, '_record_unpriced_usage') as record:
+            r = self._call(body, openrouter={
+                'choices': [{'message': {'content': 'ok'}}], 'usage': {}})
+        self.assertEqual(r.status_code, 200)
+        record.assert_called_once()
+
     def test_budget_and_director(self):
         body = {'model': 'm', 'messages': [{'role': 'user',
                                             'content': 'hi'}],

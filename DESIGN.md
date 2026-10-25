@@ -416,6 +416,22 @@ receive a mailbox notification (`peer_review_request`) and must submit a
 verdict (clean = approval counted, actionable = fix re-queued to the author).
 The gate closes at 2 approvals or 1 + review timeout.
 
+### Plan approval gate
+
+A player's large request is first stored as a pending `plan_revisions` row:
+goal, constraints, route (`staffed` or `backlog`), approved rooms, budget
+estimate, authority, and team. It executes nothing. The player approves,
+rejects with a required reason, or revises it into a new version (the previous
+pending version is superseded; a diff is returned). Approval binds the exact
+revision hash and claims `applying` before mutating state, so a duplicate click
+cannot file twice. A plan whose authority/team became busy or was removed fails
+as stale and must be revised. `usage` and audit entries record every decision.
+
+The board shows pending plans with Approve, Reject, and Revise actions. The
+legacy `/api/intent/assign-big-task` path remains for webhooks and direct
+callers; the player UI uses `/api/intent/plan-big-task` and the `/api/plans/*`
+endpoints.
+
 ### New-team spawn on large request
 
 When `intent_assign_big_task` is called and every existing team is busy in an
@@ -495,6 +511,19 @@ accounting system. Each model call is attributed to a service (product id,
 used / cap / calls / lastAt / trailing-7-day burn rate / days until cap
 per service and cumulatively.
 
+Wake-on-mail is a durable state queue (`wakeQueue`) rather than only an
+in-agent marker. Entries coalesce by agent/kind/target, are claimed before an
+action tick, complete with a routed/unroutable/acting outcome, and requeue a
+claim that no tick acted on within 30 minutes. A missing `_mailAwake` marker is
+rebuilt from the queue on the next tick.
+
+Every priced call also writes a durable `usage_receipts` row before the
+projection. A receipt left unapplied by a crash is replayed on the next
+process; the ledger carries the receipt id so replay cannot charge twice.
+Usage the provider cannot price is recorded as unresolved, and
+`UNPRICED_USAGE_POLICY=block` (the default) holds that task's model budget
+until an operator resolves the receipt.
+
 ---
 
 ## 9. Security Architecture
@@ -526,6 +555,8 @@ session OR a valid agent key (so server-to-server loopback works).
 |-------|---------|-----------|
 | `kv_state` | Single-row think tank state blob (agents, teams, tasks, queue, rooms) | Forever |
 | `kv_spend` | Single-row spend ledger (per-service used/cap, byDay series) | Forever |
+| `usage_receipts` | Durable per-call usage receipts, applied flag, unpriced resolution | Forever |
+| `plan_revisions` | Versioned large-request plans, approval status, hash, decision audit | Forever |
 | `model_tiers` | Per-band model slug, name, price, chosen_at | Active bands only |
 | `model_benchmark_scores` | Cited benchmark scores (model_id, benchmark, score, source_url) | Preserved |
 | `action_log` | Per-agent activity feed (agent_id, action, details JSON, ts) | Rolling prune at `LOG_RETENTION_DAYS` (default 7, override in .env) |

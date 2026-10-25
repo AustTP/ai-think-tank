@@ -48,6 +48,7 @@ DEFAULT_BUDGET_CAP_USD = 50.0
 # {period, baseline} record), excluded from every service view and from the
 # cap's own total.
 _SPEND_CAP_BASELINE_KEY = '__spend_cap_baseline__'
+_RECEIPTS_LEDGER_KEY = '__receipts__'
 
 # Brief cache for the live OpenRouter credits reconcile (a bank readout
 # shouldn't always cost a network round-trip).
@@ -106,53 +107,71 @@ def _accrue_spend(service, cost, village_id=None, agent_id=None):
         return  # no usage.cost reported -- nothing to record
     cost = float(cost)
     try:
+        # Read first: the first read replays older unapplied receipts, and a
+        # new receipt must not be replayed by that same pass.
         ledger = _serve._spend_ledger_read()
-        bucket = ledger.setdefault(service, {'used': 0.0, 'calls': 0})
-        bucket['used'] = float(bucket.get('used', 0) or 0) + cost
-        bucket['calls'] = int(bucket.get('calls', 0) or 0) + 1
-        now = datetime.datetime.now(datetime.timezone.utc)
-        bucket['lastAt'] = now.isoformat()
-        # Daily series for the burn-rate forecast. Keyed by UTC date so the
-        # trailing-7-day rate stays cheap and monotonic across process restarts.
-        series = bucket.setdefault('byDay', {})
-        day = now.strftime('%Y-%m-%d')
-        series[day] = float(series.get(day, 0) or 0) + cost
-        if village_id:
-            vkey = _village_spend_key(village_id)
-            vbucket = ledger.setdefault(vkey, {'used': 0.0, 'calls': 0})
-            vbucket['used'] = float(vbucket.get('used', 0) or 0) + cost
-            vbucket['calls'] = int(vbucket.get('calls', 0) or 0) + 1
-            vbucket['lastAt'] = now.isoformat()
-        if agent_id:
-            akey = _agent_spend_key(agent_id)
-            abucket = ledger.setdefault(akey, {'used': 0.0, 'calls': 0})
-            abucket['used'] = float(abucket.get('used', 0) or 0) + cost
-            abucket['calls'] = int(abucket.get('calls', 0) or 0) + 1
-            abucket['lastAt'] = now.isoformat()
-            aseries = abucket.setdefault('byDay', {})
-            aseries[day] = float(aseries.get(day, 0) or 0) + cost
-            # A DIRECTOR dimension rides along on every agent call: the
-            # cost also lands in `__director__/<director_id>` (a byMonth
-            # series) so each director's team burn is visible at the bank
-            # and a per-director monthly ceiling can be enforced. The
-            # roster walk is best-effort -- an unknown agent accrues to
-            # the service/agent buckets only.
-            director_id = _director_of_agent(agent_id)
-            if director_id:
-                dkey = _director_spend_key(director_id)
-                dbucket = ledger.setdefault(
-                    dkey, {'used': 0.0, 'calls': 0, 'byMonth': {}})
-                dbucket['used'] = float(dbucket.get('used', 0) or 0) + cost
-                dbucket['calls'] = int(dbucket.get('calls', 0) or 0) + 1
-                dbucket['lastAt'] = now.isoformat()
-                dseries = dbucket.setdefault('byMonth', {})
-                dmonth = now.strftime('%Y-%m')
-                dseries[dmonth] = float(dseries.get(dmonth, 0) or 0) + cost
+    except Exception:
+        return
+    receipt_id = None
+    try:
+        receipt_id = _record_usage_receipt(
+            service, cost, village_id=village_id, agent_id=agent_id)
+    except Exception:
+        pass  # receipt audit must never break a real call
+    try:
+        _apply_spend_buckets(ledger, service, cost, village_id, agent_id,
+                             datetime.datetime.now(datetime.timezone.utc))
+        if receipt_id:
+            ledger.setdefault(_RECEIPTS_LEDGER_KEY, {})[receipt_id] = f'{cost:.9f}'
         _serve._spend_ledger_write(ledger)
+        if receipt_id:
+            _mark_usage_receipt_applied(receipt_id)
     except Exception:
         # Spend accounting must never take the think tank down: a failed read or
         # write just means this call's cost isn't reflected in the ledger.
         pass
+
+
+def _apply_spend_buckets(ledger, service, cost, village_id, agent_id, now):
+    """Mutate a ledger dict with one priced call. Pure; no DB access."""
+    bucket = ledger.setdefault(service, {'used': 0.0, 'calls': 0})
+    bucket['used'] = float(bucket.get('used', 0) or 0) + cost
+    bucket['calls'] = int(bucket.get('calls', 0) or 0) + 1
+    bucket['lastAt'] = now.isoformat()
+    # Daily series for the burn-rate forecast. Keyed by UTC date so the
+    # trailing-7-day rate stays cheap and monotonic across process restarts.
+    series = bucket.setdefault('byDay', {})
+    day = now.strftime('%Y-%m-%d')
+    series[day] = float(series.get(day, 0) or 0) + cost
+    if village_id:
+        vkey = _village_spend_key(village_id)
+        vbucket = ledger.setdefault(vkey, {'used': 0.0, 'calls': 0})
+        vbucket['used'] = float(vbucket.get('used', 0) or 0) + cost
+        vbucket['calls'] = int(vbucket.get('calls', 0) or 0) + 1
+        vbucket['lastAt'] = now.isoformat()
+    if agent_id:
+        akey = _agent_spend_key(agent_id)
+        abucket = ledger.setdefault(akey, {'used': 0.0, 'calls': 0})
+        abucket['used'] = float(abucket.get('used', 0) or 0) + cost
+        abucket['calls'] = int(abucket.get('calls', 0) or 0) + 1
+        abucket['lastAt'] = now.isoformat()
+        aseries = abucket.setdefault('byDay', {})
+        aseries[day] = float(aseries.get(day, 0) or 0) + cost
+        # A DIRECTOR dimension rides along on every agent call: the cost also
+        # lands in `__director__/<director_id>` so each director's team burn
+        # is visible at the bank and a per-director monthly ceiling can be
+        # enforced. Unknown agents accrue to service/agent buckets only.
+        director_id = _director_of_agent(agent_id)
+        if director_id:
+            dkey = _director_spend_key(director_id)
+            dbucket = ledger.setdefault(
+                dkey, {'used': 0.0, 'calls': 0, 'byMonth': {}})
+            dbucket['used'] = float(dbucket.get('used', 0) or 0) + cost
+            dbucket['calls'] = int(dbucket.get('calls', 0) or 0) + 1
+            dbucket['lastAt'] = now.isoformat()
+            dseries = dbucket.setdefault('byMonth', {})
+            dmonth = now.strftime('%Y-%m')
+            dseries[dmonth] = float(dseries.get(dmonth, 0) or 0) + cost
 
 
 def _village_spend_key(village_id):
@@ -316,10 +335,22 @@ def _village_spend_view():
     return out
 
 
+_RECEIPTS_REPLAYED = {'done': False}
+
+
 def _spend_ledger_read():
     """Read the spend ledger from its own kv_spend row. Never the whole-think tank
-    blob -- see the kv_spend DDL comment for why accounting is independent."""
+    blob -- see the kv_spend DDL comment for why accounting is independent.
+
+    The first read in a process replays any priced receipt that was recorded
+    before an interrupted projection write."""
     import serve as _serve
+    if not _RECEIPTS_REPLAYED['done']:
+        try:
+            _replay_usage_receipts()
+            _RECEIPTS_REPLAYED['done'] = True
+        except Exception:
+            pass  # retry on the next read
     try:
         with _serve._db() as conn:
             conn.execute('''CREATE TABLE IF NOT EXISTS kv_spend (
@@ -417,6 +448,11 @@ def _task_budget_exhausted(task_id):
     if not task_id:
         return False
     try:
+        if _task_unpriced_blocked(task_id):
+            return True
+    except Exception:
+        pass
+    try:
         state = _serve.get_state_from_db()
         budget = (state or {}).get('tasks', {}).get(task_id, {}).get('budgetUsd') or 0
         if not isinstance(budget, (int, float)) or budget <= 0:
@@ -437,7 +473,7 @@ def _spend_cap_period():
     return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
 
 
-_ROLLUP_BUCKET_PREFIXES = ('__village__/', '__agent__/', '__director__/')
+_ROLLUP_BUCKET_PREFIXES = ('__village__/', '__agent__/', '__director__/', '__receipts__')
 
 
 def _is_tracked_service_bucket(key, value):

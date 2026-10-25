@@ -18,6 +18,8 @@ import sqlite3
 import sys
 import tempfile
 
+import pytest
+
 _WORLD = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _WORLD not in sys.path:
     sys.path.insert(0, _WORLD)
@@ -41,3 +43,36 @@ else:
     open(_TEST_DB, 'ab').close()
 
 os.environ['THINK_TANK_DB'] = _TEST_DB
+
+
+@pytest.fixture(autouse=True)
+def _reset_credit_pause():
+    """Keep one test's simulated OpenRouter credit exhaustion from leaking.
+
+    The pause is process-global, while the live account balance can dip below
+    the watchdog floor during a test run. Without this reset, every later chat
+    test sees a 503 caused by a background probe, not by the code under test.
+    """
+    def reset():
+        try:
+            import serve
+        except Exception:
+            return
+        serve._CREDITS_PAUSE.update(active=False, since=0.0)
+        serve._CREDITS_WATCHDOG_STATE.update(low=False)
+
+    reset()
+    yield
+    reset()
+
+
+@pytest.fixture(autouse=True)
+def _clear_unpriced_receipts():
+    """Keep a mocked no-cost task call from blocking an unrelated later test."""
+    yield
+    try:
+        import serve
+        with serve._db() as conn:
+            conn.execute("DELETE FROM usage_receipts WHERE status = 'unpriced'")
+    except Exception:
+        pass

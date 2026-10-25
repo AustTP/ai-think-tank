@@ -23,6 +23,17 @@ def _exec_lines(first, last, globals_extra):
     return ns
 
 
+def _exec_policy_block(globals_extra):
+    source = open(_PART, encoding='utf-8').read()
+    start = source.index("if __name__ == '__main__':\n    try:\n        _policy_mode")
+    end = source.index('\n\ndef _reload_google_rate_limits', start)
+    padded = '\n' * source.count('\n', 0, start) + source[start:end]
+    ns = {'__name__': '__main__', '__file__': _PART}
+    ns.update(globals_extra)
+    exec(compile(padded, _PART, 'exec'), ns)
+    return ns
+
+
 class HeaderMainBlocksTest(unittest.TestCase):
     def test_main_alias_block(self):
         ns = _exec_lines(32, 38, {'sys': sys})
@@ -31,7 +42,7 @@ class HeaderMainBlocksTest(unittest.TestCase):
     def test_policy_mode_from_env(self):
         old = os.environ.get('OPTIMIZATION_POLICY_MODE')
         try:
-            ns = _exec_lines(553, 559, {
+            ns = _exec_policy_block({
                 'os': os,
                 '_load_env': lambda: {'OPTIMIZATION_POLICY_MODE': 'apply'},
             })
@@ -46,7 +57,7 @@ class HeaderMainBlocksTest(unittest.TestCase):
     def test_policy_mode_exception_is_swallowed(self):
         def _boom():
             raise RuntimeError('unreadable env')
-        _exec_lines(553, 559, {'os': os, '_load_env': _boom})
+        _exec_policy_block({'os': os, '_load_env': _boom})
 
 
 if __name__ == '__main__':
