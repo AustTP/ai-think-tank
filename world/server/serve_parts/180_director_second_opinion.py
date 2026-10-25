@@ -43,7 +43,12 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
             'is unsafe, destructive, exfiltrating, out of scope, or unjustified.'
         )
         decision, reviewer_conf, _cost = _jev_quorum_choice_sync(instr, criteria)
-        if decision == 'deny':
+        # A confident deny is final. A LOW-confidence deny is not a decision
+        # yet -- it means this reviewer also cannot tell. Continue up the
+        # chain (Nora -> Theo), exactly like a low-confidence approve. Before
+        # this, a hesitant Nora ended the chain and the chief of staff never
+        # saw the request.
+        if decision == 'deny' and reviewer_conf >= threshold:
             log_action(reviewer_id, 'jev_chain_denied',
                        {'agent': agent_id, 'action': action, 'target': target,
                         'purpose': purpose, 'jevConfidence': confidence,

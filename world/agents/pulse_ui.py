@@ -29,6 +29,14 @@ pre{white-space:pre-wrap;background:#0c131b;border:1px solid var(--line);border-
 .meta{color:var(--muted);font-size:12px;margin-top:4px;display:flex;gap:12px;flex-wrap:wrap}
 .event{border-left:2px solid var(--line);padding:4px 0 4px 8px;margin:0 0 6px;color:var(--muted);font-size:12px}
 .event b{color:var(--text)}
+.trace{border-left:2px solid var(--line);padding:6px 0 6px 10px;margin:0 0 8px}
+.trace .top{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.trace .kind{font-size:11px;border:1px solid var(--line);border-radius:99px;padding:1px 6px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.trace .kind.action{color:var(--accent);border-color:#2b5a58}
+.trace .kind.thought{color:var(--warn);border-color:#5a4a2f}
+.trace .kind.decision{color:var(--good);border-color:#2f5a35}
+.trace .summary{color:var(--muted);font-size:12px;white-space:pre-wrap;margin-top:3px}
+.trace .detail{color:var(--muted);font-size:11px;white-space:pre-wrap;margin-top:3px;max-height:120px;overflow:auto}
 .empty{color:var(--muted);font-size:12px}
 .err{color:var(--bad)}
 footer{color:var(--muted);font-size:11px;margin-top:18px}
@@ -65,6 +73,16 @@ footer{color:var(--muted);font-size:11px;margin-top:18px}
       <div class="meta" style="margin-top:10px">Takeover opens the live browser in a new tab. Hand back before the agent continues.</div>
     </section>
   </div>
+  <section style="margin-top:16px">
+    <h2>Agent traces</h2>
+    <div class="meta" style="margin-bottom:10px">
+      <select id="traceAgent" style="min-width:240px;background:#0c131b;color:inherit;border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit"></select>
+      <button id="traceRefresh">Load trace</button>
+      <label style="color:var(--muted)"><input id="traceAuto" type="checkbox" checked> auto</label>
+    </div>
+    <div id="traceMeta" class="meta"></div>
+    <div id="traces" class="empty">Loading agents...</div>
+  </section>
   <footer id="stamp"></footer>
 </main>
 <script>
@@ -160,6 +178,55 @@ async function loadSessions() {
     data.sessions.forEach(s => box.appendChild(sessRow(s)));
   } catch (e) { box.className='empty'; box.textContent = e.message; }
 }
+let traceAgentId = '';
+let traceTimer = null;
+function traceRow(x) {
+  const row = el('div','trace');
+  const top = el('div','top');
+  top.appendChild(el('span','kind '+(x.kind||''), x.kind||'event'));
+  top.appendChild(el('b',null,x.action||x.tool||'event'));
+  if (x.tool) top.appendChild(el('span','badge',x.tool));
+  if (x.confidence !== undefined && x.confidence !== null) top.appendChild(el('span','badge','conf '+x.confidence));
+  top.appendChild(el('span','badge', new Date(x.ts*1000).toLocaleString()));
+  row.appendChild(top);
+  if (x.taskId) row.appendChild(el('div','meta','task '+x.taskId));
+  if (x.summary) row.appendChild(el('div','summary',x.summary));
+  if (x.text && x.text !== x.summary) row.appendChild(el('div','detail',x.text));
+  else if (x.details) row.appendChild(el('div','detail', typeof x.details === 'string' ? x.details : JSON.stringify(x.details)));
+  return row;
+}
+async function loadAgents() {
+  const select = $('traceAgent');
+  try {
+    const data = await getJSON('/api/ops/agents');
+    const agents = data.agents || [];
+    const keep = traceAgentId || select.value || (agents[0] && agents[0].id) || '';
+    select.textContent = '';
+    agents.forEach(a => {
+      const opt = el('option', null, a.id+' / '+a.role+(a.busy ? ' / busy' : ''));
+      opt.value = a.id;
+      select.appendChild(opt);
+    });
+    if (keep && agents.some(a => a.id === keep)) select.value = keep;
+    traceAgentId = select.value;
+    if (!agents.length) { $('traces').className='empty'; $('traces').textContent='No agents.'; }
+  } catch (e) { $('traces').className='empty'; $('traces').textContent = e.message; }
+}
+async function loadTrace() {
+  const id = ($('traceAgent').value || '').trim();
+  if (!id) return;
+  traceAgentId = id;
+  const box = $('traces');
+  try {
+    const data = await getJSON('/api/ops/agents/'+encodeURIComponent(id)+'/trace?limit=150');
+    box.textContent = '';
+    const events = data.events || [];
+    $('traceMeta').textContent = id+' / '+events.length+' events / newest first';
+    if (!events.length) { box.className='empty'; box.textContent='No trace yet.'; return; }
+    box.className='';
+    events.forEach(x => box.appendChild(traceRow(x)));
+  } catch (e) { box.className='empty'; box.textContent = e.message; }
+}
 async function refresh() {
   $('error').textContent='';
   try {
@@ -170,7 +237,9 @@ async function refresh() {
     renderPulse(p); renderBoard(b);
     $('stamp').textContent = 'Updated '+new Date().toLocaleString();
   } catch (e) { $('error').textContent = e.message; }
-  loadSessions();
+  await loadSessions();
+  await loadAgents();
+  await loadTrace();
 }
 $('sessStart').addEventListener('click', async () => {
   const agentId = ($('sessAgent').value || '').trim();
@@ -181,7 +250,14 @@ $('sessStart').addEventListener('click', async () => {
   } catch (e) { alert(e.message); }
 });
 $('refresh').addEventListener('click', refresh);
+$('traceRefresh').addEventListener('click', loadTrace);
+$('traceAgent').addEventListener('change', loadTrace);
+$('traceAuto').addEventListener('change', () => {
+  if (traceTimer) { clearInterval(traceTimer); traceTimer = null; }
+  if ($('traceAuto').checked) traceTimer = setInterval(loadTrace, 10000);
+});
 refresh();
 setInterval(refresh, 30000);
+traceTimer = setInterval(loadTrace, 10000);
 </script>
 </body></html>"""

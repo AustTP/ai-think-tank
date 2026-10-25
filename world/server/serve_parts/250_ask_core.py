@@ -417,6 +417,10 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         if name == 'app_script':
             tools_used.append(name)
             return _app_script_tool(pick, args)
+        if name == 'live_read':
+            import content as _content
+            tools_used.append(name)
+            return _content._make_supervisor_live_read_executor(pick)(name, args)
         # Fall through to the shared executor: AGENT_ASK_TOOLS and
         # _make_web_tools_executor are two views of ONE tool surface, and they
         # drifted apart. api_call / propose_api_service / list_services /
@@ -444,6 +448,8 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     try:
         import content as _content
         tools = tools + [_content._PROJECT_BOARD_TOOL]
+        if _ask_is_director(pick):
+            tools = tools + [_content._SUPERVISOR_LIVE_READ_TOOL]
         if BROWSING_ENABLED:
             tools = tools + [_content._BROWSER_STEP_TOOL, _content._BROWSER_ACT_TOOL,
                              _content._CAPTCHA_SOLVE_TOOL, _content._LIST_HANDLES_TOOL,
@@ -493,7 +499,8 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
                authorized=True)
     _append_passport_decision('ask', pick, {
         'question': question[:200], 'tools': tools_used})
-    return {'reply': reply, 'agent': pick, 'tools': tools_used}
+    from core.style import sanitize_text
+    return {'reply': sanitize_text(reply), 'agent': pick, 'tools': tools_used}
 
 
 # ---------------------------------------------------------------------------

@@ -92,6 +92,8 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             text = (args or {}).get('text')
             if not to_id or not isinstance(text, str) or not text.strip():
                 return 'send_mail requires a toAgentId and non-empty text.'
+            from core.style import sanitize_text
+            text = sanitize_text(text)
             result = _http_json('POST', SELF_BASE_URL, '/api/mail/send',
                                 {'toId': to_id, 'text': text.strip()[:2000]},
                                 agent_key)

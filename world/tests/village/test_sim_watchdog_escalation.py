@@ -75,6 +75,7 @@ class DeliverWatchdogEvent(unittest.TestCase):
         self.assertEqual(len(queued), 1)
         self.assertEqual(queued[0]['assignedTo'], 'nora')
         self.assertEqual(queued[0]['goal'], 'sim-watchdog')
+        self.assertEqual(queued[0]['taskType'], 'research')
         self.assertIsNone(queued[0].get('reviewOf'))
         # Admin is NOT mailed at restart #1.
         self.assertEqual(st['agents']['theo'].get('mailbox', []), [])
@@ -95,6 +96,18 @@ class DeliverWatchdogEvent(unittest.TestCase):
         queued = [w for w in st['workQueue'] if w.get('_mailResume')]
         self.assertEqual(len(queued), 1)
         self.assertEqual(queued[0]['assignedTo'], 'nora')
+        self.assertEqual(queued[0]['taskType'], 'research')
+
+    def test_senior_director_with_a_team_is_still_nora(self):
+        st = _state(teams=[
+            {'id': 'nora', 'directorId': 'nora', 'members': ['worker']},
+            {'id': 'ben', 'directorId': 'ben', 'members': []},
+        ])
+        sim._deliver_watchdog_event(st, _evt(restarts=1))
+        self.assertEqual(len(st['agents']['nora'].get('mailbox') or []), 1)
+        queued = [w for w in st['workQueue'] if w.get('_mailResume')]
+        self.assertEqual(queued[0]['assignedTo'], 'nora')
+        self.assertEqual(queued[0]['taskType'], 'research')
 
     @mock.patch.object(serve, 'log_action')
     def test_admin_mailed_and_logged_only_at_two_restarts(self, mock_log):

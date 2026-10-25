@@ -546,10 +546,14 @@ def _api_key_auth_failures_snapshot():
 # output tokens, without demanding clipped caveman-speak.
 PLAIN_WRITING_DIRECTIVE = (
     "Write plainly, the way a competent person talks to a colleague. "
-    "Make every sentence do work. Cut filler, hedging, preamble, and any "
+    "Lead with the point. Use active voice and concrete facts. Make every "
+    "sentence do work. Cut filler, hedging, throat-clearing, preamble, "
+    "binary contrasts ('not X, it is Y'), faux-insight setups, colon reveals, "
+    "importance puffery, weasel attribution, fake-profound endings, and any "
     "closing summary or recap. Prefer short sentences. Do not use the words "
-    "or phrases: {banned}. Keep the reply exactly as long as it needs to be "
-    "and not a word longer."
+    "or phrases: {banned}. Never use em dashes or en dashes; use a period, "
+    "comma, or hyphen. Keep the reply exactly as long as it needs to be and "
+    "not a word longer."
 )
 
 
@@ -564,8 +568,11 @@ def _apply_plain_writing(messages):
     directive = PLAIN_WRITING_DIRECTIVE.format(banned=', '.join(PLAIN_WRITING_BAN_LIST))
     for i, msg in enumerate(messages):
         if isinstance(msg, dict) and msg.get('role') == 'system':
+            content = msg.get('content') or ''
+            if 'Write plainly' in content:
+                return messages
             messages[i] = dict(msg)
-            messages[i]['content'] = f"{messages[i].get('content') or ''}\n\n{directive}".strip()
+            messages[i]['content'] = f"{content}\n\n{directive}".strip()
             return messages
     return messages
 

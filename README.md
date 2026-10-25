@@ -40,7 +40,7 @@ python3 -m pytest world/tests -q
 node world/tests/js_coverage.mjs
 ```
 
-`bash world/tests/run_all.sh` runs both plus the package-boundary check. The suite has 7,887 passing Python tests and a 90% JavaScript coverage floor.
+`bash world/tests/run_all.sh` runs both plus the package-boundary check. The suite has 7,901 passing Python tests and a 90% JavaScript coverage floor.
 
 For restart and recovery evidence, run the failure-injection soak harness:
 
@@ -98,7 +98,7 @@ Nora keeps the roster, the ceremonies, and the memory. She knows that a think ta
 | `world/integrations/web_helpers.py` | Pure HTML stripping, link extraction, HTTP-date parsing, SSRF host check |
 | `world/village/sim_helpers.py` | Pure priority normalization, room and team derivation, sprint and product ID generation, village and memory-clock helpers |
 | `world/index.html` + `world/js/*.js` | Browser renderer. The client is a viewport and never the state machine. |
-| `world/tests/` | Python and JavaScript test suites (7,887 Python tests plus the JS coverage harness) |
+| `world/tests/` | Python and JavaScript test suites (7,901 Python tests plus the JS coverage harness) |
 
 ## Repo layout
 

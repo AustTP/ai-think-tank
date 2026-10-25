@@ -57,6 +57,8 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
     the prompt stack that pipes tool output into another model must wrap first
     (see the endpoint). This function itself only plumbers role:tool messages.
     """
+    from core.style import sanitize_text
+    messages = _apply_plain_writing(messages)
     current_messages = list(messages)
     denied_tools = set()
     raw_execute_tool = execute_tool
@@ -122,7 +124,7 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
                 if tool_calls:
                     break
         if not tool_calls:
-            content = (message.get('content') or '').strip()
+            content = sanitize_text((message.get('content') or '').strip())
             if not content:
                 print(f'[ask-debug] empty content for model={model} raw={json.dumps(data)[:2000]}', flush=True)
             current_messages.append(message)

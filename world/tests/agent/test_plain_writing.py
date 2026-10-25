@@ -60,6 +60,10 @@ class PlainWritingConstants(unittest.TestCase):
         d = serve.PLAIN_WRITING_DIRECTIVE.format(banned=", ".join(serve.PLAIN_WRITING_BAN_LIST))
         self.assertIn("leverage", d)
         self.assertIn("Write plainly", d)
+        self.assertIn("em dashes", d)
+        self.assertIn("en dashes", d)
+        self.assertIn("binary contrasts", d)
+        self.assertIn("Lead with the point", d)
 
 
 class ApplyPlainWriting(unittest.TestCase):
@@ -83,6 +87,18 @@ class ApplyPlainWriting(unittest.TestCase):
         msgs = ["junk", {"role": "system", "content": "sys"}]
         out = serve._apply_plain_writing(msgs)
         self.assertIn("Write plainly", out[1]["content"])
+
+    def test_second_application_is_idempotent(self):
+        msgs = [{"role": "system", "content": "You are Ada."}]
+        once = serve._apply_plain_writing(msgs)
+        twice = serve._apply_plain_writing(once)
+        self.assertEqual(once[0]["content"], twice[0]["content"])
+
+    def test_sanitizer_removes_em_and_en_dashes(self):
+        from core.style import sanitize_text
+        self.assertEqual(sanitize_text("a\u2014b"), "a - b")
+        self.assertEqual(sanitize_text("1\u20132"), "1-2")
+        self.assertIsNone(sanitize_text(None))
 
 
 class ChatEndpointPlainWriting(unittest.TestCase):

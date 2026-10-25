@@ -151,7 +151,7 @@ python3 -m pytest world/tests -q
 node world/tests/js_coverage.mjs
 ```
 
-That is 7,887 passing Python tests and a 90% JavaScript coverage floor. Any
+That is 7,901 passing Python tests and a 90% JavaScript coverage floor. Any
 failure is a new regression; diagnose it instead of treating a file as flaky.
 
 ## If a check FAILS

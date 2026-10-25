@@ -67,3 +67,31 @@ def test_scoped_issue_card_does_not_get_global_room_focus(monkeypatch):
     assert got == {'id': 'task-x'}
     assert 'observatory' not in captured['instructions']
     assert 'library/x-articles' in captured['instructions']
+
+
+def test_senior_director_can_take_watchdog_research(monkeypatch):
+    state = {
+        'agents': {'nora': {'id': 'nora', 'offDuty': False, 'busy': False,
+                            'task': None, 'pairWith': None}},
+        'agentRoster': [{'id': 'nora', 'name': 'Nora', 'isDirector': True}],
+        'tasks': {}, 'sim': {'rr': {}}, 'teams': [],
+    }
+    pick = {'title': 'Investigate sim-loop watchdog alert', 'room': None,
+            'taskType': 'research', 'assignedTo': 'nora',
+            '_mailResume': True, 'goal': 'sim-watchdog',
+            'instructions': 'Find the root cause.'}
+    seen = {}
+
+    def fake_assign(*args, **kwargs):
+        seen['agent'] = args[1]
+        seen['taskType'] = args[6].get('taskType') if len(args) > 6 else None
+        return {'id': 'task-alert'}
+
+    monkeypatch.setattr(sim, '_eligible_candidates', lambda s, include: ['nora'])
+    monkeypatch.setattr(sim, '_resolve_assignment_room', lambda p: 'pressoffice')
+    monkeypatch.setattr(sim, 'assign_task', fake_assign)
+    got = sim._assign_due_item(state, pick, True, None,
+                               {'pressoffice': {}}, 1_000_000)
+    assert got == {'id': 'task-alert'}
+    assert seen['agent'] == 'nora'
+    assert seen['taskType'] == 'research'

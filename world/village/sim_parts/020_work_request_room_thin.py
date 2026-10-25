@@ -331,8 +331,12 @@ _content_results_lock = threading.Lock()
 
 
 def _store_content_result(task_id, result):
+    from core.style import sanitize_text
+    stored = dict(result)
+    if isinstance(stored.get('note'), str):
+        stored['note'] = sanitize_text(stored['note'])
     with _content_results_lock:
-        _content_results[task_id] = dict(result)
+        _content_results[task_id] = stored
 
 
 # Bounded review-cycle escalation: a promoted

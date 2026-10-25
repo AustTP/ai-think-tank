@@ -2,9 +2,16 @@
 
 ## Unreleased
 
+### Features
+
+- Ops page now has a per-agent trace feed: actions, tool calls, model replies, JEV decisions, and task plan checkpoints, with an agent selector and auto-refresh.
+
 ### Fixes
 
 - Directors and the chief of staff can now use read-only `git_status`, `git_diff`, `git_log`, a team-scoped `task_trace`, and chief-only `find_artifact` recovery search from `live_read`.
+- Agent prose now follows the no AI slop rules: lead with the point, active voice, concrete facts, no binary contrasts, throat-clearing, importance puffery, fake endings, or recap. Outbound text strips em dashes and en dashes.
+- A director's low-confidence deny on a JEV safety gate now continues up the chain instead of ending it. Nora is tried once (immediate director and senior director dedupe), then Theo decides; only a confident deny is final.
+- Sim-watchdog escalations now queue a research card, not the default code lane, so a senior director such as Nora can actually take the investigation. A director was previously filtered out of code work and the alert could sit unowned.
 - Repair cards now inherit the original room, source paths, issue/request provenance, user story, and NEVER constraints, not just the acceptance text.
 - Scoped cards (player-filed, JIRA-linked, or a repair/review of an existing task) no longer receive the global "focus next work on <room>" line. That line was overriding a card's own room and deliverable.
 - Repair tasks now need a saved Library artifact like their original lane. A repair report that says "not completed" can no longer close as done.

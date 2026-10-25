@@ -76,6 +76,9 @@ PLAIN_WRITING_BAN_LIST_DEFAULT = (
     'that being said', 'having said that', 'when it comes to', 'at its core',
     'play a role', 'serve as', 'act as', 'allow for', 'facilitate',
     'potentially', 'effectively', 'efficiently', 'appropriately',
+    'tapestry', 'realm', 'beacon', 'multifaceted', 'meticulous', 'intricate',
+    'paramount', 'embark', 'supercharge', 'ever-evolving', 'paradigm shift',
+    'game changer', 'this is huge', 'this changes everything',
 )
 
 BROWSE_BLOCK_CATEGORIES_DEFAULT = (
