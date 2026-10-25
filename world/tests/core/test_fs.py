@@ -1,0 +1,681 @@
+"""Scoped file + app + structured-data access (world/fs.py): containment, the
+trash rule, cap enforcement, read-only SQLite reads, and gated AppleScript app
+control. The trust root is a player-issued grant (scope + caps, or an app
+bundleId) in state; three hard rules hold regardless of any grant:
+
+1. CONTAINMENT -- realpath must stay inside the granted scope (no `..`, no
+   symlink escape, no absolute path).
+2. TRASH RULE -- ~/.Trash is never a valid target; deletes move INTO the trash
+   (reversible) and can never empty it.
+3. READ-ONLY DATA -- read_store opens SQLite read-only, bounds rows/output,
+   and refuses non-read queries.
+
+Hermetic: state is injected via patched get_state_from_db/save_state_to_db and
+the scope + trash are throwaway temp dirs (TRASH_DIR env override). No real
+filesystem outside the temp dirs is touched.
+"""
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+import unittest.mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+import serve  # noqa: E402
+import fs  # noqa: E402
+
+
+def _grant(scope, caps=None):
+    return {'id': 'g-1', 'scope': scope, 'label': 'Test',
+            'caps': dict(caps or {'read': True, 'write': True, 'delete': True})}
+
+
+class FsScopeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fs-test-')
+        self.scope = os.path.join(self.tmp, 'Desktop')
+        os.makedirs(self.scope)
+        self.trash = os.path.join(self.tmp, 'Trash')
+        os.makedirs(self.trash)
+        self._env = unittest.mock.patch.dict(os.environ, {'TRASH_DIR': self.trash})
+        self._env.start()
+        self.state = {'fileGrants': [_grant(self.scope)]}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._ss = unittest.mock.patch.object(serve, 'save_state_to_db', side_effect=lambda s: None)
+        self._gs.start()
+        self._ss.start()
+
+    def tearDown(self):
+        self._gs.stop()
+        self._ss.stop()
+        self._env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_list_and_read(self):
+        with open(os.path.join(self.scope, 'notes.txt'), 'w') as f:
+            f.write('hello world')
+        entries = fs.list_scope(self.scope)
+        self.assertEqual([e['name'] for e in entries], ['notes.txt'])
+        self.assertEqual(fs.read_file(self.scope, 'notes.txt'), 'hello world')
+
+    def test_list_subdirectory(self):
+        os.makedirs(os.path.join(self.scope, 'sub'))
+        with open(os.path.join(self.scope, 'sub', 'inner.txt'), 'w') as f:
+            f.write('inner')
+        entries = fs.list_scope(self.scope, 'sub')
+        self.assertEqual([e['name'] for e in entries], ['inner.txt'])
+        self.assertEqual([e['type'] for e in entries], ['file'])
+        with self.assertRaises(FileNotFoundError):
+            fs.list_scope(self.scope, 'missing')
+
+    def test_write_and_move(self):
+        p = fs.write_file(self.scope, 'draft.docx', 'v1')
+        self.assertTrue(os.path.isfile(p))
+        fs.move_file(self.scope, 'draft.docx', 'final.docx')
+        self.assertTrue(os.path.isfile(os.path.join(self.scope, 'final.docx')))
+        self.assertFalse(os.path.exists(os.path.join(self.scope, 'draft.docx')))
+
+    def test_parent_escape_refused(self):
+        with self.assertRaises(PermissionError):
+            fs.read_file(self.scope, '../secret.txt')
+
+    def test_absolute_path_refused(self):
+        with self.assertRaises(PermissionError):
+            fs.read_file(self.scope, '/etc/passwd')
+
+    def test_symlink_escape_refused(self):
+        outside = os.path.join(self.tmp, 'outside.txt')
+        with open(outside, 'w') as f:
+            f.write('secret')
+        link = os.path.join(self.scope, 'link')
+        os.symlink(outside, link)
+        with self.assertRaises(PermissionError):
+            fs.read_file(self.scope, 'link')
+
+    def test_trash_itself_refused(self):
+        with self.assertRaises(PermissionError):
+            fs.read_file(self.scope, '../Trash/whatever')
+
+    def test_delete_moves_to_trash_not_unlink(self):
+        with open(os.path.join(self.scope, 'old.txt'), 'w') as f:
+            f.write('x')
+        dest = fs.delete_to_trash(self.scope, 'old.txt')
+        self.assertFalse(os.path.exists(os.path.join(self.scope, 'old.txt')))
+        self.assertTrue(os.path.isfile(dest))
+        self.assertTrue(os.path.realpath(dest).startswith(os.path.realpath(self.trash)))
+
+    def test_delete_collision_appends_suffix(self):
+        for name in ('a.txt', 'a-1.txt'):
+            with open(os.path.join(self.scope, name), 'w') as f:
+                f.write('x')
+        with open(os.path.join(self.trash, 'a.txt'), 'w') as f:
+            f.write('existing')
+        dest = fs.delete_to_trash(self.scope, 'a.txt')
+        self.assertEqual(os.path.basename(dest), 'a-1.txt')
+
+    def test_cap_denied(self):
+        self.state['fileGrants'] = [_grant(self.scope, {'read': True, 'write': False, 'delete': False})]
+        with self.assertRaises(PermissionError):
+            fs.write_file(self.scope, 'x.txt', 'x')
+        with self.assertRaises(PermissionError):
+            fs.delete_to_trash(self.scope, 'x.txt')
+
+    def test_no_grant_denied(self):
+        self.state['fileGrants'] = []
+        with self.assertRaises(PermissionError):
+            fs.list_scope(self.scope)
+
+
+class ReadStoreTests(unittest.TestCase):
+    """read_store: grant enforcement, read-only query gate, gzip + protobuf
+    decoding, and bounded output."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fs-store-')
+        self.scope = os.path.join(self.tmp, 'Data')
+        os.makedirs(self.scope)
+        self.state = {'fileGrants': [{'id': 'g-1', 'scope': self.scope, 'label': 'Data',
+                                      'caps': {'read': True}}]}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._gs.start()
+        self._cg = unittest.mock.patch.object(
+            serve, 'get_grants_config', return_value={'appGrants': [], 'fileGrants': []})
+        self._cg.start()
+        self._env = unittest.mock.patch.dict(os.environ, {'TRASH_DIR': os.path.join(self.tmp, 'Trash')})
+        self._env.start()
+        import sqlite3 as _s
+        self.db = os.path.join(self.scope, 'store.sqlite')
+        conn = _s.connect(self.db)
+        conn.execute('CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, payload BLOB)')
+        import gzip as _g
+        blob = _g.compress(b'hello world')
+        conn.execute('INSERT INTO items (name, payload) VALUES (?, ?)', ('a', blob))
+        conn.execute('INSERT INTO items (name, payload) VALUES (?, ?)', ('b', None))
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self._gs.stop()
+        self._cg.stop()
+        self._env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_no_grant_denied(self):
+        self.state['fileGrants'] = []
+        with self.assertRaises(PermissionError):
+            fs.read_store(self.scope, 'store.sqlite', 'SELECT * FROM items')
+
+    def test_read_required(self):
+        self.state['fileGrants'] = [{'id': 'g-1', 'scope': self.scope, 'caps': {'read': False}}]
+        with self.assertRaises(PermissionError):
+            fs.read_store(self.scope, 'store.sqlite', 'SELECT * FROM items')
+
+    def test_containment_escape_denied(self):
+        with self.assertRaises(PermissionError):
+            fs.read_store(self.scope, '../outside.sqlite', 'SELECT 1')
+
+    def test_write_query_denied(self):
+        for q in ('DELETE FROM items', 'INSERT INTO items VALUES (1,2,3)', 'DROP TABLE items', 'UPDATE items SET name=?', 'ATTACH DATABASE x AS y'):
+            with self.subTest(query=q):
+                with self.assertRaises(PermissionError):
+                    fs.read_store(self.scope, 'store.sqlite', q)
+
+    def test_select_returns_rows_and_gzip_decodes(self):
+        rows = fs.read_store(self.scope, 'store.sqlite', 'SELECT name, payload FROM items',
+                             gzip_columns=['payload'])
+        self.assertEqual(len(rows), 2)
+        by_name = {r['name']: r['payload'] for r in rows}
+        self.assertEqual(by_name['a'], 'hello world')
+        self.assertIsNone(by_name['b'])
+
+    def test_undefined_gzip_column_is_plain(self):
+        rows = fs.read_store(self.scope, 'store.sqlite', 'SELECT name, payload FROM items')
+        # No gzipColumns requested: the payload stays raw bytes (decoded lossily).
+        by_name = {r['name']: r['payload'] for r in rows}
+        self.assertNotEqual(by_name['a'], 'hello world')
+
+    def test_proto_decode_extracts_strings(self):
+        import fs as _fs
+        buf = (b'\x0a\x03abc' + b'\x12\x05hello' + b'\x1a\x06world!')
+        out = _fs.decode_proto(buf)
+        self.assertIn('abc', out)
+        self.assertIn('hello', out)
+
+    def test_row_limit_and_output_bound(self):
+        rows = fs.read_store(self.scope, 'store.sqlite', 'SELECT * FROM items', max_rows=1)
+        self.assertEqual(len(rows), 1)
+
+
+class GrantApiTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fs-grant-')
+        self.scope = os.path.join(self.tmp, 'Desktop')
+        os.makedirs(self.scope)
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            THINK_TANK_DIR=self.tmp,
+        )
+        self._cm.start()
+        serve.init_db()
+        self.state = {'fileGrants': []}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._gs.start()
+
+    def tearDown(self):
+        self._gs.stop()
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _player_env(self, **patches):
+        p = {'verify_session': lambda c: True}
+        p.update(patches)
+        return unittest.mock.patch.multiple(serve, **p)
+
+    def test_add_grant_requires_player(self):
+        from fastapi.testclient import TestClient
+        with self._player_env(verify_session=lambda c: False):
+            r = TestClient(serve.app).post('/api/file-grants',
+                                           json={'scope': self.scope})
+        self.assertEqual(r.status_code, 401)
+
+    def test_add_grant_rejects_empty_trash(self):
+        from fastapi.testclient import TestClient
+        with self._player_env():
+            r = TestClient(serve.app).post('/api/file-grants',
+                                           json={'scope': self.scope, 'caps': {'emptyTrash': True}})
+        self.assertEqual(r.status_code, 400)
+
+    def test_add_grant_success_and_duplicate(self):
+        from fastapi.testclient import TestClient
+        client = TestClient(serve.app)
+        with self._player_env():
+            r = client.post('/api/file-grants', json={'scope': self.scope, 'label': 'Desktop'})
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()['grant']['caps']['emptyTrash'])
+        with self._player_env():
+            r2 = client.post('/api/file-grants', json={'scope': self.scope})
+        self.assertEqual(r2.status_code, 409)
+
+    def test_revoke_grant(self):
+        from fastapi.testclient import TestClient
+        self.state['fileGrants'] = [{'id': 'g-1', 'scope': self.scope, 'caps': {'read': True}}]
+        client = TestClient(serve.app)
+        with self._player_env():
+            r = client.delete('/api/file-grants/g-1')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.state['fileGrants'], [])
+
+
+class AppScriptTests(unittest.TestCase):
+    """Gated AppleScript app control (world/fs.py app_script): grant check,
+    denied-primitive validation, and one-app-only wrapping."""
+
+    def setUp(self):
+        self.state = {'appGrants': [{'id': 'a-1', 'bundleId': 'com.apple.Notes',
+                                     'label': 'Notes', 'caps': {'use': True}}]}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._gs.start()
+        # Operator grants (world/grants.json) merge into the effective set, so
+        # a state-only test must blank the config or the repo's real Notes
+        # grant leaks in and defeats the empty-grant assertions.
+        self._cg = unittest.mock.patch.object(
+            serve, 'get_grants_config', return_value={'appGrants': [], 'fileGrants': []})
+        self._cg.start()
+
+    def tearDown(self):
+        self._gs.stop()
+        self._cg.stop()
+
+    def test_no_grant_denied(self):
+        self.state['appGrants'] = []
+        with self.assertRaises(PermissionError):
+            fs.app_script('com.apple.Notes', 'count of notes')
+
+    def test_unknown_app_denied(self):
+        with self.assertRaises(PermissionError):
+            fs.app_script('com.apple.Unknown', 'count of windows')
+
+    def test_use_cap_required(self):
+        self.state['appGrants'] = [{'id': 'a-1', 'bundleId': 'com.apple.Notes',
+                                    'label': 'Notes', 'caps': {'use': False}}]
+        with self.assertRaises(PermissionError):
+            fs.app_script('com.apple.Notes', 'count of notes')
+
+    def test_denied_primitives_fail_closed(self):
+        for bad in ('do shell script "ls"',
+                    'open location "https://evil.example"',
+                    'with administrator privileges',
+                    'tell application "Finder" to quit',
+                    'current application'):
+            with self.subTest(primitive=bad):
+                with self.assertRaises(PermissionError):
+                    fs.app_script('com.apple.Notes', bad)
+
+    def test_empty_body_denied(self):
+        with self.assertRaises(PermissionError):
+            fs.app_script('com.apple.Notes', '  ')
+
+    def test_valid_script_wrapped_and_returned(self):
+        seen = {}
+        def fake_osascript(script):
+            seen['script'] = script
+            return '3 notes', None
+        with unittest.mock.patch.object(fs, '_osascript', side_effect=fake_osascript):
+            out = fs.app_script('com.apple.Notes', 'count of notes')
+        self.assertEqual(out, '3 notes')
+        self.assertEqual(seen['script'],
+                         'tell application id "com.apple.Notes"\ncount of notes\nend tell')
+
+    def test_osascript_error_raised(self):
+        with unittest.mock.patch.object(fs, '_osascript', return_value=(None, 'not authorized')):
+            with self.assertRaises(PermissionError):
+                fs.app_script('com.apple.Notes', 'count of notes')
+
+
+class ConfigGrantTests(unittest.TestCase):
+    """The operator-edited world/grants.json path: an appGrant/fileGrant there
+    enables the tool even when state has no grants, and is revoked by removing
+    it (empty config grants nothing)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fs-cfg-')
+        self.scope = os.path.join(self.tmp, 'Data')
+        os.makedirs(self.scope)
+        self.state = {}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._gs.start()
+
+    def tearDown(self):
+        self._gs.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _patch_config(self, grants):
+        p = unittest.mock.patch.object(
+            serve, 'get_grants_config', return_value=grants)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_config_app_grant_enables_app_script(self):
+        self._patch_config({'appGrants': [{'id': 'cfg-a-1', 'bundleId': 'com.apple.Notes',
+                                            'label': 'Notes', 'caps': {'use': True}}],
+                            'fileGrants': []})
+        with unittest.mock.patch.object(fs, '_osascript', return_value=('3 notes', None)):
+            out = fs.app_script('com.apple.Notes', 'count of notes')
+        self.assertEqual(out, '3 notes')
+
+    def test_config_app_grant_revoked_by_removal(self):
+        self._patch_config({'appGrants': [], 'fileGrants': []})
+        with self.assertRaises(PermissionError):
+            fs.app_script('com.apple.Notes', 'count of notes')
+
+    def test_config_file_grant_enables_read_store(self):
+        import sqlite3 as _s
+        db = os.path.join(self.scope, 'store.sqlite')
+        conn = _s.connect(db)
+        conn.execute('CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)')
+        conn.execute('INSERT INTO t (name) VALUES (?)', ('x',))
+        conn.commit()
+        conn.close()
+        self._patch_config({'appGrants': [],
+                            'fileGrants': [{'id': 'cfg-g-1', 'scope': self.scope,
+                                            'caps': {'read': True}}]})
+        rows = fs.read_store(self.scope, 'store.sqlite', 'SELECT name FROM t')
+        self.assertEqual([r['name'] for r in rows], ['x'])
+
+    def test_config_file_grant_write_stays_off(self):
+        # _load_grants defaults file caps to read-only; a config grant that
+        # lists only read cannot write when it is the only grant.
+        self._patch_config({'appGrants': [],
+                            'fileGrants': [{'id': 'cfg-g-1', 'scope': self.scope,
+                                            'caps': {'read': True}}]})
+        self.state['fileGrants'] = []
+        with self.assertRaises(PermissionError):
+            fs.write_file(self.scope, 'new.txt', 'content')
+
+    def test_effective_merge_dedupes_by_id(self):
+        self._patch_config({'appGrants': [{'id': 'a-1', 'bundleId': 'com.apple.Calendar',
+                                            'label': 'Calendar', 'caps': {'use': True}}],
+                            'fileGrants': []})
+        state = {'appGrants': [{'id': 'a-1', 'bundleId': 'com.apple.Calendar',
+                                'label': 'Calendar', 'caps': {'use': True}}]}
+        effective = serve._effective_app_grants(state)
+        self.assertEqual(len(effective), 1)
+
+
+class AppGrantApiTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fs-appgrant-')
+        self._cm = unittest.mock.patch.multiple(
+            serve, DB_PATH=os.path.join(self.tmp, 'test.db'), THINK_TANK_DIR=self.tmp)
+        self._cm.start()
+        serve.init_db()
+        self.state = {'appGrants': []}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._gs.start()
+        self._cg = unittest.mock.patch.object(
+            serve, 'get_grants_config', return_value={'appGrants': [], 'fileGrants': []})
+        self._cg.start()
+
+    def tearDown(self):
+        self._gs.stop()
+        self._cg.stop()
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _player_env(self, **patches):
+        p = {'verify_session': lambda c: True}
+        p.update(patches)
+        return unittest.mock.patch.multiple(serve, **p)
+
+    def test_add_requires_player(self):
+        from fastapi.testclient import TestClient
+        with self._player_env(verify_session=lambda c: False):
+            r = TestClient(serve.app).post('/api/app-grants',
+                                           json={'bundleId': 'com.apple.Notes'})
+        self.assertEqual(r.status_code, 401)
+
+    def test_add_rejects_bad_bundle_id(self):
+        from fastapi.testclient import TestClient
+        for bad in ('Notes', 'com apple notes', '../etc', 'a..b'):
+            with self._player_env():
+                r = TestClient(serve.app).post('/api/app-grants', json={'bundleId': bad})
+            self.assertEqual(r.status_code, 400, msg=bad)
+
+    def test_add_success_and_duplicate(self):
+        from fastapi.testclient import TestClient
+        client = TestClient(serve.app)
+        with self._player_env():
+            r = client.post('/api/app-grants', json={'bundleId': 'com.apple.Notes', 'label': 'Notes'})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()['grant']['caps']['use'])
+        with self._player_env():
+            r2 = client.post('/api/app-grants', json={'bundleId': 'com.apple.Notes'})
+        self.assertEqual(r2.status_code, 409)
+
+    def test_list_and_revoke(self):
+        from fastapi.testclient import TestClient
+        client = TestClient(serve.app)
+        with self._player_env():
+            client.post('/api/app-grants', json={'bundleId': 'com.apple.Notes'})
+            r = client.get('/api/app-grants')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(r.json()['grants']), 1)
+        gid = r.json()['grants'][0]['id']
+        with self._player_env():
+            r2 = client.delete(f'/api/app-grants/{gid}')
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(self.state['appGrants'], [])
+
+
+class TrashRuleEdge(unittest.TestCase):
+    """The trash rule (fs.py:66-68) only fires when the trash dir is
+    INSIDE the granted scope: ../Trash escapes containment first, so
+    a trash dir nested in the scope is what reaches the rule."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fs-trash-')
+        self.scope = os.path.join(self.tmp, 'Desktop')
+        os.makedirs(self.scope)
+        self.trash = os.path.join(self.scope, '.Trash')
+        os.makedirs(self.trash)
+        self._env = unittest.mock.patch.dict(os.environ, {'TRASH_DIR': self.trash})
+        self._env.start()
+        self.state = {'fileGrants': [_grant(self.scope)]}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._gs.start()
+
+    def tearDown(self):
+        self._gs.stop()
+        self._env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_trash_inside_scope_is_refused_by_the_trash_rule(self):
+        with open(os.path.join(self.trash, 'x.txt'), 'w') as f:
+            f.write('x')
+        with self.assertRaises(PermissionError):
+            fs.read_file(self.scope, '.Trash/x.txt')
+
+
+class NoGrantEdges(unittest.TestCase):
+    """The per-tool 'no grant for this scope' refusals and the
+    not-found errors for read_file/delete_to_trash."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fs-nogrant-')
+        self.scope = os.path.join(self.tmp, 'Desktop')
+        os.makedirs(self.scope)
+        self.trash = os.path.join(self.tmp, 'Trash')
+        os.makedirs(self.trash)
+        self._env = unittest.mock.patch.dict(os.environ, {'TRASH_DIR': self.trash})
+        self._env.start()
+        self.state = {'fileGrants': []}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._gs.start()
+
+    def tearDown(self):
+        self._gs.stop()
+        self._env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_read_write_move_delete_refuse_a_missing_grant(self):
+        for fn, args in ((fs.read_file, (self.scope, 'a.txt')),
+                         (fs.write_file, (self.scope, 'a.txt', 'x')),
+                         (fs.move_file, (self.scope, 'a.txt', 'b.txt')),
+                         (fs.delete_to_trash, (self.scope, 'a.txt'))):
+            with self.subTest(fn=fn.__name__):
+                with self.assertRaises(PermissionError):
+                    fn(*args)
+
+    def test_read_file_of_a_missing_file(self):
+        self.state['fileGrants'] = [_grant(self.scope)]
+        with self.assertRaises(FileNotFoundError):
+            fs.read_file(self.scope, 'nope.txt')
+
+    def test_delete_of_a_missing_file(self):
+        self.state['fileGrants'] = [_grant(self.scope)]
+        with self.assertRaises(FileNotFoundError):
+            fs.delete_to_trash(self.scope, 'nope.txt')
+
+
+class OsascriptDirect(unittest.TestCase):
+    """_osascript itself: exit-code handling and the subprocess
+    failure path (the public API always mocks it away)."""
+
+    def test_success_returns_the_stripped_stdout(self):
+        proc = unittest.mock.Mock(returncode=0, stdout='  3 notes \n', stderr='')
+        with unittest.mock.patch.object(fs.subprocess, 'run', return_value=proc):
+            out, err = fs._osascript('return 3')
+        self.assertEqual(out, '3 notes')
+        self.assertIsNone(err)
+
+    def test_nonzero_exit_returns_the_stderr(self):
+        proc = unittest.mock.Mock(returncode=1, stdout='', stderr='not authorized')
+        with unittest.mock.patch.object(fs.subprocess, 'run', return_value=proc):
+            out, err = fs._osascript('return 3')
+        self.assertIsNone(out)
+        self.assertEqual(err, 'not authorized')
+
+    def test_subprocess_failure_returns_the_exception_text(self):
+        with unittest.mock.patch.object(fs.subprocess, 'run',
+                                        side_effect=OSError('no osascript')):
+            out, err = fs._osascript('return 3')
+        self.assertIsNone(out)
+        self.assertIn('no osascript', err)
+
+
+class DecodeProtoEdges(unittest.TestCase):
+    """decode_proto's wire-type branches and truncation paths, driven
+    with hand-built protobuf fragments."""
+
+    def test_empty_or_too_deep_buffer_returns_nothing(self):
+        self.assertEqual(fs.decode_proto(b''), [])
+        self.assertEqual(fs.decode_proto(b'\x0a\x01a', depth=41), [])
+
+    def test_truncated_tag_varint_returns(self):
+        self.assertEqual(fs.decode_proto(b'\x08'), [])
+
+    def test_varint_value_field_is_consumed(self):
+        self.assertEqual(fs.decode_proto(b'\x08\x05'), [])
+
+    def test_truncated_varint_value_returns(self):
+        self.assertEqual(fs.decode_proto(b'\x08\x80'), [])
+
+    def test_fixed64_field_is_skipped(self):
+        self.assertEqual(fs.decode_proto(b'\x09' + b'12345678'), [])
+
+    def test_truncated_length_delimited_returns(self):
+        self.assertEqual(fs.decode_proto(b'\x12\x80'), [])
+
+    def test_non_utf8_payload_recurses(self):
+        self.assertEqual(fs.decode_proto(b'\x12\x03\xff\xfe\xfd'), [])
+
+    def test_non_printable_payload_recurses(self):
+        self.assertEqual(fs.decode_proto(b'\x12\x04\x00\x00\x00\x00'), [])
+
+    def test_fixed32_field_is_skipped(self):
+        self.assertEqual(fs.decode_proto(b'\x0d' + b'abcd'), [])
+
+    def test_unknown_wire_type_stops(self):
+        self.assertEqual(fs.decode_proto(b'\x1b'), [])
+
+
+class CoreToDt(unittest.TestCase):
+    def test_epoch_zero_is_the_core_data_epoch(self):
+        import datetime
+        self.assertEqual(fs.core_to_dt(0), datetime.datetime(2001, 1, 1))
+
+    def test_non_numeric_timestamps_fall_back_to_the_epoch(self):
+        import datetime
+        self.assertEqual(fs.core_to_dt(None), datetime.datetime(2001, 1, 1))
+        self.assertEqual(fs.core_to_dt('not-a-number'),
+                         datetime.datetime(2001, 1, 1))
+
+
+class ReadStoreEdges(unittest.TestCase):
+    """read_store's missing-file refusal, the gzip/proto decode
+    failure paths, and the output-size bound."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fs-store-edge-')
+        self.scope = os.path.join(self.tmp, 'Data')
+        os.makedirs(self.scope)
+        self.state = {'fileGrants': [{'id': 'g-1', 'scope': self.scope,
+                                      'label': 'Data', 'caps': {'read': True}}]}
+        self._gs = unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self.state)
+        self._gs.start()
+        self._cg = unittest.mock.patch.object(
+            serve, 'get_grants_config', return_value={'appGrants': [], 'fileGrants': []})
+        self._cg.start()
+        self._env = unittest.mock.patch.dict(os.environ,
+                                             {'TRASH_DIR': os.path.join(self.tmp, 'Trash')})
+        self._env.start()
+        import sqlite3 as _s
+        import gzip as _g
+        self.db = os.path.join(self.scope, 'store.sqlite')
+        conn = _s.connect(self.db)
+        conn.execute('CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, payload BLOB)')
+        conn.execute('INSERT INTO items (name, payload) VALUES (?, ?)',
+                     ('good', _g.compress(b'hello world')))
+        conn.execute('INSERT INTO items (name, payload) VALUES (?, ?)',
+                     ('bad', b'this-is-not-gzip'))
+        conn.execute('INSERT INTO items (name, payload) VALUES (?, ?)',
+                     ('big', 'x' * 210000))
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self._gs.stop()
+        self._cg.stop()
+        self._env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_missing_db_file_is_refused(self):
+        with self.assertRaises(FileNotFoundError):
+            fs.read_store(self.scope, 'nope.sqlite', 'SELECT 1')
+
+    def test_undecodable_gzip_stays_raw(self):
+        rows = fs.read_store(self.scope, 'store.sqlite',
+                             "SELECT name, payload FROM items WHERE name = 'bad'",
+                             gzip_columns=['payload'])
+        self.assertEqual(rows[0]['name'], 'bad')
+
+    def test_proto_decode_failure_falls_back_to_lossy_text(self):
+        with unittest.mock.patch.object(fs, 'decode_proto',
+                                        side_effect=ValueError('boom')):
+            rows = fs.read_store(self.scope, 'store.sqlite',
+                                 "SELECT name, payload FROM items WHERE name = 'good'",
+                                 proto_columns=['payload'])
+        self.assertEqual(rows[0]['name'], 'good')
+        self.assertIsInstance(rows[0]['payload'], str)
+
+    def test_output_bound_stops_after_the_budget(self):
+        rows = fs.read_store(self.scope, 'store.sqlite',
+                             "SELECT name, payload FROM items WHERE name = 'big'")
+        self.assertEqual(len(rows), 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

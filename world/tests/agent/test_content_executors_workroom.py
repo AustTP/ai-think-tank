@@ -1,0 +1,574 @@
+"""Research desk, observatory, bank, and workroom content executors."""
+
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+import serve  # noqa: E402
+import content  # noqa: E402
+
+
+def _snapshot(**over):
+    base = {
+        'agentRoster': [{'id': 'cora', 'name': 'Cora'}, {'id': 'ben', 'name': 'Ben'}],
+        'agents': {'cora': {'name': 'Cora'}, 'ben': {'name': 'Ben'}},
+        'researchTopics': [],
+        'pipelines': [],
+        'products': {},
+    }
+    base.update(over)
+    return base
+
+
+def _store():
+    seen = {}
+    patcher = mock.patch('sim._store_content_result',
+                         lambda task_id, result: seen.__setitem__(task_id, result))
+    patcher.start()
+    return seen
+
+
+def _base_mocks():
+    patchers = [
+        mock.patch.object(serve, 'SELF_BASE_URL', 'http://x'),
+        mock.patch.object(serve, 'get_or_create_agent_key', return_value='key-123'),
+        mock.patch.object(serve, '_http_json', return_value={'ok': True}),
+    ]
+    for p in patchers:
+        p.start()
+    return patchers
+
+
+class _ExecutorTestCase(unittest.TestCase):
+    """The helper methods above start mock patches via .start() that are never
+    stopped by the test body (they only need to live for that one test call).
+    Without a cleanup, those patches leak across the whole test process and
+    contaminate other test modules (a stray _resolve_model_tier patch here
+    broke test_spike_content's no-tier short-circuit when run after this
+    module). Stopping everything still active at the end of each test keeps
+    this module hermetic without touching every call site."""
+
+    def tearDown(self):
+        mock.patch.stopall()
+
+
+class ResearchDeskWiring(_ExecutorTestCase):
+    """The Research Desk hooks inside _run_research_content: every candidate
+    page goes through the /api/evidence ledger on its RESOLVED identity, a
+    'covered' verdict skips the duplicate page, synthesis answers the desk
+    passes, and the run leaves coverage entries pending_review (never covered)
+    unless a failure was recorded."""
+
+    def _run_desk(self, topic, pages, chat_reply='The distilled skill file.'):
+        snapshot = _snapshot(researchTopics=[topic])
+        seen = _store()
+        _base_mocks()
+        calls = {'evidence': [], 'coverage': [], 'chat_bodies': [], 'save': 0}
+
+        def side_effect(method, base, path, body=None, header=None, timeout=30):
+            if path == '/api/browse':
+                return pages[body['url']]
+            if path == '/api/evidence':
+                calls['evidence'].append(body)
+                return {'recorded': True, 'independent': True, 'id': 'ev-1'}
+            if path == '/api/coverage':
+                calls['coverage'].append(body)
+                return {'ok': True}
+            if path == '/api/sandbox-save-page':
+                calls['save'] += 1
+                return {'allowed': True, 'ok': True}
+            if path == '/api/chat':
+                calls['chat_bodies'].append(body)
+                return {'reply': chat_reply}
+            if path.startswith('/api/library/file?'):
+                return {'content': 'old skill content'}
+            if path == '/api/library/file':
+                return {'ok': True}
+            return {'ok': True}
+
+        mock.patch.object(serve, '_http_json', side_effect=side_effect).start()
+        mock.patch.object(serve, '_resolve_model_tier', return_value='mid-tier-slug').start()
+        content._run_research_content(snapshot, 'cora', {'id': 'd1', 'research': {'topicId': topic['id'], 'since': 100}})
+        return seen['d1'], calls
+
+    def test_each_kept_page_is_recorded_on_resolved_identity(self):
+        topic = {'id': 'td', 'topic': 'D', 'startUrl': 'https://a.com',
+                 'seenUrls': [], 'pageKeyword': ''}
+        pages = {'https://a.com': {'url': 'https://landing.example/x', 'text': 'A',
+                                   'lastModified': 999, 'allowed': True, 'links': []}}
+        result, calls = self._run_desk(topic, pages)
+        self.assertEqual(len(calls['evidence']), 1)
+        rec = calls['evidence'][0]['record']
+        self.assertEqual(rec['resolved_url'], 'https://landing.example/x')
+        self.assertEqual(rec['source_url'], 'https://a.com')
+        # The evidence POST authenticates as the REAL research agent (its key
+        # rides the X-Agent-Key header) -- never a fake 'research-desk' id the
+        # endpoint's agent-key check would reject.
+        self.assertEqual(calls['evidence'][0]['agentId'], 'cora')
+
+    def test_covered_verdict_skips_duplicate_page(self):
+        topic = {'id': 'te', 'topic': 'E', 'startUrl': 'https://a.com',
+                 'seenUrls': [], 'pageKeyword': ''}
+        pages = {'https://a.com': {'url': 'https://landing.example/x', 'text': 'A',
+                                   'lastModified': 999, 'allowed': True, 'links': []}}
+        snapshot = _snapshot(researchTopics=[topic])
+        seen = _store()
+        _base_mocks()
+        calls = {'save': 0}
+
+        def side_effect(method, base, path, body=None, header=None, timeout=30):
+            if path == '/api/browse':
+                return pages[body['url']]
+            if path == '/api/evidence':
+                return {'recorded': False, 'reason': 'covered', 'identity': 'x'}
+            if path == '/api/sandbox-save-page':
+                calls['save'] += 1
+                return {'allowed': True, 'ok': True}
+            return {'ok': True}
+
+        mock.patch.object(serve, '_http_json', side_effect=side_effect).start()
+        mock.patch.object(serve, '_resolve_model_tier', return_value='mid-tier-slug').start()
+        content._run_research_content(snapshot, 'cora', {'id': 'd2', 'research': {'topicId': topic['id'], 'since': 100}})
+        # Covered -> the page is not saved and nothing is synthesized.
+        self.assertEqual(calls['save'], 0)
+        self.assertIn('nothing new since', seen['d2']['note'])
+
+    def test_synthesis_prompt_contains_desk_passes(self):
+        topic = {'id': 'tf', 'topic': 'F', 'startUrl': 'https://a.com',
+                 'seenUrls': [], 'pageKeyword': ''}
+        pages = {'https://a.com': {'url': 'https://a.com', 'text': 'A',
+                                   'lastModified': 999, 'allowed': True, 'links': []}}
+        result, calls = self._run_desk(topic, pages)
+        self.assertTrue(calls['chat_bodies'])
+        sys_msg = calls['chat_bodies'][0]['messages'][0]['content']
+        self.assertIn('announcements', sys_msg)
+        self.assertIn('practical_examples', sys_msg)
+        self.assertIn('limitations', sys_msg)
+        self.assertIn('repost', sys_msg)
+
+    def test_coverage_entries_are_pending_review_not_covered(self):
+        topic = {'id': 'tg', 'topic': 'G', 'startUrl': 'https://a.com',
+                 'seenUrls': [], 'pageKeyword': ''}
+        pages = {'https://a.com': {'url': 'https://landing.example/x', 'text': 'A',
+                                   'lastModified': 999, 'allowed': True, 'links': []}}
+        result, calls = self._run_desk(topic, pages)
+        self.assertTrue(calls['coverage'])
+        self.assertFalse(calls['coverage'][0]['reviewed'])
+        self.assertEqual(calls['coverage'][0]['artifact'], 'skills/g.md')
+
+    def test_result_carries_pass_log(self):
+        topic = {'id': 'th', 'topic': 'H', 'startUrl': 'https://a.com',
+                 'seenUrls': [], 'pageKeyword': ''}
+        pages = {'https://a.com': {'url': 'https://a.com', 'text': 'A',
+                                   'lastModified': 999, 'allowed': True, 'links': []}}
+        result, calls = self._run_desk(topic, pages)
+        self.assertEqual(len(result['passLog']), 3)
+        self.assertEqual(result['passLog'][0]['key'], 'announcements')
+
+    def test_synthesis_failure_records_coverage_failure(self):
+        topic = {'id': 'ti', 'topic': 'I', 'startUrl': 'https://a.com',
+                 'seenUrls': [], 'pageKeyword': ''}
+        pages = {'https://a.com': {'url': 'https://landing.example/x', 'text': 'A',
+                                   'lastModified': 999, 'allowed': True, 'links': []}}
+        snapshot = _snapshot(researchTopics=[topic])
+        seen = _store()
+        _base_mocks()
+        calls = {'coverage': []}
+
+        def side_effect(method, base, path, body=None, header=None, timeout=30):
+            if path == '/api/browse':
+                return pages[body['url']]
+            if path == '/api/evidence':
+                return {'recorded': True, 'id': 'ev-1'}
+            if path == '/api/coverage':
+                calls['coverage'].append(body)
+                return {'ok': True}
+            if path == '/api/sandbox-save-page':
+                return {'allowed': True, 'ok': True}
+            return {'ok': True}
+
+        mock.patch.object(serve, '_http_json', side_effect=side_effect).start()
+        mock.patch.object(serve, '_resolve_model_tier', return_value=None).start()  # no tier -> synthesis fails
+        content._run_research_content(snapshot, 'cora', {'id': 'd3', 'research': {'topicId': topic['id'], 'since': 100}})
+        self.assertTrue(calls['coverage'])
+        self.assertTrue(calls['coverage'][0]['failure'])
+        self.assertIn('no model tier', seen['d3']['note'])
+
+class ObservatoriesAndDispatcher(_ExecutorTestCase):
+    def test_observatory_dispatches_on_task_flags(self):
+        seen = _store()
+        _base_mocks()
+        for flag, task in [
+            ('distill', {'id': 'o1', 'distill': True}),
+            ('skillReview', {'id': 'o2', 'skillReview': True}),
+            ('research', {'id': 'o3', 'research': {'topicId': 'x'}}),
+            ('projectLabel', {'id': 'o4', 'projectLabel': 'proj'}),
+            ('bare', {'id': 'o5'}),
+        ]:
+            with mock.patch.object(content, '_run_distill_content') as d, \
+                 mock.patch.object(content, '_run_skill_review_content') as s, \
+                 mock.patch.object(content, '_run_research_content') as r, \
+                 mock.patch.object(content, '_run_spike_content') as rp, \
+                 mock.patch.object(content, '_run_research_bare_content') as rb:
+                content._run_observatory_content(_snapshot(), 'cora', task)
+            if flag == 'distill':
+                d.assert_called_once()
+            elif flag == 'skillReview':
+                s.assert_called_once()
+            elif flag == 'research':
+                r.assert_called_once()
+            elif flag == 'projectLabel':
+                rp.assert_called_once()
+            else:
+                rb.assert_called_once()
+
+    def test_dispatcher_routes_spike_and_review_and_rooms(self):
+        seen = _store()
+        _base_mocks()
+        for task, expected in [
+            ({'id': 'x1', 'taskType': 'spike'}, '_run_spike_content'),
+            ({'id': 'x2', 'taskType': 'review'}, '_run_review_content'),
+            ({'id': 'x3', 'taskType': 'qa'}, '_run_review_content'),
+            ({'id': 'x4', 'room': 'weatherstation'}, '_run_observatory_content'),
+            ({'id': 'x5', 'room': 'media'}, '_run_media_content'),
+            ({'id': 'x6', 'room': 'bank'}, '_run_bank_content'),
+            ({'id': 'x7', 'room': 'pressoffice'}, '_run_workroom_content'),
+            ({'id': 'x8', 'room': 'observatory'}, '_run_observatory_content'),
+            ({'id': 'x9', 'room': 'library'}, None),
+            # A research card is assigned room=observatory (taskType is NOT in
+            # the task_type_executors map), so it routes through the room path
+            # into _run_observatory_content, whose bare branch runs research.
+            ({'id': 'x11', 'taskType': 'research', 'room': 'observatory'},
+             '_run_observatory_content'),
+        ]:
+            with mock.patch.object(content, '_run_spike_content') as spike, \
+                 mock.patch.object(content, '_run_review_content') as review, \
+                 mock.patch.object(content, '_run_media_content') as media, \
+                 mock.patch.object(content, '_run_bank_content') as bank, \
+                 mock.patch.object(content, '_run_workroom_content') as workroom, \
+                 mock.patch.object(content, '_run_observatory_content') as observatory:
+                content._server_content_dispatcher(_snapshot(), 'cora', task)
+            target = {'_run_spike_content': spike, '_run_review_content': review,
+                      '_run_media_content': media,
+                      '_run_bank_content': bank, '_run_workroom_content': workroom,
+                      '_run_observatory_content': observatory}
+            if expected is None:
+                for t in target.values():
+                    t.assert_not_called()
+            else:
+                target[expected].assert_called_once()
+
+    def test_dispatcher_pipeline_step_overrides_everything(self):
+        with mock.patch.object(content, '_run_pipeline_step_content') as ps:
+            content._server_content_dispatcher(_snapshot(), 'cora',
+                                               {'id': 'x10', 'room': 'bank',
+                                                'taskType': 'review',
+                                                'pipelineStep': {'pipelineId': 'pl', 'stepIndex': 0}})
+            ps.assert_called_once()
+
+class BankAndResearchProjectContent(_ExecutorTestCase):
+    def test_bank_non_director_with_empty_view(self):
+        seen = _store()
+        _base_mocks()
+        with mock.patch.object(serve, '_is_director', return_value=False), \
+             mock.patch.object(serve, '_bank_budget_view', return_value=None):
+            content._run_bank_content(_snapshot(), 'ben', {'id': 'b1'})
+        self.assertIn('nothing has been spent yet', seen['b1']['note'])
+
+    def test_research_project_success_logs_finding(self):
+        seen = _store()
+        _base_mocks()
+        calls = {'chat': 0}
+        def side_effect(method, base, path, body=None, header=None, timeout=30):
+            if path == '/api/chat':
+                calls['chat'] += 1
+                return {'reply': 'Real finding.'}
+            return {'ok': True}
+        with mock.patch.object(serve, '_http_json', side_effect=side_effect), \
+             mock.patch.object(serve, '_resolve_model_tier', return_value='t'):
+            content._run_research_project_content(_snapshot(), 'cora',
+                                                  {'id': 'rp1', 'projectLabel': 'P', 'title': 'T'})
+        self.assertIn('Researched', seen['rp1']['note'])
+
+    def test_research_project_no_tier(self):
+        seen = _store()
+        _base_mocks()
+        with mock.patch.object(serve, '_resolve_model_tier', return_value=None):
+            content._run_research_project_content(_snapshot(), 'cora',
+                                                  {'id': 'rp2', 'projectLabel': 'P', 'title': 'T'})
+        self.assertIn('didn\'t produce anything usable', seen['rp2']['note'])
+
+    def test_research_project_empty_reply(self):
+        seen = _store()
+        _base_mocks()
+        def side_effect(method, base, path, body=None, header=None, timeout=30):
+            if path == '/api/chat':
+                return {'reply': ''}
+            return {'ok': True}
+        with mock.patch.object(serve, '_http_json', side_effect=side_effect), \
+             mock.patch.object(serve, '_resolve_model_tier', return_value='t'):
+            content._run_research_project_content(_snapshot(), 'cora',
+                                                  {'id': 'rp3', 'projectLabel': 'P', 'title': 'T'})
+        self.assertIn('didn\'t produce anything usable', seen['rp3']['note'])
+
+    def test_research_bare_with_failed_step(self):
+        seen = _store()
+        _base_mocks()
+        with mock.patch.object(serve, '_http_json', return_value={'failedStep': 'log this pass'}):
+            content._run_research_bare_content(_snapshot(), 'cora', {'id': 'rb1'})
+        self.assertIn('hit a failure', seen['rb1']['note'])
+
+    def test_research_bare_success(self):
+        seen = _store()
+        _base_mocks()
+        with mock.patch.object(serve, '_http_json', return_value={'failedStep': None}):
+            content._run_research_bare_content(_snapshot(), 'cora', {'id': 'rb2'})
+        self.assertIn('Reviewed and logged', seen['rb2']['note'])
+
+class WorkroomAndProductBuildContent(_ExecutorTestCase):
+    def test_workroom_routes_product_build(self):
+        with mock.patch.object(content, '_run_product_build_content') as pb:
+            content._run_workroom_content(_snapshot(), 'cora', {'id': 'w1', 'productId': 'prod'})
+            pb.assert_called_once()
+
+    def test_workroom_review_with_project_label(self):
+        with mock.patch.object(content, '_run_review_content') as rev:
+            content._run_workroom_content(_snapshot(), 'cora',
+                                          {'id': 'w2', 'projectLabel': 'P', 'taskType': 'review'})
+            rev.assert_called_once()
+        with mock.patch.object(content, '_run_review_content') as rev:
+            content._run_workroom_content(_snapshot(), 'cora',
+                                          {'id': 'w3', 'projectLabel': 'P', 'taskType': 'qa'})
+            rev.assert_called_once()
+
+    def test_workroom_project_label_coding_with_ls_context(self):
+        seen = _store()
+        _base_mocks()
+        with mock.patch.object(serve, '_http_json', return_value={'allowed': True,
+                                                                  'stdout': 'index.html\napp.js'}), \
+             mock.patch.object(content, '_run_coding_content',
+                               side_effect=lambda *a, **k: seen.setdefault('ctx', k.get('base_ctx'))):
+            content._run_workroom_content(_snapshot(), 'cora',
+                                          {'id': 'w4', 'projectLabel': 'P', 'title': 'T',
+                                           'instructions': 'do it'})
+        self.assertIn('Current files', seen['ctx'])
+
+    def test_workroom_project_label_ls_blocked_leaves_empty_context(self):
+        # A blocked/no-stdout ls degrades to an EMPTY context, never a
+        # fabricated one -- the coding task still runs.
+        seen = _store()
+        _base_mocks()
+        with mock.patch.object(serve, '_http_json', return_value={'allowed': False,
+                                                                  'reason': 'denied'}), \
+             mock.patch.object(content, '_run_coding_content',
+                               side_effect=lambda *a, **k: seen.setdefault('ctx', k.get('base_ctx'))):
+            content._run_workroom_content(_snapshot(), 'cora',
+                                          {'id': 'w13', 'projectLabel': 'P', 'title': 'T'})
+        self.assertEqual(seen['ctx'], '')
+
+    def test_workroom_bare_ambient_health_check(self):
+        seen = _store()
+        _base_mocks()
+        with mock.patch.object(serve, '_http_json', return_value={'failedStep': None}):
+            content._run_workroom_content(_snapshot(), 'cora', {'id': 'w5'})
+        self.assertIn('Checked and ran the shared tooling', seen['w5']['note'])
+
+    def test_product_build_missing_record(self):
+        seen = _store()
+        _base_mocks()
+        content._run_product_build_content(_snapshot(), 'cora', {'id': 'w6', 'productId': 'nope'})
+        self.assertIn('not in the catalog', seen['w6']['note'])
+
+    def test_product_build_missing_sandbox(self):
+        seen = _store()
+        _base_mocks()
+        snapshot = _snapshot(products={'prod': {'name': 'P', 'sandboxId': 'missing-dir'}})
+        content._run_product_build_content(snapshot, 'cora', {'id': 'w7', 'productId': 'prod'})
+        self.assertIn('sandbox', seen['w7']['note'])
+
+    def test_product_build_success_releases(self):
+        seen = _store()
+        _base_mocks()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        sandbox = os.path.join(tmp, 'prod-sb')
+        os.makedirs(sandbox)
+        snapshot = _snapshot(products={'prod': {'name': 'P', 'sandboxId': 'prod-sb', 'spec': 's'}})
+        with mock.patch.object(serve, 'SANDBOXES_DIR', tmp), \
+             mock.patch.object(serve, '_http_json', return_value={'allowed': True,
+                                                                   'exitCode': 0,
+                                                                   'timedOut': False,
+                                                                   'stdout': 'x'}), \
+             mock.patch.object(content, '_run_coding_content', return_value=True) as rc, \
+             mock.patch.object(content, '_release_product_from_build') as rel:
+            content._run_product_build_content(snapshot, 'cora', {'id': 'w8', 'productId': 'prod'})
+            rc.assert_called_once()
+            rel.assert_called_once_with('prod', 'cora', 'http://x', 'key-123')
+
+    def test_product_build_with_base_ctx_skips_ls(self):
+        # When the caller already provides a context summary, the build must
+        # not pay for an extra ls round-trip -- it passes the context through.
+        seen = _store()
+        _base_mocks()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        sandbox = os.path.join(tmp, 'prod-sb')
+        os.makedirs(sandbox)
+        snapshot = _snapshot(products={'prod': {'name': 'P', 'sandboxId': 'prod-sb', 'spec': 's'}})
+        calls = []
+        def side_effect(method, base, path, body=None, header=None, timeout=30):
+            calls.append(path)
+            return {'ok': True}
+        with mock.patch.object(serve, 'SANDBOXES_DIR', tmp), \
+             mock.patch.object(serve, '_http_json', side_effect=side_effect), \
+             mock.patch.object(content, '_run_coding_content',
+                               side_effect=lambda *a, **k: seen.setdefault('ctx', k.get('base_ctx'))), \
+             mock.patch.object(content, '_wiki_context_for_task', return_value=''):
+            content._run_product_build_content(snapshot, 'cora', {'id': 'w9', 'productId': 'prod'},
+                                               base_ctx='provided context')
+        self.assertNotIn('/api/execute', calls)  # no ls round-trip
+        self.assertIn('provided context', seen['ctx'])
+
+    def test_product_build_ls_blocked_leaves_empty_context(self):
+        # A blocked/no-stdout ls degrades to an empty context rather than
+        # fabricating one -- the build still runs.
+        seen = _store()
+        _base_mocks()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        sandbox = os.path.join(tmp, 'prod-sb')
+        os.makedirs(sandbox)
+        snapshot = _snapshot(products={'prod': {'name': 'P', 'sandboxId': 'prod-sb', 'spec': 's'}})
+        with mock.patch.object(serve, 'SANDBOXES_DIR', tmp), \
+             mock.patch.object(serve, '_http_json', return_value={'allowed': False,
+                                                                   'reason': 'denied'}), \
+             mock.patch.object(content, '_run_coding_content',
+                               side_effect=lambda *a, **k: seen.setdefault('ctx', k.get('base_ctx'))), \
+             mock.patch.object(content, '_wiki_context_for_task', return_value=''):
+            content._run_product_build_content(snapshot, 'cora', {'id': 'w10', 'productId': 'prod'})
+        self.assertNotIn('Current files', seen['ctx'])
+
+    def test_product_build_wiki_context_prepended(self):
+        # Think tank knowledge for the task's room is folded in BEFORE the
+        # sandbox context, so the build reasons over it first.
+        seen = _store()
+        _base_mocks()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        sandbox = os.path.join(tmp, 'prod-sb')
+        os.makedirs(sandbox)
+        snapshot = _snapshot(products={'prod': {'name': 'P', 'sandboxId': 'prod-sb', 'spec': 's'}})
+        with mock.patch.object(serve, 'SANDBOXES_DIR', tmp), \
+             mock.patch.object(serve, '_http_json', return_value={'allowed': True,
+                                                                   'stdout': 'index.html'}), \
+             mock.patch.object(content, '_run_coding_content',
+                               side_effect=lambda *a, **k: seen.setdefault('ctx', k.get('base_ctx'))), \
+             mock.patch.object(content, '_wiki_context_for_task',
+                               return_value='# Room knowledge block'):
+            content._run_product_build_content(snapshot, 'cora', {'id': 'w11', 'productId': 'prod'})
+        self.assertTrue(seen['ctx'].startswith('# Room knowledge block'))
+        self.assertIn('Current files', seen['ctx'])
+
+    def test_product_build_design_context_outermost(self):
+        # The folded design taste doc wins the outermost slot: it sits ABOVE
+        # wiki and sandbox context, so the build reads taste first.
+        seen = _store()
+        _base_mocks()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        sandbox = os.path.join(tmp, 'prod-sb')
+        os.makedirs(sandbox)
+        snapshot = _snapshot(products={'prod': {'name': 'P', 'sandboxId': 'prod-sb', 'spec': 's'}})
+        with mock.patch.object(serve, 'SANDBOXES_DIR', tmp), \
+             mock.patch.object(serve, '_http_json', return_value={'allowed': True,
+                                                                   'stdout': 'index.html'}), \
+             mock.patch.object(content, '_run_coding_content',
+                               side_effect=lambda *a, **k: seen.setdefault('ctx', k.get('base_ctx'))), \
+             mock.patch.object(content, '_wiki_context_for_task', return_value=''), \
+             mock.patch.object(content, '_design_context_for_task',
+                               return_value='# Taste doc'):
+            content._run_product_build_content(snapshot, 'cora', {'id': 'w14', 'productId': 'prod'})
+        self.assertTrue(seen['ctx'].startswith('# Taste doc'))
+        self.assertIn('Current files', seen['ctx'])
+
+    def test_product_build_coding_failure_skips_release(self):
+        # A failed coding run must NOT release a frozen revision -- the
+        # release is gated on ok=True only.
+        seen = _store()
+        _base_mocks()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        sandbox = os.path.join(tmp, 'prod-sb')
+        os.makedirs(sandbox)
+        snapshot = _snapshot(products={'prod': {'name': 'P', 'sandboxId': 'prod-sb', 'spec': 's'}})
+        with mock.patch.object(serve, 'SANDBOXES_DIR', tmp), \
+             mock.patch.object(serve, '_http_json', return_value={'ok': True}), \
+             mock.patch.object(content, '_run_coding_content', return_value=False), \
+             mock.patch.object(content, '_release_product_from_build') as rel:
+            content._run_product_build_content(snapshot, 'cora', {'id': 'w12', 'productId': 'prod'})
+            rel.assert_not_called()
+
+    def test_release_product_from_build_record_missing(self):
+        # State exists but the product is not in the catalog -- release
+        # quietly gives up (best-effort, no raise).
+        _base_mocks()
+        state = {'products': {}}
+        with mock.patch.object(serve, 'get_state_from_db', return_value=state):
+            content._release_product_from_build('nope', 'cora', 'http://x', 'key-123')  # no raise
+
+    def test_release_product_from_build_exception_swallowed(self):
+        # Any failure inside the release (e.g. the revision helper blowing up)
+        # must never break the task cycle -- best-effort. The sandbox must be a
+        # real dir so the release actually reaches the raise site (a nonexistent
+        # SANDBOXES_DIR bails earlier on the isdir check, never exercising the
+        # except block).
+        _base_mocks()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        sandbox = os.path.join(tmp, 'sb')
+        os.makedirs(sandbox)
+        state = {'products': {'prod': {'name': 'P', 'sandboxId': 'sb'}}}
+        with mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             mock.patch.object(serve, 'SANDBOXES_DIR', tmp), \
+             mock.patch('sim.next_product_revision', side_effect=RuntimeError('db down')):
+            content._release_product_from_build('prod', 'cora', 'http://x', 'key-123')  # no raise
+
+    def test_release_product_from_build_full_path(self):
+        _base_mocks()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        sandbox = os.path.join(tmp, 'sb')
+        projects = os.path.join(tmp, 'projects')
+        os.makedirs(sandbox)
+        os.makedirs(projects)
+        state = {'products': {'prod': {'name': 'P', 'sandboxId': 'sb'}}}
+        with mock.patch.object(serve, 'SANDBOXES_DIR', tmp), \
+             mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             mock.patch.object(serve, '_product_projects_dir', return_value=projects), \
+             mock.patch.object(serve, '_copy_release_snapshot', return_value=None), \
+             mock.patch.object(serve, '_write_file',
+                               side_effect=lambda path, content: open(path, 'w').write(content)), \
+             mock.patch.object(serve, 'save_state_to_db', return_value=None), \
+             mock.patch.object(serve, 'log_action', return_value=None), \
+             mock.patch.object(serve, '_append_passport_decision', return_value=None), \
+             mock.patch('sim.next_product_revision', return_value=(1, None)), \
+             mock.patch('sim.product_release_record', return_value=None):
+            content._release_product_from_build('prod', 'cora', 'http://x', 'key-123')
+        self.assertTrue(os.path.isfile(os.path.join(projects, 'v1', 'RELEASE.md')))
+
+    def test_release_product_from_build_no_state(self):
+        _base_mocks()
+        with mock.patch.object(serve, 'get_state_from_db', return_value=None):
+            content._release_product_from_build('prod', 'cora', 'http://x', 'key-123')  # no raise
+
+    def test_release_product_from_build_missing_sandbox_dir(self):
+        _base_mocks()
+        state = {'products': {'prod': {'name': 'P', 'sandboxId': 'gone'}}}
+        with mock.patch.object(serve, 'get_state_from_db', return_value=state), \
+             mock.patch.object(serve, 'SANDBOXES_DIR', '/tmp/definitely-not-here'):
+            content._release_product_from_build('prod', 'cora', 'http://x', 'key-123')  # no raise

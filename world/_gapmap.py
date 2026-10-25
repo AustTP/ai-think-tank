@@ -1,35 +1,15 @@
-import ast
-import json
-
-with open('coverage.json') as f:
-    cov = json.load(f)
-
-# Prefer the exact local sim.py key; otherwise fall back to any key whose
-# basename matches (preserves the tool across machines without embedding a
-# machine-specific absolute path).
-sim_key = next((k for k in cov['files'] if k.endswith('sim.py')), None)
-sim_data = cov['files'].get(sim_key, {})
-missing = set(sim_data['missing_lines'])
-
-src = open('sim.py').read()
-tree = ast.parse(src)
-
-def find_ranges(node, ranges):
-    for child in ast.iter_child_nodes(node):
-        find_ranges(child, ranges)
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        ranges.append((node.name, node.lineno, node.end_lineno))
-
-ranges: list[tuple[str, int, int]] = []
-find_ranges(tree, ranges)
-
-out = []
-for name, start, end in sorted(ranges, key=lambda x: x[1]):
-    miss = sorted(l for l in missing if start <= l <= end)
-    if miss:
-        out.append((name, start, end, miss))
-
-out.sort(key=lambda x: -len(x[3]))
-print(f"total missing: {len(missing)}")
-for name, start, end, miss in out:
-    print(f"{name} ({start}-{end}): {len(miss)} -> {miss}")
+# facade: tools._gapmap
+"""Compatibility loader for :mod:`tools._gapmap`."""
+import os as _os
+import sys as _sys
+_here = globals().get('__file__')
+if _here:
+    _pkg_root = _os.path.dirname(_os.path.abspath(_here))
+else:
+    _pkg_root = next((p for p in _sys.path if _os.path.isfile(_os.path.join(p, 'tools', '_gapmap.py'))), '')
+_target = _os.path.join(_pkg_root, 'tools', '_gapmap.py')
+_facade_file = globals().get('__file__')
+globals()['__file__'] = _os.path.join(_pkg_root, '_facade_' + _os.path.basename(_target))
+with open(_target, encoding='utf-8') as _fh:
+    exec(compile(_fh.read(), _target, 'exec'))
+globals()['__file__'] = _facade_file
