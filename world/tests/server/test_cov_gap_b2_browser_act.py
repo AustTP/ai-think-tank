@@ -815,3 +815,10 @@ class PipelineConfirmationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SandboxProxySourceTests(unittest.TestCase):
+    def test_moved_path_and_legacy_fallback(self):
+        self.assertTrue(serve._sandbox_proxy_source().endswith('sandbox_proxy.py'))
+        with mock.patch.object(serve.os.path, 'isfile', return_value=False):
+            self.assertTrue(serve._sandbox_proxy_source().endswith('sandbox_proxy.py'))

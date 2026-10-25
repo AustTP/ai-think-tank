@@ -497,6 +497,15 @@ EGRESS_GRANTS_PATH = os.path.join(ROOT, 'sandbox_egress_grants.json')
 PROXY_PORT = 8899
 
 
+def _sandbox_proxy_source():
+    # The proxy script moved to tools/ in the package split; keep the old
+    # top-level path as a fallback for checkouts that have not migrated yet.
+    moved = os.path.join(ROOT, 'tools', 'sandbox_proxy.py')
+    if os.path.isfile(moved):
+        return moved
+    return os.path.join(ROOT, 'sandbox_proxy.py')
+
+
 def _docker_network_exists(name):
     result = subprocess.run(['docker', 'network', 'inspect', name], capture_output=True, timeout=8)
     return result.returncode == 0
@@ -568,7 +577,7 @@ def ensure_sandbox_networking():
             '--network', SANDBOX_NETWORK,
             '-e', f'SANDBOX_EGRESS_EXTRA_HOSTS={desired_extra_hosts}',
             '-e', f'SANDBOX_EGRESS_GRANTS_PATH={EGRESS_GRANTS_PATH}',
-            '-v', f'{os.path.join(ROOT, "sandbox_proxy.py")}:/proxy.py:ro',
+            '-v', f'{_sandbox_proxy_source()}:/proxy.py:ro',
             '-v', f'{EGRESS_GRANTS_PATH}:{EGRESS_GRANTS_PATH}:ro',
             SANDBOX_IMAGE, 'python3', '/proxy.py',
         ], capture_output=True, timeout=8)
