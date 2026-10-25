@@ -114,17 +114,33 @@ _SIM_WATCHDOG_EVENT = None
 _WORLD_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def _load_outdoor_geometry():
-    """Load + scale the outdoor collision grid and door triggers exactly as the
-    client does. Returns (grid, doors): grid is the raw collision_grid.json
-    {cols,rows,cell,grid}; doors is world-space {building:{x,y,w,h}} formed by
-    scaling door_triggers.json rects by SCALE (mirrors rooms.js:103-105). Called
-    once and cached -- these are static assets, not re-read every tick."""
-    with open(os.path.join(_WORLD_DIR, 'collision_grid.json')) as f:
+def _village_geometry_paths(village='main'):
+    """Per-village data file names. The main village keeps the original
+    collision_grid.json / door_triggers.json names; every other village uses a
+    `_<village>` suffix (collision_grid_south.json, ...). Pure data selection:
+    movement physics and pathfinding are untouched."""
+    name = ''.join(c for c in str(village or 'main') if c.isalnum() or c in '_-') or 'main'
+    suffix = '' if name == 'main' else '_' + name
+    return (os.path.join(_WORLD_DIR, 'collision_grid%s.json' % suffix),
+            os.path.join(_WORLD_DIR, 'door_triggers%s.json' % suffix), name)
+
+
+def _load_outdoor_geometry(village='main'):
+    """Load + scale one village's outdoor collision grid and door triggers
+    exactly as the client does. Returns (grid, doors): grid is the raw
+    collision_grid*.json {cols,rows,cell,grid}; doors is world-space
+    {building:{x,y,w,h}} formed by scaling door_triggers*.json rects by SCALE
+    (mirrors rooms.js). Unknown villages fall back to the main files so a stale
+    village id can never crash the sim. Called once and cached -- these are
+    static assets, not re-read every tick."""
+    grid_path, doors_path, _name = _village_geometry_paths(village)
+    if not os.path.exists(grid_path):
+        grid_path, doors_path, _name = _village_geometry_paths('main')
+    with open(grid_path) as f:
         grid = json.load(f)
     doors = {}
     try:
-        with open(os.path.join(_WORLD_DIR, 'door_triggers.json')) as f:
+        with open(doors_path) as f:
             raw_doors = json.load(f)
         for building, r in raw_doors.items():
             doors[building] = {

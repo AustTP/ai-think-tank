@@ -564,7 +564,8 @@ function renderAgents(ctx, toScreen, zoom, playerSprites) {
   // agents live in the main map's coordinate space, winter-village agents in
   // the winter (flipped) map's space. Default to 'main' for any agent that
   // predates the villageId field.
-  const sceneVillage = (typeof state !== 'undefined' && state.scene === 'winter') ? 'winter' : 'main';
+  const sceneVillage = (typeof state !== 'undefined'
+    && (state.scene === 'winter' || state.scene === 'south')) ? state.scene : 'main';
   for (const id in AGENTS) {
     const a = AGENTS[id];
     if (!agentIsDrawn(a)) continue;

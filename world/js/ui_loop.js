@@ -72,12 +72,20 @@ function updateOutside(dt) {
   // The Phone Booth is a dialog-only trigger.
   for (const building in ROOM_DOOR_TRIGGERS) {
     if (overlaps(p, ROOM_DOOR_TRIGGERS[building])) {
-      if (building === 'townhall') openDoorMenu();
+      if (building === 'south_outlet') openSouthMenu();
+      else if (building === 'townhall') openDoorMenu();
       else if (building === 'house') openBoard();
       else if (building === 'phonebooth') openPhoneBooth();
       else enterRoom(building);
       return;
     }
+  }
+
+  // The south village's north gate leads back to the main village, landing
+  // just above the south outlet (not the default spawn).
+  if (state.scene === 'south' && overlaps(p, SOUTH_GATE)) {
+    returnToMainFromSouth();
+    return;
   }
 
   // Scene transition at the shared connection path: walking off the main
@@ -357,6 +365,7 @@ async function main() {
 
   renderPresetButtons();
   wireDoorMenu();
+  wireSouthOutletMenu();
   document.getElementById('startCallBtn').addEventListener('click', handleStartCall);
   document.getElementById('suggestAttendeesBtn').addEventListener('click', handleSuggestAttendees);
   document.getElementById('cancelCallBtn').addEventListener('click', handleCancelCall);

@@ -90,11 +90,13 @@ const ROOMS = {
 let ROOM_DOOR_TRIGGERS = null;
 let MAIN_DOOR_TRIGGERS = null;
 let WINTER_DOOR_TRIGGERS = null;
+let SOUTH_DOOR_TRIGGERS = null;
 
 async function loadDoorTriggers() {
-  const [mainRes, winterRes] = await Promise.all([
+  const [mainRes, winterRes, southRes] = await Promise.all([
     fetch('/door_triggers.json?v=' + Date.now()),
     fetch('/door_triggers_winter.json?v=' + Date.now()),
+    fetch('/door_triggers_south.json?v=' + Date.now()),
   ]);
   const native = await mainRes.json();
   MAIN_DOOR_TRIGGERS = {};
@@ -125,6 +127,17 @@ async function loadDoorTriggers() {
     // If the winter door file is missing, the winter map simply has no
     // enterable buildings (still walkable).
   }
+  SOUTH_DOOR_TRIGGERS = {};
+  try {
+    const southNative = await southRes.json();
+    for (const building in southNative) {
+      const d = southNative[building];
+      SOUTH_DOOR_TRIGGERS[building] = { x: d.x * SCALE, y: d.y * SCALE, w: d.w * SCALE, h: d.h * SCALE };
+    }
+  } catch (e) {
+    // A missing south door file leaves that map walkable but with no room
+    // entries; the scene itself still loads.
+  }
   ROOM_DOOR_TRIGGERS = MAIN_DOOR_TRIGGERS;
 }
 
@@ -132,6 +145,7 @@ async function loadDoorTriggers() {
 // village and the winter (adversarial) village. Called by world.js's
 // applyScene().
 function setSceneDoors(name) {
-  ROOM_DOOR_TRIGGERS = (name === 'winter' && WINTER_DOOR_TRIGGERS)
-    ? WINTER_DOOR_TRIGGERS : MAIN_DOOR_TRIGGERS;
+  if (name === 'winter' && WINTER_DOOR_TRIGGERS) ROOM_DOOR_TRIGGERS = WINTER_DOOR_TRIGGERS;
+  else if (name === 'south' && SOUTH_DOOR_TRIGGERS) ROOM_DOOR_TRIGGERS = SOUTH_DOOR_TRIGGERS;
+  else ROOM_DOOR_TRIGGERS = MAIN_DOOR_TRIGGERS;
 }

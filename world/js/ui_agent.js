@@ -495,9 +495,13 @@ function showReportForm(agentId, quote) {
 // 'outside' by construction when that fires), or the HUD bar's Call
 // Meeting button (reachable from anywhere) -- the guard matters for the
 // second path, so it's here rather than only at each call site.
-function openMeetingUI() {
+function openMeetingUI(fromDoor) {
   if (state.ui || state.location.kind !== 'outside') return;
   state.ui = 'townhall';
+  // Which door opened the meeting, so cancelling nudges off THAT door. The
+  // south outlet can start a meeting too, and cancel must not teleport the
+  // player back to the Town Hall.
+  state.meetingDoor = fromDoor || null;
   document.getElementById('meetingMsg').textContent = '';
   renderAgentChecklist();
   document.getElementById('townhallModal').classList.remove('hidden');
@@ -530,7 +534,44 @@ function doorMenuEnterHangout() {
 
 function doorMenuCallMeeting() {
   closeDoorMenu();
-  openMeetingUI();
+  openMeetingUI('townhall');
+}
+
+function openSouthMenu() {
+  if (state.ui) return;
+  state.ui = 'southOutlet';
+  document.getElementById('southOutletModal').classList.remove('hidden');
+}
+
+function closeSouthMenu() {
+  state.ui = null;
+  document.getElementById('southOutletModal').classList.add('hidden');
+  // Nudge north off the outlet tile so closing the menu does not immediately
+  // re-open it, the same way closeDoorMenu clears the Town Hall door.
+  const door = ROOM_DOOR_TRIGGERS && ROOM_DOOR_TRIGGERS.south_outlet;
+  if (door) state.player.y = door.y - state.player.h - 6;
+}
+
+function southMenuTravel() {
+  document.getElementById('southOutletModal').classList.add('hidden');
+  state.ui = null;
+  switchScene('south');
+  showToast('Arrived in the south village.');
+}
+
+function southMenuCallMeeting() {
+  closeSouthMenu();
+  openMeetingUI('south_outlet');
+}
+
+function wireSouthOutletMenu() {
+  const travel = document.getElementById('southOutletTravelBtn');
+  const meet = document.getElementById('southOutletMeetingBtn');
+  const cancel = document.getElementById('southOutletCancelBtn');
+  if (!travel) return;
+  travel.addEventListener('click', southMenuTravel);
+  meet.addEventListener('click', southMenuCallMeeting);
+  cancel.addEventListener('click', closeSouthMenu);
 }
 
 function wireDoorMenu() {
@@ -782,11 +823,13 @@ async function handleChatSend() {
 
 function handleCancelCall() {
   closeMeetingUI();
-  // Nudge off the door tile so closing the modal doesn't immediately
-  // re-trigger it next frame -- same idea as exitRoom() placing the player
-  // clear of the door they just used.
-  const door = ROOM_DOOR_TRIGGERS.townhall;
-  state.player.y = door.y + door.h + 6;
+  // Nudge off the door tile that opened the meeting so closing the modal
+  // doesn't immediately re-trigger it next frame -- same idea as exitRoom()
+  // placing the player clear of the door they just used.
+  const key = state.meetingDoor;
+  state.meetingDoor = null;
+  const door = key && ROOM_DOOR_TRIGGERS[key];
+  if (door) state.player.y = door.y + door.h + 6;
 }
 
 function handleEndCall() {

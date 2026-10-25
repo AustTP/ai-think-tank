@@ -607,6 +607,13 @@ const GROUND_H = NATIVE_H * SCALE;
 // walkable at all.
 const CONNECTION_BAND = { y0: 26 * 8 * SCALE, y1: 33 * 8 * SCALE };
 
+// The south village: a separate second map reached by the unused south path.
+// It is NOT the adversarial (winter) village and is always walkable. The
+// arrival gate is the road cut into the north edge of its background; walking
+// into it returns to the main map, just above the south outlet.
+const SOUTH_GATE = { x: 292 * SCALE, y: 0, w: 56 * SCALE, h: 10 * SCALE };
+const SOUTH_OUTLET = { x: 448 * SCALE, y: 370 * SCALE, w: 88 * SCALE, h: 14 * SCALE };
+
 const SCENES = {
   main: {
     bgSprite: '/assets/think_tank_background.png',
@@ -621,6 +628,13 @@ const SCENES = {
     // Mirrored spawn: the connection path's band on the winter (flipped)
     // map is its LEFT edge; drop the player just inside it.
     spawn: { x: 12, y: 29 * 8 * SCALE },
+  },
+  south: {
+    bgSprite: '/assets/think_tank_south.png',
+    gridSprite: '/collision_grid_south.json',
+    doorsSprite: '/door_triggers_south.json',
+    // Just inside the north arrival road, facing south into the village.
+    spawn: { x: 320 * SCALE - 10, y: 34 * SCALE },
   },
 };
 
@@ -687,6 +701,15 @@ function switchScene(to) {
   state.player.x = s.spawn.x;
   state.player.y = s.spawn.y;
   state.zoom = ZOOM_SHOW_ALL;
+}
+
+// Return from the south village to the main map, just above the south outlet.
+function returnToMainFromSouth() {
+  switchScene('main');
+  state.player.x = SOUTH_OUTLET.x + SOUTH_OUTLET.w / 2 - state.player.w / 2;
+  state.player.y = SOUTH_OUTLET.y - state.player.h - 8;
+  state.player.dir = 'north';
+  if (typeof showToast === 'function') showToast('Back in the main village.');
 }
 
 // Poll the server for the adversarial (winter) village toggle state. The
