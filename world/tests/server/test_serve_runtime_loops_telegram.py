@@ -153,17 +153,17 @@ class TelegramPollLoop(unittest.TestCase):
         with unittest.mock.patch.object(serve, '_telegram_process_update',
                                         new=unittest.mock.AsyncMock(side_effect=[('111', 'hello back'), None])) as proc, \
              unittest.mock.patch.object(serve.asyncio, 'to_thread',
-                                        side_effect=[updates, {'ok': True},
+                                        side_effect=[{'ok': True}, updates, {'ok': True},
                                                      serve._TelegramConflictError('another poller')]) as to_thread, \
              unittest.mock.patch.object(serve.asyncio, 'sleep', side_effect=[asyncio.CancelledError()]):
             with self.assertRaises(asyncio.CancelledError):
                 asyncio.run(serve._telegram_poll_loop())
         self.assertEqual(proc.await_count, 2)
-        self.assertEqual(to_thread.call_count, 3)
+        self.assertEqual(to_thread.call_count, 4)
 
     def test_tolerates_generic_loop_errors(self):
         with unittest.mock.patch.object(serve.asyncio, 'to_thread',
-                                        side_effect=[RuntimeError('blip')]), \
+                                        side_effect=[{'ok': True}, RuntimeError('blip')]), \
              unittest.mock.patch.object(serve.asyncio, 'sleep', side_effect=[asyncio.CancelledError()]):
             with self.assertRaises(asyncio.CancelledError):
                 asyncio.run(serve._telegram_poll_loop())

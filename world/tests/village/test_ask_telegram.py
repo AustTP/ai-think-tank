@@ -58,6 +58,70 @@ class TelegramBridge(unittest.TestCase):
     def _update(self, chat_id=111, text='hi'):
         return {'update_id': 1, 'message': {'chat': {'id': chat_id}, 'text': text}}
 
+    def test_plans_lists_pending_and_skips_the_admin_router(self):
+        row = {'plan_id': 'plan-7', 'version': 2, 'goal': 'Ship the wiki search',
+               'route': 'staffed', 'constraints': {'estimatedBudgetUsd': 12},
+               'payload': {}, 'plan_hash': 'h', 'status': 'pending',
+               'created_by': 'theo', 'created_at': 1, 'decided_by': None,
+               'decided_at': None, 'reason': None, 'applied_at': None,
+               'expires_at': None}
+        with unittest.mock.patch.object(serve.plan_approvals, 'list_revisions',
+                                        return_value=[row]), \
+             unittest.mock.patch.object(serve, '_route_player_request') as routed:
+            outcome = asyncio.run(serve._telegram_process_update(
+                self._update(text='/plans')))
+        self.assertIn('plan-7 v2 [staffed] $12', outcome[1])
+        self.assertIn('/approve', outcome[1])
+        routed.assert_not_called()
+
+    def test_approve_command_applies_the_latest_pending_revision(self):
+        async def fake_approve(plan_id, version, actor):
+            return {'ok': True, 'staffed': True, 'request': 'req-1',
+                    'team': 'team-a', 'plan': {'route': 'staffed'}}
+        with unittest.mock.patch.object(serve, 'latest_pending_version',
+                                        return_value=3), \
+             unittest.mock.patch.object(serve, 'approve_plan_inprocess',
+                                        side_effect=fake_approve) as approved, \
+             unittest.mock.patch.object(serve, '_route_player_request') as routed:
+            outcome = asyncio.run(serve._telegram_process_update(
+                self._update(text='/approve plan-7')))
+        approved.assert_awaited_once_with('plan-7', 3, 'player')
+        self.assertIn('Approved plan-7 v3', outcome[1])
+        self.assertIn('req-1', outcome[1])
+        routed.assert_not_called()
+
+    def test_reject_command_reports_a_plan_error_instead_of_crashing(self):
+        err = serve.plan_approvals.PlanError('plan is applied', 'applied')
+        with unittest.mock.patch.object(serve, 'latest_pending_version',
+                                        return_value=1), \
+             unittest.mock.patch.object(serve.plan_approvals, 'reject',
+                                        side_effect=err), \
+             unittest.mock.patch.object(serve, '_route_player_request') as routed:
+            outcome = asyncio.run(serve._telegram_process_update(
+                self._update(text='/reject plan-7 because')))
+        self.assertIn('Could not reject plan-7 v1', outcome[1])
+        self.assertIn('plan is applied', outcome[1])
+        routed.assert_not_called()
+
+    def test_status_command_summarizes_state(self):
+        state = {'tasks': {'t1': {'status': 'working'}, 't2': {'status': 'failed'}},
+                 'workQueue': [{'title': 'a'}], 'agentRoster': [{}, {}]}
+        with unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=state), \
+             unittest.mock.patch.object(serve, '_route_player_request') as routed:
+            outcome = asyncio.run(serve._telegram_process_update(
+                self._update(text='/status')))
+        self.assertIn('2 agents', outcome[1])
+        self.assertIn('working 1', outcome[1])
+        self.assertIn('Queue: 1', outcome[1])
+        routed.assert_not_called()
+
+    def test_unknown_command_returns_help(self):
+        outcome = asyncio.run(serve._telegram_process_update(
+            self._update(text='/wat')))
+        self.assertIn('Unknown command /wat', outcome[1])
+        self.assertIn('/approve', outcome[1])
+
     def test_non_allowlisted_chat_is_ignored(self):
         with unittest.mock.patch.object(serve, 'get_state_from_db') as gsd:
             outcome = asyncio.run(serve._telegram_process_update(self._update(chat_id=999)))

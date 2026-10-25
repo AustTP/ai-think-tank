@@ -183,6 +183,52 @@ def _plan_json(item):
     }
 
 
+def pending_plan_rows(limit=10):
+    """Pending plan revisions, newest first, as the same JSON the board uses."""
+    return [_plan_json(p) for p in plan_approvals.list_revisions('pending', limit)]
+
+
+def latest_pending_version(plan_id):
+    """The newest still-pending revision for a plan, or None."""
+    for rev in plan_approvals.history(plan_id):
+        if rev['status'] == 'pending':
+            return rev['version']
+    return None
+
+
+async def approve_plan_inprocess(plan_id, version, actor='player'):
+    """Approve and apply one plan revision without an HTTP request.
+
+    The Telegram bridge calls this directly. It mirrors approve_plan's steps
+    and error behavior; keep the two in sync. Raises plan_approvals.PlanError
+    on any refusal so a caller can report the reason."""
+    plan = plan_approvals.get(plan_id, version)
+    if not plan:
+        raise plan_approvals.PlanError('plan not found', 'not_found')
+    if plan['status'] == 'applied':
+        return {'ok': True, 'alreadyApplied': True, 'plan': _plan_json(plan)}
+    if plan['status'] == 'pending':
+        plan = plan_approvals.approve(plan_id, version, actor)
+    plan = plan_approvals.claim_apply(plan_id, version, actor)
+    state = _state_begin()
+    if not state:
+        plan_approvals.mark_failed(plan_id, version, 'state unavailable')
+        raise plan_approvals.PlanError('state unavailable', 'state')
+    try:
+        outcome = await _apply_plan(state, plan, actor)
+        save_state_to_db(state)
+        plan = plan_approvals.mark_applied(plan_id, version, actor)
+    except plan_approvals.PlanError as exc:
+        plan_approvals.mark_failed(plan_id, version, str(exc))
+        raise
+    except Exception as exc:  # noqa: BLE001 -- surface, never leave the claim stuck
+        plan_approvals.mark_failed(plan_id, version, str(exc))
+        raise
+    finally:
+        _state_abort()
+    return {**outcome, 'plan': _plan_json(plan)}
+
+
 @app.post('/api/intent/plan-big-task')
 @_state_writer
 async def intent_plan_big_task(request: Request):
