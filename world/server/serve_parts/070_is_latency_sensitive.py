@@ -140,6 +140,145 @@ def _safe_live_path(rel):
     return full
 
 
+def _run_live_git(args):
+    """Run one fixed, read-only git command in the project root. No shell, no
+    user-supplied flags, bounded output. Returns {'text', 'truncated'} or
+    {'error'}."""
+    import subprocess
+    try:
+        result = subprocess.run(['git', '-C', THINK_TANK_DIR, *args],
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {'error': f'git is unavailable: {exc}'}
+    if result.returncode != 0:
+        return {'error': (result.stderr or 'git failed').strip()[:500]}
+    text = result.stdout or ''
+    return {'text': text[:20000], 'truncated': len(text) > 20000}
+
+
+def _live_git_read(op, args):
+    if op == 'git_status':
+        out = _run_live_git(['status', '--short', '--untracked-files=normal'])
+        if 'error' in out:
+            return out
+        lines = [line for line in out['text'].splitlines()
+                 if '.env' not in line and 'secret' not in line.lower()]
+        return {'op': op, 'entries': lines[:200], 'clean': not lines,
+                'truncated': out['truncated'] or len(lines) > 200}
+    if op == 'git_diff':
+        try:
+            full = _safe_live_path(args.get('path') or '')
+        except ValueError as exc:
+            return {'error': str(exc)}
+        rel = os.path.relpath(full, THINK_TANK_DIR)
+        if rel == '.' or not os.path.exists(full):
+            return {'error': 'a changed file or directory path is required'}
+        out = _run_live_git(['diff', '--no-ext-diff', '--unified=3', '--', rel])
+        if 'error' in out:
+            return out
+        return {'op': op, 'path': rel, **out}
+    limit = max(1, min(int(args.get('limit') or 20), 50))
+    out = _run_live_git(['log', '-n', str(limit), '--oneline', '--decorate'])
+    if 'error' in out:
+        return out
+    return {'op': op, **out}
+
+
+def _live_task_trace(state, agent_id, args):
+    """Read-only, team-scoped trace for one card: state, children, queue, and
+    matching action-log rows. A director sees only cards owned by their team;
+    the chief of staff sees any card."""
+    task_id = str(args.get('taskId') or '').strip()
+    if not task_id or len(task_id) > 80:
+        return {'error': 'taskId is required'}
+    task = (state.get('tasks') or {}).get(task_id)
+    if not task:
+        return {'error': f'unknown task {task_id!r}'}
+    is_admin = _is_admin(state, agent_id)
+    team = supervisor_team_for(state, agent_id)
+    if not is_admin:
+        direct = set(_direct_reports(state, (team or {}).get('directorId') or ''))
+        if not team or (task.get('teamId') != team.get('id')
+                        and task.get('assignedTo') not in direct):
+            return {'error': 'this card is outside your team'}
+    fields = ('id', 'title', 'status', 'room', 'assignedTo', 'teamId',
+              'reviewOf', 'rootStoryId', 'deliveryState', 'failNote', 'note',
+              'nextAction', 'budgetUsd', 'storySpendUsd', 'libraryPath',
+              'reportPath', 'issueKey', 'requestId')
+    summary = {k: task.get(k) for k in fields if k in task}
+    if task.get('acceptanceCriteria'):
+        summary['acceptanceCriteria'] = str(task['acceptanceCriteria'])[:2000]
+    if task.get('instructions'):
+        summary['instructions'] = str(task['instructions'])[:2000]
+    children = [t.get('id') for t in (state.get('tasks') or {}).values()
+                if t.get('reviewOf') == task_id or t.get('investigationOf') == task_id]
+    queued = [q.get('id') or q.get('title') for q in (state.get('workQueue') or [])
+              if q.get('reviewOf') == task_id or q.get('investigationOf') == task_id]
+    limit = max(1, min(int(args.get('limit') or 40), 100))
+    rows = []
+    with _db() as conn:
+        rows = conn.execute(
+            'SELECT ts, agent_id, action, details FROM action_log '
+            'WHERE details LIKE ? ORDER BY id DESC LIMIT ?',
+            (f'%{task_id}%', limit)).fetchall()
+    return {'task': summary, 'children': children, 'queued': queued,
+            'actionLog': [{'at': r[0], 'agent': r[1], 'action': r[2],
+                           'details': (r[3] or '')[:500]} for r in rows]}
+
+
+def _live_find_artifact(state, args):
+    """Chief-of-staff recovery lookup: search the Library, archive, DB backups,
+    and archived task records for a title/filename fragment. Read-only."""
+    if not _is_admin(state, args.get('agentId')):
+        return {'error': 'only the chief of staff may search recovery stores'}
+    query = str(args.get('query') or '').strip()
+    if len(query) < 2 or len(query) > 120:
+        return {'error': 'query must be 2-120 characters'}
+    needle = query.lower()
+    roots = [os.path.join(THINK_TANK_DIR, 'library'),
+             os.path.join(THINK_TANK_DIR, 'archive'),
+             os.path.join(THINK_TANK_DIR, 'think-tank-db-backups')]
+    files = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for base, dirs, names in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in LIVE_READ_DENY and not d.startswith('.')]
+            for name in names:
+                path = os.path.join(base, name)
+                if os.path.islink(path) or os.path.getsize(path) > LIVE_READ_MAX_BYTES:
+                    continue
+                matched = needle in name.lower()
+                if not matched:
+                    try:
+                        with open(path, encoding='utf-8', errors='replace') as stream:
+                            matched = needle in stream.read(200_000).lower()
+                    except OSError:
+                        continue
+                if matched:
+                    files.append({'path': os.path.relpath(path, THINK_TANK_DIR),
+                                  'bytes': os.path.getsize(path),
+                                  'modified': os.path.getmtime(path)})
+                    if len(files) >= 25:
+                        break
+            if len(files) >= 25:
+                break
+    archived = []
+    with _db() as conn:
+        for tid, blob in conn.execute('SELECT id, blob FROM task_archive'):
+            if needle in (blob or '').lower():
+                try:
+                    task = json.loads(blob)
+                except (TypeError, ValueError):
+                    task = {}
+                archived.append({'id': tid, 'title': task.get('title'),
+                                 'status': task.get('status'),
+                                 'note': str(task.get('note') or '')[:300]})
+                if len(archived) >= 15:
+                    break
+    return {'query': query, 'files': files, 'archivedTasks': archived}
+
+
 def supervisor_live_read(agent_id, args):
     """Read-only live inspection for a director: list, read, grep the project,
     or read the team's recent action log. Never writes, never leaves an
@@ -148,6 +287,14 @@ def supervisor_live_read(agent_id, args):
     if not _is_director_or_admin(state, agent_id):
         return {'error': 'only a director or the chief of staff may read the live project'}
     op = (args.get('op') or 'ls').strip().lower()
+    if op in ('git_status', 'git_diff', 'git_log'):
+        return _live_git_read(op, args)
+    if op == 'task_trace':
+        return _live_task_trace(state, agent_id, args)
+    if op == 'find_artifact':
+        args = dict(args or {})
+        args['agentId'] = agent_id
+        return _live_find_artifact(state, args)
     if op == 'ls':
         try:
             full = _safe_live_path(args.get('path') or '')
@@ -227,7 +374,8 @@ def supervisor_live_read(agent_id, args):
         return {'entries': [
             {'at': r[0], 'agent': r[1], 'action': r[2], 'details': (r[3] or '')[:400]}
             for r in rows]}
-    return {'error': f'unknown op {op!r}; use ls, read, grep, or team_log'}
+    return {'error': f'unknown op {op!r}; use ls, read, grep, team_log, git_status, '
+                     'git_diff, git_log, task_trace, or find_artifact'}
 
 
 DELEGATE_BUDGET_CAP_USD = 0.50

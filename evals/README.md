@@ -14,4 +14,4 @@ boundaries, denied tools, idle exit, and restart recovery. Add a case by giving
 it a name, a single user message, and one or more regex expectations.
 
 Run this after changing a model, a system prompt, or a tool gate. It does not
-replace the 7,877-test code suite or the JavaScript coverage gate.
+replace the 7,887-test code suite or the JavaScript coverage gate.

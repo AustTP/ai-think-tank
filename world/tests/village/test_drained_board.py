@@ -101,6 +101,18 @@ class CompletionEvidence(unittest.TestCase):
         self.assertTrue(sim._completion_has_evidence({}, {
             'taskType': 'supervise'}))
 
+    def test_peer_review_is_exempt_but_repair_still_needs_artifact(self):
+        self.assertTrue(sim._completion_has_evidence({}, {
+            'taskType': 'review', 'reviewOf': 'task-1',
+            'note': 'Approved after checking the diff.'}))
+        self.assertFalse(sim._completion_has_evidence({}, {
+            'taskType': 'spike', 'reviewOf': 'task-1',
+            'note': 'NOT COMPLETED. No briefing was produced.'}))
+        self.assertTrue(sim._completion_has_evidence({}, {
+            'taskType': 'spike', 'reviewOf': 'task-1',
+            'reportPath': 'x-articles/ACTION-BRIEFING.md',
+            'note': 'Saved the briefing.'}))
+
     def test_finish_task_refuses_empty_deliverable(self):
         st = {
             'tasks': {'t': {'id': 't', 'title': 'x', 'status': 'working',

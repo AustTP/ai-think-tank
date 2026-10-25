@@ -227,6 +227,8 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'sizeEstimate': (extra or {}).get('sizeEstimate'),
         'reviewOf': (extra or {}).get('reviewOf'),
         'reviewAuthorId': (extra or {}).get('reviewAuthorId'),
+        'issueKey': (extra or {}).get('issueKey'),
+        'requestId': (extra or {}).get('requestId'),
         # CS329A takeaway #2: checklist survives onto the task
         # object itself (see _assign_due_item's extra dict) -- the review
         # executor grades per-requirement from here.
@@ -701,7 +703,15 @@ def _completion_has_evidence(state, task):
     if not task:
         return True
     ttype = str(task.get('taskType') or '')
-    if task.get('shadow') or task.get('reviewOf'):
+    if task.get('shadow'):
+        return True
+    # Peer-review and QA subtasks land their verdict in the note; their
+    # evidence is the vote, not a Library file. A REPAIR task also carries
+    # reviewOf, but its taskType is the original lane (spike/code/...), so it
+    # must still prove it saved a corrected deliverable. Treating every
+    # reviewOf task as evidence-exempt let a "NOT COMPLETED" repair report
+    # close as done (BEN-6).
+    if task.get('taskType') in ('review', 'qa'):
         return True
     if ttype in ('meeting', 'supervise', 'avatar', 'review', 'qa'):
         return True

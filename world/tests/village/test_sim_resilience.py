@@ -731,3 +731,20 @@ def test_assign_due_item_wait_paths(monkeypatch):
     assert sim._assign_due_item(
         state, {'taskType': 'report', 'directRoute': True}, True, {}, {}, 0,
         ['t']) is sim._ASSIGN_WAIT
+
+
+def test_peer_repair_carries_original_context():
+    parent = {'id': 'p', 'assignedTo': 'ben', 'room': 'pressoffice',
+              'taskType': 'spike', 'acceptanceCriteria': 'cite every file',
+              'userStory': 'I want the review', 'never': ['do not refetch'],
+              'sourcePaths': ['library/x-articles'], 'issueKey': 'BEN-6',
+              'requestId': 'iss-1', 'projectLabel': 'X review'}
+    state = {'agents': {'ben': {}}, 'workQueue': [], 'tasks': {}}
+    sim._queue_peer_repair(state, parent, 'redo it')
+    queued = state['workQueue'][0]
+    assert queued['reviewOf'] == 'p'
+    assert queued['acceptanceCriteria'] == 'cite every file'
+    assert queued['sourcePaths'] == ['library/x-articles']
+    assert queued['issueKey'] == 'BEN-6'
+    assert queued['requestId'] == 'iss-1'
+    assert queued['never'] == ['do not refetch']

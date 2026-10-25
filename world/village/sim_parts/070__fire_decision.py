@@ -346,6 +346,11 @@ def _queue_peer_repair(state, parent, rationale=None):
         'instructions': instructions,
         'reviewContract': parent.get('reviewContract'),
         'acceptanceCriteria': parent.get('acceptanceCriteria'),
+        'userStory': parent.get('userStory'),
+        'never': parent.get('never') or None,
+        'sourcePaths': parent.get('sourcePaths'),
+        'productId': parent.get('productId'),
+        'issueKey': parent.get('issueKey'),
         'workOrderId': parent.get('workOrderId'),
         'workOrderStoryId': parent.get('workOrderStoryId'),
         'requestId': parent.get('requestId'),
@@ -739,6 +744,9 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
             'userStory': task.get('userStory'),
             'acceptanceCriteria': task.get('acceptanceCriteria'),
             'never': task.get('never') or None,
+            'sourcePaths': task.get('sourcePaths'),
+            'issueKey': task.get('issueKey'),
+            'requestId': task.get('requestId'),
             'priority': WORK_PRIORITY['high'],
         }])
         return
@@ -791,6 +799,9 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
         'userStory': task.get('userStory'),
         'acceptanceCriteria': task.get('acceptanceCriteria'),
         'never': task.get('never') or None,
+        'sourcePaths': task.get('sourcePaths'),
+        'issueKey': task.get('issueKey'),
+        'requestId': task.get('requestId'),
         'priority': WORK_PRIORITY['high'],
     }])
 

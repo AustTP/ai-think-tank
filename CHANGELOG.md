@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixes
+
+- Directors and the chief of staff can now use read-only `git_status`, `git_diff`, `git_log`, a team-scoped `task_trace`, and chief-only `find_artifact` recovery search from `live_read`.
+- Repair cards now inherit the original room, source paths, issue/request provenance, user story, and NEVER constraints, not just the acceptance text.
+- Scoped cards (player-filed, JIRA-linked, or a repair/review of an existing task) no longer receive the global "focus next work on <room>" line. That line was overriding a card's own room and deliverable.
+- Repair tasks now need a saved Library artifact like their original lane. A repair report that says "not completed" can no longer close as done.
+
 ### Breaking changes
 
 - **Unpriced model usage holds the task budget by default.** A task whose

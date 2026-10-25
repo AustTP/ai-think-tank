@@ -174,6 +174,7 @@ def queue_work(state, items):
             # 'player') travels with its issueKey so the player task records its
             # provenance -- same class of whitelist as 'distill'/'checklist'.
             'issueKey': item.get('issueKey') or None,
+            'requestId': item.get('requestId') or None,
             # Phase E2d: an INCIDENT (bug) is pinned to the owning team's on-call
             # and pin-woken even though it carries no reviewOf.
             'incident': bool(item.get('incident')),

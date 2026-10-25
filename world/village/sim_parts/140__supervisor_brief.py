@@ -846,7 +846,7 @@ def _refocus_note_for(state, product_id):
             f'serves that -- not just what looks like a natural next addition from here.')
 
 
-def _augment_task_instructions(state, agent_id, product_id, instructions, refocus=False):
+def _augment_task_instructions(state, agent_id, product_id, instructions, refocus=False, scoped=False):
     """Append coaching + runbook knowledge to a task's instructions BEFORE
     assignment. Pure: returns the augmented instructions (or the original).
     A pending growth plan is injected once (marking it applied); a product's
@@ -854,7 +854,12 @@ def _augment_task_instructions(state, agent_id, product_id, instructions, refocu
     reminder (see _refocus_note_for) is added only when the caller says this
     task is revisiting existing work, not starting fresh. The hive-mind
     consensus relay (see _consensus_relay_step) is READ FIRST -- a one-line
-    'current direction' the next cycle acts on."""
+    'current direction' the next cycle acts on -- EXCEPT for a scoped card
+    (player-filed, JIRA-linked, or a repair/review of an existing task). A
+    global room focus must never override a card that already names its own
+    room and deliverable; that was the BEN-6 failure, where a pressoffice
+    repair was told to focus on observatory and abandoned its acceptance
+    criteria."""
     pieces = [instructions] if instructions else []
     # The spine FIRST: the charter goal opens every task's instructions so the
     # work a room does points at the player's direction (see _charter_note).
@@ -862,7 +867,7 @@ def _augment_task_instructions(state, agent_id, product_id, instructions, refocu
     if charter_line:
         pieces.insert(0, charter_line)
     relay = _consensus_relay_note(state)
-    if relay:
+    if relay and not scoped:
         pieces.insert(0, relay)
     note = _coaching_note_for(state, agent_id)
     if note:

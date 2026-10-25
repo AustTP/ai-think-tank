@@ -235,18 +235,23 @@ _SUPERVISOR_LIVE_READ_TOOL = {
     'function': {
         'name': 'live_read',
         'description': (
-            'Read-only inspection of the LIVE project (not just the sandbox): list a directory, '
-            'read a file, grep the code, or read your team\'s recent action log. Never writes, '
-            'never exposes .env, secrets, or .git.'
+            'Read-only inspection of the LIVE project: list/read/grep, read-only git '
+            'status/diff/log, a team-scoped task_trace across state and action logs, or '
+            '(chief of staff only) find_artifact in the Library, archive, backups and '
+            'archived tasks. Never writes and never exposes .env, secrets, or .git.'
         ),
         'parameters': {
             'type': 'object',
             'properties': {
-                'op': {'type': 'string', 'enum': ['ls', 'read', 'grep', 'team_log']},
-                'path': {'type': 'string', 'description': 'Repo-relative path for ls/read/grep.'},
+                'op': {'type': 'string', 'enum': ['ls', 'read', 'grep', 'team_log',
+                                                   'git_status', 'git_diff', 'git_log',
+                                                   'task_trace', 'find_artifact']},
+                'path': {'type': 'string', 'description': 'Repo-relative path for ls/read/grep/git_diff.'},
                 'pattern': {'type': 'string', 'description': 'Literal text for grep (max 120 chars).'},
                 'start': {'type': 'integer', 'description': 'First line for read.'},
-                'limit': {'type': 'integer', 'description': 'Max log rows for team_log.'},
+                'limit': {'type': 'integer', 'description': 'Max rows for team_log/git_log/task_trace.'},
+                'taskId': {'type': 'string', 'description': 'Card id for task_trace.'},
+                'query': {'type': 'string', 'description': 'Title/filename fragment for find_artifact.'},
             },
             'required': ['op'],
         },

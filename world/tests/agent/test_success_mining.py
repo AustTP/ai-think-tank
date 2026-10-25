@@ -299,6 +299,14 @@ class AugmentTaskInstructionsRelay(unittest.TestCase):
         state = {'growthPlans': {}}
         assert sim._augment_task_instructions(state, 'ada', None, 'Plain task') == 'Plain task'
 
+    def test_scoped_card_ignores_global_room_focus(self):
+        state = {'consensusRelay': {'consensus': 'Current direction: focus next work on observatory.'},
+                 'growthPlans': {}}
+        aug = sim._augment_task_instructions(state, 'ada', None, 'Fix the pressoffice brief',
+                                             scoped=True)
+        assert 'observatory' not in aug
+        assert aug == 'Fix the pressoffice brief'
+
 
 class GradeSuccessBranch(unittest.TestCase):
     def _task(self):

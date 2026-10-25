@@ -363,7 +363,7 @@ def test_delegate_success_counts_open_work(monkeypatch):
     _patch_state(monkeypatch, state)
     monkeypatch.setattr(serve, '_is_director_or_admin', lambda s, a: True)
     monkeypatch.setattr(serve, '_is_admin', lambda s, a: False)
-    monkeypatch.setattr(serve, '_direct_reports', lambda s, a: ['ruth'])
+    monkeypatch.setattr(serve, '_direct_reports', lambda s, a: ['ruth'] if a == 'nora' else [])
 
     def sim_down(*a, **k):
         raise RuntimeError('sim unavailable')
@@ -890,3 +890,165 @@ def test_senior_most_director_id():
     ]}) == 'nora'
     assert serve._senior_most_director_id({'agentRoster': [
         {'id': 'ben', 'isDirector': False}]}) is None
+
+
+def test_live_read_git_status_diff_and_log(monkeypatch, tmp_path):
+    import subprocess
+    root = tmp_path / 'repo'
+    root.mkdir()
+    subprocess.run(['git', 'init', '-q'], cwd=root, check=True)
+    (root / 'a.txt').write_text('one\n')
+    subprocess.run(['git', 'add', 'a.txt'], cwd=root, check=True)
+    subprocess.run(['git', '-c', 'user.name=T', '-c', 'user.email=t@example.com',
+                    'commit', '-qm', 'first'], cwd=root, check=True)
+    (root / 'a.txt').write_text('two\n')
+    (root / 'b.txt').write_text('untracked\n')
+    monkeypatch.setattr(serve, 'THINK_TANK_DIR', str(root))
+    _patch_state(monkeypatch, _live_state())
+    monkeypatch.setattr(serve, '_is_director_or_admin', lambda state, aid: True)
+
+    status = serve.supervisor_live_read('nora', {'op': 'git_status'})
+    assert any('a.txt' in line for line in status['entries'])
+    assert any('b.txt' in line for line in status['entries'])
+    diff = serve.supervisor_live_read('nora', {'op': 'git_diff', 'path': 'a.txt'})
+    assert '+two' in diff['text']
+    log = serve.supervisor_live_read('nora', {'op': 'git_log', 'limit': 5})
+    assert 'first' in log['text']
+    assert 'path' in serve.supervisor_live_read(
+        'nora', {'op': 'git_diff'})['error']
+
+
+def test_live_task_trace_scoping_and_admin(monkeypatch):
+    state = _state()
+    state['tasks'] = {'t1': {'id': 't1', 'title': 'card', 'teamId': 'nora',
+                             'assignedTo': 'ruth', 'status': 'failed',
+                             'acceptanceCriteria': 'must work'}}
+    state['workQueue'] = [{'id': 'q1', 'reviewOf': 't1'}]
+    _patch_state(monkeypatch, state)
+    monkeypatch.setattr(serve, '_is_director_or_admin', lambda s, a: True)
+    monkeypatch.setattr(serve, '_is_admin', lambda s, a: a == 'theo')
+    monkeypatch.setattr(serve, '_direct_reports', lambda s, a: ['ruth'] if a == 'nora' else [])
+
+    rows = [(1, 'ruth', 'task_failed', '{"taskId":"t1"}')]
+
+    class _Conn:
+        def execute(self, sql, params):
+            assert 'action_log' in sql
+            return self
+        def fetchall(self):
+            return rows
+
+    @contextlib.contextmanager
+    def fake_db():
+        yield _Conn()
+
+    monkeypatch.setattr(serve, '_db', fake_db)
+    out = serve.supervisor_live_read('nora', {'op': 'task_trace', 'taskId': 't1'})
+    assert out['task']['title'] == 'card'
+    assert out['children'] == []
+    assert out['queued'] == ['q1']
+    assert out['actionLog'][0]['action'] == 'task_failed'
+    out = serve.supervisor_live_read('ben', {'op': 'task_trace', 'taskId': 't1'})
+    assert 'outside your team' in out['error']
+    out = serve.supervisor_live_read('theo', {'op': 'task_trace', 'taskId': 't1'})
+    assert out['task']['acceptanceCriteria'] == 'must work'
+
+
+def test_live_find_artifact_files_and_archive(monkeypatch, tmp_path):
+    library = tmp_path / 'library'
+    library.mkdir()
+    (library / 'brief.md').write_text('orbital briefing\n')
+    (tmp_path / 'secret.txt').write_text('orbital\n')
+    monkeypatch.setattr(serve, 'THINK_TANK_DIR', str(tmp_path))
+    _patch_state(monkeypatch, _live_state())
+    monkeypatch.setattr(serve, '_is_director_or_admin', lambda state, aid: True)
+    monkeypatch.setattr(serve, '_is_admin', lambda state, aid: aid == 'theo')
+
+    class _Conn:
+        def execute(self, sql, params=None):
+            assert 'task_archive' in sql
+            return self
+        def __iter__(self):
+            return iter([('task-1', '{"title":"Orbital review","status":"cancelled"}')])
+
+    @contextlib.contextmanager
+    def fake_db():
+        yield _Conn()
+
+    monkeypatch.setattr(serve, '_db', fake_db)
+    out = serve.supervisor_live_read('nora', {'op': 'find_artifact', 'query': 'orbital'})
+    assert 'only the chief' in out['error']
+    out = serve.supervisor_live_read('theo', {'op': 'find_artifact', 'query': 'orbital'})
+    assert out['files'][0]['path'] == 'library/brief.md'
+    assert out['archivedTasks'][0]['title'] == 'Orbital review'
+
+
+def test_live_git_error_and_bad_path(monkeypatch, tmp_path):
+    (tmp_path / 'a.txt').write_text('x\n')
+    monkeypatch.setattr(serve, 'THINK_TANK_DIR', str(tmp_path))
+    _patch_state(monkeypatch, _live_state())
+    monkeypatch.setattr(serve, '_is_director_or_admin', lambda state, aid: True)
+    real_git = serve._run_live_git
+    monkeypatch.setattr(serve, '_run_live_git', lambda args: {'error': 'boom'})
+    assert serve.supervisor_live_read('nora', {'op': 'git_status'})['error'] == 'boom'
+    assert serve.supervisor_live_read('nora', {'op': 'git_diff', 'path': 'a.txt'})['error'] == 'boom'
+    assert serve.supervisor_live_read('nora', {'op': 'git_log'})['error'] == 'boom'
+    monkeypatch.setattr(serve, '_safe_live_path',
+                        lambda path: (_ for _ in ()).throw(ValueError('outside')))
+    assert 'outside' in serve.supervisor_live_read('nora', {'op': 'git_diff', 'path': 'a.txt'})['error']
+
+    class Bad:
+        returncode = 1
+        stderr = 'nope'
+        stdout = ''
+    monkeypatch.setattr(serve, '_run_live_git', real_git)
+    monkeypatch.setattr('subprocess.run', lambda *a, **k: Bad())
+    assert serve._run_live_git(['status'])['error'] == 'nope'
+    monkeypatch.setattr('subprocess.run',
+                        lambda *a, **k: (_ for _ in ()).throw(OSError('missing')))
+    assert 'unavailable' in serve._run_live_git(['status'])['error']
+
+
+def test_live_task_trace_validation_and_instructions(monkeypatch):
+    state = _state()
+    state['tasks'] = {'t1': {'id': 't1', 'title': 'card', 'teamId': 'nora',
+                             'instructions': 'do it'}}
+    _patch_state(monkeypatch, state)
+    monkeypatch.setattr(serve, '_is_director_or_admin', lambda s, a: True)
+    monkeypatch.setattr(serve, '_is_admin', lambda s, a: True)
+    monkeypatch.setattr(serve, '_direct_reports', lambda s, a: [])
+    assert 'required' in serve.supervisor_live_read('theo', {'op': 'task_trace'})['error']
+    assert 'unknown task' in serve.supervisor_live_read('theo', {'op': 'task_trace', 'taskId': 'x'})['error']
+    assert serve.supervisor_live_read('theo', {'op': 'task_trace', 'taskId': 't1'})['task']['instructions'] == 'do it'
+
+
+def test_live_find_artifact_limits_and_errors(monkeypatch, tmp_path):
+    library = tmp_path / 'library'
+    library.mkdir()
+    for i in range(26):
+        (library / f'orbital-{i}.md').write_text('x\n')
+    (library / 'large.md').write_text('orbital\n')
+    monkeypatch.setattr(serve, 'THINK_TANK_DIR', str(tmp_path))
+    _patch_state(monkeypatch, _live_state())
+    monkeypatch.setattr(serve, '_is_director_or_admin', lambda state, aid: True)
+    monkeypatch.setattr(serve, '_is_admin', lambda state, aid: True)
+    monkeypatch.setattr(serve, 'LIVE_READ_MAX_BYTES', 5)
+
+    class _Conn:
+        def execute(self, sql, params=None):
+            return self
+        def __iter__(self):
+            rows = [('bad', 'orbital {not json')]
+            rows += [(f't{i}', '{"title":"orbital","status":"done"}') for i in range(20)]
+            return iter(rows)
+
+    @contextlib.contextmanager
+    def fake_db():
+        yield _Conn()
+
+    monkeypatch.setattr(serve, '_db', fake_db)
+    assert '2-120' in serve.supervisor_live_read('theo', {'op': 'find_artifact', 'query': 'x'})['error']
+    out = serve.supervisor_live_read('theo', {'op': 'find_artifact', 'query': 'orbital'})
+    assert len(out['files']) == 25
+    assert len(out['archivedTasks']) == 15
+    assert out['archivedTasks'][0]['title'] is None

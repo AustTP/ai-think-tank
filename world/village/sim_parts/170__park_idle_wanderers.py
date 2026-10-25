@@ -703,6 +703,8 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         'sizeEstimate': pick.get('sizeEstimate'),
         'reviewOf': pick.get('reviewOf'),
         'reviewAuthorId': pick.get('reviewAuthorId'),
+        'issueKey': pick.get('issueKey'),
+        'requestId': pick.get('requestId'),
         # Phase E2d: an INCIDENT routes to the owning team's on-call (taskType
         # 'bug' + productId + assignedTo travel so the fix is attributable and
         # the cap can be enforced against the open task set).
@@ -763,7 +765,9 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     # THIS task's execution.
     instructions = _augment_task_instructions(
         state, chosen_id, pick.get('productId'), pick.get('instructions'),
-        refocus=bool(pick.get('reviewOf') or pick.get('incident')))
+        refocus=bool(pick.get('reviewOf') or pick.get('incident')),
+        scoped=bool(pick.get('playerAuthored') or pick.get('reviewOf')
+                    or pick.get('issueKey')))
     task = assign_task(state, chosen_id, pick.get('title'), pick.get('room'),
                        instructions, pick.get('projectLabel') or pick.get('goal'), extra,
                        grid, doors, now_ms, task_id_holder or _TASK_ID_HOLDER)
