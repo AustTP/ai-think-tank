@@ -498,12 +498,12 @@ PROXY_PORT = 8899
 
 
 def _docker_network_exists(name):
-    result = subprocess.run(['docker', 'network', 'inspect', name], capture_output=True)
+    result = subprocess.run(['docker', 'network', 'inspect', name], capture_output=True, timeout=8)
     return result.returncode == 0
 
 
 def _docker_container_running(name):
-    result = subprocess.run(['docker', 'inspect', '-f', '{{.State.Running}}', name], capture_output=True, text=True)
+    result = subprocess.run(['docker', 'inspect', '-f', '{{.State.Running}}', name], capture_output=True, text=True, timeout=8)
     return result.returncode == 0 and result.stdout.strip() == 'true'
 
 
@@ -513,7 +513,7 @@ def _docker_container_env_value(name, key):
     # on every single restart -- only when its configured allowlist has
     # actually drifted from the current one.
     result = subprocess.run(['docker', 'inspect', '-f', '{{range .Config.Env}}{{println .}}{{end}}', name],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, timeout=8)
     if result.returncode != 0:
         return None
     prefix = key + '='
@@ -539,9 +539,9 @@ def ensure_sandbox_networking():
     # connect directly still has nowhere to go -- the isolation is
     # enforced by the network topology, not by tool cooperation.
     if not _docker_network_exists(SANDBOX_NETWORK):
-        subprocess.run(['docker', 'network', 'create', '--internal', SANDBOX_NETWORK], capture_output=True)
+        subprocess.run(['docker', 'network', 'create', '--internal', SANDBOX_NETWORK], capture_output=True, timeout=8)
     if not _docker_network_exists(EGRESS_NETWORK):
-        subprocess.run(['docker', 'network', 'create', EGRESS_NETWORK], capture_output=True)
+        subprocess.run(['docker', 'network', 'create', EGRESS_NETWORK], capture_output=True, timeout=8)
     # Player-vetted data sites: the SAME BROWSE_ALLOWLIST_DOMAINS
     # /api/browse skips Jev for, passed into the proxy so agent-run SCRIPTS
     # can do real systematic crawling against them too, not just one-URL-at-
@@ -560,9 +560,9 @@ def ensure_sandbox_networking():
         # won't have it -- without it, Jev-approved browser hosts stay
         # unreachable at the network layer).
         if current_extra_hosts != desired_extra_hosts or current_grants_path != EGRESS_GRANTS_PATH:
-            subprocess.run(['docker', 'rm', '-f', PROXY_CONTAINER], capture_output=True)
+            subprocess.run(['docker', 'rm', '-f', PROXY_CONTAINER], capture_output=True, timeout=8)
     if not _docker_container_running(PROXY_CONTAINER):
-        subprocess.run(['docker', 'rm', '-f', PROXY_CONTAINER], capture_output=True)  # clear a stale/stopped one, if any
+        subprocess.run(['docker', 'rm', '-f', PROXY_CONTAINER], capture_output=True, timeout=8)  # clear a stale/stopped one, if any
         subprocess.run([
             'docker', 'run', '-d', '--name', PROXY_CONTAINER,
             '--network', SANDBOX_NETWORK,
@@ -571,8 +571,8 @@ def ensure_sandbox_networking():
             '-v', f'{os.path.join(ROOT, "sandbox_proxy.py")}:/proxy.py:ro',
             '-v', f'{EGRESS_GRANTS_PATH}:{EGRESS_GRANTS_PATH}:ro',
             SANDBOX_IMAGE, 'python3', '/proxy.py',
-        ], capture_output=True)
-        subprocess.run(['docker', 'network', 'connect', EGRESS_NETWORK, PROXY_CONTAINER], capture_output=True)
+        ], capture_output=True, timeout=8)
+        subprocess.run(['docker', 'network', 'connect', EGRESS_NETWORK, PROXY_CONTAINER], capture_output=True, timeout=8)
 
 
 # JEV-approved egress grants (2026-10-08): a {host: expiry-epoch} map in the
