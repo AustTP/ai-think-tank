@@ -1,5 +1,63 @@
 
 
+def _sanitize_tool_call_arguments(tool_calls):
+    """Return (calls, repaired_ids) with every tool call carrying syntactically
+    valid JSON arguments. A tool call whose `arguments` string was cut off
+    mid-emit (the reply hit max_tokens, so the JSON is unterminated) is kept
+    -- the model still asked for that tool -- but its arguments are replaced
+    with `{}` and its id is reported so the caller can skip executing it.
+
+    Root cause this exists for (live, 2026-10-25): a low-tier model emitting
+    `write_spike_report` with an ~8KB report inside the JSON `arguments`
+    string ran out of tokens, leaving invalid JSON. The loop replayed that
+    assistant message verbatim on the next turn, so the upstream rejected
+    every following request with 400 "Assistant tool call function.arguments
+    must be valid JSON" -- and because the transcript was checkpointed, every
+    retry of the task resumed the same poisoned conversation and failed the
+    same way. A malformed call must never be able to poison the transcript.
+    """
+    cleaned = []
+    repaired_ids = set()
+    for call in tool_calls or []:
+        if not isinstance(call, dict):
+            cleaned.append(call)
+            continue
+        raw = ((call.get('function') or {}).get('arguments'))
+        valid = True
+        if raw not in (None, ''):
+            try:
+                json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                valid = False
+        if not valid:
+            fixed = dict(call)
+            fixed['function'] = dict(call.get('function') or {})
+            fixed['function']['arguments'] = '{}'
+            call_id = call.get('id')
+            if call_id:
+                repaired_ids.add(call_id)
+            cleaned.append(fixed)
+        else:
+            cleaned.append(call)
+    return cleaned, repaired_ids
+
+
+def _model_error_detail(data):
+    """The provider's error text when a response body carries `error` instead
+    of choices, else ''. OpenRouter can answer with a body-level error object
+    (and a 200) for an upstream failure; treating that as "the model returned
+    no content" hid real 400s behind a generic "nothing usable" note."""
+    if not isinstance(data, dict):
+        return ''
+    error = data.get('error')
+    if not error:
+        return ''
+    if isinstance(error, dict):
+        message = error.get('message') or error.get('code') or ''
+        return str(message).strip()
+    return str(error).strip()
+
+
 def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3, max_tokens=None,
                           service='__player_ask__', force_first_tool=False, return_transcript=False,
                           task_id=None, village_id=None, escalate_model=None,
@@ -92,6 +150,14 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
                            if isinstance(force_first_tool, str) else 'required')
         data = _post_openrouter_raw(model, current_messages, tools=tools, max_tokens=max_tokens,
                                     tool_choice=tool_choice)
+        error_detail = _model_error_detail(data)
+        if error_detail:
+            # A provider-side rejection is a real model-call failure, not an
+            # empty answer. Raising here (instead of returning '') lets the
+            # caller record the actual reason and keeps the failure out of the
+            # misleading "returned nothing usable" bucket.
+            record_model_result(model, success=False)
+            raise RuntimeError(f'model call failed: {error_detail}')
         _accrue_spend(service, ((data or {}).get('usage') or {}).get('cost', 0.0), village_id=village_id)
         if task_id and isinstance(((data or {}).get('usage') or {}).get('cost'), (int, float)):
             task_cost = ((data or {}).get('usage') or {}).get('cost', 0.0)
@@ -100,6 +166,22 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
         choice = ((data or {}).get('choices') or [{}])[0]
         message = choice.get('message') or {}
         tool_calls = message.get('tool_calls') or []
+        # A tool call cut off at the token limit has unterminated JSON
+        # arguments. Repair it before it can enter the transcript, and skip
+        # executing it so a half-emitted command never runs.
+        truncated_ids = set()
+        if tool_calls:
+            tool_calls, truncated_ids = _sanitize_tool_call_arguments(tool_calls)
+            message = dict(message)
+            message['tool_calls'] = tool_calls
+            if truncated_ids:
+                try:
+                    log_action('system', 'tool_call_truncated',
+                               {'taskId': task_id, 'model': model,
+                                'finishReason': choice.get('finish_reason'),
+                                'count': len(truncated_ids)}, authorized=True)
+                except Exception:
+                    pass
         # Dynamic tier escalation: the forced tool did not fire. Models rotate
         # in the tiers every ~30 minutes, so instead of unconditionally
         # upgrading (waste when the cheap model behaves), retry this same
@@ -113,6 +195,10 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
                 model = esc
                 data = _post_openrouter_raw(model, current_messages, tools=tools, max_tokens=max_tokens,
                                             tool_choice=tool_choice)
+                error_detail = _model_error_detail(data)
+                if error_detail:
+                    record_model_result(model, success=False)
+                    raise RuntimeError(f'model call failed: {error_detail}')
                 _accrue_spend(service, ((data or {}).get('usage') or {}).get('cost', 0.0), village_id=village_id)
                 if task_id and isinstance(((data or {}).get('usage') or {}).get('cost'), (int, float)):
                     task_cost = ((data or {}).get('usage') or {}).get('cost', 0.0)
@@ -122,6 +208,9 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
                 message = choice.get('message') or {}
                 tool_calls = message.get('tool_calls') or []
                 if tool_calls:
+                    tool_calls, truncated_ids = _sanitize_tool_call_arguments(tool_calls)
+                    message = dict(message)
+                    message['tool_calls'] = tool_calls
                     break
         if not tool_calls:
             content = sanitize_text((message.get('content') or '').strip())
@@ -139,6 +228,17 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
         for call in tool_calls:
             try:
                 name = (call.get('function') or {}).get('name')
+                if call.get('id') in truncated_ids:
+                    # The arguments were cut off at the token limit, so there
+                    # is nothing safe to run. Tell the model exactly what
+                    # happened and how to get it in under the cap.
+                    output = (f'{name} was NOT run: its arguments were cut off at the token limit, '
+                              'so the JSON never closed. Nothing happened. Re-send the call with a '
+                              'shorter argument value, or split the content into smaller calls '
+                              '(for a long report, write it in sections).')
+                    current_messages.append({'role': 'tool', 'tool_call_id': call.get('id'),
+                                             'content': output})
+                    continue
                 args_raw = ((call.get('function') or {}).get('arguments')) or '{}'
                 try:
                     args = json.loads(args_raw) if args_raw else {}

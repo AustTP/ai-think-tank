@@ -131,7 +131,21 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
         'bank': _run_bank_content,
         # library / postoffice / unset -> no entry -> placeholder (unchanged).
     }
-    executor = task_type_executors.get(task.get('taskType')) or room_executors.get(task.get('room'))
+    task_type = task.get('taskType')
+    if task_type in ('code', 'bug'):
+        # A CODE card is code wherever it was queued. The room only decides
+        # which BUILDING it runs in, not what kind of work it is. Falling
+        # through to the room executor made a code/bug card queued into
+        # media run the feed-digest digest path (the real 2026-10-25 failure:
+        # "No feeds configured yet -- waiting on media/feeds.md in the
+        # Library." on south-outlet selector cards), and one queued into
+        # library/house hit the placeholder no-op and stored an empty note.
+        # pressoffice keeps its workroom path (project listing, product
+        # builds, ambient health check); every other room uses the coding
+        # executor directly.
+        executor = _run_workroom_content if task.get('room') == 'pressoffice' else _run_coding_content
+    else:
+        executor = task_type_executors.get(task_type) or room_executors.get(task.get('room'))
     if task.get('pipelineStep'):
         executor = _run_pipeline_step_content
     if executor:

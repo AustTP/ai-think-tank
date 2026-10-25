@@ -858,24 +858,33 @@ class CallAgentToolLoop(unittest.TestCase):
         self.assertEqual(result, '')
         pr.assert_called()
 
-    def test_tool_call_with_invalid_json_arguments_falls_back_to_empty(self):
+    def test_tool_call_with_invalid_json_arguments_is_not_executed(self):
+        # A tool call whose JSON arguments never closed was cut off at the
+        # token limit -- it must not run with fabricated {} arguments, and the
+        # malformed assistant message must be repaired before it enters the
+        # transcript (replaying it verbatim made every later request 400).
         executed = []
+        sent = []
 
         def execute_tool(name, args):
             executed.append((name, args))
             return 'tool result'
 
         calls = iter([
-            {'choices': [{'message': {'content': 'thinking', 'tool_calls': [
+            {'choices': [{'finish_reason': 'length', 'message': {'role': 'assistant', 'content': 'thinking', 'tool_calls': [
                 {'id': 'call_1', 'function': {'name': 'lookup', 'arguments': '{bad json'}}]}}]},
             {'choices': [{'message': {'content': 'final answer', 'tool_calls': []}}]},
         ])
         with unittest.mock.patch.object(serve, '_post_openrouter_raw',
-                                        side_effect=lambda *a, **k: next(calls)):
+                                        side_effect=lambda *a, **k: (sent.append(a[1]), next(calls))[1]):
             result = serve._call_agent_tool_loop('m', [{'role': 'user', 'content': 'q'}], [],
                                                  execute_tool)
         self.assertEqual(result, 'final answer')
-        self.assertEqual(executed, [('lookup', {})])
+        self.assertEqual(executed, [])
+        assistant = [m for m in sent[1] if m.get('role') == 'assistant'][0]
+        self.assertEqual(assistant['tool_calls'][0]['function']['arguments'], '{}')
+        self.assertIn('cut off at the token limit',
+                      [m for m in sent[1] if m.get('role') == 'tool'][0]['content'])
 
     def test_max_iterations_exhausted_returns_none(self):
         data = {'choices': [{'message': {'content': '', 'tool_calls': [

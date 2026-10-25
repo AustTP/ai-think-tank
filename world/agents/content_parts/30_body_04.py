@@ -673,6 +673,23 @@ def _release_product_from_build(product_id, releasing_agent, base, key):
         return
 
 
+def _heartbeat_keepalive(task_id):
+    """Keep a content run's liveness heartbeat warm across one blocking model
+    call. A synthesis completion can outlast TASK_CONTENT_HB_STALE_S with no
+    tool calls to bump on, and the sim then abandons a live run empty (real
+    2026-10-25 task-278: report saved, 306s silent synthesis, card abandoned).
+    Falls back to a no-op context manager."""
+    if not task_id:
+        import contextlib
+        return contextlib.nullcontext()
+    try:
+        import sim as _sim_module
+        return _sim_module.content_heartbeat_keepalive(task_id)
+    except Exception:
+        import contextlib
+        return contextlib.nullcontext()
+
+
 def _plain_completion(model, messages, max_tokens, service='spike', task_id=None,
                       village_id=None):
     """One non-tool completion call, with the same spend accrual _http_json
@@ -686,11 +703,18 @@ def _plain_completion(model, messages, max_tokens, service='spike', task_id=None
     if task_id and _serve._task_budget_exhausted(task_id):
         return ''
     try:
-        data = _serve._call_openrouter_sync(model, messages, max_tokens)
+        with _heartbeat_keepalive(task_id):
+            data = _serve._call_openrouter_sync(model, messages, max_tokens)
     except Exception as e:
         print(f'[spike] plain completion failed: {e}', flush=True)
         return ''
     if not isinstance(data, dict):
+        return ''
+    error_detail = _serve._model_error_detail(data)
+    if error_detail:
+        # A provider-side error in the body is not an empty answer; name it so
+        # the caller's note and the log both say what actually failed.
+        print(f'[spike] plain completion error: {error_detail}', flush=True)
         return ''
     cost = (data.get('usage') or {}).get('cost', 0.0)
     if isinstance(cost, (int, float)) and cost:

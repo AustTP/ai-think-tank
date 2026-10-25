@@ -276,6 +276,21 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     system += '\n\n' + evidence_policy.INSTRUCTIONS
     if resume_transcript is not None:
         messages = list(resume_transcript)
+        # A checkpoint saved mid-turn can carry a tool call whose JSON
+        # arguments were cut off at the token limit. Replaying it verbatim
+        # makes every upstream request 400 ("Assistant tool call
+        # function.arguments must be valid JSON"), so the task could never
+        # recover -- it failed the same way on every retry. Repair the saved
+        # transcript on the way in; the model still sees that it asked for
+        # that tool, and its result message below still explains what happened.
+        for idx, msg in enumerate(messages):
+            if not isinstance(msg, dict) or msg.get('role') != 'assistant' or not msg.get('tool_calls'):
+                continue
+            cleaned, repaired = _serve._sanitize_tool_call_arguments(msg.get('tool_calls'))
+            if repaired:
+                fixed = dict(msg)
+                fixed['tool_calls'] = cleaned
+                messages[idx] = fixed
         for call in resume_pending:
             name = ((call.get('function') or {}).get('name') or '').strip()
             if tool_replay_safety(name) == 'safe':
@@ -495,7 +510,13 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     try:
         execute_text, transcript = _run_spike_tool_loop_with_reflection(
             tier_slug, reasoning_slug, messages, spike_tools, execute_tool,
-            total_iterations=50, max_tokens=2400, force_first_tool=first_tool,
+            # 2400 -> 4096: an ~8KB report passed as write_spike_report's JSON
+            # `content` string needs more than 2400 tokens including the JSON
+            # envelope. At 2400 the reply was cut mid-string, which produced an
+            # unterminated tool call and (before the loop repaired them) a
+            # poisoned transcript. The closer below already allows 8000.
+            total_iterations=50, max_tokens=4096, force_first_tool=first_tool,
+            escalate_model=[_serve._mid_tier_slug(), _serve._high_tier_slug()],
             task_id=task.get('id'),
             village_id=_sim_village_of_agent(snapshot, agent_id),
             conversation_policy=task_tool_policy(task),
@@ -617,7 +638,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # wish (and no Jev spend) for the common "investigated, all fine" case.
     file_issue_wish = None
     try:
-        file_issue_wish = _spike_file_issue_wish(finding, task, name, backlog)
+        with _heartbeat_keepalive(task.get('id')):
+            file_issue_wish = _spike_file_issue_wish(finding, task, name, backlog)
     except Exception:
         file_issue_wish = None
     library_path = report_path

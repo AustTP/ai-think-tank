@@ -145,7 +145,8 @@ _REFLECTION_CONFIDENCE_FLOOR = 0.5
 def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, tools, execute_tool,
                                          total_iterations, max_tokens, force_first_tool, task_id=None,
                                          village_id=None, conversation_policy=None,
-                                         on_before_tools=None, on_after_tools=None):
+                                         on_before_tools=None, on_after_tools=None,
+                                         escalate_model=None):
     remaining = total_iterations
     current_messages = list(messages)
     first_round = True
@@ -158,6 +159,7 @@ def _run_spike_tool_loop_with_reflection(tier_slug, reasoning_slug, messages, to
             max_iterations=this_round, max_tokens=max_tokens, service='spike',
             force_first_tool=(force_first_tool if first_round else False), return_transcript=True,
             task_id=task_id, village_id=village_id, conversation_policy=conversation_policy,
+            escalate_model=escalate_model,
             on_before_tools=on_before_tools, on_after_tools=on_after_tools)
         remaining -= this_round
         if len(current_messages) == before_len:

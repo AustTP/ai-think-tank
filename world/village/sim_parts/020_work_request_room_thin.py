@@ -172,6 +172,40 @@ def _bump_content_heartbeat(task_id):
                 _CONTENT_HEARTBEATS.pop(key, None)
 
 
+class _ContentHeartbeatKeepalive:
+    """Bump the content heartbeat from a daemon thread for the duration of one
+    long synchronous call. A single synthesis completion (no tool calls to bump
+    on) can run past TASK_CONTENT_HB_STALE_S, which made a provably live run
+    look dead and get abandoned empty -- the real 2026-10-25 task-278 incident:
+    the report was already saved, then synthesis ran 306s with no heartbeat and
+    the card was closed as abandoned."""
+
+    def __init__(self, task_id, interval_s=30.0):
+        self.task_id = task_id
+        self.interval_s = interval_s
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        if self.task_id:
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+        return self
+
+    def _loop(self):
+        while not self._stop.wait(self.interval_s):
+            _bump_content_heartbeat(self.task_id)
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        _bump_content_heartbeat(self.task_id)
+        return False
+
+
+def content_heartbeat_keepalive(task_id, interval_s=30.0):
+    return _ContentHeartbeatKeepalive(task_id, interval_s)
+
+
 def _content_heartbeat_at(task):
     hb = task.get('_contentHeartbeat')
     task_id = task.get('id')

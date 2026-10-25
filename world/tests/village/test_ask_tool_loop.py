@@ -183,3 +183,65 @@ class WebToolsExecutorBrowsePage(unittest.TestCase):
             out = self._executor()('browse_page', {'url': 'https://dreyx.com', 'purpose': 'p'})
         self.assertIn('https://dreyx.com/39', out)
         self.assertNotIn('https://dreyx.com/45', out)  # past the 40-link cap
+
+
+class TruncatedToolCallRepair(unittest.TestCase):
+    """Live failure 2026-10-25: a low-tier model emitting an ~8KB
+    write_spike_report hit max_tokens mid-string, leaving unterminated JSON in
+    the assistant tool call. Replaying that message made every later request
+    400 ("Assistant tool call function.arguments must be valid JSON"), and the
+    checkpointed transcript made every retry fail identically."""
+
+    def test_truncated_arguments_are_repaired_and_not_executed(self):
+        executed = []
+        requests = []
+
+        def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
+            requests.append(messages)
+            if len(requests) == 1:
+                return {'choices': [{'finish_reason': 'length', 'message': {
+                    'role': 'assistant', 'content': None,
+                    'tool_calls': [{'id': 'c1', 'type': 'function', 'function': {
+                        'name': 'search_web', 'arguments': '{"query": "unterminated'}}]}}]}
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'settled'}}]}
+
+        with unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post):
+            reply = serve._call_agent_tool_loop(
+                'm', [{'role': 'user', 'content': 'q'}], serve.AGENT_ASK_TOOLS,
+                lambda n, a: executed.append((n, a)) or 'ran')
+
+        self.assertEqual(reply, 'settled')
+        self.assertEqual(executed, [])  # the half-emitted call never ran
+        bad_assistant = [m for m in requests[1] if m.get('role') == 'assistant']
+        self.assertEqual(bad_assistant[0]['tool_calls'][0]['function']['arguments'], '{}')
+        tool_msgs = [m for m in requests[1] if m.get('role') == 'tool']
+        self.assertIn('cut off at the token limit', tool_msgs[0]['content'])
+
+    def test_body_level_error_raises_instead_of_looking_empty(self):
+        def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
+            return {'id': 'gen-x', 'error': {
+                'message': 'Upstream error: Assistant tool call function.arguments must be valid JSON.',
+                'code': 400}}
+
+        with unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post):
+            with self.assertRaises(RuntimeError) as ctx:
+                serve._call_agent_tool_loop(
+                    'm', [{'role': 'user', 'content': 'q'}], serve.AGENT_ASK_TOOLS, lambda n, a: 'x')
+        self.assertIn('must be valid JSON', str(ctx.exception))
+
+    def test_valid_arguments_are_left_alone(self):
+        seen = []
+
+        def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
+            seen.append(messages[-1])
+            if len(seen) == 1:
+                return {'choices': [{'message': {'role': 'assistant', 'content': None,
+                                                 'tool_calls': [_search_tool_call('c1', 'x y')]}}]}
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'done'}}]}
+
+        executed = []
+        with unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post):
+            serve._call_agent_tool_loop(
+                'm', [{'role': 'user', 'content': 'q'}], serve.AGENT_ASK_TOOLS,
+                lambda n, a: executed.append((n, a)) or 'ok')
+        self.assertEqual(executed, [('search_web', {'query': 'x y'})])

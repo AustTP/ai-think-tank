@@ -15,6 +15,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -498,6 +499,27 @@ class WorkerStuckHelp(unittest.TestCase):
                       'a crash must be marked ok=False, not a silent success')
         self.assertIn('Content execution failed', seen['task-1'].get('note', ''))
 
+    def test_new_dispatch_drops_a_stale_result_from_a_prior_run(self):
+        # Live 2026-10-25 (task-260): a fresh spike wrote an 8KB report, but the
+        # sim consumed a leftover result from an earlier run of the same
+        # (reusable) task id, cleared the in-flight flag, and refused
+        # completion for a missing deliverable -- orphaning the real report.
+        def noop(snapshot, agent_id, task, base_ctx):  # noqa: ARG001
+            pass
+
+        real_thread = sim.threading.Thread
+
+        class _InlineThread(real_thread):
+            def start(self):
+                self._target(*self._args, **self._kwargs)
+
+        sim._content_results['task-260'] = {'ok': False, 'note': 'stale failure'}
+        task = {'id': 'task-260', 'room': 'observatory'}
+        with mock.patch('sim.threading.Thread', _InlineThread):
+            sim._dispatch_content_work(noop, _state(), 'ada', task, 1000.0)
+        self.assertIsNone(sim._take_content_result('task-260'),
+                          'a new run must not inherit the previous run result')
+
     def test_content_ceiling_honors_task_budget_ms_up_to_the_cap(self):
         # Confirmed bug (task-331, 2026-10-13): dispatch flattened every
         # content task to the generic 120s regardless of the task's own
@@ -549,6 +571,18 @@ class ContentGraceHelpers(unittest.TestCase):
     def test_stale_heartbeat_is_not_live(self):
         task = {'_contentHeartbeat': 1000.0 - sim.TASK_CONTENT_HB_STALE_S - 1.0}
         self.assertFalse(sim._content_run_is_live(task, 1000.0))
+
+    def test_keepalive_bumps_the_heartbeat_during_a_long_call(self):
+        # task-278: a 306s silent synthesis made a live spike look dead and it
+        # was closed as abandoned even though its report was already saved.
+        sim._CONTENT_HEARTBEATS.pop('keepalive-1', None)
+        with sim.content_heartbeat_keepalive('keepalive-1', interval_s=0.01):
+            time.sleep(0.05)
+        first = sim._CONTENT_HEARTBEATS.get('keepalive-1')
+        self.assertIsInstance(first, float)
+        time.sleep(0.05)
+        self.assertEqual(sim._CONTENT_HEARTBEATS.get('keepalive-1'), first,
+                         'the keepalive thread must stop when the call returns')
 
     def test_process_registry_keeps_a_live_run_alive_after_a_stale_save(self):
         # A concurrent whole-blob save can overwrite the task's heartbeat

@@ -245,18 +245,27 @@ class ObservatoriesAndDispatcher(_ExecutorTestCase):
             # into _run_observatory_content, whose bare branch runs research.
             ({'id': 'x11', 'taskType': 'research', 'room': 'observatory'},
              '_run_observatory_content'),
+            # A code/bug card is code wherever it was queued. Before this a
+            # code card in media ran the feed-digest executor (real 2026-10-25
+            # failure) and one in library hit the placeholder no-op.
+            ({'id': 'x12', 'taskType': 'code', 'room': 'media'}, '_run_coding_content'),
+            ({'id': 'x13', 'taskType': 'code', 'room': 'library'}, '_run_coding_content'),
+            ({'id': 'x14', 'taskType': 'bug', 'room': 'observatory'}, '_run_coding_content'),
+            ({'id': 'x15', 'taskType': 'code', 'room': 'pressoffice'}, '_run_workroom_content'),
         ]:
             with mock.patch.object(content, '_run_spike_content') as spike, \
                  mock.patch.object(content, '_run_review_content') as review, \
                  mock.patch.object(content, '_run_media_content') as media, \
                  mock.patch.object(content, '_run_bank_content') as bank, \
                  mock.patch.object(content, '_run_workroom_content') as workroom, \
-                 mock.patch.object(content, '_run_observatory_content') as observatory:
+                 mock.patch.object(content, '_run_observatory_content') as observatory, \
+                 mock.patch.object(content, '_run_coding_content') as coding:
                 content._server_content_dispatcher(_snapshot(), 'cora', task)
             target = {'_run_spike_content': spike, '_run_review_content': review,
                       '_run_media_content': media,
                       '_run_bank_content': bank, '_run_workroom_content': workroom,
-                      '_run_observatory_content': observatory}
+                      '_run_observatory_content': observatory,
+                      '_run_coding_content': coding}
             if expected is None:
                 for t in target.values():
                     t.assert_not_called()

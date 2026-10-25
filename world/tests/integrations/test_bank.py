@@ -712,13 +712,16 @@ class Dispatcher(unittest.TestCase):
         return seen
 
     def test_bank_room_routes_to_bank_executor(self):
-        seen = self._route('bank', 'nora')
+        # A non-code task in the bank room is bank work. (A CODE task is code
+        # wherever it is queued -- see the workroom dispatcher tests -- so this
+        # room-routing case must not carry taskType 'code'.)
+        seen = self._route('bank', 'nora', taskType=None)
         self.assertTrue(seen, 'bank task should have stored a result')
         note = next(iter(seen.values()))['note']
         self.assertIn('nothing has been spent yet', note)
 
     def test_other_placeholder_room_not_dispatched_to_bank(self):
-        seen = self._route('library', 'nora')
+        seen = self._route('library', 'nora', taskType=None)
         self.assertEqual(seen, {})  # no dispatcher branch for library -> placeholder
 
 
